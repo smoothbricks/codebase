@@ -29,6 +29,11 @@ jobs:
         with:
           bun-version: latest
 
+      - name: Setup Biome CLI
+        uses: biomejs/setup-biome@v2
+        with:
+          version: latest
+
       - id: install-deps
         name: Install dependencies
         run: |
@@ -39,8 +44,8 @@ jobs:
         run: bun run typecheck
 
       - id: lint
-        name: Lint
-        run: bun run lint
+        name: Run Biome
+        run: biome ci
 
       - id: test
         name: Run tests and checks

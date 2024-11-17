@@ -7,7 +7,7 @@
   },
   "files": {
     "ignoreUnknown": false,
-    "ignore": []
+    "ignore": ["out", "dist"]
   },
   "formatter": {
     "enabled": true,
@@ -23,7 +23,8 @@
     "enabled": true,
     "rules": {
       "recommended": true
-    }
+    },
+    "ignore": ["test"]
   },
   "javascript": {
     "formatter": {
