@@ -8,7 +8,7 @@ const defaultBuildConfig: BuildConfig = {
   packages: 'bundle',
   splitting: true,
   sourcemap: 'external',
-  external: ['react'],
+  external: ['react', 'react-dom'],
 };
 
 await $`rm -rf ./dist`;

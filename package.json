@@ -10,8 +10,7 @@
   "module": "./dist/index.js",
   "dependencies": {
     "@tldraw/state": "^3.4.0",
-    "@tldraw/state-react": "^3.4.0",
-    "react": "18.3.1"
+    "@tldraw/state-react": "^3.4.0"
   },
   "devDependencies": {
     "@testing-library/react": "^16.0.1",
@@ -19,6 +18,9 @@
     "@types/bun": "^1.1.12",
     "@types/react": "^18.3.12",
     "bun-plugin-dts": "^0.3.0"
+  },
+  "peerDependencies": {
+    "react": "18.3.0"
   },
   "exports": {
     "types": "./dist/index.d.ts",

@@ -96,7 +96,7 @@ function Counter() {
 // Setup the app with the configured event bus
 function App() {
   return (
-    <StateBusProvider bus={eventBus}>
+    <StateBusProvider value={eventBus}>
       <Counter />
     </StateBusProvider>
   );
