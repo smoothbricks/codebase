@@ -1,0 +1,68 @@
+{
+  "name": "@smoothbricks/statebus",
+  "version": "0.8.0",
+  "author": "SmoothBricks Contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/statebus.git"
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "dependencies": {
+    "@tldraw/state": "^3.4.0",
+    "@tldraw/state-react": "^3.4.0"
+  },
+  "devDependencies": {
+    "@testing-library/react": "^16.0.1",
+    "@testing-library/user-event": "^14.0.0",
+    "@types/bun": "^1.1.12",
+    "@types/react": "^18.3.12",
+    "bun-plugin-dts": "^0.3.0"
+  },
+  "peerDependencies": {
+    "react": "18.3.0"
+  },
+  "exports": {
+    "types": "./dist/index.d.ts",
+    "import": "./dist/index.js",
+    "require": "./dist/index.cjs"
+  },
+  "bugs": "https://github.com/smoothbricks/statebus/issues",
+  "description": "",
+  "files": ["dist"],
+  "homepage": "https://smoothbricks.dev/statebus",
+  "keywords": [
+    "data flow",
+    "event bus",
+    "eventbus",
+    "mobx",
+    "observable",
+    "react",
+    "react-native",
+    "recoil",
+    "redux",
+    "reducer",
+    "replay",
+    "store",
+    "signia",
+    "state manager",
+    "state management",
+    "predictable",
+    "functional",
+    "frp",
+    "immutable",
+    "immer",
+    "copy-on-write"
+  ],
+  "license": "MIT",
+  "scripts": {
+    "build": "bun run build.ts",
+    "lint": "biome check --files-ignore-unknown=true",
+    "lint:fix": "biome format --write --files-ignore-unknown=true",
+    "typecheck": "tsc --noEmit",
+    "prepublishOnly": "bun run build",
+    "upgrade-interactive": "bunx npm-check-updates -i"
+  },
+  "type": "module",
+  "types": "./dist/index.d.ts"
+}
