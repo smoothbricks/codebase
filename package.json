@@ -2,6 +2,10 @@
   "name": "corpos",
   "version": "0.0.0",
   "private": true,
+  "packageManager": "bun@1.2.10",
+  "engines": {
+    "node": ">=22.0.0"
+  },
   "dependencies": {},
   "devDependencies": {
     "@biomejs/biome": "^2.0.0",

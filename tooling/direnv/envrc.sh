@@ -22,8 +22,28 @@ watch_file apply-workspace-git-config.sh
 # Go to project root
 cd ../..
 
+# Install dependencies first so node_modules/.bin tools are available
 bun install --no-summary
 export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
+
+# Update package.json with current versions from devenv
+# Get current Node.js and Bun versions
+NODE_VERSION=$(node --version | sed 's/v//')
+BUN_VERSION=$(bun --version)
+
+# Check if update is needed
+CURRENT_NODE_ENGINE=$(jq -r '.engines.node // ""' package.json)
+CURRENT_PKG_MANAGER=$(jq -r '.packageManager // ""' package.json)
+EXPECTED_NODE_ENGINE=">=${NODE_VERSION%%.*}.0.0"
+EXPECTED_PKG_MANAGER="bun@$BUN_VERSION"
+
+if [[ "$CURRENT_NODE_ENGINE" != "$EXPECTED_NODE_ENGINE" ]] || [[ "$CURRENT_PKG_MANAGER" != "$EXPECTED_PKG_MANAGER" ]]; then
+  # Update package.json and format with biome (now available via node_modules/.bin)
+  jq --arg node "$EXPECTED_NODE_ENGINE" \
+     --arg bun "$EXPECTED_PKG_MANAGER" \
+     '.engines.node = $node | .packageManager = $bun' \
+     package.json | biome format --stdin-file-path=package.json > package.json.tmp && mv package.json.tmp package.json
+fi
 
 # Watch JS tooling changes
 watch_file bun.lock
