@@ -43,6 +43,17 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   - Adds `node_modules/.bin` to PATH
   - Applies workspace Git configuration
 - All dev tools (nx, biome, etc.) are available directly on PATH
+- **Devenv command** is available anywhere in the monorepo:
+  - `devenv shell` - Enter development shell
+  - `devenv update` - Update devenv.lock from devenv.yaml inputs
+  - `devenv up` - Start processes in the foreground
+  - `devenv processes` - Start or stop processes
+  - `devenv tasks` - Run tasks
+  - `devenv test` - Run tests
+  - `devenv search <package>` - Search for packages in nixpkgs
+  - `devenv info` - Print information about the environment
+  - `devenv gc` - Delete previous shell generations
+  - Configuration files are in `tooling/direnv/`
 
 ### Project Structure
 

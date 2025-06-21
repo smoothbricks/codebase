@@ -35,5 +35,15 @@ in {
   # https://devenv.sh/processes/
   # processes.ping.exec = "ping example.com";
 
+  # https://devenv.sh/scripts/#entershell
+  # This runs when entering the devenv shell
+  # - When using the devenv wrapper from tooling/, restore the original working directory
+  #   (The wrapper runs devenv from tooling/direnv but we want the shell to start where the user was)
+  enterShell = ''
+    if [ -n "$DEVENV_SHELL_PWD" ]; then
+      cd "$DEVENV_SHELL_PWD"
+    fi
+  '';
+
   # See full reference at https://devenv.sh/reference/options/
 }
