@@ -1,14 +1,13 @@
 {
   outputs = {...}: {
     overlays.default = self: super:
-      with super; {
-        # Overrides go here, see: https://github.com/cachix/devenv/issues/478#issuecomment-1663735284
+      with super; let
+        sources = callPackage ./_sources/generated.nix {};
+        bunSource = sources."bun-${stdenvNoCC.hostPlatform.system}";
+      in {
+        # Override bun with the version from nvfetcher
         bun = bun.overrideAttrs (finalAttrs: previousAttrs: {
-          # Use same ICU as Node.js does
-          postPatchelf = lib.optionalString stdenvNoCC.hostPlatform.isDarwin ''
-            wrapProgram $out/bin/bun \
-              --prefix DYLD_LIBRARY_PATH : ${lib.makeLibraryPath [icu]}
-          '';
+          inherit (bunSource) version src;
         });
       };
   };

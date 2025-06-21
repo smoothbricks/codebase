@@ -26,6 +26,9 @@ cd ../..
 bun install --no-summary
 export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
 
+# Make sure Biome is executable
+chmod +x node_modules/@biomejs/cli-*/biome
+
 # Update package.json with current versions from devenv
 # Get current Node.js and Bun versions
 NODE_VERSION=$(node --version | sed 's/v//')
