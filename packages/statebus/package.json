@@ -9,14 +9,14 @@
   "main": "./dist/index.cjs",
   "module": "./dist/index.js",
   "dependencies": {
-    "@tldraw/state": "^3.4.0",
-    "@tldraw/state-react": "^3.4.0"
+    "@tldraw/state": "^3.13.1",
+    "@tldraw/state-react": "^3.13.1"
   },
   "devDependencies": {
-    "@testing-library/react": "^16.0.1",
-    "@testing-library/user-event": "^14.0.0",
-    "@types/bun": "^1.1.12",
-    "@types/react": "^18.3.12",
+    "@testing-library/react": "^16.3.0",
+    "@testing-library/user-event": "^14.6.1",
+    "@types/bun": "^1.2.16",
+    "@types/react": "^19.1.8",
     "bun-plugin-dts": "^0.3.0"
   },
   "peerDependencies": {
@@ -29,7 +29,9 @@
   },
   "bugs": "https://github.com/smoothbricks/statebus/issues",
   "description": "",
-  "files": ["dist"],
+  "files": [
+    "dist"
+  ],
   "homepage": "https://smoothbricks.dev/statebus",
   "keywords": [
     "data flow",
@@ -57,12 +59,16 @@
   "license": "MIT",
   "scripts": {
     "build": "bun run build.ts",
-    "lint": "biome check --files-ignore-unknown=true",
-    "lint:fix": "biome format --write --files-ignore-unknown=true",
     "typecheck": "tsc --noEmit",
     "prepublishOnly": "bun run build",
     "upgrade-interactive": "bunx npm-check-updates -i"
   },
   "type": "module",
-  "types": "./dist/index.d.ts"
+  "types": "./dist/index.d.ts",
+  "nx": {
+    "targets": {
+      "lint": {},
+      "lint:fix": {}
+    }
+  }
 }

@@ -1,4 +1,4 @@
-import type { ByID, Events, States } from '@smoothbricks/statebus';
+import type { ByID, Events, States } from '@smoothbricks/statebus-core';
 import type { Atom, Signal as Substate } from '@tldraw/state';
 
 // #region Events
@@ -51,7 +51,6 @@ export type Listener<Topic extends Topics = Topics, Type extends EventTypes<Topi
 export interface StateBusConfig {
   initialState: InitialState;
   reducers: EventReducers;
-  autoDispatch?: boolean;
 }
 // #endregion
 

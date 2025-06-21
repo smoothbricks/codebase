@@ -20,7 +20,7 @@ import type {
   Topics,
   TopLevelReducer,
   WritableState,
-} from './types';
+} from './types.js';
 
 class Substates<T> implements ISubstates<T> {
   private readonly _byID = new Map<string | number, Atom<T | undefined>>();
@@ -52,19 +52,23 @@ class Substates<T> implements ISubstates<T> {
     const iter = this._byID.values();
     const filtered = {
       next: (): IteratorResult<T> => {
-        const result = iter.next();
-        if (result.done) {
-          return { value: undefined, done: true };
+        let result = iter.next();
+        while (!result.done) {
+          const value = result.value?.get();
+          if (value !== undefined) {
+            return { value, done: false };
+          }
+          result = iter.next();
         }
-        const value = result.value.get();
-        return value !== undefined ? { value, done: false } : filtered.next();
+        // biome-ignore lint/suspicious/noExplicitAny: iterator protocol requires value field
+        return { value: undefined as any, done: true };
       },
     };
     return filtered;
   }
 }
 
-export class StateBus implements StateBusReader {
+export abstract class StateBus implements StateBusReader {
   readonly isolates: Record<string, ReadonlyState> = {};
   readonly reduceEvent: TopLevelReducer;
   readonly state: ReadonlyState;
@@ -72,7 +76,7 @@ export class StateBus implements StateBusReader {
   private initialState: InitialState;
 
   constructor(config: StateBusConfig) {
-    const { initialState, reducers, autoDispatch = true } = config;
+    const { initialState, reducers } = config;
     this.initialState = Object.freeze(initialState);
 
     if (typeof reducers === 'function') {
@@ -103,9 +107,6 @@ export class StateBus implements StateBusReader {
       ]),
     );
     this.state = Object.freeze(s) as unknown as ReadonlyState;
-
-    // When nextFrameId is 0, requestAnimationFrame is scheduled on the next publish()
-    this.nextFrameId = autoDispatch ? 0 : -1;
   }
 
   private eventQueue: AnyEvent[] = [];
@@ -168,17 +169,12 @@ export class StateBus implements StateBusReader {
     }
   }
 
-  private nextFrameId: number;
+  protected abstract scheduleDispatch(): void;
 
   publish(event: AnyEvent) {
-    if (this.nextFrameId === 0) {
-      this.nextFrameId = requestAnimationFrame((_time) => {
-        // console.trace('Dispatching events post-render', time);
-        this.dispatchEvents();
-        this.nextFrameId = 0;
-      });
-    }
-    return this.eventQueue.push(event);
+    const length = this.eventQueue.push(event);
+    this.scheduleDispatch();
+    return length;
   }
 
   subscribe<Topic extends Topics, Type extends EventTypes<Topic>>(

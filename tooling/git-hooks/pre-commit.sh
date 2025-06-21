@@ -19,14 +19,13 @@ git-format-staged --verbose -f \
 
 # Format all files that Biome supports, excluding git submodules:
 git-format-staged --verbose -f \
-  "biome check --files-ignore-unknown=true —use-editorconfig=true '--stdin-file-path={}' --fix" $SUBMODULE_EXCLUSIONS \
-  '*.js' '*.ts' '*.jsx' '*.tsx' '*.json' '*.jsonc' '*.html' '*.css' '*.graphql' \
+  "biome check --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}' --fix" $SUBMODULE_EXCLUSIONS \
+  '*.js' '*.ts' '*.jsx' '*.tsx' '*.json' '*.jsonc' '*.html' '*.css' '*.graphql'
 
 # Format other (Markdown) files with prettier:
 git-format-staged --verbose -f \
-  "prettier --ignore-unknown --stdin-filepath '{}'" $SUBMODULE_EXCLUSIONS \
-  '!*.astro' '!*.js' '!*.ts' '!*.jsx' '!*.tsx' '!*.json' '!*.jsonc' '!*.html' '!*.css' '!*.graphql' \
-  '*' # Positive patterns must be after negatives or it won't match!
+  "prettier --ignore-unknown --stdin-filepath '{}'" '*' $SUBMODULE_EXCLUSIONS \
+  '!*.astro' '!*.js' '!*.ts' '!*.jsx' '!*.tsx' '!*.json' '!*.jsonc' '!*.html' '!*.css' '!*.graphql'
 
 # Nix
 git-format-staged --verbose -f "alejandra" '*.nix'

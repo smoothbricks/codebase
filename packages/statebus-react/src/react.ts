@@ -1,10 +1,17 @@
-import type { StateBus } from '@smoothbricks/statebus';
+import type {
+  EventPayload,
+  EventTypes,
+  StateBus,
+  StateByIDKey,
+  StateKeys,
+  StatePropKey,
+  StateValue,
+  Topics,
+} from '@smoothbricks/statebus-core';
+import { computed, sortedKeyValuePairs, type ViewFunction, type ViewProps } from '@smoothbricks/statebus-core';
 import { isSignal, type Signal } from '@tldraw/state';
 import { useValue } from '@tldraw/state-react';
 import React, { useContext, useEffect, useMemo } from 'react';
-
-import type { EventPayload, EventTypes, StateByIDKey, StateKeys, StatePropKey, StateValue, Topics } from './types';
-import { computed, sortedKeyValuePairs, type ViewFunction, type ViewProps } from './view';
 
 const StatebusReactContext = React.createContext<StateBus>({} as unknown as StateBus);
 export const StatebusProvider = StatebusReactContext.Provider;
