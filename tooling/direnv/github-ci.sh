@@ -11,7 +11,7 @@ restore_nix_store() {
     echo "=== Restoring Nix store from NAR ==="
     if [ -f "$NIX_STORE_NAR" ]; then
         echo "$NIX_STORE_NAR file found, importing..."
-        sudo $nix_store_cmd --import < "$NIX_STORE_NAR"
+        sudo $nix_store_cmd --import --quiet < "$NIX_STORE_NAR"
         echo "NAR import completed"
     else
         echo "No NAR file found, skipping import"
@@ -82,7 +82,7 @@ run_garbage_collection() {
     sudo find /nix/var/nix/gcroots -type l -exec ls -la {} \; 2>/dev/null || true
     
     echo "Running nix-collect-garbage..."
-    nix-collect-garbage
+    nix-collect-garbage --quiet
     
     echo "GC roots after cleanup:"
     sudo find /nix/var/nix/gcroots -type l -exec ls -la {} \; 2>/dev/null || true
@@ -90,14 +90,6 @@ run_garbage_collection() {
 
 # Function to export Nix store to NAR
 export_nix_store() {
-    echo "=== Environment variables ==="
-    env | grep -E "(NIX|HOME|USER|PATH)" | sort
-    echo "=== Inspecting profiles directory ==="
-    sudo ls -la /nix/var/nix/profiles/
-    echo "=== Checking HOME profile ==="
-    ls -la $HOME/.nix-profile || echo "No HOME profile"
-    echo "=== Checking per-user profiles ==="
-    sudo find /nix/var/nix/profiles -name "*" -type l -exec ls -la {} \;
     echo "=== Finding all GC roots ==="
     # Get ALL GC root targets without filtering  
     ALL_GC_ROOT_TARGETS=$(sudo find /nix/var/nix/gcroots -type l -exec readlink {} \; 2>/dev/null | sort -u)
@@ -142,7 +134,7 @@ export_nix_store() {
         if [ -n "$VALID_PATHS" ]; then
             echo "Exporting NAR with existing paths..."
             echo "Valid paths: $VALID_PATHS"
-            sudo $nix_store_cmd --export $(sudo $nix_store_cmd -qR $VALID_PATHS 2>/dev/null) > "$NIX_STORE_NAR"
+            sudo $nix_store_cmd --export --quiet $(sudo $nix_store_cmd -qR $VALID_PATHS 2>/dev/null) > "$NIX_STORE_NAR"
             echo "Exported NAR with all existing GC roots and profiles"
             ls -lh "$NIX_STORE_NAR"
         else
