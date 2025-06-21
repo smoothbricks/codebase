@@ -5,6 +5,25 @@
     "production": ["default"],
     "sharedGlobals": ["{workspaceRoot}/.github/workflows/ci.yml"]
   },
+  "targetDefaults": {
+    "test": {
+      "dependsOn": ["^build"]
+    },
+    "lint": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "biome check --files-ignore-unknown=true {projectRoot}",
+        "cwd": "{workspaceRoot}"
+      }
+    },
+    "lint:fix": {
+      "executor": "nx:run-commands",
+      "options": {
+        "command": "biome format --write --files-ignore-unknown=true {projectRoot}",
+        "cwd": "{workspaceRoot}"
+      }
+    }
+  },
   "plugins": [
     {
       "plugin": "@nx/js/typescript",
