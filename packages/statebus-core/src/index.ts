@@ -1,11 +1,8 @@
-export type { Atom, Computed } from '@tldraw/state';
-export type { track, useStateTracking } from '@tldraw/state-react';
-
-import type { StateKeys } from './types';
+import type { StateKeys } from './types.js';
 
 declare const _byID_: unique symbol;
 
-declare module '@smoothbricks/statebus' {
+declare module '@smoothbricks/statebus-core' {
   export interface States {
     // User defined mapping of state-key to state-value type (primitive or object shape)
   }
@@ -26,6 +23,23 @@ declare module '@smoothbricks/statebus' {
   }
 }
 
-export { StateBus } from './api';
-export { computedHook, StatebusProvider, useBus, useStateBus, useSubstate } from './react';
-export type { Event, Listener, ReadonlyState, StateBusConfig } from './types';
+export { StateBus } from './api.js';
+export { ManualStateBus } from './manual.js';
+export type {
+  AnyEvent,
+  Event,
+  EventPayload,
+  EventTypes,
+  Listener,
+  ReadonlyState,
+  StateBusConfig,
+  StateBusReader,
+  StateByIDKey,
+  StateKeys,
+  StatePropKey,
+  StateValue,
+  Topics,
+  WritableState,
+} from './types.js';
+export type { ViewFunction, ViewProps } from './view.js';
+export { computed, sortedKeyValuePairs } from './view.js';

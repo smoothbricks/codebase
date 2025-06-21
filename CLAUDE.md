@@ -73,6 +73,8 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   - Alejandra for Nix files
 - **TypeScript** with strict mode and composite projects
 - **Code style**: 2 spaces, single quotes, 120 character line width
+- **Nx uses inferred tasks** - don't add build/typecheck scripts to package.json (Nx infers these from tsconfig), but DO
+  add test scripts
 
 ### Testing
 

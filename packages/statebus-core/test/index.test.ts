@@ -1,8 +1,8 @@
 import { describe, expect, it } from 'bun:test';
-import { StateBus } from '../src/api';
+import { ManualStateBus } from '../src/manual';
 
 //*
-declare module '@smoothbricks/statebus' {
+declare module '@smoothbricks/statebus-core' {
   export interface States {
     counter: number;
   }
@@ -16,10 +16,9 @@ declare module '@smoothbricks/statebus' {
 }
 //*/
 
-describe('StateBus', () => {
+describe('ManualStateBus', () => {
   it('should initialize with correct initial state', () => {
-    const bus = new StateBus({
-      autoDispatch: false,
+    const bus = new ManualStateBus({
       // biome-ignore lint/suspicious/noExplicitAny: test uses simplified types
       initialState: { counter: 0 } as any,
       reducers: {
@@ -32,8 +31,7 @@ describe('StateBus', () => {
   });
 
   it('should handle events and update state through reducers', () => {
-    const bus = new StateBus({
-      autoDispatch: false,
+    const bus = new ManualStateBus({
       // biome-ignore lint/suspicious/noExplicitAny: test uses simplified types
       initialState: { counter: 0 } as any,
       reducers: {
@@ -54,8 +52,7 @@ describe('StateBus', () => {
   });
 
   it('should properly handle event listeners', () => {
-    const bus = new StateBus({
-      autoDispatch: false,
+    const bus = new ManualStateBus({
       // biome-ignore lint/suspicious/noExplicitAny: test uses simplified types
       initialState: { counter: 0 } as any,
       reducers: {},

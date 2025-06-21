@@ -1,9 +1,8 @@
 import { describe, expect, it } from 'bun:test';
-import { StateBus } from '../src';
-import { computed } from '../src/view';
+import { computed, ManualStateBus } from '../src';
 
 //*
-declare module '@smoothbricks/statebus' {
+declare module '@smoothbricks/statebus-core' {
   export interface States {
     counter1: number;
     counter2: number;
@@ -18,8 +17,7 @@ declare module '@smoothbricks/statebus' {
 
 describe('Computed States', () => {
   it('should properly compute derived state', () => {
-    const bus = new StateBus({
-      autoDispatch: false,
+    const bus = new ManualStateBus({
       // biome-ignore lint/suspicious/noExplicitAny: test uses simplified types
       initialState: { counter: 0 } as any,
       reducers: {
@@ -40,8 +38,7 @@ describe('Computed States', () => {
   });
 
   it('should update computed values when dependencies change', () => {
-    const bus = new StateBus({
-      autoDispatch: false,
+    const bus = new ManualStateBus({
       // biome-ignore lint/suspicious/noExplicitAny: test uses simplified types
       initialState: { counter1: 0, counter2: 0 } as any,
       reducers: (state, event) => {
