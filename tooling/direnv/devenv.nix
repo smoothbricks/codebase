@@ -2,28 +2,29 @@
 {
   inputs,
   pkgs,
+  lib,
   ...
 }:
 # https://devenv.sh/inputs/
 let
   git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
 in {
+  # https://devenv.sh/overlays/
+  overlays = [
+    inputs.nixpkgs-overlay.overlays.default
+  ];
+
   # https://devenv.sh/packages/
-  packages = with pkgs;
-    [
-      # Pin Node.js version to match AWS Lambda runtime
-      nodejs_22
-      # Bun.sh for javascript dependencies
-      bun
-      # Git hooks and formatters
-      git-format-staged
-      jq # Used in pre-commit hook and generally useful
-      alejandra # Nix formatter
-    ]
-    ++
-    # On macOS, it's better to use the provided git as it uses the keychain for credentials storage.
-    # Therefore, we only include git in the environment for non-macOS platforms.
-    lib.optional (!pkgs.stdenv.isDarwin) [git];
+  packages = with pkgs; [
+    # Pin Node.js version to match AWS Lambda runtime
+    nodejs_22
+    # Bun.sh for javascript dependencies
+    bun
+    # Git hooks and formatters
+    git-format-staged
+    jq # Used in pre-commit hook and generally useful
+    alejandra # Nix formatter
+  ];
 
   # https://devenv.sh/languages/
   # languages.nix.enable = true;
