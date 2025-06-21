@@ -41,6 +41,8 @@ in {
   # - When using the devenv wrapper from tooling/, restore the original working directory
   #   (The wrapper runs devenv from tooling/direnv but we want the shell to start where the user was)
   enterShell = ''
+    source ${./setup-environment.sh}
+
     if [ -n "$DEVENV_SHELL_PWD" ]; then
       cd "$DEVENV_SHELL_PWD"
     fi
