@@ -7,6 +7,7 @@ on:
 permissions:
   actions: read
   contents: read
+  statuses: write
 
 defaults:
   run:
@@ -17,12 +18,18 @@ jobs:
     runs-on: ubuntu-latest
     env:
       NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
+      GH_TOKEN: ${{ github.token }}
     steps:
+      # Step 1: GitHub adds "Set up job" automatically
+      # Step 2
       - uses: actions/checkout@v4
         with:
           filter: tree:0
           fetch-depth: 0
 
+      # --- Nix ----------------------------------------------------------------
+
+      # Step 3
       - uses: DeterminateSystems/nix-installer-action@main
         with:
           extra-conf: |
@@ -31,6 +38,7 @@ jobs:
             gc-keep-derivations = true
             gc-keep-outputs = true
 
+      # Step 4
       # Cache Nix profiles, devenv and direnv
       - name: Cache Nix profiles, devenv and direnv
         uses: actions/cache@v4
@@ -48,16 +56,22 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nar-
 
+      # Step 5
       - name: Restore Nix store from NAR
         run: ./github-ci.sh restore-store
 
+      # --- devenv shell -------------------------------------------------------
+
+      # Step 6
       - uses: cachix/cachix-action@v13
         with:
           name: devenv
 
+      # Step 7
       - name: Install devenv
         run: ./github-ci.sh install-devenv
 
+      # Step 8
       - name: Cache node_modules
         uses: actions/cache@v4
         with:
@@ -66,16 +80,17 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-node-
 
-      # --- devenv shell -------------------------------------------------------
-
+      # Step 9
       - name: Build devenv shell
         run: ./github-ci.sh build-shell
 
       # --- Nx -----------------------------------------------------------------
 
+      # Step 10
       # Sets the base and head SHAs required for the nx affected commands
       - uses: nrwl/nx-set-shas@v4
 
+      # Step 11
       - name: Cache Nx
         uses: actions/cache@v4
         with:
@@ -84,11 +99,21 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-nx-
 
-      - name: For commit affected packages, run build and test tasks
-        run: ./github-ci.sh nx-affected
+      # Step 12
+      - name: 🔍 Lint
+        run: ./github-ci.sh nx-affected lint "Lint" 12
 
-      - name: Clean up unused Nix store paths
-        run: ./github-ci.sh nix-gc
+      # Step 13
+      - name: 🧪 Unit Tests
+        run: ./github-ci.sh nx-affected test "Unit Tests" 13
 
-      - name: Export Nix store to NAR file
-        run: ./github-ci.sh export-store
+      # Step 14
+      - name: 🔨 Build
+        run: ./github-ci.sh nx-affected build "Build" 14
+
+      # --- Cleanup ------------------------------------------------------------
+
+      - name: Cleanup and cache Nix store
+        run: |
+          ./github-ci.sh nix-gc
+          ./github-ci.sh export-store
