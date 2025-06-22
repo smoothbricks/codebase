@@ -3,10 +3,10 @@
     "devenv": {
       "locked": {
         "dir": "src/modules",
-        "lastModified": 1750437384,
+        "lastModified": 1750615580,
         "owner": "cachix",
         "repo": "devenv",
-        "rev": "3bd127d022e00c6656440732a1839df6798ac946",
+        "rev": "e5dfaa34eed24f1ec79e99624666b15f51c4be97",
         "type": "github"
       },
       "original": {
@@ -37,14 +37,14 @@
         "systems": "systems"
       },
       "locked": {
-        "lastModified": 1736037534,
-        "owner": "hallettj",
+        "lastModified": 1750616431,
+        "owner": "smoothbricks",
         "repo": "git-format-staged",
-        "rev": "d37cf89066da2548be0f80dc6534e95b184665f5",
+        "rev": "0d0d713062ddc46ab8d1f79a5d2be6b82b0c1e5a",
         "type": "github"
       },
       "original": {
-        "owner": "hallettj",
+        "owner": "smoothbricks",
         "repo": "git-format-staged",
         "type": "github"
       }

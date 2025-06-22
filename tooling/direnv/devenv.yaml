@@ -8,5 +8,5 @@ inputs:
     overlays:
       - default
   git-format-staged:
-    url: github:hallettj/git-format-staged
+    url: github:smoothbricks/git-format-staged
     flake: true
