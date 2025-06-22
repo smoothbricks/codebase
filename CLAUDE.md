@@ -49,6 +49,13 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
   - Adds `node_modules/.bin` to PATH
   - Applies workspace Git configuration
 - All dev tools (nx, biome, etc.) are available directly on PATH
+- **Important**: If Claude Code is started from within a direnv session, environment changes won't reload automatically.
+  To pick up environment changes after `devenv update`:
+  - **Option 1**: Exit and re-enter the directory in your terminal, then restart Claude Code
+  - **Option 2**: Use the `direnv-run` helper script:
+    ```bash
+    tooling/direnv-run <your-command>
+    ```
 - **Devenv command** is available anywhere in the monorepo:
   - `devenv shell` - Enter development shell
   - `devenv update` - Update devenv.lock from devenv.yaml inputs
