@@ -14,7 +14,7 @@ set -e -o pipefail
 # Run `eslint --fix` for files not supported by Biome, except for hidden files:
 # - https://stackoverflow.com/questions/57947585/eslint-warning-file-ignored-by-default-use-a-negated-ignore-pattern
 git-format-staged --verbose -f \
-  "eslint-formatted.sh '{}'" \
+  "eslint-stdout '{}'" \
    '!.*' '*.astro'
 
 # Format all files that Biome supports, excluding git submodules:

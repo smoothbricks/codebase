@@ -6,7 +6,7 @@ const formatter = require('eslint-friendly-formatter');
  * characters. When run on a file that eslint is configured to ignore the
  * formatter will produce no output.
  */
-module.exports = function (results) {
+module.exports = (results) => {
   // output: The source code for the given file with as many fixes applied as possible.
   //         This property is omitted if no fix is available.
   // - https://eslint.org/docs/latest/extend/custom-formatters#the-result-object

@@ -1,0 +1,29 @@
+#!/bin/sh
+# ESLint formatter wrapper for use with git-format-staged
+# Usage: eslint-stdout <file>
+
+file="$1"
+if [ -z "$file" ]; then
+  echo "Usage: eslint-stdout <file>" >&2
+  exit 1
+fi
+
+# Change to the file's directory to support local eslint configs
+cd "$(dirname "$file")" || exit 1
+
+# Get the path to the formatter (resolve symlinks)
+# When installed as a dependency, this script is executed via a symlink in node_modules/.bin/
+# We need to resolve the symlink to find the actual location of the formatter module (index.js)
+# Without this, the path would incorrectly point to node_modules/index.js instead of node_modules/eslint-stdout/index.js
+SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" || echo "$0")")" && pwd)"
+FORMATTER_PATH="$(dirname "$SCRIPT_DIR")/index.js"
+
+# Run eslint with our custom formatter
+# - Fixed output goes to stdout
+# - Errors go to stderr
+# - EFF_NO_LINK_RULES=true disables rule links in error output
+EFF_NO_LINK_RULES=true \
+  eslint --output-file /dev/stderr \
+    --format "$FORMATTER_PATH" \
+    --fix-dry-run \
+    --stdin --stdin-filename "$file"

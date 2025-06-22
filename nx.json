@@ -41,6 +41,7 @@
     }
   ],
   "release": {
+    "projectsRelationship": "independent",
     "version": {
       "preVersionCommand": "nx run-many -t build"
     }
