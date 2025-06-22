@@ -1,0 +1,34 @@
+{
+  "name": "eslint-stdout",
+  "version": "1.0.1",
+  "description": "ESLint formatter that outputs fixed code to stdout and errors to stderr",
+  "keywords": ["eslint", "formatter", "eslint-formatter", "git-hooks", "pre-commit"],
+  "homepage": "https://github.com/smoothbricks/codebase/tree/main/packages/eslint-stdout#readme",
+  "bugs": {
+    "url": "https://github.com/smoothbricks/codebase/issues"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/eslint-stdout"
+  },
+  "license": "MIT",
+  "author": "",
+  "main": "./index.js",
+  "bin": {
+    "eslint-stdout": "./bin/eslint-stdout"
+  },
+  "exports": {
+    ".": "./index.js"
+  },
+  "files": ["index.js", "bin", "README.md"],
+  "dependencies": {
+    "eslint-friendly-formatter": "^4.0.1"
+  },
+  "peerDependencies": {
+    "eslint": ">=5.0.0"
+  },
+  "engines": {
+    "node": ">=10.0.0"
+  }
+}
