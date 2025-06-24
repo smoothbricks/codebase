@@ -1190,45 +1190,321 @@ modules/puck-tldraw/
 └── index.ts                        # Public API
 ```
 
-## Local Development Server Implementation
+## Figma Killer CLI Tool
 
-### Development Architecture with Vite
+### Standalone Development Server Architecture
 
-Vite serves as our complete development server, providing:
+The Figma Killer is a standalone CLI tool that combines an HTTP server and browser-based design tool in a single
+program. It can be run in any repository to design UI with Puck components on a tldraw canvas, dynamically loading your
+Puck configuration and providing hot-reloading as you develop.
 
-- Built-in hot module reloading for React components
-- Fast cold starts with native ES modules
-- Automatic TypeScript/JSX transformation
-- React Fast Refresh for state preservation
-- API routes for canvas persistence
+**Why a CLI Tool**: This approach allows designers and developers to use the tool in any project without modifying the
+project's build configuration or dependencies. The tool brings its own development server and build pipeline, keeping
+the user's project clean.
 
-### Vite Configuration with API Routes
+**Why Vite**: We chose Vite as our development server foundation because:
+
+1. **Native ESM Support**: Vite serves modules as native ES modules during development, enabling instant server start
+   regardless of application size
+2. **Built-in HMR**: Vite includes a robust Hot Module Replacement system that works seamlessly with React Fast Refresh
+3. **TypeScript/JSX Support**: Automatic transformation of TypeScript and JSX without configuration
+4. **Programmatic API**: Vite can be embedded and configured programmatically, perfect for our CLI tool
+5. **Module Resolution**: Handles complex module resolution including npm packages, relative imports, and dynamic
+   imports
+6. **Plugin System**: Extensible architecture allows us to add our canvas persistence API
+
+**Critical Vite Configuration Requirements**
+
+Yes, Vite does need specific configuration to work properly as a CLI tool:
+
+1. **File System Access**: We must configure `server.fs.allow` to permit access to both:
+
+   - The user's project directory (for their Puck config and components)
+   - The CLI tool's directory (for our app code)
+
+2. **Root Directory**: We set `root: __dirname` to serve from the tool's directory, not the user's current working
+   directory.
+
+3. **Config File Bypass**: We use `configFile: false` to prevent Vite from looking for the user's vite.config.js, which
+   could conflict with our setup.
+
+4. **Module Exclusions**: The `optimizeDeps.exclude` array prevents Vite from pre-bundling the user's config file,
+   ensuring it gets proper HMR treatment.
+
+5. **Middleware for HTML Serving**: We need custom middleware to serve our app's HTML template with the correct module
+   paths using `/@fs/` prefix.
+
+**How Vite Builds and HMRs the User's Config**
+
+Here's the key insight: When our app does `import(configPath)`, Vite intercepts this request even though the file is
+outside our root directory. Here's what happens:
+
+1. **File System Access**: The `server.fs.allow` configuration tells Vite it's allowed to serve files from the user's
+   project directory.
+
+2. **Module Transform**: When the browser requests the config file, Vite:
+
+   - Reads the TypeScript/JSX file from disk
+   - Transforms it to JavaScript on-the-fly
+   - Resolves all imports (like `import { Button } from './components/Button'`)
+   - Injects HMR client code
+   - Serves it with proper MIME type
+
+3. **Dependency Graph**: Vite builds a dependency graph of all modules imported by the config:
+
+   - User's config file → imports Button component
+   - Button component → imports CSS modules, other utilities
+   - All these files get HMR boundaries
+
+4. **File Watching**: Vite watches all files in the dependency graph for changes
+
+5. **HMR Updates**: When any file changes:
+   - Vite detects the change
+   - Transforms the updated module
+   - Sends it over WebSocket to the browser
+   - Our `import.meta.hot` handler re-imports the config
+   - React components get Fast Refresh
+
+The `/@fs/` prefix is Vite's way of serving files from outside the root directory. So when we import
+`/Users/danny/project/puck-config.ts`, Vite serves it as `/@fs/Users/danny/project/puck-config.ts`.
+
+**Can It Really Work as a CLI Tool?**
+
+Yes, this pattern is proven and used by several popular tools:
+
+- **Storybook**: Uses Webpack/Vite programmatically to serve component stories
+- **Vitest**: Embeds Vite to run tests with HMR support
+- **Vitepress**: Uses Vite to build documentation sites
+- **Histoire**: Similar to Storybook, uses Vite programmatically
+
+The key is that Vite provides a complete programmatic API (`createServer`) that allows full control over the dev server
+configuration. The CLI tool becomes a wrapper that:
+
+1. Accepts user arguments (config path, port, etc.)
+2. Sets up Vite with the right configuration
+3. Serves the app with proper module resolution
+4. Handles API routes for canvas persistence
+
+This approach gives us all of Vite's benefits (HMR, TypeScript, JSX, module resolution) without requiring users to
+configure anything.
+
+**CRITICAL LIMITATION: Projects Requiring Custom Vite Plugins**
+
+This CLI approach has a fundamental limitation: if the user's Puck components require specific Vite plugins to build
+(like Tamagui's optimizing CSS compiler), our standalone CLI won't work. This is because:
+
+1. We use our own Vite configuration, not the user's
+2. We can't know what plugins the user's components need
+3. Loading the user's vite.config.js would conflict with our setup
+
+**Alternative Approach for Complex Projects**
+
+For projects with custom build requirements (Tamagui, vanilla-extract, etc.), we need a different strategy:
+
+**Option 1: Vite Plugin** (Recommended) Instead of a standalone CLI, provide a Vite plugin that users add to their
+existing vite.config.js:
 
 ```typescript
 // vite.config.ts
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
-import { promises as fs } from 'fs';
-import path from 'path';
+import { tamaguiPlugin } from '@tamagui/vite-plugin';
+import { figmaKiller } from 'figma-killer/vite'; // Our plugin
 
 export default defineConfig({
   plugins: [
     react(),
-    // Custom plugin for API routes
+    tamaguiPlugin({
+      // Tamagui config
+    }),
+    figmaKiller({
+      puckConfig: './src/puck-config.ts',
+      canvasesDir: './designs',
+      // Mount under a specific path to avoid conflicts
+      basePath: '/__figma-killer',
+    }),
+  ],
+});
+```
+
+**How Vite Plugins Add Routes**
+
+Yes, Vite plugins can add routes even when the user has an API server! Vite's `configureServer` hook lets plugins add
+middleware that runs before the user's routes:
+
+```typescript
+// figma-killer/vite-plugin.ts
+export function figmaKiller(options) {
+  return {
+    name: 'figma-killer',
+    configureServer(server) {
+      // Add our routes BEFORE user's middleware
+      server.middlewares.use((req, res, next) => {
+        const url = new URL(req.url, `http://${req.headers.host}`);
+
+        // Handle our app routes
+        if (url.pathname.startsWith(options.basePath)) {
+          if (req.headers.accept?.includes('text/html')) {
+            // Serve our app HTML
+            res.setHeader('Content-Type', 'text/html');
+            res.end(generateAppHTML(options));
+            return;
+          }
+        }
+
+        // Handle our API routes
+        if (url.pathname.startsWith(`${options.basePath}/api/`)) {
+          handleCanvasAPI(req, res, options);
+          return;
+        }
+
+        // Pass through to user's routes
+        next();
+      });
+    },
+    // Also handle our app's client code
+    resolveId(id) {
+      if (id === '/@figma-killer/app') {
+        return '\0figma-killer-app'; // Virtual module
+      }
+    },
+    load(id) {
+      if (id === '\0figma-killer-app') {
+        return generateAppCode(options);
+      }
+    },
+  };
+}
+```
+
+**Avoiding Conflicts**
+
+To avoid conflicts with the user's routes:
+
+1. **Use a unique prefix**: Mount under `/__figma-killer` or similar
+2. **Check early in middleware**: Process our routes before passing to `next()`
+3. **Virtual modules**: Use Vite's virtual module system for our app code
+4. **Separate API namespace**: Use `/__figma-killer/api/` for our APIs
+
+This way, the user can have their own API at `/api/*` while we use `/__figma-killer/api/*`. Common patterns:
+
+- Storybook uses `/__storybook/*`
+- Vite's own HMR uses `/__vite_hmr`
+- Many dev tools use `/__toolname/*`
+
+**Option 2: Build Step + Static Serving** Pre-build the Puck config and components, then serve statically:
+
+```bash
+# Build step that respects user's vite.config.js
+figma-killer build ./src/puck-config.ts --out ./dist/figma-killer
+
+# Serve the pre-built version
+figma-killer serve ./dist/figma-killer
+```
+
+**Option 3: Proxy to User's Dev Server** Run alongside the user's existing dev server:
+
+```bash
+# User runs their normal dev server with all plugins
+npm run dev # Port 5173
+
+# Figma Killer proxies requests for components
+figma-killer ./src/puck-config.ts --proxy http://localhost:5173
+```
+
+**Recommendation**
+
+For maximum compatibility, we should support both approaches:
+
+1. **Simple CLI**: Works for projects without special build requirements
+2. **Vite Plugin**: For projects that need custom Vite plugins
+
+This is similar to how Storybook works - it has a standalone mode but also supports integration into existing build
+setups.
+
+### CLI Usage
+
+```bash
+# Run in any project directory
+figma-killer ./path/to/puck-config.ts
+
+# Optional: specify canvas storage directory
+figma-killer ./path/to/puck-config.ts --canvases ./design-files
+
+# Optional: specify port
+figma-killer ./path/to/puck-config.ts --port 4000
+```
+
+### CLI Implementation
+
+```typescript
+#!/usr/bin/env node
+// cli.ts
+import { createServer } from 'vite';
+import react from '@vitejs/plugin-react';
+import { promises as fs } from 'fs';
+import path from 'path';
+import { program } from 'commander';
+import { fileURLToPath } from 'url';
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+
+program
+  .name('figma-killer')
+  .description('Design tool combining tldraw canvas with Puck UI builder')
+  .argument('<config>', 'Path to Puck config file')
+  .option('-p, --port <number>', 'Port to run server on', '3000')
+  .option('-c, --canvases <path>', 'Directory to store canvas files', './canvases')
+  .parse();
+
+const options = program.opts();
+const configPath = path.resolve(program.args[0]);
+const canvasesDir = path.resolve(options.canvases);
+const port = parseInt(options.port);
+
+// Validate config file exists
+if (
+  !(await fs
+    .access(configPath)
+    .then(() => true)
+    .catch(() => false))
+) {
+  console.error(`Error: Puck config file not found at ${configPath}`);
+  process.exit(1);
+}
+
+// Create Vite server with dynamic configuration
+const server = await createServer({
+  root: __dirname, // Tool's directory, not user's
+  configFile: false, // Don't look for vite.config.js
+  plugins: [
+    react(),
+    // Plugin to serve the app
+    {
+      name: 'figma-killer-app',
+      configureServer(server) {
+        server.middlewares.use((req, res, next) => {
+          // Serve our app's index.html for all routes except API
+          if (!req.url?.startsWith('/api/') && req.headers.accept?.includes('text/html')) {
+            res.setHeader('Content-Type', 'text/html');
+            res.end(generateHTML(configPath));
+            return;
+          }
+          next();
+        });
+      },
+    },
+    // Canvas persistence API
     {
       name: 'canvas-api',
       configureServer(server) {
-        // Canvas save/load API
         server.middlewares.use('/api', async (req, res, next) => {
           const url = new URL(req.url!, `http://${req.headers.host}`);
-
-          // Extract canvas path from URL
           const canvasPath = url.pathname.replace('/api/canvas/', '').replace(/^\/|\/$/g, '');
 
           if (req.method === 'GET' && url.pathname.startsWith('/api/canvas/')) {
-            // Load canvas
             try {
-              const filePath = path.join('canvases', `${canvasPath}.json`);
+              const filePath = path.join(canvasesDir, `${canvasPath}.json`);
               const data = await fs.readFile(filePath, 'utf-8');
               res.setHeader('Content-Type', 'application/json');
               res.end(data);
@@ -1240,12 +1516,11 @@ export default defineConfig({
           }
 
           if (req.method === 'POST' && url.pathname.startsWith('/api/canvas/')) {
-            // Save canvas
             let body = '';
             req.on('data', (chunk) => (body += chunk));
             req.on('end', async () => {
               try {
-                const filePath = path.join('canvases', `${canvasPath}.json`);
+                const filePath = path.join(canvasesDir, `${canvasPath}.json`);
                 await fs.mkdir(path.dirname(filePath), { recursive: true });
                 await fs.writeFile(filePath, body);
                 res.setHeader('Content-Type', 'application/json');
@@ -1263,13 +1538,50 @@ export default defineConfig({
       },
     },
   ],
-  optimizeDeps: {
-    exclude: ['./puck-components'], // Enable HMR for Puck components
-  },
   server: {
-    port: 3000,
+    port,
+    fs: {
+      // Allow access to user's config file
+      allow: [path.dirname(configPath), __dirname],
+    },
+  },
+  optimizeDeps: {
+    // Don't pre-bundle the user's config
+    exclude: [configPath],
   },
 });
+
+await server.listen();
+
+console.log(`
+🎨 Figma Killer running at http://localhost:${port}
+📁 Loading config from: ${configPath}
+💾 Saving canvases to: ${canvasesDir}
+
+Press Ctrl+C to stop
+`);
+
+// Generate the HTML that loads our app
+function generateHTML(configPath: string) {
+  return `
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Figma Killer - Puck + tldraw</title>
+  <script type="module">
+    // Pass config path to the app
+    window.__PUCK_CONFIG_PATH__ = '${configPath}'
+  </script>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="module" src="/@fs/${__dirname}/src/main.tsx"></script>
+</body>
+</html>
+  `;
+}
 ```
 
 ### Multi-Canvas Routing
@@ -1297,10 +1609,10 @@ ReactDOM.createRoot(document.getElementById('root')!).render(
 )
 ```
 
-### Client-Side Auto-Save Integration
+### Client-Side App Implementation
 
 ```typescript
-// App.tsx
+// src/App.tsx
 const AUTO_SAVE_DELAY = 1000 // 1 second debounce
 
 interface AppProps {
@@ -1314,24 +1626,58 @@ export function App({ canvasPath }: AppProps) {
   const [isLoading, setIsLoading] = useState(true)
   const editorRef = useRef<Editor | null>(null)
 
-  // Load Puck config
-  useEffect(() => {
-    import('./puck-components').then(mod => {
-      setConfig(mod.puckConfig)
-    })
-  }, [])
+  // Get the config path from CLI
+  const configPath = (window as any).__PUCK_CONFIG_PATH__
 
-  // HMR setup
+  // Load Puck config from user's file
   useEffect(() => {
-    if (import.meta.hot) {
-      const handleUpdate = async () => {
-        const newModule = await import('./puck-components')
-        setConfig(newModule.puckConfig)
-        setConfigVersion(v => v + 1)
+    // The magic: Vite intercepts this dynamic import!
+    // Even though configPath is outside our root directory, Vite will:
+    // 1. Transform the TypeScript/JSX to JavaScript
+    // 2. Resolve all imports in the user's config file
+    // 3. Set up HMR boundaries for all dependencies
+    // 4. Serve it via the /@fs/ prefix
+    import(/* @vite-ignore */ configPath).then(mod => {
+      // Support different export styles
+      const config = mod.default || mod.puckConfig || mod.config
+      if (!config || !config.components) {
+        console.error('Invalid Puck config. Expected default export with components property.')
+        return
       }
-      import.meta.hot.accept('./puck-components', handleUpdate)
+      setConfig(config)
+    }).catch(err => {
+      console.error('Failed to load Puck config:', err)
+    })
+  }, [configPath])
+
+  // HMR setup for user's config file
+  useEffect(() => {
+    if (import.meta.hot && configPath) {
+      // Watch for changes to the user's config file
+      const handleUpdate = async () => {
+        try {
+          // Clear module cache and reload
+          const newModule = await import(/* @vite-ignore */ `${configPath}?t=${Date.now()}`)
+          const config = newModule.default || newModule.puckConfig || newModule.config
+          if (config && config.components) {
+            setConfig(config)
+            setConfigVersion(v => v + 1)
+            console.log('✨ Puck config hot-reloaded')
+          }
+        } catch (err) {
+          console.error('Failed to hot-reload Puck config:', err)
+        }
+      }
+
+      // Accept HMR for any module change
+      import.meta.hot.accept()
+      import.meta.hot.on('vite:beforeUpdate', handleUpdate)
+
+      return () => {
+        import.meta.hot.off('vite:beforeUpdate', handleUpdate)
+      }
     }
-  }, [])
+  }, [configPath])
 
   // Auto-save with debouncing
   const saveTimeoutRef = useRef<NodeJS.Timeout>()
@@ -1431,36 +1777,44 @@ built-in HMR system. Vite automatically handles:
 - Module transformation (JSX → JS)
 - React Fast Refresh to preserve component state
 
-Here's what we need to implement:
+**Puck Config Requirements**: As analyzed in modules/puck/apps/demo/config/blocks/Hero/client.tsx, Puck configs contain:
 
-#### Vite Configuration
+1. **React Components**: The `render` property is a React component reference
+2. **Functions**: Fields include async functions like `resolveData`, `fetchList`
+3. **JSX Elements**: Custom field renderers return JSX
+4. **Module Imports**: Components are imported from other files
+
+Example from the Hero config:
 
 ```typescript
-// vite.config.ts
-import { defineConfig } from 'vite';
-import react from '@vitejs/plugin-react';
-
-export default defineConfig({
-  plugins: [react()],
-  optimizeDeps: {
-    exclude: ['./puck-components'], // Ensure Puck components can be hot-reloaded
+export const Hero: ComponentConfig<HeroProps> = {
+  fields: {
+    url: {
+      type: "custom",
+      render: ({ value, onChange }) => ( // Returns JSX
+        <FieldLabel><AutoField value={value} onChange={onChange} /></FieldLabel>
+      ),
+    },
   },
-  server: {
-    port: 3000,
-  },
-});
+  resolveData: async ({ props }) => { /* async function */ },
+  render: HeroComponent, // React component reference
+};
 ```
 
-#### Puck Components Module
+This is why we need Vite - to handle JSX transformation, module resolution, and hot-reloading of React components.
+
+#### Expected Puck Config Format
+
+Your Puck config file should export a valid Puck configuration. The CLI supports multiple export styles:
 
 ```typescript
-// puck-components/index.tsx
-import { Config } from '@measured/puck';
-import { Button } from './Button';
-import { Card } from './Card';
-import { Hero } from './Hero';
+// puck-config.ts - Default export (recommended)
+import type { Config } from '@measured/puck';
+import { Button } from './components/Button';
+import { Card } from './components/Card';
+import { Hero } from './components/Hero';
 
-export const puckConfig: Config = {
+const config: Config = {
   components: {
     Button: {
       fields: {
@@ -1474,7 +1828,7 @@ export const puckConfig: Config = {
         },
       },
       defaultProps: { text: 'Click me', variant: 'primary' },
-      render: Button, // React component reference
+      render: Button,
     },
     Card: {
       fields: {
@@ -1492,7 +1846,15 @@ export const puckConfig: Config = {
     },
   },
 };
+
+export default config;
+
+// Also supported:
+// export { config }
+// export const puckConfig = config
 ```
+
+The config file can import components from anywhere in your project - they'll all be hot-reloaded when changed.
 
 #### App Integration
 
