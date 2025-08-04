@@ -28,6 +28,7 @@
     "unlink:all": "for pkg in packages/*; do (cd $pkg && bun unlink); done",
     "list:nx-build-targets": "nx show projects | xargs -n1 nx show project --json | jq -r  '.name as $name | .targets | to_entries[] | \"\\($name):\\(.key)\"'",
     "reload:direnv": "rm -rf tooling/direnv/.{direnv,devenv}; direnv reload",
+    "reload:node_modules": "tooling/rm_node_modules; bun install",
     "show:tree": "tree --gitignore -d",
     "update:devenv": "cd tooling/direnv; devenv update",
     "update:npm:interactive": "bunx npm-check-updates -i",
