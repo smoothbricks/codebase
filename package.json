@@ -3,9 +3,7 @@
   "version": "0.0.0",
   "private": true,
   "packageManager": "bun@1.2.16",
-  "engines": {
-    "node": ">=22.0.0"
-  },
+  "engines": { "node": ">=22.0.0" },
   "dependencies": {},
   "devDependencies": {
     "@biomejs/biome": "^2.0.2",
@@ -13,7 +11,7 @@
     "@swc-node/register": "~1.10.10",
     "@swc/core": "~1.12.4",
     "@swc/helpers": "~0.5.17",
-    "@types/node": "24.0.3",
+    "@types/node": "~22.0.0",
     "eslint": "^9.29.0",
     "eslint-friendly-formatter": "^4.0.1",
     "eslint-stdout": "workspace:*",
@@ -41,15 +39,9 @@
     "targets": {
       "local-registry": {
         "executor": "@nx/js:verdaccio",
-        "options": {
-          "port": 4873,
-          "config": ".verdaccio/config.yml",
-          "storage": "tmp/local-registry/storage"
-        }
+        "options": { "port": 4873, "config": ".verdaccio/config.yml", "storage": "tmp/local-registry/storage" }
       }
     }
   },
-  "patchedDependencies": {
-    "nx@21.2.1": "patches/nx@21.2.1.patch"
-  }
+  "patchedDependencies": { "nx@21.2.1": "patches/nx@21.2.1.patch" }
 }
