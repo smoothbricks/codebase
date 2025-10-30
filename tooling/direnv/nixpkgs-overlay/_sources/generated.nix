@@ -7,34 +7,34 @@
 }: {
   bun-aarch64-darwin = {
     pname = "bun-aarch64-darwin";
-    version = "1.2.16";
+    version = "1.3.2";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.2.16/bun-darwin-aarch64.zip";
-      sha256 = "sha256-IBaCFzMLDruOkUg25jqvVxQK/wz5VxYidlh8qwQS8X8=";
+      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.2/bun-darwin-aarch64.zip";
+      sha256 = "sha256-2FhHmC21dFGBMKRVgrzxTY4r6WELZstQRsIDSFeLD+I=";
     };
   };
   bun-aarch64-linux = {
     pname = "bun-aarch64-linux";
-    version = "1.2.16";
+    version = "1.3.2";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.2.16/bun-linux-aarch64.zip";
-      sha256 = "sha256-gKAkQ0q1sJjCWe5VsfWCgFkdHeKGxcZStjNkCoyZ5j4=";
+      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.2/bun-linux-aarch64.zip";
+      sha256 = "sha256-/jjBO2trRQr05PD7jgSyLspT+c1xBo0dHuv09KRPAvs=";
     };
   };
   bun-x86_64-darwin = {
     pname = "bun-x86_64-darwin";
-    version = "1.2.16";
+    version = "1.3.2";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.2.16/bun-darwin-x64.zip";
-      sha256 = "sha256-k7JuZ9HyGaKrgIZ70TDbH10QkXCzjMcPQZJdQZjBF1M=";
+      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.2/bun-darwin-x64.zip";
+      sha256 = "sha256-eNTwyGN0J6wL5VY5ppf/agJejrlAppIMpQhgPEGlp7A=";
     };
   };
   bun-x86_64-linux = {
     pname = "bun-x86_64-linux";
-    version = "1.2.16";
+    version = "1.3.2";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.2.16/bun-linux-x64.zip";
-      sha256 = "sha256-+DEdjXyqDZOMbEzs8KYA5enOTidaQR44oun4x30MEAI=";
+      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.2/bun-linux-x64.zip";
+      sha256 = "sha256-DLVqRIS9d2Sj7vm55nq0V4QJgSh7RnlJdNHmYSy/Zwk=";
     };
   };
 }
