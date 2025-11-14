@@ -4,6 +4,12 @@
   "files": [],
   "references": [
     {
+      "path": "./packages/arrow-builder"
+    },
+    {
+      "path": "./packages/lmao"
+    },
+    {
       "path": "./packages/statebus-core"
     },
     {
