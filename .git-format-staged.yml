@@ -8,6 +8,7 @@ formatters:
     patterns:
       - *.astro
       - !.* # Exclude hidden files
+      - !.*/** # Exclude files in hidden directories
 
   # Biome for JS/TS/JSX/TSX/JSON/HTML/CSS/GraphQL files
   biome:

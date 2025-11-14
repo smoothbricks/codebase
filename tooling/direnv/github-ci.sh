@@ -52,7 +52,7 @@ build_devenv_shell() {
     fi
     
     # Build the shell to ensure all dependencies are available
-    devenv shell -- date
+    devenv shell --verbose -- date
     
     # Add shell environment derivations to GC roots
     if [ -d .devenv ]; then
