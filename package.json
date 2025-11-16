@@ -51,8 +51,5 @@
         }
       }
     }
-  },
-  "patchedDependencies": {
-    "nx@21.2.1": "patches/nx@21.2.1.patch"
   }
 }
