@@ -83,7 +83,7 @@ function prepareChangelogData(updates: PackageUpdate[], changelogs: Map<string, 
     const changelog = changelogs.get(update.name);
     if (changelog) {
       // Truncate long changelogs
-      const truncated = changelog.length > 1000 ? changelog.substring(0, 1000) + '...' : changelog;
+      const truncated = changelog.length > 1000 ? `${changelog.substring(0, 1000)}...` : changelog;
       parts.push(`\nChangelog:\n${truncated}`);
     } else {
       parts.push('\nNo changelog available');
@@ -152,7 +152,7 @@ function generateFallbackSummary(updates: PackageUpdate[]): string {
  */
 export async function generateCommitMessage(
   updates: PackageUpdate[],
-  config: DepUpdaterConfig,
+  _config: DepUpdaterConfig,
 ): Promise<{ title: string; body: string }> {
   const ecosystems = [...new Set(updates.map((u) => u.ecosystem))];
   const hasBreaking = updates.some((u) => u.updateType === 'major');

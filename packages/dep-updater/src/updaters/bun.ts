@@ -152,7 +152,7 @@ export async function updateBunDependencies(
           cwd: repoRoot,
         });
         logger?.info('✓ Lock file synced');
-      } catch (error) {
+      } catch (_error) {
         logger?.warn('Warning: bun install failed, lock file may be out of sync');
       }
 
@@ -163,7 +163,7 @@ export async function updateBunDependencies(
         });
         logger?.info(syncpackResult.stdout);
         logger?.info(`✓ Syncpack ${syncpackFixCommand} completed`);
-      } catch (error) {
+      } catch (_error) {
         logger?.warn(`Warning: ${syncpackFixCommand} failed, continuing...`);
       }
 
@@ -177,7 +177,7 @@ export async function updateBunDependencies(
         if (diffResult.stdout) {
           updates = parsePackageJsonDiff(diffResult.stdout);
         }
-      } catch (error) {
+      } catch (_error) {
         logger?.warn('Warning: Could not get git diff, falling back to stdout parsing');
         // Fallback to stdout parsing
         updates = parseBunUpdateOutput(result.stdout);

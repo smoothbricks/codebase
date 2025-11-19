@@ -646,9 +646,9 @@ describe('PR Stacking Workflow - getOpenUpdatePRs Integration', () => {
 
     // Should filter out feat/new-feature and sort by date (oldest first)
     expect(prs).toHaveLength(3);
-    expect(prs[0]!.number).toBe(1);
-    expect(prs[1]!.number).toBe(2);
-    expect(prs[2]!.number).toBe(3);
+    expect(prs[0]?.number).toBe(1);
+    expect(prs[1]?.number).toBe(2);
+    expect(prs[2]?.number).toBe(3);
   });
 });
 

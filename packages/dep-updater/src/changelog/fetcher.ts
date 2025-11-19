@@ -116,7 +116,7 @@ export async function fetchChangelog(
   }
 
   // If we have a URL, fetch the content
-  if (changelog && changelog.startsWith('http')) {
+  if (changelog?.startsWith('http')) {
     const content = await fetchChangelogContent(changelog);
     return content || changelog; // Return URL if content fetch fails
   }

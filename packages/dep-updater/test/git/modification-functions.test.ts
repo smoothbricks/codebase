@@ -163,7 +163,7 @@ describe('commit', () => {
     await commit('/repo', 'feat: add feature', 'Detailed description here', spy.mock);
 
     expect(spy.calls).toHaveLength(1);
-    const commitMessage = spy.calls[0]![1]![2];
+    const commitMessage = spy.calls[0]?.[1]?.[2];
     expect(commitMessage).toContain('feat: add feature');
     expect(commitMessage).toContain('Detailed description here');
     expect(commitMessage).toContain('\n\n'); // Double newline separator
@@ -177,7 +177,7 @@ describe('commit', () => {
 
     await commit('/repo', 'fix: bug', body, spy.mock);
 
-    const commitMessage = spy.calls[0]![1]![2];
+    const commitMessage = spy.calls[0]?.[1]?.[2];
     expect(commitMessage).toBe(`fix: bug\n\n${body}`);
   });
 
@@ -188,7 +188,7 @@ describe('commit', () => {
 
     await commit('/repo', 'fix: handle "quoted" strings', undefined, spy.mock);
 
-    expect(spy.calls[0]![1]![2]).toContain('"quoted"');
+    expect(spy.calls[0]?.[1]?.[2]).toContain('"quoted"');
   });
 
   test('should throw when nothing staged', async () => {

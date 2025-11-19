@@ -45,9 +45,9 @@ describe('checkPRConflicts', () => {
     await checkPRConflicts('/repo', 100, spy.mock);
 
     expect(spy.calls).toHaveLength(1);
-    expect(spy.calls[0]![0]).toBe('gh');
-    expect(spy.calls[0]![1]).toEqual(['pr', 'view', '100', '--json', 'mergeable']);
-    expect(spy.calls[0]![2]!.cwd).toBe('/repo');
+    expect(spy.calls[0]?.[0]).toBe('gh');
+    expect(spy.calls[0]?.[1]).toEqual(['pr', 'view', '100', '--json', 'mergeable']);
+    expect(spy.calls[0]?.[2]?.cwd).toBe('/repo');
   });
 
   test('should return false on error', async () => {
@@ -114,8 +114,8 @@ describe('getOpenUpdatePRs', () => {
     const prs = await getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca);
 
     expect(prs).toHaveLength(2);
-    expect(prs[0]!.number).toBe(1);
-    expect(prs[1]!.number).toBe(3);
+    expect(prs[0]?.number).toBe(1);
+    expect(prs[1]?.number).toBe(3);
   });
 
   test('should sort PRs by creation date (oldest first)', async () => {
@@ -159,9 +159,9 @@ describe('getOpenUpdatePRs', () => {
     const prs = await getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca);
 
     expect(prs).toHaveLength(3);
-    expect(prs[0]!.number).toBe(1); // Oldest first
-    expect(prs[1]!.number).toBe(2);
-    expect(prs[2]!.number).toBe(3);
+    expect(prs[0]?.number).toBe(1); // Oldest first
+    expect(prs[1]?.number).toBe(2);
+    expect(prs[2]?.number).toBe(3);
   });
 
   test('should check conflicts for each PR', async () => {
@@ -201,8 +201,8 @@ describe('getOpenUpdatePRs', () => {
     const prs = await getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca);
 
     expect(prs).toHaveLength(2);
-    expect(prs[0]!.hasConflicts).toBe(false);
-    expect(prs[1]!.hasConflicts).toBe(true);
+    expect(prs[0]?.hasConflicts).toBe(false);
+    expect(prs[1]?.hasConflicts).toBe(true);
   });
 
   test('should handle date parsing', async () => {
@@ -232,8 +232,8 @@ describe('getOpenUpdatePRs', () => {
     const prs = await getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca);
 
     expect(prs).toHaveLength(1);
-    expect(prs[0]!.createdAt).toBeInstanceOf(Date);
-    expect(prs[0]!.createdAt.toISOString()).toBe('2025-01-15T14:30:00.000Z');
+    expect(prs[0]?.createdAt).toBeInstanceOf(Date);
+    expect(prs[0]?.createdAt.toISOString()).toBe('2025-01-15T14:30:00.000Z');
   });
 
   test('should return empty array on error', async () => {

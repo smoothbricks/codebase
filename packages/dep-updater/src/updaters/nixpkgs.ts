@@ -72,7 +72,7 @@ export async function updateNixpkgsOverlay(
         });
         nvfetcherSuccess = true;
         logger?.info('✓ nvfetcher update completed');
-      } catch (error) {
+      } catch (_error) {
         logger?.info('Direct nvfetcher not found, trying via nix shell...');
 
         // Method 2: Try via nix shell (slower, but self-contained)
@@ -83,7 +83,7 @@ export async function updateNixpkgsOverlay(
           });
           nvfetcherSuccess = true;
           logger?.info('✓ nvfetcher update completed (via nix shell)');
-        } catch (nixError) {
+        } catch (_nixError) {
           logger?.warn('Warning: nvfetcher update failed');
           logger?.warn('  - nvfetcher not in PATH');
           logger?.warn('  - nix shell also failed');
@@ -107,7 +107,7 @@ export async function updateNixpkgsOverlay(
           stdio: 'inherit',
         });
         logger?.info('✓ Nix build verification passed');
-      } catch (error) {
+      } catch (_error) {
         logger?.warn('Warning: Nix build verification failed');
       }
     }
