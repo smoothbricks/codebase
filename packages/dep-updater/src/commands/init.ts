@@ -47,7 +47,7 @@ function generateJSONConfig(options: {
     },
   };
 
-  return JSON.stringify(config, null, 2) + '\n';
+  return `${JSON.stringify(config, null, 2)}\n`;
 }
 
 /**

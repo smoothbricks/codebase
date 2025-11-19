@@ -157,7 +157,7 @@ export async function generateSyncpackConfig(
  * Write syncpack configuration to file
  */
 export async function writeSyncpackConfig(config: SyncpackConfig, configPath: string): Promise<void> {
-  const content = JSON.stringify(config, null, 2) + '\n';
+  const content = `${JSON.stringify(config, null, 2)}\n`;
   await writeFile(configPath, content, 'utf-8');
 }
 

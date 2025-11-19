@@ -16,7 +16,7 @@ import { safeResolve } from '../utils/path-validation.js';
 /**
  * Check if new Expo SDK is available
  */
-export async function checkExpoSDK(config: DepUpdaterConfig, options: UpdateOptions): Promise<void> {
+export async function checkExpoSDK(config: DepUpdaterConfig, _options: UpdateOptions): Promise<void> {
   if (!config.expo?.enabled) {
     config.logger?.info('Expo SDK updates are disabled in config');
     return;

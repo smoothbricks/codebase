@@ -222,7 +222,7 @@ export function generateBranchName(config: DepUpdaterConfig, date?: Date): strin
   const now = date || new Date();
   const dateStr = now.toISOString().split('T')[0];
   // Add hour-minute for uniqueness (multiple PRs same day)
-  const timeStr = now.toISOString().split('T')[1]!.substring(0, 5).replace(':', '');
+  const timeStr = now.toISOString().split('T')[1]?.substring(0, 5).replace(':', '');
 
   return `${prStrategy.branchPrefix}-${dateStr}-${timeStr}`;
 }

@@ -20,7 +20,7 @@
  * ```
  */
 export function createMockExeca(responses: Record<string, string>) {
-  return async (cmd: string | URL, args?: readonly string[], opts?: Record<string, any>) => {
+  return async (cmd: string | URL, args?: readonly string[], _opts?: Record<string, any>) => {
     const command = typeof cmd === 'string' ? cmd : cmd.toString();
     const key = [command, ...(args || [])].join(' ');
     if (key in responses) {

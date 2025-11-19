@@ -411,9 +411,9 @@ describe('createStackedPR', () => {
     );
 
     // Should close PR #1
-    const closeCalls = spy.calls.filter((c) => c[1]![0] === 'pr' && c[1]![1] === 'close');
+    const closeCalls = spy.calls.filter((c) => c[1]?.[0] === 'pr' && c[1]?.[1] === 'close');
     expect(closeCalls).toHaveLength(1);
-    expect(closeCalls[0]![1]![2]).toBe('1');
+    expect(closeCalls[0]?.[1]?.[2]).toBe('1');
 
     // Should create new PR
     expect(result.number).toBe(4);
@@ -529,7 +529,7 @@ describe('createStackedPR', () => {
     );
 
     // Should not close any PRs
-    const closeCalls = spy.calls.filter((c) => c[1]![0] === 'pr' && c[1]![1] === 'close');
+    const closeCalls = spy.calls.filter((c) => c[1]?.[0] === 'pr' && c[1]?.[1] === 'close');
     expect(closeCalls).toHaveLength(0);
   });
 });

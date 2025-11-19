@@ -69,8 +69,8 @@ describe('createPR', () => {
     );
 
     expect(spy.calls).toHaveLength(1);
-    expect(spy.calls[0]![0]).toBe('gh');
-    expect(spy.calls[0]![1]).toEqual([
+    expect(spy.calls[0]?.[0]).toBe('gh');
+    expect(spy.calls[0]?.[1]).toEqual([
       'pr',
       'create',
       '--title',
@@ -82,7 +82,7 @@ describe('createPR', () => {
       '--head',
       'chore/update-deps-2025-01-01',
     ]);
-    expect(spy.calls[0]![2]!.cwd).toBe('/repo');
+    expect(spy.calls[0]?.[2]?.cwd).toBe('/repo');
   });
 
   test('should handle PR with multi-line body', async () => {
@@ -258,9 +258,9 @@ describe('autoCloseOldPRs', () => {
     await autoCloseOldPRs(baseConfig, '/repo', spy.mock);
 
     // Should close PR #1 (oldest)
-    const closeCalls = spy.calls.filter((c) => c[1]![0] === 'pr' && c[1]![1] === 'close');
+    const closeCalls = spy.calls.filter((c) => c[1]?.[0] === 'pr' && c[1]?.[1] === 'close');
     expect(closeCalls).toHaveLength(1);
-    expect(closeCalls[0]![1]![2]).toBe('1');
+    expect(closeCalls[0]?.[1]?.[2]).toBe('1');
   });
 
   test('should close multiple PRs when over maxStackDepth', async () => {
@@ -317,11 +317,11 @@ describe('autoCloseOldPRs', () => {
     await autoCloseOldPRs(baseConfig, '/repo', spy.mock);
 
     // Should close PRs #1, #2, #3 (5 PRs total, maxStackDepth is 3, so close oldest 3)
-    const closeCalls = spy.calls.filter((c) => c[1]![0] === 'pr' && c[1]![1] === 'close');
+    const closeCalls = spy.calls.filter((c) => c[1]?.[0] === 'pr' && c[1]?.[1] === 'close');
     expect(closeCalls).toHaveLength(3);
-    expect(closeCalls[0]![1]![2]).toBe('1');
-    expect(closeCalls[1]![1]![2]).toBe('2');
-    expect(closeCalls[2]![1]![2]).toBe('3');
+    expect(closeCalls[0]?.[1]?.[2]).toBe('1');
+    expect(closeCalls[1]?.[1]?.[2]).toBe('2');
+    expect(closeCalls[2]?.[1]?.[2]).toBe('3');
   });
 
   test('should continue on close error', async () => {

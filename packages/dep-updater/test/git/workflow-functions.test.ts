@@ -19,12 +19,12 @@ describe('createUpdateCommit', () => {
     expect(spy.calls).toHaveLength(3);
     expect(spy.getCallsFor('git')).toHaveLength(3);
     // First: getRepoRoot
-    expect(spy.calls[0]![1]).toEqual(['rev-parse', '--show-toplevel']);
+    expect(spy.calls[0]?.[1]).toEqual(['rev-parse', '--show-toplevel']);
     // Second: stageAll
-    expect(spy.calls[1]![1]).toEqual(['add', '-A']);
+    expect(spy.calls[1]?.[1]).toEqual(['add', '-A']);
     // Third: commit
-    expect(spy.calls[2]![1]![0]).toBe('commit');
-    expect(spy.calls[2]![1]![2]).toBe('chore: update dependencies');
+    expect(spy.calls[2]?.[1]?.[0]).toBe('commit');
+    expect(spy.calls[2]?.[1]?.[2]).toBe('chore: update dependencies');
   });
 
   test('should stage all and commit with message and body', async () => {
@@ -36,7 +36,7 @@ describe('createUpdateCommit', () => {
 
     await createUpdateCommit({}, 'feat: add feature', 'Detailed description', spy.mock);
 
-    const commitMessage = spy.calls[2]![1]![2];
+    const commitMessage = spy.calls[2]?.[1]?.[2];
     expect(commitMessage).toContain('feat: add feature');
     expect(commitMessage).toContain('\n\n');
     expect(commitMessage).toContain('Detailed description');
@@ -51,10 +51,10 @@ describe('createUpdateCommit', () => {
     await createUpdateCommit({ repoRoot: '/custom/repo' }, 'test', undefined, spy.mock);
 
     // Should NOT call getRepoRoot
-    expect(spy.getCallsFor('git').filter((c) => c[1]![0] === 'rev-parse')).toHaveLength(0);
+    expect(spy.getCallsFor('git').filter((c) => c[1]?.[0] === 'rev-parse')).toHaveLength(0);
     // Should use /custom/repo as cwd
-    expect(spy.calls[0]![2]!.cwd).toBe('/custom/repo');
-    expect(spy.calls[1]![2]!.cwd).toBe('/custom/repo');
+    expect(spy.calls[0]?.[2]?.cwd).toBe('/custom/repo');
+    expect(spy.calls[1]?.[2]?.cwd).toBe('/custom/repo');
   });
 
   test('should call getRepoRoot if repoRoot not in config', async () => {
@@ -67,10 +67,10 @@ describe('createUpdateCommit', () => {
     await createUpdateCommit({}, 'test', undefined, spy.mock);
 
     // Should call getRepoRoot first
-    expect(spy.calls[0]![1]).toEqual(['rev-parse', '--show-toplevel']);
+    expect(spy.calls[0]?.[1]).toEqual(['rev-parse', '--show-toplevel']);
     // Should use detected repo as cwd
-    expect(spy.calls[1]![2]!.cwd).toBe('/detected/repo');
-    expect(spy.calls[2]![2]!.cwd).toBe('/detected/repo');
+    expect(spy.calls[1]?.[2]?.cwd).toBe('/detected/repo');
+    expect(spy.calls[2]?.[2]?.cwd).toBe('/detected/repo');
   });
 
   test('should propagate stageAll errors', async () => {
@@ -164,10 +164,10 @@ describe('createUpdateBranch', () => {
     await createUpdateBranch({ repoRoot: '/custom/repo' }, 'feature', undefined, spy.mock);
 
     // Should NOT call getRepoRoot
-    expect(spy.getCallsFor('git').filter((c) => c[1]![0] === 'rev-parse')).toHaveLength(0);
+    expect(spy.getCallsFor('git').filter((c) => c[1]?.[0] === 'rev-parse')).toHaveLength(0);
     // Should use /custom/repo as cwd
-    expect(spy.calls[0]![2]!.cwd).toBe('/custom/repo');
-    expect(spy.calls[1]![2]!.cwd).toBe('/custom/repo');
+    expect(spy.calls[0]?.[2]?.cwd).toBe('/custom/repo');
+    expect(spy.calls[1]?.[2]?.cwd).toBe('/custom/repo');
   });
 
   test('should call getRepoRoot if repoRoot not in config', async () => {
@@ -180,10 +180,10 @@ describe('createUpdateBranch', () => {
     await createUpdateBranch({}, 'feature', undefined, spy.mock);
 
     // Should call getRepoRoot first
-    expect(spy.calls[0]![1]).toEqual(['rev-parse', '--show-toplevel']);
+    expect(spy.calls[0]?.[1]).toEqual(['rev-parse', '--show-toplevel']);
     // Should use detected repo as cwd
-    expect(spy.calls[1]![2]!.cwd).toBe('/detected/repo');
-    expect(spy.calls[2]![2]!.cwd).toBe('/detected/repo');
+    expect(spy.calls[1]?.[2]?.cwd).toBe('/detected/repo');
+    expect(spy.calls[2]?.[2]?.cwd).toBe('/detected/repo');
   });
 
   test('should propagate createBranch errors', async () => {
