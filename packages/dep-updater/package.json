@@ -1,5 +1,5 @@
 {
-  "name": "dep-updater",
+  "name": "@smoothbricks/dep-updater",
   "version": "0.0.1",
   "description": "Automated dependency update tool with Expo support, stacked PRs, and AI-powered changelogs",
   "type": "module",
@@ -46,5 +46,11 @@
     "ai",
     "stacked-prs"
   ],
-  "private": true
+  "private": true,
+  "nx": {
+    "targets": {
+      "lint": {},
+      "lint:fix": {}
+    }
+  }
 }
