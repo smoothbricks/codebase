@@ -40,8 +40,8 @@ function createPRWorkflowMock(scenario: {
     // Check mergeable status for any PR
     if (key.startsWith('gh pr view') && key.includes('--json mergeable')) {
       const prNumberMatch = key.match(/gh pr view (\d+)/);
-      if (prNumberMatch) {
-        const prNumber = Number.parseInt(prNumberMatch[1]!, 10);
+      if (prNumberMatch?.[1]) {
+        const prNumber = Number.parseInt(prNumberMatch[1], 10);
         const pr = existingPRs.find((p) => p.number === prNumber);
         if (pr) {
           return {
@@ -57,8 +57,8 @@ function createPRWorkflowMock(scenario: {
     // Close PR
     if (key.startsWith('gh pr close')) {
       const prNumberMatch = key.match(/gh pr close (\d+)/);
-      if (prNumberMatch) {
-        const prNumber = Number.parseInt(prNumberMatch[1]!, 10);
+      if (prNumberMatch?.[1]) {
+        const prNumber = Number.parseInt(prNumberMatch[1], 10);
         closedSet.add(prNumber);
       }
       return { stdout: '', stderr: '', exitCode: 0 };
@@ -223,8 +223,8 @@ describe('PR Stacking Workflow - Sequential PR Creation', () => {
 
       if (key.startsWith('gh pr close')) {
         const prNumberMatch = key.match(/gh pr close (\d+)/);
-        if (prNumberMatch) {
-          closedPRs.push(Number.parseInt(prNumberMatch[1]!, 10));
+        if (prNumberMatch?.[1]) {
+          closedPRs.push(Number.parseInt(prNumberMatch[1], 10));
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }
@@ -489,8 +489,8 @@ describe('PR Stacking Workflow - Stacking Disabled', () => {
 
       if (key.startsWith('gh pr close')) {
         const prNumberMatch = key.match(/gh pr close (\d+)/);
-        if (prNumberMatch) {
-          closedPRs.push(Number.parseInt(prNumberMatch[1]!, 10));
+        if (prNumberMatch?.[1]) {
+          closedPRs.push(Number.parseInt(prNumberMatch[1], 10));
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }
@@ -726,8 +726,8 @@ describe('PR Stacking Workflow - autoCloseOldPRs Integration', () => {
 
       if (key.startsWith('gh pr close')) {
         const prNumberMatch = key.match(/gh pr close (\d+)/);
-        if (prNumberMatch) {
-          closedPRs.push(Number.parseInt(prNumberMatch[1]!, 10));
+        if (prNumberMatch?.[1]) {
+          closedPRs.push(Number.parseInt(prNumberMatch[1], 10));
         }
         return { stdout: '', stderr: '', exitCode: 0 };
       }

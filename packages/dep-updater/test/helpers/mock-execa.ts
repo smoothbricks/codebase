@@ -20,7 +20,7 @@
  * ```
  */
 export function createMockExeca(responses: Record<string, string>) {
-  return async (cmd: string | URL, args?: readonly string[], _opts?: Record<string, any>) => {
+  return async (cmd: string | URL, args?: readonly string[], _opts?: Record<string, unknown>) => {
     const command = typeof cmd === 'string' ? cmd : cmd.toString();
     const key = [command, ...(args || [])].join(' ');
     if (key in responses) {
@@ -43,8 +43,8 @@ export function createMockExeca(responses: Record<string, string>) {
  * ```
  */
 export function createErrorExeca(errorMessage: string) {
-  return async (_cmd: string | URL, _args?: readonly string[], _opts?: Record<string, any>) => {
-    const error: any = new Error(errorMessage);
+  return async (_cmd: string | URL, _args?: readonly string[], _opts?: Record<string, unknown>) => {
+    const error = new Error(errorMessage) as Error & { exitCode: number; stderr: string };
     error.exitCode = 1;
     error.stderr = errorMessage;
     throw error;
@@ -71,9 +71,9 @@ export function createErrorExeca(errorMessage: string) {
  * ```
  */
 export function createExecaSpy(responses: Record<string, string>) {
-  const calls: Array<[string | URL, readonly string[] | undefined, Record<string, any> | undefined]> = [];
+  const calls: Array<[string | URL, readonly string[] | undefined, Record<string, unknown> | undefined]> = [];
 
-  const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, any>) => {
+  const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, unknown>) => {
     calls.push([cmd, args, opts]);
     const command = typeof cmd === 'string' ? cmd : cmd.toString();
     const key = [command, ...(args || [])].join(' ');

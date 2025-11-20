@@ -2,12 +2,13 @@ import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import type { Logger } from '../../src/logger.js';
 import { updateNixpkgsOverlay } from '../../src/updaters/nixpkgs.js';
 
 describe('Nixpkgs Overlay Updater', () => {
   const testDir = '/tmp/dep-updater-test-nixpkgs';
   const sourcesDir = join(testDir, '_sources');
-  let mockLogger: any;
+  let mockLogger: Logger;
 
   beforeEach(async () => {
     // Clean up and create test directory
