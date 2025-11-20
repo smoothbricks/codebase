@@ -502,6 +502,510 @@ describe('defineTagAttributes', () => {
 
 ---
 
+### Step 1.6: Implement `defineFeatureFlags` Function
+
+**File**: `packages/lmao/src/lib/schema/defineFeatureFlags.ts`
+
+**Task**: Create the feature flag schema definition system with sync/async flag support and automatic analytics tracking.
+
+**Note**: Feature flags use the same `S` schema builder as tag attributes, but with added `.default().sync()/.async()` methods.
+
+**Implementation**:
+
+```typescript
+import type { FeatureFlagDefinition } from './types';
+import * as Sury from '@sury/sury';
+
+/**
+ * Feature flag schema with sync/async markers
+ */
+export interface FeatureFlagSchema {
+  [key: string]: FeatureFlagDefinition<any>;
+}
+
+/**
+ * Define feature flags with type-safe access patterns
+ * 
+ * @param schema - Object mapping flag names to flag definitions
+ * @returns Feature flag definition object for use with evaluator
+ */
+export function defineFeatureFlags<T extends FeatureFlagSchema>(
+  schema: T
+): {
+  schema: T;
+  syncFlags: SyncFlagKeys<T>;
+  asyncFlags: AsyncFlagKeys<T>;
+  type: InferFeatureFlags<T>;
+} {
+  const syncFlags: string[] = [];
+  const asyncFlags: string[] = [];
+  
+  for (const [key, definition] of Object.entries(schema)) {
+    if (definition.evaluationType === 'sync') {
+      syncFlags.push(key);
+    } else {
+      asyncFlags.push(key);
+    }
+  }
+  
+  return {
+    schema,
+    syncFlags: syncFlags as any,
+    asyncFlags: asyncFlags as any,
+    type: undefined as any
+  };
+}
+
+/**
+ * Extract sync flag keys
+ */
+export type SyncFlagKeys<T extends FeatureFlagSchema> = {
+  [K in keyof T]: T[K]['evaluationType'] extends 'sync' ? K : never;
+}[keyof T];
+
+/**
+ * Extract async flag keys
+ */
+export type AsyncFlagKeys<T extends FeatureFlagSchema> = {
+  [K in keyof T]: T[K]['evaluationType'] extends 'async' ? K : never;
+}[keyof T];
+
+/**
+ * Infer TypeScript types from feature flag schema
+ */
+export type InferFeatureFlags<T extends FeatureFlagSchema> = {
+  [K in keyof T]: Sury.Output<T[K]['schema']>;
+};
+
+/**
+ * Evaluation context for feature flag decisions
+ */
+export interface EvaluationContext {
+  userId?: string;
+  requestId?: string;
+  userPlan?: string;
+  region?: string;
+  [key: string]: any;
+}
+
+/**
+ * Usage tracking context for A/B testing analytics
+ */
+export interface UsageContext {
+  action?: string;
+  outcome?: 'success' | 'failure';
+  value?: number;
+  metadata?: Record<string, any>;
+}
+```
+
+**Acceptance Criteria**:
+- [ ] S builder creates flag definitions with sync/async markers via .default()
+- [ ] defineFeatureFlags extracts sync and async flag keys
+- [ ] Type inference works for InferFeatureFlags
+- [ ] Fluent API: `S.boolean().default(false).sync()`
+- [ ] Works with examples from spec lines 66-86
+
+---
+
+### Step 1.7: Implement Feature Flag Evaluator
+
+**File**: `packages/lmao/src/lib/schema/evaluator.ts`
+
+**Task**: Implement the FeatureFlagEvaluator class that provides sync property access and async methods with automatic analytics tracking.
+
+**Implementation**:
+
+```typescript
+import type { 
+  FeatureFlagSchema, 
+  SyncFlagKeys, 
+  AsyncFlagKeys,
+  EvaluationContext,
+  UsageContext,
+  InferFeatureFlags
+} from './defineFeatureFlags';
+
+/**
+ * Feature flag evaluator interface
+ * 
+ * This is implemented by the backend (database, LaunchDarkly, etc.)
+ * and provides the actual flag values.
+ */
+export interface FlagEvaluator {
+  /**
+   * Get a flag value synchronously (for cached/static flags)
+   */
+  getSync<K extends string>(
+    flag: K,
+    context: EvaluationContext
+  ): any;
+  
+  /**
+   * Get a flag value asynchronously (for dynamic flags)
+   */
+  getAsync<K extends string>(
+    flag: K,
+    context: EvaluationContext
+  ): Promise<any>;
+}
+
+/**
+ * Column writers interface (to be implemented in buffer phase)
+ * 
+ * Used for logging flag access and usage to span buffers.
+ */
+export interface FlagColumnWriters {
+  writeEntryType(type: 'ff-access' | 'ff-usage'): void;
+  writeFfName(name: string): void;
+  writeFfValue(value: any): void;
+  writeAction(action?: string): void;
+  writeOutcome(outcome?: string): void;
+  writeContextAttributes(context: EvaluationContext): void;
+}
+
+/**
+ * Feature flag evaluator with span-aware logging
+ * 
+ * This class provides type-safe access to feature flags with automatic
+ * analytics tracking. Sync flags are exposed as direct properties for
+ * zero-overhead access, while async flags use methods.
+ */
+export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
+  protected schema: T;
+  protected context: EvaluationContext;
+  protected evaluator: FlagEvaluator;
+  protected columnWriters?: FlagColumnWriters;
+  
+  constructor(
+    schema: T,
+    context: EvaluationContext,
+    evaluator: FlagEvaluator,
+    columnWriters?: FlagColumnWriters
+  ) {
+    this.schema = schema;
+    this.context = context;
+    this.evaluator = evaluator;
+    this.columnWriters = columnWriters;
+    
+    // Initialize sync flags as direct properties
+    this.initializeSyncFlags();
+  }
+  
+  /**
+   * Initialize sync flags as getter properties
+   * 
+   * This allows sync flags to be accessed as direct properties:
+   * ctx.ff.debugMode instead of ctx.ff.get('debugMode')
+   */
+  protected initializeSyncFlags(): void {
+    for (const [key, definition] of Object.entries(this.schema)) {
+      if (definition.evaluationType === 'sync') {
+        Object.defineProperty(this, key, {
+          get: () => {
+            const value = this.evaluator.getSync(key, this.context);
+            
+            // Log flag access for analytics
+            if (this.columnWriters) {
+              this.columnWriters.writeEntryType('ff-access');
+              this.columnWriters.writeFfName(key);
+              this.columnWriters.writeFfValue(value);
+              this.columnWriters.writeContextAttributes(this.context);
+            }
+            
+            return value ?? definition.defaultValue;
+          },
+          enumerable: true,
+          configurable: true
+        });
+      }
+    }
+  }
+  
+  /**
+   * Get async flag value
+   * 
+   * Async flags must be accessed via this method:
+   * await ctx.ff.get('userSpecificLimit')
+   */
+  async get<K extends AsyncFlagKeys<T>>(
+    flag: K
+  ): Promise<InferFeatureFlags<T>[K]> {
+    const definition = this.schema[flag];
+    const value = await this.evaluator.getAsync(flag as string, this.context);
+    
+    // Log flag access for analytics
+    if (this.columnWriters) {
+      this.columnWriters.writeEntryType('ff-access');
+      this.columnWriters.writeFfName(flag as string);
+      this.columnWriters.writeFfValue(value);
+      this.columnWriters.writeContextAttributes(this.context);
+    }
+    
+    return value ?? definition.defaultValue;
+  }
+  
+  /**
+   * Track feature flag usage for A/B testing analytics
+   * 
+   * This logs when a flag actually affects behavior, not just when it's accessed.
+   * For example, after performing an action enabled by a flag.
+   */
+  trackUsage<K extends keyof T>(
+    flag: K,
+    context?: UsageContext
+  ): void {
+    if (this.columnWriters) {
+      this.columnWriters.writeEntryType('ff-usage');
+      this.columnWriters.writeFfName(flag as string);
+      this.columnWriters.writeAction(context?.action);
+      this.columnWriters.writeOutcome(context?.outcome);
+      this.columnWriters.writeContextAttributes(this.context);
+    }
+  }
+}
+
+/**
+ * Simple in-memory flag evaluator for testing
+ */
+export class InMemoryFlagEvaluator implements FlagEvaluator {
+  private flags: Record<string, any> = {};
+  
+  constructor(initialFlags: Record<string, any> = {}) {
+    this.flags = initialFlags;
+  }
+  
+  getSync<K extends string>(flag: K, _context: EvaluationContext): any {
+    return this.flags[flag];
+  }
+  
+  async getAsync<K extends string>(flag: K, _context: EvaluationContext): Promise<any> {
+    return this.flags[flag];
+  }
+  
+  setFlag(flag: string, value: any): void {
+    this.flags[flag] = value;
+  }
+}
+```
+
+**Acceptance Criteria**:
+- [ ] Sync flags accessible as direct properties
+- [ ] Async flags require .get() method
+- [ ] All flag access logged to column writers
+- [ ] trackUsage() logs usage events
+- [ ] InMemoryFlagEvaluator works for testing
+- [ ] Matches spec implementation lines 127-197
+
+---
+
+### Step 1.8: Add Tests for Feature Flags
+
+**File**: `packages/lmao/src/lib/schema/__tests__/featureFlags.test.ts`
+
+**Task**: Write comprehensive tests for feature flag definition and evaluation.
+
+**Implementation**:
+
+```typescript
+import { describe, expect, test } from 'bun:test';
+import { defineFeatureFlags } from '../defineFeatureFlags';
+import { FeatureFlagEvaluator, InMemoryFlagEvaluator } from '../evaluator';
+import { S } from '../builder';
+
+describe('Feature Flags', () => {
+  test('defines feature flags with sync/async markers', () => {
+    const flags = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+      maxRetries: S.number().default(3).sync(),
+      userSpecificLimit: S.number().default(100).async(),
+    });
+    
+    expect(flags.schema).toBeDefined();
+    expect(flags.syncFlags).toContain('debugMode');
+    expect(flags.syncFlags).toContain('maxRetries');
+    expect(flags.asyncFlags).toContain('userSpecificLimit');
+  });
+  
+  test('evaluator provides sync flags as properties', () => {
+    const schema = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+      maxRetries: S.number().default(3).sync(),
+    });
+    
+    const evaluator = new InMemoryFlagEvaluator({
+      debugMode: true,
+      maxRetries: 5
+    });
+    
+    const ff = new FeatureFlagEvaluator(
+      schema.schema,
+      { userId: 'user-123' },
+      evaluator
+    );
+    
+    // Sync flags accessed as properties
+    expect((ff as any).debugMode).toBe(true);
+    expect((ff as any).maxRetries).toBe(5);
+  });
+  
+  test('evaluator provides async flags via get method', async () => {
+    const schema = defineFeatureFlags({
+      userSpecificLimit: S.number().default(100).async(),
+      dynamicProvider: S.enum(['stripe', 'paypal'] as const).default('stripe').async(),
+    });
+    
+    const evaluator = new InMemoryFlagEvaluator({
+      userSpecificLimit: 200,
+      dynamicProvider: 'paypal'
+    });
+    
+    const ff = new FeatureFlagEvaluator(
+      schema.schema,
+      { userId: 'user-123' },
+      evaluator
+    );
+    
+    // Async flags accessed via get()
+    const limit = await ff.get('userSpecificLimit');
+    const provider = await ff.get('dynamicProvider');
+    
+    expect(limit).toBe(200);
+    expect(provider).toBe('paypal');
+  });
+  
+  test('returns default values when flag not set', async () => {
+    const schema = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+      userLimit: S.number().default(100).async(),
+    });
+    
+    const evaluator = new InMemoryFlagEvaluator({}); // No flags set
+    
+    const ff = new FeatureFlagEvaluator(
+      schema.schema,
+      { userId: 'user-123' },
+      evaluator
+    );
+    
+    expect((ff as any).debugMode).toBe(false);
+    expect(await ff.get('userLimit')).toBe(100);
+  });
+  
+  test('trackUsage logs usage events', () => {
+    const schema = defineFeatureFlags({
+      advancedValidation: S.boolean().default(false).sync(),
+    });
+    
+    const evaluator = new InMemoryFlagEvaluator({
+      advancedValidation: true
+    });
+    
+    const logs: any[] = [];
+    const mockWriters = {
+      writeEntryType: (type: string) => logs.push({ type }),
+      writeFfName: (name: string) => logs.push({ name }),
+      writeFfValue: (value: any) => logs.push({ value }),
+      writeAction: (action?: string) => logs.push({ action }),
+      writeOutcome: (outcome?: string) => logs.push({ outcome }),
+      writeContextAttributes: (ctx: any) => logs.push({ context: ctx })
+    };
+    
+    const ff = new FeatureFlagEvaluator(
+      schema.schema,
+      { userId: 'user-123' },
+      evaluator,
+      mockWriters
+    );
+    
+    ff.trackUsage('advancedValidation', {
+      action: 'validation_performed',
+      outcome: 'success'
+    });
+    
+    expect(logs).toContainEqual({ type: 'ff-usage' });
+    expect(logs).toContainEqual({ name: 'advancedValidation' });
+    expect(logs).toContainEqual({ action: 'validation_performed' });
+    expect(logs).toContainEqual({ outcome: 'success' });
+  });
+  
+  test('sync flag access is logged', () => {
+    const schema = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+    });
+    
+    const evaluator = new InMemoryFlagEvaluator({ debugMode: true });
+    
+    const logs: any[] = [];
+    const mockWriters = {
+      writeEntryType: (type: string) => logs.push({ type }),
+      writeFfName: (name: string) => logs.push({ name }),
+      writeFfValue: (value: any) => logs.push({ value }),
+      writeAction: () => {},
+      writeOutcome: () => {},
+      writeContextAttributes: (ctx: any) => logs.push({ context: ctx })
+    };
+    
+    const ff = new FeatureFlagEvaluator(
+      schema.schema,
+      { userId: 'user-123' },
+      evaluator,
+      mockWriters
+    );
+    
+    // Access the flag
+    const value = (ff as any).debugMode;
+    
+    expect(value).toBe(true);
+    expect(logs).toContainEqual({ type: 'ff-access' });
+    expect(logs).toContainEqual({ name: 'debugMode' });
+    expect(logs).toContainEqual({ value: true });
+  });
+  
+  test('async flag access is logged', async () => {
+    const schema = defineFeatureFlags({
+      userLimit: S.number().default(100).async(),
+    });
+    
+    const evaluator = new InMemoryFlagEvaluator({ userLimit: 200 });
+    
+    const logs: any[] = [];
+    const mockWriters = {
+      writeEntryType: (type: string) => logs.push({ type }),
+      writeFfName: (name: string) => logs.push({ name }),
+      writeFfValue: (value: any) => logs.push({ value }),
+      writeAction: () => {},
+      writeOutcome: () => {},
+      writeContextAttributes: (ctx: any) => logs.push({ context: ctx })
+    };
+    
+    const ff = new FeatureFlagEvaluator(
+      schema.schema,
+      { userId: 'user-123' },
+      evaluator,
+      mockWriters
+    );
+    
+    const value = await ff.get('userLimit');
+    
+    expect(value).toBe(200);
+    expect(logs).toContainEqual({ type: 'ff-access' });
+    expect(logs).toContainEqual({ name: 'userLimit' });
+    expect(logs).toContainEqual({ value: 200 });
+  });
+});
+```
+
+**Acceptance Criteria**:
+- [ ] All tests pass
+- [ ] Tests verify sync property access
+- [ ] Tests verify async get() method
+- [ ] Tests verify default value fallback
+- [ ] Tests verify analytics logging
+- [ ] Tests verify usage tracking
+
+---
+
 ## Phase 2: Apache Arrow Columnar Buffer Foundation
 
 ### Step 2.1: Create Arrow-Based SpanBuffer Types
@@ -1068,11 +1572,15 @@ describe('Schema to Arrow Integration', () => {
 
 ## Implementation Order Summary
 
-1. **Phase 1: Sury Schema System** (Steps 1.1-1.5) - **START HERE**
-   - Install @sury/sury and apache-arrow
-   - Implement Sury-based schema builder
-   - Add masking transformations
-   - Test schema validation
+1. **Phase 1: Sury Schema System** (Steps 1.1-1.8) - **START HERE**
+   - Install @sury/sury and apache-arrow (Step 1.1)
+   - Implement Sury-based schema builder (Step 1.2)
+   - Implement tag attribute definition (Step 1.3)
+   - Add schema extension support (Step 1.4)
+   - Test tag attributes (Step 1.5)
+   - Implement feature flag definition (Step 1.6)
+   - Implement feature flag evaluator (Step 1.7)
+   - Test feature flags (Step 1.8)
 
 2. **Phase 2: Arrow Buffer Foundation** (Steps 2.1-2.3)
    - Define Arrow-based SpanBuffer types

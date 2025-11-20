@@ -3,10 +3,48 @@
  * 
  * This module provides the S object that wraps Sury's schema API
  * with custom masking transformations for sensitive data.
+ * Also supports feature flag definitions with .default().sync()/.async() pattern.
  */
 
 import * as Sury from '@sury/sury';
-import type { SchemaBuilder, MaskType, MaskTransform } from './types.js';
+import type { 
+  SchemaBuilder, 
+  MaskType, 
+  MaskTransform, 
+  SchemaOrFlagBuilder,
+  FlagBuilderWithDefault,
+  FeatureFlagDefinition 
+} from './types.js';
+
+/**
+ * Create a flag builder that wraps a Sury schema
+ * This allows schemas to be used for both tag attributes and feature flags
+ */
+function createSchemaWithFlagBuilder<T>(schema: Sury.Schema<T, unknown>): SchemaOrFlagBuilder<T> {
+  const schemaWithBuilder = schema as SchemaOrFlagBuilder<T>;
+  
+  // Add the .default() method for feature flag definitions
+  schemaWithBuilder.default = function(defaultValue: T): FlagBuilderWithDefault<T> {
+    return {
+      sync(): FeatureFlagDefinition<T, 'sync'> {
+        return {
+          schema,
+          defaultValue,
+          evaluationType: 'sync' as const,
+        };
+      },
+      async(): FeatureFlagDefinition<T, 'async'> {
+        return {
+          schema,
+          defaultValue,
+          evaluationType: 'async' as const,
+        };
+      },
+    };
+  };
+  
+  return schemaWithBuilder;
+}
 
 /**
  * Masking functions for sensitive data
@@ -79,24 +117,30 @@ const schemaBuilderImpl: SchemaBuilder = {
    * Create string schema
    * 
    * Usage:
-   * - SchemaBuilder.string() - basic string
-   * - S.transform(SchemaBuilder.string(), fn) - with transformation
+   * - S.string() - basic string for tag attributes
+   * - S.string().default('value').sync() - feature flag
+   * - S.transform(S.string(), fn) - with transformation
    */
-  string: () => Sury.string,
+  string: () => createSchemaWithFlagBuilder(Sury.string),
   
   /**
    * Create number schema
    * 
    * Usage:
-   * - SchemaBuilder.number() - any number
-   * - S.refine(SchemaBuilder.number(), x => x > 0) - with validation
+   * - S.number() - any number for tag attributes
+   * - S.number().default(0).sync() - feature flag
+   * - S.refine(S.number(), x => x > 0) - with validation
    */
-  number: () => Sury.number,
+  number: () => createSchemaWithFlagBuilder(Sury.number),
   
   /**
    * Create boolean schema
+   * 
+   * Usage:
+   * - S.boolean() - for tag attributes
+   * - S.boolean().default(false).sync() - feature flag
    */
-  boolean: () => Sury.boolean,
+  boolean: () => createSchemaWithFlagBuilder(Sury.boolean),
   
   /**
    * Wrap schema to make it optional
@@ -135,25 +179,28 @@ const schemaBuilderImpl: SchemaBuilder = {
    * This is a convenience wrapper for common use case of string unions.
    * 
    * Usage:
-   * - SchemaBuilder.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE'])
+   * - S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']) - for tag attributes
+   * - S.enum(['dev', 'staging', 'prod']).default('dev').sync() - feature flag
    * 
    * Creates: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE'
    * 
    * Implementation: Uses S.refine with validation that fails on invalid values
    */
-  enum: <T extends readonly string[]>(values: T): Sury.Schema<T[number], string> => {
+  enum: <T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]> => {
     if (values.length === 0) {
       throw new Error('Enum must have at least one value');
     }
     
     // Use refine to validate string is one of the allowed values
     // The callback receives (value, fail) where fail.fail(message) throws validation error
-    return Sury.refine(Sury.string, (value, fail): T[number] => {
+    const schema = Sury.refine(Sury.string, (value, fail): T[number] => {
       if (!values.includes(value)) {
         fail.fail(`Value must be one of: ${values.join(', ')}`);
       }
       return value as T[number];
     }) as Sury.Schema<T[number], string>;
+    
+    return createSchemaWithFlagBuilder(schema);
   },
   
   /**

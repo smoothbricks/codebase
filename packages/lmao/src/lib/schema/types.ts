@@ -49,13 +49,45 @@ export type InferTagAttributesInput<T extends TagAttributeSchema> = {
 export type MaskType = 'hash' | 'url' | 'sql' | 'email';
 
 /**
+ * Feature flag builder with default value support
+ * Returned by S.string(), S.number(), S.boolean(), S.enum() when used for feature flags
+ */
+export interface FlagBuilder<T> {
+  default(value: T): FlagBuilderWithDefault<T>;
+}
+
+/**
+ * Feature flag builder with sync/async evaluation type support
+ */
+export interface FlagBuilderWithDefault<T> {
+  sync(): FeatureFlagDefinition<T, 'sync'>;
+  async(): FeatureFlagDefinition<T, 'async'>;
+}
+
+/**
+ * Feature flag definition with default value and evaluation type
+ */
+export interface FeatureFlagDefinition<T, EvalType extends 'sync' | 'async' = 'sync' | 'async'> {
+  schema: Sury.Schema<T, unknown>;
+  defaultValue: T;
+  evaluationType: EvalType;
+}
+
+/**
+ * Schema that can be used for both tag attributes and feature flags
+ * This type is returned by S.string(), S.number(), etc.
+ */
+export type SchemaOrFlagBuilder<T> = Sury.Schema<T, unknown> & FlagBuilder<T>;
+
+/**
  * Schema builder interface that wraps Sury with custom API
+ * Supports both tag attributes and feature flags
  */
 export interface SchemaBuilder {
-  // Primitive types
-  string(): Sury.Schema<string, string>;
-  number(): Sury.Schema<number, number>;
-  boolean(): Sury.Schema<boolean, boolean>;
+  // Primitive types - return schemas that can also be used as flag builders
+  string(): SchemaOrFlagBuilder<string>;
+  number(): SchemaOrFlagBuilder<number>;
+  boolean(): SchemaOrFlagBuilder<boolean>;
   
   // Optional wrapper
   optional<T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined>;
@@ -66,7 +98,7 @@ export interface SchemaBuilder {
   ): Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>>;
   
   // Enum - for string literal unions (common case)
-  enum<T extends readonly string[]>(values: T): Sury.Schema<T[number], string>;
+  enum<T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]>;
   
   // String with masking transformation
   masked(type: MaskType): Sury.Schema<string, string>;
