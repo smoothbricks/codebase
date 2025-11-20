@@ -15,6 +15,24 @@ AI-powered changelog summaries.
 - Multi-ecosystem support (npm, Expo, Nix/devenv)
 - Dry-run mode for safe testing
 
+## Requirements
+
+**This tool is designed for Nx monorepos.**
+
+- **Nx workspace**: The generated GitHub Actions workflow uses Nx targets for task orchestration and caching
+- **Bun package manager**: Used for build and execution (via `nx:run-commands`)
+- **Git repository**: Required for all git operations and PR creation
+- **GitHub CLI (gh)**: Optional but recommended for PR operations
+
+**Why Nx-only?**
+
+- Leverages Nx computation caching for faster CI runs
+- Automatic task dependency management (build before run)
+- Consistent with monorepo best practices
+- Simpler architecture focusing on one deployment model
+
+**Future considerations:** GitHub App version could support non-Nx projects by running on external infrastructure.
+
 ## Architecture
 
 ```
@@ -251,10 +269,10 @@ Located in `src/pr/stacking.ts` (274 lines, **FULLY TESTED** - 47 tests):
 
 **Key Features:**
 
-- Detects if running in local package setup (checks for `packages/dep-updater`)
-- Generates workflow that builds and runs CLI directly
+- Uses Nx target for CLI execution (automatic builds + caching)
 - Configures git user for commits (github-actions[bot])
 - Uses fine-grained PAT for PR creation
+- Supports Nx computation caching for faster CI runs
 
 **Authentication:** Fine-grained Personal Access Token (GH_PAT)
 
@@ -269,9 +287,11 @@ Located in `src/pr/stacking.ts` (274 lines, **FULLY TESTED** - 47 tests):
 1. Checkout repo with full history (`fetch-depth: 0`)
 2. Setup Bun
 3. Install dependencies
-4. Build dep-updater (for local package setup)
-5. Configure git identity
-6. Run CLI with GH_PAT and optional ANTHROPIC_API_KEY
+4. Configure git identity
+5. Run CLI via Nx target (`nx run @smoothbricks/dep-updater:update-deps`)
+   - Nx automatically builds the CLI if needed
+   - Nx caches build results for faster subsequent runs
+   - Passes GH_PAT and optional ANTHROPIC_API_KEY via env vars
 
 **TODO:** Add GitHub App authentication support for production (not user-dependent, better for orgs)
 
@@ -315,6 +335,34 @@ bun run build      # Build CLI
 bun run test       # Run all tests
 bun run typecheck  # Type check src/ and test/
 bun test --watch   # Watch mode for tests
+```
+
+### Nx Targets
+
+The package includes an Nx target for running the CLI in CI environments:
+
+```bash
+nx run @smoothbricks/dep-updater:update-deps -- [CLI_FLAGS]
+```
+
+**Benefits:**
+
+- **Automatic build**: Depends on the `build` target, so Nx ensures the CLI is built before running
+- **Computation caching**: Nx can cache and reuse build results (locally and in CI with Nx Cloud)
+- **Task orchestration**: Leverages Nx's dependency graph and task scheduling
+- **Better CI performance**: Skips rebuilds when code hasn't changed, saving CI minutes
+
+**Usage in CI:** The generated GitHub Actions workflow uses this target instead of manually building and running the
+CLI. This allows Nx to cache the build and skip it on subsequent runs if nothing changed.
+
+**Example:**
+
+```bash
+# Run with verbose logging and skip AI
+nx run @smoothbricks/dep-updater:update-deps -- --verbose --skip-ai
+
+# All CLI flags work with -- separator
+nx run @smoothbricks/dep-updater:update-deps -- --dry-run
 ```
 
 ### Before Committing

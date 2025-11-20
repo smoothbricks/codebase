@@ -49,7 +49,17 @@
   "nx": {
     "targets": {
       "lint": {},
-      "lint:fix": {}
+      "lint:fix": {},
+      "update-deps": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "command": "node dist/cli.js update-deps",
+          "cwd": "{projectRoot}"
+        }
+      }
     }
   }
 }

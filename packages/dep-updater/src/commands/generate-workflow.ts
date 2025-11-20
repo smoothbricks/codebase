@@ -45,11 +45,6 @@ jobs:
       - name: Install dependencies
         run: bun install
 
-      - name: Build dep-updater
-        run: |
-          cd packages/dep-updater
-          bun run build
-
       - name: Configure git
         run: |
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -59,8 +54,8 @@ jobs:
         env:
           GH_TOKEN: \${{ secrets.GH_PAT }}${useAI ? '\n          ANTHROPIC_API_KEY: ' + '$' + '{{ secrets.ANTHROPIC_API_KEY }}' : ''}
         run: |
-          # Run the built CLI directly
-          bun run packages/dep-updater/dist/cli.js update-deps --verbose${!useAI ? ' --skip-ai' : ''}
+          # Run via Nx target (automatically builds if needed, supports caching)
+          nx run @smoothbricks/dep-updater:update-deps -- --verbose${!useAI ? ' --skip-ai' : ''}
 `;
 }
 
