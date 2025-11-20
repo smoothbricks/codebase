@@ -3,7 +3,7 @@
  */
 
 import { generateCommitMessage } from '../changelog/analyzer.js';
-import type { DepUpdaterConfig } from '../config.js';
+import { type DepUpdaterConfig, resolveExpoProjects } from '../config.js';
 import { checkForExpoUpdate } from '../expo/sdk-checker.js';
 import { fetchExpoVersions } from '../expo/versions-fetcher.js';
 import { createUpdateBranch, createUpdateCommit, getRepoRoot } from '../git.js';
@@ -23,32 +23,49 @@ export async function checkExpoSDK(config: DepUpdaterConfig, _options: UpdateOpt
   }
 
   const repoRoot = config.repoRoot || (await getRepoRoot());
-  const packageJsonPath = safeResolve(repoRoot, config.expo.packageJsonPath);
+  const projects = await resolveExpoProjects(config);
 
-  config.logger?.info('Checking for Expo SDK updates...\n');
-
-  const { hasUpdate, current, latest } = await checkForExpoUpdate(packageJsonPath);
-
-  if (!current) {
-    config.logger?.error('❌ No Expo SDK found in package.json');
+  if (projects.length === 0) {
+    config.logger?.warn('No Expo projects found to check');
     return;
   }
 
-  config.logger?.info(`Current Expo SDK: ${current}`);
-  config.logger?.info(`Latest Expo SDK: ${latest.version}`);
+  config.logger?.info(`Checking for Expo SDK updates in ${projects.length} project(s)...\n`);
 
-  if (hasUpdate) {
-    config.logger?.info(`\n✨ New Expo SDK available: ${current} → ${latest.version}`);
-    if (latest.changelogUrl) {
-      config.logger?.info(`Changelog: ${latest.changelogUrl}`);
+  let hasAnyUpdate = false;
+  for (const project of projects) {
+    const packageJsonPath = safeResolve(repoRoot, project.packageJsonPath);
+    config.logger?.info(`📦 ${project.name || project.packageJsonPath}`);
+
+    const { hasUpdate, current, latest } = await checkForExpoUpdate(packageJsonPath);
+
+    if (!current) {
+      config.logger?.warn('   !  No Expo SDK found');
+      continue;
     }
-  } else {
-    config.logger?.info('\n✓ Already on latest Expo SDK');
+
+    config.logger?.info(`   Current: ${current}`);
+    config.logger?.info(`   Latest:  ${latest.version}`);
+
+    if (hasUpdate) {
+      config.logger?.info(`   ✨ Update available: ${current} → ${latest.version}`);
+      if (latest.changelogUrl) {
+        config.logger?.info(`   Changelog: ${latest.changelogUrl}`);
+      }
+      hasAnyUpdate = true;
+    } else {
+      config.logger?.info('   ✓ Up to date');
+    }
+    config.logger?.info('');
+  }
+
+  if (hasAnyUpdate) {
+    config.logger?.info('💡 Run `dep-updater update-expo` to update all projects');
   }
 }
 
 /**
- * Update Expo SDK and dependencies
+ * Update Expo SDK and dependencies for all projects
  */
 export async function updateExpo(config: DepUpdaterConfig, options: UpdateOptions): Promise<void> {
   if (!config.expo?.enabled) {
@@ -57,23 +74,42 @@ export async function updateExpo(config: DepUpdaterConfig, options: UpdateOption
   }
 
   const repoRoot = config.repoRoot || (await getRepoRoot());
-  const packageJsonPath = safeResolve(repoRoot, config.expo.packageJsonPath);
+  const projects = await resolveExpoProjects(config);
 
-  config.logger?.info('Checking for Expo SDK updates...\n');
-
-  const { hasUpdate, current, latest } = await checkForExpoUpdate(packageJsonPath);
-
-  if (!current) {
-    config.logger?.error('❌ No Expo SDK found in package.json');
+  if (projects.length === 0) {
+    config.logger?.warn('No Expo projects found to update');
     return;
   }
 
-  if (!hasUpdate) {
-    config.logger?.info('✓ Already on latest Expo SDK');
+  config.logger?.info(`Checking for Expo SDK updates in ${projects.length} project(s)...\n`);
+
+  // Check all projects and collect update info
+  const projectUpdates: Array<{ project: (typeof projects)[0]; current: string; latest: string }> = [];
+  let targetVersion: string | null = null;
+
+  for (const project of projects) {
+    const packageJsonPath = safeResolve(repoRoot, project.packageJsonPath);
+    const { hasUpdate, current, latest } = await checkForExpoUpdate(packageJsonPath);
+
+    if (!current) {
+      config.logger?.warn(`!  ${project.name || project.packageJsonPath}: No Expo SDK found`);
+      continue;
+    }
+
+    config.logger?.info(`📦 ${project.name || project.packageJsonPath}: ${current}`);
+
+    if (hasUpdate) {
+      projectUpdates.push({ project, current, latest: latest.version });
+      targetVersion = latest.version; // All projects should update to the same latest version
+    }
+  }
+
+  if (projectUpdates.length === 0 || !targetVersion) {
+    config.logger?.info('\n✓ All Expo projects are up to date');
     return;
   }
 
-  config.logger?.info(`Updating Expo SDK: ${current} → ${latest.version}\n`);
+  config.logger?.info(`\n✨ ${projectUpdates.length} project(s) can be updated to Expo SDK ${targetVersion}\n`);
 
   if (options.dryRun) {
     config.logger?.info('[DRY RUN] Would perform the following steps:');
@@ -84,9 +120,9 @@ export async function updateExpo(config: DepUpdaterConfig, options: UpdateOption
     return;
   }
 
-  // Step 1: Fetch Expo recommended versions
+  // Step 1: Fetch Expo recommended versions (targetVersion is guaranteed to be non-null here)
   config.logger?.info('Fetching Expo recommended versions...');
-  const expoVersions = await fetchExpoVersions(latest.version);
+  const expoVersions = await fetchExpoVersions(targetVersion);
   config.logger?.info(`✓ Fetched ${Object.keys(expoVersions.packages).length} package versions`);
 
   // Step 2: Regenerate syncpack config
@@ -117,10 +153,14 @@ export async function updateExpo(config: DepUpdaterConfig, options: UpdateOption
 
   // Step 4: Generate commit message
   const { body } = await generateCommitMessage(updateResult.updates, config);
-  const expoCommitTitle = `chore: update Expo SDK to ${latest.version}`;
-  const expoCommitBody = `Updated Expo SDK from ${current} to ${latest.version}
+  const projectList = projectUpdates
+    .map((u) => `  - ${u.project.name || u.project.packageJsonPath}: ${u.current} → ${u.latest}`)
+    .join('\n');
+  const expoCommitTitle = `chore: update Expo SDK to ${targetVersion}`;
+  const expoCommitBody = `Updated Expo SDK to ${targetVersion}
 
-Changelog: ${latest.changelogUrl || 'N/A'}
+Projects updated:
+${projectList}
 
 ${body}`;
 
@@ -129,11 +169,11 @@ ${body}`;
     await createUpdateCommit(config, expoCommitTitle, expoCommitBody);
 
     // Step 6: Create branch and push
-    const branchName = `${config.prStrategy.branchPrefix}-expo-${latest.version}`;
+    const branchName = `${config.prStrategy.branchPrefix}-expo-${targetVersion}`;
     await createUpdateBranch(config, branchName);
 
     // Step 7: Create PR
-    const prTitle = `chore: update Expo SDK to ${latest.version}`;
+    const prTitle = `chore: update Expo SDK to ${targetVersion}`;
     const prBody = expoCommitBody;
 
     const pr = await createStackedPR(config, repoRoot, {

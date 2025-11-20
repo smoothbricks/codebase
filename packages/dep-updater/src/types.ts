@@ -112,6 +112,17 @@ export interface ExpoPackageVersions {
 }
 
 /**
+ * Expo project configuration
+ * Used for managing multiple Expo apps in a monorepo
+ */
+export interface ExpoProject {
+  /** Project name (optional, for logging) */
+  name?: string;
+  /** Path to package.json containing Expo dependency */
+  packageJsonPath: string;
+}
+
+/**
  * Options for update commands
  */
 export interface UpdateOptions {

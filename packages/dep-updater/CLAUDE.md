@@ -169,7 +169,40 @@ Integration tests validate end-to-end workflows and module interactions:
 
 ## Key Design Decisions
 
-### 1. Partial Config in Workflow Functions
+### 1. Type Organization
+
+**All shared types must be defined in `src/types.ts`**
+
+- Never define types directly in implementation files (config.ts, commands/, etc.)
+- Import types from `types.ts` where needed
+- Keep types centralized for easy discovery and reuse
+- Group related types together with clear JSDoc comments
+
+**Example:**
+
+```typescript
+// ✅ Good: Define in types.ts
+export interface ExpoProject {
+  name?: string;
+  packageJsonPath: string;
+}
+
+// ✅ Good: Import from types.ts
+import type { ExpoProject } from './types.js';
+
+// ❌ Bad: Define types in implementation files
+export interface ExpoProject { ... } // in config.ts
+```
+
+**Why:**
+
+- Single source of truth for all types
+- Easier to find and update types
+- Prevents duplicate type definitions
+- Better IDE autocomplete and navigation
+- Clearer separation of concerns
+
+### 2. Partial Config in Workflow Functions
 
 Workflow functions accept `Partial<DepUpdaterConfig>` instead of full config:
 
@@ -184,7 +217,7 @@ export async function createUpdateCommit(
 
 **Why:** Tests only need to provide relevant config fields (e.g., `{ repoRoot: '/repo' }`), not entire config structure.
 
-### 2. Git Porcelain Format Parsing
+### 3. Git Porcelain Format Parsing
 
 `getChangedFiles` parses git porcelain format (`XY filename`):
 
@@ -192,7 +225,7 @@ export async function createUpdateCommit(
 - Format: `XY filename` where X=index status, Y=worktree status (single chars), space, filename
 - Extract filename with `.substring(3)` to skip status codes and space
 
-### 3. CommandExecutor Type
+### 4. CommandExecutor Type
 
 ```typescript
 export type CommandExecutor = (
@@ -208,7 +241,7 @@ export type CommandExecutor = (
 - Actual usage is type-safe (we only access `.stdout`)
 - Avoids complex type compatibility issues
 
-### 4. PR Stacking Strategy
+### 5. PR Stacking Strategy
 
 Located in `src/pr/stacking.ts` (274 lines, **FULLY TESTED** - 47 tests):
 
@@ -219,7 +252,7 @@ Located in `src/pr/stacking.ts` (274 lines, **FULLY TESTED** - 47 tests):
 - PR creation with stacking workflow (`createStackedPR`)
 - All functions accept `executor` parameter for testability
 
-### 5. Command Refactoring for Maintainability
+### 6. Command Refactoring for Maintainability
 
 **update-deps.ts** - Refactored from 246-line monolithic function into 5 focused functions (301 lines total):
 
@@ -399,7 +432,11 @@ Config structure in `src/config.ts`:
 
 ```typescript
 interface DepUpdaterConfig {
-  expo?: { enabled: boolean; packageJsonPath: string };
+  expo?: {
+    enabled: boolean;
+    autoDetect?: boolean; // Auto-detect Expo projects (default: true)
+    projects?: ExpoProject[]; // Explicit list of projects
+  };
   syncpack?: { configPath: string; preserveCustomRules: boolean };
   nix?: { enabled: boolean; devenvPath: string; nixpkgsOverlayPath: string };
   prStrategy: { stackingEnabled: boolean; maxStackDepth: number; ... };
@@ -409,6 +446,46 @@ interface DepUpdaterConfig {
   repoRoot?: string;
 }
 ```
+
+### Expo Multi-Project Support
+
+The tool supports managing multiple Expo projects in a monorepo:
+
+**Auto-Detection (Recommended):**
+
+```typescript
+export default defineConfig({
+  expo: {
+    enabled: true,
+    autoDetect: true, // Scans workspace for packages with "expo" dependency
+  },
+});
+```
+
+**Manual Project List:**
+
+```typescript
+export default defineConfig({
+  expo: {
+    enabled: true,
+    autoDetect: false,
+    projects: [
+      { name: 'customer-app', packageJsonPath: './apps/customer/package.json' },
+      { name: 'driver-app', packageJsonPath: './apps/driver/package.json' },
+      { name: 'admin-app', packageJsonPath: './apps/admin/package.json' },
+    ],
+  },
+});
+```
+
+**Implementation Details:**
+
+- Auto-detection scans workspace patterns from root `package.json`
+- Checks each package for `expo` in `dependencies` or `devDependencies`
+- `resolveExpoProjects()` in `src/config.ts` handles priority: explicit list → auto-detection
+- `detectExpoProjects()` in `src/utils/workspace-detector.ts` performs the scanning
+- All projects update to the same Expo SDK version
+- Commit message lists all updated projects with version changes
 
 **Config File Loading:** The tool automatically searches for config files in `tooling/` directory (TypeScript first,
 then JSON):

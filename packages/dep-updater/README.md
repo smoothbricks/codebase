@@ -154,7 +154,12 @@ export default defineConfig({
   // Expo SDK management (optional)
   expo: {
     enabled: true,
-    packageJsonPath: './package.json',
+    autoDetect: true, // Auto-detect all Expo projects in monorepo
+    // OR specify projects explicitly:
+    // projects: [
+    //   { name: 'mobile', packageJsonPath: './apps/mobile/package.json' },
+    //   { name: 'tablet', packageJsonPath: './apps/tablet/package.json' },
+    // ],
   },
 
   // Syncpack integration
@@ -211,7 +216,8 @@ Create `tooling/dep-updater.json` for simple, declarative configuration:
 {
   "expo": {
     "enabled": true,
-    "packageJsonPath": "./package.json"
+    "autoDetect": true,
+    "projects": []
   },
   "nix": {
     "enabled": false,
@@ -307,7 +313,29 @@ The tool searches for config files in the current directory and parent directori
 #### Expo (`expo`)
 
 - `enabled`: Enable Expo SDK updates
-- `packageJsonPath`: Path to package.json containing Expo dependency
+- `autoDetect`: Auto-detect Expo projects by scanning workspace packages (default: `true`)
+- `projects`: Explicit list of Expo projects (array of `{ name?: string, packageJsonPath: string }`)
+
+**Multi-Project Example:**
+
+```typescript
+expo: {
+  enabled: true,
+  projects: [
+    { name: 'customer-app', packageJsonPath: './apps/customer/package.json' },
+    { name: 'driver-app', packageJsonPath: './apps/driver/package.json' },
+  ],
+}
+```
+
+**Auto-Detection Example:**
+
+```typescript
+expo: {
+  enabled: true,
+  autoDetect: true, // Scans workspace for packages with "expo" dependency
+}
+```
 
 #### Syncpack (`syncpack`)
 
