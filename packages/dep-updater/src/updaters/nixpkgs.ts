@@ -19,12 +19,11 @@ async function parseNvfetcherSources(sourcesPath: string): Promise<Map<string, s
     const versionPattern = /version\s*=\s*"([^"]+)"/g;
     const versions = new Map<string, string>();
 
-    let match: RegExpExecArray | null;
-    while ((match = versionPattern.exec(content)) !== null) {
+    const match: RegExpExecArray | null = versionPattern.exec(content);
+    if (match) {
       // Assume first version is Bun version
       // In actual implementation, we'd parse the Nix AST properly
       versions.set('bun', match[1]);
-      break;
     }
 
     return versions;

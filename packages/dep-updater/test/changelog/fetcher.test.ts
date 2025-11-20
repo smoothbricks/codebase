@@ -1,9 +1,10 @@
 import { beforeEach, describe, expect, mock, test } from 'bun:test';
 import { fetchChangelog, fetchChangelogs, generateSimpleChangelog } from '../../src/changelog/fetcher.js';
+import type { Logger } from '../../src/logger.js';
 import type { PackageUpdate } from '../../src/types.js';
 
 describe('Changelog Fetcher', () => {
-  let mockLogger: any;
+  let mockLogger: Logger;
 
   beforeEach(() => {
     mockLogger = {
@@ -323,7 +324,7 @@ describe('Changelog Fetcher', () => {
               get: () => 'text/html',
             },
             text: async () => '<html>Release notes here</html>',
-          } as any;
+          } as Response;
         }
 
         return { ok: false } as Response;
@@ -376,7 +377,7 @@ describe('Changelog Fetcher', () => {
               body: 'Release notes in JSON format',
               html_url: 'https://github.com/facebook/react/releases/tag/v19.1.0',
             }),
-          } as any;
+          } as Response;
         }
 
         return { ok: false } as Response;

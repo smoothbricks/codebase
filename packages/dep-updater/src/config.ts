@@ -249,13 +249,15 @@ export function mergeConfig(userConfig: DeepPartial<DepUpdaterConfig>): DepUpdat
   return {
     ...defaultConfig,
     ...userConfig,
-    expo: userConfig.expo ? { ...defaultConfig.expo!, ...userConfig.expo } : defaultConfig.expo,
-    syncpack: userConfig.syncpack ? { ...defaultConfig.syncpack!, ...userConfig.syncpack } : defaultConfig.syncpack,
-    nix: userConfig.nix ? { ...defaultConfig.nix!, ...userConfig.nix } : defaultConfig.nix,
+    expo: userConfig.expo ? { ...(defaultConfig.expo || {}), ...userConfig.expo } : defaultConfig.expo,
+    syncpack: userConfig.syncpack
+      ? { ...(defaultConfig.syncpack || {}), ...userConfig.syncpack }
+      : defaultConfig.syncpack,
+    nix: userConfig.nix ? { ...(defaultConfig.nix || {}), ...userConfig.nix } : defaultConfig.nix,
     prStrategy: { ...defaultConfig.prStrategy, ...(userConfig.prStrategy || {}) },
     autoMerge: { ...defaultConfig.autoMerge, ...(userConfig.autoMerge || {}) },
     ai: { ...defaultConfig.ai, ...(userConfig.ai || {}) },
-    git: userConfig.git ? { ...defaultConfig.git!, ...userConfig.git } : defaultConfig.git,
+    git: userConfig.git ? { ...(defaultConfig.git || {}), ...userConfig.git } : defaultConfig.git,
     // Logger is runtime-only, always use default logger (can be overridden later)
     logger: defaultConfig.logger,
   };
