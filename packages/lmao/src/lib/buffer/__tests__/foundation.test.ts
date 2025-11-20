@@ -1,45 +1,112 @@
 import { describe, it, expect } from 'bun:test';
-import { getCacheAlignedCapacity } from '../capacity.js';
-import { createEmptySpanBuffer } from '../createSpanBuffer.js';
+import { createEmptySpanBuffer, createSpanBuffer } from '../createSpanBuffer.js';
+import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
+import { S } from '../../schema/builder.js';
+import type { TaskContext } from '../types.js';
+import type { TagAttributeSchema } from '../../schema/types.js';
+
+/**
+ * Type helper to extract schema fields from ExtendedSchema
+ * Removes the validation and extension methods, leaving only Sury schemas
+ */
+type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
 
 describe('Buffer Foundation', () => {
-  it('computes cache-aligned capacities', () => {
-    // 1 element of 1 byte -> 64-byte alignment
-    expect(getCacheAlignedCapacity(1, 1)).toBe(64);
+  // Helper to create a test task context
+  function createTestTaskContext(): TaskContext {
+    const schema = defineTagAttributes({
+      userId: S.string(),
+      count: S.number()
+    });
 
-    // 16 elements of 1 byte -> still 64-byte aligned
-    expect(getCacheAlignedCapacity(16, 1)).toBe(64);
+    // Extract just the schema fields (exclude methods like validate, parse, etc.)
+    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
-    // 65 elements -> rounds up to next 64-byte boundary (128 bytes), capacity 128
-    expect(getCacheAlignedCapacity(65, 1)).toBe(128);
+    return {
+      module: {
+        moduleId: 1,
+        gitSha: 'abc123',
+        filePath: 'test.ts',
+        tagAttributes,
+        spanBufferCapacityStats: {
+          currentCapacity: 64,
+          totalWrites: 0,
+          overflowWrites: 0,
+          totalBuffersCreated: 0
+        }
+      },
+      spanNameId: 1,
+      lineNumber: 10
+    };
+  }
 
-    // Larger count around 130 -> 192 bytes, capacity 192
-    expect(getCacheAlignedCapacity(130, 1)).toBe(192);
-  });
-
-  it('creates empty SpanBuffer with core columns and proper length', () => {
-    const buf = createEmptySpanBuffer(1, 16, 4);
+  it('creates empty SpanBuffer with Arrow builders', () => {
+    const taskContext = createTestTaskContext();
+    const schema = taskContext.module.tagAttributes;
+    
+    const buf = createEmptySpanBuffer(1, schema, taskContext, undefined, 64);
 
     expect(buf.spanId).toBe(1);
-    // All core arrays should be the aligned length
-    expect(buf.timestamps.length).toBe(64);
-    expect(buf.operations.length).toBe(64);
-    expect(buf.nullBitmap.length).toBe(64);
+    
+    // Check Arrow builders are created
+    expect(buf.timestampBuilder).toBeDefined();
+    expect(buf.operationBuilder).toBeDefined();
+    expect(buf.attributeBuilders).toBeDefined();
+    
+    // Check attribute builders exist for each schema field
+    expect(buf.attributeBuilders['attr_userId']).toBeDefined();
+    expect(buf.attributeBuilders['attr_count']).toBeDefined();
 
     // Metadata
     expect(buf.children).toBeInstanceOf(Array);
     expect(buf.writeIndex).toBe(0);
-    expect(buf.capacity).toBe(16);
+    expect(buf.capacity).toBe(64);
+    expect(buf.task).toBe(taskContext);
   });
 
-  it('uses Uint16Array for moderate attribute counts', () => {
-    const buf = createEmptySpanBuffer(2, 16, 9);
-    // nullBitmap type should be Uint16Array when attributeCount <= 16
-    expect(buf.nullBitmap).toBeInstanceOf(Uint16Array);
+  it('creates root SpanBuffer with createSpanBuffer', () => {
+    const taskContext = createTestTaskContext();
+    const schema = taskContext.module.tagAttributes;
+    
+    const buf = createSpanBuffer(schema, taskContext);
+    
+    expect(buf.spanId).toBeGreaterThan(0);
+    expect(buf.parent).toBeUndefined();
+    expect(buf.children).toHaveLength(0);
   });
 
-  it('throws on too many attributes', () => {
-    // attributeCount > 32 should throw
-    expect(() => createEmptySpanBuffer(3, 8, 33)).toThrow();
+  it('tracks buffer creation in capacity stats', () => {
+    const taskContext = createTestTaskContext();
+    const schema = taskContext.module.tagAttributes;
+    
+    const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
+    
+    createEmptySpanBuffer(1, schema, taskContext, undefined, 64);
+    
+    expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
+  });
+
+  it('handles different schema sizes', () => {
+    const taskContext = createTestTaskContext();
+    // Define a larger schema
+    const largeSchema = defineTagAttributes({
+      field1: S.string(),
+      field2: S.number(),
+      field3: S.boolean(),
+      field4: S.string(),
+      field5: S.number(),
+    });
+    
+    // Extract just the schema fields (exclude methods)
+    const { validate, parse, safeParse, extend, ...schemaFields } = largeSchema;
+    const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
+    
+    const buf = createEmptySpanBuffer(1, tagAttributes, taskContext, undefined, 64);
+    
+    // Should have builders for all 5 attributes
+    expect(Object.keys(buf.attributeBuilders)).toHaveLength(5);
+    expect(buf.attributeBuilders['attr_field1']).toBeDefined();
+    expect(buf.attributeBuilders['attr_field5']).toBeDefined();
   });
 });
