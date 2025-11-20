@@ -170,5 +170,44 @@ describe('project-detection', () => {
       expect(result.hasSyncpack).toBe(true);
       expect(result.packageManager).toBe('bun');
     });
+
+    test('should detect Nix from nested devenv directory', async () => {
+      await mkdir(join(testDir, 'tooling', 'devenv'), { recursive: true });
+      await writeFile(join(testDir, 'tooling', 'devenv', 'flake.nix'), '# Nix flake');
+
+      const result = await detectProjectSetup(testDir);
+
+      expect(result.hasNix).toBe(true);
+    });
+
+    test('should detect Nix from devenv.yaml anywhere', async () => {
+      await mkdir(join(testDir, 'tooling', 'direnv'), { recursive: true });
+      await writeFile(join(testDir, 'tooling', 'direnv', 'devenv.yaml'), 'inputs: {}');
+
+      const result = await detectProjectSetup(testDir);
+
+      expect(result.hasNix).toBe(true);
+    });
+
+    test('should detect Nix from .envrc in subdirectory', async () => {
+      await mkdir(join(testDir, 'nix'), { recursive: true });
+      await writeFile(join(testDir, 'nix', '.envrc'), 'use flake');
+
+      const result = await detectProjectSetup(testDir);
+
+      expect(result.hasNix).toBe(true);
+    });
+
+    test('should detect untracked Nix files (not yet committed)', async () => {
+      // This tests the key advantage of fast-glob over git ls-files
+      // Create files but don't commit them to git
+      await mkdir(join(testDir, 'tooling', 'devenv'), { recursive: true });
+      await writeFile(join(testDir, 'tooling', 'devenv', 'devenv.yaml'), 'inputs: {}');
+
+      const result = await detectProjectSetup(testDir);
+
+      // Should detect even though not committed (unlike git ls-files)
+      expect(result.hasNix).toBe(true);
+    });
   });
 });

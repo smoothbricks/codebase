@@ -536,7 +536,7 @@ const safePath = safeResolve(baseDir, userProvidedPath);
 
 ## Code Coverage Status
 
-### ✅ Tested (318 tests total, +50 from previous 268)
+### ✅ Tested (342 tests total)
 
 - **Git operations** - All 19 functions (86 tests)
 - **PR Stacking** - All 8 functions (47 tests)
@@ -555,8 +555,8 @@ const safePath = safeResolve(baseDir, userProvidedPath);
   - Bun updater: Package.json diff parsing, version classification
   - Devenv (Nix): Dry-run mode, lock file parsing, error handling (10 tests)
   - Nixpkgs overlay: Version extraction from Nix expressions, malformed file handling (9 tests)
-- **Utils** - Path validation, workspace detection, project detection (14 tests)
-  - Project detection: Package manager, Expo, Nix, Syncpack detection (14 tests)
+- **Utils** - Path validation, workspace detection, project detection (18 tests)
+  - Project detection: Package manager, Expo, Nix, Syncpack detection (18 tests)
 - **Expo SDK** - Version checking, package detection
 - **Syncpack** - Config generation
 

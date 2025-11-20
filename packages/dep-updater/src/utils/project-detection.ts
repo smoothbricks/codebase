@@ -5,6 +5,7 @@
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
+import fg from 'fast-glob';
 
 export interface ProjectSetup {
   hasExpo: boolean;
@@ -42,8 +43,21 @@ export async function detectProjectSetup(repoRoot: string): Promise<ProjectSetup
     }
   }
 
-  // Check for Nix
-  const hasNix = existsSync(join(repoRoot, 'flake.nix')) || existsSync(join(repoRoot, '.envrc'));
+  // Check for Nix/devenv files anywhere in repo (including untracked files)
+  let hasNix = false;
+  try {
+    const nixFiles = await fg(['**/flake.nix', '**/.envrc', '**/devenv.yaml', '**/devenv.nix'], {
+      cwd: repoRoot,
+      ignore: ['**/node_modules/**', '**/.git/**', '**/dist/**', '**/build/**'],
+      onlyFiles: true,
+      absolute: false,
+      deep: 10, // Reasonable depth limit
+    });
+    hasNix = nixFiles.length > 0;
+  } catch {
+    // Fallback to root directory check if glob fails
+    hasNix = existsSync(join(repoRoot, 'flake.nix')) || existsSync(join(repoRoot, '.envrc'));
+  }
 
   // Check for syncpack
   const hasSyncpack = existsSync(join(repoRoot, '.syncpackrc.json')) || existsSync(join(repoRoot, '.syncpackrc.yml'));
