@@ -15,10 +15,14 @@ Automated dependency update tool with Expo SDK support, stacked PRs, and AI-powe
 
 ## Prerequisites
 
+> **⚠️ Important:** This tool is designed for **Nx monorepos**. The generated GitHub Actions workflow uses Nx targets
+> for task orchestration and caching benefits.
+
 Before using dep-updater, ensure you have the following installed:
 
 **Required:**
 
+- **[Nx](https://nx.dev)** - Monorepo build system (must be set up in your workspace)
 - [Bun](https://bun.sh) - JavaScript runtime and package manager
 - [Git](https://git-scm.com) - Version control system
 - [GitHub CLI](https://cli.github.com) (`gh`) - For creating PRs
@@ -359,6 +363,13 @@ dep-updater generate-workflow
 ```
 
 This creates `.github/workflows/update-deps.yml` that runs daily at 2 AM UTC.
+
+**How it works:**
+
+- The workflow uses `nx run @smoothbricks/dep-updater:update-deps` to execute the tool
+- Nx automatically builds the package if needed (with `dependsOn: ["build"]`)
+- Build results are cached by Nx for faster subsequent runs
+- This approach leverages Nx's task orchestration and computation caching
 
 ### Authentication Setup
 
