@@ -137,7 +137,8 @@ describe('Config Integration - mergeConfig Deep Merging', () => {
     const merged = mergeConfig(userConfig);
 
     expect(merged.expo?.enabled).toBe(true);
-    expect(merged.expo?.packageJsonPath).toBe('./package.json'); // Keeps default
+    expect(merged.expo?.autoDetect).toBe(true); // Keeps default
+    expect(merged.expo?.projects).toEqual([]); // Keeps default
   });
 
   test('should deep merge nix section with custom paths', () => {
@@ -187,7 +188,7 @@ describe('Config Integration - Realistic Scenarios', () => {
     const userConfig: DeepPartial<DepUpdaterConfig> = {
       expo: {
         enabled: true,
-        packageJsonPath: './apps/mobile/package.json',
+        projects: [{ name: 'mobile', packageJsonPath: './apps/mobile/package.json' }],
       },
       prStrategy: {
         stackingEnabled: false,
@@ -199,7 +200,8 @@ describe('Config Integration - Realistic Scenarios', () => {
     const merged = mergeConfig(userConfig);
 
     expect(merged.expo?.enabled).toBe(true);
-    expect(merged.expo?.packageJsonPath).toBe('./apps/mobile/package.json');
+    expect(merged.expo?.projects).toHaveLength(1);
+    expect(merged.expo?.projects?.[0]?.packageJsonPath).toBe('./apps/mobile/package.json');
     expect(merged.prStrategy.stackingEnabled).toBe(false);
     expect(merged.prStrategy.maxStackDepth).toBe(5); // Keeps default
     expect(merged.syncpack).toEqual(defaultConfig.syncpack); // Uses defaults
@@ -284,6 +286,56 @@ describe('Config Integration - Realistic Scenarios', () => {
     expect(merged.prStrategy.prTitlePrefix).toBe('build(deps): update');
     expect(merged.syncpack?.configPath).toBe('./configs/.syncpackrc.json');
     expect(merged.syncpack?.fixScriptName).toBe('fix:versions');
+  });
+
+  test('config for monorepo with multiple Expo projects', () => {
+    const userConfig: DeepPartial<DepUpdaterConfig> = {
+      expo: {
+        enabled: true,
+        projects: [
+          { name: 'customer-app', packageJsonPath: './apps/customer/package.json' },
+          { name: 'driver-app', packageJsonPath: './apps/driver/package.json' },
+          { name: 'admin-app', packageJsonPath: './apps/admin/package.json' },
+        ],
+      },
+      syncpack: {
+        configPath: './.syncpackrc.json',
+        preserveCustomRules: true,
+      },
+      prStrategy: {
+        stackingEnabled: true,
+        maxStackDepth: 3,
+      },
+      ai: {
+        apiKey: process.env.ANTHROPIC_API_KEY,
+      },
+    };
+    const merged = mergeConfig(userConfig);
+
+    expect(merged.expo?.enabled).toBe(true);
+    expect(merged.expo?.projects).toHaveLength(3);
+    expect(merged.expo?.projects?.[0]?.name).toBe('customer-app');
+    expect(merged.expo?.projects?.[1]?.name).toBe('driver-app');
+    expect(merged.expo?.projects?.[2]?.name).toBe('admin-app');
+    expect(merged.expo?.autoDetect).toBe(true); // Keeps default
+    expect(merged.syncpack?.preserveCustomRules).toBe(true);
+    expect(merged.prStrategy.maxStackDepth).toBe(3);
+  });
+
+  test('config with Expo auto-detection disabled', () => {
+    const userConfig: DeepPartial<DepUpdaterConfig> = {
+      expo: {
+        enabled: true,
+        autoDetect: false,
+        projects: [{ name: 'main', packageJsonPath: './package.json' }],
+      },
+    };
+    const merged = mergeConfig(userConfig);
+
+    expect(merged.expo?.enabled).toBe(true);
+    expect(merged.expo?.autoDetect).toBe(false);
+    expect(merged.expo?.projects).toHaveLength(1);
+    expect(merged.expo?.projects?.[0]?.name).toBe('main');
   });
 });
 

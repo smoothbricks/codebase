@@ -6,16 +6,20 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
+import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
-import type { DeepPartial } from './types.js';
+import type { DeepPartial, ExpoProject } from './types.js';
+import { detectExpoProjects } from './utils/workspace-detector.js';
 
 export interface DepUpdaterConfig {
   /** Expo SDK management configuration */
   expo?: {
     /** Enable Expo SDK updates */
     enabled: boolean;
-    /** Path to package.json containing Expo dependency */
-    packageJsonPath: string;
+    /** Auto-detect all Expo projects in the monorepo */
+    autoDetect?: boolean;
+    /** Explicit list of Expo projects to update */
+    projects?: ExpoProject[];
   };
 
   /** Syncpack configuration */
@@ -102,7 +106,8 @@ export interface DepUpdaterConfig {
 export const defaultConfig: DepUpdaterConfig = {
   expo: {
     enabled: false,
-    packageJsonPath: './package.json',
+    autoDetect: true, // Auto-detect Expo projects by default
+    projects: [],
   },
   syncpack: {
     configPath: './.syncpackrc.json',
@@ -283,6 +288,47 @@ export function sanitizeConfigForLogging(config: DepUpdaterConfig): Partial<DepU
       apiKey: config.ai.apiKey ? '***REDACTED***' : undefined,
     },
   };
+}
+
+/**
+ * Resolve Expo projects from config
+ * Handles auto-detection and explicit projects list
+ *
+ * @param config - The configuration containing expo settings
+ * @returns Array of Expo projects to update
+ *
+ * @example
+ * ```typescript
+ * const config = await loadConfig();
+ * const projects = await resolveExpoProjects(config);
+ * for (const project of projects) {
+ *   console.log(`Updating ${project.name} at ${project.packageJsonPath}`);
+ * }
+ * ```
+ */
+export async function resolveExpoProjects(config: DepUpdaterConfig): Promise<ExpoProject[]> {
+  if (!config.expo?.enabled) {
+    return [];
+  }
+
+  const repoRoot = config.repoRoot || (await getRepoRoot());
+
+  // Explicit projects list
+  if (config.expo.projects && config.expo.projects.length > 0) {
+    config.logger?.debug(`Using ${config.expo.projects.length} explicit project(s) from config`);
+    return config.expo.projects;
+  }
+
+  // Auto-detect
+  if (config.expo.autoDetect !== false) {
+    config.logger?.debug('Auto-detecting Expo projects in monorepo...');
+    const detected = await detectExpoProjects(repoRoot);
+    config.logger?.debug(`Found ${detected.length} Expo project(s)`);
+    return detected;
+  }
+
+  config.logger?.warn('No Expo projects configured and auto-detection is disabled');
+  return [];
 }
 
 /**

@@ -19,7 +19,11 @@ interface GenerateSyncpackOptions extends UpdateOptions {
  */
 export async function generateSyncpack(config: DepUpdaterConfig, options: GenerateSyncpackOptions): Promise<void> {
   const repoRoot = config.repoRoot || (await getRepoRoot());
-  const packageJsonPath = safeResolve(repoRoot, config.expo?.packageJsonPath || './package.json');
+
+  // Get the first project's package.json path, or use root package.json
+  const firstProject = config.expo?.projects?.[0];
+  const defaultPath = firstProject?.packageJsonPath || './package.json';
+  const packageJsonPath = safeResolve(repoRoot, defaultPath);
   const syncpackPath = safeResolve(repoRoot, config.syncpack?.configPath || './.syncpackrc.json');
 
   let sdkVersion = options.expoSdkVersion;

@@ -114,22 +114,24 @@ describe('mergeConfig', () => {
     const merged = mergeConfig(userConfig);
 
     expect(merged.expo?.enabled).toBe(true);
-    expect(merged.expo?.packageJsonPath).toBe('./package.json'); // From defaults
+    expect(merged.expo?.autoDetect).toBe(true); // From defaults
+    expect(merged.expo?.projects).toEqual([]); // From defaults
     expect(merged.prStrategy.stackingEnabled).toBe(true); // From defaults
   });
 
-  test('should merge partial config with custom package.json path', () => {
+  test('should merge partial config with explicit projects', () => {
     const userConfig = {
       expo: {
         enabled: true,
-        packageJsonPath: './apps/mobile/package.json',
+        projects: [{ packageJsonPath: './apps/mobile/package.json' }],
       },
     };
 
     const merged = mergeConfig(userConfig);
 
     expect(merged.expo?.enabled).toBe(true);
-    expect(merged.expo?.packageJsonPath).toBe('./apps/mobile/package.json');
+    expect(merged.expo?.projects).toHaveLength(1);
+    expect(merged.expo?.projects?.[0]?.packageJsonPath).toBe('./apps/mobile/package.json');
     expect(merged.prStrategy.stackingEnabled).toBe(true); // from defaults
     expect(merged.ai.provider).toBe('anthropic'); // from defaults
   });
@@ -181,6 +183,41 @@ describe('mergeConfig', () => {
 
     expect(merged.prStrategy.stackingEnabled).toBe(false);
     expect(merged.prStrategy.autoCloseOldPRs).toBe(false);
+  });
+
+  test('should merge multiple Expo projects', () => {
+    const userConfig = {
+      expo: {
+        enabled: true,
+        projects: [
+          { name: 'mobile', packageJsonPath: './apps/mobile/package.json' },
+          { name: 'tablet', packageJsonPath: './apps/tablet/package.json' },
+        ],
+      },
+    };
+
+    const merged = mergeConfig(userConfig);
+
+    expect(merged.expo?.enabled).toBe(true);
+    expect(merged.expo?.projects).toHaveLength(2);
+    expect(merged.expo?.projects?.[0]?.name).toBe('mobile');
+    expect(merged.expo?.projects?.[1]?.packageJsonPath).toBe('./apps/tablet/package.json');
+  });
+
+  test('should allow disabling Expo auto-detection', () => {
+    const userConfig = {
+      expo: {
+        enabled: true,
+        autoDetect: false,
+        projects: [{ packageJsonPath: './apps/mobile/package.json' }],
+      },
+    };
+
+    const merged = mergeConfig(userConfig);
+
+    expect(merged.expo?.enabled).toBe(true);
+    expect(merged.expo?.autoDetect).toBe(false);
+    expect(merged.expo?.projects).toHaveLength(1);
   });
 });
 

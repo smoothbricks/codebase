@@ -5,7 +5,7 @@ import type { PackageUpdate } from '../../src/types.js';
 
 describe('Changelog Analyzer', () => {
   const mockConfig: DepUpdaterConfig = {
-    expo: { enabled: false, packageJsonPath: './package.json' },
+    expo: { enabled: false, autoDetect: true, projects: [] },
     syncpack: { configPath: './.syncpackrc.json', preserveCustomRules: true, fixScriptName: 'syncpack:fix' },
     prStrategy: {
       stackingEnabled: true,

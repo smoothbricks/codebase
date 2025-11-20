@@ -25,7 +25,8 @@ function generateJSONConfig(options: {
   const config: Partial<DepUpdaterConfig> = {
     expo: {
       enabled: options.enableExpo,
-      packageJsonPath: './package.json',
+      autoDetect: true,
+      projects: [],
     },
     nix: {
       enabled: options.enableNix,
@@ -65,7 +66,8 @@ function generateTypeScriptConfig(options: {
 export default defineConfig({
   expo: {
     enabled: ${options.enableExpo},
-    packageJsonPath: './package.json',
+    autoDetect: true,
+    projects: [],
   },
   nix: {
     enabled: ${options.enableNix},
@@ -199,6 +201,13 @@ export async function init(config: DepUpdaterConfig, options: InitOptions): Prom
 
     if (enableAI) {
       p.note('Requires ANTHROPIC_API_KEY in GitHub Secrets', 'Note');
+    }
+
+    if (enableExpo) {
+      p.note(
+        'Expo projects will be auto-detected by scanning for packages with "expo" dependency.\nTo manually specify projects, edit the "projects" array in the config file.',
+        'Expo Auto-Detection',
+      );
     }
 
     const stackingPrompt = await p.confirm({
