@@ -317,6 +317,20 @@ bun run typecheck  # Type check src/ and test/
 bun test --watch   # Watch mode for tests
 ```
 
+### Before Committing
+
+**IMPORTANT:** After making code changes, always run these checks to catch issues early:
+
+```bash
+bun run format     # Format code with Biome (or let git hooks do it)
+nx run @smoothbricks/dep-updater:lint  # Run linting
+bun run typecheck  # Type check both src/ and test/
+bun test           # Run all tests
+```
+
+These checks help ensure code quality and prevent CI failures. The git hooks will auto-format on commit, but it's good
+practice to run lint and typecheck manually before committing.
+
 ### Type Checking
 
 - Uses `tsconfig.typecheck.json` to check both `src/` and `test/` files
