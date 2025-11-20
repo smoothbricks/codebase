@@ -5,9 +5,13 @@
 The columnar buffer architecture is the core performance engine of the trace logging system. It provides:
 
 1. **Data-oriented design** with columnar TypedArrays for maximum performance
-2. **Self-tuning capacity management** that adapts to usage patterns
-3. **Tree-structured spans** with efficient parent-child relationships
-4. **Background processing pipeline** for Arrow/Parquet serialization
+2. **Per-span buffers** - each span gets its own buffer for sorted output and simple implementation
+3. **Self-tuning capacity management** that adapts to usage patterns
+4. **Buffer chaining for overflow** - part of self-tuning mechanism when capacity is exceeded
+5. **Tree-structured spans** with efficient parent-child relationships
+6. **Background processing pipeline** for Arrow/Parquet serialization
+
+**Key Design Insight**: Every span gets its own buffer. This eliminates the need for traceId/spanId TypedArrays (they're constant per buffer), keeps logs sorted in Arrow output, and enables zero-copy conversion.
 
 ## Design Philosophy
 
@@ -82,39 +86,25 @@ interface SpanBuffer {
   
   // Buffer management
   writeIndex: number;          // Current write position (0 to capacity-1)
-  next?: SpanBuffer;           // Chain to next buffer when full
+  next?: SpanBuffer;           // Chain to next buffer when overflow (part of self-tuning)
 
-  spanId: number;              // Incremental ID for THIS SpanBuffer (assigned at creation), unique only in combination with root UUID
-}
-
-// Module context shared across all tasks in same module
-interface ModuleContext {
-  moduleId: number;
-  gitSha: string;
-  filePath: string;
+  spanId: number;              // Incremental ID for THIS SpanBuffer (assigned at creation)
+  traceId: string;             // Root trace ID (constant per span, no TypedArray needed)
   
-  // Self-tuning capacity per module
-  spanBufferCapacityStats: {
-    currentCapacity: number;
-    totalWrites: number;
-    overflowWrites: number;      // Writes that went to .next
-    totalBuffersCreated: number;
-  };
-}
-
-// Task context combines module + task-specific data
-interface TaskContext {
-  module: ModuleContext;
-  spanNameId: number;
-  lineNumber: number;
+  // NOTE: Each span gets its own buffer, so traceId and spanId are constant
+  // No need for traceId/spanId TypedArrays - they're the same for every row in this buffer
+  // This keeps logs sorted and enables zero-copy Arrow conversion
 }
 ```
 
 **Why This Design**:
+- **Per-span buffers**: Each span gets its own buffer for sorted logs and simple implementation
+- **No traceId/spanId arrays**: These are constant per buffer, stored as properties
 - **Minimal interface**: Only essential fields, no capacity/length bloat
 - **Shared references**: Module context shared across all tasks
 - **Tree structure**: Efficient parent-child span relationships
-- **Buffer chaining**: Handle overflow with linked buffers
+- **Buffer chaining**: Handle overflow with linked buffers (part of self-tuning mechanism)
+- **Freelist consideration**: May keep pool of buffers if long-lived TypedArrays help V8's GC
 
 ## Schema-Generated Buffer Extensions
 
@@ -305,15 +295,16 @@ function createEmptySpanBuffer<T extends TagAttributeSchema>(
 let nextGlobalSpanId = 1;
 
 function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
-  // For chained buffers, the SpanId is inherited from the current logical span.
-  // This means a 'next' buffer is just a continuation of the current one.
+  // Buffer chaining is part of the self-tuning mechanism (see 01b2_buffer_self_tuning.md)
+  // When a buffer overflows, we chain to a new buffer for the SAME logical span
+  // The chained buffer inherits spanId and traceId since it's a continuation
   return createEmptySpanBuffer(
-    // Inherit the spanId from the current buffer as it's the same logical span
-    buffer.spanId,
+    buffer.spanId,     // Same logical span
+    buffer.traceId,    // Same trace
     getSchemaFromBuffer(buffer), // Re-use schema
-    buffer.task, // Re-use task context
-    buffer.parent // Parent is the same as the current buffer's parent
-    );
+    buffer.task,       // Re-use task context
+    buffer.parent      // Parent is the same as the current buffer's parent
+  );
 }
 
 function createChildSpan(
@@ -327,7 +318,8 @@ function createChildSpan(
     lineNumber: getCurrentLineNumber(), // Build tool injected
   };
 
-  // Create child buffer linked to parent
+  // Each child span gets its own NEW buffer with its own spanId
+  // This keeps child logs separate from parent logs in Arrow output
   const childBuffer = createSpanBuffer(
     getSchemaFromBuffer(parentBuffer), // Child inherits parent's schema
     childTaskContext, 
@@ -571,6 +563,7 @@ function appendToBuffer(buffer: SpanBuffer, data: any) {
   const originalBuffer = buffer;
   
   // Find the buffer with space (CPU branch predictor friendly)
+  // Buffer chaining is part of self-tuning - handles overflow gracefully
   while (buffer.writeIndex >= buffer.timestamps.length) {
     buffer = !buffer.next ? createNextBuffer(buffer) : buffer.next;
   }
@@ -578,21 +571,24 @@ function appendToBuffer(buffer: SpanBuffer, data: any) {
   // Hot path - always taken after loop
   const index = buffer.writeIndex++;
   
-  // Count stats ONCE
+  // Count stats ONCE for self-tuning
   const stats = originalBuffer.task.module.spanBufferCapacityStats;
   stats.totalWrites++;
   if (buffer !== originalBuffer) {
-    stats.overflowWrites++;  // Went to a chained buffer
+    stats.overflowWrites++;  // Went to a chained buffer (triggers tuning)
   }
   
-  // Tune capacity if needed
+  // Tune capacity if needed (see 01b2_buffer_self_tuning.md)
   shouldTuneCapacity(stats);
   
-  // Write data (no branches)
+  // Write data (no branches) - direct TypedArray assignments
   buffer.timestamps[index] = data.timestamp;
   buffer.operations[index] = data.operation;
   // ... write other columns based on data.attributes and schema
 }
+
+// NOTE: Since each span has its own buffer, traceId and spanId are NOT written per row
+// They're constant properties on the SpanBuffer itself, eliminating two TypedArray writes per operation
 
 function shouldTuneCapacity(stats: ModuleContext['spanBufferCapacityStats']): boolean {
   const minSamples = 100; // Need enough data

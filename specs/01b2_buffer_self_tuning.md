@@ -14,6 +14,8 @@ Traditional logging requires configuration:
 
 This is wrong. The system should adapt automatically.
 
+**Key Insight**: Self-tuning is part of the trace logging system, not a general-purpose buffer library. The tuning mechanism has clear metrics (overflow rate, utilization) from the specific use case of span logging. Buffer chaining handles overflow gracefully while the system learns optimal capacity per module.
+
 ### Self-Tuning Benefits
 
 1. **Zero Configuration** - Works out of the box
@@ -21,6 +23,9 @@ This is wrong. The system should adapt automatically.
 3. **Memory Safety** - Never causes OOM
 4. **Optimal Throughput** - Balances memory vs performance
 5. **Environment Agnostic** - Same code everywhere
+6. **Per-Span Buffers** - Each span gets its own buffer, avoiding traceId/spanId TypedArrays
+7. **Buffer Chaining** - Graceful overflow handling while learning optimal capacity
+8. **Freelist Consideration** - May pool buffers if long-lived TypedArrays help V8's GC
 
 ## Self-Tuning Architecture
 
@@ -748,5 +753,10 @@ Self-tuning buffers provide:
 - **Memory awareness** - Responds to system pressure
 - **Workload optimization** - Adapts to usage patterns
 - **Global coordination** - Multiple buffers share resources
+- **Per-span isolation** - Each span gets its own buffer for sorted output
+- **Buffer chaining** - Overflow handled gracefully while tuning learns optimal size
+- **Freelist optimization** - Consider pooling buffers if long-lived TypedArrays benefit V8 GC
+
+**Important Note**: This self-tuning is specifically designed for trace logging, where we have clear metrics (spans per module, overflow rates, utilization patterns). The tuning mechanism is part of the trace logging system, not a general-purpose buffer library. Each span's own buffer eliminates the need for traceId/spanId TypedArrays since they're constant per buffer.
 
 The result: a logging system that "just works" whether you're on a Raspberry Pi or a 64-core server.

@@ -186,12 +186,12 @@ class StandardSpanLogger extends BaseSpanLogger {
 }
 ```
 
-As `log.tag` write a new entry (and so does `log.info()` etc) returning a fluent interface,
+As `ctx.log.tag` writes a new entry (and so does `ctx.log.info()` etc) returning a fluent interface,
 we need an ESLint rule preventing users from capturing the fluent interface in a variable:
 
 ```typescript
-let entry = log.info("entry") // INVALID capturing fluent interface
-let tag = log.tag; // INVALID
+let entry = ctx.log.info("entry") // INVALID capturing fluent interface
+let tag = ctx.log.tag; // INVALID
 tag.user_id(123) // INVALID USE OF ATTRIBUTE API via captured fluent interface
 ```
 

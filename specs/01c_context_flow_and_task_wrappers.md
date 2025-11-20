@@ -20,10 +20,12 @@ Request Context
 ├── env: EnvironmentConfig (plain object)
 └── task('create-user') creates:
     ├── Span Context (create-user span buffer)
+    ├── log: SpanLogger (new instance, logs to create-user buffer)
     ├── ff: NEW FeatureFlagEvaluator (logs to create-user span)
     ├── env: SAME EnvironmentConfig (passed through)
     └── ctx.span('validate-user') creates:
         ├── Child Span Context (validate-user span buffer)
+        ├── log: SpanLogger (new instance, logs to validate-user buffer)
         ├── ff: NEW FeatureFlagEvaluator (logs to validate-user span)
         └── env: SAME EnvironmentConfig (passed through)
 ```
@@ -105,7 +107,13 @@ export const createUser = task('create-user', async (ctx, userData) => {
 
 ## Task Wrapper Implementation
 
-**Purpose**: Create span-aware contexts that log feature flag and environment access to the correct span buffer.
+**Purpose**: Create span-aware contexts that log feature flag and environment access to the correct span buffer. 
+
+**Key Design Decision**: Each span creates its own buffer and a new `SpanLogger` instance. This design:
+- Gives the logger a direct reference to its buffer (avoiding traceid+spanid lookups on every log statement)
+- Keeps each span's logs neatly sorted together in the final Arrow output
+- Enables zero-copy conversion since each span buffer can be directly sliced to Arrow vectors
+- Each span has its own buffer, so traceId and spanId TypedArrays are not needed - they're constant per buffer
 
 ```typescript
 function createTaskWrapper(
@@ -157,6 +165,13 @@ function createTaskWrapper(
 - **Environment pass-through**: No overhead for environment variable access
 - **Unified logging interface**: Single `SpanLogger` class handles all entry types
 
+**V8 Memory Layout Optimization**:
+Depending on V8's memory layout and GC behavior, we could optimize by either:
+- **Option A**: Store buffers, spanId, traceId directly in Context, create new Logger and FeatureFlag instances with Context reference
+- **Option B**: Logger and FF instances store their own buffer/spanId/traceId references directly
+
+This is a performance tuning decision that should be benchmarked. Option A keeps Context as the single source of truth. Option B reduces indirection (one less pointer chase per buffer access).
+
 ## SpanLogger Zero-Allocation Design
 
 ### Self-Reference Pattern
@@ -167,7 +182,16 @@ The `SpanLogger` uses a clever self-reference pattern to achieve zero allocation
 class SpanLogger {
   constructor(buffer) {
     this.buffer = buffer;
-    this.tag = this; // Key insight: tag points to same instance!
+    // Runtime class generation uses `new Function` returning 'this' for chainable API
+    // Every span creates a new log instance to have a reference to its buffer
+    // This avoids traceid+spanid appends on every log statement
+    // It also keeps the span logs neatly sorted together in the final Arrow output
+  }
+  
+  // Tag getter creates new entry and returns this for chaining
+  get tag() {
+    this._writeTagEntry(); // Creates new tag entry
+    return this; // Return for chaining with individual attribute methods
   }
   
   // Fluent methods return this for zero-allocation chaining
@@ -181,16 +205,26 @@ class SpanLogger {
     return this;
   }
   
-  // Tag methods compiled onto prototype at task creation time
-  userId(value) { this.buffer.writeUserId(value); return this; }
-  httpStatus(value) { this.buffer.writeHttpStatus(value); return this; }
+  // Tag methods compiled onto prototype at module context creation time
+  userId(value) { 
+    this.buffer.attr_userId[this.buffer.writeIndex] = value;
+    return this;
+  }
+  httpStatus(value) { 
+    this.buffer.attr_httpStatus[this.buffer.writeIndex] = value;
+    return this;
+  }
 }
 ```
 
 ### Design Benefits
 
-- **Zero allocation**: Only the SpanLogger instance itself is allocated
-- **Prototype compilation**: Tag methods added to prototype at task creation time, not runtime
+- **Zero allocation**: Only the SpanLogger instance itself is allocated per span
+- **Runtime class generation**: SpanLogger class built with `new Function` returning 'this' for chainable API
+- **Per-span buffers**: Each span gets its own buffer, avoiding traceId/spanId TypedArrays (they're constant per buffer)
+- **Direct buffer reference**: Logger has reference to its buffer, avoiding lookups on every log statement
+- **Sorted output**: Each span's logs are together in final Arrow output for efficient querying
+- **Prototype compilation**: Tag methods added to prototype at module context creation time, not runtime
 - **Fluent chaining**: All methods return `this` for seamless chaining
 - **API clarity**: `ctx.log.tag.userId()` vs `ctx.log.info()` provides clear separation
 
@@ -256,30 +290,30 @@ function createChildSpan(
 ### Basic Task Usage
 
 ```typescript
-export const createUser = task('create-user', async ({ log, ff, env }, userData: UserData) => {
+export const createUser = task('create-user', async (ctx, userData: UserData) => {
   // Feature flag access (automatically logged to this span)
-  if (ff.advancedValidation) {
+  if (ctx.ff.advancedValidation) {
     const result = await performAdvancedValidation(userData);
-    ff.trackUsage('advancedValidation', {
+    ctx.ff.trackUsage('advancedValidation', {
       action: 'validation_performed',
       outcome: result.success ? 'success' : 'failure'
     });
   }
   
   // Environment access (just property access, no logging)
-  const region = env.awsRegion;
-  const maxConnections = env.maxConnections;
+  const region = ctx.env.awsRegion;
+  const maxConnections = ctx.env.maxConnections;
   
-  // Tag operations (logged to this span's buffer)
-  log.tag.requestId(ctx.requestId);
-  log.tag.userId(userData.id);
-  log.tag.operation('INSERT');
+  // Tag operations (logged to this span's buffer via ctx.log)
+  ctx.log.tag.requestId(ctx.requestId);
+  ctx.log.tag.userId(userData.id);
+  ctx.log.tag.operation('INSERT');
   
-  log.info("Creating new user")
+  ctx.log.info("Creating new user")
     .with({ userId: userData.id, email: userData.email });
   
   const user = await db.createUser(userData);
-  return log.ok(user)
+  return ctx.ok(user)
     .with({ userId: user.id, operation: 'CREATE' })
     .message("User created successfully");
 });
@@ -289,12 +323,12 @@ export const createUser = task('create-user', async ({ log, ff, env }, userData:
 
 ```typescript
 export const processOrder = task('process-order', async (ctx, order: Order) => {
-  ctx.tag.orderId(order.id);
-  ctx.tag.amount(order.total);
+  ctx.log.tag.orderId(order.id);
+  ctx.log.tag.amount(order.total);
   
-  // Child span with its own context and initial attributes
+  // Child span with its own context, buffer, and new log instance
   const validation = await ctx.span('validate-order', async (childCtx) => {
-    childCtx.tag.itemCount(order.items.length);
+    childCtx.log.tag.itemCount(order.items.length);
     
     // Feature flag access logged to child span
     if (childCtx.ff.strictValidation) {
@@ -324,7 +358,7 @@ export const processOrder = task('process-order', async (ctx, order: Order) => {
       amount: order.total 
     })
     .run(async (childCtx) => {
-      childCtx.tag.paymentMethod(order.paymentMethod);
+      childCtx.log.tag.paymentMethod(order.paymentMethod);
       
       // Environment access in child span
       const paymentProvider = childCtx.env.paymentProvider;

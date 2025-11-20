@@ -29,26 +29,10 @@ const baseAttributes = defineTagAttributes({
   userId: S.optional(S.string.with(S.hash)),
   timestamp: S.number,
   
-  // Feature flag operations now use ff-access and ff-usage operations
-  // Context stored in regular attribute columns (user_id, user_plan, etc.)
-  // No separate featureFlagAccess/featureFlagUsage attributes needed
-});
-
-// Database-specific attributes
-const dbAttributes = baseAttributes.extend({
-  query: S.string.with(S.mask, 'sql'),
-  duration: S.number,
-  rowCount: S.optional(S.number),
-  connectionId: S.string,
-  operation: S.union(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
-});
-
-// Payment-specific attributes  
-const paymentAttributes = baseAttributes.extend({
-  amount: S.number,
-  currency: S.string,
-  paymentMethodId: S.string.with(S.mask, 'hash'),
-  merchantId: S.string,
+  // Feature flag operations use ff-access and ff-usage entry types
+  // They write directly to span buffer via ctx.ff methods
+  // Flag evaluation context stored in regular attribute columns
+  // No separate FF-specific columns needed beyond ff_name and ff_value
 });
 ```
 
@@ -125,19 +109,22 @@ type EnvironmentConfig = typeof environmentConfig;
 
 ## Feature Flag Evaluator Implementation
 
-**Purpose**: Handle feature flag evaluation with span-aware logging for analytics.
+**Purpose**: Handle feature flag evaluation with span-aware logging for analytics. Feature flags write directly to the span buffer via `ctx.ff` methods, similar to how `ctx.log` writes logging entries.
 
 ```typescript
 // Feature flag evaluator (only flags need complex evaluation)
+// Similar to SpanLogger, ctx.ff writes directly to the span buffer
 class FeatureFlagEvaluator<T> {
   protected schema: T;
   protected context: EvaluationContext;
   protected evaluator: FlagEvaluator;
+  protected buffer: SpanBuffer;  // Direct reference to span buffer for writing
   
-  constructor(schema: T, context: EvaluationContext, evaluator: FlagEvaluator) {
+  constructor(schema: T, context: EvaluationContext, evaluator: FlagEvaluator, buffer: SpanBuffer) {
     this.schema = schema;
     this.context = context;
     this.evaluator = evaluator;
+    this.buffer = buffer;  // Reference to current span's buffer
     
     // Initialize sync flags as direct properties
     this.initializeSyncFlags();
@@ -151,11 +138,13 @@ class FeatureFlagEvaluator<T> {
           get: () => {
             const value = this.evaluator[key];
             
-            // TODO: Use low-level column writers (design TBD)
-            // this.columnWriters.writeEntryType('ff-access');
-            // this.columnWriters.writeFfName(key);
-            // this.columnWriters.writeFfValue(value);
-            // + context attributes from evaluation context
+            // Write ff-access entry directly to span buffer (TypedArray writes)
+            const idx = this.buffer.writeIndex++;
+            this.buffer.timestamps[idx] = performance.now();
+            this.buffer.operations[idx] = OPERATION_FF_ACCESS;
+            this.buffer.attr_ff_name[idx] = internString(key);
+            this.buffer.attr_ff_value[idx] = value ? 1 : 0;
+            // Evaluation context attributes (user_id, etc.) written to regular attribute columns
             
             return value;
           },
@@ -169,30 +158,41 @@ class FeatureFlagEvaluator<T> {
   async get<K extends AsyncFlagKeys<T>>(flag: K): Promise<T[K]> {
     const value = await this.evaluator.getAsync(flag, this.context);
     
-    // TODO: Use low-level column writers (design TBD)
-    // this.columnWriters.writeEntryType('ff-access');
-    // this.columnWriters.writeFfName(flag);
-    // this.columnWriters.writeFfValue(value);
-    // + context attributes from evaluation context
+    // Write ff-access entry directly to span buffer (TypedArray writes)
+    const idx = this.buffer.writeIndex++;
+    this.buffer.timestamps[idx] = performance.now();
+    this.buffer.operations[idx] = OPERATION_FF_ACCESS;
+    this.buffer.attr_ff_name[idx] = internString(flag);
+    this.buffer.attr_ff_value[idx] = value ? 1 : 0;
+    // Evaluation context attributes written to regular attribute columns
     
     return value;
   }
   
   trackUsage<K extends keyof T>(flag: K, context?: UsageContext): void {
-    // TODO: Use low-level column writers (design TBD)
-    // this.columnWriters.writeEntryType('ff-usage');
-    // this.columnWriters.writeFfName(flag);
-    // this.columnWriters.writeAction(context?.action);
-    // this.columnWriters.writeOutcome(context?.outcome);
-    // + evaluation context attributes
+    // Write ff-usage entry directly to span buffer (TypedArray writes)
+    const idx = this.buffer.writeIndex++;
+    this.buffer.timestamps[idx] = performance.now();
+    this.buffer.operations[idx] = OPERATION_FF_USAGE;
+    this.buffer.attr_ff_name[idx] = internString(flag);
+    if (context?.action) {
+      this.buffer.attr_ff_action[idx] = internString(context.action);
+    }
+    if (context?.outcome) {
+      this.buffer.attr_ff_outcome[idx] = internString(context.outcome);
+    }
+    // Evaluation context attributes written to regular attribute columns
   }
 }
 ```
 
 **Why This Implementation**:
+- **Direct buffer writes**: ctx.ff writes directly to span buffer via TypedArray assignments (minimal overhead)
+- **Similar to ctx.log**: Both ctx.ff and ctx.log write to the same span buffer, just different entry types
 - **Automatic logging**: All flag access logged to current span for analytics
 - **Performance optimization**: Sync flags cached as properties
 - **Span correlation**: Flag usage tied to specific operations
+- **Regular attribute columns**: FF evaluation context (user_id, plan, etc.) uses regular attribute columns
 - **A/B testing support**: Explicit usage tracking for product analytics
 
 ## Schema Integration Patterns
@@ -209,11 +209,13 @@ function createRequestContext(params: {
     ...params,
     traceId: generateTraceId(),
     
-    // Feature flag evaluator with context
+    // Feature flag evaluator with user context and buffer reference
+    // Buffer reference will be set when span context is created
     ff: new FeatureFlagEvaluator(
       featureFlags,
       { userId: params.userId, requestId: params.requestId },
-      new DatabaseFlagEvaluator()
+      new DatabaseFlagEvaluator(),
+      null  // Buffer set later in task wrapper
     ),
     
     // Environment config (just a plain object)
@@ -252,31 +254,31 @@ export const createUser = task('create-user', async (ctx, userData: UserData) =>
   const maxConnections = ctx.env.maxConnections; // 100
   const dbUrl = ctx.env.databaseUrl;       // Real postgres URL
   
-  // Tag operations (typed based on dbAttributes)
-  ctx.tag.requestId(ctx.requestId);  // Sets bit 0, writes to attr_requestId column
-  ctx.tag.userId(userData.id);       // Sets bit 1, writes to attr_userId column  
-  ctx.tag.operation('INSERT');       // Sets bit 4, writes to attr_operation column
+  // Tag operations (typed based on dbAttributes) - via ctx.log
+  ctx.log.tag.requestId(ctx.requestId);  // Sets bit 0, writes to attr_requestId column
+  ctx.log.tag.userId(userData.id);       // Sets bit 1, writes to attr_userId column  
+  ctx.log.tag.operation('INSERT');       // Sets bit 4, writes to attr_operation column
 
   // Or, object-based API for multiple attributes, appending to multiple columns in the same row
-  ctx.tag({ 
+  ctx.log.tag.with({ 
     requestId: ctx.requestId,
     userId: userData.id,
     operation: 'INSERT'
   });
   
   // Masking only happens if you explicitly log environment values
-  ctx.tag.region(region);                  // Safe to log
-  // ctx.tag.databaseUrl(dbUrl);           // Would be masked by tag schema
+  ctx.log.tag.region(region);                     // Safe to log
+  // ctx.log.tag.databaseUrl(dbUrl);              // Would be masked by tag schema
   
   // Child spans create child SpanBuffers in tree structure
-  const validation = await ctx.span('validate-user', async (ctx) => {
-    ctx.tag.query('SELECT COUNT(*) FROM users WHERE email = ?');  // Sets bit 5
-    ctx.tag.duration(12.5);                                       // Sets bit 2
+  const validation = await ctx.span('validate-user', async (childCtx) => {
+    childCtx.log.tag.query('SELECT COUNT(*) FROM users WHERE email = ?');  // Sets bit 5
+    childCtx.log.tag.duration(12.5);                                       // Sets bit 2
     
     if (existingUser) {
-      return ctx.err('USER_EXISTS', { email: userData.email });
+      return childCtx.err('USER_EXISTS', { email: userData.email });
     }
-    return ctx.ok({ valid: true });
+    return childCtx.ok({ valid: true });
   });
   
   if (!validation.success) {

@@ -53,7 +53,7 @@ These entry types enable gradual migration from console.log by providing structu
 ### Structured Data Entry Types
 
 - **`tag`** - General structured data logging during execution
-  - Used for `ctx.tag({ key: value })` calls
+  - Used for `ctx.log.tag.attribute()` calls
   - Contains arbitrary attribute data
   - Can occur at any point during span execution
 
@@ -96,13 +96,13 @@ const payment = await ctx.span('process-payment')
   });
 
 // Fluent logging API
-ctx.info("Processing user data")
+ctx.log.info("Processing user data")
   .with({ userId: user.id, operation: 'PROCESS' });
 
 // Simple usage when no additional context needed
 return ctx.ok(result);
 return ctx.err('VALIDATION_FAILED');
-ctx.info("Simple message");
+ctx.log.info("Simple message");
 ```
 
 This fluent pattern provides a consistent, composable API across all trace operations.
@@ -142,17 +142,21 @@ constructor(buffer) {
 ```
 *Problem*: Still allocating objects, even if only once per span.
 
-**✅ Final Approach: Self-Reference Pattern with Tag Getter**
+**✅ Final Approach: Tag Getter Creates Entry and Returns this**
 ```typescript
 class SpanLogger {
   constructor(buffer) {
     this.buffer = buffer;
+    // Runtime class generation uses `new Function` returning 'this' for chainable API
+    // Every span creates a new log instance to have a reference to its buffer
+    // This avoids traceid+spanid appends on every log statement
+    // It also keeps the span logs neatly sorted together in the final Arrow output
   }
   
   // Tag getter creates new entry and returns this for chaining
   get tag() {
-    this._writeTagEntry(); // Creates new tag entry
-    return this; // Return for chaining with individual attribute methods
+    this._writeTagEntry(); // Creates new tag entry in buffer
+    return this; // Return this for chaining with individual attribute methods
   }
   
   // Fluent methods return this for chaining
@@ -175,13 +179,14 @@ class SpanLogger {
   }
   
   // Tag methods compiled directly onto prototype at module context creation time
+  // These directly write to TypedArrays for minimal overhead
   userId(value) { 
-    this.buffer.writeUserId(value);
+    this.buffer.attr_userId[this.buffer.writeIndex] = value;
     return this; // Even tag calls can chain!
   }
   
   httpStatus(value) {
-    this.buffer.writeHttpStatus(value);
+    this.buffer.attr_httpStatus[this.buffer.writeIndex] = value;
     return this;
   }
 }
@@ -191,10 +196,13 @@ class SpanLogger {
 
 1. **Tag getter creates entries**: `get tag()` creates a new tag entry and returns `this` for chaining
 2. **Zero allocation chaining**: All fluent methods return the same instance for continued chaining
-3. **Prototype compilation**: Tag methods are compiled onto the SpanLogger prototype at module context creation time
-4. **Module boundary safety**: Unknown columns written as null when called from deeper contexts
-5. **Reserved method names**: `with`, `message`, `tag` are reserved and cannot be used as attribute column names
-6. **Separate APIs**: `ctx.log` for explicit logging, `ctx.ok()`/`ctx.err()` for span completion
+3. **Runtime class generation**: SpanLogger class built at runtime with `new Function` returning 'this' for chainable API
+4. **Per-span log instances**: Every span creates a new log instance to reference its buffer, avoiding traceid+spanid appends
+5. **Sorted output**: Each span's own log instance keeps logs neatly sorted together in final Arrow output
+6. **Prototype compilation**: Tag methods are compiled onto the SpanLogger prototype at module context creation time
+7. **Module boundary safety**: Unknown columns written as null when called from deeper contexts
+8. **Reserved method names**: `with`, `message`, `tag` are reserved and cannot be used as attribute column names
+9. **Separate APIs**: `ctx.log` for explicit logging, `ctx.ok()`/`ctx.err()` for span completion
 
 #### Usage Examples
 
@@ -318,10 +326,11 @@ const createUser = task('create-user', async (
     .with({ operation: 'CREATE' });  // ✅ Can chain .with() after info()
   
   // Tag methods are dynamically generated from UserServiceAttributes
+  // ctx.log.tag creates a new entry and returns this for chaining
   ctx.log.tag
-    .user_id(userData.id)    // ✅ Generated: (value: string) => FluentAttributes
-    .http_status(201)        // ✅ Generated: (value: number) => FluentAttributes  
-    .operation('CREATE')     // ✅ Generated: (value: 'CREATE' | 'UPDATE' | 'DELETE') => FluentAttributes
+    .user_id(userData.id)    // ✅ Generated: (value: string) => this
+    .http_status(201)        // ✅ Generated: (value: number) => this  
+    .operation('CREATE')     // ✅ Generated: (value: 'CREATE' | 'UPDATE' | 'DELETE') => this
     .message("User tagged"); // ✅ Built-in fluent method
   
   // .with() calls stay in the same fluent interface
@@ -330,7 +339,7 @@ const createUser = task('create-user', async (
     operation: 'CREATE',
     email: userData.email,       // ✅ optional property
     // tag: "invalid"            // ❌ TypeScript error: reserved name
-  }).message("Bulk tagged")      // ✅ Still FluentAttributes, can continue chaining
+  }).message("Bulk tagged")      // ✅ Still returns this, can continue chaining
     .with({ http_status: 201 }); // ✅ Can chain more .with() calls
   
   // TypeScript knows exactly what methods are available:
@@ -359,8 +368,9 @@ When defining attribute schemas, these names must be avoided to prevent conflict
 
 **Public Logging API** (`ctx.log`):
 - `info()`, `debug()`, `warn()`, `error()` - structured logging
-- `tag.method()` - structured attribute logging  
+- `tag.attribute()` - structured attribute logging via getter that creates entry
 - `with()`, `message()` - fluent chaining
+- Every span creates a new `log` instance with reference to its buffer
 
 **Public Context API** (`ctx`):
 - `ctx.ok()`, `ctx.err()` - span completion with fluent chaining
@@ -369,9 +379,9 @@ When defining attribute schemas, these names must be avoided to prevent conflict
 **Low-Level Operations** (handled by context system):
 - `span-ok`, `span-err`, `span-exception` entries created when functions return `ctx.ok()`, `ctx.err()`, or throw exceptions
 - `span-start` entries created automatically when spans begin
-- Direct column writing operations
+- Direct TypedArray writes for minimal overhead
 
-The `ctx.log` API is for explicit logging during execution, while `ctx.ok()`/`ctx.err()` are for span completion. Both use the same underlying entry type system.
+The `ctx.log` API is for explicit logging during execution, while `ctx.ok()`/`ctx.err()` are for span completion. Both use the same underlying entry type system. Each span's log instance references its own buffer, avoiding traceid+spanid appends and keeping logs neatly sorted in Arrow output.
 
 ## Low-Level Logging API
 
