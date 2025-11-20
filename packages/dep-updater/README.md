@@ -340,8 +340,46 @@ expo: {
 #### Syncpack (`syncpack`)
 
 - `configPath`: Path to .syncpackrc.json
-- `preserveCustomRules`: Preserve custom rules when regenerating from Expo
+- `preserveCustomRules`: Preserve custom rules when regenerating from Expo (default: `true`)
 - `fixScriptName`: Script name to run syncpack fix (default: `'syncpack:fix'`)
+
+**Adding Custom Syncpack Rules:**
+
+The tool generates Expo-related syncpack rules automatically, but you can add your own custom rules by editing
+`.syncpackrc.json` directly:
+
+1. **Generate initial config**: Run `dep-updater generate-syncpack --expo-sdk 52` to create `.syncpackrc.json` with Expo
+   rules
+2. **Add your custom rules**: Edit `.syncpackrc.json` and add your own version groups:
+   ```json
+   {
+     "versionGroups": [
+       {
+         "label": "Pin lodash to 4.17.21",
+         "dependencies": ["lodash"],
+         "pinVersion": "4.17.21"
+       },
+       {
+         "label": "Keep TypeScript on 5.x",
+         "dependencies": ["typescript"],
+         "packages": ["**"],
+         "policy": "sameRange",
+         "dependencyTypes": ["prod", "dev"]
+       }
+     ]
+   }
+   ```
+3. **Enable preservation**: Set `preserveCustomRules: true` in your dep-updater config
+4. **Regenerate safely**: When the tool regenerates the config, it will filter out rules that match ANY of these
+   conditions:
+   - Label contains "Expo SDK"
+   - Label contains "workspace protocol"
+   - Dependencies include `react`, `react-native`, or `expo`
+
+   All other custom rules (like the lodash rule above) are preserved and merged with new generated Expo rules.
+
+This keeps a clean separation: dep-updater manages Expo SDK rules, you manage project-specific rules in the syncpack
+config where they belong.
 
 #### Nix (`nix`) - Optional
 
