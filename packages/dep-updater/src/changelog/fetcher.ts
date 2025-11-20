@@ -100,32 +100,34 @@ async function fetchChangelogContent(url: string): Promise<string | null> {
 
 /**
  * Fetch changelog for a package update
+ * Returns an object with URL and content
  */
 export async function fetchChangelog(
   update: PackageUpdate,
   logger?: import('../logger.js').Logger,
-): Promise<string | null> {
+): Promise<{ url: string | null; content: string | null }> {
   logger?.info(`Fetching changelog for ${update.name}...`);
 
   // Try npm registry first
-  let changelog = await fetchNpmChangelog(update.name, update.toVersion);
+  let changelogUrl = await fetchNpmChangelog(update.name, update.toVersion);
 
   // If npm didn't work, try GitHub
-  if (!changelog) {
-    changelog = await fetchGitHubChangelog(update.name, update.toVersion);
+  if (!changelogUrl) {
+    changelogUrl = await fetchGitHubChangelog(update.name, update.toVersion);
   }
 
   // If we have a URL, fetch the content
-  if (changelog?.startsWith('http')) {
-    const content = await fetchChangelogContent(changelog);
-    return content || changelog; // Return URL if content fetch fails
+  if (changelogUrl?.startsWith('http')) {
+    const content = await fetchChangelogContent(changelogUrl);
+    return { url: changelogUrl, content: content || changelogUrl };
   }
 
-  return changelog;
+  return { url: changelogUrl, content: changelogUrl };
 }
 
 /**
  * Fetch changelogs for multiple package updates
+ * Populates changelogUrl on update objects and returns content map
  */
 export async function fetchChangelogs(
   updates: PackageUpdate[],
@@ -139,14 +141,19 @@ export async function fetchChangelogs(
     const batch = updates.slice(i, i + maxConcurrent);
     const results = await Promise.all(
       batch.map(async (update) => {
-        const changelog = await fetchChangelog(update, logger);
-        return { update, changelog };
+        const result = await fetchChangelog(update, logger);
+        return { update, result };
       }),
     );
 
-    for (const { update, changelog } of results) {
-      if (changelog) {
-        changelogs.set(update.name, changelog);
+    for (const { update, result } of results) {
+      // Store URL in update object
+      if (result.url) {
+        update.changelogUrl = result.url;
+      }
+      // Store content in map
+      if (result.content) {
+        changelogs.set(update.name, result.content);
       }
     }
   }

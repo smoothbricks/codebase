@@ -84,7 +84,7 @@ describe('Changelog Analyzer', () => {
 
       expect(body).toContain('## Dependency Updates');
       expect(body).toContain('### ! Major Updates');
-      expect(body).toContain('**react**: 19.1.0 → 20.0.0');
+      expect(body).toContain('**react: 19.1.0 → 20.0.0**');
       expect(body).toContain('### Minor Updates');
       expect(body).toContain('vite: 7.2.0 → 7.3.0');
       expect(body).toContain('### Patch Updates');

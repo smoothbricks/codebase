@@ -6,7 +6,7 @@ Automated dependency update tool with Expo SDK support, stacked PRs, and AI-powe
 
 - 🎯 **Expo SDK Aware**: Automatically updates Expo SDK and regenerates syncpack config with compatible versions
 - 📚 **Stacked PRs**: Creates incremental PRs for better tracking and easier review
-- 🤖 **AI-Powered**: Uses Claude to analyze changelogs and highlight breaking changes
+- 🤖 **AI-Powered**: Uses Claude to analyze changelogs, highlight breaking changes, and include source links to releases
 - 🔄 **Multiple Ecosystems**: Supports npm (via Bun), optional Nix/devenv, and nixpkgs
 - 🚀 **GitHub Actions Ready**: Interactive setup wizard generates workflow for automated daily updates
 - 🧪 **Dry Run Mode**: Test locally without making changes

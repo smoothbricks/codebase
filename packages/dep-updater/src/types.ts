@@ -53,6 +53,8 @@ export interface PackageUpdate {
   ecosystem: DependencyEcosystem;
   /** Changelog URL or text */
   changelog?: string;
+  /** Changelog source URL (e.g., GitHub releases) */
+  changelogUrl?: string;
   /** Breaking changes detected */
   breakingChanges?: string[];
 }
