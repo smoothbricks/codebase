@@ -321,8 +321,7 @@ export const createUser = task('create-user', async (ctx, userData: UserData) =>
 
 ```typescript
 export const processOrder = task('process-order', async (ctx, order: Order) => {
-  ctx.log.tag.orderId(order.id);
-  ctx.log.tag.amount(order.total);
+  ctx.log.tag.orderId(order.id).amount(order.total);
   
   // Child span with its own context, buffer, and new log instance
   const validation = await ctx.span('validate-order', async (childCtx) => {
