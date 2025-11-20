@@ -35,12 +35,13 @@ Your task:
 2. Identify breaking changes and highlight them with !
 3. Note security fixes with 🔒
 4. Group related updates together
-5. Keep it concise and actionable
+5. Include source links to changelogs where available
+6. Keep it concise and actionable
 
 Updates:
 ${changelogData}
 
-Please provide a markdown summary suitable for a Pull Request description.`;
+Please provide a markdown summary suitable for a Pull Request description. Include clickable links to changelog sources in the format: [changelog](url)`;
 
     const message = await client.messages.create({
       model: config.ai.model || 'claude-sonnet-4-5-20250929',
@@ -80,6 +81,11 @@ function prepareChangelogData(updates: PackageUpdate[], changelogs: Map<string, 
     parts.push(`Type: ${update.updateType}`);
     parts.push(`Ecosystem: ${update.ecosystem}`);
 
+    // Include changelog URL if available
+    if (update.changelogUrl) {
+      parts.push(`Source: ${update.changelogUrl}`);
+    }
+
     const changelog = changelogs.get(update.name);
     if (changelog) {
       // Truncate long changelogs
@@ -116,12 +122,20 @@ function generateFallbackSummary(updates: PackageUpdate[]): string {
     }
   }
 
+  const formatUpdate = (update: PackageUpdate): string => {
+    const version = `${update.fromVersion} → ${update.toVersion}`;
+    if (update.changelogUrl) {
+      return `${update.name}: ${version} ([changelog](${update.changelogUrl}))`;
+    }
+    return `${update.name}: ${version}`;
+  };
+
   const parts: string[] = ['## Dependency Updates\n'];
 
   if (sections.major.length > 0) {
     parts.push('### ! Major Updates\n');
     for (const update of sections.major) {
-      parts.push(`- **${update.name}**: ${update.fromVersion} → ${update.toVersion}`);
+      parts.push(`- **${formatUpdate(update)}**`);
     }
     parts.push('');
   }
@@ -129,7 +143,7 @@ function generateFallbackSummary(updates: PackageUpdate[]): string {
   if (sections.minor.length > 0) {
     parts.push('### Minor Updates\n');
     for (const update of sections.minor) {
-      parts.push(`- ${update.name}: ${update.fromVersion} → ${update.toVersion}`);
+      parts.push(`- ${formatUpdate(update)}`);
     }
     parts.push('');
   }
@@ -137,7 +151,7 @@ function generateFallbackSummary(updates: PackageUpdate[]): string {
   if (sections.patch.length > 0) {
     parts.push('### Patch Updates\n');
     for (const update of sections.patch) {
-      parts.push(`- ${update.name}: ${update.fromVersion} → ${update.toVersion}`);
+      parts.push(`- ${formatUpdate(update)}`);
     }
     parts.push('');
   }

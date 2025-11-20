@@ -93,7 +93,8 @@ describe('Changelog Fetcher', () => {
 
       const result = await fetchChangelog(update, mockLogger);
 
-      expect(result).toBeNull();
+      expect(result.url).toBeNull();
+      expect(result.content).toBeNull();
 
       globalThis.fetch = originalFetch;
     });
@@ -120,6 +121,87 @@ describe('Changelog Fetcher', () => {
   });
 
   describe('fetchChangelogs', () => {
+    test('populates changelogUrl field on update objects', async () => {
+      const originalFetch = globalThis.fetch;
+
+      globalThis.fetch = mock(async (url: string | Request) => {
+        const urlString = typeof url === 'string' ? url : url.url;
+
+        if (urlString.includes('registry.npmjs.org/react')) {
+          return {
+            ok: true,
+            json: async () => ({
+              versions: {
+                '19.1.0': {
+                  repository: {
+                    url: 'git+https://github.com/facebook/react.git',
+                  },
+                },
+              },
+            }),
+          } as Response;
+        }
+
+        if (urlString.includes('registry.npmjs.org/vite')) {
+          return {
+            ok: true,
+            json: async () => ({
+              versions: {
+                '7.3.0': {
+                  repository: {
+                    url: 'git+https://github.com/vitejs/vite.git',
+                  },
+                },
+              },
+            }),
+          } as Response;
+        }
+
+        if (urlString.includes('github.com/facebook/react/releases/tag')) {
+          return {
+            ok: true,
+            headers: {
+              get: () => 'text/html',
+            },
+            text: async () => '<html>React release notes</html>',
+          } as Response;
+        }
+
+        if (urlString.includes('github.com/vitejs/vite/releases/tag')) {
+          return {
+            ok: true,
+            headers: {
+              get: () => 'text/html',
+            },
+            text: async () => '<html>Vite release notes</html>',
+          } as Response;
+        }
+
+        return { ok: false } as Response;
+      }) as unknown as typeof fetch;
+
+      const updates: PackageUpdate[] = [
+        { name: 'react', fromVersion: '19.0.0', toVersion: '19.1.0', updateType: 'minor', ecosystem: 'npm' },
+        { name: 'vite', fromVersion: '7.2.0', toVersion: '7.3.0', updateType: 'minor', ecosystem: 'npm' },
+        { name: 'typescript', fromVersion: '5.9.0', toVersion: '5.9.1', updateType: 'patch', ecosystem: 'npm' }, // Will fail
+      ];
+
+      const result = await fetchChangelogs(updates, 3, mockLogger);
+
+      // Verify changelogUrl was populated on update objects (side effect)
+      expect(updates[0].changelogUrl).toContain('github.com/facebook/react/releases/tag/v19.1.0');
+      expect(updates[1].changelogUrl).toContain('github.com/vitejs/vite/releases/tag/v7.3.0');
+      expect(updates[2].changelogUrl).toBeUndefined(); // No changelog found for typescript
+
+      // Verify content map was populated
+      expect(result).toBeInstanceOf(Map);
+      expect(result.size).toBe(2); // react and vite
+      expect(result.get('react')).toContain('React release notes');
+      expect(result.get('vite')).toContain('Vite release notes');
+
+      globalThis.fetch = originalFetch;
+    });
+
     test('processes updates in batches', async () => {
       // Mock fetch to fail (so we don't make actual network requests)
       const originalFetch = globalThis.fetch;
@@ -253,7 +335,8 @@ describe('Changelog Fetcher', () => {
 
       const result = await fetchChangelog(update, mockLogger);
 
-      expect(result).toBeNull();
+      expect(result.url).toBeNull();
+      expect(result.content).toBeNull();
 
       globalThis.fetch = originalFetch;
     });
@@ -287,7 +370,8 @@ describe('Changelog Fetcher', () => {
 
       const result = await fetchChangelog(update, mockLogger);
 
-      expect(result).toBeNull();
+      expect(result.url).toBeNull();
+      expect(result.content).toBeNull();
 
       globalThis.fetch = originalFetch;
     });
@@ -340,7 +424,8 @@ describe('Changelog Fetcher', () => {
 
       const result = await fetchChangelog(update, mockLogger);
 
-      expect(result).toBe('<html>Release notes here</html>');
+      expect(result.content).toBe('<html>Release notes here</html>');
+      expect(result.url).toContain('github.com/facebook/react/releases/tag/v19.1.0');
       expect(fetchCount).toBeGreaterThanOrEqual(2); // npm registry + content fetch
 
       globalThis.fetch = originalFetch;
@@ -393,7 +478,8 @@ describe('Changelog Fetcher', () => {
 
       const result = await fetchChangelog(update, mockLogger);
 
-      expect(result).toBe('Release notes in JSON format');
+      expect(result.content).toBe('Release notes in JSON format');
+      expect(result.url).toContain('github.com/facebook/react/releases/tag/v19.1.0');
 
       globalThis.fetch = originalFetch;
     });
@@ -437,7 +523,8 @@ describe('Changelog Fetcher', () => {
       const result = await fetchChangelog(update, mockLogger);
 
       // Should return URL since content fetch failed
-      expect(result).toContain('github.com/facebook/react/releases/tag/v19.1.0');
+      expect(result.url).toContain('github.com/facebook/react/releases/tag/v19.1.0');
+      expect(result.content).toContain('github.com/facebook/react/releases/tag/v19.1.0');
 
       globalThis.fetch = originalFetch;
     });
