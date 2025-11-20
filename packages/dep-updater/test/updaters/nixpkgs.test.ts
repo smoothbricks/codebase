@@ -82,7 +82,7 @@ describe('Nixpkgs Overlay Updater', () => {
 
       await updateNixpkgsOverlay(testDir, { dryRun: true, logger: mockLogger });
 
-      expect(mockLogger.info).toHaveBeenCalledWith('Updating nixpkgs overlay (Bun binary)...');
+      expect(mockLogger.info).toHaveBeenCalledWith('Updating nixpkgs overlay...');
       expect(mockLogger.info).toHaveBeenCalledWith(expect.stringContaining('Found'));
     });
   });
@@ -158,7 +158,7 @@ describe('Nixpkgs Overlay Updater', () => {
       const result = await updateNixpkgsOverlay(testDir, { dryRun: true, logger: mockLogger });
 
       expect(result.success).toBe(true);
-      // Parser only extracts first version (bun)
+      // Parser extracts all packages, but in dry-run before & after are the same
       expect(result.updates).toHaveLength(0);
     });
 
