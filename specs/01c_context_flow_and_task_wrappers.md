@@ -305,9 +305,7 @@ export const createUser = task('create-user', async (ctx, userData: UserData) =>
   const maxConnections = ctx.env.maxConnections;
   
   // Tag operations (logged to this span's buffer via ctx.log)
-  ctx.log.tag.requestId(ctx.requestId);
-  ctx.log.tag.userId(userData.id);
-  ctx.log.tag.operation('INSERT');
+  ctx.log.tag.requestId(ctx.requestId).userId(userData.id).operation('INSERT');
   
   ctx.log.info("Creating new user")
     .with({ userId: userData.id, email: userData.email });
