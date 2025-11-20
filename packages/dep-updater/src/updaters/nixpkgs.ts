@@ -1,5 +1,5 @@
 /**
- * Nixpkgs overlay updater (for Bun binary via nvfetcher)
+ * Nixpkgs overlay updater via nvfetcher
  */
 
 import { readFile } from 'node:fs/promises';
@@ -14,16 +14,15 @@ async function parseNvfetcherSources(sourcesPath: string): Promise<Map<string, s
   try {
     const content = await readFile(sourcesPath, 'utf-8');
 
-    // Parse Nix expression to extract versions
-    // This is a simple regex-based parser
-    const versionPattern = /version\s*=\s*"([^"]+)"/g;
+    // Parse Nix expression to extract all package versions
+    // This is a simple regex-based parser for nvfetcher's generated.nix format
+    // Format: packageName = { ... version = "x.y.z"; ... };
+    const packagePattern = /(\w+)\s*=\s*\{[^}]*version\s*=\s*"([^"]+)"[^}]*\}/gs;
     const versions = new Map<string, string>();
 
-    const match: RegExpExecArray | null = versionPattern.exec(content);
-    if (match) {
-      // Assume first version is Bun version
-      // In actual implementation, we'd parse the Nix AST properly
-      versions.set('bun', match[1]);
+    for (const match of content.matchAll(packagePattern)) {
+      const [, packageName, version] = match;
+      versions.set(packageName, version);
     }
 
     return versions;
@@ -52,7 +51,7 @@ export async function updateNixpkgsOverlay(
   const { dryRun = false, logger } = options;
 
   try {
-    logger?.info('Updating nixpkgs overlay (Bun binary)...');
+    logger?.info('Updating nixpkgs overlay...');
 
     const sourcesPath = join(overlayPath, '_sources', 'generated.nix');
 
@@ -98,17 +97,6 @@ export async function updateNixpkgsOverlay(
           ecosystem: 'nixpkgs',
         };
       }
-
-      // Run nix build to verify
-      try {
-        await execa('nix', ['build', '.#bun', '--no-link'], {
-          cwd: overlayPath,
-          stdio: 'inherit',
-        });
-        logger?.info('✓ Nix build verification passed');
-      } catch (_error) {
-        logger?.warn('Warning: Nix build verification failed');
-      }
     }
 
     // Parse sources after update
@@ -131,6 +119,22 @@ export async function updateNixpkgsOverlay(
     }
 
     logger?.info(`✓ Found ${updates.length} nixpkgs overlay updates`);
+
+    // Verify updated packages can build (non-fatal)
+    if (!dryRun && updates.length > 0) {
+      for (const update of updates) {
+        const packageName = update.name.replace('nixpkgs-', '');
+        try {
+          await execa('nix', ['build', `.#${packageName}`, '--no-link'], {
+            cwd: overlayPath,
+            stdio: 'inherit',
+          });
+          logger?.info(`✓ Nix build verification passed for ${packageName}`);
+        } catch (_error) {
+          logger?.warn(`Warning: Nix build verification failed for ${packageName}`);
+        }
+      }
+    }
 
     return {
       success: true,
