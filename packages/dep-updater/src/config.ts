@@ -26,7 +26,16 @@ export interface DepUpdaterConfig {
   syncpack?: {
     /** Path to .syncpackrc.json */
     configPath: string;
-    /** Preserve custom syncpack rules when regenerating from Expo */
+    /**
+     * Preserve custom syncpack rules when regenerating from Expo.
+     *
+     * When true, the tool filters out managed rules and keeps custom ones:
+     * - **Managed (removed)**: Rules with labels containing "Expo SDK" or "workspace protocol",
+     *   OR rules with dependencies including `react`, `react-native`, or `expo`
+     * - **Custom (preserved)**: All other rules (e.g., pinning lodash, TypeScript version constraints)
+     *
+     * The preserved custom rules are merged with newly generated Expo rules.
+     */
     preserveCustomRules: boolean;
     /** Script name to run syncpack fix (default: 'syncpack:fix') */
     fixScriptName: string;
