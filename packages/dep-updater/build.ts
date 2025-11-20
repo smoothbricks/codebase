@@ -16,15 +16,6 @@ const bundleResult = await build({
   minify: false,
   sourcemap: 'none',
   external: [
-    // Node built-ins
-    'fs',
-    'path',
-    'util',
-    'node:fs',
-    'node:path',
-    'node:util',
-    'node:fs/promises',
-    'node:child_process',
     // Keep external dependencies
     '@anthropic-ai/sdk',
     'commander',
