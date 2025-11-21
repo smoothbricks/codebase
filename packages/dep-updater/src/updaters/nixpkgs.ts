@@ -5,24 +5,21 @@
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { execa } from 'execa';
-import type { PackageUpdate, UpdateResult } from '../types.js';
+import type { NvfetcherSources, PackageUpdate, UpdateResult } from '../types.js';
 
 /**
- * Parse nvfetcher generated sources
+ * Parse nvfetcher generated sources from JSON
  */
 async function parseNvfetcherSources(sourcesPath: string): Promise<Map<string, string>> {
   try {
     const content = await readFile(sourcesPath, 'utf-8');
+    const sources: NvfetcherSources = JSON.parse(content);
 
-    // Parse Nix expression to extract all package versions
-    // This is a simple regex-based parser for nvfetcher's generated.nix format
-    // Format: packageName = { ... version = "x.y.z"; ... };
-    const packagePattern = /(\w+)\s*=\s*\{[^}]*version\s*=\s*"([^"]+)"[^}]*\}/gs;
     const versions = new Map<string, string>();
-
-    for (const match of content.matchAll(packagePattern)) {
-      const [, packageName, version] = match;
-      versions.set(packageName, version);
+    for (const [packageName, data] of Object.entries(sources)) {
+      if (data.version) {
+        versions.set(packageName, data.version);
+      }
     }
 
     return versions;
@@ -53,7 +50,7 @@ export async function updateNixpkgsOverlay(
   try {
     logger?.info('Updating nixpkgs overlay...');
 
-    const sourcesPath = join(overlayPath, '_sources', 'generated.nix');
+    const sourcesPath = join(overlayPath, '_sources', 'generated.json');
 
     // Parse sources before update
     const versionsBefore = await parseNvfetcherSources(sourcesPath);
