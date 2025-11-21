@@ -13,7 +13,7 @@ import { describe, expect, it, beforeEach } from 'bun:test';
 import { S } from '../schema/builder.js';
 import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
-import { InMemoryFlagEvaluator, FeatureFlagEvaluator } from '../schema/evaluator.js';
+import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 import { createRequestContext, createModuleContext } from '../lmao.js';
 import type { TagAttributeSchema } from '../schema/types.js';
 
@@ -151,7 +151,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/test.ts',
           moduleName: 'TestService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('test-chaining', async (ctx) => {
@@ -478,14 +478,14 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
         // Async flags use method call
-        // Type assertion needed because the type system can't infer async flag types through generic params
-        type FFType = typeof featureFlags.schema;
-        const experimentalEnabled = await (ctx.ff as FeatureFlagEvaluator<FFType>).get('experimentalFeature');
+        // TypeScript can't properly infer async flag types through the generic chain
+        // so we use a type assertion to access the specific flag type
+        const experimentalEnabled = await (ctx.ff.get as (flag: 'experimentalFeature') => Promise<boolean>)('experimentalFeature');
         expect(experimentalEnabled).toBe(false);
 
         return ctx.ok({ experimental: experimentalEnabled });

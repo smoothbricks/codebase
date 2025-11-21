@@ -9,3 +9,4 @@ export * from './lib/schema/defineTagAttributes.js';
 export * from './lib/schema/defineFeatureFlags.js';
 export * from './lib/schema/evaluator.js';
 export * from './lib/schema/extend.js';
+export * from './lib/schema/typeGuards.js';

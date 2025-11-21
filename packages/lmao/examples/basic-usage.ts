@@ -59,7 +59,7 @@ const { task } = createModuleContext({
     filePath: 'src/services/user.ts',
     moduleName: 'UserService',
   },
-  tagAttributes: dbAttributes as any,
+  tagAttributes: dbAttributes,
 });
 
 // 6. Define tasks with typed context

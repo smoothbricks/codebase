@@ -90,6 +90,14 @@ export type UnwrapExtendedSchema<T> = T extends ExtendedSchema<infer S>
     : never;
 
 /**
+ * Type helper to convert any object to TagAttributeSchema by picking only schema properties
+ * This strips out methods like 'extend', 'validate', etc.
+ */
+export type AsTagAttributeSchema<T> = {
+  [K in keyof T as T[K] extends Function ? never : K]: T[K];
+};
+
+/**
  * Create an extendable schema wrapper
  * 
  * This provides a fluent API for schema composition while maintaining

@@ -14,6 +14,7 @@ import type { FeatureFlagSchema, InferFeatureFlags, EvaluationContext } from './
 import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from './schema/evaluator.js';
 import type { SpanBuffer, ModuleContext, TaskContext } from './buffer/types.js';
 import { createSpanBuffer, createChildSpanBuffer } from './buffer/createSpanBuffer.js';
+import { isArrowBuilder } from './schema/typeGuards.js';
 
 /**
  * Result types for ok/err pattern
@@ -268,17 +269,6 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 }
 
 /**
- * Type guard to check if a value is an Arrow builder
- */
-function isArrowBuilder(value: unknown): value is arrow.Builder {
-  return value !== null && 
-         value !== undefined && 
-         typeof value === 'object' &&
-         'append' in value &&
-         typeof (value as Record<string, unknown>).append === 'function';
-}
-
-/**
  * Write a value to an Arrow column builder
  * Handles type conversion for different Arrow builder types
  */
@@ -400,6 +390,25 @@ function createSpanLogger<T extends TagAttributeSchema>(
 }
 
 /**
+ * Extract just the schema fields from an object, removing methods
+ * This allows us to accept objects with additional methods like validate, extend, etc.
+ * 
+ * This type recursively picks all properties that are not functions from intersections
+ */
+type ExtractSchemaFields<T> = T extends infer U
+  ? {
+      [K in keyof U as U[K] extends Function ? never : K]: U[K];
+    }
+  : never;
+
+/**
+ * Type predicate to check if extracted fields match TagAttributeSchema
+ */
+type IsValidTagSchema<T> = ExtractSchemaFields<T> extends TagAttributeSchema
+  ? ExtractSchemaFields<T>
+  : TagAttributeSchema;
+
+/**
  * Create module context with tag attributes
  * 
  * This creates a task wrapper that:
@@ -411,8 +420,9 @@ function createSpanLogger<T extends TagAttributeSchema>(
  * @returns Module context builder with task wrapper
  */
 export function createModuleContext<
-  T extends TagAttributeSchema,
-  FF extends FeatureFlagSchema,
+  TInput,
+  T extends TagAttributeSchema = IsValidTagSchema<TInput>,
+  FF extends FeatureFlagSchema = FeatureFlagSchema,
   Env = Record<string, unknown>
 >(options: {
   moduleMetadata: {
@@ -420,16 +430,26 @@ export function createModuleContext<
     filePath: string;
     moduleName: string;
   };
-  tagAttributes: T;
+  tagAttributes: TInput;
 }): ModuleContextBuilder<T, FF, Env> {
   const { moduleMetadata, tagAttributes } = options;
+  
+  // Extract only the schema fields, removing methods like validate, extend, etc.
+  const schemaOnly = Object.keys(tagAttributes as Record<string, unknown>).reduce((acc, key) => {
+    const value = (tagAttributes as Record<string, unknown>)[key];
+    // Only include non-function properties
+    if (typeof value !== 'function') {
+      acc[key] = value;
+    }
+    return acc;
+  }, {} as Record<string, unknown>) as T;
   
   // Create module context (stub for now - will integrate with buffer system)
   const moduleContext: ModuleContext = {
     moduleId: Math.floor(Math.random() * 1000000), // Stub
     gitSha: moduleMetadata.gitSha,
     filePath: moduleMetadata.filePath,
-    tagAttributes,
+    tagAttributes: schemaOnly,
     spanBufferCapacityStats: {
       currentCapacity: 1024,
       totalWrites: 0,
@@ -452,7 +472,7 @@ export function createModuleContext<
         };
         
         // Create span buffer with Arrow builders
-        const spanBuffer = createSpanBuffer(tagAttributes, taskContext);
+        const spanBuffer = createSpanBuffer(schemaOnly, taskContext);
         
         // Connect feature flag evaluator to buffer for analytics
         // The evaluator is a FeatureFlagEvaluator instance, we need to set columnWriters
@@ -461,7 +481,7 @@ export function createModuleContext<
         }
         
         // Create span logger with typed tag methods
-        const spanLogger = createSpanLogger(tagAttributes, spanBuffer);
+        const spanLogger = createSpanLogger(schemaOnly, spanBuffer);
         
         // Create span context
         const spanContext: SpanContext<T, FF, Env> = {
@@ -484,7 +504,7 @@ export function createModuleContext<
             const childBuffer = createChildSpanBuffer(spanBuffer, taskContext);
             
             // Create child context with its own logger
-            const childLogger = createSpanLogger(tagAttributes, childBuffer);
+            const childLogger = createSpanLogger(schemaOnly, childBuffer);
             const childContext: SpanContext<T, FF, Env> = {
               ...spanContext,
               log: childLogger,

@@ -48,7 +48,7 @@ const { task } = createModuleContext({
     filePath: 'src/services/order.ts',
     moduleName: 'OrderService',
   },
-  tagAttributes: orderAttributes as any,
+  tagAttributes: orderAttributes,
 });
 
 // Example 1: Simple chaining

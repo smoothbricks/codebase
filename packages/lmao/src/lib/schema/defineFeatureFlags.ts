@@ -5,8 +5,7 @@ import type { FeatureFlagDefinition } from './types.js';
  * Feature flag schema with sync/async markers
  */
 export interface FeatureFlagSchema {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  [key: string]: FeatureFlagDefinition<any>;
+  [key: string]: FeatureFlagDefinition<string | number | boolean>;
 }
 
 /**

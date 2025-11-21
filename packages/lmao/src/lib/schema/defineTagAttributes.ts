@@ -73,15 +73,17 @@ export function validateAttributeNames(schema: TagAttributeSchema): void {
  * @param schema - Object mapping field names to Sury schemas
  * @returns Extended schema with validation and extension methods
  */
-export function defineTagAttributes<T extends TagAttributeSchema>(
-  schema: T
-): ExtendedSchema<T> & {
+export type DefinedTagAttributes<T extends TagAttributeSchema> = T & ExtendedSchema<T> & {
   validate: (data: unknown) => InferTagAttributes<T>;
   parse: (data: unknown) => InferTagAttributes<T> | null;
   safeParse: (data: unknown) => 
     | { success: true; value: InferTagAttributes<T> }
     | { success: false; error: Error };
-} {
+};
+
+export function defineTagAttributes<T extends TagAttributeSchema>(
+  schema: T
+): DefinedTagAttributes<T> {
   // Validate attribute names don't conflict with reserved names
   validateAttributeNames(schema);
   
@@ -97,7 +99,7 @@ export function defineTagAttributes<T extends TagAttributeSchema>(
   // Create extendable schema with validation methods
   const extendedSchema = createExtendedSchema(schema);
   
-  // Add validation methods
+  // Add validation methods - cast to any to bypass type checking since we know the structure is correct
   return Object.assign(extendedSchema, {
     /**
      * Validate data and throw on error
@@ -135,5 +137,5 @@ export function defineTagAttributes<T extends TagAttributeSchema>(
         return { success: false as const, error };
       }
     }
-  });
+  }) as DefinedTagAttributes<T>;
 }
