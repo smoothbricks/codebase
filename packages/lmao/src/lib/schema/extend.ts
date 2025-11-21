@@ -80,6 +80,16 @@ export interface ExtendedSchema<T extends TagAttributeSchema> {
 }
 
 /**
+ * Type helper to extract the raw schema from ExtendedSchema
+ * The ExtendedSchema spreads the schema fields, so we can use it directly as TagAttributeSchema
+ */
+export type UnwrapExtendedSchema<T> = T extends ExtendedSchema<infer S> 
+  ? S 
+  : T extends TagAttributeSchema 
+    ? T 
+    : never;
+
+/**
  * Create an extendable schema wrapper
  * 
  * This provides a fluent API for schema composition while maintaining
