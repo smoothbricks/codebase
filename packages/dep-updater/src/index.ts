@@ -8,6 +8,8 @@
  * - Multiple dependency ecosystems (npm, Nix, nixpkgs)
  */
 
+// Export authentication utilities
+export * from './auth/github-client.js';
 // Export changelog utilities
 export * from './changelog/analyzer.js';
 export * from './changelog/fetcher.js';
@@ -15,6 +17,7 @@ export * from './changelog/fetcher.js';
 export * from './commands/generate-syncpack.js';
 export * from './commands/update-deps.js';
 export * from './commands/update-expo.js';
+export * from './commands/validate-setup.js';
 // Export configuration
 export * from './config.js';
 // Export Expo utilities
