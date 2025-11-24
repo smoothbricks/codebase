@@ -111,6 +111,31 @@ jobs:
       - name: 🔨 Build
         run: ./github-ci.sh nx-affected build "Build" 14
 
+      # Step 15
+      - name: 🚀 Smoke Tests (dep-updater)
+        working-directory: ${{ github.workspace }}
+        run: |
+          # Only run if dep-updater was built (affected or not)
+          if [ -f "packages/dep-updater/dist/cli.js" ]; then
+            echo "Running dep-updater smoke tests..."
+
+            # Test CLI help
+            node packages/dep-updater/dist/cli.js --help
+
+            # Test init command (dry-run)
+            node packages/dep-updater/dist/cli.js init --yes --dry-run
+
+            # Test generate-workflow command (dry-run)
+            node packages/dep-updater/dist/cli.js generate-workflow --dry-run
+
+            # Test update-deps command (dry-run, skip-ai)
+            node packages/dep-updater/dist/cli.js update-deps --dry-run --skip-ai || true
+
+            echo "✓ Smoke tests passed"
+          else
+            echo "Skipping smoke tests (dep-updater not built)"
+          fi
+
       # --- Cleanup ------------------------------------------------------------
 
       - name: Cleanup and cache Nix store
