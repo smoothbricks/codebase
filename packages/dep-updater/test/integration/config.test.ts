@@ -651,7 +651,7 @@ describe('Config Integration - Script Mode', () => {
 
   describe('Script Mode Integration', () => {
     test('should verify example script file exists', async () => {
-      const exampleScriptPath = join(process.cwd(), 'examples', 'script-mode.ts');
+      const exampleScriptPath = join(__dirname, '..', '..', 'examples', 'script-mode.ts');
 
       // Verify the example file exists
       expect(existsSync(exampleScriptPath)).toBe(true);
