@@ -3,6 +3,12 @@
   "version": "0.0.1",
   "description": "Automated dependency update tool with Expo support, stacked PRs, and AI-powered changelogs",
   "type": "module",
+  "files": [
+    "dist",
+    "templates",
+    "README.md",
+    "CLAUDE.md"
+  ],
   "bin": {
     "dep-updater": "./dist/cli.js"
   },
@@ -68,6 +74,16 @@
         ],
         "options": {
           "command": "node dist/cli.js update-deps",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "generate-workflow": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "command": "node dist/cli.js generate-workflow",
           "cwd": "{projectRoot}"
         }
       }

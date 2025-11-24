@@ -174,6 +174,10 @@ export interface GenerateWorkflowOptions extends UpdateOptions {
   schedule?: string;
   /** Name of the workflow */
   workflowName?: string;
+  /** Authentication type: 'pat' or 'github-app' */
+  authType?: 'pat' | 'github-app';
+  /** Explicitly enable AI (overrides auto-detection) */
+  enableAI?: boolean;
 }
 
 /**
@@ -197,3 +201,21 @@ export type CommandExecutor = (
   args?: readonly string[],
   options?: Options,
 ) => Promise<ExecutorResult>;
+
+/**
+ * GitHub Pull Request information
+ */
+export interface GitHubPR {
+  /** PR number */
+  number: number;
+  /** PR title */
+  title: string;
+  /** Head branch name */
+  headRefName: string;
+  /** PR creation date */
+  createdAt: string;
+  /** PR URL */
+  url: string;
+  /** Whether the PR is mergeable (no conflicts) */
+  mergeable?: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+}
