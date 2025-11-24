@@ -3,6 +3,7 @@
  */
 
 import { execa as execaOriginal } from 'execa';
+import { GitHubCLIClient, type IGitHubClient } from '../auth/github-client.js';
 import type { DepUpdaterConfig } from '../config.js';
 import type { CommandExecutor, OpenPR } from '../types.js';
 
@@ -16,36 +17,22 @@ export async function getOpenUpdatePRs(
   repoRoot: string,
   branchPrefix: string,
   executor: CommandExecutor = defaultExecutor,
+  client?: IGitHubClient,
 ): Promise<OpenPR[]> {
   try {
-    // Use gh CLI to list PRs
-    const { stdout } = await executor(
-      'gh',
-      ['pr', 'list', '--json', 'number,title,headRefName,createdAt,url', '--state', 'open'],
-      { cwd: repoRoot },
-    );
+    // Use GitHub client if provided, otherwise fall back to CLI
+    const githubClient = client || new GitHubCLIClient(executor);
 
-    const rawData = JSON.parse(stdout);
-    if (!Array.isArray(rawData)) {
-      console.error('Invalid GitHub CLI response: expected array');
-      return [];
-    }
+    // Get all open PRs
+    const allPRs = await githubClient.listUpdatePRs(repoRoot);
 
-    const allPRs = rawData as Array<{
-      number: number;
-      title: string;
-      headRefName: string;
-      createdAt: string;
-      url: string;
-    }>;
-
-    // Filter to only update PRs matching our branch prefix
-    const updatePRs = allPRs.filter((pr) => pr.headRefName.startsWith(branchPrefix));
+    // Filter by branch prefix
+    const filteredPRs = allPRs.filter((pr) => pr.headRefName.startsWith(branchPrefix));
 
     // Check each PR for conflicts
     const prsWithConflicts = await Promise.all(
-      updatePRs.map(async (pr) => {
-        const hasConflicts = await checkPRConflicts(repoRoot, pr.number, executor);
+      filteredPRs.map(async (pr) => {
+        const hasConflicts = await checkPRConflicts(repoRoot, pr.number, executor, client);
         return {
           number: pr.number,
           title: pr.title,
@@ -74,14 +61,12 @@ export async function checkPRConflicts(
   repoRoot: string,
   prNumber: number,
   executor: CommandExecutor = defaultExecutor,
+  client?: IGitHubClient,
 ): Promise<boolean> {
   try {
-    const { stdout } = await executor('gh', ['pr', 'view', prNumber.toString(), '--json', 'mergeable'], {
-      cwd: repoRoot,
-    });
-
-    const data = JSON.parse(stdout) as { mergeable: string };
-    return data.mergeable === 'CONFLICTING';
+    // Use GitHub client if provided, otherwise fall back to CLI
+    const githubClient = client || new GitHubCLIClient(executor);
+    return await githubClient.checkPRConflicts(repoRoot, prNumber);
   } catch (error) {
     console.warn(`Failed to check PR #${prNumber} conflicts:`, error instanceof Error ? error.message : String(error));
     return false;
@@ -95,6 +80,7 @@ export async function determineBaseBranch(
   config: DepUpdaterConfig,
   repoRoot: string,
   executor: CommandExecutor = defaultExecutor,
+  client?: IGitHubClient,
 ): Promise<{ baseBranch: string; reason: string }> {
   const { prStrategy, git } = config;
   const mainBranch = git?.baseBranch || 'main';
@@ -107,7 +93,7 @@ export async function determineBaseBranch(
   }
 
   // Get open update PRs
-  const openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor);
+  const openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor, client);
 
   if (openPRs.length === 0) {
     return {
@@ -141,6 +127,7 @@ export async function autoCloseOldPRs(
   config: DepUpdaterConfig,
   repoRoot: string,
   executor: CommandExecutor = defaultExecutor,
+  client?: IGitHubClient,
 ): Promise<void> {
   const { prStrategy } = config;
 
@@ -148,11 +135,14 @@ export async function autoCloseOldPRs(
     return;
   }
 
-  const openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor);
+  const openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor, client);
 
   if (openPRs.length < prStrategy.maxStackDepth) {
     return;
   }
+
+  // Use GitHub client if provided, otherwise fall back to CLI
+  const githubClient = client || new GitHubCLIClient(executor);
 
   // Close oldest PRs beyond maxStackDepth
   const prsToClose = openPRs.slice(0, openPRs.length - prStrategy.maxStackDepth + 1);
@@ -161,11 +151,7 @@ export async function autoCloseOldPRs(
     try {
       config.logger?.info(`Closing old PR #${pr.number}: ${pr.title}`);
 
-      await executor(
-        'gh',
-        ['pr', 'close', pr.number.toString(), '--comment', 'Auto-closed: superseded by newer dependency updates'],
-        { cwd: repoRoot },
-      );
+      await githubClient.closePR(repoRoot, pr.number, 'Auto-closed: superseded by newer dependency updates');
 
       config.logger?.info(`✓ Closed PR #${pr.number}`);
     } catch (error) {
@@ -175,7 +161,7 @@ export async function autoCloseOldPRs(
 }
 
 /**
- * Create a new PR using gh CLI
+ * Create a new PR using GitHub client
  */
 export async function createPR(
   config: DepUpdaterConfig,
@@ -187,6 +173,7 @@ export async function createPR(
     headBranch: string;
   },
   executor: CommandExecutor = defaultExecutor,
+  client?: IGitHubClient,
 ): Promise<{ number: number; url: string }> {
   const { title, body, baseBranch, headBranch } = options;
 
@@ -194,20 +181,19 @@ export async function createPR(
     config.logger?.info(`Creating PR: ${title}`);
     config.logger?.info(`Base: ${baseBranch} ← Head: ${headBranch}`);
 
-    const { stdout } = await executor(
-      'gh',
-      ['pr', 'create', '--title', title, '--body', body, '--base', baseBranch, '--head', headBranch],
-      { cwd: repoRoot },
-    );
+    // Use GitHub client if provided, otherwise fall back to CLI
+    const githubClient = client || new GitHubCLIClient(executor);
 
-    // Extract PR URL from output
-    const url = stdout.trim();
-    const prNumberMatch = url.match(/\/pull\/(\d+)$/);
-    const number = prNumberMatch ? Number.parseInt(prNumberMatch[1], 10) : 0;
+    const result = await githubClient.createPR(repoRoot, {
+      title,
+      body,
+      head: headBranch,
+      base: baseBranch,
+    });
 
-    config.logger?.info(`✓ Created PR #${number}: ${url}`);
+    config.logger?.info(`✓ Created PR #${result.number}: ${result.url}`);
 
-    return { number, url };
+    return result;
   } catch (error) {
     throw new Error(`Failed to create PR: ${error}`);
   }
@@ -257,13 +243,14 @@ export async function createStackedPR(
     headBranch: string;
   },
   executor: CommandExecutor = defaultExecutor,
+  client?: IGitHubClient,
 ): Promise<{ number: number; url: string; baseBranch: string; reason: string }> {
   // Determine base branch
-  const { baseBranch, reason } = await determineBaseBranch(config, repoRoot, executor);
+  const { baseBranch, reason } = await determineBaseBranch(config, repoRoot, executor, client);
   config.logger?.info(`Base branch: ${baseBranch} (${reason})`);
 
   // Auto-close old PRs
-  await autoCloseOldPRs(config, repoRoot, executor);
+  await autoCloseOldPRs(config, repoRoot, executor, client);
 
   // Create PR
   const pr = await createPR(
@@ -274,6 +261,7 @@ export async function createStackedPR(
       baseBranch,
     },
     executor,
+    client,
   );
 
   return { ...pr, baseBranch, reason };
