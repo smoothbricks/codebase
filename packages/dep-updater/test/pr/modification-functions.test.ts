@@ -106,25 +106,24 @@ describe('createPR', () => {
     expect(result.number).toBe(789);
   });
 
-  test('should return 0 for number if URL does not match pattern', async () => {
+  test('should throw if URL does not match pattern', async () => {
     const spy = createExecaSpy({
       'gh pr create --title PR --body body --base main --head feature': 'https://github.com/owner/repo',
     });
 
-    const result = await createPR(
-      config,
-      '/repo',
-      {
-        title: 'PR',
-        body: 'body',
-        baseBranch: 'main',
-        headBranch: 'feature',
-      },
-      spy.mock,
-    );
-
-    expect(result.number).toBe(0);
-    expect(result.url).toBe('https://github.com/owner/repo');
+    await expect(
+      createPR(
+        config,
+        '/repo',
+        {
+          title: 'PR',
+          body: 'body',
+          baseBranch: 'main',
+          headBranch: 'feature',
+        },
+        spy.mock,
+      ),
+    ).rejects.toThrow('Failed to create PR');
   });
 
   test('should throw error on failure', async () => {
