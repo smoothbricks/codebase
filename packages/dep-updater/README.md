@@ -13,6 +13,47 @@ Automated dependency update tool with Expo SDK support, stacked PRs, and AI-powe
 - 📦 **Syncpack Integration**: Respects version constraints and regenerates config from Expo
 - ⚙️ **Highly Configurable**: Works with any project structure through flexible configuration
 
+## Getting Started
+
+**👉 New to dep-updater?** Start with the getting started guide:
+
+- **[Getting Started Guide](docs/GETTING-STARTED.md)** - Complete setup walkthrough
+  - **PAT authentication** - Simple 5-minute setup for small teams
+  - **GitHub App authentication** - Advanced 15-minute setup for organizations
+  - Choose the method that fits your needs
+
+**Interactive setup (recommended):**
+
+```bash
+# Interactive wizard guides you through setup
+npx @smoothbricks/dep-updater init
+
+# Choose PAT (simple) or GitHub App (advanced)
+# Generates config and workflow automatically
+```
+
+**Manual workflow generation:**
+
+```bash
+# Generate workflow with PAT authentication (default)
+npx @smoothbricks/dep-updater generate-workflow
+
+# Or with GitHub App authentication
+npx @smoothbricks/dep-updater generate-workflow --auth-type github-app
+
+# Validate GitHub App setup (if using GitHub App)
+npx @smoothbricks/dep-updater validate-setup
+```
+
+## Documentation
+
+📚 **Complete Guides:**
+
+- **[Getting Started Guide](./docs/GETTING-STARTED.md)** - Setup walkthrough (PAT or GitHub App)
+- **[Configuration Reference](./docs/CONFIGURATION.md)** - All configuration options and examples
+- **[API Reference](./docs/API.md)** - Programmatic usage and TypeScript types
+- **[Troubleshooting Guide](./docs/TROUBLESHOOTING.md)** - Common issues and solutions
+
 ## Prerequisites
 
 > **⚠️ Important:** This tool is designed for **Nx monorepos**. The generated GitHub Actions workflow uses Nx targets
@@ -50,8 +91,10 @@ gh auth status  # Verify GitHub authentication
 ## Installation
 
 ```bash
-bun add dep-updater
+bun add @smoothbricks/dep-updater
 ```
+
+> **Note:** Once installed globally or in your project, you can use the `dep-updater` command directly.
 
 ## Quick Start
 
@@ -96,8 +139,44 @@ Generates `.github/workflows/update-deps.yml` for automated daily dependency upd
 
 **Options:**
 
+- `--auth-type <type>`: Authentication type: `"pat"` or `"github-app"` (default: `"pat"`)
 - `--schedule <cron>`: Custom cron schedule (default: `0 2 * * *` - 2 AM UTC daily)
 - `--workflow-name <name>`: Custom workflow name (default: `Update Dependencies`)
+
+**Examples:**
+
+```bash
+# PAT authentication (default, simplest)
+dep-updater generate-workflow
+
+# GitHub App authentication (advanced)
+dep-updater generate-workflow --auth-type github-app
+
+# Enable AI changelog analysis
+dep-updater generate-workflow --enable-ai
+
+# Custom schedule with PAT
+dep-updater generate-workflow --schedule "0 3 * * 1" --workflow-name "Weekly Updates"
+```
+
+**Upgrading to AI:**
+
+If you initially set up without AI and want to add it later:
+
+```bash
+# 1. Add ANTHROPIC_API_KEY to your organization secrets
+gh secret set ANTHROPIC_API_KEY --org YOUR_ORG
+
+# 2. Regenerate workflow with AI support
+dep-updater generate-workflow --enable-ai --auth-type <your-auth-type>
+
+# 3. Commit and push
+git add .github/workflows/update-deps.yml
+git commit -m "chore: enable AI changelog analysis"
+git push
+```
+
+The `--enable-ai` flag explicitly requests the AI-enabled workflow template, regardless of your local configuration.
 
 ### Check for Expo SDK updates
 
@@ -141,368 +220,143 @@ dep-updater generate-syncpack --expo-sdk 52
 
 ## Configuration
 
-The tool uses sensible defaults and can be configured in three ways:
+The tool uses sensible defaults and can be configured using TypeScript or JSON config files in the `tooling/` directory.
 
-### Option 1: Declarative TypeScript Config (Recommended)
+### Quick Configuration
 
-Create `tooling/dep-updater.ts` for type-safe declarative configuration:
+Create `tooling/dep-updater.ts` or `tooling/dep-updater.json`:
 
 ```typescript
-import { defineConfig } from 'dep-updater';
+import { defineConfig } from '@smoothbricks/dep-updater';
 
 export default defineConfig({
-  // Expo SDK management (optional)
-  expo: {
-    enabled: true,
-    autoDetect: true, // Auto-detect all Expo projects in monorepo
-    // OR specify projects explicitly:
-    // projects: [
-    //   { name: 'mobile', packageJsonPath: './apps/mobile/package.json' },
-    //   { name: 'tablet', packageJsonPath: './apps/tablet/package.json' },
-    // ],
-  },
-
-  // Syncpack integration
-  syncpack: {
-    configPath: './.syncpackrc.json',
-    preserveCustomRules: true,
-    fixScriptName: 'syncpack:fix', // Customize your syncpack script name
-  },
-
-  // Nix ecosystem support (optional, disabled by default)
-  nix: {
-    enabled: false, // Set to true to enable Nix updates
-    devenvPath: './tooling/direnv',
-    nixpkgsOverlayPath: './tooling/direnv/nixpkgs-overlay',
-  },
-
-  // Stacked PR strategy
-  prStrategy: {
-    stackingEnabled: true,
-    maxStackDepth: 5,
-    autoCloseOldPRs: true,
-    resetOnMerge: true,
-    stopOnConflicts: true,
-    branchPrefix: 'chore/update-deps',
-    prTitlePrefix: 'chore: update dependencies',
-  },
-
-  // Auto-merge configuration
-  autoMerge: {
-    enabled: false,
-    mode: 'none', // 'none' | 'patch' | 'minor'
-    requireTests: true,
-  },
-
-  // AI-powered changelog analysis
-  ai: {
-    provider: 'anthropic',
-    model: 'claude-sonnet-4-5-20250929',
-  },
-
-  // Git configuration
-  git: {
-    remote: 'origin',
-    baseBranch: 'main',
-  },
+  expo: { enabled: true, autoDetect: true },
+  prStrategy: { stackingEnabled: true, maxStackDepth: 5 },
+  ai: { provider: 'anthropic' },
 });
 ```
 
-### Option 2: JSON Config (Simple)
+### Interactive Setup
 
-Create `tooling/dep-updater.json` for simple, declarative configuration:
+The easiest way to configure is using the interactive wizard:
 
-```json
-{
-  "expo": {
-    "enabled": true,
-    "autoDetect": true,
-    "projects": []
-  },
-  "nix": {
-    "enabled": false,
-    "devenvPath": "./tooling/direnv",
-    "nixpkgsOverlayPath": "./tooling/direnv/nixpkgs-overlay"
-  },
-  "prStrategy": {
-    "stackingEnabled": true,
-    "maxStackDepth": 5,
-    "autoCloseOldPRs": true,
-    "resetOnMerge": true,
-    "stopOnConflicts": true,
-    "branchPrefix": "chore/update-deps",
-    "prTitlePrefix": "chore: update dependencies"
-  },
-  "ai": {
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-5-20250929"
-  }
-}
+```bash
+dep-updater init
 ```
 
-### Option 3: Script Mode (Advanced)
-
-For complete control over the update process, export a function instead of a configuration object:
-
-```typescript
-// tooling/dep-updater.ts
-import { updateBunDependencies, loadConfig } from 'dep-updater';
-
-export default async function () {
-  console.log('🚀 Running custom update script...\n');
-
-  // Load config for settings
-  const config = await loadConfig();
-
-  // Run bun updater to detect available updates
-  const result = await updateBunDependencies(config.repoRoot || process.cwd());
-
-  if (result.updates.length === 0) {
-    console.log('✓ No updates available');
-    return;
-  }
-
-  console.log(`Found ${result.updates.length} updates:\n`);
-
-  // Custom logic: Filter updates
-  const filtered = result.updates.filter((update) => {
-    // Skip React 19.x
-    if (update.name === 'react' && update.toVersion.startsWith('19')) {
-      console.log(`⏭️  Skipping ${update.name} ${update.toVersion} (React 19 not ready)`);
-      return false;
-    }
-
-    // Skip major version bumps for specific packages
-    if (update.updateType === 'major' && ['typescript', 'eslint'].includes(update.name)) {
-      console.log(`⏭️  Skipping major update for ${update.name} (needs manual review)`);
-      return false;
-    }
-
-    return true;
-  });
-
-  console.log(`\n${filtered.length} updates after filtering:\n`);
-  for (const update of filtered) {
-    console.log(`  • ${update.name}: ${update.fromVersion} → ${update.toVersion} (${update.updateType})`);
-  }
-
-  // Apply updates, create commits, generate PRs, etc.
-  // You have full control over the workflow!
-}
-```
-
-**When to use script mode:**
-
-- Need custom filtering logic for specific packages
-- Want to implement custom update strategies
-- Need to integrate with other tools or APIs
-- Require workflow customization beyond config options
-
-See `examples/script-mode.ts` for a complete example.
-
-**Config File Priority:**
-
-1. `tooling/dep-updater.ts` - If exports a function, runs in script mode. If exports an object, uses as declarative
-   config.
-2. `tooling/dep-updater.json` - Always used as declarative config
-
-The tool searches for config files in the current directory and parent directories up to 10 levels.
+This will auto-detect your project setup and generate the appropriate config file.
 
 ### Configuration Options
 
-#### Expo (`expo`)
+Key configuration sections:
 
-- `enabled`: Enable Expo SDK updates
-- `autoDetect`: Auto-detect Expo projects by scanning workspace packages (default: `true`)
-- `projects`: Explicit list of Expo projects (array of `{ name?: string, packageJsonPath: string }`)
+- **Expo**: SDK management and multi-project support
+- **Syncpack**: Version constraint management and custom rules
+- **Nix**: devenv and nixpkgs overlay updates (optional)
+- **PR Strategy**: Stacking, auto-close, conflict handling
+- **AI**: Changelog analysis with Claude
+- **Git**: Remote and base branch settings
 
-**Multi-Project Example:**
-
-```typescript
-expo: {
-  enabled: true,
-  projects: [
-    { name: 'customer-app', packageJsonPath: './apps/customer/package.json' },
-    { name: 'driver-app', packageJsonPath: './apps/driver/package.json' },
-  ],
-}
-```
-
-**Auto-Detection Example:**
-
-```typescript
-expo: {
-  enabled: true,
-  autoDetect: true, // Scans workspace for packages with "expo" dependency
-}
-```
-
-#### Syncpack (`syncpack`)
-
-- `configPath`: Path to .syncpackrc.json
-- `preserveCustomRules`: Preserve custom rules when regenerating from Expo (default: `true`)
-- `fixScriptName`: Script name to run syncpack fix (default: `'syncpack:fix'`)
-
-**Adding Custom Syncpack Rules:**
-
-The tool generates Expo-related syncpack rules automatically, but you can add your own custom rules by editing
-`.syncpackrc.json` directly:
-
-1. **Generate initial config**: Run `dep-updater generate-syncpack --expo-sdk 52` to create `.syncpackrc.json` with Expo
-   rules
-2. **Add your custom rules**: Edit `.syncpackrc.json` and add your own version groups:
-   ```json
-   {
-     "versionGroups": [
-       {
-         "label": "Pin lodash to 4.17.21",
-         "dependencies": ["lodash"],
-         "pinVersion": "4.17.21"
-       },
-       {
-         "label": "Keep TypeScript on 5.x",
-         "dependencies": ["typescript"],
-         "packages": ["**"],
-         "policy": "sameRange",
-         "dependencyTypes": ["prod", "dev"]
-       }
-     ]
-   }
-   ```
-3. **Enable preservation**: Set `preserveCustomRules: true` in your dep-updater config
-4. **Regenerate safely**: When the tool regenerates the config, it will filter out rules that match ANY of these
-   conditions:
-   - Label contains "Expo SDK"
-   - Label contains "workspace protocol"
-   - Dependencies include `react`, `react-native`, or `expo`
-
-   All other custom rules (like the lodash rule above) are preserved and merged with new generated Expo rules.
-
-This keeps a clean separation: dep-updater manages Expo SDK rules, you manage project-specific rules in the syncpack
-config where they belong.
-
-#### Nix (`nix`) - Optional
-
-- `enabled`: Enable Nix ecosystem updates (default: `false`)
-- `devenvPath`: Path to devenv directory
-- `nixpkgsOverlayPath`: Path to nixpkgs overlay directory
-
-#### PR Strategy (`prStrategy`)
-
-- `stackingEnabled`: Enable PR stacking
-- `maxStackDepth`: Maximum number of stacked PRs
-- `autoCloseOldPRs`: Auto-close PRs older than maxStackDepth
-- `resetOnMerge`: Reset stack after any PR is merged
-- `stopOnConflicts`: Don't create new PR if base has conflicts
-- `branchPrefix`: Branch name prefix
-- `prTitlePrefix`: PR title prefix
-
-#### Auto-merge (`autoMerge`)
-
-> ⚠️ **Note**: Auto-merge feature is planned but not yet implemented. Configuration is reserved for future use.
-
-- `enabled`: Enable auto-merge functionality
-- `mode`: Auto-merge mode (`'none'` | `'patch'` | `'minor'`)
-- `requireTests`: Require tests to pass before auto-merge
-
-#### AI (`ai`)
-
-- `provider`: AI provider (currently only `'anthropic'`)
-- `model`: Model to use for changelog analysis
-
-#### Git (`git`)
-
-- `remote`: Remote name (default: `'origin'`)
-- `baseBranch`: Base branch (default: `'main'`)
+📖 **See [Configuration Reference](./docs/CONFIGURATION.md) for complete documentation and examples.**
 
 ## Environment Variables
 
-- `ANTHROPIC_API_KEY`: Required for AI-powered changelog analysis
-- `GH_TOKEN` or `GH_PAT`: GitHub token for creating PRs (required in CI)
+### Required (in GitHub Actions)
+
+**For PAT authentication:**
+
+- `GH_TOKEN`: Set to `${{ secrets.DEP_UPDATER_TOKEN }}` (your Personal Access Token)
+
+**For GitHub App authentication:**
+
+- `DEP_UPDATER_APP_ID`: GitHub App ID (from app settings)
+- `DEP_UPDATER_APP_PRIVATE_KEY`: GitHub App private key (PEM format)
+- `GH_TOKEN`: Auto-generated by `actions/create-github-app-token@v2` action
+
+### Optional
+
+- `ANTHROPIC_API_KEY`: Required for AI-powered changelog analysis (both auth methods)
 
 ## GitHub Actions Setup
 
-To run dep-updater automatically on a schedule, use the workflow generator:
+dep-updater supports two authentication methods for GitHub Actions:
 
-```bash
-dep-updater generate-workflow
-```
+### Option 1: Personal Access Token (PAT) - Simple & Fast
 
-This creates `.github/workflows/update-deps.yml` that runs daily at 2 AM UTC.
+**Best for:** Small teams, quick setup, getting started
 
-**How it works:**
+**Setup time:** ~5 minutes
 
-- The workflow uses `nx run @smoothbricks/dep-updater:update-deps` to execute the tool
+**Quick steps:**
+
+1. Generate PAT: https://github.com/settings/tokens/new (scope: `repo`)
+2. Add to org secrets: `gh secret set DEP_UPDATER_TOKEN --org YOUR_ORG`
+3. Generate workflow: `dep-updater generate-workflow`
+4. Commit and push
+
+**📖 Full guide:** [Getting Started Guide → PAT Setup](docs/GETTING-STARTED.md#option-a-pat-setup-5-minutes)
+
+**Limitations:**
+
+- 5,000 requests/hour rate limit (vs 15,000 for GitHub App)
+- PRs don't trigger CI workflows automatically (requires manual trigger)
+- Token needs renewal every 90 days
+
+### Option 2: GitHub App - Production Ready
+
+**Best for:** Organizations with many repos, higher volume, production use
+
+**Setup time:** ~15-20 minutes (one-time per organization)
+
+**Quick steps:**
+
+1. Create GitHub App for your organization
+2. Install app to your repositories
+3. Configure organization secrets (`DEP_UPDATER_APP_ID`, `DEP_UPDATER_APP_PRIVATE_KEY`)
+4. Generate workflow: `dep-updater generate-workflow --auth-type github-app`
+5. Validate: `dep-updater validate-setup`
+6. Commit and push
+
+**📖 Full guide:**
+[Getting Started Guide → GitHub App Setup](docs/GETTING-STARTED.md#option-b-github-app-setup-15-20-minutes)
+
+**Benefits:**
+
+- ✅ **Better rate limits:** 15,000 requests/hour vs 5,000 for PATs
+- ✅ **Triggers CI workflows:** PRs properly trigger `pull_request` workflows
+- ✅ **Auto-expiring tokens:** 1-hour expiration for better security
+- ✅ **Organization-scoped:** Setup once, all repos inherit
+- ✅ **No token renewal:** Tokens auto-refresh, no 90-day expiration
+
+### Comparison Table
+
+| Feature            | PAT                        | GitHub App             |
+| ------------------ | -------------------------- | ---------------------- |
+| **Setup time**     | 5 minutes                  | 15-20 minutes          |
+| **Rate limit**     | 5,000 req/hour             | 15,000 req/hour        |
+| **Triggers CI**    | No (manual trigger needed) | Yes                    |
+| **Token lifetime** | 90 days (renewable)        | 1 hour (auto-renewed)  |
+| **Best for**       | Small teams, quick start   | Large orgs, production |
+
+### How it works
+
+- Workflow uses `nx run @smoothbricks/dep-updater:update-deps` to execute the tool
 - Nx automatically builds the package if needed (with `dependsOn: ["build"]`)
 - Build results are cached by Nx for faster subsequent runs
-- This approach leverages Nx's task orchestration and computation caching
-
-### Authentication Setup
-
-GitHub Actions requires a fine-grained Personal Access Token (PAT) to create pull requests:
-
-1. **Create fine-grained PAT:**
-   - Go to https://github.com/settings/tokens?type=beta
-   - Click "Generate new token"
-   - Set token name (e.g., "dep-updater")
-   - Set expiration (max 1 year)
-   - Select repository access (this repo or specific repos)
-   - Set permissions:
-     - **Contents:** Read and write
-     - **Pull requests:** Read and write
-     - **Workflows:** Read and write
-   - Generate and copy token
-
-2. **Add as repository secret:**
-   - Go to repository **Settings → Secrets and variables → Actions**
-   - Click "New repository secret"
-   - Name: `GH_PAT`
-   - Value: paste your token
-   - Click "Add secret"
-
-3. **(Optional) Add ANTHROPIC_API_KEY for AI analysis:**
-   - Same steps as above
-   - Name: `ANTHROPIC_API_KEY`
-   - Value: your Anthropic API key
-
-### Why fine-grained PAT?
-
-- ✅ Triggers CI workflows automatically (GITHUB_TOKEN doesn't)
-- ✅ Repository-specific permissions (better security)
-- ✅ Granular access control
-- ℹ️ Must be regenerated annually
-
-> **Note:** GitHub App authentication support is planned for production use (not user-dependent).
+- Leverages Nx's task orchestration and computation caching
 
 ## Programmatic Usage
 
-You can also use the package programmatically in your own scripts:
+You can use the package programmatically in your own scripts and tools:
 
 ```typescript
-import { updateDeps, loadConfig, mergeConfig } from 'dep-updater';
+import { updateDeps, loadConfig, mergeConfig } from '@smoothbricks/dep-updater';
 
-// Load default config
-const baseConfig = await loadConfig();
-
-// Customize for your project
-const config = mergeConfig({
-  nix: {
-    enabled: true, // Enable Nix updates
-    devenvPath: './nix',
-    nixpkgsOverlayPath: './nix/overlay',
-  },
-  syncpack: {
-    fixScriptName: 'fix:versions', // Custom script name
-  },
-});
-
-// Run updates
-await updateDeps(config, {
-  dryRun: false,
-  skipGit: false,
-  skipAI: false,
-});
+const config = await loadConfig();
+await updateDeps(config, { dryRun: false });
 ```
+
+📖 **See [API Reference](./docs/API.md) for complete API documentation, TypeScript types, and advanced examples.**
 
 ## Development
 
@@ -525,7 +379,7 @@ bun run src/cli.ts check-expo --dry-run
 
 ## Testing
 
-The project has comprehensive test coverage (318 tests):
+The project has comprehensive test coverage (415 tests):
 
 - **Git operations** (86 tests) - All git commands with dependency injection
 - **PR Stacking** (47 tests) - PR creation, stacking, conflict handling, auto-close
