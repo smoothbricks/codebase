@@ -1,0 +1,48 @@
+# Automated dependency updates with dep-updater
+#
+# Authentication: Personal Access Token{{AI_HEADER_SUFFIX}}
+#
+# Setup (5 minutes):
+#   1. Generate PAT at https://github.com/settings/tokens/new (scope: repo){{AI_SETUP_STEP}}
+#   {{STEP_SECRETS}}. Add organization secret{{AI_SECRETS_PLURAL}}:
+#      gh secret set DEP_UPDATER_TOKEN --org YOUR_ORG{{AI_SECRET_COMMAND}}
+#   {{STEP_COPY}}. Copy this file to .github/workflows/update-deps.yml
+#   {{STEP_COMMIT}}. Commit and push
+#
+# 📖 Quick Start: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/QUICK-START.md
+
+name: Update Dependencies
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  update-deps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for git operations
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Run dep-updater{{AI_STEP_SUFFIX}}
+        env:
+          GH_TOKEN: ${{ secrets.DEP_UPDATER_TOKEN }} # Personal Access Token{{AI_ENV_VAR}}
+        run: nx run @smoothbricks/dep-updater:update-deps

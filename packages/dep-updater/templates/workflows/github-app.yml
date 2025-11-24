@@ -1,0 +1,57 @@
+# Automated dependency updates with dep-updater
+#
+# Authentication: GitHub App{{AI_HEADER_SUFFIX}}
+#
+# Setup (15 minutes):
+#   1. Create GitHub App for your organization
+#   2. Install app to this repository{{AI_SETUP_STEP}}
+#   {{STEP_VAR}}. Add organization variable: DEP_UPDATER_APP_ID
+#   {{STEP_SECRETS}}. Add organization secret{{AI_SECRETS_PLURAL}}:
+#      - DEP_UPDATER_APP_PRIVATE_KEY{{AI_SECRET_LIST}}
+#   {{STEP_COPY}}. Copy this file to .github/workflows/update-deps.yml
+#   {{STEP_VALIDATE}}. Validate: npx @smoothbricks/dep-updater validate-setup
+#
+# 📖 Detailed setup guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/SETUP.md
+
+name: Update Dependencies
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggers
+
+jobs:
+  update-deps:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for git operations
+
+      - name: Generate GitHub App token
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.DEP_UPDATER_APP_ID }}
+          private-key: ${{ secrets.DEP_UPDATER_APP_PRIVATE_KEY }}
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Run dep-updater{{AI_STEP_SUFFIX}}
+        env:
+          GH_TOKEN: ${{ steps.app-token.outputs.token }} # GitHub App token{{AI_ENV_VAR}}
+        run: nx run @smoothbricks/dep-updater:update-deps
