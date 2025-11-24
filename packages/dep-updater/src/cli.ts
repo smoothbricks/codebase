@@ -111,17 +111,28 @@ program
 program
   .command('generate-workflow')
   .description('Generate GitHub Actions workflow for automated dependency updates')
+  .option('--auth-type <type>', 'Authentication type: "pat" or "github-app" (default: "pat")')
   .option('--schedule <cron>', 'Cron schedule for workflow (default: "0 2 * * *")')
   .option('--workflow-name <name>', 'Name of the workflow (default: "Update Dependencies")')
+  .option('--enable-ai', 'Enable AI changelog analysis (overrides auto-detection)')
   .action(async (options) => {
     const config = await setupConfig();
 
     const { generateWorkflow } = await import('./commands/generate-workflow.js');
 
+    // Validate auth type
+    const authType = options.authType?.toLowerCase();
+    if (authType && authType !== 'pat' && authType !== 'github-app') {
+      console.error('Error: --auth-type must be either "pat" or "github-app"');
+      process.exit(1);
+    }
+
     await generateWorkflow(config, {
       ...getUpdateOptions(),
+      authType: (authType as 'pat' | 'github-app') || 'pat',
       schedule: options.schedule,
       workflowName: options.workflowName,
+      enableAI: options.enableAi, // Note: commander converts --enable-ai to enableAi
     });
   });
 
@@ -142,6 +153,22 @@ program
       ...getUpdateOptions(),
       yes: options.yes,
     });
+  });
+
+/**
+ * Command: validate-setup
+ * Validate dep-updater setup (GitHub CLI, auth, app installation, permissions)
+ */
+program
+  .command('validate-setup')
+  .description('Validate dep-updater setup and configuration')
+  .action(async () => {
+    const logger = new ConsoleLogger(program.opts().verbose ? LogLevel.DEBUG : LogLevel.INFO);
+
+    const { validateSetup } = await import('./commands/validate-setup.js');
+
+    const exitCode = await validateSetup(logger);
+    process.exit(exitCode);
   });
 
 // Parse arguments and run
