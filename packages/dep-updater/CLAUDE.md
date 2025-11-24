@@ -46,17 +46,20 @@ src/
 │   ├── update-deps.ts     # Main dependency update command (refactored into 5 focused functions)
 │   ├── update-expo.ts     # Expo SDK update command
 │   ├── init.ts            # Interactive setup wizard (refactored, 195 lines)
-│   ├── generate-workflow.ts # GitHub Actions workflow generator
-│   └── generate-syncpack.ts
+│   ├── generate-workflow.ts # GitHub Actions workflow generator (with enhanced comments)
+│   ├── generate-syncpack.ts
+│   └── validate-setup.ts  # Setup validation command (checks GitHub CLI, auth, app installation)
+├── auth/                  # GitHub authentication
+│   └── github-client.ts   # GitHub CLI client for PR operations
 ├── pr/
 │   └── stacking.ts        # PR stacking algorithm (all functions accept executor param for testing)
 ├── changelog/
 │   ├── fetcher.ts         # Fetch changelogs from npm/GitHub
 │   └── analyzer.ts        # AI-powered changelog analysis
 ├── updaters/              # Ecosystem-specific updaters
-│   ├── bun.ts
-│   ├── devenv.ts
-│   └── nixpkgs.ts
+│   ├── bun.ts             # npm package updates via Bun
+│   ├── devenv.ts          # Nix devenv updates (devenv.yaml, devenv.lock)
+│   └── nixpkgs.ts         # nvfetcher overlay updates (parses generated.json)
 ├── expo/
 │   ├── sdk-checker.ts     # Check Expo SDK versions
 │   └── versions-fetcher.ts
@@ -67,6 +70,8 @@ src/
     └── project-detection.ts    # Project setup detection (package manager, Expo, Nix, syncpack)
 
 test/                      # Mirrors src/ structure
+├── auth/                  # GitHub client tests (20 tests - COMPLETE)
+│   └── github-client.test.ts          # GitHubCLIClient unit tests (20 tests)
 ├── git/                   # Git operation tests (86 tests - COMPLETE)
 │   ├── query-functions.test.ts        # Read-only operations (41 tests)
 │   ├── modification-functions.test.ts # State-changing operations (31 tests)
@@ -90,6 +95,144 @@ test/                      # Mirrors src/ structure
 └── helpers/
     └── mock-execa.ts      # Test utilities for mocking command execution
 ```
+
+## Setup and Validation
+
+### Comprehensive Setup Documentation
+
+**File: `docs/GETTING-STARTED.md`** - Complete setup guide covering both authentication methods:
+
+- **PAT Setup**: 5-minute simple setup for small teams
+- **GitHub App Setup**: 15-minute organization-level setup with validation
+- Creating GitHub App with correct permissions
+- Installing app to organization
+- Configuring organization-level secrets (reusable across all repos)
+- Testing and troubleshooting
+- Security best practices
+
+**Why organization-level setup:**
+
+- Single setup for entire organization (PAT or GitHub App)
+- All repos inherit credentials automatically
+- Easy to manage and rotate keys
+- No per-repo configuration needed
+
+### Setup Validation Command
+
+**File: `src/commands/validate-setup.ts`**
+
+New `validate-setup` command checks entire setup:
+
+- ✓ GitHub CLI is installed
+- ✓ GitHub CLI is authenticated
+- ✓ GitHub App is installed on repository
+- ✓ App has required permissions (contents:write, pull-requests:write)
+- ✓ Can generate GitHub App tokens
+- ✓ Config file is valid
+
+Returns exit code 0 if all checks pass, 1 if any fail. Provides actionable error messages and links to documentation.
+
+**Usage:**
+
+```bash
+dep-updater validate-setup
+```
+
+**Integration:**
+
+- CLI command via `cli.ts`
+- Exported from package for programmatic use
+- Referenced in setup guide and workflow generator output
+
+## GitHub Authentication Architecture
+
+### Current Implementation: gh CLI Only
+
+All GitHub operations (creating PRs, listing PRs, checking conflicts, closing PRs) use the **GitHub CLI (`gh`)**
+exclusively. No Octokit SDK is used.
+
+**How it works:**
+
+1. GitHub Actions workflow generates a token using `actions/create-github-app-token@v2`
+2. Token is passed as `GH_TOKEN` environment variable
+3. `gh` CLI automatically uses `GH_TOKEN` for authentication
+4. All operations go through `GitHubCLIClient` class
+
+**File: `src/auth/github-client.ts`**
+
+- `IGitHubClient` interface - Defines PR operations
+- `GitHubCLIClient` class - Implements all operations via `gh` CLI commands
+- Uses dependency injection pattern for testing
+- **Enhanced error handling** - Wraps GitHub CLI errors with helpful troubleshooting information
+
+**Error Enhancement:** All methods now catch errors and enhance them with:
+
+- Detection of common error patterns (401, 404, 403)
+- Actionable troubleshooting steps specific to the error type
+- Links to setup documentation
+- Reminder to run `validate-setup` command
+
+Example enhanced error:
+
+```
+Failed to create PR: HTTP 401: Unauthorized
+
+Troubleshooting:
+  • Check that DEP_UPDATER_APP_ID is set correctly
+  • Check that DEP_UPDATER_APP_PRIVATE_KEY contains valid PEM content
+  • Verify GitHub App is installed on this repository
+  • Ensure App has required permissions (contents:write, pull-requests:write)
+
+📖 Setup guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/GETTING-STARTED.md
+🔍 Run: dep-updater validate-setup
+```
+
+**Why gh CLI instead of Octokit?**
+
+✅ **Simpler implementation:**
+
+- No token management or refresh logic needed
+- No rate limit tracking required
+- GitHub Actions handles token generation
+
+✅ **Leverage existing tools:**
+
+- `gh` CLI already installed in GitHub Actions
+- Well-tested, production-ready tool
+- Consistent with manual workflows
+
+✅ **Better for CI:**
+
+- Token generation handled by official GitHub action
+- Auto-expiring tokens (1 hour)
+- No credential storage needed
+
+❌ **Trade-offs:**
+
+- Requires `gh` CLI to be installed
+- JSON parsing needed for output
+- Less control over API requests
+
+### Future Extensibility
+
+The `IGitHubClient` interface allows for future Octokit implementation if needed:
+
+```typescript
+export interface IGitHubClient {
+  listUpdatePRs(repoRoot: string): Promise<GitHubPR[]>;
+  checkPRConflicts(repoRoot: string, prNumber: number): Promise<boolean>;
+  createPR(repoRoot: string, options: {...}): Promise<{number, url}>;
+  closePR(repoRoot: string, prNumber: number, comment: string): Promise<void>;
+}
+```
+
+**When might Octokit be needed?**
+
+- Running outside GitHub Actions (local development, other CI)
+- Need for more granular API control
+- Rate limit optimization with caching
+
+**Current decision:** Keep it simple - gh CLI meets all current needs.
 
 ## Testing Strategy
 
@@ -294,39 +437,261 @@ Located in `src/pr/stacking.ts` (274 lines, **FULLY TESTED** - 47 tests):
 - Extracted `src/utils/project-detection.ts` - Project setup detection logic
 - Core init logic remains focused on workflow orchestration
 
+## Pending Architecture Decisions
+
+These features require deeper architectural decisions and are documented for future implementation:
+
+### 1. Smart Nixpkgs Detection
+
+**Current Implementation:** Uses nvfetcher's `_sources/generated.json` output
+
+- Parses JSON file generated by nvfetcher
+- Avoids fragile Nix expression parsing
+- Fast and reliable
+- Only supports GitHub sources (nvfetcher limitation)
+
+**Problem:** Nixpkgs updates daily with commit hash changes, but actual package versions may not change. This could
+create unnecessary daily PRs.
+
+**Potential Approaches:**
+
+- **Config-based**: User lists packages to track in config (`trackedPackages: ['nodejs_22', 'bun']`)
+  - Pros: Fast, reliable, user has full control
+  - Cons: Manual maintenance required
+- **Time-based heuristic**: Only report updates if >7 days since last nixpkgs update
+  - Pros: Simple, no parsing/queries needed
+  - Cons: May miss urgent security updates
+- **Commit message parsing**: Parse nixpkgs commit messages for package name mentions
+  - Pros: No nix eval queries, reasonably accurate
+  - Cons: Requires git history access, may have false positives/negatives
+
+**Current Behavior:** Simple hash comparison - reports all nixpkgs hash changes
+
+**Why Not Implemented:** Initial approach (parsing devenv.nix + querying package versions via `nix eval`) had
+fundamental issues:
+
+- Fragile regex parsing of Nix syntax
+- 10s timeouts per package query (performance impact)
+- False positives from transient query failures
+- Only supports GitHub sources
+
+### 2. Expo SDK Detection via @expo/cli
+
+**Current:** Uses `expo-constants` package dependency to detect Expo projects
+
+**Proposed:** Use `@expo/cli` package instead, which may be more reliable
+
+**Decision Needed:** Validate if `@expo/cli` is a better indicator of Expo projects than `expo-constants`
+
+### 3. OpenCode SDK Integration
+
+**Context:** OpenCode SDK provides a programmatic API for fetching package changelogs, release notes, and dependency
+information. It could potentially replace or supplement the current changelog fetching logic.
+
+**Current Implementation:**
+
+- Uses `npm view` command to fetch package metadata
+- Scrapes GitHub releases API for changelog information
+- Manual parsing of changelog formats
+- No structured API, relies on convention
+
+**Potential Benefits of OpenCode SDK:**
+
+- Structured API for changelog/release data
+- Better reliability than scraping
+- May have pre-processed changelog summaries
+- Could reduce rate limiting issues with GitHub API
+
+**Trade-offs:**
+
+- Additional dependency
+- Requires API key (?)
+- May not cover all packages/ecosystems
+- Need to validate coverage and data quality
+
+**Decision Needed:**
+
+1. Evaluate OpenCode SDK capabilities and coverage
+2. Compare reliability vs current implementation
+3. Assess if benefits justify additional dependency
+4. Determine if it should replace or supplement current fetcher
+
 ## GitHub Actions Integration
 
 ### Workflow Generator (`src/commands/generate-workflow.ts`)
 
 **Purpose:** Generate `.github/workflows/update-deps.yml` for automated dependency updates.
 
+**Supports Two Authentication Methods:**
+
+The workflow generator creates different workflow templates based on the `--auth-type` flag:
+
+1. **PAT (Personal Access Token)** - Default, simple setup
+   - Template: `templates/workflows/pat.yml`
+   - Setup time: ~5 minutes
+   - Best for: Small teams, quick start
+
+2. **GitHub App** - Advanced, production-ready
+   - Template: `templates/workflows/github-app.yml`
+   - Setup time: ~15-20 minutes
+   - Best for: Organizations, high volume
+
+**Template Processing System:**
+
+Templates use placeholder substitution for flexibility. There are only 2 template files, and AI features are
+enabled/disabled through placeholder replacement:
+
+- **Template files:**
+  - `templates/workflows/pat.yml` - PAT authentication template
+  - `templates/workflows/github-app.yml` - GitHub App authentication template
+
+- **Placeholders:**
+  - AI-related: `{{AI_HEADER_SUFFIX}}`, `{{AI_SETUP_STEP}}`, `{{AI_ENV_VAR}}`, `{{AI_STEP_SUFFIX}}`, etc.
+  - Step numbering: `{{STEP_VAR}}`, `{{STEP_SECRETS}}`, `{{STEP_COPY}}`, `{{STEP_COMMIT}}`, `{{STEP_VALIDATE}}`
+
+- **Constants for type safety:**
+  - `AUTH_TYPES` - Authentication type literals ('pat' | 'github-app')
+  - `PLACEHOLDERS` - Template placeholder strings (compile-time typo checking)
+  - `EXTERNAL_URLS` - External service URLs (centralized URL management)
+
+- **Validation:**
+  - `validateTemplateProcessing()` ensures all placeholders are replaced
+  - YAML syntax validated with `parseYaml()` before writing file
+  - Throws descriptive errors if validation fails
+
 **Key Features:**
 
 - Uses Nx target for CLI execution (automatic builds + caching)
 - Configures git user for commits (github-actions[bot])
-- Uses fine-grained PAT for PR creation
+- Template-based workflow generation with placeholder substitution
 - Supports Nx computation caching for faster CI runs
+- **Enhanced workflow comments** - Generated workflows include:
+  - Setup checklist at top of file
+  - Link to appropriate setup documentation (GETTING-STARTED.md)
+  - Inline comments explaining each step and configuration
+  - Clear explanation of authentication method
 
-**Authentication:** Fine-grained Personal Access Token (GH_PAT)
+**Template Selection Logic:**
 
-**Why PAT instead of GITHUB_TOKEN?**
+```typescript
+const templateName = authType === AUTH_TYPES.PAT ? 'pat.yml' : 'github-app.yml';
+// AI features toggled via placeholder substitution in processTemplate()
+```
 
-- GITHUB_TOKEN doesn't trigger `pull_request` workflows (by design)
-- Fine-grained PAT has repository-specific permissions (better security)
-- Triggers CI/checks automatically when PR is created
+**Console Output:**
 
-**Workflow Steps:**
+- Shows different next steps based on selected auth type
+- Links to appropriate documentation (GETTING-STARTED.md)
+- PAT: Shows how to generate token and add to secrets
+- GitHub App: Shows validation command and setup guide link
+
+**CLI Usage:**
+
+```bash
+# Generate with PAT authentication (default)
+dep-updater generate-workflow
+
+# Generate with GitHub App authentication
+dep-updater generate-workflow --auth-type github-app
+
+# Enable AI changelog analysis (explicit override)
+dep-updater generate-workflow --enable-ai
+
+# Custom schedule with GitHub App
+dep-updater generate-workflow --auth-type github-app --schedule "0 3 * * 1"
+```
+
+**AI Template Selection Logic:**
+
+```typescript
+// Auto-detect: checks config OR environment variable
+const hasAIConfigured = config.ai?.apiKey !== undefined || process.env.ANTHROPIC_API_KEY !== undefined;
+
+// Priority: explicit flag > skipAI flag > auto-detection
+const useAI = options.enableAI ? true : options.skipAI ? false : hasAIConfigured;
+```
+
+This allows users to:
+
+- Add AI later without updating local config (just set env var or use `--enable-ai`)
+- Explicitly disable AI even if configured (use `--skip-ai`)
+- Auto-detect based on configuration or environment
+
+**Upgrading to AI:**
+
+Users who initially set up without AI can easily upgrade:
+
+```bash
+# 1. Add ANTHROPIC_API_KEY to organization secrets
+gh secret set ANTHROPIC_API_KEY --org YOUR_ORG
+
+# 2. Regenerate workflow (remembering their auth type)
+dep-updater generate-workflow --enable-ai --auth-type pat  # or github-app
+
+# 3. Commit and push
+```
+
+The `--enable-ai` flag explicitly requests the AI template regardless of local config.
+
+### Authentication Method Comparison
+
+**Personal Access Token (PAT):**
+
+- ✅ Simple 5-minute setup
+- ✅ One token works for all repos in org
+- ✅ No app creation needed
+- ⚠️ 5,000 requests/hour rate limit
+- ⚠️ PRs don't trigger CI workflows automatically
+- ⚠️ 90-day token expiration (needs renewal)
+
+**GitHub App:**
+
+- ✅ Higher rate limits (15,000 requests/hour)
+- ✅ PRs trigger CI workflows properly
+- ✅ Auto-expiring tokens (1-hour, auto-renewed)
+- ✅ Organization-scoped credentials
+- ⚠️ 15-20 minute setup (one-time per org)
+- ⚠️ Requires app creation and installation
+
+**Workflow Steps (PAT):**
 
 1. Checkout repo with full history (`fetch-depth: 0`)
 2. Setup Bun
 3. Install dependencies
 4. Configure git identity
-5. Run CLI via Nx target (`nx run @smoothbricks/dep-updater:update-deps`)
-   - Nx automatically builds the CLI if needed
-   - Nx caches build results for faster subsequent runs
-   - Passes GH_PAT and optional ANTHROPIC_API_KEY via env vars
+5. Run CLI with `GH_TOKEN: ${{ secrets.DEP_UPDATER_TOKEN }}`
 
-**TODO:** Add GitHub App authentication support for production (not user-dependent, better for orgs)
+**Workflow Steps (GitHub App):**
+
+1. Checkout repo with full history (`fetch-depth: 0`)
+2. Generate GitHub App token using `actions/create-github-app-token@v2`
+   - Reads `DEP_UPDATER_APP_ID` from repository variables
+   - Reads `DEP_UPDATER_APP_PRIVATE_KEY` from repository secrets
+   - Token auto-expires after 1 hour
+3. Setup Bun
+4. Install dependencies
+5. Configure git identity
+6. Run CLI with `GH_TOKEN: ${{ steps.app-token.outputs.token }}`
+
+**Setup Requirements:**
+
+**For PAT:**
+
+1. Generate PAT: https://github.com/settings/tokens/new (scope: `repo`)
+2. Add organization secret: `DEP_UPDATER_TOKEN`
+3. Optional: Add `ANTHROPIC_API_KEY` for AI features
+
+**For GitHub App:**
+
+1. Create GitHub App with repository permissions:
+   - Contents: Read and write
+   - Pull requests: Read and write
+   - Workflows: Read and write
+2. Install app to repository
+3. Add organization variables and secrets:
+   - Variable: `DEP_UPDATER_APP_ID` (App ID from GitHub App settings)
+   - Secret: `DEP_UPDATER_APP_PRIVATE_KEY` (Private key PEM file content)
+   - Secret (optional): `ANTHROPIC_API_KEY` (for AI-powered changelog analysis)
 
 ### Init Command (`src/commands/init.ts`)
 
@@ -340,19 +705,55 @@ Located in `src/pr/stacking.ts` (274 lines, **FULLY TESTED** - 47 tests):
 
 **Features:**
 
+- **Authentication type selection** - First prompt asks user to choose:
+  - PAT (Personal Access Token) - Simple 5-minute setup
+  - GitHub App - Advanced 15-minute setup with higher rate limits
+- Shows contextual setup notes based on selected auth type
+- Conditional credential checking (only for GitHub App)
 - Auto-detects project setup:
   - Package manager (bun/npm/pnpm/yarn) - via lock file detection
   - Expo project - via package.json dependencies
   - Nix setup (devenv, flake.nix, .envrc)
   - Syncpack config (.syncpackrc.json, .syncpackrc.yml)
 - Interactive prompts for configuration options
-- Generates `.dep-updater.json` config file
-- Calls `generate-workflow` to create GitHub Actions workflow
-- Provides next steps with setup instructions
+- Generates `.dep-updater.json` or `.dep-updater.ts` config file
+- Calls `generate-workflow` with selected auth type
+- Provides next steps tailored to chosen authentication method
+
+**Prompt Flow:**
+
+1. **Authentication type** - PAT or GitHub App
+2. **Setup verification** (GitHub App only) - Check if credentials are configured
+3. **Config format** - JSON or TypeScript
+4. **Feature flags** - Expo, Nix, AI, PR stacking
+5. **Workflow generation** - Confirm workflow creation
+6. **Validation** (GitHub App only) - Optionally run `validate-setup`
+
+**Next Steps Output:**
+
+The command shows different next steps based on selected auth type:
+
+**For PAT:**
+
+1. Generate Personal Access Token
+2. Add organization secret (DEP_UPDATER_TOKEN)
+3. (Optional) Add ANTHROPIC_API_KEY
+4. Commit and push
+5. Test workflow
+6. Link to GETTING-STARTED.md (PAT section)
+
+**For GitHub App:**
+
+1. Validate GitHub App setup (validate-setup command)
+2. Review config file
+3. (Optional) Add ANTHROPIC_API_KEY
+4. Commit and push
+5. Test workflow
+6. Link to GETTING-STARTED.md (GitHub App section)
 
 **Options:**
 
-- `--yes`: Skip prompts and use defaults (for CI/automation)
+- `--yes`: Skip prompts and use defaults (for CI/automation, defaults to PAT)
 
 **Reusable Utilities:**
 
@@ -536,8 +937,14 @@ const safePath = safeResolve(baseDir, userProvidedPath);
 
 ## Code Coverage Status
 
-### ✅ Tested (342 tests total)
+### ✅ Tested (415 tests total)
 
+- **GitHub Client** - GitHubCLIClient class (20 tests)
+  - listUpdatePRs: JSON parsing, empty results, command verification, error handling (5 tests)
+  - checkPRConflicts: All mergeable statuses, JSON validation, error handling (6 tests)
+  - createPR: URL parsing, PR number extraction, invalid format handling (4 tests)
+  - closePR: Comment inclusion, argument handling (3 tests)
+  - Constructor: Custom and default executors (2 tests)
 - **Git operations** - All 19 functions (86 tests)
 - **PR Stacking** - All 8 functions (47 tests)
   - Pure functions: `generateBranchName`, `generatePRTitle`
@@ -554,9 +961,11 @@ const safePath = safeResolve(baseDir, userProvidedPath);
 - **Updaters** - All updaters (19 tests)
   - Bun updater: Package.json diff parsing, version classification
   - Devenv (Nix): Dry-run mode, lock file parsing, error handling (10 tests)
-  - Nixpkgs overlay: Version extraction from Nix expressions, malformed file handling (9 tests)
+  - Nixpkgs overlay: Parses nvfetcher JSON (\_sources/generated.json), version extraction, malformed file handling (9
+    tests)
 - **Utils** - Path validation, workspace detection, project detection (18 tests)
-  - Project detection: Package manager, Expo, Nix, Syncpack detection (18 tests)
+  - Project detection: Package manager detection, Expo detection, Nix detection (flake.nix, .envrc, devenv.yaml),
+    Syncpack detection (18 tests)
 - **Expo SDK** - Version checking, package detection
 - **Syncpack** - Config generation
 
