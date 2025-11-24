@@ -7,6 +7,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import * as p from '@clack/prompts';
 import type { DepUpdaterConfig } from '../config.js';
 import { getRepoRoot } from '../git.js';
+import { ConsoleLogger, LogLevel } from '../logger.js';
 import type { InitOptions } from '../types.js';
 import { safeResolve } from '../utils/path-validation.js';
 import { detectProjectSetup } from '../utils/project-detection.js';
@@ -146,9 +147,71 @@ export async function init(config: DepUpdaterConfig, options: InitOptions): Prom
   let maxStackDepth = 5;
   let generateWorkflowFile = true;
   let useTypeScript = false;
+  let authType: 'pat' | 'github-app' = 'pat'; // Default to PAT (simpler)
 
   // Interactive prompts (unless --yes flag)
   if (!options.yes) {
+    // Ask about authentication type first
+    const authPrompt = await p.select({
+      message: 'Choose authentication method for GitHub Actions:',
+      options: [
+        {
+          value: 'pat',
+          label: 'Personal Access Token (PAT)',
+          hint: 'Simple 5-minute setup, good for small teams',
+        },
+        {
+          value: 'github-app',
+          label: 'GitHub App',
+          hint: 'Advanced 15-minute setup, higher rate limits',
+        },
+      ],
+      initialValue: 'pat',
+    });
+    if (p.isCancel(authPrompt)) {
+      p.cancel('Operation cancelled.');
+      return;
+    }
+    authType = authPrompt as 'pat' | 'github-app';
+
+    // Show appropriate setup note based on auth type
+    if (authType === 'github-app') {
+      const hasGitHubApp = process.env.DEP_UPDATER_APP_ID && process.env.DEP_UPDATER_APP_PRIVATE_KEY;
+
+      if (!hasGitHubApp) {
+        p.note(
+          'GitHub App authentication requires one-time setup (15-20 minutes):\n\n' +
+            '  • Organization-level configuration (all repos inherit settings)\n' +
+            '  • Higher rate limits (15,000 req/hour vs 5,000 for PAT)\n' +
+            '  • PRs trigger CI workflows (unlike GITHUB_TOKEN)\n\n' +
+            '📖 See docs/SETUP.md in the dep-updater package',
+          'GitHub App Setup Required',
+        );
+
+        const hasCompletedSetup = await p.confirm({
+          message: 'Have you completed the GitHub App setup?',
+          initialValue: false,
+        });
+
+        if (p.isCancel(hasCompletedSetup) || !hasCompletedSetup) {
+          p.outro(
+            'Please complete the GitHub App setup first, then run this command again.\n\n' +
+              '📖 Setup guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/SETUP.md',
+          );
+          return;
+        }
+      }
+    } else {
+      // PAT setup note
+      p.note(
+        'Personal Access Token setup is quick and simple:\n\n' +
+          '  1. Generate PAT: https://github.com/settings/tokens/new\n' +
+          '  2. Add to org secrets: gh secret set DEP_UPDATER_TOKEN --org YOUR_ORG\n\n' +
+          '📖 Quick start guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/QUICK-START.md',
+        'PAT Setup (5 minutes)',
+      );
+    }
+
     const formatPrompt = await p.select({
       message: 'Config file format?',
       options: [
@@ -318,29 +381,97 @@ export async function init(config: DepUpdaterConfig, options: InitOptions): Prom
       dryRun: false,
       skipGit: false,
       skipAI: !enableAI,
+      authType,
     });
   }
 
-  // Show next steps
-  let nextSteps = `1. Review and customize tooling/${configFileName} if needed\n`;
+  // Optionally run validate-setup if GitHub App credentials are configured locally
+  if (authType === 'github-app' && !options.yes) {
+    const hasGitHubApp = process.env.DEP_UPDATER_APP_ID && process.env.DEP_UPDATER_APP_PRIVATE_KEY;
 
-  if (enableAI) {
-    nextSteps += '2. Add ANTHROPIC_API_KEY to GitHub Secrets\n';
-    nextSteps += '   (Settings → Secrets and variables → Actions → New repository secret)\n';
+    if (hasGitHubApp) {
+      const runValidation = await p.confirm({
+        message: 'Run setup validation now?',
+        initialValue: true,
+      });
+
+      if (!p.isCancel(runValidation) && runValidation) {
+        p.log.step('Running setup validation...\n');
+
+        const { validateSetup } = await import('./validate-setup.js');
+        const logger = config.logger || new ConsoleLogger(LogLevel.INFO);
+        const exitCode = await validateSetup(logger, repoRoot);
+
+        if (exitCode === 0) {
+          p.log.success('✅ Setup validation passed!\n');
+        } else {
+          p.log.warning('!  Some validation checks failed. Please review the output above.\n');
+        }
+      }
+    }
   }
 
+  // Show next steps
+  let nextSteps = '';
+  let stepNumber = 1;
+
+  // Authentication-specific steps
+  if (authType === 'pat') {
+    // PAT authentication steps
+    nextSteps += `${stepNumber}. Generate Personal Access Token:\n`;
+    nextSteps += '   https://github.com/settings/tokens/new (scope: repo)\n\n';
+    stepNumber++;
+
+    nextSteps += `${stepNumber}. Add organization secret:\n`;
+    nextSteps += '   gh secret set DEP_UPDATER_TOKEN --org YOUR_ORG\n\n';
+    stepNumber++;
+  } else {
+    // GitHub App authentication steps
+    nextSteps += `${stepNumber}. Validate your GitHub App setup:\n`;
+    nextSteps += '   npx @smoothbricks/dep-updater validate-setup\n\n';
+    stepNumber++;
+  }
+
+  // Review config
+  nextSteps += `${stepNumber}. Review and customize tooling/${configFileName} if needed\n\n`;
+  stepNumber++;
+
+  // Add API key if AI enabled
+  if (enableAI) {
+    nextSteps += `${stepNumber}. Add ANTHROPIC_API_KEY to GitHub organization secrets\n`;
+    nextSteps += '   (Organization settings → Secrets and variables → Actions → New organization secret)\n\n';
+    stepNumber++;
+  }
+
+  // Commit and push
   if (generateWorkflowFile) {
-    nextSteps += `${enableAI ? '3' : '2'}. Commit the generated files:\n`;
+    nextSteps += `${stepNumber}. Commit the generated files:\n`;
     nextSteps += `   git add tooling/${configFileName} .github/workflows/update-deps.yml\n`;
     nextSteps += '   git commit -m "chore: add automated dependency updates"\n';
-    nextSteps += '   git push\n';
-    nextSteps += `${enableAI ? '4' : '3'}. Workflow will run daily at 2 AM UTC\n`;
+    nextSteps += '   git push\n\n';
+    stepNumber++;
   } else {
-    nextSteps += `${enableAI ? '3' : '2'}. Commit tooling/${configFileName}\n`;
+    nextSteps += `${stepNumber}. Commit tooling/${configFileName}\n\n`;
+    stepNumber++;
   }
 
-  nextSteps += '\nTest it now:\n';
-  nextSteps += '  bunx @conloca/dep-updater update-deps --dry-run';
+  // Test or wait for scheduled run
+  if (generateWorkflowFile) {
+    nextSteps += `${stepNumber}. Test manually: gh workflow run update-deps.yml\n`;
+    nextSteps += '   Or wait for scheduled run (daily at 2 AM UTC)\n';
+  } else {
+    nextSteps += `${stepNumber}. Test it now:\n`;
+    nextSteps += '   bunx @smoothbricks/dep-updater update-deps --dry-run';
+  }
+
+  // Link to appropriate setup guide
+  if (authType === 'pat') {
+    nextSteps +=
+      '\n\n📖 Quick start guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/QUICK-START.md';
+  } else {
+    nextSteps +=
+      '\n\n📖 Setup guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/SETUP.md';
+  }
 
   p.note(nextSteps, 'Next steps');
   p.outro('✓ Initialization complete!');
