@@ -8,13 +8,11 @@
  * - Task wrappers with span buffers
  */
 
-import * as arrow from 'apache-arrow';
 import type { TagAttributeSchema, InferTagAttributes } from './schema/types.js';
 import type { FeatureFlagSchema, InferFeatureFlags, EvaluationContext } from './schema/defineFeatureFlags.js';
 import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from './schema/evaluator.js';
 import type { SpanBuffer, ModuleContext, TaskContext } from './buffer/types.js';
 import { createSpanBuffer, createChildSpanBuffer } from './buffer/createSpanBuffer.js';
-import { isArrowBuilder } from './schema/typeGuards.js';
 
 /**
  * Result types for ok/err pattern
@@ -211,96 +209,133 @@ const ENTRY_TYPE_MESSAGE = 4;
 
 /**
  * Create column writers for feature flag analytics
- * Writes to Arrow columnar buffers in memory
+ * Writes to TypedArray columnar buffers in memory (hot path)
  */
 function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
   return {
     writeEntryType(type: 'ff-access' | 'ff-usage'): void {
       // Write entry type code to operation column
       const typeCode = type === 'ff-access' ? ENTRY_TYPE_FF_ACCESS : ENTRY_TYPE_FF_USAGE;
-      buffer.operationBuilder.append(typeCode);
+      buffer.operations[buffer.writeIndex] = typeCode;
+      
+      // Write timestamp
+      buffer.timestamps[buffer.writeIndex] = Date.now();
     },
     
     writeFfName(name: string): void {
       // Write to attr_ffName column if it exists
-      const builder = buffer.attributeBuilders['attr_ffName'];
-      if (builder) {
-        builder.append(name);
+      // For string types (category/text), we store as string in TypedArray (will be interned later)
+      const column = buffer['attr_ffName' as keyof SpanBuffer];
+      if (column && ArrayBuffer.isView(column)) {
+        // For now, store string index (TODO: implement string interning)
+        // Placeholder: store 0 for now, will implement string table later
+        (column as Uint32Array)[buffer.writeIndex] = 0;
       }
     },
     
     writeFfValue(value: string | number | boolean | null): void {
-      // Write to attr_ffValue column - serialize to string for Utf8Builder
-      const builder = buffer.attributeBuilders['attr_ffValue'];
-      if (builder) {
-        builder.append(value !== null ? String(value) : null);
+      // Write to attr_ffValue column
+      // For mixed types, serialize to string and store index
+      const column = buffer['attr_ffValue' as keyof SpanBuffer];
+      if (column && ArrayBuffer.isView(column)) {
+        // Placeholder: store 0 for now, will implement string table later
+        (column as Uint32Array)[buffer.writeIndex] = 0;
       }
     },
     
     writeAction(action?: string): void {
       // Write to attr_action column
-      const builder = buffer.attributeBuilders['attr_action'];
-      if (builder) {
-        builder.append(action ?? null);
+      const column = buffer['attr_action' as keyof SpanBuffer];
+      if (column && ArrayBuffer.isView(column)) {
+        // Placeholder: store 0 for now, will implement string table later
+        (column as Uint32Array)[buffer.writeIndex] = 0;
       }
     },
     
     writeOutcome(outcome?: string): void {
       // Write to attr_outcome column
-      const builder = buffer.attributeBuilders['attr_outcome'];
-      if (builder) {
-        builder.append(outcome ?? null);
+      const column = buffer['attr_outcome' as keyof SpanBuffer];
+      if (column && ArrayBuffer.isView(column)) {
+        // Placeholder: store 0 for now, will implement string table later
+        (column as Uint32Array)[buffer.writeIndex] = 0;
       }
     },
     
     writeContextAttributes(context: EvaluationContext): void {
       // Write context attributes to their respective columns
       if (context.userId) {
-        const builder = buffer.attributeBuilders['attr_contextUserId'];
-        if (builder) builder.append(context.userId);
+        const column = buffer['attr_contextUserId' as keyof SpanBuffer];
+        if (column && ArrayBuffer.isView(column)) {
+          (column as Uint32Array)[buffer.writeIndex] = 0; // Placeholder
+        }
       }
       if (context.requestId) {
-        const builder = buffer.attributeBuilders['attr_contextRequestId'];
-        if (builder) builder.append(context.requestId);
+        const column = buffer['attr_contextRequestId' as keyof SpanBuffer];
+        if (column && ArrayBuffer.isView(column)) {
+          (column as Uint32Array)[buffer.writeIndex] = 0; // Placeholder
+        }
       }
       // Additional context fields can be written similarly
+      
+      // Increment write index after all writes
+      buffer.writeIndex++;
     },
   };
 }
 
 /**
- * Write a value to an Arrow column builder
- * Handles type conversion for different Arrow builder types
+ * Write a value to a TypedArray column
+ * Handles type conversion for different column types
  */
-function writeToColumnBuilder(builder: arrow.Builder | undefined, value: unknown): void {
-  if (!builder || !isArrowBuilder(builder)) return;
+function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, index: number): void {
+  const column = buffer[columnName as keyof SpanBuffer];
   
-  // Handle null/undefined
+  if (!column || !ArrayBuffer.isView(column)) return;
+  
+  // Handle null/undefined - store 0 and set null bitmap
   if (value === null || value === undefined) {
-    builder.append(null);
+    if (column instanceof Uint8Array) {
+      column[index] = 0;
+    } else if (column instanceof Uint32Array) {
+      column[index] = 0;
+    } else if (column instanceof Float64Array) {
+      column[index] = 0;
+    }
+    // Set null bit in bitmap (TODO: implement null bitmap)
     return;
   }
   
-  // Arrow builders handle their own type conversion
-  // Utf8Builder accepts strings
-  // Float64Builder accepts numbers
-  // BoolBuilder accepts booleans
-  
-  // For now, since we're using Utf8Builder for all types (from createBuilders.ts),
-  // we convert everything to string
-  builder.append(String(value));
+  // Write based on column type
+  if (column instanceof Uint8Array) {
+    // For boolean or enum types
+    if (typeof value === 'boolean') {
+      column[index] = value ? 1 : 0;
+    } else if (typeof value === 'number') {
+      column[index] = value;
+    } else {
+      // For string enums, need compile-time mapping (TODO)
+      column[index] = 0;
+    }
+  } else if (column instanceof Uint32Array) {
+    // For category/text types - store string index
+    // TODO: implement string interning for categories
+    column[index] = 0; // Placeholder
+  } else if (column instanceof Float64Array) {
+    // For number types
+    column[index] = typeof value === 'number' ? value : 0;
+  }
 }
 
 /**
  * Create span logger with typed tag methods and method chaining
- * Writes to Arrow columnar buffers in memory
+ * Writes to TypedArray columnar buffers in memory (hot path)
  */
 function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
   buffer: SpanBuffer
 ): SpanLogger<T> {
   // Create the chainable tag API
-  // Each method writes to the appropriate Arrow column builder and returns itself for chaining
+  // Each method writes to the appropriate TypedArray column and returns itself for chaining
   const createChainableTag = (): ChainableTagAPI<T> => {
     // Create a record to hold the methods, starting with the 'with' method
     type TagMethod = (value: InferTagAttributes<T>[keyof T]) => ChainableTagAPI<T>;
@@ -310,17 +345,18 @@ function createSpanLogger<T extends TagAttributeSchema>(
     
     // Add the 'with' method for bulk setting
     tagAPI.with = function(attributes: Partial<InferTagAttributes<T>>): ChainableTagAPI<T> {
+      const idx = buffer.writeIndex;
+      
       // Write entry type for tag entry
-      buffer.operationBuilder.append(ENTRY_TYPE_TAG);
+      buffer.operations[idx] = ENTRY_TYPE_TAG;
       
       // Write timestamp
-      buffer.timestampBuilder.append(Date.now());
+      buffer.timestamps[idx] = Date.now();
       
       // Write each attribute to its column
       for (const [key, value] of Object.entries(attributes)) {
         const columnName = `attr_${key}`;
-        const builder = buffer.attributeBuilders[columnName];
-        writeToColumnBuilder(builder, value);
+        writeToColumn(buffer, columnName, value, idx);
       }
       
       // Increment write index
@@ -332,16 +368,17 @@ function createSpanLogger<T extends TagAttributeSchema>(
     // Add individual attribute methods dynamically
     for (const key of Object.keys(schema)) {
       tagAPI[key] = function(value: unknown): ChainableTagAPI<T> {
+        const idx = buffer.writeIndex;
+        
         // Write entry type for tag entry
-        buffer.operationBuilder.append(ENTRY_TYPE_TAG);
+        buffer.operations[idx] = ENTRY_TYPE_TAG;
         
         // Write timestamp
-        buffer.timestampBuilder.append(Date.now());
+        buffer.timestamps[idx] = Date.now();
         
         // Write the attribute value to its column
         const columnName = `attr_${key}`;
-        const builder = buffer.attributeBuilders[columnName];
-        writeToColumnBuilder(builder, value);
+        writeToColumn(buffer, columnName, value, idx);
         
         // Increment write index
         buffer.writeIndex++;
@@ -358,18 +395,17 @@ function createSpanLogger<T extends TagAttributeSchema>(
   return {
     tag,
     message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void {
+      const idx = buffer.writeIndex;
+      
       // Write entry type for message
-      buffer.operationBuilder.append(ENTRY_TYPE_MESSAGE);
+      buffer.operations[idx] = ENTRY_TYPE_MESSAGE;
       
       // Write timestamp
-      buffer.timestampBuilder.append(Date.now());
+      buffer.timestamps[idx] = Date.now();
       
       // Write message level and content to attribute columns
-      const levelBuilder = buffer.attributeBuilders['attr_logLevel'];
-      const messageBuilder = buffer.attributeBuilders['attr_logMessage'];
-      
-      if (levelBuilder) levelBuilder.append(level);
-      if (messageBuilder) messageBuilder.append(message);
+      writeToColumn(buffer, 'attr_logLevel', level, idx);
+      writeToColumn(buffer, 'attr_logMessage', message, idx);
       
       // Increment write index
       buffer.writeIndex++;

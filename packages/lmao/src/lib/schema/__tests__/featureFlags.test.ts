@@ -220,7 +220,7 @@ describe('Feature Flags', () => {
         .sync(),
 
       // Async flags
-      userTier: S.string().default('free').async(),
+      userTier: S.category().default('free').async(),
       customLimit: S.number().default(100).async(),
     });
 
@@ -273,3 +273,4 @@ describe('Feature Flags', () => {
     expect(await evaluator.getAsync('asyncFlag', {})).toBe(42);
   });
 });
+

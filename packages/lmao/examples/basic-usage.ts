@@ -20,14 +20,18 @@ import { InMemoryFlagEvaluator } from '../src/lib/schema/evaluator.js';
 import { createRequestContext, createModuleContext } from '../src/lib/lmao.js';
 
 // 1. Define tag attributes for your domain
+// Using the three string types per specs/01a_trace_schema_system.md:
+// - S.enum: Known values at compile time (Uint8Array, 1 byte)
+// - S.category: Values that often repeat (Uint32Array with string interning)
+// - S.text: Unique values (no dictionary overhead)
 const dbAttributes = defineTagAttributes({
-  requestId: S.string(),
-  userId: S.string(),
+  requestId: S.category(),              // Category: request IDs repeat within traces
+  userId: S.category(),                 // Category: user IDs repeat across operations
   duration: S.number(),
   httpStatus: S.number(),
-  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
-  query: S.string(),
-  region: S.string(),
+  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),  // Enum: known DB operations
+  query: S.text(),                      // Text: SQL queries are mostly unique
+  region: S.category(),                 // Category: AWS regions have limited cardinality
 });
 
 // 2. Define feature flags

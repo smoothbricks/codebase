@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'bun:test';
-import { createAttributeBuilders } from '../createBuilders.js';
+import { createAttributeColumns } from '../createBuilders.js';
 import { createSpanBuffer } from '../createSpanBuffer.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
 import { S } from '../../schema/builder.js';
@@ -33,9 +33,9 @@ describe('Buffer Integration', () => {
     };
   }
 
-  it('generates Arrow builders with proper names for defined schema', () => {
+  it('generates TypedArray columns with proper names for defined schema', () => {
     const schema = defineTagAttributes({
-      userId: S.string(),
+      userId: S.category(),  // Category: user IDs repeat
       isActive: S.boolean(),
       score: S.number(),
     });
@@ -45,22 +45,22 @@ describe('Buffer Integration', () => {
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     const capacity = 64;
-    const builders = createAttributeBuilders(tagAttributes, capacity);
+    const columns = createAttributeColumns(tagAttributes, capacity);
 
     // Keys - should have attr_ prefix
-    expect(builders).toHaveProperty('attr_userId');
-    expect(builders).toHaveProperty('attr_isActive');
-    expect(builders).toHaveProperty('attr_score');
+    expect(columns).toHaveProperty('attr_userId');
+    expect(columns).toHaveProperty('attr_isActive');
+    expect(columns).toHaveProperty('attr_score');
 
-    // All builders should be defined
-    expect(builders.attr_userId).toBeDefined();
-    expect(builders.attr_isActive).toBeDefined();
-    expect(builders.attr_score).toBeDefined();
+    // All columns should be TypedArrays
+    expect(columns.attr_userId).toBeInstanceOf(Uint32Array); // category
+    expect(columns.attr_isActive).toBeInstanceOf(Uint8Array); // boolean
+    expect(columns.attr_score).toBeInstanceOf(Float64Array); // number
   });
 
-  it('creates a SpanBuffer with core and attribute Arrow builders', () => {
+  it('creates a SpanBuffer with core and attribute TypedArray columns', () => {
     const schema = defineTagAttributes({
-      userId: S.string(),
+      userId: S.category(),  // Category: user IDs repeat
       score: S.number(),
     });
 
@@ -72,13 +72,13 @@ describe('Buffer Integration', () => {
     const capacity = 64;
     const buf = createSpanBuffer(tagAttributes, taskContext, capacity);
 
-    // Core builders exist
-    expect(buf.timestampBuilder).toBeDefined();
-    expect(buf.operationBuilder).toBeDefined();
+    // Core TypedArrays exist
+    expect(buf.timestamps).toBeInstanceOf(Float64Array);
+    expect(buf.operations).toBeInstanceOf(Uint8Array);
     
-    // Attribute builders exist
-    expect(buf.attributeBuilders).toHaveProperty('attr_userId');
-    expect(buf.attributeBuilders).toHaveProperty('attr_score');
+    // Attribute columns exist with correct types
+    expect(buf['attr_userId']).toBeInstanceOf(Uint32Array); // category
+    expect(buf['attr_score']).toBeInstanceOf(Float64Array); // number
 
     // Metadata
     expect(buf.capacity).toBe(capacity);
@@ -89,9 +89,9 @@ describe('Buffer Integration', () => {
   it('integrates schema definition with buffer creation', () => {
     // Define schema with defineTagAttributes
     const schema = defineTagAttributes({
-      requestId: S.string(),
+      requestId: S.category(),  // Category: request IDs repeat
       httpStatus: S.number(),
-      operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
+      operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),  // Enum: known HTTP methods
     });
 
     // Extract just the schema fields (exclude methods)
@@ -102,10 +102,10 @@ describe('Buffer Integration', () => {
     const taskContext = createTestTaskContext(tagAttributes);
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
-    // Verify all attribute columns created
-    expect(buffer.attributeBuilders['attr_requestId']).toBeDefined();
-    expect(buffer.attributeBuilders['attr_httpStatus']).toBeDefined();
-    expect(buffer.attributeBuilders['attr_operation']).toBeDefined();
+    // Verify all attribute columns created as TypedArrays with correct types
+    expect(buffer['attr_requestId']).toBeInstanceOf(Uint32Array); // category
+    expect(buffer['attr_httpStatus']).toBeInstanceOf(Float64Array); // number
+    expect(buffer['attr_operation']).toBeInstanceOf(Uint8Array); // enum
 
     // Verify task context is set
     expect(buffer.task).toBe(taskContext);
@@ -114,7 +114,7 @@ describe('Buffer Integration', () => {
 
   it('handles optional fields in schema', () => {
     const schema = defineTagAttributes({
-      required: S.string(),
+      required: S.category(),  // Category string
       optional: S.optional(S.number()),
     });
 
@@ -125,16 +125,16 @@ describe('Buffer Integration', () => {
     const taskContext = createTestTaskContext(tagAttributes);
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
-    // Both should have builders
-    expect(buffer.attributeBuilders['attr_required']).toBeDefined();
-    expect(buffer.attributeBuilders['attr_optional']).toBeDefined();
+    // Both should have TypedArray columns
+    expect(buffer['attr_required']).toBeInstanceOf(Uint32Array);
+    expect(buffer['attr_optional']).toBeInstanceOf(Uint32Array);
   });
 
   it('handles masked fields in schema', () => {
     const schema = defineTagAttributes({
       userId: S.masked('hash'),
       email: S.masked('email'),
-      plainText: S.string(),
+      plainText: S.text(),  // Text: unmasked plain text
     });
 
     // Extract just the schema fields (exclude methods)
@@ -144,9 +144,9 @@ describe('Buffer Integration', () => {
     const taskContext = createTestTaskContext(tagAttributes);
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
-    // All should have builders (masking is applied during serialization, not buffer creation)
-    expect(buffer.attributeBuilders['attr_userId']).toBeDefined();
-    expect(buffer.attributeBuilders['attr_email']).toBeDefined();
-    expect(buffer.attributeBuilders['attr_plainText']).toBeDefined();
+    // All should have TypedArray columns (masking is applied during serialization, not buffer creation)
+    expect(buffer['attr_userId']).toBeInstanceOf(Uint32Array);
+    expect(buffer['attr_email']).toBeInstanceOf(Uint32Array);
+    expect(buffer['attr_plainText']).toBeInstanceOf(Uint32Array); // text
   });
 });

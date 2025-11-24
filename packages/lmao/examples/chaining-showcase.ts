@@ -12,17 +12,18 @@ import { InMemoryFlagEvaluator } from '../src/lib/schema/evaluator.js';
 import { createRequestContext, createModuleContext } from '../src/lib/lmao.js';
 
 // Define comprehensive tag attributes
+// Using the three string types per specs/01a_trace_schema_system.md
 const orderAttributes = defineTagAttributes({
-  requestId: S.string(),
-  userId: S.string(),
-  orderId: S.string(),
+  requestId: S.category(),              // Category: request IDs repeat
+  userId: S.category(),                 // Category: user IDs repeat
+  orderId: S.category(),                // Category: order IDs may repeat in tracking
   amount: S.number(),
-  currency: S.string(),
-  paymentMethod: S.enum(['card', 'paypal', 'bank_transfer']),
-  status: S.enum(['pending', 'processing', 'completed', 'failed']),
+  currency: S.enum(['USD', 'EUR', 'GBP', 'JPY']),  // Enum: known currencies
+  paymentMethod: S.enum(['card', 'paypal', 'bank_transfer']),  // Enum: known methods
+  status: S.enum(['pending', 'processing', 'completed', 'failed']),  // Enum: known statuses
   duration: S.number(),
   httpStatus: S.number(),
-  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
+  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),  // Enum: known operations
 });
 
 const featureFlags = defineFeatureFlags({

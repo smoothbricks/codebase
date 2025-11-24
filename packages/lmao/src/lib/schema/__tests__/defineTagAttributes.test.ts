@@ -17,7 +17,7 @@ import { S } from '../builder.js';
 describe('defineTagAttributes with Sury', () => {
   test('defines base attributes with Sury schemas', () => {
     const attrs = defineTagAttributes({
-      requestId: S.string(),
+      requestId: S.category(),
       userId: S.optional(S.masked('hash')),
       timestamp: S.number(),
     });
@@ -30,7 +30,7 @@ describe('defineTagAttributes with Sury', () => {
   
   test('validates data correctly with Sury', () => {
     const attrs = defineTagAttributes({
-      requestId: S.string(),
+      requestId: S.category(),
       count: S.number(),
     });
     
@@ -84,7 +84,7 @@ describe('defineTagAttributes with Sury', () => {
   
   test('supports schema extension', () => {
     const base = defineTagAttributes({
-      requestId: S.string()
+      requestId: S.category()
     });
 
     const extended = base.extend({ duration: S.number() });
@@ -113,7 +113,7 @@ describe('defineTagAttributes with Sury', () => {
   
   test('handles optional fields correctly', () => {
     const schema = defineTagAttributes({
-      required: S.string(),
+      required: S.category(),
       optional: S.optional(S.number()),
     });
     
@@ -164,19 +164,19 @@ describe('defineTagAttributes with Sury', () => {
   test('rejects reserved attribute names', () => {
     expect(() => {
       validateAttributeNames({
-        with: S.string(), // Reserved!
+        with: S.category(), // Reserved!
       });
     }).toThrow(/reserved/i);
     
     expect(() => {
       validateAttributeNames({
-        message: S.string(), // Reserved!
+        message: S.category(), // Reserved!
       });
     }).toThrow(/reserved/i);
     
     expect(() => {
       validateAttributeNames({
-        tag: S.string(), // Reserved!
+        tag: S.category(), // Reserved!
       });
     }).toThrow(/reserved/i);
   });
@@ -184,8 +184,8 @@ describe('defineTagAttributes with Sury', () => {
   test('allows non-reserved names', () => {
     expect(() => {
       validateAttributeNames({
-        requestId: S.string(),
-        userId: S.string(),
+        requestId: S.category(),
+        userId: S.category(),
         customField: S.number(),
       });
     }).not.toThrow();
@@ -193,7 +193,7 @@ describe('defineTagAttributes with Sury', () => {
   
   test('fluent extend API works', () => {
     const base = createExtendedSchema({
-      requestId: S.string(),
+      requestId: S.category(),
     });
     
     const extended = base.extend({
@@ -206,7 +206,7 @@ describe('defineTagAttributes with Sury', () => {
   
   test('chained extensions work', () => {
     const base = createExtendedSchema({
-      requestId: S.string(),
+      requestId: S.category(),
     });
     
     const withHttp = base.extend({
@@ -223,7 +223,7 @@ describe('defineTagAttributes with Sury', () => {
   });
   
   test('extendSchema detects conflicts', () => {
-    const base = { requestId: S.string() };
+    const base = { requestId: S.category() };
     const extension = { requestId: S.number() }; // Conflict!
     
     expect(() => {
@@ -233,7 +233,7 @@ describe('defineTagAttributes with Sury', () => {
   
   test('union schemas work', () => {
     const schema = defineTagAttributes({
-      value: S.union([S.string(), S.number()]),
+      value: S.union([S.category(), S.number()]),
     });
     
     const result1 = schema.validate({ value: 'test' });
@@ -245,11 +245,11 @@ describe('defineTagAttributes with Sury', () => {
   
   test('complex nested schema validation', () => {
     const schema = defineTagAttributes({
-      requestId: S.string(),
+      requestId: S.category(),
       userId: S.optional(S.masked('hash')),
       httpStatus: S.number(),
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
-      metadata: S.optional(S.string()),
+      metadata: S.optional(S.category()),
     });
     
     const result = schema.validate({
@@ -266,3 +266,4 @@ describe('defineTagAttributes with Sury', () => {
     expect(result.metadata).toBeUndefined();
   });
 });
+

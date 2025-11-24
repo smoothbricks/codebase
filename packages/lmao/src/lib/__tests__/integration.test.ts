@@ -19,14 +19,18 @@ import type { TagAttributeSchema } from '../schema/types.js';
 
 describe('Schema Integration Patterns', () => {
   // Define tag attributes for DB operations
+  // Using the three string types per specs/01a_trace_schema_system.md:
+  // - S.enum: Known values at compile time
+  // - S.category: Values that often repeat
+  // - S.text: Unique values
   const dbAttributes = defineTagAttributes({
-    requestId: S.string(),
-    userId: S.string(),
+    requestId: S.category(),              // Category: request IDs repeat within traces
+    userId: S.category(),                 // Category: user IDs repeat across operations
     duration: S.number(),
     httpStatus: S.number(),
-    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
-    query: S.string(),
-    region: S.string(),
+    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),  // Enum: known DB operations
+    query: S.text(),                      // Text: SQL queries are mostly unique
+    region: S.category(),                 // Category: AWS regions have limited cardinality
   });
 
   // Define feature flags

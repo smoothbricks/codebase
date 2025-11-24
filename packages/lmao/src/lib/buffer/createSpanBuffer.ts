@@ -1,60 +1,86 @@
 /**
- * Create SpanBuffer with Arrow builders
+ * Create SpanBuffer with native TypedArrays
  * 
- * Arrow builders handle:
- * - Cache-aligned memory allocation
+ * Per specs/01b_columnar_buffer_architecture.md:
+ * - Cache-aligned TypedArrays (64-byte boundaries)
  * - Null bitmap management
- * - Automatic resizing
- * - Zero-copy conversion to Arrow vectors
+ * - Per-span buffers (no traceId/spanId arrays needed)
+ * - Direct TypedArray writes in hot path
+ * - Arrow conversion in cold path (background processing)
  */
 
-import * as arrow from 'apache-arrow';
-import type { SpanBuffer, TaskContext } from './types.js';
+import type { SpanBuffer, TaskContext, TypedArray } from './types.js';
 import type { TagAttributeSchema } from '../schema/types.js';
-import { createAttributeBuilders } from './createBuilders.js';
+import { createAttributeColumns } from './createBuilders.js';
 
 let nextGlobalSpanId = 1;
 
 /**
- * Create empty SpanBuffer with Arrow builders
+ * Get cache-aligned capacity
  * 
- * Arrow builders handle:
- * - Cache-aligned memory allocation
- * - Null bitmap management
- * - Automatic resizing
- * - Zero-copy conversion to Arrow vectors
+ * Aligns to 64-byte cache line boundaries for optimal CPU performance.
+ * Uses 1-byte element size (worst case) to ensure ALL array types are aligned.
+ */
+function getCacheAlignedCapacity(elementCount: number): number {
+  const CACHE_LINE_SIZE = 64; // Cache line size in bytes
+  const totalBytes = elementCount * 1; // Use 1 byte (worst case - Uint8Array)
+  const alignedBytes = Math.ceil(totalBytes / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
+  return alignedBytes; // Return byte count which becomes element count for Uint8Array
+}
+
+/**
+ * Create empty SpanBuffer with native TypedArrays
+ * 
+ * Per specs/01b_columnar_buffer_architecture.md:
+ * - Each span gets its own buffer
+ * - traceId and spanId are constant per buffer (stored as properties)
+ * - All TypedArrays have equal length (columnar storage requirement)
  */
 export function createEmptySpanBuffer(
   spanId: number,
   schema: TagAttributeSchema,
   taskContext: TaskContext,
   parentBuffer?: SpanBuffer,
-  capacity: number = 64
+  requestedCapacity: number = 64
 ): SpanBuffer {
-  // Create core column builders
-  const timestampBuilder = new arrow.Float64Builder({
-    type: new arrow.Float64(),
-    nullValues: [null, undefined]
-  });
+  // Cache-align capacity for all arrays
+  const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
   
-  const operationBuilder = new arrow.Uint8Builder({
-    type: new arrow.Uint8(),
-    nullValues: [null, undefined]
-  });
+  // Create core columns
+  const timestamps = new Float64Array(alignedCapacity);
+  const operations = new Uint8Array(alignedCapacity);
   
-  // Create attribute builders from schema
-  const attributeBuilders = createAttributeBuilders(schema, capacity);
+  // Choose bitmap type based on attribute count
+  const attributeCount = Object.keys(schema).length;
+  let nullBitmap: Uint8Array | Uint16Array | Uint32Array;
   
+  if (attributeCount <= 8) {
+    nullBitmap = new Uint8Array(alignedCapacity);
+  } else if (attributeCount <= 16) {
+    nullBitmap = new Uint16Array(alignedCapacity);
+  } else if (attributeCount <= 32) {
+    nullBitmap = new Uint32Array(alignedCapacity);
+  } else {
+    throw new Error(`Too many attributes: ${attributeCount}. Maximum 32 supported.`);
+  }
+  
+  // Create attribute columns from schema
+  const attributeColumns = createAttributeColumns(schema, alignedCapacity);
+  
+  // Type-safe spread of attribute columns
+  // We know attributeColumns has keys like attr_${string}, which matches SpanBuffer's index signature
   const buffer: SpanBuffer = {
     spanId,
-    timestampBuilder,
-    operationBuilder,
-    attributeBuilders,
+    traceId: parentBuffer?.traceId || `trace-${spanId}`, // Inherit from parent or generate new
+    timestamps,
+    operations,
+    nullBitmap,
+    ...(attributeColumns as Record<`attr_${string}`, TypedArray>),
     children: [],
     parent: parentBuffer,
     task: taskContext,
     writeIndex: 0,
-    capacity,
+    capacity: requestedCapacity, // Logical capacity for overflow detection
     next: undefined
   };
   

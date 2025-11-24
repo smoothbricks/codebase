@@ -15,7 +15,7 @@ describe('Buffer Foundation', () => {
   // Helper to create a test task context
   function createTestTaskContext(): TaskContext {
     const schema = defineTagAttributes({
-      userId: S.string(),
+      userId: S.category(),  // Category: user IDs repeat
       count: S.number()
     });
 
@@ -41,22 +41,23 @@ describe('Buffer Foundation', () => {
     };
   }
 
-  it('creates empty SpanBuffer with Arrow builders', () => {
+  it('creates empty SpanBuffer with TypedArrays', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
     
     const buf = createEmptySpanBuffer(1, schema, taskContext, undefined, 64);
 
     expect(buf.spanId).toBe(1);
+    expect(buf.traceId).toBeDefined();
     
-    // Check Arrow builders are created
-    expect(buf.timestampBuilder).toBeDefined();
-    expect(buf.operationBuilder).toBeDefined();
-    expect(buf.attributeBuilders).toBeDefined();
+    // Check TypedArrays are created
+    expect(buf.timestamps).toBeInstanceOf(Float64Array);
+    expect(buf.operations).toBeInstanceOf(Uint8Array);
+    expect(buf.nullBitmap).toBeDefined();
     
-    // Check attribute builders exist for each schema field
-    expect(buf.attributeBuilders['attr_userId']).toBeDefined();
-    expect(buf.attributeBuilders['attr_count']).toBeDefined();
+    // Check attribute columns exist for each schema field
+    expect(buf['attr_userId']).toBeInstanceOf(Uint32Array); // category → Uint32Array
+    expect(buf['attr_count']).toBeInstanceOf(Float64Array);  // number → Float64Array
 
     // Metadata
     expect(buf.children).toBeInstanceOf(Array);
@@ -91,10 +92,10 @@ describe('Buffer Foundation', () => {
     const taskContext = createTestTaskContext();
     // Define a larger schema
     const largeSchema = defineTagAttributes({
-      field1: S.string(),
+      field1: S.category(),  // Category string
       field2: S.number(),
       field3: S.boolean(),
-      field4: S.string(),
+      field4: S.text(),      // Text string
       field5: S.number(),
     });
     
@@ -104,9 +105,11 @@ describe('Buffer Foundation', () => {
     
     const buf = createEmptySpanBuffer(1, tagAttributes, taskContext, undefined, 64);
     
-    // Should have builders for all 5 attributes
-    expect(Object.keys(buf.attributeBuilders)).toHaveLength(5);
-    expect(buf.attributeBuilders['attr_field1']).toBeDefined();
-    expect(buf.attributeBuilders['attr_field5']).toBeDefined();
+    // Should have TypedArray columns for all 5 attributes
+    // Get all attr_ keys from the buffer
+    const attrKeys = Object.keys(buf).filter(k => k.startsWith('attr_'));
+    expect(attrKeys).toHaveLength(5);
+    expect(buf['attr_field1']).toBeInstanceOf(Uint32Array); // category
+    expect(buf['attr_field4']).toBeInstanceOf(Uint32Array); // text
   });
 });

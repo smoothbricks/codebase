@@ -1,77 +1,106 @@
 /**
- * Create Arrow builders for attribute columns based on schema
+ * Create TypedArray columns for attribute columns based on schema
  * 
- * This maps Sury schema types to appropriate Arrow builders:
- * - string/masked → Utf8Builder
- * - number → Float64Builder
- * - boolean → BoolBuilder
- * - enum/union → Utf8Builder (dictionary encoding can be added later)
+ * This maps Sury schema types to appropriate TypedArrays per
+ * specs/01b_columnar_buffer_architecture.md:
+ * - enum → Uint8Array (compile-time mapping)
+ * - category → Uint32Array (string interning indices)
+ * - text → Uint32Array (raw string indices)
+ * - number → Float64Array
+ * - boolean → Uint8Array
  */
 
-import * as arrow from 'apache-arrow';
 import * as Sury from '@sury/sury';
-import type { TagAttributeSchema } from '../schema/types.js';
+import type { TagAttributeSchema, SchemaWithMetadata } from '../schema/types.js';
+import type { TypedArray, TypedArrayConstructor } from './types.js';
 
 /**
- * Create Arrow builders for attribute columns based on schema
+ * Create TypedArray columns for attribute columns based on schema
  * 
- * This maps Sury schema types to appropriate Arrow builders.
  * Each attribute gets an `attr_` prefix to distinguish it from core columns.
+ * Returns a record of TypedArrays with cache-aligned capacity.
  */
-export function createAttributeBuilders(
+export function createAttributeColumns(
   schema: TagAttributeSchema,
   capacity: number = 64
-): Record<string, arrow.Builder> {
-  const builders: Record<string, arrow.Builder> = {};
+): Record<string, TypedArray> {
+  const columns: Record<string, TypedArray> = {};
   
   for (const [fieldName, surySchema] of Object.entries(schema)) {
     const columnName = `attr_${fieldName}`;
-    builders[columnName] = createBuilderForSchema(surySchema, capacity);
+    columns[columnName] = createTypedArrayForSchema(surySchema, capacity);
   }
   
-  return builders;
+  return columns;
 }
 
 /**
- * Create appropriate Arrow builder for a Sury schema
+ * Create appropriate TypedArray for a Sury schema
  * 
- * Note: Sury schemas don't expose type info directly at runtime.
- * This is a simplified implementation that defaults to Utf8Builder.
+ * STRING TYPE SYSTEM (See specs/01a_trace_schema_system.md):
+ * - enum: Uint8Array (1 byte with compile-time mapping)
+ * - category: Uint32Array (runtime string interning indices)
+ * - text: Uint32Array (raw string indices)
  * 
- * In production, you would either:
- * 1. Add type hints to your schema definitions
- * 2. Use schema introspection if Sury provides it
- * 3. Maintain a type registry alongside schemas
+ * OTHER TYPES:
+ * - number: Float64Array (full precision)
+ * - boolean: Uint8Array (0 or 1)
+ * 
+ * We attach metadata to schemas in builder.ts to identify the type.
  */
-function createBuilderForSchema(
+function createTypedArrayForSchema(
   schema: Sury.Schema<unknown, unknown>,
   capacity: number
-): arrow.Builder {
-  // For now, use Utf8Builder as default
-  // This works for all types with string serialization
-  // TODO: Add proper type detection when Sury provides schema introspection
+): TypedArray {
+  const schemaWithMetadata = schema as SchemaWithMetadata;
+  const lmaoType = schemaWithMetadata.__lmao_type;
   
-  return new arrow.Utf8Builder({
-    type: new arrow.Utf8(),
-    nullValues: [null, undefined]
-  });
+  // Handle three string types
+  if (lmaoType === 'enum') {
+    // Enum: Uint8Array for compile-time mapped values (0-255)
+    return new Uint8Array(capacity);
+  }
+  
+  if (lmaoType === 'category') {
+    // Category: Uint32Array for string interning indices
+    return new Uint32Array(capacity);
+  }
+  
+  if (lmaoType === 'text') {
+    // Text: Uint32Array for raw string indices (no interning)
+    return new Uint32Array(capacity);
+  }
+  
+  // Handle number and boolean types
+  if (lmaoType === 'number') {
+    // Number: Float64Array for full precision
+    return new Float64Array(capacity);
+  }
+  
+  if (lmaoType === 'boolean') {
+    // Boolean: Uint8Array (0 or 1)
+    return new Uint8Array(capacity);
+  }
+  
+  // Default to Uint32Array for unknown types
+  return new Uint32Array(capacity);
 }
 
 /**
- * Determine Arrow data type from Sury schema
+ * Get TypedArray constructor for a schema type
  * 
- * This examines the Sury schema to determine the appropriate Arrow type.
- * Currently simplified - returns Utf8 for all types.
- * 
- * TODO: Implement proper type detection:
- * - Check if Sury exposes schema metadata
- * - Use type hints from schema definitions
- * - Map to appropriate Arrow types (Float64, Bool, Int32, etc.)
+ * This examines the Sury schema to determine the appropriate TypedArray constructor.
  */
-export function getArrowTypeFromSchema(
+export function getTypedArrayConstructor(
   schema: Sury.Schema<unknown, unknown>
-): arrow.DataType {
-  // Simplified implementation - would need schema introspection
-  // For now, default to Utf8 for strings
-  return new arrow.Utf8();
+): TypedArrayConstructor {
+  const schemaWithMetadata = schema as SchemaWithMetadata;
+  const lmaoType = schemaWithMetadata.__lmao_type;
+  
+  if (lmaoType === 'enum') return Uint8Array;
+  if (lmaoType === 'category') return Uint32Array;
+  if (lmaoType === 'text') return Uint32Array;
+  
+  // Default for unknown types
+  return Uint32Array;
 }

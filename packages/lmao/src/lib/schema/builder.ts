@@ -13,7 +13,12 @@ import type {
   MaskTransform, 
   SchemaOrFlagBuilder,
   FlagBuilderWithDefault,
-  FeatureFlagDefinition 
+  FeatureFlagDefinition,
+  NumberSchemaWithMetadata,
+  BooleanSchemaWithMetadata,
+  EnumSchemaWithMetadata,
+  CategorySchemaWithMetadata,
+  TextSchemaWithMetadata
 } from './types.js';
 
 /**
@@ -109,20 +114,13 @@ const maskingTransforms: Record<MaskType, MaskTransform> = {
  * - Full TypeScript inference
  * - Runtime transformations
  * 
- * Note: Sury exports primitive schemas as constants (S.string, S.number, etc.)
- * not as factory functions. We wrap them in functions for a consistent API.
+ * STRING TYPE SYSTEM (See specs/01a_trace_schema_system.md):
+ * Three distinct string types, each with different storage strategies:
+ * - S.enum(['A', 'B', 'C']) - Known values at compile time (Uint8Array, 1 byte)
+ * - S.category() - Repeated values (Uint32Array with string interning)
+ * - S.text() - Unique values (no dictionary overhead)
  */
 const schemaBuilderImpl: SchemaBuilder = {
-  /**
-   * Create string schema
-   * 
-   * Usage:
-   * - S.string() - basic string for tag attributes
-   * - S.string().default('value').sync() - feature flag
-   * - S.transform(S.string(), fn) - with transformation
-   */
-  string: () => createSchemaWithFlagBuilder(Sury.string),
-  
   /**
    * Create number schema
    * 
@@ -131,7 +129,12 @@ const schemaBuilderImpl: SchemaBuilder = {
    * - S.number().default(0).sync() - feature flag
    * - S.refine(S.number(), x => x > 0) - with validation
    */
-  number: () => createSchemaWithFlagBuilder(Sury.number),
+  number: () => {
+    const schema = createSchemaWithFlagBuilder(Sury.number);
+    // Attach number metadata for code generation by mutating the object
+    (schema as unknown as NumberSchemaWithMetadata).__lmao_type = 'number';
+    return schema as SchemaOrFlagBuilder<number> & NumberSchemaWithMetadata;
+  },
   
   /**
    * Create boolean schema
@@ -140,7 +143,12 @@ const schemaBuilderImpl: SchemaBuilder = {
    * - S.boolean() - for tag attributes
    * - S.boolean().default(false).sync() - feature flag
    */
-  boolean: () => createSchemaWithFlagBuilder(Sury.boolean),
+  boolean: () => {
+    const schema = createSchemaWithFlagBuilder(Sury.boolean);
+    // Attach boolean metadata for code generation by mutating the object
+    (schema as unknown as BooleanSchemaWithMetadata).__lmao_type = 'boolean';
+    return schema as SchemaOrFlagBuilder<boolean> & BooleanSchemaWithMetadata;
+  },
   
   /**
    * Wrap schema to make it optional
@@ -174,21 +182,29 @@ const schemaBuilderImpl: SchemaBuilder = {
   },
   
   /**
-   * Create enum from string literals
+   * Enum - Known values at compile time
    * 
-   * This is a convenience wrapper for common use case of string unions.
+   * Storage: Uint8Array (1 byte) with compile-time mapping
+   * Arrow: Dictionary with pre-defined values
+   * Use for: Operations, HTTP methods, entry types, status enums
    * 
    * Usage:
-   * - S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']) - for tag attributes
+   * - S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']) - for tag attributes
    * - S.enum(['dev', 'staging', 'prod']).default('dev').sync() - feature flag
    * 
-   * Creates: 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE'
-   * 
-   * Implementation: Uses S.refine with validation that fails on invalid values
+   * Generated code maps strings to integers:
+   * switch(value) {
+   *   case 'CREATE': buffer.attr_operation[idx] = 0; break;
+   *   case 'READ': buffer.attr_operation[idx] = 1; break;
+   *   ...
+   * }
    */
   enum: <T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]> => {
     if (values.length === 0) {
       throw new Error('Enum must have at least one value');
+    }
+    if (values.length > 256) {
+      throw new Error('Enum can have at most 256 values (Uint8Array limit)');
     }
     
     // Use refine to validate string is one of the allowed values
@@ -200,7 +216,58 @@ const schemaBuilderImpl: SchemaBuilder = {
       return value as T[number];
     }) as Sury.Schema<T[number], string>;
     
-    return createSchemaWithFlagBuilder(schema);
+    // Attach enum metadata for code generation by mutating the object
+    const schemaWithMetadata = schema as unknown as EnumSchemaWithMetadata<T[number]>;
+    schemaWithMetadata.__lmao_type = 'enum';
+    schemaWithMetadata.__lmao_enum_values = values;
+    
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<T[number]> & EnumSchemaWithMetadata<T[number]>;
+  },
+  
+  /**
+   * Category - Values that often repeat (limited cardinality)
+   * 
+   * Storage: Uint32Array indices with string interning
+   * Arrow: Dictionary built dynamically from interned strings
+   * Use for: userIds, sessionIds, moduleNames, spanNames, table names
+   * 
+   * Usage:
+   * - S.category() - for tag attributes
+   * - S.category().default('default-value').sync() - feature flag
+   * 
+   * Hot path write:
+   * buffer.attr_userId[idx] = internString(userId); // Returns Uint32 index
+   */
+  category: (): SchemaOrFlagBuilder<string> => {
+    const schema = createSchemaWithFlagBuilder(Sury.string);
+    
+    // Attach category metadata for code generation by mutating the object
+    (schema as unknown as CategorySchemaWithMetadata).__lmao_type = 'category';
+    
+    return schema as SchemaOrFlagBuilder<string> & CategorySchemaWithMetadata;
+  },
+  
+  /**
+   * Text - Unique values that rarely repeat
+   * 
+   * Storage: Raw strings without interning
+   * Arrow: Plain string column (no dictionary overhead)
+   * Use for: Unique error messages, URLs, request bodies, masked queries
+   * 
+   * Usage:
+   * - S.text() - for tag attributes
+   * - S.text().default('').sync() - feature flag (rare use case)
+   * 
+   * Hot path write:
+   * buffer.attr_errorMsg[idx] = rawString; // No interning
+   */
+  text: (): SchemaOrFlagBuilder<string> => {
+    const schema = createSchemaWithFlagBuilder(Sury.string);
+    
+    // Attach text metadata for code generation by mutating the object
+    (schema as unknown as TextSchemaWithMetadata).__lmao_type = 'text';
+    
+    return schema as SchemaOrFlagBuilder<string> & TextSchemaWithMetadata;
   },
   
   /**

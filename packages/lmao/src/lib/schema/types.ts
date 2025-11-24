@@ -85,9 +85,38 @@ export type SchemaOrFlagBuilder<T> = Sury.Schema<T, unknown> & FlagBuilder<T>;
  */
 export interface SchemaBuilder {
   // Primitive types - return schemas that can also be used as flag builders
-  string(): SchemaOrFlagBuilder<string>;
   number(): SchemaOrFlagBuilder<number>;
   boolean(): SchemaOrFlagBuilder<boolean>;
+  
+  // String types - THREE DISTINCT TYPES per specs/01a_trace_schema_system.md
+  // IMPORTANT: Never use generic "string" - always choose enum/category/text
+  
+  /**
+   * Enum - Known values at compile time
+   * Storage: Uint8Array (1 byte) with compile-time mapping
+   * Arrow: Dictionary with pre-defined values
+   * Use for: Operations, HTTP methods, entry types, status enums
+   * Example: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'])
+   */
+  enum<T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]>;
+  
+  /**
+   * Category - Values that often repeat (limited cardinality)
+   * Storage: Uint32Array indices with string interning
+   * Arrow: Dictionary built dynamically from interned strings
+   * Use for: userIds, sessionIds, moduleNames, spanNames, table names
+   * Example: S.category (no arguments needed)
+   */
+  category(): SchemaOrFlagBuilder<string>;
+  
+  /**
+   * Text - Unique values that rarely repeat
+   * Storage: Raw strings without interning
+   * Arrow: Plain string column (no dictionary overhead)
+   * Use for: Unique error messages, URLs, request bodies, masked queries
+   * Example: S.text (no arguments needed)
+   */
+  text(): SchemaOrFlagBuilder<string>;
   
   // Optional wrapper
   optional<T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined>;
@@ -97,10 +126,7 @@ export interface SchemaBuilder {
     schemas: T
   ): Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>>;
   
-  // Enum - for string literal unions (common case)
-  enum<T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]>;
-  
-  // String with masking transformation
+  // String with masking transformation - can be applied to category or text
   masked(type: MaskType): Sury.Schema<string, string>;
 }
 
@@ -108,3 +134,54 @@ export interface SchemaBuilder {
  * Masking helper function type
  */
 export type MaskTransform = (value: string) => string;
+
+/**
+ * Schema metadata types - attached to Sury schemas for code generation
+ * 
+ * These types allow us to access the __lmao_type metadata on schemas
+ */
+export type LmaoSchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
+
+/**
+ * Base schema with LMAO metadata
+ * Using intersection type since we can't extend Sury.Schema directly
+ */
+export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> & {
+  __lmao_type?: LmaoSchemaType;
+};
+
+/**
+ * Enum schema with enum values metadata
+ */
+export type EnumSchemaWithMetadata<T extends string = string> = Sury.Schema<T, unknown> & {
+  __lmao_type: 'enum';
+  __lmao_enum_values: readonly string[];
+};
+
+/**
+ * Category schema with metadata
+ */
+export type CategorySchemaWithMetadata = Sury.Schema<string, unknown> & {
+  __lmao_type: 'category';
+};
+
+/**
+ * Text schema with metadata
+ */
+export type TextSchemaWithMetadata = Sury.Schema<string, unknown> & {
+  __lmao_type: 'text';
+};
+
+/**
+ * Number schema with metadata
+ */
+export type NumberSchemaWithMetadata = Sury.Schema<number, unknown> & {
+  __lmao_type: 'number';
+};
+
+/**
+ * Boolean schema with metadata
+ */
+export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> & {
+  __lmao_type: 'boolean';
+};
