@@ -26,17 +26,19 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Full history for git operations
-
+      # Generate token FIRST so we can use it for checkout (needed for push)
       - name: Generate GitHub App token
         id: app-token
         uses: actions/create-github-app-token@v2
         with:
           app-id: ${{ vars.DEP_UPDATER_APP_ID }}
           private-key: ${{ secrets.DEP_UPDATER_APP_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for git operations
+          token: ${{ steps.app-token.outputs.token }}
 
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
