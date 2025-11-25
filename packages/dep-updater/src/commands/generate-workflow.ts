@@ -150,22 +150,24 @@ export async function generateWorkflow(config: DepUpdaterConfig, options: Genera
 
   const workflowContent = await generateWorkflowContentFromTemplate({ authType, useAI });
 
+  // Compute paths first so we can show them in dry-run
+  const workflowDir = safeResolve(repoRoot, '.github/workflows');
+  const workflowPath = join(workflowDir, 'update-deps.yml');
+
   if (options.dryRun) {
-    config.logger?.info('[DRY RUN] Would generate workflow file');
+    config.logger?.info(`[DRY RUN] Would generate: ${workflowPath}`);
     config.logger?.info('\nWorkflow content:\n');
     config.logger?.info(workflowContent);
     return;
   }
 
   // Create .github/workflows directory
-  const workflowDir = safeResolve(repoRoot, '.github/workflows');
   if (!existsSync(workflowDir)) {
     await mkdir(workflowDir, { recursive: true });
     config.logger?.info('✓ Created .github/workflows directory');
   }
 
   // Write workflow file
-  const workflowPath = join(workflowDir, 'update-deps.yml');
   await writeFile(workflowPath, workflowContent, 'utf-8');
 
   config.logger?.info(`✓ Generated workflow file: ${workflowPath}\n`);

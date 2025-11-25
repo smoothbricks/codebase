@@ -288,9 +288,14 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
     }
   }
 
-  // Dry run exit
+  // Dry run exit - show what would be created
   if (options.dryRun) {
-    config.logger?.info('\n[DRY RUN] Would create commit and PR with these updates');
+    const branchName = generateBranchName(config);
+    const { title } = await generateCommitMessage(allUpdates, config);
+    config.logger?.info('\n[DRY RUN] Would create:');
+    config.logger?.info(`  Branch: ${branchName}`);
+    config.logger?.info(`  Commit: ${title}`);
+    config.logger?.info(`  PR base: ${stackBase}`);
     return;
   }
 
