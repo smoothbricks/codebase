@@ -20,6 +20,7 @@
   ],
   "dependencies": {
     "tslib": "^2.3.0",
+    "@smoothbricks/arrow-builder": "workspace:*",
     "@sury/sury": "npm:@jsr/sury__sury",
     "apache-arrow": "^21.1.0"
   }

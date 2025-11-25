@@ -2,25 +2,81 @@
 ## 📚 BEFORE WRITING CODE, READ THESE SPECS:
 ### Core System (Read First)
 - **System Overview**: specs/01_trace_logging_system.md - Architecture overview & hot/cold path design
-- **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, tag attributes, feature flags
-- **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - Request→Module→Task→Span hierarchy
-- **Buffer Architecture**: specs/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
-### Buffer System Details
+- **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, tag attributes, feature flags [**LMAO**]
+- **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - Request→Module→Task→Span hierarchy [**LMAO**]
+- **Buffer Architecture**: specs/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!) [**ARROW-BUILDER**]
+
+### Buffer System Details (All in @packages/arrow-builder)
 - **Buffer Overview**: specs/01b_columnar_buffer_architecture_overview.md - High-level columnar storage concepts
 - **Performance Opts**: specs/01b1_buffer_performance_optimizations.md - Cache alignment, string interning, enum optimization
 - **Self-Tuning**: specs/01b2_buffer_self_tuning.md - Zero-config capacity management
-### API & Code Generation
+- **Arrow Table**: specs/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
+
+### API & Code Generation (All in @packages/lmao)
 - **Entry Types**: specs/01h_entry_types_and_logging_primitives.md - Unified entry type enum, fluent API
 - **Context API Codegen**: specs/01g_trace_context_api_codegen.md - Runtime code generation for tag methods
 - **Module Context**: specs/01j_module_context_and_spanlogger_generation.md - SpanLogger class generation
 - **Span Scope**: specs/01i_span_scope_attributes.md - Scoped attributes for zero-overhead propagation
+
 ### Integration & Output
-- **Arrow Table**: specs/01f_arrow_table_structure.md - Final queryable format (enum/category/text dictionaries)
-- **Library Pattern**: specs/01e_library_integration_pattern.md - Third-party library integration with prefixing
-- **AI Agent Integration**: specs/01d_ai_agent_integration.md - MCP server for AI trace querying
-## 🏗️ CRITICAL ARCHITECTURE SEPARATION:
-- **@packages/arrow-builder**: Low-level TypedArray buffers in Arrow-compatible layout (cache-aligned, columnar)
-- **@packages/lmao**: High-level logging API (ctx.log.tag, method chaining, etc.) - uses arrow-builder, NOT Arrow directly!
+- **Library Pattern**: specs/01e_library_integration_pattern.md - Third-party library integration with prefixing [**LMAO**]
+- **AI Agent Integration**: specs/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
+
+## 🏗️ PACKAGE ARCHITECTURE - TWO SIBLING PACKAGES:
+
+### @packages/arrow-builder - Low-Level Buffer Engine
+**Purpose**: Fast memory layouts and Arrow-ready storage (hot path)
+
+**Owns**:
+- Cache-aligned TypedArray buffer creation (specs/01b, 01b_overview, 01b1)
+- Null bitmap management
+- Self-tuning capacity & buffer chaining (specs/01b2)
+- String interning for categories
+- Equal-length array enforcement
+- Zero-copy conversion to Arrow format (specs/01f)
+- SpanBuffer, TypedArray types, ModuleContext, TaskContext
+
+**Does NOT know about**:
+- Fluent APIs (ctx.log.tag)
+- Schema ergonomics (S.enum/category/text)
+- Feature flags
+- Context propagation
+- Entry type semantics
+
+**Key Files**:
+- `src/lib/buffer/types.ts` - Buffer interfaces
+- `src/lib/buffer/createBuilders.ts` - TypedArray column creation
+- `src/lib/buffer/createSpanBuffer.ts` - Buffer allocation
+
+### @packages/lmao - High-Level Logging/Runtime
+**Purpose**: Developer ergonomics and schema-aware orchestration
+
+**Owns**:
+- Schema system (S.enum/category/text) (specs/01a)
+- Tag attribute definitions with masking
+- Feature flag evaluation (specs/01a)
+- Context propagation (request→module→task→span) (specs/01c)
+- SpanLogger/ctx API generation (specs/01g, 01j)
+- Fluent logging (ctx.log.tag, ctx.ok, ctx.err) (specs/01h)
+- Span scope attributes (specs/01i)
+- Library integration & prefixing (specs/01e)
+- Entry type orchestration (specs/01h)
+- AI agent integration (specs/01d)
+
+**Does NOT**:
+- Create raw TypedArrays (calls arrow-builder)
+- Manage buffer capacity/chaining
+- Handle Arrow conversion
+
+**Key Files**:
+- `src/lib/schema/` - Schema builders, tag attributes, feature flags
+- `src/lib/lmao.ts` - Main integration, context creation, task wrappers
+
+**Relationship**: Lmao calls arrow-builder functions to write bytes, arrow-builder imports lmao types for schema metadata.
+
+## 🚫 CRITICAL RULES:
+- **Hot Path**: TypedArray assignments ONLY in arrow-builder. No Arrow builders, no objects!
+- **Package Imports**: arrow-builder can import from `@smoothbricks/lmao`, lmao can import from `@smoothbricks/arrow-builder`
 - **DO NOT**: Use Apache Arrow builders in hot path - only TypedArray assignments per specs/01b_columnar_buffer_architecture.md
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/01a_trace_schema_system.md):
 Three distinct string types, each with different storage strategies:
@@ -54,14 +110,14 @@ x typecheck lmao | **Format**: bun run format (auto-formats on git commit)
   - Enums: buffer.attr_operation[idx] = OPERATION_MAP[value] (compile-time lookup)
   - Categories: buffer.attr_userId[idx] = internString(userId) (runtime interning)
   - Text: buffer.attr_errorMsg[idx] = rawString (no interning)
-- **Method Chaining**: Return 	his from tag methods for fluent API: .userId(id).requestId(req)
+- **Method Chaining**: Return this from tag methods for fluent API: .userId(id).requestId(req)
 - **Per-Span Buffers**: Each span owns its columnar TypedArrays (Uint8Array, Float64Array, etc.)
 ## Entry Type System (See specs/01h_entry_types_and_logging_primitives.md)
 Unified enum for ALL trace events:
 - **Span lifecycle**: span-start, span-ok, span-err, span-exception
 - **Logging**: info, debug, warn, error
-- **Structured data**: 	ag
-- **Feature flags**: f-access, f-usage
+- **Structured data**: tag
+- **Feature flags**: ff-access, ff-usage
 Entry types use compile-time enum mapping to Uint8Array for 1-byte storage.
 ## Critical Performance Rules (See specs/01b1_buffer_performance_optimizations.md)
 1. **Hot Path**: TypedArray writes ONLY. No Arrow builders, no objects, no console.log
@@ -76,7 +132,7 @@ Entry types use compile-time enum mapping to Uint8Array for 1-byte storage.
 - **SpanLogger generation**: Runtime class generation with typed methods per schema
 - **Attribute methods**: Each schema field gets a typed method on SpanLogger
 - **Dual API**: Object-based (ctx.tag({ userId: "123" })) and property-based (ctx.tag.userId("123"))
-- **Zero allocation**: Fluent methods return 	his, no intermediate objects
+- **Zero allocation**: Fluent methods return this, no intermediate objects
 ## Library Integration (See specs/01e_library_integration_pattern.md)
 - Libraries define clean schemas without prefixes
 - Prefixing happens at composition time

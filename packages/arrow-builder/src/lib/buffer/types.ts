@@ -1,4 +1,4 @@
-import type { TagAttributeSchema } from '../schema/types.js';
+import type { TagAttributeSchema } from '@smoothbricks/lmao';
 
 /**
  * TypedArray-based SpanBuffer for zero-copy columnar storage

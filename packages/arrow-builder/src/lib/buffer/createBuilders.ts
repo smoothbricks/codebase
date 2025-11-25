@@ -11,7 +11,7 @@
  */
 
 import * as Sury from '@sury/sury';
-import type { TagAttributeSchema, SchemaWithMetadata } from '../schema/types.js';
+import type { TagAttributeSchema, SchemaWithMetadata } from '@smoothbricks/lmao';
 import type { TypedArray, TypedArrayConstructor } from './types.js';
 
 /**

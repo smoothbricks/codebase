@@ -11,8 +11,8 @@
 import type { TagAttributeSchema, InferTagAttributes } from './schema/types.js';
 import type { FeatureFlagSchema, InferFeatureFlags, EvaluationContext } from './schema/defineFeatureFlags.js';
 import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from './schema/evaluator.js';
-import type { SpanBuffer, ModuleContext, TaskContext } from './buffer/types.js';
-import { createSpanBuffer, createChildSpanBuffer } from './buffer/createSpanBuffer.js';
+import type { SpanBuffer, ModuleContext, TaskContext } from '@smoothbricks/arrow-builder';
+import { createSpanBuffer, createChildSpanBuffer } from '@smoothbricks/arrow-builder';
 
 /**
  * Result types for ok/err pattern

@@ -10,7 +10,7 @@
  */
 
 import type { SpanBuffer, TaskContext, TypedArray } from './types.js';
-import type { TagAttributeSchema } from '../schema/types.js';
+import type { TagAttributeSchema } from '@smoothbricks/lmao';
 import { createAttributeColumns } from './createBuilders.js';
 
 let nextGlobalSpanId = 1;
