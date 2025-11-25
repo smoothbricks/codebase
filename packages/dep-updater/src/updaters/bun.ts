@@ -7,6 +7,51 @@ import type { Logger } from '../logger.js';
 import type { PackageUpdate, UpdateResult } from '../types.js';
 
 /**
+ * Parse bun outdated output to detect available updates
+ *
+ * Output format:
+ * | Package | Current | Update | Latest |
+ * |---------|---------|--------|--------|
+ * | axios   | 1.6.0   | 1.13.2 | 1.13.2 |
+ */
+export function parseBunOutdated(output: string): PackageUpdate[] {
+  const updates: PackageUpdate[] = [];
+  const lines = output.split('\n');
+
+  for (const line of lines) {
+    // Skip header, separator, and empty lines
+    if (!line.includes('|') || line.includes('Package') || line.includes('---')) {
+      continue;
+    }
+
+    // Parse table row: | name | current | update | latest |
+    const parts = line
+      .split('|')
+      .map((p) => p.trim())
+      .filter((p) => p.length > 0);
+
+    if (parts.length < 4) continue;
+
+    const [nameWithDev, current, update] = parts;
+    // Remove "(dev)" suffix if present
+    const name = nameWithDev.replace(/\s*\(dev\)\s*$/, '');
+
+    // Only include if there's an actual update (current !== update)
+    if (current && update && current !== update) {
+      updates.push({
+        name,
+        fromVersion: current,
+        toVersion: update,
+        updateType: classifyUpdateType(current, update),
+        ecosystem: 'npm',
+      });
+    }
+  }
+
+  return updates;
+}
+
+/**
  * Parse package updates from git diff of package.json files
  *
  * Parses diff lines like:
@@ -181,6 +226,18 @@ export async function updateBunDependencies(
         logger?.warn('Warning: Could not get git diff, falling back to stdout parsing');
         // Fallback to stdout parsing
         updates = parseBunUpdateOutput(result.stdout);
+      }
+    } else {
+      // Dry run: use bun outdated to detect available updates
+      logger?.info('Checking for available updates...');
+      try {
+        const outdatedResult = await execa('bun', ['outdated'], {
+          cwd: repoRoot,
+        });
+        updates = parseBunOutdated(outdatedResult.stdout);
+      } catch (_error) {
+        // bun outdated may fail if no updates available
+        logger?.info('No updates detected');
       }
     }
 
