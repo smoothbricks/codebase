@@ -3,60 +3,135 @@
  */
 
 import { existsSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import type { DepUpdaterConfig } from '../config.js';
 import { getRepoRoot } from '../git.js';
 import type { GenerateWorkflowOptions } from '../types.js';
 import { safeResolve } from '../utils/path-validation.js';
 
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+
 /**
- * Generate GitHub Actions workflow YAML content
+ * Get the path to the templates directory
  */
-function generateWorkflowContent(options: { schedule: string; workflowName: string; useAI: boolean }): string {
-  const { schedule, workflowName, useAI } = options;
+function getTemplatesDir(): string {
+  // When running from dist/, templates are at ../templates
+  // When running from src/ (dev), templates are at ../../templates
+  const distTemplates = join(__dirname, '..', 'templates', 'workflows');
+  const srcTemplates = join(__dirname, '..', '..', 'templates', 'workflows');
 
-  return `name: ${workflowName}
+  if (existsSync(distTemplates)) {
+    return distTemplates;
+  }
+  if (existsSync(srcTemplates)) {
+    return srcTemplates;
+  }
 
-on:
-  schedule:
-    # Run daily at 2 AM UTC
-    - cron: '${schedule}'
-  workflow_dispatch: # Allow manual triggers
+  throw new Error('Could not find templates directory');
+}
 
-permissions:
-  contents: write
-  pull-requests: write
+/**
+ * Process template placeholders for PAT authentication
+ */
+function processPATTemplate(template: string, useAI: boolean): string {
+  let result = template;
 
-jobs:
-  update-dependencies:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0 # Fetch all history for proper git operations
+  if (useAI) {
+    // With AI
+    result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
+    result = result.replace(
+      '{{AI_SETUP_STEP}}',
+      '\n#   2. Generate Anthropic API key at https://console.anthropic.com/settings/keys',
+    );
+    result = result.replace('{{STEP_SECRETS}}', '3');
+    result = result.replace('{{AI_SECRETS_PLURAL}}', 's:');
+    result = result.replace('{{AI_SECRET_COMMAND}}', '\n#      gh secret set ANTHROPIC_API_KEY --org YOUR_ORG');
+    result = result.replace('{{STEP_COPY}}', '4');
+    result = result.replace('{{STEP_COMMIT}}', '5');
+    result = result.replace('{{AI_STEP_SUFFIX}}', ' with AI changelog analysis');
+    result = result.replace(
+      '{{AI_ENV_VAR}}',
+      '\n          ANTHROPIC_API_KEY: ' + '$' + '{{ secrets.ANTHROPIC_API_KEY }}',
+    );
+  } else {
+    // Without AI
+    result = result.replace('{{AI_HEADER_SUFFIX}}', ' (Simple Setup)');
+    result = result.replace('{{AI_SETUP_STEP}}', '');
+    result = result.replace('{{STEP_SECRETS}}', '2');
+    result = result.replace('{{AI_SECRETS_PLURAL}}', ':');
+    result = result.replace('{{AI_SECRET_COMMAND}}', '');
+    result = result.replace('{{STEP_COPY}}', '3');
+    result = result.replace('{{STEP_COMMIT}}', '4');
+    result = result.replace('{{AI_STEP_SUFFIX}}', '');
+    result = result.replace('{{AI_ENV_VAR}}', '');
+  }
 
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
+  return result;
+}
 
-      - name: Install dependencies
-        run: bun install
+/**
+ * Process template placeholders for GitHub App authentication
+ */
+function processGitHubAppTemplate(template: string, useAI: boolean): string {
+  let result = template;
 
-      - name: Configure git
-        run: |
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git config --global user.name "github-actions[bot]"
+  if (useAI) {
+    // With AI
+    result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
+    result = result.replace(
+      '{{AI_SETUP_STEP}}',
+      '\n#   3. Generate Anthropic API key at https://console.anthropic.com/settings/keys',
+    );
+    result = result.replace('{{STEP_VAR}}', '4');
+    result = result.replace('{{STEP_SECRETS}}', '5');
+    result = result.replace('{{AI_SECRETS_PLURAL}}', 's:');
+    result = result.replace('{{AI_SECRET_LIST}}', '\n#      - ANTHROPIC_API_KEY');
+    result = result.replace('{{STEP_COPY}}', '6');
+    result = result.replace('{{STEP_VALIDATE}}', '7');
+    result = result.replace('{{AI_STEP_SUFFIX}}', ' with AI changelog analysis');
+    result = result.replace(
+      '{{AI_ENV_VAR}}',
+      '\n          ANTHROPIC_API_KEY: ' + '$' + '{{ secrets.ANTHROPIC_API_KEY }}',
+    );
+  } else {
+    // Without AI
+    result = result.replace('{{AI_HEADER_SUFFIX}}', ' (Simple Setup)');
+    result = result.replace('{{AI_SETUP_STEP}}', '');
+    result = result.replace('{{STEP_VAR}}', '3');
+    result = result.replace('{{STEP_SECRETS}}', '4');
+    result = result.replace('{{AI_SECRETS_PLURAL}}', ':');
+    result = result.replace('{{AI_SECRET_LIST}}', '');
+    result = result.replace('{{STEP_COPY}}', '5');
+    result = result.replace('{{STEP_VALIDATE}}', '6');
+    result = result.replace('{{AI_STEP_SUFFIX}}', '');
+    result = result.replace('{{AI_ENV_VAR}}', '');
+  }
 
-      - name: Run dependency updater
-        env:
-          GH_TOKEN: \${{ secrets.GH_PAT }}${useAI ? '\n          ANTHROPIC_API_KEY: ' + '$' + '{{ secrets.ANTHROPIC_API_KEY }}' : ''}
-        run: |
-          # Run via Nx target (automatically builds if needed, supports caching)
-          nx run @smoothbricks/dep-updater:update-deps -- --verbose${!useAI ? ' --skip-ai' : ''}
-`;
+  return result;
+}
+
+/**
+ * Generate workflow content from template
+ */
+async function generateWorkflowContentFromTemplate(options: {
+  authType: 'pat' | 'github-app';
+  useAI: boolean;
+}): Promise<string> {
+  const { authType, useAI } = options;
+
+  const templatesDir = getTemplatesDir();
+  const templateFile = authType === 'github-app' ? 'github-app.yml' : 'pat.yml';
+  const templatePath = join(templatesDir, templateFile);
+
+  const template = await readFile(templatePath, 'utf-8');
+
+  if (authType === 'github-app') {
+    return processGitHubAppTemplate(template, useAI);
+  }
+  return processPATTemplate(template, useAI);
 }
 
 /**
@@ -65,20 +140,20 @@ jobs:
 export async function generateWorkflow(config: DepUpdaterConfig, options: GenerateWorkflowOptions): Promise<void> {
   const repoRoot = config.repoRoot || (await getRepoRoot());
 
-  // Default values
-  const schedule = options.schedule || '0 2 * * *'; // 2 AM UTC daily
-  const workflowName = options.workflowName || 'Update Dependencies';
-  const useAI = !options.skipAI && config.ai?.apiKey !== undefined;
+  // Determine settings
+  const authType = options.authType || 'pat';
+  const useAI = options.enableAI === true || (!options.skipAI && config.ai?.apiKey !== undefined);
 
   config.logger?.info('Generating GitHub Actions workflow...\n');
-  config.logger?.info(`  Schedule: ${schedule}`);
-  config.logger?.info(`  Workflow name: ${workflowName}`);
+  config.logger?.info(`  Auth type: ${authType}`);
   config.logger?.info(`  AI analysis: ${useAI ? 'enabled' : 'disabled'}\n`);
+
+  const workflowContent = await generateWorkflowContentFromTemplate({ authType, useAI });
 
   if (options.dryRun) {
     config.logger?.info('[DRY RUN] Would generate workflow file');
     config.logger?.info('\nWorkflow content:\n');
-    config.logger?.info(generateWorkflowContent({ schedule, workflowName, useAI }));
+    config.logger?.info(workflowContent);
     return;
   }
 
@@ -89,48 +164,10 @@ export async function generateWorkflow(config: DepUpdaterConfig, options: Genera
     config.logger?.info('✓ Created .github/workflows directory');
   }
 
-  // Generate workflow content
-  const workflowContent = generateWorkflowContent({ schedule, workflowName, useAI });
-
   // Write workflow file
   const workflowPath = join(workflowDir, 'update-deps.yml');
   await writeFile(workflowPath, workflowContent, 'utf-8');
 
   config.logger?.info(`✓ Generated workflow file: ${workflowPath}\n`);
-
-  // Print next steps
-  config.logger?.info('Next steps:');
-  config.logger?.info('  1. Create a fine-grained Personal Access Token:');
-  config.logger?.info('     a. Go to https://github.com/settings/tokens?type=beta');
-  config.logger?.info('     b. Click "Generate new token"');
-  config.logger?.info('     c. Set token name (e.g., "dep-updater")');
-  config.logger?.info("     d. Set expiration (max 1 year, you'll need to regenerate)");
-  config.logger?.info('     e. Select repository access (only this repo or specific repos)');
-  config.logger?.info('     f. Set permissions:');
-  config.logger?.info('        - Contents: Read and write');
-  config.logger?.info('        - Pull requests: Read and write');
-  config.logger?.info('        - Workflows: Read and write');
-  config.logger?.info('     g. Generate token and copy it');
-  config.logger?.info('');
-  config.logger?.info('  2. Add the token as a repository secret:');
-  config.logger?.info('     a. Go to repository Settings → Secrets and variables → Actions');
-  config.logger?.info('     b. Click "New repository secret"');
-  config.logger?.info('     c. Name: GH_PAT');
-  config.logger?.info('     d. Value: paste your token');
-  config.logger?.info('     e. Click "Add secret"');
-  if (useAI) {
-    config.logger?.info('');
-    config.logger?.info('  3. Add ANTHROPIC_API_KEY to GitHub Secrets (same steps as above)');
-  }
-  config.logger?.info('');
-  config.logger?.info(`  ${useAI ? '4' : '3'}. Review the generated workflow file`);
-  config.logger?.info(`  ${useAI ? '5' : '4'}. Commit and push the workflow file`);
-  config.logger?.info(`  ${useAI ? '6' : '5'}. The workflow will run daily at 2 AM UTC`);
-  config.logger?.info(`  ${useAI ? '7' : '6'}. You can also trigger it manually from GitHub Actions tab\n`);
-
-  config.logger?.info('Why fine-grained PAT? It triggers CI workflows and has better security than classic tokens.');
-  if (useAI) {
-    config.logger?.info('Note: ANTHROPIC_API_KEY is required for AI-powered changelog analysis.');
-  }
-  config.logger?.info('\n// TODO: Add GitHub App authentication support for production use (not user-dependent)');
+  config.logger?.info('Follow the setup instructions in the workflow file header.\n');
 }
