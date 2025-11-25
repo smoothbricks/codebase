@@ -57,6 +57,11 @@
     "targets": {
       "lint": {},
       "lint:fix": {},
+      "test": {
+        "dependsOn": [
+          "build"
+        ]
+      },
       "typecheck": {
         "executor": "nx:run-commands",
         "dependsOn": [
