@@ -91,6 +91,22 @@
           "command": "node dist/cli.js generate-workflow",
           "cwd": "{projectRoot}"
         }
+      },
+      "smoke-test": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "commands": [
+            "node dist/cli.js --help",
+            "node dist/cli.js init --yes --dry-run",
+            "node dist/cli.js generate-workflow --dry-run",
+            "node dist/cli.js update-deps --dry-run --skip-ai || true"
+          ],
+          "cwd": "{projectRoot}",
+          "parallel": false
+        }
       }
     }
   }
