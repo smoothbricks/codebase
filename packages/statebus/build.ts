@@ -16,7 +16,15 @@ await $`rm -rf ./dist`;
 const [esm, cjs] = await Promise.all([
   Bun.build({
     ...defaultBuildConfig,
-    plugins: [dts()],
+    plugins: [
+      // Use separate tsconfig for DTS generation to avoid bun-types bug.
+      // See tsconfig.build.json for details.
+      dts({
+        compilationOptions: {
+          preferredConfigPath: './tsconfig.build.json',
+        },
+      }),
+    ],
     format: 'esm',
     naming: '[dir]/[name].js',
   }),
