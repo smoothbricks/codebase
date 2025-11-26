@@ -1,0 +1,18 @@
+{
+  // This config is used ONLY for generating .d.ts files during build.
+  // It extends the main tsconfig.json but overrides "types" to prevent
+  // auto-loading @types/* packages.
+  //
+  // WHY: bun-types/globals.d.ts has a bug where it tries to import
+  // ReadableStreamBYOBRequest as a type from "node:stream/web", but
+  // @types/node exports it as a const (value). This breaks dts-bundle-generator.
+  //
+  // CONSTRAINT: With types: [], Node.js imports (node:*) won't work in src/
+  // because @types/node won't be loaded during build.
+
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "types": []
+  },
+  "include": ["src"]
+}
