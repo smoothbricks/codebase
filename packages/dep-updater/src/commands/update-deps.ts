@@ -6,7 +6,7 @@ import { analyzeChangelogs, generateCommitMessage } from '../changelog/analyzer.
 import { fetchChangelogs } from '../changelog/fetcher.js';
 import type { DepUpdaterConfig } from '../config.js';
 import { executeConfigScript, findConfigFile, isConfigScript } from '../config.js';
-import { createUpdateCommit, fetch, getCurrentBranch, getRepoRoot, switchBranch } from '../git.js';
+import { createUpdateCommit, fetch, getRepoRoot, switchBranch } from '../git.js';
 import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/stacking.js';
 import type { PackageUpdate, UpdateOptions, UpdateResult } from '../types.js';
 import { updateBunDependencies } from '../updaters/bun.js';
@@ -16,18 +16,17 @@ import { safeResolve } from '../utils/path-validation.js';
 
 /**
  * Setup branch for stacked PR workflow
- * Returns the base branch to use and the original branch to restore later
+ * Returns the base branch to use for the PR
  */
 async function setupBranchForStacking(
   config: DepUpdaterConfig,
   repoRoot: string,
-): Promise<{ stackBase: string; originalBranch: string; mainBranch: string }> {
+): Promise<{ stackBase: string; mainBranch: string }> {
   // Determine base branch for stacking FIRST (before running updates)
   const { baseBranch: stackBase, reason } = await determineBaseBranch(config, repoRoot);
   config.logger?.info(`Base branch: ${stackBase} (${reason})\n`);
 
   const mainBranch = config.git?.baseBranch || 'main';
-  const originalBranch = await getCurrentBranch(repoRoot);
 
   // If stacking is enabled and we're basing on a PR branch, checkout that branch first
   // This ensures updates only find NEW changes beyond what's in the base PR
@@ -39,7 +38,7 @@ async function setupBranchForStacking(
     config.logger?.info(`✓ Switched to ${stackBase}\n`);
   }
 
-  return { stackBase, originalBranch, mainBranch };
+  return { stackBase, mainBranch };
 }
 
 /**
@@ -251,7 +250,7 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   }
 
   // Setup branch for stacking
-  const { stackBase, originalBranch, mainBranch } = await setupBranchForStacking(config, repoRoot);
+  const { stackBase, mainBranch } = await setupBranchForStacking(config, repoRoot);
 
   // Run all updaters
   const { allUpdates } = await runAllUpdaters(config, repoRoot, options);
@@ -263,12 +262,6 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   // Handle no updates case
   if (allUpdates.length === 0 && isClean) {
     config.logger?.info('\n✓ No updates available');
-    // Switch back to original branch
-    if (originalBranch !== stackBase) {
-      config.logger?.info(`Switching back to ${originalBranch}...`);
-      await switchBranch(repoRoot, originalBranch);
-      config.logger?.info(`✓ Back on ${originalBranch}`);
-    }
     return;
   }
 
@@ -281,9 +274,6 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
     if (stackBase !== mainBranch) {
       config.logger?.info('    Already on PR branch - these changes may already be committed');
       config.logger?.info('    Skipping to avoid duplicate PR');
-      config.logger?.info(`\nSwitching back to ${originalBranch}...`);
-      await switchBranch(repoRoot, originalBranch);
-      config.logger?.info(`✓ Back on ${originalBranch}`);
       return;
     }
   }
@@ -305,11 +295,6 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   // Create PR workflow
   if (!options.skipGit) {
     await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates);
-
-    // Switch back to original branch
-    config.logger?.info(`\n=== Switching back to ${originalBranch} ===`);
-    await switchBranch(repoRoot, originalBranch);
-    config.logger?.info(`✓ Switched back to ${originalBranch}`);
   }
 
   config.logger?.info('\n✓ Dependency update complete!');
