@@ -31,8 +31,6 @@
       "name": "@smoothbricks/arrow-builder",
       "version": "0.0.1",
       "dependencies": {
-        "@sury/sury": "npm:@jsr/sury__sury",
-        "apache-arrow": "^21.1.0",
         "tslib": "^2.3.0",
       },
     },
@@ -53,7 +51,6 @@
       "name": "@smoothbricks/lmao",
       "version": "0.0.1",
       "dependencies": {
-        "@smoothbricks/arrow-builder": "workspace:*",
         "@sury/sury": "npm:@jsr/sury__sury",
         "apache-arrow": "^21.1.0",
         "tslib": "^2.3.0",

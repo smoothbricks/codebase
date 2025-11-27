@@ -456,7 +456,8 @@ function getBufferWithSpace(buffer: SpanBuffer): { buffer: SpanBuffer; didOverfl
     if (!buffer.next) {
       buffer.next = createNextBuffer(buffer);
     }
-    buffer = buffer.next;
+    // Type assertion: createNextBuffer always returns SpanBuffer
+    buffer = buffer.next as SpanBuffer;
     didOverflow = true;
   }
   
@@ -614,8 +615,7 @@ function createSpanLogger<T extends TagAttributeSchema>(
     // Tag getter - creates new entry and returns chainable API
     get tag(): ChainableTagAPI<T> {
       // Check for overflow and get buffer with space
-      const { buffer: bufferWithSpace, didOverflow } = getBufferWithSpace(activeBuffer);
-      activeBuffer = bufferWithSpace;
+      activeBuffer = getBufferWithSpace(activeBuffer).buffer;
       
       // Create new tag entry
       const idx = activeBuffer.writeIndex;

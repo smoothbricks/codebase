@@ -1,9 +1,7 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { describe, it, expect } from 'bun:test';
 import { createModuleContext, createRequestContext } from '../lmao.js';
 import { defineTagAttributes } from '../schema/defineTagAttributes.js';
-import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { S } from '../schema/builder.js';
-import type { TagAttributeSchema } from '../schema/types.js';
 
 /**
  * Tests for buffer overflow handling and capacity tuning
@@ -19,15 +17,16 @@ describe('Buffer Overflow and Capacity Management', () => {
     query: S.text(),
   });
 
-  const featureFlags = defineFeatureFlags({
-    advancedValidation: S.boolean(),
-    newUI: S.boolean(),
-  });
+  const featureFlags = {
+    schema: {
+      advancedValidation: S.boolean(),
+      newUI: S.boolean(),
+    },
+  };
 
   const flagEvaluator = {
-    async evaluate() {
-      return true;
-    },
+    getSync: () => true,
+    getAsync: async () => true,
   };
 
   const environmentConfig = {
