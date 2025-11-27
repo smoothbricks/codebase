@@ -296,11 +296,17 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   // Dry run exit - show what would be created
   if (options.dryRun) {
     const branchName = generateBranchName(config);
-    const { title } = await generateCommitMessage(allUpdates, config);
+    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options);
     config.logger?.info('\n[DRY RUN] Would create:');
     config.logger?.info(`  Branch: ${branchName}`);
-    config.logger?.info(`  Commit: ${title}`);
+    config.logger?.info(`  Commit: ${commitTitle}`);
     config.logger?.info(`  PR base: ${stackBase}`);
+    config.logger?.info('\n  PR Description:');
+    config.logger?.info(`  ${'─'.repeat(50)}`);
+    for (const line of prBody.split('\n')) {
+      config.logger?.info(`  ${line}`);
+    }
+    config.logger?.info(`  ${'─'.repeat(50)}`);
     return;
   }
 
