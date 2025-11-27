@@ -30,6 +30,66 @@ function generateTraceId(): string {
 }
 
 /**
+ * String interning for category columns
+ * 
+ * Per specs/01b1_buffer_performance_optimizations.md:
+ * - Store strings once, reference by index
+ * - Fast integer comparison vs string comparison
+ * - Direct Arrow dictionary creation
+ * - Cache-friendly integer storage
+ */
+class StringInterner {
+  private strings: string[] = [];
+  private indices = new Map<string, number>();
+  
+  /**
+   * Intern a string and return its index
+   * O(1) lookup via Map, O(1) insertion
+   */
+  intern(str: string): number {
+    let idx = this.indices.get(str);
+    
+    if (idx === undefined) {
+      idx = this.strings.length;
+      this.strings.push(str);
+      this.indices.set(str, idx);
+    }
+    
+    return idx;
+  }
+  
+  /**
+   * Get string by index
+   * Used during Arrow conversion
+   */
+  getString(idx: number): string | undefined {
+    return this.strings[idx];
+  }
+  
+  /**
+   * Get all strings for Arrow dictionary
+   */
+  getStrings(): readonly string[] {
+    return this.strings;
+  }
+  
+  /**
+   * Get count of unique strings
+   */
+  size(): number {
+    return this.strings.length;
+  }
+}
+
+/**
+ * Global string interners
+ * One per string type to keep dictionaries separate
+ */
+const categoryInterner = new StringInterner();
+const moduleIdInterner = new StringInterner();
+const spanNameInterner = new StringInterner();
+
+/**
  * Request context created at request boundary
  * Contains trace ID, feature flags, and environment config
  */
@@ -210,6 +270,10 @@ const ENTRY_TYPE_MESSAGE = 4;
 /**
  * Create column writers for feature flag analytics
  * Writes to TypedArray columnar buffers in memory (hot path)
+ * 
+ * Per specs/01b1_buffer_performance_optimizations.md:
+ * - String interning for category columns
+ * - Direct TypedArray writes (no allocations)
  */
 function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
   return {
@@ -223,59 +287,90 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
     },
     
     writeFfName(name: string): void {
-      // Write to attr_ffName column if it exists
-      // For string types (category/text), we store as string in TypedArray (will be interned later)
+      // Write to attr_ffName column with string interning
       const column = buffer['attr_ffName' as keyof SpanBuffer];
-      if (column && ArrayBuffer.isView(column)) {
-        // For now, store string index (TODO: implement string interning)
-        // Placeholder: store 0 for now, will implement string table later
-        (column as Uint32Array)[buffer.writeIndex] = 0;
+      if (column && column instanceof Uint32Array) {
+        column[buffer.writeIndex] = categoryInterner.intern(name);
       }
     },
     
     writeFfValue(value: string | number | boolean | null): void {
       // Write to attr_ffValue column
-      // For mixed types, serialize to string and store index
+      // For mixed types, serialize to string and intern
       const column = buffer['attr_ffValue' as keyof SpanBuffer];
-      if (column && ArrayBuffer.isView(column)) {
-        // Placeholder: store 0 for now, will implement string table later
-        (column as Uint32Array)[buffer.writeIndex] = 0;
+      if (column && column instanceof Uint32Array) {
+        const strValue = value === null ? 'null' : String(value);
+        column[buffer.writeIndex] = categoryInterner.intern(strValue);
       }
     },
     
     writeAction(action?: string): void {
       // Write to attr_action column
       const column = buffer['attr_action' as keyof SpanBuffer];
-      if (column && ArrayBuffer.isView(column)) {
-        // Placeholder: store 0 for now, will implement string table later
-        (column as Uint32Array)[buffer.writeIndex] = 0;
+      if (column && column instanceof Uint32Array) {
+        const idx = buffer.writeIndex;
+        if (action) {
+          column[idx] = categoryInterner.intern(action);
+          // Mark as non-null in bitmap
+          const nullBitmap = buffer.nullBitmaps['attr_action'];
+          if (nullBitmap) {
+            const byteIndex = Math.floor(idx / 8);
+            const bitOffset = idx % 8;
+            nullBitmap[byteIndex] |= (1 << bitOffset);
+          }
+        }
       }
     },
     
     writeOutcome(outcome?: string): void {
       // Write to attr_outcome column
       const column = buffer['attr_outcome' as keyof SpanBuffer];
-      if (column && ArrayBuffer.isView(column)) {
-        // Placeholder: store 0 for now, will implement string table later
-        (column as Uint32Array)[buffer.writeIndex] = 0;
+      if (column && column instanceof Uint32Array) {
+        const idx = buffer.writeIndex;
+        if (outcome) {
+          column[idx] = categoryInterner.intern(outcome);
+          // Mark as non-null in bitmap
+          const nullBitmap = buffer.nullBitmaps['attr_outcome'];
+          if (nullBitmap) {
+            const byteIndex = Math.floor(idx / 8);
+            const bitOffset = idx % 8;
+            nullBitmap[byteIndex] |= (1 << bitOffset);
+          }
+        }
       }
     },
     
     writeContextAttributes(context: EvaluationContext): void {
-      // Write context attributes to their respective columns
+      const idx = buffer.writeIndex;
+      
+      // Write context attributes to their respective columns with string interning
       if (context.userId) {
         const column = buffer['attr_contextUserId' as keyof SpanBuffer];
-        if (column && ArrayBuffer.isView(column)) {
-          (column as Uint32Array)[buffer.writeIndex] = 0; // Placeholder
+        if (column && column instanceof Uint32Array) {
+          column[idx] = categoryInterner.intern(context.userId);
+          // Mark as non-null in bitmap
+          const nullBitmap = buffer.nullBitmaps['attr_contextUserId'];
+          if (nullBitmap) {
+            const byteIndex = Math.floor(idx / 8);
+            const bitOffset = idx % 8;
+            nullBitmap[byteIndex] |= (1 << bitOffset);
+          }
         }
       }
+      
       if (context.requestId) {
         const column = buffer['attr_contextRequestId' as keyof SpanBuffer];
-        if (column && ArrayBuffer.isView(column)) {
-          (column as Uint32Array)[buffer.writeIndex] = 0; // Placeholder
+        if (column && column instanceof Uint32Array) {
+          column[idx] = categoryInterner.intern(context.requestId);
+          // Mark as non-null in bitmap
+          const nullBitmap = buffer.nullBitmaps['attr_contextRequestId'];
+          if (nullBitmap) {
+            const byteIndex = Math.floor(idx / 8);
+            const bitOffset = idx % 8;
+            nullBitmap[byteIndex] |= (1 << bitOffset);
+          }
         }
       }
-      // Additional context fields can be written similarly
       
       // Increment write index after all writes
       buffer.writeIndex++;
@@ -286,40 +381,75 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 /**
  * Write a value to a TypedArray column
  * Handles type conversion for different column types
+ * 
+ * Per specs/01b1_buffer_performance_optimizations.md:
+ * - String interning for category types
+ * - Null bitmap management per Arrow spec
+ * - Direct TypedArray writes (hot path)
  */
 function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, index: number): void {
   const column = buffer[columnName as keyof SpanBuffer];
   
   if (!column || !ArrayBuffer.isView(column)) return;
   
+  // Get null bitmap for this column (Arrow format: 1 Uint8Array per column)
+  const nullBitmap = buffer.nullBitmaps[columnName as `attr_${string}`];
+  
   // Handle null/undefined - store 0 and set null bitmap
   if (value === null || value === undefined) {
     if (column instanceof Uint8Array) {
+      column[index] = 0;
+    } else if (column instanceof Uint16Array) {
       column[index] = 0;
     } else if (column instanceof Uint32Array) {
       column[index] = 0;
     } else if (column instanceof Float64Array) {
       column[index] = 0;
     }
-    // Set null bit in bitmap (TODO: implement null bitmap)
+    
+    // Set null bit in bitmap (Arrow format: 1 bit per row, 0 = null, 1 = valid)
+    // We store 0 for null, so no need to set the bit (defaults to 0)
+    if (nullBitmap) {
+      const byteIndex = Math.floor(index / 8);
+      const bitOffset = index % 8;
+      // Clear the bit (0 = null in Arrow format)
+      nullBitmap[byteIndex] &= ~(1 << bitOffset);
+    }
     return;
+  }
+  
+  // Mark as non-null in bitmap (1 = valid in Arrow format)
+  if (nullBitmap) {
+    const byteIndex = Math.floor(index / 8);
+    const bitOffset = index % 8;
+    nullBitmap[byteIndex] |= (1 << bitOffset);
   }
   
   // Write based on column type
   if (column instanceof Uint8Array) {
-    // For boolean or enum types
+    // For boolean or small enum types
     if (typeof value === 'boolean') {
       column[index] = value ? 1 : 0;
     } else if (typeof value === 'number') {
       column[index] = value;
-    } else {
-      // For string enums, need compile-time mapping (TODO)
+    } else if (typeof value === 'string') {
+      // For string enums, try to find enum value index
+      // This requires schema metadata to be available
+      // For now, store 0 (will be improved with compile-time mapping)
       column[index] = 0;
     }
+  } else if (column instanceof Uint16Array) {
+    // For medium enum types (256-65535 values)
+    if (typeof value === 'number') {
+      column[index] = value;
+    }
   } else if (column instanceof Uint32Array) {
-    // For category/text types - store string index
-    // TODO: implement string interning for categories
-    column[index] = 0; // Placeholder
+    // For category/text types - store string index via interning
+    if (typeof value === 'string') {
+      column[index] = categoryInterner.intern(value);
+    } else if (typeof value === 'number') {
+      column[index] = value;
+    }
   } else if (column instanceof Float64Array) {
     // For number types
     column[index] = typeof value === 'number' ? value : 0;
@@ -480,14 +610,15 @@ export function createModuleContext<
     return acc;
   }, {} as Record<string, unknown>) as T;
   
-  // Create module context (stub for now - will integrate with buffer system)
+  // Create module context with string-interned module ID
+  // Module ID is the file path, interned for efficient storage
   const moduleContext: ModuleContext = {
-    moduleId: Math.floor(Math.random() * 1000000), // Stub
+    moduleId: moduleIdInterner.intern(moduleMetadata.filePath),
     gitSha: moduleMetadata.gitSha,
     filePath: moduleMetadata.filePath,
     tagAttributes: schemaOnly,
     spanBufferCapacityStats: {
-      currentCapacity: 1024,
+      currentCapacity: 64, // Start with cache-friendly size (see specs/01b_columnar_buffer_architecture.md)
       totalWrites: 0,
       overflowWrites: 0,
       totalBuffersCreated: 0,
@@ -500,10 +631,10 @@ export function createModuleContext<
       fn: TaskFunction<Args, Result, T, FF, Env>
     ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result> {
       return async (requestCtx: RequestContext<FF, Env>, ...args: Args): Promise<Result> => {
-        // Create task context
+        // Create task context with string-interned span name
         const taskContext: TaskContext = {
           module: moduleContext,
-          spanNameId: Math.floor(Math.random() * 1000000), // TODO: Use string table for span names
+          spanNameId: spanNameInterner.intern(name),
           lineNumber: 0, // Would be set by code generation
         };
         

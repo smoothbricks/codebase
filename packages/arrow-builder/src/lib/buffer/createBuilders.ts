@@ -3,7 +3,7 @@
  * 
  * This maps Sury schema types to appropriate TypedArrays per
  * specs/01b_columnar_buffer_architecture.md:
- * - enum → Uint8Array (compile-time mapping)
+ * - enum → Uint8/Uint16/Uint32Array (size based on enum value count)
  * - category → Uint32Array (string interning indices)
  * - text → Uint32Array (raw string indices)
  * - number → Float64Array
@@ -38,7 +38,7 @@ export function createAttributeColumns(
  * Create appropriate TypedArray for a Sury schema
  * 
  * STRING TYPE SYSTEM (See specs/01a_trace_schema_system.md):
- * - enum: Uint8Array (1 byte with compile-time mapping)
+ * - enum: Uint8/16/32Array (size based on enum value count: <256=8bit, <65536=16bit, else 32bit)
  * - category: Uint32Array (runtime string interning indices)
  * - text: Uint32Array (raw string indices)
  * 
@@ -57,8 +57,23 @@ function createTypedArrayForSchema(
   
   // Handle three string types
   if (lmaoType === 'enum') {
-    // Enum: Uint8Array for compile-time mapped values (0-255)
-    return new Uint8Array(capacity);
+    // Enum: Select TypedArray size based on enum value count
+    const enumValues = schemaWithMetadata.__lmao_enum_values;
+    const enumCount = enumValues?.length ?? 0;
+    
+    if (enumCount === 0) {
+      // No enum values specified, default to Uint8Array
+      return new Uint8Array(capacity);
+    } else if (enumCount <= 255) {
+      // 0-255 values: Uint8Array (1 byte)
+      return new Uint8Array(capacity);
+    } else if (enumCount <= 65535) {
+      // 256-65535 values: Uint16Array (2 bytes)
+      return new Uint16Array(capacity);
+    } else {
+      // >65535 values: Uint32Array (4 bytes)
+      return new Uint32Array(capacity);
+    }
   }
   
   if (lmaoType === 'category') {

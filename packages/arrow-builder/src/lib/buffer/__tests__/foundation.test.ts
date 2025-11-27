@@ -52,7 +52,11 @@ describe('Buffer Foundation', () => {
     // Check TypedArrays are created
     expect(buf.timestamps).toBeInstanceOf(Float64Array);
     expect(buf.operations).toBeInstanceOf(Uint8Array);
-    expect(buf.nullBitmap).toBeDefined();
+    
+    // Check null bitmaps exist for each attribute (Arrow format: 1 Uint8Array per column)
+    expect(buf.nullBitmaps).toBeDefined();
+    expect(buf.nullBitmaps['attr_userId']).toBeInstanceOf(Uint8Array);
+    expect(buf.nullBitmaps['attr_count']).toBeInstanceOf(Uint8Array);
     
     // Check attribute columns exist for each schema field
     expect(buf['attr_userId']).toBeInstanceOf(Uint32Array); // category → Uint32Array

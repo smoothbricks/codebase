@@ -3,7 +3,7 @@
  * 
  * Per specs/01b_columnar_buffer_architecture.md:
  * - Cache-aligned TypedArrays (64-byte boundaries)
- * - Null bitmap management
+ * - Null bitmap management (one Uint8Array per nullable column per Arrow spec)
  * - Per-span buffers (no traceId/spanId arrays needed)
  * - Direct TypedArray writes in hot path
  * - Arrow conversion in cold path (background processing)
@@ -35,6 +35,7 @@ function getCacheAlignedCapacity(elementCount: number): number {
  * - Each span gets its own buffer
  * - traceId and spanId are constant per buffer (stored as properties)
  * - All TypedArrays have equal length (columnar storage requirement)
+ * - Null bitmaps: one Uint8Array per nullable column (Arrow format)
  */
 export function createEmptySpanBuffer(
   spanId: number,
@@ -50,18 +51,15 @@ export function createEmptySpanBuffer(
   const timestamps = new Float64Array(alignedCapacity);
   const operations = new Uint8Array(alignedCapacity);
   
-  // Choose bitmap type based on attribute count
-  const attributeCount = Object.keys(schema).length;
-  let nullBitmap: Uint8Array | Uint16Array | Uint32Array;
+  // Create null bitmaps - one Uint8Array per nullable column (Arrow format)
+  // Each bitmap stores 8 rows per byte (1 bit per row)
+  // Length = Math.ceil(alignedCapacity / 8) bytes
+  const nullBitmaps: Record<`attr_${string}`, Uint8Array> = {};
+  const bitmapByteLength = Math.ceil(alignedCapacity / 8);
   
-  if (attributeCount <= 8) {
-    nullBitmap = new Uint8Array(alignedCapacity);
-  } else if (attributeCount <= 16) {
-    nullBitmap = new Uint16Array(alignedCapacity);
-  } else if (attributeCount <= 32) {
-    nullBitmap = new Uint32Array(alignedCapacity);
-  } else {
-    throw new Error(`Too many attributes: ${attributeCount}. Maximum 32 supported.`);
+  for (const fieldName of Object.keys(schema)) {
+    const columnName = `attr_${fieldName}` as `attr_${string}`;
+    nullBitmaps[columnName] = new Uint8Array(bitmapByteLength);
   }
   
   // Create attribute columns from schema
@@ -74,7 +72,7 @@ export function createEmptySpanBuffer(
     traceId: parentBuffer?.traceId || `trace-${spanId}`, // Inherit from parent or generate new
     timestamps,
     operations,
-    nullBitmap,
+    nullBitmaps,
     ...(attributeColumns as Record<`attr_${string}`, TypedArray>),
     children: [],
     parent: parentBuffer,

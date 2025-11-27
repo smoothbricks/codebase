@@ -148,4 +148,20 @@ describe('Buffer Integration', () => {
     expect(buffer['attr_email']).toBeInstanceOf(Uint32Array);
     expect(buffer['attr_plainText']).toBeInstanceOf(Uint32Array); // text
   });
+
+  it('selects correct enum TypedArray size based on value count', () => {
+    // Small enum (<256 values) should use Uint8Array
+    const smallEnumSchema = defineTagAttributes({
+      operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
+    });
+
+    const { validate: v1, parse: p1, safeParse: s1, extend: e1, ...smallFields } = smallEnumSchema;
+    const smallAttrs = smallFields as ExtractSchemaFields<typeof smallEnumSchema> & TagAttributeSchema;
+    
+    const smallContext = createTestTaskContext(smallAttrs);
+    const smallBuffer = createSpanBuffer(smallAttrs, smallContext);
+
+    // Should use Uint8Array for enums with ≤255 values
+    expect(smallBuffer['attr_operation']).toBeInstanceOf(Uint8Array);
+  });
 });

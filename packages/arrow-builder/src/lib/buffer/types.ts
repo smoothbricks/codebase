@@ -1,39 +1,33 @@
 import type { TagAttributeSchema } from '../schema-types.js';
 
 /**
- * TypedArray-based SpanBuffer for zero-copy columnar storage
+ * TypedArray-based ColumnBuffer for zero-copy columnar storage
  * 
  * Uses native TypeScript TypedArrays for efficient memory management
  * per specs/01b_columnar_buffer_architecture.md.
  * 
  * Arrow table conversion happens in cold path (background processing).
+ * 
+ * NOTE: This is a generic buffer structure that lmao will extend for span-specific use.
  */
-export interface SpanBuffer {
+export interface ColumnBuffer {
   // Core columns - always present
   timestamps: Float64Array;    // Every operation appends timestamp
   operations: Uint8Array;      // Operation type: tag, ok, err, etc.
   
-  // Null bitmap - dynamically sized based on attribute count
-  nullBitmap: Uint8Array | Uint16Array | Uint32Array;  // Bit flags for which attributes have values
+  // Null bitmaps - one Uint8Array per nullable column (Arrow format)
+  // Each bitmap has length = Math.ceil(capacity / 8) bytes
+  // Bit 0 = row 0, bit 1 = row 1, etc. within each byte
+  nullBitmaps: Record<`attr_${string}`, Uint8Array>;
   
   // Attribute columns (generated from schema with attr_ prefix)
   // These are TypedArrays matching the schema field types
   [key: `attr_${string}`]: TypedArray;
   
-  // Tree structure
-  children: SpanBuffer[];
-  parent?: SpanBuffer;
-  
   // Buffer management
   writeIndex: number;          // Current write position (0 to capacity-1)
   capacity: number;            // Logical capacity for bounds checking
-  next?: SpanBuffer;           // Chain to next buffer when overflow
-  
-  spanId: number;              // Incremental ID for this SpanBuffer
-  traceId: string;             // Root trace ID (constant per span)
-  
-  // Reference to task context
-  task: TaskContext;
+  next?: ColumnBuffer;         // Chain to next buffer when overflow
 }
 
 /**
@@ -50,7 +44,21 @@ export type TypedArray =
   | Float64Array;
 
 /**
+ * Capacity stats for buffer size tuning
+ * Generic stats that any use case can build upon
+ */
+export interface BufferCapacityStats {
+  currentCapacity: number;
+  totalWrites: number;
+  overflowWrites: number;
+  totalBuffersCreated: number;
+}
+
+/**
  * Module context shared across all tasks in same module
+ * 
+ * NOTE: This is a lmao-specific concept but kept here for backward compatibility.
+ * In future, lmao should extend this with its own type.
  */
 export interface ModuleContext {
   moduleId: number;
@@ -61,21 +69,37 @@ export interface ModuleContext {
   tagAttributes: TagAttributeSchema;
   
   // Self-tuning capacity stats
-  spanBufferCapacityStats: {
-    currentCapacity: number;
-    totalWrites: number;
-    overflowWrites: number;
-    totalBuffersCreated: number;
-  };
+  spanBufferCapacityStats: BufferCapacityStats;
 }
 
 /**
  * Task context combines module + task-specific data
+ * 
+ * NOTE: This is a lmao-specific concept but kept here for backward compatibility.
+ * In future, lmao should extend this with its own type.
  */
 export interface TaskContext {
   module: ModuleContext;
   spanNameId: number;
   lineNumber: number;
+}
+
+/**
+ * SpanBuffer - lmao-specific extension of ColumnBuffer
+ * 
+ * Adds span tree structure and task context to the base ColumnBuffer.
+ * Kept for backward compatibility with lmao package.
+ */
+export interface SpanBuffer extends ColumnBuffer {
+  // Tree structure (lmao-specific for span hierarchy)
+  children: SpanBuffer[];
+  parent?: SpanBuffer;
+  
+  spanId: number;              // Incremental ID for this span
+  traceId: string;             // Root trace ID (constant per span)
+  
+  // Reference to task context (lmao-specific)
+  task: TaskContext;
 }
 
 /**
