@@ -270,10 +270,25 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
     config.logger?.info('\n!  No package.json updates, but lock files were updated');
     config.logger?.info('    (dependencies updated within existing semver ranges)');
 
-    // If we're on a PR branch (not main), these changes might already be committed
-    if (stackBase !== mainBranch) {
-      config.logger?.info('    Already on PR branch - these changes may already be committed');
-      config.logger?.info('    Skipping to avoid duplicate PR');
+    // If we're on a PR branch (not main) and stacking is enabled, commit the lock file changes to it
+    // The stackingEnabled check ensures we actually switched to stackBase in setupBranchForStacking
+    if (stackBase !== mainBranch && config.prStrategy.stackingEnabled) {
+      config.logger?.info('    Committing lock file updates to existing PR branch');
+
+      if (!options.skipGit) {
+        // Commit lock file changes to existing PR branch
+        await createUpdateCommit(
+          config,
+          'chore: update lock file',
+          'Updated lock file to resolve dependencies within existing semver ranges.',
+        );
+
+        // Push to remote
+        const remote = config.git?.remote || 'origin';
+        const { push } = await import('../git.js');
+        await push(repoRoot, remote, stackBase);
+        config.logger?.info(`✓ Lock file changes pushed to ${stackBase}`);
+      }
       return;
     }
   }
