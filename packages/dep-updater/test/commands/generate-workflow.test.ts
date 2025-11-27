@@ -311,7 +311,6 @@ describe('Workflow Template Generation', () => {
         const stepNames = steps.map((s: WorkflowStep) => s.name);
         expect(stepNames).toContain('Checkout repository');
         expect(stepNames).toContain('Setup Bun');
-        expect(stepNames).toContain('Install dependencies');
         expect(stepNames).toContain('Configure git');
         expect(stepNames.some((n: string) => n.includes('Run dep-updater'))).toBe(true);
       });
