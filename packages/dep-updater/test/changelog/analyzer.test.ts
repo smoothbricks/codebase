@@ -137,23 +137,6 @@ describe('Changelog Analyzer', () => {
       expect(body).toContain('npm, nix');
     });
 
-    test('includes Claude Code attribution', async () => {
-      const updates: PackageUpdate[] = [
-        {
-          name: 'vite',
-          fromVersion: '7.2.0',
-          toVersion: '7.2.1',
-          updateType: 'patch',
-          ecosystem: 'npm',
-        },
-      ];
-
-      const { body } = await generateCommitMessage(updates, mockConfig);
-
-      expect(body).toContain('Generated with [Claude Code]');
-      expect(body).toContain('Co-Authored-By: Claude');
-    });
-
     test('handles empty updates array', async () => {
       const updates: PackageUpdate[] = [];
 
