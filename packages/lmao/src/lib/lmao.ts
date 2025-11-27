@@ -157,6 +157,11 @@ export function createRequestContext<
 /**
  * Chainable tag API type
  * Each method returns the tag object for chaining
+ * 
+ * Per specs/01h_entry_types_and_logging_primitives.md:
+ * - Tag getter creates a new entry in the buffer
+ * - Subsequent method calls write to the SAME row
+ * - All methods return this for zero-allocation chaining
  */
 export type ChainableTagAPI<T extends TagAttributeSchema> = {
   /**
@@ -175,16 +180,22 @@ export type ChainableTagAPI<T extends TagAttributeSchema> = {
 /**
  * Span logger context - provides logging API for spans
  * This is what's available as ctx.log in task wrappers
+ * 
+ * Per specs/01h_entry_types_and_logging_primitives.md:
+ * - tag is a GETTER that creates a new entry and returns chainable API
+ * - All methods write to the SAME row until the next tag access
  */
 export interface SpanLogger<T extends TagAttributeSchema> {
   /**
    * Tag attribute API with method chaining support
-   * Each method returns the tag object for chaining:
-   * - ctx.log.tag.userId(value) - returns tag for chaining
-   * - ctx.log.tag.userId(value).requestId(value2) - chain multiple calls
-   * - ctx.log.tag.with({ userId, requestId }) - bulk set (chainable)
+   * This is a GETTER that creates a new tag entry in the buffer
+   * 
+   * Usage:
+   * - ctx.log.tag.userId(value) - creates entry, sets userId, returns this
+   * - ctx.log.tag.userId(value).requestId(value2) - continues on SAME entry
+   * - ctx.log.tag.with({ userId, requestId }) - bulk set on SAME entry
    */
-  tag: ChainableTagAPI<T>;
+  readonly tag: ChainableTagAPI<T>;
   
   /**
    * Log a message entry
@@ -459,29 +470,30 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
 /**
  * Create span logger with typed tag methods and method chaining
  * Writes to TypedArray columnar buffers in memory (hot path)
+ * 
+ * Per specs/01h_entry_types_and_logging_primitives.md:
+ * - Tag getter creates a new entry and returns a chainable API
+ * - All chained methods write to the SAME row
+ * - Zero allocations: returns same object instance
  */
 function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
   buffer: SpanBuffer
 ): SpanLogger<T> {
-  // Create the chainable tag API
-  // Each method writes to the appropriate TypedArray column and returns itself for chaining
+  // Track which row index the current tag chain is writing to
+  let currentTagIndex: number | null = null;
+  
+  // Create the chainable tag API that writes to the current row
   const createChainableTag = (): ChainableTagAPI<T> => {
-    // Create a record to hold the methods, starting with the 'with' method
     type TagMethod = (value: InferTagAttributes<T>[keyof T]) => ChainableTagAPI<T>;
     type TagAPIRecord = Record<string, TagMethod | ((attributes: Partial<InferTagAttributes<T>>) => ChainableTagAPI<T>)>;
     
     const tagAPI = {} as TagAPIRecord;
     
-    // Add the 'with' method for bulk setting
+    // Add the 'with' method for bulk setting - writes to current row
     tagAPI.with = function(attributes: Partial<InferTagAttributes<T>>): ChainableTagAPI<T> {
-      const idx = buffer.writeIndex;
-      
-      // Write entry type for tag entry
-      buffer.operations[idx] = ENTRY_TYPE_TAG;
-      
-      // Write timestamp
-      buffer.timestamps[idx] = Date.now();
+      // Use the current tag index (set by tag getter)
+      const idx = currentTagIndex !== null ? currentTagIndex : buffer.writeIndex;
       
       // Write each attribute to its column
       for (const [key, value] of Object.entries(attributes)) {
@@ -489,29 +501,18 @@ function createSpanLogger<T extends TagAttributeSchema>(
         writeToColumn(buffer, columnName, value, idx);
       }
       
-      // Increment write index
-      buffer.writeIndex++;
-      
       return tagAPI as ChainableTagAPI<T>;
     };
     
-    // Add individual attribute methods dynamically
+    // Add individual attribute methods dynamically - write to current row
     for (const key of Object.keys(schema)) {
       tagAPI[key] = function(value: unknown): ChainableTagAPI<T> {
-        const idx = buffer.writeIndex;
-        
-        // Write entry type for tag entry
-        buffer.operations[idx] = ENTRY_TYPE_TAG;
-        
-        // Write timestamp
-        buffer.timestamps[idx] = Date.now();
+        // Use the current tag index (set by tag getter)
+        const idx = currentTagIndex !== null ? currentTagIndex : buffer.writeIndex;
         
         // Write the attribute value to its column
         const columnName = `attr_${key}`;
         writeToColumn(buffer, columnName, value, idx);
-        
-        // Increment write index
-        buffer.writeIndex++;
         
         return tagAPI as ChainableTagAPI<T>;
       };
@@ -520,10 +521,31 @@ function createSpanLogger<T extends TagAttributeSchema>(
     return tagAPI as ChainableTagAPI<T>;
   };
   
-  const tag = createChainableTag();
+  const tagAPIInstance = createChainableTag();
   
-  return {
-    tag,
+  // SpanLogger instance
+  const logger = {
+    // Tag getter - creates new entry and returns chainable API
+    get tag(): ChainableTagAPI<T> {
+      // Create new tag entry
+      const idx = buffer.writeIndex;
+      
+      // Write entry type for tag entry
+      buffer.operations[idx] = ENTRY_TYPE_TAG;
+      
+      // Write timestamp
+      buffer.timestamps[idx] = Date.now();
+      
+      // Set current tag index for chained calls
+      currentTagIndex = idx;
+      
+      // Increment write index for next entry
+      buffer.writeIndex++;
+      
+      // Return the chainable API (all subsequent calls write to idx)
+      return tagAPIInstance;
+    },
+    
     message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void {
       const idx = buffer.writeIndex;
       
@@ -553,6 +575,8 @@ function createSpanLogger<T extends TagAttributeSchema>(
       this.message('error', message);
     },
   };
+  
+  return logger as SpanLogger<T>;
 }
 
 /**
