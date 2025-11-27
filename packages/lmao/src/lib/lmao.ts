@@ -11,8 +11,8 @@
 import type { TagAttributeSchema, InferTagAttributes } from './schema/types.js';
 import type { FeatureFlagSchema, InferFeatureFlags, EvaluationContext } from './schema/defineFeatureFlags.js';
 import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from './schema/evaluator.js';
-import type { SpanBuffer, ModuleContext, TaskContext } from '@smoothbricks/arrow-builder';
-import { createSpanBuffer, createChildSpanBuffer } from '@smoothbricks/arrow-builder';
+import type { SpanBuffer, ModuleContext, TaskContext, BufferCapacityStats } from '@smoothbricks/arrow-builder';
+import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from '@smoothbricks/arrow-builder';
 
 /**
  * Result types for ok/err pattern
@@ -88,6 +88,56 @@ class StringInterner {
 const categoryInterner = new StringInterner();
 const moduleIdInterner = new StringInterner();
 const spanNameInterner = new StringInterner();
+
+/**
+ * Check if capacity should be tuned based on usage patterns
+ * 
+ * Per specs/01b_columnar_buffer_architecture.md:
+ * - Increase if >15% writes overflow
+ * - Decrease if <5% writes overflow with many buffers
+ * - Bounded growth: 8-1024 entries
+ */
+function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
+  const minSamples = 100; // Need enough data
+  if (stats.totalWrites < minSamples) return false;
+  
+  const overflowRatio = stats.overflowWrites / stats.totalWrites;
+  
+  // Increase if >15% writes overflow
+  if (overflowRatio > 0.15 && stats.currentCapacity < 1024) {
+    const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
+    
+    // TODO: Trace the tuning event as structured data
+    console.log(`[Capacity Tuning] Increasing capacity: ${stats.currentCapacity} → ${newCapacity} (overflow ratio: ${(overflowRatio * 100).toFixed(1)}%)`);
+    
+    stats.currentCapacity = newCapacity;
+    resetStats(stats);
+    return true;
+  }
+  
+  // Decrease if <5% writes overflow and we have many buffers
+  if (overflowRatio < 0.05 && stats.totalBuffersCreated >= 10 && stats.currentCapacity > 8) {
+    const newCapacity = Math.max(8, stats.currentCapacity / 2);
+    
+    // TODO: Trace the tuning event as structured data
+    console.log(`[Capacity Tuning] Decreasing capacity: ${stats.currentCapacity} → ${newCapacity} (low utilization)`);
+    
+    stats.currentCapacity = newCapacity;
+    resetStats(stats);
+    return true;
+  }
+  
+  return false;
+}
+
+/**
+ * Reset stats after capacity tuning
+ */
+function resetStats(stats: BufferCapacityStats): void {
+  stats.totalWrites = 0;
+  stats.overflowWrites = 0;
+  stats.totalBuffersCreated = 0;
+}
 
 /**
  * Request context created at request boundary
@@ -390,6 +440,40 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 }
 
 /**
+ * Find buffer with space, creating chained buffer if needed
+ * 
+ * Per specs/01b_columnar_buffer_architecture.md:
+ * - Buffer chaining handles overflow gracefully
+ * - Tracks overflow stats for self-tuning
+ * - CPU branch predictor friendly
+ */
+function getBufferWithSpace(buffer: SpanBuffer): { buffer: SpanBuffer; didOverflow: boolean } {
+  const originalBuffer = buffer;
+  let didOverflow = false;
+  
+  // Find buffer with space (CPU branch predictor friendly)
+  while (buffer.writeIndex >= buffer.capacity) {
+    if (!buffer.next) {
+      buffer.next = createNextBuffer(buffer);
+    }
+    buffer = buffer.next;
+    didOverflow = true;
+  }
+  
+  // Track stats for self-tuning
+  const stats = originalBuffer.task.module.spanBufferCapacityStats;
+  stats.totalWrites++;
+  if (didOverflow) {
+    stats.overflowWrites++;
+  }
+  
+  // Check if capacity should be tuned
+  shouldTuneCapacity(stats);
+  
+  return { buffer, didOverflow };
+}
+
+/**
  * Write a value to a TypedArray column
  * Handles type conversion for different column types
  * 
@@ -482,6 +566,8 @@ function createSpanLogger<T extends TagAttributeSchema>(
 ): SpanLogger<T> {
   // Track which row index the current tag chain is writing to
   let currentTagIndex: number | null = null;
+  // Track the active buffer (may change due to overflow)
+  let activeBuffer = buffer;
   
   // Create the chainable tag API that writes to the current row
   const createChainableTag = (): ChainableTagAPI<T> => {
@@ -493,12 +579,12 @@ function createSpanLogger<T extends TagAttributeSchema>(
     // Add the 'with' method for bulk setting - writes to current row
     tagAPI.with = function(attributes: Partial<InferTagAttributes<T>>): ChainableTagAPI<T> {
       // Use the current tag index (set by tag getter)
-      const idx = currentTagIndex !== null ? currentTagIndex : buffer.writeIndex;
+      const idx = currentTagIndex !== null ? currentTagIndex : activeBuffer.writeIndex;
       
-      // Write each attribute to its column
+      // Write each attribute to its column on the active buffer
       for (const [key, value] of Object.entries(attributes)) {
         const columnName = `attr_${key}`;
-        writeToColumn(buffer, columnName, value, idx);
+        writeToColumn(activeBuffer, columnName, value, idx);
       }
       
       return tagAPI as ChainableTagAPI<T>;
@@ -508,11 +594,11 @@ function createSpanLogger<T extends TagAttributeSchema>(
     for (const key of Object.keys(schema)) {
       tagAPI[key] = function(value: unknown): ChainableTagAPI<T> {
         // Use the current tag index (set by tag getter)
-        const idx = currentTagIndex !== null ? currentTagIndex : buffer.writeIndex;
+        const idx = currentTagIndex !== null ? currentTagIndex : activeBuffer.writeIndex;
         
-        // Write the attribute value to its column
+        // Write the attribute value to its column on the active buffer
         const columnName = `attr_${key}`;
-        writeToColumn(buffer, columnName, value, idx);
+        writeToColumn(activeBuffer, columnName, value, idx);
         
         return tagAPI as ChainableTagAPI<T>;
       };
@@ -527,40 +613,48 @@ function createSpanLogger<T extends TagAttributeSchema>(
   const logger = {
     // Tag getter - creates new entry and returns chainable API
     get tag(): ChainableTagAPI<T> {
+      // Check for overflow and get buffer with space
+      const { buffer: bufferWithSpace, didOverflow } = getBufferWithSpace(activeBuffer);
+      activeBuffer = bufferWithSpace;
+      
       // Create new tag entry
-      const idx = buffer.writeIndex;
+      const idx = activeBuffer.writeIndex;
       
       // Write entry type for tag entry
-      buffer.operations[idx] = ENTRY_TYPE_TAG;
+      activeBuffer.operations[idx] = ENTRY_TYPE_TAG;
       
       // Write timestamp
-      buffer.timestamps[idx] = Date.now();
+      activeBuffer.timestamps[idx] = Date.now();
       
       // Set current tag index for chained calls
       currentTagIndex = idx;
       
       // Increment write index for next entry
-      buffer.writeIndex++;
+      activeBuffer.writeIndex++;
       
-      // Return the chainable API (all subsequent calls write to idx)
+      // Return the chainable API (all subsequent calls write to idx on activeBuffer)
       return tagAPIInstance;
     },
     
     message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void {
-      const idx = buffer.writeIndex;
+      // Check for overflow and get buffer with space
+      const { buffer: bufferWithSpace } = getBufferWithSpace(activeBuffer);
+      activeBuffer = bufferWithSpace;
+      
+      const idx = activeBuffer.writeIndex;
       
       // Write entry type for message
-      buffer.operations[idx] = ENTRY_TYPE_MESSAGE;
+      activeBuffer.operations[idx] = ENTRY_TYPE_MESSAGE;
       
       // Write timestamp
-      buffer.timestamps[idx] = Date.now();
+      activeBuffer.timestamps[idx] = Date.now();
       
       // Write message level and content to attribute columns
-      writeToColumn(buffer, 'attr_logLevel', level, idx);
-      writeToColumn(buffer, 'attr_logMessage', message, idx);
+      writeToColumn(activeBuffer, 'attr_logLevel', level, idx);
+      writeToColumn(activeBuffer, 'attr_logMessage', message, idx);
       
       // Increment write index
-      buffer.writeIndex++;
+      activeBuffer.writeIndex++;
     },
     info(message: string): void {
       this.message('info', message);

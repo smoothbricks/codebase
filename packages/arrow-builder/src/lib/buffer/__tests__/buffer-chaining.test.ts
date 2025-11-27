@@ -1,0 +1,206 @@
+import { describe, it, expect, beforeEach } from 'bun:test';
+import { createSpanBuffer, createNextBuffer } from '../createSpanBuffer.js';
+import { defineTagAttributes, S } from '@smoothbricks/lmao';
+import type { TaskContext, SpanBuffer } from '../types.js';
+import type { TagAttributeSchema } from '@smoothbricks/lmao';
+
+/**
+ * Type helper to extract schema fields from ExtendedSchema
+ */
+type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
+
+describe('Buffer Chaining', () => {
+  let taskContext: TaskContext;
+  let schema: TagAttributeSchema;
+
+  beforeEach(() => {
+    const schemaDefinition = defineTagAttributes({
+      userId: S.category(),
+      requestId: S.category(),
+      operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
+      duration: S.number(),
+    });
+
+    const { validate, parse, safeParse, extend, ...schemaFields } = schemaDefinition;
+    schema = schemaFields as ExtractSchemaFields<typeof schemaDefinition> & TagAttributeSchema;
+
+    taskContext = {
+      module: {
+        moduleId: 1,
+        gitSha: 'abc123',
+        filePath: 'test.ts',
+        tagAttributes: schema,
+        spanBufferCapacityStats: {
+          currentCapacity: 64,
+          totalWrites: 0,
+          overflowWrites: 0,
+          totalBuffersCreated: 0,
+        },
+      },
+      spanNameId: 1,
+      lineNumber: 10,
+    };
+  });
+
+  describe('createNextBuffer', () => {
+    it('should create a chained buffer with same spanId and traceId', () => {
+      const buffer = createSpanBuffer(schema, taskContext);
+      const nextBuffer = createNextBuffer(buffer);
+
+      // Should inherit spanId and traceId
+      expect(nextBuffer.spanId).toBe(buffer.spanId);
+      expect(nextBuffer.traceId).toBe(buffer.traceId);
+
+      // Should be linked via next property
+      expect(buffer.next).toBe(nextBuffer);
+
+      // Should have same parent
+      expect(nextBuffer.parent).toBe(buffer.parent);
+
+      // Should have same task context
+      expect(nextBuffer.task).toBe(buffer.task);
+    });
+
+    it('should create buffer with current capacity from stats', () => {
+      const buffer = createSpanBuffer(schema, taskContext);
+      
+      // Update capacity stats
+      taskContext.module.spanBufferCapacityStats.currentCapacity = 128;
+      
+      const nextBuffer = createNextBuffer(buffer);
+
+      // Should use updated capacity
+      expect(nextBuffer.capacity).toBe(128);
+    });
+
+    it('should create independent writeIndex for chained buffer', () => {
+      const buffer = createSpanBuffer(schema, taskContext);
+      
+      // Write some data to original buffer
+      buffer.writeIndex = 50;
+      
+      const nextBuffer = createNextBuffer(buffer);
+
+      // Chained buffer should start at 0
+      expect(nextBuffer.writeIndex).toBe(0);
+      expect(nextBuffer.capacity).toBe(64);
+    });
+
+    it('should maintain schema structure in chained buffer', () => {
+      const buffer = createSpanBuffer(schema, taskContext);
+      const nextBuffer = createNextBuffer(buffer);
+
+      // Should have same attribute columns
+      expect(nextBuffer['attr_userId']).toBeInstanceOf(Uint32Array);
+      expect(nextBuffer['attr_requestId']).toBeInstanceOf(Uint32Array);
+      expect(nextBuffer['attr_operation']).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer['attr_duration']).toBeInstanceOf(Float64Array);
+
+      // Should have core columns
+      expect(nextBuffer.timestamps).toBeInstanceOf(Float64Array);
+      expect(nextBuffer.operations).toBeInstanceOf(Uint8Array);
+    });
+
+    it('should handle multiple chained buffers', () => {
+      const buffer1 = createSpanBuffer(schema, taskContext);
+      const buffer2 = createNextBuffer(buffer1);
+      const buffer3 = createNextBuffer(buffer2);
+
+      // All should have same spanId and traceId
+      expect(buffer2.spanId).toBe(buffer1.spanId);
+      expect(buffer3.spanId).toBe(buffer1.spanId);
+      expect(buffer2.traceId).toBe(buffer1.traceId);
+      expect(buffer3.traceId).toBe(buffer1.traceId);
+
+      // Should be properly linked
+      expect(buffer1.next).toBe(buffer2);
+      expect(buffer2.next).toBe(buffer3);
+    });
+
+    it('should increment totalBuffersCreated stat', () => {
+      const buffer = createSpanBuffer(schema, taskContext);
+      const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
+
+      createNextBuffer(buffer);
+
+      expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
+    });
+
+    it('should handle buffer with parent correctly', () => {
+      const parentBuffer = createSpanBuffer(schema, taskContext);
+      
+      const childTaskContext: TaskContext = {
+        ...taskContext,
+        spanNameId: 2,
+      };
+      
+      const childBuffer = createSpanBuffer(schema, childTaskContext);
+      childBuffer.parent = parentBuffer;
+      parentBuffer.children.push(childBuffer);
+
+      const nextChildBuffer = createNextBuffer(childBuffer);
+
+      // Should maintain parent relationship
+      expect(nextChildBuffer.parent).toBe(parentBuffer);
+      
+      // Should NOT be added to parent's children (it's a continuation, not a new span)
+      expect(parentBuffer.children).toHaveLength(1);
+      expect(parentBuffer.children[0]).toBe(childBuffer);
+    });
+
+    it('should create empty children array for chained buffer', () => {
+      const buffer = createSpanBuffer(schema, taskContext);
+      
+      // Add a child to original buffer
+      const childTaskContext: TaskContext = { ...taskContext, spanNameId: 2 };
+      const childBuffer = createSpanBuffer(schema, childTaskContext);
+      buffer.children.push(childBuffer);
+
+      const nextBuffer = createNextBuffer(buffer);
+
+      // Chained buffer should have empty children array
+      expect(nextBuffer.children).toHaveLength(0);
+    });
+  });
+
+  describe('Buffer Chaining Edge Cases', () => {
+    it('should handle buffer at exact capacity', () => {
+      const buffer = createSpanBuffer(schema, taskContext, 10);
+      buffer.writeIndex = 10; // At exact capacity
+
+      const nextBuffer = createNextBuffer(buffer);
+
+      expect(nextBuffer.writeIndex).toBe(0);
+      expect(nextBuffer.capacity).toBe(taskContext.module.spanBufferCapacityStats.currentCapacity);
+    });
+
+    it('should preserve null bitmaps structure in chained buffer', () => {
+      const buffer = createSpanBuffer(schema, taskContext);
+      const nextBuffer = createNextBuffer(buffer);
+
+      // Should have null bitmaps for each attribute
+      expect(nextBuffer.nullBitmaps).toBeDefined();
+      expect(nextBuffer.nullBitmaps['attr_userId']).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.nullBitmaps['attr_requestId']).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.nullBitmaps['attr_operation']).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.nullBitmaps['attr_duration']).toBeInstanceOf(Uint8Array);
+    });
+
+    it('should handle capacity changes between chained buffers', () => {
+      const buffer1 = createSpanBuffer(schema, taskContext);
+      expect(buffer1.capacity).toBe(64);
+
+      // Simulate capacity tuning
+      taskContext.module.spanBufferCapacityStats.currentCapacity = 128;
+
+      const buffer2 = createNextBuffer(buffer1);
+      expect(buffer2.capacity).toBe(128);
+
+      // Change capacity again
+      taskContext.module.spanBufferCapacityStats.currentCapacity = 256;
+
+      const buffer3 = createNextBuffer(buffer2);
+      expect(buffer3.capacity).toBe(256);
+    });
+  });
+});

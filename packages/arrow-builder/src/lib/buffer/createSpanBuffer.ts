@@ -122,3 +122,32 @@ export function createChildSpanBuffer(
   
   return childBuffer;
 }
+
+/**
+ * Create next buffer in chain for overflow handling
+ * 
+ * Per specs/01b_columnar_buffer_architecture.md:
+ * - Buffer chaining is part of self-tuning mechanism
+ * - Chained buffer inherits spanId and traceId (continuation)
+ * - Same parent, same schema, same task context
+ */
+export function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
+  const schema = buffer.task.module.tagAttributes;
+  const capacity = buffer.task.module.spanBufferCapacityStats.currentCapacity;
+  
+  const nextBuffer = createEmptySpanBuffer(
+    buffer.spanId,     // Same logical span
+    schema,
+    buffer.task,       // Same task context
+    buffer.parent,     // Same parent
+    capacity
+  );
+  
+  // Inherit traceId from current buffer
+  nextBuffer.traceId = buffer.traceId;
+  
+  // Link current buffer to next
+  buffer.next = nextBuffer;
+  
+  return nextBuffer;
+}
