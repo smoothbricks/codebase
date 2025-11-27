@@ -371,24 +371,4 @@ describe('update-deps command', () => {
       expect(isClean).toBe(true);
     });
   });
-
-  describe('Branch restoration', () => {
-    test('should restore original branch after workflow', () => {
-      const originalBranch = 'main';
-      const stackBase = 'chore/update-deps-2025-01-19';
-
-      const shouldRestore = originalBranch !== stackBase;
-
-      expect(shouldRestore).toBe(true);
-    });
-
-    test('should not restore if already on correct branch', () => {
-      const originalBranch = 'main';
-      const stackBase = 'main';
-
-      const shouldRestore = originalBranch !== stackBase;
-
-      expect(shouldRestore).toBe(false);
-    });
-  });
 });
