@@ -22,6 +22,129 @@ export type ErrorResult<E> = { success: false; error: { code: string; details: E
 export type Result<V, E = unknown> = SuccessResult<V> | ErrorResult<E>;
 
 /**
+ * Fluent result builder for ctx.ok()/ctx.err()
+ * Allows chaining attributes and message before returning result
+ * 
+ * Per specs/01h_entry_types_and_logging_primitives.md:
+ * - Writes span-ok or span-err entry to buffer
+ * - Supports .with() for attributes and .message() for text
+ * - Returns final result after writing to buffer
+ * 
+ * This class extends the base Result type to support method chaining
+ * while maintaining proper TypeScript type narrowing.
+ */
+class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessResult<V> {
+  readonly success = true as const;
+  readonly value: V;
+  private buffer: SpanBuffer;
+  private entryIndex: number;
+  
+  constructor(
+    buffer: SpanBuffer,
+    value: V,
+    _schema: T // Needed for generic type inference
+  ) {
+    this.value = value;
+    
+    // Find buffer with space and create entry
+    const { buffer: bufferWithSpace } = getBufferWithSpace(buffer);
+    this.buffer = bufferWithSpace;
+    
+    this.entryIndex = this.buffer.writeIndex;
+    
+    // Write entry type (span-ok)
+    this.buffer.operations[this.entryIndex] = ENTRY_TYPE_SPAN_OK;
+    
+    // Write timestamp
+    this.buffer.timestamps[this.entryIndex] = Date.now();
+    
+    // Increment write index
+    this.buffer.writeIndex++;
+  }
+  
+  /**
+   * Set multiple attributes on the result entry
+   * Example: ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
+   */
+  with(attributes: Partial<InferTagAttributes<T>>): this {
+    // Write each attribute to its column
+    for (const [key, value] of Object.entries(attributes)) {
+      const columnName = `attr_${key}`;
+      writeToColumn(this.buffer, columnName, value, this.entryIndex);
+    }
+    return this;
+  }
+  
+  /**
+   * Set a message on the result entry
+   * Example: ctx.ok(result).message('User created successfully')
+   */
+  message(text: string): this {
+    writeToColumn(this.buffer, 'attr_resultMessage', text, this.entryIndex);
+    return this;
+  }
+}
+
+/**
+ * Fluent error result with chaining support
+ */
+class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<E> {
+  readonly success = false as const;
+  readonly error: { code: string; details: E };
+  private buffer: SpanBuffer;
+  private entryIndex: number;
+  
+  constructor(
+    buffer: SpanBuffer,
+    code: string,
+    details: E,
+    _schema: T // Needed for generic type inference
+  ) {
+    this.error = { code, details };
+    
+    // Find buffer with space and create entry
+    const { buffer: bufferWithSpace } = getBufferWithSpace(buffer);
+    this.buffer = bufferWithSpace;
+    
+    this.entryIndex = this.buffer.writeIndex;
+    
+    // Write entry type (span-err)
+    this.buffer.operations[this.entryIndex] = ENTRY_TYPE_SPAN_ERR;
+    
+    // Write timestamp
+    this.buffer.timestamps[this.entryIndex] = Date.now();
+    
+    // Write error code
+    writeToColumn(this.buffer, 'attr_errorCode', code, this.entryIndex);
+    
+    // Increment write index
+    this.buffer.writeIndex++;
+  }
+  
+  /**
+   * Set multiple attributes on the result entry
+   * Example: ctx.err('ERROR', details).with({ userId: 'u1' })
+   */
+  with(attributes: Partial<InferTagAttributes<T>>): this {
+    // Write each attribute to its column
+    for (const [key, value] of Object.entries(attributes)) {
+      const columnName = `attr_${key}`;
+      writeToColumn(this.buffer, columnName, value, this.entryIndex);
+    }
+    return this;
+  }
+  
+  /**
+   * Set a message on the result entry
+   * Example: ctx.err('ERROR', details).message('Operation failed')
+   */
+  message(text: string): this {
+    writeToColumn(this.buffer, 'attr_resultMessage', text, this.entryIndex);
+    return this;
+  }
+}
+
+/**
  * Generate unique trace ID
  */
 function generateTraceId(): string {
@@ -279,9 +402,9 @@ export interface SpanContext<
   // Environment config
   env: Env;
   
-  // Result helpers
-  ok<V>(value: V): SuccessResult<V>;
-  err<E>(code: string, error: E): ErrorResult<E>;
+  // Result helpers with fluent API
+  ok<V>(value: V): FluentSuccessResult<V, T>;
+  err<E>(code: string, error: E): FluentErrorResult<E, T>;
   
   // Child span creation
   // The span can return any type R, and TypeScript will infer it from the child function
@@ -322,11 +445,16 @@ export interface ModuleContextBuilder<
 
 /**
  * Entry type codes for operation tracking
+ * Per specs/01h_entry_types_and_logging_primitives.md
  */
 const ENTRY_TYPE_FF_ACCESS = 1;
 const ENTRY_TYPE_FF_USAGE = 2;
 const ENTRY_TYPE_TAG = 3;
 const ENTRY_TYPE_MESSAGE = 4;
+const ENTRY_TYPE_SPAN_START = 5;
+const ENTRY_TYPE_SPAN_OK = 6;
+const ENTRY_TYPE_SPAN_ERR = 7;
+const ENTRY_TYPE_SPAN_EXCEPTION = 8;
 
 /**
  * Create column writers for feature flag analytics
@@ -472,6 +600,28 @@ function getBufferWithSpace(buffer: SpanBuffer): { buffer: SpanBuffer; didOverfl
   shouldTuneCapacity(stats);
   
   return { buffer, didOverflow };
+}
+
+/**
+ * Write span-start entry to buffer
+ * Per specs/01h_entry_types_and_logging_primitives.md
+ */
+function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
+  // Find buffer with space
+  const { buffer: bufferWithSpace } = getBufferWithSpace(buffer);
+  const idx = bufferWithSpace.writeIndex;
+  
+  // Write entry type
+  bufferWithSpace.operations[idx] = ENTRY_TYPE_SPAN_START;
+  
+  // Write timestamp
+  bufferWithSpace.timestamps[idx] = Date.now();
+  
+  // Write span name
+  writeToColumn(bufferWithSpace, 'attr_spanName', spanName, idx);
+  
+  // Increment write index
+  bufferWithSpace.writeIndex++;
 }
 
 /**
@@ -765,6 +915,9 @@ export function createModuleContext<
           (requestCtx.ff as FeatureFlagEvaluator<FF>)['columnWriters'] = createFlagColumnWriters(spanBuffer);
         }
         
+        // Write span-start entry
+        writeSpanStart(spanBuffer, name);
+        
         // Create span logger with typed tag methods
         const spanLogger = createSpanLogger(schemaOnly, spanBuffer);
         
@@ -773,12 +926,12 @@ export function createModuleContext<
           ...requestCtx,
           log: spanLogger,
           
-          ok<V>(value: V): SuccessResult<V> {
-            return { success: true, value };
+          ok<V>(value: V): FluentSuccessResult<V, T> {
+            return new FluentSuccessResult<V, T>(spanBuffer, value, schemaOnly);
           },
           
-          err<E>(code: string, error: E): ErrorResult<E> {
-            return { success: false, error: { code, details: error } };
+          err<E>(code: string, error: E): FluentErrorResult<E, T> {
+            return new FluentErrorResult<E, T>(spanBuffer, code, error, schemaOnly);
           },
           
           async span<R>(
@@ -788,6 +941,9 @@ export function createModuleContext<
             // Create child span buffer with Arrow builders
             const childBuffer = createChildSpanBuffer(spanBuffer, taskContext);
             
+            // Write span-start for child span
+            writeSpanStart(childBuffer, childName);
+            
             // Create child context with its own logger
             const childLogger = createSpanLogger(schemaOnly, childBuffer);
             const childContext: SpanContext<T, FF, Env> = {
@@ -795,12 +951,59 @@ export function createModuleContext<
               log: childLogger,
             };
             
-            return childFn(childContext);
+            // Execute child span with exception handling
+            try {
+              return await childFn(childContext);
+            } catch (error) {
+              // Write span-exception entry
+              const { buffer: bufferWithSpace } = getBufferWithSpace(childBuffer);
+              const idx = bufferWithSpace.writeIndex;
+              
+              bufferWithSpace.operations[idx] = ENTRY_TYPE_SPAN_EXCEPTION;
+              bufferWithSpace.timestamps[idx] = Date.now();
+              
+              // Write exception details
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              const errorStack = error instanceof Error ? error.stack : undefined;
+              
+              writeToColumn(bufferWithSpace, 'attr_exceptionMessage', errorMessage, idx);
+              if (errorStack) {
+                writeToColumn(bufferWithSpace, 'attr_exceptionStack', errorStack, idx);
+              }
+              
+              bufferWithSpace.writeIndex++;
+              
+              // Re-throw to propagate
+              throw error;
+            }
           },
         };
         
-        // Execute task function
-        return fn(spanContext, ...args);
+        // Execute task function with exception handling
+        try {
+          return await fn(spanContext, ...args);
+        } catch (error) {
+          // Write span-exception entry
+          const { buffer: bufferWithSpace } = getBufferWithSpace(spanBuffer);
+          const idx = bufferWithSpace.writeIndex;
+          
+          bufferWithSpace.operations[idx] = ENTRY_TYPE_SPAN_EXCEPTION;
+          bufferWithSpace.timestamps[idx] = Date.now();
+          
+          // Write exception details
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const errorStack = error instanceof Error ? error.stack : undefined;
+          
+          writeToColumn(bufferWithSpace, 'attr_exceptionMessage', errorMessage, idx);
+          if (errorStack) {
+            writeToColumn(bufferWithSpace, 'attr_exceptionStack', errorStack, idx);
+          }
+          
+          bufferWithSpace.writeIndex++;
+          
+          // Re-throw to propagate
+          throw error;
+        }
       };
     },
   };
