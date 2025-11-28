@@ -4,6 +4,7 @@
 
 import { execa } from 'execa';
 import type { DepUpdaterConfig } from './config.js';
+import type { Logger } from './logger.js';
 import type { CommandExecutor } from './types.js';
 
 /**
@@ -95,6 +96,7 @@ export async function branchExists(
   branchName: string,
   checkRemote = false,
   executor: CommandExecutor = defaultExecutor,
+  logger?: Logger,
 ): Promise<boolean> {
   try {
     if (checkRemote) {
@@ -109,7 +111,7 @@ export async function branchExists(
     return true;
   } catch (error) {
     const location = checkRemote ? 'remote' : 'local';
-    console.warn(
+    logger?.warn(
       `Branch "${branchName}" does not exist (${location}):`,
       error instanceof Error ? error.message : String(error),
     );

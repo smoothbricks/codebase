@@ -237,24 +237,22 @@ describe('getOpenUpdatePRs', () => {
     expect(prs[0]?.createdAt.toISOString()).toBe('2025-01-15T14:30:00.000Z');
   });
 
-  test('should return empty array on error', async () => {
+  test('should throw on error (callers handle fallback)', async () => {
     const mockExeca = createErrorExeca('gh: authentication required');
 
-    const prs = await getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca);
-
-    expect(prs).toEqual([]);
+    // getOpenUpdatePRs now throws so callers can distinguish "no PRs" from "GitHub unreachable"
+    await expect(getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca)).rejects.toThrow();
   });
 
-  test('should return empty array for non-array response', async () => {
+  test('should throw for non-array response', async () => {
     const mockExeca = createMockExeca({
       'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify({
         error: 'invalid',
       }),
     });
 
-    const prs = await getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca);
-
-    expect(prs).toEqual([]);
+    // GitHubCLIClient throws for invalid responses, getOpenUpdatePRs propagates the error
+    await expect(getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca)).rejects.toThrow();
   });
 
   test('should include all PR fields', async () => {

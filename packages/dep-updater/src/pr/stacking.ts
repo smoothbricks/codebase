@@ -5,6 +5,7 @@
 import { execa as execaOriginal } from 'execa';
 import { GitHubCLIClient, type IGitHubClient } from '../auth/github-client.js';
 import type { DepUpdaterConfig } from '../config.js';
+import type { Logger } from '../logger.js';
 import type { CommandExecutor, OpenPR } from '../types.js';
 
 /** Default executor - execa cast to CommandExecutor type */
@@ -12,46 +13,44 @@ const defaultExecutor = execaOriginal as unknown as CommandExecutor;
 
 /**
  * Get list of open update PRs
+ * @throws Error if GitHub API call fails (callers should handle this)
  */
 export async function getOpenUpdatePRs(
   repoRoot: string,
   branchPrefix: string,
   executor: CommandExecutor = defaultExecutor,
   client?: IGitHubClient,
+  logger?: Logger,
 ): Promise<OpenPR[]> {
-  try {
-    // Use GitHub client if provided, otherwise fall back to CLI
-    const githubClient = client || new GitHubCLIClient(executor);
+  // Use GitHub client if provided, otherwise fall back to CLI
+  const githubClient = client || new GitHubCLIClient(executor);
 
-    // Get all open PRs
-    const allPRs = await githubClient.listUpdatePRs(repoRoot);
+  // Get all open PRs - let errors propagate so callers can distinguish
+  // "no PRs" from "GitHub unreachable"
+  const allPRs = await githubClient.listUpdatePRs(repoRoot);
 
-    // Filter by branch prefix
-    const filteredPRs = allPRs.filter((pr) => pr.headRefName.startsWith(branchPrefix));
+  // Filter by branch prefix
+  const filteredPRs = allPRs.filter((pr) => pr.headRefName.startsWith(branchPrefix));
 
-    // Check each PR for conflicts
-    const prsWithConflicts = await Promise.all(
-      filteredPRs.map(async (pr) => {
-        const hasConflicts = await checkPRConflicts(repoRoot, pr.number, executor, client);
-        return {
-          number: pr.number,
-          title: pr.title,
-          branch: pr.headRefName,
-          createdAt: new Date(pr.createdAt),
-          hasConflicts,
-          url: pr.url,
-        };
-      }),
-    );
+  // Check each PR for conflicts
+  const prsWithConflicts = await Promise.all(
+    filteredPRs.map(async (pr) => {
+      const hasConflicts = await checkPRConflicts(repoRoot, pr.number, executor, client, logger);
+      return {
+        number: pr.number,
+        title: pr.title,
+        branch: pr.headRefName,
+        createdAt: new Date(pr.createdAt),
+        hasConflicts,
+        url: pr.url,
+      };
+    }),
+  );
 
-    // Sort by creation date (oldest first)
-    prsWithConflicts.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
+  // Sort by creation date (oldest first)
+  prsWithConflicts.sort((a, b) => a.createdAt.getTime() - b.createdAt.getTime());
 
-    return prsWithConflicts;
-  } catch (error) {
-    console.warn('Failed to fetch open PRs:', error);
-    return [];
-  }
+  return prsWithConflicts;
 }
 
 /**
@@ -63,6 +62,7 @@ export async function checkPRConflicts(
   prNumber: number,
   executor: CommandExecutor = defaultExecutor,
   client?: IGitHubClient,
+  logger?: Logger,
 ): Promise<boolean> {
   try {
     // Use GitHub client if provided, otherwise fall back to CLI
@@ -71,7 +71,7 @@ export async function checkPRConflicts(
   } catch (error) {
     // Return true (assume conflicts) when check fails - safer than assuming no conflicts
     // This prevents stacking on a potentially conflicted branch when GitHub is unreachable
-    console.warn(
+    logger?.warn(
       `Failed to check PR #${prNumber} conflicts (assuming conflicts):`,
       error instanceof Error ? error.message : String(error),
     );
@@ -88,7 +88,7 @@ export async function determineBaseBranch(
   executor: CommandExecutor = defaultExecutor,
   client?: IGitHubClient,
 ): Promise<{ baseBranch: string; reason: string }> {
-  const { prStrategy, git } = config;
+  const { prStrategy, git, logger } = config;
   const mainBranch = git?.baseBranch || 'main';
 
   if (!prStrategy.stackingEnabled) {
@@ -98,8 +98,20 @@ export async function determineBaseBranch(
     };
   }
 
-  // Get open update PRs
-  const openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor, client);
+  // Get open update PRs - fall back to mainBranch if GitHub is unreachable
+  let openPRs: OpenPR[];
+  try {
+    openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor, client, logger);
+  } catch (error) {
+    logger?.warn(
+      'Failed to fetch open PRs, falling back to main branch:',
+      error instanceof Error ? error.message : String(error),
+    );
+    return {
+      baseBranch: mainBranch,
+      reason: 'GitHub unreachable, using main branch',
+    };
+  }
 
   if (openPRs.length === 0) {
     return {
@@ -135,13 +147,20 @@ export async function autoCloseOldPRs(
   executor: CommandExecutor = defaultExecutor,
   client?: IGitHubClient,
 ): Promise<void> {
-  const { prStrategy } = config;
+  const { prStrategy, logger } = config;
 
   if (!prStrategy.autoCloseOldPRs) {
     return;
   }
 
-  const openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor, client);
+  // Get open PRs - if GitHub is unreachable, skip auto-close (safe default)
+  let openPRs: OpenPR[];
+  try {
+    openPRs = await getOpenUpdatePRs(repoRoot, prStrategy.branchPrefix, executor, client, logger);
+  } catch (error) {
+    logger?.warn('Failed to fetch open PRs for auto-close:', error instanceof Error ? error.message : String(error));
+    return;
+  }
 
   if (openPRs.length < prStrategy.maxStackDepth) {
     return;
