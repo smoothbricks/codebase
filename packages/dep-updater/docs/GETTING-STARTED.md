@@ -384,6 +384,43 @@ After setup is complete:
 4. **Adds details**: Each PR includes changelog and version info
 5. **Awaits review**: You review and merge when ready
 
+## Nix/devenv Support
+
+For repositories using [devenv](https://devenv.sh) for development environments, dep-updater automatically handles Nix
+tooling.
+
+### Automatic Installation
+
+The generated workflow **automatically installs Nix tooling** when `devenv.yaml` is detected in your repository:
+
+- **Nix installer** -
+  [DeterminateSystems/nix-installer-action](https://github.com/DeterminateSystems/nix-installer-action)
+- **Nix cache** -
+  [DeterminateSystems/magic-nix-cache-action](https://github.com/DeterminateSystems/magic-nix-cache-action)
+- **devenv & nvfetcher** - Installed via `nix profile install`
+
+No manual configuration required - just add a `devenv.yaml` to your repo and the workflow handles the rest.
+
+### What Gets Updated
+
+When Nix is enabled, dep-updater can update:
+
+1. **devenv.lock** - Updates all Nix flake inputs (nixpkgs, git-hooks, etc.)
+2. **nixpkgs overlays** - Updates packages tracked by nvfetcher in `_sources/`
+
+### Derivation Diffing with dix
+
+For accurate package version detection, dep-updater uses [dix](https://github.com/faukah/dix) to compare Nix derivation
+closures. This shows actual package version changes (e.g., `python3 3.13.8 → 3.13.9`) rather than just commit hash
+changes.
+
+dix is fetched on-demand via `nix shell github:faukah/dix` - no installation required.
+
+### GitHub API Rate Limits
+
+nvfetcher queries GitHub releases, which may hit API rate limits. The workflow automatically passes `GH_TOKEN` to
+nvfetcher for authenticated requests (15,000 req/hour vs 60 unauthenticated).
+
 ## Configuration (Optional)
 
 Create `tooling/dep-updater.json` to customize behavior:

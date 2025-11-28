@@ -40,6 +40,18 @@ jobs:
           fetch-depth: 0 # Full history for git operations
           token: ${{ steps.app-token.outputs.token }}
 
+      - name: Install Nix
+        if: hashFiles('**/devenv.yaml') != ''
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        if: hashFiles('**/devenv.yaml') != ''
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Install devenv and nvfetcher
+        if: hashFiles('**/devenv.yaml') != ''
+        run: nix profile install nixpkgs#devenv nixpkgs#nvfetcher
+
       - name: Setup Bun
         uses: oven-sh/setup-bun@v2
         with:

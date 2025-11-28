@@ -79,6 +79,9 @@ Before using dep-updater, ensure you have the following installed:
   - Set `ANTHROPIC_API_KEY` environment variable
   - Get key from [Anthropic Console](https://console.anthropic.com)
 
+> **Note:** The generated GitHub Actions workflow automatically installs Nix, devenv, and nvfetcher when `devenv.yaml`
+> is detected in your repository. No manual Nix setup required for CI.
+
 **Verification:**
 
 ```bash

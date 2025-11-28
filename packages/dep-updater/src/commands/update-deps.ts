@@ -51,6 +51,7 @@ async function runAllUpdaters(
   options: UpdateOptions,
 ): Promise<{
   allUpdates: PackageUpdate[];
+  allDowngrades: PackageUpdate[];
   errors: string[];
   results: {
     bun: UpdateResult;
@@ -59,6 +60,7 @@ async function runAllUpdaters(
   };
 }> {
   const allUpdates: PackageUpdate[] = [];
+  const allDowngrades: PackageUpdate[] = [];
   const errors: string[] = [];
 
   // Update Bun dependencies (will only find updates beyond what's in current branch)
@@ -99,6 +101,9 @@ async function runAllUpdaters(
 
     if (devenvResult.success) {
       allUpdates.push(...devenvResult.updates);
+      if (devenvResult.downgrades) {
+        allDowngrades.push(...devenvResult.downgrades);
+      }
     } else {
       errors.push(`Devenv update failed: ${devenvResult.error}`);
     }
@@ -138,6 +143,7 @@ async function runAllUpdaters(
 
   return {
     allUpdates,
+    allDowngrades,
     errors,
     results: {
       bun: bunResult,
@@ -155,6 +161,7 @@ async function generateCommitData(
   allUpdates: PackageUpdate[],
   config: DepUpdaterConfig,
   options: UpdateOptions,
+  allDowngrades: PackageUpdate[] = [],
 ): Promise<{ commitTitle: string; prBody: string }> {
   if (allUpdates.length === 0) {
     // Lock file only update
@@ -173,14 +180,14 @@ async function generateCommitData(
   let prBody: string;
 
   if (options.skipAI || changelogs.size === 0) {
-    const { body } = await generateCommitMessage(allUpdates, config);
+    const { body } = await generateCommitMessage(allUpdates, config, allDowngrades);
     prBody = body;
   } else {
     config.logger?.info('Analyzing changelogs with AI...');
-    prBody = await analyzeChangelogs(allUpdates, changelogs, config);
+    prBody = await analyzeChangelogs(allUpdates, changelogs, config, allDowngrades);
   }
 
-  const { title } = await generateCommitMessage(allUpdates, config);
+  const { title } = await generateCommitMessage(allUpdates, config, allDowngrades);
 
   return {
     commitTitle: title,
@@ -253,7 +260,7 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   const { stackBase, mainBranch } = await setupBranchForStacking(config, repoRoot);
 
   // Run all updaters
-  const { allUpdates } = await runAllUpdaters(config, repoRoot, options);
+  const { allUpdates, allDowngrades } = await runAllUpdaters(config, repoRoot, options);
 
   // Check if there are any uncommitted changes (including lock files)
   const { isWorkingDirectoryClean } = await import('../git.js');
@@ -296,7 +303,7 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   // Dry run exit - show what would be created
   if (options.dryRun) {
     const branchName = generateBranchName(config);
-    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options);
+    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
     config.logger?.info('\n[DRY RUN] Would create:');
     config.logger?.info(`  Branch: ${branchName}`);
     config.logger?.info(`  Commit: ${commitTitle}`);
@@ -311,7 +318,7 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   }
 
   // Generate commit data
-  const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options);
+  const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
 
   // Create PR workflow
   if (!options.skipGit) {

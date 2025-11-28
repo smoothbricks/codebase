@@ -55,45 +55,50 @@ export async function updateNixpkgsOverlay(
     // Parse sources before update
     const versionsBefore = await parseNvfetcherSources(sourcesPath);
 
-    if (!dryRun) {
-      // Try running nvfetcher with fallback chain
-      let nvfetcherSuccess = false;
+    // Always run nvfetcher to detect updates (even in dry-run)
+    // In dry-run mode, we'll restore the files afterwards
+    let nvfetcherSuccess = false;
 
-      // Method 1: Try direct nvfetcher (fast, works in devenv)
+    // Pass GitHub token to nvfetcher for API rate limits
+    const githubToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
+    const nvfetcherEnv = githubToken ? { ...process.env, GITHUB_TOKEN: githubToken } : process.env;
+
+    // Method 1: Try direct nvfetcher (fast, works in devenv)
+    try {
+      await execa('nvfetcher', [], {
+        cwd: overlayPath,
+        stdio: 'inherit',
+        env: nvfetcherEnv,
+      });
+      nvfetcherSuccess = true;
+      logger?.info('✓ nvfetcher update completed');
+    } catch (_error) {
+      logger?.info('Direct nvfetcher not found, trying via nix shell...');
+
+      // Method 2: Try via nix shell (slower, but self-contained)
       try {
-        await execa('nvfetcher', [], {
+        await execa('nix', ['shell', 'nixpkgs#nvfetcher', '-c', 'nvfetcher'], {
           cwd: overlayPath,
           stdio: 'inherit',
+          env: nvfetcherEnv,
         });
         nvfetcherSuccess = true;
-        logger?.info('✓ nvfetcher update completed');
-      } catch (_error) {
-        logger?.info('Direct nvfetcher not found, trying via nix shell...');
-
-        // Method 2: Try via nix shell (slower, but self-contained)
-        try {
-          await execa('nix', ['shell', 'nixpkgs#nvfetcher', '-c', 'nvfetcher'], {
-            cwd: overlayPath,
-            stdio: 'inherit',
-          });
-          nvfetcherSuccess = true;
-          logger?.info('✓ nvfetcher update completed (via nix shell)');
-        } catch (_nixError) {
-          logger?.warn('Warning: nvfetcher update failed');
-          logger?.warn('  - nvfetcher not in PATH');
-          logger?.warn('  - nix shell also failed');
-          logger?.warn('Skipping nixpkgs overlay update...');
-        }
+        logger?.info('✓ nvfetcher update completed (via nix shell)');
+      } catch (_nixError) {
+        logger?.warn('Warning: nvfetcher update failed');
+        logger?.warn('  - nvfetcher not in PATH');
+        logger?.warn('  - nix shell also failed');
+        logger?.warn('Skipping nixpkgs overlay update...');
       }
+    }
 
-      if (!nvfetcherSuccess) {
-        return {
-          success: false,
-          updates: [],
-          error: 'nvfetcher not available (tried direct command and nix shell)',
-          ecosystem: 'nixpkgs',
-        };
-      }
+    if (!nvfetcherSuccess) {
+      return {
+        success: false,
+        updates: [],
+        error: 'nvfetcher not available (tried direct command and nix shell)',
+        ecosystem: 'nixpkgs',
+      };
     }
 
     // Parse sources after update
@@ -117,7 +122,19 @@ export async function updateNixpkgsOverlay(
 
     logger?.info(`✓ Found ${updates.length} nixpkgs overlay updates`);
 
-    // Verify updated packages can build (non-fatal)
+    // In dry-run mode, restore the _sources directory to its original state
+    if (dryRun) {
+      try {
+        const sourcesDir = join(overlayPath, '_sources');
+        await execa('git', ['restore', sourcesDir], { cwd: overlayPath });
+        logger?.debug?.('Restored _sources directory (dry-run mode)');
+      } catch {
+        // If git restore fails (e.g., not a git repo), changes will persist
+        logger?.warn('Could not restore _sources via git, changes will persist');
+      }
+    }
+
+    // Verify updated packages can build (non-fatal, skip in dry-run)
     if (!dryRun && updates.length > 0) {
       for (const update of updates) {
         const packageName = update.name.replace('nixpkgs-', '');

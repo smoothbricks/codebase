@@ -73,13 +73,14 @@ export async function analyzeChangelogs(
   updates: PackageUpdate[],
   changelogs: Map<string, string>,
   config: DepUpdaterConfig,
+  downgrades: PackageUpdate[] = [],
 ): Promise<string> {
   const apiKey = config.ai.apiKey || process.env.ANTHROPIC_API_KEY;
 
   if (!apiKey) {
     config.logger?.warn('No Anthropic API key found, skipping AI analysis');
     config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
-    return generateFallbackSummary(updates);
+    return generateFallbackSummary(updates, downgrades);
   }
 
   try {
@@ -97,16 +98,29 @@ export async function analyzeChangelogs(
 
     const content = message.content[0];
     if (content.type === 'text') {
-      return content.text;
+      // Append nix updates and downgrades sections
+      // AI may omit nix packages since they don't have changelogs
+      let result = content.text;
+
+      const nixSection = formatNixUpdatesSection(updates);
+      if (nixSection) {
+        result = `${result}\n\n${nixSection}`;
+      }
+
+      if (downgrades.length > 0) {
+        result = `${result}\n\n${formatDowngradesSection(downgrades)}`;
+      }
+
+      return result;
     }
 
-    return generateFallbackSummary(updates);
+    return generateFallbackSummary(updates, downgrades);
   } catch (error) {
     config.logger?.warn('Claude API analysis failed:', error instanceof Error ? error.message : String(error));
     if (process.env.VERBOSE) {
       config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
     }
-    return generateFallbackSummary(updates);
+    return generateFallbackSummary(updates, downgrades);
   }
 }
 
@@ -214,13 +228,59 @@ function prepareChangelogData(updates: PackageUpdate[], changelogs: Map<string, 
 }
 
 /**
+ * Format a single update for display
+ */
+function formatUpdate(update: PackageUpdate): string {
+  const version = `${update.fromVersion} → ${update.toVersion}`;
+  if (update.changelogUrl) {
+    return `${update.name}: ${version} ([changelog](${update.changelogUrl}))`;
+  }
+  return `${update.name}: ${version}`;
+}
+
+/**
+ * Format downgrades/removals section for PR description
+ */
+function formatDowngradesSection(downgrades: PackageUpdate[]): string {
+  if (downgrades.length === 0) return '';
+
+  const parts: string[] = ['### i Downgrades & Removals (Informational)\n'];
+  parts.push('> These changes are side effects of updating other packages and are shown for visibility.\n');
+
+  for (const pkg of downgrades) {
+    const ecosystemLabel = pkg.ecosystem !== 'npm' ? ` (${pkg.ecosystem})` : '';
+    parts.push(`- ${formatUpdate(pkg)}${ecosystemLabel}`);
+  }
+
+  return parts.join('\n');
+}
+
+/**
+ * Format nix updates section for PR description
+ * Nix packages don't have changelogs fetched from npm, so ensure they're listed
+ */
+function formatNixUpdatesSection(updates: PackageUpdate[]): string {
+  const nixUpdates = updates.filter((u) => u.ecosystem === 'nix' || u.ecosystem === 'nixpkgs');
+  if (nixUpdates.length === 0) return '';
+
+  const parts: string[] = ['### Nix Updates\n'];
+
+  for (const pkg of nixUpdates) {
+    parts.push(`- ${formatUpdate(pkg)} (${pkg.ecosystem})`);
+  }
+
+  return parts.join('\n');
+}
+
+/**
  * Generate fallback summary without AI
  */
-function generateFallbackSummary(updates: PackageUpdate[]): string {
+function generateFallbackSummary(updates: PackageUpdate[], downgrades: PackageUpdate[] = []): string {
   const sections = {
     major: [] as PackageUpdate[],
     minor: [] as PackageUpdate[],
     patch: [] as PackageUpdate[],
+    other: [] as PackageUpdate[],
   };
 
   // Group by update type
@@ -231,16 +291,10 @@ function generateFallbackSummary(updates: PackageUpdate[]): string {
       sections.minor.push(update);
     } else if (update.updateType === 'patch') {
       sections.patch.push(update);
+    } else {
+      sections.other.push(update);
     }
   }
-
-  const formatUpdate = (update: PackageUpdate): string => {
-    const version = `${update.fromVersion} → ${update.toVersion}`;
-    if (update.changelogUrl) {
-      return `${update.name}: ${version} ([changelog](${update.changelogUrl}))`;
-    }
-    return `${update.name}: ${version}`;
-  };
 
   const parts: string[] = ['## Dependency Updates\n'];
 
@@ -268,6 +322,21 @@ function generateFallbackSummary(updates: PackageUpdate[]): string {
     parts.push('');
   }
 
+  if (sections.other.length > 0) {
+    parts.push('### Other Updates\n');
+    for (const update of sections.other) {
+      const ecosystemLabel = update.ecosystem !== 'npm' ? ` (${update.ecosystem})` : '';
+      parts.push(`- ${formatUpdate(update)}${ecosystemLabel}`);
+    }
+    parts.push('');
+  }
+
+  // Add downgrades section if any
+  if (downgrades.length > 0) {
+    parts.push(formatDowngradesSection(downgrades));
+    parts.push('');
+  }
+
   parts.push(`\nTotal updates: ${updates.length}`);
 
   return parts.join('\n');
@@ -279,6 +348,7 @@ function generateFallbackSummary(updates: PackageUpdate[]): string {
 export async function generateCommitMessage(
   updates: PackageUpdate[],
   _config: DepUpdaterConfig,
+  downgrades: PackageUpdate[] = [],
 ): Promise<{ title: string; body: string }> {
   const ecosystems = [...new Set(updates.map((u) => u.ecosystem))];
   const hasBreaking = updates.some((u) => u.updateType === 'major');
@@ -288,7 +358,7 @@ export async function generateCommitMessage(
 
   const body = `Updated ${updates.length} packages across ${ecosystems.join(', ')} ecosystems.
 
-${generateFallbackSummary(updates)}`;
+${generateFallbackSummary(updates, downgrades)}`;
 
   return { title, body };
 }
