@@ -230,8 +230,8 @@ function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
   if (overflowRatio > 0.15 && stats.currentCapacity < 1024) {
     const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
     
-    // TODO: Trace the tuning event as structured data
-    console.log(`[Capacity Tuning] Increasing capacity: ${stats.currentCapacity} → ${newCapacity} (overflow ratio: ${(overflowRatio * 100).toFixed(1)}%)`);
+    // TODO: Use system tracer for self-tracing capacity tuning events
+    // For now, removed console.log to avoid hot path overhead
     
     stats.currentCapacity = newCapacity;
     resetStats(stats);
@@ -242,8 +242,8 @@ function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
   if (overflowRatio < 0.05 && stats.totalBuffersCreated >= 10 && stats.currentCapacity > 8) {
     const newCapacity = Math.max(8, stats.currentCapacity / 2);
     
-    // TODO: Trace the tuning event as structured data
-    console.log(`[Capacity Tuning] Decreasing capacity: ${stats.currentCapacity} → ${newCapacity} (low utilization)`);
+    // TODO: Use system tracer for self-tracing capacity tuning events
+    // For now, removed console.log to avoid hot path overhead
     
     stats.currentCapacity = newCapacity;
     resetStats(stats);
@@ -625,11 +625,50 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
 }
 
 /**
+ * Text string storage - raw strings without interning
+ * Separate from category interning to avoid dictionary overhead for unique strings
+ */
+class TextStringStorage {
+  private strings: string[] = [];
+  
+  /**
+   * Store a text string and return its index
+   * No deduplication - every string gets a new index
+   */
+  store(str: string): number {
+    const idx = this.strings.length;
+    this.strings.push(str);
+    return idx;
+  }
+  
+  /**
+   * Get string by index
+   */
+  getString(idx: number): string | undefined {
+    return this.strings[idx];
+  }
+  
+  /**
+   * Get all strings for Arrow column
+   */
+  getStrings(): readonly string[] {
+    return this.strings;
+  }
+}
+
+/**
+ * Global text string storage
+ * One instance for all text columns
+ */
+const textStringStorage = new TextStringStorage();
+
+/**
  * Write a value to a TypedArray column
  * Handles type conversion for different column types
  * 
  * Per specs/01b1_buffer_performance_optimizations.md:
  * - String interning for category types
+ * - Raw storage for text types
  * - Null bitmap management per Arrow spec
  * - Direct TypedArray writes (hot path)
  */
@@ -671,6 +710,11 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
     nullBitmap[byteIndex] |= (1 << bitOffset);
   }
   
+  // Get schema metadata to determine string type (category vs text)
+  const fieldName = columnName.replace('attr_', '');
+  const schema = buffer.task.module.tagAttributes;
+  const fieldSchema = schema[fieldName];
+  
   // Write based on column type
   if (column instanceof Uint8Array) {
     // For boolean or small enum types
@@ -690,9 +734,19 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
       column[index] = value;
     }
   } else if (column instanceof Uint32Array) {
-    // For category/text types - store string index via interning
+    // For category/text types - check schema metadata to decide
     if (typeof value === 'string') {
-      column[index] = categoryInterner.intern(value);
+      // Check if this is a category or text type via schema metadata
+      const schemaWithMetadata = fieldSchema as import('./schema/types.js').SchemaWithMetadata;
+      const lmaoType = schemaWithMetadata?.__lmao_type;
+      
+      if (lmaoType === 'text') {
+        // Text: raw storage without interning
+        column[index] = textStringStorage.store(value);
+      } else {
+        // Category (or unknown): use string interning
+        column[index] = categoryInterner.intern(value);
+      }
     } else if (typeof value === 'number') {
       column[index] = value;
     }
@@ -710,6 +764,14 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
  * - Tag getter creates a new entry and returns a chainable API
  * - All chained methods write to the SAME row
  * - Zero allocations: returns same object instance
+ * 
+ * TODO: Implement runtime class generation using new Function() per specs/01g and 01j
+ * for zero-overhead prototype methods. Current implementation uses dynamic property
+ * assignment which works but is not optimal for performance.
+ * 
+ * @param schema - Tag attribute schema with field definitions
+ * @param buffer - SpanBuffer to write entries to (per-span instance)
+ * @returns SpanLogger with typed methods matching schema
  */
 function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
@@ -718,9 +780,17 @@ function createSpanLogger<T extends TagAttributeSchema>(
   // Track which row index the current tag chain is writing to
   let currentTagIndex: number | null = null;
   // Track the active buffer (may change due to overflow)
+  // SAFETY: Each SpanLogger instance gets its own closure, so concurrent
+  // async operations on different spans won't interfere with each other.
   let activeBuffer = buffer;
   
-  // Create the chainable tag API that writes to the current row
+  /**
+   * Create the chainable tag API that writes to the current row
+   * 
+   * Type safety note: While we use `as` casts here, the ChainableTagAPI<T>
+   * type ensures that only valid attribute names from the schema can be called.
+   * This provides compile-time safety even though the methods are created dynamically.
+   */
   const createChainableTag = (): ChainableTagAPI<T> => {
     type TagMethod = (value: InferTagAttributes<T>[keyof T]) => ChainableTagAPI<T>;
     type TagAPIRecord = Record<string, TagMethod | ((attributes: Partial<InferTagAttributes<T>>) => ChainableTagAPI<T>)>;
@@ -742,6 +812,7 @@ function createSpanLogger<T extends TagAttributeSchema>(
     };
     
     // Add individual attribute methods dynamically - write to current row
+    // Each method is strongly typed via ChainableTagAPI<T> interface
     for (const key of Object.keys(schema)) {
       tagAPI[key] = function(value: unknown): ChainableTagAPI<T> {
         // Use the current tag index (set by tag getter)
