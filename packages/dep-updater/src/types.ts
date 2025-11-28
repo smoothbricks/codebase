@@ -65,8 +65,10 @@ export interface PackageUpdate {
 export interface UpdateResult {
   /** Whether the update was successful */
   success: boolean;
-  /** List of package updates */
+  /** List of package updates (upgrades only) */
   updates: PackageUpdate[];
+  /** List of package downgrades (for informational purposes, not included in PRs) */
+  downgrades?: PackageUpdate[];
   /** Error message if failed */
   error?: string;
   /** Ecosystem that was updated */
