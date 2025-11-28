@@ -55,8 +55,8 @@ async function summarizeChangelog(
         },
       ],
     });
-    const content = message.content[0];
-    return content.type === 'text' ? content.text : changelog.substring(0, 1000);
+    const content = message.content?.[0];
+    return content?.type === 'text' ? content.text : changelog.substring(0, 1000);
   } catch (error) {
     config.logger?.warn(
       `Failed to summarize changelog for ${packageName}: ${error instanceof Error ? error.message : String(error)}`,
@@ -96,8 +96,8 @@ export async function analyzeChangelogs(
       messages: [{ role: 'user', content: prompt }],
     });
 
-    const content = message.content[0];
-    if (content.type === 'text') {
+    const content = message.content?.[0];
+    if (content?.type === 'text') {
       // Append nix updates and downgrades sections
       // AI may omit nix packages since they don't have changelogs
       let result = content.text;

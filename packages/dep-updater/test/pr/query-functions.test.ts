@@ -50,12 +50,13 @@ describe('checkPRConflicts', () => {
     expect(spy.calls[0]?.[2]?.cwd).toBe('/repo');
   });
 
-  test('should return false on error', async () => {
+  test('should return true on error (fail-safe: assume conflicts)', async () => {
     const mockExeca = createErrorExeca('gh: command not found');
 
     const hasConflicts = await checkPRConflicts('/repo', 999, mockExeca);
 
-    expect(hasConflicts).toBe(false);
+    // Returns true on error - safer than assuming no conflicts when GitHub is unreachable
+    expect(hasConflicts).toBe(true);
   });
 });
 

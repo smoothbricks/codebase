@@ -301,6 +301,8 @@ export async function updateDevenv(
     // Try derivation diffing first if enabled
     let updates: PackageUpdate[] = [];
     let downgrades: PackageUpdate[] = [];
+    let profileAfter: string | undefined;
+
     if (useDerivationDiff && profileBefore) {
       // Force environment rebuild to get the new profile path
       // devenv info only returns cached profile, we need to evaluate the updated config
@@ -312,7 +314,7 @@ export async function updateDevenv(
       } catch {
         logger?.warn('Failed to rebuild devenv environment for diff');
       }
-      const profileAfter = await getDevenvProfilePath(devenvPath);
+      profileAfter = await getDevenvProfilePath(devenvPath);
       logger?.debug?.(`Profile before: ${profileBefore}`);
       logger?.debug?.(`Profile after: ${profileAfter}`);
       if (profileAfter && profileBefore !== profileAfter) {
@@ -338,7 +340,7 @@ export async function updateDevenv(
 
     // Fallback to lock file comparison only if we couldn't compare derivations
     // If profiles were identical, there are no actual package changes - don't show lock file hash changes
-    const profilesWereIdentical = profileBefore && profileBefore === (await getDevenvProfilePath(devenvPath));
+    const profilesWereIdentical = profileBefore && profileBefore === profileAfter;
 
     if (updates.length === 0 && downgrades.length === 0 && !profilesWereIdentical) {
       logger?.debug?.(`Lock before: ${lockBefore.size} entries, after: ${lockAfter.size} entries`);
