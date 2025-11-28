@@ -5,6 +5,7 @@
 import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import glob from 'fast-glob';
+import type { Logger } from '../logger.js';
 import type { ExpoProject } from '../types.js';
 
 interface PackageJson {
@@ -17,7 +18,7 @@ interface PackageJson {
 /**
  * Read package.json and extract workspace package names
  */
-async function getWorkspacePackageNames(repoRoot: string): Promise<string[]> {
+async function getWorkspacePackageNames(repoRoot: string, logger?: Logger): Promise<string[]> {
   try {
     const packageJsonPath = resolve(repoRoot, 'package.json');
     const content = await readFile(packageJsonPath, 'utf-8');
@@ -55,7 +56,7 @@ async function getWorkspacePackageNames(repoRoot: string): Promise<string[]> {
           packageNames.push(pkg.name);
         }
       } catch (error) {
-        console.warn(
+        logger?.warn(
           `Failed to read workspace package at ${pkgPath}:`,
           error instanceof Error ? error.message : String(error),
         );
@@ -64,7 +65,7 @@ async function getWorkspacePackageNames(repoRoot: string): Promise<string[]> {
 
     return packageNames;
   } catch (error) {
-    console.warn(
+    logger?.warn(
       `Failed to detect workspace packages in ${repoRoot}:`,
       error instanceof Error ? error.message : String(error),
     );
@@ -94,8 +95,8 @@ function extractScopes(packageNames: string[]): string[] {
  * Auto-detect workspace scopes from package.json
  * Returns unique scope prefixes like ['@company', '@example']
  */
-export async function detectWorkspaceScopes(repoRoot: string): Promise<string[]> {
-  const packageNames = await getWorkspacePackageNames(repoRoot);
+export async function detectWorkspaceScopes(repoRoot: string, logger?: Logger): Promise<string[]> {
+  const packageNames = await getWorkspacePackageNames(repoRoot, logger);
   return extractScopes(packageNames);
 }
 
@@ -117,9 +118,10 @@ function hasExpoDependency(pkg: PackageJson): boolean {
 /**
  * Auto-detect all Expo projects in the monorepo
  * @param repoRoot - Root directory of the repository
+ * @param logger - Optional logger instance
  * @returns Array of Expo project configurations
  */
-export async function detectExpoProjects(repoRoot: string): Promise<ExpoProject[]> {
+export async function detectExpoProjects(repoRoot: string, logger?: Logger): Promise<ExpoProject[]> {
   try {
     const packageJsonPath = resolve(repoRoot, 'package.json');
     const content = await readFile(packageJsonPath, 'utf-8');
@@ -170,13 +172,13 @@ export async function detectExpoProjects(repoRoot: string): Promise<ExpoProject[
           });
         }
       } catch (error) {
-        console.warn(`Failed to read package at ${pkgPath}:`, error instanceof Error ? error.message : String(error));
+        logger?.warn(`Failed to read package at ${pkgPath}:`, error instanceof Error ? error.message : String(error));
       }
     }
 
     return expoProjects;
   } catch (error) {
-    console.warn(
+    logger?.warn(
       `Failed to detect Expo projects in ${repoRoot}:`,
       error instanceof Error ? error.message : String(error),
     );

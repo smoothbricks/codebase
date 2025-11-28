@@ -4,6 +4,7 @@
 
 import { readFile, writeFile } from 'node:fs/promises';
 import { filterCriticalVersions } from '../expo/versions-fetcher.js';
+import type { Logger } from '../logger.js';
 import type { ExpoPackageVersions } from '../types.js';
 import { detectWorkspaceScopes } from '../utils/workspace-detector.js';
 
@@ -28,7 +29,7 @@ interface SyncpackConfig {
 /**
  * Read existing syncpack configuration
  */
-export async function readSyncpackConfig(configPath: string): Promise<SyncpackConfig> {
+export async function readSyncpackConfig(configPath: string, logger?: Logger): Promise<SyncpackConfig> {
   try {
     const content = await readFile(configPath, 'utf-8');
     return JSON.parse(content);
@@ -38,7 +39,7 @@ export async function readSyncpackConfig(configPath: string): Promise<SyncpackCo
       return {};
     }
     // Other errors should be logged
-    console.warn(
+    logger?.warn(
       `Failed to read syncpack config from ${configPath}:`,
       error instanceof Error ? error.message : String(error),
     );
@@ -130,12 +131,13 @@ export async function generateSyncpackConfig(
   options: {
     preserveCustomRules?: boolean;
     workspaceScopes?: string[];
+    logger?: Logger;
   } = {},
 ): Promise<SyncpackConfig> {
-  const { preserveCustomRules = true, workspaceScopes = [] } = options;
+  const { preserveCustomRules = true, workspaceScopes = [], logger } = options;
 
   // Read existing config
-  const existing = await readSyncpackConfig(configPath);
+  const existing = await readSyncpackConfig(configPath, logger);
 
   // Generate Expo version groups
   const expoGroups = generateExpoVersionGroups(expoVersions);
