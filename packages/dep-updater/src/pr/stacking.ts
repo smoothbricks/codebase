@@ -56,6 +56,7 @@ export async function getOpenUpdatePRs(
 
 /**
  * Check if a PR has merge conflicts
+ * Returns true (assume conflicts) if check fails - safer than assuming no conflicts
  */
 export async function checkPRConflicts(
   repoRoot: string,
@@ -68,8 +69,13 @@ export async function checkPRConflicts(
     const githubClient = client || new GitHubCLIClient(executor);
     return await githubClient.checkPRConflicts(repoRoot, prNumber);
   } catch (error) {
-    console.warn(`Failed to check PR #${prNumber} conflicts:`, error instanceof Error ? error.message : String(error));
-    return false;
+    // Return true (assume conflicts) when check fails - safer than assuming no conflicts
+    // This prevents stacking on a potentially conflicted branch when GitHub is unreachable
+    console.warn(
+      `Failed to check PR #${prNumber} conflicts (assuming conflicts):`,
+      error instanceof Error ? error.message : String(error),
+    );
+    return true;
   }
 }
 

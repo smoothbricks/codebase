@@ -208,9 +208,10 @@ async function createPRWorkflow(
 ): Promise<void> {
   config.logger?.info('\n=== Creating update branch ===');
   const branchName = generateBranchName(config);
+  const remote = config.git?.remote || 'origin';
 
   // Create new branch from current position (already checked out correct base)
-  const { createBranch, pushWithUpstream } = await import('../git.js');
+  const { createBranch, pushWithUpstream, deleteRemoteBranch } = await import('../git.js');
   await createBranch(repoRoot, branchName);
   config.logger?.info('✓ Created branch:', branchName);
 
@@ -220,25 +221,40 @@ async function createPRWorkflow(
 
   // Push the branch
   config.logger?.info('\n=== Pushing branch ===');
-  const remote = config.git?.remote || 'origin';
   await pushWithUpstream(repoRoot, remote, branchName);
   config.logger?.info('✓ Pushed to remote:', `${remote}/${branchName}`);
 
   // Create PR (uses stackBase determined at the beginning)
+  // If PR creation fails, clean up the orphan branch on remote
   config.logger?.info('\n=== Creating PR ===');
   const hasBreaking = allUpdates.some((u) => u.updateType === 'major');
   const prTitle = generatePRTitle(config, hasBreaking);
 
-  const { createPR } = await import('../pr/stacking.js');
-  const pr = await createPR(config, repoRoot, {
-    title: prTitle,
-    body: prBody,
-    baseBranch: stackBase,
-    headBranch: branchName,
-  });
+  try {
+    const { createPR } = await import('../pr/stacking.js');
+    const pr = await createPR(config, repoRoot, {
+      title: prTitle,
+      body: prBody,
+      baseBranch: stackBase,
+      headBranch: branchName,
+    });
 
-  config.logger?.info(`\n✓ Created PR #${pr.number}: ${pr.url}`);
-  config.logger?.info(`  Base: ${stackBase}`);
+    config.logger?.info(`\n✓ Created PR #${pr.number}: ${pr.url}`);
+    config.logger?.info(`  Base: ${stackBase}`);
+  } catch (error) {
+    // Clean up orphan branch on remote if PR creation fails
+    config.logger?.error('PR creation failed, cleaning up remote branch...');
+    try {
+      await deleteRemoteBranch(repoRoot, remote, branchName);
+      config.logger?.info(`✓ Deleted orphan branch: ${remote}/${branchName}`);
+    } catch (cleanupError) {
+      config.logger?.warn(
+        `Failed to clean up remote branch ${branchName}:`,
+        cleanupError instanceof Error ? cleanupError.message : String(cleanupError),
+      );
+    }
+    throw error;
+  }
 }
 
 /**

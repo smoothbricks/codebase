@@ -190,6 +190,20 @@ export async function pushWithUpstream(
 }
 
 /**
+ * Delete a remote branch
+ */
+export async function deleteRemoteBranch(
+  repoRoot: string,
+  remote: string,
+  branch: string,
+  executor: CommandExecutor = defaultExecutor,
+): Promise<void> {
+  await executor('git', ['push', remote, '--delete', branch], {
+    cwd: repoRoot,
+  });
+}
+
+/**
  * Get the last commit message
  */
 export async function getLastCommitMessage(
