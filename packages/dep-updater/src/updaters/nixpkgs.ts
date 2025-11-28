@@ -36,6 +36,18 @@ async function parseNvfetcherSources(sourcesPath: string): Promise<Map<string, s
 }
 
 /**
+ * Check if a command is available in PATH
+ */
+async function isCommandAvailable(command: string): Promise<boolean> {
+  try {
+    await execa('which', [command]);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Update nixpkgs overlay via nvfetcher
  */
 export async function updateNixpkgsOverlay(
@@ -50,53 +62,40 @@ export async function updateNixpkgsOverlay(
   try {
     logger?.info('Updating nixpkgs overlay...');
 
+    // Quick check if nvfetcher is available before proceeding
+    const hasNvfetcher = await isCommandAvailable('nvfetcher');
+
+    if (!hasNvfetcher) {
+      return {
+        success: false,
+        updates: [],
+        error: 'nvfetcher not available (not found in PATH)',
+        ecosystem: 'nixpkgs',
+      };
+    }
+
     const sourcesPath = join(overlayPath, '_sources', 'generated.json');
 
     // Parse sources before update
     const versionsBefore = await parseNvfetcherSources(sourcesPath);
 
-    // Always run nvfetcher to detect updates (even in dry-run)
-    // In dry-run mode, we'll restore the files afterwards
-    let nvfetcherSuccess = false;
-
     // Pass GitHub token to nvfetcher for API rate limits
     const githubToken = process.env.GITHUB_TOKEN || process.env.GH_TOKEN;
     const nvfetcherEnv = githubToken ? { ...process.env, GITHUB_TOKEN: githubToken } : process.env;
 
-    // Method 1: Try direct nvfetcher (fast, works in devenv)
+    // Run nvfetcher to detect and apply updates
     try {
       await execa('nvfetcher', [], {
         cwd: overlayPath,
         stdio: 'inherit',
         env: nvfetcherEnv,
       });
-      nvfetcherSuccess = true;
       logger?.info('✓ nvfetcher update completed');
-    } catch (_error) {
-      logger?.info('Direct nvfetcher not found, trying via nix shell...');
-
-      // Method 2: Try via nix shell (slower, but self-contained)
-      try {
-        await execa('nix', ['shell', 'nixpkgs#nvfetcher', '-c', 'nvfetcher'], {
-          cwd: overlayPath,
-          stdio: 'inherit',
-          env: nvfetcherEnv,
-        });
-        nvfetcherSuccess = true;
-        logger?.info('✓ nvfetcher update completed (via nix shell)');
-      } catch (_nixError) {
-        logger?.warn('Warning: nvfetcher update failed');
-        logger?.warn('  - nvfetcher not in PATH');
-        logger?.warn('  - nix shell also failed');
-        logger?.warn('Skipping nixpkgs overlay update...');
-      }
-    }
-
-    if (!nvfetcherSuccess) {
+    } catch (error) {
       return {
         success: false,
         updates: [],
-        error: 'nvfetcher not available (tried direct command and nix shell)',
+        error: `nvfetcher failed: ${error instanceof Error ? error.message : String(error)}`,
         ecosystem: 'nixpkgs',
       };
     }
