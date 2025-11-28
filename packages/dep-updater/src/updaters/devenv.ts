@@ -336,8 +336,11 @@ export async function updateDevenv(
       logger?.debug?.('No profile before update - skipping derivation diff');
     }
 
-    // Fallback to lock file comparison if no derivation diff results
-    if (updates.length === 0 && downgrades.length === 0) {
+    // Fallback to lock file comparison only if we couldn't compare derivations
+    // If profiles were identical, there are no actual package changes - don't show lock file hash changes
+    const profilesWereIdentical = profileBefore && profileBefore === (await getDevenvProfilePath(devenvPath));
+
+    if (updates.length === 0 && downgrades.length === 0 && !profilesWereIdentical) {
       logger?.debug?.(`Lock before: ${lockBefore.size} entries, after: ${lockAfter.size} entries`);
       updates = compareDevenvLocks(lockBefore, lockAfter);
       if (updates.length > 0) {
@@ -349,6 +352,8 @@ export async function updateDevenv(
           logger?.debug?.(`Lock entries: ${[...lockBefore.keys()].join(', ')}`);
         }
       }
+    } else if (profilesWereIdentical && updates.length === 0) {
+      logger?.info('✓ Nix inputs updated but no package version changes detected');
     }
 
     // In dry-run mode, restore the lock file to its original state
