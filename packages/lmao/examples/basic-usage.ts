@@ -57,6 +57,8 @@ const flagEvaluator = new InMemoryFlagEvaluator({
 });
 
 // 5. Create module context with tag attributes
+// Note: Using the internal createModuleContext API directly
+// In production, you'd typically use createLibraryModule for better ergonomics
 const { task } = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123def456',

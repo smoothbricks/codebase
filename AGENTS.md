@@ -47,6 +47,7 @@
 - `src/lib/buffer/types.ts` - Buffer interfaces
 - `src/lib/buffer/createBuilders.ts` - TypedArray column creation
 - `src/lib/buffer/createSpanBuffer.ts` - Buffer allocation
+- `src/lib/buffer/convertToArrow.ts` - Zero-copy Arrow table conversion
 
 ### @packages/lmao - High-Level Logging/Runtime
 **Purpose**: Developer ergonomics and schema-aware orchestration
@@ -71,6 +72,9 @@
 **Key Files**:
 - `src/lib/schema/` - Schema builders, tag attributes, feature flags
 - `src/lib/lmao.ts` - Main integration, context creation, task wrappers
+- `src/lib/codegen/spanLoggerGenerator.ts` - Runtime SpanLogger class generation
+- `src/lib/library.ts` - Library integration with prefix support
+- `src/lib/flushScheduler.ts` - Background flush scheduler
 
 **Relationship**: Lmao calls arrow-builder functions to write bytes, arrow-builder imports lmao types for schema metadata.
 
@@ -78,6 +82,14 @@
 - **Hot Path**: TypedArray assignments ONLY in arrow-builder. No Arrow builders, no objects!
 - **Package Imports**: arrow-builder can import from `@smoothbricks/lmao`, lmao can import from `@smoothbricks/arrow-builder`
 - **DO NOT**: Use Apache Arrow builders in hot path - only TypedArray assignments per specs/01b_columnar_buffer_architecture.md
+- **⚠️ SEARCH BEFORE IMPLEMENTING**: Before writing ANY new code, ALWAYS search for existing implementations in BOTH packages:
+  - Use `grep` or `glob` to find similar functions/types/patterns
+  - Check `packages/lmao/src/lib/` for high-level APIs
+  - Check `packages/arrow-builder/src/lib/` for low-level buffer operations
+  - Look for existing helper functions, types, and patterns
+  - **DO NOT re-implement what already exists** - reuse existing code
+  - **DO NOT create raw objects** - use `defineTagAttributes()` and `S` schema builder
+  - **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineTagAttributes` and use it properly
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/01a_trace_schema_system.md):
 Three distinct string types, each with different storage strategies:
 ### S.enum - Known Values (Uint8Array)
@@ -105,6 +117,19 @@ x build lmao | **Test Single**: bun test path/to/file.test.ts | **Test Pattern**
 - **Typecheck**: 
 x typecheck lmao | **Format**: bun run format (auto-formats on git commit)
 ## Implementation Patterns (See specs/01h_entry_types_and_logging_primitives.md)
+- **Schema Definition**: ALWAYS use `defineTagAttributes()` with `S` builder:
+  ```typescript
+  // ✅ CORRECT
+  const schema = defineTagAttributes({
+    userId: S.category(),
+    operation: S.enum(['CREATE', 'READ']),
+    errorMsg: S.text(),
+    count: S.number(),
+  });
+  
+  // ❌ WRONG - Never create raw objects
+  const schema = { userId: { __lmao_type: 'category' } };
+  ```
 - **Buffer Creation**: arrow-builder provides TypedArray buffers, lmao wraps with logging API
 - **Hot Path Writes**: Direct TypedArray assignment only
   - Enums: buffer.attr_operation[idx] = OPERATION_MAP[value] (compile-time lookup)
@@ -159,3 +184,68 @@ Entry types use compile-time enum mapping to Uint8Array for 1-byte storage.
 - Text columns: Plain strings without dictionary
 - Zero-copy conversion from SpanBuffer to Arrow
 - Optimized for ClickHouse/Parquet analytics
+
+## ✅ IMPLEMENTED FEATURES (Search These First!)
+
+### Core Schema System (@packages/lmao/src/lib/schema/)
+- ✅ `S.enum()` - Compile-time known values with Uint8Array storage
+- ✅ `S.category()` - Runtime string interning for repeated values
+- ✅ `S.text()` - Raw strings for unique values
+- ✅ `S.number()` - Float64Array storage
+- ✅ `S.boolean()` - Uint8Array (0/1) storage
+- ✅ `defineTagAttributes()` - Schema definition with validation
+- ✅ `defineFeatureFlags()` - Feature flag schema with sync/async evaluation
+- ✅ Schema extension with `.extend()` method
+- ✅ Masking transforms (hash, url, sql, email)
+
+### Buffer System (@packages/arrow-builder/src/lib/buffer/)
+- ✅ `createSpanBuffer()` - Cache-aligned TypedArray buffer creation
+- ✅ `createChildSpanBuffer()` - Child span buffer with tree structure
+- ✅ `createNextBuffer()` - Buffer chaining for overflow
+- ✅ `createAttributeColumns()` - Schema-based column creation
+- ✅ Null bitmap management (Arrow format)
+- ✅ Self-tuning capacity with overflow tracking
+- ✅ `convertToArrowTable()` - Zero-copy Arrow conversion
+- ✅ `convertSpanTreeToArrowTable()` - Recursive tree conversion
+
+### Code Generation (@packages/lmao/src/lib/codegen/)
+- ✅ `generateSpanLoggerClass()` - Runtime class code generation
+- ✅ `createSpanLoggerClass()` - Compile and cache SpanLogger classes
+- ✅ Compile-time enum mapping in generated code
+- ✅ Prototype methods for zero-overhead tag writing
+- ✅ Scoped attributes with `scope()` method
+- ✅ Distinct entry types (info/debug/warn/error)
+
+### Context & Integration (@packages/lmao/src/lib/)
+- ✅ `createRequestContext()` - Request-level context with ff/env
+- ✅ `createModuleContext()` - Module-level context with task wrapper
+- ✅ `ctx.ok()` / `ctx.err()` - Fluent result API
+- ✅ `ctx.span()` - Child span creation
+- ✅ `ctx.log.tag` - Chainable tag API
+- ✅ `ctx.log.scope()` - Scoped attribute propagation
+- ✅ Feature flag evaluation with analytics tracking
+
+### Library Integration (@packages/lmao/src/lib/library.ts)
+- ✅ `prefixSchema()` - Add prefix to all schema fields
+- ✅ `createLibraryModule()` - Library module factory
+- ✅ `moduleContextFactory()` - Compose libraries with prefixes
+- ✅ `createHttpLibrary()` - Example HTTP library
+- ✅ `createDatabaseLibrary()` - Example database library
+
+### Background Processing (@packages/lmao/src/lib/flushScheduler.ts)
+- ✅ `FlushScheduler` - Adaptive background flushing
+- ✅ Capacity-based flushing (80% threshold)
+- ✅ Time-based flushing (10s max, 1s min intervals)
+- ✅ Idle detection (5s timeout)
+- ✅ Memory pressure detection (Node.js only)
+- ✅ Manual flush with `flush()` method
+
+### String Storage
+- ✅ `StringInterner` - Category string interning (exported from lmao.ts)
+- ✅ `TextStringStorage` - Text storage without interning (exported from lmao.ts)
+- ✅ `categoryInterner` - Global category interner
+- ✅ `textStringStorage` - Global text storage
+- ✅ `moduleIdInterner` - Module ID interning
+- ✅ `spanNameInterner` - Span name interning
+
+**BEFORE IMPLEMENTING**: Search these modules first! Most functionality already exists.

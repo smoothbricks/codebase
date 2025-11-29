@@ -13,6 +13,7 @@ import type { FeatureFlagSchema, InferFeatureFlags, EvaluationContext } from './
 import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from './schema/evaluator.js';
 import type { SpanBuffer, ModuleContext, TaskContext, BufferCapacityStats } from '@smoothbricks/arrow-builder';
 import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from '@smoothbricks/arrow-builder';
+import { createSpanLoggerClass, type BaseSpanLogger } from './codegen/spanLoggerGenerator.js';
 
 /**
  * Result types for ok/err pattern
@@ -207,10 +208,12 @@ class StringInterner {
 /**
  * Global string interners
  * One per string type to keep dictionaries separate
+ * 
+ * Exported for Arrow table conversion
  */
-const categoryInterner = new StringInterner();
-const moduleIdInterner = new StringInterner();
-const spanNameInterner = new StringInterner();
+export const categoryInterner = new StringInterner();
+export const moduleIdInterner = new StringInterner();
+export const spanNameInterner = new StringInterner();
 
 /**
  * Check if capacity should be tuned based on usage patterns
@@ -357,6 +360,9 @@ export type ChainableTagAPI<T extends TagAttributeSchema> = {
  * Per specs/01h_entry_types_and_logging_primitives.md:
  * - tag is a GETTER that creates a new entry and returns chainable API
  * - All methods write to the SAME row until the next tag access
+ * 
+ * Per specs/01i_span_scope_attributes.md:
+ * - scope() sets attributes that auto-propagate to all subsequent entries
  */
 export interface SpanLogger<T extends TagAttributeSchema> {
   /**
@@ -369,6 +375,15 @@ export interface SpanLogger<T extends TagAttributeSchema> {
    * - ctx.log.tag.with({ userId, requestId }) - bulk set on SAME entry
    */
   readonly tag: ChainableTagAPI<T>;
+  
+  /**
+   * Set scoped attributes that auto-propagate to all subsequent entries
+   * 
+   * Usage:
+   * - ctx.log.scope({ requestId: req.id, userId: req.user?.id })
+   * - All subsequent log.tag, log.info, etc. will include these attributes
+   */
+  scope(attributes: Partial<InferTagAttributes<T>>): void;
   
   /**
    * Log a message entry
@@ -446,15 +461,22 @@ export interface ModuleContextBuilder<
 /**
  * Entry type codes for operation tracking
  * Per specs/01h_entry_types_and_logging_primitives.md
+ * 
+ * Exported for use in codegen and Arrow conversion
  */
-const ENTRY_TYPE_FF_ACCESS = 1;
-const ENTRY_TYPE_FF_USAGE = 2;
-const ENTRY_TYPE_TAG = 3;
-const ENTRY_TYPE_MESSAGE = 4;
-const ENTRY_TYPE_SPAN_START = 5;
-const ENTRY_TYPE_SPAN_OK = 6;
-const ENTRY_TYPE_SPAN_ERR = 7;
-const ENTRY_TYPE_SPAN_EXCEPTION = 8;
+export const ENTRY_TYPE_FF_ACCESS = 1;
+export const ENTRY_TYPE_FF_USAGE = 2;
+export const ENTRY_TYPE_TAG = 3;
+export const ENTRY_TYPE_MESSAGE = 4; // Generic message (deprecated, use specific levels)
+export const ENTRY_TYPE_SPAN_START = 5;
+export const ENTRY_TYPE_SPAN_OK = 6;
+export const ENTRY_TYPE_SPAN_ERR = 7;
+export const ENTRY_TYPE_SPAN_EXCEPTION = 8;
+// Distinct entry types for log levels (specs/01h)
+export const ENTRY_TYPE_INFO = 9;
+export const ENTRY_TYPE_DEBUG = 10;
+export const ENTRY_TYPE_WARN = 11;
+export const ENTRY_TYPE_ERROR = 12;
 
 /**
  * Create column writers for feature flag analytics
@@ -659,8 +681,10 @@ class TextStringStorage {
 /**
  * Global text string storage
  * One instance for all text columns
+ * 
+ * Exported for Arrow table conversion
  */
-const textStringStorage = new TextStringStorage();
+export const textStringStorage = new TextStringStorage();
 
 /**
  * Write a value to a TypedArray column
@@ -723,15 +747,33 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
     } else if (typeof value === 'number') {
       column[index] = value;
     } else if (typeof value === 'string') {
-      // For string enums, try to find enum value index
-      // This requires schema metadata to be available
-      // For now, store 0 (will be improved with compile-time mapping)
-      column[index] = 0;
+      // For string enums, map to index using enum values from schema metadata
+      const schemaWithMetadata = fieldSchema as import('./schema/types.js').EnumSchemaWithMetadata;
+      const enumValues = schemaWithMetadata?.__lmao_enum_values;
+      
+      if (enumValues) {
+        // Find index of value in enum values array
+        const enumIndex = enumValues.indexOf(value);
+        column[index] = enumIndex >= 0 ? enumIndex : 0;
+      } else {
+        column[index] = 0;
+      }
     }
   } else if (column instanceof Uint16Array) {
     // For medium enum types (256-65535 values)
     if (typeof value === 'number') {
       column[index] = value;
+    } else if (typeof value === 'string') {
+      // Map enum string to index
+      const schemaWithMetadata = fieldSchema as import('./schema/types.js').EnumSchemaWithMetadata;
+      const enumValues = schemaWithMetadata?.__lmao_enum_values;
+      
+      if (enumValues) {
+        const enumIndex = enumValues.indexOf(value);
+        column[index] = enumIndex >= 0 ? enumIndex : 0;
+      } else {
+        column[index] = 0;
+      }
     }
   } else if (column instanceof Uint32Array) {
     // For category/text types - check schema metadata to decide
@@ -757,17 +799,30 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
 }
 
 /**
+ * Get buffer with space function type
+ */
+type GetBufferWithSpaceFn = (buffer: SpanBuffer) => { buffer: SpanBuffer; didOverflow: boolean };
+
+/**
+ * Cache for generated SpanLogger classes
+ * Per-schema cache to avoid regenerating the same class
+ */
+const spanLoggerClassCache = new WeakMap<TagAttributeSchema, new (
+  buffer: SpanBuffer,
+  categoryInterner: StringInterner,
+  textStorage: TextStringStorage,
+  getBufferWithSpace: GetBufferWithSpaceFn
+) => BaseSpanLogger<TagAttributeSchema>>();
+
+/**
  * Create span logger with typed tag methods and method chaining
  * Writes to TypedArray columnar buffers in memory (hot path)
  * 
- * Per specs/01h_entry_types_and_logging_primitives.md:
+ * Per specs/01g_trace_context_api_codegen.md and 01j_module_context_and_spanlogger_generation.md:
+ * - Uses runtime class generation with new Function() for zero-overhead prototype methods
  * - Tag getter creates a new entry and returns a chainable API
  * - All chained methods write to the SAME row
  * - Zero allocations: returns same object instance
- * 
- * TODO: Implement runtime class generation using new Function() per specs/01g and 01j
- * for zero-overhead prototype methods. Current implementation uses dynamic property
- * assignment which works but is not optimal for performance.
  * 
  * @param schema - Tag attribute schema with field definitions
  * @param buffer - SpanBuffer to write entries to (per-span instance)
@@ -777,119 +832,21 @@ function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
   buffer: SpanBuffer
 ): SpanLogger<T> {
-  // Track which row index the current tag chain is writing to
-  let currentTagIndex: number | null = null;
-  // Track the active buffer (may change due to overflow)
-  // SAFETY: Each SpanLogger instance gets its own closure, so concurrent
-  // async operations on different spans won't interfere with each other.
-  let activeBuffer = buffer;
+  // Get or create the generated SpanLogger class (cold path - happens once per schema)
+  let SpanLoggerClass = spanLoggerClassCache.get(schema);
   
-  /**
-   * Create the chainable tag API that writes to the current row
-   * 
-   * Type safety note: While we use `as` casts here, the ChainableTagAPI<T>
-   * type ensures that only valid attribute names from the schema can be called.
-   * This provides compile-time safety even though the methods are created dynamically.
-   */
-  const createChainableTag = (): ChainableTagAPI<T> => {
-    type TagMethod = (value: InferTagAttributes<T>[keyof T]) => ChainableTagAPI<T>;
-    type TagAPIRecord = Record<string, TagMethod | ((attributes: Partial<InferTagAttributes<T>>) => ChainableTagAPI<T>)>;
-    
-    const tagAPI = {} as TagAPIRecord;
-    
-    // Add the 'with' method for bulk setting - writes to current row
-    tagAPI.with = function(attributes: Partial<InferTagAttributes<T>>): ChainableTagAPI<T> {
-      // Use the current tag index (set by tag getter)
-      const idx = currentTagIndex !== null ? currentTagIndex : activeBuffer.writeIndex;
-      
-      // Write each attribute to its column on the active buffer
-      for (const [key, value] of Object.entries(attributes)) {
-        const columnName = `attr_${key}`;
-        writeToColumn(activeBuffer, columnName, value, idx);
-      }
-      
-      return tagAPI as ChainableTagAPI<T>;
-    };
-    
-    // Add individual attribute methods dynamically - write to current row
-    // Each method is strongly typed via ChainableTagAPI<T> interface
-    for (const key of Object.keys(schema)) {
-      tagAPI[key] = function(value: unknown): ChainableTagAPI<T> {
-        // Use the current tag index (set by tag getter)
-        const idx = currentTagIndex !== null ? currentTagIndex : activeBuffer.writeIndex;
-        
-        // Write the attribute value to its column on the active buffer
-        const columnName = `attr_${key}`;
-        writeToColumn(activeBuffer, columnName, value, idx);
-        
-        return tagAPI as ChainableTagAPI<T>;
-      };
-    }
-    
-    return tagAPI as ChainableTagAPI<T>;
-  };
+  if (!SpanLoggerClass) {
+    SpanLoggerClass = createSpanLoggerClass(schema);
+    spanLoggerClassCache.set(schema, SpanLoggerClass);
+  }
   
-  const tagAPIInstance = createChainableTag();
-  
-  // SpanLogger instance
-  const logger = {
-    // Tag getter - creates new entry and returns chainable API
-    get tag(): ChainableTagAPI<T> {
-      // Check for overflow and get buffer with space
-      activeBuffer = getBufferWithSpace(activeBuffer).buffer;
-      
-      // Create new tag entry
-      const idx = activeBuffer.writeIndex;
-      
-      // Write entry type for tag entry
-      activeBuffer.operations[idx] = ENTRY_TYPE_TAG;
-      
-      // Write timestamp
-      activeBuffer.timestamps[idx] = Date.now();
-      
-      // Set current tag index for chained calls
-      currentTagIndex = idx;
-      
-      // Increment write index for next entry
-      activeBuffer.writeIndex++;
-      
-      // Return the chainable API (all subsequent calls write to idx on activeBuffer)
-      return tagAPIInstance;
-    },
-    
-    message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void {
-      // Check for overflow and get buffer with space
-      const { buffer: bufferWithSpace } = getBufferWithSpace(activeBuffer);
-      activeBuffer = bufferWithSpace;
-      
-      const idx = activeBuffer.writeIndex;
-      
-      // Write entry type for message
-      activeBuffer.operations[idx] = ENTRY_TYPE_MESSAGE;
-      
-      // Write timestamp
-      activeBuffer.timestamps[idx] = Date.now();
-      
-      // Write message level and content to attribute columns
-      writeToColumn(activeBuffer, 'attr_logLevel', level, idx);
-      writeToColumn(activeBuffer, 'attr_logMessage', message, idx);
-      
-      // Increment write index
-      activeBuffer.writeIndex++;
-    },
-    info(message: string): void {
-      this.message('info', message);
-    },
-    debug(message: string): void {
-      this.message('debug', message);
-    },
-    warn(message: string): void {
-      this.message('warn', message);
-    },
-    error(message: string): void {
-      this.message('error', message);
-    },
-  };
+  // Create instance (hot path - happens once per span)
+  const logger = new SpanLoggerClass(
+    buffer,
+    categoryInterner,
+    textStringStorage,
+    getBufferWithSpace
+  );
   
   return logger as SpanLogger<T>;
 }

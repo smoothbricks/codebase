@@ -185,3 +185,20 @@ export type NumberSchemaWithMetadata = Sury.Schema<number, unknown> & {
 export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> & {
   __lmao_type: 'boolean';
 };
+
+/**
+ * Get schema field entries, filtering out methods added by defineTagAttributes
+ * 
+ * Methods like validate, parse, safeParse, extend are added by defineTagAttributes
+ * but should not be treated as schema fields for iteration.
+ * 
+ * @param schema - Tag attribute schema (possibly with methods)
+ * @returns Array of [fieldName, fieldSchema] tuples, excluding methods
+ */
+export function getSchemaFields<T extends TagAttributeSchema>(
+  schema: T
+): Array<[string, Sury.Schema<unknown, unknown>]> {
+  return Object.entries(schema).filter(
+    ([_, value]) => typeof value !== 'function'
+  ) as Array<[string, Sury.Schema<unknown, unknown>]>;
+}
