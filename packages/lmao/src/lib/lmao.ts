@@ -840,6 +840,12 @@ function createSpanLogger<T extends TagAttributeSchema>(
     spanLoggerClassCache.set(schema, SpanLoggerClass);
   }
   
+  // TypeScript doesn't know the WeakMap guarantees non-null after set
+  // So we add an assertion here
+  if (!SpanLoggerClass) {
+    throw new Error('Failed to create SpanLogger class');
+  }
+  
   // Create instance (hot path - happens once per span)
   const logger = new SpanLoggerClass(
     buffer,
@@ -856,12 +862,16 @@ function createSpanLogger<T extends TagAttributeSchema>(
  * This allows us to accept objects with additional methods like validate, extend, etc.
  * 
  * This type recursively picks all properties that are not functions from intersections
+ * 
+ * IMPORTANT: This must properly filter out methods added by defineTagAttributes like:
+ * - validate
+ * - parse
+ * - safeParse
+ * - extend
  */
-type ExtractSchemaFields<T> = T extends infer U
-  ? {
-      [K in keyof U as U[K] extends Function ? never : K]: U[K];
-    }
-  : never;
+type ExtractSchemaFields<T> = {
+  [K in keyof T as T[K] extends Function ? never : K]: T[K];
+};
 
 /**
  * Type predicate to check if extracted fields match TagAttributeSchema

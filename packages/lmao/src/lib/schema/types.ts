@@ -29,9 +29,31 @@ export type TagAttributeSchema = Record<string, Sury.Schema<unknown, unknown>>;
 /**
  * Extract TypeScript output types from tag attribute schema
  * This enables full type inference from Sury schemas
+ * 
+ * IMPORTANT: This type must properly infer from schemas with __lmao_type metadata
+ * 
+ * Type resolution order:
+ * 1. Check if it's an enum schema → extract enum type
+ * 2. Check if it's a category schema → string
+ * 3. Check if it's a text schema → string
+ * 4. Check if it's a number schema → number
+ * 5. Check if it's a boolean schema → boolean
+ * 6. Fall back to Sury.Output<T[K]>
  */
 export type InferTagAttributes<T extends TagAttributeSchema> = {
-  [K in keyof T]: Sury.Output<T[K]>;
+  [K in keyof T]: T[K] extends EnumSchemaWithMetadata<infer E>
+    ? E
+    : T[K] extends CategorySchemaWithMetadata
+    ? string
+    : T[K] extends TextSchemaWithMetadata
+    ? string
+    : T[K] extends NumberSchemaWithMetadata
+    ? number
+    : T[K] extends BooleanSchemaWithMetadata
+    ? boolean
+    : T[K] extends Sury.Schema<infer Out, unknown>
+    ? Out
+    : never;
 };
 
 /**
