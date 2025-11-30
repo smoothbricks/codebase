@@ -64,6 +64,7 @@ export interface BaseSpanLogger<T extends TagAttributeSchema> {
   warn(message: string): void;
   error(message: string): void;
   scope(attributes: Partial<InferTagAttributes<T>>): void;
+  getScopedAttributes(): Record<string, unknown>;
 }
 
 /**
@@ -222,13 +223,13 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
   ${enumMappings.join('\n')}
   
   class ${className} {
-    constructor(buffer, categoryInterner, textStorage, getBufferWithSpace) {
+    constructor(buffer, categoryInterner, textStorage, getBufferWithSpace, initialScopedAttributes = {}) {
       this._buffer = buffer;
       this._categoryInterner = categoryInterner;
       this._textStorage = textStorage;
       this._getBufferWithSpace = getBufferWithSpace;
       this._currentTagIndex = null;
-      this._scopedAttributes = {};
+      this._scopedAttributes = initialScopedAttributes;
     }
     
     // Tag getter - creates new entry and returns chainable API
@@ -413,6 +414,11 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
     error(message) {
       this._writeMessage(${ENTRY_TYPE_ERROR}, message);
     }
+    
+    // Get scoped attributes for inheritance
+    getScopedAttributes() {
+      return this._scopedAttributes;
+    }
   }
   
   return ${className};
@@ -432,7 +438,8 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
   buffer: SpanBuffer,
   categoryInterner: StringInterner,
   textStorage: TextStorage,
-  getBufferWithSpace: GetBufferWithSpaceFn
+  getBufferWithSpace: GetBufferWithSpaceFn,
+  initialScopedAttributes?: Record<string, unknown>
 ) => BaseSpanLogger<T> {
   const classCode = generateSpanLoggerClass(schema).trim();
   
@@ -445,6 +452,7 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
     buffer: SpanBuffer,
     categoryInterner: StringInterner,
     textStorage: TextStorage,
-    getBufferWithSpace: GetBufferWithSpaceFn
+    getBufferWithSpace: GetBufferWithSpaceFn,
+    initialScopedAttributes?: Record<string, unknown>
   ) => BaseSpanLogger<T>;
 }

@@ -36,9 +36,17 @@ function getCacheAlignedCapacity(elementCount: number): number {
  * - traceId and spanId are constant per buffer (stored as properties)
  * - All TypedArrays have equal length (columnar storage requirement)
  * - Null bitmaps: one Uint8Array per nullable column (Arrow format)
+ * 
+ * @param spanId - Unique span identifier
+ * @param traceId - Trace ID from request context (passed through all spans)
+ * @param schema - Tag attribute schema
+ * @param taskContext - Task context with module metadata
+ * @param parentBuffer - Optional parent buffer for tree structure
+ * @param requestedCapacity - Requested buffer capacity
  */
 export function createEmptySpanBuffer(
   spanId: number,
+  traceId: string,
   schema: TagAttributeSchema,
   taskContext: TaskContext,
   parentBuffer?: SpanBuffer,
@@ -69,7 +77,7 @@ export function createEmptySpanBuffer(
   // We know attributeColumns has keys like attr_${string}, which matches SpanBuffer's index signature
   const buffer: SpanBuffer = {
     spanId,
-    traceId: parentBuffer?.traceId || `trace-${spanId}`, // Inherit from parent or generate new
+    traceId, // TraceId from request context (constant across all spans in trace)
     timestamps,
     operations,
     nullBitmaps,
@@ -89,18 +97,25 @@ export function createEmptySpanBuffer(
 
 /**
  * Create root SpanBuffer for new trace
+ * 
+ * @param schema - Tag attribute schema
+ * @param taskContext - Task context with module metadata
+ * @param traceId - Trace ID from request context
+ * @param capacity - Optional buffer capacity
  */
 export function createSpanBuffer(
   schema: TagAttributeSchema,
   taskContext: TaskContext,
+  traceId: string,
   capacity?: number
 ): SpanBuffer {
   const spanId = nextGlobalSpanId++;
-  return createEmptySpanBuffer(spanId, schema, taskContext, undefined, capacity);
+  return createEmptySpanBuffer(spanId, traceId, schema, taskContext, undefined, capacity);
 }
 
 /**
  * Create child SpanBuffer
+ * Inherits traceId from parent (all spans in same trace share traceId)
  */
 export function createChildSpanBuffer(
   parentBuffer: SpanBuffer,
@@ -112,6 +127,7 @@ export function createChildSpanBuffer(
   
   const childBuffer = createEmptySpanBuffer(
     spanId,
+    parentBuffer.traceId, // Inherit traceId from parent
     schema,
     taskContext,
     parentBuffer,
@@ -137,14 +153,12 @@ export function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
   
   const nextBuffer = createEmptySpanBuffer(
     buffer.spanId,     // Same logical span
+    buffer.traceId,    // Same trace (continuation)
     schema,
     buffer.task,       // Same task context
     buffer.parent,     // Same parent
     capacity
   );
-  
-  // Inherit traceId from current buffer
-  nextBuffer.traceId = buffer.traceId;
   
   // Link current buffer to next
   buffer.next = nextBuffer;

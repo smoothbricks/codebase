@@ -487,12 +487,53 @@ export function convertSpanTreeToArrowTable(
     return tables[0];
   }
   
-  // Concatenate all tables by extracting their record batches
-  const allBatches: arrow.RecordBatch[] = [];
+  // When combining multiple tables, they must have identical schemas
+  // Since different spans can have different tag attributes, we need to:
+  // 1. Merge all schemas to find the union of all columns
+  // 2. Convert each table's data to match the merged schema (adding nulls for missing columns)
+  // 3. Concatenate the aligned batches
+  
+  // Collect all unique field names across all tables
+  const allFieldNames = new Set<string>();
   for (const table of tables) {
-    for (let i = 0; i < table.batches.length; i++) {
-      allBatches.push(table.batches[i]);
+    for (const field of table.schema.fields) {
+      allFieldNames.add(field.name);
     }
   }
-  return new arrow.Table(allBatches);
+  
+  // Build merged data column by column
+  const allData: Record<string, unknown[]> = {};
+  for (const fieldName of allFieldNames) {
+    allData[fieldName] = [];
+  }
+  
+  // For each table, extract data and append to merged columns
+  for (const table of tables) {
+    const numRows = table.numRows;
+    const fieldMap = new Map<string, arrow.Vector>();
+    
+    // Build map of field name to vector
+    for (let i = 0; i < table.schema.fields.length; i++) {
+      const field = table.schema.fields[i];
+      fieldMap.set(field.name, table.getChildAt(i)!);
+    }
+    
+    // For each merged field, extract data or add nulls
+    for (const fieldName of allFieldNames) {
+      const vector = fieldMap.get(fieldName);
+      if (vector) {
+        // Extract values from vector
+        for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
+          allData[fieldName].push(vector.get(rowIdx));
+        }
+      } else {
+        // Field doesn't exist in this table, add nulls
+        for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
+          allData[fieldName].push(null);
+        }
+      }
+    }
+  }
+  
+  return arrow.tableFromArrays(allData);
 }

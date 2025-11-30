@@ -14,6 +14,7 @@ import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from
 import type { SpanBuffer, ModuleContext, TaskContext, BufferCapacityStats } from '@smoothbricks/arrow-builder';
 import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from '@smoothbricks/arrow-builder';
 import { createSpanLoggerClass, type BaseSpanLogger } from './codegen/spanLoggerGenerator.js';
+import { mergeWithSystemSchema } from './schema/systemSchema.js';
 
 /**
  * Result types for ok/err pattern
@@ -386,6 +387,12 @@ export interface SpanLogger<T extends TagAttributeSchema> {
   scope(attributes: Partial<InferTagAttributes<T>>): void;
   
   /**
+   * Get current scoped attributes (for inheritance)
+   * @internal - Used internally for scope inheritance
+   */
+  getScopedAttributes(): Record<string, unknown>;
+  
+  /**
    * Log a message entry
    */
   message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void;
@@ -690,10 +697,12 @@ export const textStringStorage = new TextStringStorage();
  * Write a value to a TypedArray column
  * Handles type conversion for different column types
  * 
- * Per specs/01b1_buffer_performance_optimizations.md:
- * - String interning for category types
- * - Raw storage for text types
- * - Null bitmap management per Arrow spec
+ * Per specs/01b1_buffer_performance_optimizations.md and 01a_trace_schema_system.md:
+ * - THREE DISTINCT STRING TYPES:
+ *   1. enum: Uint8Array with compile-time enum values (0-255)
+ *   2. category: Uint32Array with runtime string interning
+ *   3. text: Uint32Array with raw string storage (no interning)
+ * - Null bitmap management per Arrow spec (1 = valid, 0 = null)
  * - Direct TypedArray writes (hot path)
  */
 function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, index: number): void {
@@ -704,7 +713,7 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
   // Get null bitmap for this column (Arrow format: 1 Uint8Array per column)
   const nullBitmap = buffer.nullBitmaps[columnName as `attr_${string}`];
   
-  // Handle null/undefined - store 0 and set null bitmap
+  // Handle null/undefined - store 0 and clear null bitmap bit
   if (value === null || value === undefined) {
     if (column instanceof Uint8Array) {
       column[index] = 0;
@@ -716,43 +725,42 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
       column[index] = 0;
     }
     
-    // Set null bit in bitmap (Arrow format: 1 bit per row, 0 = null, 1 = valid)
-    // We store 0 for null, so no need to set the bit (defaults to 0)
+    // Clear bit in bitmap (Arrow format: 0 = null, 1 = valid)
     if (nullBitmap) {
       const byteIndex = Math.floor(index / 8);
       const bitOffset = index % 8;
-      // Clear the bit (0 = null in Arrow format)
       nullBitmap[byteIndex] &= ~(1 << bitOffset);
     }
     return;
   }
   
-  // Mark as non-null in bitmap (1 = valid in Arrow format)
+  // Mark as non-null in bitmap (Arrow format: 1 = valid)
   if (nullBitmap) {
     const byteIndex = Math.floor(index / 8);
     const bitOffset = index % 8;
     nullBitmap[byteIndex] |= (1 << bitOffset);
   }
   
-  // Get schema metadata to determine string type (category vs text)
+  // Get schema metadata to determine type
   const fieldName = columnName.replace('attr_', '');
   const schema = buffer.task.module.tagAttributes;
   const fieldSchema = schema[fieldName];
+  const schemaWithMetadata = fieldSchema as import('./schema/types.js').SchemaWithMetadata;
+  const lmaoType = schemaWithMetadata?.__lmao_type;
   
-  // Write based on column type
+  // Write based on column type and schema metadata
   if (column instanceof Uint8Array) {
-    // For boolean or small enum types
+    // Boolean or small enum types (0-255 values)
     if (typeof value === 'boolean') {
       column[index] = value ? 1 : 0;
     } else if (typeof value === 'number') {
       column[index] = value;
-    } else if (typeof value === 'string') {
-      // For string enums, map to index using enum values from schema metadata
-      const schemaWithMetadata = fieldSchema as import('./schema/types.js').EnumSchemaWithMetadata;
-      const enumValues = schemaWithMetadata?.__lmao_enum_values;
+    } else if (typeof value === 'string' && lmaoType === 'enum') {
+      // Enum: map string to index using enum values from schema
+      const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
+      const enumValues = enumSchema?.__lmao_enum_values;
       
       if (enumValues) {
-        // Find index of value in enum values array
         const enumIndex = enumValues.indexOf(value);
         column[index] = enumIndex >= 0 ? enumIndex : 0;
       } else {
@@ -760,13 +768,12 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
       }
     }
   } else if (column instanceof Uint16Array) {
-    // For medium enum types (256-65535 values)
+    // Medium enum types (256-65535 values)
     if (typeof value === 'number') {
       column[index] = value;
-    } else if (typeof value === 'string') {
-      // Map enum string to index
-      const schemaWithMetadata = fieldSchema as import('./schema/types.js').EnumSchemaWithMetadata;
-      const enumValues = schemaWithMetadata?.__lmao_enum_values;
+    } else if (typeof value === 'string' && lmaoType === 'enum') {
+      const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
+      const enumValues = enumSchema?.__lmao_enum_values;
       
       if (enumValues) {
         const enumIndex = enumValues.indexOf(value);
@@ -776,24 +783,24 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
       }
     }
   } else if (column instanceof Uint32Array) {
-    // For category/text types - check schema metadata to decide
+    // Category or text types (both use Uint32Array but different storage)
     if (typeof value === 'string') {
-      // Check if this is a category or text type via schema metadata
-      const schemaWithMetadata = fieldSchema as import('./schema/types.js').SchemaWithMetadata;
-      const lmaoType = schemaWithMetadata?.__lmao_type;
-      
+      // CRITICAL: Check __lmao_type metadata to distinguish category vs text
       if (lmaoType === 'text') {
-        // Text: raw storage without interning
+        // TEXT: raw storage without interning (specs/01a)
         column[index] = textStringStorage.store(value);
+      } else if (lmaoType === 'category') {
+        // CATEGORY: string interning for repeated values (specs/01a)
+        column[index] = categoryInterner.intern(value);
       } else {
-        // Category (or unknown): use string interning
+        // Fallback: treat as category (safe default)
         column[index] = categoryInterner.intern(value);
       }
     } else if (typeof value === 'number') {
       column[index] = value;
     }
   } else if (column instanceof Float64Array) {
-    // For number types
+    // Number types - full precision
     column[index] = typeof value === 'number' ? value : 0;
   }
 }
@@ -811,7 +818,8 @@ const spanLoggerClassCache = new WeakMap<TagAttributeSchema, new (
   buffer: SpanBuffer,
   categoryInterner: StringInterner,
   textStorage: TextStringStorage,
-  getBufferWithSpace: GetBufferWithSpaceFn
+  getBufferWithSpace: GetBufferWithSpaceFn,
+  initialScopedAttributes?: Record<string, unknown>
 ) => BaseSpanLogger<TagAttributeSchema>>();
 
 /**
@@ -830,7 +838,8 @@ const spanLoggerClassCache = new WeakMap<TagAttributeSchema, new (
  */
 function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
-  buffer: SpanBuffer
+  buffer: SpanBuffer,
+  inheritedScopedAttributes?: Record<string, unknown>
 ): SpanLogger<T> {
   // Get or create the generated SpanLogger class (cold path - happens once per schema)
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
@@ -851,8 +860,14 @@ function createSpanLogger<T extends TagAttributeSchema>(
     buffer,
     categoryInterner,
     textStringStorage,
-    getBufferWithSpace
+    getBufferWithSpace,
+    inheritedScopedAttributes || {}
   );
+  
+  // If scoped attributes were inherited, pre-fill the buffer
+  if (inheritedScopedAttributes && Object.keys(inheritedScopedAttributes).length > 0) {
+    logger.scope(inheritedScopedAttributes);
+  }
   
   return logger as SpanLogger<T>;
 }
@@ -907,14 +922,18 @@ export function createModuleContext<
   const { moduleMetadata, tagAttributes } = options;
   
   // Extract only the schema fields, removing methods like validate, extend, etc.
-  const schemaOnly = Object.keys(tagAttributes as Record<string, unknown>).reduce((acc, key) => {
+  const userSchemaOnly = Object.keys(tagAttributes as Record<string, unknown>).reduce((acc, key) => {
     const value = (tagAttributes as Record<string, unknown>)[key];
     // Only include non-function properties
     if (typeof value !== 'function') {
       acc[key] = value;
     }
     return acc;
-  }, {} as Record<string, unknown>) as T;
+  }, {} as Record<string, unknown>);
+  
+  // Merge with system schema to get all required columns
+  // Per specs/01h and 01f - system columns always included
+  const schemaOnly = mergeWithSystemSchema(userSchemaOnly) as T;
   
   // Create module context with string-interned module ID
   // Module ID is the file path, interned for efficient storage
@@ -944,8 +963,9 @@ export function createModuleContext<
           lineNumber: 0, // Would be set by code generation
         };
         
-        // Create span buffer with Arrow builders
-        const spanBuffer = createSpanBuffer(schemaOnly, taskContext);
+        // Create span buffer with traceId from request context
+        // Per specs/01b - traceId is constant across all spans in a trace
+        const spanBuffer = createSpanBuffer(schemaOnly, taskContext, requestCtx.traceId);
         
         // Connect feature flag evaluator to buffer for analytics
         // The evaluator is a FeatureFlagEvaluator instance, we need to set columnWriters
@@ -956,8 +976,12 @@ export function createModuleContext<
         // Write span-start entry
         writeSpanStart(spanBuffer, name);
         
-        // Create span logger with typed tag methods
-        const spanLogger = createSpanLogger(schemaOnly, spanBuffer);
+        // Inherit scoped attributes from parent context if available
+        // Per specs/01i_span_scope_attributes.md - tasks inherit scoped attributes from calling context
+        const inheritedScopedAttributes = (requestCtx as RequestContext<FF, Env> & { log?: SpanLogger<T> }).log?.getScopedAttributes() || {};
+        
+        // Create span logger with typed tag methods (with inherited scoped attributes)
+        const spanLogger = createSpanLogger(schemaOnly, spanBuffer, inheritedScopedAttributes);
         
         // Create span context
         const spanContext: SpanContext<T, FF, Env> = {
@@ -982,8 +1006,12 @@ export function createModuleContext<
             // Write span-start for child span
             writeSpanStart(childBuffer, childName);
             
-            // Create child context with its own logger
-            const childLogger = createSpanLogger(schemaOnly, childBuffer);
+            // Inherit scoped attributes from parent span
+            // Per specs/01i_span_scope_attributes.md - child spans inherit parent's scoped attributes
+            const parentScopedAttributes = spanLogger.getScopedAttributes();
+            
+            // Create child context with its own logger (with inherited scoped attributes)
+            const childLogger = createSpanLogger(schemaOnly, childBuffer, parentScopedAttributes);
             const childContext: SpanContext<T, FF, Env> = {
               ...spanContext,
               log: childLogger,

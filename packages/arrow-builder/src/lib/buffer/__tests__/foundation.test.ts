@@ -44,10 +44,10 @@ describe('Buffer Foundation', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
     
-    const buf = createEmptySpanBuffer(1, schema, taskContext, undefined, 64);
+    const buf = createEmptySpanBuffer(1, 'trace-123', schema, taskContext, undefined, 64);
 
     expect(buf.spanId).toBe(1);
-    expect(buf.traceId).toBeDefined();
+    expect(buf.traceId).toBe('trace-123');
     
     // Check TypedArrays are created
     expect(buf.timestamps).toBeInstanceOf(Float64Array);
@@ -73,7 +73,7 @@ describe('Buffer Foundation', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
     
-    const buf = createSpanBuffer(schema, taskContext);
+    const buf = createSpanBuffer(schema, taskContext, 'trace-999');
     
     expect(buf.spanId).toBeGreaterThan(0);
     expect(buf.parent).toBeUndefined();
@@ -86,7 +86,7 @@ describe('Buffer Foundation', () => {
     
     const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
     
-    createEmptySpanBuffer(1, schema, taskContext, undefined, 64);
+    createEmptySpanBuffer(1, 'trace-456', schema, taskContext, undefined, 64);
     
     expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
   });
@@ -106,7 +106,7 @@ describe('Buffer Foundation', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = largeSchema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
     
-    const buf = createEmptySpanBuffer(1, tagAttributes, taskContext, undefined, 64);
+    const buf = createEmptySpanBuffer(1, 'trace-789', tagAttributes, taskContext, undefined, 64);
     
     // Should have TypedArray columns for all 5 attributes
     // Get all attr_ keys from the buffer
