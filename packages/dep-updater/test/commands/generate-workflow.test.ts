@@ -93,11 +93,12 @@ describe('Workflow Template Generation', () => {
       return match ? match[1] : result;
     }
 
-    describe('PAT without AI', () => {
+    describe('PAT without AI (--skip-ai)', () => {
       let workflow: string;
 
       beforeEach(async () => {
-        workflow = await generateWorkflow([]);
+        // Must explicitly skip AI since default provider (opencode) enables free AI
+        workflow = await generateWorkflow(['--skip-ai']);
       });
 
       it('should generate valid YAML', () => {
@@ -130,6 +131,7 @@ describe('Workflow Template Generation', () => {
       it('should have correct step name (no AI suffix)', () => {
         expect(workflow).toContain('- name: Run dep-updater');
         expect(workflow).not.toContain('with AI changelog analysis');
+        expect(workflow).not.toContain('with free AI changelog analysis');
       });
 
       it('should link to Quick Start guide', () => {
@@ -137,11 +139,13 @@ describe('Workflow Template Generation', () => {
       });
     });
 
-    describe('PAT with AI', () => {
+    describe('PAT with Free AI (default: opencode)', () => {
       let workflow: string;
 
       beforeEach(async () => {
-        workflow = await generateWorkflow(['--enable-ai']);
+        // Default provider is opencode (free), so AI is enabled by default
+        // No --enable-ai needed, but we can use it to be explicit
+        workflow = await generateWorkflow([]);
       });
 
       it('should generate valid YAML', () => {
@@ -153,40 +157,41 @@ describe('Workflow Template Generation', () => {
         expect(workflow).not.toMatch(/{{STEP_/);
       });
 
-      it('should have correct header with AI', () => {
-        expect(workflow).toContain('Personal Access Token + AI Changelog Analysis');
+      it('should have correct header with Free AI', () => {
+        expect(workflow).toContain('Personal Access Token + Free AI Changelog Analysis');
       });
 
-      it('should have steps numbered 1-5 with AI step', () => {
+      it('should have steps numbered 1-4 (no API key step for free tier)', () => {
         expect(workflow).toContain('#   1. Generate PAT');
-        expect(workflow).toContain('#   2. Generate Anthropic API key');
-        expect(workflow).toContain('#   3. Add organization secrets:');
-        expect(workflow).toContain('#   4. Copy this file');
-        expect(workflow).toContain('#   5. Commit and push');
-        expect(workflow).not.toContain('#   6.');
+        expect(workflow).toContain('#   2. Add organization secret:'); // singular, not secrets
+        expect(workflow).toContain('#   3. Copy this file');
+        expect(workflow).toContain('#   4. Commit and push');
+        expect(workflow).not.toContain('#   5.');
       });
 
-      it('should have both GH_TOKEN and ANTHROPIC_API_KEY env vars', () => {
+      it('should have only GH_TOKEN env var (no API key for free tier)', () => {
         expect(workflow).toContain('GH_TOKEN: $' + '{{ secrets.DEP_UPDATER_TOKEN }}');
-        expect(workflow).toContain('ANTHROPIC_API_KEY: $' + '{{ secrets.ANTHROPIC_API_KEY }}');
+        expect(workflow).not.toContain('ANTHROPIC_API_KEY');
+        expect(workflow).not.toContain('OPENAI_API_KEY');
+        expect(workflow).not.toContain('GOOGLE_API_KEY');
       });
 
-      it('should have AI suffix in step name', () => {
-        expect(workflow).toContain('- name: Run dep-updater with AI changelog analysis');
+      it('should have free AI suffix in step name', () => {
+        expect(workflow).toContain('- name: Run dep-updater with free AI changelog analysis');
       });
 
-      it('should mention secrets plural', () => {
-        expect(workflow).toContain('Add organization secrets:');
+      it('should mention only DEP_UPDATER_TOKEN secret', () => {
         expect(workflow).toContain('gh secret set DEP_UPDATER_TOKEN');
-        expect(workflow).toContain('gh secret set ANTHROPIC_API_KEY');
+        expect(workflow).not.toContain('gh secret set ANTHROPIC_API_KEY');
       });
     });
 
-    describe('GitHub App without AI', () => {
+    describe('GitHub App without AI (--skip-ai)', () => {
       let workflow: string;
 
       beforeEach(async () => {
-        workflow = await generateWorkflow(['--auth-type', 'github-app']);
+        // Must explicitly skip AI since default provider (opencode) enables free AI
+        workflow = await generateWorkflow(['--auth-type', 'github-app', '--skip-ai']);
       });
 
       it('should generate valid YAML', () => {
@@ -235,11 +240,12 @@ describe('Workflow Template Generation', () => {
       });
     });
 
-    describe('GitHub App with AI', () => {
+    describe('GitHub App with Free AI (default: opencode)', () => {
       let workflow: string;
 
       beforeEach(async () => {
-        workflow = await generateWorkflow(['--auth-type', 'github-app', '--enable-ai']);
+        // Default provider is opencode (free), so AI is enabled by default
+        workflow = await generateWorkflow(['--auth-type', 'github-app']);
       });
 
       it('should generate valid YAML', () => {
@@ -251,41 +257,43 @@ describe('Workflow Template Generation', () => {
         expect(workflow).not.toMatch(/{{STEP_/);
       });
 
-      it('should have correct header with AI', () => {
-        expect(workflow).toContain('GitHub App + AI Changelog Analysis');
+      it('should have correct header with Free AI', () => {
+        expect(workflow).toContain('GitHub App + Free AI Changelog Analysis');
       });
 
-      it('should have steps numbered 1-7 with AI step', () => {
+      it('should have steps numbered 1-6 (no API key step for free tier)', () => {
         expect(workflow).toContain('#   1. Create GitHub App');
         expect(workflow).toContain('#   2. Install app');
-        expect(workflow).toContain('#   3. Generate Anthropic API key');
-        expect(workflow).toContain('#   4. Add organization variable');
-        expect(workflow).toContain('#   5. Add organization secrets:');
-        expect(workflow).toContain('#   6. Copy this file');
-        expect(workflow).toContain('#   7. Validate:');
+        expect(workflow).toContain('#   3. Add organization variable');
+        expect(workflow).toContain('#   4. Add organization secret:'); // singular
+        expect(workflow).toContain('#   5. Copy this file');
+        expect(workflow).toContain('#   6. Validate:');
+        expect(workflow).not.toContain('#   7.');
       });
 
-      it('should have both GH_TOKEN and ANTHROPIC_API_KEY env vars', () => {
+      it('should have only GH_TOKEN env var (no API key for free tier)', () => {
         expect(workflow).toContain('GH_TOKEN: $' + '{{ steps.app-token.outputs.token }}');
-        expect(workflow).toContain('ANTHROPIC_API_KEY: $' + '{{ secrets.ANTHROPIC_API_KEY }}');
+        expect(workflow).not.toContain('ANTHROPIC_API_KEY');
+        expect(workflow).not.toContain('OPENAI_API_KEY');
+        expect(workflow).not.toContain('GOOGLE_API_KEY');
       });
 
-      it('should list ANTHROPIC_API_KEY in secrets section', () => {
+      it('should list only APP_PRIVATE_KEY in secrets section', () => {
         expect(workflow).toContain('- DEP_UPDATER_APP_PRIVATE_KEY');
-        expect(workflow).toContain('- ANTHROPIC_API_KEY');
+        expect(workflow).not.toContain('- ANTHROPIC_API_KEY');
       });
 
-      it('should have AI suffix in step name', () => {
-        expect(workflow).toContain('- name: Run dep-updater with AI changelog analysis');
+      it('should have free AI suffix in step name', () => {
+        expect(workflow).toContain('- name: Run dep-updater with free AI changelog analysis');
       });
     });
 
     describe('Common Workflow Properties', () => {
       it.each([
-        ['PAT without AI', []],
-        ['PAT with AI', ['--enable-ai']],
-        ['GitHub App without AI', ['--auth-type', 'github-app']],
-        ['GitHub App with AI', ['--auth-type', 'github-app', '--enable-ai']],
+        ['PAT without AI', ['--skip-ai']],
+        ['PAT with Free AI (default)', []],
+        ['GitHub App without AI', ['--auth-type', 'github-app', '--skip-ai']],
+        ['GitHub App with Free AI (default)', ['--auth-type', 'github-app']],
       ])('%s should have correct workflow structure', async (_name, args) => {
         const workflow = await generateWorkflow(args);
         const parsed = parseYaml(workflow);
@@ -298,10 +306,10 @@ describe('Workflow Template Generation', () => {
       });
 
       it.each([
-        ['PAT without AI', []],
-        ['PAT with AI', ['--enable-ai']],
-        ['GitHub App without AI', ['--auth-type', 'github-app']],
-        ['GitHub App with AI', ['--auth-type', 'github-app', '--enable-ai']],
+        ['PAT without AI', ['--skip-ai']],
+        ['PAT with Free AI (default)', []],
+        ['GitHub App without AI', ['--auth-type', 'github-app', '--skip-ai']],
+        ['GitHub App with Free AI (default)', ['--auth-type', 'github-app']],
       ])('%s should have required workflow steps', async (_name, args) => {
         const workflow = await generateWorkflow(args);
         const parsed = parseYaml(workflow);

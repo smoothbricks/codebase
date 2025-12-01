@@ -133,7 +133,7 @@ describe('mergeConfig', () => {
     expect(merged.expo?.projects).toHaveLength(1);
     expect(merged.expo?.projects?.[0]?.packageJsonPath).toBe('./apps/mobile/package.json');
     expect(merged.prStrategy.stackingEnabled).toBe(true); // from defaults
-    expect(merged.ai.provider).toBe('anthropic'); // from defaults
+    expect(merged.ai.provider).toBe('opencode'); // from defaults (free tier)
   });
 
   test('should not introduce undefined in nested objects', () => {
@@ -225,7 +225,7 @@ describe('defaultConfig', () => {
   test('should have sensible defaults', () => {
     expect(defaultConfig.prStrategy.maxStackDepth).toBe(5);
     expect(defaultConfig.prStrategy.branchPrefix).toBe('chore/update-deps');
-    expect(defaultConfig.ai.provider).toBe('anthropic');
+    expect(defaultConfig.ai.provider).toBe('opencode'); // Free tier by default
     expect(defaultConfig.autoMerge.enabled).toBe(false);
     expect(defaultConfig.git?.baseBranch).toBe('main');
   });
@@ -266,7 +266,7 @@ describe('loadConfig', () => {
     expect(config.nix?.enabled).toBe(true);
     // Should still have defaults for unspecified values
     expect(config.prStrategy.stackingEnabled).toBe(true);
-    expect(config.ai.provider).toBe('anthropic');
+    expect(config.ai.provider).toBe('opencode'); // Free tier by default
   });
 
   test('should load config from tooling/dep-updater.json', async () => {

@@ -6,13 +6,7 @@ import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import fg from 'fast-glob';
-
-export interface ProjectSetup {
-  hasExpo: boolean;
-  hasNix: boolean;
-  hasSyncpack: boolean;
-  packageManager: 'bun' | 'npm' | 'pnpm' | 'yarn';
-}
+import type { ProjectSetup } from '../types.js';
 
 /**
  * Detect project setup by checking for specific files/config

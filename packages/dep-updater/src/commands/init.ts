@@ -44,8 +44,8 @@ function generateJSONConfig(options: {
       prTitlePrefix: 'chore: update dependencies',
     },
     ai: {
-      provider: 'anthropic',
-      model: 'claude-sonnet-4-5-20250929',
+      provider: 'opencode',
+      model: 'big-pickle',
     },
   };
 
@@ -263,7 +263,11 @@ export async function init(config: DepUpdaterConfig, options: InitOptions): Prom
     enableAI = aiPrompt;
 
     if (enableAI) {
-      p.note('Requires ANTHROPIC_API_KEY in GitHub Secrets', 'Note');
+      p.note(
+        'Requires an AI provider API key in GitHub Secrets.\n' +
+          'Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY',
+        'Note',
+      );
     }
 
     if (enableExpo) {
@@ -438,7 +442,8 @@ export async function init(config: DepUpdaterConfig, options: InitOptions): Prom
 
   // Add API key if AI enabled
   if (enableAI) {
-    nextSteps += `${stepNumber}. Add ANTHROPIC_API_KEY to GitHub organization secrets\n`;
+    nextSteps += `${stepNumber}. Add your AI provider API key to GitHub organization secrets\n`;
+    nextSteps += '   Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY\n';
     nextSteps += '   (Organization settings → Secrets and variables → Actions → New organization secret)\n\n';
     stepNumber++;
   }

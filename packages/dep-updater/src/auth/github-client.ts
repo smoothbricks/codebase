@@ -4,41 +4,7 @@
  */
 
 import { execa } from 'execa';
-import type { CommandExecutor, GitHubPR } from '../types.js';
-
-/**
- * GitHub client interface
- * Defines operations for pull request management
- */
-export interface IGitHubClient {
-  /**
-   * List open pull requests with update- prefix
-   */
-  listUpdatePRs(repoRoot: string): Promise<GitHubPR[]>;
-
-  /**
-   * Check if a PR has merge conflicts
-   */
-  checkPRConflicts(repoRoot: string, prNumber: number): Promise<boolean>;
-
-  /**
-   * Create a new pull request
-   */
-  createPR(
-    repoRoot: string,
-    options: {
-      title: string;
-      body: string;
-      head: string;
-      base: string;
-    },
-  ): Promise<{ number: number; url: string }>;
-
-  /**
-   * Close a pull request with a comment
-   */
-  closePR(repoRoot: string, prNumber: number, comment: string): Promise<void>;
-}
+import type { CommandExecutor, GitHubPR, IGitHubClient } from '../types.js';
 
 /**
  * GitHub CLI client implementation

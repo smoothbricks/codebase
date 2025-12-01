@@ -84,10 +84,9 @@ export default defineConfig({
     requireTests: true,
   },
 
-  // AI-powered changelog analysis
+  // AI-powered changelog analysis (free by default, no API key needed)
   ai: {
-    provider: 'anthropic',
-    model: 'claude-sonnet-4-5-20250929',
+    provider: 'opencode', // Free tier, or: 'anthropic', 'openai', 'google'
   },
 
   // Git configuration
@@ -124,8 +123,7 @@ Create `tooling/dep-updater.json`:
     "prTitlePrefix": "chore: update dependencies"
   },
   "ai": {
-    "provider": "anthropic",
-    "model": "claude-sonnet-4-5-20250929"
+    "provider": "opencode"
   }
 }
 ```
@@ -269,22 +267,62 @@ Controls automatic merging of dependency update PRs.
 
 ### AI (`ai`)
 
-Controls AI-powered changelog analysis.
+Controls AI-powered changelog analysis. Supports multiple AI providers via the OpenCode SDK.
+
+**Key Feature:** AI analysis works out of the box with no API key required using the free OpenCode tier.
 
 **Options:**
 
-- `provider` (string) - AI provider (currently only `'anthropic'`)
-- `model` (string) - Model to use for changelog analysis (default: `'claude-sonnet-4-5-20250929'`)
+- `provider` (string) - AI provider (default: `'opencode'`)
+- `model` (string) - Model to use (provider-specific defaults apply)
+- `tokenBudget` (number) - Token budget for changelog prompts (optional, provider-specific defaults apply)
 
-**Environment Variable:**
+**Provider Comparison:**
 
-The tool requires an `ANTHROPIC_API_KEY` environment variable when AI features are enabled. You can also configure the
-API key in the config (not recommended for security reasons):
+| Provider    | API Key Required | Quality   | Cost | Default Model              |
+| ----------- | ---------------- | --------- | ---- | -------------------------- |
+| `opencode`  | ❌ No            | Good      | Free | big-pickle                 |
+| `anthropic` | ✅ Yes           | Excellent | $$   | claude-sonnet-4-5-20250929 |
+| `openai`    | ✅ Yes           | Excellent | $$   | gpt-4o                     |
+| `google`    | ✅ Yes           | Very Good | $    | gemini-1.5-pro             |
+
+**Environment Variables (for premium providers):**
+
+| Provider  | Environment Variable |
+| --------- | -------------------- |
+| anthropic | `ANTHROPIC_API_KEY`  |
+| openai    | `OPENAI_API_KEY`     |
+| google    | `GOOGLE_API_KEY`     |
+
+**Default Token Budgets:**
+
+When changelogs exceed the token budget, they're automatically summarized to fit. Provider-specific defaults are:
+
+| Provider    | Default Budget | Rationale                       |
+| ----------- | -------------- | ------------------------------- |
+| `opencode`  | 16,000         | Conservative for unknown limits |
+| `anthropic` | 64,000         | Claude handles 200k context     |
+| `openai`    | 64,000         | GPT-4o handles 128k context     |
+| `google`    | 128,000        | Gemini handles 1M context       |
+
+**Examples:**
 
 ```typescript
+// Free tier (default) - works without any API key
+ai: {
+  provider: 'opencode',
+}
+
+// Premium provider - requires API key
 ai: {
   provider: 'anthropic',
-  apiKey: process.env.ANTHROPIC_API_KEY, // TypeScript config only
+  // Set ANTHROPIC_API_KEY environment variable
+}
+
+// Custom token budget - override provider default
+ai: {
+  provider: 'anthropic',
+  tokenBudget: 32000, // Use 32k instead of default 64k
 }
 ```
 
@@ -327,7 +365,7 @@ export default defineConfig({
 });
 ```
 
-### Nix + Expo + AI
+### Nix + Expo + Premium AI
 
 ```typescript
 export default defineConfig({
@@ -340,6 +378,7 @@ export default defineConfig({
     devenvPath: './tooling/direnv',
     nixpkgsOverlayPath: './tooling/direnv/nixpkgs-overlay',
   },
+  // Upgrade to premium AI for better quality (requires API key)
   ai: {
     provider: 'anthropic',
   },

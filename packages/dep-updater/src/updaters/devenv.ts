@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { execa } from 'execa';
 
 import type { Logger } from '../logger.js';
-import type { PackageUpdate, UpdateResult } from '../types.js';
+import type { DixParseResult, PackageUpdate, UpdateResult } from '../types.js';
 
 /**
  * Compare two version strings to determine if newVersion is a downgrade from oldVersion
@@ -65,11 +65,6 @@ export function isVersionDowngrade(oldVersion: string, newVersion: string): bool
   }
 
   return false;
-}
-
-export interface DixParseResult {
-  updates: PackageUpdate[];
-  downgrades: PackageUpdate[];
 }
 
 /**

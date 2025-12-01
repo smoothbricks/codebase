@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
-import type { DeepPartial, ExpoProject } from './types.js';
+import type { DeepPartial, ExpoProject, SupportedProvider } from './types.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
 export interface DepUpdaterConfig {
@@ -87,11 +87,17 @@ export interface DepUpdaterConfig {
   /** AI-powered changelog analysis */
   ai: {
     /** AI provider for changelog analysis */
-    provider: 'anthropic';
-    /** Anthropic API key (from env or config) */
-    apiKey?: string;
-    /** Model to use for analysis */
+    provider: SupportedProvider;
+    /** Provider-specific model ID */
     model?: string;
+    /** API key (falls back to env vars: ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) */
+    apiKey?: string;
+    /**
+     * Token budget for changelog analysis prompts.
+     * When changelogs exceed this limit, they're summarized to fit.
+     * Defaults vary by provider: opencode=16k, anthropic/openai=64k, google=128k
+     */
+    tokenBudget?: number;
   };
 
   /** Git configuration */
@@ -143,8 +149,8 @@ export const defaultConfig: DepUpdaterConfig = {
     requireTests: true,
   },
   ai: {
-    provider: 'anthropic',
-    model: 'claude-sonnet-4-5-20250929',
+    provider: 'opencode', // Free tier by default
+    model: 'big-pickle', // Free model via OpenCode
   },
   git: {
     remote: 'origin',

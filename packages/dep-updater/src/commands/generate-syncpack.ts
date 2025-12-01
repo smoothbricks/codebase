@@ -7,12 +7,8 @@ import { getCurrentExpoSDK } from '../expo/sdk-checker.js';
 import { fetchExpoVersions } from '../expo/versions-fetcher.js';
 import { getRepoRoot } from '../git.js';
 import { updateSyncpackWithExpo } from '../syncpack/generator.js';
-import type { UpdateOptions } from '../types.js';
+import type { GenerateSyncpackOptions } from '../types.js';
 import { safeResolve } from '../utils/path-validation.js';
-
-interface GenerateSyncpackOptions extends UpdateOptions {
-  expoSdkVersion?: string;
-}
 
 /**
  * Generate syncpack configuration from Expo SDK

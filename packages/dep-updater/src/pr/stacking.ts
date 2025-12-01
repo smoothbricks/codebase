@@ -3,10 +3,10 @@
  */
 
 import { execa as execaOriginal } from 'execa';
-import { GitHubCLIClient, type IGitHubClient } from '../auth/github-client.js';
+import { GitHubCLIClient } from '../auth/github-client.js';
 import type { DepUpdaterConfig } from '../config.js';
 import type { Logger } from '../logger.js';
-import type { CommandExecutor, OpenPR } from '../types.js';
+import type { CommandExecutor, IGitHubClient, OpenPR } from '../types.js';
 
 /** Default executor - execa cast to CommandExecutor type */
 const defaultExecutor = execaOriginal as unknown as CommandExecutor;

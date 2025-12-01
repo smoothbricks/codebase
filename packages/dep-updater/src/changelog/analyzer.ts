@@ -1,62 +1,77 @@
 /**
- * AI-powered changelog analysis using Claude
+ * AI-powered changelog analysis using OpenCode SDK
  *
- * TODO: Migrate to OpenCode SDK when available to support multiple AI providers
+ * Supports multiple AI providers via SST's OpenCode SDK:
+ * - OpenCode (free tier, no API key required)
+ * - Anthropic (Claude)
+ * - OpenAI (GPT-4)
+ * - Google (Gemini)
  */
 
-import Anthropic from '@anthropic-ai/sdk';
+import { PROVIDER_ENV_VARS, sendPrompt } from '../ai/opencode-client.js';
+import { countTokens } from '../ai/token-counter.js';
 import { type DepUpdaterConfig, sanitizeConfigForLogging } from '../config.js';
-import type { PackageUpdate } from '../types.js';
-
-/** Token budget for the analysis prompt */
-const TOKEN_BUDGET = 8000;
-/** Model to use for summarization (cheaper/faster) */
-const SUMMARIZATION_MODEL = 'claude-3-5-haiku-latest';
+import type { PackageUpdate, SupportedProvider } from '../types.js';
 
 /**
- * Count tokens for a prompt using the Anthropic API
+ * Provider-specific default token budgets
+ * These are conservative defaults based on each provider's context window
  */
-async function countTokens(
-  client: Anthropic,
-  model: string,
-  content: string,
-  config: DepUpdaterConfig,
-): Promise<number> {
-  try {
-    const result = await client.beta.messages.countTokens({
-      model,
-      messages: [{ role: 'user', content }],
-    });
-    return result.input_tokens;
-  } catch (error) {
-    config.logger?.warn(`Token counting API failed: ${error instanceof Error ? error.message : String(error)}`);
-    config.logger?.warn('Falling back to character estimate (~4 chars/token)');
-    return Math.ceil(content.length / 4);
+const DEFAULT_TOKEN_BUDGETS: Record<string, number> = {
+  opencode: 16000, // Conservative for unknown limits
+  anthropic: 64000, // Claude handles 200k context
+  openai: 64000, // GPT-4o handles 128k context
+  google: 128000, // Gemini handles 1M context
+};
+
+/** Default model for summarization (cheaper/faster) - provider-specific */
+const SUMMARIZATION_MODELS: Record<string, string> = {
+  opencode: 'big-pickle', // Free model via OpenCode
+  anthropic: 'claude-3-5-haiku-latest',
+  openai: 'gpt-4o-mini',
+  google: 'gemini-1.5-flash',
+};
+
+/**
+ * Check if provider requires an API key
+ * OpenCode (big-pickle model) is free and doesn't require authentication
+ */
+function requiresApiKey(provider: string): boolean {
+  return provider !== 'opencode';
+}
+
+/**
+ * Get the summarization model for a provider (cheaper/faster model)
+ */
+function getSummarizationModel(provider: string): string {
+  return SUMMARIZATION_MODELS[provider] || SUMMARIZATION_MODELS.anthropic;
+}
+
+/**
+ * Get the token budget for changelog analysis
+ * User config override takes priority, then falls back to provider default
+ */
+function getTokenBudget(config: DepUpdaterConfig): number {
+  // User override takes priority
+  if (config.ai.tokenBudget) {
+    return config.ai.tokenBudget;
   }
+  // Fall back to provider default
+  return DEFAULT_TOKEN_BUDGETS[config.ai.provider] || 16000;
 }
 
 /**
  * Summarize a large changelog using a faster model
  */
-async function summarizeChangelog(
-  client: Anthropic,
-  changelog: string,
-  packageName: string,
-  config: DepUpdaterConfig,
-): Promise<string> {
+async function summarizeChangelog(changelog: string, packageName: string, config: DepUpdaterConfig): Promise<string> {
   try {
-    const message = await client.messages.create({
-      model: SUMMARIZATION_MODEL,
-      max_tokens: 500,
-      messages: [
-        {
-          role: 'user',
-          content: `Summarize this changelog for ${packageName} in 2-3 bullet points. Focus on breaking changes, security fixes, and important new features. Be concise.\n\n${changelog}`,
-        },
-      ],
+    const prompt = `Summarize this changelog for ${packageName} in 2-3 bullet points. Focus on breaking changes, security fixes, and important new features. Be concise.\n\n${changelog}`;
+
+    const response = await sendPrompt(config, prompt, {
+      model: getSummarizationModel(config.ai.provider),
     });
-    const content = message.content?.[0];
-    return content?.type === 'text' ? content.text : changelog.substring(0, 1000);
+
+    return response || changelog.substring(0, 1000);
   } catch (error) {
     config.logger?.warn(
       `Failed to summarize changelog for ${packageName}: ${error instanceof Error ? error.message : String(error)}`,
@@ -67,7 +82,7 @@ async function summarizeChangelog(
 }
 
 /**
- * Analyze changelogs using Claude API
+ * Analyze changelogs using OpenCode SDK (multi-provider AI)
  */
 export async function analyzeChangelogs(
   updates: PackageUpdate[],
@@ -75,32 +90,28 @@ export async function analyzeChangelogs(
   config: DepUpdaterConfig,
   downgrades: PackageUpdate[] = [],
 ): Promise<string> {
-  const apiKey = config.ai.apiKey || process.env.ANTHROPIC_API_KEY;
+  // Check for API key based on provider (opencode doesn't need one)
+  if (requiresApiKey(config.ai.provider)) {
+    const apiKey = config.ai.apiKey || getProviderApiKey(config.ai.provider);
 
-  if (!apiKey) {
-    config.logger?.warn('No Anthropic API key found, skipping AI analysis');
-    config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
-    return generateFallbackSummary(updates, downgrades);
+    if (!apiKey) {
+      config.logger?.warn(`No API key found for provider '${config.ai.provider}', skipping AI analysis`);
+      config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
+      return generateFallbackSummary(updates, downgrades);
+    }
   }
 
   try {
-    const client = new Anthropic({ apiKey });
-    const model = config.ai.model || 'claude-sonnet-4-5';
-
     // Build prompt and check token count, summarizing large changelogs if needed
-    const prompt = await buildPromptWithinBudget(client, model, updates, changelogs, config);
+    const prompt = await buildPromptWithinBudget(updates, changelogs, config);
 
-    const message = await client.messages.create({
-      model,
-      max_tokens: 2048,
-      messages: [{ role: 'user', content: prompt }],
-    });
+    // Send prompt via OpenCode SDK
+    const response = await sendPrompt(config, prompt);
 
-    const content = message.content?.[0];
-    if (content?.type === 'text') {
+    if (response) {
       // Append nix updates and downgrades sections
       // AI may omit nix packages since they don't have changelogs
-      let result = content.text;
+      let result = response;
 
       const nixSection = formatNixUpdatesSection(updates);
       if (nixSection) {
@@ -116,7 +127,7 @@ export async function analyzeChangelogs(
 
     return generateFallbackSummary(updates, downgrades);
   } catch (error) {
-    config.logger?.warn('Claude API analysis failed:', error instanceof Error ? error.message : String(error));
+    config.logger?.warn('AI analysis failed:', error instanceof Error ? error.message : String(error));
     if (process.env.VERBOSE) {
       config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
     }
@@ -125,15 +136,24 @@ export async function analyzeChangelogs(
 }
 
 /**
+ * Get the API key environment variable for a provider
+ */
+function getProviderApiKey(provider: SupportedProvider): string | undefined {
+  const envVar = PROVIDER_ENV_VARS[provider];
+  return process.env[envVar];
+}
+
+/**
  * Build the analysis prompt, summarizing changelogs if total tokens exceed budget
  */
 async function buildPromptWithinBudget(
-  client: Anthropic,
-  model: string,
   updates: PackageUpdate[],
   changelogs: Map<string, string>,
   config: DepUpdaterConfig,
 ): Promise<string> {
+  // Get token budget (user override or provider default)
+  const tokenBudget = getTokenBudget(config);
+
   // Start with original changelogs (copy to avoid mutating input)
   const workingChangelogs = new Map(changelogs);
 
@@ -141,17 +161,17 @@ async function buildPromptWithinBudget(
   let changelogData = prepareChangelogData(updates, workingChangelogs);
   let prompt = buildPrompt(changelogData);
 
-  // Count tokens once for the full prompt
-  let tokens = await countTokens(client, model, prompt, config);
+  // Count tokens using gpt-tokenizer
+  let tokens = countTokens(prompt);
   config.logger?.debug?.(`Initial prompt tokens: ${tokens}`);
 
   // If under budget, we're done
-  if (tokens <= TOKEN_BUDGET) {
+  if (tokens <= tokenBudget) {
     return prompt;
   }
 
   // Over budget - find and summarize the largest changelogs
-  config.logger?.info(`Prompt exceeds token budget (${tokens} > ${TOKEN_BUDGET}), summarizing large changelogs`);
+  config.logger?.info(`Prompt exceeds token budget (${tokens} > ${tokenBudget}), summarizing large changelogs`);
 
   // Sort changelogs by size (largest first)
   const sortedBySize = [...workingChangelogs.entries()]
@@ -160,16 +180,16 @@ async function buildPromptWithinBudget(
 
   // Summarize largest changelogs until under budget
   for (const [name, content] of sortedBySize) {
-    if (tokens <= TOKEN_BUDGET) break;
+    if (tokens <= tokenBudget) break;
 
     config.logger?.info(`Summarizing changelog for ${name} (${content.length} chars)`);
-    const summarized = await summarizeChangelog(client, content, name, config);
+    const summarized = await summarizeChangelog(content, name, config);
     workingChangelogs.set(name, summarized);
 
-    // Rebuild prompt and recount
+    // Rebuild prompt and re-count tokens
     changelogData = prepareChangelogData(updates, workingChangelogs);
     prompt = buildPrompt(changelogData);
-    tokens = await countTokens(client, model, prompt, config);
+    tokens = countTokens(prompt);
     config.logger?.debug?.(`After summarizing ${name}: ${tokens} tokens`);
   }
 
