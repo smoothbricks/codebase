@@ -1,0 +1,114 @@
+{
+  "name": "@smoothbricks/dep-updater",
+  "version": "0.0.1",
+  "description": "Automated dependency update tool with Expo support, stacked PRs, and AI-powered changelogs",
+  "type": "module",
+  "files": [
+    "dist",
+    "templates",
+    "README.md",
+    "CLAUDE.md"
+  ],
+  "bin": {
+    "dep-updater": "./dist/cli.js"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    "./package.json": "./package.json",
+    ".": {
+      "development": "./src/index.ts",
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
+  "scripts": {
+    "build": "bun run build.ts",
+    "typecheck": "tsc --build --emitDeclarationOnly",
+    "test": "bun test",
+    "test:watch": "bun test --watch"
+  },
+  "dependencies": {
+    "@clack/prompts": "^0.7.0",
+    "@opencode-ai/sdk": "^1.0.0",
+    "commander": "^12.1.0",
+    "execa": "^9.5.2",
+    "fast-glob": "^3.3.2",
+    "gpt-tokenizer": "^3.4.0",
+    "tslib": "^2.8.1",
+    "yaml": "^2.8.1"
+  },
+  "devDependencies": {
+    "@types/bun": "^1.3.1",
+    "memfs": "^4.17.0"
+  },
+  "keywords": [
+    "dependencies",
+    "updates",
+    "expo",
+    "automation",
+    "changelog",
+    "ai",
+    "stacked-prs"
+  ],
+  "private": true,
+  "nx": {
+    "targets": {
+      "lint": {},
+      "lint:fix": {},
+      "test": {
+        "dependsOn": [
+          "build"
+        ]
+      },
+      "typecheck": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "command": "tsc --build --emitDeclarationOnly",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "update-deps": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "command": "node dist/cli.js update-deps",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "generate-workflow": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "command": "node dist/cli.js generate-workflow",
+          "cwd": "{projectRoot}"
+        }
+      },
+      "smoke-test": {
+        "executor": "nx:run-commands",
+        "dependsOn": [
+          "build"
+        ],
+        "options": {
+          "commands": [
+            "node dist/cli.js --help",
+            "node dist/cli.js init --yes --dry-run",
+            "node dist/cli.js generate-workflow --dry-run",
+            "node dist/cli.js update-deps --dry-run --skip-ai || true"
+          ],
+          "cwd": "{projectRoot}",
+          "parallel": false
+        }
+      }
+    }
+  }
+}

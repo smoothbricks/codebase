@@ -111,6 +111,10 @@ jobs:
       - name: 🔨 Build
         run: ./github-ci.sh nx-affected build "Build" 14
 
+      # Step 15
+      - name: 🚀 Smoke Tests
+        run: ./github-ci.sh nx-affected smoke-test "Smoke Tests" 15
+
       # --- Cleanup ------------------------------------------------------------
 
       - name: Cleanup and cache Nix store
