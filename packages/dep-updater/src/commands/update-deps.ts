@@ -2,6 +2,7 @@
  * Update all dependencies command
  */
 
+import * as p from '@clack/prompts';
 import { shutdownOpenCodeClient } from '../ai/opencode-client.js';
 import { analyzeChangelogs, generateCommitMessage } from '../changelog/analyzer.js';
 import { fetchChangelogs } from '../changelog/fetcher.js';
@@ -25,18 +26,19 @@ async function setupBranchForStacking(
 ): Promise<{ stackBase: string; mainBranch: string }> {
   // Determine base branch for stacking FIRST (before running updates)
   const { baseBranch: stackBase, reason } = await determineBaseBranch(config, repoRoot);
-  config.logger?.info(`Base branch: ${stackBase} (${reason})\n`);
+  p.log.info(`Base branch: ${stackBase} (${reason})`);
 
   const mainBranch = config.git?.baseBranch || 'main';
 
   // If stacking is enabled and we're basing on a PR branch, checkout that branch first
   // This ensures updates only find NEW changes beyond what's in the base PR
   if (stackBase !== mainBranch && config.prStrategy.stackingEnabled) {
-    config.logger?.info(`=== Checking out base branch ${stackBase} ===`);
+    const checkoutSpinner = p.spinner();
+    checkoutSpinner.start(`Checking out base branch ${stackBase}`);
     const remote = config.git?.remote || 'origin';
     await fetch(repoRoot, remote);
     await switchBranch(repoRoot, stackBase);
-    config.logger?.info(`✓ Switched to ${stackBase}\n`);
+    checkoutSpinner.stop(`Switched to ${stackBase}`);
   }
 
   return { stackBase, mainBranch };
@@ -65,7 +67,8 @@ async function runAllUpdaters(
   const errors: string[] = [];
 
   // Update Bun dependencies (will only find updates beyond what's in current branch)
-  config.logger?.info('=== Updating npm dependencies (Bun) ===');
+  const bunSpinner = p.spinner();
+  bunSpinner.start('Updating npm dependencies');
   const bunResult = await updateBunDependencies(repoRoot, {
     dryRun: options.dryRun,
     recursive: true,
@@ -75,8 +78,10 @@ async function runAllUpdaters(
 
   if (bunResult.success) {
     allUpdates.push(...bunResult.updates);
+    bunSpinner.stop(`npm: ${bunResult.updates.length} updates`);
   } else {
     errors.push(`Bun update failed: ${bunResult.error}`);
+    bunSpinner.stop('npm: failed');
   }
 
   // Nix updates (optional)
@@ -93,7 +98,8 @@ async function runAllUpdaters(
 
   if (config.nix?.enabled) {
     // Update devenv
-    config.logger?.info('\n=== Updating devenv (Nix) ===');
+    const devenvSpinner = p.spinner();
+    devenvSpinner.start('Updating devenv');
     const devenvPath = safeResolve(repoRoot, config.nix.devenvPath);
     devenvResult = await updateDevenv(devenvPath, {
       dryRun: options.dryRun,
@@ -105,12 +111,15 @@ async function runAllUpdaters(
       if (devenvResult.downgrades) {
         allDowngrades.push(...devenvResult.downgrades);
       }
+      devenvSpinner.stop(`devenv: ${devenvResult.updates.length} updates`);
     } else {
       errors.push(`Devenv update failed: ${devenvResult.error}`);
+      devenvSpinner.stop('devenv: failed');
     }
 
     // Update nixpkgs overlay
-    config.logger?.info('\n=== Updating nixpkgs overlay ===');
+    const nixpkgsSpinner = p.spinner();
+    nixpkgsSpinner.start('Updating nixpkgs overlay');
     const overlayPath = safeResolve(repoRoot, config.nix.nixpkgsOverlayPath);
     nixpkgsResult = await updateNixpkgsOverlay(overlayPath, {
       dryRun: options.dryRun,
@@ -119,28 +128,27 @@ async function runAllUpdaters(
 
     if (nixpkgsResult.success) {
       allUpdates.push(...nixpkgsResult.updates);
+      nixpkgsSpinner.stop(`nixpkgs: ${nixpkgsResult.updates.length} updates`);
     } else {
       errors.push(`Nixpkgs update failed: ${nixpkgsResult.error}`);
+      nixpkgsSpinner.stop('nixpkgs: failed');
     }
-  } else {
-    config.logger?.info('\n=== Skipping Nix updates (disabled in config) ===');
   }
 
-  // Report results
-  config.logger?.info('\n=== Update Summary ===');
-  config.logger?.info(`Total updates: ${allUpdates.length}`);
-  config.logger?.info(`- npm: ${bunResult.updates.length}`);
+  // Report summary using p.note()
+  const summaryLines = [`Total: ${allUpdates.length} updates`, `  npm: ${bunResult.updates.length}`];
   if (config.nix?.enabled) {
-    config.logger?.info(`- nix: ${devenvResult.updates.length}`);
-    config.logger?.info(`- nixpkgs: ${nixpkgsResult.updates.length}`);
+    summaryLines.push(`  devenv: ${devenvResult.updates.length}`);
+    summaryLines.push(`  nixpkgs: ${nixpkgsResult.updates.length}`);
   }
-
   if (errors.length > 0) {
-    config.logger?.error('\nErrors:');
+    summaryLines.push('');
+    summaryLines.push('Errors:');
     for (const error of errors) {
-      config.logger?.error(`  - ${error}`);
+      summaryLines.push(`  ${error}`);
     }
   }
+  p.note(summaryLines.join('\n'), 'Summary');
 
   return {
     allUpdates,
@@ -173,19 +181,27 @@ async function generateCommitData(
   }
 
   // Fetch changelogs
-  config.logger?.info('\n=== Fetching changelogs ===');
-  const changelogs = options.skipAI ? new Map<string, string>() : await fetchChangelogs(allUpdates, 5, config.logger);
+  let changelogs: Map<string, string>;
+  if (options.skipAI) {
+    changelogs = new Map<string, string>();
+  } else {
+    const changelogSpinner = p.spinner();
+    changelogSpinner.start('Fetching changelogs');
+    changelogs = await fetchChangelogs(allUpdates, 5, config.logger);
+    changelogSpinner.stop(`Fetched ${changelogs.size} changelogs`);
+  }
 
   // Generate commit message
-  config.logger?.info('\n=== Generating commit message ===');
   let prBody: string;
 
   if (options.skipAI || changelogs.size === 0) {
     const { body } = await generateCommitMessage(allUpdates, config, allDowngrades);
     prBody = body;
   } else {
-    config.logger?.info('Analyzing changelogs with AI...');
+    const aiSpinner = p.spinner();
+    aiSpinner.start('Analyzing changelogs with AI');
     prBody = await analyzeChangelogs(allUpdates, changelogs, config, allDowngrades);
+    aiSpinner.stop('AI analysis complete');
   }
 
   const { title } = await generateCommitMessage(allUpdates, config, allDowngrades);
@@ -207,27 +223,32 @@ async function createPRWorkflow(
   stackBase: string,
   allUpdates: PackageUpdate[],
 ): Promise<void> {
-  config.logger?.info('\n=== Creating update branch ===');
   const branchName = generateBranchName(config);
   const remote = config.git?.remote || 'origin';
 
   // Create new branch from current position (already checked out correct base)
+  const branchSpinner = p.spinner();
+  branchSpinner.start('Creating update branch');
   const { createBranch, pushWithUpstream, deleteRemoteBranch } = await import('../git.js');
   await createBranch(repoRoot, branchName);
-  config.logger?.info('✓ Created branch:', branchName);
+  branchSpinner.stop(`Created branch: ${branchName}`);
 
   // Create commit on the new branch
-  config.logger?.info('\n=== Creating commit ===');
+  const commitSpinner = p.spinner();
+  commitSpinner.start('Creating commit');
   await createUpdateCommit(config, commitTitle, prBody);
+  commitSpinner.stop('Commit created');
 
   // Push the branch
-  config.logger?.info('\n=== Pushing branch ===');
+  const pushSpinner = p.spinner();
+  pushSpinner.start('Pushing to remote');
   await pushWithUpstream(repoRoot, remote, branchName);
-  config.logger?.info('✓ Pushed to remote:', `${remote}/${branchName}`);
+  pushSpinner.stop(`Pushed to ${remote}/${branchName}`);
 
   // Create PR (uses stackBase determined at the beginning)
   // If PR creation fails, clean up the orphan branch on remote
-  config.logger?.info('\n=== Creating PR ===');
+  const prSpinner = p.spinner();
+  prSpinner.start('Creating pull request');
   const hasBreaking = allUpdates.some((u) => u.updateType === 'major');
   const prTitle = generatePRTitle(config, hasBreaking);
 
@@ -240,14 +261,15 @@ async function createPRWorkflow(
       headBranch: branchName,
     });
 
-    config.logger?.info(`\n✓ Created PR #${pr.number}: ${pr.url}`);
-    config.logger?.info(`  Base: ${stackBase}`);
+    prSpinner.stop(`Created PR #${pr.number}`);
+    p.note(`${pr.url}\nBase: ${stackBase}`, 'Pull Request');
   } catch (error) {
+    prSpinner.stop('PR creation failed');
     // Clean up orphan branch on remote if PR creation fails
-    config.logger?.error('PR creation failed, cleaning up remote branch...');
+    config.logger?.error('Cleaning up remote branch...');
     try {
       await deleteRemoteBranch(repoRoot, remote, branchName);
-      config.logger?.info(`✓ Deleted orphan branch: ${remote}/${branchName}`);
+      config.logger?.info(`Deleted orphan branch: ${remote}/${branchName}`);
     } catch (cleanupError) {
       config.logger?.warn(
         `Failed to clean up remote branch ${branchName}:`,
@@ -267,11 +289,13 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
   // Check if config file is an executable script (script mode)
   const configPath = await findConfigFile(repoRoot);
   if (configPath && (await isConfigScript(configPath))) {
-    config.logger?.info('🔧 Running config script...\n');
+    p.intro('🔧 Running config script');
     await executeConfigScript(configPath);
-    config.logger?.info('\n✓ Script execution complete!');
+    p.outro('✓ Script execution complete!');
     return;
   }
+
+  p.intro('📦 Updating dependencies');
 
   try {
     // Setup branch for stacking
@@ -286,21 +310,21 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
 
     // Handle no updates case
     if (allUpdates.length === 0 && isClean) {
-      config.logger?.info('\n✓ No updates available');
+      p.outro('No updates available');
       return;
     }
 
     // Handle lock file only updates on PR branches
     if (allUpdates.length === 0 && !isClean) {
-      config.logger?.info('\n!  No package.json updates, but lock files were updated');
-      config.logger?.info('    (dependencies updated within existing semver ranges)');
+      p.log.warn('No package.json updates, but lock files were updated');
+      p.log.info('Dependencies updated within existing semver ranges');
 
       // If we're on a PR branch (not main) and stacking is enabled, commit the lock file changes to it
       // The stackingEnabled check ensures we actually switched to stackBase in setupBranchForStacking
       if (stackBase !== mainBranch && config.prStrategy.stackingEnabled) {
-        config.logger?.info('    Committing lock file updates to existing PR branch');
-
         if (!options.skipGit) {
+          const lockSpinner = p.spinner();
+          lockSpinner.start('Committing lock file updates to existing PR branch');
           // Commit lock file changes to existing PR branch
           await createUpdateCommit(
             config,
@@ -312,8 +336,9 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
           const remote = config.git?.remote || 'origin';
           const { push } = await import('../git.js');
           await push(repoRoot, remote, stackBase);
-          config.logger?.info(`✓ Lock file changes pushed to ${stackBase}`);
+          lockSpinner.stop(`Lock file changes pushed to ${stackBase}`);
         }
+        p.outro('Lock file update complete');
         return;
       }
     }
@@ -322,16 +347,11 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
     if (options.dryRun) {
       const branchName = generateBranchName(config);
       const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
-      config.logger?.info('\n[DRY RUN] Would create:');
-      config.logger?.info(`  Branch: ${branchName}`);
-      config.logger?.info(`  Commit: ${commitTitle}`);
-      config.logger?.info(`  PR base: ${stackBase}`);
-      config.logger?.info('\n  PR Description:');
-      config.logger?.info(`  ${'─'.repeat(50)}`);
-      for (const line of prBody.split('\n')) {
-        config.logger?.info(`  ${line}`);
-      }
-      config.logger?.info(`  ${'─'.repeat(50)}`);
+
+      const dryRunInfo = [`Branch: ${branchName}`, `Commit: ${commitTitle}`, `PR base: ${stackBase}`].join('\n');
+      p.note(dryRunInfo, 'Dry Run - Would Create');
+      p.note(prBody, 'PR Description');
+      p.outro('Dry run complete');
       return;
     }
 
@@ -343,7 +363,7 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
       await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates);
     }
 
-    config.logger?.info('\n✓ Dependency update complete!');
+    p.outro('Dependency update complete!');
   } finally {
     // Shutdown OpenCode server if it was started (allows process to exit cleanly)
     await shutdownOpenCodeClient(config.logger);
