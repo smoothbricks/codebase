@@ -176,8 +176,6 @@ export interface GenerateWorkflowOptions extends UpdateOptions {
   schedule?: string;
   /** Name of the workflow */
   workflowName?: string;
-  /** Authentication type: 'pat' or 'github-app' */
-  authType?: 'pat' | 'github-app';
   /** Explicitly enable AI (overrides auto-detection) */
   enableAI?: boolean;
 }

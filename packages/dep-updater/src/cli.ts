@@ -111,7 +111,6 @@ program
 program
   .command('generate-workflow')
   .description('Generate GitHub Actions workflow for automated dependency updates')
-  .option('--auth-type <type>', 'Authentication type: "pat" or "github-app" (default: "pat")')
   .option('--schedule <cron>', 'Cron schedule for workflow (default: "0 2 * * *")')
   .option('--workflow-name <name>', 'Name of the workflow (default: "Update Dependencies")')
   .option('--enable-ai', 'Enable AI changelog analysis (overrides auto-detection)')
@@ -120,16 +119,8 @@ program
 
     const { generateWorkflow } = await import('./commands/generate-workflow.js');
 
-    // Validate auth type
-    const authType = options.authType?.toLowerCase();
-    if (authType && authType !== 'pat' && authType !== 'github-app') {
-      console.error('Error: --auth-type must be either "pat" or "github-app"');
-      process.exit(1);
-    }
-
     await generateWorkflow(config, {
       ...getUpdateOptions(),
-      authType: (authType as 'pat' | 'github-app') || 'pat',
       schedule: options.schedule,
       workflowName: options.workflowName,
       enableAI: options.enableAi, // Note: commander converts --enable-ai to enableAi

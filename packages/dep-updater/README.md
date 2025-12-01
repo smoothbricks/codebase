@@ -36,13 +36,10 @@ npx @smoothbricks/dep-updater init
 **Manual workflow generation:**
 
 ```bash
-# Generate workflow with PAT authentication (default)
+# Generate workflow (auth is auto-detected at runtime)
 npx @smoothbricks/dep-updater generate-workflow
 
-# Or with GitHub App authentication
-npx @smoothbricks/dep-updater generate-workflow --auth-type github-app
-
-# Validate GitHub App setup (if using GitHub App)
+# Validate setup
 npx @smoothbricks/dep-updater validate-setup
 ```
 
@@ -141,47 +138,42 @@ dep-updater generate-workflow
 
 Generates `.github/workflows/update-deps.yml` for automated daily dependency updates.
 
+The generated workflow uses **runtime auth detection** - it automatically uses GitHub App if `DEP_UPDATER_APP_ID` is
+configured, otherwise falls back to PAT. No need to specify auth type.
+
 **Options:**
 
-- `--auth-type <type>`: Authentication type: `"pat"` or `"github-app"` (default: `"pat"`)
 - `--schedule <cron>`: Custom cron schedule (default: `0 2 * * *` - 2 AM UTC daily)
 - `--workflow-name <name>`: Custom workflow name (default: `Update Dependencies`)
+- `--enable-ai`: Explicitly enable AI changelog analysis
+- `--skip-ai`: Disable AI changelog analysis
 
 **Examples:**
 
 ```bash
-# PAT authentication (default, simplest)
+# Generate workflow (auth auto-detected at runtime)
 dep-updater generate-workflow
 
-# GitHub App authentication (advanced)
-dep-updater generate-workflow --auth-type github-app
+# Disable AI changelog analysis
+dep-updater generate-workflow --skip-ai
 
-# Enable AI changelog analysis
-dep-updater generate-workflow --enable-ai
-
-# Custom schedule with PAT
+# Custom schedule
 dep-updater generate-workflow --schedule "0 3 * * 1" --workflow-name "Weekly Updates"
 ```
 
-**Upgrading to AI:**
+**Upgrading to Premium AI:**
 
-If you initially set up without AI and want to add it later:
+The default free tier (OpenCode) works out of the box. To upgrade to premium AI:
 
 ```bash
 # 1. Add your AI provider API key to organization secrets
 # Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY
 gh secret set ANTHROPIC_API_KEY --org YOUR_ORG
 
-# 2. Regenerate workflow with AI support
-dep-updater generate-workflow --enable-ai --auth-type <your-auth-type>
-
-# 3. Commit and push
-git add .github/workflows/update-deps.yml
-git commit -m "chore: enable AI changelog analysis"
-git push
+# 2. That's it! The workflow automatically uses premium AI when API key is available
 ```
 
-The `--enable-ai` flag explicitly requests the AI-enabled workflow template, regardless of your local configuration.
+To disable AI entirely, set repository variable `DEP_UPDATER_SKIP_AI=true` or regenerate with `--skip-ai`.
 
 ### Check for Expo SDK updates
 
@@ -323,8 +315,8 @@ dep-updater supports two authentication methods for GitHub Actions:
 
 1. Create GitHub App for your organization
 2. Install app to your repositories
-3. Configure organization secrets (`DEP_UPDATER_APP_ID`, `DEP_UPDATER_APP_PRIVATE_KEY`)
-4. Generate workflow: `dep-updater generate-workflow --auth-type github-app`
+3. Configure organization variable (`DEP_UPDATER_APP_ID`) and secret (`DEP_UPDATER_APP_PRIVATE_KEY`)
+4. Generate workflow: `dep-updater generate-workflow` (auth auto-detected)
 5. Validate: `dep-updater validate-setup`
 6. Commit and push
 

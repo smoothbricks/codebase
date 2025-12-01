@@ -528,121 +528,91 @@ information. It could potentially replace or supplement the current changelog fe
 
 **Purpose:** Generate `.github/workflows/update-deps.yml` for automated dependency updates.
 
-**Supports Two Authentication Methods:**
+**Unified Template with Runtime Auth Detection:**
 
-The workflow generator creates different workflow templates based on the `--auth-type` flag:
+The workflow generator creates a **single unified template** that auto-detects authentication at runtime:
 
-1. **PAT (Personal Access Token)** - Default, simple setup
-   - Template: `templates/workflows/pat.yml`
-   - Setup time: ~5 minutes
-   - Best for: Small teams, quick start
+- **Template file:** `templates/workflows/unified.yml`
+- **Auth detection:** If `vars.DEP_UPDATER_APP_ID` is set → GitHub App mode; otherwise → PAT mode
+- **No regeneration needed:** Users can switch auth methods by just adding/removing secrets/variables
 
-2. **GitHub App** - Advanced, production-ready
-   - Template: `templates/workflows/github-app.yml`
-   - Setup time: ~15-20 minutes
-   - Best for: Organizations, high volume
+**Runtime Auth Detection Expression:**
+
+```yaml
+# GitHub App token generation (skipped if not configured)
+- name: Generate GitHub App token
+  if: ${{ vars.DEP_UPDATER_APP_ID != '' }}
+  uses: actions/create-github-app-token@v2
+
+# Token fallback in GH_TOKEN
+GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.DEP_UPDATER_TOKEN }}
+```
 
 **Template Processing System:**
 
-Templates use placeholder substitution for flexibility. There are only 2 template files, and AI features are
-enabled/disabled through placeholder replacement:
+The unified template uses minimal placeholder substitution (AI-related only):
 
-- **Template files:**
-  - `templates/workflows/pat.yml` - PAT authentication template
-  - `templates/workflows/github-app.yml` - GitHub App authentication template
+- **Template file:** `templates/workflows/unified.yml`
 
-- **Placeholders:**
-  - AI-related: `{{AI_HEADER_SUFFIX}}`, `{{AI_SETUP_STEP}}`, `{{AI_ENV_VAR}}`, `{{AI_STEP_SUFFIX}}`, etc.
-  - Step numbering: `{{STEP_VAR}}`, `{{STEP_SECRETS}}`, `{{STEP_COPY}}`, `{{STEP_COMMIT}}`, `{{STEP_VALIDATE}}`
+- **Placeholders (AI-related only):**
+  - `{{AI_HEADER_SUFFIX}}` - Header comment suffix
+  - `{{AI_SETUP_NOTE}}` - Additional setup notes for paid providers
+  - `{{AI_STEP_SUFFIX}}` - Step name suffix
+  - `{{AI_ENV_VAR}}` - API key environment variable
 
-- **Constants for type safety:**
-  - `AUTH_TYPES` - Authentication type literals ('pat' | 'github-app')
-  - `PLACEHOLDERS` - Template placeholder strings (compile-time typo checking)
-  - `EXTERNAL_URLS` - External service URLs (centralized URL management)
-
-- **Validation:**
-  - `validateTemplateProcessing()` ensures all placeholders are replaced
-  - YAML syntax validated with `parseYaml()` before writing file
-  - Throws descriptive errors if validation fails
+- **Removed placeholders:** All `{{STEP_*}}` placeholders were removed (no longer needed with unified template)
 
 **Key Features:**
 
 - Uses Nx target for CLI execution (automatic builds + caching)
 - Configures git user for commits (github-actions[bot])
-- Template-based workflow generation with placeholder substitution
 - Supports Nx computation caching for faster CI runs
+- **Runtime auth detection** - No need to regenerate workflow when switching auth methods
+- **Conditional AI** - `vars.DEP_UPDATER_SKIP_AI` variable can disable AI at runtime
 - **Enhanced workflow comments** - Generated workflows include:
-  - Setup checklist at top of file
-  - Link to appropriate setup documentation (GETTING-STARTED.md)
-  - Inline comments explaining each step and configuration
-  - Clear explanation of authentication method
-
-**Template Selection Logic:**
-
-```typescript
-const templateName = authType === AUTH_TYPES.PAT ? 'pat.yml' : 'github-app.yml';
-// AI features toggled via placeholder substitution in processTemplate()
-```
-
-**Console Output:**
-
-- Shows different next steps based on selected auth type
-- Links to appropriate documentation (GETTING-STARTED.md)
-- PAT: Shows how to generate token and add to secrets
-- GitHub App: Shows validation command and setup guide link
+  - Setup options for both PAT and GitHub App
+  - Link to GETTING-STARTED.md documentation
+  - Inline comments explaining each step
 
 **CLI Usage:**
 
 ```bash
-# Generate with PAT authentication (default)
+# Generate workflow (auth is auto-detected at runtime)
 dep-updater generate-workflow
 
-# Generate with GitHub App authentication
-dep-updater generate-workflow --auth-type github-app
+# Disable AI changelog analysis
+dep-updater generate-workflow --skip-ai
 
-# Enable AI changelog analysis (explicit override)
+# Enable AI explicitly (default with opencode free tier)
 dep-updater generate-workflow --enable-ai
 
-# Custom schedule with GitHub App
-dep-updater generate-workflow --auth-type github-app --schedule "0 3 * * 1"
+# Custom schedule
+dep-updater generate-workflow --schedule "0 3 * * 1"
 ```
 
-**AI Template Selection Logic:**
+**AI Configuration:**
 
 ```typescript
-// Auto-detect: checks config OR environment variable (any supported provider)
-const hasAIConfigured =
-  config.ai?.apiKey !== undefined ||
-  process.env.ANTHROPIC_API_KEY !== undefined ||
-  process.env.OPENAI_API_KEY !== undefined ||
-  process.env.GOOGLE_API_KEY !== undefined;
-
-// Priority: explicit flag > skipAI flag > auto-detection
-const useAI = options.enableAI ? true : options.skipAI ? false : hasAIConfigured;
+// AI is enabled by default with free tier (opencode)
+// Priority: explicit flag > skipAI flag > auto-detection (free tier enabled by default)
+const isFreeProvider = !providerRequiresSecret(config.ai.provider);
+const useAI = options.enableAI === true || (!options.skipAI && (isFreeProvider || config.ai?.apiKey !== undefined));
 ```
 
-This allows users to:
-
-- Add AI later without updating local config (just set env var or use `--enable-ai`)
-- Explicitly disable AI even if configured (use `--skip-ai`)
-- Auto-detect based on configuration or environment
-
-**Upgrading to AI:**
-
-Users who initially set up without AI can easily upgrade:
+**Switching Auth Methods (No Regeneration Needed):**
 
 ```bash
-# 1. Add AI provider API key to organization secrets
-# Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY
-gh secret set ANTHROPIC_API_KEY --org YOUR_ORG
+# To use PAT: Add secret
+gh secret set DEP_UPDATER_TOKEN --org YOUR_ORG
 
-# 2. Regenerate workflow (remembering their auth type)
-dep-updater generate-workflow --enable-ai --auth-type pat  # or github-app
+# To use GitHub App (takes priority if both configured):
+# Add variable and secret
+gh variable set DEP_UPDATER_APP_ID --org YOUR_ORG
+gh secret set DEP_UPDATER_APP_PRIVATE_KEY --org YOUR_ORG
 
-# 3. Commit and push
+# To disable AI at runtime: Add variable
+gh variable set DEP_UPDATER_SKIP_AI --body "true" --org YOUR_ORG
 ```
-
-The `--enable-ai` flag explicitly requests the AI template regardless of local config.
 
 ### Authentication Method Comparison
 
@@ -729,43 +699,32 @@ The `--enable-ai` flag explicitly requests the AI template regardless of local c
   - Syncpack config (.syncpackrc.json, .syncpackrc.yml)
 - Interactive prompts for configuration options
 - Generates `.dep-updater.json` or `.dep-updater.ts` config file
-- Calls `generate-workflow` with selected auth type
-- Provides next steps tailored to chosen authentication method
+- Calls `generate-workflow` to create unified workflow (auth auto-detected at runtime)
+- Provides unified next steps with both auth options explained
 
 **Prompt Flow:**
 
-1. **Authentication type** - PAT or GitHub App
-2. **Setup verification** (GitHub App only) - Check if credentials are configured
-3. **Config format** - JSON or TypeScript
-4. **Feature flags** - Expo, Nix, AI, PR stacking
-5. **Workflow generation** - Confirm workflow creation
-6. **Validation** (GitHub App only) - Optionally run `validate-setup`
+1. **Auth info** - Shows unified auth setup note (both PAT and GitHub App options)
+2. **Config format** - JSON or TypeScript
+3. **Feature flags** - Expo, Nix, AI, PR stacking
+4. **Workflow generation** - Confirm workflow creation
 
 **Next Steps Output:**
 
-The command shows different next steps based on selected auth type:
+The command shows unified next steps with both auth options:
 
-**For PAT:**
-
-1. Generate Personal Access Token
-2. Add organization secret (DEP_UPDATER_TOKEN)
-3. (Optional) Add AI provider API key
-4. Commit and push
-5. Test workflow
-6. Link to GETTING-STARTED.md (PAT section)
-
-**For GitHub App:**
-
-1. Validate GitHub App setup (validate-setup command)
+1. Set up authentication (choose one):
+   - Option A: PAT (5 min) - Add DEP_UPDATER_TOKEN secret
+   - Option B: GitHub App (15 min) - Add DEP_UPDATER_APP_ID variable + private key secret
 2. Review config file
 3. (Optional) Add AI provider API key
 4. Commit and push
 5. Test workflow
-6. Link to GETTING-STARTED.md (GitHub App section)
+6. Link to GETTING-STARTED.md
 
 **Options:**
 
-- `--yes`: Skip prompts and use defaults (for CI/automation, defaults to PAT)
+- `--yes`: Skip prompts and use defaults (for CI/automation)
 
 **Reusable Utilities:**
 

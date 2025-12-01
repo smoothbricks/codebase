@@ -25,7 +25,7 @@ describe('init command', () => {
       requireTests: true,
     },
     ai: {
-      provider: 'anthropic',
+      provider: 'opencode',
     },
     git: {
       remote: 'origin',
@@ -144,8 +144,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'anthropic',
-          model: 'claude-sonnet-4-5-20250929',
+          provider: 'opencode',
+          model: 'big-pickle',
         },
       };
 
@@ -191,8 +191,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'anthropic',
-          model: 'claude-sonnet-4-5-20250929',
+          provider: 'opencode',
+          model: 'big-pickle',
         },
       };
 
@@ -231,8 +231,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'anthropic',
-          model: 'claude-sonnet-4-5-20250929',
+          provider: 'opencode',
+          model: 'big-pickle',
         },
       };
 
@@ -271,8 +271,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'anthropic',
-          model: 'claude-sonnet-4-5-20250929',
+          provider: 'opencode',
+          model: 'big-pickle',
         },
       };
 
@@ -316,8 +316,8 @@ export default defineConfig({
     prTitlePrefix: 'chore: update dependencies',
   },
   ai: {
-    provider: 'anthropic',
-    model: 'claude-sonnet-4-5-20250929',
+    provider: 'opencode',
+    model: 'big-pickle',
   },
 });
 `;
@@ -394,25 +394,29 @@ export default defineConfig({
     });
   });
 
-  describe('Authentication type selection', () => {
-    test('should default to PAT auth', () => {
-      const authType: 'pat' | 'github-app' = 'pat';
+  describe('Unified auth (runtime detection)', () => {
+    test('should not require auth type selection', () => {
+      // Auth is auto-detected at runtime:
+      // - If DEP_UPDATER_APP_ID is set → GitHub App
+      // - Otherwise → PAT fallback
+      const initOptions = {
+        yes: false,
+        dryRun: false,
+      };
 
-      expect(authType).toBe('pat');
+      // No authType field needed in init options
+      expect(initOptions).not.toHaveProperty('authType');
     });
 
-    test('should support GitHub App auth', () => {
-      const authType: 'pat' | 'github-app' = 'github-app';
+    test('workflow generator should work without authType', () => {
+      const workflowOptions = {
+        skipAI: true,
+        dryRun: false,
+        skipGit: false,
+      };
 
-      expect(authType).toBe('github-app');
-    });
-
-    test('should validate auth type', () => {
-      const validAuthTypes = ['pat', 'github-app'];
-
-      expect(validAuthTypes).toContain('pat');
-      expect(validAuthTypes).toContain('github-app');
-      expect(validAuthTypes).not.toContain('invalid');
+      // authType was removed - auth is detected at runtime
+      expect(workflowOptions).not.toHaveProperty('authType');
     });
   });
 
@@ -477,26 +481,27 @@ export default defineConfig({
   });
 
   describe('Workflow generation integration', () => {
-    test('should generate workflow with correct auth type', () => {
-      const authType = 'pat';
+    test('should generate workflow without auth type (runtime detection)', () => {
+      // Auth is auto-detected at runtime, no authType needed
       const generateWorkflowOptions = {
-        authType,
         skipAI: true,
+        dryRun: false,
+        skipGit: false,
       };
 
-      expect(generateWorkflowOptions.authType).toBe('pat');
       expect(generateWorkflowOptions.skipAI).toBe(true);
+      expect(generateWorkflowOptions).not.toHaveProperty('authType');
     });
 
     test('should pass enableAI to workflow generator', () => {
       const enableAI = true;
       const generateWorkflowOptions = {
-        authType: 'github-app' as const,
-        enableAI,
+        dryRun: false,
+        skipGit: false,
+        skipAI: !enableAI,
       };
 
-      expect(generateWorkflowOptions.enableAI).toBe(true);
-      expect(generateWorkflowOptions.authType).toBe('github-app');
+      expect(generateWorkflowOptions.skipAI).toBe(false);
     });
 
     test('should skip workflow generation if user declines', () => {
@@ -539,17 +544,16 @@ export default defineConfig({
   });
 
   describe('AI configuration', () => {
-    test('should use Anthropic provider', () => {
-      const aiProvider = 'anthropic';
+    test('should use OpenCode provider by default (free tier)', () => {
+      const aiProvider = 'opencode';
 
-      expect(aiProvider).toBe('anthropic');
+      expect(aiProvider).toBe('opencode');
     });
 
-    test('should use correct Claude model', () => {
-      const model = 'claude-sonnet-4-5-20250929';
+    test('should use correct default model', () => {
+      const model = 'big-pickle';
 
-      expect(model).toContain('claude-sonnet');
-      expect(model).toContain('20250929'); // Version date
+      expect(model).toBe('big-pickle');
     });
   });
 
