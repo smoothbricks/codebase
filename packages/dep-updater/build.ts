@@ -17,7 +17,7 @@ const bundleResult = await build({
   sourcemap: 'none',
   external: [
     // Keep external dependencies
-    '@anthropic-ai/sdk',
+    '@opencode-ai/sdk',
     'commander',
     'execa',
     'fast-glob',

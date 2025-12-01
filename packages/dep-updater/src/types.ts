@@ -221,3 +221,76 @@ export interface GitHubPR {
   /** Whether the PR is mergeable (no conflicts) */
   mergeable?: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
 }
+
+/**
+ * Supported AI providers for changelog analysis
+ * - opencode: Free tier via OpenCode (requires `opencode auth login`, default model: big-pickle)
+ * - anthropic, openai, google: Premium tiers (require API keys)
+ */
+export const SUPPORTED_PROVIDERS = ['opencode', 'anthropic', 'openai', 'google'] as const;
+export type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
+
+/**
+ * Options for sending a prompt to AI
+ */
+export interface SendPromptOptions {
+  /** Override the default model for this request */
+  model?: string;
+  /** Override the provider for this request */
+  provider?: SupportedProvider;
+}
+
+/**
+ * Result from parsing dix (devenv diff) output
+ */
+export interface DixParseResult {
+  /** Package upgrades */
+  updates: PackageUpdate[];
+  /** Package downgrades */
+  downgrades: PackageUpdate[];
+}
+
+/**
+ * Project setup detection result
+ */
+export interface ProjectSetup {
+  /** Whether project uses Expo */
+  hasExpo: boolean;
+  /** Whether project uses Nix/devenv */
+  hasNix: boolean;
+  /** Whether project uses syncpack */
+  hasSyncpack: boolean;
+  /** Detected package manager */
+  packageManager: 'bun' | 'npm' | 'pnpm' | 'yarn';
+}
+
+/**
+ * GitHub client interface
+ * Defines operations for pull request management
+ */
+export interface IGitHubClient {
+  /** List open pull requests with update- prefix */
+  listUpdatePRs(repoRoot: string): Promise<GitHubPR[]>;
+  /** Check if a PR has merge conflicts */
+  checkPRConflicts(repoRoot: string, prNumber: number): Promise<boolean>;
+  /** Create a new pull request */
+  createPR(
+    repoRoot: string,
+    options: {
+      title: string;
+      body: string;
+      head: string;
+      base: string;
+    },
+  ): Promise<{ number: number; url: string }>;
+  /** Close a pull request with a comment */
+  closePR(repoRoot: string, prNumber: number, comment: string): Promise<void>;
+}
+
+/**
+ * Options for generate-syncpack command
+ */
+export interface GenerateSyncpackOptions extends UpdateOptions {
+  /** Target Expo SDK version */
+  expoSdkVersion?: string;
+}

@@ -11,7 +11,7 @@ AI-powered changelog summaries.
 
 - Expo SDK version management with syncpack integration
 - Stacked PR workflow (base new PRs on previous update PRs)
-- AI-powered changelog analysis using Claude
+- AI-powered changelog analysis (free by default via OpenCode, or premium with Anthropic/OpenAI/Google)
 - Multi-ecosystem support (npm, Expo, Nix/devenv)
 - Dry-run mode for safe testing
 
@@ -53,6 +53,9 @@ src/
 │   └── github-client.ts   # GitHub CLI client for PR operations
 ├── pr/
 │   └── stacking.ts        # PR stacking algorithm (all functions accept executor param for testing)
+├── ai/                    # AI integration
+│   ├── opencode-client.ts # OpenCode SDK client for multi-provider AI
+│   └── token-counter.ts   # Token counting with gpt-tokenizer
 ├── changelog/
 │   ├── fetcher.ts         # Fetch changelogs from npm/GitHub
 │   └── analyzer.ts        # AI-powered changelog analysis
@@ -84,6 +87,9 @@ test/                      # Mirrors src/ structure
 ├── integration/           # Integration tests (46 tests - COMPLETE)
 │   ├── pr-stacking-workflow.test.ts   # End-to-end PR stacking workflows (14 tests)
 │   └── config.test.ts                 # Config loading, merging, sanitization (32 tests)
+├── ai/                    # AI integration tests (30 tests)
+│   ├── opencode-client.test.ts        # OpenCode SDK client tests (16 tests)
+│   └── token-counter.test.ts          # Token counting tests (14 tests)
 ├── changelog/             # Changelog tests (25 tests)
 │   ├── analyzer.test.ts               # Commit message generation (8 tests)
 │   └── fetcher.test.ts                # Changelog fetching and parsing (17 tests)
@@ -604,8 +610,12 @@ dep-updater generate-workflow --auth-type github-app --schedule "0 3 * * 1"
 **AI Template Selection Logic:**
 
 ```typescript
-// Auto-detect: checks config OR environment variable
-const hasAIConfigured = config.ai?.apiKey !== undefined || process.env.ANTHROPIC_API_KEY !== undefined;
+// Auto-detect: checks config OR environment variable (any supported provider)
+const hasAIConfigured =
+  config.ai?.apiKey !== undefined ||
+  process.env.ANTHROPIC_API_KEY !== undefined ||
+  process.env.OPENAI_API_KEY !== undefined ||
+  process.env.GOOGLE_API_KEY !== undefined;
 
 // Priority: explicit flag > skipAI flag > auto-detection
 const useAI = options.enableAI ? true : options.skipAI ? false : hasAIConfigured;
@@ -622,7 +632,8 @@ This allows users to:
 Users who initially set up without AI can easily upgrade:
 
 ```bash
-# 1. Add ANTHROPIC_API_KEY to organization secrets
+# 1. Add AI provider API key to organization secrets
+# Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY
 gh secret set ANTHROPIC_API_KEY --org YOUR_ORG
 
 # 2. Regenerate workflow (remembering their auth type)
@@ -679,7 +690,7 @@ The `--enable-ai` flag explicitly requests the AI template regardless of local c
 
 1. Generate PAT: https://github.com/settings/tokens/new (scope: `repo`)
 2. Add organization secret: `DEP_UPDATER_TOKEN`
-3. Optional: Add `ANTHROPIC_API_KEY` for AI features
+3. Optional: Add AI provider API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`)
 
 **For GitHub App:**
 
@@ -691,7 +702,8 @@ The `--enable-ai` flag explicitly requests the AI template regardless of local c
 3. Add organization variables and secrets:
    - Variable: `DEP_UPDATER_APP_ID` (App ID from GitHub App settings)
    - Secret: `DEP_UPDATER_APP_PRIVATE_KEY` (Private key PEM file content)
-   - Secret (optional): `ANTHROPIC_API_KEY` (for AI-powered changelog analysis)
+   - Secret (optional): AI provider API key for changelog analysis (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
+     `GOOGLE_API_KEY`)
 
 ### Init Command (`src/commands/init.ts`)
 
@@ -737,7 +749,7 @@ The command shows different next steps based on selected auth type:
 
 1. Generate Personal Access Token
 2. Add organization secret (DEP_UPDATER_TOKEN)
-3. (Optional) Add ANTHROPIC_API_KEY
+3. (Optional) Add AI provider API key
 4. Commit and push
 5. Test workflow
 6. Link to GETTING-STARTED.md (PAT section)
@@ -746,7 +758,7 @@ The command shows different next steps based on selected auth type:
 
 1. Validate GitHub App setup (validate-setup command)
 2. Review config file
-3. (Optional) Add ANTHROPIC_API_KEY
+3. (Optional) Add AI provider API key
 4. Commit and push
 5. Test workflow
 6. Link to GETTING-STARTED.md (GitHub App section)
@@ -842,7 +854,7 @@ interface DepUpdaterConfig {
   nix?: { enabled: boolean; devenvPath: string; nixpkgsOverlayPath: string };
   prStrategy: { stackingEnabled: boolean; maxStackDepth: number; ... };
   autoMerge: { enabled: boolean; mode: 'none' | 'patch' | 'minor'; ... };
-  ai: { provider: 'anthropic'; apiKey?: string; model?: string };
+  ai: { provider: SupportedProvider; apiKey?: string; model?: string }; // SupportedProvider = 'opencode' | 'anthropic' | 'openai' | 'google'
   git?: { remote: string; baseBranch: string };
   repoRoot?: string;
 }
@@ -1024,7 +1036,6 @@ await createUpdateCommit({}, 'message');
 
 - GitHub API only (no GitLab/Bitbucket)
 - Bun package manager only (uses npm registry)
-- Anthropic AI only (no OpenAI/other providers)
 - No retry logic for network failures
 
 ## Troubleshooting

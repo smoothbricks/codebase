@@ -63,9 +63,9 @@ describe('Config Integration - loadConfig', () => {
     expect(config.git?.remote).toBe('origin');
     expect(config.git?.baseBranch).toBe('main');
 
-    // AI defaults
-    expect(config.ai.provider).toBe('anthropic');
-    expect(config.ai.model).toBe('claude-sonnet-4-5-20250929');
+    // AI defaults (opencode is free tier with big-pickle model)
+    expect(config.ai.provider).toBe('opencode');
+    expect(config.ai.model).toBe('big-pickle');
   });
 });
 
@@ -124,8 +124,8 @@ describe('Config Integration - mergeConfig Deep Merging', () => {
     const merged = mergeConfig(userConfig);
 
     expect(merged.ai.apiKey).toBe('sk-test-key');
-    expect(merged.ai.provider).toBe('anthropic'); // Keeps default
-    expect(merged.ai.model).toBe('claude-sonnet-4-5-20250929'); // Keeps default
+    expect(merged.ai.provider).toBe('opencode'); // Keeps default (free tier)
+    expect(merged.ai.model).toBe('big-pickle'); // Keeps default
   });
 
   test('should deep merge expo section when enabled', () => {

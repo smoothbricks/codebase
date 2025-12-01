@@ -2,6 +2,7 @@
  * Update all dependencies command
  */
 
+import { shutdownOpenCodeClient } from '../ai/opencode-client.js';
 import { analyzeChangelogs, generateCommitMessage } from '../changelog/analyzer.js';
 import { fetchChangelogs } from '../changelog/fetcher.js';
 import type { DepUpdaterConfig } from '../config.js';
@@ -272,74 +273,79 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
     return;
   }
 
-  // Setup branch for stacking
-  const { stackBase, mainBranch } = await setupBranchForStacking(config, repoRoot);
+  try {
+    // Setup branch for stacking
+    const { stackBase, mainBranch } = await setupBranchForStacking(config, repoRoot);
 
-  // Run all updaters
-  const { allUpdates, allDowngrades } = await runAllUpdaters(config, repoRoot, options);
+    // Run all updaters
+    const { allUpdates, allDowngrades } = await runAllUpdaters(config, repoRoot, options);
 
-  // Check if there are any uncommitted changes (including lock files)
-  const { isWorkingDirectoryClean } = await import('../git.js');
-  const isClean = await isWorkingDirectoryClean(repoRoot);
+    // Check if there are any uncommitted changes (including lock files)
+    const { isWorkingDirectoryClean } = await import('../git.js');
+    const isClean = await isWorkingDirectoryClean(repoRoot);
 
-  // Handle no updates case
-  if (allUpdates.length === 0 && isClean) {
-    config.logger?.info('\n✓ No updates available');
-    return;
-  }
-
-  // Handle lock file only updates on PR branches
-  if (allUpdates.length === 0 && !isClean) {
-    config.logger?.info('\n!  No package.json updates, but lock files were updated');
-    config.logger?.info('    (dependencies updated within existing semver ranges)');
-
-    // If we're on a PR branch (not main) and stacking is enabled, commit the lock file changes to it
-    // The stackingEnabled check ensures we actually switched to stackBase in setupBranchForStacking
-    if (stackBase !== mainBranch && config.prStrategy.stackingEnabled) {
-      config.logger?.info('    Committing lock file updates to existing PR branch');
-
-      if (!options.skipGit) {
-        // Commit lock file changes to existing PR branch
-        await createUpdateCommit(
-          config,
-          'chore: update lock file',
-          'Updated lock file to resolve dependencies within existing semver ranges.',
-        );
-
-        // Push to remote
-        const remote = config.git?.remote || 'origin';
-        const { push } = await import('../git.js');
-        await push(repoRoot, remote, stackBase);
-        config.logger?.info(`✓ Lock file changes pushed to ${stackBase}`);
-      }
+    // Handle no updates case
+    if (allUpdates.length === 0 && isClean) {
+      config.logger?.info('\n✓ No updates available');
       return;
     }
-  }
 
-  // Dry run exit - show what would be created
-  if (options.dryRun) {
-    const branchName = generateBranchName(config);
-    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
-    config.logger?.info('\n[DRY RUN] Would create:');
-    config.logger?.info(`  Branch: ${branchName}`);
-    config.logger?.info(`  Commit: ${commitTitle}`);
-    config.logger?.info(`  PR base: ${stackBase}`);
-    config.logger?.info('\n  PR Description:');
-    config.logger?.info(`  ${'─'.repeat(50)}`);
-    for (const line of prBody.split('\n')) {
-      config.logger?.info(`  ${line}`);
+    // Handle lock file only updates on PR branches
+    if (allUpdates.length === 0 && !isClean) {
+      config.logger?.info('\n!  No package.json updates, but lock files were updated');
+      config.logger?.info('    (dependencies updated within existing semver ranges)');
+
+      // If we're on a PR branch (not main) and stacking is enabled, commit the lock file changes to it
+      // The stackingEnabled check ensures we actually switched to stackBase in setupBranchForStacking
+      if (stackBase !== mainBranch && config.prStrategy.stackingEnabled) {
+        config.logger?.info('    Committing lock file updates to existing PR branch');
+
+        if (!options.skipGit) {
+          // Commit lock file changes to existing PR branch
+          await createUpdateCommit(
+            config,
+            'chore: update lock file',
+            'Updated lock file to resolve dependencies within existing semver ranges.',
+          );
+
+          // Push to remote
+          const remote = config.git?.remote || 'origin';
+          const { push } = await import('../git.js');
+          await push(repoRoot, remote, stackBase);
+          config.logger?.info(`✓ Lock file changes pushed to ${stackBase}`);
+        }
+        return;
+      }
     }
-    config.logger?.info(`  ${'─'.repeat(50)}`);
-    return;
+
+    // Dry run exit - show what would be created
+    if (options.dryRun) {
+      const branchName = generateBranchName(config);
+      const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
+      config.logger?.info('\n[DRY RUN] Would create:');
+      config.logger?.info(`  Branch: ${branchName}`);
+      config.logger?.info(`  Commit: ${commitTitle}`);
+      config.logger?.info(`  PR base: ${stackBase}`);
+      config.logger?.info('\n  PR Description:');
+      config.logger?.info(`  ${'─'.repeat(50)}`);
+      for (const line of prBody.split('\n')) {
+        config.logger?.info(`  ${line}`);
+      }
+      config.logger?.info(`  ${'─'.repeat(50)}`);
+      return;
+    }
+
+    // Generate commit data
+    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
+
+    // Create PR workflow
+    if (!options.skipGit) {
+      await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates);
+    }
+
+    config.logger?.info('\n✓ Dependency update complete!');
+  } finally {
+    // Shutdown OpenCode server if it was started (allows process to exit cleanly)
+    await shutdownOpenCodeClient(config.logger);
   }
-
-  // Generate commit data
-  const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
-
-  // Create PR workflow
-  if (!options.skipGit) {
-    await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates);
-  }
-
-  config.logger?.info('\n✓ Dependency update complete!');
 }
