@@ -1,5 +1,9 @@
 /**
  * Generate GitHub Actions workflow for automated dependency updates
+ *
+ * Uses a unified template that auto-detects auth type at runtime:
+ * - If vars.DEP_UPDATER_APP_ID is set → GitHub App mode (priority)
+ * - Otherwise → PAT mode (uses secrets.DEP_UPDATER_TOKEN)
  */
 
 import { existsSync } from 'node:fs';
@@ -58,51 +62,36 @@ function getAIEnvVarConfig(provider: SupportedProvider): { envVar: string; secre
 }
 
 /**
- * Process template placeholders for PAT authentication
+ * Process unified template placeholders
+ * Only handles AI-related placeholders - auth detection is runtime
  */
-function processPATTemplate(template: string, useAI: boolean, provider: SupportedProvider): string {
+function processUnifiedTemplate(template: string, useAI: boolean, provider: SupportedProvider): string {
   let result = template;
 
   if (useAI) {
     const aiConfig = getAIEnvVarConfig(provider);
     const needsSecret = aiConfig !== null;
 
-    // With AI (supports opencode free tier, or paid providers: anthropic, openai, google)
     if (needsSecret) {
       // Paid provider - needs API key secret
       result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
       result = result.replace(
-        '{{AI_SETUP_STEP}}',
-        `\n#   2. Get API key for your AI provider (configured: ${provider})`,
+        '{{AI_SETUP_NOTE}}',
+        `\n#   - Configured provider: ${provider} (requires ${aiConfig.envVar} secret)`,
       );
-      result = result.replace('{{STEP_SECRETS}}', '3');
-      result = result.replace('{{AI_SECRETS_PLURAL}}', 's:');
-      result = result.replace('{{AI_SECRET_COMMAND}}', `\n#      gh secret set ${aiConfig.envVar} --org YOUR_ORG`);
-      result = result.replace('{{STEP_COPY}}', '4');
-      result = result.replace('{{STEP_COMMIT}}', '5');
       result = result.replace('{{AI_STEP_SUFFIX}}', ' with AI changelog analysis');
       result = result.replace('{{AI_ENV_VAR}}', aiConfig.secretRef);
     } else {
       // Free tier (opencode) - no API key needed
       result = result.replace('{{AI_HEADER_SUFFIX}}', ' + Free AI Changelog Analysis');
-      result = result.replace('{{AI_SETUP_STEP}}', ''); // No API key step needed
-      result = result.replace('{{STEP_SECRETS}}', '2');
-      result = result.replace('{{AI_SECRETS_PLURAL}}', ':');
-      result = result.replace('{{AI_SECRET_COMMAND}}', '');
-      result = result.replace('{{STEP_COPY}}', '3');
-      result = result.replace('{{STEP_COMMIT}}', '4');
+      result = result.replace('{{AI_SETUP_NOTE}}', ''); // No extra note needed for free tier
       result = result.replace('{{AI_STEP_SUFFIX}}', ' with free AI changelog analysis');
       result = result.replace('{{AI_ENV_VAR}}', '');
     }
   } else {
     // Without AI
-    result = result.replace('{{AI_HEADER_SUFFIX}}', ' (Simple Setup)');
-    result = result.replace('{{AI_SETUP_STEP}}', '');
-    result = result.replace('{{STEP_SECRETS}}', '2');
-    result = result.replace('{{AI_SECRETS_PLURAL}}', ':');
-    result = result.replace('{{AI_SECRET_COMMAND}}', '');
-    result = result.replace('{{STEP_COPY}}', '3');
-    result = result.replace('{{STEP_COMMIT}}', '4');
+    result = result.replace('{{AI_HEADER_SUFFIX}}', '');
+    result = result.replace('{{AI_SETUP_NOTE}}', '');
     result = result.replace('{{AI_STEP_SUFFIX}}', '');
     result = result.replace('{{AI_ENV_VAR}}', '');
   }
@@ -111,81 +100,19 @@ function processPATTemplate(template: string, useAI: boolean, provider: Supporte
 }
 
 /**
- * Process template placeholders for GitHub App authentication
- */
-function processGitHubAppTemplate(template: string, useAI: boolean, provider: SupportedProvider): string {
-  let result = template;
-
-  if (useAI) {
-    const aiConfig = getAIEnvVarConfig(provider);
-    const needsSecret = aiConfig !== null;
-
-    // With AI (supports opencode free tier, or paid providers: anthropic, openai, google)
-    if (needsSecret) {
-      // Paid provider - needs API key secret
-      result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
-      result = result.replace(
-        '{{AI_SETUP_STEP}}',
-        `\n#   3. Get API key for your AI provider (configured: ${provider})`,
-      );
-      result = result.replace('{{STEP_VAR}}', '4');
-      result = result.replace('{{STEP_SECRETS}}', '5');
-      result = result.replace('{{AI_SECRETS_PLURAL}}', 's:');
-      result = result.replace('{{AI_SECRET_LIST}}', `\n#      - ${aiConfig.envVar}`);
-      result = result.replace('{{STEP_COPY}}', '6');
-      result = result.replace('{{STEP_VALIDATE}}', '7');
-      result = result.replace('{{AI_STEP_SUFFIX}}', ' with AI changelog analysis');
-      result = result.replace('{{AI_ENV_VAR}}', aiConfig.secretRef);
-    } else {
-      // Free tier (opencode) - no API key needed
-      result = result.replace('{{AI_HEADER_SUFFIX}}', ' + Free AI Changelog Analysis');
-      result = result.replace('{{AI_SETUP_STEP}}', ''); // No API key step needed
-      result = result.replace('{{STEP_VAR}}', '3');
-      result = result.replace('{{STEP_SECRETS}}', '4');
-      result = result.replace('{{AI_SECRETS_PLURAL}}', ':');
-      result = result.replace('{{AI_SECRET_LIST}}', '');
-      result = result.replace('{{STEP_COPY}}', '5');
-      result = result.replace('{{STEP_VALIDATE}}', '6');
-      result = result.replace('{{AI_STEP_SUFFIX}}', ' with free AI changelog analysis');
-      result = result.replace('{{AI_ENV_VAR}}', '');
-    }
-  } else {
-    // Without AI
-    result = result.replace('{{AI_HEADER_SUFFIX}}', ' (Simple Setup)');
-    result = result.replace('{{AI_SETUP_STEP}}', '');
-    result = result.replace('{{STEP_VAR}}', '3');
-    result = result.replace('{{STEP_SECRETS}}', '4');
-    result = result.replace('{{AI_SECRETS_PLURAL}}', ':');
-    result = result.replace('{{AI_SECRET_LIST}}', '');
-    result = result.replace('{{STEP_COPY}}', '5');
-    result = result.replace('{{STEP_VALIDATE}}', '6');
-    result = result.replace('{{AI_STEP_SUFFIX}}', '');
-    result = result.replace('{{AI_ENV_VAR}}', '');
-  }
-
-  return result;
-}
-
-/**
- * Generate workflow content from template
+ * Generate workflow content from unified template
  */
 async function generateWorkflowContentFromTemplate(options: {
-  authType: 'pat' | 'github-app';
   useAI: boolean;
   provider: SupportedProvider;
 }): Promise<string> {
-  const { authType, useAI, provider } = options;
+  const { useAI, provider } = options;
 
   const templatesDir = getTemplatesDir();
-  const templateFile = authType === 'github-app' ? 'github-app.yml' : 'pat.yml';
-  const templatePath = join(templatesDir, templateFile);
+  const templatePath = join(templatesDir, 'unified.yml');
 
   const template = await readFile(templatePath, 'utf-8');
-
-  if (authType === 'github-app') {
-    return processGitHubAppTemplate(template, useAI, provider);
-  }
-  return processPATTemplate(template, useAI, provider);
+  return processUnifiedTemplate(template, useAI, provider);
 }
 
 /**
@@ -194,8 +121,6 @@ async function generateWorkflowContentFromTemplate(options: {
 export async function generateWorkflow(config: DepUpdaterConfig, options: GenerateWorkflowOptions): Promise<void> {
   const repoRoot = config.repoRoot || (await getRepoRoot());
 
-  // Determine settings
-  const authType = options.authType || 'pat';
   // AI is enabled by default for free tier (opencode), or when explicitly enabled, or when API key is configured
   const isFreeProvider = !providerRequiresSecret(config.ai.provider);
   const useAI = options.enableAI === true || (!options.skipAI && (isFreeProvider || config.ai?.apiKey !== undefined));
@@ -203,10 +128,10 @@ export async function generateWorkflow(config: DepUpdaterConfig, options: Genera
   const provider = config.ai.provider;
 
   config.logger?.info('Generating GitHub Actions workflow...\n');
-  config.logger?.info(`  Auth type: ${authType}`);
+  config.logger?.info('  Auth type: auto-detected at runtime (GitHub App > PAT)');
   config.logger?.info(`  AI analysis: ${useAI ? `enabled (${provider})` : 'disabled'}\n`);
 
-  const workflowContent = await generateWorkflowContentFromTemplate({ authType, useAI, provider });
+  const workflowContent = await generateWorkflowContentFromTemplate({ useAI, provider });
 
   // Compute paths first so we can show them in dry-run
   const workflowDir = safeResolve(repoRoot, '.github/workflows');
@@ -229,5 +154,10 @@ export async function generateWorkflow(config: DepUpdaterConfig, options: Genera
   await writeFile(workflowPath, workflowContent, 'utf-8');
 
   config.logger?.info(`✓ Generated workflow file: ${workflowPath}\n`);
-  config.logger?.info('Follow the setup instructions in the workflow file header.\n');
+  config.logger?.info('Next steps:\n');
+  config.logger?.info('  1. Choose your auth method and configure secrets/variables:');
+  config.logger?.info('     • PAT: Add DEP_UPDATER_TOKEN secret');
+  config.logger?.info('     • GitHub App: Add DEP_UPDATER_APP_ID variable + DEP_UPDATER_APP_PRIVATE_KEY secret\n');
+  config.logger?.info('  2. Commit and push the workflow file\n');
+  config.logger?.info('  3. Test: gh workflow run update-deps.yml\n');
 }

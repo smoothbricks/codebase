@@ -224,7 +224,6 @@ async function generateWorkflow(config: DepUpdaterConfig, options: GenerateWorkf
 
 - `config` - Full configuration object
 - `options` - Workflow generation options:
-  - `authType?: 'pat' | 'github-app'` - Authentication method (default: 'pat')
   - `schedule?: string` - Cron schedule (default: '0 2 \* \* \*')
   - `workflowName?: string` - Workflow display name
   - `enableAI?: boolean` - Force enable AI features
@@ -234,7 +233,7 @@ async function generateWorkflow(config: DepUpdaterConfig, options: GenerateWorkf
 **Behavior:**
 
 - Generates `.github/workflows/update-deps.yml`
-- Selects appropriate template based on auth type
+- Uses unified template with runtime auth detection
 - Processes placeholders for AI features
 - Validates YAML syntax before writing
 
@@ -242,7 +241,6 @@ async function generateWorkflow(config: DepUpdaterConfig, options: GenerateWorkf
 
 ```typescript
 await generateWorkflow(config, {
-  authType: 'github-app',
   enableAI: true,
   schedule: '0 3 * * 1', // Weekly on Monday at 3 AM
 });
@@ -363,7 +361,6 @@ Options for `generateWorkflow()` function.
 
 ```typescript
 interface GenerateWorkflowOptions {
-  authType?: 'pat' | 'github-app';
   schedule?: string;
   workflowName?: string;
   enableAI?: boolean;
@@ -446,9 +443,8 @@ import { generateWorkflow, loadConfig } from '@smoothbricks/dep-updater';
 
 const config = await loadConfig();
 
-// Generate workflow for monthly updates
+// Generate workflow for monthly updates (auth auto-detected at runtime)
 await generateWorkflow(config, {
-  authType: 'github-app',
   schedule: '0 2 1 * *', // First day of month at 2 AM
   workflowName: 'Monthly Dependency Updates',
   enableAI: true,

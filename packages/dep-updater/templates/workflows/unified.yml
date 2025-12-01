@@ -1,0 +1,94 @@
+# Automated dependency updates with dep-updater{{AI_HEADER_SUFFIX}}
+#
+# Authentication: Auto-detected at runtime
+#   - If DEP_UPDATER_APP_ID is set → GitHub App mode (recommended)
+#   - Otherwise → PAT mode (uses DEP_UPDATER_TOKEN secret)
+#
+# Setup options:
+#
+#   Option A: Personal Access Token (5 minutes)
+#     1. Generate PAT: https://github.com/settings/tokens/new (scope: repo)
+#     2. Add organization secret: DEP_UPDATER_TOKEN
+#
+#   Option B: GitHub App (15 minutes, recommended for organizations)
+#     1. Create GitHub App with permissions: contents:write, pull-requests:write
+#     2. Install app to repository
+#     3. Add organization variable: DEP_UPDATER_APP_ID
+#     4. Add organization secret: DEP_UPDATER_APP_PRIVATE_KEY
+#
+# Optional: AI Changelog Analysis
+#   - Free: Works out of the box with OpenCode (no API key needed)
+#   - Premium: Add ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY secret{{AI_SETUP_NOTE}}
+#   - Disable: Set repository variable DEP_UPDATER_SKIP_AI=true
+#
+# 📖 Full guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/GETTING-STARTED.md
+
+name: Update Dependencies
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggers
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-deps:
+    runs-on: ubuntu-latest
+
+    steps:
+      # GitHub App token generation (skipped if DEP_UPDATER_APP_ID not set)
+      - name: Generate GitHub App token
+        if: ${{ vars.DEP_UPDATER_APP_ID != '' }}
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.DEP_UPDATER_APP_ID }}
+          private-key: ${{ secrets.DEP_UPDATER_APP_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for git operations
+          # Uses App token if available, otherwise default token (PAT in GH_TOKEN handles API calls)
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Install Nix
+        if: hashFiles('**/devenv.yaml') != ''
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        if: hashFiles('**/devenv.yaml') != ''
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Install devenv and nvfetcher
+        if: hashFiles('**/devenv.yaml') != ''
+        run: nix profile install nixpkgs#devenv nixpkgs#nvfetcher
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Install OpenCode CLI
+        if: ${{ vars.DEP_UPDATER_SKIP_AI != 'true' }}
+        run: bun add -g opencode-ai@latest
+
+      - name: Run dep-updater{{AI_STEP_SUFFIX}}
+        env:
+          # Uses App token if available (priority), otherwise falls back to PAT
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.DEP_UPDATER_TOKEN }}{{AI_ENV_VAR}}
+        run: |
+          FLAGS=""
+          if [[ "${{ vars.DEP_UPDATER_SKIP_AI }}" == "true" ]]; then
+            FLAGS="--skip-ai"
+          fi
+          npx @smoothbricks/dep-updater update-deps --verbose $FLAGS

@@ -2,11 +2,19 @@
 
 This guide will help you set up dep-updater for automated dependency updates in your organization.
 
-## Choose Your Setup Method
+## Unified Workflow with Runtime Auth Detection
 
-dep-updater supports two authentication methods. Choose based on your needs:
+dep-updater uses a **single workflow file** that automatically detects your authentication method at runtime:
 
-| Feature            | PAT (Simple)               | GitHub App (Advanced)     |
+- **If `DEP_UPDATER_APP_ID` is set** → Uses GitHub App (priority)
+- **Otherwise** → Falls back to PAT using `DEP_UPDATER_TOKEN`
+
+This means you can **switch auth methods without regenerating the workflow file** - just add or remove the appropriate
+secrets/variables.
+
+## Choose Your Auth Method
+
+| Feature            | PAT (Simple)               | GitHub App (Recommended)  |
 | ------------------ | -------------------------- | ------------------------- |
 | **Setup time**     | 5 minutes                  | 15-20 minutes             |
 | **Best for**       | Small teams, trying it out | Organizations, production |
@@ -19,7 +27,7 @@ dep-updater supports two authentication methods. Choose based on your needs:
 
 - 🚀 **Just trying it out?** → Start with [PAT Setup](#option-a-pat-setup-5-minutes)
 - 🏢 **Setting up for your organization?** → Use [GitHub App Setup](#option-b-github-app-setup-15-20-minutes)
-- ❓ **Not sure?** Start with PAT, you can upgrade to GitHub App later
+- ❓ **Not sure?** Start with PAT, you can upgrade to GitHub App later without changing the workflow file
 
 ---
 
@@ -80,23 +88,19 @@ gh secret set DEP_UPDATER_TOKEN --org YOUR_ORG
 
 ### Step 3: Generate Workflow File (1 minute)
 
-#### Without AI (Recommended to start)
-
 ```bash
 npx @smoothbricks/dep-updater generate-workflow
 ```
 
-This creates `.github/workflows/update-deps.yml` configured for PAT authentication.
+This creates `.github/workflows/update-deps.yml` with runtime auth detection. The workflow will automatically use PAT
+authentication since you have `DEP_UPDATER_TOKEN` configured.
 
-#### With AI Changelog Analysis
+**AI Changelog Analysis** is enabled by default using the free OpenCode provider. To disable AI:
 
-```bash
-# First, add ANTHROPIC_API_KEY to your org secrets
-gh secret set ANTHROPIC_API_KEY --org YOUR_ORG
+- Set repository variable `DEP_UPDATER_SKIP_AI=true`, or
+- Regenerate with `--skip-ai` flag
 
-# Then generate workflow with AI enabled
-npx @smoothbricks/dep-updater generate-workflow --enable-ai
-```
+**Premium AI providers:** Add your API key secret (e.g., `ANTHROPIC_API_KEY`) to use Anthropic, OpenAI, or Google.
 
 ### Step 4: Commit and Push (1 minute)
 
@@ -302,16 +306,15 @@ In each repository where you want to run dep-updater:
 
 ```bash
 cd /path/to/your/repository
-npx @smoothbricks/dep-updater generate-workflow --auth-type github-app
+npx @smoothbricks/dep-updater generate-workflow
 ```
 
-With AI enabled:
+This creates `.github/workflows/update-deps.yml` with runtime auth detection. The workflow will automatically use GitHub
+App authentication since you have `DEP_UPDATER_APP_ID` configured.
 
-```bash
-npx @smoothbricks/dep-updater generate-workflow --auth-type github-app --enable-ai
-```
+**AI Changelog Analysis** is enabled by default using the free OpenCode provider. To disable:
 
-This creates `.github/workflows/update-deps.yml` with the correct configuration.
+- Set repository variable `DEP_UPDATER_SKIP_AI=true`
 
 #### 4.2 Commit and Push
 
@@ -474,17 +477,19 @@ npx @smoothbricks/dep-updater init
 
 ## Upgrading from PAT to GitHub App
 
-Already using PAT and want to upgrade? Easy:
+Already using PAT and want to upgrade? With the unified workflow, **no regeneration needed**:
 
-1. Follow [GitHub App Setup](#option-b-github-app-setup-15-20-minutes) above
-2. Regenerate workflow with new auth type:
-   ```bash
-   dep-updater generate-workflow --auth-type github-app
-   ```
-3. Commit and push the updated workflow
-4. Delete old `DEP_UPDATER_TOKEN` secret (optional, but recommended for cleanup)
+1. Follow [GitHub App Setup](#option-b-github-app-setup-15-20-minutes) steps 1-3 (create app, install, add secrets)
+2. Add the organization variable: `DEP_UPDATER_APP_ID`
+3. Add the organization secret: `DEP_UPDATER_APP_PRIVATE_KEY`
+4. **That's it!** The workflow will automatically use GitHub App on next run
 
-The workflow will now use GitHub App authentication with all its benefits.
+The workflow detects auth method at runtime:
+
+- If `DEP_UPDATER_APP_ID` is set → GitHub App (priority)
+- Otherwise → PAT fallback
+
+**Optional cleanup:** Delete old `DEP_UPDATER_TOKEN` secret after confirming GitHub App works.
 
 ## Security Best Practices
 
