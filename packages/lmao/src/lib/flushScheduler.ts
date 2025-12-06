@@ -7,7 +7,7 @@
  * - Background processing (cold path)
  */
 
-import type { SpanBuffer } from '@smoothbricks/arrow-builder';
+import type { SpanBuffer } from './types.js';
 import { convertSpanTreeToArrowTable, type StringInterner } from '@smoothbricks/arrow-builder';
 import type * as arrow from 'apache-arrow';
 

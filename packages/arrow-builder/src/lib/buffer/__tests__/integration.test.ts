@@ -1,7 +1,6 @@
 import { describe, it, expect } from 'bun:test';
 import { createAttributeColumns } from '../createBuilders.js';
-import { createSpanBuffer } from '../createSpanBuffer.js';
-import { defineTagAttributes, S } from '@smoothbricks/lmao';
+import { createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
 import type { TaskContext } from '../types.js';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
 

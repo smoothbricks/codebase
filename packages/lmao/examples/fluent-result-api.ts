@@ -5,11 +5,14 @@
  * with automatic span lifecycle tracking (span-start, span-ok, span-err, span-exception)
  */
 
-import { createModuleContext, createRequestContext } from '../src/lib/lmao.js';
-import { defineTagAttributes } from '../src/lib/schema/defineTagAttributes.js';
-import { defineFeatureFlags } from '../src/lib/schema/defineFeatureFlags.js';
-import { InMemoryFlagEvaluator } from '../src/lib/schema/evaluator.js';
-import { S } from '../src/lib/schema/builder.js';
+import { 
+  createModuleContext,
+  createRequestContext,
+  defineTagAttributes,
+  defineFeatureFlags,
+  InMemoryFlagEvaluator,
+  S
+} from '../src/index.js';
 
 // Define schema for user management operations
 const userSchema = defineTagAttributes({

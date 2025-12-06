@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach } from 'bun:test';
-import type { BufferCapacityStats } from '@smoothbricks/arrow-builder';
+import type { BufferCapacityStats } from '../types.js';
 
 /**
  * Mock implementation of shouldTuneCapacity for testing

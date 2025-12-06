@@ -10,7 +10,7 @@
  */
 
 import { describe, test, expect, beforeEach } from 'bun:test';
-import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from '../createSpanBuffer.js';
+import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from '@smoothbricks/lmao';
 import { convertToArrowTable, convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import type { SpanBuffer, TaskContext, ModuleContext } from '../types.js';
 import type { TagAttributeSchema } from '../../schema-types.js';

@@ -20,16 +20,32 @@ export interface StringInterner {
 }
 
 /**
+ * System column builder function type
+ * Allows lmao package to inject its own system columns (trace_id, span_id, etc.)
+ * while keeping arrow-builder generic.
+ */
+export type SystemColumnBuilder = (
+  buffer: SpanBuffer,
+  buffers: SpanBuffer[],
+  totalRows: number
+) => { fields: arrow.Field[]; vectors: arrow.Vector[] };
+
+/**
  * Convert SpanBuffer to Apache Arrow Table
  * 
  * This is a cold-path operation that happens in background processing.
  * It creates a queryable Arrow table from the hot-path columnar buffers.
+ * 
+ * NOTE: This function currently includes lmao-specific system columns (trace_id, span_id, etc.)
+ * for backward compatibility. Future versions should move these to the lmao package
+ * via the optional systemColumnBuilder parameter.
  * 
  * @param buffer - SpanBuffer to convert
  * @param categoryInterner - String interner for category columns
  * @param textStorage - Text string storage (no interning)
  * @param moduleIdInterner - Module ID interner
  * @param spanNameInterner - Span name interner
+ * @param systemColumnBuilder - Optional function to add system columns (lmao-specific)
  * @returns Apache Arrow Table
  */
 export function convertToArrowTable(
@@ -37,7 +53,8 @@ export function convertToArrowTable(
   categoryInterner: StringInterner,
   textStorage: StringInterner,
   moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner
+  spanNameInterner: StringInterner,
+  systemColumnBuilder?: SystemColumnBuilder
 ): arrow.Table {
   // Collect all buffers in the chain
   const buffers: SpanBuffer[] = [];
@@ -59,15 +76,24 @@ export function convertToArrowTable(
   // Build Arrow schema from buffer columns
   const schema = buffer.task.module.tagAttributes;
   const fields: arrow.Field[] = [];
+  let systemVectors: arrow.Vector[] = [];
   
-  // Core system columns (always present)
-  fields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampNanosecond() }));
-  fields.push(arrow.Field.new({ name: 'trace_id', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
-  fields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint64() }));
-  fields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint64(), nullable: true }));
-  fields.push(arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()) }));
-  fields.push(arrow.Field.new({ name: 'module', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
-  fields.push(arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
+  // Use custom system column builder if provided, otherwise use default lmao-specific columns
+  if (systemColumnBuilder) {
+    const systemColumns = systemColumnBuilder(buffer, buffers, totalRows);
+    fields.push(...systemColumns.fields);
+    systemVectors = systemColumns.vectors;
+  } else {
+    // DEPRECATED: Default lmao-specific system columns for backward compatibility
+    // These should be provided via systemColumnBuilder parameter in future
+    fields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampNanosecond() }));
+    fields.push(arrow.Field.new({ name: 'trace_id', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
+    fields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint64() }));
+    fields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint64(), nullable: true }));
+    fields.push(arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()) }));
+    fields.push(arrow.Field.new({ name: 'module', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
+    fields.push(arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
+  }
   
   // Add attribute columns from schema
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
@@ -130,122 +156,13 @@ export function convertToArrowTable(
   // Build vectors from buffers
   const vectors: arrow.Vector[] = [];
   
-  // Timestamp vector (microseconds, not nanoseconds - Arrow uses microseconds for TimestampMicrosecond)
-  const timestampBuilder = arrow.makeBuilder({
-    type: new arrow.TimestampNanosecond(),
-    nullValues: [null]
-  });
-  
-  for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      // Convert milliseconds to nanoseconds
-      const timestampMs = buf.timestamps[i];
-      const timestampNs = Math.floor(timestampMs * 1_000_000); // ms to ns
-      timestampBuilder.append(timestampNs);
-    }
+  // Add system column vectors (either from systemColumnBuilder or default lmao-specific ones)
+  if (systemColumnBuilder) {
+    vectors.push(...systemVectors);
+  } else {
+    // DEPRECATED: Build default lmao-specific system column vectors for backward compatibility
+    buildDefaultSystemVectors(buffers, vectors, moduleIdInterner, spanNameInterner);
   }
-  vectors.push(timestampBuilder.finish().toVector());
-  
-  // Trace ID vector (dictionary encoded)
-  const traceIdBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
-    nullValues: [null]
-  });
-  
-  for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      traceIdBuilder.append(buf.traceId);
-    }
-  }
-  vectors.push(traceIdBuilder.finish().toVector());
-  
-  // Span ID vector
-  const spanIdBuilder = arrow.makeBuilder({
-    type: new arrow.Uint64(),
-    nullValues: [null]
-  });
-  
-  for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      spanIdBuilder.append(BigInt(buf.spanId));
-    }
-  }
-  vectors.push(spanIdBuilder.finish().toVector());
-  
-  // Parent span ID vector (nullable)
-  const parentSpanIdBuilder = arrow.makeBuilder({
-    type: new arrow.Uint64(),
-    nullValues: [null]
-  });
-  
-  for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      if (buf.parent) {
-        parentSpanIdBuilder.append(BigInt(buf.parent.spanId));
-      } else {
-        parentSpanIdBuilder.append(null);
-      }
-    }
-  }
-  vectors.push(parentSpanIdBuilder.finish().toVector());
-  
-  // Entry type vector (dictionary with entry type names)
-  const entryTypeNames = [
-    'ff-access',      // 1
-    'ff-usage',       // 2
-    'tag',            // 3
-    'message',        // 4
-    'span-start',     // 5
-    'span-ok',        // 6
-    'span-err',       // 7
-    'span-exception', // 8
-    'info',           // 9
-    'debug',          // 10
-    'warn',           // 11
-    'error'           // 12
-  ];
-  
-  const entryTypeBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()),
-    nullValues: [null]
-  });
-  
-  for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      const entryTypeCode = buf.operations[i];
-      const entryTypeName = entryTypeNames[entryTypeCode - 1] || 'unknown';
-      entryTypeBuilder.append(entryTypeName);
-    }
-  }
-  vectors.push(entryTypeBuilder.finish().toVector());
-  
-  // Module vector (dictionary from moduleIdInterner)
-  const moduleBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
-    nullValues: [null]
-  });
-  
-  for (const buf of buffers) {
-    const moduleName = moduleIdInterner.getString(buf.task.module.moduleId);
-    for (let i = 0; i < buf.writeIndex; i++) {
-      moduleBuilder.append(moduleName || 'unknown');
-    }
-  }
-  vectors.push(moduleBuilder.finish().toVector());
-  
-  // Span name vector (dictionary from spanNameInterner)
-  const spanNameBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
-    nullValues: [null]
-  });
-  
-  for (const buf of buffers) {
-    const spanName = spanNameInterner.getString(buf.task.spanNameId);
-    for (let i = 0; i < buf.writeIndex; i++) {
-      spanNameBuilder.append(spanName || 'unknown');
-    }
-  }
-  vectors.push(spanNameBuilder.finish().toVector());
   
   // Attribute columns
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
@@ -439,15 +356,159 @@ function isRowNonNull(nullBitmap: Uint8Array | undefined, rowIndex: number): boo
 }
 
 /**
+ * Build default lmao-specific system column vectors
+ * 
+ * DEPRECATED: This should be moved to the lmao package. It's kept here for
+ * backward compatibility until lmao provides its own systemColumnBuilder.
+ * 
+ * @param buffers - Array of SpanBuffers to convert
+ * @param vectors - Array to append vectors to
+ * @param moduleIdInterner - Module ID string interner
+ * @param spanNameInterner - Span name string interner
+ */
+function buildDefaultSystemVectors(
+  buffers: SpanBuffer[],
+  vectors: arrow.Vector[],
+  moduleIdInterner: StringInterner,
+  spanNameInterner: StringInterner
+): void {
+  // Timestamp vector (microseconds, not nanoseconds - Arrow uses microseconds for TimestampMicrosecond)
+  const timestampBuilder = arrow.makeBuilder({
+    type: new arrow.TimestampNanosecond(),
+    nullValues: [null]
+  });
+  
+  for (const buf of buffers) {
+    for (let i = 0; i < buf.writeIndex; i++) {
+      // Convert milliseconds to nanoseconds
+      const timestampMs = buf.timestamps[i];
+      const timestampNs = Math.floor(timestampMs * 1_000_000); // ms to ns
+      timestampBuilder.append(timestampNs);
+    }
+  }
+  vectors.push(timestampBuilder.finish().toVector());
+  
+  // Trace ID vector (dictionary encoded)
+  const traceIdBuilder = arrow.makeBuilder({
+    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    nullValues: [null]
+  });
+  
+  for (const buf of buffers) {
+    for (let i = 0; i < buf.writeIndex; i++) {
+      traceIdBuilder.append(buf.traceId);
+    }
+  }
+  vectors.push(traceIdBuilder.finish().toVector());
+  
+  // Span ID vector
+  const spanIdBuilder = arrow.makeBuilder({
+    type: new arrow.Uint64(),
+    nullValues: [null]
+  });
+  
+  for (const buf of buffers) {
+    for (let i = 0; i < buf.writeIndex; i++) {
+      spanIdBuilder.append(BigInt(buf.spanId));
+    }
+  }
+  vectors.push(spanIdBuilder.finish().toVector());
+  
+  // Parent span ID vector (nullable)
+  const parentSpanIdBuilder = arrow.makeBuilder({
+    type: new arrow.Uint64(),
+    nullValues: [null]
+  });
+  
+  for (const buf of buffers) {
+    for (let i = 0; i < buf.writeIndex; i++) {
+      if (buf.parent) {
+        parentSpanIdBuilder.append(BigInt(buf.parent.spanId));
+      } else {
+        parentSpanIdBuilder.append(null);
+      }
+    }
+  }
+  vectors.push(parentSpanIdBuilder.finish().toVector());
+  
+  // Entry type vector (dictionary with entry type names)
+  const entryTypeNames = [
+    'ff-access',      // 1
+    'ff-usage',       // 2
+    'tag',            // 3
+    'message',        // 4
+    'span-start',     // 5
+    'span-ok',        // 6
+    'span-err',       // 7
+    'span-exception', // 8
+    'info',           // 9
+    'debug',          // 10
+    'warn',           // 11
+    'error'           // 12
+  ];
+  
+  const entryTypeBuilder = arrow.makeBuilder({
+    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()),
+    nullValues: [null]
+  });
+  
+  for (const buf of buffers) {
+    for (let i = 0; i < buf.writeIndex; i++) {
+      const entryTypeCode = buf.operations[i];
+      const entryTypeName = entryTypeNames[entryTypeCode - 1] || 'unknown';
+      entryTypeBuilder.append(entryTypeName);
+    }
+  }
+  vectors.push(entryTypeBuilder.finish().toVector());
+  
+  // Module vector (dictionary from moduleIdInterner)
+  const moduleBuilder = arrow.makeBuilder({
+    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    nullValues: [null]
+  });
+  
+  for (const buf of buffers) {
+    const moduleName = moduleIdInterner.getString(buf.task.module.moduleId);
+    for (let i = 0; i < buf.writeIndex; i++) {
+      moduleBuilder.append(moduleName || 'unknown');
+    }
+  }
+  vectors.push(moduleBuilder.finish().toVector());
+  
+  // Span name vector (dictionary from spanNameInterner)
+  const spanNameBuilder = arrow.makeBuilder({
+    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    nullValues: [null]
+  });
+  
+  for (const buf of buffers) {
+    const spanName = spanNameInterner.getString(buf.task.spanNameId);
+    for (let i = 0; i < buf.writeIndex; i++) {
+      spanNameBuilder.append(spanName || 'unknown');
+    }
+  }
+  vectors.push(spanNameBuilder.finish().toVector());
+}
+
+/**
  * Convert SpanBuffer tree to Arrow Table (includes child spans)
  * Recursively collects all spans in the tree
+ * 
+ * @param rootBuffer - Root span buffer
+ * @param categoryInterner - Category string interner
+ * @param textStorage - Text string storage
+ * @param moduleIdInterner - Module ID interner
+ * @param spanNameInterner - Span name interner
+ * @param systemColumnBuilder - Optional system column builder (lmao-specific)
+ * @returns Arrow Table containing all spans in tree
  */
 export function convertSpanTreeToArrowTable(
   rootBuffer: SpanBuffer,
   categoryInterner: StringInterner,
   textStorage: StringInterner,
   moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner
+  spanNameInterner: StringInterner,
+  systemColumnBuilder?: SystemColumnBuilder
 ): arrow.Table {
   // Collect all buffers in tree (depth-first)
   const allBuffers: SpanBuffer[] = [];
@@ -471,7 +532,8 @@ export function convertSpanTreeToArrowTable(
       categoryInterner,
       textStorage,
       moduleIdInterner,
-      spanNameInterner
+      spanNameInterner,
+      systemColumnBuilder
     );
     
     if (table.numRows > 0) {

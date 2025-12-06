@@ -11,7 +11,7 @@ import {
   type GetBufferWithSpaceFn,
 } from '../spanLoggerGenerator.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
-import type { SpanBuffer, ModuleContext, TaskContext } from '@smoothbricks/arrow-builder';
+import type { SpanBuffer, ModuleContext, TaskContext } from '../../types.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
 import { S } from '../../schema/builder.js';
 

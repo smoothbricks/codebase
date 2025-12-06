@@ -10,13 +10,13 @@
  */
 
 import { 
-  createRequestContext, 
-  createModuleContext
-} from '../src/lib/lmao.js';
-import { defineTagAttributes } from '../src/lib/schema/defineTagAttributes.js';
-import { defineFeatureFlags } from '../src/lib/schema/defineFeatureFlags.js';
-import { InMemoryFlagEvaluator } from '../src/lib/schema/evaluator.js';
-import { S } from '../src/lib/schema/builder.js';
+  createRequestContext,
+  createModuleContext,
+  defineTagAttributes,
+  defineFeatureFlags,
+  InMemoryFlagEvaluator,
+  S
+} from '../src/index.js';
 
 // ====================
 // Schema Definition

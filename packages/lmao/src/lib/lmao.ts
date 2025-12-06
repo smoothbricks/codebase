@@ -11,8 +11,8 @@
 import type { TagAttributeSchema, InferTagAttributes } from './schema/types.js';
 import type { FeatureFlagSchema, InferFeatureFlags, EvaluationContext } from './schema/defineFeatureFlags.js';
 import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from './schema/evaluator.js';
-import type { SpanBuffer, ModuleContext, TaskContext, BufferCapacityStats } from '@smoothbricks/arrow-builder';
-import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from '@smoothbricks/arrow-builder';
+import type { SpanBuffer, ModuleContext, TaskContext, BufferCapacityStats } from './types.js';
+import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from './spanBuffer.js';
 import { createSpanLoggerClass, type BaseSpanLogger } from './codegen/spanLoggerGenerator.js';
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
 
@@ -274,18 +274,15 @@ export interface RequestContext<
   FF extends FeatureFlagSchema = FeatureFlagSchema,
   Env = Record<string, unknown>
 > {
-  requestId: string;
-  userId?: string;
-  traceId: string;
+  readonly requestId: string;
+  readonly userId?: string;
+  readonly traceId: string;
   
   // Feature flag evaluator (buffer reference set later by task wrapper)
-  ff: FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
+  readonly ff: FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
   
   // Environment config (just plain object, no tracking)
-  env: Env;
-  
-  // Additional context fields
-  [key: string]: unknown;
+  readonly env: Env;
 }
 
 /**
@@ -324,7 +321,8 @@ export function createRequestContext<
   ) as FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
   
   return {
-    ...params,
+    requestId: params.requestId,
+    userId: params.userId,
     traceId: generateTraceId(),
     ff: ffEvaluator,
     env: environmentConfig,
@@ -410,19 +408,19 @@ export interface SpanLogger<T extends TagAttributeSchema> {
  * Span context provided to task functions
  * Contains logging API, feature flags, environment, and span operations
  */
+/**
+ * Span context extends RequestContext with logging and span methods
+ * 
+ * This is what's provided to task functions and child spans.
+ * It includes all RequestContext properties plus logging capabilities.
+ */
 export interface SpanContext<
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema,
   Env = Record<string, unknown>
-> {
-  // Logging API
+> extends RequestContext<FF, Env> {
+  // Logging API (adds to RequestContext)
   log: SpanLogger<T>;
-  
-  // Feature flags (with buffer reference set)
-  ff: FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
-  
-  // Environment config
-  env: Env;
   
   // Result helpers with fluent API
   ok<V>(value: V): FluentSuccessResult<V, T>;
@@ -431,9 +429,6 @@ export interface SpanContext<
   // Child span creation
   // The span can return any type R, and TypeScript will infer it from the child function
   span<R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R>;
-  
-  // Additional request context fields
-  [key: string]: unknown;
 }
 
 /**

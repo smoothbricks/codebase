@@ -2,6 +2,9 @@
 export * from './lib/lmao.js';
 export type { Result, SuccessResult, ErrorResult } from './lib/lmao.js';
 
+// LMAO types (SpanBuffer, ModuleContext, TaskContext)
+export * from './lib/types.js';
+
 // Schema system
 export * from './lib/schema/types.js';
 export * from './lib/schema/builder.js';
@@ -13,6 +16,9 @@ export * from './lib/schema/typeGuards.js';
 
 // Library integration
 export * from './lib/library.js';
+
+// SpanBuffer creation (lmao-specific buffer management)
+export * from './lib/spanBuffer.js';
 
 // Code generation (re-export BaseSpanLogger only, ChainableTagAPI already exported from lmao.js)
 export type { BaseSpanLogger } from './lib/codegen/spanLoggerGenerator.js';

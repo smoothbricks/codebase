@@ -14,18 +14,16 @@
 import { 
   createRequestContext, 
   createModuleContext,
-  FlushScheduler
-} from '../src/lib/lmao.js';
-import { defineTagAttributes } from '../src/lib/schema/defineTagAttributes.js';
-import { defineFeatureFlags } from '../src/lib/schema/defineFeatureFlags.js';
-import { InMemoryFlagEvaluator } from '../src/lib/schema/evaluator.js';
-import { S } from '../src/lib/schema/builder.js';
-import {
+  FlushScheduler,
+  defineTagAttributes,
+  defineFeatureFlags,
+  InMemoryFlagEvaluator,
+  S,
   categoryInterner,
   textStringStorage,
   moduleIdInterner,
   spanNameInterner
-} from '../src/lib/lmao.js';
+} from '../src/index.js';
 
 // ====================
 // 1. Define Tag Attributes

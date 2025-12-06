@@ -9,6 +9,9 @@ import type { TagAttributeSchema } from '../schema-types.js';
  * Arrow table conversion happens in cold path (background processing).
  * 
  * NOTE: This is a generic buffer structure that lmao will extend for span-specific use.
+ * 
+ * TODO (future optimization): Consider lazy column initialization with getters
+ * to only allocate memory for columns actually used. See GitHub review comment.
  */
 export interface ColumnBuffer {
   // Core columns - always present

@@ -10,7 +10,7 @@
 
 import type { TagAttributeSchema, InferTagAttributes } from '../schema/types.js';
 import { getSchemaFields } from '../schema/types.js';
-import type { SpanBuffer } from '@smoothbricks/arrow-builder';
+import type { SpanBuffer } from '../types.js';
 
 /**
  * String interner interface for category columns

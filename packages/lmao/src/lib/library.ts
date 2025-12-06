@@ -72,38 +72,54 @@ export function prefixSchema<T extends TagAttributeSchema>(
 }
 
 /**
+ * Extract schema fields from extended schema
+ * Removes validation methods added by defineTagAttributes
+ */
+type ExtractSchemaFields<T> = {
+  [K in keyof T as T[K] extends Function ? never : K]: T[K];
+};
+
+/**
  * Create a library module with clean schema
  * Library authors use this to define their module
+ * 
+ * Accepts both plain TagAttributeSchema and extended schemas from defineTagAttributes
  * 
  * @param options - Library metadata, schema, and operations
  * @returns Library module with operations
  */
 export function createLibraryModule<
-  T extends TagAttributeSchema,
+  T,
   FF extends FeatureFlagSchema = FeatureFlagSchema,
   Env = Record<string, unknown>,
-  Ops extends Record<string, LibraryOperation<any[], any, T, FF, Env>> = Record<string, LibraryOperation<any[], any, T, FF, Env>>
+  SchemaFields = ExtractSchemaFields<T>,
+  Ops extends Record<string, LibraryOperation<any[], any, TagAttributeSchema, FF, Env>> = Record<string, LibraryOperation<any[], any, TagAttributeSchema, FF, Env>>
 >(options: {
   gitSha: string;
   filePath: string;
   moduleName?: string;
   schema: T;
   operations?: Ops;
-}): LibraryModule<T, FF, Env, Ops> {
+}): LibraryModule<SchemaFields & TagAttributeSchema, FF, Env, Ops> {
+  // Extract just the schema fields (without validation methods)
+  const schemaFields = getSchemaFields(options.schema as any);
+  const cleanSchema: TagAttributeSchema = {};
+  for (const [fieldName, fieldSchema] of schemaFields) {
+    cleanSchema[fieldName] = fieldSchema;
+  }
+  
   // Create module context with clean schema (no prefix yet)
-  // Note: createModuleContext defaults to FeatureFlagSchema and Record<string, unknown>
-  // but the actual FF and Env types will be provided by the application at runtime
-  const moduleContext = createModuleContext<typeof options.schema, T, FF, Env>({
+  const moduleContext = createModuleContext<typeof cleanSchema, SchemaFields & TagAttributeSchema, FF, Env>({
     moduleMetadata: {
       gitSha: options.gitSha,
       filePath: options.filePath,
       moduleName: options.moduleName || options.filePath,
     },
-    tagAttributes: options.schema,
+    tagAttributes: cleanSchema,
   });
   
   return {
-    schema: options.schema,
+    schema: cleanSchema as SchemaFields & TagAttributeSchema,
     operations: (options.operations || {}) as Ops,
     task: moduleContext.task,
   };

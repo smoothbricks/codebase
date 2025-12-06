@@ -13,11 +13,14 @@
  * Key Feature: All tag methods return the tag object for fluent chaining!
  */
 
-import { S } from '../src/lib/schema/builder.js';
-import { defineTagAttributes } from '../src/lib/schema/defineTagAttributes.js';
-import { defineFeatureFlags } from '../src/lib/schema/defineFeatureFlags.js';
-import { InMemoryFlagEvaluator } from '../src/lib/schema/evaluator.js';
-import { createRequestContext, createModuleContext } from '../src/lib/lmao.js';
+import { 
+  S,
+  defineTagAttributes,
+  defineFeatureFlags,
+  InMemoryFlagEvaluator,
+  createRequestContext,
+  createModuleContext
+} from '../src/index.js';
 
 // 1. Define tag attributes for your domain
 // Using the three string types per specs/01a_trace_schema_system.md:

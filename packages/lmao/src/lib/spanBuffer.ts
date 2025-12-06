@@ -1,32 +1,20 @@
 /**
- * Create SpanBuffer with native TypedArrays
+ * SpanBuffer creation functions for LMAO trace logging
+ * 
+ * These functions extend the generic ColumnBuffer from arrow-builder
+ * with span-specific fields (spanId, traceId, parent, children, task).
  * 
  * Per specs/01b_columnar_buffer_architecture.md:
- * - Cache-aligned TypedArrays (64-byte boundaries)
- * - Null bitmap management (one Uint8Array per nullable column per Arrow spec)
- * - Per-span buffers (no traceId/spanId arrays needed)
- * - Direct TypedArray writes in hot path
- * - Arrow conversion in cold path (background processing)
+ * - Each span gets its own buffer
+ * - traceId and spanId are constant per buffer (stored as properties)
+ * - Buffer chaining handles overflow gracefully
  */
 
-import type { SpanBuffer, TaskContext, TypedArray } from './types.js';
-import type { TagAttributeSchema } from '../schema-types.js';
-import { createAttributeColumns } from './createBuilders.js';
+import type { SpanBuffer, TaskContext } from './types.js';
+import type { TagAttributeSchema } from './schema/types.js';
+import { createColumnBuffer } from '@smoothbricks/arrow-builder';
 
 let nextGlobalSpanId = 1;
-
-/**
- * Get cache-aligned capacity
- * 
- * Aligns to 64-byte cache line boundaries for optimal CPU performance.
- * Uses 1-byte element size (worst case) to ensure ALL array types are aligned.
- */
-function getCacheAlignedCapacity(elementCount: number): number {
-  const CACHE_LINE_SIZE = 64; // Cache line size in bytes
-  const totalBytes = elementCount * 1; // Use 1 byte (worst case - Uint8Array)
-  const alignedBytes = Math.ceil(totalBytes / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
-  return alignedBytes; // Return byte count which becomes element count for Uint8Array
-}
 
 /**
  * Create empty SpanBuffer with native TypedArrays
@@ -52,42 +40,17 @@ export function createEmptySpanBuffer(
   parentBuffer?: SpanBuffer,
   requestedCapacity: number = 64
 ): SpanBuffer {
-  // Cache-align capacity for all arrays
-  const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
+  // Create generic column buffer first
+  const columnBuffer = createColumnBuffer(schema, requestedCapacity);
   
-  // Create core columns
-  const timestamps = new Float64Array(alignedCapacity);
-  const operations = new Uint8Array(alignedCapacity);
-  
-  // Create null bitmaps - one Uint8Array per nullable column (Arrow format)
-  // Each bitmap stores 8 rows per byte (1 bit per row)
-  // Length = Math.ceil(alignedCapacity / 8) bytes
-  const nullBitmaps: Record<`attr_${string}`, Uint8Array> = {};
-  const bitmapByteLength = Math.ceil(alignedCapacity / 8);
-  
-  for (const fieldName of Object.keys(schema)) {
-    const columnName = `attr_${fieldName}` as `attr_${string}`;
-    nullBitmaps[columnName] = new Uint8Array(bitmapByteLength);
-  }
-  
-  // Create attribute columns from schema
-  const attributeColumns = createAttributeColumns(schema, alignedCapacity);
-  
-  // Type-safe spread of attribute columns
-  // We know attributeColumns has keys like attr_${string}, which matches SpanBuffer's index signature
+  // Extend with span-specific fields
   const buffer: SpanBuffer = {
+    ...columnBuffer,
     spanId,
     traceId, // TraceId from request context (constant across all spans in trace)
-    timestamps,
-    operations,
-    nullBitmaps,
-    ...(attributeColumns as Record<`attr_${string}`, TypedArray>),
     children: [],
     parent: parentBuffer,
     task: taskContext,
-    writeIndex: 0,
-    capacity: requestedCapacity, // Logical capacity for overflow detection
-    next: undefined
   };
   
   taskContext.module.spanBufferCapacityStats.totalBuffersCreated++;
@@ -100,17 +63,36 @@ export function createEmptySpanBuffer(
  * 
  * @param schema - Tag attribute schema
  * @param taskContext - Task context with module metadata
- * @param traceId - Trace ID from request context
+ * @param traceId - Trace ID from request context (defaults to auto-generated if not provided)
  * @param capacity - Optional buffer capacity
  */
 export function createSpanBuffer(
   schema: TagAttributeSchema,
   taskContext: TaskContext,
-  traceId: string,
+  traceId?: string | number,
   capacity?: number
 ): SpanBuffer {
   const spanId = nextGlobalSpanId++;
-  return createEmptySpanBuffer(spanId, traceId, schema, taskContext, undefined, capacity);
+  
+  // Handle the case where traceId might be a number (capacity) or omitted
+  let actualTraceId: string;
+  let actualCapacity: number | undefined;
+  
+  if (typeof traceId === 'number') {
+    // traceId was omitted, this is actually the capacity
+    actualCapacity = traceId;
+    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  } else if (traceId === undefined) {
+    // Both traceId and capacity omitted
+    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    actualCapacity = capacity;
+  } else {
+    // Normal case: traceId provided as string
+    actualTraceId = traceId;
+    actualCapacity = capacity;
+  }
+  
+  return createEmptySpanBuffer(spanId, actualTraceId, schema, taskContext, undefined, actualCapacity);
 }
 
 /**

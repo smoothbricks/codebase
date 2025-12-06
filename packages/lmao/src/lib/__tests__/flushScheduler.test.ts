@@ -9,8 +9,8 @@ import {
   type FlushMetadata,
   type FlushSchedulerConfig,
 } from '../flushScheduler.js';
-import type { SpanBuffer, ModuleContext, TaskContext } from '@smoothbricks/arrow-builder';
-import type { StringInterner } from '../../../../arrow-builder/src/lib/buffer/convertToArrow.js';
+import type { SpanBuffer, ModuleContext, TaskContext } from '../types.js';
+import type { StringInterner } from '@smoothbricks/arrow-builder';
 
 // Mock StringInterner
 class MockStringInterner implements StringInterner {

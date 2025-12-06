@@ -156,7 +156,7 @@ describe('createLibraryModule', () => {
       expect(typeof module.task).toBe('function');
     });
 
-    it('should preserve schema reference in module', () => {
+    it('should extract schema fields without validation methods', () => {
       const schema = defineTagAttributes({
         field: S.text(),
       });
@@ -168,7 +168,14 @@ describe('createLibraryModule', () => {
         schema,
       });
 
-      expect(module.schema).toBe(schema);
+      // Schema should have the field
+      expect(module.schema.field).toBeDefined();
+      expect(module.schema.field).toBe(schema.field);
+      
+      // But should NOT have validation methods (those are stripped)
+      expect((module.schema as any).validate).toBeUndefined();
+      expect((module.schema as any).parse).toBeUndefined();
+      expect((module.schema as any).safeParse).toBeUndefined();
     });
 
     it('should create module with operations object', () => {
