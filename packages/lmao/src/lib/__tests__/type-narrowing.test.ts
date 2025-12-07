@@ -12,7 +12,7 @@ import { S } from '../schema/builder.js';
 
 const testSchema = defineTagAttributes({
   userId: S.category(),
-  errorCode: S.category(),
+  customField: S.category(),
 });
 
 const testFlags = defineFeatureFlags({

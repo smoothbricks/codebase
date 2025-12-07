@@ -45,7 +45,7 @@ function getArrayConstructorForField(
     const enumValues = schemaWithMetadata.__lmao_enum_values;
     const enumCount = enumValues?.length ?? 0;
     
-    // Uint8Array can hold 0-255 (256 values total)
+    // Uint8Array can hold 0-255 indices (256 values total)
     if (enumCount === 0 || enumCount <= 256) {
       return new Uint8Array(alignedCapacity);
     } else if (enumCount <= 65536) {

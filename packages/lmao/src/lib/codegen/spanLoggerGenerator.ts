@@ -215,12 +215,23 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
     generateAttributeWriter(fieldName, fieldSchema, enumFieldNames.has(fieldName))
   );
   
+  // Create schema type map for runtime type detection in scope()
+  const schemaTypeMap = Object.fromEntries(
+    schemaFields.map(([fieldName, fieldSchema]) => {
+      const schemaWithMetadata = fieldSchema as { __lmao_type?: string };
+      return [fieldName, schemaWithMetadata.__lmao_type || 'unknown'];
+    })
+  );
+  
   // Generate the complete class
   const classCode = `
 (function() {
   'use strict';
   
   ${enumMappings.join('\n')}
+  
+  // Schema type map for runtime type detection
+  const SCHEMA_TYPES = ${JSON.stringify(schemaTypeMap)};
   
   class ${className} {
     constructor(buffer, categoryInterner, textStorage, getBufferWithSpace, initialScopedAttributes = {}) {
@@ -306,12 +317,21 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
         const column = this._buffer[columnName];
         
         if (column && value !== null && value !== undefined) {
-          // Process value based on type
+          // Process value based on schema type (not TypedArray type)
           let processedValue = value;
+          const fieldType = SCHEMA_TYPES[key];
           
-          // For category types, intern the string
-          if (typeof value === 'string' && column instanceof Uint32Array) {
-            processedValue = this._categoryInterner.intern(value);
+          if (typeof value === 'string') {
+            // Category: intern the string
+            if (fieldType === 'category') {
+              processedValue = this._categoryInterner.intern(value);
+            }
+            // Text: store without interning
+            else if (fieldType === 'text') {
+              processedValue = this._textStorage.store(value);
+            }
+            // Enum: should use the enum method instead, but handle gracefully
+            // (this shouldn't happen in normal usage since enums are compile-time)
           }
           
           this._scopedAttributes[key] = processedValue;

@@ -64,14 +64,14 @@ function createTypedArrayForSchema(
     if (enumCount === 0) {
       // No enum values specified, default to Uint8Array
       return new Uint8Array(capacity);
-    } else if (enumCount <= 255) {
-      // 0-255 values: Uint8Array (1 byte)
+    } else if (enumCount <= 256) {
+      // 0-255 indices (256 values total): Uint8Array (1 byte)
       return new Uint8Array(capacity);
-    } else if (enumCount <= 65535) {
-      // 256-65535 values: Uint16Array (2 bytes)
+    } else if (enumCount <= 65536) {
+      // 256-65535 indices (65536 values total): Uint16Array (2 bytes)
       return new Uint16Array(capacity);
     } else {
-      // >65535 values: Uint32Array (4 bytes)
+      // >65536 values: Uint32Array (4 bytes)
       return new Uint32Array(capacity);
     }
   }
@@ -115,6 +115,8 @@ export function getTypedArrayConstructor(
   if (lmaoType === 'enum') return Uint8Array;
   if (lmaoType === 'category') return Uint32Array;
   if (lmaoType === 'text') return Uint32Array;
+  if (lmaoType === 'number') return Float64Array;
+  if (lmaoType === 'boolean') return Uint8Array;
   
   // Default for unknown types
   return Uint32Array;

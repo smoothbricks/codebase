@@ -57,9 +57,14 @@ const apiModule = createModuleContext({
 });
 
 // ====================
-// Simulated Express Request/Response
+// Simulated Express Request/Response with Proper Typing
 // ====================
 
+// Define RequestContext type we'll attach
+// ✅ Use typeof featureFlags.schema to get the FeatureFlagSchema type
+type LmaoRequestContext = ReturnType<typeof createRequestContext<typeof featureFlags.schema, Record<string, unknown>>>;
+
+// Extend Request interface using declaration merging (proper TypeScript pattern)
 interface Request {
   id: string;
   method: string;
@@ -67,6 +72,8 @@ interface Request {
   user?: { id: string };
   headers: { [key: string]: string };
   ip: string;
+  // ✅ PROPER WAY: Extend the interface instead of using (as any)
+  ctx: LmaoRequestContext;
 }
 
 interface Response {
@@ -104,25 +111,8 @@ function lmaoMiddleware(req: Request, res: Response, next: () => void) {
     {}
   );
   
-  // **KEY FEATURE**: Set request-level scope ONCE in middleware
-  // All business logic tasks will inherit these attributes automatically
-  (requestCtx as any).log = {
-    scope: (attrs: any) => {
-      // This would be set by the first task, but for middleware pattern,
-      // we want to set it early
-    },
-    _scopedAttributes: {
-      requestId: req.id,
-      userId: req.user?.id || 'anonymous',
-      endpoint: req.path,
-      httpMethod: req.method as any,
-      userAgent: req.headers['user-agent'] || 'unknown',
-      ipAddress: req.ip,
-    }
-  };
-  
-  // Attach to request for business logic
-  (req as any).ctx = requestCtx;
+  // ✅ Attach context to request (now type-safe!)
+  req.ctx = requestCtx;
   
   next();
 }
@@ -188,6 +178,9 @@ const createUser = apiModule.task('create-user', async (ctx, userData: {
 
 /**
  * Get user endpoint
+ * 
+ * ✅ IMPORTANT: This function can return EITHER success OR error,
+ * so TypeScript infers a union type, allowing proper type narrowing.
  */
 const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
   // Only set business-specific scope
@@ -200,12 +193,23 @@ const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
   ctx.log.info('Fetching user');
   
   // Simulate database fetch
-  const user = { id: userId, email: 'user@example.com', name: 'John Doe' };
+  const user = await (async () => {
+    // Simulate not found case
+    if (userId === 'not-found') {
+      return null;
+    }
+    return { id: userId, email: 'user@example.com', name: 'John Doe' };
+  })();
   
-  ctx.log.scope({
-    httpStatus: 200,
-  });
+  // ✅ Error case - TypeScript knows this returns FluentErrorResult
+  if (!user) {
+    ctx.log.scope({ httpStatus: 404 });
+    ctx.log.info('User not found');
+    return ctx.err('USER_NOT_FOUND', { userId });
+  }
   
+  // ✅ Success case - TypeScript knows this returns FluentSuccessResult
+  ctx.log.scope({ httpStatus: 200 });
   ctx.log.info('User fetched successfully');
   
   return ctx.ok(user);
@@ -257,10 +261,9 @@ const updateUser = apiModule.task('update-user', async (ctx, userId: string, upd
 // Simulated Express Routes
 // ====================
 
+// ✅ PROPER WAY: No more (as any) casts - fully type-safe!
 async function handleCreateUser(req: Request, res: Response) {
-  const requestCtx = (req as any).ctx;
-  
-  const result = await createUser(requestCtx, {
+  const result = await createUser(req.ctx, {
     email: 'newuser@example.com',
     name: 'New User'
   });
@@ -275,23 +278,23 @@ async function handleCreateUser(req: Request, res: Response) {
 }
 
 async function handleGetUser(req: Request, res: Response) {
-  const requestCtx = (req as any).ctx;
+  const result = await getUser(req.ctx, 'user-123');
   
-  const result = await getUser(requestCtx, 'user-123');
-  
+  // ✅ TypeScript knows result is a union: FluentSuccessResult | FluentErrorResult
+  // Type narrowing with 'if (result.success)' gives us type safety
   if (result.success) {
+    // TypeScript knows: result.value exists, result.error doesn't
     res.status(200).json(result.value);
     console.log('✅ User fetched:', result.value.id);
   } else {
+    // TypeScript knows: result.error exists, result.value doesn't
     res.status(404).json({ error: result.error });
     console.log('❌ Not found:', result.error);
   }
 }
 
 async function handleUpdateUser(req: Request, res: Response) {
-  const requestCtx = (req as any).ctx;
-  
-  const result = await updateUser(requestCtx, 'user-123', {
+  const result = await updateUser(req.ctx, 'user-123', {
     name: 'Updated Name'
   });
   
@@ -323,14 +326,14 @@ async function main() {
   } as Response;
   
   // Request 1: POST /api/users
-  const req1: Request = {
+  const req1 = {
     id: 'req-001',
     method: 'POST',
     path: '/api/users',
     user: { id: 'admin-123' },
     headers: { 'user-agent': 'Mozilla/5.0' },
     ip: '192.168.1.100'
-  };
+  } as Partial<Request> as Request;
   
   lmaoMiddleware(req1, mockResponse, async () => {
     await handleCreateUser(req1, mockResponse);
@@ -340,14 +343,14 @@ async function main() {
   await new Promise(resolve => setTimeout(resolve, 100));
   
   // Request 2: GET /api/users/123
-  const req2: Request = {
+  const req2 = {
     id: 'req-002',
     method: 'GET',
     path: '/api/users/123',
     user: { id: 'admin-123' },
     headers: { 'user-agent': 'Mozilla/5.0' },
     ip: '192.168.1.100'
-  };
+  } as Partial<Request> as Request;
   
   lmaoMiddleware(req2, mockResponse, async () => {
     await handleGetUser(req2, mockResponse);
@@ -357,14 +360,14 @@ async function main() {
   await new Promise(resolve => setTimeout(resolve, 100));
   
   // Request 3: PUT /api/users/123
-  const req3: Request = {
+  const req3 = {
     id: 'req-003',
     method: 'PUT',
     path: '/api/users/123',
     user: { id: 'admin-123' },
     headers: { 'user-agent': 'Mozilla/5.0' },
     ip: '192.168.1.100'
-  };
+  } as Partial<Request> as Request;
   
   lmaoMiddleware(req3, mockResponse, async () => {
     await handleUpdateUser(req3, mockResponse);

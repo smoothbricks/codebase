@@ -204,7 +204,7 @@ const schemaBuilderImpl: SchemaBuilder = {
       throw new Error('Enum must have at least one value');
     }
     if (values.length > 256) {
-      throw new Error('Enum can have at most 256 values (Uint8Array limit)');
+      throw new Error('Enum can have at most 256 values (Uint8Array limit: indices 0-255)');
     }
     
     // Use refine to validate string is one of the allowed values

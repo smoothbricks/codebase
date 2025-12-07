@@ -18,10 +18,10 @@ export type { Schema, Output, Input } from '@sury/sury';
  * 
  * Example:
  * {
- *   userId: S.string().transform(hashString),
- *   requestId: S.string(),
+ *   userId: S.category(),
+ *   requestId: S.category(),
  *   duration: S.number(),
- *   operation: S.literal('SELECT').or(S.literal('INSERT'))
+ *   operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE'])
  * }
  */
 export type TagAttributeSchema = Record<string, Sury.Schema<unknown, unknown>>;

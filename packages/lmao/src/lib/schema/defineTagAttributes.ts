@@ -50,8 +50,8 @@ export function validateAttributeNames(schema: TagAttributeSchema): void {
  * Example:
  * ```typescript
  * const attrs = defineTagAttributes({
- *   requestId: S.string(),
- *   userId: S.optional(S.masked('hash')),
+ *   requestId: S.category(),
+ *   userId: S.optional(S.category()),
  *   httpStatus: S.number(),
  *   operation: S.enum(['SELECT', 'INSERT', 'UPDATE'])
  * });
