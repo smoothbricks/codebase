@@ -1,9 +1,9 @@
 /**
  * Minimal schema type definitions needed by arrow-builder
- * 
+ *
  * These types are duplicated from @smoothbricks/lmao to avoid circular dependencies.
  * Arrow-builder is a low-level package that should not depend on lmao at build time.
- * 
+ *
  * The full schema system lives in @smoothbricks/lmao.
  */
 

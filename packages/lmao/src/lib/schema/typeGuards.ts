@@ -1,13 +1,13 @@
 /**
  * Type guard functions for runtime type checking
- * 
+ *
  * These functions provide type-safe runtime validation for various types used in the system.
  * They follow the TypeScript type predicate pattern: `(value: unknown): value is Type`
  */
 
-import * as arrow from 'apache-arrow';
-import type { FeatureFlagDefinition } from './types.js';
+import type * as arrow from 'apache-arrow';
 import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
+import type { FeatureFlagDefinition } from './types.js';
 
 /**
  * Type guard to check if a value is an Arrow builder
@@ -26,15 +26,13 @@ export function isArrowBuilder(value: unknown): value is arrow.Builder {
 /**
  * Type guard to check if a value is a FeatureFlagDefinition
  */
-export function isFeatureFlagDefinition(
-  value: unknown
-): value is FeatureFlagDefinition<string | number | boolean> {
+export function isFeatureFlagDefinition(value: unknown): value is FeatureFlagDefinition<string | number | boolean> {
   if (value === null || typeof value !== 'object') {
     return false;
   }
-  
+
   const obj = value as Record<string, unknown>;
-  
+
   return (
     'schema' in obj &&
     'defaultValue' in obj &&
@@ -50,23 +48,18 @@ export function isEvaluationContext(value: unknown): value is EvaluationContext 
   if (value === null || typeof value !== 'object') {
     return false;
   }
-  
+
   const obj = value as Record<string, unknown>;
-  
+
   // EvaluationContext can have various string/number/boolean properties
   // Check that all values are of valid types
   for (const key in obj) {
     const val = obj[key];
-    if (
-      val !== undefined &&
-      typeof val !== 'string' &&
-      typeof val !== 'number' &&
-      typeof val !== 'boolean'
-    ) {
+    if (val !== undefined && typeof val !== 'string' && typeof val !== 'number' && typeof val !== 'boolean') {
       return false;
     }
   }
-  
+
   return true;
 }
 
@@ -77,35 +70,30 @@ export function isUsageContext(value: unknown): value is UsageContext {
   if (value === null || typeof value !== 'object') {
     return false;
   }
-  
+
   const obj = value as Record<string, unknown>;
-  
+
   // Check action property if present
   if ('action' in obj && typeof obj.action !== 'string' && obj.action !== undefined) {
     return false;
   }
-  
+
   // Check outcome property if present
-  if (
-    'outcome' in obj &&
-    obj.outcome !== undefined &&
-    obj.outcome !== 'success' &&
-    obj.outcome !== 'failure'
-  ) {
+  if ('outcome' in obj && obj.outcome !== undefined && obj.outcome !== 'success' && obj.outcome !== 'failure') {
     return false;
   }
-  
+
   // Check value property if present
   if ('value' in obj && typeof obj.value !== 'number' && obj.value !== undefined) {
     return false;
   }
-  
+
   // Check metadata property if present
   if ('metadata' in obj && obj.metadata !== undefined) {
     if (typeof obj.metadata !== 'object' || obj.metadata === null) {
       return false;
     }
-    
+
     // Validate metadata values
     const metadata = obj.metadata as Record<string, unknown>;
     for (const key in metadata) {
@@ -115,7 +103,7 @@ export function isUsageContext(value: unknown): value is UsageContext {
       }
     }
   }
-  
+
   return true;
 }
 
@@ -167,18 +155,16 @@ export function isPlainObject(value: unknown): value is Record<string, unknown> 
  * Type guard to check if a value is a valid record with primitive values
  * Useful for validating tag attribute objects
  */
-export function isRecordOfPrimitives(
-  value: unknown
-): value is Record<string, string | number | boolean> {
+export function isRecordOfPrimitives(value: unknown): value is Record<string, string | number | boolean> {
   if (!isPlainObject(value)) {
     return false;
   }
-  
+
   for (const key in value) {
     if (!isPrimitive(value[key])) {
       return false;
     }
   }
-  
+
   return true;
 }

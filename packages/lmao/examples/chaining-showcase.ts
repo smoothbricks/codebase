@@ -1,32 +1,32 @@
 /**
  * Method Chaining Showcase
- * 
+ *
  * This example demonstrates the fluent method chaining API for tag attributes.
  * Each tag method returns the tag object, allowing natural, readable chaining.
  */
 
-import { 
-  S,
-  defineTagAttributes,
-  defineFeatureFlags,
-  InMemoryFlagEvaluator,
+import {
+  createModuleContext,
   createRequestContext,
-  createModuleContext
+  defineFeatureFlags,
+  defineTagAttributes,
+  InMemoryFlagEvaluator,
+  S,
 } from '../src/index.js';
 
 // Define comprehensive tag attributes
 // Using the three string types per specs/01a_trace_schema_system.md
 const orderAttributes = defineTagAttributes({
-  requestId: S.category(),              // Category: request IDs repeat
-  userId: S.category(),                 // Category: user IDs repeat
-  orderId: S.category(),                // Category: order IDs may repeat in tracking
+  requestId: S.category(), // Category: request IDs repeat
+  userId: S.category(), // Category: user IDs repeat
+  orderId: S.category(), // Category: order IDs may repeat in tracking
   amount: S.number(),
-  currency: S.enum(['USD', 'EUR', 'GBP', 'JPY']),  // Enum: known currencies
-  paymentMethod: S.enum(['card', 'paypal', 'bank_transfer']),  // Enum: known methods
-  status: S.enum(['pending', 'processing', 'completed', 'failed']),  // Enum: known statuses
+  currency: S.enum(['USD', 'EUR', 'GBP', 'JPY']), // Enum: known currencies
+  paymentMethod: S.enum(['card', 'paypal', 'bank_transfer']), // Enum: known methods
+  status: S.enum(['pending', 'processing', 'completed', 'failed']), // Enum: known statuses
   duration: S.number(),
   httpStatus: S.number(),
-  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),  // Enum: known operations
+  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']), // Enum: known operations
 });
 
 const featureFlags = defineFeatureFlags({
@@ -90,11 +90,7 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
     const startTime = Date.now();
 
     // Chaining in child spans
-    childCtx.log.tag
-      .operation('INSERT')
-      .orderId(order.id)
-      .amount(order.total)
-      .status('processing');
+    childCtx.log.tag.operation('INSERT').orderId(order.id).amount(order.total).status('processing');
 
     // Simulate API call
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -105,19 +101,13 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
     const duration = Date.now() - startTime;
 
     if (!paymentSucceeded) {
-      childCtx.log.tag
-        .duration(duration)
-        .httpStatus(402)
-        .status('failed');
+      childCtx.log.tag.duration(duration).httpStatus(402).status('failed');
 
       return childCtx.err('INSUFFICIENT_FUNDS', { amount: order.total, limit: 10000 });
     }
 
     // Chain more after processing
-    childCtx.log.tag
-      .duration(duration)
-      .httpStatus(200)
-      .status('completed');
+    childCtx.log.tag.duration(duration).httpStatus(200).status('completed');
 
     return childCtx.ok({ transactionId: 'txn-123', duration });
   });
@@ -128,10 +118,7 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
   }
 
   // Final status update with chaining
-  ctx.log.tag
-    .status('completed')
-    .httpStatus(201)
-    .duration(payment.value.duration);
+  ctx.log.tag.status('completed').httpStatus(201).duration(payment.value.duration);
 
   return ctx.ok({
     orderId: order.id,
@@ -159,10 +146,7 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
   // Feature flags work alongside chaining
   if (ctx.ff.fraudDetection) {
     await ctx.span('fraud-check', async (childCtx) => {
-      childCtx.log.tag
-        .orderId(orderData.id!)
-        .operation('SELECT')
-        .status('pending');
+      childCtx.log.tag.orderId(orderData.id!).operation('SELECT').status('pending');
 
       // Fraud check logic...
       return childCtx.ok({ safe: true });
@@ -170,10 +154,7 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
   }
 
   // More chaining after async operations
-  ctx.log.tag
-    .status('completed')
-    .httpStatus(201)
-    .duration(25.5);
+  ctx.log.tag.status('completed').httpStatus(201).duration(25.5);
 
   return ctx.ok({ created: true, orderId: orderData.id });
 });
@@ -187,7 +168,7 @@ async function runExamples() {
     },
     featureFlags,
     flagEvaluator,
-    environmentConfig
+    environmentConfig,
   );
 
   console.log('\n=== Example 1: Simple Chaining ===');

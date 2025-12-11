@@ -3,12 +3,12 @@
  * Per specs/01h_entry_types_and_logging_primitives.md
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import { createModuleContext, createRequestContext } from '../lmao.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
-import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
-import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 import { S } from '../schema/builder.js';
+import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
+import { defineTagAttributes } from '../schema/defineTagAttributes.js';
+import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 
 // Test schema
 const testSchema = defineTagAttributes({
@@ -45,12 +45,7 @@ describe('Span Lifecycle', () => {
       return ctx.ok('success');
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1', userId: 'user1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1', userId: 'user1' }, testFlags, mockEvaluator, {});
 
     await task(requestCtx);
 
@@ -73,12 +68,7 @@ describe('Span Lifecycle', () => {
       return ctx.ok({ id: 123, name: 'test' });
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -102,12 +92,7 @@ describe('Span Lifecycle', () => {
       return ctx.err('VALIDATION_ERROR', { field: 'email', message: 'Invalid email' });
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -132,12 +117,7 @@ describe('Span Lifecycle', () => {
       throw new Error('Unexpected error');
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     await expect(task(requestCtx)).rejects.toThrow('Unexpected error');
   });
@@ -162,12 +142,7 @@ describe('Fluent Result API', () => {
       return result;
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -191,12 +166,7 @@ describe('Fluent Result API', () => {
       return ctx.ok({ id: 123 }).message('User created successfully');
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -217,18 +187,10 @@ describe('Fluent Result API', () => {
     });
 
     const task = moduleCtx.task('testTask', async (ctx) => {
-      return ctx
-        .ok({ id: 123 })
-        .with({ userId: 'user1', operation: 'CREATE' })
-        .message('User created successfully');
+      return ctx.ok({ id: 123 }).with({ userId: 'user1', operation: 'CREATE' }).message('User created successfully');
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -249,17 +211,10 @@ describe('Fluent Result API', () => {
     });
 
     const task = moduleCtx.task('testTask', async (ctx) => {
-      return ctx
-        .err('VALIDATION_ERROR', { field: 'email' })
-        .with({ userId: 'user1', operation: 'CREATE' });
+      return ctx.err('VALIDATION_ERROR', { field: 'email' }).with({ userId: 'user1', operation: 'CREATE' });
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -280,17 +235,10 @@ describe('Fluent Result API', () => {
     });
 
     const task = moduleCtx.task('testTask', async (ctx) => {
-      return ctx
-        .err('VALIDATION_ERROR', { field: 'email' })
-        .message('Invalid email format');
+      return ctx.err('VALIDATION_ERROR', { field: 'email' }).message('Invalid email format');
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -320,12 +268,7 @@ describe('Child Span Lifecycle', () => {
       return ctx.ok(childResult);
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -348,12 +291,7 @@ describe('Child Span Lifecycle', () => {
       });
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     await expect(task(requestCtx)).rejects.toThrow('Child span error');
   });
@@ -379,12 +317,7 @@ describe('Child Span Lifecycle', () => {
       return ctx.ok(result1);
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
 
@@ -405,7 +338,7 @@ describe('FluentResult Type Compatibility', () => {
 
     const task = moduleCtx.task('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123 });
-      
+
       // Should be able to access success property directly
       if (result.success) {
         return result.value;
@@ -413,12 +346,7 @@ describe('FluentResult Type Compatibility', () => {
       return null;
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
     expect(result).toEqual({ id: 123 });
@@ -436,7 +364,7 @@ describe('FluentResult Type Compatibility', () => {
 
     const task = moduleCtx.task('testTask', async (ctx) => {
       const result = ctx.err('TEST_ERROR', { message: 'test' });
-      
+
       // Should be able to access error property directly
       if (!result.success) {
         return result.error.code;
@@ -444,12 +372,7 @@ describe('FluentResult Type Compatibility', () => {
       return null;
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const result = await task(requestCtx);
     expect(result).toBe('TEST_ERROR');

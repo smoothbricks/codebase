@@ -1,20 +1,16 @@
+import * as S from '@sury/sury';
 import type {
-  FeatureFlagSchema,
   AsyncFlagKeys,
   EvaluationContext,
-  UsageContext,
+  FeatureFlagSchema,
   InferFeatureFlags,
+  UsageContext,
 } from './defineFeatureFlags.js';
-import * as S from '@sury/sury';
 
 /**
  * Type guard to validate flag value matches schema
  */
-function validateFlagValue<T>(
-  value: unknown,
-  schema: S.Schema<T, unknown>,
-  defaultValue: T
-): T {
+function validateFlagValue<T>(value: unknown, schema: S.Schema<T, unknown>, defaultValue: T): T {
   try {
     return S.parseOrThrow(value, schema);
   } catch {
@@ -72,12 +68,7 @@ export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
   protected evaluator: FlagEvaluator;
   protected columnWriters?: FlagColumnWriters;
 
-  constructor(
-    schema: T,
-    context: EvaluationContext,
-    evaluator: FlagEvaluator,
-    columnWriters?: FlagColumnWriters
-  ) {
+  constructor(schema: T, context: EvaluationContext, evaluator: FlagEvaluator, columnWriters?: FlagColumnWriters) {
     this.schema = schema;
     this.context = context;
     this.evaluator = evaluator;

@@ -1,12 +1,12 @@
 /**
  * Library Integration Pattern - Complete Example
- * 
+ *
  * Per specs/01e_library_integration_pattern.md:
  * - Libraries define clean schemas without prefixes
  * - Libraries provide traced operations
  * - Prefixing happens at composition time to avoid conflicts
  * - Zero hot path overhead through compile-time optimization
- * 
+ *
  * This example demonstrates:
  * 1. Creating library modules with clean schemas
  * 2. Defining traced operations within libraries
@@ -14,15 +14,15 @@
  * 4. Using library operations in application code
  */
 
-import { 
-  S,
-  defineTagAttributes,
-  defineFeatureFlags,
-  InMemoryFlagEvaluator,
-  createRequestContext,
-  createModuleContext,
+import {
   createLibraryModule,
-  moduleContextFactory
+  createModuleContext,
+  createRequestContext,
+  defineFeatureFlags,
+  defineTagAttributes,
+  InMemoryFlagEvaluator,
+  moduleContextFactory,
+  S,
 } from '../src/index.js';
 import type { SpanContext } from '../src/lib/lmao.js';
 
@@ -78,10 +78,10 @@ function createHttpLibrary(prefix = 'http') {
      */
     request: module.task('http-request', async (ctx, opts: RequestOptions) => {
       const startTime = performance.now();
-      
+
       // Clean, unprefixed API - library doesn't worry about conflicts
       ctx.log.tag.method(opts.method).url(opts.url);
-      
+
       // Simulate HTTP request
       try {
         // Mock: simulate successful response
@@ -89,10 +89,10 @@ function createHttpLibrary(prefix = 'http') {
           status: opts.method === 'POST' ? 201 : 200,
           data: { success: true },
         };
-        
+
         const duration = performance.now() - startTime;
         ctx.log.tag.status(response.status).duration(duration);
-        
+
         return ctx.ok(response);
       } catch (error) {
         const duration = performance.now() - startTime;
@@ -115,7 +115,7 @@ function createHttpLibrary(prefix = 'http') {
  */
 const dbSchema = defineTagAttributes({
   query: S.text(),
-  duration: S.number(),  // Same name as HTTP library - will be prefixed
+  duration: S.number(), // Same name as HTTP library - will be prefixed
   table: S.category(),
   operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
   rowsAffected: S.number(),
@@ -137,27 +137,27 @@ function createDatabaseLibrary(prefix = 'db') {
      */
     query: module.task('db-query', async (ctx, sql: string) => {
       const startTime = performance.now();
-      
+
       // Extract table name from SQL (simplified)
       const tableName = sql.match(/FROM\s+(\w+)/i)?.[1] || 'unknown';
       const operation = sql.trim().split(' ')[0].toUpperCase();
-      
+
       // Clean API: ctx.log.tag.query(), ctx.log.tag.table(), etc.
       ctx.log.tag
         .query(sql)
         .table(tableName)
         .operation(operation as 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE');
-      
+
       try {
         // Mock: simulate query execution
         const result = {
           rows: operation === 'SELECT' ? [{ id: 1, name: 'Test' }] : [],
           rowCount: operation === 'SELECT' ? 1 : operation === 'INSERT' ? 1 : 0,
         };
-        
+
         const duration = performance.now() - startTime;
         ctx.log.tag.duration(duration).rowsAffected(result.rowCount);
-        
+
         return ctx.ok(result);
       } catch (error) {
         const duration = performance.now() - startTime;
@@ -197,19 +197,22 @@ function createCacheLibrary(prefix = 'cache') {
   const operations = {
     get: module.task('cache-get', async (ctx, key: string) => {
       ctx.log.tag.operation('GET').key(key);
-      
+
       // Mock: simulate cache lookup
       const hit = Math.random() > 0.3; // 70% hit rate
       const value = hit ? { data: 'cached-value' } : null;
-      
+
       ctx.log.tag.hit(hit);
-      
+
       return ctx.ok({ value, hit });
     }),
-    
+
     set: module.task('cache-set', async (ctx, key: string, value: unknown, ttl = 3600) => {
-      ctx.log.tag.operation('SET').key(key).ttl(ttl as number);
-      
+      ctx.log.tag
+        .operation('SET')
+        .key(key)
+        .ttl(ttl as number);
+
       // Mock: simulate cache write
       return ctx.ok({ success: true });
     }),
@@ -283,53 +286,50 @@ interface UserData {
 const getUserProfile = task('get-user-profile', async (ctx, userId: string) => {
   // Set application-specific attributes
   ctx.log.tag.userId(userId).requestId(ctx.requestId);
-  
+
   // Check feature flag
   if (ctx.ff.useCache) {
     ctx.log.info('Cache enabled - checking cache first');
-    
+
     // Use cache library (writes to redis_* columns)
     const cacheKey = `user:${userId}`;
     const cached = await cacheLib.operations.get(ctx, cacheKey);
-    
+
     if (cached.success && cached.value.hit) {
       ctx.log.info('Cache hit');
       ctx.log.tag.businessMetric(1); // Track cache hits as metric
       return ctx.ok(cached.value.value);
     }
   }
-  
+
   // Cache miss - fetch from database (writes to db_* columns)
   ctx.log.info('Fetching from database');
-  const dbResult = await dbLib.operations.query(
-    ctx,
-    `SELECT * FROM users WHERE id = '${userId}'`
-  );
-  
+  const dbResult = await dbLib.operations.query(ctx, `SELECT * FROM users WHERE id = '${userId}'`);
+
   if (!dbResult.success) {
     return ctx.err('DB_QUERY_FAILED', dbResult.error);
   }
-  
+
   const user = dbResult.value.rows[0] as unknown as UserData;
-  
+
   // Make HTTP call to enrich user data (writes to http_* columns)
   ctx.log.info('Enriching user data from external API');
   const enrichResult = await httpLib.operations.request(ctx, {
     method: 'GET',
     url: `https://api.example.com/users/${userId}/profile`,
   });
-  
+
   if (!enrichResult.success) {
     ctx.log.warn('Failed to enrich user data, continuing with basic data');
   }
-  
+
   // Cache the result
   if (ctx.ff.useCache) {
     await cacheLib.operations.set(ctx, `user:${userId}`, user, 3600);
   }
-  
+
   ctx.log.tag.businessMetric(0.5); // Track partial success
-  
+
   return ctx.ok(user);
 });
 
@@ -339,39 +339,39 @@ const getUserProfile = task('get-user-profile', async (ctx, userId: string) => {
 
 async function runExample() {
   console.log('\n🚀 Library Integration Pattern Example\n');
-  console.log('=' .repeat(70));
-  
+  console.log('='.repeat(70));
+
   // Create request context
   const flagEvaluator = new InMemoryFlagEvaluator({
     useCache: true,
     debugMode: false,
   });
-  
+
   const requestCtx = createRequestContext(
-    { 
+    {
       requestId: 'req-' + Date.now(),
       userId: 'admin',
     },
     appFlags,
     flagEvaluator,
-    { environment: 'production' }
+    { environment: 'production' },
   );
-  
+
   console.log('\n📊 Request Context:');
   console.log(`   Request ID: ${requestCtx.requestId}`);
   console.log(`   Trace ID: ${requestCtx.traceId}`);
   console.log(`   Cache Enabled: ${requestCtx.ff.useCache}`);
-  
+
   // Execute business logic that uses multiple libraries
   console.log('\n🔄 Executing getUserProfile task...\n');
   const result = await getUserProfile(requestCtx, 'user-123');
-  
+
   if (result.success) {
     console.log('✅ Success! User profile retrieved:', result.value);
   } else {
     console.log('❌ Error:', result.error);
   }
-  
+
   console.log('\n' + '='.repeat(70));
   console.log('\n💡 Key Points Demonstrated:\n');
   console.log('1. ✅ HTTP library writes to: http_status, http_method, http_url, http_duration');
@@ -381,7 +381,7 @@ async function runExample() {
   console.log('5. ✅ NO CONFLICTS - Each library has its own namespace');
   console.log('6. ✅ Libraries use CLEAN API - no prefixes in library code');
   console.log('7. ✅ Zero hot path overhead - all mapping done at module creation time\n');
-  
+
   console.log('📈 All trace data is written to Arrow columnar buffers:');
   console.log('   - System columns: timestamp, trace_id, span_id, entry_type, etc.');
   console.log('   - HTTP columns: http_status, http_method, http_url, http_duration');

@@ -26,7 +26,7 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 | Column Name      | Type                 | Description            | Example Values                                                                                                                                |
 | ---------------- | -------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timestamp`      | `timestamp[ns]`      | When event occurred    | `2024-01-01T10:00:00.000Z`                                                                                                                    |
+| `timestamp`      | `timestamp[ns]` (Node) / `timestamp[μs]` (Browser) / `timestamp[ms]` (Fallback) | When event occurred (platform-specific precision) | `2024-01-01T10:00:00.000000000Z` (Node), `2024-01-01T10:00:00.000000Z` (Browser), `2024-01-01T10:00:00.000Z` (Fallback) |
 | `trace_id`       | `dictionary<string>` | Root trace identifier  | `'req-abc123'`, `'X-Request-Id-456'`                                                                                                          |
 | `span_id`        | `uint64`             | Span identifier        | `1`, `2`, `3`                                                                                                                                 |
 | `parent_span_id` | `uint64`             | Parent span (nullable) | `1` or `null`                                                                                                                                 |
@@ -269,12 +269,33 @@ GROUP BY ft.ff_value, up.user_plan;
 
 ## Performance Characteristics
 
+### Timestamp Precision (Platform-Specific)
+
+The timestamp column uses platform-specific precision for optimal performance:
+
+- **Node.js**: `timestamp[ns]` (nanosecond) using `process.hrtime.bigint()`
+  - Highest precision for server-side applications
+  - Accurate to nanoseconds for detailed performance profiling
+  
+- **Browser**: `timestamp[μs]` (microsecond) using `performance.now()` + `Date.now()`
+  - High precision for client-side applications
+  - Combines absolute time (Date.now) with relative high-res time (performance.now)
+  - Microsecond precision for detailed browser performance tracking
+  
+- **Fallback**: `timestamp[ms]` (millisecond) using `Date.now()`
+  - Used when high-resolution timing is unavailable
+  - Standard millisecond precision
+
+All timestamps are stored as Float64Array in memory (milliseconds) during hot path logging,
+then converted to the appropriate Arrow timestamp type during cold path conversion.
+
 ### Storage Efficiency
 
 - **Dictionary encoding**: Module names, span names, HTTP methods stored once
 - **Null bitmap compression**: Sparse columns compressed efficiently
 - **Type optimization**: Appropriate numeric types minimize storage
 - **Parquet compression**: Additional compression when written to storage
+- **Timestamp precision**: Platform-optimized precision minimizes storage while maximizing accuracy
 
 ### Query Performance
 
@@ -282,6 +303,7 @@ GROUP BY ft.ff_value, up.user_plan;
 - **Predicate pushdown**: Filters applied at storage level
 - **Parallel processing**: ClickHouse can parallelize across columns
 - **Index support**: Dictionary columns enable efficient filtering
+- **Timestamp indexing**: Nanosecond/microsecond precision enables precise time-based queries
 
 ### Data Characteristics
 

@@ -1,0 +1,17 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "rootDir": "src",
+    "types": ["bun"]
+  },
+  "include": ["src/**/*.test.ts", "src/**/__tests__/**"],
+  "references": [
+    {
+      "path": "../lmao/tsconfig.lib.json"
+    },
+    {
+      "path": "./tsconfig.lib.json"
+    }
+  ]
+}

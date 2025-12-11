@@ -1,18 +1,18 @@
 /**
  * Library integration pattern with prefix support
- * 
+ *
  * Per specs/01e_library_integration_pattern.md:
  * - Libraries define clean schemas without prefixes
  * - Prefixing happens at composition time
  * - Avoids naming conflicts across libraries
  */
 
+import type { ModuleContextBuilder, RequestContext, TaskFunction } from './lmao.js';
+import { createModuleContext } from './lmao.js';
+import { S } from './schema/builder.js';
+import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { TagAttributeSchema } from './schema/types.js';
 import { getSchemaFields } from './schema/types.js';
-import type { ModuleContextBuilder, TaskFunction, RequestContext } from './lmao.js';
-import { createModuleContext } from './lmao.js';
-import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
-import { S } from './schema/builder.js';
 
 /**
  * Library operation definition
@@ -23,7 +23,7 @@ export interface LibraryOperation<
   Result,
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema,
-  Env = Record<string, unknown>
+  Env = Record<string, unknown>,
 > {
   fn: TaskFunction<Args, Result, T, FF, Env>;
   spanName: string;
@@ -37,37 +37,37 @@ export interface LibraryModule<
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema,
   Env = Record<string, unknown>,
-  Ops extends Record<string, LibraryOperation<any[], any, T, FF, Env>> = Record<string, LibraryOperation<any[], any, T, FF, Env>>
+  Ops extends Record<string, LibraryOperation<any[], any, T, FF, Env>> = Record<
+    string,
+    LibraryOperation<any[], any, T, FF, Env>
+  >,
 > {
   schema: T;
   operations: Ops;
   task<Args extends unknown[], Result>(
     name: string,
-    fn: TaskFunction<Args, Result, T, FF, Env>
+    fn: TaskFunction<Args, Result, T, FF, Env>,
   ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
 }
 
 /**
  * Prefix a tag attribute schema
  * Renames all fields with a prefix to avoid conflicts
- * 
+ *
  * Example:
  * - Input: { status: S.number(), method: S.enum(['GET', 'POST']) }
  * - Prefix: 'http'
  * - Output: { http_status: S.number(), http_method: S.enum(['GET', 'POST']) }
  */
-export function prefixSchema<T extends TagAttributeSchema>(
-  schema: T,
-  prefix: string
-): TagAttributeSchema {
+export function prefixSchema<T extends TagAttributeSchema>(schema: T, prefix: string): TagAttributeSchema {
   const prefixedSchema: TagAttributeSchema = {};
-  
+
   // Get schema fields, excluding methods added by defineTagAttributes
   for (const [fieldName, fieldSchema] of getSchemaFields(schema)) {
     const prefixedName = `${prefix}_${fieldName}`;
     prefixedSchema[prefixedName] = fieldSchema;
   }
-  
+
   return prefixedSchema;
 }
 
@@ -82,18 +82,21 @@ type ExtractSchemaFields<T> = {
 /**
  * Create a library module with clean schema
  * Library authors use this to define their module
- * 
+ *
  * Accepts both plain TagAttributeSchema and extended schemas from defineTagAttributes
- * 
+ *
  * @param options - Library metadata, schema, and operations
  * @returns Library module with operations
  */
 export function createLibraryModule<
-  T,
+  T extends TagAttributeSchema,
   FF extends FeatureFlagSchema = FeatureFlagSchema,
   Env = Record<string, unknown>,
   SchemaFields = ExtractSchemaFields<T>,
-  Ops extends Record<string, LibraryOperation<any[], any, TagAttributeSchema, FF, Env>> = Record<string, LibraryOperation<any[], any, TagAttributeSchema, FF, Env>>
+  Ops extends Record<string, LibraryOperation<any[], any, TagAttributeSchema, FF, Env>> = Record<
+    string,
+    LibraryOperation<any[], any, TagAttributeSchema, FF, Env>
+  >,
 >(options: {
   gitSha: string;
   filePath: string;
@@ -102,12 +105,12 @@ export function createLibraryModule<
   operations?: Ops;
 }): LibraryModule<SchemaFields & TagAttributeSchema, FF, Env, Ops> {
   // Extract just the schema fields (without validation methods)
-  const schemaFields = getSchemaFields(options.schema as any);
+  const schemaFields = getSchemaFields(options.schema);
   const cleanSchema: TagAttributeSchema = {};
   for (const [fieldName, fieldSchema] of schemaFields) {
     cleanSchema[fieldName] = fieldSchema;
   }
-  
+
   // Create module context with clean schema (no prefix yet)
   const moduleContext = createModuleContext<typeof cleanSchema, SchemaFields & TagAttributeSchema, FF, Env>({
     moduleMetadata: {
@@ -117,7 +120,7 @@ export function createLibraryModule<
     },
     tagAttributes: cleanSchema,
   });
-  
+
   return {
     schema: cleanSchema as SchemaFields & TagAttributeSchema,
     operations: (options.operations || {}) as Ops,
@@ -128,12 +131,12 @@ export function createLibraryModule<
 /**
  * Module context factory for library composition
  * Applications use this to compose libraries with prefixes
- * 
+ *
  * Per specs/01e:
  * - Library writes: ctx.tag.status(200)
  * - Final column: http_status (with prefix)
  * - All mapping happens at task creation time (cold path)
- * 
+ *
  * @param prefix - Prefix to apply to all schema fields
  * @param moduleMetadata - Library metadata
  * @param schema - Clean library schema
@@ -143,7 +146,7 @@ export function createLibraryModule<
 export function moduleContextFactory<
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema = FeatureFlagSchema,
-  Env = Record<string, unknown>
+  Env = Record<string, unknown>,
 >(
   prefix: string,
   moduleMetadata: {
@@ -152,22 +155,22 @@ export function moduleContextFactory<
     moduleName: string;
   },
   schema: T,
-  operations?: Record<string, LibraryOperation<any[], any, T, FF, Env>>
+  operations?: Record<string, LibraryOperation<any[], any, T, FF, Env>>,
 ): ModuleContextBuilder<TagAttributeSchema, FF, Env> & {
   operations: Record<string, (...args: any[]) => any>;
 } {
   // Apply prefix to schema
   const prefixedSchema = prefixSchema(schema, prefix);
-  
+
   // Create module context with prefixed schema
   const moduleContext = createModuleContext({
     moduleMetadata,
     tagAttributes: prefixedSchema,
   }) as ModuleContextBuilder<TagAttributeSchema, FF, Env>;
-  
+
   // Wrap operations with task wrappers
   const wrappedOperations: Record<string, (...args: any[]) => any> = {};
-  
+
   if (operations) {
     for (const [opName, opDef] of Object.entries(operations)) {
       // Create task wrapper for operation
@@ -175,13 +178,13 @@ export function moduleContextFactory<
       // This is safe because the code generator handles the transformation at runtime.
       // The prefixing only affects column names, not the TypeScript types at call sites.
       const taskWrapper = moduleContext.task(
-        opDef.spanName, 
-        opDef.fn as TaskFunction<any[], any, TagAttributeSchema, FF, Env>
+        opDef.spanName,
+        opDef.fn as TaskFunction<any[], any, TagAttributeSchema, FF, Env>,
       );
       wrappedOperations[opName] = taskWrapper;
     }
   }
-  
+
   return {
     ...moduleContext,
     operations: wrappedOperations,
@@ -191,10 +194,14 @@ export function moduleContextFactory<
 /**
  * Library factory result type
  */
-export interface LibraryFactory<T extends TagAttributeSchema, FF extends FeatureFlagSchema = FeatureFlagSchema, Env = Record<string, unknown>> {
+export interface LibraryFactory<
+  T extends TagAttributeSchema,
+  FF extends FeatureFlagSchema = FeatureFlagSchema,
+  Env = Record<string, unknown>,
+> {
   task: <Args extends unknown[], Result>(
     name: string,
-    fn: TaskFunction<Args, Result, T, FF, Env>
+    fn: TaskFunction<Args, Result, T, FF, Env>,
   ) => (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
   operations: Record<string, (...args: unknown[]) => Promise<unknown>>;
 }
@@ -212,16 +219,16 @@ export function createHttpLibrary(prefix = 'http'): LibraryFactory<TagAttributeS
     url: S.text(),
     duration: S.number(),
   };
-  
+
   const moduleMetadata = {
     gitSha: 'dev',
     filePath: 'http-library',
     moduleName: 'http',
   };
-  
+
   // Operations would be defined here
   const operations = {};
-  
+
   // Pass the raw schema object (without methods)
   return moduleContextFactory(prefix, moduleMetadata, httpSchemaDefinition, operations);
 }
@@ -238,15 +245,15 @@ export function createDatabaseLibrary(prefix = 'db'): LibraryFactory<TagAttribut
     table: S.category(),
     operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
   };
-  
+
   const moduleMetadata = {
     gitSha: 'dev',
     filePath: 'db-library',
     moduleName: 'database',
   };
-  
+
   const operations = {};
-  
+
   // Pass the raw schema object (without methods)
   return moduleContextFactory(prefix, moduleMetadata, dbSchemaDefinition, operations);
 }

@@ -1,6 +1,6 @@
 /**
  * Define tag attributes with runtime validation and type inference
- * 
+ *
  * This module leverages Sury for:
  * - Ultra-fast runtime validation (94,828 ops/ms)
  * - Automatic TypeScript inference
@@ -9,22 +9,30 @@
  */
 
 import * as S from '@sury/sury';
-import type { TagAttributeSchema, InferTagAttributes } from './types.js';
-import { createExtendedSchema } from './extend.js';
 import type { ExtendedSchema } from './extend.js';
+import { createExtendedSchema } from './extend.js';
+import type { InferTagAttributes, TagAttributeSchema } from './types.js';
 
 /**
  * Reserved method names that cannot be used as attribute names
  * These conflict with the fluent API methods in SpanLogger
  */
 export const RESERVED_NAMES = new Set([
-  'with', 'message', 'tag', 'info', 'debug', 'warn', 'error',
-  'ok', 'err', 'span'
+  'with',
+  'message',
+  'tag',
+  'info',
+  'debug',
+  'warn',
+  'error',
+  'ok',
+  'err',
+  'span',
 ]);
 
 /**
  * Validate that attribute names don't conflict with reserved names
- * 
+ *
  * @throws Error if any attribute name is reserved
  */
 export function validateAttributeNames(schema: TagAttributeSchema): void {
@@ -32,7 +40,7 @@ export function validateAttributeNames(schema: TagAttributeSchema): void {
     if (RESERVED_NAMES.has(name)) {
       throw new Error(
         `Attribute name '${name}' is reserved and cannot be used. ` +
-        `Reserved names: ${Array.from(RESERVED_NAMES).join(', ')}`
+          `Reserved names: ${Array.from(RESERVED_NAMES).join(', ')}`,
       );
     }
   }
@@ -40,13 +48,13 @@ export function validateAttributeNames(schema: TagAttributeSchema): void {
 
 /**
  * Define tag attributes with runtime validation and type inference
- * 
+ *
  * This wraps Sury's object schema to provide:
  * - Runtime validation via Sury
  * - Type inference from schema
  * - Extension capabilities
  * - Reserved name validation
- * 
+ *
  * Example:
  * ```typescript
  * const attrs = defineTagAttributes({
@@ -55,7 +63,7 @@ export function validateAttributeNames(schema: TagAttributeSchema): void {
  *   httpStatus: S.number(),
  *   operation: S.enum(['SELECT', 'INSERT', 'UPDATE'])
  * });
- * 
+ *
  * // Validate data
  * const result = attrs.validate({
  *   requestId: 'req-123',
@@ -63,79 +71,73 @@ export function validateAttributeNames(schema: TagAttributeSchema): void {
  *   httpStatus: 200,
  *   operation: 'SELECT'
  * });
- * 
+ *
  * // Extend schema
  * const extended = attrs.extend({
  *   duration: S.number()
  * });
  * ```
- * 
+ *
  * @param schema - Object mapping field names to Sury schemas
  * @returns Extended schema with validation and extension methods
  */
-export type DefinedTagAttributes<T extends TagAttributeSchema> = T & ExtendedSchema<T> & {
-  validate: (data: unknown) => InferTagAttributes<T>;
-  parse: (data: unknown) => InferTagAttributes<T> | null;
-  safeParse: (data: unknown) => 
-    | { success: true; value: InferTagAttributes<T> }
-    | { success: false; error: Error };
-};
+export type DefinedTagAttributes<T extends TagAttributeSchema> = T &
+  ExtendedSchema<T> & {
+    validate: (data: unknown) => InferTagAttributes<T>;
+    parse: (data: unknown) => InferTagAttributes<T> | null;
+    safeParse: (data: unknown) => { success: true; value: InferTagAttributes<T> } | { success: false; error: Error };
+  };
 
-export function defineTagAttributes<T extends TagAttributeSchema>(
-  schema: T
-): DefinedTagAttributes<T> {
+export function defineTagAttributes<T extends TagAttributeSchema>(schema: T): DefinedTagAttributes<T> {
   // Validate attribute names don't conflict with reserved names
   validateAttributeNames(schema);
-  
+
   // Convert to Sury object schema for validation using builder pattern
-  const objectSchema = S.object(s => {
+  const objectSchema = S.object((s) => {
     const output: Record<string, unknown> = {};
     for (const [key, surySchema] of Object.entries(schema)) {
       output[key] = s.field(key, surySchema);
     }
     return output as InferTagAttributes<T>;
   });
-  
+
   // Create extendable schema with validation methods
   const extendedSchema = createExtendedSchema(schema);
-  
+
   // Add validation methods - cast to any to bypass type checking since we know the structure is correct
   return Object.assign(extendedSchema, {
     /**
      * Validate data and throw on error
-     * 
+     *
      * @throws Error if validation fails
      */
     validate: (data: unknown): InferTagAttributes<T> => {
       return S.parseOrThrow(data, objectSchema);
     },
-    
+
     /**
      * Validate data and return null on error
-     * 
+     *
      * @returns Validated data or null if invalid
      */
     parse: (data: unknown): InferTagAttributes<T> | null => {
       const result = S.safe(() => S.parseOrThrow(data, objectSchema));
       return result.success ? result.value : null;
     },
-    
+
     /**
      * Safe parse with detailed error information
-     * 
+     *
      * @returns Result object with success flag
      */
     safeParse: (data: unknown) => {
       const result = S.safe(() => S.parseOrThrow(data, objectSchema));
       if (result.success) {
         return { success: true as const, value: result.value };
-      } else {
-        // Convert Sury error to standard Error
-        const error = result.error instanceof Error 
-          ? result.error 
-          : new Error(String(result.error));
-        return { success: false as const, error };
       }
-    }
+      // Convert Sury error to standard Error
+      const error = result.error instanceof Error ? result.error : new Error(String(result.error));
+      return { success: false as const, error };
+    },
   }) as DefinedTagAttributes<T>;
 }

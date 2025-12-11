@@ -2,18 +2,18 @@
  * Unit tests for SpanLogger code generation
  */
 
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { beforeEach, describe, expect, it } from 'bun:test';
+import { S } from '../../schema/builder.js';
+import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
+import type { TagAttributeSchema } from '../../schema/types.js';
+import type { ModuleContext, SpanBuffer, TaskContext } from '../../types.js';
 import {
-  generateSpanLoggerClass,
   createSpanLoggerClass,
+  type GetBufferWithSpaceFn,
+  generateSpanLoggerClass,
   type StringInterner,
   type TextStorage,
-  type GetBufferWithSpaceFn,
 } from '../spanLoggerGenerator.js';
-import type { TagAttributeSchema } from '../../schema/types.js';
-import type { SpanBuffer, ModuleContext, TaskContext } from '../../types.js';
-import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
-import { S } from '../../schema/builder.js';
 
 // Mock implementations
 class MockStringInterner implements StringInterner {
@@ -236,12 +236,7 @@ describe('createSpanLoggerClass', () => {
       });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(
-        buffer,
-        categoryInterner,
-        textStorage,
-        mockGetBufferWithSpace
-      );
+      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
 
       // Should have tag property
       expect(logger).toHaveProperty('tag');
@@ -259,12 +254,7 @@ describe('createSpanLoggerClass', () => {
       (buffer as any).attr_userId = new Uint32Array(64);
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(
-        buffer,
-        categoryInterner,
-        textStorage,
-        mockGetBufferWithSpace
-      );
+      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
 
       // Access tag to create entry
       const tag = logger.tag;
@@ -285,12 +275,7 @@ describe('createSpanLoggerClass', () => {
       (buffer as any).attr_userId = new Uint32Array(64);
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(
-        buffer,
-        categoryInterner,
-        textStorage,
-        mockGetBufferWithSpace
-      );
+      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
 
       // Should be able to call scope without error
       expect(() => {
@@ -304,12 +289,7 @@ describe('createSpanLoggerClass', () => {
       const schema = defineTagAttributes({});
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(
-        buffer,
-        categoryInterner,
-        textStorage,
-        mockGetBufferWithSpace
-      );
+      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
 
       expect(logger).toBeDefined();
       expect(logger).toHaveProperty('tag');
@@ -339,12 +319,7 @@ describe('createSpanLoggerClass', () => {
       const SpanLoggerClass = createSpanLoggerClass(schema);
       expect(SpanLoggerClass).toBeDefined();
 
-      const logger = new SpanLoggerClass(
-        buffer,
-        categoryInterner,
-        textStorage,
-        mockGetBufferWithSpace
-      );
+      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
 
       expect(logger).toBeDefined();
     });

@@ -2,15 +2,10 @@
  * Unit tests for background flush scheduler
  */
 
-import { describe, it, expect, beforeEach, afterEach, mock } from 'bun:test';
-import {
-  FlushScheduler,
-  type FlushHandler,
-  type FlushMetadata,
-  type FlushSchedulerConfig,
-} from '../flushScheduler.js';
-import type { SpanBuffer, ModuleContext, TaskContext } from '../types.js';
-import type { StringInterner } from '@smoothbricks/arrow-builder';
+import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
+import type { StringInterner } from '../convertToArrow.js';
+import { type FlushHandler, type FlushMetadata, FlushScheduler, type FlushSchedulerConfig } from '../flushScheduler.js';
+import type { ModuleContext, SpanBuffer, TaskContext } from '../types.js';
 
 // Mock StringInterner
 class MockStringInterner implements StringInterner {
@@ -62,13 +57,13 @@ function createMockSpanBuffer(): SpanBuffer {
     writeIndex: 5, // Some rows written
     capacity: 64,
   };
-  
+
   // Initialize timestamp values to avoid undefined errors
   for (let i = 0; i < buffer.writeIndex; i++) {
     buffer.timestamps[i] = Date.now();
     buffer.operations[i] = 1; // entry type: span-start
   }
-  
+
   return buffer;
 }
 
@@ -92,13 +87,7 @@ describe('FlushScheduler', () => {
     moduleIdInterner = new MockStringInterner();
     spanNameInterner = new MockStringInterner();
 
-    scheduler = new FlushScheduler(
-      flushHandler,
-      categoryInterner,
-      textStorage,
-      moduleIdInterner,
-      spanNameInterner
-    );
+    scheduler = new FlushScheduler(flushHandler, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
   });
 
   afterEach(() => {
@@ -216,14 +205,10 @@ describe('FlushScheduler', () => {
       });
 
       it('should unregister multiple buffers', () => {
-        const buffers = [
-          createMockSpanBuffer(),
-          createMockSpanBuffer(),
-          createMockSpanBuffer(),
-        ];
+        const buffers = [createMockSpanBuffer(), createMockSpanBuffer(), createMockSpanBuffer()];
 
-        buffers.forEach(b => scheduler.register(b));
-        buffers.forEach(b => scheduler.unregister(b));
+        buffers.forEach((b) => scheduler.register(b));
+        buffers.forEach((b) => scheduler.unregister(b));
 
         expect(scheduler).toBeDefined();
       });
@@ -355,10 +340,10 @@ describe('FlushScheduler', () => {
       it('should flush multiple buffers together', async () => {
         const buffer1 = createMockSpanBuffer();
         const buffer2 = createMockSpanBuffer();
-        
+
         // Make buffers share the same module context to ensure schema compatibility
         buffer2.task = buffer1.task;
-        
+
         buffer1.writeIndex = 10;
         buffer2.writeIndex = 20;
 
@@ -393,11 +378,7 @@ describe('FlushScheduler', () => {
         const buffer = createMockSpanBuffer();
         scheduler.register(buffer);
 
-        await Promise.all([
-          scheduler.flush(),
-          scheduler.flush(),
-          scheduler.flush(),
-        ]);
+        await Promise.all([scheduler.flush(), scheduler.flush(), scheduler.flush()]);
 
         expect(flushCalls.length).toBeGreaterThanOrEqual(1);
       });
@@ -414,7 +395,7 @@ describe('FlushScheduler', () => {
           categoryInterner,
           textStorage,
           moduleIdInterner,
-          spanNameInterner
+          spanNameInterner,
         );
 
         const buffer = createMockSpanBuffer();
@@ -422,7 +403,7 @@ describe('FlushScheduler', () => {
 
         // Should complete without throwing (error is caught and logged)
         await errorScheduler.flush();
-        
+
         // Verify it tried to flush (error logged but didn't propagate)
         expect(buffer.writeIndex).toBeGreaterThan(0);
 
@@ -437,7 +418,7 @@ describe('FlushScheduler', () => {
 
         // Should complete without throwing (error is caught and logged)
         await scheduler.flush();
-        
+
         // Flush should have been attempted
         expect(true).toBe(true);
       });
@@ -452,7 +433,7 @@ describe('FlushScheduler', () => {
           categoryInterner,
           textStorage,
           moduleIdInterner,
-          spanNameInterner
+          spanNameInterner,
         );
 
         const buffer = createMockSpanBuffer();
@@ -460,7 +441,7 @@ describe('FlushScheduler', () => {
 
         // Should complete without throwing (error is caught and logged)
         await rejectedScheduler.flush();
-        
+
         // Verify it tried to flush
         expect(buffer.writeIndex).toBeGreaterThan(0);
 
@@ -523,7 +504,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config
+          config,
         );
 
         expect(customScheduler).toBeDefined();
@@ -536,7 +517,7 @@ describe('FlushScheduler', () => {
           categoryInterner,
           textStorage,
           moduleIdInterner,
-          spanNameInterner
+          spanNameInterner,
         );
 
         expect(defaultScheduler).toBeDefined();
@@ -554,7 +535,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config
+          config,
         );
 
         expect(partialScheduler).toBeDefined();
@@ -575,7 +556,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config
+          config,
         );
 
         expect(zeroScheduler).toBeDefined();
@@ -594,7 +575,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config
+          config,
         );
 
         expect(largeScheduler).toBeDefined();
@@ -611,7 +592,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config1
+          config1,
         );
 
         const scheduler2 = new FlushScheduler(
@@ -620,7 +601,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config2
+          config2,
         );
 
         expect(scheduler1).toBeDefined();
@@ -644,7 +625,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config
+          config,
         );
 
         expect(negativeScheduler).toBeDefined();
@@ -662,7 +643,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config
+          config,
         );
 
         expect(overScheduler).toBeDefined();
@@ -671,8 +652,8 @@ describe('FlushScheduler', () => {
 
       it('should handle NaN in configuration', () => {
         const config: FlushSchedulerConfig = {
-          maxFlushInterval: NaN,
-          capacityThreshold: NaN,
+          maxFlushInterval: Number.NaN,
+          capacityThreshold: Number.NaN,
         };
 
         const nanScheduler = new FlushScheduler(
@@ -681,7 +662,7 @@ describe('FlushScheduler', () => {
           textStorage,
           moduleIdInterner,
           spanNameInterner,
-          config
+          config,
         );
 
         expect(nanScheduler).toBeDefined();

@@ -1,21 +1,21 @@
 /**
  * Middleware Pattern Example
- * 
+ *
  * Demonstrates how to use LMAO in an Express-style middleware architecture:
  * - Middleware sets request-level scope attributes
  * - Business logic tasks inherit scoped attributes
  * - Zero repetition of context attributes
- * 
+ *
  * Per specs/01i_span_scope_attributes.md - Middleware Pattern
  */
 
-import { 
-  createRequestContext,
+import {
   createModuleContext,
-  defineTagAttributes,
+  createRequestContext,
   defineFeatureFlags,
+  defineTagAttributes,
   InMemoryFlagEvaluator,
-  S
+  S,
 } from '../src/index.js';
 
 // ====================
@@ -30,7 +30,7 @@ const apiSchema = defineTagAttributes({
   httpMethod: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
   userAgent: S.text(),
   ipAddress: S.category(),
-  
+
   // Business logic attributes
   operation: S.enum(['CREATE_USER', 'UPDATE_USER', 'DELETE_USER', 'GET_USER']),
   resourceId: S.category(),
@@ -51,9 +51,9 @@ const apiModule = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123',
     filePath: 'src/api/user-controller.ts',
-    moduleName: 'user-api'
+    moduleName: 'user-api',
   },
-  tagAttributes: apiSchema
+  tagAttributes: apiSchema,
 });
 
 // ====================
@@ -87,19 +87,19 @@ interface Response {
 
 /**
  * LMAO middleware - creates request context and sets scope
- * 
+ *
  * This runs once per request and sets attributes that apply to ALL
  * subsequent operations in the request lifecycle.
  */
 function lmaoMiddleware(req: Request, res: Response, next: () => void) {
   console.log(`\n🌐 ${req.method} ${req.path}`);
-  
+
   // Create flag evaluator
   const flagEvaluator = new InMemoryFlagEvaluator({
     rateLimiting: true,
     detailedLogging: true,
   });
-  
+
   // Create request context
   const requestCtx = createRequestContext(
     {
@@ -108,12 +108,12 @@ function lmaoMiddleware(req: Request, res: Response, next: () => void) {
     },
     featureFlags,
     flagEvaluator,
-    {}
+    {},
   );
-  
+
   // ✅ Attach context to request (now type-safe!)
   req.ctx = requestCtx;
-  
+
   next();
 }
 
@@ -123,62 +123,68 @@ function lmaoMiddleware(req: Request, res: Response, next: () => void) {
 
 /**
  * Create user endpoint
- * 
+ *
  * Notice: NO repetitive context setting!
  * All request attributes are inherited from middleware
  */
-const createUser = apiModule.task('create-user', async (ctx, userData: {
-  email: string;
-  name: string;
-}) => {
-  // Add business-specific scope (merges with middleware scope)
-  ctx.log.scope({
-    operation: 'CREATE_USER',
-    resourceId: userData.email,
-  });
-  
-  ctx.log.info('Creating new user');
-  // ↑ This log entry includes: requestId, userId, endpoint, httpMethod, userAgent, ipAddress, operation, resourceId
-  
-  // Validate email
-  if (!userData.email.includes('@')) {
-    ctx.log.info('Invalid email format');
-    return ctx.err('INVALID_EMAIL', 'Email must contain @');
-  }
-  
-  // Check feature flag
-  if (ctx.ff.detailedLogging) {
-    ctx.log.info('Detailed logging enabled - checking for duplicate email');
-  }
-  
-  // Simulate database check
-  const existingUser = false; // await db.findByEmail(userData.email);
-  
-  if (existingUser) {
-    ctx.log.info('Email already exists');
-    return ctx.err('EMAIL_EXISTS', 'User with this email already exists');
-  }
-  
-  // Create user
-  const userId = `user-${Date.now()}`;
-  
-  ctx.log.scope({
-    resourceId: userId,
-    httpStatus: 201,
-  });
-  
-  ctx.log.info('User created successfully');
-  
-  return ctx.ok({
-    id: userId,
-    email: userData.email,
-    name: userData.name,
-  });
-});
+const createUser = apiModule.task(
+  'create-user',
+  async (
+    ctx,
+    userData: {
+      email: string;
+      name: string;
+    },
+  ) => {
+    // Add business-specific scope (merges with middleware scope)
+    ctx.log.scope({
+      operation: 'CREATE_USER',
+      resourceId: userData.email,
+    });
+
+    ctx.log.info('Creating new user');
+    // ↑ This log entry includes: requestId, userId, endpoint, httpMethod, userAgent, ipAddress, operation, resourceId
+
+    // Validate email
+    if (!userData.email.includes('@')) {
+      ctx.log.info('Invalid email format');
+      return ctx.err('INVALID_EMAIL', 'Email must contain @');
+    }
+
+    // Check feature flag
+    if (ctx.ff.detailedLogging) {
+      ctx.log.info('Detailed logging enabled - checking for duplicate email');
+    }
+
+    // Simulate database check
+    const existingUser = false; // await db.findByEmail(userData.email);
+
+    if (existingUser) {
+      ctx.log.info('Email already exists');
+      return ctx.err('EMAIL_EXISTS', 'User with this email already exists');
+    }
+
+    // Create user
+    const userId = `user-${Date.now()}`;
+
+    ctx.log.scope({
+      resourceId: userId,
+      httpStatus: 201,
+    });
+
+    ctx.log.info('User created successfully');
+
+    return ctx.ok({
+      id: userId,
+      email: userData.email,
+      name: userData.name,
+    });
+  },
+);
 
 /**
  * Get user endpoint
- * 
+ *
  * ✅ IMPORTANT: This function can return EITHER success OR error,
  * so TypeScript infers a union type, allowing proper type narrowing.
  */
@@ -189,9 +195,9 @@ const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
     operation: 'GET_USER',
     resourceId: userId,
   });
-  
+
   ctx.log.info('Fetching user');
-  
+
   // Simulate database fetch
   const user = await (async () => {
     // Simulate not found case
@@ -200,62 +206,69 @@ const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
     }
     return { id: userId, email: 'user@example.com', name: 'John Doe' };
   })();
-  
+
   // ✅ Error case - TypeScript knows this returns FluentErrorResult
   if (!user) {
     ctx.log.scope({ httpStatus: 404 });
     ctx.log.info('User not found');
     return ctx.err('USER_NOT_FOUND', { userId });
   }
-  
+
   // ✅ Success case - TypeScript knows this returns FluentSuccessResult
   ctx.log.scope({ httpStatus: 200 });
   ctx.log.info('User fetched successfully');
-  
+
   return ctx.ok(user);
 });
 
 /**
  * Update user endpoint - demonstrates child spans
  */
-const updateUser = apiModule.task('update-user', async (ctx, userId: string, updates: {
-  name?: string;
-  email?: string;
-}) => {
-  ctx.log.scope({
-    operation: 'UPDATE_USER',
-    resourceId: userId,
-  });
-  
-  ctx.log.info('Updating user');
-  
-  // Validate updates in a child span
-  const validationResult = await ctx.span('validate-updates', async (childCtx) => {
-    // Child inherits all parent scope: requestId, userId, endpoint, operation, resourceId, etc.
-    childCtx.log.info('Validating update data');
-    
-    if (updates.email && !updates.email.includes('@')) {
-      return childCtx.err('INVALID_EMAIL', 'Email must contain @');
+const updateUser = apiModule.task(
+  'update-user',
+  async (
+    ctx,
+    userId: string,
+    updates: {
+      name?: string;
+      email?: string;
+    },
+  ) => {
+    ctx.log.scope({
+      operation: 'UPDATE_USER',
+      resourceId: userId,
+    });
+
+    ctx.log.info('Updating user');
+
+    // Validate updates in a child span
+    const validationResult = await ctx.span('validate-updates', async (childCtx) => {
+      // Child inherits all parent scope: requestId, userId, endpoint, operation, resourceId, etc.
+      childCtx.log.info('Validating update data');
+
+      if (updates.email && !updates.email.includes('@')) {
+        return childCtx.err('INVALID_EMAIL', 'Email must contain @');
+      }
+
+      return childCtx.ok({ validated: true });
+    });
+
+    if (!validationResult.success) {
+      return ctx.err('VALIDATION_FAILED', validationResult.error);
     }
-    
-    return childCtx.ok({ validated: true });
-  });
-  
-  if (!validationResult.success) {
-    return ctx.err('VALIDATION_FAILED', validationResult.error);
-  }
-  
-  // Apply updates
-  const updatedUser = { id: userId, ...updates };
-  
-  ctx.log.scope({
-    httpStatus: 200,
-  });
-  
-  ctx.log.info('User updated successfully');
-  
-  return ctx.ok(updatedUser);
-});
+
+    // Apply updates
+    const updatedUser = { id: userId, ...updates };
+
+    ctx.log.scope({
+      httpStatus: 200,
+    });
+
+    ctx.log.info('User updated successfully');
+
+    return ctx.ok(updatedUser);
+  },
+);
 
 // ====================
 // Simulated Express Routes
@@ -265,9 +278,9 @@ const updateUser = apiModule.task('update-user', async (ctx, userId: string, upd
 async function handleCreateUser(req: Request, res: Response) {
   const result = await createUser(req.ctx, {
     email: 'newuser@example.com',
-    name: 'New User'
+    name: 'New User',
   });
-  
+
   if (result.success) {
     res.status(201).json(result.value);
     console.log('✅ User created:', result.value.id);
@@ -279,7 +292,7 @@ async function handleCreateUser(req: Request, res: Response) {
 
 async function handleGetUser(req: Request, res: Response) {
   const result = await getUser(req.ctx, 'user-123');
-  
+
   // ✅ TypeScript knows result is a union: FluentSuccessResult | FluentErrorResult
   // Type narrowing with 'if (result.success)' gives us type safety
   if (result.success) {
@@ -295,9 +308,9 @@ async function handleGetUser(req: Request, res: Response) {
 
 async function handleUpdateUser(req: Request, res: Response) {
   const result = await updateUser(req.ctx, 'user-123', {
-    name: 'Updated Name'
+    name: 'Updated Name',
   });
-  
+
   if (result.success) {
     res.status(200).json(result.value);
     console.log('✅ User updated:', result.value.id);
@@ -318,13 +331,13 @@ async function main() {
   console.log('- Business logic inherits all middleware attributes');
   console.log('- Zero repetition of context attributes');
   console.log('- Clean, focused business logic\n');
-  
+
   // Simulate Express app
   const mockResponse = {
     status: (code: number) => mockResponse,
-    json: (data: unknown) => {}
+    json: (data: unknown) => {},
   } as Response;
-  
+
   // Request 1: POST /api/users
   const req1 = {
     id: 'req-001',
@@ -332,16 +345,16 @@ async function main() {
     path: '/api/users',
     user: { id: 'admin-123' },
     headers: { 'user-agent': 'Mozilla/5.0' },
-    ip: '192.168.1.100'
+    ip: '192.168.1.100',
   } as Partial<Request> as Request;
-  
+
   lmaoMiddleware(req1, mockResponse, async () => {
     await handleCreateUser(req1, mockResponse);
   });
-  
+
   // Wait a bit
-  await new Promise(resolve => setTimeout(resolve, 100));
-  
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
   // Request 2: GET /api/users/123
   const req2 = {
     id: 'req-002',
@@ -349,16 +362,16 @@ async function main() {
     path: '/api/users/123',
     user: { id: 'admin-123' },
     headers: { 'user-agent': 'Mozilla/5.0' },
-    ip: '192.168.1.100'
+    ip: '192.168.1.100',
   } as Partial<Request> as Request;
-  
+
   lmaoMiddleware(req2, mockResponse, async () => {
     await handleGetUser(req2, mockResponse);
   });
-  
+
   // Wait a bit
-  await new Promise(resolve => setTimeout(resolve, 100));
-  
+  await new Promise((resolve) => setTimeout(resolve, 100));
+
   // Request 3: PUT /api/users/123
   const req3 = {
     id: 'req-003',
@@ -366,13 +379,13 @@ async function main() {
     path: '/api/users/123',
     user: { id: 'admin-123' },
     headers: { 'user-agent': 'Mozilla/5.0' },
-    ip: '192.168.1.100'
+    ip: '192.168.1.100',
   } as Partial<Request> as Request;
-  
+
   lmaoMiddleware(req3, mockResponse, async () => {
     await handleUpdateUser(req3, mockResponse);
   });
-  
+
   console.log('\n✨ Example complete!');
   console.log('\n💡 Key Takeaway:');
   console.log('   Middleware sets requestId, userId, endpoint, httpMethod, userAgent, ipAddress ONCE');

@@ -2,17 +2,17 @@
  * Unit tests for library integration with prefix support
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import {
-  prefixSchema,
+  createDatabaseLibrary,
+  createHttpLibrary,
   createLibraryModule,
   moduleContextFactory,
-  createHttpLibrary,
-  createDatabaseLibrary,
+  prefixSchema,
 } from '../library.js';
-import type { TagAttributeSchema } from '../schema/types.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { S } from '../schema/builder.js';
+import { defineTagAttributes } from '../schema/defineTagAttributes.js';
+import type { TagAttributeSchema } from '../schema/types.js';
 
 describe('prefixSchema', () => {
   describe('success cases', () => {
@@ -171,7 +171,7 @@ describe('createLibraryModule', () => {
       // Schema should have the field
       expect(module.schema.field).toBeDefined();
       expect(module.schema.field).toBe(schema.field);
-      
+
       // But should NOT have validation methods (those are stripped)
       expect((module.schema as any).validate).toBeUndefined();
       expect((module.schema as any).parse).toBeUndefined();
@@ -304,7 +304,7 @@ describe('moduleContextFactory', () => {
           filePath: 'test.ts',
           moduleName: 'http',
         },
-        schema
+        schema,
       );
 
       expect(factory).toBeDefined();
@@ -325,7 +325,7 @@ describe('moduleContextFactory', () => {
           filePath: 'test.ts',
           moduleName: 'http',
         },
-        schema
+        schema,
       );
 
       expect(factory).toBeDefined();
@@ -340,7 +340,7 @@ describe('moduleContextFactory', () => {
           filePath: 'test.ts',
           moduleName: 'test',
         },
-        defineTagAttributes({})
+        defineTagAttributes({}),
       );
 
       expect(factory.operations).toBeDefined();
@@ -357,7 +357,7 @@ describe('moduleContextFactory', () => {
           filePath: 'test.ts',
           moduleName: 'test',
         },
-        defineTagAttributes({ field: S.text() })
+        defineTagAttributes({ field: S.text() }),
       );
 
       expect(factory).toBeDefined();
@@ -372,7 +372,7 @@ describe('moduleContextFactory', () => {
           filePath: 'test.ts',
           moduleName: 'test',
         },
-        defineTagAttributes({})
+        defineTagAttributes({}),
       );
 
       expect(factory).toBeDefined();
@@ -387,7 +387,7 @@ describe('moduleContextFactory', () => {
           moduleName: 'test',
         },
         defineTagAttributes({}),
-        {}
+        {},
       );
 
       expect(factory.operations).toEqual({});
@@ -404,7 +404,7 @@ describe('moduleContextFactory', () => {
           moduleName: 'test',
         },
         defineTagAttributes({}),
-        undefined
+        undefined,
       );
 
       expect(factory).toBeDefined();
@@ -419,7 +419,7 @@ describe('moduleContextFactory', () => {
           filePath: 'test.ts',
           moduleName: 'test',
         },
-        defineTagAttributes({ field: S.text() })
+        defineTagAttributes({ field: S.text() }),
       );
 
       expect(factory).toBeDefined();

@@ -1,6 +1,6 @@
 /**
  * Integration tests for schema integration patterns
- * 
+ *
  * Tests the full integration of:
  * - Request context creation with feature flags and environment
  * - Module context with tag attributes
@@ -9,12 +9,12 @@
  * - Typed tag attribute API
  */
 
-import { describe, expect, it, beforeEach } from 'bun:test';
+import { beforeEach, describe, expect, it } from 'bun:test';
+import { createModuleContext, createRequestContext } from '../lmao.js';
 import { S } from '../schema/builder.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
+import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
-import { createRequestContext, createModuleContext } from '../lmao.js';
 import type { TagAttributeSchema } from '../schema/types.js';
 
 describe('Schema Integration Patterns', () => {
@@ -24,13 +24,13 @@ describe('Schema Integration Patterns', () => {
   // - S.category: Values that often repeat
   // - S.text: Unique values
   const dbAttributes = defineTagAttributes({
-    requestId: S.category(),              // Category: request IDs repeat within traces
-    userId: S.category(),                 // Category: user IDs repeat across operations
+    requestId: S.category(), // Category: request IDs repeat within traces
+    userId: S.category(), // Category: user IDs repeat across operations
     duration: S.number(),
     httpStatus: S.number(),
-    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),  // Enum: known DB operations
-    query: S.text(),                      // Text: SQL queries are mostly unique
-    region: S.category(),                 // Category: AWS regions have limited cardinality
+    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']), // Enum: known DB operations
+    query: S.text(), // Text: SQL queries are mostly unique
+    region: S.category(), // Category: AWS regions have limited cardinality
   });
 
   // Define feature flags
@@ -63,7 +63,7 @@ describe('Schema Integration Patterns', () => {
         { requestId: 'req-123', userId: 'user-456' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       expect(ctx.requestId).toBe('req-123');
@@ -74,12 +74,7 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should provide access to environment config as plain properties', () => {
-      const ctx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const ctx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       expect(ctx.env.awsRegion).toBe('us-east-1');
       expect(ctx.env.maxConnections).toBe(100);
@@ -87,12 +82,7 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should create feature flag evaluator', () => {
-      const ctx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const ctx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       // Access sync flags as properties
       expect(ctx.ff.advancedValidation).toBe(true);
@@ -135,12 +125,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
@@ -176,16 +161,11 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ chained: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-001' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-001' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
-      
+
       // Note: Buffer writes are happening in memory to Arrow columnar format
       // Each tag method call writes to the appropriate attribute column
     });
@@ -218,12 +198,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ chained: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-002' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-002' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
@@ -256,7 +231,7 @@ describe('Schema Integration Patterns', () => {
         { requestId: 'req-003', userId: 'user-003' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx, 'order-789', 149.99);
@@ -281,12 +256,7 @@ describe('Schema Integration Patterns', () => {
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
         // Method chaining - each method returns the tag object
-        ctx.log.tag
-          .requestId('req-123')
-          .userId('user-456')
-          .operation('INSERT')
-          .duration(12.5)
-          .httpStatus(200);
+        ctx.log.tag.requestId('req-123').userId('user-456').operation('INSERT').duration(12.5).httpStatus(200);
 
         // Can also chain after with()
         ctx.log.tag
@@ -303,12 +273,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
@@ -334,12 +299,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
@@ -363,12 +323,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.err('VALIDATION_ERROR', { field: 'email' });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       const successResult = await successTask(requestCtx);
       expect(successResult.success).toBe(true);
@@ -396,18 +351,11 @@ describe('Schema Integration Patterns', () => {
 
       const testTask = moduleContext.task('parent-task', async (ctx) => {
         // Parent span with chained tags
-        ctx.log.tag
-          .requestId('req-123')
-          .operation('INSERT')
-          .duration(50.0);
+        ctx.log.tag.requestId('req-123').operation('INSERT').duration(50.0);
 
         const childResult = await ctx.span('child-task', async (childCtx) => {
           // Child span with chained tags
-          childCtx.log.tag
-            .operation('SELECT')
-            .query('SELECT * FROM users')
-            .duration(5.2)
-            .httpStatus(200);
+          childCtx.log.tag.operation('SELECT').query('SELECT * FROM users').duration(5.2).httpStatus(200);
 
           return { found: true };
         });
@@ -417,12 +365,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
@@ -461,12 +404,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: shouldValidate });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
@@ -489,18 +427,15 @@ describe('Schema Integration Patterns', () => {
         // Async flags use method call
         // TypeScript can't properly infer async flag types through the generic chain
         // so we use a type assertion to access the specific flag type
-        const experimentalEnabled = await (ctx.ff.get as (flag: 'experimentalFeature') => Promise<boolean>)('experimentalFeature');
+        const experimentalEnabled = await (ctx.ff.get as (flag: 'experimentalFeature') => Promise<boolean>)(
+          'experimentalFeature',
+        );
         expect(experimentalEnabled).toBe(false);
 
         return ctx.ok({ experimental: experimentalEnabled });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig
-      );
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
@@ -538,7 +473,7 @@ describe('Schema Integration Patterns', () => {
         { requestId: 'req-999', userId: 'user-123' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await processOrder(requestCtx, 'order-456', 99.99);
@@ -572,11 +507,7 @@ describe('Schema Integration Patterns', () => {
         }
 
         // Environment access and chained tags
-        ctx.log.tag
-          .requestId(ctx.requestId)
-          .userId(userData.email)
-          .region(ctx.env.awsRegion)
-          .operation('INSERT');
+        ctx.log.tag.requestId(ctx.requestId).userId(userData.email).region(ctx.env.awsRegion).operation('INSERT');
 
         // Child span with chaining
         const validation = await ctx.span('validate-user', async (childCtx) => {
@@ -600,9 +531,7 @@ describe('Schema Integration Patterns', () => {
         }
 
         // Complete operation with chained tags
-        ctx.log.tag
-          .duration(50.3)
-          .httpStatus(201);
+        ctx.log.tag.duration(50.3).httpStatus(201);
 
         return ctx.ok({ id: 'user-123', ...userData });
       });
@@ -612,7 +541,7 @@ describe('Schema Integration Patterns', () => {
         { requestId: 'req-123', userId: 'user-456' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       // Execute task

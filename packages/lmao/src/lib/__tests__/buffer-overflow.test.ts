@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import { createModuleContext, createRequestContext } from '../lmao.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { S } from '../schema/builder.js';
+import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 
 /**
  * Tests for buffer overflow handling and capacity tuning
@@ -64,11 +64,11 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-overflow-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
-      
+
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.value.written).toBe(100);
@@ -103,7 +103,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-chain-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -133,7 +133,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-large-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -170,7 +170,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-message-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -206,7 +206,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-mixed-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -248,7 +248,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-child-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -274,9 +274,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         for (let childNum = 0; childNum < 5; childNum++) {
           await ctx.span(`child-${childNum}`, async (childCtx) => {
             for (let i = 0; i < 100; i++) {
-              childCtx.log.tag
-                .requestId(`child-${childNum}-req-${i}`)
-                .userId(`user-${i}`);
+              childCtx.log.tag.requestId(`child-${childNum}-req-${i}`).userId(`user-${i}`);
             }
           });
         }
@@ -288,7 +286,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-multi-child-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -323,7 +321,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-rapid-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       // Run task multiple times
@@ -359,7 +357,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-boundary-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -398,7 +396,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-no-loss-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);
@@ -441,7 +439,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         { requestId: 'req-error-test' },
         featureFlags,
         flagEvaluator,
-        environmentConfig
+        environmentConfig,
       );
 
       const result = await testTask(requestCtx);

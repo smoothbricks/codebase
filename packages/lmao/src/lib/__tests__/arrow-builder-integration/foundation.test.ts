@@ -1,7 +1,7 @@
-import { describe, it, expect } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
+import type { TagAttributeSchema } from '@smoothbricks/lmao';
 import { createEmptySpanBuffer, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
 import type { TaskContext } from '../types.js';
-import type { TagAttributeSchema } from '@smoothbricks/lmao';
 
 /**
  * Type helper to extract schema fields from ExtendedSchema
@@ -13,8 +13,8 @@ describe('Buffer Foundation', () => {
   // Helper to create a test task context
   function createTestTaskContext(): TaskContext {
     const schema = defineTagAttributes({
-      userId: S.category(),  // Category: user IDs repeat
-      count: S.number()
+      userId: S.category(), // Category: user IDs repeat
+      count: S.number(),
     });
 
     // Extract just the schema fields (exclude methods like validate, parse, etc.)
@@ -31,35 +31,35 @@ describe('Buffer Foundation', () => {
           currentCapacity: 64,
           totalWrites: 0,
           overflowWrites: 0,
-          totalBuffersCreated: 0
-        }
+          totalBuffersCreated: 0,
+        },
       },
       spanNameId: 1,
-      lineNumber: 10
+      lineNumber: 10,
     };
   }
 
   it('creates empty SpanBuffer with TypedArrays', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
-    
+
     const buf = createEmptySpanBuffer(1, 'trace-123', schema, taskContext, undefined, 64);
 
     expect(buf.spanId).toBe(1);
     expect(buf.traceId).toBe('trace-123');
-    
+
     // Check TypedArrays are created
     expect(buf.timestamps).toBeInstanceOf(Float64Array);
     expect(buf.operations).toBeInstanceOf(Uint8Array);
-    
+
     // Check null bitmaps exist for each attribute (Arrow format: 1 Uint8Array per column)
     expect(buf.nullBitmaps).toBeDefined();
     expect(buf.nullBitmaps['attr_userId']).toBeInstanceOf(Uint8Array);
     expect(buf.nullBitmaps['attr_count']).toBeInstanceOf(Uint8Array);
-    
+
     // Check attribute columns exist for each schema field
     expect(buf['attr_userId']).toBeInstanceOf(Uint32Array); // category → Uint32Array
-    expect(buf['attr_count']).toBeInstanceOf(Float64Array);  // number → Float64Array
+    expect(buf['attr_count']).toBeInstanceOf(Float64Array); // number → Float64Array
 
     // Metadata
     expect(buf.children).toBeInstanceOf(Array);
@@ -71,9 +71,9 @@ describe('Buffer Foundation', () => {
   it('creates root SpanBuffer with createSpanBuffer', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
-    
+
     const buf = createSpanBuffer(schema, taskContext, 'trace-999');
-    
+
     expect(buf.spanId).toBeGreaterThan(0);
     expect(buf.parent).toBeUndefined();
     expect(buf.children).toHaveLength(0);
@@ -82,11 +82,11 @@ describe('Buffer Foundation', () => {
   it('tracks buffer creation in capacity stats', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
-    
+
     const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
-    
+
     createEmptySpanBuffer(1, 'trace-456', schema, taskContext, undefined, 64);
-    
+
     expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
   });
 
@@ -94,22 +94,22 @@ describe('Buffer Foundation', () => {
     const taskContext = createTestTaskContext();
     // Define a larger schema
     const largeSchema = defineTagAttributes({
-      field1: S.category(),  // Category string
+      field1: S.category(), // Category string
       field2: S.number(),
       field3: S.boolean(),
-      field4: S.text(),      // Text string
+      field4: S.text(), // Text string
       field5: S.number(),
     });
-    
+
     // Extract just the schema fields (exclude methods)
     const { validate, parse, safeParse, extend, ...schemaFields } = largeSchema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
-    
+
     const buf = createEmptySpanBuffer(1, 'trace-789', tagAttributes, taskContext, undefined, 64);
-    
+
     // Should have TypedArray columns for all 5 attributes
     // Get all attr_ keys from the buffer
-    const attrKeys = Object.keys(buf).filter(k => k.startsWith('attr_'));
+    const attrKeys = Object.keys(buf).filter((k) => k.startsWith('attr_'));
     expect(attrKeys).toHaveLength(5);
     expect(buf['attr_field1']).toBeInstanceOf(Uint32Array); // category
     expect(buf['attr_field4']).toBeInstanceOf(Uint32Array); // text

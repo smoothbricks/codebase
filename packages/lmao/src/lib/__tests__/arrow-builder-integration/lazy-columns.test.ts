@@ -1,10 +1,10 @@
-import { describe, it, expect } from 'bun:test';
-import { createColumnBuffer } from '../createColumnBuffer.js';
+import { describe, expect, it } from 'bun:test';
 import { defineTagAttributes, S } from '@smoothbricks/lmao';
+import { createColumnBuffer } from '@smoothbricks/arrow-builder';
 
 /**
  * Tests for lazy column initialization
- * 
+ *
  * Per GitHub review feedback: Columns should only be allocated when accessed,
  * not eagerly during buffer creation. This saves memory for sparse columns.
  */
@@ -27,22 +27,26 @@ describe('Lazy Column Initialization', () => {
     expect(buffer.timestamps).toBeInstanceOf(Float64Array);
     expect(buffer.operations).toBeInstanceOf(Uint8Array);
 
-    // Access one attribute column - should allocate it
+    // Access one attribute column - should allocate it lazily on first access
     const userIdColumn = buffer['attr_userId'];
-    expect(userIdColumn).toBeInstanceOf(Uint32Array);
+    expect(Array.isArray(userIdColumn)).toBe(true); // Category is now Array<string>
     expect(userIdColumn.length).toBeGreaterThan(0);
 
-    // Access null bitmap - should allocate it
+    // Access null bitmap - should allocate it lazily on first access
     const userIdNulls = buffer.nullBitmaps['attr_userId'];
     expect(userIdNulls).toBeInstanceOf(Uint8Array);
     expect(userIdNulls.length).toBeGreaterThan(0);
+
+    // Verify lazy allocation worked by checking that multiple accesses return same object
+    expect(buffer['attr_userId']).toBe(userIdColumn);
+    expect(buffer.nullBitmaps['attr_userId']).toBe(userIdNulls);
   });
 
   it('should allocate correct TypedArray type for different schema types', () => {
     const schema = defineTagAttributes({
       smallEnum: S.enum(['A', 'B', 'C']), // < 256 values -> Uint8Array
-      category: S.category(), // -> Uint32Array
-      text: S.text(), // -> Uint32Array
+      category: S.category(), // -> Array<string> (no hot-path interning)
+      text: S.text(), // -> Array<string> (no hot-path interning)
       num: S.number(), // -> Float64Array
       bool: S.boolean(), // -> Uint8Array
     });
@@ -52,8 +56,8 @@ describe('Lazy Column Initialization', () => {
 
     // Access each column and verify type
     expect(buffer['attr_smallEnum']).toBeInstanceOf(Uint8Array);
-    expect(buffer['attr_category']).toBeInstanceOf(Uint32Array);
-    expect(buffer['attr_text']).toBeInstanceOf(Uint32Array);
+    expect(Array.isArray(buffer['attr_category'])).toBe(true); // Array<string> now
+    expect(Array.isArray(buffer['attr_text'])).toBe(true); // Array<string> now
     expect(buffer['attr_num']).toBeInstanceOf(Float64Array);
     expect(buffer['attr_bool']).toBeInstanceOf(Uint8Array);
   });
@@ -82,14 +86,14 @@ describe('Lazy Column Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Write to columns (triggering lazy allocation)
-    const userIdColumn = buffer['attr_userId'] as Uint32Array;
+    const userIdColumn = buffer['attr_userId'] as Array<string>;
     const countColumn = buffer['attr_count'] as Float64Array;
 
-    userIdColumn[0] = 123;
+    userIdColumn[0] = 'user123'; // Direct string storage now
     countColumn[0] = 45.67;
 
     // Verify values
-    expect(userIdColumn[0]).toBe(123);
+    expect(userIdColumn[0]).toBe('user123');
     expect(countColumn[0]).toBe(45.67);
   });
 
@@ -103,7 +107,7 @@ describe('Lazy Column Initialization', () => {
 
     // First access
     const column1 = buffer['attr_userId'];
-    
+
     // Second access - should return same array
     const column2 = buffer['attr_userId'];
 

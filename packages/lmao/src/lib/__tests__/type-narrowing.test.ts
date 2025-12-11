@@ -3,12 +3,12 @@
  * Ensures that result.success properly narrows types
  */
 
-import { describe, it, expect } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import { createModuleContext, createRequestContext } from '../lmao.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
-import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
-import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 import { S } from '../schema/builder.js';
+import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
+import { defineTagAttributes } from '../schema/defineTagAttributes.js';
+import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 
 const testSchema = defineTagAttributes({
   userId: S.category(),
@@ -36,7 +36,7 @@ describe('Type Narrowing with FluentResult', () => {
 
     const task = moduleCtx.task('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123, name: 'test' });
-      
+
       // Type narrowing should work with FluentResult
       if (result.success) {
         // result.value should be accessible and typed correctly
@@ -45,16 +45,11 @@ describe('Type Narrowing with FluentResult', () => {
         expect(value.name).toBe('test');
         return value;
       }
-      
+
       return null;
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const output = await task(requestCtx);
     expect(output).toEqual({ id: 123, name: 'test' });
@@ -72,7 +67,7 @@ describe('Type Narrowing with FluentResult', () => {
 
     const task = moduleCtx.task('testTask', async (ctx) => {
       const result = ctx.err('TEST_ERROR', { field: 'email', reason: 'invalid' });
-      
+
       // Type narrowing should work with FluentResult
       if (!result.success) {
         // result.error should be accessible and typed correctly
@@ -82,16 +77,11 @@ describe('Type Narrowing with FluentResult', () => {
         expect(error.details.reason).toBe('invalid');
         return error.code;
       }
-      
+
       return null;
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const output = await task(requestCtx);
     expect(output).toBe('TEST_ERROR');
@@ -108,26 +98,18 @@ describe('Type Narrowing with FluentResult', () => {
     });
 
     const task = moduleCtx.task('testTask', async (ctx) => {
-      const result = ctx
-        .ok({ id: 456 })
-        .with({ userId: 'user1' })
-        .message('Success');
-      
+      const result = ctx.ok({ id: 456 }).with({ userId: 'user1' }).message('Success');
+
       // Type narrowing should still work after chaining
       if (result.success) {
         expect(result.value.id).toBe(456);
         return result.value.id;
       }
-      
+
       return 0;
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const output = await task(requestCtx);
     expect(output).toBe(456);
@@ -148,23 +130,18 @@ describe('Type Narrowing with FluentResult', () => {
         .err('VALIDATION_ERROR', { message: 'Invalid input' })
         .with({ userId: 'user1' })
         .message('Validation failed');
-      
+
       // Type narrowing should work after chaining
       if (!result.success) {
         expect(result.error.code).toBe('VALIDATION_ERROR');
         expect(result.error.details.message).toBe('Invalid input');
         return result.error.code;
       }
-      
+
       return 'OK';
     });
 
-    const requestCtx = createRequestContext(
-      { requestId: 'req1' },
-      testFlags,
-      mockEvaluator,
-      {}
-    );
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     const output = await task(requestCtx);
     expect(output).toBe('VALIDATION_ERROR');

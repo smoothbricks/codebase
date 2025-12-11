@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
+import { beforeEach, describe, expect, it } from 'bun:test';
 import type { BufferCapacityStats } from '../types.js';
 
 /**
@@ -8,9 +8,9 @@ import type { BufferCapacityStats } from '../types.js';
 function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
   const minSamples = 100;
   if (stats.totalWrites < minSamples) return false;
-  
+
   const overflowRatio = stats.overflowWrites / stats.totalWrites;
-  
+
   // Increase if >15% writes overflow
   if (overflowRatio > 0.15 && stats.currentCapacity < 1024) {
     const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
@@ -18,7 +18,7 @@ function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
     resetStats(stats);
     return true;
   }
-  
+
   // Decrease if <5% writes overflow and we have many buffers
   if (overflowRatio < 0.05 && stats.totalBuffersCreated >= 10 && stats.currentCapacity > 8) {
     const newCapacity = Math.max(8, stats.currentCapacity / 2);
@@ -26,7 +26,7 @@ function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
     resetStats(stats);
     return true;
   }
-  
+
   return false;
 }
 

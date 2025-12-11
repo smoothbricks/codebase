@@ -14,7 +14,9 @@ export interface FeatureFlagSchema {
  * @param schema - Object mapping flag names to flag definitions
  * @returns Feature flag definition object for use with evaluator
  */
-export function defineFeatureFlags<T extends FeatureFlagSchema>(schema: T): {
+export function defineFeatureFlags<T extends FeatureFlagSchema>(
+  schema: T,
+): {
   schema: T;
   syncFlags: SyncFlagKeys<T>[];
   asyncFlags: AsyncFlagKeys<T>[];

@@ -1,6 +1,6 @@
 /**
  * Example: Basic LMAO Integration Pattern with Method Chaining
- * 
+ *
  * This example demonstrates:
  * - Creating request context with feature flags and environment
  * - Defining tag attributes for structured logging
@@ -9,17 +9,17 @@
  * - METHOD CHAINING: ctx.log.tag.userId(id).requestId(req).operation('INSERT')
  * - Chaining with with(): ctx.log.tag.with({...}).operation('SELECT')
  * - Creating child spans with chained tags
- * 
+ *
  * Key Feature: All tag methods return the tag object for fluent chaining!
  */
 
-import { 
-  S,
-  defineTagAttributes,
-  defineFeatureFlags,
-  InMemoryFlagEvaluator,
+import {
+  createModuleContext,
   createRequestContext,
-  createModuleContext
+  defineFeatureFlags,
+  defineTagAttributes,
+  InMemoryFlagEvaluator,
+  S,
 } from '../src/index.js';
 
 // 1. Define tag attributes for your domain
@@ -28,13 +28,13 @@ import {
 // - S.category: Values that often repeat (Uint32Array with string interning)
 // - S.text: Unique values (no dictionary overhead)
 const dbAttributes = defineTagAttributes({
-  requestId: S.category(),              // Category: request IDs repeat within traces
-  userId: S.category(),                 // Category: user IDs repeat across operations
+  requestId: S.category(), // Category: request IDs repeat within traces
+  userId: S.category(), // Category: user IDs repeat across operations
   duration: S.number(),
   httpStatus: S.number(),
-  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),  // Enum: known DB operations
-  query: S.text(),                      // Text: SQL queries are mostly unique
-  region: S.category(),                 // Category: AWS regions have limited cardinality
+  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']), // Enum: known DB operations
+  query: S.text(), // Text: SQL queries are mostly unique
+  region: S.category(), // Category: AWS regions have limited cardinality
 });
 
 // 2. Define feature flags
@@ -81,7 +81,7 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
   // Feature flag access (sync flags are properties)
   if (ctx.ff.advancedValidation) {
     ctx.log.info('Using advanced validation');
-    
+
     // Track feature flag usage for analytics
     ctx.ff.trackUsage('advancedValidation', {
       action: 'validation_performed',
@@ -94,11 +94,7 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
   const maxConnections = ctx.env.maxConnections;
 
   // METHOD CHAINING: Each tag method returns the tag object for chaining
-  ctx.log.tag
-    .requestId(ctx.requestId)
-    .userId(userData.email)
-    .operation('INSERT')
-    .region(region);
+  ctx.log.tag.requestId(ctx.requestId).userId(userData.email).operation('INSERT').region(region);
 
   // Can also chain with with() method
   ctx.log.tag
@@ -123,7 +119,7 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
     if (existingUser) {
       return childCtx.err('USER_EXISTS', { email: userData.email });
     }
-    
+
     return childCtx.ok({ valid: true });
   });
 
@@ -132,14 +128,10 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
   }
 
   // Simulate database operation with chained tags
-  ctx.log.tag
-    .operation('INSERT')
-    .query('INSERT INTO users (email, name) VALUES (?, ?)')
-    .duration(50.3)
-    .httpStatus(201);
+  ctx.log.tag.operation('INSERT').query('INSERT INTO users (email, name) VALUES (?, ?)').duration(50.3).httpStatus(201);
 
-  return ctx.ok({ 
-    id: 'user-123', 
+  return ctx.ok({
+    id: 'user-123',
     ...userData,
     createdAt: new Date().toISOString(),
   });
@@ -149,13 +141,13 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
 async function handleRequest() {
   // Create request context at request boundary
   const requestCtx = createRequestContext(
-    { 
+    {
       requestId: 'req-' + Date.now(),
       userId: 'user-456',
     },
     featureFlags,
     flagEvaluator,
-    environmentConfig
+    environmentConfig,
   );
 
   console.log('\n📊 Request context created:', {

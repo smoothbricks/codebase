@@ -1,7 +1,7 @@
-import { describe, it, expect, beforeEach } from 'bun:test';
-import { createSpanBuffer, createNextBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
-import type { TaskContext, SpanBuffer } from '../types.js';
+import { beforeEach, describe, expect, it } from 'bun:test';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
+import { createNextBuffer, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
+import type { SpanBuffer, TaskContext } from '../types.js';
 
 /**
  * Type helper to extract schema fields from ExtendedSchema
@@ -62,10 +62,10 @@ describe('Buffer Chaining', () => {
 
     it('should create buffer with current capacity from stats', () => {
       const buffer = createSpanBuffer(schema, taskContext);
-      
+
       // Update capacity stats
       taskContext.module.spanBufferCapacityStats.currentCapacity = 128;
-      
+
       const nextBuffer = createNextBuffer(buffer);
 
       // Should use updated capacity
@@ -74,10 +74,10 @@ describe('Buffer Chaining', () => {
 
     it('should create independent writeIndex for chained buffer', () => {
       const buffer = createSpanBuffer(schema, taskContext);
-      
+
       // Write some data to original buffer
       buffer.writeIndex = 50;
-      
+
       const nextBuffer = createNextBuffer(buffer);
 
       // Chained buffer should start at 0
@@ -127,12 +127,12 @@ describe('Buffer Chaining', () => {
 
     it('should handle buffer with parent correctly', () => {
       const parentBuffer = createSpanBuffer(schema, taskContext);
-      
+
       const childTaskContext: TaskContext = {
         ...taskContext,
         spanNameId: 2,
       };
-      
+
       const childBuffer = createSpanBuffer(schema, childTaskContext);
       childBuffer.parent = parentBuffer;
       parentBuffer.children.push(childBuffer);
@@ -141,7 +141,7 @@ describe('Buffer Chaining', () => {
 
       // Should maintain parent relationship
       expect(nextChildBuffer.parent).toBe(parentBuffer);
-      
+
       // Should NOT be added to parent's children (it's a continuation, not a new span)
       expect(parentBuffer.children).toHaveLength(1);
       expect(parentBuffer.children[0]).toBe(childBuffer);
@@ -149,7 +149,7 @@ describe('Buffer Chaining', () => {
 
     it('should create empty children array for chained buffer', () => {
       const buffer = createSpanBuffer(schema, taskContext);
-      
+
       // Add a child to original buffer
       const childTaskContext: TaskContext = { ...taskContext, spanNameId: 2 };
       const childBuffer = createSpanBuffer(schema, childTaskContext);

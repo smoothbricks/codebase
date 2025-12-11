@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test';
-import { defineFeatureFlags, type EvaluationContext } from '../defineFeatureFlags.js';
-import { FeatureFlagEvaluator, InMemoryFlagEvaluator, type FlagValue } from '../evaluator.js';
 import { S } from '../builder.js';
+import { defineFeatureFlags, type EvaluationContext } from '../defineFeatureFlags.js';
+import { FeatureFlagEvaluator, type FlagValue, InMemoryFlagEvaluator } from '../evaluator.js';
 
 describe('Feature Flags', () => {
   test('defines feature flags with sync/async markers', () => {
@@ -28,11 +28,7 @@ describe('Feature Flags', () => {
       maxRetries: 5,
     });
 
-    const ff = new FeatureFlagEvaluator(
-      schema.schema,
-      { userId: 'user-123' },
-      evaluator
-    );
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
     // Sync flags accessed as properties
     type FfWithSyncFlags = typeof ff & { debugMode: boolean; maxRetries: number };
@@ -43,9 +39,7 @@ describe('Feature Flags', () => {
   test('evaluator provides async flags via get method', async () => {
     const schema = defineFeatureFlags({
       userSpecificLimit: S.number().default(100).async(),
-      dynamicProvider: S.enum(['stripe', 'paypal'])
-        .default('stripe')
-        .async(),
+      dynamicProvider: S.enum(['stripe', 'paypal']).default('stripe').async(),
     });
 
     const evaluator = new InMemoryFlagEvaluator({
@@ -53,11 +47,7 @@ describe('Feature Flags', () => {
       dynamicProvider: 'paypal',
     });
 
-    const ff = new FeatureFlagEvaluator(
-      schema.schema,
-      { userId: 'user-123' },
-      evaluator
-    );
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
     // Async flags accessed via get()
     const limit = await ff.get('userSpecificLimit');
@@ -75,11 +65,7 @@ describe('Feature Flags', () => {
 
     const evaluator = new InMemoryFlagEvaluator({}); // No flags set
 
-    const ff = new FeatureFlagEvaluator(
-      schema.schema,
-      { userId: 'user-123' },
-      evaluator
-    );
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
     type FfWithSyncFlags = typeof ff & { debugMode: boolean };
     expect((ff as FfWithSyncFlags).debugMode).toBe(false);
@@ -106,12 +92,7 @@ describe('Feature Flags', () => {
       writeContextAttributes: (ctx: EvaluationContext) => logs.push({ context: ctx }),
     };
 
-    const ff = new FeatureFlagEvaluator(
-      schema.schema,
-      { userId: 'user-123' },
-      evaluator,
-      mockWriters
-    );
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator, mockWriters);
 
     ff.trackUsage('advancedValidation', {
       action: 'validation_performed',
@@ -142,12 +123,7 @@ describe('Feature Flags', () => {
       writeContextAttributes: (ctx: EvaluationContext) => logs.push({ context: ctx }),
     };
 
-    const ff = new FeatureFlagEvaluator(
-      schema.schema,
-      { userId: 'user-123' },
-      evaluator,
-      mockWriters
-    );
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator, mockWriters);
 
     // Access the flag
     type FfWithSyncFlags = typeof ff & { debugMode: boolean };
@@ -177,12 +153,7 @@ describe('Feature Flags', () => {
       writeContextAttributes: (ctx: EvaluationContext) => logs.push({ context: ctx }),
     };
 
-    const ff = new FeatureFlagEvaluator(
-      schema.schema,
-      { userId: 'user-123' },
-      evaluator,
-      mockWriters
-    );
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator, mockWriters);
 
     const value = await ff.get('userLimit');
 
@@ -232,11 +203,7 @@ describe('Feature Flags', () => {
       customLimit: 500,
     });
 
-    const ff = new FeatureFlagEvaluator(
-      schema.schema,
-      { userId: 'user-123' },
-      evaluator
-    );
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
     // Test sync flags
     type FfWithSyncFlags = typeof ff & {
@@ -273,4 +240,3 @@ describe('Feature Flags', () => {
     expect(await evaluator.getAsync('asyncFlag', {})).toBe(42);
   });
 });
-

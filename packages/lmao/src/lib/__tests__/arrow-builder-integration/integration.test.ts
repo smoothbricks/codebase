@@ -1,8 +1,8 @@
-import { describe, it, expect } from 'bun:test';
-import { createAttributeColumns } from '../createBuilders.js';
-import { createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
-import type { TaskContext } from '../types.js';
+import { describe, expect, it } from 'bun:test';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
+import { createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
+import { createAttributeColumns } from '../createBuilders.js';
+import type { TaskContext } from '../types.js';
 
 /**
  * Type helper to extract schema fields from ExtendedSchema
@@ -23,17 +23,17 @@ describe('Buffer Integration', () => {
           currentCapacity: 64,
           totalWrites: 0,
           overflowWrites: 0,
-          totalBuffersCreated: 0
-        }
+          totalBuffersCreated: 0,
+        },
       },
       spanNameId: 1,
-      lineNumber: 10
+      lineNumber: 10,
     };
   }
 
   it('generates TypedArray columns with proper names for defined schema', () => {
     const schema = defineTagAttributes({
-      userId: S.category(),  // Category: user IDs repeat
+      userId: S.category(), // Category: user IDs repeat
       isActive: S.boolean(),
       score: S.number(),
     });
@@ -58,7 +58,7 @@ describe('Buffer Integration', () => {
 
   it('creates a SpanBuffer with core and attribute TypedArray columns', () => {
     const schema = defineTagAttributes({
-      userId: S.category(),  // Category: user IDs repeat
+      userId: S.category(), // Category: user IDs repeat
       score: S.number(),
     });
 
@@ -73,7 +73,7 @@ describe('Buffer Integration', () => {
     // Core TypedArrays exist
     expect(buf.timestamps).toBeInstanceOf(Float64Array);
     expect(buf.operations).toBeInstanceOf(Uint8Array);
-    
+
     // Attribute columns exist with correct types
     expect(buf['attr_userId']).toBeInstanceOf(Uint32Array); // category
     expect(buf['attr_score']).toBeInstanceOf(Float64Array); // number
@@ -87,9 +87,9 @@ describe('Buffer Integration', () => {
   it('integrates schema definition with buffer creation', () => {
     // Define schema with defineTagAttributes
     const schema = defineTagAttributes({
-      requestId: S.category(),  // Category: request IDs repeat
+      requestId: S.category(), // Category: request IDs repeat
       httpStatus: S.number(),
-      operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),  // Enum: known HTTP methods
+      operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // Enum: known HTTP methods
     });
 
     // Extract just the schema fields (exclude methods)
@@ -112,7 +112,7 @@ describe('Buffer Integration', () => {
 
   it('handles optional fields in schema', () => {
     const schema = defineTagAttributes({
-      required: S.category(),  // Category string
+      required: S.category(), // Category string
       optional: S.optional(S.number()),
     });
 
@@ -132,7 +132,7 @@ describe('Buffer Integration', () => {
     const schema = defineTagAttributes({
       userId: S.masked('hash'),
       email: S.masked('email'),
-      plainText: S.text(),  // Text: unmasked plain text
+      plainText: S.text(), // Text: unmasked plain text
     });
 
     // Extract just the schema fields (exclude methods)
@@ -156,7 +156,7 @@ describe('Buffer Integration', () => {
 
     const { validate: v1, parse: p1, safeParse: s1, extend: e1, ...smallFields } = smallEnumSchema;
     const smallAttrs = smallFields as ExtractSchemaFields<typeof smallEnumSchema> & TagAttributeSchema;
-    
+
     const smallContext = createTestTaskContext(smallAttrs);
     const smallBuffer = createSpanBuffer(smallAttrs, smallContext);
 

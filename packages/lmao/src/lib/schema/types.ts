@@ -1,6 +1,6 @@
 /**
  * Schema type definitions using Sury (ReScript Schema)
- * 
+ *
  * Sury provides:
  * - Runtime validation (94,828 ops/ms - fastest in JavaScript)
  * - TypeScript inference
@@ -11,11 +11,11 @@
 import type * as Sury from '@sury/sury';
 
 // Re-export Sury's core types for external use
-export type { Schema, Output, Input } from '@sury/sury';
+export type { Input, Output, Schema } from '@sury/sury';
 
 /**
  * Tag attribute schema - maps field names to Sury schemas
- * 
+ *
  * Example:
  * {
  *   userId: S.category(),
@@ -29,9 +29,9 @@ export type TagAttributeSchema = Record<string, Sury.Schema<unknown, unknown>>;
 /**
  * Extract TypeScript output types from tag attribute schema
  * This enables full type inference from Sury schemas
- * 
+ *
  * IMPORTANT: This type must properly infer from schemas with __lmao_type metadata
- * 
+ *
  * Type resolution order:
  * 1. Check if it's an enum schema → extract enum type
  * 2. Check if it's a category schema → string
@@ -44,16 +44,16 @@ export type InferTagAttributes<T extends TagAttributeSchema> = {
   [K in keyof T]: T[K] extends EnumSchemaWithMetadata<infer E>
     ? E
     : T[K] extends CategorySchemaWithMetadata
-    ? string
-    : T[K] extends TextSchemaWithMetadata
-    ? string
-    : T[K] extends NumberSchemaWithMetadata
-    ? number
-    : T[K] extends BooleanSchemaWithMetadata
-    ? boolean
-    : T[K] extends Sury.Schema<infer Out, unknown>
-    ? Out
-    : never;
+      ? string
+      : T[K] extends TextSchemaWithMetadata
+        ? string
+        : T[K] extends NumberSchemaWithMetadata
+          ? number
+          : T[K] extends BooleanSchemaWithMetadata
+            ? boolean
+            : T[K] extends Sury.Schema<infer Out, unknown>
+              ? Out
+              : never;
 };
 
 /**
@@ -109,10 +109,10 @@ export interface SchemaBuilder {
   // Primitive types - return schemas that can also be used as flag builders
   number(): SchemaOrFlagBuilder<number>;
   boolean(): SchemaOrFlagBuilder<boolean>;
-  
+
   // String types - THREE DISTINCT TYPES per specs/01a_trace_schema_system.md
   // IMPORTANT: Never use generic "string" - always choose enum/category/text
-  
+
   /**
    * Enum - Known values at compile time
    * Storage: Uint8Array (1 byte) with compile-time mapping
@@ -121,7 +121,7 @@ export interface SchemaBuilder {
    * Example: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'])
    */
   enum<T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]>;
-  
+
   /**
    * Category - Values that often repeat (limited cardinality)
    * Storage: Uint32Array indices with string interning
@@ -130,7 +130,7 @@ export interface SchemaBuilder {
    * Example: S.category (no arguments needed)
    */
   category(): SchemaOrFlagBuilder<string>;
-  
+
   /**
    * Text - Unique values that rarely repeat
    * Storage: Raw strings without interning
@@ -139,15 +139,15 @@ export interface SchemaBuilder {
    * Example: S.text (no arguments needed)
    */
   text(): SchemaOrFlagBuilder<string>;
-  
+
   // Optional wrapper
   optional<T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined>;
-  
+
   // Union types - for multiple schemas
   union<T extends readonly [Sury.Schema<unknown, unknown>, ...Sury.Schema<unknown, unknown>[]]>(
-    schemas: T
+    schemas: T,
   ): Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>>;
-  
+
   // String with masking transformation - can be applied to category or text
   masked(type: MaskType): Sury.Schema<string, string>;
 }
@@ -159,7 +159,7 @@ export type MaskTransform = (value: string) => string;
 
 /**
  * Schema metadata types - attached to Sury schemas for code generation
- * 
+ *
  * These types allow us to access the __lmao_type metadata on schemas
  */
 export type LmaoSchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
@@ -210,17 +210,17 @@ export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> & {
 
 /**
  * Get schema field entries, filtering out methods added by defineTagAttributes
- * 
+ *
  * Methods like validate, parse, safeParse, extend are added by defineTagAttributes
  * but should not be treated as schema fields for iteration.
- * 
+ *
  * @param schema - Tag attribute schema (possibly with methods)
  * @returns Array of [fieldName, fieldSchema] tuples, excluding methods
  */
 export function getSchemaFields<T extends TagAttributeSchema>(
-  schema: T
+  schema: T,
 ): Array<[string, Sury.Schema<unknown, unknown>]> {
-  return Object.entries(schema).filter(
-    ([_, value]) => typeof value !== 'function'
-  ) as Array<[string, Sury.Schema<unknown, unknown>]>;
+  return Object.entries(schema).filter(([_, value]) => typeof value !== 'function') as Array<
+    [string, Sury.Schema<unknown, unknown>]
+  >;
 }

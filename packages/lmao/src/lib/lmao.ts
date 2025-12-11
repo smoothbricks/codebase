@@ -1,20 +1,20 @@
 /**
  * Main LMAO integration - Context creation and task wrapper system
- * 
+ *
  * This module ties together:
  * - Feature flags with automatic analytics
- * - Environment configuration 
+ * - Environment configuration
  * - Tag attributes with columnar storage
  * - Task wrappers with span buffers
  */
 
-import type { TagAttributeSchema, InferTagAttributes } from './schema/types.js';
-import type { FeatureFlagSchema, InferFeatureFlags, EvaluationContext } from './schema/defineFeatureFlags.js';
-import { FeatureFlagEvaluator, type FlagEvaluator, type FlagColumnWriters } from './schema/evaluator.js';
-import type { SpanBuffer, ModuleContext, TaskContext, BufferCapacityStats } from './types.js';
-import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from './spanBuffer.js';
-import { createSpanLoggerClass, type BaseSpanLogger } from './codegen/spanLoggerGenerator.js';
+import { type BaseSpanLogger, createSpanLoggerClass } from './codegen/spanLoggerGenerator.js';
+import type { EvaluationContext, FeatureFlagSchema, InferFeatureFlags } from './schema/defineFeatureFlags.js';
+import { FeatureFlagEvaluator, type FlagColumnWriters, type FlagEvaluator } from './schema/evaluator.js';
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
+import type { InferTagAttributes, TagAttributeSchema } from './schema/types.js';
+import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from './spanBuffer.js';
+import type { BufferCapacityStats, ModuleContext, SpanBuffer, TaskContext } from './types.js';
 
 /**
  * Result types for ok/err pattern
@@ -26,12 +26,12 @@ export type Result<V, E = unknown> = SuccessResult<V> | ErrorResult<E>;
 /**
  * Fluent result builder for ctx.ok()/ctx.err()
  * Allows chaining attributes and message before returning result
- * 
+ *
  * Per specs/01h_entry_types_and_logging_primitives.md:
  * - Writes span-ok or span-err entry to buffer
  * - Supports .with() for attributes and .message() for text
  * - Returns final result after writing to buffer
- * 
+ *
  * This class extends the base Result type to support method chaining
  * while maintaining proper TypeScript type narrowing.
  */
@@ -40,30 +40,30 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
   readonly value: V;
   private buffer: SpanBuffer;
   private entryIndex: number;
-  
+
   constructor(
     buffer: SpanBuffer,
     value: V,
-    _schema: T // Needed for generic type inference
+    _schema: T, // Needed for generic type inference
   ) {
     this.value = value;
-    
+
     // Find buffer with space and create entry
     const { buffer: bufferWithSpace } = getBufferWithSpace(buffer);
     this.buffer = bufferWithSpace;
-    
+
     this.entryIndex = this.buffer.writeIndex;
-    
+
     // Write entry type (span-ok)
     this.buffer.operations[this.entryIndex] = ENTRY_TYPE_SPAN_OK;
-    
+
     // Write timestamp
     this.buffer.timestamps[this.entryIndex] = Date.now();
-    
+
     // Increment write index
     this.buffer.writeIndex++;
   }
-  
+
   /**
    * Set multiple attributes on the result entry
    * Example: ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
@@ -76,7 +76,7 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
     }
     return this;
   }
-  
+
   /**
    * Set a message on the result entry
    * Example: ctx.ok(result).message('User created successfully')
@@ -95,34 +95,34 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
   readonly error: { code: string; details: E };
   private buffer: SpanBuffer;
   private entryIndex: number;
-  
+
   constructor(
     buffer: SpanBuffer,
     code: string,
     details: E,
-    _schema: T // Needed for generic type inference
+    _schema: T, // Needed for generic type inference
   ) {
     this.error = { code, details };
-    
+
     // Find buffer with space and create entry
     const { buffer: bufferWithSpace } = getBufferWithSpace(buffer);
     this.buffer = bufferWithSpace;
-    
+
     this.entryIndex = this.buffer.writeIndex;
-    
+
     // Write entry type (span-err)
     this.buffer.operations[this.entryIndex] = ENTRY_TYPE_SPAN_ERR;
-    
+
     // Write timestamp
     this.buffer.timestamps[this.entryIndex] = Date.now();
-    
+
     // Write error code
     writeToColumn(this.buffer, 'attr_errorCode', code, this.entryIndex);
-    
+
     // Increment write index
     this.buffer.writeIndex++;
   }
-  
+
   /**
    * Set multiple attributes on the result entry
    * Example: ctx.err('ERROR', details).with({ userId: 'u1' })
@@ -135,7 +135,7 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
     }
     return this;
   }
-  
+
   /**
    * Set a message on the result entry
    * Example: ctx.err('ERROR', details).message('Operation failed')
@@ -156,7 +156,7 @@ function generateTraceId(): string {
 
 /**
  * String interning for category columns
- * 
+ *
  * Per specs/01b1_buffer_performance_optimizations.md:
  * - Store strings once, reference by index
  * - Fast integer comparison vs string comparison
@@ -166,23 +166,23 @@ function generateTraceId(): string {
 class StringInterner {
   private strings: string[] = [];
   private indices = new Map<string, number>();
-  
+
   /**
    * Intern a string and return its index
    * O(1) lookup via Map, O(1) insertion
    */
   intern(str: string): number {
     let idx = this.indices.get(str);
-    
+
     if (idx === undefined) {
       idx = this.strings.length;
       this.strings.push(str);
       this.indices.set(str, idx);
     }
-    
+
     return idx;
   }
-  
+
   /**
    * Get string by index
    * Used during Arrow conversion
@@ -190,14 +190,14 @@ class StringInterner {
   getString(idx: number): string | undefined {
     return this.strings[idx];
   }
-  
+
   /**
    * Get all strings for Arrow dictionary
    */
   getStrings(): readonly string[] {
     return this.strings;
   }
-  
+
   /**
    * Get count of unique strings
    */
@@ -209,7 +209,7 @@ class StringInterner {
 /**
  * Global string interners
  * One per string type to keep dictionaries separate
- * 
+ *
  * Exported for Arrow table conversion
  */
 export const categoryInterner = new StringInterner();
@@ -218,7 +218,7 @@ export const spanNameInterner = new StringInterner();
 
 /**
  * Check if capacity should be tuned based on usage patterns
- * 
+ *
  * Per specs/01b_columnar_buffer_architecture.md:
  * - Increase if >15% writes overflow
  * - Decrease if <5% writes overflow with many buffers
@@ -227,33 +227,33 @@ export const spanNameInterner = new StringInterner();
 function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
   const minSamples = 100; // Need enough data
   if (stats.totalWrites < minSamples) return false;
-  
+
   const overflowRatio = stats.overflowWrites / stats.totalWrites;
-  
+
   // Increase if >15% writes overflow
   if (overflowRatio > 0.15 && stats.currentCapacity < 1024) {
     const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
-    
+
     // TODO: Use system tracer for self-tracing capacity tuning events
     // For now, removed console.log to avoid hot path overhead
-    
+
     stats.currentCapacity = newCapacity;
     resetStats(stats);
     return true;
   }
-  
+
   // Decrease if <5% writes overflow and we have many buffers
   if (overflowRatio < 0.05 && stats.totalBuffersCreated >= 10 && stats.currentCapacity > 8) {
     const newCapacity = Math.max(8, stats.currentCapacity / 2);
-    
+
     // TODO: Use system tracer for self-tracing capacity tuning events
     // For now, removed console.log to avoid hot path overhead
-    
+
     stats.currentCapacity = newCapacity;
     resetStats(stats);
     return true;
   }
-  
+
   return false;
 }
 
@@ -270,34 +270,28 @@ function resetStats(stats: BufferCapacityStats): void {
  * Request context created at request boundary
  * Contains trace ID, feature flags, and environment config
  */
-export interface RequestContext<
-  FF extends FeatureFlagSchema = FeatureFlagSchema,
-  Env = Record<string, unknown>
-> {
+export interface RequestContext<FF extends FeatureFlagSchema = FeatureFlagSchema, Env = Record<string, unknown>> {
   readonly requestId: string;
   readonly userId?: string;
   readonly traceId: string;
-  
+
   // Feature flag evaluator (buffer reference set later by task wrapper)
   readonly ff: FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
-  
+
   // Environment config (just plain object, no tracking)
   readonly env: Env;
 }
 
 /**
  * Create request context with feature flags and environment
- * 
+ *
  * @param params - Request parameters (requestId, userId, etc.)
  * @param featureFlagSchema - Feature flag schema object
  * @param evaluator - Feature flag evaluator backend
  * @param environmentConfig - Environment configuration object
  * @returns Request context with ff and env
  */
-export function createRequestContext<
-  FF extends FeatureFlagSchema,
-  Env extends Record<string, unknown>
->(
+export function createRequestContext<FF extends FeatureFlagSchema, Env extends Record<string, unknown>>(
   params: {
     requestId: string;
     userId?: string;
@@ -305,21 +299,21 @@ export function createRequestContext<
   },
   featureFlagSchema: { schema: FF },
   evaluator: FlagEvaluator,
-  environmentConfig: Env
+  environmentConfig: Env,
 ): RequestContext<FF, Env> {
   const evaluationContext: EvaluationContext = {
     userId: params.userId,
     requestId: params.requestId,
   };
-  
+
   // Create feature flag evaluator (buffer will be set by task wrapper)
   const ffEvaluator = new FeatureFlagEvaluator(
     featureFlagSchema.schema,
     evaluationContext,
     evaluator,
-    undefined // Column writers set later when span context is created
+    undefined, // Column writers set later when span context is created
   ) as FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
-  
+
   return {
     requestId: params.requestId,
     userId: params.userId,
@@ -332,7 +326,7 @@ export function createRequestContext<
 /**
  * Chainable tag API type
  * Each method returns the tag object for chaining
- * 
+ *
  * Per specs/01h_entry_types_and_logging_primitives.md:
  * - Tag getter creates a new entry in the buffer
  * - Subsequent method calls write to the SAME row
@@ -355,11 +349,11 @@ export type ChainableTagAPI<T extends TagAttributeSchema> = {
 /**
  * Span logger context - provides logging API for spans
  * This is what's available as ctx.log in task wrappers
- * 
+ *
  * Per specs/01h_entry_types_and_logging_primitives.md:
  * - tag is a GETTER that creates a new entry and returns chainable API
  * - All methods write to the SAME row until the next tag access
- * 
+ *
  * Per specs/01i_span_scope_attributes.md:
  * - scope() sets attributes that auto-propagate to all subsequent entries
  */
@@ -367,34 +361,34 @@ export interface SpanLogger<T extends TagAttributeSchema> {
   /**
    * Tag attribute API with method chaining support
    * This is a GETTER that creates a new tag entry in the buffer
-   * 
+   *
    * Usage:
    * - ctx.log.tag.userId(value) - creates entry, sets userId, returns this
    * - ctx.log.tag.userId(value).requestId(value2) - continues on SAME entry
    * - ctx.log.tag.with({ userId, requestId }) - bulk set on SAME entry
    */
   readonly tag: ChainableTagAPI<T>;
-  
+
   /**
    * Set scoped attributes that auto-propagate to all subsequent entries
-   * 
+   *
    * Usage:
    * - ctx.log.scope({ requestId: req.id, userId: req.user?.id })
    * - All subsequent log.tag, log.info, etc. will include these attributes
    */
   scope(attributes: Partial<InferTagAttributes<T>>): void;
-  
+
   /**
    * Get current scoped attributes (for inheritance)
    * @internal - Used internally for scope inheritance
    */
   getScopedAttributes(): Record<string, unknown>;
-  
+
   /**
    * Log a message entry
    */
   message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void;
-  
+
   /**
    * Convenience methods for message logging
    */
@@ -410,22 +404,19 @@ export interface SpanLogger<T extends TagAttributeSchema> {
  */
 /**
  * Span context extends RequestContext with logging and span methods
- * 
+ *
  * This is what's provided to task functions and child spans.
  * It includes all RequestContext properties plus logging capabilities.
  */
-export interface SpanContext<
-  T extends TagAttributeSchema,
-  FF extends FeatureFlagSchema,
-  Env = Record<string, unknown>
-> extends RequestContext<FF, Env> {
+export interface SpanContext<T extends TagAttributeSchema, FF extends FeatureFlagSchema, Env = Record<string, unknown>>
+  extends RequestContext<FF, Env> {
   // Logging API (adds to RequestContext)
   log: SpanLogger<T>;
-  
+
   // Result helpers with fluent API
   ok<V>(value: V): FluentSuccessResult<V, T>;
   err<E>(code: string, error: E): FluentErrorResult<E, T>;
-  
+
   // Child span creation
   // The span can return any type R, and TypeScript will infer it from the child function
   span<R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R>;
@@ -439,7 +430,7 @@ export type TaskFunction<
   Result,
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema,
-  Env = Record<string, unknown>
+  Env = Record<string, unknown>,
 > = (ctx: SpanContext<T, FF, Env>, ...args: Args) => Promise<Result>;
 
 /**
@@ -449,21 +440,21 @@ export type TaskFunction<
 export interface ModuleContextBuilder<
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema,
-  Env = Record<string, unknown>
+  Env = Record<string, unknown>,
 > {
   /**
    * Create a task wrapper with span tracking
    */
   task<Args extends unknown[], Result>(
     name: string,
-    fn: TaskFunction<Args, Result, T, FF, Env>
+    fn: TaskFunction<Args, Result, T, FF, Env>,
   ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
 }
 
 /**
  * Entry type codes for operation tracking
  * Per specs/01h_entry_types_and_logging_primitives.md
- * 
+ *
  * Exported for use in codegen and Arrow conversion
  */
 export const ENTRY_TYPE_FF_ACCESS = 1;
@@ -481,9 +472,29 @@ export const ENTRY_TYPE_WARN = 11;
 export const ENTRY_TYPE_ERROR = 12;
 
 /**
+ * Entry type names array for Arrow dictionary encoding
+ * Index matches the entry type constant values
+ */
+export const ENTRY_TYPE_NAMES = [
+  '', // 0 - unused
+  'ff-access', // 1
+  'ff-usage', // 2
+  'tag', // 3
+  'message', // 4
+  'span-start', // 5
+  'span-ok', // 6
+  'span-err', // 7
+  'span-exception', // 8
+  'info', // 9
+  'debug', // 10
+  'warn', // 11
+  'error', // 12
+] as const;
+
+/**
  * Create column writers for feature flag analytics
  * Writes to TypedArray columnar buffers in memory (hot path)
- * 
+ *
  * Per specs/01b1_buffer_performance_optimizations.md:
  * - String interning for category columns
  * - Direct TypedArray writes (no allocations)
@@ -494,11 +505,11 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
       // Write entry type code to operation column
       const typeCode = type === 'ff-access' ? ENTRY_TYPE_FF_ACCESS : ENTRY_TYPE_FF_USAGE;
       buffer.operations[buffer.writeIndex] = typeCode;
-      
+
       // Write timestamp
       buffer.timestamps[buffer.writeIndex] = Date.now();
     },
-    
+
     writeFfName(name: string): void {
       // Write to attr_ffName column with string interning
       const column = buffer['attr_ffName' as keyof SpanBuffer];
@@ -506,7 +517,7 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
         column[buffer.writeIndex] = categoryInterner.intern(name);
       }
     },
-    
+
     writeFfValue(value: string | number | boolean | null): void {
       // Write to attr_ffValue column
       // For mixed types, serialize to string and intern
@@ -516,7 +527,7 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
         column[buffer.writeIndex] = categoryInterner.intern(strValue);
       }
     },
-    
+
     writeAction(action?: string): void {
       // Write to attr_action column
       const column = buffer['attr_action' as keyof SpanBuffer];
@@ -529,12 +540,12 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= (1 << bitOffset);
+            nullBitmap[byteIndex] |= 1 << bitOffset;
           }
         }
       }
     },
-    
+
     writeOutcome(outcome?: string): void {
       // Write to attr_outcome column
       const column = buffer['attr_outcome' as keyof SpanBuffer];
@@ -547,15 +558,15 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= (1 << bitOffset);
+            nullBitmap[byteIndex] |= 1 << bitOffset;
           }
         }
       }
     },
-    
+
     writeContextAttributes(context: EvaluationContext): void {
       const idx = buffer.writeIndex;
-      
+
       // Write context attributes to their respective columns with string interning
       if (context.userId) {
         const column = buffer['attr_contextUserId' as keyof SpanBuffer];
@@ -566,11 +577,11 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= (1 << bitOffset);
+            nullBitmap[byteIndex] |= 1 << bitOffset;
           }
         }
       }
-      
+
       if (context.requestId) {
         const column = buffer['attr_contextRequestId' as keyof SpanBuffer];
         if (column && column instanceof Uint32Array) {
@@ -580,11 +591,11 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= (1 << bitOffset);
+            nullBitmap[byteIndex] |= 1 << bitOffset;
           }
         }
       }
-      
+
       // Increment write index after all writes
       buffer.writeIndex++;
     },
@@ -593,7 +604,7 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 
 /**
  * Find buffer with space, creating chained buffer if needed
- * 
+ *
  * Per specs/01b_columnar_buffer_architecture.md:
  * - Buffer chaining handles overflow gracefully
  * - Tracks overflow stats for self-tuning
@@ -602,7 +613,7 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 function getBufferWithSpace(buffer: SpanBuffer): { buffer: SpanBuffer; didOverflow: boolean } {
   const originalBuffer = buffer;
   let didOverflow = false;
-  
+
   // Find buffer with space (CPU branch predictor friendly)
   while (buffer.writeIndex >= buffer.capacity) {
     if (!buffer.next) {
@@ -612,17 +623,17 @@ function getBufferWithSpace(buffer: SpanBuffer): { buffer: SpanBuffer; didOverfl
     buffer = buffer.next as SpanBuffer;
     didOverflow = true;
   }
-  
+
   // Track stats for self-tuning
   const stats = originalBuffer.task.module.spanBufferCapacityStats;
   stats.totalWrites++;
   if (didOverflow) {
     stats.overflowWrites++;
   }
-  
+
   // Check if capacity should be tuned
   shouldTuneCapacity(stats);
-  
+
   return { buffer, didOverflow };
 }
 
@@ -634,16 +645,16 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
   // Find buffer with space
   const { buffer: bufferWithSpace } = getBufferWithSpace(buffer);
   const idx = bufferWithSpace.writeIndex;
-  
+
   // Write entry type
   bufferWithSpace.operations[idx] = ENTRY_TYPE_SPAN_START;
-  
+
   // Write timestamp
   bufferWithSpace.timestamps[idx] = Date.now();
-  
+
   // Write span name
   writeToColumn(bufferWithSpace, 'attr_spanName', spanName, idx);
-  
+
   // Increment write index
   bufferWithSpace.writeIndex++;
 }
@@ -654,7 +665,7 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
  */
 class TextStringStorage {
   private strings: string[] = [];
-  
+
   /**
    * Store a text string and return its index
    * No deduplication - every string gets a new index
@@ -664,14 +675,14 @@ class TextStringStorage {
     this.strings.push(str);
     return idx;
   }
-  
+
   /**
    * Get string by index
    */
   getString(idx: number): string | undefined {
     return this.strings[idx];
   }
-  
+
   /**
    * Get all strings for Arrow column
    */
@@ -683,7 +694,7 @@ class TextStringStorage {
 /**
  * Global text string storage
  * One instance for all text columns
- * 
+ *
  * Exported for Arrow table conversion
  */
 export const textStringStorage = new TextStringStorage();
@@ -691,7 +702,7 @@ export const textStringStorage = new TextStringStorage();
 /**
  * Write a value to a TypedArray column
  * Handles type conversion for different column types
- * 
+ *
  * Per specs/01b1_buffer_performance_optimizations.md and 01a_trace_schema_system.md:
  * - THREE DISTINCT STRING TYPES:
  *   1. enum: Uint8Array with compile-time enum values (0-255)
@@ -702,12 +713,12 @@ export const textStringStorage = new TextStringStorage();
  */
 function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, index: number): void {
   const column = buffer[columnName as keyof SpanBuffer];
-  
+
   if (!column || !ArrayBuffer.isView(column)) return;
-  
+
   // Get null bitmap for this column (Arrow format: 1 Uint8Array per column)
   const nullBitmap = buffer.nullBitmaps[columnName as `attr_${string}`];
-  
+
   // Handle null/undefined - store 0 and clear null bitmap bit
   if (value === null || value === undefined) {
     if (column instanceof Uint8Array) {
@@ -719,7 +730,7 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
     } else if (column instanceof Float64Array) {
       column[index] = 0;
     }
-    
+
     // Clear bit in bitmap (Arrow format: 0 = null, 1 = valid)
     if (nullBitmap) {
       const byteIndex = Math.floor(index / 8);
@@ -728,21 +739,21 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
     }
     return;
   }
-  
+
   // Mark as non-null in bitmap (Arrow format: 1 = valid)
   if (nullBitmap) {
     const byteIndex = Math.floor(index / 8);
     const bitOffset = index % 8;
-    nullBitmap[byteIndex] |= (1 << bitOffset);
+    nullBitmap[byteIndex] |= 1 << bitOffset;
   }
-  
+
   // Get schema metadata to determine type
   const fieldName = columnName.replace('attr_', '');
   const schema = buffer.task.module.tagAttributes;
   const fieldSchema = schema[fieldName];
   const schemaWithMetadata = fieldSchema as import('./schema/types.js').SchemaWithMetadata;
   const lmaoType = schemaWithMetadata?.__lmao_type;
-  
+
   // Write based on column type and schema metadata
   if (column instanceof Uint8Array) {
     // Boolean or small enum types (0-255 values)
@@ -754,7 +765,7 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
       // Enum: map string to index using enum values from schema
       const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
       const enumValues = enumSchema?.__lmao_enum_values;
-      
+
       if (enumValues) {
         const enumIndex = enumValues.indexOf(value);
         column[index] = enumIndex >= 0 ? enumIndex : 0;
@@ -769,7 +780,7 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
     } else if (typeof value === 'string' && lmaoType === 'enum') {
       const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
       const enumValues = enumSchema?.__lmao_enum_values;
-      
+
       if (enumValues) {
         const enumIndex = enumValues.indexOf(value);
         column[index] = enumIndex >= 0 ? enumIndex : 0;
@@ -809,24 +820,27 @@ type GetBufferWithSpaceFn = (buffer: SpanBuffer) => { buffer: SpanBuffer; didOve
  * Cache for generated SpanLogger classes
  * Per-schema cache to avoid regenerating the same class
  */
-const spanLoggerClassCache = new WeakMap<TagAttributeSchema, new (
-  buffer: SpanBuffer,
-  categoryInterner: StringInterner,
-  textStorage: TextStringStorage,
-  getBufferWithSpace: GetBufferWithSpaceFn,
-  initialScopedAttributes?: Record<string, unknown>
-) => BaseSpanLogger<TagAttributeSchema>>();
+const spanLoggerClassCache = new WeakMap<
+  TagAttributeSchema,
+  new (
+    buffer: SpanBuffer,
+    categoryInterner: StringInterner,
+    textStorage: TextStringStorage,
+    getBufferWithSpace: GetBufferWithSpaceFn,
+    initialScopedAttributes?: Record<string, unknown>,
+  ) => BaseSpanLogger<TagAttributeSchema>
+>();
 
 /**
  * Create span logger with typed tag methods and method chaining
  * Writes to TypedArray columnar buffers in memory (hot path)
- * 
+ *
  * Per specs/01g_trace_context_api_codegen.md and 01j_module_context_and_spanlogger_generation.md:
  * - Uses runtime class generation with new Function() for zero-overhead prototype methods
  * - Tag getter creates a new entry and returns a chainable API
  * - All chained methods write to the SAME row
  * - Zero allocations: returns same object instance
- * 
+ *
  * @param schema - Tag attribute schema with field definitions
  * @param buffer - SpanBuffer to write entries to (per-span instance)
  * @returns SpanLogger with typed methods matching schema
@@ -834,45 +848,45 @@ const spanLoggerClassCache = new WeakMap<TagAttributeSchema, new (
 function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
   buffer: SpanBuffer,
-  inheritedScopedAttributes?: Record<string, unknown>
+  inheritedScopedAttributes?: Record<string, unknown>,
 ): SpanLogger<T> {
   // Get or create the generated SpanLogger class (cold path - happens once per schema)
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
-  
+
   if (!SpanLoggerClass) {
     SpanLoggerClass = createSpanLoggerClass(schema);
     spanLoggerClassCache.set(schema, SpanLoggerClass);
   }
-  
+
   // TypeScript doesn't know the WeakMap guarantees non-null after set
   // So we add an assertion here
   if (!SpanLoggerClass) {
     throw new Error('Failed to create SpanLogger class');
   }
-  
+
   // Create instance (hot path - happens once per span)
   const logger = new SpanLoggerClass(
     buffer,
     categoryInterner,
     textStringStorage,
     getBufferWithSpace,
-    inheritedScopedAttributes || {}
+    inheritedScopedAttributes || {},
   );
-  
+
   // If scoped attributes were inherited, pre-fill the buffer
   if (inheritedScopedAttributes && Object.keys(inheritedScopedAttributes).length > 0) {
     logger.scope(inheritedScopedAttributes);
   }
-  
+
   return logger as SpanLogger<T>;
 }
 
 /**
  * Extract just the schema fields from an object, removing methods
  * This allows us to accept objects with additional methods like validate, extend, etc.
- * 
+ *
  * This type recursively picks all properties that are not functions from intersections
- * 
+ *
  * IMPORTANT: This must properly filter out methods added by defineTagAttributes like:
  * - validate
  * - parse
@@ -892,12 +906,12 @@ type IsValidTagSchema<T> = ExtractSchemaFields<T> extends TagAttributeSchema
 
 /**
  * Create module context with tag attributes
- * 
+ *
  * This creates a task wrapper that:
  * - Creates span buffers for each task execution
  * - Connects feature flag evaluator to buffer for analytics
  * - Provides typed logging API based on tag attributes
- * 
+ *
  * @param options - Module metadata and tag attributes
  * @returns Module context builder with task wrapper
  */
@@ -905,7 +919,7 @@ export function createModuleContext<
   TInput,
   T extends TagAttributeSchema = IsValidTagSchema<TInput>,
   FF extends FeatureFlagSchema = FeatureFlagSchema,
-  Env = Record<string, unknown>
+  Env = Record<string, unknown>,
 >(options: {
   moduleMetadata: {
     gitSha: string;
@@ -915,21 +929,24 @@ export function createModuleContext<
   tagAttributes: TInput;
 }): ModuleContextBuilder<T, FF, Env> {
   const { moduleMetadata, tagAttributes } = options;
-  
+
   // Extract only the schema fields, removing methods like validate, extend, etc.
-  const userSchemaOnly = Object.keys(tagAttributes as Record<string, unknown>).reduce((acc, key) => {
-    const value = (tagAttributes as Record<string, unknown>)[key];
-    // Only include non-function properties
-    if (typeof value !== 'function') {
-      acc[key] = value;
-    }
-    return acc;
-  }, {} as Record<string, unknown>);
-  
+  const userSchemaOnly = Object.keys(tagAttributes as Record<string, unknown>).reduce(
+    (acc, key) => {
+      const value = (tagAttributes as Record<string, unknown>)[key];
+      // Only include non-function properties
+      if (typeof value !== 'function') {
+        acc[key] = value;
+      }
+      return acc;
+    },
+    {} as Record<string, unknown>,
+  );
+
   // Merge with system schema to get all required columns
   // Per specs/01h and 01f - system columns always included
   const schemaOnly = mergeWithSystemSchema(userSchemaOnly) as T;
-  
+
   // Create module context with string-interned module ID
   // Module ID is the file path, interned for efficient storage
   const moduleContext: ModuleContext = {
@@ -944,11 +961,11 @@ export function createModuleContext<
       totalBuffersCreated: 0,
     },
   };
-  
+
   return {
     task<Args extends unknown[], Result>(
       name: string,
-      fn: TaskFunction<Args, Result, T, FF, Env>
+      fn: TaskFunction<Args, Result, T, FF, Env>,
     ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result> {
       return async (requestCtx: RequestContext<FF, Env>, ...args: Args): Promise<Result> => {
         // Create task context with string-interned span name
@@ -957,61 +974,59 @@ export function createModuleContext<
           spanNameId: spanNameInterner.intern(name),
           lineNumber: 0, // Would be set by code generation
         };
-        
+
         // Create span buffer with traceId from request context
         // Per specs/01b - traceId is constant across all spans in a trace
         const spanBuffer = createSpanBuffer(schemaOnly, taskContext, requestCtx.traceId);
-        
+
         // Connect feature flag evaluator to buffer for analytics
         // The evaluator is a FeatureFlagEvaluator instance, we need to set columnWriters
         if (requestCtx.ff instanceof FeatureFlagEvaluator) {
           (requestCtx.ff as FeatureFlagEvaluator<FF>)['columnWriters'] = createFlagColumnWriters(spanBuffer);
         }
-        
+
         // Write span-start entry
         writeSpanStart(spanBuffer, name);
-        
+
         // Inherit scoped attributes from parent context if available
         // Per specs/01i_span_scope_attributes.md - tasks inherit scoped attributes from calling context
-        const inheritedScopedAttributes = (requestCtx as RequestContext<FF, Env> & { log?: SpanLogger<T> }).log?.getScopedAttributes() || {};
-        
+        const inheritedScopedAttributes =
+          (requestCtx as RequestContext<FF, Env> & { log?: SpanLogger<T> }).log?.getScopedAttributes() || {};
+
         // Create span logger with typed tag methods (with inherited scoped attributes)
         const spanLogger = createSpanLogger(schemaOnly, spanBuffer, inheritedScopedAttributes);
-        
+
         // Create span context
         const spanContext: SpanContext<T, FF, Env> = {
           ...requestCtx,
           log: spanLogger,
-          
+
           ok<V>(value: V): FluentSuccessResult<V, T> {
             return new FluentSuccessResult<V, T>(spanBuffer, value, schemaOnly);
           },
-          
+
           err<E>(code: string, error: E): FluentErrorResult<E, T> {
             return new FluentErrorResult<E, T>(spanBuffer, code, error, schemaOnly);
           },
-          
-          async span<R>(
-            childName: string,
-            childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>
-          ): Promise<R> {
+
+          async span<R>(childName: string, childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R> {
             // Create child span buffer with Arrow builders
             const childBuffer = createChildSpanBuffer(spanBuffer, taskContext);
-            
+
             // Write span-start for child span
             writeSpanStart(childBuffer, childName);
-            
+
             // Inherit scoped attributes from parent span
             // Per specs/01i_span_scope_attributes.md - child spans inherit parent's scoped attributes
             const parentScopedAttributes = spanLogger.getScopedAttributes();
-            
+
             // Create child context with its own logger (with inherited scoped attributes)
             const childLogger = createSpanLogger(schemaOnly, childBuffer, parentScopedAttributes);
             const childContext: SpanContext<T, FF, Env> = {
               ...spanContext,
               log: childLogger,
             };
-            
+
             // Execute child span with exception handling
             try {
               return await childFn(childContext);
@@ -1019,27 +1034,27 @@ export function createModuleContext<
               // Write span-exception entry
               const { buffer: bufferWithSpace } = getBufferWithSpace(childBuffer);
               const idx = bufferWithSpace.writeIndex;
-              
+
               bufferWithSpace.operations[idx] = ENTRY_TYPE_SPAN_EXCEPTION;
               bufferWithSpace.timestamps[idx] = Date.now();
-              
+
               // Write exception details
               const errorMessage = error instanceof Error ? error.message : String(error);
               const errorStack = error instanceof Error ? error.stack : undefined;
-              
+
               writeToColumn(bufferWithSpace, 'attr_exceptionMessage', errorMessage, idx);
               if (errorStack) {
                 writeToColumn(bufferWithSpace, 'attr_exceptionStack', errorStack, idx);
               }
-              
+
               bufferWithSpace.writeIndex++;
-              
+
               // Re-throw to propagate
               throw error;
             }
           },
         };
-        
+
         // Execute task function with exception handling
         try {
           return await fn(spanContext, ...args);
@@ -1047,21 +1062,21 @@ export function createModuleContext<
           // Write span-exception entry
           const { buffer: bufferWithSpace } = getBufferWithSpace(spanBuffer);
           const idx = bufferWithSpace.writeIndex;
-          
+
           bufferWithSpace.operations[idx] = ENTRY_TYPE_SPAN_EXCEPTION;
           bufferWithSpace.timestamps[idx] = Date.now();
-          
+
           // Write exception details
           const errorMessage = error instanceof Error ? error.message : String(error);
           const errorStack = error instanceof Error ? error.stack : undefined;
-          
+
           writeToColumn(bufferWithSpace, 'attr_exceptionMessage', errorMessage, idx);
           if (errorStack) {
             writeToColumn(bufferWithSpace, 'attr_exceptionStack', errorStack, idx);
           }
-          
+
           bufferWithSpace.writeIndex++;
-          
+
           // Re-throw to propagate
           throw error;
         }
