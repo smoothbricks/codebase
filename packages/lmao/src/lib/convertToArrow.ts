@@ -51,14 +51,25 @@ export function createZeroCopyData<T extends arrow.DataType>(
   length: number,
   nullBitmap?: Uint8Array,
 ): arrow.Data<T> {
-  // Note: arrow.makeData API varies by version and data type
-  // This is a demonstration of the zero-copy concept
-  // For production, we'd need to handle buffer chaining and proper null bitmap calculation
+  // Create a Uint8Array view of the TypedArray's underlying buffer
+  // Honor byteOffset and byteLength to handle sliced TypedArrays correctly
+  const valueBuffer = new Uint8Array(
+    data.buffer,
+    data.byteOffset,
+    data.byteLength
+  );
+
+  // Build the buffers array: [nullBitmap (if present), valueBuffer]
+  const buffers: ArrayBufferView[] = nullBitmap
+    ? [nullBitmap, valueBuffer]
+    : [new Uint8Array(0), valueBuffer];
+
   return arrow.makeData({
     type,
     length,
     nullCount: nullBitmap ? countNulls(nullBitmap, length) : 0,
     nullBitmap: nullBitmap,
+    buffers,
   }) as arrow.Data<T>;
 }
 
@@ -481,13 +492,16 @@ export function convertToArrowTable(
 /**
  * Check if a row is non-null in the null bitmap
  * Arrow format: 1 = valid, 0 = null
+ * If nullBitmap is undefined, the row is considered valid (non-null)
  */
 function isRowNonNull(nullBitmap: Uint8Array | undefined, rowIndex: number): boolean {
-  if (!nullBitmap) return false;
+  // If no null bitmap exists, treat all rows as valid (non-null)
+  if (!nullBitmap) return true;
 
   const byteIndex = Math.floor(rowIndex / 8);
   const bitOffset = rowIndex % 8;
 
+  // Out of range means null
   if (byteIndex >= nullBitmap.length) return false;
 
   return (nullBitmap[byteIndex] & (1 << bitOffset)) !== 0;

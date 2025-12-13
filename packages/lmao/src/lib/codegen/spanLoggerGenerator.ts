@@ -146,18 +146,28 @@ function generateAttributeWriter(
     }`;
   }
   
-  // For text, use raw storage
+  // For text, use raw storage with null/undefined handling
   if (lmaoType === 'text') {
     return `
     ${fieldName}(value) {
       const idx = this._currentTagIndex !== null ? this._currentTagIndex : this._buffer.writeIndex;
+      const nullBitmap = this._buffer.nullBitmaps.${columnName};
+      const byteIndex = Math.floor(idx / 8);
+      const bitOffset = idx % 8;
+      
+      // Handle null/undefined: clear null bitmap bit and return early
+      if (value === null || value === undefined) {
+        if (nullBitmap) {
+          nullBitmap[byteIndex] &= ~(1 << bitOffset);
+        }
+        return this;
+      }
+      
+      // Store the text value
       this._buffer.${columnName}[idx] = this._textStorage.store(value);
       
       // Mark as non-null
-      const nullBitmap = this._buffer.nullBitmaps.${columnName};
       if (nullBitmap) {
-        const byteIndex = Math.floor(idx / 8);
-        const bitOffset = idx % 8;
         nullBitmap[byteIndex] |= (1 << bitOffset);
       }
       

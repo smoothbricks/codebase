@@ -297,13 +297,12 @@ let nextGlobalSpanId = 1;
 function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
   // Buffer chaining is part of the self-tuning mechanism (see 01b2_buffer_self_tuning.md)
   // When a buffer overflows, we chain to a new buffer for the SAME logical span
-  // The chained buffer inherits spanId and traceId since it's a continuation
+  // The chained buffer inherits spanId and uses the same task context
   return createEmptySpanBuffer(
-    buffer.spanId,     // Same logical span
-    buffer.traceId,    // Same trace
-    getSchemaFromBuffer(buffer), // Re-use schema
-    buffer.task,       // Re-use task context
-    buffer.parent      // Parent is the same as the current buffer's parent
+    buffer.spanId,                // Same logical span
+    getSchemaFromBuffer(buffer),  // Re-use schema
+    buffer.task,                  // Re-use task context (includes traceId)
+    buffer.parent                 // Parent is the same as the current buffer's parent
   );
 }
 

@@ -69,11 +69,15 @@ const validateOrder = task('validate-order', async (ctx, orderId: string) => {
 });
 
 // Example 2: Real-world pattern from requirements
+type Currency = 'USD' | 'EUR' | 'GBP' | 'JPY';
+
+type PaymentMethod = 'card' | 'paypal' | 'bank_transfer';
+
 interface Order {
   id: string;
   total: number;
-  currency: string;
-  paymentMethod: 'card' | 'paypal' | 'bank_transfer';
+  currency: Currency;
+  paymentMethod: PaymentMethod;
 }
 
 const processPayment = task('process-payment', async (ctx, order: Order) => {
@@ -129,6 +133,16 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
 
 // Example 3: Mixing with() and chaining
 const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) => {
+  // Validate required fields or apply safe defaults
+  const id = orderData.id ?? `order-${Date.now()}`;
+  const total = orderData.total ?? 0;
+  const currency: Currency = orderData.currency ?? 'USD';
+  const paymentMethod: PaymentMethod = orderData.paymentMethod ?? 'card';
+
+  if (!orderData.id || orderData.total === undefined || !orderData.currency || !orderData.paymentMethod) {
+    ctx.log.warn('createOrder called with missing required fields, using defaults');
+  }
+
   // Start with bulk setting
   ctx.log.tag
     .with({
@@ -136,17 +150,17 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
       userId: ctx.userId || 'guest',
       operation: 'INSERT',
     })
-    // Then chain specific values
-    .orderId(orderData.id!)
-    .amount(orderData.total!)
-    .currency(orderData.currency!)
-    .paymentMethod(orderData.paymentMethod!)
+    // Then chain specific values with validated/normalized values
+    .orderId(id)
+    .amount(total)
+    .currency(currency)
+    .paymentMethod(paymentMethod)
     .status('pending');
 
   // Feature flags work alongside chaining
   if (ctx.ff.fraudDetection) {
     await ctx.span('fraud-check', async (childCtx) => {
-      childCtx.log.tag.orderId(orderData.id!).operation('SELECT').status('pending');
+      childCtx.log.tag.orderId(id).operation('SELECT').status('pending');
 
       // Fraud check logic...
       return childCtx.ok({ safe: true });
@@ -156,7 +170,7 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
   // More chaining after async operations
   ctx.log.tag.status('completed').httpStatus(201).duration(25.5);
 
-  return ctx.ok({ created: true, orderId: orderData.id });
+  return ctx.ok({ created: true, orderId: id });
 });
 
 // Run examples

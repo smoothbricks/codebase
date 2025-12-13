@@ -2,7 +2,7 @@
  * Platform-specific timestamp utilities
  * 
  * Per vizanto's review feedback and specs/01f_arrow_table_structure.md:
- * - Node.js: Use process.hrtime.bigint() for nanosecond precision
+ * - Node.js: Use epoch-based timestamps with sub-millisecond precision via hrtime anchoring
  * - Browser: Use performance.now() + Date.now() for microsecond precision
  * 
  * Timestamps are stored in Float64Array as milliseconds in the hot path,
@@ -16,6 +16,13 @@ const isNode =
   typeof process !== 'undefined' && process.versions != null && process.versions.node != null;
 
 /**
+ * Module-level anchors for epoch-based timestamps in Node.js
+ * Captures epoch time and hrtime at module load to compute epoch ms with sub-ms precision
+ */
+const moduleStartEpoch = Date.now();
+const moduleStartHr = isNode ? process.hrtime.bigint() : BigInt(0);
+
+/**
  * Span start time tracker for browser relative timestamps
  * Maps span ID to { startTime: Date.now(), startPerf: performance.now() }
  */
@@ -25,18 +32,20 @@ const spanStartTimes = new Map<
 >();
 
 /**
- * Get current timestamp in milliseconds
+ * Get current timestamp in milliseconds (epoch time)
  * 
- * - Node.js: Uses process.hrtime.bigint() with nanosecond precision
+ * - Node.js: Uses anchored hrtime for sub-millisecond precision epoch time
  * - Browser: Uses Date.now() for absolute time
  * 
- * @returns Timestamp in milliseconds (Float64)
+ * @returns Timestamp in milliseconds since Unix epoch (Float64)
  */
 export function getCurrentTimestamp(): number {
   if (isNode) {
-    // Node.js: Get nanoseconds and convert to milliseconds
-    const nanos = process.hrtime.bigint();
-    return Number(nanos) / 1_000_000; // Convert nanoseconds to milliseconds
+    // Node.js: Compute epoch ms using anchored hrtime for sub-ms precision
+    // moduleStartEpoch + elapsed time since module load
+    const elapsedNanos = process.hrtime.bigint() - moduleStartHr;
+    const elapsedMs = Number(elapsedNanos) / 1_000_000;
+    return moduleStartEpoch + elapsedMs;
   }
 
   // Browser: Use Date.now() for millisecond precision

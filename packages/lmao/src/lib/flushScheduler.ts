@@ -372,8 +372,25 @@ export class FlushScheduler {
     try {
       await this.handler(combinedTable, metadata);
       this.lastFlushTime = now;
+
+      // Reset buffers after successful flush to avoid duplicate re-processing
+      for (const buffer of buffersToFlush) {
+        // Reset writeIndex to 0 for the root buffer
+        buffer.writeIndex = 0;
+
+        // Clear any linked/chained buffers
+        let nextBuffer = buffer.next as SpanBuffer | undefined;
+        while (nextBuffer) {
+          nextBuffer.writeIndex = 0;
+          const temp = nextBuffer.next as SpanBuffer | undefined;
+          nextBuffer.next = undefined; // Unlink chained buffer
+          nextBuffer = temp;
+        }
+        buffer.next = undefined; // Clear link from root buffer
+      }
     } catch (error) {
       console.error('Error in flush handler:', error);
+      // Do NOT reset buffers on failure to avoid data loss
     }
   }
 

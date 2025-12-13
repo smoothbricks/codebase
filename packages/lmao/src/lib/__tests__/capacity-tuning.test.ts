@@ -258,7 +258,7 @@ describe('Capacity Tuning Algorithm', () => {
 
       shouldTuneCapacity(stats);
 
-      expect(stats.currentCapacity).toBe(1024); // Not 1024 (capped)
+      expect(stats.currentCapacity).toBe(1024); // Capped at 1024 (max capacity)
     });
 
     it('should not decrease below 8', () => {

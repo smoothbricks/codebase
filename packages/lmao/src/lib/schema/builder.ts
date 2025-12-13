@@ -97,6 +97,8 @@ const maskingTransforms: Record<MaskType, MaskTransform> = {
   email: (value: string): string => {
     const [local, domain] = value.split('@');
     if (!domain) return '*****';
+    // Guard against empty local part (e.g., "@domain.com")
+    if (!local || local.length === 0) return `*****@${domain}`;
     return `${local[0]}*****@${domain}`;
   },
 };
