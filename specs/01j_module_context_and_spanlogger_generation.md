@@ -1,13 +1,15 @@
-# Module Context and SpanLogger Generation
+# Module Context and TagAPI/SpanLogger Generation
 
 ## Overview
 
-The module context system provides the foundation for creating task wrappers with generated SpanLogger classes. It handles:
+The module context system provides the foundation for creating task wrappers with generated TagAPI and SpanLogger
+classes. It handles:
 
 1. **Module-level configuration** shared across all tasks in the same module
-2. **SpanLogger class generation** with typed attribute methods
-3. **Schema compilation** for both standard and library modules
-4. **Factory patterns** for clean library integration
+2. **TagAPI class generation** with typed attribute methods (for `ctx.tag`)
+3. **SpanLogger class generation** with log methods (for `ctx.log`)
+4. **Schema compilation** for both standard and library modules
+5. **Factory patterns** for clean library integration
 
 This system operates at build/startup time to generate efficient runtime code with zero overhead.
 
@@ -22,16 +24,13 @@ const { task } = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123...',
     filePath: 'src/services/user.ts',
-    moduleName: 'UserService'
+    moduleName: 'UserService',
   },
-  tagAttributes: dbAttributes  // Use DB-specific attributes
+  tagAttributes: dbAttributes, // Use DB-specific attributes
 });
 
 // High-level API for standard modules
-function createModuleContext(config: {
-  moduleMetadata: ModuleMetadata,
-  tagAttributes: TagAttributeSchema
-}) {
+function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttributes: TagAttributeSchema }) {
   // Standard case: method names = column names
   const compiledTagOps = compileTagOperations(config.tagAttributes);
 
@@ -39,10 +38,7 @@ function createModuleContext(config: {
 }
 
 // Low-level API that takes pre-compiled tag operations
-function createModuleContextFromCompiled(
-  moduleMetadata: ModuleMetadata,
-  compiledTagOps: CompiledTagOperations
-) {
+function createModuleContextFromCompiled(moduleMetadata: ModuleMetadata, compiledTagOps: CompiledTagOperations) {
   // Register module once, get shared reference
   const moduleContext: ModuleContext = {
     moduleId: registerModule(moduleMetadata),
@@ -55,24 +51,25 @@ function createModuleContextFromCompiled(
       totalWrites: 0,
       overflowWrites: 0,
       totalBuffersCreated: 0,
-    }
+    },
   };
 
   return {
-    task: createTaskWrapper(moduleContext, compiledTagOps)
+    task: createTaskWrapper(moduleContext, compiledTagOps),
   };
 }
 ```
 
 **Why This Design**:
+
 - **Shared module context**: All tasks in the same module share metadata and capacity stats
 - **Self-tuning**: Each module learns its optimal buffer capacity independently
 - **Build tool integration**: Module metadata injected automatically
 - **Type safety**: Full TypeScript inference maintained throughout
 
-## SpanLogger Class Generation
+## TagAPI and SpanLogger Class Generation
 
-The `compileTagOperations` function creates the appropriate SpanLogger class based on the module type:
+The `compileTagOperations` function creates the appropriate TagAPI class (for `ctx.tag`) based on the module type:
 
 ### Standard Compilation
 
@@ -80,11 +77,11 @@ The `compileTagOperations` function creates the appropriate SpanLogger class bas
 // Standard compilation: method names = column names
 function compileTagOperations(tagAttributes: TagAttributeSchema) {
   const attributeNames = Object.keys(tagAttributes);
-  const SpanLogger = generateSpanLoggerClass(attributeNames, attributeNames, tagAttributes);
+  const TagAPI = generateTagAPIClass(attributeNames, attributeNames, tagAttributes);
 
   return {
     schema: tagAttributes,
-    SpanLogger
+    TagAPI,
   };
 }
 ```
@@ -95,14 +92,14 @@ function compileTagOperations(tagAttributes: TagAttributeSchema) {
 // Library compilation: clean method names → prefixed column names
 function compilePrefixedTagOperations(cleanSchema: TagAttributeSchema, prefix: string) {
   const cleanNames = Object.keys(cleanSchema);
-  const prefixedNames = cleanNames.map(name => `${prefix}_${name}`);
+  const prefixedNames = cleanNames.map((name) => `${prefix}_${name}`);
   const prefixedSchema = createPrefixedSchema(cleanSchema, prefix);
 
-  const LibrarySpanLogger = generateSpanLoggerClass(cleanNames, prefixedNames, prefixedSchema);
+  const LibraryTagAPI = generateTagAPIClass(cleanNames, prefixedNames, prefixedSchema);
 
   return {
     schema: prefixedSchema,
-    SpanLogger: LibrarySpanLogger
+    TagAPI: LibraryTagAPI,
   };
 }
 ```
@@ -110,45 +107,56 @@ function compilePrefixedTagOperations(cleanSchema: TagAttributeSchema, prefix: s
 ### Core Generation Logic
 
 ```typescript
-function generateSpanLoggerClass(methodNames, columnNames, schema) {
-  // Generate individual attribute methods
-  const attributeMethods = methodNames.map((methodName, i) => `
+function generateTagAPIClass(methodNames, columnNames, schema) {
+  // Generate individual attribute methods for ctx.tag.attribute()
+  const attributeMethods = methodNames
+    .map(
+      (methodName, i) => `
     ${methodName}(value) {
+      this._writeTagEntry();
       this.buffer.write${capitalize(columnNames[i])}(value);
       return this;
     }
-  `).join('\n');
+  `
+    )
+    .join('\n');
 
-  // Generate .with() method that handles bulk attributes
-  const withMethodBody = methodNames.map((methodName, i) => `
+  // Generate callable body for ctx.tag({ ... }) object API
+  const callableBody = methodNames
+    .map(
+      (methodName, i) => `
     if (attributes.${methodName} !== undefined) {
       this.buffer.write${capitalize(columnNames[i])}(attributes.${methodName});
     }
-  `).join('\n');
+  `
+    )
+    .join('\n');
 
-  // Create the complete SpanLogger class
-  return new Function('BaseSpanLogger', `
-    return class extends BaseSpanLogger {
-      get tag() {
-        this._writeTagEntry(); // Creates new tag entry
+  // Create the complete TagAPI class
+  return new Function(
+    'BaseTagAPI',
+    `
+    return class extends BaseTagAPI {
+      // Callable for object-based API: ctx.tag({ ... })
+      call(attributes) {
+        this._writeTagEntry();
+        ${callableBody}
         return this;
       }
 
       ${attributeMethods}
-
-      with(attributes) {
-        ${withMethodBody}
-        return this;
-      }
     }
-  `)(SpanLogger);
+  `
+  )(TagAPI);
 }
 ```
 
 **Why This Approach**:
+
 - **Zero runtime overhead**: All mapping happens at class generation time
+- **Cleaner API**: `ctx.tag.userId()` instead of `ctx.log.tag.userId()`
 - **Type safety**: Both standard and library cases maintain full TypeScript inference
-- **Efficient .with()**: Bulk attribute setting checks each property and writes to correct column
+- **Dual API**: Both `ctx.tag({ ... })` and `ctx.tag.attr()` supported
 - **Separation of concerns**: Standard modules use simple API, libraries handle their own prefixing
 
 ## Generated Code Examples
@@ -156,25 +164,12 @@ function generateSpanLoggerClass(methodNames, columnNames, schema) {
 ### Standard Module (no prefix)
 
 ```typescript
-// Input: { user_id: S.string, operation: S.string }
-// Generated class:
-class StandardSpanLogger extends BaseSpanLogger {
-  get tag() {
+// Input: { user_id: S.category(), operation: S.enum(['INSERT', 'UPDATE', 'DELETE']) }
+// Generated TagAPI class (for ctx.tag):
+class StandardTagAPI extends BaseTagAPI {
+  // Object-based API: ctx.tag({ user_id: "123", operation: "INSERT" })
+  call(attributes) {
     this._writeTagEntry();
-    return this;
-  }
-
-  user_id(value) {
-    this.buffer.writeUserId(value);  // Method name = column name
-    return this;
-  }
-
-  operation(value) {
-    this.buffer.writeOperation(value);
-    return this;
-  }
-
-  with(attributes) {
     if (attributes.user_id !== undefined) {
       this.buffer.writeUserId(attributes.user_id);
     }
@@ -183,22 +178,74 @@ class StandardSpanLogger extends BaseSpanLogger {
     }
     return this;
   }
+
+  // Chainable API: ctx.tag.user_id("123")
+  user_id(value) {
+    this._writeTagEntry();
+    this.buffer.writeUserId(value);
+    return this;
+  }
+
+  operation(value) {
+    this._writeTagEntry();
+    this.buffer.writeOperation(value);
+    return this;
+  }
 }
 ```
 
-As `ctx.log.tag` writes a new entry (and so does `ctx.log.info()` etc) returning a fluent interface,
-we need an ESLint rule preventing users from capturing the fluent interface in a variable:
+As `ctx.tag` writes a new entry (and so does `ctx.log.info()` etc) returning a fluent interface, we need an ESLint rule
+preventing users from capturing the fluent interface in a variable:
 
 ```typescript
-let entry = ctx.log.info("entry") // INVALID capturing fluent interface
-let tag = ctx.log.tag; // INVALID
-tag.user_id(123) // INVALID USE OF ATTRIBUTE API via captured fluent interface
+let tag = ctx.tag; // INVALID capturing fluent interface
+tag.user_id(123); // INVALID USE via captured reference
 ```
 
 ### Library Module (with prefix 'http')
 
 ```typescript
-// Input: { status: S.number, method: S.string }, prefix: 'http'
+// Input: { status: S.number(), method: S.category() }, prefix: 'http'
+// Generated TagAPI class:
+class LibraryTagAPI extends BaseTagAPI {
+  call(attributes) {
+    this._writeTagEntry();
+    if (attributes.status !== undefined) {
+      this.buffer.writeHttpStatus(attributes.status); // Clean attr → prefixed column
+    }
+    if (attributes.method !== undefined) {
+      this.buffer.writeHttpMethod(attributes.method);
+    }
+    return this;
+  }
+
+  status(value) {
+    this._writeTagEntry();
+    this.buffer.writeHttpStatus(value); // Clean method → prefixed column
+    return this;
+  }
+
+  method(value) {
+    this._writeTagEntry();
+    this.buffer.writeHttpMethod(value);
+    return this;
+  }
+}
+```
+
+As `ctx.tag` writes a new entry (and so does `ctx.log.info()` etc) returning a fluent interface, we need an ESLint rule
+preventing users from capturing the fluent interface in a variable:
+
+```typescript
+let entry = ctx.log.info('entry'); // INVALID capturing fluent interface
+let tag = ctx.tag; // INVALID
+tag.user_id(123); // INVALID USE via captured reference
+```
+
+### Library Module (with prefix 'http')
+
+```typescript
+// Input: { status: S.number(), method: S.category() }, prefix: 'http'
 // Generated class:
 class LibrarySpanLogger extends BaseSpanLogger {
   get tag() {
@@ -207,7 +254,7 @@ class LibrarySpanLogger extends BaseSpanLogger {
   }
 
   status(value) {
-    this.buffer.writeHttpStatus(value);  // Clean method → prefixed column
+    this.buffer.writeHttpStatus(value); // Clean method → prefixed column
     return this;
   }
 
@@ -218,7 +265,7 @@ class LibrarySpanLogger extends BaseSpanLogger {
 
   with(attributes) {
     if (attributes.status !== undefined) {
-      this.buffer.writeHttpStatus(attributes.status);  // Clean attr → prefixed column
+      this.buffer.writeHttpStatus(attributes.status); // Clean attr → prefixed column
     }
     if (attributes.method !== undefined) {
       this.buffer.writeHttpMethod(attributes.method);
@@ -235,12 +282,15 @@ The generic `TaskContext<TSchema>` type that task functions receive:
 ```typescript
 // Generic task context type - exported from the main library
 type TaskContext<TSchema extends ValidAttributes<TSchema> = {}> = {
-  // Span logging with typed attributes
+  // Span attributes - chainable setters (directly on ctx, not ctx.log.tag)
+  tag: TagAPI<TSchema>;
+
+  // Log messages - info/debug/warn/error with scope support
   log: SpanLogger<TSchema>;
 
   // Span completion methods
-  ok: (data?: any) => any;
-  err: (error: string, data?: any) => any;
+  ok: (data?: any) => FluentResult;
+  err: (error: string) => FluentResult;
 
   // Feature flags (logs access to current span)
   ff: FeatureFlagEvaluator;
@@ -258,15 +308,19 @@ type TaskContext<TSchema extends ValidAttributes<TSchema> = {}> = {
 };
 
 // Functions can duck-type by picking only what they need
+type TagContext<TSchema> = Pick<TaskContext<TSchema>, 'tag'>;
 type LoggingContext<TSchema> = Pick<TaskContext<TSchema>, 'log'>;
 type FeatureFlagContext = Pick<TaskContext, 'ff'>;
-type MinimalContext<TSchema> = Pick<TaskContext<TSchema>, 'log' | 'ok' | 'err'>;
+type MinimalContext<TSchema> = Pick<TaskContext<TSchema>, 'tag' | 'log' | 'ok' | 'err'>;
 ```
 
 **Design Benefits**:
+
 - **Type safety**: Full TypeScript inference for all context properties
+- **Cleaner API**: `ctx.tag` directly on context instead of `ctx.log.tag`
 - **Flexibility**: Functions can pick only the context properties they need
 - **Generic attributes**: `TSchema` provides typed access to tag attributes
+- **OpenTelemetry alignment**: `ctx.tag` mirrors `Span.setAttribute()`
 
 ## Library Factory Pattern
 
@@ -275,10 +329,10 @@ For third-party libraries that need prefixed attributes and clean APIs:
 ```typescript
 // Clean schema (no prefixes) - used for typing
 const HTTP_SCHEMA = {
-  status: S.number,
-  method: S.string,
-  url: S.string,
-  duration: S.number
+  status: S.number(),
+  method: S.category(),
+  url: S.text(),
+  duration: S.number(),
 };
 
 // Define library-specific context type once
@@ -288,34 +342,34 @@ type Ctx = TaskContext<typeof HTTP_SCHEMA>;
 async function get(ctx: Ctx, url: string, options = {}) {
   const startTime = performance.now();
 
-  ctx.log.tag.method('GET').url(url);  // ✅ TypeScript knows these methods exist
+  ctx.tag.method('GET').url(url); // ✅ TypeScript knows these methods exist
 
   try {
     const response = await fetch(url, { method: 'GET', ...options });
-    ctx.log.tag.status(response.status).duration(performance.now() - startTime);
+    ctx.tag.status(response.status).duration(performance.now() - startTime);
     return ctx.ok(response);
   } catch (error) {
-    ctx.log.tag.duration(performance.now() - startTime);
-    return ctx.err('HTTP_ERROR', error);
+    ctx.tag.duration(performance.now() - startTime);
+    return ctx.err('HTTP_ERROR');
   }
 }
 
 async function post(ctx: Ctx, url: string, data: any, options = {}) {
   const startTime = performance.now();
 
-  ctx.log.tag.method('POST').url(url);  // ✅ TypeScript knows these methods exist
+  ctx.tag.method('POST').url(url); // ✅ TypeScript knows these methods exist
 
   try {
     const response = await fetch(url, {
       method: 'POST',
       body: JSON.stringify(data),
-      ...options
+      ...options,
     });
-    ctx.log.tag.status(response.status).duration(performance.now() - startTime);
+    ctx.tag.status(response.status).duration(performance.now() - startTime);
     return ctx.ok(response);
   } catch (error) {
-    ctx.log.tag.duration(performance.now() - startTime);
-    return ctx.err('HTTP_ERROR', error);
+    ctx.tag.duration(performance.now() - startTime);
+    return ctx.err('HTTP_ERROR');
   }
 }
 
@@ -323,14 +377,14 @@ async function post(ctx: Ctx, url: string, data: any, options = {}) {
 const HTTP_MODULE_METADATA = {
   gitSha: 'abc123...',
   filePath: '@my-company/http-tracing',
-  moduleName: 'HttpTracing'
+  moduleName: 'HttpTracing',
 };
 
 // Factory call with custom span names
 export const createHttpLibrary = moduleContextFactory(
-  'http',                    // prefix
-  HTTP_MODULE_METADATA,      // module metadata
-  HTTP_SCHEMA,               // clean schema
+  'http', // prefix
+  HTTP_MODULE_METADATA, // module metadata
+  HTTP_SCHEMA, // clean schema
   {
     get: { fn: get, spanName: 'http-request' },
     post: { fn: post, spanName: 'http-request' },
@@ -345,7 +399,7 @@ function moduleContextFactory(
   prefix: string,
   moduleMetadata: ModuleMetadata,
   cleanSchema: TagAttributeSchema,
-  functions: Record<string, { fn: Function, spanName: string }>
+  functions: Record<string, { fn: Function; spanName: string }>
 ) {
   // Compile with prefix
   const compiledTagOps = compilePrefixedTagOperations(cleanSchema, prefix);
@@ -357,20 +411,21 @@ function moduleContextFactory(
   const wrappedFunctions = Object.fromEntries(
     Object.entries(functions).map(([name, { fn, spanName }]) => [
       name,
-      task(spanName, fn)  // Use library author's chosen span name
+      task(spanName, fn), // Use library author's chosen span name
     ])
   );
 
   // Return wrapped functions + schema for composition
   return {
     ...wrappedFunctions,
-    tagAttributes: compiledTagOps.schema  // Prefixed schema for user composition
+    tagAttributes: compiledTagOps.schema, // Prefixed schema for user composition
   };
 }
 ```
 
 **Why This Pattern**:
-- **Clean library APIs**: Libraries use `ctx.log.tag.status()` but write to `http_status` column
+
+- **Clean library APIs**: Libraries use `ctx.tag.status()` but write to `http_status` column
 - **Actual operations**: Libraries return real HTTP functions, not just schemas
 - **Custom span names**: Library authors control span naming conventions
 - **Schema composition**: Prefixed schema available for user composition with other libraries
@@ -382,17 +437,19 @@ This module context system integrates seamlessly with the runtime context flow:
 ```typescript
 // Module setup (build/startup time)
 const { task } = createModuleContext({
-  moduleMetadata: { /* ... */ },
-  tagAttributes: dbAttributes
+  moduleMetadata: {
+    /* ... */
+  },
+  tagAttributes: dbAttributes,
 });
 
 // Runtime usage (request processing)
 export const createUser = task('create-user', async (ctx, userData) => {
-  // ctx.log is an instance of the generated SpanLogger class
-  ctx.log.tag.userId(userData.id).operation('INSERT');
+  // ctx.tag is an instance of the generated TagAPI class
+  ctx.tag.userId(userData.id).operation('INSERT');
 
-  // All the generated methods are available with full TypeScript support
-  ctx.log.info("Creating user").with({ email: userData.email });
+  // ctx.log handles log messages with full TypeScript support
+  ctx.log.info('Creating user').with({ email: userData.email });
 
   return ctx.ok(user);
 });
@@ -430,7 +487,11 @@ The generated approach eliminates all runtime overhead for attribute mapping.
 
 This module context and SpanLogger generation system integrates with:
 
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides the generated SpanLogger classes used in task wrappers
-- **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes TagAttributeSchema definitions to generate appropriate SpanLogger classes
-- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Uses the factory pattern for clean library APIs with prefixed columns
-- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generated SpanLogger methods write to the columnar SpanBuffer structure
+- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides the generated SpanLogger
+  classes used in task wrappers
+- **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes TagAttributeSchema definitions to generate
+  appropriate SpanLogger classes
+- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Uses the factory pattern for clean library
+  APIs with prefixed columns
+- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generated SpanLogger methods write to the
+  columnar SpanBuffer structure

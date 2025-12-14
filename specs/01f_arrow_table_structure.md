@@ -11,7 +11,8 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ## Design Philosophy
 
-**Key Insight**: The Arrow table structure must balance query performance with data completeness. Every entry in the system becomes a row in the final table, enabling rich analytical queries while maintaining efficient storage.
+**Key Insight**: The Arrow table structure must balance query performance with data completeness. Every entry in the
+system becomes a row in the final table, enabling rich analytical queries while maintaining efficient storage.
 
 **Core Principles**:
 
@@ -24,16 +25,16 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ### Core System Columns (Always Present)
 
-| Column Name      | Type                 | Description            | Example Values                                                                                                                                |
-| ---------------- | -------------------- | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timestamp`      | `timestamp[ns]` (Node) / `timestamp[μs]` (Browser) / `timestamp[ms]` (Fallback) | When event occurred (platform-specific precision) | `2024-01-01T10:00:00.000000000Z` (Node), `2024-01-01T10:00:00.000000Z` (Browser), `2024-01-01T10:00:00.000Z` (Fallback) |
-| `trace_id`       | `dictionary<string>` | Root trace identifier  | `'req-abc123'`, `'X-Request-Id-456'`                                                                                                          |
-| `span_id`        | `uint64`             | Span identifier        | `1`, `2`, `3`                                                                                                                                 |
-| `parent_span_id` | `uint64`             | Parent span (nullable) | `1` or `null`                                                                                                                                 |
-| `entry_type`     | `dictionary<string>` | Log entry type         | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'tag'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
-| `module`         | `dictionary<string>` | Module name            | `'UserController'`, `'DatabaseService'`                                                                                                       |
-| `span_name`      | `dictionary<string>` | Span/task name         | `'create-user'`, `'validate-email'`                                                                                                           |
-| `message`        | `string`             | Log message (nullable) | `'Starting user registration'`, `'User created successfully'` or `null`                                                                       |
+| Column Name      | Type                 | Description                                                                  | Example Values                                                                                                                                |
+| ---------------- | -------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timestamp`      | `timestamp[μs]`      | When event occurred (microseconds since epoch, sub-ms precision from anchor) | `2024-01-01T10:00:00.000123Z`                                                                                                                 |
+| `trace_id`       | `dictionary<string>` | Root trace identifier                                                        | `'req-abc123'`, `'X-Request-Id-456'`                                                                                                          |
+| `span_id`        | `uint64`             | Span identifier                                                              | `1`, `2`, `3`                                                                                                                                 |
+| `parent_span_id` | `uint64`             | Parent span (nullable)                                                       | `1` or `null`                                                                                                                                 |
+| `entry_type`     | `dictionary<string>` | Log entry type                                                               | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'tag'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
+| `module`         | `dictionary<string>` | Module name                                                                  | `'UserController'`, `'DatabaseService'`                                                                                                       |
+| `span_name`      | `dictionary<string>` | Span/task name                                                               | `'create-user'`, `'validate-email'`                                                                                                           |
+| `message`        | `string`             | Log message (nullable)                                                       | `'Starting user registration'`, `'User created successfully'` or `null`                                                                       |
 
 ### Library-Specific Attribute Columns (Sparse/Nullable)
 
@@ -54,7 +55,8 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ## Complete Trace Example: User Registration Flow
 
-This example shows a complete user registration request with multiple spans, HTTP calls, database operations, and console.log compatibility traces.
+This example shows a complete user registration request with multiple spans, HTTP calls, database operations, and
+console.log compatibility traces.
 
 | trace_id     | span_id | parent_span_id | timestamp                  | entry_type   | module                | span_name            | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_name              | ff_value |
 | ------------ | ------- | -------------- | -------------------------- | ------------ | --------------------- | -------------------- | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------------------- | -------- |
@@ -100,9 +102,11 @@ This example shows a complete user registration request with multiple spans, HTT
 
 ### 3. Entry Type System
 
-The `entry_type` column uses a dictionary-encoded enum that covers all possible trace events. For complete definitions and low-level API details, see **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**.
+The `entry_type` column uses a dictionary-encoded enum that covers all possible trace events. For complete definitions
+and low-level API details, see **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**.
 
-**Entry Types**: `span-start`, `span-ok`, `span-err`, `span-exception`, `tag`, `info`, `debug`, `warn`, `error`, `ff-access`, `ff-usage`
+**Entry Types**: `span-start`, `span-ok`, `span-err`, `span-exception`, `tag`, `info`, `debug`, `warn`, `error`,
+`ff-access`, `ff-usage`
 
 **Key Benefits**:
 
@@ -269,25 +273,43 @@ GROUP BY ft.ff_value, up.user_plan;
 
 ## Performance Characteristics
 
-### Timestamp Precision (Platform-Specific)
+### Timestamp Precision (High-Resolution Anchored Design)
 
-The timestamp column uses platform-specific precision for optimal performance:
+The timestamp system uses a high-precision anchored design that captures a single time reference at trace root creation,
+then uses high-resolution timers for all subsequent timestamps. See
+[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md) for full implementation details.
 
-- **Node.js**: `timestamp[ns]` (nanosecond) using `process.hrtime.bigint()`
-  - Highest precision for server-side applications
-  - Accurate to nanoseconds for detailed performance profiling
-  
-- **Browser**: `timestamp[μs]` (microsecond) using `performance.now()` + `Date.now()`
-  - High precision for client-side applications
-  - Combines absolute time (Date.now) with relative high-res time (performance.now)
-  - Microsecond precision for detailed browser performance tracking
-  
-- **Fallback**: `timestamp[ms]` (millisecond) using `Date.now()`
+**Core Design**:
+
+- ONE `Date.now()` captured at trace root (RequestContext creation)
+- ONE high-resolution timer captured at trace root (`performance.now()` or `process.hrtime.bigint()`)
+- All subsequent timestamps: `anchorEpochMicros + (highResNow - anchorHighRes) * scale`
+
+**Platform Implementations**:
+
+- **Browser**: `performance.now()` deltas from anchor
+  - ~5μs resolution for sub-millisecond precision
+  - No `Date.now()` calls per span
+  - Stored as `timestamp[μs]` (microsecond) in Arrow
+- **Node.js**: `process.hrtime.bigint()` deltas from anchor
+  - Nanosecond precision available
+  - Stored as microseconds for consistency
+  - Arrow type: `timestamp[μs]` (microsecond)
+- **Fallback**: `Date.now()` (millisecond precision)
   - Used when high-resolution timing is unavailable
-  - Standard millisecond precision
+  - Arrow type: `timestamp[ms]` (millisecond)
 
-All timestamps are stored as Float64Array in memory (milliseconds) during hot path logging,
-then converted to the appropriate Arrow timestamp type during cold path conversion.
+**Hot Path Storage**: All timestamps stored as `Float64Array` (microseconds since epoch) during logging. No object
+allocations, no `Date.now()` calls per entry.
+
+**Cold Path Conversion**: Converted to Arrow `TimestampMicrosecond` type, compatible with ClickHouse `DateTime64(6)`.
+
+**Benefits**:
+
+- Zero allocations per timestamp
+- Sub-millisecond precision enables detailed performance analysis
+- All spans in trace share same anchor (comparable, consistent)
+- DST/NTP safe - anchor per trace, traces are short-lived
 
 ### Storage Efficiency
 
@@ -316,10 +338,15 @@ then converted to the appropriate Arrow timestamp type during cold path conversi
 
 This Arrow table structure integrates with:
 
-- **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**: Foundational entry type system and low-level logging API
-- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Direct conversion from SpanBuffer columns with `attr_` prefix stripping
-- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Prefixed columns from different libraries cleanly separated
-- **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Runtime generation of APIs that populate these Arrow columns
+- **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**: Foundational entry type system
+  and low-level logging API
+- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Direct conversion from SpanBuffer columns
+  with `attr_` prefix stripping
+- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Prefixed columns from different libraries
+  cleanly separated
+- **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Runtime generation of APIs that populate these
+  Arrow columns
 - **Background Processing Pipeline** (future document): Batch conversion process from buffers to Arrow/Parquet
 
-The flat table structure enables rich analytical queries while maintaining the performance benefits of columnar storage and efficient null handling.
+The flat table structure enables rich analytical queries while maintaining the performance benefits of columnar storage
+and efficient null handling.

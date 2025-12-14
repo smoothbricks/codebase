@@ -1,48 +1,73 @@
 # Project: Trace Logging System
 
 ## Core Insight
-**Observation**: Most logging systems are either too slow (string concatenation at runtime) or too hard to query (unstructured). We need something that's blazing fast at runtime but produces rich, queryable data.
+
+**Observation**: Most logging systems are either too slow (string concatenation at runtime) or too hard to query
+(unstructured). We need something that's blazing fast at runtime but produces rich, queryable data.
 
 ## System Overview
 
-The trace logging system provides a complete solution for high-performance, structured observability with AI agent integration. It consists of four main components, each detailed in a separate document:
+The trace logging system provides a complete solution for high-performance, structured observability with AI agent
+integration. It consists of four main components, each detailed in a separate document:
 
 ### 1. [Trace Schema System](./01a_trace_schema_system.md)
+
 **Purpose**: Type-safe configuration and attribute management
+
 - **Tag Attributes**: Structured data logged to spans with automatic masking
-- **Feature Flags**: Dynamic behavior configuration with analytics tracking  
-- **WHY**: Provides a single source of truth for data shapes, validation, and privacy rules, enabling type-safe operations and automatic masking.
+- **Feature Flags**: Dynamic behavior configuration with analytics tracking
+- **WHY**: Provides a single source of truth for data shapes, validation, and privacy rules, enabling type-safe
+  operations and automatic masking.
 
 ### 2. [Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)
-**Purpose**: High-performance append-only runtime log buffers.
-- Implements the data-oriented storage with columnar TypedArrays and self-tuning capacity.
-- **WHY**: Achieves <0.1ms runtime overhead and >90% storage compression by separating the hot path (writes) from the cold path (serialization).
+
+**Purpose**: High-performance runtime log buffers with fixed row layout.
+
+- Implements data-oriented storage with columnar TypedArrays and self-tuning capacity.
+- **Fixed Row Layout**: Row 0 = span-start (ctx.tag overwrites), Row 1 = completion (pre-initialized as span-exception),
+  Row 2+ = events (ctx.log appends).
+- **High-Precision Timestamps**: Anchored design with sub-millisecond precision from performance.now()/hrtime.
+- **WHY**: Achieves <0.1ms runtime overhead and >90% storage compression by separating the hot path (writes) from the
+  cold path (serialization).
 
 ### 3. [Arrow Table Structure](./01f_arrow_table_structure.md)
+
 **Purpose**: Queryable data format for analysis and storage.
+
 - Zero-copy conversion from runtime buffers to Apache Arrow format.
 - **WHY**: Enables efficient querying, compression, and integration with data analysis tools.
 
 ### 4. [Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)
+
 **Purpose**: Hierarchical context management with span correlation.
+
 - Manages how context is created and passed through the system (request → task → child span).
-- **WHY**: Ensures every operation has the correct execution context, enabling proper trace correlation, span-aware logging and feature flag values.
+- **WHY**: Ensures every operation has the correct execution context, enabling proper trace correlation, span-aware
+  logging and feature flag values.
 
 ### 5. [AI Agent Integration](./01d_ai_agent_integration.md)
+
 **Purpose**: Structured trace access for automated analysis and debugging.
+
 - Details the MCP server, test framework plugins for AI test run correlation, and production log access.
-- **WHY**: Allows AI agents to query and understand real system behavior, moving from static code analysis to dynamic trace analysis.
+- **WHY**: Allows AI agents to query and understand real system behavior, moving from static code analysis to dynamic
+  trace analysis.
 
 ### 6. [Library Integration Pattern](./01e_library_integration_pattern.md)
+
 **Purpose**: Enable third-party libraries to provide traced operations with clean APIs.
+
 - Defines the core pattern for library authors to create traced functionality without naming conflicts.
-- **WHY**: Enables a rich ecosystem of traced libraries while maintaining performance and avoiding attribute name collisions through prefixing.
+- **WHY**: Enables a rich ecosystem of traced libraries while maintaining performance and avoiding attribute name
+  collisions through prefixing.
 
 ## Core Architecture Principles
 
 - **Two-Phase Logging**: Separate runtime writes from background processing.
-- **Data-Oriented Design**: Use columnar storage and null bitmaps for performance, and near instant conversion to columnar formats like Apache Arrow.
-- **CPU-Friendly Performance**: Design patterns that leverage V8 optimizations like hidden classes and inline caches, and are friendly to the CPU's branch predictor.
+- **Data-Oriented Design**: Use columnar storage and null bitmaps for performance, and near instant conversion to
+  columnar formats like Apache Arrow.
+- **CPU-Friendly Performance**: Design patterns that leverage V8 optimizations like hidden classes and inline caches,
+  and are friendly to the CPU's branch predictor.
 - **Runtime Codegen**: Use new Function() code generation at application startup to avoid runtime overhead.
 
 ## Key Innovations
@@ -54,13 +79,20 @@ The trace logging system provides a complete solution for high-performance, stru
 
 ## Implementation Status
 
-This is a design document exploring high-performance trace logging concepts. The system is not yet implemented but provides a comprehensive architecture for experimentation and validation.
+The core trace logging system is implemented in `@packages/lmao` with buffer infrastructure in
+`@packages/arrow-builder`. Key features that are operational:
 
-## Experiments Needed
+- Schema system with `S.enum()`, `S.category()`, `S.text()`, `S.number()`, `S.boolean()`
+- Tag attribute definitions with masking transforms
+- Feature flag evaluation with analytics tracking
+- SpanLogger class generation with typed methods
+- Buffer chaining and self-tuning capacity management
+- Arrow table conversion via `convertToArrowTable()`
 
-- **Apache Arrow Integration**: Benchmark direct conversion from span buffers to Arrow IPC format
-- **Buffer Performance**: Benchmark different columnar storage strategies (e.g., single TypedArray vs. multiple) for memory and CPU efficiency.
-- **TypeScript Transformer**: Evaluate metadata extraction and string interning performance
+## Future Experiments
+
+- **Buffer Performance**: Benchmark different columnar storage strategies (e.g., single TypedArray vs. multiple) for
+  memory and CPU efficiency
 - **Schema Evolution**: Test backward compatibility and migration strategies
 - **Prototype schema-driven masking** with runtime codegen
 

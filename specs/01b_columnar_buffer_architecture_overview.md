@@ -2,23 +2,27 @@
 
 > **📚 HIGH-PERFORMANCE LOGGING CORE**
 >
-> This document introduces the columnar buffer architecture that powers the trace logging system with <0.1ms runtime overhead. For implementation details, see the sub-documents linked below.
+> This document introduces the columnar buffer architecture that powers the trace logging system with <0.1ms runtime
+> overhead. For implementation details, see the sub-documents linked below.
 
 ## Core Insight: Columnar Storage for Logs
 
-Instead of creating objects and serializing them, we write directly to columnar TypedArrays. This separates the hot path (array writes) from the cold path (Arrow/Parquet conversion).
+Instead of creating objects and serializing them, we write directly to columnar TypedArrays. This separates the hot path
+(array writes) from the cold path (Arrow/Parquet conversion).
 
 ## WHY: Traditional Logging is Too Slow
 
 ### Objects Kill Performance
 
 Traditional logging:
+
 ```javascript
 logger.info({ userId: '123', action: 'login', timestamp: Date.now() });
 // Creates object → Serializes to JSON → Writes to disk
 ```
 
 Problems:
+
 1. **Object allocation** - Triggers garbage collection
 2. **Property access** - Dynamic lookups
 3. **Serialization cost** - JSON.stringify overhead
@@ -36,6 +40,7 @@ buffer.attr_action[writeIndex] = internString('login');
 ```
 
 Benefits:
+
 - **Zero allocations** - Reuse pre-allocated arrays
 - **Cache-friendly** - Sequential memory access
 - **Direct Arrow conversion** - Arrays become Arrow columns
@@ -57,14 +62,18 @@ Benefits:
 ## Key Design Principles
 
 ### 1. Equal Length Arrays
+
 All TypedArrays maintain identical length:
+
 ```typescript
-buffer.timestamps.length === buffer.operations.length === buffer.attr_userId.length
+(buffer.timestamps.length === buffer.operations.length) === buffer.attr_userId.length;
 // This enables direct row indexing and zero-copy Arrow conversion
 ```
 
 ### 2. Cache Line Alignment
+
 Arrays sized to 64-byte boundaries:
+
 ```typescript
 // 64 elements = optimal for all array types
 timestamps: new Float64Array(64),  // 64 × 8 = 512 bytes (8 cache lines)
@@ -72,7 +81,9 @@ operations: new Uint8Array(64),    // 64 × 1 = 64 bytes (1 cache line)
 ```
 
 ### 3. String Interning
+
 Build Arrow dictionaries while logging:
+
 ```typescript
 const internedStrings = ['user-123', 'login', 'dashboard']; // Pre-built dictionary
 buffer.attr_action[i] = 1; // Index into dictionary, not string
@@ -80,16 +91,16 @@ buffer.attr_action[i] = 1; // Index into dictionary, not string
 ```
 
 ### 4. Self-Tuning Capacity
-Buffers grow and shrink automatically:
+
+Buffers chain automatically when capacity is exceeded:
+
 ```typescript
-// Start small
+// Start with initial capacity
 const buffer = createSpanBuffer(64);
 
-// Grows as needed
-buffer.write(); // 64 → 128 → 256 → ...
-
-// Compacts when mostly empty
-buffer.compact(); // 2048 → 512 if only using 400 entries
+// Overflows chain to next buffer transparently
+// When buffer.writeIndex >= buffer.capacity, createNextBuffer() is called
+// The system learns optimal capacity per module over time
 ```
 
 ## Quick Example
@@ -101,23 +112,21 @@ const buffer = createSpanBuffer();
 // Hot path - just array writes
 function logUserAction(userId: string, action: string) {
   const idx = buffer.writeIndex++;
-  
+
   buffer.timestamps[idx] = Date.now();
   buffer.operations[idx] = OP_TAG;
   buffer.attr_userId[idx] = internString(userId);
   buffer.attr_action[idx] = internString(action);
-  
-  // Self-tuning happens automatically
-  if (idx >= buffer.capacity - 1) {
-    buffer.grow(); // Transparent to caller
-  }
+
+  // Self-tuning happens automatically via buffer chaining
+  // When capacity is exceeded, createNextBuffer() chains a new buffer
 }
 
-// Background conversion to Arrow (zero-copy)
+// Background conversion to Arrow (via convertToArrowTable)
 setInterval(() => {
-  const arrowBatch = buffer.toArrow();
+  const arrowTable = convertToArrowTable(buffer);
   // Dictionary already built during logging!
-  sendToStorage(arrowBatch);
+  sendToStorage(arrowTable);
 }, 1000);
 ```
 
@@ -160,7 +169,9 @@ Before implementing columnar buffers, understand:
 ## Common Patterns
 
 ### Sparse Attributes
+
 Use null bitmap for optional fields:
+
 ```typescript
 if (error) {
   buffer.attr_errorCode[idx] = internString(error.code);
@@ -169,13 +180,17 @@ if (error) {
 ```
 
 ### High-Cardinality Strings
+
 Intern only common values:
+
 ```typescript
 const value = isCommon(str) ? internString(str) : storeRawString(str);
 ```
 
 ### Nested Data
+
 Flatten to columns:
+
 ```typescript
 // Instead of: { user: { id: '123', name: 'Alice' } }
 buffer.attr_userId[idx] = internString('123');
@@ -190,6 +205,7 @@ buffer.attr_userName[idx] = internString('Alice');
 ## Summary
 
 Columnar buffers revolutionize logging performance by:
+
 - Writing directly to typed arrays (no objects)
 - Building Arrow dictionaries during logging (no second scan)
 - Self-tuning capacity (no configuration)

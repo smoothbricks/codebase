@@ -2,455 +2,283 @@
 
 ## Overview
 
-Span scope attributes allow setting attributes at the span level that automatically propagate to all subsequent log entries and child spans within that scope. This eliminates repetitive attribute setting, ensures consistency, and provides zero-runtime-cost attribute inclusion.
+Scope attributes are span-level values that automatically propagate to all rows in the span and inherit to child spans.
+Unlike `ctx.tag` which writes to row 0 only, `ctx.scope` sets values that appear on EVERY row when converted to Arrow.
 
-## Design Philosophy
+**Key difference from tag**:
 
-**Key Insight**: Many attributes are contextual to an entire span scope (requestId, userId, orderId) and should be set once at the span level rather than repeated on every log entry. This is particularly valuable in middleware and top-level request handling.
+- `ctx.tag.userId('123')` → writes to row 0 only
+- `ctx.scope.userId('123')` → appears on ALL rows (0, 1, 2, 3, ...) in Arrow output
 
-**Scope Hierarchy**:
-```
-Request Middleware: scope({ requestId, userId, endpoint, method })
-├── Business Logic: scope({ orderId, orderAmount })
-├── ├── All log entries include: requestId, userId, endpoint, method, orderId, orderAmount
-├── └── Child Span: scope({ validationStep })
-├──     └── All child entries include: requestId, userId, endpoint, method, orderId, orderAmount, validationStep
-```
+## Design: Lazy Scope with Zero Hot-Path Allocation
 
-**Performance Optimization**: Scoped attributes are pre-filled into the remaining buffer capacity, meaning subsequent log operations have zero additional overhead for including these attributes.
+The critical insight: scope values should NOT force TypedArray allocation. We use lazy columns that store a scope value
+separately from the actual array data.
 
-## SpanLogger Scope API
-
-### Core Implementation
+### LazyColumn Class
 
 ```typescript
-class SpanLogger {
-  constructor(buffer, scopedAttributes = {}) {
-    this.buffer = buffer;
-    this.scoped = scopedAttributes; // Attributes scoped to this span
-    this.tag = this;
+class LazyColumn<T extends TypedArray | string[]> {
+  private _values: T | null = null;
+  private _nullBitmap: Uint8Array | null = null;
+  private _scopeValue: number | string | boolean | null = null;
+
+  readonly capacity: number;
+  readonly ArrayType: TypedArrayConstructor | ArrayConstructor;
+
+  // For black-box testing
+  get isInitialized(): boolean {
+    return this._values !== null;
   }
-  
-  // Set scope-level attributes that apply to all subsequent operations
-  scope(attributes) {
-    // Merge with existing scoped attributes
-    this.scoped = { ...this.scoped, ...attributes };
-    
-    // Pre-fill remaining buffer capacity with these attributes
-    this._prefillRemainingCapacity(attributes);
-    
-    return this;
+
+  get hasScopeValue(): boolean {
+    return this._scopeValue !== null;
   }
-  
-  // Internal method to pre-fill buffer arrays with scoped attributes
-  _prefillRemainingCapacity(newScoped) {
-    const startIndex = this.buffer.writeIndex;
-    const capacity = this.buffer.capacity;
-    
-    // Pre-fill the remaining buffer space with scoped attributes
-    for (const [attrName, value] of Object.entries(newScoped)) {
-      const columnName = `attr_${attrName}`;
-      const column = this.buffer[columnName];
-      
-      if (column) {
-        const processedValue = this._processValue(value, attrName);
-        const bitPos = this._getAttributeBitPosition(attrName);
-        
-        // Fill from current write position to end of buffer
-        for (let i = startIndex; i < capacity; i++) {
-          column[i] = processedValue;
-          // Set null bitmap bit to indicate this attribute has a value
-          this.buffer.nullBitmap[i] |= (1 << bitPos);
-        }
-      }
+
+  // Set scope value - NO ALLOCATION
+  setScope(value: number | string | boolean): void {
+    if (this._scopeValue !== null && this._values === null) {
+      // Second scope call with different value - must allocate NOW
+      // to preserve the old scope value in rows 0..writeIndex
+      this._allocateAndFillWithScope();
+    }
+    this._scopeValue = value;
+  }
+
+  private _allocateAndFillWithScope(): void {
+    this._values = new this.ArrayType(this.capacity);
+    if (this._scopeValue !== null) {
+      this._values.fill(this._scopeValue);
     }
   }
-  
-  // All log operations benefit from pre-filled scoped attributes
-  info(message) {
-    const index = this.buffer.writeIndex++;
-    this.buffer.timestamps[index] = performance.now();
-    this.buffer.operations[index] = OPERATION_INFO;
-    
-    // Scoped attributes are already pre-filled!
-    // Just write the message-specific data
-    this._writeMessage(index, message);
-    
-    return this;
-  }
-  
-  // Tag operations can add to scoped attributes
-  tag = {
-    userId: (value) => {
-      const index = this.buffer.writeIndex++;
-      this.buffer.timestamps[index] = performance.now();
-      this.buffer.operations[index] = OPERATION_TAG;
-      
-      // Scoped attributes already present, just add this specific tag
-      this.buffer.attr_userId[index] = this._processValue(value, 'userId');
-      this.buffer.nullBitmap[index] |= (1 << this._getAttributeBitPosition('userId'));
-      
-      return this;
+
+  // Hot path - allocate on first direct write
+  get values(): T {
+    if (!this._values) {
+      this._allocateAndFillWithScope();
     }
-    // ... other tag methods
-  };
+    return this._values;
+  }
+
+  // Cold path - Arrow conversion
+  getValuesForArrow(writeIndex: number): T | null {
+    if (this._values) {
+      // Was written to directly - zero-copy
+      return this._values.subarray(0, writeIndex);
+    }
+    if (this._scopeValue !== null) {
+      // Never written directly, but has scope value
+      // Allocate NOW (cold path) and fill
+      const arr = new this.ArrayType(writeIndex);
+      arr.fill(this._scopeValue);
+      return arr;
+    }
+    // No data, no scope - null column
+    return null;
+  }
 }
 ```
 
-### Scope Inheritance Mechanisms
+### Allocation Triggers
 
-#### Task Wrapper Integration
+TypedArray allocation happens:
+
+1. **Direct write** (e.g., `ctx.tag.userId()`) - accesses `.values`, triggers allocation + scope fill
+2. **Second scope call** - must preserve old scope value, triggers allocation + fill
+3. **Cold path Arrow conversion** - if still lazy but has scope value, allocate and fill
+
+First `ctx.scope.X()` call = just sets `_scopeValue`, NO allocation.
+
+## API Design
+
+### ctx.scope vs ctx.tag
 
 ```typescript
-function createTaskWrapper(moduleContext, compiledTagOps) {
-  return function task(spanName, fn) {
-    return (...args) => {
-      const [originalCtx, ...restArgs] = args;
-      
-      // Create buffer (existing code)
-      const buffer = createSpanBuffer(compiledTagOps.schema, taskModuleContext);
-      
-      // Inherit scoped attributes from parent context
-      const inheritedScoped = originalCtx.log?.scoped || {};
-      
-      // Create enhanced context with inherited scoped attributes
-      const enhancedCtx = {
-        ...originalCtx,
-        log: new taskModuleContext.SpanLogger(buffer, inheritedScoped)
-      };
-      
-      // Pre-fill buffer with inherited scoped attributes
-      if (Object.keys(inheritedScoped).length > 0) {
-        enhancedCtx.log._prefillRemainingCapacity(inheritedScoped);
-      }
-      
-      // Rest of existing implementation...
-      return fn(enhancedCtx, ...restArgs);
-    };
-  };
-}
+// ctx.tag - writes to row 0 only, NOT inherited
+ctx.tag.userId('123'); // Allocates column, writes to row 0
+
+// ctx.scope - sets scope value, inherited to children, appears on ALL rows
+ctx.scope.userId('123'); // Just sets _scopeValue, NO allocation
+ctx.scope.requestId('req-1'); // Just sets _scopeValue, NO allocation
 ```
 
-#### Child Span Inheritance
+Both are chainable:
 
 ```typescript
-// In TaskContext.span method
-async function createChildSpan(parentCtx, spanName, childFn) {
-  // Create child buffer (existing code)
-  const childBuffer = createSpanBuffer(/*...*/);
-  
-  // Child inherits parent's scoped attributes
-  const childCtx = {
-    ...parentCtx,
-    log: new SpanLogger(childBuffer, parentCtx.log.scoped) // Inherit scoped attributes
-  };
-  
-  // Pre-fill child buffer with inherited scoped attributes
-  if (Object.keys(parentCtx.log.scoped).length > 0) {
-    childCtx.log._prefillRemainingCapacity(parentCtx.log.scoped);
-  }
-  
-  return childFn(childCtx);
-}
+ctx.scope.userId('123').requestId('req-1').orderId('ord-456');
+ctx.tag.status(200).method('POST');
 ```
 
-#### Buffer Overflow Handling
+### Scope Inheritance
+
+Child spans inherit parent's scope object:
 
 ```typescript
-function createNextBuffer(buffer) {
-  const nextBuffer = createEmptySpanBuffer(/*...*/);
-  
-  // Carry forward scoped attributes to overflow buffer
-  if (buffer.log && buffer.log.scoped) {
-    const scopedCount = Object.keys(buffer.log.scoped).length;
-    if (scopedCount > 0) {
-      // Create new SpanLogger with inherited scoped attributes
-      nextBuffer.log = new SpanLogger(nextBuffer, buffer.log.scoped);
-      // Pre-fill entire new buffer with scoped attributes
-      nextBuffer.log._prefillRemainingCapacity(buffer.log.scoped);
+// Parent span
+ctx.scope.userId('u1').requestId('r1');
+
+await ctx.span('child-operation', async (childCtx) => {
+  // childCtx has NEW LazyColumns, each with inherited _scopeValue
+  // No TypedArrays allocated yet
+
+  childCtx.scope.orderId('ord-1'); // Add to scope, still no allocation
+
+  childCtx.log.info('processing'); // Only allocates attr_logMessage
+  // attr_userId, attr_requestId, attr_orderId still lazy
+
+  // At Arrow conversion: all three columns materialized with scope values
+});
+```
+
+### Implementation of Scope Inheritance
+
+```typescript
+function createChildSpanBuffer(parentBuffer: SpanBuffer): SpanBuffer {
+  const childBuffer = createEmptySpanBuffer(/* ... */);
+
+  // Copy parent's scope values to child's LazyColumns
+  for (const [columnName, parentColumn] of Object.entries(parentBuffer.columns)) {
+    if (parentColumn.hasScopeValue) {
+      childBuffer.columns[columnName].setScope(parentColumn._scopeValue);
     }
   }
-  
-  return nextBuffer;
+
+  return childBuffer;
 }
 ```
 
-## Usage Patterns
-
-### Middleware Pattern
-
-The most powerful use case is setting up request-level scope in middleware that flows through all business logic:
+## Hot Path Behavior
 
 ```typescript
-// Express middleware sets up request-level scope
-app.use((req, res, next) => {
-  const ctx = createRequestContext({ 
-    requestId: req.id, 
-    userId: req.user?.id 
-  });
-  
-  // Set scope attributes once at middleware level
-  ctx.log.scope({
-    requestId: req.id,
-    userId: req.user?.id,
-    endpoint: req.path,
-    method: req.method,
-    userAgent: req.get('User-Agent'),
-    ip: req.ip
-  });
-  
-  req.ctx = ctx;
-  next();
-});
+ctx.scope.userId('u1'); // _scopeValue = 'u1', NO allocation
+ctx.scope.requestId('r1'); // _scopeValue = 'r1', NO allocation
+ctx.log.info('step 1'); // Allocates attr_logMessage ONLY
+ctx.log.info('step 2'); // Writes to attr_logMessage
+ctx.log.info('step 3'); // Writes to attr_logMessage
 
-// Business logic focuses on domain concerns
-export const createUser = task('create-user', async (ctx, userData) => {
-  // Add business-specific scope attributes
-  ctx.log.scope({
-    operation: 'CREATE_USER',
-    email: userData.email // Masked in the background process for privacy (as defined in schema)
-  });
-  
-  // All subsequent operations include middleware + business scope attributes
-  ctx.log.info("Starting user creation");
-  // ↑ Includes: requestId, userId, endpoint, method, userAgent, ip, operation, email
-  
-  // Feature flag access (automatically includes scope attributes)
-  if (ctx.ff.advancedValidation) {
-    ctx.log.info("Using advanced validation");
-    // ↑ Also includes all scope attributes
-  }
-  
-  // Child span inherits all scope attributes
-  const validation = await ctx.span('validate-email', async (childCtx) => {
-    // Child adds validation-specific scope
-    childCtx.log.scope({
-      validationStep: 'email_uniqueness'
-    });
-    
-    childCtx.log.info("Checking email uniqueness");
-    // ↑ Includes: requestId, userId, endpoint, method, userAgent, ip, operation, email, validationStep
-    
-    if (existingUser) {
-      return childCtx.err('EMAIL_EXISTS');
-      // ↑ Error also includes all scope attributes
+// attr_userId: _values = null, _scopeValue = 'u1'
+// attr_requestId: _values = null, _scopeValue = 'r1'
+// attr_logMessage: _values = ['step 1', 'step 2', 'step 3', ...]
+```
+
+## Cold Path: Arrow Conversion
+
+```typescript
+function convertToArrow(buffer: SpanBuffer): ArrowData {
+  const columns: Record<string, TypedArray | string[]> = {};
+
+  for (const [name, lazyColumn] of Object.entries(buffer.columns)) {
+    const arrowData = lazyColumn.getValuesForArrow(buffer.writeIndex);
+    if (arrowData !== null) {
+      columns[name] = arrowData;
     }
-    
-    return childCtx.ok({ unique: true });
-  });
-  
-  if (!validation.success) {
-    return ctx.err('VALIDATION_FAILED', validation.error);
   }
-  
-  const user = await db.createUser(userData);
-  return ctx.ok(user);
-});
+
+  // Zero-copy for directly written columns
+  // Allocate + fill for scope-only columns
+  return buildArrowData(columns);
+}
 ```
 
-### Multi-Level Scoping
+**Result in Arrow table**:
 
-Demonstrates how scoped attributes layer naturally in complex business flows:
-
-```typescript
-export const processOrder = task('process-order', async (ctx, order) => {
-  // Order-level scope
-  ctx.log.scope({
-    orderId: order.id,
-    orderAmount: order.total,
-    customerTier: order.customer.tier
-  });
-  
-  ctx.log.info("Order processing started");
-  
-  // Payment processing with additional scope
-  const payment = await ctx.span('process-payment', async (paymentCtx) => {
-    paymentCtx.log.scope({
-      paymentMethod: order.paymentMethod,
-      paymentProvider: 'stripe'
-    });
-    
-    paymentCtx.log.info("Initiating payment");
-    // ↑ Includes: orderId, orderAmount, customerTier, paymentMethod, paymentProvider
-    
-    // Fraud check with even more specific scope
-    const fraudCheck = await paymentCtx.span('fraud-check', async (fraudCtx) => {
-      fraudCtx.log.scope({
-        riskScore: calculateRiskScore(order),
-        fraudModel: 'v2.1'
-      });
-      
-      fraudCtx.log.info("Running fraud detection");
-      // ↑ Includes all parent scope + riskScore, fraudModel
-      
-      return fraudCtx.ok({ riskLevel: 'low' });
-    });
-    
-    return paymentCtx.ok({ charged: true });
-  });
-  
-  return ctx.ok({ processed: true });
-});
+```
+| row | timestamp | logMessage | userId | requestId |
+|-----|-----------|------------|--------|-----------|
+| 0   | 1000      | null       | u1     | r1        |  <- span-start
+| 1   | 2000      | null       | u1     | r1        |  <- span-end
+| 2   | 1100      | 'step 1'   | u1     | r1        |  <- event
+| 3   | 1200      | 'step 2'   | u1     | r1        |  <- event
+| 4   | 1300      | 'step 3'   | u1     | r1        |  <- event
 ```
 
-### Library Integration
+Scope values appear on EVERY row - but the TypedArray was only allocated in the cold path.
 
-Third-party libraries can use scoped attributes to provide clean APIs while ensuring traceability:
+## Edge Case: Double Scope
+
+Rare case where scope is set twice for same attribute:
 
 ```typescript
-// HTTP library sets up request-specific scope
-export const get = task('http-get', async (ctx, url, options = {}) => {
-  // Scope all HTTP operations with request metadata
-  ctx.log.scope({
-    http_method: 'GET',
-    http_url: url,
-    http_timeout: options.timeout || 30000
-  });
-  
-  const startTime = performance.now();
-  ctx.log.info("HTTP request initiated");
-  
-  try {
-    const response = await fetch(url, { method: 'GET', ...options });
-    
-    // Add response-specific scope
-    ctx.log.scope({
-      http_status: response.status,
-      http_duration: performance.now() - startTime
-    });
-    
-    ctx.log.info("HTTP request completed");
-    return ctx.ok(response);
-    
-  } catch (error) {
-    ctx.log.scope({
-      http_error: error.message,
-      http_duration: performance.now() - startTime
-    });
-    
-    ctx.log.info("HTTP request failed");
-    return ctx.err('HTTP_ERROR', error);
-  }
-});
+ctx.scope.userId('u1'); // _scopeValue = 'u1', no allocation
+ctx.log.info('msg1'); // Row 2, only touches logMessage
+ctx.log.info('msg2'); // Row 3, only touches logMessage
+ctx.scope.userId('u2'); // SECOND scope call!
+// Must allocate NOW to preserve 'u1' in rows 0-3
+// Fill 0..writeIndex with 'u1'
+// Set _scopeValue = 'u2' for remainder
+ctx.log.info('msg3'); // Row 4, only touches logMessage
+```
+
+**Arrow output**:
+
+```
+| row | logMessage | userId |
+|-----|------------|--------|
+| 0   | null       | u1     |  <- rows 0-3 have old value
+| 1   | null       | u1     |
+| 2   | 'msg1'     | u1     |
+| 3   | 'msg2'     | u1     |
+| 4   | 'msg3'     | u2     |  <- row 4+ have new value
 ```
 
 ## Performance Characteristics
 
-### Memory Pre-filling Strategy
+| Operation                         | Allocation      | Cost                                      |
+| --------------------------------- | --------------- | ----------------------------------------- |
+| First `scope.X(value)`            | None            | O(1) - just set \_scopeValue              |
+| Second `scope.X(value)`           | Yes             | O(n) - allocate + fill to writeIndex      |
+| `tag.X(value)`                    | Yes             | O(n) - allocate + fill with scope + write |
+| `log.info(msg)`                   | Only logMessage | O(1) - single column write                |
+| Arrow conversion (scope column)   | Yes if lazy     | O(n) - allocate + fill                    |
+| Arrow conversion (written column) | None            | O(1) - zero-copy subarray                 |
 
-The key performance optimization is pre-filling buffer arrays when scoped attributes are set:
+## Comparison with ctx.tag
 
-```typescript
-// When ctx.log.scope({ userId: "user123", requestId: "req456" }) is called:
+| Aspect                | ctx.tag               | ctx.scope                       |
+| --------------------- | --------------------- | ------------------------------- |
+| Writes to row 0       | Yes                   | No (unless also using tag)      |
+| Appears on all rows   | No (row 0 only)       | Yes (at Arrow conversion)       |
+| Allocates on call     | Yes                   | No (first call)                 |
+| Inherited by children | No                    | Yes                             |
+| Use case              | Span-level attributes | Request context flowing through |
 
-// 1. Current buffer state:
-//    writeIndex = 5, capacity = 64
-//    attr_userId = [val1, val2, val3, val4, val5, 0, 0, 0, ...] (59 zeros)
-//    attr_requestId = [val1, val2, val3, val4, val5, 0, 0, 0, ...] (59 zeros)
+## Usage Patterns
 
-// 2. After scope() call:
-//    attr_userId = [val1, val2, val3, val4, val5, "user123", "user123", ...] (59 copies of "user123")
-//    attr_requestId = [val1, val2, val3, val4, val5, "req456", "req456", ...] (59 copies of "req456")
-
-// 3. Subsequent log operations just increment writeIndex:
-//    ctx.log.info("message") → writeIndex = 6, userId and requestId are already there!
-```
-
-### Runtime Overhead Analysis
-
-- **Scope Setting**: O(n × m) where n = remaining capacity, m = number of scoped attributes
-- **Log Operations**: O(1) - no additional work for scoped attributes
-- **Memory Usage**: No additional allocation, uses existing buffer capacity
-- **CPU Cache**: Pre-filling improves cache locality for subsequent operations
-
-### Comparison with Repetitive Tagging
+### Request Middleware
 
 ```typescript
-// WITHOUT scope (current approach) - O(m) per log operation
-ctx.log.tag.userId("user123").requestId("req456").info("Step 1");
-ctx.log.tag.userId("user123").requestId("req456").info("Step 2");
-ctx.log.tag.userId("user123").requestId("req456").info("Step 3");
-// Total: 6 attribute writes + 3 log operations = 9 operations
+app.use((req, res, next) => {
+  const ctx = createRequestContext({ requestId: req.id });
 
-// WITH scope - O(1) per log operation after initial setup
-ctx.log.scope({ userId: "user123", requestId: "req456" }); // One-time setup
-ctx.log.info("Step 1"); // userId, requestId already present
-ctx.log.info("Step 2"); // userId, requestId already present  
-ctx.log.info("Step 3"); // userId, requestId already present
-// Total: 1 setup + 3 log operations = 4 operations (56% reduction)
+  // Set scope once - flows through ALL operations
+  ctx.scope.requestId(req.id).userId(req.user?.id).endpoint(req.path).method(req.method);
+
+  req.ctx = ctx;
+  next();
+});
 ```
 
-## Integration with Existing Systems
-
-### Compatibility with Tag Operations
-
-Scoped attributes work seamlessly with existing tag operations:
+### Business Logic
 
 ```typescript
-// Set scope once
-ctx.log.scope({ requestId: ctx.requestId, userId: order.userId });
+const processOrder = task('process-order', async (ctx, order) => {
+  // Add business-specific scope (inherits request scope)
+  ctx.scope.orderId(order.id).customerId(order.customerId);
 
-// All subsequent operations include scoped attributes automatically
-ctx.log.info("Processing order");              // ← Includes requestId, userId
-ctx.log.tag.step('validation');                // ← Includes requestId, userId + step
-ctx.log.err('VALIDATION_FAILED', error);       // ← Includes requestId, userId + error
-ctx.log.ok({ processed: true });               // ← Includes requestId, userId + result
+  // All log entries and child spans get these values automatically
+  ctx.log.info('Processing order');
+
+  await ctx.span('validate', async (childCtx) => {
+    // childCtx inherits: requestId, userId, endpoint, method, orderId, customerId
+    childCtx.log.info('Validating'); // All scope values in Arrow output
+  });
+
+  return ctx.ok({ processed: true });
+});
 ```
-
-### Feature Flag Integration
-
-Scoped attributes are automatically included in feature flag usage tracking:
-
-```typescript
-ctx.log.scope({ userId: order.userId, orderId: order.id });
-
-// Feature flag access includes scoped attributes
-if (ctx.ff.advancedValidation) {
-  // Feature flag usage automatically includes userId, orderId in its trace entry
-  ctx.ff.trackUsage('advancedValidation', { action: 'validation_enabled' });
-}
-```
-
-### Arrow/Parquet Output
-
-Scoped attributes are handled efficiently during background processing:
-
-```typescript
-// Arrow conversion recognizes pre-filled values
-const createArrowVectors = (spanBuffer) => {
-  return {
-    // Standard columns
-    timestamp: arrow.Float64Vector.from(spanBuffer.timestamps.slice(0, spanBuffer.writeIndex)),
-    
-    // Scoped attributes are efficiently converted (many duplicate values compress well)
-    user_id: arrow.Utf8Vector.from(spanBuffer.attr_userId.slice(0, spanBuffer.writeIndex)),
-    request_id: arrow.Utf8Vector.from(spanBuffer.attr_requestId.slice(0, spanBuffer.writeIndex)),
-  };
-};
-
-// Parquet compression handles repeated scoped values very efficiently
-// Example: 1000 log entries with same userId compresses to ~12 bytes in Parquet
-```
-
-## Benefits Summary
-
-1. **Zero Runtime Overhead**: Scoped attributes are pre-filled once, not written repeatedly
-2. **Consistency**: Impossible to forget important contextual attributes
-3. **Clean Code**: Business logic focuses on domain concerns, not logging boilerplate
-4. **Hierarchical Context**: Child spans automatically inherit parent context
-5. **Memory Efficient**: Pre-filling leverages existing buffer capacity
-6. **Compression Friendly**: Repeated scoped values compress extremely well in Parquet
-7. **Type Safe**: Full TypeScript inference for scoped attribute names and types
-8. **Middleware Integration**: Perfect fit for request-level context setup
-
-This scope-based approach transforms logging from a repetitive, error-prone task into a clean, consistent, and performant operation that scales naturally with complex request flows.
 
 ## Integration Points
 
-This span scope attributes system integrates with:
-
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides the foundational context creation and inheritance mechanisms
-- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Defines the SpanBuffer structure that gets pre-filled with scoped attributes
-- **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Shows how the `ctx.log.scope()` API is generated at runtime
-- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Demonstrates how libraries can use scoped attributes for clean traced operations
-``` 
+- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: LazyColumn implementation
+- **[Context Flow](./01c_context_flow_and_task_wrappers.md)**: Scope inheritance in task/span creation
+- **[Arrow Table Structure](./01f_arrow_table_structure.md)**: Cold-path materialization
