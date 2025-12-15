@@ -1,7 +1,14 @@
 import { describe, expect, test } from 'bun:test';
 import { S } from '../builder.js';
 import { defineFeatureFlags, type EvaluationContext } from '../defineFeatureFlags.js';
-import { FeatureFlagEvaluator, type FlagValue, InMemoryFlagEvaluator } from '../evaluator.js';
+import {
+  type BooleanFlagContext,
+  FeatureFlagEvaluator,
+  type FlagTrackContext,
+  type FlagValue,
+  InMemoryFlagEvaluator,
+  type VariantFlagContext,
+} from '../evaluator.js';
 
 describe('Feature Flags', () => {
   test('defines feature flags with sync/async markers', () => {
@@ -17,7 +24,7 @@ describe('Feature Flags', () => {
     expect(flags.asyncFlags).toContain('userSpecificLimit');
   });
 
-  test('evaluator provides sync flags as properties', () => {
+  test('evaluator returns FlagContext for truthy flags', () => {
     const schema = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
       maxRetries: S.number().default(3).sync(),
@@ -30,13 +37,39 @@ describe('Feature Flags', () => {
 
     const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
-    // Sync flags accessed as properties
-    type FfWithSyncFlags = typeof ff & { debugMode: boolean; maxRetries: number };
-    expect((ff as FfWithSyncFlags).debugMode).toBe(true);
-    expect((ff as FfWithSyncFlags).maxRetries).toBe(5);
+    // New API: truthy flags return FlagContext wrappers
+    type FfWithFlags = typeof ff & {
+      debugMode: BooleanFlagContext | undefined;
+      maxRetries: { value: number; track: (ctx?: FlagTrackContext) => void } | undefined;
+    };
+
+    const debugMode = (ff as FfWithFlags).debugMode;
+    expect(debugMode).toBeDefined();
+    expect(debugMode?.value).toBe(true);
+    expect(typeof debugMode?.track).toBe('function');
+
+    const maxRetries = (ff as FfWithFlags).maxRetries;
+    expect(maxRetries).toBeDefined();
+    expect(maxRetries?.value).toBe(5);
+    expect(typeof maxRetries?.track).toBe('function');
   });
 
-  test('evaluator provides async flags via get method', async () => {
+  test('evaluator returns undefined for falsy flags', () => {
+    const schema = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+      userLimit: S.number().default(100).async(),
+    });
+
+    const evaluator = new InMemoryFlagEvaluator({}); // No flags set → null values
+
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
+
+    // New API: falsy flags (including false defaults) return undefined
+    type FfWithFlags = typeof ff & { debugMode: BooleanFlagContext | undefined };
+    expect((ff as FfWithFlags).debugMode).toBeUndefined();
+  });
+
+  test('async flags return FlagContext via get method', async () => {
     const schema = defineFeatureFlags({
       userSpecificLimit: S.number().default(100).async(),
       dynamicProvider: S.enum(['stripe', 'paypal']).default('stripe').async(),
@@ -49,30 +82,17 @@ describe('Feature Flags', () => {
 
     const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
-    // Async flags accessed via get()
-    const limit = await ff.get('userSpecificLimit');
-    const provider = await ff.get('dynamicProvider');
+    // Async flags accessed via get() return FlagContext
+    const limit = (await ff.get('userSpecificLimit')) as { value: number; track: () => void };
+    expect(limit).toBeDefined();
+    expect(limit.value).toBe(200);
 
-    expect(limit).toBe(200);
-    expect(provider).toBe('paypal');
+    const provider = (await ff.get('dynamicProvider')) as VariantFlagContext<string>;
+    expect(provider).toBeDefined();
+    expect(provider.value).toBe('paypal');
   });
 
-  test('returns default values when flag not set', async () => {
-    const schema = defineFeatureFlags({
-      debugMode: S.boolean().default(false).sync(),
-      userLimit: S.number().default(100).async(),
-    });
-
-    const evaluator = new InMemoryFlagEvaluator({}); // No flags set
-
-    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
-
-    type FfWithSyncFlags = typeof ff & { debugMode: boolean };
-    expect((ff as FfWithSyncFlags).debugMode).toBe(false);
-    expect(await ff.get('userLimit')).toBe(100);
-  });
-
-  test('trackUsage logs usage events', () => {
+  test('trackUsage logs usage events (legacy API)', () => {
     const schema = defineFeatureFlags({
       advancedValidation: S.boolean().default(false).sync(),
     });
@@ -105,7 +125,45 @@ describe('Feature Flags', () => {
     expect(logs).toContainEqual({ outcome: 'success' });
   });
 
-  test('sync flag access is logged', () => {
+  test('track() on FlagContext logs usage events', () => {
+    const schema = defineFeatureFlags({
+      advancedValidation: S.boolean().default(false).sync(),
+    });
+
+    const evaluator = new InMemoryFlagEvaluator({
+      advancedValidation: true,
+    });
+
+    type LogEntry = Record<string, unknown>;
+    const logs: LogEntry[] = [];
+    const mockWriters = {
+      writeEntryType: (type: string) => logs.push({ type }),
+      writeFfName: (name: string) => logs.push({ name }),
+      writeFfValue: (value: FlagValue) => logs.push({ value }),
+      writeAction: (action?: string) => logs.push({ action }),
+      writeOutcome: (outcome?: string) => logs.push({ outcome }),
+      writeContextAttributes: (ctx: EvaluationContext) => logs.push({ context: ctx }),
+    };
+
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator, mockWriters);
+
+    // Access flag to get FlagContext
+    type FfWithFlags = typeof ff & { advancedValidation: BooleanFlagContext | undefined };
+    const flag = (ff as FfWithFlags).advancedValidation;
+
+    // Clear logs from access
+    logs.length = 0;
+
+    // Use track() on the flag context
+    flag?.track({ action: 'validation_performed', outcome: 'success' });
+
+    expect(logs).toContainEqual({ type: 'ff-usage' });
+    expect(logs).toContainEqual({ name: 'advancedValidation' });
+    expect(logs).toContainEqual({ action: 'validation_performed' });
+    expect(logs).toContainEqual({ outcome: 'success' });
+  });
+
+  test('sync flag access is logged only once per span', () => {
     const schema = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
     });
@@ -125,14 +183,20 @@ describe('Feature Flags', () => {
 
     const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator, mockWriters);
 
-    // Access the flag
-    type FfWithSyncFlags = typeof ff & { debugMode: boolean };
-    const value = (ff as FfWithSyncFlags).debugMode;
+    // Access the flag multiple times
+    type FfWithFlags = typeof ff & { debugMode: BooleanFlagContext | undefined };
+    const value1 = (ff as FfWithFlags).debugMode;
+    const value2 = (ff as FfWithFlags).debugMode;
+    const value3 = (ff as FfWithFlags).debugMode;
 
-    expect(value).toBe(true);
-    expect(logs).toContainEqual({ type: 'ff-access' });
-    expect(logs).toContainEqual({ name: 'debugMode' });
-    expect(logs).toContainEqual({ value: true });
+    // All accesses should return same cached value
+    expect(value1).toBe(value2);
+    expect(value2).toBe(value3);
+    expect(value1?.value).toBe(true);
+
+    // Only ONE ff-access log should be written (deduplication)
+    const accessLogs = logs.filter((l) => l.type === 'ff-access');
+    expect(accessLogs).toHaveLength(1);
   });
 
   test('async flag access is logged', async () => {
@@ -155,9 +219,9 @@ describe('Feature Flags', () => {
 
     const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator, mockWriters);
 
-    const value = await ff.get('userLimit');
+    const value = (await ff.get('userLimit')) as { value: number };
 
-    expect(value).toBe(200);
+    expect(value.value).toBe(200);
     expect(logs).toContainEqual({ type: 'ff-access' });
     expect(logs).toContainEqual({ name: 'userLimit' });
     expect(logs).toContainEqual({ value: 200 });
@@ -205,19 +269,28 @@ describe('Feature Flags', () => {
 
     const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
-    // Test sync flags
-    type FfWithSyncFlags = typeof ff & {
-      enableFeatureX: boolean;
-      maxConnectionPool: number;
-      logLevel: 'info' | 'debug' | 'warn';
+    // Test sync flags - now return FlagContext wrappers
+    type FfWithFlags = typeof ff & {
+      enableFeatureX: BooleanFlagContext | undefined;
+      maxConnectionPool: { value: number; track: () => void } | undefined;
+      logLevel: VariantFlagContext<string> | undefined;
     };
-    expect((ff as FfWithSyncFlags).enableFeatureX).toBe(true);
-    expect((ff as FfWithSyncFlags).maxConnectionPool).toBe(20);
-    expect((ff as FfWithSyncFlags).logLevel).toBe('debug');
+
+    const enableFeatureX = (ff as FfWithFlags).enableFeatureX;
+    expect(enableFeatureX?.value).toBe(true);
+
+    const maxConnectionPool = (ff as FfWithFlags).maxConnectionPool;
+    expect(maxConnectionPool?.value).toBe(20);
+
+    const logLevel = (ff as FfWithFlags).logLevel;
+    expect(logLevel?.value).toBe('debug');
 
     // Test async flags
-    expect(await ff.get('userTier')).toBe('premium');
-    expect(await ff.get('customLimit')).toBe(500);
+    const userTier = (await ff.get('userTier')) as VariantFlagContext<string>;
+    expect(userTier.value).toBe('premium');
+
+    const customLimit = (await ff.get('customLimit')) as { value: number };
+    expect(customLimit.value).toBe(500);
   });
 
   test('InMemoryFlagEvaluator setFlag updates values', () => {
@@ -238,5 +311,66 @@ describe('Feature Flags', () => {
     });
 
     expect(await evaluator.getAsync('asyncFlag', {})).toBe(42);
+  });
+
+  test('withContext creates child evaluator with additional context', () => {
+    const schema = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+    });
+
+    const evaluator = new InMemoryFlagEvaluator({ debugMode: true });
+
+    const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
+
+    // Create child evaluator with additional context
+    const childFf = ff.withContext({ requestId: 'req-456' });
+
+    // Both should have the flag accessible
+    type FfWithFlags = typeof ff & { debugMode: BooleanFlagContext | undefined };
+    expect((ff as FfWithFlags).debugMode?.value).toBe(true);
+    expect((childFf as unknown as FfWithFlags).debugMode?.value).toBe(true);
+
+    // Child should have merged context
+    expect(childFf.getContext().userId).toBe('user-123');
+    expect(childFf.getContext().requestId).toBe('req-456');
+  });
+
+  test('usage example from spec: undefined/truthy pattern', () => {
+    const schema = defineFeatureFlags({
+      darkMode: S.boolean().default(false).sync(),
+      advancedSearch: S.boolean().default(false).sync(),
+    });
+
+    // Scenario 1: darkMode is enabled
+    const enabledEvaluator = new InMemoryFlagEvaluator({ darkMode: true });
+    const ffEnabled = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, enabledEvaluator);
+
+    type FfWithFlags = typeof ffEnabled & {
+      darkMode: BooleanFlagContext | undefined;
+      advancedSearch: BooleanFlagContext | undefined;
+    };
+
+    const darkMode = (ffEnabled as FfWithFlags).darkMode;
+
+    // Truthy check works naturally with undefined/truthy semantics
+    if (darkMode) {
+      // darkMode is BooleanFlagContext here
+      expect(darkMode.value).toBe(true);
+      // Can track usage
+      darkMode.track({ action: 'applied' });
+    }
+
+    // Scenario 2: darkMode is disabled
+    const disabledEvaluator = new InMemoryFlagEvaluator({ darkMode: false });
+    const ffDisabled = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, disabledEvaluator);
+
+    const darkModeDisabled = (ffDisabled as FfWithFlags).darkMode;
+
+    // Falsy check works - undefined is falsy
+    expect(darkModeDisabled).toBeUndefined();
+    if (!darkModeDisabled) {
+      // This branch executes for disabled flags
+      expect(true).toBe(true);
+    }
   });
 });

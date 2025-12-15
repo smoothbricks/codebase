@@ -62,13 +62,13 @@ Span completion entry types (all written to row 1):
 - **`span-exception`** - Span threw unexpected exception - **Always row 1**
   - Pre-initialized at span creation (row 1 defaults to this)
   - Remains if exception bypassed normal `ctx.ok()`/`ctx.err()` flow
-  - Contains exception details in message column
+  - Contains exception details in the `label` column (see "The `label` Column" below)
   - Indicates truly exceptional circumstances
   - Duration still valid: `timestamps[1] - timestamps[0]`
 
 ### Log Level Entry Types
 
-Structured logging with message and optional typed attributes - **APPENDS new rows starting at row 2**:
+Structured logging with message templates and typed attributes - **APPENDS new rows starting at row 2**:
 
 - **`info`** - Information messages with optional structured data
 - **`debug`** - Debug messages with optional structured data
@@ -77,6 +77,60 @@ Structured logging with message and optional typed attributes - **APPENDS new ro
 
 These entry types enable gradual migration from console.log by providing structured logging with the familiar log
 levels, but with typed attributes instead of just string concatenation.
+
+#### The `label` Column: Format Strings, NOT Interpolation
+
+**CRITICAL DESIGN DECISION**: Log messages use FORMAT STRINGS stored in the `label` column.
+
+When you write:
+
+```typescript
+ctx.log.info('User ${userId} processed ${count} items').userId('user-123').count(42);
+```
+
+The system stores:
+
+| Column        | Value                                       | Type         |
+| ------------- | ------------------------------------------- | ------------ |
+| `label`       | `'User ${userId} processed ${count} items'` | S.category() |
+| `attr_userId` | `'user-123'`                                | S.category() |
+| `attr_count`  | `42`                                        | S.number()   |
+
+**The message is NOT interpolated.** The template `'User ${userId} processed ${count} items'` is stored verbatim.
+
+**Why Format Strings?**
+
+1. **String Interning**: `label` uses `S.category()` type. Each unique template is interned once. Even if you log
+   `"User ${userId} processed ${count} items"` 10,000 times with different values, the template string is stored ONCE.
+
+2. **Queryable Templates**: You can find all logs matching a specific template:
+
+   ```sql
+   SELECT * FROM traces WHERE label = 'User ${userId} processed ${count} items';
+   ```
+
+3. **Analytics on Values**: Group and aggregate by the actual values:
+
+   ```sql
+   SELECT attr_userId, count(*), avg(attr_count)
+   FROM traces
+   WHERE label = 'User ${userId} processed ${count} items'
+   GROUP BY attr_userId;
+   ```
+
+4. **Type Safety**: Values are stored in typed columns (`attr_count` as Float64, not as part of a string).
+
+**Contrast with Traditional Logging**:
+
+```typescript
+// Traditional - interpolated string, no structure
+console.log(`User ${userId} processed ${count} items`);
+// Stores: "User user-123 processed 42 items" - unique string every time!
+
+// LMAO - format string with typed values
+ctx.log.info('User ${userId} processed ${count} items').userId('user-123').count(42);
+// Stores: template once, values in typed columns - structured and efficient!
+```
 
 **Row Behavior**: Unlike `ctx.tag.*` which overwrites row 0, `ctx.log.*` methods APPEND new rows:
 
@@ -111,12 +165,14 @@ ctx.log.warn('Slow operation'); // Writes to row 4, writeIndex → 5
 
 - **`ff-access`** - When feature flags are evaluated
   - Logged automatically by `FeatureFlagEvaluator`
-  - Contains flag name, evaluated value, and evaluation context
+  - Flag name stored in unified `label` column (consistent with span names and log templates)
+  - Flag value stored in `ff_value` column (S.category for efficient storage of repeated values)
   - Tracks when decisions are made based on flags
 
 - **`ff-usage`** - When flag-gated features are actually used
   - Logged when flag-controlled code paths execute
-  - Contains usage context and outcome data
+  - Flag name stored in unified `label` column
+  - Contains usage context and outcome data in attribute columns
   - Tracks actual feature utilization vs just evaluation
 
 ## Fluent API Design
@@ -296,14 +352,23 @@ ctx.tag.userId('user-123').requestId('req-456').operation('CREATE');
 ctx.tag({ userId: 'user-123', requestId: 'req-456', operation: 'CREATE' });
 
 // ===== LOG MESSAGES (ctx.log) =====
-// Traditional logging with optional attributes
-ctx.log.info('Processing user', { userId: 123, step: 'validation' });
-ctx.log.debug('Query details', { table: 'users' });
-ctx.log.warn('Rate limit approaching', { current: 95, max: 100 });
-ctx.log.error('Connection failed', { host: 'db.example.com' });
+// FORMAT STRING PATTERN - template stored in label, values in attr_* columns
+// The message is NOT interpolated - template and values stored separately!
 
-// Fluent chaining for additional attributes
-ctx.log.info('Processing user').with({ userId: 123 });
+ctx.log.info('Processing user ${userId}').userId(123);
+// Stores: label='Processing user ${userId}', attr_userId=123
+
+ctx.log.debug('Query on ${table} took ${duration}ms').table('users').duration(12.5);
+// Stores: label='Query on ${table} took ${duration}ms', attr_table='users', attr_duration=12.5
+
+ctx.log.warn('Rate limit ${current}/${max}').current(95).max(100);
+// Stores: label='Rate limit ${current}/${max}', attr_current=95, attr_max=100
+
+ctx.log.error('Connection to ${host} failed').host('db.example.com');
+// Stores: label='Connection to ${host} failed', attr_host='db.example.com'
+
+// Object-based API for multiple attributes at once
+ctx.log.info('Processing user ${userId}', { userId: 123, step: 'validation' });
 
 // Scoped attributes (pre-fill remaining buffer capacity)
 ctx.log.scope({ requestId: 'req-456', userId: 'user-123' });
@@ -490,8 +555,7 @@ interface ColumnWriters {
   writeParentSpanId(value: bigint | null): void;
   writeEntryType(value: EntryType): void;
   writeModule(value: string): void;
-  writeSpanName(value: string): void;
-  writeMessage(value: string | null): void;
+  writeLabel(value: string): void; // Span name OR log message template (S.category)
 
   // Generated attribute columns (example - actual API TBD)
   writeHttpStatus(value: number): void;
@@ -509,21 +573,14 @@ calls to illustrate the concepts - the actual column writing API is still being 
 #### Span Start Pattern
 
 ```typescript
-function createSpanStart(
-  module: string,
-  spanName: string,
-  parentSpanId?: bigint,
-  attributes?: Record<string, any>,
-  message?: string
-) {
+function createSpanStart(module: string, spanName: string, parentSpanId?: bigint, attributes?: Record<string, any>) {
   writers.writeTimestamp(BigInt(Date.now()));
   writers.writeTraceId(getCurrentTraceId());
   writers.writeSpanId(generateSpanId());
   writers.writeParentSpanId(parentSpanId ?? null);
   writers.writeEntryType('span-start');
   writers.writeModule(module);
-  writers.writeSpanName(spanName);
-  writers.writeMessage(message ?? null);
+  writers.writeLabel(spanName); // label = span name for span entries
 
   // Optional structured attributes for span start
   // TODO: Actual column writing API design TBD
@@ -541,20 +598,14 @@ function createSpanStart(
 #### Span Completion Pattern
 
 ```typescript
-function createSpanCompletion(
-  entryType: 'span-ok' | 'span-err',
-  result?: any,
-  attributes?: Record<string, any>,
-  message?: string
-) {
+function createSpanCompletion(entryType: 'span-ok' | 'span-err', result?: any, attributes?: Record<string, any>) {
   writers.writeTimestamp(BigInt(Date.now()));
   writers.writeTraceId(getCurrentTraceId());
   writers.writeSpanId(getCurrentSpanId());
   writers.writeParentSpanId(getCurrentParentSpanId());
   writers.writeEntryType(entryType);
   writers.writeModule(getCurrentModule());
-  writers.writeSpanName(getCurrentSpanName());
-  writers.writeMessage(message ?? null);
+  writers.writeLabel(getCurrentSpanName()); // label = span name for span entries
 
   // Structured attributes from completion
   // TODO: Actual column writing API design TBD
@@ -575,17 +626,24 @@ function createSpanCompletion(
 #### Log Entry Pattern
 
 ```typescript
-function createLogEntry(level: 'info' | 'debug' | 'warn' | 'error', message: string, attributes?: Record<string, any>) {
+// IMPORTANT: messageTemplate is a FORMAT STRING, not an interpolated message!
+// Example: 'User ${userId} created' - the template is stored verbatim
+// Values like userId are written to their own attr_* columns
+function createLogEntry(
+  level: 'info' | 'debug' | 'warn' | 'error',
+  messageTemplate: string, // FORMAT STRING - stored as-is, NOT interpolated
+  attributes?: Record<string, any>
+) {
   writers.writeTimestamp(BigInt(Date.now()));
   writers.writeTraceId(getCurrentTraceId());
   writers.writeSpanId(getCurrentSpanId());
   writers.writeParentSpanId(getCurrentParentSpanId());
   writers.writeEntryType(level);
   writers.writeModule(getCurrentModule());
-  writers.writeSpanName(getCurrentSpanName());
-  writers.writeMessage(message);
+  writers.writeLabel(messageTemplate); // label = message TEMPLATE (not interpolated!)
 
-  // Optional structured attributes
+  // Attribute VALUES go in their own columns
+  // Template references like ${userId} are NOT replaced - stored verbatim
   // TODO: Actual column writing API design TBD
   if (attributes) {
     for (const [key, value] of Object.entries(attributes)) {
@@ -608,8 +666,7 @@ function createTagEntry(attributes: Record<string, any>) {
   writers.writeParentSpanId(getCurrentParentSpanId());
   writers.writeEntryType('tag');
   writers.writeModule(getCurrentModule());
-  writers.writeSpanName(getCurrentSpanName());
-  writers.writeMessage(null);
+  writers.writeLabel(getCurrentSpanName()); // label = span name for tag entries
 
   // Populate attribute columns based on provided data
   // TODO: Actual column writing API design TBD
@@ -628,7 +685,7 @@ function createTagEntry(attributes: Record<string, any>) {
 function createFeatureFlagEntry(
   entryType: 'ff-access' | 'ff-usage',
   flagName: string,
-  flagValue: boolean,
+  flagValue: boolean | number | string,
   context: Record<string, any>
 ) {
   writers.writeTimestamp(BigInt(Date.now()));
@@ -637,12 +694,10 @@ function createFeatureFlagEntry(
   writers.writeParentSpanId(getCurrentParentSpanId());
   writers.writeEntryType(entryType);
   writers.writeModule(getCurrentModule());
-  writers.writeSpanName(getCurrentSpanName());
-  writers.writeMessage(null);
+  writers.writeLabel(flagName); // label = flag name for ff entries (unified column)
 
-  // Feature flag specific columns
-  writers.writeFfName(flagName);
-  writers.writeFfValue(flagValue);
+  // Feature flag value column (S.category for efficient storage of repeated values)
+  writers.writeFfValue(String(flagValue)); // Serialized to string, category-interned
 
   // Context flows into regular attribute columns
   // TODO: Actual column writing API design TBD
@@ -694,11 +749,21 @@ The system enforces entry type constraints at the API level:
 
 ### Required Columns by Entry Type
 
-- **All entry types**: `timestamp`, `trace_id`, `span_id`, `entry_type`, `module`
-- **Span lifecycle**: `span_name` required, `message` and attributes optional
-- **Log level types**: `message` required, attributes optional
-- **Feature flag types**: `ff_name`, `ff_value` required
-- **Tag entries**: At least one attribute column must be populated
+- **All entry types**: `timestamp`, `trace_id`, `span_id`, `entry_type`, `module`, `label`
+- **Span lifecycle** (`span-start`, `span-ok`, `span-err`, `span-exception`): `label` contains span name
+- **Log level types** (`info`, `debug`, `warn`, `error`): `label` contains message TEMPLATE (format string, not
+  interpolated)
+- **Feature flag types** (`ff-access`, `ff-usage`): `label` contains flag name, `ff_value` contains the evaluated value
+- **Tag entries**: `label` contains span name, at least one attribute column must be populated
+
+### The `label` Column by Entry Type
+
+| Entry Type                                            | `label` Contains                                        |
+| ----------------------------------------------------- | ------------------------------------------------------- |
+| `span-start`, `span-ok`, `span-err`, `span-exception` | Span name (e.g., `'create-user'`)                       |
+| `info`, `debug`, `warn`, `error`                      | Log message template (e.g., `'User ${userId} created'`) |
+| `ff-access`, `ff-usage`                               | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)  |
+| `tag`                                                 | Span name (same as span lifecycle entries)              |
 
 ### Fixed Row Constraints
 

@@ -6,8 +6,8 @@
  * - Defining tag attributes for structured logging
  * - Using task wrappers with typed span context
  * - Accessing feature flags and environment config
- * - METHOD CHAINING: ctx.log.tag.userId(id).requestId(req).operation('INSERT')
- * - Chaining with with(): ctx.log.tag.with({...}).operation('SELECT')
+ * - METHOD CHAINING: ctx.tag.userId(id).requestId(req).operation('INSERT')
+ * - Chaining with with(): ctx.tag.with({...}).operation('SELECT')
  * - Creating child spans with chained tags
  *
  * Key Feature: All tag methods return the tag object for fluent chaining!
@@ -94,10 +94,10 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
   const maxConnections = ctx.env.maxConnections;
 
   // METHOD CHAINING: Each tag method returns the tag object for chaining
-  ctx.log.tag.requestId(ctx.requestId).userId(userData.email).operation('INSERT').region(region);
+  ctx.tag.requestId(ctx.requestId).userId(userData.email).operation('INSERT').region(region);
 
   // Can also chain with with() method
-  ctx.log.tag
+  ctx.tag
     .with({
       httpStatus: 200,
       duration: 5.0,
@@ -128,7 +128,7 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
   }
 
   // Simulate database operation with chained tags
-  ctx.log.tag.operation('INSERT').query('INSERT INTO users (email, name) VALUES (?, ?)').duration(50.3).httpStatus(201);
+  ctx.tag.operation('INSERT').query('INSERT INTO users (email, name) VALUES (?, ?)').duration(50.3).httpStatus(201);
 
   return ctx.ok({
     id: 'user-123',

@@ -34,7 +34,8 @@ const baseAttributes = defineTagAttributes({
   // Feature flag operations use ff-access and ff-usage entry types
   // They write directly to span buffer via ctx.ff methods
   // Flag evaluation context stored in regular attribute columns
-  // No separate FF-specific columns needed beyond ff_name and ff_value
+  // Flag name stored in unified `label` column (same as span name / log template)
+  // Only ffValue is FF-specific (S.category for efficient storage of repeated values)
 });
 ```
 
@@ -126,22 +127,81 @@ const tagAttributes = defineTagAttributes({
 });
 
 // track() returns chainable API with SAME methods as ctx.tag
-ctx.ff
-  .track('darkMode')
-  .action('button-click') // Writes to attr_action column
-  .outcome('converted'); // Writes to attr_outcome column
-
 // Equivalent to:
 // 1. Write entry_type = FF_USAGE
-// 2. Write attr_ffName = 'darkMode'  (system column)
+// 2. Write label = 'darkMode'  (unified label column - flag name)
 // 3. Write attr_action = 'button-click'  (from tag schema)
 // 4. Write attr_outcome = 'converted'    (from tag schema)
 ```
 
-**System columns** for feature flags (defined in systemSchema):
+**System columns** (defined in systemSchema):
 
-- `ffName`: S.category() - the flag name being accessed/tracked
-- `ffValue`: S.text() - the flag value (serialized)
+```typescript
+// Core system columns
+const systemSchema = defineTagAttributes({
+  // Trace structure
+  timestamp: S.number(), // Microseconds since epoch
+  traceId: S.category(), // Request trace ID
+  spanId: S.number(), // Span identifier
+  parentSpanId: S.number(), // Parent span (nullable)
+  entryType: S.enum([
+    // Entry type enum
+    'span-start',
+    'span-ok',
+    'span-err',
+    'span-exception',
+    'info',
+    'debug',
+    'warn',
+    'error',
+    'tag',
+    'ff-access',
+    'ff-usage',
+  ]),
+  module: S.category(), // Module name
+
+  // UNIFIED LABEL COLUMN - span name, log message template, OR flag name
+  label: S.category(), // See "The label System Column" below
+
+  // Feature flag value column
+  ffValue: S.category(), // Flag value - uses category for efficient storage (values repeat: true/false, 'blue'/'green', etc.)
+});
+```
+
+### The `label` System Column
+
+The `label` column is a **unified column** that serves different purposes based on entry type:
+
+| Entry Type                                                   | What `label` Contains                                       |
+| ------------------------------------------------------------ | ----------------------------------------------------------- |
+| `span-start`, `span-ok`, `span-err`, `span-exception`, `tag` | **Span name** (e.g., `'create-user'`)                       |
+| `info`, `debug`, `warn`, `error`                             | **Log message template** (e.g., `'User ${userId} created'`) |
+| `ff-access`, `ff-usage`                                      | **Flag name** (e.g., `'darkMode'`, `'advancedValidation'`)  |
+
+**Why unified?**
+
+1. **Simpler schema**: One column instead of separate `span_name`, `message`, and `ffName` columns (most would be null)
+2. **Better storage**: `S.category()` means string interning - templates/names stored once
+3. **Efficient queries**: Find all logs matching a template pattern, or all accesses of a specific flag
+
+**CRITICAL - Format Strings, NOT Interpolation**:
+
+```typescript
+// This:
+ctx.log.info('User ${userId} processed ${count} items').userId('user-123').count(42);
+
+// Stores:
+// - label: 'User ${userId} processed ${count} items'  (template, interned)
+// - attr_userId: 'user-123'                           (value, in typed column)
+// - attr_count: 42                                    (value, in typed column)
+
+// NOT:
+// - label: 'User user-123 processed 42 items'  (interpolated - WRONG!)
+```
+
+The template string is stored verbatim. Values go in their typed attribute columns.
+
+See **[Arrow Table Structure](./01f_arrow_table_structure.md)** for detailed examples and query patterns.
 
 **All other attributes** come from your tag schema - same columns, same table structure.
 
@@ -446,7 +506,7 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> 
 
     buffer.timestamps[idx] = getTimestampMicros(ctx.anchorEpochMicros, ctx.anchorPerfNow);
     buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-    buffer.attr_ffName[idx] = internString(String(flagName));
+    buffer.label[idx] = internString(String(flagName)); // Unified label column
 
     // Return chainable tracker using SAME schema as ctx.tag
     return this.createChainableTracker(idx);
@@ -484,8 +544,8 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> 
 
     buffer.timestamps[idx] = getTimestampMicros(this.ctx.anchorEpochMicros, this.ctx.anchorPerfNow);
     buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-    buffer.attr_ffName[idx] = internString(flagName);
-    buffer.attr_ffValue[idx] = serializeValue(value);
+    buffer.label[idx] = internString(flagName); // Unified label column
+    buffer.attr_ffValue[idx] = internString(String(value)); // S.category for efficient storage
   }
 
   private createChainableTracker(idx: number): FlagTracker<Tag> {
@@ -611,7 +671,8 @@ instantiation cost.
 
 - Same column names (`attr_action`, `attr_outcome`, not `attr_ff_action`)
 - Same Arrow table structure - no schema split
-- Only `ffName` and `ffValue` are FF-specific system columns
+- Flag name stored in unified `label` column (consistent with span names and log templates)
+- Only `ffValue` is FF-specific (S.category for efficient storage of repeated values like true/false)
 
 **Per-Span Caching**: Each accessor has fresh caches:
 

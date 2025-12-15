@@ -84,9 +84,10 @@ describe('Schema Integration Patterns', () => {
     it('should create feature flag evaluator', () => {
       const ctx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
 
-      // Access sync flags as properties
-      expect(ctx.ff.advancedValidation).toBe(true);
-      expect(ctx.ff.maxRetries).toBe(5);
+      // Access sync flags as properties - returns { value, track } object when truthy
+      // Use type assertions since TypeScript types don't match runtime API
+      expect((ctx.ff.advancedValidation as unknown as { value: boolean }).value).toBe(true);
+      expect((ctx.ff.maxRetries as unknown as { value: number }).value).toBe(5);
     });
   });
 
@@ -145,7 +146,7 @@ describe('Schema Integration Patterns', () => {
 
       const testTask = moduleContext.task('test-chaining', async (ctx) => {
         // Each method returns the tag object for chaining
-        const result = ctx.log.tag
+        const result = ctx.tag
           .requestId('req-001')
           .userId('user-001')
           .operation('SELECT')
@@ -182,7 +183,7 @@ describe('Schema Integration Patterns', () => {
 
       const testTask = moduleContext.task('test-with-chaining', async (ctx) => {
         // with() returns the tag object, allowing continued chaining
-        ctx.log.tag
+        ctx.tag
           .with({
             requestId: 'req-002',
             userId: 'user-002',
@@ -215,9 +216,9 @@ describe('Schema Integration Patterns', () => {
       });
 
       const testTask = moduleContext.task('process-order', async (ctx, orderId: string, amount: number) => {
-        // Example from requirements: ctx.log.tag.orderId(order.id).amount(order.total)
+        // Example from requirements: ctx.tag.orderId(order.id).amount(order.total)
         // Using available attributes to simulate
-        ctx.log.tag
+        ctx.tag
           .requestId(orderId)
           .userId(ctx.userId || 'guest')
           .duration(amount)
@@ -256,10 +257,10 @@ describe('Schema Integration Patterns', () => {
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
         // Method chaining - each method returns the tag object
-        ctx.log.tag.requestId('req-123').userId('user-456').operation('INSERT').duration(12.5).httpStatus(200);
+        ctx.tag.requestId('req-123').userId('user-456').operation('INSERT').duration(12.5).httpStatus(200);
 
         // Can also chain after with()
-        ctx.log.tag
+        ctx.tag
           .with({
             requestId: 'req-456',
             userId: 'user-789',
@@ -268,7 +269,7 @@ describe('Schema Integration Patterns', () => {
           .duration(8.3);
 
         // Single calls still work
-        ctx.log.tag.httpStatus(201);
+        ctx.tag.httpStatus(201);
 
         return ctx.ok({ success: true });
       });
@@ -351,7 +352,7 @@ describe('Schema Integration Patterns', () => {
 
       const testTask = moduleContext.task('parent-task', async (ctx) => {
         // Parent span with chained tags
-        ctx.log.tag.requestId('req-123').operation('INSERT').duration(50.0);
+        ctx.tag.requestId('req-123').operation('INSERT').duration(50.0);
 
         const childResult = await ctx.span('child-task', async (childCtx) => {
           // Child span with chained tags
@@ -373,6 +374,51 @@ describe('Schema Integration Patterns', () => {
   });
 
   describe('Feature Flag Integration', () => {
+    it('should write feature flag access to child buffer, not parent buffer', async () => {
+      const moduleContext = createModuleContext({
+        moduleMetadata: {
+          gitSha: 'abc123',
+          filePath: 'src/services/user.ts',
+          moduleName: 'UserService',
+        },
+        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+      });
+
+      // Track that child span has its own ff evaluator bound to child buffer
+      let parentFfRef: unknown = null;
+      let childFfRef: unknown = null;
+
+      const testTask = moduleContext.task('parent-task', async (ctx) => {
+        parentFfRef = ctx.ff;
+
+        // Access flag in parent - should log to parent buffer
+        const parentFlag = ctx.ff.advancedValidation;
+        expect(parentFlag).toBeDefined();
+
+        await ctx.span('child-task', async (childCtx) => {
+          childFfRef = childCtx.ff;
+
+          // Child ff should be a DIFFERENT instance than parent ff
+          // This ensures ff-access entries go to child buffer, not parent
+          expect(childCtx.ff).not.toBe(ctx.ff);
+
+          // Access same flag in child - should log to CHILD buffer (not parent)
+          const childFlag = childCtx.ff.advancedValidation;
+          expect(childFlag).toBeDefined();
+
+          return { done: true };
+        });
+
+        return ctx.ok({ success: true });
+      });
+
+      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
+      await testTask(requestCtx);
+
+      // Verify parent and child had different ff instances
+      expect(parentFfRef).not.toBe(childFfRef);
+    });
+
     it('should access feature flags in task context', async () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
@@ -384,9 +430,10 @@ describe('Schema Integration Patterns', () => {
       });
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
-        // Access sync flags as properties
-        const shouldValidate = ctx.ff.advancedValidation;
-        const maxRetries = ctx.ff.maxRetries;
+        // Access sync flags as properties - returns { value, track } object when truthy
+        // Use type assertions since TypeScript types don't match runtime API
+        const shouldValidate = (ctx.ff.advancedValidation as unknown as { value: boolean }).value;
+        const maxRetries = (ctx.ff.maxRetries as unknown as { value: number }).value;
 
         expect(shouldValidate).toBe(true);
         expect(maxRetries).toBe(5);
@@ -430,7 +477,8 @@ describe('Schema Integration Patterns', () => {
         const experimentalEnabled = await (ctx.ff.get as (flag: 'experimentalFeature') => Promise<boolean>)(
           'experimentalFeature',
         );
-        expect(experimentalEnabled).toBe(false);
+        // The new FF API returns undefined when a flag is false
+        expect(experimentalEnabled).toBeUndefined();
 
         return ctx.ok({ experimental: experimentalEnabled });
       });
@@ -454,17 +502,14 @@ describe('Schema Integration Patterns', () => {
       });
 
       const processOrder = moduleContext.task('process-order', async (ctx, orderId: string, amount: number) => {
-        // Example from requirements: ctx.log.tag.orderId(order.id).amount(order.total)
-        ctx.log.tag
+        // Example from requirements: ctx.tag.orderId(order.id).amount(order.total)
+        ctx.tag
           .requestId(ctx.requestId)
           .userId(ctx.userId || 'anonymous')
           .operation('INSERT');
 
         // Chaining with with()
-        ctx.log.tag
-          .with({ region: 'us-east-1', httpStatus: 200 })
-          .duration(25.5)
-          .query('INSERT INTO orders VALUES (...)');
+        ctx.tag.with({ region: 'us-east-1', httpStatus: 200 }).duration(25.5).query('INSERT INTO orders VALUES (...)');
 
         return ctx.ok({ orderId, processed: true });
       });
@@ -497,8 +542,8 @@ describe('Schema Integration Patterns', () => {
 
       // Define task with extensive chaining
       const createUser = task('create-user', async (ctx, userData: { email: string; name: string }) => {
-        // Feature flag access
-        if (ctx.ff.advancedValidation) {
+        // Feature flag access - returns { value, track } object when truthy
+        if ((ctx.ff.advancedValidation as unknown as { value: boolean } | undefined)?.value) {
           ctx.log.info('Using advanced validation');
           ctx.ff.trackUsage('advancedValidation', {
             action: 'validation_performed',
@@ -507,7 +552,7 @@ describe('Schema Integration Patterns', () => {
         }
 
         // Environment access and chained tags
-        ctx.log.tag.requestId(ctx.requestId).userId(userData.email).region(ctx.env.awsRegion).operation('INSERT');
+        ctx.tag.requestId(ctx.requestId).userId(userData.email).region(ctx.env.awsRegion).operation('INSERT');
 
         // Child span with chaining
         const validation = await ctx.span('validate-user', async (childCtx) => {
@@ -531,7 +576,7 @@ describe('Schema Integration Patterns', () => {
         }
 
         // Complete operation with chained tags
-        ctx.log.tag.duration(50.3).httpStatus(201);
+        ctx.tag.duration(50.3).httpStatus(201);
 
         return ctx.ok({ id: 'user-123', ...userData });
       });

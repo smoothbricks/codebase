@@ -57,7 +57,7 @@ const createUser = userModule.task('createUser', async (ctx, email: string, name
   const userId = `user_${Math.random().toString(36).substr(2, 9)}`;
 
   // Log during operation
-  ctx.log.tag.userId(userId).email(email).operation('CREATE');
+  ctx.tag.userId(userId).email(email).operation('CREATE');
 
   ctx.log.info(`Creating user with email: ${email}`);
 

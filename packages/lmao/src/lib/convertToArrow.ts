@@ -8,10 +8,11 @@
  * - Zero-copy wrap TypedArrays as Arrow vectors
  */
 
-import * as arrow from 'apache-arrow';
-import type { SpanBuffer } from './types.js';
 import type { TypedArray } from '@smoothbricks/arrow-builder';
+import * as arrow from 'apache-arrow';
 import { ENTRY_TYPE_NAMES } from './lmao.js';
+import { getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
+import type { SpanBuffer } from './types.js';
 
 /**
  * String interner interface (matches lmao's implementation)
@@ -23,17 +24,17 @@ export interface StringInterner {
 
 /**
  * Zero-copy helper: Create Arrow Data from TypedArray without copying
- * 
+ *
  * This demonstrates the zero-copy approach using arrow.makeData instead of builders.
  * For full zero-copy conversion, we'd need to handle buffer chaining, dictionaries,
  * and null bitmaps. Current implementation uses builders for simplicity in cold path.
- * 
+ *
  * @param type - Arrow data type
  * @param data - TypedArray with data
  * @param length - Number of valid elements
  * @param nullBitmap - Optional null bitmap
  * @returns Arrow Data object (zero-copy)
- * 
+ *
  * @example
  * ```typescript
  * // Zero-copy wrap a Float64Array as Arrow data
@@ -51,19 +52,20 @@ export function createZeroCopyData<T extends arrow.DataType>(
   length: number,
   nullBitmap?: Uint8Array,
 ): arrow.Data<T> {
-  // Slice the TypedArray to the specified length to get only valid data
-  const slicedData = data.slice(0, length);
-  
+  // Use subarray() to create a VIEW into the same ArrayBuffer (zero-copy)
+  // slice() would create a COPY of the data to a new ArrayBuffer
+  const slicedData = data.subarray(0, length);
+
   // Create a vector from the sliced TypedArray using makeVector
   // This properly wraps the buffer and creates valid Arrow Data with values
   const vector = arrow.makeVector(slicedData);
-  
+
   // Extract the Data from the vector
   // Note: Custom null bitmaps require using builders or lower-level APIs
   // The nullBitmap parameter is used for nullCount calculation but the actual
   // null bitmap in the returned Data comes from makeVector (all valid by default)
   const vectorData = vector.data[0];
-  
+
   // If a null bitmap was provided, log that it's being used for reference
   // but the actual Data uses makeVector's default (all valid)
   if (nullBitmap) {
@@ -72,14 +74,14 @@ export function createZeroCopyData<T extends arrow.DataType>(
     const _nullCount = countNulls(nullBitmap, length);
     void _nullCount; // Acknowledge the calculation
   }
-  
+
   // Cast through unknown to handle the generic type constraint
   return vectorData as unknown as arrow.Data<T>;
 }
 
 /**
  * Count nulls in a null bitmap
- * 
+ *
  * @param nullBitmap - Null bitmap (bit-packed)
  * @param length - Number of elements
  * @returns Number of null values
@@ -95,6 +97,24 @@ function countNulls(nullBitmap: Uint8Array, length: number): number {
     }
   }
   return count;
+}
+
+/**
+ * Map schema field names to Arrow column names.
+ *
+ * Some fields are renamed during Arrow conversion to match the spec
+ * while avoiding conflicts with API method names.
+ *
+ * @param fieldName - Schema field name (e.g., 'logMessage')
+ * @returns Arrow column name (e.g., 'message')
+ */
+function getArrowFieldName(fieldName: string): string {
+  // Map logMessage -> message per specs/01f_arrow_table_structure.md
+  // Named 'logMessage' in schema to avoid conflict with SpanLogger.message() method
+  if (fieldName === 'logMessage') {
+    return 'message';
+  }
+  return fieldName;
 }
 
 /**
@@ -163,7 +183,7 @@ export function convertToArrowTable(
     systemVectors = systemColumns.vectors;
   } else {
     // Default lmao system columns
-    fields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampNanosecond() }));
+    fields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampMicrosecond() }));
     fields.push(arrow.Field.new({ name: 'trace_id', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
     fields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint64() }));
     fields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint64(), nullable: true }));
@@ -174,21 +194,21 @@ export function convertToArrowTable(
     fields.push(
       arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
     );
+    // Note: 'logMessage' column is renamed to 'message' in Arrow output
+    // per specs/01f_arrow_table_structure.md (named logMessage to avoid SpanLogger.message() conflict)
   }
 
   // Add attribute columns from schema
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
-    const schemaWithMetadata = fieldSchema as {
-      __lmao_type?: string;
-      __lmao_enum_values?: readonly string[];
-    };
-    const lmaoType = schemaWithMetadata.__lmao_type;
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+    // Map logMessage -> message per spec (avoids SpanLogger.message() method conflict)
+    const arrowFieldName = getArrowFieldName(fieldName);
 
     if (lmaoType === 'enum') {
       // Enum: Dictionary with compile-time values
       fields.push(
         arrow.Field.new({
-          name: fieldName,
+          name: arrowFieldName,
           type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8()),
           nullable: true,
         }),
@@ -197,7 +217,7 @@ export function convertToArrowTable(
       // Category: Dictionary with runtime-built values
       fields.push(
         arrow.Field.new({
-          name: fieldName,
+          name: arrowFieldName,
           type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
           nullable: true,
         }),
@@ -206,7 +226,7 @@ export function convertToArrowTable(
       // Text: Plain string column (no dictionary)
       fields.push(
         arrow.Field.new({
-          name: fieldName,
+          name: arrowFieldName,
           type: new arrow.Utf8(),
           nullable: true,
         }),
@@ -215,7 +235,7 @@ export function convertToArrowTable(
       // Number: Float64
       fields.push(
         arrow.Field.new({
-          name: fieldName,
+          name: arrowFieldName,
           type: new arrow.Float64(),
           nullable: true,
         }),
@@ -224,7 +244,7 @@ export function convertToArrowTable(
       // Boolean: Bool type
       fields.push(
         arrow.Field.new({
-          name: fieldName,
+          name: arrowFieldName,
           type: new arrow.Bool(),
           nullable: true,
         }),
@@ -247,16 +267,12 @@ export function convertToArrowTable(
 
   // Attribute columns
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
-    const schemaWithMetadata = fieldSchema as {
-      __lmao_type?: string;
-      __lmao_enum_values?: readonly string[];
-    };
-    const lmaoType = schemaWithMetadata.__lmao_type;
+    const lmaoType = getLmaoSchemaType(fieldSchema);
     const columnName = `attr_${fieldName}` as `attr_${string}`;
 
     if (lmaoType === 'enum') {
       // Enum: Dictionary with compile-time values
-      const enumValues = schemaWithMetadata.__lmao_enum_values || [];
+      const enumValues = getEnumValues(fieldSchema) || [];
       const enumBuilder = arrow.makeBuilder({
         type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8()),
         nullValues: [null],
@@ -287,8 +303,8 @@ export function convertToArrowTable(
 
       vectors.push(enumBuilder.finish().toVector());
     } else if (lmaoType === 'category') {
-      // Category: Build dictionary at conversion time (no hot-path interning)
-      // Per vizanto's review: Always build dictionary for category columns, sorted by value
+      // Category: Build dictionary at conversion time using string interner
+      // Per spec: category columns store Uint32Array indices into categoryInterner
       const categoryBuilder = arrow.makeBuilder({
         type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
         nullValues: [null],
@@ -298,14 +314,15 @@ export function convertToArrowTable(
         const column = buf[columnName];
         const nullBitmap = buf.nullBitmaps[columnName];
 
-        if (column && Array.isArray(column)) {
-          // Column is Array<string> - direct string storage
+        if (column && column instanceof Uint32Array) {
+          // Column is Uint32Array with indices into categoryInterner
           for (let i = 0; i < buf.writeIndex; i++) {
             const isNull = !isRowNonNull(nullBitmap, i);
             if (isNull) {
               categoryBuilder.append(null);
             } else {
-              const stringValue = column[i] || '';
+              const idx = column[i];
+              const stringValue = categoryInterner.getString(idx) || '';
               categoryBuilder.append(stringValue);
             }
           }
@@ -321,6 +338,7 @@ export function convertToArrowTable(
     } else if (lmaoType === 'text') {
       // Text: Build dictionary only if it saves space (>128 bytes)
       // Per vizanto's review: Calculate space savings before deciding dictionary vs plain UTF-8
+      // Per spec: text columns store Uint32Array indices into textStorage
 
       // First pass: collect strings and count occurrences
       const stringOccurrences = new Map<string, number>();
@@ -330,11 +348,12 @@ export function convertToArrowTable(
         const column = buf[columnName];
         const nullBitmap = buf.nullBitmaps[columnName];
 
-        if (column && Array.isArray(column)) {
+        if (column && column instanceof Uint32Array) {
           for (let i = 0; i < buf.writeIndex; i++) {
             const isNull = !isRowNonNull(nullBitmap, i);
             if (!isNull) {
-              const stringValue = column[i] || '';
+              const idx = column[i];
+              const stringValue = textStorage.getString(idx) || '';
               stringOccurrences.set(stringValue, (stringOccurrences.get(stringValue) || 0) + 1);
               totalRows++;
             }
@@ -372,13 +391,14 @@ export function convertToArrowTable(
           const column = buf[columnName];
           const nullBitmap = buf.nullBitmaps[columnName];
 
-          if (column && Array.isArray(column)) {
+          if (column && column instanceof Uint32Array) {
             for (let i = 0; i < buf.writeIndex; i++) {
               const isNull = !isRowNonNull(nullBitmap, i);
               if (isNull) {
                 textBuilder.append(null);
               } else {
-                const stringValue = column[i] || '';
+                const idx = column[i];
+                const stringValue = textStorage.getString(idx) || '';
                 textBuilder.append(stringValue);
               }
             }
@@ -401,13 +421,14 @@ export function convertToArrowTable(
           const column = buf[columnName];
           const nullBitmap = buf.nullBitmaps[columnName];
 
-          if (column && Array.isArray(column)) {
+          if (column && column instanceof Uint32Array) {
             for (let i = 0; i < buf.writeIndex; i++) {
               const isNull = !isRowNonNull(nullBitmap, i);
               if (isNull) {
                 textBuilder.append(null);
               } else {
-                const stringValue = column[i] || '';
+                const idx = column[i];
+                const stringValue = textStorage.getString(idx) || '';
                 textBuilder.append(stringValue);
               }
             }
@@ -528,18 +549,15 @@ function buildDefaultSystemVectors(
   moduleIdInterner: StringInterner,
   spanNameInterner: StringInterner,
 ): void {
-  // Timestamp vector (microseconds, not nanoseconds - Arrow uses microseconds for TimestampMicrosecond)
+  // Timestamp vector (microseconds - matches storage format)
   const timestampBuilder = arrow.makeBuilder({
-    type: new arrow.TimestampNanosecond(),
+    type: new arrow.TimestampMicrosecond(),
     nullValues: [null],
   });
 
   for (const buf of buffers) {
     for (let i = 0; i < buf.writeIndex; i++) {
-      // Convert milliseconds to nanoseconds
-      const timestampMs = buf.timestamps[i];
-      const timestampNs = Math.floor(timestampMs * 1_000_000); // ms to ns
-      timestampBuilder.append(timestampNs);
+      timestampBuilder.append(buf.timestamps[i]);
     }
   }
   vectors.push(timestampBuilder.finish().toVector());

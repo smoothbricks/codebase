@@ -58,7 +58,7 @@ const { task } = createModuleContext({
 // Example 1: Simple chaining
 const validateOrder = task('validate-order', async (ctx, orderId: string) => {
   // Clean, readable chaining
-  ctx.log.tag
+  ctx.tag
     .requestId(ctx.requestId)
     .userId(ctx.userId || 'guest')
     .orderId(orderId)
@@ -81,8 +81,8 @@ interface Order {
 }
 
 const processPayment = task('process-payment', async (ctx, order: Order) => {
-  // Example: ctx.log.tag.orderId(order.id).amount(order.total)
-  ctx.log.tag
+  // Example: ctx.tag.orderId(order.id).amount(order.total)
+  ctx.tag
     .orderId(order.id)
     .amount(order.total)
     .currency(order.currency)
@@ -117,12 +117,12 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
   });
 
   if (!payment.success) {
-    ctx.log.tag.status('failed').httpStatus(500);
+    ctx.tag.status('failed').httpStatus(500);
     return ctx.err('PAYMENT_FAILED', payment.error);
   }
 
   // Final status update with chaining
-  ctx.log.tag.status('completed').httpStatus(201).duration(payment.value.duration);
+  ctx.tag.status('completed').httpStatus(201).duration(payment.value.duration);
 
   return ctx.ok({
     orderId: order.id,
@@ -144,7 +144,7 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
   }
 
   // Start with bulk setting
-  ctx.log.tag
+  ctx.tag
     .with({
       requestId: ctx.requestId,
       userId: ctx.userId || 'guest',
@@ -168,7 +168,7 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
   }
 
   // More chaining after async operations
-  ctx.log.tag.status('completed').httpStatus(201).duration(25.5);
+  ctx.tag.status('completed').httpStatus(201).duration(25.5);
 
   return ctx.ok({ created: true, orderId: id });
 });

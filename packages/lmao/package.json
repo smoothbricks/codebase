@@ -12,6 +12,18 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
+    },
+    "./node": {
+      "development": "./src/node.ts",
+      "types": "./dist/node.d.ts",
+      "import": "./dist/node.js",
+      "default": "./dist/node.js"
+    },
+    "./es": {
+      "development": "./src/es.ts",
+      "types": "./dist/es.d.ts",
+      "import": "./dist/es.js",
+      "default": "./dist/es.js"
     }
   },
   "files": [

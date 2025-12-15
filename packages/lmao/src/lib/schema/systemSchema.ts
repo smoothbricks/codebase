@@ -14,7 +14,7 @@ import { defineTagAttributes } from './defineTagAttributes.js';
  *
  * These columns support:
  * - Span lifecycle (spanName)
- * - Logging (logMessage)
+ * - Logging (logMessage) - stored as attr_logMessage to avoid conflict with SpanLogger.message()
  * - Error handling (errorCode, exceptionMessage, exceptionStack)
  * - Result messages (resultMessage)
  * - Feature flags (ffName, ffValue, action, outcome, contextUserId, contextRequestId)
@@ -23,7 +23,16 @@ export const systemSchema = defineTagAttributes({
   // Span lifecycle
   spanName: S.category(),
 
-  // Logging (text type - messages are unique)
+  /**
+   * Log message column for log entries (info/debug/warn/error).
+   *
+   * Per specs/01f_arrow_table_structure.md: Core system column for log messages.
+   * Named 'logMessage' (not 'message') to avoid conflict with SpanLogger.message() method.
+   * Stored as `attr_logMessage` in SpanBuffer, converted to 'message' column in Arrow output.
+   * Text type since log messages are typically unique strings.
+   *
+   * @see convertToArrowTable - Maps 'logMessage' -> 'message' during Arrow conversion
+   */
   logMessage: S.text(),
 
   // Error handling
@@ -64,7 +73,7 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
 
   if (conflictingKeys.length > 0) {
     console.warn(
-      `⚠️  User schema conflicts with system schema fields: ${conflictingKeys.join(', ')}\n` +
+      `!  User schema conflicts with system schema fields: ${conflictingKeys.join(', ')}\n` +
         '   User definitions will override system schema. This may cause unexpected behavior.\n' +
         `   System fields: ${Array.from(systemKeys).join(', ')}`,
     );

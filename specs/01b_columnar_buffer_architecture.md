@@ -351,8 +351,9 @@ cache-aligned:
 
 ## Lazy Column Initialization
 
-**Memory Optimization**: Attribute columns (`attr_*`) are created lazily using `Object.defineProperty` getters,
-allocating memory only when the column is first accessed. This provides significant memory savings for sparse columns.
+**Memory Optimization**: Attribute columns (`attr_*`) use the `LazyColumn` class - ONE object per column that handles
+lazy TypedArray allocation, lazy null bitmap allocation, AND scope value storage. This provides significant memory
+savings for sparse columns while supporting the scope attribute pattern.
 
 ### Why Lazy Initialization
 
@@ -365,6 +366,8 @@ allocating memory only when the column is first accessed. This provides signific
 3. **Schema Flexibility**: Modules can define comprehensive schemas with many optional attributes without paying memory
    cost for unused ones.
 
+4. **Scope Value Support**: LazyColumn stores scope values without allocating TypedArrays until needed.
+
 ### What Gets Allocated When
 
 **Immediately Allocated (Core Columns)**:
@@ -372,70 +375,122 @@ allocating memory only when the column is first accessed. This provides signific
 - `timestamps: Float64Array` - Every entry has a timestamp
 - `operations: Uint8Array` - Every entry has an operation/entry type
 
-**Lazily Allocated (Attribute Columns)**:
+**Lazily Allocated (via LazyColumn)**:
 
-- `attr_*` columns - Only allocated on first property access
-- Per-column null bitmaps - Only allocated when their column is accessed
+- `_values: TypedArray | string[]` - Only allocated on first `.values` access or when scope changes
+- `_nullBitmap: Uint8Array` - Only allocated on first `.nullBitmap` access or `.set()` call
+- `_scopeValue` - Stored immediately, NO allocation
 
-### Implementation Pattern
+### LazyColumn Class
+
+Each attribute column is represented by ONE `LazyColumn` object that manages all column state:
 
 ```typescript
-// From createColumnBuffer.ts
-function createColumnBuffer(schema: TagAttributeSchema, requestedCapacity: number = 64): ColumnBuffer {
-  const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
+class LazyColumn<T extends TypedArray | string[]> {
+  private _values: T | null = null;
+  private _nullBitmap: Uint8Array | null = null;
+  private _scopeValue: number | string | boolean | null = null;
 
-  // Core columns are ALWAYS allocated - they're used for every entry
-  const timestamps = new Float64Array(alignedCapacity);
-  const operations = new Uint8Array(alignedCapacity);
+  readonly capacity: number;
+  readonly ArrayType: TypedArrayConstructor | ArrayConstructor;
 
-  // Storage for lazily-initialized attribute columns
-  const lazyColumnStorage: Record<`attr_${string}`, { nulls?: Uint8Array; data?: TypedArray }> = {};
-
-  const buffer: ColumnBuffer = {
-    timestamps,
-    operations,
-    nullBitmaps: {}, // Empty object, getters added below
-    writeIndex: 0,
-    capacity: requestedCapacity,
-    next: undefined,
-  };
-
-  // Define lazy getters for each attribute column
-  for (const fieldName of Object.keys(schema)) {
-    const columnName = `attr_${fieldName}` as `attr_${string}`;
-
-    // Initialize empty storage - no TypedArray allocated yet
-    lazyColumnStorage[columnName] = {};
-
-    // Getter creates TypedArray on first access
-    Object.defineProperty(buffer, columnName, {
-      get() {
-        const storage = lazyColumnStorage[columnName];
-        if (!storage.data) {
-          // LAZY: Only now do we allocate the TypedArray
-          storage.data = getArrayConstructorForField(schema, fieldName, alignedCapacity);
-        }
-        return storage.data;
-      },
-      enumerable: true,
-      configurable: true,
-    });
-
-    // Same pattern for null bitmaps
-    Object.defineProperty(buffer.nullBitmaps, columnName, {
-      get() {
-        const storage = lazyColumnStorage[columnName];
-        if (!storage.nulls) {
-          storage.nulls = new Uint8Array(Math.ceil(alignedCapacity / 8));
-        }
-        return storage.nulls;
-      },
-      enumerable: true,
-      configurable: true,
-    });
+  constructor(capacity: number, ArrayType: TypedArrayConstructor | ArrayConstructor) {
+    this.capacity = capacity;
+    this.ArrayType = ArrayType;
   }
 
-  return buffer;
+  // For black-box testing
+  get isInitialized(): boolean {
+    return this._values !== null;
+  }
+
+  get hasScopeValue(): boolean {
+    return this._scopeValue !== null;
+  }
+
+  // Get scope value - for ctx.scope getters to read
+  get scopeValue(): number | string | boolean | null {
+    return this._scopeValue;
+  }
+
+  // Set scope value - NO ALLOCATION (unless second scope call)
+  setScope(value: number | string | boolean): void {
+    if (this._scopeValue !== null && this._values === null) {
+      // Second scope call with different value - must allocate NOW
+      // to preserve the old scope value in rows 0..writeIndex
+      this._allocateAndFillWithScope();
+    }
+    this._scopeValue = value;
+  }
+
+  private _allocateAndFillWithScope(): void {
+    this._values = new this.ArrayType(this.capacity) as T;
+    if (this._scopeValue !== null) {
+      (this._values as any).fill(this._scopeValue);
+    }
+  }
+
+  // Get null bitmap - allocate lazily
+  get nullBitmap(): Uint8Array {
+    if (!this._nullBitmap) {
+      this._nullBitmap = new Uint8Array(Math.ceil(this.capacity / 8));
+    }
+    return this._nullBitmap;
+  }
+
+  // Hot path - allocate values on first direct write
+  get values(): T {
+    if (!this._values) {
+      this._allocateAndFillWithScope();
+    }
+    return this._values!;
+  }
+
+  // Set a value at a specific index (hot path)
+  set(index: number, value: number | string | boolean): void {
+    this.values[index] = value as any;
+    // Set null bitmap bit (value is present)
+    const byteIndex = Math.floor(index / 8);
+    const bitOffset = index % 8;
+    this.nullBitmap[byteIndex] |= 1 << bitOffset;
+  }
+
+  // Cold path - Arrow conversion
+  getValuesForArrow(writeIndex: number): T | null {
+    if (this._values) {
+      // Was written to directly - zero-copy subarray
+      return (this._values as any).subarray(0, writeIndex) as T;
+    }
+    if (this._scopeValue !== null) {
+      // Never written directly, but has scope value
+      // Allocate NOW (cold path) and fill
+      const arr = new this.ArrayType(writeIndex) as T;
+      (arr as any).fill(this._scopeValue);
+      return arr;
+    }
+    // No data, no scope - null column
+    return null;
+  }
+
+  // Get null bitmap for Arrow conversion (cold path)
+  getNullBitmapForArrow(writeIndex: number): Uint8Array | null {
+    if (this._nullBitmap) {
+      const neededBytes = Math.ceil(writeIndex / 8);
+      return this._nullBitmap.subarray(0, neededBytes);
+    }
+    if (this._scopeValue !== null) {
+      // Scope value means all rows have values - create full bitmap
+      const neededBytes = Math.ceil(writeIndex / 8);
+      const bitmap = new Uint8Array(neededBytes);
+      bitmap.fill(0xff);
+      const extraBits = writeIndex % 8;
+      if (extraBits > 0) {
+        bitmap[neededBytes - 1] &= (1 << extraBits) - 1;
+      }
+      return bitmap;
+    }
+    return null;
+  }
 }
 ```
 
@@ -446,16 +501,23 @@ Consider a schema with 20 attributes where a typical span only uses 3:
 ```typescript
 // Without lazy initialization:
 // 20 columns × 64 elements × 4 bytes/element = 5,120 bytes per span
+// + 20 null bitmaps × 8 bytes = 160 bytes
+// Total: 5,280 bytes per span
 
-// With lazy initialization:
+// With LazyColumn:
 // 2 core columns (timestamps + operations) = 576 bytes (always)
+// 20 LazyColumn objects (no TypedArrays) = ~400 bytes (small objects)
 // 3 used attr columns × 64 × 4 = 768 bytes (on demand)
-// Total: 1,344 bytes per span (74% memory savings!)
+// 3 null bitmaps × 8 bytes = 24 bytes (on demand)
+// Total: ~1,768 bytes per span (67% memory savings!)
 ```
 
 ## Base SpanBuffer Interface
 
 **Purpose**: Provide a generic interface that can be extended with schema-generated columns.
+
+**CRITICAL**: LazyColumn instances are **direct properties** on the SpanBuffer (no nested `columns: Record<...>`). This
+design provides zero indirection for hot path access.
 
 ```typescript
 interface SpanBuffer {
@@ -463,8 +525,16 @@ interface SpanBuffer {
   timestamps: Float64Array; // Every operation appends timestamp
   operations: Uint8Array; // Operation type: tag, ok, err, etc.
 
-  // Null bitmaps - lazily allocated per column
-  nullBitmaps: Record<`attr_${string}`, Uint8Array>; // Arrow-format bitmaps
+  // Attribute columns - DIRECT PROPERTIES on buffer (NOT nested in a Record!)
+  // Each LazyColumn handles: values, null bitmap, AND scope value
+  // Schema-generated: one direct property per attribute
+  attr_userId: LazyColumn<Uint32Array>;
+  attr_requestId: LazyColumn<Uint32Array>;
+  attr_orderId: LazyColumn<Uint32Array>;
+  attr_http_status: LazyColumn<Uint16Array>;
+  attr_http_method: LazyColumn<Uint32Array>;
+  attr_logMessage: LazyColumn<string[]>;
+  // ... etc - one direct property per schema attribute
 
   // Tree structure
   children: SpanBuffer[];
@@ -473,24 +543,32 @@ interface SpanBuffer {
 
   // Buffer management
   writeIndex: number; // Current write position (0 to capacity-1)
+  capacity: number; // Logical capacity for bounds checking
   next?: SpanBuffer; // Chain to next buffer when overflow (part of self-tuning)
 
   spanId: number; // Incremental ID for THIS SpanBuffer (assigned at creation)
   traceId: string; // Root trace ID (constant per span, no TypedArray needed)
 
-  // Attribute columns: attr_* properties are added via lazy getters
-  // They appear as TypedArrays but are only allocated on first access
-
   // NOTE: Each span gets its own buffer, so traceId and spanId are constant
   // No need for traceId/spanId TypedArrays - they're the same for every row in this buffer
   // This keeps logs sorted and enables efficient Arrow conversion
 }
+
+// Access pattern - DIRECT property access, zero indirection:
+buffer.attr_userId.set(idx, value); // ✅ Direct access
+buffer.attr_userId.setScope(value); // ✅ Direct access
+const scope = buffer.attr_userId.scopeValue; // ✅ Direct read
+
+// NOT this pattern (extra indirection via nested Record):
+// buffer.columns.attr_userId.set(idx, value);  // ❌ One extra lookup
 ```
 
 **Why This Design**:
 
+- **Zero indirection**: Direct property access is faster than nested Record lookup
 - **Per-span buffers**: Each span gets its own buffer for sorted logs and simple implementation
 - **No traceId/spanId arrays**: These are constant per buffer, stored as properties
+- **Single object per column**: LazyColumn handles values, null bitmap, AND scope value in one place
 - **Minimal interface**: Only essential fields, no capacity/length bloat
 - **Shared references**: Module context shared across all tasks
 - **Tree structure**: Efficient parent-child span relationships
@@ -505,6 +583,7 @@ interface SpanBuffer {
 
 ```typescript
 // Generated from composed schema (HTTP + DB + user attributes)
+// Each attribute becomes a DIRECT LazyColumn property on buffer
 interface ComposedSpanBuffer extends SpanBuffer {
   // HTTP library attributes (attr_ prefix prevents conflicts with SpanBuffer internals)
   attr_http_status: Uint16Array; // HTTP status codes
@@ -528,21 +607,6 @@ interface ComposedSpanBuffer extends SpanBuffer {
 // Without prefix, user attribute "task" would conflict with buffer.task
 // Without prefix, user attribute "writeIndex" would conflict with buffer.writeIndex
 
-// Bitmap sizing based on total attribute count
-const COMPOSED_ATTR_BITS = {
-  http_status: 0, // Maps to attr_http_status
-  http_method: 1, // Maps to attr_http_method
-  http_url: 2, // Maps to attr_http_url
-  http_duration: 3, // Maps to attr_http_duration
-  db_query: 4, // Maps to attr_db_query
-  db_duration: 5, // Maps to attr_db_duration
-  db_rows: 6, // Maps to attr_db_rows
-  db_table: 7, // Maps to attr_db_table
-  user_id: 8, // Maps to attr_user_id
-  business_metric: 9, // Maps to attr_business_metric
-  // 10 attributes → Uint16Array bitmap (16 bits available)
-};
-
 function createSpanBuffer<T extends TagAttributeSchema>(
   schema: T,
   taskContext: TaskContext,
@@ -556,158 +620,59 @@ function createEmptySpanBuffer<T extends TagAttributeSchema>(
   spanId: number,
   schema: T,
   taskContext: TaskContext,
-  parentBuffer: SpanBuffer
+  parentBuffer?: SpanBuffer
 ): SpanBuffer {
   /**
    * Cache line alignment utility - ensures TypedArrays are aligned to 64-byte boundaries
-   *
-   * DESIGN RATIONALE:
-   * - CPU cache lines are 64 bytes on most modern processors (x86, ARM)
-   * - Aligning arrays to cache line boundaries reduces cache misses and improves memory bandwidth
-   * - Vectorized operations (SIMD) perform better on aligned data
-   * - Prevents false sharing between different arrays in multi-threaded scenarios
-   *
-   * @param elementCount - Number of elements requested
-   * @param bytesPerElement - Size of each element in bytes
-   * @returns Element count rounded up to nearest cache line boundary
    */
-  function getCacheAlignedCapacity(elementCount: number, bytesPerElement: number): number {
-    const CACHE_LINE_SIZE = 64; // Cache line size in bytes (standard for x86/ARM)
-    const totalBytes = elementCount * bytesPerElement;
+  function getCacheAlignedCapacity(elementCount: number): number {
+    const CACHE_LINE_SIZE = 64;
+    const totalBytes = elementCount * 1; // Use 1-byte (worst case) for alignment
     const alignedBytes = Math.ceil(totalBytes / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
-    return Math.ceil(alignedBytes / bytesPerElement);
-  }
-
-  // Choose smallest bitmap type that fits all attributes
-  let BitmapType: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor;
-  const attributeCount = Object.keys(schema.fields).length;
-  if (attributeCount <= 8) {
-    BitmapType = Uint8Array; // 8 bits
-  } else if (attributeCount <= 16) {
-    BitmapType = Uint16Array; // 16 bits
-  } else if (attributeCount <= 32) {
-    BitmapType = Uint32Array; // 32 bits
-  } else {
-    throw new Error(`Too many attributes: ${attributeCount}. Maximum 32 supported.`);
+    return alignedBytes;
   }
 
   const requestedCapacity = taskContext.module.spanBufferCapacityStats.currentCapacity;
+  const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
 
-  /**
-   * CRITICAL DESIGN CONSTRAINT: Columnar Storage Equal Length Requirement
-   *
-   * ALL TypedArrays in a SpanBuffer MUST have exactly the same length to maintain
-   * columnar storage invariants. This enables:
-   * - Direct indexing: buffer.timestamps[i], buffer.operations[i], buffer.attr_userId[i] all refer to the same row
-   * - Zero-copy Arrow conversion: slicing arrays directly to Arrow vectors
-   * - Consistent null bitmap indexing: buffer.nullBitmap[i] tracks nulls for row i across all attributes
-   *
-   * CACHE ALIGNMENT STRATEGY:
-   * We calculate alignment using the SMALLEST element size (1 byte = Uint8Array) as the worst case.
-   * This ensures ALL array types are cache-aligned (or over-aligned):
-   *
-   * With 64-element capacity:
-   * - Uint8Array:   64 × 1 = 64 bytes   (exactly 1 cache line - optimal)
-   * - Uint16Array:  64 × 2 = 128 bytes  (exactly 2 cache lines - optimal)
-   * - Uint32Array:  64 × 4 = 256 bytes  (exactly 4 cache lines - optimal)
-   * - Float64Array: 64 × 8 = 512 bytes  (exactly 8 cache lines - optimal)
-   *
-   * MEMORY TRADE-OFF:
-   * Using 1-byte alignment may over-allocate for larger types, but:
-   * 1. Preserves equal length requirement (fundamental)
-   * 2. Ensures cache alignment for smallest arrays (performance critical)
-   * 3. Starting capacity of 64 elements minimizes unexpected size increases
-   * 4. Self-tuning capacity management adapts to actual usage patterns
-   */
-  const alignedCapacity = getCacheAlignedCapacity(requestedCapacity, 1);
-
-  const buffer = {
+  // Start with core buffer properties
+  const buffer: SpanBuffer = {
     spanId,
 
-    /**
-     * CORE COLUMNS: All use identical cache-aligned capacity
-     *
-     * timestamps: Float64Array - High-precision timestamps for every operation
-     * operations: Uint8Array - Operation type codes (tag, ok, err, etc.)
-     * nullBitmap: Variable type - Bit flags tracking which attributes have values per row
-     *
-     * EQUAL LENGTH GUARANTEE: All arrays have length = alignedCapacity
-     * This enables direct row-based indexing across all columns.
-     */
+    // Core columns - always allocated immediately
     timestamps: new Float64Array(alignedCapacity),
     operations: new Uint8Array(alignedCapacity),
-    nullBitmap: new BitmapType(alignedCapacity),
-
-    /**
-     * SCHEMA-GENERATED ATTRIBUTE COLUMNS
-     *
-     * Generated dynamically based on TagAttributeSchema, all using the same alignedCapacity.
-     * Each attribute gets its own TypedArray with 'attr_' prefix to prevent naming conflicts.
-     *
-     * Examples:
-     * - attr_http_status: Uint16Array(alignedCapacity)  // HTTP status codes
-     * - attr_user_id: Uint32Array(alignedCapacity)      // String registry indices
-     * - attr_duration: Float32Array(alignedCapacity)    // Timing measurements
-     */
-    ...generateAttributeColumns(schema, alignedCapacity),
 
     // Tree structure
     children: [],
-    parent: parentBuffer, // Set parent reference
+    parent: parentBuffer,
     task: taskContext,
 
-    /**
-     * BUFFER MANAGEMENT
-     *
-     * writeIndex: Current write position (0 to capacity-1)
-     * capacity: LOGICAL capacity for bounds checking (original requested size)
-     * next: Chain to next buffer when logical capacity is exceeded
-     *
-     * IMPORTANT: Physical array length (alignedCapacity) may be larger than logical capacity
-     * due to cache alignment. The writeIndex and overflow logic use the original capacity
-     * to maintain consistent buffer chaining behavior regardless of alignment padding.
-     *
-     * Example:
-     * - Requested capacity: 100 elements
-     * - Aligned capacity: 128 elements (due to cache alignment)
-     * - Logical capacity: 100 (used for overflow detection)
-     * - Array lengths: 128 (actual memory allocation)
-     */
+    // Buffer management
     writeIndex: 0,
-    capacity: requestedCapacity, // Keep original capacity for logical bounds checking
-    next: undefined, // Chain to next buffer when full
-  };
+    capacity: requestedCapacity,
+    next: undefined,
+  } as SpanBuffer;
 
-  // Define lazy getters for each schema attribute
+  // Add LazyColumn as DIRECT properties on buffer (not nested in a Record)
   for (const fieldName of Object.keys(schema.fields)) {
-    const columnName = `attr_${fieldName}` as `attr_${string}`;
-    lazyColumnStorage[columnName] = {};
+    const columnName = `attr_${fieldName}` as keyof SpanBuffer;
+    const ArrayType = getArrayConstructorForField(schema.fields[fieldName]);
+    (buffer as any)[columnName] = new LazyColumn(alignedCapacity, ArrayType);
+  }
 
-    // Lazy getter for attribute column
-    Object.defineProperty(buffer, columnName, {
-      get() {
-        const storage = lazyColumnStorage[columnName];
-        if (!storage.data) {
-          storage.data = createTypedArrayForField(schema.fields[fieldName], alignedCapacity);
-        }
-        return storage.data;
-      },
-      enumerable: true,
-      configurable: true,
-    });
+  // If parentBuffer exists, inherit scope values
+  if (parentBuffer) {
+    for (const fieldName of Object.keys(schema.fields)) {
+      const columnName = `attr_${fieldName}` as keyof SpanBuffer;
+      const parentColumn = parentBuffer[columnName] as LazyColumn<any>;
+      const childColumn = buffer[columnName] as LazyColumn<any>;
 
-    // Lazy getter for null bitmap
-    Object.defineProperty(buffer.nullBitmaps, columnName, {
-      get() {
-        const storage = lazyColumnStorage[columnName];
-        if (!storage.nulls) {
-          storage.nulls = new Uint8Array(Math.ceil(alignedCapacity / 8));
-        }
-        return storage.nulls;
-      },
-      enumerable: true,
-      configurable: true,
-    });
+      if (parentColumn?.hasScopeValue) {
+        // Copy scope value from parent to child
+        childColumn.setScope(parentColumn.scopeValue);
+      }
+    }
   }
 
   taskContext.module.spanBufferCapacityStats.totalBuffersCreated++;
@@ -737,11 +702,11 @@ function createChildSpan(parentBuffer: SpanBuffer, label: string, childFn: SpanF
   };
 
   // Each child span gets its own NEW buffer with its own spanId
-  // This keeps child logs separate from parent logs in Arrow output
+  // Scope values are inherited from parent via createEmptySpanBuffer
   const childBuffer = createSpanBuffer(
     getSchemaFromBuffer(parentBuffer), // Child inherits parent's schema
     childTaskContext,
-    parentBuffer // Set parent reference
+    parentBuffer // Set parent reference (also triggers scope inheritance)
   );
 
   // Link parent-child relationship in tree
@@ -838,27 +803,25 @@ function generateAttributeColumns<T extends TagAttributeSchema>(
 ```typescript
 // ctx.tag writes to row 0 - OVERWRITES, not appends
 // Follows Datadog's span.set_tag() and OpenTelemetry's Span.setAttribute()
+// Uses LazyColumn.set() which handles both value AND null bitmap
+// LazyColumn is a DIRECT property on buffer (not nested in .columns)
 
 const tagOperations = {
-  requestId: (buffer: DbSpanBuffer, value: string) => {
+  requestId: (buffer: SpanBuffer, value: string) => {
     // ALWAYS write to row 0 (span-start row) - overwrite semantics
-    const index = 0;
-
-    // Set bit for this attribute in null bitmap (row 0)
-    buffer.nullBitmaps.attr_requestId[0] |= 1 << 0;
-
-    // Write to THIS attribute's column at row 0
-    buffer.attr_requestId[index] = hashString(value);
+    // LazyColumn.set() handles:
+    // 1. Lazy allocation of TypedArray (if first write)
+    // 2. Writing the value
+    // 3. Setting the null bitmap bit
+    buffer.attr_requestId.set(0, hashString(value)); // Direct property access
 
     // Return this for chaining
     return this;
   },
 
-  userId: (buffer: DbSpanBuffer, value: string) => {
-    // Same pattern - always row 0
-    const index = 0;
-    buffer.nullBitmaps.attr_userId[0] |= 1 << 0;
-    buffer.attr_userId[index] = hashString(value);
+  userId: (buffer: SpanBuffer, value: string) => {
+    // Same pattern - always row 0, direct property access
+    buffer.attr_userId.set(0, hashString(value));
     return this;
   },
 };
@@ -869,11 +832,55 @@ ctx.tag.userId('user-456'); // Writes to attr_userId[0]
 ctx.tag.requestId('req-789'); // OVERWRITES attr_requestId[0] - last write wins!
 ```
 
+### ctx.scope - Compiled Class with Getters/Setters
+
+```typescript
+// ctx.scope is a compiled class with getters/setters for reading AND writing scope values
+// Scope values appear on ALL rows in Arrow output
+// LazyColumn is a DIRECT property on buffer (not nested in .columns)
+
+// Generated at module creation time (cold path) using new Function()
+class GeneratedScope {
+  constructor(private buffer: SpanBuffer) {}
+
+  // Getter - read scope value
+  get userId(): string | undefined {
+    return this.buffer.attr_userId.scopeValue as string | undefined;
+  }
+
+  // Setter - set scope value (NO allocation)
+  set userId(value: string) {
+    this.buffer.attr_userId.setScope(hashString(value));
+  }
+
+  get requestId(): string | undefined {
+    return this.buffer.attr_requestId.scopeValue as string | undefined;
+  }
+
+  set requestId(value: string) {
+    this.buffer.attr_requestId.setScope(hashString(value));
+  }
+
+  // ... generated for each schema attribute
+}
+
+// Usage: ctx.scope uses property assignment syntax
+ctx.scope.userId = 'user-123'; // _scopeValue set, NO TypedArray allocated
+ctx.scope.requestId = 'req-456'; // _scopeValue set, NO TypedArray allocated
+
+// Reading scope values
+const currentUserId = ctx.scope.userId; // Returns 'user-123' or undefined
+if (ctx.scope.requestId !== undefined) {
+  console.log('Request ID:', ctx.scope.requestId);
+}
+```
+
 ### ctx.log - Appends New Rows (Events)
 
 ```typescript
 // ctx.log creates NEW rows starting at row 2 - APPENDS
 // Row 0 = span-start, Row 1 = completion, Row 2+ = events
+// LazyColumn is a DIRECT property on buffer (not nested in .columns)
 
 const logOperations = {
   info: (buffer: SpanBuffer, message: string, attributes?: Record<string, any>) => {
@@ -883,7 +890,9 @@ const logOperations = {
     // Core columns - always written
     buffer.timestamps[index] = getTimestamp(buffer.task.requestContext);
     buffer.operations[index] = ENTRY_TYPE_INFO;
-    buffer.messages[index] = message;
+
+    // Message attribute via LazyColumn (direct property access)
+    buffer.attr_message.set(index, message);
 
     // Optional attributes
     if (attributes) {
@@ -905,8 +914,9 @@ ctx.log.debug('Details...'); // Writes to row 3, writeIndex → 4
 - **No wasted rows**: Multiple tag calls don't bloat the buffer
 - **Progressive enrichment**: Set initial values early, refine with more context later
 - **Clear separation**: Tags (span attributes) vs logs (events) have distinct semantics
-- **Hot path optimization**: Just TypedArray writes and bitwise operations
-- **Null tracking**: Bitmap efficiently tracks which attributes have values at row 0
+- **Scope values**: Zero-allocation for values that appear on all rows
+- **Hot path optimization**: LazyColumn.set() is a single method call
+- **Null tracking**: LazyColumn handles bitmap internally
 
 ## Self-Tuning Capacity Management
 
@@ -1147,11 +1157,13 @@ The hottest path. Zero allocations allowed:
 // HOTTEST PATH: Happens on EVERY tag/log call
 ctx.tag.userId('123'); // ctx.tag directly on context
 
-// What happens (all direct writes, no allocations):
+// What happens (LazyColumn.set() handles everything):
 buffer.timestamps[index] = performance.now(); // Float64 write
 buffer.operations[index] = ENTRY_TYPE.TAG; // Uint8 write
-buffer.attr_userId[index] = internedStringIndex; // Uint32 write
-buffer.nullBitmaps.attr_userId[byteIdx] |= bitmask; // Uint8 bitwise OR
+buffer.attr_userId.set(index, internedStringIndex); // Direct property access (no .columns)
+// LazyColumn.set() internally does:
+//   this.values[index] = value;           // Uint32 write (lazy alloc on first access)
+//   this.nullBitmap[byteIdx] |= bitmask;  // Uint8 bitwise OR (lazy alloc on first access)
 index++;
 
 // What MUST NOT happen:
@@ -1193,14 +1205,14 @@ index++;
 - **Dictionary building**: Arrow builders accumulate values before finalizing
 
 ```typescript
-// COPY: slice() creates new ArrayBuffer
-const copied = buffer.timestamps.slice(0, buffer.writeIndex);
+// COPY: slice() creates new ArrayBuffer (avoid on hot path!)
+const copied = buffer.timestamps.slice(0, buffer.writeIndex); // BAD for zero-copy
 
 // VIEW: subarray() shares the underlying ArrayBuffer
 const view = buffer.timestamps.subarray(0, buffer.writeIndex);
 
-// Current implementation uses slice() for safety (cold path, correctness > micro-optimization)
-// Future optimization: use subarray() with careful lifetime management
+// IMPORTANT: For zero-copy Arrow conversion, use subarray()!
+// subarray() creates a view, slice() copies - significant difference for large buffers
 ```
 
 ### Arrow Conversion Process
@@ -1213,7 +1225,7 @@ async function writeSpanBuffersToArrow(buffers: SpanBuffer[]) {
   logCapacityStats(buffers);
 
   // 2. Create Arrow RecordBatches from SpanBuffers
-  //    Uses Arrow builders for correctness and null handling
+  //    Uses LazyColumn.getValuesForArrow() and getNullBitmapForArrow()
   const recordBatches = buffers.map((buffer) => createRecordBatch(buffer));
 
   // 3. Create Arrow Table from multiple RecordBatches
@@ -1228,13 +1240,13 @@ function createRecordBatch(buffer: SpanBuffer): arrow.RecordBatch {
   const arrowVectors: Record<string, arrow.Vector> = {};
 
   // --- Core SpanBuffer Columns ---
-  // These are sliced from TypedArrays (creates copies for safety)
+  // Use subarray() for zero-copy views into TypedArrays
   arrowVectors.spanId = arrow.Int64Vector.from(generateSpanIds(buffer));
   arrowVectors.parentId = arrow.Int64Vector.from(generateParentIds(buffer));
   arrowVectors.timestamp = arrow.Float64Vector.from(
-    buffer.timestamps.slice(0, buffer.writeIndex) // slice() = copy
+    buffer.timestamps.subarray(0, buffer.writeIndex) // subarray() = zero-copy view
   );
-  arrowVectors.operation = arrow.Utf8Vector.from(buffer.operations.slice(0, buffer.writeIndex));
+  arrowVectors.operation = arrow.Utf8Vector.from(buffer.operations.subarray(0, buffer.writeIndex));
 
   // --- Module Metadata Columns (expanded from shared reference) ---
   arrowVectors.gitSha = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'gitSha'));
@@ -1244,63 +1256,30 @@ function createRecordBatch(buffer: SpanBuffer): arrow.RecordBatch {
   );
   arrowVectors.lineNumber = arrow.Int32Vector.from(getModuleMetadataColumn(buffer, 'lineNumber'));
 
-  // --- Attribute Columns ---
+  // --- Attribute Columns (via LazyColumn) ---
   for (const [attrName, fieldConfig] of Object.entries(tagAttributes.fields)) {
     const columnName = `attr_${attrName}` as `attr_${string}`;
+    const lazyColumn = buffer.columns[columnName];
 
-    // Check if column was ever accessed (lazy initialization)
-    // If the getter was never called, the column doesn't exist - skip it!
-    const rawColumnData = Object.getOwnPropertyDescriptor(buffer, columnName)?.value;
-    if (!rawColumnData) {
-      // Column was never written to - no conversion needed
-      // This is where lazy initialization saves work
+    // Use LazyColumn's Arrow conversion methods
+    // - Returns null if column was never written AND has no scope value
+    // - Returns zero-copy subarray() if column was written directly
+    // - Allocates and fills if only scope value was set (cold path allocation)
+    const arrowData = lazyColumn.getValuesForArrow(buffer.writeIndex);
+    if (arrowData === null) {
+      // Column has no data and no scope value - skip it
       continue;
     }
 
-    // Get null bitmap for this column
-    const nullBitmap = buffer.nullBitmaps[columnName];
-    const slicedData = rawColumnData.slice(0, buffer.writeIndex);
-
-    // Convert null bitmap from our format to Arrow's format
-    const arrowNullBitmap = convertNullBitmapToArrowFormat(nullBitmap, buffer.writeIndex);
+    // Get null bitmap from the SAME LazyColumn object
+    const arrowNullBitmap = lazyColumn.getNullBitmapForArrow(buffer.writeIndex);
 
     // Create Arrow Vector with null bitmap
-    const arrowVector = createArrowVector(fieldConfig.type, slicedData, arrowNullBitmap);
+    const arrowVector = createArrowVector(fieldConfig.type, arrowData, arrowNullBitmap);
     arrowVectors[attrName] = arrowVector; // Strip attr_ prefix for clean column names
   }
 
   return new arrow.RecordBatch(arrowVectors);
-}
-
-/**
- * Convert our null bitmap format to Arrow's format
- *
- * Our format: 1 bit per row, per column (set = value present)
- * Arrow format: 1 bit per row (set = value valid/non-null)
- *
- * This is NOT zero-copy - we must transform the bitmap
- */
-function convertNullBitmapToArrowFormat(nullBitmap: Uint8Array | undefined, numRows: number): Uint8Array {
-  const arrowBitmap = new Uint8Array(Math.ceil(numRows / 8));
-
-  if (!nullBitmap) {
-    // No bitmap means all values are null
-    return arrowBitmap;
-  }
-
-  // Copy bits from our format to Arrow format
-  // (In practice, formats are similar so this is mostly a copy)
-  for (let i = 0; i < numRows; i++) {
-    const byteIndex = Math.floor(i / 8);
-    const bitOffset = i % 8;
-    const isPresent = (nullBitmap[byteIndex] & (1 << bitOffset)) !== 0;
-
-    if (isPresent) {
-      arrowBitmap[byteIndex] |= 1 << bitOffset;
-    }
-  }
-
-  return arrowBitmap;
 }
 
 function logCapacityStats(buffers: SpanBuffer[]) {
@@ -1337,37 +1316,43 @@ function logCapacityStats(buffers: SpanBuffer[]) {
 
 **Key Integration Points**:
 
-1. **Lazy Columns**: Columns never accessed have zero conversion cost - they simply don't exist
-2. **TypedArray Slicing**: Core numeric columns slice efficiently from source TypedArrays
-3. **Null Bitmap Transformation**: Per-column bitmaps convert to Arrow's validity format
+1. **LazyColumn API**: Each column uses `getValuesForArrow()` and `getNullBitmapForArrow()` for conversion
+2. **TypedArray subarray()**: Core columns and LazyColumn use subarray() for zero-copy views
+3. **Scope Value Handling**: Scope-only columns allocate and fill during cold path (not hot path)
 4. **Attribute Prefix Stripping**: `attr_` prefixes removed during conversion for clean column names
 5. **String Registry Resolution**: Category/text indices resolve to actual strings during conversion
 
 **Copy vs View Semantics**:
 
 ```typescript
-// Current implementation (safe, some copying):
-const data = buffer.timestamps.slice(0, writeIndex); // Creates copy
+// IMPORTANT: Use subarray() for zero-copy conversion
+const view = buffer.timestamps.subarray(0, writeIndex); // Zero-copy VIEW into same ArrayBuffer
 
-// Potential optimization (view, careful lifetime management needed):
-const view = buffer.timestamps.subarray(0, writeIndex); // Shares buffer
+// LazyColumn.getValuesForArrow() uses subarray() internally for written columns
+const arrowData = lazyColumn.getValuesForArrow(writeIndex);
+// If column was written: returns subarray() (zero-copy)
+// If only scope value: allocates new array and fills (cold path allocation)
+// If neither: returns null (column omitted)
 
-// Arrow conversion uses builders which copy data anyway,
-// so slice() vs subarray() is less important in practice
+// LazyColumn.getNullBitmapForArrow() also uses subarray() when possible
+const nullBitmap = lazyColumn.getNullBitmapForArrow(writeIndex);
 ```
 
 **Example Conversion**:
 
 ```typescript
-// SpanBuffer (in-memory)                    →  Arrow Table (queryable)
-buffer.attr_http_status: Uint16Array[200]   →  http_status: 200
-buffer.attr_db_query: Array<string>["..."]  →  db_query: "SELECT * FROM users WHERE id = ?"
-buffer.nullBitmaps.attr_http_status[0]=0x01 →  Arrow validity bitmap: 0x01
-// Column never accessed (lazy getter)      →  Column omitted entirely (zero cost)
+// SpanBuffer with LazyColumn (in-memory)    →  Arrow Table (queryable)
+// LazyColumn is DIRECT property on buffer (not nested in .columns)
+buffer.attr_http_status.values[0]            →  http_status: 200
+buffer.attr_db_query.values[0]               →  db_query: "SELECT * FROM users WHERE id = ?"
+buffer.attr_http_status.nullBitmap           →  Arrow validity bitmap: 0x01
+// LazyColumn with hasScopeValue but !isInitialized  →  allocate + fill at conversion
+// LazyColumn with !hasScopeValue && !isInitialized  →  Column omitted entirely (zero cost)
 ```
 
 **See Also**:
 
+- **[Span Scope Attributes](./01i_span_scope_attributes.md)**: LazyColumn class definition and scope value handling
 - **Arrow Table Structure** (future document): Complete Arrow schema, examples with realistic trace data, ClickHouse
   query patterns
 - **Background Processing Pipeline** (future document): Detailed Arrow/Parquet conversion process, performance

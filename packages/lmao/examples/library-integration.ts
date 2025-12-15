@@ -73,14 +73,14 @@ function createHttpLibrary(prefix = 'http') {
   const operations = {
     /**
      * Traced HTTP request operation
-     * Uses clean API: ctx.log.tag.status(200), ctx.log.tag.method('POST')
+     * Uses clean API: ctx.tag.status(200), ctx.tag.method('POST')
      * But writes to prefixed columns: http_status, http_method
      */
     request: module.task('http-request', async (ctx, opts: RequestOptions) => {
       const startTime = performance.now();
 
       // Clean, unprefixed API - library doesn't worry about conflicts
-      ctx.log.tag.method(opts.method).url(opts.url);
+      ctx.tag.method(opts.method).url(opts.url);
 
       // Simulate HTTP request
       try {
@@ -91,12 +91,12 @@ function createHttpLibrary(prefix = 'http') {
         };
 
         const duration = performance.now() - startTime;
-        ctx.log.tag.status(response.status).duration(duration);
+        ctx.tag.status(response.status).duration(duration);
 
         return ctx.ok(response);
       } catch (error) {
         const duration = performance.now() - startTime;
-        ctx.log.tag.status(0).duration(duration);
+        ctx.tag.status(0).duration(duration);
         return ctx.err('HTTP_ERROR', error);
       }
     }),
@@ -142,8 +142,8 @@ function createDatabaseLibrary(prefix = 'db') {
       const tableName = sql.match(/FROM\s+(\w+)/i)?.[1] || 'unknown';
       const operation = sql.trim().split(' ')[0].toUpperCase();
 
-      // Clean API: ctx.log.tag.query(), ctx.log.tag.table(), etc.
-      ctx.log.tag
+      // Clean API: ctx.tag.query(), ctx.tag.table(), etc.
+      ctx.tag
         .query(sql)
         .table(tableName)
         .operation(operation as 'SELECT' | 'INSERT' | 'UPDATE' | 'DELETE');
@@ -156,12 +156,12 @@ function createDatabaseLibrary(prefix = 'db') {
         };
 
         const duration = performance.now() - startTime;
-        ctx.log.tag.duration(duration).rowsAffected(result.rowCount);
+        ctx.tag.duration(duration).rowsAffected(result.rowCount);
 
         return ctx.ok(result);
       } catch (error) {
         const duration = performance.now() - startTime;
-        ctx.log.tag.duration(duration);
+        ctx.tag.duration(duration);
         return ctx.err('DB_ERROR', error);
       }
     }),
@@ -196,19 +196,19 @@ function createCacheLibrary(prefix = 'cache') {
 
   const operations = {
     get: module.task('cache-get', async (ctx, key: string) => {
-      ctx.log.tag.operation('GET').key(key);
+      ctx.tag.operation('GET').key(key);
 
       // Mock: simulate cache lookup
       const hit = Math.random() > 0.3; // 70% hit rate
       const value = hit ? { data: 'cached-value' } : null;
 
-      ctx.log.tag.hit(hit);
+      ctx.tag.hit(hit);
 
       return ctx.ok({ value, hit });
     }),
 
     set: module.task('cache-set', async (ctx, key: string, value: unknown, ttl = 3600) => {
-      ctx.log.tag
+      ctx.tag
         .operation('SET')
         .key(key)
         .ttl(ttl as number);
@@ -285,7 +285,7 @@ interface UserData {
  */
 const getUserProfile = task('get-user-profile', async (ctx, userId: string) => {
   // Set application-specific attributes
-  ctx.log.tag.userId(userId).requestId(ctx.requestId);
+  ctx.tag.userId(userId).requestId(ctx.requestId);
 
   // Check feature flag
   if (ctx.ff.useCache) {
@@ -297,7 +297,7 @@ const getUserProfile = task('get-user-profile', async (ctx, userId: string) => {
 
     if (cached.success && cached.value.hit) {
       ctx.log.info('Cache hit');
-      ctx.log.tag.businessMetric(1); // Track cache hits as metric
+      ctx.tag.businessMetric(1); // Track cache hits as metric
       return ctx.ok(cached.value.value);
     }
   }
@@ -328,7 +328,7 @@ const getUserProfile = task('get-user-profile', async (ctx, userId: string) => {
     await cacheLib.operations.set(ctx, `user:${userId}`, user, 3600);
   }
 
-  ctx.log.tag.businessMetric(0.5); // Track partial success
+  ctx.tag.businessMetric(0.5); // Track partial success
 
   return ctx.ok(user);
 });

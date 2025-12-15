@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
 import { createEmptySpanBuffer, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
-import type { TaskContext } from '../types.js';
+import type { TaskContext } from '../../types.js';
 
 /**
  * Type helper to extract schema fields from ExtendedSchema

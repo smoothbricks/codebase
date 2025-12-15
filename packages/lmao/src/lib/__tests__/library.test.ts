@@ -522,3 +522,156 @@ describe('createDatabaseLibrary', () => {
     });
   });
 });
+
+describe('prefix remapping', () => {
+  describe('createPrefixMapping', () => {
+    it('should create mapping from clean names to prefixed names', () => {
+      const { createPrefixMapping } = require('../library.js');
+      const schema = defineTagAttributes({
+        status: S.number(),
+        method: S.category(),
+      });
+
+      const mapping = createPrefixMapping(schema, 'http');
+
+      expect(mapping).toEqual({
+        status: 'http_status',
+        method: 'http_method',
+      });
+    });
+
+    it('should handle empty schema', () => {
+      const { createPrefixMapping } = require('../library.js');
+      const schema = defineTagAttributes({});
+
+      const mapping = createPrefixMapping(schema, 'test');
+
+      expect(mapping).toEqual({});
+    });
+  });
+
+  describe('generateRemappedSpanLoggerClass', () => {
+    it('should generate valid JavaScript code', () => {
+      const { generateRemappedSpanLoggerClass, createPrefixMapping } = require('../library.js');
+      const schema = defineTagAttributes({
+        status: S.number(),
+        method: S.enum(['GET', 'POST']),
+      });
+      const mapping = createPrefixMapping(schema, 'http');
+
+      const code = generateRemappedSpanLoggerClass(schema, mapping);
+
+      // Should be valid JavaScript
+      expect(() => new Function(`return ${code}`)()).not.toThrow();
+    });
+
+    it('should generate class with clean method names', () => {
+      const { generateRemappedSpanLoggerClass, createPrefixMapping } = require('../library.js');
+      const schema = defineTagAttributes({
+        status: S.number(),
+        duration: S.number(),
+      });
+      const mapping = createPrefixMapping(schema, 'http');
+
+      const code = generateRemappedSpanLoggerClass(schema, mapping);
+
+      // Should contain clean method names
+      expect(code).toContain('status(value)');
+      expect(code).toContain('duration(value)');
+      // Should reference prefixed columns
+      expect(code).toContain('attr_http_status');
+      expect(code).toContain('attr_http_duration');
+    });
+
+    it('should include enum mapping functions', () => {
+      const { generateRemappedSpanLoggerClass, createPrefixMapping } = require('../library.js');
+      const schema = defineTagAttributes({
+        method: S.enum(['GET', 'POST', 'PUT']),
+      });
+      const mapping = createPrefixMapping(schema, 'http');
+
+      const code = generateRemappedSpanLoggerClass(schema, mapping);
+
+      // Should contain enum mapping function
+      expect(code).toContain('getEnumIndex_method');
+      expect(code).toContain('case "GET"');
+      expect(code).toContain('case "POST"');
+      expect(code).toContain('case "PUT"');
+    });
+
+    it('should include prefix mapping for with() method', () => {
+      const { generateRemappedSpanLoggerClass, createPrefixMapping } = require('../library.js');
+      const schema = defineTagAttributes({
+        status: S.number(),
+      });
+      const mapping = createPrefixMapping(schema, 'http');
+
+      const code = generateRemappedSpanLoggerClass(schema, mapping);
+
+      // Should include PREFIX_MAPPING constant
+      expect(code).toContain('PREFIX_MAPPING');
+      expect(code).toContain('"status":"http_status"');
+    });
+  });
+
+  describe('createRemappedSpanLoggerClass', () => {
+    it('should create a class constructor', () => {
+      const { createRemappedSpanLoggerClass, createPrefixMapping } = require('../library.js');
+      const schema = defineTagAttributes({
+        status: S.number(),
+      });
+      const mapping = createPrefixMapping(schema, 'http');
+
+      const SpanLoggerClass = createRemappedSpanLoggerClass(schema, mapping);
+
+      expect(typeof SpanLoggerClass).toBe('function');
+    });
+  });
+
+  describe('moduleContextFactory with remapping', () => {
+    it('should return cleanSchema and prefixMapping', () => {
+      const schema = defineTagAttributes({
+        status: S.number(),
+        method: S.category(),
+      });
+
+      const factory = moduleContextFactory(
+        'http',
+        {
+          gitSha: 'test',
+          filePath: 'test.ts',
+          moduleName: 'http',
+        },
+        schema,
+      );
+
+      expect(factory.cleanSchema).toBeDefined();
+      expect(factory.prefixMapping).toBeDefined();
+      expect(factory.prefixMapping).toEqual({
+        status: 'http_status',
+        method: 'http_method',
+      });
+    });
+
+    it('should expose clean schema for type inference', () => {
+      const schema = defineTagAttributes({
+        status: S.number(),
+        url: S.text(),
+      });
+
+      const factory = moduleContextFactory(
+        'http',
+        {
+          gitSha: 'test',
+          filePath: 'test.ts',
+          moduleName: 'http',
+        },
+        schema,
+      );
+
+      // cleanSchema should have original field names
+      expect(factory.cleanSchema.status).toBeDefined();
+      expect(factory.cleanSchema.url).toBeDefined();
+    });
+  });
+});

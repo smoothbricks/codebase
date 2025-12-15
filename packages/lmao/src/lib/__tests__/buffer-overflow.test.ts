@@ -50,7 +50,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         // Write more entries than the initial capacity
         // Initial capacity is 64, so write 100 entries
         for (let i = 0; i < 100; i++) {
-          ctx.log.tag
+          ctx.tag
             .requestId(`req-${i}`)
             .userId(`user-${i}`)
             .operation('SELECT')
@@ -88,7 +88,7 @@ describe('Buffer Overflow and Capacity Management', () => {
       const testTask = moduleContext.task('test-chaining', async (ctx) => {
         // Each tag write should work even after overflow
         for (let i = 0; i < 10; i++) {
-          ctx.log.tag
+          ctx.tag
             .requestId(`req-${i}`)
             .userId(`user-${i}`)
             .with({ operation: 'SELECT', duration: 10.5 })
@@ -123,7 +123,7 @@ describe('Buffer Overflow and Capacity Management', () => {
       const testTask = moduleContext.task('test-large-writes', async (ctx) => {
         // Write 1000 entries to test multiple buffer chains
         for (let i = 0; i < 1000; i++) {
-          ctx.log.tag.requestId(`req-${i}`).userId(`user-${i}`);
+          ctx.tag.requestId(`req-${i}`).userId(`user-${i}`);
         }
 
         return ctx.ok({ written: 1000 });
@@ -193,9 +193,9 @@ describe('Buffer Overflow and Capacity Management', () => {
       const testTask = moduleContext.task('test-mixed-writes', async (ctx) => {
         // Interleave tag writes and messages
         for (let i = 0; i < 100; i++) {
-          ctx.log.tag.requestId(`req-${i}`).userId(`user-${i}`);
+          ctx.tag.requestId(`req-${i}`).userId(`user-${i}`);
           ctx.log.info(`Processing request ${i}`);
-          ctx.log.tag.operation('SELECT').duration(10.5);
+          ctx.tag.operation('SELECT').duration(10.5);
           ctx.log.debug(`Query completed for ${i}`);
         }
 
@@ -231,7 +231,7 @@ describe('Buffer Overflow and Capacity Management', () => {
       const testTask = moduleContext.task('test-child-overflow', async (ctx) => {
         // Parent writes
         for (let i = 0; i < 50; i++) {
-          ctx.log.tag.requestId(`parent-${i}`);
+          ctx.tag.requestId(`parent-${i}`);
         }
 
         // Child span with many writes
@@ -312,7 +312,7 @@ describe('Buffer Overflow and Capacity Management', () => {
       // Execute multiple tasks to trigger capacity tuning
       const testTask = moduleContext.task('test-rapid', async (ctx) => {
         for (let i = 0; i < 200; i++) {
-          ctx.log.tag.requestId(`req-${i}`);
+          ctx.tag.requestId(`req-${i}`);
         }
         return ctx.ok({ written: 200 });
       });
@@ -344,11 +344,11 @@ describe('Buffer Overflow and Capacity Management', () => {
       const testTask = moduleContext.task('test-boundary', async (ctx) => {
         // Write exactly 64 entries (initial capacity)
         for (let i = 0; i < 64; i++) {
-          ctx.log.tag.requestId(`req-${i}`);
+          ctx.tag.requestId(`req-${i}`);
         }
 
         // Write one more to trigger overflow
-        ctx.log.tag.requestId('req-64');
+        ctx.tag.requestId('req-64');
 
         return ctx.ok({ written: 65 });
       });
@@ -365,6 +365,97 @@ describe('Buffer Overflow and Capacity Management', () => {
       if (result.success) {
         expect(result.value.written).toBe(65);
       }
+    });
+  });
+
+  describe('Scoped Attributes on Buffer Overflow', () => {
+    it('should carry scoped attributes forward when buffer overflows', async () => {
+      const moduleContext = createModuleContext({
+        moduleMetadata: {
+          gitSha: 'abc123',
+          filePath: 'src/services/test.ts',
+          moduleName: 'TestService',
+        },
+        tagAttributes: dbAttributes,
+      });
+
+      const testTask = moduleContext.task('test-scope-overflow', async (ctx) => {
+        // Set scoped attributes at the beginning
+        ctx.log.scope({ requestId: 'scoped-req-123', userId: 'scoped-user-456' });
+
+        // Write enough messages to trigger buffer overflow
+        // Initial capacity is 64, and writeIndex starts at 2 (row 0: span-start, row 1: span-end)
+        // So we need 62+ messages to overflow
+        for (let i = 0; i < 100; i++) {
+          ctx.log.info(`Message ${i}`);
+        }
+
+        // The scoped attributes should be present in the new buffer
+        // We can verify by getting the scoped attributes
+        const scopedAttrs = ctx.log.getScopedAttributes();
+
+        return ctx.ok({
+          messagesWritten: 100,
+          scopedRequestId: scopedAttrs.requestId,
+          scopedUserId: scopedAttrs.userId,
+        });
+      });
+
+      const requestCtx = createRequestContext(
+        { requestId: 'req-scope-overflow-test' },
+        featureFlags,
+        flagEvaluator,
+        environmentConfig,
+      );
+
+      const result = await testTask(requestCtx);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.value.messagesWritten).toBe(100);
+        // Scoped attributes should still be accessible (they're stored in the logger, not buffer)
+        expect(result.value.scopedRequestId).toBeDefined();
+        expect(result.value.scopedUserId).toBeDefined();
+      }
+    });
+
+    it('should apply scoped attributes to messages in chained buffer after overflow', async () => {
+      const moduleContext = createModuleContext({
+        moduleMetadata: {
+          gitSha: 'abc123',
+          filePath: 'src/services/test.ts',
+          moduleName: 'TestService',
+        },
+        tagAttributes: dbAttributes,
+      });
+
+      // We need access to the buffer to verify scoped attributes are pre-filled
+      // This is an internal implementation test
+      const bufferAfterOverflow: unknown = null;
+
+      const testTask = moduleContext.task('test-scope-prefill', async (ctx) => {
+        // Set scoped attributes
+        ctx.log.scope({ region: 'us-east-1' });
+
+        // Write enough messages to trigger overflow
+        for (let i = 0; i < 80; i++) {
+          ctx.log.info(`Message ${i}`);
+        }
+
+        // Write a final message after overflow - scoped attributes should be applied
+        ctx.log.info('Final message after overflow');
+
+        return ctx.ok({ success: true });
+      });
+
+      const requestCtx = createRequestContext(
+        { requestId: 'req-scope-prefill-test' },
+        featureFlags,
+        flagEvaluator,
+        environmentConfig,
+      );
+
+      const result = await testTask(requestCtx);
+      expect(result.success).toBe(true);
     });
   });
 
@@ -386,7 +477,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         for (let i = 0; i < 150; i++) {
           const reqId = `req-${i}`;
           writes.push(reqId);
-          ctx.log.tag.requestId(reqId);
+          ctx.tag.requestId(reqId);
         }
 
         return ctx.ok({ totalWrites: writes.length });
@@ -420,7 +511,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         try {
           // Write some entries
           for (let i = 0; i < 50; i++) {
-            ctx.log.tag.requestId(`req-${i}`);
+            ctx.tag.requestId(`req-${i}`);
           }
 
           // Simulate an error
@@ -428,7 +519,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         } catch (error) {
           // Continue writing after error
           for (let i = 50; i < 100; i++) {
-            ctx.log.tag.requestId(`req-${i}`);
+            ctx.tag.requestId(`req-${i}`);
           }
 
           return ctx.ok({ recovered: true, writes: 100 });

@@ -1,151 +1,92 @@
 /**
- * Platform-specific timestamp utilities
- * 
- * Per vizanto's review feedback and specs/01f_arrow_table_structure.md:
- * - Node.js: Use epoch-based timestamps with sub-millisecond precision via hrtime anchoring
- * - Browser: Use performance.now() + Date.now() for microsecond precision
- * 
- * Timestamps are stored in Float64Array as milliseconds in the hot path,
- * then converted to appropriate Arrow timestamp type during conversion.
+ * High-precision timestamp system (Generic/Browser implementation)
+ *
+ * Provides microsecond-precision timestamps using `performance.now()` for browsers
+ * and generic JavaScript environments. For Node.js with nanosecond precision,
+ * import from `'@smoothbricks/lmao/node'` instead.
+ *
+ * **Why anchoring?**
+ * - `Date.now()` has millisecond precision and can drift with system clock adjustments
+ * - `performance.now()` has sub-millisecond precision but measures relative time
+ * - By anchoring once per request, we get both absolute epoch time AND high precision
+ *
+ * **How it works:**
+ * 1. At request start: Capture `Date.now()` (absolute) and `performance.now()` (precise)
+ * 2. For each timestamp: Calculate delta from `performance.now()` anchor
+ * 3. Add delta to epoch anchor for high-precision absolute timestamp
+ *
+ * @module timestamp
+ *
+ * @example
+ * ```typescript
+ * // At request start (once)
+ * const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
+ *
+ * // Later, get high-precision timestamps
+ * const timestamp1 = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+ * await doSomeWork();
+ * const timestamp2 = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+ *
+ * console.log(`Work took ${timestamp2 - timestamp1} microseconds`);
+ * ```
  */
 
 /**
- * Detect runtime environment
+ * Creates a time anchor at the trace root (called ONCE per request).
+ *
+ * This captures both the absolute epoch time and the high-resolution performance
+ * counter at the same instant. All subsequent timestamp calculations use these
+ * anchor values for efficient delta calculation.
+ *
+ * **Performance**: Returns flat primitives instead of a nested object for
+ * zero-allocation spread when passing to child functions.
+ *
+ * @returns Object with anchor values for timestamp calculations
+ * @returns {number} anchorEpochMicros - Epoch time in microseconds when anchor was created
+ * @returns {number} anchorPerfNow - High-precision performance.now() value in microseconds
+ *
+ * @example
+ * ```typescript
+ * // In request context creation
+ * const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
+ *
+ * // Pass to child contexts via spread
+ * const childContext = { ...parentContext, anchorEpochMicros, anchorPerfNow };
+ * ```
  */
-const isNode =
-  typeof process !== 'undefined' && process.versions != null && process.versions.node != null;
+export function createTimeAnchor(): {
+  anchorEpochMicros: number;
+  anchorPerfNow: number;
+} {
+  const epochMicros = Date.now() * 1000;
+  const perfNowMicros = performance.now() * 1000; // Convert ms to microseconds
 
-/**
- * Module-level anchors for epoch-based timestamps in Node.js
- * Captures epoch time and hrtime at module load to compute epoch ms with sub-ms precision
- */
-const moduleStartEpoch = Date.now();
-const moduleStartHr = isNode ? process.hrtime.bigint() : BigInt(0);
-
-/**
- * Span start time tracker for browser relative timestamps
- * Maps span ID to { startTime: Date.now(), startPerf: performance.now() }
- */
-const spanStartTimes = new Map<
-  number,
-  { startTime: number; startPerf: number }
->();
-
-/**
- * Get current timestamp in milliseconds (epoch time)
- * 
- * - Node.js: Uses anchored hrtime for sub-millisecond precision epoch time
- * - Browser: Uses Date.now() for absolute time
- * 
- * @returns Timestamp in milliseconds since Unix epoch (Float64)
- */
-export function getCurrentTimestamp(): number {
-  if (isNode) {
-    // Node.js: Compute epoch ms using anchored hrtime for sub-ms precision
-    // moduleStartEpoch + elapsed time since module load
-    const elapsedNanos = process.hrtime.bigint() - moduleStartHr;
-    const elapsedMs = Number(elapsedNanos) / 1_000_000;
-    return moduleStartEpoch + elapsedMs;
-  }
-
-  // Browser: Use Date.now() for millisecond precision
-  return Date.now();
+  return {
+    anchorEpochMicros: epochMicros,
+    anchorPerfNow: perfNowMicros,
+  };
 }
 
 /**
- * Initialize span timing (browser only)
- * 
- * Captures both Date.now() and performance.now() at span creation
- * to enable high-precision relative timestamps
- * 
- * @param spanId - Span identifier
+ * Gets the current timestamp in microseconds since Unix epoch.
+ *
+ * Uses delta calculation from the anchor point for high precision without
+ * repeated system calls. This function is designed for the hot path - it
+ * performs ZERO allocations, just arithmetic operations.
+ *
+ * **Precision**: Sub-millisecond precision (typically 5-20 microseconds depending on browser)
+ *
+ * @param anchorEpochMicros - Epoch time in microseconds when anchor was created
+ * @param anchorPerfNow - High-precision performance.now() value when anchor was created (microseconds)
+ * @returns Current timestamp in microseconds since Unix epoch
+ *
+ * @example
+ * ```typescript
+ * // Store timestamp in trace buffer
+ * buffer.timestamps[idx] = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+ * ```
  */
-export function initSpanTiming(spanId: number): void {
-  if (!isNode && typeof performance !== 'undefined') {
-    spanStartTimes.set(spanId, {
-      startTime: Date.now(),
-      startPerf: performance.now(),
-    });
-  }
-}
-
-/**
- * Get relative timestamp from span start (browser only)
- * 
- * Uses performance.now() for microsecond precision relative timing
- * 
- * @param spanId - Span identifier
- * @returns Timestamp in milliseconds relative to span start, or absolute time if not initialized
- */
-export function getRelativeTimestamp(spanId: number): number {
-  if (isNode) {
-    // Node.js: Just use hrtime
-    return getCurrentTimestamp();
-  }
-
-  // Browser: Use performance.now() for high-precision relative time
-  if (typeof performance !== 'undefined') {
-    const spanStart = spanStartTimes.get(spanId);
-    if (spanStart) {
-      const elapsedPerf = performance.now() - spanStart.startPerf;
-      return spanStart.startTime + elapsedPerf;
-    }
-  }
-
-  // Fallback to Date.now()
-  return Date.now();
-}
-
-/**
- * Clean up span timing data
- * 
- * @param spanId - Span identifier
- */
-export function cleanupSpanTiming(spanId: number): void {
-  spanStartTimes.delete(spanId);
-}
-
-/**
- * Get Arrow timestamp type for current platform
- * 
- * - Node.js: TimestampNanosecond (nanosecond precision)
- * - Browser: TimestampMicrosecond (microsecond precision via performance.now())
- * 
- * @returns Arrow timestamp type unit
- */
-export function getArrowTimestampUnit(): 'nanosecond' | 'microsecond' | 'millisecond' {
-  if (isNode) {
-    return 'nanosecond'; // Node.js has nanosecond precision with process.hrtime.bigint()
-  }
-  
-  // Browser: performance.now() has microsecond precision
-  if (typeof performance !== 'undefined') {
-    return 'microsecond';
-  }
-  
-  // Fallback: Date.now() has millisecond precision
-  return 'millisecond';
-}
-
-/**
- * Convert milliseconds timestamp to Arrow timestamp value
- * 
- * @param timestampMs - Timestamp in milliseconds
- * @param unit - Target Arrow timestamp unit
- * @returns Timestamp in target unit
- */
-export function convertToArrowTimestamp(
-  timestampMs: number,
-  unit: 'nanosecond' | 'microsecond' | 'millisecond',
-): number {
-  switch (unit) {
-    case 'nanosecond':
-      return Math.floor(timestampMs * 1_000_000); // ms to ns
-    case 'microsecond':
-      return Math.floor(timestampMs * 1_000); // ms to μs
-    case 'millisecond':
-      return Math.floor(timestampMs); // Already in ms
-    default:
-      return Math.floor(timestampMs);
-  }
+export function getTimestampMicros(anchorEpochMicros: number, anchorPerfNow: number): number {
+  const nowMicros = performance.now() * 1000;
+  return anchorEpochMicros + (nowMicros - anchorPerfNow);
 }

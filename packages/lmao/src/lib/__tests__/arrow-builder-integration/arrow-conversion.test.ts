@@ -11,9 +11,9 @@
 
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '@smoothbricks/lmao';
-import type { TagAttributeSchema } from '../../schema-types.js';
-import { convertSpanTreeToArrowTable, convertToArrowTable } from '../convertToArrow.js';
-import type { ModuleContext, SpanBuffer, TaskContext } from '../types.js';
+import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
+import type { TagAttributeSchema } from '../../schema/types.js';
+import type { ModuleContext, SpanBuffer, TaskContext } from '../../types.js';
 
 /**
  * Mock string interner for testing

@@ -23,5 +23,3 @@ export * from './lib/schema/types.js';
 export * from './lib/spanBuffer.js';
 // LMAO types (SpanBuffer, ModuleContext, TaskContext)
 export * from './lib/types.js';
-// Timestamp utilities (platform-specific)
-export * from './lib/timestamp.js';

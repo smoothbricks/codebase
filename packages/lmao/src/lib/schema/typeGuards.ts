@@ -7,7 +7,7 @@
 
 import type * as arrow from 'apache-arrow';
 import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
-import type { FeatureFlagDefinition } from './types.js';
+import type { EnumSchemaWithMetadata, FeatureFlagDefinition, LmaoSchemaType, SchemaWithMetadata } from './types.js';
 
 /**
  * Type guard to check if a value is an Arrow builder
@@ -21,6 +21,71 @@ export function isArrowBuilder(value: unknown): value is arrow.Builder {
     'append' in value &&
     typeof (value as Record<string, unknown>).append === 'function'
   );
+}
+
+/**
+ * Valid LMAO schema types
+ */
+const LMAO_SCHEMA_TYPES: readonly LmaoSchemaType[] = ['enum', 'category', 'text', 'number', 'boolean'];
+
+/**
+ * Type guard to check if a value is a SchemaWithMetadata
+ * This is used to safely access __lmao_type metadata on schemas
+ */
+export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadata {
+  if (value === null || typeof value !== 'object') {
+    return false;
+  }
+
+  const obj = value as Record<string, unknown>;
+
+  // __lmao_type is optional, but if present must be a valid type
+  if ('__lmao_type' in obj) {
+    return LMAO_SCHEMA_TYPES.includes(obj.__lmao_type as LmaoSchemaType);
+  }
+
+  // If __lmao_type is not present, it's still valid (just unknown type)
+  return true;
+}
+
+/**
+ * Type guard to check if a value is an EnumSchemaWithMetadata
+ * This is used to safely access enum values metadata
+ */
+export function isEnumSchemaWithMetadata(value: unknown): value is EnumSchemaWithMetadata {
+  if (!isSchemaWithMetadata(value)) {
+    return false;
+  }
+
+  const obj = value as SchemaWithMetadata;
+
+  return (
+    obj.__lmao_type === 'enum' &&
+    '__lmao_enum_values' in obj &&
+    Array.isArray((obj as EnumSchemaWithMetadata).__lmao_enum_values)
+  );
+}
+
+/**
+ * Get the LMAO schema type from a value, returning undefined if not found
+ * Safe alternative to casting to access __lmao_type
+ */
+export function getLmaoSchemaType(value: unknown): LmaoSchemaType | undefined {
+  if (isSchemaWithMetadata(value)) {
+    return value.__lmao_type;
+  }
+  return undefined;
+}
+
+/**
+ * Get enum values from a schema, returning undefined if not an enum schema
+ * Safe alternative to casting to access __lmao_enum_values
+ */
+export function getEnumValues(value: unknown): readonly string[] | undefined {
+  if (isEnumSchemaWithMetadata(value)) {
+    return value.__lmao_enum_values;
+  }
+  return undefined;
 }
 
 /**

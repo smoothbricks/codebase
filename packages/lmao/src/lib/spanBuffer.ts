@@ -1,13 +1,53 @@
 /**
- * SpanBuffer creation functions for LMAO trace logging
+ * SpanBuffer creation functions for LMAO trace logging.
  *
- * These functions extend the generic ColumnBuffer from arrow-builder
- * with span-specific fields (spanId, traceId, parent, children, task).
+ * This module provides factory functions for creating span-specific buffers that
+ * extend the generic ColumnBuffer from arrow-builder with tracing metadata.
  *
- * Per specs/01b_columnar_buffer_architecture.md:
- * - Each span gets its own buffer
- * - traceId and spanId are constant per buffer (stored as properties)
- * - Buffer chaining handles overflow gracefully
+ * **Why SpanBuffer vs ColumnBuffer?**
+ *
+ * The arrow-builder package provides generic columnar storage. SpanBuffer extends
+ * this with span-specific metadata:
+ * - `spanId`: Unique identifier for this span
+ * - `traceId`: Shared across all spans in a request (from RequestContext)
+ * - `parent`/`children`: Tree structure for nested spans
+ * - `task`: Link to module context for schema and capacity stats
+ *
+ * **Buffer Memory Layout**
+ *
+ * LMAO uses a fixed row layout (per specs/01h_entry_types_and_logging_primitives.md):
+ * - Row 0: `span-start` entry (reserved)
+ * - Row 1: `span-end` entry (pre-initialized as `span-exception`, overwritten by ok/err)
+ * - Row 2+: Event entries (ctx.log.*, ctx.tag.*, etc.)
+ *
+ * **Usage Pattern**
+ *
+ * ```typescript
+ * // 1. Create buffer (writeIndex starts at 0)
+ * const buffer = createSpanBuffer(schema, taskContext, traceId);
+ *
+ * // 2. Initialize fixed row layout (REQUIRED - sets writeIndex to 2)
+ * writeSpanStart(buffer, spanName, anchorEpochMicros, anchorPerfNow);
+ *
+ * // 3. Log events (writeIndex increments from 2)
+ * ctx.log.info('Processing...');
+ * ctx.tag.userId('u123');
+ *
+ * // 4. Complete span (writes to row 1)
+ * return ctx.ok(result); // or ctx.err('CODE', details)
+ * ```
+ *
+ * **Buffer Chaining**
+ *
+ * When a buffer fills up, {@link createNextBuffer} creates a continuation buffer.
+ * The chained buffer shares the same spanId and traceId (it's the same logical span,
+ * just more storage). Overflow stats are tracked for self-tuning capacity.
+ *
+ * @module spanBuffer
+ *
+ * @see {@link createSpanBuffer} - Create a root span buffer
+ * @see {@link createChildSpanBuffer} - Create a child span buffer
+ * @see {@link createNextBuffer} - Create overflow continuation buffer
  */
 
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
@@ -17,20 +57,29 @@ import type { SpanBuffer, TaskContext } from './types.js';
 let nextGlobalSpanId = 1;
 
 /**
- * Create empty SpanBuffer with native TypedArrays
+ * Creates an empty SpanBuffer with native TypedArrays.
  *
- * Per specs/01b_columnar_buffer_architecture.md:
- * - Each span gets its own buffer
- * - traceId and spanId are constant per buffer (stored as properties)
- * - All TypedArrays have equal length (columnar storage requirement)
- * - Null bitmaps: one Uint8Array per nullable column (Arrow format)
+ * This is a low-level factory function that creates the raw buffer structure.
+ * Most code should use {@link createSpanBuffer} or {@link createChildSpanBuffer} instead.
  *
- * @param spanId - Unique span identifier
- * @param traceId - Trace ID from request context (passed through all spans)
- * @param schema - Tag attribute schema
- * @param taskContext - Task context with module metadata
- * @param parentBuffer - Optional parent buffer for tree structure
- * @param requestedCapacity - Requested buffer capacity
+ * **Buffer Properties:**
+ * - Cache-aligned TypedArrays for all columns (64-byte alignment)
+ * - Null bitmaps per nullable column (Arrow format: 1 bit per row)
+ * - Span metadata (spanId, traceId, parent/children links)
+ *
+ * **Important**: Returns buffer with `writeIndex = 0`. Callers MUST call
+ * `writeSpanStart()` from lmao.ts to initialize the fixed row layout.
+ *
+ * @param spanId - Unique span identifier (auto-generated incrementing number)
+ * @param traceId - Trace ID from request context (shared across all spans in trace)
+ * @param schema - Tag attribute schema defining column types
+ * @param taskContext - Task context with module metadata and capacity stats
+ * @param parentBuffer - Optional parent buffer for building span tree
+ * @param requestedCapacity - Initial buffer capacity (default: 64, may be adjusted)
+ *
+ * @returns SpanBuffer with writeIndex = 0 (requires initialization)
+ *
+ * @internal Use {@link createSpanBuffer} for root spans, {@link createChildSpanBuffer} for children
  */
 export function createEmptySpanBuffer(
   spanId: number,
@@ -59,12 +108,33 @@ export function createEmptySpanBuffer(
 }
 
 /**
- * Create root SpanBuffer for new trace
+ * Creates a root SpanBuffer for a new trace or task.
  *
- * @param schema - Tag attribute schema
- * @param taskContext - Task context with module metadata
- * @param traceId - Trace ID from request context (defaults to auto-generated if not provided)
- * @param capacity - Optional buffer capacity
+ * This is the primary factory function for creating span buffers. It assigns
+ * a unique spanId and either uses the provided traceId or auto-generates one.
+ *
+ * **When to use:**
+ * - Starting a new task from `moduleContext.task()`
+ * - Creating a standalone span for testing
+ *
+ * **After creation:**
+ * Call `writeSpanStart()` to initialize the fixed row layout before logging.
+ *
+ * @param schema - Tag attribute schema defining column types
+ * @param taskContext - Task context with module metadata and capacity stats
+ * @param traceId - Trace ID from request context (auto-generated if omitted)
+ * @param capacity - Buffer capacity (uses module's tuned capacity if omitted)
+ *
+ * @returns SpanBuffer ready for initialization via `writeSpanStart()`
+ *
+ * @example
+ * ```typescript
+ * // With traceId from request context
+ * const buffer = createSpanBuffer(schema, taskContext, requestCtx.traceId);
+ *
+ * // Auto-generate traceId (for testing or standalone spans)
+ * const buffer = createSpanBuffer(schema, taskContext);
+ * ```
  */
 export function createSpanBuffer(
   schema: TagAttributeSchema,
@@ -96,8 +166,33 @@ export function createSpanBuffer(
 }
 
 /**
- * Create child SpanBuffer
- * Inherits traceId from parent (all spans in same trace share traceId)
+ * Creates a child SpanBuffer for nested span operations.
+ *
+ * Child spans inherit the traceId from their parent, maintaining trace correlation
+ * across the entire request. The child is automatically linked to the parent's
+ * `children` array for tree traversal during Arrow conversion.
+ *
+ * **When to use:**
+ * - Called by `ctx.span()` to create nested operations
+ * - Building span hierarchies (e.g., request → database → query)
+ *
+ * **Inheritance:**
+ * - traceId: Inherited from parent (same distributed trace)
+ * - spanId: Newly generated (unique per span)
+ * - capacity: Inherited from parent
+ * - schema: Inherited from parent's module
+ *
+ * @param parentBuffer - Parent span's buffer (for traceId and tree structure)
+ * @param taskContext - Task context (may differ from parent if calling across modules)
+ *
+ * @returns Child SpanBuffer linked to parent, ready for `writeSpanStart()`
+ *
+ * @example
+ * ```typescript
+ * // Inside ctx.span() implementation
+ * const childBuffer = createChildSpanBuffer(parentBuffer, taskContext);
+ * writeSpanStart(childBuffer, childName, anchorEpochMicros, anchorPerfNow);
+ * ```
  */
 export function createChildSpanBuffer(parentBuffer: SpanBuffer, taskContext: TaskContext): SpanBuffer {
   const spanId = nextGlobalSpanId++;
@@ -119,12 +214,36 @@ export function createChildSpanBuffer(parentBuffer: SpanBuffer, taskContext: Tas
 }
 
 /**
- * Create next buffer in chain for overflow handling
+ * Creates a continuation buffer when the current buffer overflows.
  *
- * Per specs/01b_columnar_buffer_architecture.md:
- * - Buffer chaining is part of self-tuning mechanism
- * - Chained buffer inherits spanId and traceId (continuation)
- * - Same parent, same schema, same task context
+ * This is part of LMAO's self-tuning buffer system. When a span needs more
+ * entries than the current buffer capacity, a chained buffer is created to
+ * continue the same logical span.
+ *
+ * **Key characteristics:**
+ * - Same spanId: The chained buffer is the same logical span
+ * - Same traceId: Still part of the same distributed trace
+ * - Linked via `next`: Forms a singly-linked list of buffers
+ * - Uses tuned capacity: Takes the module's current optimized capacity
+ *
+ * **Self-tuning mechanism:**
+ * Overflow events are tracked in `module.spanBufferCapacityStats`. When
+ * overflow rate exceeds thresholds, future buffers get larger capacity.
+ *
+ * @param buffer - The full buffer that needs overflow handling
+ *
+ * @returns New SpanBuffer linked via `buffer.next`, ready for writes
+ *
+ * @example
+ * ```typescript
+ * // In getBufferWithSpace()
+ * while (currentBuffer.writeIndex >= currentBuffer.capacity) {
+ *   if (!currentBuffer.next) {
+ *     currentBuffer.next = createNextBuffer(currentBuffer);
+ *   }
+ *   currentBuffer = currentBuffer.next;
+ * }
+ * ```
  */
 export function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
   const schema = buffer.task.module.tagAttributes;

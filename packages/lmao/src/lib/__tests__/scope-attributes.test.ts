@@ -56,7 +56,7 @@ describe('Span Scope Attributes', () => {
         });
 
         // Write a tag entry
-        ctx.log.tag.orderId('order789');
+        ctx.tag.orderId('order789');
 
         return ctx.ok('done');
       });
@@ -92,7 +92,7 @@ describe('Span Scope Attributes', () => {
 
         // All subsequent operations should include scoped attributes
         ctx.log.info('Step 1');
-        ctx.log.tag.action('step2');
+        ctx.tag.action('step2');
         ctx.log.info('Step 3');
 
         return ctx.ok('done');

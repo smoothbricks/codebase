@@ -668,24 +668,31 @@ attributes that automatically propagate to all subsequent log entries and child 
 
 The scope attributes system provides:
 
-- **Zero-runtime-cost** attribute inclusion through buffer pre-filling
+- **Zero-runtime-cost** attribute inclusion through lazy columns
 - **Hierarchical inheritance** from parent to child spans
 - **Middleware integration** for request-level context setup
 - **Clean business logic** that focuses on domain concerns rather than logging boilerplate
+- **Readable scope values** via compiled getters
+- **Zero indirection** with LazyColumn as direct properties on SpanBuffer
 
 **Quick Example**:
 
 ```typescript
-// Set scope once at middleware level
-ctx.log.scope({ requestId: req.id, userId: req.user?.id });
+// Set scope once at middleware level using property assignment
+ctx.scope.requestId = req.id;
+ctx.scope.userId = req.user?.id;
 
 // All subsequent operations automatically include these attributes
 ctx.log.info('Processing order'); // ← Includes requestId, userId
 ctx.tag.step('validation'); // ← Includes requestId, userId + step
 
-// Child spans inherit and can extend scope
+// Child spans inherit and can READ/extend scope
 await ctx.span('payment', async (childCtx) => {
-  childCtx.log.scope({ paymentMethod: 'stripe' });
+  // Can read inherited scope values
+  console.log('Processing for user:', childCtx.scope.userId);
+
+  // Extend scope for this span
+  childCtx.scope.paymentMethod = 'stripe';
   childCtx.log.info('Processing payment'); // ← Includes requestId, userId, paymentMethod
 });
 ```
