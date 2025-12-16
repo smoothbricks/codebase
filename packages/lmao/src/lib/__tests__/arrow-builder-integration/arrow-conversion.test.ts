@@ -82,43 +82,65 @@ function writeRow(
   buffer.timestamps[idx] = data.timestamp;
   buffer.operations[idx] = data.operation;
 
-  // Write attributes
+  // Write attributes using new attr_X_values and attr_X_nulls pattern
   if (data.attributes) {
     for (const [key, value] of Object.entries(data.attributes)) {
-      const columnName = `attr_${key}` as keyof SpanBuffer;
-      const column = buffer[columnName];
-      const nullBitmap = buffer.nullBitmaps[`attr_${key}` as `attr_${string}`];
+      const valuesKey = `attr_${key}_values` as keyof SpanBuffer;
+      const nullsKey = `attr_${key}_nulls` as keyof SpanBuffer;
+      const column = buffer[valuesKey];
+      const nullBitmap = buffer[nullsKey] as Uint8Array | undefined;
 
-      if (column && ArrayBuffer.isView(column)) {
-        if (value === null || value === undefined) {
-          // Write 0 and clear null bit
-          if (column instanceof Float64Array) {
-            column[idx] = 0;
-          } else {
-            (column as Uint8Array | Uint16Array | Uint32Array)[idx] = 0;
-          }
-
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] &= ~(1 << bitOffset);
-          }
-        } else {
-          // Write value and set null bit
-          if (typeof value === 'number') {
-            if (column instanceof Float64Array) {
-              column[idx] = value;
-            } else {
-              (column as Uint8Array | Uint16Array | Uint32Array)[idx] = value;
+      if (column) {
+        // Handle string arrays (category/text columns)
+        if (Array.isArray(column)) {
+          if (value === null || value === undefined) {
+            (column as string[])[idx] = '';
+            if (nullBitmap) {
+              const byteIndex = Math.floor(idx / 8);
+              const bitOffset = idx % 8;
+              nullBitmap[byteIndex] &= ~(1 << bitOffset);
             }
-          } else if (typeof value === 'boolean') {
-            (column as Uint8Array)[idx] = value ? 1 : 0;
+          } else {
+            (column as string[])[idx] = value as string;
+            if (nullBitmap) {
+              const byteIndex = Math.floor(idx / 8);
+              const bitOffset = idx % 8;
+              nullBitmap[byteIndex] |= 1 << bitOffset;
+            }
           }
+        } else if (ArrayBuffer.isView(column)) {
+          // Handle TypedArrays (number/enum/boolean columns)
+          const typedColumn = column as Float64Array | Uint8Array | Uint16Array | Uint32Array;
+          if (value === null || value === undefined) {
+            // Write 0 and clear null bit
+            if (typedColumn instanceof Float64Array) {
+              typedColumn[idx] = 0;
+            } else {
+              typedColumn[idx] = 0;
+            }
 
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
+            if (nullBitmap) {
+              const byteIndex = Math.floor(idx / 8);
+              const bitOffset = idx % 8;
+              nullBitmap[byteIndex] &= ~(1 << bitOffset);
+            }
+          } else {
+            // Write value and set null bit
+            if (typeof value === 'number') {
+              if (typedColumn instanceof Float64Array) {
+                typedColumn[idx] = value;
+              } else {
+                typedColumn[idx] = value;
+              }
+            } else if (typeof value === 'boolean') {
+              (typedColumn as Uint8Array)[idx] = value ? 1 : 0;
+            }
+
+            if (nullBitmap) {
+              const byteIndex = Math.floor(idx / 8);
+              const bitOffset = idx % 8;
+              nullBitmap[byteIndex] |= 1 << bitOffset;
+            }
           }
         }
       }
@@ -129,14 +151,10 @@ function writeRow(
 }
 
 describe('Arrow Table Conversion', () => {
-  let categoryInterner: MockStringInterner;
-  let textStorage: MockStringInterner;
   let moduleIdInterner: MockStringInterner;
   let spanNameInterner: MockStringInterner;
 
   beforeEach(() => {
-    categoryInterner = new MockStringInterner();
-    textStorage = new MockStringInterner();
     moduleIdInterner = new MockStringInterner();
     spanNameInterner = new MockStringInterner();
   });
@@ -145,7 +163,7 @@ describe('Arrow Table Conversion', () => {
     test('converts empty buffer to empty table', () => {
       const schema: TagAttributeSchema = {
         userId: {
-          __lmao_type: 'category',
+          __schema_type: 'category',
         } as any,
       };
 
@@ -156,7 +174,7 @@ describe('Arrow Table Conversion', () => {
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       expect(table.numRows).toBe(0);
     });
@@ -164,10 +182,10 @@ describe('Arrow Table Conversion', () => {
     test('converts single row with basic types', () => {
       const schema: TagAttributeSchema = {
         count: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
         active: {
-          __lmao_type: 'boolean',
+          __schema_type: 'boolean',
         } as any,
       };
 
@@ -188,7 +206,7 @@ describe('Arrow Table Conversion', () => {
         },
       });
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       expect(table.numRows).toBe(1);
 
@@ -215,7 +233,7 @@ describe('Arrow Table Conversion', () => {
     test('converts multiple rows', () => {
       const schema: TagAttributeSchema = {
         value: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
       };
 
@@ -234,7 +252,7 @@ describe('Arrow Table Conversion', () => {
         });
       }
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       expect(table.numRows).toBe(5);
 
@@ -251,7 +269,7 @@ describe('Arrow Table Conversion', () => {
     test('handles null values correctly', () => {
       const schema: TagAttributeSchema = {
         value: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
       };
 
@@ -280,7 +298,7 @@ describe('Arrow Table Conversion', () => {
         attributes: { value: 100 },
       });
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const valueVector = batch.getChild('value');
@@ -293,7 +311,7 @@ describe('Arrow Table Conversion', () => {
     test('handles all-null column', () => {
       const schema: TagAttributeSchema = {
         optional: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
       };
 
@@ -312,7 +330,7 @@ describe('Arrow Table Conversion', () => {
         });
       }
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const optionalVector = batch.getChild('optional');
@@ -327,8 +345,8 @@ describe('Arrow Table Conversion', () => {
     test('converts enum type to dictionary', () => {
       const schema: TagAttributeSchema = {
         status: {
-          __lmao_type: 'enum',
-          __lmao_enum_values: ['pending', 'active', 'completed'],
+          __schema_type: 'enum',
+          __enum_values: ['pending', 'active', 'completed'],
         } as any,
       };
 
@@ -357,7 +375,7 @@ describe('Arrow Table Conversion', () => {
         attributes: { status: 1 }, // 'active'
       });
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const statusVector = batch.getChild('status');
@@ -370,7 +388,7 @@ describe('Arrow Table Conversion', () => {
     test('converts category type with string interning', () => {
       const schema: TagAttributeSchema = {
         userId: {
-          __lmao_type: 'category',
+          __schema_type: 'category',
         } as any,
       };
 
@@ -380,30 +398,26 @@ describe('Arrow Table Conversion', () => {
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
 
-      // Intern some user IDs
-      const user1Idx = categoryInterner.intern('user-123');
-      const user2Idx = categoryInterner.intern('user-456');
-
-      // Write rows with category values (stored as interned indices)
+      // Write rows with category values (stored as raw strings on hot path)
       writeRow(buffer, {
         timestamp: 1000,
         operation: 3,
-        attributes: { userId: user1Idx },
+        attributes: { userId: 'user-123' },
       });
 
       writeRow(buffer, {
         timestamp: 2000,
         operation: 3,
-        attributes: { userId: user2Idx },
+        attributes: { userId: 'user-456' },
       });
 
       writeRow(buffer, {
         timestamp: 3000,
         operation: 3,
-        attributes: { userId: user1Idx }, // Repeated
+        attributes: { userId: 'user-123' }, // Repeated
       });
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const userIdVector = batch.getChild('userId');
@@ -416,7 +430,7 @@ describe('Arrow Table Conversion', () => {
     test('converts text type without interning', () => {
       const schema: TagAttributeSchema = {
         message: {
-          __lmao_type: 'text',
+          __schema_type: 'text',
         } as any,
       };
 
@@ -426,30 +440,26 @@ describe('Arrow Table Conversion', () => {
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
 
-      // Store text messages (each gets unique index)
-      const msg1Idx = textStorage.intern('First message');
-      const msg2Idx = textStorage.intern('Second message');
-      const msg3Idx = textStorage.intern('Third message');
-
+      // Write text messages (stored as raw strings on hot path)
       writeRow(buffer, {
         timestamp: 1000,
         operation: 3,
-        attributes: { message: msg1Idx },
+        attributes: { message: 'First message' },
       });
 
       writeRow(buffer, {
         timestamp: 2000,
         operation: 3,
-        attributes: { message: msg2Idx },
+        attributes: { message: 'Second message' },
       });
 
       writeRow(buffer, {
         timestamp: 3000,
         operation: 3,
-        attributes: { message: msg3Idx },
+        attributes: { message: 'Third message' },
       });
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const messageVector = batch.getChild('message');
@@ -464,7 +474,7 @@ describe('Arrow Table Conversion', () => {
     test('converts chained buffers correctly', () => {
       const schema: TagAttributeSchema = {
         value: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
       };
 
@@ -495,7 +505,7 @@ describe('Arrow Table Conversion', () => {
         });
       }
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       // Should have all rows from both buffers
       expect(table.numRows).toBe(5);
@@ -516,7 +526,7 @@ describe('Arrow Table Conversion', () => {
     test('maintains spanId across chained buffers', () => {
       const schema: TagAttributeSchema = {
         value: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
       };
 
@@ -526,7 +536,8 @@ describe('Arrow Table Conversion', () => {
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
 
-      const originalSpanId = buffer.spanId;
+      const originalThreadId = buffer.threadId;
+      const originalLocalSpanId = buffer.localSpanId;
 
       writeRow(buffer, {
         timestamp: 1000,
@@ -536,8 +547,9 @@ describe('Arrow Table Conversion', () => {
 
       const nextBuffer = createNextBuffer(buffer);
 
-      // Chained buffer should have same spanId (continuation)
-      expect(nextBuffer.spanId).toBe(originalSpanId);
+      // Chained buffer should have same threadId and localSpanId (continuation)
+      expect(nextBuffer.threadId).toBe(originalThreadId);
+      expect(nextBuffer.localSpanId).toBe(originalLocalSpanId);
 
       writeRow(nextBuffer, {
         timestamp: 2000,
@@ -545,14 +557,19 @@ describe('Arrow Table Conversion', () => {
         attributes: { value: 2 },
       });
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const spanIdVector = batch.getChild('span_id');
 
-      // Both rows should have same spanId
-      expect(spanIdVector?.get(0)).toBe(BigInt(originalSpanId));
-      expect(spanIdVector?.get(1)).toBe(BigInt(originalSpanId));
+      // Both rows should have same span_id struct (thread + local)
+      const spanId0 = spanIdVector?.get(0) as { thread: bigint; local: number };
+      const spanId1 = spanIdVector?.get(1) as { thread: bigint; local: number };
+
+      expect(spanId0.thread).toBe(originalThreadId);
+      expect(spanId0.local).toBe(originalLocalSpanId);
+      expect(spanId1.thread).toBe(originalThreadId);
+      expect(spanId1.local).toBe(originalLocalSpanId);
     });
   });
 
@@ -560,7 +577,7 @@ describe('Arrow Table Conversion', () => {
     test('converts parent and child spans', () => {
       const schema: TagAttributeSchema = {
         value: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
       };
 
@@ -601,13 +618,7 @@ describe('Arrow Table Conversion', () => {
         attributes: { value: 4 },
       });
 
-      const table = convertSpanTreeToArrowTable(
-        parentBuffer,
-        categoryInterner,
-        textStorage,
-        moduleIdInterner,
-        spanNameInterner,
-      );
+      const table = convertSpanTreeToArrowTable(parentBuffer, moduleIdInterner, spanNameInterner);
 
       // Should have rows from both parent and child
       expect(table.numRows).toBe(4);
@@ -617,24 +628,31 @@ describe('Arrow Table Conversion', () => {
       const spanIdVector = batch.getChild('span_id');
       const parentSpanIdVector = batch.getChild('parent_span_id');
 
-      // Rows 0-1 are from parent span (2 writes)
-      // Rows 2-3 are from child span (2 writes)
-      const parentSpanId = spanIdVector?.get(0);
-      const childSpanId = spanIdVector?.get(2); // Child starts at row 2
+      // Get span_id struct for parent (rows 0-1) and child (rows 2-3)
+      const parentSpanId = spanIdVector?.get(0) as { thread: bigint; local: number };
+      const childSpanId = spanIdVector?.get(2) as { thread: bigint; local: number };
 
       // Parent rows should have null parent_span_id
       expect(parentSpanIdVector?.get(0)).toBe(null);
       expect(parentSpanIdVector?.get(1)).toBe(null);
 
-      // Child rows' parent_span_id should match parent's span_id
-      expect(parentSpanIdVector?.get(2)).toBe(parentSpanId);
-      expect(parentSpanIdVector?.get(3)).toBe(parentSpanId);
+      // Child rows' parent_span_id should match parent's span_id (by value, not reference)
+      const childParentSpanId0 = parentSpanIdVector?.get(2) as { thread: bigint; local: number };
+      const childParentSpanId1 = parentSpanIdVector?.get(3) as { thread: bigint; local: number };
+
+      expect(childParentSpanId0.thread).toBe(parentSpanId.thread);
+      expect(childParentSpanId0.local).toBe(parentSpanId.local);
+      expect(childParentSpanId1.thread).toBe(parentSpanId.thread);
+      expect(childParentSpanId1.local).toBe(parentSpanId.local);
+
+      // Child span should have different localSpanId from parent
+      expect(childSpanId.local).not.toBe(parentSpanId.local);
     });
 
     test('converts deep span hierarchy', () => {
       const schema: TagAttributeSchema = {
         depth: {
-          __lmao_type: 'number',
+          __schema_type: 'number',
         } as any,
       };
 
@@ -670,13 +688,7 @@ describe('Arrow Table Conversion', () => {
         attributes: { depth: 2 },
       });
 
-      const table = convertSpanTreeToArrowTable(
-        root,
-        categoryInterner,
-        textStorage,
-        moduleIdInterner,
-        spanNameInterner,
-      );
+      const table = convertSpanTreeToArrowTable(root, moduleIdInterner, spanNameInterner);
 
       expect(table.numRows).toBe(3);
 
@@ -719,7 +731,7 @@ describe('Arrow Table Conversion', () => {
         });
       }
 
-      const table = convertToArrowTable(buffer, categoryInterner, textStorage, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const entryTypeVector = batch.getChild('entry_type');
@@ -753,13 +765,7 @@ describe('Arrow Table Conversion', () => {
         operation: 5,
       });
 
-      const table = convertSpanTreeToArrowTable(
-        buffer,
-        categoryInterner,
-        textStorage,
-        moduleIdInterner,
-        spanNameInterner,
-      );
+      const table = convertSpanTreeToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
       const traceIdVector = batch.getChild('trace_id');

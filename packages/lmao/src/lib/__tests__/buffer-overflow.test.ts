@@ -391,8 +391,8 @@ describe('Buffer Overflow and Capacity Management', () => {
         }
 
         // The scoped attributes should be present in the new buffer
-        // We can verify by getting the scoped attributes
-        const scopedAttrs = ctx.log.getScopedAttributes();
+        // We can verify by getting the scoped values from the scope instance
+        const scopedAttrs = ctx.log._getScope()._getScopeValues();
 
         return ctx.ok({
           messagesWritten: 100,

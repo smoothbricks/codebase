@@ -37,9 +37,9 @@ describe('prefixSchema', () => {
 
       const prefixed = prefixSchema(schema, 'db');
 
-      expect(prefixed.db_operation).toHaveProperty('__lmao_type', 'enum');
-      expect(prefixed.db_operation).toHaveProperty('__lmao_enum_values');
-      expect((prefixed.db_operation as any).__lmao_enum_values).toEqual(['CREATE', 'DELETE']);
+      expect(prefixed.db_operation).toHaveProperty('__schema_type', 'enum');
+      expect(prefixed.db_operation).toHaveProperty('__enum_values');
+      expect((prefixed.db_operation as any).__enum_values).toEqual(['CREATE', 'DELETE']);
     });
 
     it('should work with different prefix strings', () => {
@@ -102,7 +102,7 @@ describe('prefixSchema', () => {
   describe('failure cases', () => {
     it('should handle schema with undefined fields gracefully', () => {
       const schema: TagAttributeSchema = {
-        validField: { __lmao_type: 'text' },
+        validField: { __schema_type: 'text' },
         undefinedField: undefined as any,
       };
 
@@ -126,7 +126,7 @@ describe('prefixSchema', () => {
 
     it('should handle special characters in prefix', () => {
       const schema: TagAttributeSchema = {
-        field: { __lmao_type: 'text' },
+        field: { __schema_type: 'text' },
       };
 
       const prefixed = prefixSchema(schema, 'prefix-with-dashes');
@@ -275,7 +275,7 @@ describe('createLibraryModule', () => {
 
     it('should handle schema with invalid field types', () => {
       const schema = defineTagAttributes({
-        field: { __lmao_type: 'invalid' as any },
+        field: { __schema_type: 'invalid' as any },
       });
 
       expect(() => {

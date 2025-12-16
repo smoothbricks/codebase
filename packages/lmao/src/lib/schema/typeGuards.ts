@@ -7,7 +7,13 @@
 
 import type * as arrow from 'apache-arrow';
 import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
-import type { EnumSchemaWithMetadata, FeatureFlagDefinition, LmaoSchemaType, SchemaWithMetadata } from './types.js';
+import type {
+  EnumSchemaWithMetadata,
+  EnumUtf8Precomputed,
+  FeatureFlagDefinition,
+  LmaoSchemaType,
+  SchemaWithMetadata,
+} from './types.js';
 
 /**
  * Type guard to check if a value is an Arrow builder
@@ -30,7 +36,7 @@ const LMAO_SCHEMA_TYPES: readonly LmaoSchemaType[] = ['enum', 'category', 'text'
 
 /**
  * Type guard to check if a value is a SchemaWithMetadata
- * This is used to safely access __lmao_type metadata on schemas
+ * This is used to safely access __schema_type metadata on schemas
  */
 export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadata {
   if (value === null || typeof value !== 'object') {
@@ -39,12 +45,12 @@ export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadat
 
   const obj = value as Record<string, unknown>;
 
-  // __lmao_type is optional, but if present must be a valid type
-  if ('__lmao_type' in obj) {
-    return LMAO_SCHEMA_TYPES.includes(obj.__lmao_type as LmaoSchemaType);
+  // __schema_type is optional, but if present must be a valid type
+  if ('__schema_type' in obj) {
+    return LMAO_SCHEMA_TYPES.includes(obj.__schema_type as LmaoSchemaType);
   }
 
-  // If __lmao_type is not present, it's still valid (just unknown type)
+  // If __schema_type is not present, it's still valid (just unknown type)
   return true;
 }
 
@@ -60,30 +66,44 @@ export function isEnumSchemaWithMetadata(value: unknown): value is EnumSchemaWit
   const obj = value as SchemaWithMetadata;
 
   return (
-    obj.__lmao_type === 'enum' &&
-    '__lmao_enum_values' in obj &&
-    Array.isArray((obj as EnumSchemaWithMetadata).__lmao_enum_values)
+    obj.__schema_type === 'enum' &&
+    '__enum_values' in obj &&
+    Array.isArray((obj as EnumSchemaWithMetadata).__enum_values)
   );
 }
 
 /**
  * Get the LMAO schema type from a value, returning undefined if not found
- * Safe alternative to casting to access __lmao_type
+ * Safe alternative to casting to access __schema_type
  */
 export function getLmaoSchemaType(value: unknown): LmaoSchemaType | undefined {
   if (isSchemaWithMetadata(value)) {
-    return value.__lmao_type;
+    return value.__schema_type;
   }
   return undefined;
 }
 
 /**
  * Get enum values from a schema, returning undefined if not an enum schema
- * Safe alternative to casting to access __lmao_enum_values
+ * Safe alternative to casting to access __enum_values
  */
 export function getEnumValues(value: unknown): readonly string[] | undefined {
   if (isEnumSchemaWithMetadata(value)) {
-    return value.__lmao_enum_values;
+    return value.__enum_values;
+  }
+  return undefined;
+}
+
+/**
+ * Get pre-computed UTF-8 bytes for enum values
+ * Returns undefined if not an enum schema or if UTF-8 bytes weren't pre-computed
+ *
+ * Per string storage design: enum UTF-8 bytes are pre-computed at schema definition
+ * time (cold path) so Arrow conversion just copies the pre-built dictionary data.
+ */
+export function getEnumUtf8(value: unknown): EnumUtf8Precomputed | undefined {
+  if (isEnumSchemaWithMetadata(value) && '__enum_utf8' in value) {
+    return (value as EnumSchemaWithMetadata).__enum_utf8;
   }
   return undefined;
 }

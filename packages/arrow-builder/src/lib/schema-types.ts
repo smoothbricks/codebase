@@ -1,10 +1,8 @@
 /**
- * Minimal schema type definitions needed by arrow-builder
+ * Schema type definitions for arrow-builder
  *
- * These types are duplicated from @smoothbricks/lmao to avoid circular dependencies.
- * Arrow-builder is a low-level package that should not depend on lmao at build time.
- *
- * The full schema system lives in @smoothbricks/lmao.
+ * Arrow-builder is a low-level columnar buffer engine that works with
+ * generic schemas provided by consumer packages.
  */
 
 import type * as Sury from '@sury/sury';
@@ -15,15 +13,15 @@ import type * as Sury from '@sury/sury';
 export type TagAttributeSchema = Record<string, Sury.Schema<unknown, unknown>>;
 
 /**
- * LMAO schema type marker
+ * Schema type marker for columnar storage
  */
-export type LmaoSchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
+export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
 
 /**
- * Schema with LMAO metadata attached
+ * Schema with metadata attached
  * Used to determine which TypedArray to create
  */
 export interface SchemaWithMetadata {
-  __lmao_type?: LmaoSchemaType;
-  __lmao_enum_values?: readonly string[];
+  __schema_type?: SchemaType;
+  __enum_values?: readonly string[];
 }

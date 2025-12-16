@@ -92,7 +92,7 @@ describe('Feature Flags', () => {
     expect(provider.value).toBe('paypal');
   });
 
-  test('trackUsage logs usage events (legacy API)', () => {
+  test('trackUsage logs usage events via FlagColumnWriters', () => {
     const schema = defineFeatureFlags({
       advancedValidation: S.boolean().default(false).sync(),
     });
@@ -313,7 +313,7 @@ describe('Feature Flags', () => {
     expect(await evaluator.getAsync('asyncFlag', {})).toBe(42);
   });
 
-  test('withContext creates child evaluator with additional context', () => {
+  test('forContext creates child evaluator with additional context', () => {
     const schema = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
     });
@@ -323,7 +323,7 @@ describe('Feature Flags', () => {
     const ff = new FeatureFlagEvaluator(schema.schema, { userId: 'user-123' }, evaluator);
 
     // Create child evaluator with additional context
-    const childFf = ff.withContext({ requestId: 'req-456' });
+    const childFf = ff.forContext({ requestId: 'req-456' });
 
     // Both should have the flag accessible
     type FfWithFlags = typeof ff & { debugMode: BooleanFlagContext | undefined };

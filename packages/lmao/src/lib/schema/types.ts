@@ -169,43 +169,59 @@ export type LmaoSchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean'
  * Using intersection type since we can't extend Sury.Schema directly
  */
 export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> & {
-  __lmao_type?: LmaoSchemaType;
+  __schema_type?: LmaoSchemaType;
 };
 
 /**
+ * Pre-computed UTF-8 bytes for enum values
+ * Built at schema definition time (cold path) for zero-cost Arrow conversion
+ */
+export interface EnumUtf8Precomputed {
+  /** UTF-8 bytes for each enum value, in order */
+  readonly bytes: readonly Uint8Array[];
+  /** Concatenated UTF-8 bytes for all enum values */
+  readonly concatenated: Uint8Array;
+  /** Arrow-format offsets array (Int32Array, length = values.length + 1) */
+  readonly offsets: Int32Array;
+}
+
+/**
  * Enum schema with enum values metadata
+ * Uses __schema_type and __enum_values to match arrow-builder convention
  */
 export type EnumSchemaWithMetadata<T extends string = string> = Sury.Schema<T, unknown> & {
-  __lmao_type: 'enum';
-  __lmao_enum_values: readonly string[];
+  __schema_type: 'enum';
+  __enum_values: readonly string[];
+  /** Pre-computed UTF-8 bytes for zero-cost Arrow conversion */
+  __enum_utf8: EnumUtf8Precomputed;
 };
 
 /**
  * Category schema with metadata
  */
 export type CategorySchemaWithMetadata = Sury.Schema<string, unknown> & {
-  __lmao_type: 'category';
+  __schema_type: 'category';
 };
 
 /**
  * Text schema with metadata
  */
 export type TextSchemaWithMetadata = Sury.Schema<string, unknown> & {
-  __lmao_type: 'text';
+  __schema_type: 'text';
 };
 
 /**
  * Number schema with metadata
  */
 export type NumberSchemaWithMetadata = Sury.Schema<number, unknown> & {
-  __lmao_type: 'number';
+  __schema_type: 'number';
 };
 
 /**
  * Boolean schema with metadata
  */
 export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> & {
-  __lmao_type: 'boolean';
+  __schema_type: 'boolean';
 };
 
 /**

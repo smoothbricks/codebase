@@ -42,10 +42,12 @@ describe('Buffer Foundation', () => {
   it('creates empty SpanBuffer with TypedArrays', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
+    const threadId = BigInt('0x123456789ABCDEF0');
 
-    const buf = createEmptySpanBuffer(1, 'trace-123', schema, taskContext, undefined, 64);
+    const buf = createEmptySpanBuffer(1, threadId, 'trace-123', schema, taskContext, undefined, 64);
 
-    expect(buf.spanId).toBe(1);
+    expect(buf.localSpanId).toBe(1);
+    expect(buf.threadId).toBe(threadId);
     expect(buf.traceId).toBe('trace-123');
 
     // Check TypedArrays are created
@@ -53,13 +55,13 @@ describe('Buffer Foundation', () => {
     expect(buf.operations).toBeInstanceOf(Uint8Array);
 
     // Check null bitmaps exist for each attribute (Arrow format: 1 Uint8Array per column)
-    expect(buf.nullBitmaps).toBeDefined();
-    expect(buf.nullBitmaps['attr_userId']).toBeInstanceOf(Uint8Array);
-    expect(buf.nullBitmaps['attr_count']).toBeInstanceOf(Uint8Array);
+    expect(buf.attr_userId_nulls).toBeInstanceOf(Uint8Array);
+    expect(buf.attr_count_nulls).toBeInstanceOf(Uint8Array);
 
-    // Check attribute columns exist for each schema field
-    expect(buf['attr_userId']).toBeInstanceOf(Uint32Array); // category → Uint32Array
-    expect(buf['attr_count']).toBeInstanceOf(Float64Array); // number → Float64Array
+    // Check attribute columns exist for each schema field (using _values suffix)
+    // category columns now use string[] arrays for zero-cost hot path writes
+    expect(Array.isArray(buf.attr_userId_values)).toBe(true); // category → string[]
+    expect(buf.attr_count_values).toBeInstanceOf(Float64Array); // number → Float64Array
 
     // Metadata
     expect(buf.children).toBeInstanceOf(Array);
@@ -74,7 +76,8 @@ describe('Buffer Foundation', () => {
 
     const buf = createSpanBuffer(schema, taskContext, 'trace-999');
 
-    expect(buf.spanId).toBeGreaterThan(0);
+    expect(buf.localSpanId).toBeGreaterThan(0);
+    expect(buf.threadId).toBeDefined();
     expect(buf.parent).toBeUndefined();
     expect(buf.children).toHaveLength(0);
   });
@@ -82,10 +85,11 @@ describe('Buffer Foundation', () => {
   it('tracks buffer creation in capacity stats', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
+    const threadId = BigInt('0x123456789ABCDEF0');
 
     const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
 
-    createEmptySpanBuffer(1, 'trace-456', schema, taskContext, undefined, 64);
+    createEmptySpanBuffer(1, threadId, 'trace-456', schema, taskContext, undefined, 64);
 
     expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
   });
@@ -105,13 +109,19 @@ describe('Buffer Foundation', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = largeSchema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
 
-    const buf = createEmptySpanBuffer(1, 'trace-789', tagAttributes, taskContext, undefined, 64);
+    const threadId = BigInt('0x123456789ABCDEF0');
+    const buf = createEmptySpanBuffer(1, threadId, 'trace-789', tagAttributes, taskContext, undefined, 64);
 
-    // Should have TypedArray columns for all 5 attributes
-    // Get all attr_ keys from the buffer
-    const attrKeys = Object.keys(buf).filter((k) => k.startsWith('attr_'));
-    expect(attrKeys).toHaveLength(5);
-    expect(buf['attr_field1']).toBeInstanceOf(Uint32Array); // category
-    expect(buf['attr_field4']).toBeInstanceOf(Uint32Array); // text
+    // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
+    // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them
+    // Access them directly to trigger allocation and verify they exist
+    expect(Array.isArray(buf['attr_field1_values'])).toBe(true); // category (raw strings)expect(buf['attr_field1_nulls']).toBeInstanceOf(Uint8Array); // null bitmap
+    expect(buf['attr_field2_values']).toBeInstanceOf(Float64Array); // number
+    expect(buf['attr_field2_nulls']).toBeInstanceOf(Uint8Array);
+    expect(buf['attr_field3_values']).toBeInstanceOf(Uint8Array); // boolean
+    expect(buf['attr_field3_nulls']).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buf['attr_field4_values'])).toBe(true); // category (raw strings)expect(buf['attr_field4_nulls']).toBeInstanceOf(Uint8Array);
+    expect(buf['attr_field5_values']).toBeInstanceOf(Float64Array); // number
+    expect(buf['attr_field5_nulls']).toBeInstanceOf(Uint8Array);
   });
 });

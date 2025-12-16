@@ -75,7 +75,7 @@ describe('Buffer Integration', () => {
     expect(buf.operations).toBeInstanceOf(Uint8Array);
 
     // Attribute columns exist with correct types
-    expect(buf['attr_userId']).toBeInstanceOf(Uint32Array); // category
+    expect(Array.isArray(buf['attr_userId'])).toBe(true); // category (raw strings)
     expect(buf['attr_score']).toBeInstanceOf(Float64Array); // number
 
     // Metadata
@@ -101,7 +101,7 @@ describe('Buffer Integration', () => {
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
     // Verify all attribute columns created as TypedArrays with correct types
-    expect(buffer['attr_requestId']).toBeInstanceOf(Uint32Array); // category
+    expect(Array.isArray(buffer['attr_requestId'])).toBe(true); // category (raw strings)
     expect(buffer['attr_httpStatus']).toBeInstanceOf(Float64Array); // number
     expect(buffer['attr_operation']).toBeInstanceOf(Uint8Array); // enum
 
@@ -124,7 +124,9 @@ describe('Buffer Integration', () => {
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
     // Both should have TypedArray columns
-    expect(buffer['attr_required']).toBeInstanceOf(Uint32Array);
+    expect(Array.isArray(buffer['attr_required'])).toBe(true); // category (raw strings)
+    // Note: S.optional() wraps the inner schema, losing __schema_type metadata
+    // This falls back to Uint32Array (default)
     expect(buffer['attr_optional']).toBeInstanceOf(Uint32Array);
   });
 
@@ -143,9 +145,11 @@ describe('Buffer Integration', () => {
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
     // All should have TypedArray columns (masking is applied during serialization, not buffer creation)
-    expect(buffer['attr_userId']).toBeInstanceOf(Uint32Array);
-    expect(buffer['attr_email']).toBeInstanceOf(Uint32Array);
-    expect(buffer['attr_plainText']).toBeInstanceOf(Uint32Array); // text
+    // Note: S.masked() creates a transformed Sury schema without __schema_type metadata
+    // This falls back to Uint32Array (default)
+    expect(buffer['attr_userId']).toBeInstanceOf(Uint32Array); // masked hash (no metadata)
+    expect(buffer['attr_email']).toBeInstanceOf(Uint32Array); // masked email (no metadata)
+    expect(Array.isArray(buffer['attr_plainText'])).toBe(true); // text (raw strings)
   });
 
   it('selects correct enum TypedArray size based on value count', () => {

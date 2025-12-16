@@ -1,171 +1,57 @@
 /**
  * Create ColumnBuffer with native TypedArrays
  *
- * Per specs/01b_columnar_buffer_architecture.md:
+ * Per specs/01b_columnar_buffer_architecture.md and 01b1_buffer_performance_optimizations.md:
  * - Cache-aligned TypedArrays (64-byte boundaries)
- * - Null bitmap management (one Uint8Array per nullable column per Arrow spec)
- * - Direct TypedArray writes in hot path
+ * - Direct properties for zero-indirection access (no lazy getters)
+ * - attr_${name}_nulls and attr_${name}_values share ONE ArrayBuffer per column
+ * - Runtime class generation for optimal V8 performance
  * - Arrow conversion in cold path (background processing)
  *
- * NOTE: This module provides both generic ColumnBuffer creation (for arrow-builder)
- * and SpanBuffer creation (for lmao compatibility). The SpanBuffer functions
- * should eventually be moved to the lmao package.
+ * NOTE: This is a GENERIC columnar buffer implementation. Arrow-builder knows
+ * nothing about application-specific concepts. Those are added by consumer packages.
  */
 
 import type { TagAttributeSchema } from '../schema-types.js';
-import type { ColumnBuffer, TypedArray } from './types.js';
+import { createGeneratedColumnBuffer } from './columnBufferGenerator.js';
+import type { ColumnBuffer } from './types.js';
 
 /**
- * Get cache-aligned capacity
- *
- * Aligns to 64-byte cache line boundaries for optimal CPU performance.
- * Uses 1-byte element size (worst case) to ensure ALL array types are aligned.
- */
-function getCacheAlignedCapacity(elementCount: number): number {
-  const CACHE_LINE_SIZE = 64; // Cache line size in bytes
-  const totalBytes = elementCount * 1; // Use 1 byte (worst case - Uint8Array)
-  const alignedBytes = Math.ceil(totalBytes / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
-  return alignedBytes; // Return byte count which becomes element count for Uint8Array
-}
-
-/**
- * Helper to get TypedArray constructor for a schema field
- */
-function getArrayConstructorForField(
-  schema: TagAttributeSchema,
-  fieldName: string,
-  alignedCapacity: number,
-): TypedArray {
-  const fieldSchema = schema[fieldName];
-  const schemaWithMetadata = fieldSchema as import('../schema-types.js').SchemaWithMetadata;
-  const lmaoType = schemaWithMetadata?.__lmao_type;
-
-  // Handle three string types
-  if (lmaoType === 'enum') {
-    const enumValues = schemaWithMetadata.__lmao_enum_values;
-    const enumCount = enumValues?.length ?? 0;
-
-    // Uint8Array can hold 0-255 indices (256 values total)
-    if (enumCount === 0 || enumCount <= 256) {
-      return new Uint8Array(alignedCapacity);
-    }
-    if (enumCount <= 65536) {
-      return new Uint16Array(alignedCapacity);
-    }
-    return new Uint32Array(alignedCapacity);
-  }
-
-  if (lmaoType === 'category') {
-    return new Uint32Array(alignedCapacity);
-  }
-
-  if (lmaoType === 'text') {
-    return new Uint32Array(alignedCapacity);
-  }
-
-  if (lmaoType === 'number') {
-    return new Float64Array(alignedCapacity);
-  }
-
-  if (lmaoType === 'boolean') {
-    return new Uint8Array(alignedCapacity);
-  }
-
-  // Default to Uint32Array
-  return new Uint32Array(alignedCapacity);
-}
-
-/**
- * Create generic ColumnBuffer with lazy column initialization
+ * Create generic ColumnBuffer using runtime class generation
  *
  * This is the generic buffer creation function that arrow-builder exports.
- * It knows nothing about spans, traces, or any application-specific concepts.
+ * It knows nothing about application-specific concepts.
  *
- * Per GitHub review feedback: Uses lazy getters to only allocate memory for
- * columns that are actually written to. This saves memory for sparse columns.
+ * Per specs/01b1_buffer_performance_optimizations.md:
+ * - Uses runtime-generated class with direct properties
+ * - Zero indirection: attr_${name}_nulls and attr_${name}_values are direct properties
+ * - Shared ArrayBuffer: nulls and values use same buffer (cache-aligned)
+ * - V8 optimizations: hidden class stability, monomorphic access, inline caching
  *
  * ## writeIndex Initialization
  *
  * The buffer is initialized with `writeIndex: 0`, which is correct for a generic
- * columnar buffer. Application-specific consumers (like LMAO's SpanBuffer) may
- * override this after creation to implement fixed row layouts.
+ * columnar buffer. Application-specific consumers may override this after creation
+ * to implement fixed row layouts or other domain-specific patterns.
  *
- * For example, LMAO uses a fixed row layout where:
- * - Row 0: span-start (reserved)
- * - Row 1: span-end (reserved, pre-initialized)
- * - Row 2+: events
+ * ## Column Layout
  *
- * The LMAO package's `writeSpanStart()` function sets `writeIndex = 2` after
- * initializing rows 0 and 1, ensuring events are written starting at row 2.
+ * Each attribute column consists of TWO direct properties sharing ONE ArrayBuffer:
+ * - attr_X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
+ * - attr_X_values: TypedArray for actual values
+ *
+ * Both arrays are backed by the SAME ArrayBuffer, partitioned as:
+ * [null bitmap bytes | padding to bytesPerElement boundary | value bytes]
+ *
+ * This ensures properly aligned access while maintaining memory locality.
  *
  * @param schema - Tag attribute schema
  * @param requestedCapacity - Requested buffer capacity
- * @returns Generic ColumnBuffer with timestamps, operations, and lazy attribute columns
+ * @returns Generic ColumnBuffer with timestamps, operations, and direct attribute columns
  */
 export function createColumnBuffer(schema: TagAttributeSchema, requestedCapacity = 64): ColumnBuffer {
-  // Cache-align capacity for all arrays
-  const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
-  const bitmapByteLength = Math.ceil(alignedCapacity / 8);
-
-  // Create core columns (always allocated)
-  const timestamps = new Float64Array(alignedCapacity);
-  const operations = new Uint8Array(alignedCapacity);
-
-  // Storage for lazily-initialized columns
-  const lazyColumnStorage: Record<`attr_${string}`, { nulls?: Uint8Array; data?: TypedArray }> = {};
-
-  // Legacy nullBitmaps object for backward compatibility
-  // This will be populated lazily via getters
-  const nullBitmaps: Record<`attr_${string}`, Uint8Array> = {};
-
-  // Create base buffer object
-  const buffer: ColumnBuffer = {
-    timestamps,
-    operations,
-    nullBitmaps,
-    writeIndex: 0,
-    capacity: requestedCapacity,
-    next: undefined,
-  };
-
-  // Define lazy getters for each attribute column
-  for (const fieldName of Object.keys(schema)) {
-    const columnName = `attr_${fieldName}` as `attr_${string}`;
-
-    // Initialize lazy storage for this column
-    lazyColumnStorage[columnName] = {};
-
-    // Define getter for the data column (attr_fieldName)
-    Object.defineProperty(buffer, columnName, {
-      get() {
-        // Lazy initialization: only allocate on first access
-        const storage = lazyColumnStorage[columnName];
-        if (!storage.data) {
-          storage.data = getArrayConstructorForField(schema, fieldName, alignedCapacity);
-        }
-        return storage.data;
-      },
-      enumerable: true,
-      configurable: true,
-    });
-
-    // Define getter for null bitmap
-    Object.defineProperty(nullBitmaps, columnName, {
-      get() {
-        // Lazy initialization: only allocate on first access
-        const storage = lazyColumnStorage[columnName];
-        if (!storage.nulls) {
-          storage.nulls = new Uint8Array(bitmapByteLength);
-        }
-        return storage.nulls;
-      },
-      enumerable: true,
-      configurable: true,
-    });
-  }
-
-  return buffer;
+  return createGeneratedColumnBuffer(schema, requestedCapacity);
 }
 
-// SpanBuffer creation functions have been moved to @smoothbricks/lmao package
-// Import them from there: import { createSpanBuffer, createChildSpanBuffer, createNextBuffer } from '@smoothbricks/lmao';
+// NOTE: Application-specific buffer types can extend ColumnBuffer in consumer packages
+// to add domain-specific metadata and functionality.

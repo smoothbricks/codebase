@@ -93,7 +93,7 @@ The core trace logging system is implemented in `@packages/lmao` with buffer inf
 
 - **Buffer Performance**: Benchmark different columnar storage strategies (e.g., single TypedArray vs. multiple) for
   memory and CPU efficiency
-- **Schema Evolution**: Test backward compatibility and migration strategies
+- **Schema Evolution**: Design and test schema versioning and migration strategies
 - **Prototype schema-driven masking** with runtime codegen
 
 ## Integration with Development Platform

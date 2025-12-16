@@ -1,7 +1,7 @@
-// Export schema types (duplicated from lmao to avoid circular deps)
-
+// Export schema types
 export * from './lib/buffer/createBuilders.js';
 export * from './lib/buffer/createColumnBuffer.js';
+export * from './lib/buffer/microseconds.js';
 // Export buffer types and functions
 export * from './lib/buffer/types.js';
 export * from './lib/schema-types.js';

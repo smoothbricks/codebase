@@ -11,8 +11,9 @@
 import type { TypedArray } from '@smoothbricks/arrow-builder';
 import * as arrow from 'apache-arrow';
 import { ENTRY_TYPE_NAMES } from './lmao.js';
-import { getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
+import { getEnumUtf8, getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
 import type { SpanBuffer } from './types.js';
+import { globalUtf8Cache } from './utf8Cache.js';
 
 /**
  * String interner interface (matches lmao's implementation)

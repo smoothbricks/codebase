@@ -8,10 +8,12 @@
  * - Direct buffer writes without intermediate objects
  */
 
+import type { Microseconds } from '@smoothbricks/arrow-builder';
 import { getEnumValues, getLmaoSchemaType } from '../schema/typeGuards.js';
 import type { InferTagAttributes, TagAttributeSchema } from '../schema/types.js';
 import { getSchemaFields } from '../schema/types.js';
 import type { SpanBuffer } from '../types.js';
+import type { GeneratedScope } from './scopeGenerator.js';
 
 /**
  * String interner interface for category columns
@@ -65,13 +67,13 @@ export interface BaseSpanLogger<T extends TagAttributeSchema> {
   warn(message: string): void;
   error(message: string): void;
   scope(attributes: Partial<InferTagAttributes<T>>): void;
-  getScopedAttributes(): Record<string, unknown>;
+  _getScope(): GeneratedScope;
 }
 
 /**
  * Entry type constants for operation tracking
- * Note: ENTRY_TYPE_TAG (3) is no longer used here - span-start entry type
- * is set at buffer creation time, and ctx.tag.* writes to row 0 (overwrite semantics)
+ * Note: span-start entry type is set at buffer creation time,
+ * and ctx.tag.* writes to row 0 (overwrite semantics)
  */
 const ENTRY_TYPE_INFO = 9;
 const ENTRY_TYPE_DEBUG = 10;
@@ -112,44 +114,44 @@ function generateAttributeWriter(fieldName: string, schema: unknown, hasEnumMapp
       // ALWAYS write to row 0 (span-start) - overwrite semantics
       const idx = 0;
       const enumIndex = getEnumIndex_${fieldName}(value);
-      this._buffer.${columnName}[idx] = enumIndex;
-      
+      this._buffer.${columnName}_values[idx] = enumIndex;
+
       // Mark as non-null (bit 0 for idx 0)
-      const nullBitmap = this._buffer.nullBitmaps.${columnName};
+      const nullBitmap = this._buffer.${columnName}_nulls;
       if (nullBitmap) {
         nullBitmap[0] |= 1;
       }
-      
+
       return this;
     }`;
   }
 
-  // For categories, use string interning
+  // For categories, write raw string (no interning on hot path)
   if (lmaoType === 'category') {
     return `
     ${fieldName}(value) {
       // ALWAYS write to row 0 (span-start) - overwrite semantics
       const idx = 0;
-      this._buffer.${columnName}[idx] = this._categoryInterner.intern(value);
-      
+      this._buffer.${columnName}_values[idx] = value;
+
       // Mark as non-null (bit 0 for idx 0)
-      const nullBitmap = this._buffer.nullBitmaps.${columnName};
+      const nullBitmap = this._buffer.${columnName}_nulls;
       if (nullBitmap) {
         nullBitmap[0] |= 1;
       }
-      
+
       return this;
     }`;
   }
 
-  // For text, use raw storage with null/undefined handling
+  // For text, write raw string (no interning on hot path)
   if (lmaoType === 'text') {
     return `
     ${fieldName}(value) {
       // ALWAYS write to row 0 (span-start) - overwrite semantics
       const idx = 0;
-      const nullBitmap = this._buffer.nullBitmaps.${columnName};
-      
+      const nullBitmap = this._buffer.${columnName}_nulls;
+
       // Handle null/undefined: clear null bitmap bit and return early
       if (value === null || value === undefined) {
         if (nullBitmap) {
@@ -157,33 +159,446 @@ function generateAttributeWriter(fieldName: string, schema: unknown, hasEnumMapp
         }
         return this;
       }
-      
-      // Store the text value
-      this._buffer.${columnName}[idx] = this._textStorage.store(value);
-      
+
+      // Store the text value (raw string, no interning)
+      this._buffer.${columnName}_values[idx] = value;
+
       // Mark as non-null (bit 0 for idx 0)
       if (nullBitmap) {
         nullBitmap[0] |= 1;
       }
-      
+
       return this;
     }`;
   }
 
-  // Generic writer for other types (number, boolean)
+  // Boolean: bit-packed storage (8 values per byte)
+  if (lmaoType === 'boolean') {
+    return `
+    ${fieldName}(value) {
+      // ALWAYS write to row 0 (span-start) - overwrite semantics
+      // Bit-packed: bit 0 of byte 0 is index 0
+      if (value) {
+        this._buffer.${columnName}_values[0] |= 1;
+      } else {
+        this._buffer.${columnName}_values[0] &= ~1;
+      }
+
+      // Mark as non-null (bit 0 for idx 0)
+      const nullBitmap = this._buffer.${columnName}_nulls;
+      if (nullBitmap) {
+        nullBitmap[0] |= 1;
+      }
+
+      return this;
+    }`;
+  }
+
+  // Generic writer for other types (number)
   return `
     ${fieldName}(value) {
       // ALWAYS write to row 0 (span-start) - overwrite semantics
       const idx = 0;
-      this._buffer.${columnName}[idx] = value;
-      
+      this._buffer.${columnName}_values[idx] = value;
+
       // Mark as non-null (bit 0 for idx 0)
-      const nullBitmap = this._buffer.nullBitmaps.${columnName};
+      const nullBitmap = this._buffer.${columnName}_nulls;
       if (nullBitmap) {
         nullBitmap[0] |= 1;
       }
-      
+
       return this;
+    }`;
+}
+
+/**
+ * Generate with() method code - UNROLLED per-column code
+ * No Object.entries at runtime - each column gets explicit code
+ */
+function generateWithMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
+  const columnWrites = schemaFields.map(([fieldName, fieldSchema]) => {
+    const columnName = `attr_${fieldName}`;
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+
+    // Boolean uses bit-packed storage (8 values per byte)
+    if (lmaoType === 'boolean') {
+      return `
+      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
+        // Bit-packed boolean write at index 0
+        if (attributes.${fieldName}) {
+          this._buffer.${columnName}_values[0] |= 1;
+        } else {
+          this._buffer.${columnName}_values[0] &= ~1;
+        }
+        this._buffer.${columnName}_nulls[0] |= 1;
+      }`;
+    }
+
+    // Value processing based on type
+    let valueExpr = `attributes.${fieldName}`;
+    if (lmaoType === 'enum' && enumFieldNames.has(fieldName)) {
+      valueExpr = `getEnumIndex_${fieldName}(attributes.${fieldName})`;
+    }
+    // category and text: write raw strings (no interning on hot path)
+
+    return `
+      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
+        this._buffer.${columnName}_values[0] = ${valueExpr};
+        this._buffer.${columnName}_nulls[0] |= 1;
+      }`;
+  });
+
+  return `
+    with(attributes) {
+      ${columnWrites.join('\n')}
+      return this;
+    }`;
+}
+
+/**
+ * Generate scope() method code - UNROLLED per-column with BULK null bitmap fill
+ * Uses TypedArray.fill() for values and bulk 0xFF writes for null bitmaps
+ */
+function generateScopeMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
+  const scopeUpdates = schemaFields.map(([fieldName]) => {
+    return `
+      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
+        this._scope.${fieldName} = attributes.${fieldName};
+      }`;
+  });
+
+  const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
+    const columnName = `attr_${fieldName}`;
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+
+    // Boolean uses bit-packed storage - bulk fill with 0xFF or 0x00
+    if (lmaoType === 'boolean') {
+      return `
+      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
+        // Bit-packed boolean bulk fill
+        const values = this._buffer.${columnName}_values;
+        const fillByte = attributes.${fieldName} ? 0xFF : 0x00;
+        const startByte = startIdx >>> 3;
+        const endByte = (endIdx - 1) >>> 3;
+
+        // Fill full bytes
+        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+          if (byteIdx === startByte && (startIdx & 7) !== 0) {
+            // Partial first byte
+            const mask = 0xFF << (startIdx & 7);
+            if (attributes.${fieldName}) {
+              values[byteIdx] |= mask;
+            } else {
+              values[byteIdx] &= ~mask;
+            }
+          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
+            // Partial last byte
+            const mask = (1 << (endIdx & 7)) - 1;
+            if (attributes.${fieldName}) {
+              values[byteIdx] |= mask;
+            } else {
+              values[byteIdx] &= ~mask;
+            }
+          } else {
+            values[byteIdx] = fillByte;
+          }
+        }
+
+        // Bulk fill null bitmap
+        const nullBitmap = this._buffer.${columnName}_nulls;
+        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+          if (byteIdx === startByte && (startIdx & 7) !== 0) {
+            nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
+          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
+            nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
+          } else {
+            nullBitmap[byteIdx] = 0xFF;
+          }
+        }
+      }`;
+    }
+
+    // Value processing based on type
+    let valueExpr = `attributes.${fieldName}`;
+    if (lmaoType === 'enum' && enumFieldNames.has(fieldName)) {
+      valueExpr = `getEnumIndex_${fieldName}(attributes.${fieldName})`;
+    }
+    // category and text: write raw strings (no interning on hot path)
+
+    // For string arrays (category/text), use manual loop instead of fill()
+    if (lmaoType === 'category' || lmaoType === 'text') {
+      return `
+      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
+        // Fill string array with manual loop
+        const values = this._buffer.${columnName}_values;
+        for (let i = startIdx; i < endIdx; i++) {
+          values[i] = ${valueExpr};
+        }
+
+        // Bulk fill null bitmap
+        const nullBitmap = this._buffer.${columnName}_nulls;
+        const startByte = Math.floor(startIdx / 8);
+        const endByte = Math.floor((endIdx - 1) / 8);
+
+        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+          if (byteIdx === startByte && startIdx % 8 !== 0) {
+            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
+          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
+            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
+          } else {
+            nullBitmap[byteIdx] = 0xFF;
+          }
+        }
+      }`;
+    }
+
+    return `
+      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
+        // Fill values with SIMD-friendly TypedArray.fill()
+        this._buffer.${columnName}_values.fill(${valueExpr}, startIdx, endIdx);
+
+        // Bulk fill null bitmap: full bytes get 0xFF, partial last byte gets individual bits
+        const nullBitmap = this._buffer.${columnName}_nulls;
+        const startByte = Math.floor(startIdx / 8);
+        const endByte = Math.floor((endIdx - 1) / 8);
+
+        // Set full bytes to 0xFF (all bits valid)
+        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+          // For partial first byte, only set bits >= startIdx % 8
+          if (byteIdx === startByte && startIdx % 8 !== 0) {
+            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
+          }
+          // For partial last byte, only set bits < endIdx % 8 (or all if endIdx % 8 === 0)
+          else if (byteIdx === endByte && endIdx % 8 !== 0) {
+            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
+          }
+          // Full byte - set all bits
+          else {
+            nullBitmap[byteIdx] = 0xFF;
+          }
+        }
+      }`;
+  });
+
+  return `
+    scope(attributes) {
+      // Update the Scope instance (stores raw values, not interned)
+      ${scopeUpdates.join('\n')}
+
+      // Pre-fill remaining buffer capacity with scoped attributes
+      const startIdx = this._buffer.writeIndex;
+      const endIdx = this._buffer.capacity;
+
+      ${columnFills.join('\n')}
+    }`;
+}
+
+/**
+ * Generate _prefillScopedAttributes() method - UNROLLED per-column with BULK null bitmap fill
+ */
+function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
+  const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
+    const columnName = `attr_${fieldName}`;
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+
+    // Boolean uses bit-packed storage
+    if (lmaoType === 'boolean') {
+      return `
+      {
+        const scopeValue = this._scope.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined) {
+          // Bit-packed boolean bulk fill
+          const values = this._buffer.${columnName}_values;
+          const fillByte = scopeValue ? 0xFF : 0x00;
+          const startByte = startIdx >>> 3;
+          const endByte = (endIdx - 1) >>> 3;
+
+          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+            if (byteIdx === startByte && (startIdx & 7) !== 0) {
+              const mask = 0xFF << (startIdx & 7);
+              if (scopeValue) {
+                values[byteIdx] |= mask;
+              } else {
+                values[byteIdx] &= ~mask;
+              }
+            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
+              const mask = (1 << (endIdx & 7)) - 1;
+              if (scopeValue) {
+                values[byteIdx] |= mask;
+              } else {
+                values[byteIdx] &= ~mask;
+              }
+            } else {
+              values[byteIdx] = fillByte;
+            }
+          }
+
+          // Bulk fill null bitmap
+          const nullBitmap = this._buffer.${columnName}_nulls;
+          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+            if (byteIdx === startByte && (startIdx & 7) !== 0) {
+              nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
+            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
+              nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
+            } else {
+              nullBitmap[byteIdx] = 0xFF;
+            }
+          }
+        }
+      }`;
+    }
+
+    // Value processing based on type
+    let valueExpr = 'scopeValue';
+    if (lmaoType === 'enum' && enumFieldNames.has(fieldName)) {
+      valueExpr = `getEnumIndex_${fieldName}(scopeValue)`;
+    }
+    // category and text: write raw strings (no interning on hot path)
+
+    // For string arrays (category/text), use manual loop instead of fill()
+    if (lmaoType === 'category' || lmaoType === 'text') {
+      return `
+      {
+        const scopeValue = this._scope.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined) {
+          // Fill string array with manual loop
+          const values = this._buffer.${columnName}_values;
+          for (let i = startIdx; i < endIdx; i++) {
+            values[i] = scopeValue;
+          }
+
+          // Bulk fill null bitmap
+          const nullBitmap = this._buffer.${columnName}_nulls;
+          const startByte = Math.floor(startIdx / 8);
+          const endByte = Math.floor((endIdx - 1) / 8);
+
+          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+            if (byteIdx === startByte && startIdx % 8 !== 0) {
+              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
+            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
+              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
+            } else {
+              nullBitmap[byteIdx] = 0xFF;
+            }
+          }
+        }
+      }`;
+    }
+
+    return `
+      {
+        const scopeValue = this._scope.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined) {
+          // Fill values with SIMD-friendly TypedArray.fill()
+          this._buffer.${columnName}_values.fill(${valueExpr}, startIdx, endIdx);
+
+          // Bulk fill null bitmap
+          const nullBitmap = this._buffer.${columnName}_nulls;
+          const startByte = Math.floor(startIdx / 8);
+          const endByte = Math.floor((endIdx - 1) / 8);
+
+          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
+            if (byteIdx === startByte && startIdx % 8 !== 0) {
+              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
+            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
+              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
+            } else {
+              nullBitmap[byteIdx] = 0xFF;
+            }
+          }
+        }
+      }`;
+  });
+
+  return `
+    _prefillScopedAttributes() {
+      const startIdx = this._buffer.writeIndex;
+      const endIdx = this._buffer.capacity;
+
+      ${columnFills.join('\n')}
+    }`;
+}
+
+/**
+ * Generate _writeMessage() method - UNROLLED per-column scope writes
+ */
+function generateWriteMessageMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
+  const scopeWrites = schemaFields.map(([fieldName, fieldSchema]) => {
+    const columnName = `attr_${fieldName}`;
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+
+    // Boolean uses bit-packed storage
+    if (lmaoType === 'boolean') {
+      return `
+      {
+        const scopeValue = this._scope.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined) {
+          const byteIndex = idx >>> 3;
+          const bitOffset = idx & 7;
+          // Bit-packed boolean write
+          if (scopeValue) {
+            this._buffer.${columnName}_values[byteIndex] |= (1 << bitOffset);
+          } else {
+            this._buffer.${columnName}_values[byteIndex] &= ~(1 << bitOffset);
+          }
+          this._buffer.${columnName}_nulls[byteIndex] |= (1 << bitOffset);
+        }
+      }`;
+    }
+
+    // Value processing based on type
+    let valueExpr = 'scopeValue';
+    if (lmaoType === 'enum' && enumFieldNames.has(fieldName)) {
+      valueExpr = `getEnumIndex_${fieldName}(scopeValue)`;
+    }
+    // category and text: write raw strings (no interning on hot path)
+
+    return `
+      {
+        const scopeValue = this._scope.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined) {
+          this._buffer.${columnName}_values[idx] = ${valueExpr};
+          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
+          const bitOffset = idx & 7;     // idx % 8
+          this._buffer.${columnName}_nulls[byteIndex] |= (1 << bitOffset);
+        }
+      }`;
+  });
+
+  return `
+    _writeMessage(entryType, message) {
+      const result = this._getBufferWithSpace(this._buffer);
+
+      // If overflow occurred, pre-fill new buffer with scoped attributes
+      if (result.didOverflow) {
+        this._buffer = result.buffer;
+        this._prefillScopedAttributes();
+      } else {
+        this._buffer = result.buffer;
+      }
+
+      const idx = this._buffer.writeIndex;
+
+      // Write entry type
+      this._buffer.operations[idx] = entryType;
+
+      // Write timestamp using anchor for high precision (microseconds)
+      this._buffer.timestamps[idx] = getTimestampMicros(this._anchorEpochMicros, this._anchorPerfNow);
+
+      // Write message to attr_logMessage column (raw string, no interning)
+      const messageColumn = this._buffer.attr_logMessage_values;
+      if (messageColumn) {
+        messageColumn[idx] = message;
+        const byteIndex = idx >>> 3;
+        const bitOffset = idx & 7;
+        this._buffer.attr_logMessage_nulls[byteIndex] |= (1 << bitOffset);
+      }
+
+      // Apply scoped attributes - UNROLLED per-column
+      ${scopeWrites.join('\n')}
+
+      // Increment write index
+      this._buffer.writeIndex++;
     }`;
 }
 
@@ -217,40 +632,34 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
     generateAttributeWriter(fieldName, fieldSchema, enumFieldNames.has(fieldName)),
   );
 
-  // Create schema type map for runtime type detection in scope()
-  const schemaTypeMap = Object.fromEntries(
-    schemaFields.map(([fieldName, fieldSchema]) => {
-      return [fieldName, getLmaoSchemaType(fieldSchema) || 'unknown'];
-    }),
-  );
+  // Generate unrolled methods (NO Object.entries at runtime)
+  const withMethod = generateWithMethod(schemaFields, enumFieldNames);
+  const scopeMethod = generateScopeMethod(schemaFields, enumFieldNames);
+  const prefillMethod = generatePrefillScopedAttributesMethod(schemaFields, enumFieldNames);
+  const writeMessageMethod = generateWriteMessageMethod(schemaFields, enumFieldNames);
 
   // Generate the complete class
   const classCode = `
 (function() {
   'use strict';
-  
+
   // Inline getTimestampMicros for performance (zero function call overhead)
   // Uses performance.now() which is browser-safe and provides sub-millisecond precision
   function getTimestampMicros(anchorEpochMicros, anchorPerfNow) {
     return anchorEpochMicros + (performance.now() * 1000 - anchorPerfNow);
   }
-  
+
   ${enumMappings.join('\n')}
-  
-  // Schema type map for runtime type detection
-  const SCHEMA_TYPES = ${JSON.stringify(schemaTypeMap)};
-  
+
   class ${className} {
-    constructor(buffer, categoryInterner, textStorage, getBufferWithSpace, anchorEpochMicros, anchorPerfNow, initialScopedAttributes = {}) {
+    constructor(buffer, getBufferWithSpace, anchorEpochMicros, anchorPerfNow, scopeInstance) {
       this._buffer = buffer;
-      this._categoryInterner = categoryInterner;
-      this._textStorage = textStorage;
       this._getBufferWithSpace = getBufferWithSpace;
       this._anchorEpochMicros = anchorEpochMicros;
       this._anchorPerfNow = anchorPerfNow;
-      this._scopedAttributes = initialScopedAttributes;
+      this._scope = scopeInstance;
     }
-    
+
     // Tag getter - returns chainable API that writes to row 0 (span-start)
     // Note: No overflow check needed - row 0 always exists
     // Note: No writeIndex increment - always writing to same row (overwrite semantics)
@@ -259,171 +668,29 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
       // Just return this for chaining - individual methods write to row 0
       return this;
     }
-    
+
     // with() method for bulk attribute setting - writes to row 0
-    with(attributes) {
-      // ALWAYS write to row 0 (span-start) - overwrite semantics
-      const idx = 0;
-      
-      for (const [key, value] of Object.entries(attributes)) {
-        const columnName = 'attr_' + key;
-        const column = this._buffer[columnName];
-        if (column && value !== null && value !== undefined) {
-          column[idx] = value;
-          
-          // Mark as non-null (bit 0 for idx 0)
-          const nullBitmap = this._buffer.nullBitmaps[columnName];
-          if (nullBitmap) {
-            nullBitmap[0] |= 1;
-          }
-        }
-      }
-      
-      return this;
-    }
-    
+    // UNROLLED: Each column gets explicit code, no Object.entries iteration
+    ${withMethod}
+
     // Attribute writer methods (generated from schema)
     ${attributeWriters.join('\n')}
-    
-    // Scoped attributes
-    scope(attributes) {
-      // Store scoped attributes (already interned/processed)
-      for (const [key, value] of Object.entries(attributes)) {
-        const columnName = 'attr_' + key;
-        const column = this._buffer[columnName];
-        
-        if (column && value !== null && value !== undefined) {
-          // Process value based on schema type (not TypedArray type)
-          let processedValue = value;
-          const fieldType = SCHEMA_TYPES[key];
-          
-          if (typeof value === 'string') {
-            // Category: intern the string
-            if (fieldType === 'category') {
-              processedValue = this._categoryInterner.intern(value);
-            }
-            // Text: store without interning
-            else if (fieldType === 'text') {
-              processedValue = this._textStorage.store(value);
-            }
-            // Enum: should use the enum method instead, but handle gracefully
-            // (this shouldn't happen in normal usage since enums are compile-time)
-          }
-          
-          this._scopedAttributes[key] = processedValue;
-        }
-      }
-      
-      // Pre-fill remaining buffer capacity with scoped attributes
-      const startIdx = this._buffer.writeIndex;
-      const endIdx = this._buffer.capacity;
-      
-      for (let idx = startIdx; idx < endIdx; idx++) {
-        for (const [key, value] of Object.entries(this._scopedAttributes)) {
-          const columnName = 'attr_' + key;
-          const column = this._buffer[columnName];
-          if (column) {
-            column[idx] = value;
-            
-            // Mark as non-null
-            const nullBitmap = this._buffer.nullBitmaps[columnName];
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] |= (1 << bitOffset);
-            }
-          }
-        }
-      }
-    }
-    
+
+    // Scoped attributes - writes to Scope instance and pre-fills buffer
+    // UNROLLED: Each column gets explicit TypedArray.fill() + bulk null bitmap
+    ${scopeMethod}
+
     /**
      * Pre-fill buffer with scoped attributes from current writeIndex to capacity.
      * Called after buffer overflow to propagate scoped attributes to the new buffer.
-     * 
-     * Per specs/01i_span_scope_attributes.md:
-     * - Scoped attributes propagate to all entries in a span
-     * - When overflow creates a new chained buffer, it must be pre-filled
+     *
+     * UNROLLED: Each column gets explicit code with bulk null bitmap operations
      */
-    _prefillScopedAttributes() {
-      const startIdx = this._buffer.writeIndex;
-      const endIdx = this._buffer.capacity;
-      
-      for (let idx = startIdx; idx < endIdx; idx++) {
-        for (const [key, value] of Object.entries(this._scopedAttributes)) {
-          const columnName = 'attr_' + key;
-          const column = this._buffer[columnName];
-          if (column) {
-            column[idx] = value;
-            
-            // Mark as non-null
-            const nullBitmap = this._buffer.nullBitmaps[columnName];
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] |= (1 << bitOffset);
-            }
-          }
-        }
-      }
-    }
-    
+    ${prefillMethod}
+
     // Message logging methods
-    _writeMessage(entryType, message) {
-      const result = this._getBufferWithSpace(this._buffer);
-      
-      // If overflow occurred, pre-fill new buffer with scoped attributes
-      if (result.didOverflow) {
-        this._buffer = result.buffer;
-        this._prefillScopedAttributes();
-      } else {
-        this._buffer = result.buffer;
-      }
-      
-      const idx = this._buffer.writeIndex;
-      
-      // Write entry type
-      this._buffer.operations[idx] = entryType;
-      
-      // Write timestamp using anchor for high precision (microseconds)
-      this._buffer.timestamps[idx] = getTimestampMicros(this._anchorEpochMicros, this._anchorPerfNow);
-      
-      // Write message to attr_logMessage column
-      // Named logMessage (not message) to avoid conflict with SpanLogger.message() method
-      // Converted to 'message' column in Arrow output per specs/01f_arrow_table_structure.md
-      const messageColumn = this._buffer.attr_logMessage;
-      if (messageColumn) {
-        messageColumn[idx] = this._textStorage.store(message);
-        
-        // Mark as non-null
-        const nullBitmap = this._buffer.nullBitmaps.attr_logMessage;
-        if (nullBitmap) {
-          const byteIndex = Math.floor(idx / 8);
-          const bitOffset = idx % 8;
-          nullBitmap[byteIndex] |= (1 << bitOffset);
-        }
-      }
-      
-      // Apply scoped attributes
-      for (const [key, value] of Object.entries(this._scopedAttributes)) {
-        const columnName = 'attr_' + key;
-        const column = this._buffer[columnName];
-        if (column) {
-          column[idx] = value;
-          
-          // Mark as non-null
-          const nullBitmap = this._buffer.nullBitmaps[columnName];
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= (1 << bitOffset);
-          }
-        }
-      }
-      
-      // Increment write index
-      this._buffer.writeIndex++;
-    }
+    // UNROLLED: Scope attribute writes are explicit per-column, no Object.entries
+    ${writeMessageMethod}
     
     message(level, message) {
       const entryTypeMap = {
@@ -450,13 +717,13 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
     error(message) {
       this._writeMessage(${ENTRY_TYPE_ERROR}, message);
     }
-    
-    // Get scoped attributes for inheritance
-    getScopedAttributes() {
-      return this._scopedAttributes;
+
+    // Get the Scope instance directly
+    _getScope() {
+      return this._scope;
     }
   }
-  
+
   return ${className};
 })()
 `;
@@ -472,12 +739,10 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
   schema: T,
 ): new (
   buffer: SpanBuffer,
-  categoryInterner: StringInterner,
-  textStorage: TextStorage,
   getBufferWithSpace: GetBufferWithSpaceFn,
-  anchorEpochMicros: number,
-  anchorPerfNow: number,
-  initialScopedAttributes?: Record<string, unknown>,
+  anchorEpochMicros: Microseconds,
+  anchorPerfNow: Microseconds,
+  scopeInstance: GeneratedScope,
 ) => BaseSpanLogger<T> {
   const classCode = generateSpanLoggerClass(schema).trim();
 
@@ -488,11 +753,9 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
 
   return GeneratedClass as new (
     buffer: SpanBuffer,
-    categoryInterner: StringInterner,
-    textStorage: TextStorage,
     getBufferWithSpace: GetBufferWithSpaceFn,
-    anchorEpochMicros: number,
-    anchorPerfNow: number,
-    initialScopedAttributes?: Record<string, unknown>,
+    anchorEpochMicros: Microseconds,
+    anchorPerfNow: Microseconds,
+    scopeInstance: GeneratedScope,
   ) => BaseSpanLogger<T>;
 }

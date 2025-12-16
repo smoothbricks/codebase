@@ -47,12 +47,12 @@ export function createAttributeColumns(schema: TagAttributeSchema, capacity = 64
  */
 function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capacity: number): TypedArray {
   const schemaWithMetadata = schema as SchemaWithMetadata;
-  const lmaoType = schemaWithMetadata.__lmao_type;
+  const schemaType = schemaWithMetadata.__schema_type;
 
   // Handle three string types
-  if (lmaoType === 'enum') {
+  if (schemaType === 'enum') {
     // Enum: Select TypedArray size based on enum value count
-    const enumValues = schemaWithMetadata.__lmao_enum_values;
+    const enumValues = schemaWithMetadata.__enum_values;
     const enumCount = enumValues?.length ?? 0;
 
     if (enumCount === 0) {
@@ -71,23 +71,23 @@ function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capaci
     return new Uint32Array(capacity);
   }
 
-  if (lmaoType === 'category') {
+  if (schemaType === 'category') {
     // Category: Uint32Array for string interning indices
     return new Uint32Array(capacity);
   }
 
-  if (lmaoType === 'text') {
+  if (schemaType === 'text') {
     // Text: Uint32Array for raw string indices (no interning)
     return new Uint32Array(capacity);
   }
 
   // Handle number and boolean types
-  if (lmaoType === 'number') {
+  if (schemaType === 'number') {
     // Number: Float64Array for full precision
     return new Float64Array(capacity);
   }
 
-  if (lmaoType === 'boolean') {
+  if (schemaType === 'boolean') {
     // Boolean: Uint8Array (0 or 1)
     return new Uint8Array(capacity);
   }
@@ -103,13 +103,13 @@ function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capaci
  */
 export function getTypedArrayConstructor(schema: Sury.Schema<unknown, unknown>): TypedArrayConstructor {
   const schemaWithMetadata = schema as SchemaWithMetadata;
-  const lmaoType = schemaWithMetadata.__lmao_type;
+  const schemaType = schemaWithMetadata.__schema_type;
 
-  if (lmaoType === 'enum') return Uint8Array;
-  if (lmaoType === 'category') return Uint32Array;
-  if (lmaoType === 'text') return Uint32Array;
-  if (lmaoType === 'number') return Float64Array;
-  if (lmaoType === 'boolean') return Uint8Array;
+  if (schemaType === 'enum') return Uint8Array;
+  if (schemaType === 'category') return Uint32Array;
+  if (schemaType === 'text') return Uint32Array;
+  if (schemaType === 'number') return Float64Array;
+  if (schemaType === 'boolean') return Uint8Array;
 
   // Default for unknown types
   return Uint32Array;

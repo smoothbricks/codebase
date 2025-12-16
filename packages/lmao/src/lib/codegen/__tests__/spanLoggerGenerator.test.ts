@@ -6,6 +6,7 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
+import { createSpanBuffer } from '../../spanBuffer.js';
 import type { ModuleContext, SpanBuffer, TaskContext } from '../../types.js';
 import {
   createSpanLoggerClass,
@@ -86,12 +87,11 @@ function createMockSpanBuffer(): SpanBuffer {
     traceId: 'test-trace',
     timestamps: new Float64Array(64),
     operations: new Uint8Array(64),
-    nullBitmaps: {},
     children: [],
     task: taskContext,
     writeIndex: 0,
     capacity: 64,
-  };
+  } as SpanBuffer;
 }
 
 const mockGetBufferWithSpace: GetBufferWithSpaceFn = (buffer) => ({
@@ -181,8 +181,8 @@ describe('generateSpanLoggerClass', () => {
     it('should handle enum without values gracefully', () => {
       const schema: TagAttributeSchema = {
         operation: {
-          __lmao_type: 'enum',
-          __lmao_enum_values: undefined as unknown as readonly string[],
+          __schema_type: 'enum',
+          __enum_values: undefined as unknown as readonly string[],
         },
       };
       const code = generateSpanLoggerClass(schema);
@@ -194,7 +194,7 @@ describe('generateSpanLoggerClass', () => {
     it('should handle unknown lmao_type gracefully', () => {
       const schema: TagAttributeSchema = {
         field: {
-          __lmao_type: 'unknown' as any,
+          __schema_type: 'unknown' as any,
         },
       };
       const code = generateSpanLoggerClass(schema);
@@ -206,8 +206,8 @@ describe('generateSpanLoggerClass', () => {
     it('should handle empty enum values array', () => {
       const schema: TagAttributeSchema = {
         status: {
-          __lmao_type: 'enum',
-          __lmao_enum_values: [],
+          __schema_type: 'enum',
+          __enum_values: [],
         },
       };
       const code = generateSpanLoggerClass(schema);
@@ -236,7 +236,7 @@ describe('createSpanLoggerClass', () => {
       });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
+      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, 0, 0, undefined);
 
       // Should have tag property
       expect(logger).toHaveProperty('tag');
@@ -250,11 +250,12 @@ describe('createSpanLoggerClass', () => {
       });
 
       buffer.task.module.tagAttributes = schema;
-      buffer.nullBitmaps.attr_userId = new Uint8Array(8);
-      (buffer as any).attr_userId = new Uint32Array(64);
+      (buffer as any).attr_userId_nulls = new Uint8Array(8);
+      // Category columns now use string[] arrays (hot path optimization)
+      (buffer as any).attr_userId_values = new Array(64).fill('');
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
+      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, 0, 0, undefined);
 
       // Access tag to create entry
       const tag = logger.tag;
@@ -268,14 +269,15 @@ describe('createSpanLoggerClass', () => {
         userId: S.category(),
       });
 
-      buffer.task.module.tagAttributes = schema;
-      buffer.nullBitmaps.attr_requestId = new Uint8Array(8);
-      buffer.nullBitmaps.attr_userId = new Uint8Array(8);
-      (buffer as any).attr_requestId = new Uint32Array(64);
-      (buffer as any).attr_userId = new Uint32Array(64);
+      // Use createSpanBuffer to get a properly generated buffer with lazy getters
+      const properBuffer = createSpanBuffer(schema, buffer.task);
+      properBuffer.task.module.tagAttributes = schema;
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
+      // Create mock scope instance
+      const mockScope = { requestId: null, userId: null, _getScopeValues: () => ({ requestId: null, userId: null }) };
+      // New constructor: (buffer, getBufferWithSpace, anchorEpochMicros, anchorPerfNow, scopeInstance)
+      const logger = new SpanLoggerClass(properBuffer, mockGetBufferWithSpace, 0, 0, mockScope);
 
       // Should be able to call scope without error
       expect(() => {
@@ -289,7 +291,7 @@ describe('createSpanLoggerClass', () => {
       const schema = defineTagAttributes({});
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
+      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, 0, 0, undefined);
 
       expect(logger).toBeDefined();
       expect(logger).toHaveProperty('tag');
@@ -319,7 +321,7 @@ describe('createSpanLoggerClass', () => {
       const SpanLoggerClass = createSpanLoggerClass(schema);
       expect(SpanLoggerClass).toBeDefined();
 
-      const logger = new SpanLoggerClass(buffer, categoryInterner, textStorage, mockGetBufferWithSpace);
+      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, 0, 0, undefined);
 
       expect(logger).toBeDefined();
     });
@@ -340,8 +342,8 @@ describe('createSpanLoggerClass', () => {
     it('should handle malformed enum values', () => {
       const schema: TagAttributeSchema = {
         status: {
-          __lmao_type: 'enum',
-          __lmao_enum_values: null as any,
+          __schema_type: 'enum',
+          __enum_values: null as any,
         },
       };
 
@@ -352,7 +354,7 @@ describe('createSpanLoggerClass', () => {
 
     it('should handle schema with circular references gracefully', () => {
       const schema: TagAttributeSchema = {
-        field: { __lmao_type: 'text' },
+        field: { __schema_type: 'text' },
       };
       // Add circular reference
       (schema as any).circular = schema;

@@ -90,9 +90,7 @@ describe('Buffer Chaining', () => {
       const nextBuffer = createNextBuffer(buffer);
 
       // Should have same attribute columns
-      expect(nextBuffer['attr_userId']).toBeInstanceOf(Uint32Array);
-      expect(nextBuffer['attr_requestId']).toBeInstanceOf(Uint32Array);
-      expect(nextBuffer['attr_operation']).toBeInstanceOf(Uint8Array);
+      expect(Array.isArray(nextBuffer['attr_userId'])).toBe(true); // category (raw strings)expect(Array.isArray(nextBuffer['attr_requestId'])).toBe(true); // category (raw strings)expect(nextBuffer['attr_operation']).toBeInstanceOf(Uint8Array);
       expect(nextBuffer['attr_duration']).toBeInstanceOf(Float64Array);
 
       // Should have core columns
@@ -177,12 +175,11 @@ describe('Buffer Chaining', () => {
       const buffer = createSpanBuffer(schema, taskContext);
       const nextBuffer = createNextBuffer(buffer);
 
-      // Should have null bitmaps for each attribute
-      expect(nextBuffer.nullBitmaps).toBeDefined();
-      expect(nextBuffer.nullBitmaps['attr_userId']).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer.nullBitmaps['attr_requestId']).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer.nullBitmaps['attr_operation']).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer.nullBitmaps['attr_duration']).toBeInstanceOf(Uint8Array);
+      // Should have null bitmaps for each attribute (direct properties)
+      expect(nextBuffer.attr_userId_nulls).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.attr_requestId_nulls).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.attr_operation_nulls).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.attr_duration_nulls).toBeInstanceOf(Uint8Array);
     });
 
     it('should handle capacity changes between chained buffers', () => {

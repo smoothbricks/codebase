@@ -1,5 +1,3 @@
-import type { TagAttributeSchema } from '../schema-types.js';
-
 /**
  * TypedArray-based ColumnBuffer for zero-copy columnar storage
  *
@@ -8,24 +6,34 @@ import type { TagAttributeSchema } from '../schema-types.js';
  *
  * Arrow table conversion happens in cold path (background processing).
  *
- * NOTE: This is a generic buffer structure that lmao will extend for span-specific use.
+ * NOTE: This is a GENERIC columnar buffer. Consumer packages
+ * extend this type to add domain-specific metadata.
  *
- * TODO (future optimization): Consider lazy column initialization with getters
- * to only allocate memory for columns actually used. See GitHub review comment.
+ * ## Column Layout
+ *
+ * Each attribute column consists of TWO direct properties sharing ONE ArrayBuffer:
+ * - attr_X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
+ * - attr_X_values: TypedArray for actual values
+ *
+ * Both arrays are backed by the SAME ArrayBuffer, partitioned as:
+ * [null bitmap bytes | padding to 64-byte cache line | value bytes]
+ *
+ * This ensures cache-aligned access while maintaining memory locality.
  */
 export interface ColumnBuffer {
   // Core columns - always present
-  timestamps: Float64Array; // Every operation appends timestamp
+  timestamps: Float64Array; // Microsecond-precision timestamps (values are Microseconds branded type)
   operations: Uint8Array; // Operation type: tag, ok, err, etc.
 
-  // Null bitmaps - one Uint8Array per nullable column (Arrow format)
-  // Each bitmap has length = Math.ceil(capacity / 8) bytes
-  // Bit 0 = row 0, bit 1 = row 1, etc. within each byte
-  nullBitmaps: Record<`attr_${string}`, Uint8Array>;
-
   // Attribute columns (generated from schema with attr_ prefix)
-  // These are TypedArrays matching the schema field types
-  [key: `attr_${string}`]: TypedArray;
+  // Each attribute has TWO properties:
+  // - attr_X_nulls: Uint8Array for null bitmap
+  // - attr_X_values: TypedArray OR string[] for actual values
+  //
+  // For category/text columns, values are stored as string[] on the hot path
+  // For enum/number/boolean columns, values are stored in TypedArray
+  [key: `attr_${string}_nulls`]: Uint8Array;
+  [key: `attr_${string}_values`]: ColumnValueType;
 
   // Buffer management
   writeIndex: number; // Current write position (0 to capacity-1)
@@ -47,6 +55,15 @@ export type TypedArray =
   | Float64Array;
 
 /**
+ * Column value type - TypedArray or string array for category/text columns
+ *
+ * Per new string storage design:
+ * - Hot path stores raw JavaScript strings in string[] (zero conversion cost)
+ * - Cold path (Arrow conversion) handles UTF-8 encoding and dictionary building
+ */
+export type ColumnValueType = TypedArray | string[];
+
+/**
  * Capacity stats for buffer size tuning
  * Generic stats that any use case can build upon
  */
@@ -55,54 +72,6 @@ export interface BufferCapacityStats {
   totalWrites: number;
   overflowWrites: number;
   totalBuffersCreated: number;
-}
-
-/**
- * Module context shared across all tasks in same module
- *
- * NOTE: This is a lmao-specific concept but kept here for backward compatibility.
- * In future, lmao should extend this with its own type.
- */
-export interface ModuleContext {
-  moduleId: number;
-  gitSha: string;
-  filePath: string;
-
-  // Tag attribute schema for this module
-  tagAttributes: TagAttributeSchema;
-
-  // Self-tuning capacity stats
-  spanBufferCapacityStats: BufferCapacityStats;
-}
-
-/**
- * Task context combines module + task-specific data
- *
- * NOTE: This is a lmao-specific concept but kept here for backward compatibility.
- * In future, lmao should extend this with its own type.
- */
-export interface TaskContext {
-  module: ModuleContext;
-  spanNameId: number;
-  lineNumber: number;
-}
-
-/**
- * SpanBuffer - lmao-specific extension of ColumnBuffer
- *
- * Adds span tree structure and task context to the base ColumnBuffer.
- * Kept for backward compatibility with lmao package.
- */
-export interface SpanBuffer extends ColumnBuffer {
-  // Tree structure (lmao-specific for span hierarchy)
-  children: SpanBuffer[];
-  parent?: SpanBuffer;
-
-  spanId: number; // Incremental ID for this span
-  traceId: string; // Root trace ID (constant per span)
-
-  // Reference to task context (lmao-specific)
-  task: TaskContext;
 }
 
 /**
