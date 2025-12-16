@@ -19,8 +19,8 @@ describe('Buffer Overflow and Capacity Management', () => {
 
   const featureFlags = {
     schema: {
-      advancedValidation: S.boolean(),
-      newUI: S.boolean(),
+      advancedValidation: S.boolean().default(false).sync(),
+      newUI: S.boolean().default(false).sync(),
     },
   };
 
@@ -428,10 +428,6 @@ describe('Buffer Overflow and Capacity Management', () => {
         tagAttributes: dbAttributes,
       });
 
-      // We need access to the buffer to verify scoped attributes are pre-filled
-      // This is an internal implementation test
-      const bufferAfterOverflow: unknown = null;
-
       const testTask = moduleContext.task('test-scope-prefill', async (ctx) => {
         // Set scoped attributes
         ctx.scope({ region: 'us-east-1' });
@@ -568,9 +564,6 @@ describe('Buffer Overflow and Capacity Management', () => {
             .duration(i * 10);
         }
 
-        // SpanLogger tracks _writeIndex
-        const logger = ctx.log;
-
         // Collect all entries from buffer chain
         // We know there are NUM_ENTRIES entries starting at row 2 of root buffer
         const entries: Array<{
@@ -588,7 +581,7 @@ describe('Buffer Overflow and Capacity Management', () => {
           bufferNum++;
           // Skip rows 0-1 (tag and result rows) in root buffer only
           const startRow = bufferNum === 1 ? 2 : 0;
-          const endRow = currentBuffer.capacity;
+          const endRow = currentBuffer._capacity;
 
           for (let row = startRow; row < endRow && entriesCollected < NUM_ENTRIES; row++) {
             entries.push({
@@ -622,7 +615,6 @@ describe('Buffer Overflow and Capacity Management', () => {
         expect(result.value.entriesWritten).toBe(128);
 
         // Verify each entry has correct attributes
-        const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
         for (let i = 0; i < 128; i++) {
           const entry = result.value.entries[i];
           expect(entry.requestId).toBe(`req-${i}`);

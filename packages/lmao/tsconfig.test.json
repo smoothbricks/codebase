@@ -8,7 +8,7 @@
   "include": ["src/**/*.test.ts", "src/**/__tests__/*.ts"],
   "references": [
     {
-      "path": "../lmao/tsconfig.lib.json"
+      "path": "../arrow-builder/tsconfig.lib.json"
     },
     {
       "path": "./tsconfig.lib.json"

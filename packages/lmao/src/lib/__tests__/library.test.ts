@@ -102,7 +102,7 @@ describe('prefixSchema', () => {
   describe('failure cases', () => {
     it('should handle schema with undefined fields gracefully', () => {
       const schema: TagAttributeSchema = {
-        validField: { __schema_type: 'text' },
+        validField: S.text(),
         undefinedField: undefined as any,
       };
 
@@ -126,7 +126,7 @@ describe('prefixSchema', () => {
 
     it('should handle special characters in prefix', () => {
       const schema: TagAttributeSchema = {
-        field: { __schema_type: 'text' },
+        field: S.text(),
       };
 
       const prefixed = prefixSchema(schema, 'prefix-with-dashes');
@@ -273,9 +273,9 @@ describe('createLibraryModule', () => {
       expect(module).toBeDefined();
     });
 
-    it('should handle schema with invalid field types', () => {
+    it('should handle schema with various field types', () => {
       const schema = defineTagAttributes({
-        field: { __schema_type: 'invalid' as any },
+        field: S.text(),
       });
 
       expect(() => {

@@ -239,7 +239,9 @@ const schemaBuilderImpl: SchemaBuilder = {
    * UTF-8 bytes are pre-computed at schema definition time (cold path) so
    * Arrow conversion just copies the pre-built dictionary data (zero re-encoding).
    */
-  enum: <T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]> => {
+  enum: <T extends readonly string[]>(
+    values: T,
+  ): SchemaOrFlagBuilder<T[number]> & EnumSchemaWithMetadata<T[number]> => {
     if (values.length === 0) {
       throw new Error('Enum must have at least one value');
     }
@@ -281,7 +283,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    * Hot path write:
    * buffer.attr_userId[idx] = internString(userId); // Returns Uint32 index
    */
-  category: (): SchemaOrFlagBuilder<string> => {
+  category: (): SchemaOrFlagBuilder<string> & CategorySchemaWithMetadata => {
     // IMPORTANT: Use Object.create to clone with prototype chain intact
     // This avoids mutating the shared Sury.string singleton while preserving
     // the prototype methods needed for Sury.union() and other schema operations
@@ -309,7 +311,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    * Hot path write:
    * buffer.attr_errorMsg[idx] = rawString; // No interning
    */
-  text: (): SchemaOrFlagBuilder<string> => {
+  text: (): SchemaOrFlagBuilder<string> & TextSchemaWithMetadata => {
     // IMPORTANT: Use Object.create to clone with prototype chain intact
     // This avoids mutating the shared Sury.string singleton while preserving
     // the prototype methods needed for Sury.union() and other schema operations

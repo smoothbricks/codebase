@@ -19,7 +19,6 @@ import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 import type { TagAttributeSchema } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import type { SpanBuffer } from '../types.js';
 import { createTestTaskContext } from './test-helpers.js';
 
 // Test schema
@@ -400,9 +399,6 @@ describe('FluentResult Type Compatibility', () => {
  */
 describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 after task begins', async () => {
-    // Track the buffer via a captured reference
-    const capturedBuffer: SpanBuffer | null = null;
-
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
@@ -442,8 +438,6 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should have span-ok at row 1 after ctx.ok()', async () => {
-    const finalOperations: Uint8Array | null = null;
-
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
@@ -522,8 +516,6 @@ describe('Fixed Row Layout', () => {
       },
       tagAttributes: testSchema,
     });
-
-    const writeIndexAtStart = -1;
 
     const task = moduleCtx.task('test', async (ctx) => {
       // At this point, writeSpanStart has been called

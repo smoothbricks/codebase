@@ -37,24 +37,21 @@ export interface ColumnBuffer {
   _timestamps: BigInt64Array; // Nanosecond-precision timestamps since Unix epoch
   _operations: Uint8Array; // Operation type: tag, ok, err, etc.
 
-  // User attribute columns (generated from schema - NO prefix)
+  // User attribute columns are added dynamically at runtime via code generation
   // Each attribute has TWO properties:
   // - X_nulls: Uint8Array for null bitmap
   // - X_values: TypedArray OR string[] for actual values
   //
   // For category/text columns, values are stored as string[] on the hot path
   // For enum/number/boolean columns, values are stored in TypedArray
+
+  // Index signatures for dynamic column properties created at runtime
   [key: `${string}_nulls`]: Uint8Array;
-  [key: `${string}_values`]: ColumnValueType;
+  [key: `${string}_values`]: Uint8Array | Uint16Array | Uint32Array | Float64Array | string[];
 
   // Buffer management - prefixed with _ to avoid collision with user columns
   _capacity: number; // Logical capacity for bounds checking
   _next?: ColumnBuffer; // Chain to next buffer when overflow
-
-  // Generated column setter methods
-  // Each schema field gets a setter: buffer.fieldName(position, value) => this
-  // These are generated at runtime by columnBufferGenerator.ts
-  [key: string]: unknown;
 }
 
 /**

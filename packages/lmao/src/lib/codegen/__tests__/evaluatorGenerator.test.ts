@@ -1,5 +1,4 @@
 import { describe, expect, test } from 'bun:test';
-import type { Microseconds } from '@smoothbricks/arrow-builder';
 import { S } from '../../schema/builder.js';
 import { defineFeatureFlags, type EvaluationContext } from '../../schema/defineFeatureFlags.js';
 import { type BooleanFlagContext, type FlagValue, InMemoryFlagEvaluator } from '../../schema/evaluator.js';
@@ -13,7 +12,7 @@ const mockValidateFlagValue = <T>(value: unknown, _schema: unknown, defaultValue
   return value as T;
 };
 
-const mockGetTimestampMicros = (anchor: Microseconds, _perfNow: Microseconds): Microseconds => anchor;
+const mockGetTimestampNanos = (): bigint => BigInt(Date.now()) * 1_000_000n;
 
 const MOCK_FF_ACCESS = 7;
 const MOCK_FF_USAGE = 8;
@@ -79,7 +78,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -92,8 +91,7 @@ describe('EvaluatorGenerator', () => {
         evaluationContext: { userId: 'test' },
         evaluator,
         buffer: null,
-        anchorEpochMicros: 0 as Microseconds,
-        anchorPerfNow: 0 as Microseconds,
+
         accessedFlags: new Set(),
         flagCache: new Map(),
       };
@@ -110,7 +108,7 @@ describe('EvaluatorGenerator', () => {
       const Class1 = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -118,7 +116,7 @@ describe('EvaluatorGenerator', () => {
       const Class2 = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -139,7 +137,7 @@ describe('EvaluatorGenerator', () => {
       const Class1 = createEvaluatorClass(
         schema1.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -147,7 +145,7 @@ describe('EvaluatorGenerator', () => {
       const Class2 = createEvaluatorClass(
         schema2.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -166,7 +164,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -177,8 +175,7 @@ describe('EvaluatorGenerator', () => {
         evaluationContext: { userId: 'test' },
         evaluator,
         buffer: null,
-        anchorEpochMicros: 0 as Microseconds,
-        anchorPerfNow: 0 as Microseconds,
+
         accessedFlags: new Set(),
         flagCache: new Map(),
       };
@@ -201,7 +198,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -212,8 +209,7 @@ describe('EvaluatorGenerator', () => {
         evaluationContext: { userId: 'test' },
         evaluator,
         buffer: null,
-        anchorEpochMicros: 0 as Microseconds,
-        anchorPerfNow: 0 as Microseconds,
+
         accessedFlags: new Set(),
         flagCache: new Map(),
       };
@@ -232,7 +228,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -243,8 +239,7 @@ describe('EvaluatorGenerator', () => {
         evaluationContext: { userId: 'user-123' },
         evaluator,
         buffer: null,
-        anchorEpochMicros: 0 as Microseconds,
-        anchorPerfNow: 0 as Microseconds,
+
         accessedFlags: new Set(),
         flagCache: new Map(),
       };
@@ -273,7 +268,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -283,8 +278,7 @@ describe('EvaluatorGenerator', () => {
         evaluationContext: { userId: 'test' },
         evaluator: trackingEvaluator,
         buffer: null,
-        anchorEpochMicros: 0 as Microseconds,
-        anchorPerfNow: 0 as Microseconds,
+
         accessedFlags: new Set(),
         flagCache: new Map(),
       };
@@ -308,7 +302,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -319,8 +313,7 @@ describe('EvaluatorGenerator', () => {
         evaluationContext: { userId: 'test' },
         evaluator,
         buffer: null,
-        anchorEpochMicros: 0 as Microseconds,
-        anchorPerfNow: 0 as Microseconds,
+
         accessedFlags: new Set(),
         flagCache: new Map(),
       };
@@ -351,7 +344,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -362,8 +355,7 @@ describe('EvaluatorGenerator', () => {
         evaluationContext: { userId: 'test' },
         evaluator,
         buffer: null,
-        anchorEpochMicros: 0 as Microseconds,
-        anchorPerfNow: 0 as Microseconds,
+
         columnWriters: mockWriters,
         accessedFlags: new Set(),
         flagCache: new Map(),
@@ -389,7 +381,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );
@@ -402,8 +394,7 @@ describe('EvaluatorGenerator', () => {
           evaluationContext: { userId: 'test' },
           evaluator,
           buffer: null,
-          anchorEpochMicros: 0 as Microseconds,
-          anchorPerfNow: 0 as Microseconds,
+
           accessedFlags: new Set(),
           flagCache: new Map(),
         };
@@ -432,7 +423,7 @@ describe('EvaluatorGenerator', () => {
       const GeneratedClass = createEvaluatorClass(
         schema.schema,
         mockValidateFlagValue,
-        mockGetTimestampMicros,
+        mockGetTimestampNanos,
         MOCK_FF_ACCESS,
         MOCK_FF_USAGE,
       );

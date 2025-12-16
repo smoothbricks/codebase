@@ -18,6 +18,7 @@ import { convertToArrowTable } from '../../convertToArrow.js';
 import { S } from '../../schema/builder.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
+import { createTraceId } from '../../traceId.js';
 import type { SpanBuffer, TaskContext } from '../../types.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
@@ -187,7 +188,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = [1.5, 2.5, 3.5, Number.NaN, 5.5];
       for (const value of testValues) {
@@ -222,7 +223,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = [true, false, true, false, true, false, true, false, true];
       for (const value of testValues) {
@@ -247,7 +248,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Write enum indices
       const testIndices = [0, 2, 1, 0, 2];
@@ -274,7 +275,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = ['user-123', 'user-456', 'user-789', 'user-123', 'user-456'];
       for (const userId of testValues) {
@@ -299,7 +300,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = ['First message', 'Second message', 'Third message', 'Second message', 'First message'];
       for (const value of testValues) {
@@ -324,7 +325,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = [1.0, null, 3.0, null, 5.0];
       for (const value of testValues) {
@@ -353,7 +354,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testData = [
         { count: 42, active: true, status: 0, userId: 'user-123', message: 'First message' },
@@ -401,7 +402,7 @@ describe('Arrow IPC Round-Trip', () => {
       const schema: TagAttributeSchema = {};
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Write a few rows with timestamps (BigInt64Array stores nanoseconds)
       const timestamps = [1000n, 1100n, 1200n];
@@ -444,7 +445,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
       writeRow(buffer, { timestamp: 1000n, operation: 1 });
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -474,7 +475,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
       writeRow(buffer, {
         timestamp: 1000n,
         operation: 1,
@@ -503,7 +504,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Write pattern: valid, null, valid, null, valid, null, valid, null
       const values = [1.0, null, 2.0, null, 3.0, null, 4.0, null];
@@ -538,7 +539,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Only one null in 10 values
       const values = [1, 2, 3, null, 5, 6, 7, 8, 9, 10];
@@ -570,7 +571,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // No nulls - write all valid values and set null bits
       const values = [1, 2, 3, 4, 5];
@@ -601,7 +602,7 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = ['alpha', 'beta', 'zebra', 'alpha', 'beta'];
       for (const category of testValues) {
@@ -627,7 +628,7 @@ describe('Arrow IPC Round-Trip', () => {
 
       const taskContext = createMockTaskContext(schema);
       // Use capacity of 128 to hold 100 rows without overflow
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123', 128);
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 128);
 
       // Write same value many times
       const testValue = 'user-repeated';

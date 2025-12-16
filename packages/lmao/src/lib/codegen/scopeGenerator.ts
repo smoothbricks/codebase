@@ -29,6 +29,7 @@ import { getSchemaFields } from '../schema/types.js';
  */
 export interface GeneratedScope {
   _getScopeValues(): Record<string, unknown>;
+  // Index signature for dynamically generated scope properties
   [key: string]: unknown;
 }
 

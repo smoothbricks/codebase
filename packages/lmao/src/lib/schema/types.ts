@@ -8,29 +8,53 @@
  * - Standard Schema spec compliance
  */
 
+import type { TagAttributeSchema } from '@smoothbricks/arrow-builder';
 import type * as Sury from '@sury/sury';
 
+// Re-export TagAttributeSchema from arrow-builder (single source of truth)
+export type { TagAttributeSchema } from '@smoothbricks/arrow-builder';
 // Re-export Sury's core types for external use
 export type { Input, Output, Schema } from '@sury/sury';
 
+// Import the brand symbol from defineTagAttributes for ExtractOriginalSchema detection
+import type { DEFINED_TAG_ATTRIBUTES_BRAND } from './defineTagAttributes.js';
+
 /**
- * Tag attribute schema - maps field names to Sury schemas
- *
- * Example:
- * {
- *   userId: S.category(),
- *   requestId: S.category(),
- *   duration: S.number(),
- *   operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE'])
- * }
+ * Extract the original schema type from DefinedTagAttributes.
+ * If T has the brand marker, extract the original schema from it.
+ * Otherwise, return T unchanged.
  */
-export type TagAttributeSchema = Record<string, Sury.Schema<unknown, unknown>>;
+type ExtractOriginalSchema<T extends TagAttributeSchema> = T extends {
+  readonly [DEFINED_TAG_ATTRIBUTES_BRAND]?: infer Original extends TagAttributeSchema;
+}
+  ? Original
+  : T;
+
+/**
+ * Filter out function keys from a schema type.
+ * Methods like validate, parse, safeParse, extend are added by defineTagAttributes
+ * but should not be treated as schema fields.
+ *
+ * Works on the ORIGINAL schema (without index signature pollution).
+ */
+type SchemaFieldKeys<T extends TagAttributeSchema> = keyof ExtractOriginalSchema<T> extends infer K
+  ? K extends string
+    ? string extends K // Exclude index signature (where K is exactly `string`)
+      ? never
+      : ExtractOriginalSchema<T>[K] extends (...args: unknown[]) => unknown // Exclude functions
+        ? never
+        : K
+    : never
+  : never;
 
 /**
  * Extract TypeScript output types from tag attribute schema
  * This enables full type inference from Sury schemas
  *
  * IMPORTANT: This type must properly infer from schemas with __lmao_type metadata
+ *
+ * For DefinedTagAttributes, uses the brand marker to extract the original schema
+ * type before the index signature was added, preserving type inference.
  *
  * Type resolution order:
  * 1. Check if it's an enum schema → extract enum type
@@ -39,19 +63,21 @@ export type TagAttributeSchema = Record<string, Sury.Schema<unknown, unknown>>;
  * 4. Check if it's a number schema → number
  * 5. Check if it's a boolean schema → boolean
  * 6. Fall back to Sury.Output<T[K]>
+ *
+ * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
 export type InferTagAttributes<T extends TagAttributeSchema> = {
-  [K in keyof T]: T[K] extends EnumSchemaWithMetadata<infer E>
+  [K in SchemaFieldKeys<T>]: ExtractOriginalSchema<T>[K] extends EnumSchemaWithMetadata<infer E>
     ? E
-    : T[K] extends CategorySchemaWithMetadata
+    : ExtractOriginalSchema<T>[K] extends CategorySchemaWithMetadata
       ? string
-      : T[K] extends TextSchemaWithMetadata
+      : ExtractOriginalSchema<T>[K] extends TextSchemaWithMetadata
         ? string
-        : T[K] extends NumberSchemaWithMetadata
+        : ExtractOriginalSchema<T>[K] extends NumberSchemaWithMetadata
           ? number
-          : T[K] extends BooleanSchemaWithMetadata
+          : ExtractOriginalSchema<T>[K] extends BooleanSchemaWithMetadata
             ? boolean
-            : T[K] extends Sury.Schema<infer Out, unknown>
+            : ExtractOriginalSchema<T>[K] extends Sury.Schema<infer Out, unknown>
               ? Out
               : never;
 };
@@ -59,9 +85,11 @@ export type InferTagAttributes<T extends TagAttributeSchema> = {
 /**
  * Extract TypeScript input types from tag attribute schema
  * Used for validation before transformation
+ *
+ * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
 export type InferTagAttributesInput<T extends TagAttributeSchema> = {
-  [K in keyof T]: Sury.Input<T[K]>;
+  [K in SchemaFieldKeys<T>]: T[K] extends Sury.Schema<unknown, infer In> ? In : never;
 };
 
 /**

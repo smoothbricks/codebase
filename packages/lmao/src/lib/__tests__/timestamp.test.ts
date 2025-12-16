@@ -47,7 +47,7 @@ describe('ES Timestamp (performance.now)', () => {
     it('should export fromMillis()', () => {
       const ms = 1000;
       const ns = Nanoseconds.fromMillis(ms);
-      expect(ns).toBe(1_000_000_000n);
+      expect(ns).toBe(Nanoseconds.unsafe(1_000_000_000n));
     });
 
     it('should export toMillis()', () => {
@@ -59,7 +59,7 @@ describe('ES Timestamp (performance.now)', () => {
     it('should export unsafe()', () => {
       const raw = 123456789n;
       const ns = Nanoseconds.unsafe(raw);
-      expect(ns).toBe(raw);
+      expect(ns).toBe(Nanoseconds.unsafe(raw));
     });
   });
 });

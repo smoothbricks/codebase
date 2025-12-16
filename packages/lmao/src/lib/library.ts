@@ -86,14 +86,6 @@ export function prefixSchema<T extends TagAttributeSchema>(schema: T, prefix: st
 }
 
 /**
- * Extract schema fields from extended schema
- * Removes validation methods added by defineTagAttributes
- */
-type ExtractSchemaFields<T> = {
-  [K in keyof T as T[K] extends Function ? never : K]: T[K];
-};
-
-/**
  * Prefix mapping: maps clean names to prefixed column names
  *
  * WHY: Library authors write ctx.tag.status() but buffer column is attr_http_status
@@ -580,10 +572,9 @@ export function createLibraryModule<
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema = FeatureFlagSchema,
   Env = Record<string, unknown>,
-  SchemaFields = ExtractSchemaFields<T>,
-  Ops extends Record<string, LibraryOperation<any[], any, TagAttributeSchema, FF, Env>> = Record<
+  Ops extends Record<string, LibraryOperation<any[], any, T, FF, Env>> = Record<
     string,
-    LibraryOperation<any[], any, TagAttributeSchema, FF, Env>
+    LibraryOperation<any[], any, T, FF, Env>
   >,
 >(options: {
   gitSha: string;
@@ -591,16 +582,16 @@ export function createLibraryModule<
   moduleName?: string;
   schema: T;
   operations?: Ops;
-}): LibraryModule<SchemaFields & TagAttributeSchema, FF, Env, Ops> {
+}): LibraryModule<T, FF, Env, Ops> {
   // Extract just the schema fields (without validation methods)
   const schemaFields = getSchemaFields(options.schema);
-  const cleanSchema: TagAttributeSchema = {};
+  const cleanSchema = {} as T;
   for (const [fieldName, fieldSchema] of schemaFields) {
-    cleanSchema[fieldName] = fieldSchema;
+    (cleanSchema as Record<string, unknown>)[fieldName] = fieldSchema;
   }
 
   // Create module context with clean schema (no prefix yet)
-  const moduleContext = createModuleContext<typeof cleanSchema, SchemaFields & TagAttributeSchema, FF, Env>({
+  const moduleContext = createModuleContext<T, FF, Env>({
     moduleMetadata: {
       gitSha: options.gitSha,
       filePath: options.filePath,
@@ -610,7 +601,7 @@ export function createLibraryModule<
   });
 
   return {
-    schema: cleanSchema as SchemaFields & TagAttributeSchema,
+    schema: cleanSchema,
     operations: (options.operations || {}) as Ops,
     task: moduleContext.task,
   };
@@ -682,13 +673,15 @@ function createRemappedScopeFunction<T extends TagAttributeSchema>(
   originalScope: SpanContext<TagAttributeSchema, FeatureFlagSchema>['scope'],
   prefixMapping: PrefixMapping,
 ): SpanContext<T, FeatureFlagSchema>['scope'] {
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Type erasure at runtime boundary
   return (attributes: Record<string, unknown>) => {
     const remappedAttributes: Record<string, unknown> = {};
     for (const [key, value] of Object.entries(attributes)) {
       const prefixedKey = prefixMapping[key] || key;
       remappedAttributes[prefixedKey] = value;
     }
-    originalScope(remappedAttributes as Partial<Record<string, unknown>>);
+    // Type assertion needed because we're remapping between different schema types at runtime
+    (originalScope as (attrs: Record<string, unknown>) => void)(remappedAttributes);
   };
 }
 
@@ -807,7 +800,9 @@ export function moduleContextFactory<
   }
 
   return {
-    task: wrappedTask,
+    // Type assertion needed because wrappedTask uses T (library schema) but return type uses TagAttributeSchema
+    // This is intentional type erasure at the runtime boundary
+    task: wrappedTask as ModuleContextBuilder<TagAttributeSchema, FF, Env>['task'],
     operations: wrappedOperations,
     cleanSchema: schema,
     prefixMapping,

@@ -13,6 +13,7 @@ import { beforeEach, describe, expect, test } from 'bun:test';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
+import { createTraceId } from '../../traceId.js';
 import type { SpanBuffer, TaskContext } from '../../types.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
@@ -152,7 +153,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Intern module and span names
       moduleIdInterner.intern('test-file.ts');
@@ -174,7 +175,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Intern required strings
       moduleIdInterner.intern('test-file.ts');
@@ -222,7 +223,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -258,7 +259,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -300,7 +301,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -335,7 +336,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -377,7 +378,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -419,7 +420,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -463,7 +464,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -515,7 +516,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -567,7 +568,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const parentBuffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const parentBuffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('parent-span');
@@ -644,7 +645,7 @@ describe('Arrow Table Conversion', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const root = createSpanBuffer(schema, taskContext, 'trace-123');
+      const root = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('span');
@@ -692,7 +693,7 @@ describe('Arrow Table Conversion', () => {
     test('maps all entry type codes correctly', () => {
       const schema: TagAttributeSchema = {};
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
@@ -733,7 +734,7 @@ describe('Arrow Table Conversion', () => {
     test('maintains traceId across all spans', () => {
       const schema: TagAttributeSchema = {};
       const taskContext = createMockTaskContext(schema);
-      const traceId = 'trace-xyz-789';
+      const traceId = createTraceId('trace-xyz-789');
       const buffer = createSpanBuffer(schema, taskContext, traceId);
 
       moduleIdInterner.intern('test-file.ts');

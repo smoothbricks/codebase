@@ -2,11 +2,12 @@
  * Debug dictionary encoding issue
  */
 import { describe, expect, it } from 'bun:test';
-import * as arrow from 'apache-arrow';
+
 import { convertToArrowTable } from '../convertToArrow.js';
 import { S } from '../schema/builder.js';
 import type { TagAttributeSchema } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
+import { createTraceId } from '../traceId.js';
 import type { SpanBuffer, TaskContext } from '../types.js';
 import { createTestTaskContext } from './test-helpers.js';
 
@@ -119,7 +120,7 @@ describe('Debug Dictionary', () => {
     };
 
     const taskContext = createMockTaskContext(schema);
-    const buffer = createSpanBuffer(schema, taskContext, 'trace-123');
+    const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
     // Write test data (raw strings - no interning on hot path)
     writeRow(buffer, {

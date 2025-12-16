@@ -66,7 +66,7 @@ describe('Buffer Foundation', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
 
-    const buf = createSpanBuffer(schema, taskContext, 'trace-999');
+    const buf = createSpanBuffer(schema, taskContext, createTraceId('trace-999'));
 
     expect(buf.spanId).toBeGreaterThan(0);
     expect(buf.hasParent).toBe(false);
@@ -80,7 +80,7 @@ describe('Buffer Foundation', () => {
 
     const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
 
-    createSpanBuffer(schema, taskContext, 'trace-456', 64);
+    createSpanBuffer(schema, taskContext, createTraceId('trace-456'), 64);
 
     expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
   });
@@ -103,7 +103,7 @@ describe('Buffer Foundation', () => {
     const moduleContext = new ModuleContext(2, 'abc123', 'test.ts', tagAttributes);
     const taskContext = new TaskContext(moduleContext, 1, 10);
 
-    const buf = createSpanBuffer(tagAttributes, taskContext, 'trace-789', 64);
+    const buf = createSpanBuffer(tagAttributes, taskContext, createTraceId('trace-789'), 64);
 
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them

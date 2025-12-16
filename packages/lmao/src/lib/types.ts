@@ -50,6 +50,11 @@ export { TaskContext } from './taskContext.js';
  * This makes isParentOf/isChildOf O(1) pointer comparisons.
  */
 export interface SpanBuffer extends ColumnBuffer {
+  // Index signature for dynamically generated attribute columns
+  // Each attribute has X_nulls (Uint8Array) and X_values (TypedArray | string[])
+  [key: `${string}_nulls`]: Uint8Array;
+  [key: `${string}_values`]: Uint8Array | Uint16Array | Uint32Array | Float64Array | string[];
+
   // ============================================================================
   // Unified System ArrayBuffer
   // ============================================================================

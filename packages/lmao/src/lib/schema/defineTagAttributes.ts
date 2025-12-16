@@ -8,10 +8,17 @@
  * - Extension composition
  */
 
+import { getSchemaFields } from '@smoothbricks/arrow-builder';
 import * as S from '@sury/sury';
 import type { ExtendedSchema } from './extend.js';
 import { createExtendedSchema } from './extend.js';
 import type { InferTagAttributes, TagAttributeSchema } from './types.js';
+
+/**
+ * Brand symbol for DefinedTagAttributes - used to detect this type in conditionals.
+ * Must be exported so types.ts can import it for ExtractOriginalSchema.
+ */
+export declare const DEFINED_TAG_ATTRIBUTES_BRAND: unique symbol;
 
 /**
  * Reserved method names that cannot be used as attribute names
@@ -85,11 +92,30 @@ export function validateAttributeNames(schema: TagAttributeSchema): void {
  * @param schema - Object mapping field names to Sury schemas
  * @returns Extended schema with validation and extension methods
  */
+
+/**
+ * DefinedTagAttributes type - result of defineTagAttributes()
+ *
+ * Includes:
+ * - All original schema fields (T)
+ * - Extension methods (extend)
+ * - Validation methods (validate, parse, safeParse)
+ * - Index signature for TagAttributeSchema compatibility
+ * - Brand marker for type detection in InferTagAttributes
+ *
+ * The brand marker allows InferTagAttributes to detect when it receives a
+ * DefinedTagAttributes and extract the original schema type T for inference.
+ */
 export type DefinedTagAttributes<T extends TagAttributeSchema> = T &
   ExtendedSchema<T> & {
     validate: (data: unknown) => InferTagAttributes<T>;
     parse: (data: unknown) => InferTagAttributes<T> | null;
     safeParse: (data: unknown) => { success: true; value: InferTagAttributes<T> } | { success: false; error: Error };
+    /** Brand marker - never actually set, only for type discrimination */
+    readonly [DEFINED_TAG_ATTRIBUTES_BRAND]?: T;
+  } & {
+    // Index signature for assignability to TagAttributeSchema
+    [key: string]: import('@sury/sury').Schema<unknown, unknown> | ((...args: unknown[]) => unknown);
   };
 
 export function defineTagAttributes<T extends TagAttributeSchema>(schema: T): DefinedTagAttributes<T> {
@@ -97,9 +123,10 @@ export function defineTagAttributes<T extends TagAttributeSchema>(schema: T): De
   validateAttributeNames(schema);
 
   // Convert to Sury object schema for validation using builder pattern
+  // Use getSchemaFields to filter out methods (validate, parse, etc.)
   const objectSchema = S.object((s) => {
     const output: Record<string, unknown> = {};
-    for (const [key, surySchema] of Object.entries(schema)) {
+    for (const [key, surySchema] of getSchemaFields(schema)) {
       output[key] = s.field(key, surySchema);
     }
     return output as InferTagAttributes<T>;

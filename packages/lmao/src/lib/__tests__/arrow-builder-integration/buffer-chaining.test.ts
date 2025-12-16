@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
 import { createNextBuffer, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
-import type { SpanBuffer, TaskContext } from '../../types.js';
+import type { TaskContext } from '../../types.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
 /**
@@ -147,7 +147,7 @@ describe('Buffer Chaining', () => {
 
   describe('Buffer Chaining Edge Cases', () => {
     it('should handle buffer at exact capacity', () => {
-      const buffer = createSpanBuffer(schema, taskContext, 10);
+      const buffer = createSpanBuffer(schema, taskContext, undefined, 10);
       buffer.writeIndex = 10; // At exact capacity
 
       const nextBuffer = createNextBuffer(buffer);

@@ -17,7 +17,7 @@ import { createTestTaskContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
-import { createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
+import { createSpanBuffer } from '../../spanBuffer.js';
 import type { SpanBuffer } from '../../types.js';
 import { createScope } from '../scopeGenerator.js';
 import { createSpanLoggerClass } from '../spanLoggerGenerator.js';

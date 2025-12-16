@@ -1,31 +1,22 @@
 {
-  "name": "@smoothbricks/arrow-builder",
+  "name": "@smoothbricks/lmao",
   "$schema": "../../node_modules/nx/schemas/project-schema.json",
-  "sourceRoot": "packages/arrow-builder/src",
+  "sourceRoot": "packages/lmao/src",
   "projectType": "library",
   "targets": {
-    "build": {
-      "executor": "nx:run-commands",
-      "options": {
-        "command": "tsc --build tsconfig.lib.json",
-        "cwd": "packages/arrow-builder"
-      },
-      "outputs": ["{projectRoot}/dist"],
-      "dependsOn": []
-    },
     "typecheck-tests": {
       "executor": "nx:run-commands",
       "options": {
         "command": "tsc --noEmit -p tsconfig.test.json",
-        "cwd": "packages/arrow-builder"
+        "cwd": "packages/lmao"
       },
-      "dependsOn": ["build"]
+      "dependsOn": ["build", "^build"]
     },
     "test": {
       "executor": "nx:run-commands",
       "options": {
         "command": "bun test",
-        "cwd": "packages/arrow-builder"
+        "cwd": "packages/lmao"
       },
       "dependsOn": ["typecheck-tests"]
     }

@@ -17,7 +17,7 @@
  * 3. Return `this` for chaining: `writer.nextRow().userId("123").status("ok")`
  */
 
-import type { SchemaWithMetadata, TagAttributeSchema } from '../schema-types.js';
+import { getSchemaFields, type SchemaWithMetadata, type TagAttributeSchema } from '../schema-types.js';
 import type { ColumnBuffer } from './types.js';
 
 /**
@@ -90,14 +90,26 @@ export interface ColumnWriterExtension {
 }
 
 /**
- * Base ColumnWriter interface - the runtime shape of generated writer classes
+ * ColumnWriter with schema-specific fluent setter methods.
+ *
+ * Each schema field gets a setter method that:
+ * 1. Writes the value at _writeIndex
+ * 2. Returns `this` for fluent chaining
+ *
+ * @example
+ * ```typescript
+ * const writer: ColumnWriter<{ userId: S.category(), count: S.number() }>;
+ * writer.nextRow().userId("u123").count(42);
+ * ```
  */
-export interface ColumnWriter {
+export type ColumnWriter<T extends TagAttributeSchema = TagAttributeSchema> = {
   _buffer: ColumnBuffer;
   _writeIndex: number;
-  nextRow(): this;
+  nextRow(): ColumnWriter<T>;
   _getNextBuffer(): ColumnBuffer;
-}
+} & {
+  [K in keyof T as K extends string ? K : never]: (value: import('@sury/sury').Output<T[K]>) => ColumnWriter<T>;
+};
 
 /**
  * Get the setter method body for a schema field type
@@ -145,7 +157,8 @@ export function generateColumnWriterClass(
   className = 'GeneratedColumnWriter',
   extension?: ColumnWriterExtension,
 ): string {
-  const schemaFields = Object.keys(schema);
+  // Use getSchemaFields to filter out methods (validate, parse, etc.)
+  const schemaFields = getSchemaFields(schema).map(([name]) => name);
 
   // Generate setter methods for each schema field
   const setterMethods: string[] = [];

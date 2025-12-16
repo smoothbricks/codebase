@@ -534,16 +534,11 @@ export interface FluentLogEntry {
  * ctx.log.warn('Slow operation');
  * ```
  */
-export interface SpanLogger<T extends TagAttributeSchema> extends BaseSpanLogger<T> {
-  // BaseSpanLogger provides:
-  // - info(message: string): this
-  // - debug(message: string): this
-  // - warn(message: string): this
-  // - error(message: string): this
-  // - _getScope(): GeneratedScope
-  // - _setScope(attributes): void
-  // Plus fluent attribute setters from ColumnWriter
-}
+/**
+ * SpanLogger type - just an alias for BaseSpanLogger which already includes
+ * schema-specific setter methods via ColumnWriter<T>.
+ */
+export type SpanLogger<T extends TagAttributeSchema> = BaseSpanLogger<T>;
 
 /**
  * Fluent span builder that supports .line() chaining
@@ -1183,29 +1178,6 @@ function createSpanLoggerWithScope<T extends TagAttributeSchema>(
 }
 
 /**
- * Extract just the schema fields from an object, removing methods
- * This allows us to accept objects with additional methods like validate, extend, etc.
- *
- * This type recursively picks all properties that are not functions from intersections
- *
- * IMPORTANT: This must properly filter out methods added by defineTagAttributes like:
- * - validate
- * - parse
- * - safeParse
- * - extend
- */
-type ExtractSchemaFields<T> = {
-  [K in keyof T as T[K] extends Function ? never : K]: T[K];
-};
-
-/**
- * Type predicate to check if extracted fields match TagAttributeSchema
- */
-type IsValidTagSchema<T> = ExtractSchemaFields<T> extends TagAttributeSchema
-  ? ExtractSchemaFields<T>
-  : TagAttributeSchema;
-
-/**
  * Creates a module context with typed tag attributes and task wrappers.
  *
  * This is the primary entry point for instrumenting application modules.
@@ -1275,8 +1247,7 @@ type IsValidTagSchema<T> = ExtractSchemaFields<T> extends TagAttributeSchema
  * @see {@link SpanContext} - Context provided to task functions
  */
 export function createModuleContext<
-  TInput,
-  T extends TagAttributeSchema = IsValidTagSchema<TInput>,
+  T extends TagAttributeSchema,
   FF extends FeatureFlagSchema = FeatureFlagSchema,
   Env = Record<string, unknown>,
 >(options: {
@@ -1285,7 +1256,7 @@ export function createModuleContext<
     filePath: string;
     moduleName: string;
   };
-  tagAttributes: TInput;
+  tagAttributes: T;
 }): ModuleContextBuilder<T, FF, Env> {
   const { moduleMetadata, tagAttributes } = options;
 

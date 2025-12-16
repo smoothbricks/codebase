@@ -11,7 +11,7 @@
  */
 
 import type * as Sury from '@sury/sury';
-import type { SchemaWithMetadata, TagAttributeSchema } from '../schema-types.js';
+import { getSchemaFields, type SchemaWithMetadata, type TagAttributeSchema } from '../schema-types.js';
 import type { TypedArray, TypedArrayConstructor } from './types.js';
 
 /**
@@ -23,7 +23,8 @@ import type { TypedArray, TypedArrayConstructor } from './types.js';
 export function createAttributeColumns(schema: TagAttributeSchema, capacity = 64): Record<string, TypedArray> {
   const columns: Record<string, TypedArray> = {};
 
-  for (const [fieldName, surySchema] of Object.entries(schema)) {
+  // Use getSchemaFields to filter out methods (validate, parse, etc.)
+  for (const [fieldName, surySchema] of getSchemaFields(schema)) {
     // User columns have no prefix
     columns[fieldName] = createTypedArrayForSchema(surySchema, capacity);
   }

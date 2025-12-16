@@ -48,7 +48,7 @@ describe('Buffer Integration', () => {
 
     const taskContext = createTestTaskContext(tagAttributes);
     const capacity = 64;
-    const buf = createSpanBuffer(tagAttributes, taskContext, capacity);
+    const buf = createSpanBuffer(tagAttributes, taskContext, undefined, capacity);
 
     // Core TypedArrays exist
     expect(buf.timestamps).toBeInstanceOf(BigInt64Array);

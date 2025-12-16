@@ -15,7 +15,7 @@
  * - Cache alignment: ArrayBuffers aligned to 64-byte boundaries
  */
 
-import type { TagAttributeSchema } from '../schema-types.js';
+import { getSchemaFields, type TagAttributeSchema } from '../schema-types.js';
 import { bufferHelpers } from './bufferHelpers.js';
 import type { ColumnBuffer } from './types.js';
 
@@ -233,7 +233,8 @@ export function generateColumnBufferClass(
   className = 'GeneratedColumnBuffer',
   extension?: ColumnBufferExtension,
 ): string {
-  const schemaFields = Object.keys(schema);
+  // Use getSchemaFields to filter out methods (validate, parse, etc.)
+  const schemaFields = getSchemaFields(schema).map(([name]) => name);
 
   // Generate constructor code for eager system columns
   const constructorCode: string[] = [];

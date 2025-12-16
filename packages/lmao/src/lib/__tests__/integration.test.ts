@@ -15,7 +15,6 @@ import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
-import type { TagAttributeSchema } from '../schema/types.js';
 
 describe('Schema Integration Patterns', () => {
   // Define tag attributes for DB operations
@@ -99,7 +98,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       expect(moduleContext).toBeDefined();
@@ -113,7 +112,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
@@ -178,7 +177,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/test.ts',
           moduleName: 'TestService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('test-with-chaining', async (ctx) => {
@@ -212,7 +211,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/order.ts',
           moduleName: 'OrderService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('process-order', async (ctx, orderId: string, amount: number) => {
@@ -252,7 +251,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
@@ -287,7 +286,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
@@ -314,7 +313,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const successTask = moduleContext.task('success-task', async (ctx) => {
@@ -348,7 +347,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('parent-task', async (ctx) => {
@@ -382,7 +381,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       // Track that child span has its own ff evaluator bound to child buffer
@@ -427,7 +426,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const testTask = moduleContext.task('test-task', async (ctx) => {
@@ -499,7 +498,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/order.ts',
           moduleName: 'OrderService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       const processOrder = moduleContext.task('process-order', async (ctx, orderId: string, amount: number) => {
@@ -538,7 +537,7 @@ describe('Schema Integration Patterns', () => {
           filePath: 'src/services/user.ts',
           moduleName: 'UserService',
         },
-        tagAttributes: dbAttributes as unknown as TagAttributeSchema,
+        tagAttributes: dbAttributes,
       });
 
       // Define task with extensive chaining
@@ -553,7 +552,11 @@ describe('Schema Integration Patterns', () => {
         }
 
         // Environment access and chained tags
-        ctx.tag.requestId(ctx.requestId).userId(userData.email).region(ctx.env.awsRegion).operation('INSERT');
+        ctx.tag
+          .requestId(ctx.requestId)
+          .userId(userData.email)
+          .region(ctx.env.awsRegion as string)
+          .operation('INSERT');
 
         // Child span with chaining - tag is on childCtx directly, not on childCtx.log
         const validation = await ctx.span('validate-user', async (childCtx) => {

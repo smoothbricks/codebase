@@ -33,27 +33,24 @@ const ENTRY_TYPE_WARN = 11;
 const ENTRY_TYPE_ERROR = 12;
 
 /**
- * Base SpanLogger interface with core methods.
- * Extends ColumnWriter with logging-specific methods.
+ * SpanLogger interface with logging methods and schema-specific attribute setters.
  *
- * Note: Tag writing (row 0) and attribute setters are NOT on SpanLogger -
- * those are on TagWriter. SpanLogger only handles log entries (rows 2+).
+ * Extends ColumnWriter<T> which provides:
+ * - _buffer, _writeIndex, nextRow(), _getNextBuffer()
+ * - Fluent setter methods for each schema field
+ *
+ * SpanLogger adds:
+ * - info/debug/warn/error logging methods
+ * - Scope management (_getScope, _setScope)
  */
-export interface BaseSpanLogger<T extends TagAttributeSchema> extends ColumnWriter {
-  // Logging methods - write entry at current position
-  info(message: string): this;
-  debug(message: string): this;
-  warn(message: string): this;
-  error(message: string): this;
-
-  // Scope management
+export type BaseSpanLogger<T extends TagAttributeSchema> = ColumnWriter<T> & {
+  info(message: string): BaseSpanLogger<T>;
+  debug(message: string): BaseSpanLogger<T>;
+  warn(message: string): BaseSpanLogger<T>;
+  error(message: string): BaseSpanLogger<T>;
   _getScope(): GeneratedScope;
-  /**
-   * Internal method to set scoped attributes. Called by ctx.scope().
-   * @internal
-   */
   _setScope(attributes: Partial<InferTagAttributes<T>>): void;
-}
+};
 
 /**
  * Generate enum value mapping code
