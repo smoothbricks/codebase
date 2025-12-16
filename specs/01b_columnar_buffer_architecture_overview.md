@@ -32,11 +32,12 @@ Problems:
 ### Our Approach: Direct Array Writes
 
 ```typescript
-// Write directly to typed arrays
-buffer.timestamps[writeIndex] = Date.now();
-buffer.operations[writeIndex] = OP_TAG;
-buffer.attr_userId[writeIndex] = internString('123');
-buffer.attr_action[writeIndex] = internString('login');
+// Write directly to typed arrays - NO interning on hot path
+buffer._timestamps[writeIndex] = Date.now();
+buffer._operations[writeIndex] = OP_TAG;
+buffer.userId[writeIndex] = '123'; // Raw string stored in string[]
+buffer.action[writeIndex] = 'login'; // Raw string stored in string[]
+// Dictionary building happens in cold path (Arrow conversion)
 ```
 
 Benefits:
@@ -44,7 +45,7 @@ Benefits:
 - **Zero allocations** - Reuse pre-allocated arrays
 - **Cache-friendly** - Sequential memory access
 - **Direct Arrow conversion** - Arrays become Arrow columns
-- **String interning** - Build dictionaries during logging
+- **Deferred dictionary building** - Heavy work happens in cold path
 - **Self-tuning** - Automatically adapts capacity
 
 ## System Architecture
@@ -66,8 +67,8 @@ Benefits:
 All TypedArrays maintain identical length:
 
 ```typescript
-(buffer.timestamps.length === buffer.operations.length) === buffer.attr_userId.length;
-// This enables direct row indexing and zero-copy Arrow conversion
+(buffer._timestamps.length === buffer._operations.length) === buffer.userId.length;
+// This enables direct row indexing and Arrow conversion
 ```
 
 ### 2. Cache Line Alignment
@@ -76,18 +77,21 @@ Arrays sized to 64-byte boundaries:
 
 ```typescript
 // 64 elements = optimal for all array types
-timestamps: new Float64Array(64),  // 64 × 8 = 512 bytes (8 cache lines)
+timestamps: new BigInt64Array(64),  // 64 × 8 = 512 bytes (8 cache lines)
 operations: new Uint8Array(64),    // 64 × 1 = 64 bytes (1 cache line)
 ```
 
-### 3. String Interning
+### 3. Deferred String Processing
 
-Build Arrow dictionaries while logging:
+Store raw strings on hot path, build Arrow dictionaries on cold path:
 
 ```typescript
-const internedStrings = ['user-123', 'login', 'dashboard']; // Pre-built dictionary
-buffer.attr_action[i] = 1; // Index into dictionary, not string
-// Direct Arrow Dictionary creation - no second scan needed!
+// HOT PATH: Just store raw strings (zero overhead)
+buffer.action[i] = 'login'; // Raw string reference
+
+// COLD PATH: Build sorted dictionary during Arrow conversion
+// Dictionary built per-flush, strings cleared after conversion
+// SIEVE cache helps with UTF-8 encoding across flushes
 ```
 
 ### 4. Self-Tuning Capacity
@@ -109,14 +113,14 @@ const buffer = createSpanBuffer(64);
 // Create a buffer - no size configuration needed
 const buffer = createSpanBuffer();
 
-// Hot path - just array writes
+// Hot path - just array writes (NO interning)
 function logUserAction(userId: string, action: string) {
-  const idx = buffer.writeIndex++;
+  const idx = buffer._writeIndex++;
 
-  buffer.timestamps[idx] = Date.now();
-  buffer.operations[idx] = OP_TAG;
-  buffer.attr_userId[idx] = internString(userId);
-  buffer.attr_action[idx] = internString(action);
+  buffer._timestamps[idx] = Date.now();
+  buffer._operations[idx] = OP_TAG;
+  buffer.userId[idx] = userId; // Raw string stored
+  buffer.action[idx] = action; // Raw string stored
 
   // Self-tuning happens automatically via buffer chaining
   // When capacity is exceeded, createNextBuffer() chains a new buffer
@@ -125,7 +129,8 @@ function logUserAction(userId: string, action: string) {
 // Background conversion to Arrow (via convertToArrowTable)
 setInterval(() => {
   const arrowTable = convertToArrowTable(buffer);
-  // Dictionary already built during logging!
+  // Dictionary built during conversion (cold path)
+  // Strings cleared after conversion
   sendToStorage(arrowTable);
 }, 1000);
 ```
@@ -134,9 +139,9 @@ setInterval(() => {
 
 - **Write latency**: <100ns per log entry
 - **Memory overhead**: ~100 bytes per entry
-- **GC pressure**: Near zero (pre-allocated arrays)
-- **Arrow conversion**: Zero-copy, <1ms for 10K entries
-- **String deduplication**: 10-100x compression
+- **GC pressure**: Near zero (pre-allocated arrays, strings cleared per-flush)
+- **Arrow conversion**: <1ms for 10K entries
+- **String deduplication**: 10-100x compression (built during cold-path conversion)
 
 ## Prerequisites
 
@@ -159,9 +164,9 @@ Before implementing columnar buffers, understand:
 - [ ] Understand cache line alignment benefits
 - [ ] Design schema for your attributes
 - [ ] Implement basic buffer with core columns
-- [ ] Add string interning for repeated values
+- [ ] Store raw strings in string[] arrays (deferred dictionary)
 - [ ] Implement self-tuning growth/compaction
-- [ ] Create Arrow conversion pipeline
+- [ ] Create Arrow conversion pipeline (with dictionary building)
 - [ ] Add null bitmap for sparse attributes
 - [ ] Test memory pressure scenarios
 - [ ] Benchmark against object-based logging
@@ -174,17 +179,24 @@ Use null bitmap for optional fields:
 
 ```typescript
 if (error) {
-  buffer.attr_errorCode[idx] = internString(error.code);
+  buffer.errorCode[idx] = error.code; // Raw string
   buffer.setAttributeNotNull(idx, ATTR_ERROR_CODE);
 }
 ```
 
-### High-Cardinality Strings
+### String Type Selection
 
-Intern only common values:
+Choose based on cardinality (see 01a_trace_schema_system.md):
 
 ```typescript
-const value = isCommon(str) ? internString(str) : storeRawString(str);
+// S.enum() - Known values at compile time (Map lookup on hot path)
+operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']);
+
+// S.category() - Values that repeat (raw strings, dictionary built on cold path)
+userId: S.category();
+
+// S.text() - Unique values (raw strings, conditional dictionary on cold path)
+errorMessage: S.text();
 ```
 
 ### Nested Data
@@ -193,8 +205,8 @@ Flatten to columns:
 
 ```typescript
 // Instead of: { user: { id: '123', name: 'Alice' } }
-buffer.attr_userId[idx] = internString('123');
-buffer.attr_userName[idx] = internString('Alice');
+buffer.userId[idx] = '123';
+buffer.userName[idx] = 'Alice';
 ```
 
 ## Next Steps
@@ -207,7 +219,8 @@ buffer.attr_userName[idx] = internString('Alice');
 Columnar buffers revolutionize logging performance by:
 
 - Writing directly to typed arrays (no objects)
-- Building Arrow dictionaries during logging (no second scan)
+- Storing raw strings on hot path (no Map lookups during logging)
+- Building Arrow dictionaries on cold path (heavy work deferred to flush)
 - Self-tuning capacity (no configuration)
 - Cache-aligned memory layout (CPU-friendly)
 

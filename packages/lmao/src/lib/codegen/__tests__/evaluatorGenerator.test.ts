@@ -460,3 +460,56 @@ describe('EvaluatorGenerator', () => {
     });
   });
 });
+
+describe('generateEvaluatorClass snapshots', () => {
+  test('snapshot: single boolean flag', () => {
+    const schema = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+    });
+    const code = generateEvaluatorClass(schema.schema);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: multiple flags of different types', () => {
+    const schema = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+      maxRetries: S.number().default(3).sync(),
+      logLevel: S.enum(['debug', 'info', 'warn', 'error'] as const)
+        .default('info')
+        .sync(),
+    });
+    const code = generateEvaluatorClass(schema.schema);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: async flags', () => {
+    const schema = defineFeatureFlags({
+      asyncFeature: S.boolean().default(false).async(),
+      asyncLimit: S.number().default(100).async(),
+    });
+    const code = generateEvaluatorClass(schema.schema);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: custom class name', () => {
+    const schema = defineFeatureFlags({
+      testFlag: S.boolean().default(false).sync(),
+    });
+    const code = generateEvaluatorClass(schema.schema, 'CustomFeatureFlagEvaluator');
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: many flags', () => {
+    const schema = defineFeatureFlags({
+      flag1: S.boolean().default(false).sync(),
+      flag2: S.boolean().default(true).sync(),
+      flag3: S.number().default(0).sync(),
+      flag4: S.number().default(100).sync(),
+      flag5: S.enum(['a', 'b', 'c'] as const)
+        .default('a')
+        .sync(),
+    });
+    const code = generateEvaluatorClass(schema.schema);
+    expect(code).toMatchSnapshot();
+  });
+});

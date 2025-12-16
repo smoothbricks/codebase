@@ -17,15 +17,15 @@ import type { TypedArray, TypedArrayConstructor } from './types.js';
 /**
  * Create TypedArray columns for attribute columns based on schema
  *
- * Each attribute gets an `attr_` prefix to distinguish it from core columns.
+ * User columns have no prefix - the column name IS the field name.
  * Returns a record of TypedArrays with cache-aligned capacity.
  */
 export function createAttributeColumns(schema: TagAttributeSchema, capacity = 64): Record<string, TypedArray> {
   const columns: Record<string, TypedArray> = {};
 
   for (const [fieldName, surySchema] of Object.entries(schema)) {
-    const columnName = `attr_${fieldName}`;
-    columns[columnName] = createTypedArrayForSchema(surySchema, capacity);
+    // User columns have no prefix
+    columns[fieldName] = createTypedArrayForSchema(surySchema, capacity);
   }
 
   return columns;

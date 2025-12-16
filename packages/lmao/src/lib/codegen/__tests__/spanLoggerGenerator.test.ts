@@ -2,7 +2,7 @@
  * Unit tests for SpanLogger code generation
  */
 
-import { beforeEach, describe, expect, it } from 'bun:test';
+import { beforeEach, describe, expect, it, test } from 'bun:test';
 import { createTestTaskContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
@@ -83,7 +83,8 @@ describe('generateSpanLoggerClass', () => {
       expect(code).toContain('class GeneratedSpanLogger');
       expect(code).toContain('get tag()');
       expect(code).toContain('with(attributes)');
-      expect(code).toContain('scope(attributes)');
+      // NOTE: scope() is now on ctx directly, SpanLogger has _setScope internally
+      expect(code).toContain('_setScope(attributes)');
       expect(code).toContain('info(message)');
       expect(code).toContain('debug(message)');
       expect(code).toContain('warn(message)');
@@ -217,7 +218,7 @@ describe('createSpanLoggerClass', () => {
       // Should have tag property
       expect(logger).toHaveProperty('tag');
       expect(logger).toHaveProperty('info');
-      expect(logger).toHaveProperty('scope');
+      expect(logger).toHaveProperty('_setScope');
     });
 
     it('should create a class that can write category fields', () => {
@@ -256,9 +257,9 @@ describe('createSpanLoggerClass', () => {
       // Constructor: (buffer, getBufferWithSpace, scopeInstance)
       const logger = new SpanLoggerClass(properBuffer, mockGetBufferWithSpace, scopeInstance);
 
-      // Should be able to call scope without error
+      // Should be able to call _setScope without error
       expect(() => {
-        logger.scope({ requestId: 'req-123', userId: 'user-456' });
+        logger._setScope({ requestId: 'req-123', userId: 'user-456' });
       }).not.toThrow();
     });
   });
@@ -341,5 +342,64 @@ describe('createSpanLoggerClass', () => {
         createSpanLoggerClass(schema);
       }).not.toThrow();
     });
+  });
+});
+
+describe('generateSpanLoggerClass snapshots', () => {
+  test('snapshot: empty schema', () => {
+    const schema = defineTagAttributes({});
+    const code = generateSpanLoggerClass(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: all field types', () => {
+    const schema = defineTagAttributes({
+      userId: S.category(),
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+      errorMsg: S.text(),
+      count: S.number(),
+      enabled: S.boolean(),
+    });
+    const code = generateSpanLoggerClass(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: enum with many values', () => {
+    const schema = defineTagAttributes({
+      httpMethod: S.enum(['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'HEAD', 'OPTIONS']),
+      status: S.enum(['pending', 'active', 'completed', 'failed', 'cancelled']),
+    });
+    const code = generateSpanLoggerClass(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: category and text fields', () => {
+    const schema = defineTagAttributes({
+      userId: S.category(),
+      sessionId: S.category(),
+      requestBody: S.text(),
+      errorMessage: S.text(),
+    });
+    const code = generateSpanLoggerClass(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: numeric and boolean fields', () => {
+    const schema = defineTagAttributes({
+      count: S.number(),
+      duration: S.number(),
+      isValid: S.boolean(),
+      isEnabled: S.boolean(),
+    });
+    const code = generateSpanLoggerClass(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: custom class name', () => {
+    const schema = defineTagAttributes({
+      userId: S.category(),
+    });
+    const code = generateSpanLoggerClass(schema as any, 'CustomSpanLogger');
+    expect(code).toMatchSnapshot();
   });
 });

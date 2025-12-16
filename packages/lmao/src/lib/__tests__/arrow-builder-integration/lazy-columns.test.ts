@@ -21,21 +21,21 @@ describe('True Lazy Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Core columns are always allocated
-    expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);
-    expect(buffer.operations).toBeInstanceOf(Uint8Array);
+    expect(buffer._timestamps).toBeInstanceOf(BigInt64Array);
+    expect(buffer._operations).toBeInstanceOf(Uint8Array);
 
     // Access ONE column (category = Array now, not Uint32Array)
-    const userIdColumn = buffer['attr_userId'];
+    const userIdColumn = buffer['userId'];
     expect(Array.isArray(userIdColumn)).toBe(true);
 
     // Now check that OTHER columns were NOT allocated
     // Getters are on the prototype, not the instance
     const proto = Object.getPrototypeOf(buffer);
-    const descriptor = Object.getOwnPropertyDescriptor(proto, 'attr_requestId');
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'requestId');
     expect(descriptor?.get).toBeDefined(); // Should be a getter on prototype
 
     // After access, the getter should be replaced with the value
-    const requestIdColumn = buffer['attr_requestId'];
+    const requestIdColumn = buffer['requestId'];
     expect(Array.isArray(requestIdColumn)).toBe(true);
   });
 
@@ -48,16 +48,16 @@ describe('True Lazy Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Access userId column (category = Array now)
-    const userIdColumn = buffer['attr_userId'];
+    const userIdColumn = buffer['userId'];
     expect(Array.isArray(userIdColumn)).toBe(true);
 
     // Check that userId's null bitmap was allocated (by accessing it)
-    const userIdBitmap = buffer.attr_userId_nulls;
+    const userIdBitmap = buffer.userId_nulls;
     expect(userIdBitmap).toBeInstanceOf(Uint8Array);
 
     // Check requestId's null bitmap is still a getter on prototype (not accessed yet)
     const proto = Object.getPrototypeOf(buffer);
-    const bitmapDescriptor = Object.getOwnPropertyDescriptor(proto, 'attr_requestId_nulls');
+    const bitmapDescriptor = Object.getOwnPropertyDescriptor(proto, 'requestId_nulls');
     expect(bitmapDescriptor?.get).toBeDefined();
   });
 
@@ -73,14 +73,14 @@ describe('True Lazy Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 1024);
 
     // Only access 2 of 5 columns
-    buffer['attr_col1'][0] = 1;
-    buffer['attr_col3'][0] = 3;
+    buffer['col1'][0] = 1;
+    buffer['col3'][0] = 3;
 
     // col2, col4, col5 should still be getters on prototype (not accessed yet)
     const proto = Object.getPrototypeOf(buffer);
-    const col2Desc = Object.getOwnPropertyDescriptor(proto, 'attr_col2');
-    const col4Desc = Object.getOwnPropertyDescriptor(proto, 'attr_col4');
-    const col5Desc = Object.getOwnPropertyDescriptor(proto, 'attr_col5');
+    const col2Desc = Object.getOwnPropertyDescriptor(proto, 'col2');
+    const col4Desc = Object.getOwnPropertyDescriptor(proto, 'col4');
+    const col5Desc = Object.getOwnPropertyDescriptor(proto, 'col5');
 
     expect(col2Desc?.get).toBeDefined();
     expect(col4Desc?.get).toBeDefined();
@@ -97,15 +97,15 @@ describe('True Lazy Initialization', () => {
 
     // Before access: should be getter on prototype
     const proto = Object.getPrototypeOf(buffer);
-    const beforeDesc = Object.getOwnPropertyDescriptor(proto, 'attr_field1');
+    const beforeDesc = Object.getOwnPropertyDescriptor(proto, 'field1');
     expect(beforeDesc?.get).toBeDefined();
 
     // Access the column (category = Array now)
-    const column = buffer['attr_field1'];
+    const column = buffer['field1'];
     expect(Array.isArray(column)).toBe(true);
 
     // After access: the property should still work (getter returns cached value from symbol-keyed storage)
-    const afterValue = buffer['attr_field1'];
+    const afterValue = buffer['field1'];
     expect(afterValue).toBe(column); // Same instance returned
     expect(Array.isArray(afterValue)).toBe(true);
   });
@@ -126,23 +126,23 @@ describe('Lazy Column Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Core columns should be allocated immediately
-    expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);
-    expect(buffer.operations).toBeInstanceOf(Uint8Array);
+    expect(buffer._timestamps).toBeInstanceOf(BigInt64Array);
+    expect(buffer._operations).toBeInstanceOf(Uint8Array);
 
     // Access one attribute column - should allocate it lazily on first access
-    const userIdColumn = buffer['attr_userId'];
+    const userIdColumn = buffer['userId'];
     // Category stores raw strings in Array
     expect(Array.isArray(userIdColumn)).toBe(true);
     expect(userIdColumn.length).toBeGreaterThan(0);
 
     // Access null bitmap - should allocate it lazily on first access
-    const userIdNulls = buffer.attr_userId_nulls;
+    const userIdNulls = buffer.userId_nulls;
     expect(userIdNulls).toBeInstanceOf(Uint8Array);
     expect(userIdNulls.length).toBeGreaterThan(0);
 
     // Verify lazy allocation worked by checking that multiple accesses return same object
-    expect(buffer['attr_userId']).toBe(userIdColumn);
-    expect(buffer.attr_userId_nulls).toBe(userIdNulls);
+    expect(buffer['userId']).toBe(userIdColumn);
+    expect(buffer.userId_nulls).toBe(userIdNulls);
   });
 
   it('should allocate correct TypedArray type for different schema types', () => {
@@ -162,11 +162,11 @@ describe('Lazy Column Initialization', () => {
     // - enum: Uint8Array (small enums) or Uint16Array/Uint32Array (larger)
     // - category: Uint32Array with string interning (indices)
     // - text: Uint32Array with raw storage (indices into TextStringStorage)
-    expect(buffer['attr_smallEnum']).toBeInstanceOf(Uint8Array);
-    expect(Array.isArray(buffer['attr_category'])).toBe(true); // Category stores raw strings
-    expect(Array.isArray(buffer['attr_text'])).toBe(true); // Text stores raw strings
-    expect(buffer['attr_num']).toBeInstanceOf(Float64Array);
-    expect(buffer['attr_bool']).toBeInstanceOf(Uint8Array);
+    expect(buffer['smallEnum']).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buffer['category'])).toBe(true); // Category stores raw strings
+    expect(Array.isArray(buffer['text'])).toBe(true); // Text stores raw strings
+    expect(buffer['num']).toBeInstanceOf(Float64Array);
+    expect(buffer['bool']).toBeInstanceOf(Uint8Array);
   });
 
   it('should allocate small enum as Uint8Array', () => {
@@ -180,7 +180,7 @@ describe('Lazy Column Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Should use Uint8Array for <= 255 values
-    expect(buffer['attr_maxEnum']).toBeInstanceOf(Uint8Array);
+    expect(buffer['maxEnum']).toBeInstanceOf(Uint8Array);
   });
 
   it('should work correctly when writing to lazily-allocated columns', () => {
@@ -194,8 +194,8 @@ describe('Lazy Column Initialization', () => {
 
     // Write to columns (triggering lazy allocation)
     // Category stores Uint32Array indices (not strings directly)
-    const userIdColumn = buffer['attr_userId'] as Uint32Array;
-    const countColumn = buffer['attr_count'] as Float64Array;
+    const userIdColumn = buffer['userId'] as Uint32Array;
+    const countColumn = buffer['count'] as Float64Array;
 
     // Write an interned index for category (simulating how the system works)
     userIdColumn[0] = 42; // This would be an interned string index
@@ -215,10 +215,10 @@ describe('Lazy Column Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // First access
-    const column1 = buffer['attr_userId'];
+    const column1 = buffer['userId'];
 
     // Second access - should return same array
-    const column2 = buffer['attr_userId'];
+    const column2 = buffer['userId'];
 
     // Should be the exact same object
     expect(column1).toBe(column2);
@@ -234,17 +234,17 @@ describe('Lazy Column Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Access one null bitmap
-    const userIdNulls = buffer.attr_userId_nulls;
+    const userIdNulls = buffer.userId_nulls;
     expect(userIdNulls).toBeInstanceOf(Uint8Array);
 
     // Access another null bitmap
-    const requestIdNulls = buffer.attr_requestId_nulls;
+    const requestIdNulls = buffer.requestId_nulls;
     expect(requestIdNulls).toBeInstanceOf(Uint8Array);
 
     // Should be different arrays
     expect(userIdNulls).not.toBe(requestIdNulls);
 
     // Multiple accesses should return same array
-    expect(buffer.attr_userId_nulls).toBe(userIdNulls);
+    expect(buffer.userId_nulls).toBe(userIdNulls);
   });
 });

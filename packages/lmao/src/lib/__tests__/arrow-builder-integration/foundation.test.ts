@@ -47,13 +47,13 @@ describe('Buffer Foundation', () => {
     expect(buf.operations).toBeInstanceOf(Uint8Array);
 
     // Check null bitmaps exist for each attribute (Arrow format: 1 Uint8Array per column)
-    expect(buf.attr_userId_nulls).toBeInstanceOf(Uint8Array);
-    expect(buf.attr_count_nulls).toBeInstanceOf(Uint8Array);
+    expect(buf.userId_nulls).toBeInstanceOf(Uint8Array);
+    expect(buf.count_nulls).toBeInstanceOf(Uint8Array);
 
     // Check attribute columns exist for each schema field (using _values suffix)
     // category columns now use string[] arrays for zero-cost hot path writes
-    expect(Array.isArray(buf.attr_userId_values)).toBe(true); // category → string[]
-    expect(buf.attr_count_values).toBeInstanceOf(Float64Array); // number → Float64Array
+    expect(Array.isArray(buf.userId_values)).toBe(true); // category → string[]
+    expect(buf.count_values).toBeInstanceOf(Float64Array); // number → Float64Array
 
     // Metadata
     expect(buf.children).toBeInstanceOf(Array);
@@ -108,15 +108,15 @@ describe('Buffer Foundation', () => {
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them
     // Access them directly to trigger allocation and verify they exist
-    expect(Array.isArray(buf['attr_field1_values'])).toBe(true); // category (raw strings)
-    expect(buf['attr_field1_nulls']).toBeInstanceOf(Uint8Array); // null bitmap
-    expect(buf['attr_field2_values']).toBeInstanceOf(Float64Array); // number
-    expect(buf['attr_field2_nulls']).toBeInstanceOf(Uint8Array);
-    expect(buf['attr_field3_values']).toBeInstanceOf(Uint8Array); // boolean
-    expect(buf['attr_field3_nulls']).toBeInstanceOf(Uint8Array);
-    expect(Array.isArray(buf['attr_field4_values'])).toBe(true); // text (raw strings)
-    expect(buf['attr_field4_nulls']).toBeInstanceOf(Uint8Array);
-    expect(buf['attr_field5_values']).toBeInstanceOf(Float64Array); // number
-    expect(buf['attr_field5_nulls']).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buf['field1_values'])).toBe(true); // category (raw strings)
+    expect(buf['field1_nulls']).toBeInstanceOf(Uint8Array); // null bitmap
+    expect(buf['field2_values']).toBeInstanceOf(Float64Array); // number
+    expect(buf['field2_nulls']).toBeInstanceOf(Uint8Array);
+    expect(buf['field3_values']).toBeInstanceOf(Uint8Array); // boolean
+    expect(buf['field3_nulls']).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buf['field4_values'])).toBe(true); // text (raw strings)
+    expect(buf['field4_nulls']).toBeInstanceOf(Uint8Array);
+    expect(buf['field5_values']).toBeInstanceOf(Float64Array); // number
+    expect(buf['field5_nulls']).toBeInstanceOf(Uint8Array);
   });
 });

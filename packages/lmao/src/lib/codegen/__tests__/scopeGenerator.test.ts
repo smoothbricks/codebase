@@ -11,7 +11,12 @@
 import { describe, expect, test } from 'bun:test';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
-import { createScope, createScopeWithInheritance, generateScopeClass } from '../scopeGenerator.js';
+import {
+  createScope,
+  createScopeWithInheritance,
+  generateScopeClass,
+  generateScopeClassCode,
+} from '../scopeGenerator.js';
 
 describe('Scope Class Generation', () => {
   describe('Basic Scope Creation', () => {
@@ -331,5 +336,46 @@ describe('Scope Class Generation', () => {
       expect(scope2.userId).toBe('user2');
       expect(scope2.count).toBe(20);
     });
+  });
+});
+
+describe('generateScopeClassCode snapshots', () => {
+  test('snapshot: empty schema', () => {
+    const schema = defineTagAttributes({});
+    const code = generateScopeClassCode(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: all field types', () => {
+    const schema = defineTagAttributes({
+      userId: S.category(),
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+      errorMsg: S.text(),
+      count: S.number(),
+      enabled: S.boolean(),
+    });
+    const code = generateScopeClassCode(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: category fields only', () => {
+    const schema = defineTagAttributes({
+      userId: S.category(),
+      sessionId: S.category(),
+      requestId: S.category(),
+    });
+    const code = generateScopeClassCode(schema as any);
+    expect(code).toMatchSnapshot();
+  });
+
+  test('snapshot: mixed types', () => {
+    const schema = defineTagAttributes({
+      status: S.enum(['pending', 'active', 'completed']),
+      duration: S.number(),
+      isValid: S.boolean(),
+      errorMessage: S.text(),
+    });
+    const code = generateScopeClassCode(schema as any);
+    expect(code).toMatchSnapshot();
   });
 });

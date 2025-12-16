@@ -56,17 +56,32 @@ export type ChainableTagAPI<T extends TagAttributeSchema> = {
 };
 
 /**
+ * Fluent builder for log entries - supports .line() chaining
+ */
+export interface FluentLogEntry {
+  /**
+   * Set the source code line number for this log entry.
+   * @param lineNumber - Source line number (0-65535)
+   */
+  line(lineNumber: number): void;
+}
+
+/**
  * Base SpanLogger interface with core methods
  */
 export interface BaseSpanLogger<T extends TagAttributeSchema> {
   readonly tag: ChainableTagAPI<T>;
-  message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void;
-  info(message: string): void;
-  debug(message: string): void;
-  warn(message: string): void;
-  error(message: string): void;
-  scope(attributes: Partial<InferTagAttributes<T>>): void;
+  message(level: 'info' | 'debug' | 'warn' | 'error', message: string): FluentLogEntry;
+  info(message: string): FluentLogEntry;
+  debug(message: string): FluentLogEntry;
+  warn(message: string): FluentLogEntry;
+  error(message: string): FluentLogEntry;
   _getScope(): GeneratedScope;
+  /**
+   * Internal method to set scoped attributes. Called by ctx.scope().
+   * @internal
+   */
+  _setScope(attributes: Partial<InferTagAttributes<T>>): void;
 }
 
 /**
@@ -103,7 +118,7 @@ ${cases}
  * with overwrite semantics (last write wins, like Datadog)
  */
 function generateAttributeWriter(fieldName: string, schema: unknown, hasEnumMapping: boolean): string {
-  const columnName = `attr_${fieldName}`;
+  const columnName = fieldName; // User columns use just the field name (arrow-builder convention)
   const lmaoType = getLmaoSchemaType(schema);
 
   // For enums, use pre-generated mapping function
@@ -216,7 +231,7 @@ function generateAttributeWriter(fieldName: string, schema: unknown, hasEnumMapp
  */
 function generateWithMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
   const columnWrites = schemaFields.map(([fieldName, fieldSchema]) => {
-    const columnName = `attr_${fieldName}`;
+    const columnName = fieldName; // User columns use just the field name (arrow-builder convention)
     const lmaoType = getLmaoSchemaType(fieldSchema);
 
     // Boolean uses bit-packed storage (8 values per byte)
@@ -267,7 +282,7 @@ function generateScopeMethod(schemaFields: [string, unknown][], enumFieldNames: 
   });
 
   const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
-    const columnName = `attr_${fieldName}`;
+    const columnName = fieldName; // User columns use just the field name (arrow-builder convention)
     const lmaoType = getLmaoSchemaType(fieldSchema);
 
     // Boolean uses bit-packed storage - bulk fill with 0xFF or 0x00
@@ -397,7 +412,7 @@ function generateScopeMethod(schemaFields: [string, unknown][], enumFieldNames: 
  */
 function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
   const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
-    const columnName = `attr_${fieldName}`;
+    const columnName = fieldName; // User columns use just the field name (arrow-builder convention)
     const lmaoType = getLmaoSchemaType(fieldSchema);
 
     // Boolean uses bit-packed storage
@@ -523,7 +538,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
  */
 function generateWriteMessageMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
   const scopeWrites = schemaFields.map(([fieldName, fieldSchema]) => {
-    const columnName = `attr_${fieldName}`;
+    const columnName = fieldName; // User columns use just the field name (arrow-builder convention)
     const lmaoType = getLmaoSchemaType(fieldSchema);
 
     // Boolean uses bit-packed storage
@@ -577,6 +592,7 @@ function generateWriteMessageMethod(schemaFields: [string, unknown][], enumField
       }
 
       const idx = this._buffer.writeIndex;
+      const self = this;
 
       // Write entry type
       this._buffer.operations[idx] = entryType;
@@ -584,13 +600,13 @@ function generateWriteMessageMethod(schemaFields: [string, unknown][], enumField
       // Write timestamp (nanoseconds since epoch)
       this._buffer.timestamps[idx] = getTimestampNanos();
 
-      // Write message to attr_logMessage column (raw string, no interning)
-      const messageColumn = this._buffer.attr_logMessage_values;
+      // Write message to logMessage column (raw string, no interning)
+      const messageColumn = this._buffer.logMessage_values;
       if (messageColumn) {
         messageColumn[idx] = message;
         const byteIndex = idx >>> 3;
         const bitOffset = idx & 7;
-        this._buffer.attr_logMessage_nulls[byteIndex] |= (1 << bitOffset);
+        this._buffer.logMessage_nulls[byteIndex] |= (1 << bitOffset);
       }
 
       // Apply scoped attributes - UNROLLED per-column
@@ -598,6 +614,22 @@ function generateWriteMessageMethod(schemaFields: [string, unknown][], enumField
 
       // Increment write index
       this._buffer.writeIndex++;
+
+      // Return fluent object for .line() chaining
+      // The idx captured above is the row we just wrote to
+      return {
+        line(lineNumber) {
+          // Write lineNumber to lineNumber column at the captured idx
+          const lineCol = self._buffer.lineNumber_values;
+          if (lineCol) {
+            lineCol[idx] = lineNumber;
+            // Mark as non-null
+            const byteIndex = idx >>> 3;
+            const bitOffset = idx & 7;
+            self._buffer.lineNumber_nulls[byteIndex] |= (1 << bitOffset);
+          }
+        }
+      };
     }`;
 }
 
@@ -676,8 +708,9 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
     ${attributeWriters.join('\n')}
 
     // Scoped attributes - writes to Scope instance and pre-fills buffer
+    // NOTE: scope() exposed via ctx.scope, but SpanLogger provides _setScope for implementation
     // UNROLLED: Each column gets explicit TypedArray.fill() + bulk null bitmap
-    ${scopeMethod}
+    ${scopeMethod.replace('scope(attributes)', '_setScope(attributes)')}
 
     /**
      * Pre-fill buffer with scoped attributes from current writeIndex to capacity.
@@ -698,23 +731,23 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
         'warn': ${ENTRY_TYPE_WARN},
         'error': ${ENTRY_TYPE_ERROR}
       };
-      this._writeMessage(entryTypeMap[level] || ${ENTRY_TYPE_INFO}, message);
+      return this._writeMessage(entryTypeMap[level] || ${ENTRY_TYPE_INFO}, message);
     }
     
     info(message) {
-      this._writeMessage(${ENTRY_TYPE_INFO}, message);
+      return this._writeMessage(${ENTRY_TYPE_INFO}, message);
     }
     
     debug(message) {
-      this._writeMessage(${ENTRY_TYPE_DEBUG}, message);
+      return this._writeMessage(${ENTRY_TYPE_DEBUG}, message);
     }
     
     warn(message) {
-      this._writeMessage(${ENTRY_TYPE_WARN}, message);
+      return this._writeMessage(${ENTRY_TYPE_WARN}, message);
     }
     
     error(message) {
-      this._writeMessage(${ENTRY_TYPE_ERROR}, message);
+      return this._writeMessage(${ENTRY_TYPE_ERROR}, message);
     }
 
     // Get the Scope instance directly

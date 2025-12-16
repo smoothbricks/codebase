@@ -54,7 +54,7 @@ const scopeClassCache = new WeakMap<TagAttributeSchema, ScopeClass>();
  * @param schema - Tag attribute schema (user-defined attributes only)
  * @returns JavaScript code string for the Scope class
  */
-function generateScopeClassCode(schema: TagAttributeSchema): string {
+export function generateScopeClassCode(schema: TagAttributeSchema): string {
   // Get schema fields (excluding methods added by defineTagAttributes)
   const schemaFields = getSchemaFields(schema);
   const fieldNames = schemaFields.map(([name]) => name);

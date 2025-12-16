@@ -51,7 +51,7 @@ function writeToBuffer(buffer: any, index: number, value: any) {
 
 // GOOD: Monomorphic access
 class SpanBuffer {
-  timestamps: Float64Array;
+  timestamps: BigInt64Array;
   operations: Uint8Array;
 
   writeTimestamp(idx: number, value: number) {
@@ -87,7 +87,7 @@ function generateWriteMethods(schema: BufferSchema) {
 // BAD: Dynamic property addition
 class BadBuffer {
   constructor() {
-    this.timestamps = new Float64Array(64);
+    this.timestamps = new BigInt64Array(64);
     // Properties added later cause hidden class transitions
   }
 
@@ -99,14 +99,14 @@ class BadBuffer {
 // GOOD: Fixed shape from construction
 class GoodBuffer {
   // All properties defined upfront
-  readonly timestamps: Float64Array;
+  readonly timestamps: BigInt64Array;
   readonly operations: Uint8Array;
   readonly attr_userId: Uint32Array;
   readonly attr_action: Uint32Array;
 
   constructor(capacity: number) {
     // Single hidden class, never changes
-    this.timestamps = new Float64Array(capacity);
+    this.timestamps = new BigInt64Array(capacity);
     this.operations = new Uint8Array(capacity);
     this.attr_userId = new Uint32Array(capacity);
     this.attr_action = new Uint32Array(capacity);
@@ -154,7 +154,7 @@ function alignedCapacity(requestedSize: number, bytesPerElement: number): number
 class AlignedBuffer {
   constructor(capacity: number) {
     // Each array starts on cache line boundary
-    this.timestamps = new Float64Array(alignedCapacity(capacity, 8));
+    this.timestamps = new BigInt64Array(alignedCapacity(capacity, 8));
     this.operations = new Uint8Array(alignedCapacity(capacity, 1));
 
     // Ensure arrays are cache-aligned in memory
@@ -199,7 +199,7 @@ class SequentialBuffer {
 }
 ```
 
-## String Interning Optimization
+## String Column Optimization
 
 ### The String Problem
 
@@ -210,6 +210,25 @@ Strings are expensive:
 - No cache locality
 - GC pressure
 - UTF-8 conversion is CPU-intensive
+
+### Hot Path vs Cold Path: Deferred Processing
+
+**CRITICAL DESIGN PRINCIPLE**: The hot path (logging) should be as lightweight as possible. All expensive string
+operations (dictionary building, UTF-8 encoding, sorting) are deferred to the cold path (Arrow conversion).
+
+```
+HOT PATH (logging)                    COLD PATH (Arrow conversion)
+────────────────────                  ────────────────────────────
+• ENUM: Map lookup → Uint8 write      • Zero work (pre-built)
+• CATEGORY: string[] assignment       • Sort + dedupe + UTF-8 encode
+• TEXT: string[] assignment           • 2-pass conditional dictionary
+
+No interning, no UTF-8, no sorting    All dictionary/UTF-8 work here
+```
+
+**Why this matters**: A busy service might log 100,000+ entries per second. Even a simple `Map.get()` call for string
+interning adds measurable overhead. By storing raw JS strings and deferring dictionary building to flush time, we keep
+logging latency minimal.
 
 ### Three String Types, Three Strategies
 
@@ -279,12 +298,12 @@ class EnumColumn {
 log n) sort + O(n) UTF-8 encode | Dictionary arrays | | Hot path write | O(1) Map lookup + array write | Zero | | Cold
 path flush | O(1) slice | Index array copy |
 
-#### 2. CATEGORY: Direct String Storage + SIEVE-Cached UTF-8 (Repeated Values)
+#### 2. CATEGORY: Raw String Storage + Cold-Path Dictionary (Repeated Values)
 
 **Use Case**: Runtime values that repeat (user IDs, actions, regions)
 
-**Key Insight**: Store raw strings in hot path (zero cost), build sorted dictionary with SIEVE-cached UTF-8 encoding in
-cold path.
+**Key Insight**: Store raw JS strings in `string[]` on hot path (zero cost). Build sorted dictionary with SIEVE-cached
+UTF-8 encoding only during Arrow conversion (cold path). **NO interning on hot path.**
 
 ```typescript
 // Schema definition
@@ -298,14 +317,14 @@ const schema = {
 class CategoryColumn {
   private strings: string[] = []; // Just JS string references
 
-  // HOT PATH: Just store reference (zero work)
+  // HOT PATH: Just store reference (zero work, NO interning)
   write(idx: number, value: string): void {
-    this.strings[idx] = value;
+    this.strings[idx] = value; // Direct array assignment only
   }
 
   // COLD PATH: Build SORTED dictionary + SIEVE-cached UTF-8
   toArrow(): ArrowColumn {
-    // 1. Collect unique strings
+    // 1. Collect unique strings (deduplication happens HERE, not on hot path)
     const uniqueStrings = new Set<string>();
     for (const str of this.strings) {
       if (str != null) uniqueStrings.add(str);
@@ -334,9 +353,10 @@ class CategoryColumn {
 }
 ```
 
-**SIEVE Cache for UTF-8 Encoding:**
+**SIEVE Cache for UTF-8 Encoding (Cold Path Only):**
 
-Uses SIEVE algorithm (NSDI'24) - simpler AND better than LRU:
+Uses SIEVE algorithm (NSDI'24) - simpler AND better than LRU. **Note:** This cache is only used during Arrow conversion,
+not on the hot path.
 
 ```typescript
 import { SieveCache } from '@neophi/sieve-cache';
@@ -349,6 +369,7 @@ class Utf8Cache {
     this.cache = new SieveCache(maxSize);
   }
 
+  // Called ONLY during cold path (Arrow conversion)
   encode(str: string): Uint8Array {
     const cached = this.cache.get(str);
     if (cached) return cached;
@@ -389,6 +410,17 @@ export const globalUtf8Cache = new Utf8Cache();
 | Cold path flush | O(n log n) sort + O(n) UTF-8 | Dictionary arrays |
 | UTF-8 (cached)  | O(1) SIEVE get               | Zero              |
 | UTF-8 (miss)    | O(k) encode + O(1) SIEVE set | Uint8Array        |
+
+**Why No Hot-Path Interning for CATEGORY:**
+
+The original design considered interning strings on the hot path (Map lookup → integer index). This was rejected
+because:
+
+1. **Map lookups add latency**: Even O(1) Map.get() has overhead vs direct array assignment
+2. **Global state complexity**: A global interner requires careful lifecycle management
+3. **Premature optimization**: Most category columns have low cardinality; deduplication at flush time is fast enough
+4. **Memory tradeoff**: Storing raw strings temporarily uses more memory, but flushes happen frequently enough that this
+   is bounded
 
 #### 3. TEXT: No Interning, Conditional Dictionary (Unique Values)
 
@@ -502,35 +534,38 @@ arrays | | Post-flush | Strings array cleared | Zero (GC releases) |
 
 ### String Type Comparison
 
-| Aspect                | ENUM                      | CATEGORY                  | TEXT                 |
-| --------------------- | ------------------------- | ------------------------- | -------------------- |
-| **Hot path**          | Map lookup + array write  | Array assignment          | Array assignment     |
-| **Hot path cost**     | O(1)                      | O(1)                      | O(1)                 |
-| **Cold path**         | Zero (pre-computed)       | Sort + SIEVE-cached UTF-8 | 2-pass + conditional |
-| **Memory bound**      | Fixed (schema)            | Per-flush + SIEVE cache   | Per-flush (cleared)  |
-| **Dictionary sorted** | ✓ At startup              | ✓ At flush                | ✓ If used            |
-| **UTF-8 timing**      | At startup (pre-computed) | At flush (SIEVE cached)   | At flush             |
-| **Best for**          | Compile-time known        | Runtime repeated          | Unique/rare repeat   |
+| Aspect                 | ENUM                      | CATEGORY                    | TEXT                        |
+| ---------------------- | ------------------------- | --------------------------- | --------------------------- |
+| **Hot path storage**   | Uint8Array (index)        | string[] (raw JS strings)   | string[] (raw JS strings)   |
+| **Hot path work**      | Map lookup + array write  | Array assignment only       | Array assignment only       |
+| **Hot path cost**      | O(1)                      | O(1)                        | O(1)                        |
+| **Hot path interning** | No (compile-time map)     | **No** (deferred to cold)   | **No** (deferred to cold)   |
+| **Cold path**          | Zero (pre-computed)       | Sort + dedupe + SIEVE UTF-8 | 2-pass + conditional dict   |
+| **Memory bound**       | Fixed (schema)            | Per-flush (strings cleared) | Per-flush (strings cleared) |
+| **Dictionary sorted**  | ✓ At startup              | ✓ At flush                  | ✓ If used                   |
+| **UTF-8 timing**       | At startup (pre-computed) | At flush (SIEVE cached)     | At flush                    |
+| **Best for**           | Compile-time known        | Runtime repeated            | Unique/rare repeat          |
 
 ### Memory Growth Prevention Summary
 
-| Type     | Bound Mechanism       | When Cleared      | Risk if Misused             |
-| -------- | --------------------- | ----------------- | --------------------------- |
-| ENUM     | Fixed at construction | Never (immutable) | None - compile-time known   |
-| CATEGORY | Per-flush + SIEVE     | After each flush  | High memory between flushes |
-| TEXT     | Per-flush             | After each flush  | High memory between flushes |
+| Type     | Hot Path Storage   | Bound Mechanism       | When Cleared      | Risk if Misused             |
+| -------- | ------------------ | --------------------- | ----------------- | --------------------------- |
+| ENUM     | Uint8Array indices | Fixed at construction | Never (immutable) | None - compile-time known   |
+| CATEGORY | string[] (raw)     | Per-flush clearing    | After each flush  | High memory between flushes |
+| TEXT     | string[] (raw)     | Per-flush clearing    | After each flush  | High memory between flushes |
 
-**Note:** Both CATEGORY and TEXT now use the same hot-path strategy (array assignment). The difference is in cold-path
-dictionary building: CATEGORY always builds a sorted dictionary, TEXT only if it saves >128 bytes.
+**Note:** Both CATEGORY and TEXT use the same hot-path strategy: store raw JS strings in a `string[]` array. **No
+interning happens on the hot path.** The difference is in cold-path dictionary building: CATEGORY always builds a sorted
+dictionary, TEXT only if it saves >128 bytes.
 
-### Interning Benefits
+### Deferred Dictionary Benefits
 
-1. **Memory**: "login" stored once, not 10,000 times (CATEGORY)
-2. **Speed**: Integer comparison vs string comparison
-3. **Arrow**: Sorted dictionaries enable binary search queries
-4. **Cache**: Integers fit in CPU cache lines
-5. **Deferred UTF-8**: Expensive encoding only in cold path
-6. **Bounded growth**: LRU prevents memory exhaustion
+1. **Minimal hot-path overhead**: No Map lookups, no UTF-8 encoding during logging
+2. **Memory deduplication**: Unique strings identified during cold-path flush
+3. **Arrow optimization**: Sorted dictionaries enable binary search queries
+4. **Cache efficiency**: Dictionary indices (integers) fit in CPU cache lines
+5. **Bounded growth**: Strings cleared after each flush, SIEVE cache bounds UTF-8 memory
+6. **Simpler implementation**: No global interner state to manage
 
 ## Memory Layout Optimization
 
@@ -927,28 +962,29 @@ class FlushScheduler {
 }
 ```
 
-### Per-Trace vs Global Interning
+### Per-Flush String Storage (Both CATEGORY and TEXT)
 
-**Decision: Global interning for CATEGORY, per-flush for TEXT**
+**Decision: No hot-path interning. Both CATEGORY and TEXT store raw strings, dictionary built per-flush.**
 
-| Strategy              | CATEGORY                                       | TEXT                                 |
-| --------------------- | ---------------------------------------------- | ------------------------------------ |
-| **Scope**             | Global (shared across traces)                  | Per-flush (no sharing)               |
-| **Why**               | Same userIds, spanNames appear across requests | Error messages unique per occurrence |
-| **Lifetime**          | Process lifetime (LRU bounded)                 | Single flush cycle                   |
-| **Cross-flush dedup** | ✓ Same string → same index (if in LRU)         | ✗ New indices each flush             |
+| Aspect                | CATEGORY                         | TEXT                                         |
+| --------------------- | -------------------------------- | -------------------------------------------- |
+| **Hot path storage**  | string[] (raw JS strings)        | string[] (raw JS strings)                    |
+| **Cold path**         | Always builds sorted dictionary  | Conditional dictionary (if saves >128 bytes) |
+| **Cross-flush dedup** | ✗ New dictionary each flush      | ✗ New dictionary each flush                  |
+| **UTF-8 caching**     | SIEVE cache helps across flushes | No caching (unique values)                   |
 
-**Why global for CATEGORY:**
+**Why no hot-path interning:**
 
-- Same userId appears in many requests → dedup saves memory
-- Same spanName ("create-user") across all requests → single dictionary entry
-- LRU bounds memory even with global scope
+- **Simpler**: No global interner state to manage
+- **Faster**: Array assignment faster than Map lookup
+- **Bounded**: Memory naturally bounded by flush interval
+- **Sufficient**: Cold-path deduplication works well for typical flush sizes
 
-**Why per-flush for TEXT:**
+**Why SIEVE cache still helps CATEGORY:**
 
-- Error messages rarely repeat across flushes
-- Stack traces are unique per error occurrence
-- Global interner would just accumulate garbage
+- Same strings often appear across multiple flushes (userIds, spanNames)
+- SIEVE caches UTF-8 encoded bytes, avoiding re-encoding on each flush
+- Cache is bounded (4096 entries default), so memory stays controlled
 
 ### Preventing Unbounded Growth
 

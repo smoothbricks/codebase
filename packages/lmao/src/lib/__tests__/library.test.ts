@@ -579,8 +579,8 @@ describe('prefix remapping', () => {
       expect(code).toContain('status(value)');
       expect(code).toContain('duration(value)');
       // Should reference prefixed columns
-      expect(code).toContain('attr_http_status');
-      expect(code).toContain('attr_http_duration');
+      expect(code).toContain('http_status');
+      expect(code).toContain('http_duration');
     });
 
     it('should include enum mapping functions', () => {

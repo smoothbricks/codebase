@@ -152,7 +152,7 @@ class GeneratedColumnBuffer {
   constructor(requestedCapacity) {
     const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
     this._alignedCapacity = alignedCapacity;
-    this.timestamps = new Float64Array(alignedCapacity);
+    this.timestamps = new BigInt64Array(alignedCapacity);
     this.operations = new Uint8Array(alignedCapacity);
     this.writeIndex = 0;
     this.capacity = requestedCapacity;

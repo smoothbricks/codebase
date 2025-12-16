@@ -13,7 +13,7 @@ import { defineTagAttributes } from './defineTagAttributes.js';
  * Base system schema that all modules inherit
  *
  * These columns support:
- * - Span lifecycle (spanName)
+ * - Span lifecycle (spanName, lineNumber)
  * - Logging (logMessage) - stored as attr_logMessage to avoid conflict with SpanLogger.message()
  * - Error handling (errorCode, exceptionMessage, exceptionStack)
  * - Result messages (resultMessage)
@@ -22,6 +22,24 @@ import { defineTagAttributes } from './defineTagAttributes.js';
 export const systemSchema = defineTagAttributes({
   // Span lifecycle
   spanName: S.category(),
+
+  /**
+   * Source code line number for this entry.
+   *
+   * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
+   * - Uint16 column (max 65535 lines per file)
+   * - TypeScript transformer injects `.line(N)` calls at compile time
+   * - No runtime overhead - just a method call with literal number
+   * - Value of 0 means "line number not set"
+   *
+   * Used for:
+   * - Linking trace entries back to source code
+   * - Debugging and error analysis
+   * - IDE integration for "jump to line"
+   *
+   * @see .line() fluent method on span/logging APIs
+   */
+  lineNumber: S.number(),
 
   /**
    * Log message column for log entries (info/debug/warn/error).

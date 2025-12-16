@@ -583,7 +583,7 @@ class SelfTuningSpanBuffer {
   private capacity = getInitialCapacity();
 
   // Typed arrays
-  private timestamps: Float64Array;
+  private timestamps: BigInt64Array;
   private operations: Uint8Array;
   private attributes: Map<string, Uint32Array> = new Map();
 
@@ -632,7 +632,7 @@ class SelfTuningSpanBuffer {
     const newCapacity = this.calculateNewCapacity();
 
     // Allocate new arrays
-    const newTimestamps = new Float64Array(newCapacity);
+    const newTimestamps = new BigInt64Array(newCapacity);
     const newOperations = new Uint8Array(newCapacity);
 
     // Copy data
@@ -1022,7 +1022,7 @@ export function generateColumnBufferClass(
   constructorCode.push(`    // System columns (eager - written on every entry)`);
   constructorCode.push(`    const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);`);
   constructorCode.push(`    this._alignedCapacity = alignedCapacity;`);
-  constructorCode.push(`    this.timestamps = new Float64Array(alignedCapacity);`);
+  constructorCode.push(`    this.timestamps = new BigInt64Array(alignedCapacity);`);
   constructorCode.push(`    this.operations = new Uint8Array(alignedCapacity);`);
   constructorCode.push(``);
 

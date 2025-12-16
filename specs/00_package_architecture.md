@@ -17,7 +17,7 @@ This monorepo contains two distinct packages with clear separation of concerns:
 │                                                                  │
 │  • Schema DSL (S.enum/category/text/number/boolean)             │
 │  • Context flow (request→module→task→span)                      │
-│  • SpanBuffer classes with direct properties (attr_$name_*)     │
+│  • SpanBuffer classes with direct properties ($name_*)          │
 │  • Scope classes (SEPARATE from buffer columns)                 │
 │  • Feature flag evaluation                                       │
 │  • Fluent logging API (ctx.tag, ctx.log)                        │
@@ -81,10 +81,10 @@ This is problematic for high-performance logging because:
 ```typescript
 // arrow-builder - allocations EXPLICIT
 const buffer = createColumnBuffer(schema, 64); // Explicit capacity
-buffer.attr_userId_values[idx] = internedId; // Direct write, no hidden alloc
+buffer.userId_values[idx] = value; // Direct write, no hidden alloc
 
 // Lazy columns: allocation happens when getter is first accessed
-const values = buffer.attr_userId_values; // Allocates HERE, once, explicitly
+const values = buffer.userId_values; // Allocates HERE, once, explicitly
 ```
 
 **lmao** builds on this with logging-specific optimizations:
@@ -94,8 +94,8 @@ const values = buffer.attr_userId_values; // Allocates HERE, once, explicitly
 // System columns: ALWAYS eager (hot path critical)
 // User attributes: lazy by default (sparse data)
 const span = ctx.span('operation');
-span.log.info('Starting'); // timestamps/operations already allocated (eager)
-span.tag.userId('u123'); // attr_userId allocated on first use (lazy)
+span.log.info('Starting'); // _timestamps/_operations already allocated (eager)
+span.tag.userId('u123'); // userId column allocated on first use (lazy)
 ```
 
 ---
@@ -137,7 +137,7 @@ break these optimizations.
 **HOW both packages implement this**:
 
 - **Composition over inheritance**: SpanBuffer wraps ColumnBuffer, doesn't extend it
-- **Direct properties**: `buffer.attr_userId_values`, not `buffer.columns['userId'].values`
+- **Direct properties**: `buffer.userId_values`, not `buffer.columns['userId'].values`
 - **Runtime codegen**: `new Function()` generates monomorphic code with stable call sites
 - **No dynamic property access**: All property names known at codegen time
 
@@ -198,7 +198,6 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 
 - ❌ Logging or tracing concepts (spans, traces, contexts)
 - ❌ Entry types (info, warn, error, span-start, span-end)
-- ❌ The `attr_` prefix convention (lmao-specific naming)
 - ❌ Scope or scoped attributes
 - ❌ Feature flags or evaluation contexts
 - ❌ Masking functions (hash, url, sql, email)
@@ -206,6 +205,29 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 - ❌ System vs user column distinction
 - ❌ Tree structures (parent/child spans, buffer.children, buffer.next)
 - ❌ Any `@smoothbricks/lmao` dependency
+
+### Column Naming Convention
+
+**User columns** use the field name directly from the schema (no prefix):
+
+```typescript
+buffer.userId; // User attribute column (lazy)
+buffer.requestId; // User attribute column (lazy)
+buffer.httpStatus; // User attribute column (lazy)
+```
+
+**System properties** use `_` prefix to prevent namespace collisions:
+
+```typescript
+buffer._timestamps; // System column (eager)
+buffer._operations; // System column (eager)
+buffer._writeIndex; // Internal state
+buffer._capacity; // Internal state
+buffer._next; // Buffer chaining
+```
+
+This keeps the user API clean while preventing collisions between user-defined field names and internal buffer
+properties.
 
 ### Lazy Column Storage Pattern
 
@@ -226,12 +248,12 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 
 ```typescript
 // Symbol for per-instance lazy storage
-const attr_userId_sym = Symbol('attr_userId');
+const userId_sym = Symbol('userId');
 
-function allocate_attr_userId(self) {
-  if (self[attr_userId_sym]) return self[attr_userId_sym];
+function allocate_userId(self) {
+  if (self[userId_sym]) return self[userId_sym];
 
-  const capacity = self._alignedCapacity;
+  const capacity = self._capacity;
   const nullBitmapSize = Math.ceil(capacity / 8);
   const alignedNullOffset = Math.ceil(nullBitmapSize / 4) * 4; // 4 = bytesPerElement
   const totalSize = alignedNullOffset + capacity * 4;
@@ -242,16 +264,16 @@ function allocate_attr_userId(self) {
     nulls: new Uint8Array(buffer, 0, nullBitmapSize),
     values: new Uint32Array(buffer, alignedNullOffset, capacity),
   };
-  self[attr_userId_sym] = storage;
+  self[userId_sym] = storage;
   return storage;
 }
 
 class GeneratedColumnBuffer {
-  get attr_userId_nulls() {
-    return allocate_attr_userId(this).nulls;
+  get userId_nulls() {
+    return allocate_userId(this).nulls;
   }
-  get attr_userId_values() {
-    return allocate_attr_userId(this).values;
+  get userId_values() {
+    return allocate_userId(this).values;
   }
 }
 ```
@@ -295,7 +317,7 @@ A high-level structured logging library providing excellent developer experience
 ### What lmao OWNS
 
 1. **Schema DSL** - `S.enum()`, `S.category()`, `S.text()`, `S.number()`, `S.boolean()`
-2. **Tag attribute definitions** - Schema definitions with masking transforms and `attr_` prefix
+2. **Tag attribute definitions** - Schema definitions with masking transforms
 3. **Feature flag evaluation** - `defineFeatureFlags()` with sync/async evaluation
 4. **Context flow** - Request context → Module context → Task context → Span context
 5. **SpanBuffer creation** - Extends arrow-builder's ColumnBuffer with span metadata
@@ -319,10 +341,10 @@ requirements.
 
 These columns are written on EVERY log entry and MUST have zero overhead:
 
-| Column       | Type           | Description                                     | Allocation       |
-| ------------ | -------------- | ----------------------------------------------- | ---------------- |
-| `timestamps` | `Float64Array` | Microsecond-precision anchored timestamps       | **ALWAYS eager** |
-| `operations` | `Uint8Array`   | Entry type enum (span-start, info, error, etc.) | **ALWAYS eager** |
+| Column        | Type            | Description                                     | Allocation       |
+| ------------- | --------------- | ----------------------------------------------- | ---------------- |
+| `_timestamps` | `BigInt64Array` | Nanosecond-precision anchored timestamps        | **ALWAYS eager** |
+| `_operations` | `Uint8Array`    | Entry type enum (span-start, info, error, etc.) | **ALWAYS eager** |
 
 **WHY never lazy**: Adding `if (values === null)` checks to the hottest path would add microseconds per entry. These
 columns are pre-allocated in the constructor.
@@ -333,18 +355,18 @@ columns are pre-allocated in the constructor.
 class GeneratedSpanBuffer {
   constructor(requestedCapacity) {
     // System columns (EAGER - written on every entry)
+    // Note: _ prefix for system properties prevents namespace collisions
     const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
-    this._alignedCapacity = alignedCapacity;
-    this.timestamps = new Float64Array(alignedCapacity); // Allocated HERE
-    this.operations = new Uint8Array(alignedCapacity); // Allocated HERE
-
-    this.writeIndex = 0;
-    this.capacity = requestedCapacity;
+    this._capacity = alignedCapacity;
+    this._timestamps = new BigInt64Array(alignedCapacity); // Allocated HERE
+    this._operations = new Uint8Array(alignedCapacity); // Allocated HERE
+    this._writeIndex = 0;
   }
 
   // User attributes are LAZY getters (not in constructor)
-  get attr_userId_values() {
-    return allocate_attr_userId(this).values;
+  // User columns use field names directly (no prefix)
+  get userId_values() {
+    return allocate_userId(this).values;
   }
 }
 ```
@@ -413,15 +435,18 @@ class GeneratedScope {
 
 // SpanBuffer: TypedArray columns for per-entry data
 class GeneratedSpanBuffer {
-  // System columns (eager)
-  timestamps: Float64Array;
-  operations: Uint8Array;
+  // System columns (eager, _ prefix prevents namespace collisions)
+  _timestamps: BigInt64Array;
+  _operations: Uint8Array;
+  _writeIndex: number;
+  _capacity: number;
+  _next?: SpanBuffer;
 
-  // User attributes (lazy getters)
-  get attr_userId_values() {
+  // User attributes (lazy getters, no prefix - clean API)
+  get userId_values() {
     /* lazy allocation */
   }
-  get attr_userId_nulls() {
+  get userId_nulls() {
     /* lazy allocation */
   }
 }
@@ -471,17 +496,22 @@ interface SpanBuffer extends ColumnBuffer {
 
 ```typescript
 // ❌ WRONG - Dynamic lookup, megamorphic
-buffer.columns['attr_userId'].values[idx] = value;
+buffer.columns['userId'].values[idx] = value;
 
 // ✅ CORRECT - Direct property, monomorphic
-buffer.attr_userId_values[idx] = value;
+buffer.userId_values[idx] = value;
 ```
 
 The generated SpanBuffer class has direct properties for each column:
 
-- `attr_${name}_nulls` - Uint8Array null bitmap
-- `attr_${name}_values` - TypedArray for values
-- `attr_${name}` - Alias for `_values` (convenience)
+- `${name}_nulls` - Uint8Array null bitmap
+- `${name}_values` - TypedArray for values
+- `${name}` - Alias for `_values` (convenience)
+
+System properties use `_` prefix to prevent collisions:
+
+- `_timestamps`, `_operations` - System columns
+- `_writeIndex`, `_capacity`, `_next` - Internal state
 
 ---
 
@@ -607,9 +637,10 @@ packages/
 | **Focus**          | Explicit allocations, memory efficiency | Developer experience, zero overhead hot path |
 | **Knowledge**      | Generic columnar data                   | Logging/tracing semantics                    |
 | **Allocations**    | Visible, controllable                   | Delegates to arrow-builder                   |
-| **Schema**         | Generic types, extensible metadata      | Extends with masking, `attr_` prefix         |
+| **Schema**         | Generic types, extensible metadata      | Extends with masking                         |
+| **Naming**         | User-defined column names               | `_` prefix for system, direct for user       |
 | **Lazy Columns**   | Provides pattern (shared ArrayBuffer)   | Uses for user attributes                     |
-| **System Columns** | No concept                              | ALWAYS eager (timestamps, operations)        |
+| **System Columns** | No concept                              | ALWAYS eager (\_timestamps, \_operations)    |
 | **Scope**          | No concept                              | SEPARATE class from buffer columns           |
 | **Codegen**        | `generateColumnBufferClass()`           | Extends with SpanLogger, Scope               |
 | **Tree Walking**   | No concept                              | Owns tree traversal and dictionary building  |
@@ -633,23 +664,23 @@ Is it logging/tracing specific?
 
 ### Concrete Examples
 
-| Feature                             | Package       | Why                               |
-| ----------------------------------- | ------------- | --------------------------------- |
-| Cache-aligned TypedArray allocation | arrow-builder | Generic optimization              |
-| Lazy column with shared ArrayBuffer | arrow-builder | Generic memory pattern            |
-| Null bitmap management              | arrow-builder | Generic Arrow format              |
-| Buffer capacity, no hidden resize   | arrow-builder | Generic allocation control        |
-| Runtime class generation            | arrow-builder | Generic V8 optimization           |
-| `attr_` prefix convention           | **lmao**      | Logging-specific naming           |
-| System columns (timestamps, ops)    | **lmao**      | Logging-specific hot path         |
-| Scope class generation              | **lmao**      | Logging-specific inheritance      |
-| Entry types (span-start, info)      | **lmao**      | Logging-specific lifecycle        |
-| SpanLogger with typed methods       | **lmao**      | Logging-specific API              |
-| Masking functions                   | **lmao**      | Logging-specific privacy          |
-| Context flow                        | **lmao**      | Logging-specific hierarchy        |
-| Tree walking (span trees)           | **lmao**      | Logging-specific tree structure   |
-| Dictionary building across tree     | **lmao**      | Logging-specific Arrow conversion |
-| RecordBatch creation with dicts     | **lmao**      | Logging-specific Arrow output     |
+| Feature                              | Package       | Why                               |
+| ------------------------------------ | ------------- | --------------------------------- |
+| Cache-aligned TypedArray allocation  | arrow-builder | Generic optimization              |
+| Lazy column with shared ArrayBuffer  | arrow-builder | Generic memory pattern            |
+| Null bitmap management               | arrow-builder | Generic Arrow format              |
+| Buffer capacity, no hidden resize    | arrow-builder | Generic allocation control        |
+| Runtime class generation             | arrow-builder | Generic V8 optimization           |
+| `_` prefix for system properties     | **lmao**      | Logging-specific namespace mgmt   |
+| System columns (\_timestamps, \_ops) | **lmao**      | Logging-specific hot path         |
+| Scope class generation               | **lmao**      | Logging-specific inheritance      |
+| Entry types (span-start, info)       | **lmao**      | Logging-specific lifecycle        |
+| SpanLogger with typed methods        | **lmao**      | Logging-specific API              |
+| Masking functions                    | **lmao**      | Logging-specific privacy          |
+| Context flow                         | **lmao**      | Logging-specific hierarchy        |
+| Tree walking (span trees)            | **lmao**      | Logging-specific tree structure   |
+| Dictionary building across tree      | **lmao**      | Logging-specific Arrow conversion |
+| RecordBatch creation with dicts      | **lmao**      | Logging-specific Arrow output     |
 
 ---
 

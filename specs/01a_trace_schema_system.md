@@ -22,13 +22,17 @@ requirements. The system optimizes each type appropriately rather than forcing t
 
 ### String Type Performance Characteristics
 
-LMAO provides three distinct string types with different storage strategies optimized for different access patterns:
+LMAO provides three distinct string types with different storage strategies optimized for different access patterns.
 
-| Type         | Storage (Hot Path)       | Dictionary (Cold Path)           | Memory Growth     | Use Case                     |
-| ------------ | ------------------------ | -------------------------------- | ----------------- | ---------------------------- |
-| **ENUM**     | Uint8Array (1 byte)      | Pre-allocated, sorted at startup | Bounded (fixed)   | Known compile-time values    |
-| **CATEGORY** | Uint32Array indices (4B) | Sorted, from LRU cache           | Bounded (LRU)     | Values that often repeat     |
-| **TEXT**     | JS string array          | Conditional (saves >128B)        | Per-flush bounded | Unique values, rarely repeat |
+**CRITICAL**: Strings are **NOT interned on the hot path**. CATEGORY and TEXT columns store raw JS strings in `string[]`
+arrays during logging. Dictionary building and UTF-8 encoding happen only during cold-path Arrow conversion. This keeps
+logging lightweight while conversion can be heavier.
+
+| Type         | Hot Path Storage       | Cold Path (Arrow Conversion)      | Memory Growth     | Use Case                     |
+| ------------ | ---------------------- | --------------------------------- | ----------------- | ---------------------------- |
+| **ENUM**     | Uint8Array (1 byte)    | Zero work (pre-built dictionary)  | Bounded (fixed)   | Known compile-time values    |
+| **CATEGORY** | string[] (raw strings) | Sort + dedupe → sorted dictionary | Per-flush bounded | Values that often repeat     |
+| **TEXT**     | string[] (raw strings) | 2-pass conditional dictionary     | Per-flush bounded | Unique values, rarely repeat |
 
 #### 1. ENUM - Known Values at Compile Time
 
@@ -91,11 +95,19 @@ function toArrowDictionary() {
 
 **Storage Strategy:**
 
-- **Hot path**: Store raw JS strings directly in buffer array (zero cost, just reference assignment)
+- **Hot path**: Store raw JS strings in `string[]` array (zero cost, just reference assignment). **NO interning.**
 - **Cold path**: Build SORTED Arrow Dictionary, UTF-8 encode with SIEVE cache
 - **Memory**: Per-flush bounded (strings cleared after Arrow conversion)
 
-**Why Sorted Dictionary:**
+**Why No Hot-Path Interning:**
+
+Interning (Map lookup → integer index) was considered but rejected:
+
+- Map lookups add latency even at O(1)
+- Global interner state is complex to manage
+- Deduplication at flush time is fast enough for typical workloads
+
+**Why Sorted Dictionary (Cold Path):**
 
 - Enables binary search for "does value X exist?" queries
 - Consistent ordering across flushes for efficient Parquet merging
@@ -119,12 +131,13 @@ class CategoryColumn {
 
 **Cold Path (Arrow Conversion with SIEVE Cache):**
 
-During Arrow conversion, category columns build a sorted dictionary and use SIEVE-cached UTF-8 encoding:
+During Arrow conversion, category columns build a sorted dictionary and use SIEVE-cached UTF-8 encoding. This is where
+all the "heavy" work happens:
 
 ```typescript
 // In convertToArrow.ts - cold path only
 function buildSortedCategoryDictionary(buffers, columnName) {
-  // 1. Collect all unique strings from all buffers
+  // 1. Collect all unique strings from all buffers (deduplication HERE)
   const uniqueStrings = new Set<string>();
   for (const buf of buffers) {
     const strings = buf[columnName];
@@ -146,7 +159,7 @@ function buildSortedCategoryDictionary(buffers, columnName) {
   return { dictionary, indices };
 }
 
-// UTF-8 encoding uses global SIEVE cache
+// UTF-8 encoding uses global SIEVE cache (cold path only)
 const { data, offsets } = globalUtf8Cache.encodeMany(dictionary);
 ```
 
@@ -217,15 +230,15 @@ uuid: S.category(); // ✗ UUIDs are unique by definition
 
 **Storage Strategy:**
 
-- **Hot path**: Store raw JS strings in array (no interning, no UTF-8 conversion)
+- **Hot path**: Store raw JS strings in `string[]` array (no interning, no UTF-8 conversion)
 - **Cold path**: 2-pass Arrow conversion with conditional dictionary encoding
 - **Memory**: Bounded per-flush (strings cleared after Arrow conversion)
 
-**Why No Hot-Path Interning:** TEXT columns are designed for unique/high-cardinality values. Interning would:
+**Why No Hot-Path Interning:** TEXT columns are designed for unique/high-cardinality values. But note that CATEGORY also
+doesn't intern on the hot path - both store raw strings. The difference is only in cold-path behavior:
 
-- Waste memory (cache fills with unique values that never repeat)
-- Add overhead (Map lookups for values that won't be found)
-- Provide no benefit (dictionary encoding decided at flush time anyway)
+- TEXT: May skip dictionary encoding if it doesn't save space
+- CATEGORY: Always builds a sorted dictionary (assumes values repeat)
 
 **Hot Path (Zero Overhead):**
 
@@ -348,11 +361,12 @@ class TextColumn {
 3. JS GC can collect the original strings
 4. Arrow data is serialized/sent (then Arrow buffers released)
 
-**No Global Interner Needed:** Unlike CATEGORY, TEXT has no global interner because:
+**No Global Interner for Either Type:** Neither CATEGORY nor TEXT use a global interner on the hot path:
 
-- Values rarely repeat (interner would have poor hit rate)
-- Dictionary decision is per-flush (no cross-flush deduplication needed)
+- Both store raw JS strings during logging
+- Dictionary building happens per-flush in cold path
 - Memory naturally bounded by flush interval
+- SIEVE cache (for UTF-8 encoding) provides cross-flush benefit for repeated strings
 
 **Use Cases:**
 
@@ -401,12 +415,12 @@ uuid: S.text(); // UUIDs are unique by definition
 
 **CATEGORY:**
 
-- ✓ Bounded memory (LRU eviction, configurable limits)
-- ✓ Fast hot path (Map lookup + integer write)
-- ✓ Smart UTF-8 caching (only after 2+ occurrences)
+- ✓ Zero hot-path overhead (just store string reference)
+- ✓ Bounded memory (per-flush, cleared after Arrow conversion)
+- ✓ Smart UTF-8 caching in cold path (SIEVE cache)
 - ✓ Sorted dictionary for query optimization
-- ⚠ 4 bytes per value (Uint32Array indices)
-- ⚠ LRU eviction means same string may get different index across flushes
+- ⚠ String storage in JS heap during logging (not TypedArray)
+- ⚠ Dictionary rebuilt each flush (no cross-flush index stability)
 
 **TEXT:**
 

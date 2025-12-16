@@ -32,11 +32,15 @@ export const RESERVED_NAMES = new Set([
 
 /**
  * Validate that attribute names don't conflict with reserved names
+ * and don't start with underscore (reserved for system properties)
  *
- * @throws Error if any attribute name is reserved
+ * @throws Error if any attribute name is reserved or starts with _
  */
 export function validateAttributeNames(schema: TagAttributeSchema): void {
   for (const name of Object.keys(schema)) {
+    if (name.startsWith('_')) {
+      throw new Error(`Field name '${name}' cannot start with '_' - this prefix is reserved for system properties`);
+    }
     if (RESERVED_NAMES.has(name)) {
       throw new Error(
         `Attribute name '${name}' is reserved and cannot be used. ` +

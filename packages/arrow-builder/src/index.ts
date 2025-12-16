@@ -1,5 +1,6 @@
 // Export schema types
 
+export * from './lib/buffer/bufferHelpers.js';
 export * from './lib/buffer/columnBufferGenerator.js';
 export * from './lib/buffer/createBuilders.js';
 export * from './lib/buffer/createColumnBuffer.js';

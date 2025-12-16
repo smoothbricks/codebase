@@ -71,11 +71,11 @@ function writeRow(
   buffer.timestamps[idx] = data.timestamp;
   buffer.operations[idx] = data.operation;
 
-  // Write attributes using attr_X_values and attr_X_nulls pattern
+  // Write attributes using X_values and X_nulls pattern
   if (data.attributes) {
     for (const [key, value] of Object.entries(data.attributes)) {
-      const valuesKey = `attr_${key}_values` as keyof SpanBuffer;
-      const nullsKey = `attr_${key}_nulls` as keyof SpanBuffer;
+      const valuesKey = `${key}_values` as keyof SpanBuffer;
+      const nullsKey = `${key}_nulls` as keyof SpanBuffer;
       const column = buffer[valuesKey];
       const nullBitmap = buffer[nullsKey] as Uint8Array | undefined;
 

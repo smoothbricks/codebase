@@ -380,8 +380,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       });
 
       const testTask = moduleContext.task('test-scope-overflow', async (ctx) => {
-        // Set scoped attributes at the beginning
-        ctx.log.scope({ requestId: 'scoped-req-123', userId: 'scoped-user-456' });
+        // Set scoped attributes at the beginning (scope is now on ctx directly)
+        ctx.scope({ requestId: 'scoped-req-123', userId: 'scoped-user-456' });
 
         // Write enough messages to trigger buffer overflow
         // Initial capacity is 64, and writeIndex starts at 2 (row 0: span-start, row 1: span-end)
@@ -434,7 +434,7 @@ describe('Buffer Overflow and Capacity Management', () => {
 
       const testTask = moduleContext.task('test-scope-prefill', async (ctx) => {
         // Set scoped attributes
-        ctx.log.scope({ region: 'us-east-1' });
+        ctx.scope({ region: 'us-east-1' });
 
         // Write enough messages to trigger overflow
         for (let i = 0; i < 80; i++) {

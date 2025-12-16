@@ -124,7 +124,7 @@ function concatenateTypedArrays<T extends TypedArray>(arrays: T[]): T {
 
 function concatenateNullBitmaps(
   buffers: SpanBuffer[],
-  columnName: `attr_${string}`,
+  columnName: string,
 ): { nullBitmap: Uint8Array | undefined; nullCount: number } {
   const nullsName = `${columnName}_nulls` as const;
   const hasAnyNulls = buffers.some((buf) => buf[nullsName] !== undefined);
@@ -182,7 +182,7 @@ function getArrowFieldName(fieldName: string): string {
 
 function buildSortedCategoryDictionary(
   buffers: SpanBuffer[],
-  columnName: `attr_${string}`,
+  columnName: string,
 ): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } {
   const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
@@ -221,7 +221,7 @@ function buildSortedCategoryDictionary(
 
 function buildTextDictionary(
   buffers: SpanBuffer[],
-  columnName: `attr_${string}`,
+  columnName: string,
 ): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } | null {
   const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
@@ -370,7 +370,7 @@ function convertBuffersToRecordBatch(
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
-    const columnName = `attr_${fieldName}` as `attr_${string}`;
+    const columnName = fieldName; // User columns have no prefix
 
     if (lmaoType === 'enum') {
       const enumValues = getEnumValues(fieldSchema) || [];
@@ -962,7 +962,7 @@ export function convertSpanTreeToArrowTable(
     spanNameBuilder.add(spanName);
 
     for (const [fieldName, builder] of categoryBuilders) {
-      const col = buffer[`attr_${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      const col = buffer[`${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
       if (col) {
         for (let i = 0; i < buffer.writeIndex; i++) {
           if (col[i] != null) builder.add(col[i]);
@@ -971,7 +971,7 @@ export function convertSpanTreeToArrowTable(
     }
 
     for (const [fieldName, builder] of textBuilders) {
-      const col = buffer[`attr_${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      const col = buffer[`${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
       if (col) {
         for (let i = 0; i < buffer.writeIndex; i++) {
           if (col[i] != null) builder.add(col[i]);
@@ -1381,7 +1381,7 @@ function convertBuffersWithSharedDicts(
 
   for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
-    const columnName = `attr_${fieldName}` as `attr_${string}`;
+    const columnName = fieldName; // User columns have no prefix
     const valuesKey = `${columnName}_values` as keyof SpanBuffer;
     const nullsKey = `${columnName}_nulls` as keyof SpanBuffer;
 

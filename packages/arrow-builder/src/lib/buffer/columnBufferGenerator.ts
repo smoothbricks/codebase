@@ -4,7 +4,7 @@
  * Per specs/01b1_buffer_performance_optimizations.md:
  * - Generate concrete class at module initialization time (cold path)
  * - Direct properties for each column (no lazy getters, no wrapper objects)
- * - attr_${name}_nulls and attr_${name}_values share ONE ArrayBuffer per column
+ * - ${name}_nulls and ${name}_values share ONE ArrayBuffer per column
  * - System columns (timestamps, operations) as direct Float64Array/Uint8Array
  * - Zero indirection in the hot path
  *
@@ -16,7 +16,11 @@
  */
 
 import type { TagAttributeSchema } from '../schema-types.js';
+import { bufferHelpers } from './bufferHelpers.js';
 import type { ColumnBuffer } from './types.js';
+
+// Re-export for consumers
+export { getAlignedCapacity } from './bufferHelpers.js';
 
 /**
  * Extension options for injecting custom code into generated ColumnBuffer classes.
@@ -144,7 +148,7 @@ function getTypedArrayInfo(
  *
  * Creates a concrete class with:
  * 1. EAGER system columns (timestamps, operations) - allocated in constructor
- * 2. LAZY user attribute columns (attr_X_nulls, attr_X_values) - getters that allocate on first access
+ * 2. LAZY user attribute columns (X_nulls, X_values) - getters that allocate on first access
  * 3. Shared ArrayBuffer per column (nulls and values use same buffer when allocated)
  * 4. Cache-aligned allocations
  *
@@ -169,15 +173,15 @@ export function generateColumnBufferClass(
 
   // System columns (ALWAYS EAGER - written on every entry)
   constructorCode.push('    // System columns (eager - written on every entry)');
-  constructorCode.push('    const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);');
+  constructorCode.push('    const alignedCapacity = helpers.getAlignedCapacity(requestedCapacity);');
   constructorCode.push('    this._alignedCapacity = alignedCapacity;');
-  constructorCode.push('    this.timestamps = new BigInt64Array(alignedCapacity);');
-  constructorCode.push('    this.operations = new Uint8Array(alignedCapacity);');
+  constructorCode.push('    this._timestamps = new BigInt64Array(alignedCapacity);');
+  constructorCode.push('    this._operations = new Uint8Array(alignedCapacity);');
   constructorCode.push('');
-  constructorCode.push('    // Buffer management');
-  constructorCode.push('    this.writeIndex = 0;');
-  constructorCode.push('    this.capacity = requestedCapacity;');
-  constructorCode.push('    this.next = undefined;');
+  constructorCode.push('    // Buffer management (system properties use _ prefix)');
+  constructorCode.push('    this._writeIndex = 0;');
+  constructorCode.push('    this._capacity = requestedCapacity;');
+  constructorCode.push('    this._next = undefined;');
 
   // Generate symbol declarations and allocator functions for lazy columns
   const symbolDeclarations: string[] = [];
@@ -185,7 +189,7 @@ export function generateColumnBufferClass(
   const getterMethods: string[] = [];
 
   for (const fieldName of schemaFields) {
-    const columnName = `attr_${fieldName}`;
+    const columnName = fieldName; // User columns have no prefix
     const { constructorName, bytesPerElement, isBitPacked } = getTypedArrayInfo(schema, fieldName);
 
     // Symbol declaration
@@ -285,19 +289,10 @@ ${extension.methods
   const preambleCode = extension?.preamble ? `\n  // Extension preamble\n${extension.preamble}\n` : '';
 
   // Generate the complete class code
+  // Note: 'helpers' is injected by getColumnBufferClass() via new Function('helpers', code)
+  // The generated code is NOT an IIFE - it's the body of a function that receives helpers
   const classCode = `
-(function() {
   'use strict';
-
-  // Cache line size constant
-  const CACHE_LINE_SIZE = 64;
-
-  // Cache-aligned capacity calculation
-  function getCacheAlignedCapacity(elementCount) {
-    const totalBytes = elementCount * 1;
-    const alignedBytes = Math.ceil(totalBytes / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
-    return alignedBytes;
-  }
 
   // Symbol registry for lazy column allocation checking
   const columnSymbols = {};
@@ -331,7 +326,6 @@ ${extensionMethods}
   }
 
   return ${className};
-})()
 `;
 
   return classCode;
@@ -384,24 +378,28 @@ export function getColumnBufferClass(
     const classCode = generateColumnBufferClass(schema, 'GeneratedColumnBuffer', extension).trim();
 
     // Compile with new Function()
-    // If dependencies are provided, inject them as function parameters
+    // Always inject bufferHelpers; extension dependencies are merged in
     // This is safe because we control the code generation
+    const depNames = ['helpers'];
+    const depValues: unknown[] = [bufferHelpers];
+
     if (extension?.dependencies && Object.keys(extension.dependencies).length > 0) {
-      const depNames = Object.keys(extension.dependencies);
-      const depValues = depNames.map((name) => extension.dependencies![name]);
-      // Create function that takes dependencies as parameters and returns the class
-      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-      const factory = new Function(...depNames, `return ${classCode}`) as (
-        ...args: unknown[]
-      ) => new (
-        capacity: number,
-        ...args: unknown[]
-      ) => ColumnBuffer;
-      BufferClass = factory(...depValues);
-    } else {
-      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-      BufferClass = new Function(`return ${classCode}`)() as new (capacity: number, ...args: unknown[]) => ColumnBuffer;
+      for (const [name, value] of Object.entries(extension.dependencies)) {
+        depNames.push(name);
+        depValues.push(value);
+      }
     }
+
+    // Create function that takes dependencies as parameters and returns the class
+    // The classCode is the body of the function, ending with 'return ClassName;'
+    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+    const factory = new Function(...depNames, classCode) as (
+      ...args: unknown[]
+    ) => new (
+      capacity: number,
+      ...args: unknown[]
+    ) => ColumnBuffer;
+    BufferClass = factory(...depValues);
 
     // Cache for future use
     classCache.set(cacheKey, BufferClass);

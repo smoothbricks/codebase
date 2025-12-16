@@ -268,7 +268,7 @@ The final Arrow table has clean, collision-free columns:
 
 | Column             | Type                 | Description                     | Source              |
 | ------------------ | -------------------- | ------------------------------- | ------------------- |
-| `timestamp`        | `timestamp[μs]`      | Event timestamp                 | Core system         |
+| `timestamp`        | `timestamp[ns]`      | Event timestamp                 | Core system         |
 | `trace_id`         | `dictionary<string>` | Trace identifier                | Core system         |
 | `thread_id`        | `uint64`             | Thread/worker identifier        | Core system         |
 | `span_id`          | `uint32`             | Unit of work within thread      | Core system         |

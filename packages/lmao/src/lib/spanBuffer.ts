@@ -27,6 +27,7 @@
 
 import { type ColumnBufferExtension, getColumnBufferClass } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
+import { spanBufferHelpers } from './spanBufferHelpers.js';
 import { createTraceId, generateTraceId, type TraceId } from './traceId.js';
 import type { SpanBuffer, TaskContext } from './types.js';
 
@@ -89,10 +90,8 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
     constructorParams: 'task, parent, isChained, traceId',
     preamble: `
         // Thread-local span counter (per-process/worker, see threadId.ts docs)
+        // This MUST stay in preamble - it's per-class state incremented during construction
         let nextSpanId = 1;
-        
-        // TextEncoder for traceId
-        const textEncoder = new TextEncoder();
       `,
     constructorCode: `
         // Store task context
@@ -121,18 +120,14 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
           // Set threadId (bytes 0-7) via TaskContext (singleton per process/worker)
           task.copyThreadIdTo(this._identity, 0);
           
-          // Set spanId (bytes 8-11, little-endian)
-          const spanId = nextSpanId++;
-          this._identity[8] = spanId & 0xff;
-          this._identity[9] = (spanId >> 8) & 0xff;
-          this._identity[10] = (spanId >> 16) & 0xff;
-          this._identity[11] = (spanId >> 24) & 0xff;
+          // Set spanId (bytes 8-11, little-endian) using injected helper
+          sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
           
           // Link to parent
           parent.children.push(this);
         } else {
           // ROOT: identity with traceId
-          const traceBytes = traceId ? textEncoder.encode(traceId) : new Uint8Array(0);
+          const traceBytes = traceId ? sbHelpers.textEncoder.encode(traceId) : new Uint8Array(0);
           const identitySize = 13 + traceBytes.length;
           this._system = new ArrayBuffer(systemSize + identitySize);
           this._identity = new Uint8Array(this._system, systemSize, identitySize);
@@ -140,12 +135,8 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
           // Set threadId (bytes 0-7) via TaskContext (singleton per process/worker)
           task.copyThreadIdTo(this._identity, 0);
           
-          // Set spanId (bytes 8-11, little-endian)
-          const spanId = nextSpanId++;
-          this._identity[8] = spanId & 0xff;
-          this._identity[9] = (spanId >> 8) & 0xff;
-          this._identity[10] = (spanId >> 16) & 0xff;
-          this._identity[11] = (spanId >> 24) & 0xff;
+          // Set spanId (bytes 8-11, little-endian) using injected helper
+          sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
           
           // Set traceId length and bytes
           this._identity[12] = traceBytes.length;
@@ -153,31 +144,38 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
         }
         
         // System columns at FIXED offsets (same for ALL buffer types)
-        this.timestamps = new BigInt64Array(this._system, 0, requestedCapacity);
-        this.operations = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
+        // These override the ColumnBuffer's _timestamps/_operations with our unified layout
+        this._timestamps = new BigInt64Array(this._system, 0, requestedCapacity);
+        this._operations = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
+        
+        // Direct property aliases for system columns (lmao code uses these)
+        // These are direct assignments, not getters - V8 hidden class friendly
+        this.timestamps = this._timestamps;
+        this.operations = this._operations;
         
         // Track buffer creation
         task.module.spanBufferCapacityStats.totalBuffersCreated++;
       `,
     methods: `
-        // spanId getter - reads from identity bytes 8-11 (little-endian)
+        // Aliases for buffer management properties (native getters - V8 optimized)
+        get writeIndex() { return this._writeIndex; }
+        set writeIndex(v) { this._writeIndex = v; }
+        get capacity() { return this._capacity; }
+        get next() { return this._next; }
+        set next(v) { this._next = v; }
+        
+        // spanId getter - uses injected helper to read from identity bytes 8-11
         get spanId() {
-          const b = this._identity;
-          return b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
+          return sbHelpers.readSpanId(this._identity, 8);
         }
         
-        // traceId getter - walks up parent chain to root
+        // traceId getter - walks up parent chain to root, uses helper for decoding
         get traceId() {
           if (this.parent) {
             return this.parent.traceId;
           }
-          // Root: decode from identity bytes [12]=len, [13+]=traceId
-          const len = this._identity[12];
-          let str = '';
-          for (let i = 0; i < len; i++) {
-            str += String.fromCharCode(this._identity[13 + i]);
-          }
-          return str;
+          // Root: decode from identity bytes using helper
+          return sbHelpers.decodeTraceId(this._identity, 12);
         }
         
         // hasParent getter
@@ -223,6 +221,10 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
                  (BigInt(b[4]) << 32n) | (BigInt(b[5]) << 40n) | (BigInt(b[6]) << 48n) | (BigInt(b[7]) << 56n);
         }
       `,
+    // Inject helpers as dependency - available as 'sbHelpers' in generated code
+    dependencies: {
+      sbHelpers: spanBufferHelpers,
+    },
   };
 
   // Generate class using arrow-builder (provides lazy attribute columns)

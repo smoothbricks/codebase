@@ -50,7 +50,7 @@ describe('Span Scope Attributes', () => {
 
       const testTask = module.task('test-task', async (ctx) => {
         // Set scope attributes
-        ctx.log.scope({
+        ctx.scope({
           userId: 'user123',
           requestId: 'req456',
         });
@@ -85,7 +85,7 @@ describe('Span Scope Attributes', () => {
 
       const testTask = module.task('test-task', async (ctx) => {
         // Set scope once
-        ctx.log.scope({
+        ctx.scope({
           userId: 'user123',
           requestId: 'req456',
         });
@@ -125,7 +125,7 @@ describe('Span Scope Attributes', () => {
 
       const testTask = module.task('test-task', async (ctx) => {
         // Set scope at parent level
-        ctx.log.scope({
+        ctx.scope({
           userId: 'user123',
           requestId: 'req456',
           operation: 'process_order',
@@ -137,7 +137,7 @@ describe('Span Scope Attributes', () => {
         const childResult = await ctx.span('child-task', async (childCtx) => {
           // Child should have access to parent's scoped attributes
           // Add additional scope in child
-          childCtx.log.scope({
+          childCtx.scope({
             step: 'validation',
           });
 
@@ -174,13 +174,13 @@ describe('Span Scope Attributes', () => {
       });
 
       const testTask = module.task('test-task', async (ctx) => {
-        ctx.log.scope({ userId: 'user123', level1: 'L1' });
+        ctx.scope({ userId: 'user123', level1: 'L1' });
 
         await ctx.span('level-2', async (ctx2) => {
-          ctx2.log.scope({ level2: 'L2' });
+          ctx2.scope({ level2: 'L2' });
 
           await ctx2.span('level-3', async (ctx3) => {
-            ctx3.log.scope({ level3: 'L3' });
+            ctx3.scope({ level3: 'L3' });
 
             // This span should have all scoped attributes: userId, level1, level2, level3
             ctx3.log.info('Deep nested span');
@@ -219,7 +219,7 @@ describe('Span Scope Attributes', () => {
       });
 
       const parentTask = module.task('parent-task', async (ctx) => {
-        ctx.log.scope({
+        ctx.scope({
           userId: 'user123',
           requestId: 'req456',
           taskName: 'parent',
@@ -233,7 +233,7 @@ describe('Span Scope Attributes', () => {
 
       const childTask = module.task('child-task', async (ctx) => {
         // This task should inherit userId and requestId from parent
-        ctx.log.scope({
+        ctx.scope({
           taskName: 'child',
         });
 
@@ -272,7 +272,7 @@ describe('Span Scope Attributes', () => {
 
       const middlewareTask = module.task('middleware', async (ctx) => {
         // Middleware sets up request-level scope
-        ctx.log.scope({
+        ctx.scope({
           requestId: 'req123',
           userId: 'user456',
           endpoint: '/api/users',
@@ -292,7 +292,7 @@ describe('Span Scope Attributes', () => {
         ctx.log.info('Processing business logic');
 
         // Business can add its own scope
-        ctx.log.scope({
+        ctx.scope({
           endpoint: '/api/users/create', // Override endpoint
         });
 
@@ -328,7 +328,7 @@ describe('Span Scope Attributes', () => {
       });
 
       const testTask = module.task('test-task', async (ctx) => {
-        ctx.log.scope({
+        ctx.scope({
           status: 'active',
           userId: 'user123',
           errorMessage: 'No errors',
@@ -367,7 +367,7 @@ describe('Span Scope Attributes', () => {
 
       const testTask = module.task('test-task', async (ctx) => {
         // Initial scope
-        ctx.log.scope({
+        ctx.scope({
           phase: 'initialization',
           status: 'starting',
           progress: 0,
@@ -376,7 +376,7 @@ describe('Span Scope Attributes', () => {
         ctx.log.info('Phase 1');
 
         // Update scope
-        ctx.log.scope({
+        ctx.scope({
           phase: 'processing',
           status: 'in_progress',
           progress: 50,
@@ -385,7 +385,7 @@ describe('Span Scope Attributes', () => {
         ctx.log.info('Phase 2');
 
         // Update again
-        ctx.log.scope({
+        ctx.scope({
           phase: 'finalization',
           status: 'completing',
           progress: 100,

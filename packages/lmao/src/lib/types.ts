@@ -26,6 +26,14 @@ export { TaskContext } from './taskContext.js';
  *
  * Adds span tree structure and task context to the base ColumnBuffer.
  *
+ * **Naming Convention**
+ *
+ * System properties use `_` prefix to avoid collision with user column names:
+ * - `_system`, `_identity`, `_timestamps`, `_operations`, `_writeIndex`, `_capacity`, `_next`
+ *
+ * User columns use NO prefix - just the field name:
+ * - `userId`, `userId_values`, `userId_nulls`
+ *
  * **Unified Memory Layout (per specs/01b_columnar_buffer_architecture.md)**
  *
  * Single `_system` ArrayBuffer contains:
@@ -59,6 +67,26 @@ export interface SpanBuffer extends ColumnBuffer {
    * - Chained: shared reference to first buffer's identity
    */
   readonly _identity: Uint8Array;
+
+  // ============================================================================
+  // Convenient aliases for system columns (same as ColumnBuffer._timestamps etc.)
+  // These are generated as direct references in spanBuffer.ts
+  // ============================================================================
+
+  /** Alias for _timestamps - nanosecond-precision timestamps */
+  readonly timestamps: BigInt64Array;
+
+  /** Alias for _operations - entry type codes */
+  readonly operations: Uint8Array;
+
+  /** Alias for _writeIndex - current write position */
+  writeIndex: number;
+
+  /** Alias for _capacity - buffer capacity */
+  readonly capacity: number;
+
+  /** Alias for _next - chain to overflow buffer */
+  next?: SpanBuffer;
 
   // ============================================================================
   // Identity Getters (read from _identity bytes)

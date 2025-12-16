@@ -9,11 +9,18 @@
  * NOTE: This is a GENERIC columnar buffer. Consumer packages
  * extend this type to add domain-specific metadata.
  *
+ * ## Naming Conventions
+ *
+ * - System properties use `_` prefix: `_writeIndex`, `_capacity`, `_next`, `_timestamps`, `_operations`
+ * - User columns have NO prefix, just suffixes: `userId_nulls`, `userId_values`, `userId` (alias)
+ *
+ * This prevents collisions between user-defined field names and system internals.
+ *
  * ## Column Layout
  *
  * Each attribute column consists of TWO direct properties sharing ONE ArrayBuffer:
- * - attr_X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
- * - attr_X_values: TypedArray for actual values
+ * - X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
+ * - X_values: TypedArray for actual values
  *
  * Both arrays are backed by the SAME ArrayBuffer, partitioned as:
  * [null bitmap bytes | padding to 64-byte cache line | value bytes]
@@ -21,24 +28,24 @@
  * This ensures cache-aligned access while maintaining memory locality.
  */
 export interface ColumnBuffer {
-  // Core columns - always present
-  timestamps: BigInt64Array; // Nanosecond-precision timestamps since Unix epoch
-  operations: Uint8Array; // Operation type: tag, ok, err, etc.
+  // System columns - prefixed with _ to avoid collision with user columns
+  _timestamps: BigInt64Array; // Nanosecond-precision timestamps since Unix epoch
+  _operations: Uint8Array; // Operation type: tag, ok, err, etc.
 
-  // Attribute columns (generated from schema with attr_ prefix)
+  // User attribute columns (generated from schema - NO prefix)
   // Each attribute has TWO properties:
-  // - attr_X_nulls: Uint8Array for null bitmap
-  // - attr_X_values: TypedArray OR string[] for actual values
+  // - X_nulls: Uint8Array for null bitmap
+  // - X_values: TypedArray OR string[] for actual values
   //
   // For category/text columns, values are stored as string[] on the hot path
   // For enum/number/boolean columns, values are stored in TypedArray
-  [key: `attr_${string}_nulls`]: Uint8Array;
-  [key: `attr_${string}_values`]: ColumnValueType;
+  [key: `${string}_nulls`]: Uint8Array;
+  [key: `${string}_values`]: ColumnValueType;
 
-  // Buffer management
-  writeIndex: number; // Current write position (0 to capacity-1)
-  capacity: number; // Logical capacity for bounds checking
-  next?: ColumnBuffer; // Chain to next buffer when overflow
+  // Buffer management - prefixed with _ to avoid collision with user columns
+  _writeIndex: number; // Current write position (0 to capacity-1)
+  _capacity: number; // Logical capacity for bounds checking
+  _next?: ColumnBuffer; // Chain to next buffer when overflow
 }
 
 /**

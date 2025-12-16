@@ -76,8 +76,8 @@ describe('Buffer Chaining', () => {
       const nextBuffer = createNextBuffer(buffer);
 
       // Should have same attribute columns
-      expect(Array.isArray(nextBuffer['attr_userId'])).toBe(true); // category (raw strings)expect(Array.isArray(nextBuffer['attr_requestId'])).toBe(true); // category (raw strings)expect(nextBuffer['attr_operation']).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer['attr_duration']).toBeInstanceOf(Float64Array);
+      expect(Array.isArray(nextBuffer['userId'])).toBe(true); // category (raw strings)expect(Array.isArray(nextBuffer['requestId'])).toBe(true); // category (raw strings)expect(nextBuffer['operation']).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer['duration']).toBeInstanceOf(Float64Array);
 
       // Should have core columns
       expect(nextBuffer.timestamps).toBeInstanceOf(BigInt64Array);
@@ -159,10 +159,10 @@ describe('Buffer Chaining', () => {
       const nextBuffer = createNextBuffer(buffer);
 
       // Should have null bitmaps for each attribute (direct properties)
-      expect(nextBuffer.attr_userId_nulls).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer.attr_requestId_nulls).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer.attr_operation_nulls).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer.attr_duration_nulls).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.userId_nulls).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.requestId_nulls).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.operation_nulls).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.duration_nulls).toBeInstanceOf(Uint8Array);
     });
 
     it('should handle capacity changes between chained buffers', () => {

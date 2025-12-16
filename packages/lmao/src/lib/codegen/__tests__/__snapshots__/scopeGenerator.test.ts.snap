@@ -1,0 +1,196 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`generateScopeClassCode snapshots snapshot: empty schema 1`] = `
+"
+(function() {
+  'use strict';
+
+  class GeneratedScope {
+
+
+
+  _getScopeValues() {
+    return {
+      
+    };
+  }
+  }
+
+  return GeneratedScope;
+})()
+"
+`;
+
+exports[`generateScopeClassCode snapshots snapshot: all field types 1`] = `
+"
+(function() {
+  'use strict';
+
+  class GeneratedScope {
+  _userId = undefined;
+  _operation = undefined;
+  _errorMsg = undefined;
+  _count = undefined;
+  _enabled = undefined;
+
+  get userId() {
+    return this._userId;
+  }
+
+  set userId(value) {
+    this._userId = value;
+  }
+
+  get operation() {
+    return this._operation;
+  }
+
+  set operation(value) {
+    this._operation = value;
+  }
+
+  get errorMsg() {
+    return this._errorMsg;
+  }
+
+  set errorMsg(value) {
+    this._errorMsg = value;
+  }
+
+  get count() {
+    return this._count;
+  }
+
+  set count(value) {
+    this._count = value;
+  }
+
+  get enabled() {
+    return this._enabled;
+  }
+
+  set enabled(value) {
+    this._enabled = value;
+  }
+
+  _getScopeValues() {
+    return {
+      userId: this._userId,
+      operation: this._operation,
+      errorMsg: this._errorMsg,
+      count: this._count,
+      enabled: this._enabled
+    };
+  }
+  }
+
+  return GeneratedScope;
+})()
+"
+`;
+
+exports[`generateScopeClassCode snapshots snapshot: category fields only 1`] = `
+"
+(function() {
+  'use strict';
+
+  class GeneratedScope {
+  _userId = undefined;
+  _sessionId = undefined;
+  _requestId = undefined;
+
+  get userId() {
+    return this._userId;
+  }
+
+  set userId(value) {
+    this._userId = value;
+  }
+
+  get sessionId() {
+    return this._sessionId;
+  }
+
+  set sessionId(value) {
+    this._sessionId = value;
+  }
+
+  get requestId() {
+    return this._requestId;
+  }
+
+  set requestId(value) {
+    this._requestId = value;
+  }
+
+  _getScopeValues() {
+    return {
+      userId: this._userId,
+      sessionId: this._sessionId,
+      requestId: this._requestId
+    };
+  }
+  }
+
+  return GeneratedScope;
+})()
+"
+`;
+
+exports[`generateScopeClassCode snapshots snapshot: mixed types 1`] = `
+"
+(function() {
+  'use strict';
+
+  class GeneratedScope {
+  _status = undefined;
+  _duration = undefined;
+  _isValid = undefined;
+  _errorMessage = undefined;
+
+  get status() {
+    return this._status;
+  }
+
+  set status(value) {
+    this._status = value;
+  }
+
+  get duration() {
+    return this._duration;
+  }
+
+  set duration(value) {
+    this._duration = value;
+  }
+
+  get isValid() {
+    return this._isValid;
+  }
+
+  set isValid(value) {
+    this._isValid = value;
+  }
+
+  get errorMessage() {
+    return this._errorMessage;
+  }
+
+  set errorMessage(value) {
+    this._errorMessage = value;
+  }
+
+  _getScopeValues() {
+    return {
+      status: this._status,
+      duration: this._duration,
+      isValid: this._isValid,
+      errorMessage: this._errorMessage
+    };
+  }
+  }
+
+  return GeneratedScope;
+})()
+"
+`;

@@ -128,10 +128,9 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    * Example: ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
    */
   with(attributes: Partial<InferTagAttributes<T>>): this {
-    // Write each attribute to its column
+    // Write each attribute to its column (use field name directly)
     for (const [key, value] of Object.entries(attributes)) {
-      const columnName = `attr_${key}`;
-      writeToColumn(this.buffer, columnName, value, this.entryIndex);
+      writeToColumn(this.buffer, key, value, this.entryIndex);
     }
     return this;
   }
@@ -141,7 +140,16 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    * Example: ctx.ok(result).message('User created successfully')
    */
   message(text: string): this {
-    writeToColumn(this.buffer, 'attr_resultMessage', text, this.entryIndex);
+    writeToColumn(this.buffer, 'resultMessage', text, this.entryIndex);
+    return this;
+  }
+
+  /**
+   * Set the source code line number for this result entry
+   * Example: ctx.ok(result).line(42)
+   */
+  line(lineNumber: number): this {
+    writeToColumn(this.buffer, 'lineNumber', lineNumber, this.entryIndex);
     return this;
   }
 }
@@ -175,7 +183,7 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
     this.buffer.timestamps[1] = getTimestampNanos();
 
     // Write error code
-    writeToColumn(this.buffer, 'attr_errorCode', code, this.entryIndex);
+    writeToColumn(this.buffer, 'errorCode', code, this.entryIndex);
 
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
   }
@@ -185,10 +193,9 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
    * Example: ctx.err('ERROR', details).with({ userId: 'u1' })
    */
   with(attributes: Partial<InferTagAttributes<T>>): this {
-    // Write each attribute to its column
+    // Write each attribute to its column (use field name directly)
     for (const [key, value] of Object.entries(attributes)) {
-      const columnName = `attr_${key}`;
-      writeToColumn(this.buffer, columnName, value, this.entryIndex);
+      writeToColumn(this.buffer, key, value, this.entryIndex);
     }
     return this;
   }
@@ -198,7 +205,16 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
    * Example: ctx.err('ERROR', details).message('Operation failed')
    */
   message(text: string): this {
-    writeToColumn(this.buffer, 'attr_resultMessage', text, this.entryIndex);
+    writeToColumn(this.buffer, 'resultMessage', text, this.entryIndex);
+    return this;
+  }
+
+  /**
+   * Set the source code line number for this result entry
+   * Example: ctx.err('ERROR', details).line(42)
+   */
+  line(lineNumber: number): this {
+    writeToColumn(this.buffer, 'lineNumber', lineNumber, this.entryIndex);
     return this;
   }
 }
@@ -471,18 +487,37 @@ export function createRequestContext<FF extends FeatureFlagSchema, Env extends R
 }
 
 /**
+ * Fluent builder for log entries - supports .line() chaining
+ *
+ * Returned by ctx.log.info(), ctx.log.warn(), etc. to enable:
+ * ctx.log.info('message').line(42)
+ */
+export interface FluentLogEntry {
+  /**
+   * Set the source code line number for this log entry.
+   *
+   * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
+   * - TypeScript transformer injects these calls at compile time
+   * - No runtime overhead - just a method call with literal number
+   *
+   * @param lineNumber - Source line number (0-65535)
+   *
+   * @example
+   * ctx.log.info('Processing user').line(42);
+   */
+  line(lineNumber: number): void;
+}
+
+/**
  * Span logger context - provides logging API for spans
  *
  * This is what's available as `ctx.log` in task wrappers.
  * For span attributes, use `ctx.tag` directly (not `ctx.log.tag`).
- *
- * Per specs/01i_span_scope_attributes.md:
- * - scope() sets attributes that auto-propagate to all subsequent entries
+ * For scoped attributes, use `ctx.scope` directly (not `ctx.log.scope`).
  *
  * @example
  * ```typescript
- * ctx.log.info('Processing user');
- * ctx.log.scope({ requestId: 'req-1' }); // All subsequent logs include requestId
+ * ctx.log.info('Processing user').line(42);
  * ctx.log.warn('Slow operation');
  * ```
  */
@@ -494,56 +529,73 @@ export interface SpanLogger<T extends TagAttributeSchema> {
   readonly tag: ChainableTagAPI<T>;
 
   /**
-   * Set scoped attributes that auto-propagate to all subsequent log entries
-   *
-   * Scoped attributes are automatically included in all log entries
-   * and inherited by child spans.
-   *
-   * @param attributes - Attributes to scope to this span
-   *
-   * @example
-   * ctx.log.scope({ requestId: req.id, userId: req.user?.id });
-   * ctx.log.info('Processing'); // Includes requestId and userId
-   */
-  scope(attributes: Partial<InferTagAttributes<T>>): void;
-
-  /**
    * Get the Scope instance directly
    * @internal Used internally for scope inheritance via _getScopeValues()
    */
   _getScope(): import('./codegen/scopeGenerator.js').GeneratedScope;
 
   /**
+   * Internal method to set scoped attributes. Called by ctx.scope().
+   * @internal
+   */
+  _setScope(attributes: Partial<InferTagAttributes<T>>): void;
+
+  /**
    * Log a message entry with specified level
    *
    * @param level - Log level (info, debug, warn, error)
    * @param message - Log message text
+   * @returns Fluent builder for .line() chaining
    */
-  message(level: 'info' | 'debug' | 'warn' | 'error', message: string): void;
+  message(level: 'info' | 'debug' | 'warn' | 'error', message: string): FluentLogEntry;
 
   /**
    * Log an info message
    * @param message - Log message text
+   * @returns Fluent builder for .line() chaining
    */
-  info(message: string): void;
+  info(message: string): FluentLogEntry;
 
   /**
    * Log a debug message
    * @param message - Log message text
+   * @returns Fluent builder for .line() chaining
    */
-  debug(message: string): void;
+  debug(message: string): FluentLogEntry;
 
   /**
    * Log a warning message
    * @param message - Log message text
+   * @returns Fluent builder for .line() chaining
    */
-  warn(message: string): void;
+  warn(message: string): FluentLogEntry;
 
   /**
    * Log an error message
    * @param message - Log message text
+   * @returns Fluent builder for .line() chaining
    */
-  error(message: string): void;
+  error(message: string): FluentLogEntry;
+}
+
+/**
+ * Fluent span builder that supports .line() chaining
+ *
+ * Returned by ctx.span() to enable:
+ * await ctx.span('name', fn).line(42)
+ */
+export interface FluentSpan<R> extends Promise<R> {
+  /**
+   * Set the source code line number for this span entry.
+   *
+   * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
+   * - TypeScript transformer injects these calls at compile time
+   * - No runtime overhead - just a method call with literal number
+   *
+   * @param lineNumber - Source line number (0-65535)
+   * @returns The same promise, allowing: await ctx.span('x', fn).line(42)
+   */
+  line(lineNumber: number): Promise<R>;
 }
 
 /**
@@ -552,18 +604,22 @@ export interface SpanLogger<T extends TagAttributeSchema> {
  * This is what's provided to task functions and child spans.
  * Extends RequestContext with:
  * - `tag` - Chainable span attribute API (writes to row 0)
- * - `log` - Logging API (info, debug, warn, error, scope)
+ * - `log` - Logging API (info, debug, warn, error)
+ * - `scope` - Set scoped attributes that propagate to all entries
  * - `ok`/`err` - Result helpers with fluent API
  * - `span` - Child span creation
  *
  * @example
  * ```typescript
  * const createUser = task('create-user', async (ctx, userData) => {
- *   // Span attributes (writes to span-start row)
- *   ctx.tag.userId(userData.id).operation('INSERT');
+ *   // Scoped attributes (propagate to all log entries)
+ *   ctx.scope({ userId: userData.id });
  *
- *   // Logging
- *   ctx.log.info('Creating user');
+ *   // Span attributes (writes to span-start row)
+ *   ctx.tag.operation('INSERT');
+ *
+ *   // Logging (includes scoped attributes)
+ *   ctx.log.info('Creating user').line(42);
  *
  *   // Results
  *   return ctx.ok(user);
@@ -591,10 +647,23 @@ export interface SpanContext<T extends TagAttributeSchema, FF extends FeatureFla
    * Logs are appended to the buffer (row 2+).
    *
    * @example
-   * ctx.log.info('Processing request');
-   * ctx.log.scope({ requestId: 'req-1' }); // Set scoped attributes
+   * ctx.log.info('Processing request').line(42);
    */
   readonly log: SpanLogger<T>;
+
+  /**
+   * Set scoped attributes that auto-propagate to all subsequent log entries
+   *
+   * Scoped attributes are automatically included in all log entries
+   * and inherited by child spans.
+   *
+   * @param attributes - Attributes to scope to this span
+   *
+   * @example
+   * ctx.scope({ requestId: req.id, userId: req.user?.id });
+   * ctx.log.info('Processing'); // Includes requestId and userId
+   */
+  scope(attributes: Partial<InferTagAttributes<T>>): void;
 
   /**
    * Create a success result with optional attributes
@@ -630,18 +699,19 @@ export interface SpanContext<T extends TagAttributeSchema, FF extends FeatureFla
    *
    * Child spans inherit scoped attributes from the parent.
    * The child function receives a new SpanContext.
+   * Supports fluent .line() for source code location.
    *
    * @param name - Child span name
    * @param fn - Async function to execute in child span
-   * @returns Promise resolving to child function result
+   * @returns Fluent span builder with .line() support
    *
    * @example
    * const result = await ctx.span('validate', async (childCtx) => {
    *   childCtx.tag.step('validation');
    *   return childCtx.ok({ valid: true });
-   * });
+   * }).line(42);
    */
-  span<R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R>;
+  span<R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): FluentSpan<R>;
 }
 
 /**
@@ -842,16 +912,16 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
     },
 
     writeFfName(name: string): void {
-      // Write to attr_ffName column (raw string, no interning)
-      const column = buffer['attr_ffName' as keyof SpanBuffer] as string[] | undefined;
+      // Write to ffName column (raw string, no interning)
+      const column = buffer['ffName_values' as keyof SpanBuffer] as string[] | undefined;
       if (column && Array.isArray(column)) {
         column[buffer.writeIndex] = name;
       }
     },
 
     writeFfValue(value: string | number | boolean | null): void {
-      // Write to attr_ffValue column (raw string, no interning)
-      const column = buffer['attr_ffValue' as keyof SpanBuffer] as string[] | undefined;
+      // Write to ffValue column (raw string, no interning)
+      const column = buffer['ffValue_values' as keyof SpanBuffer] as string[] | undefined;
       if (column && Array.isArray(column)) {
         const strValue = value === null ? 'null' : String(value);
         column[buffer.writeIndex] = strValue;
@@ -859,14 +929,14 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
     },
 
     writeAction(action?: string): void {
-      // Write to attr_action column (raw string, no interning)
-      const column = buffer['attr_action' as keyof SpanBuffer] as string[] | undefined;
+      // Write to action column (raw string, no interning)
+      const column = buffer['action_values' as keyof SpanBuffer] as string[] | undefined;
       if (column && Array.isArray(column)) {
         const idx = buffer.writeIndex;
         if (action) {
           column[idx] = action;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.attr_action_nulls;
+          const nullBitmap = buffer.action_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -877,14 +947,14 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
     },
 
     writeOutcome(outcome?: string): void {
-      // Write to attr_outcome column (raw string, no interning)
-      const column = buffer['attr_outcome' as keyof SpanBuffer] as string[] | undefined;
+      // Write to outcome column (raw string, no interning)
+      const column = buffer['outcome_values' as keyof SpanBuffer] as string[] | undefined;
       if (column && Array.isArray(column)) {
         const idx = buffer.writeIndex;
         if (outcome) {
           column[idx] = outcome;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.attr_outcome_nulls;
+          const nullBitmap = buffer.outcome_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -899,11 +969,11 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 
       // Write context attributes to their respective columns (raw strings, no interning)
       if (context.userId) {
-        const column = buffer['attr_contextUserId' as keyof SpanBuffer] as string[] | undefined;
+        const column = buffer['contextUserId_values' as keyof SpanBuffer] as string[] | undefined;
         if (column && Array.isArray(column)) {
           column[idx] = context.userId;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.attr_contextUserId_nulls;
+          const nullBitmap = buffer.contextUserId_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -913,11 +983,11 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
       }
 
       if (context.requestId) {
-        const column = buffer['attr_contextRequestId' as keyof SpanBuffer] as string[] | undefined;
+        const column = buffer['contextRequestId_values' as keyof SpanBuffer] as string[] | undefined;
         if (column && Array.isArray(column)) {
           column[idx] = context.requestId;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.attr_contextRequestId_nulls;
+          const nullBitmap = buffer.contextRequestId_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -982,7 +1052,7 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
   // Row 0: span-start (fixed layout)
   buffer.operations[0] = ENTRY_TYPE_SPAN_START;
   buffer.timestamps[0] = getTimestampNanos();
-  writeToColumn(buffer, 'attr_spanName', spanName, 0);
+  writeToColumn(buffer, 'spanName', spanName, 0);
 
   // Row 1: pre-initialize as span-exception (will be overwritten on ok/err)
   buffer.operations[1] = ENTRY_TYPE_SPAN_EXCEPTION;
@@ -1040,8 +1110,8 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
     nullBitmap[byteIndex] |= 1 << bitOffset;
   }
 
-  // Get schema metadata to determine type
-  const fieldName = columnName.replace('attr_', '');
+  // Get schema metadata to determine type (column name is same as field name)
+  const fieldName = columnName;
   const schema = buffer.task.module.tagAttributes;
   const fieldSchema = schema[fieldName];
   const schemaWithMetadata = fieldSchema as import('./schema/types.js').SchemaWithMetadata;
@@ -1176,9 +1246,9 @@ function createSpanLogger<T extends TagAttributeSchema>(
   );
 
   // If scoped values were inherited, pre-fill the buffer
-  // The scope() method will update both the Scope instance and pre-fill buffer
+  // The _setScope() method will update both the Scope instance and pre-fill buffer
   if (inheritedScopeValues && Object.keys(inheritedScopeValues).length > 0) {
-    logger.scope(inheritedScopeValues);
+    logger._setScope(inheritedScopeValues);
   }
 
   return logger as SpanLogger<T>;
@@ -1359,6 +1429,11 @@ export function createModuleContext<
           tag: spanLogger.tag as ChainableTagAPI<T>,
           log: spanLogger,
 
+          scope(attributes: Partial<InferTagAttributes<T>>): void {
+            // Delegate to the internal _setScope method on spanLogger
+            spanLogger._setScope(attributes);
+          },
+
           ok<V>(value: V): FluentSuccessResult<V, T> {
             return new FluentSuccessResult<V, T>(spanBuffer, value, schemaOnly);
           },
@@ -1367,7 +1442,7 @@ export function createModuleContext<
             return new FluentErrorResult<E, T>(spanBuffer, code, error, schemaOnly);
           },
 
-          async span<R>(childName: string, childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R> {
+          span<R>(childName: string, childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): FluentSpan<R> {
             // Create child span buffer with Arrow builders
             const childBuffer = createChildSpanBuffer(spanBuffer, taskContext);
 
@@ -1395,28 +1470,42 @@ export function createModuleContext<
               ff: childFf,
               tag: childLogger.tag as ChainableTagAPI<T>,
               log: childLogger,
+              scope(attrs: Partial<InferTagAttributes<T>>): void {
+                childLogger._setScope(attrs);
+              },
             };
 
             // Execute child span with exception handling
-            try {
-              return await childFn(childContext);
-            } catch (error) {
-              // Write span-exception to row 1 (fixed layout)
-              // Row 1 was pre-initialized as exception, just update timestamp
-              childBuffer.timestamps[1] = getTimestampNanos();
+            const resultPromise = (async () => {
+              try {
+                return await childFn(childContext);
+              } catch (error) {
+                // Write span-exception to row 1 (fixed layout)
+                // Row 1 was pre-initialized as exception, just update timestamp
+                childBuffer.timestamps[1] = getTimestampNanos();
 
-              // Write exception details to row 1
-              const errorMessage = error instanceof Error ? error.message : String(error);
-              const errorStack = error instanceof Error ? error.stack : undefined;
+                // Write exception details to row 1
+                const errorMessage = error instanceof Error ? error.message : String(error);
+                const errorStack = error instanceof Error ? error.stack : undefined;
 
-              writeToColumn(childBuffer, 'attr_exceptionMessage', errorMessage, 1);
-              if (errorStack) {
-                writeToColumn(childBuffer, 'attr_exceptionStack', errorStack, 1);
+                writeToColumn(childBuffer, 'exceptionMessage', errorMessage, 1);
+                if (errorStack) {
+                  writeToColumn(childBuffer, 'exceptionStack', errorStack, 1);
+                }
+
+                // Re-throw to propagate
+                throw error;
               }
+            })();
 
-              // Re-throw to propagate
-              throw error;
-            }
+            // Create fluent span with .line() method
+            const fluentSpan = resultPromise as FluentSpan<R>;
+            fluentSpan.line = (lineNumber: number): Promise<R> => {
+              // Write lineNumber to attr_lineNumber column at row 0 (span-start)
+              writeToColumn(childBuffer, 'lineNumber', lineNumber, 0);
+              return resultPromise;
+            };
+            return fluentSpan;
           },
         };
 
@@ -1432,9 +1521,9 @@ export function createModuleContext<
           const errorMessage = error instanceof Error ? error.message : String(error);
           const errorStack = error instanceof Error ? error.stack : undefined;
 
-          writeToColumn(spanBuffer, 'attr_exceptionMessage', errorMessage, 1);
+          writeToColumn(spanBuffer, 'exceptionMessage', errorMessage, 1);
           if (errorStack) {
-            writeToColumn(spanBuffer, 'attr_exceptionStack', errorStack, 1);
+            writeToColumn(spanBuffer, 'exceptionStack', errorStack, 1);
           }
 
           // Re-throw to propagate

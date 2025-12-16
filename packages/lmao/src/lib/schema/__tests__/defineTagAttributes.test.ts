@@ -161,6 +161,14 @@ describe('defineTagAttributes with Sury', () => {
     expect(result.query).toBe('SELECT * FROM users WHERE id = ? AND name = ?');
   });
 
+  test('should reject field names starting with _', () => {
+    expect(() =>
+      defineTagAttributes({
+        _reserved: S.text(),
+      }),
+    ).toThrow("Field name '_reserved' cannot start with '_'");
+  });
+
   test('rejects reserved attribute names', () => {
     expect(() => {
       validateAttributeNames({

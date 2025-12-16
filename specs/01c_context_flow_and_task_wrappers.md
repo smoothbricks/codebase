@@ -171,11 +171,11 @@ The context captures a single time anchor at creation, enabling sub-millisecond 
 // Node.js: ONE Date.now() + ONE process.hrtime.bigint() captured at trace root
 // All subsequent timestamps use delta calculation from anchor
 
-function getTimestamp(ctx: RequestContext): number {
-  // Returns microseconds since epoch with sub-millisecond precision
+function getTimestamp(ctx: RequestContext): bigint {
+  // Returns nanoseconds since epoch with sub-millisecond precision
   // Browser: ~5μs resolution from performance.now()
-  // Node.js: nanosecond precision from hrtime, truncated to microseconds
-  return ctx.anchorEpochMicros + (performance.now() - ctx.anchorPerfNow) * 1000;
+  // Node.js: nanosecond precision from hrtime
+  return ctx.anchorEpochNanos + BigInt(Math.round((performance.now() - ctx.anchorPerfNow) * 1_000_000));
 }
 ```
 
@@ -189,7 +189,7 @@ function getTimestamp(ctx: RequestContext): number {
 
 **Precision Guarantees**:
 
-- **Storage**: Microseconds in `Float64Array` (hot path)
+- **Storage**: Nanoseconds in `BigInt64Array` (hot path)
 - **Safe Range**: Float64 can exactly represent integers up to `Number.MAX_SAFE_INTEGER` (2^53 - 1)
   - Maximum safe value: 9,007,199,254,740,991 microseconds
   - Equivalent date: ~September 2255
@@ -860,5 +860,80 @@ await ctx.span('payment', async (childCtx) => {
   // Extend scope for this span
   childCtx.scope.paymentMethod = 'stripe';
   childCtx.log.info('Processing payment'); // ← Includes requestId, userId, paymentMethod
+});
+```
+
+## Line Number System
+
+The `lineNumber` system column allows linking trace entries back to source code locations.
+
+### Design
+
+- **Storage**: Uint16 column (max 65535 lines per file)
+- **Injection**: TypeScript transformer injects `.line(N)` calls at compile time
+- **Overhead**: Zero runtime overhead - just a method call with literal number
+- **Default**: Value of 0 means "line number not set"
+
+### API
+
+The `.line()` fluent method is available on:
+
+- **Logging methods**: `ctx.log.info('msg').line(42)`
+- **Span creation**: `await ctx.span('name', fn).line(42)`
+- **Results**: `ctx.ok(value).line(42)` and `ctx.err('CODE', details).line(42)`
+
+### TypeScript Transformer Approach
+
+The line numbers are injected at compile time by a TypeScript transformer:
+
+```typescript
+// Source code (what you write):
+ctx.log.info('Processing user');
+await ctx.span('validate', async (childCtx) => { ... });
+
+// Transformed code (after compilation):
+ctx.log.info('Processing user').line(42);
+await ctx.span('validate', async (childCtx) => { ... }).line(43);
+```
+
+**Benefits**:
+
+- **Zero runtime cost**: No stack trace parsing or Error.captureStackTrace
+- **Accurate line numbers**: Compiler knows exact source location
+- **Source map compatible**: Works with source maps for debugging
+- **Optional**: If transformer not used, line numbers default to 0
+
+### Implementation Notes
+
+The `lineNumber` is stored in the `attr_lineNumber` system column:
+
+```typescript
+// In systemSchema.ts
+lineNumber: (S.number(), // Uint16 storage (0-65535)
+  // In generated code
+  (fluentSpan.line = (lineNumber) => {
+    writeToColumn(childBuffer, 'attr_lineNumber', lineNumber, 0);
+    return resultPromise;
+  }));
+```
+
+### Usage Example
+
+```typescript
+const createUser = task('create-user', async (ctx, userData) => {
+  // Scoped attributes propagate to all entries
+  ctx.scope({ userId: userData.id });
+
+  // Line numbers injected by transformer
+  ctx.log.info('Starting user creation').line(15);
+
+  const result = await ctx
+    .span('validate', async (childCtx) => {
+      childCtx.log.debug('Validating email').line(19);
+      return childCtx.ok({ valid: true });
+    })
+    .line(18);
+
+  return ctx.ok(user).line(24);
 });
 ```

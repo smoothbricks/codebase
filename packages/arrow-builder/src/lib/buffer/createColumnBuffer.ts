@@ -4,7 +4,7 @@
  * Per specs/01b_columnar_buffer_architecture.md and 01b1_buffer_performance_optimizations.md:
  * - Cache-aligned TypedArrays (64-byte boundaries)
  * - Direct properties for zero-indirection access (no lazy getters)
- * - attr_${name}_nulls and attr_${name}_values share ONE ArrayBuffer per column
+ * - ${name}_nulls and ${name}_values share ONE ArrayBuffer per column
  * - Runtime class generation for optimal V8 performance
  * - Arrow conversion in cold path (background processing)
  *
@@ -24,7 +24,7 @@ import type { ColumnBuffer } from './types.js';
  *
  * Per specs/01b1_buffer_performance_optimizations.md:
  * - Uses runtime-generated class with direct properties
- * - Zero indirection: attr_${name}_nulls and attr_${name}_values are direct properties
+ * - Zero indirection: ${name}_nulls and ${name}_values are direct properties
  * - Shared ArrayBuffer: nulls and values use same buffer (cache-aligned)
  * - V8 optimizations: hidden class stability, monomorphic access, inline caching
  *
@@ -37,8 +37,8 @@ import type { ColumnBuffer } from './types.js';
  * ## Column Layout
  *
  * Each attribute column consists of TWO direct properties sharing ONE ArrayBuffer:
- * - attr_X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
- * - attr_X_values: TypedArray for actual values
+ * - X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
+ * - X_values: TypedArray for actual values
  *
  * Both arrays are backed by the SAME ArrayBuffer, partitioned as:
  * [null bitmap bytes | padding to bytesPerElement boundary | value bytes]
