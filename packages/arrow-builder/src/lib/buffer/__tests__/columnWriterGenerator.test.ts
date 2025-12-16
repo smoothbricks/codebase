@@ -130,8 +130,8 @@ describe('createColumnWriter', () => {
     // Write multiple booleans to test bit-packing
     for (let i = 0; i < 16; i++) {
       writer.nextRow();
-      // @ts-expect-error - dynamic method
-      writer.enabled(i % 2 === 0); // alternating true/false
+      // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+      (writer as any).enabled(i % 2 === 0); // alternating true/false
     }
 
     const enabledValues = (buffer as unknown as { enabled_values: Uint8Array }).enabled_values;
@@ -206,8 +206,8 @@ transformed(value) {
     });
 
     writer.nextRow();
-    // @ts-expect-error - dynamic method
-    writer.transformed('hello');
+    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+    (writer as any).transformed('hello');
 
     expect((buffer as unknown as { message_values: string[] }).message_values[0]).toBe('HELLO');
   });
@@ -219,8 +219,8 @@ describe('null bitmap handling', () => {
     const writer = createColumnWriter(testSchema, buffer);
 
     writer.nextRow();
-    // @ts-expect-error - dynamic method
-    writer.userId('test');
+    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+    (writer as any).userId('test');
 
     const nullBitmap = (buffer as unknown as { userId_nulls: Uint8Array }).userId_nulls;
     // Bit 0 should be set (first row written)
@@ -233,8 +233,8 @@ describe('null bitmap handling', () => {
 
     writer.nextRow();
     // Only write userId, not status
-    // @ts-expect-error - dynamic method
-    writer.userId('test');
+    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+    (writer as any).userId('test');
 
     const statusNulls = (buffer as unknown as { status_nulls: Uint8Array }).status_nulls;
     // Bit 0 should be unset (status was not written)

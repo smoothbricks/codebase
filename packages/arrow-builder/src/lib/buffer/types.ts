@@ -47,7 +47,18 @@ export interface ColumnBuffer {
 
   // Index signatures for dynamic column properties created at runtime
   [key: `${string}_nulls`]: Uint8Array;
-  [key: `${string}_values`]: Uint8Array | Uint16Array | Uint32Array | Float64Array | string[];
+  [key: `${string}_values`]:
+    | Int8Array
+    | Int16Array
+    | Int32Array
+    | BigInt64Array
+    | Uint8Array
+    | Uint16Array
+    | Uint32Array
+    | BigUint64Array
+    | Float32Array
+    | Float64Array
+    | string[];
 
   // Buffer management - prefixed with _ to avoid collision with user columns
   _capacity: number; // Logical capacity for bounds checking

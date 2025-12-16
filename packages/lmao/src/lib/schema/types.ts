@@ -1,21 +1,37 @@
 /**
- * Schema type definitions using Sury (ReScript Schema)
+ * Schema type definitions for lmao
  *
- * Sury provides:
- * - Runtime validation (94,828 ops/ms - fastest in JavaScript)
- * - TypeScript inference
- * - Transformations (e.g., masking)
- * - Standard Schema spec compliance
+ * Re-exports core schema types from arrow-builder and adds lmao-specific types
+ * for feature flags and type inference.
  */
 
-import type { TagAttributeSchema } from '@smoothbricks/arrow-builder';
 import type * as Sury from '@sury/sury';
 
-// Re-export TagAttributeSchema from arrow-builder (single source of truth)
-export type { TagAttributeSchema } from '@smoothbricks/arrow-builder';
+// Re-export schema metadata types from arrow-builder (single source of truth)
+export type {
+  BooleanSchemaWithMetadata,
+  CategorySchemaWithMetadata,
+  EnumSchemaWithMetadata,
+  EnumUtf8Precomputed,
+  NumberSchemaWithMetadata,
+  SchemaType,
+  SchemaWithMetadata,
+  TagAttributeSchema,
+  TextSchemaWithMetadata,
+} from '@smoothbricks/arrow-builder';
+
 // Re-export Sury's core types for external use
 export type { Input, Output, Schema } from '@sury/sury';
 
+// Import schema metadata types for use in InferTagAttributes
+import type {
+  BooleanSchemaWithMetadata,
+  CategorySchemaWithMetadata,
+  EnumSchemaWithMetadata,
+  NumberSchemaWithMetadata,
+  TagAttributeSchema,
+  TextSchemaWithMetadata,
+} from '@smoothbricks/arrow-builder';
 // Import the brand symbol from defineTagAttributes for ExtractOriginalSchema detection
 import type { DEFINED_TAG_ATTRIBUTES_BRAND } from './defineTagAttributes.js';
 
@@ -51,17 +67,17 @@ type SchemaFieldKeys<T extends TagAttributeSchema> = keyof ExtractOriginalSchema
  * Extract TypeScript output types from tag attribute schema
  * This enables full type inference from Sury schemas
  *
- * IMPORTANT: This type must properly infer from schemas with __lmao_type metadata
+ * IMPORTANT: This type must properly infer from schemas with __schema_type metadata
  *
  * For DefinedTagAttributes, uses the brand marker to extract the original schema
  * type before the index signature was added, preserving type inference.
  *
  * Type resolution order:
- * 1. Check if it's an enum schema → extract enum type
- * 2. Check if it's a category schema → string
- * 3. Check if it's a text schema → string
- * 4. Check if it's a number schema → number
- * 5. Check if it's a boolean schema → boolean
+ * 1. Check if it's an enum schema -> extract enum type
+ * 2. Check if it's a category schema -> string
+ * 3. Check if it's a text schema -> string
+ * 4. Check if it's a number schema -> number
+ * 5. Check if it's a boolean schema -> boolean
  * 6. Fall back to Sury.Output<T[K]>
  *
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
@@ -184,74 +200,6 @@ export interface SchemaBuilder {
  * Masking helper function type
  */
 export type MaskTransform = (value: string) => string;
-
-/**
- * Schema metadata types - attached to Sury schemas for code generation
- *
- * These types allow us to access the __lmao_type metadata on schemas
- */
-export type LmaoSchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
-
-/**
- * Base schema with LMAO metadata
- * Using intersection type since we can't extend Sury.Schema directly
- */
-export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> & {
-  __schema_type?: LmaoSchemaType;
-  __enum_values?: readonly string[];
-};
-
-/**
- * Pre-computed UTF-8 bytes for enum values
- * Built at schema definition time (cold path) for zero-cost Arrow conversion
- */
-export interface EnumUtf8Precomputed {
-  /** UTF-8 bytes for each enum value, in order */
-  readonly bytes: readonly Uint8Array[];
-  /** Concatenated UTF-8 bytes for all enum values */
-  readonly concatenated: Uint8Array;
-  /** Arrow-format offsets array (Int32Array, length = values.length + 1) */
-  readonly offsets: Int32Array;
-}
-
-/**
- * Enum schema with enum values metadata
- * Uses __schema_type and __enum_values to match arrow-builder convention
- */
-export type EnumSchemaWithMetadata<T extends string = string> = Sury.Schema<T, unknown> & {
-  __schema_type: 'enum';
-  __enum_values: readonly string[];
-  /** Pre-computed UTF-8 bytes for zero-cost Arrow conversion */
-  __enum_utf8: EnumUtf8Precomputed;
-};
-
-/**
- * Category schema with metadata
- */
-export type CategorySchemaWithMetadata = Sury.Schema<string, unknown> & {
-  __schema_type: 'category';
-};
-
-/**
- * Text schema with metadata
- */
-export type TextSchemaWithMetadata = Sury.Schema<string, unknown> & {
-  __schema_type: 'text';
-};
-
-/**
- * Number schema with metadata
- */
-export type NumberSchemaWithMetadata = Sury.Schema<number, unknown> & {
-  __schema_type: 'number';
-};
-
-/**
- * Boolean schema with metadata
- */
-export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> & {
-  __schema_type: 'boolean';
-};
 
 /**
  * Get schema field entries, filtering out methods added by defineTagAttributes

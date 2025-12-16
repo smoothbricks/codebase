@@ -1,62 +1,28 @@
 /**
- * Sury-based schema builder with masking transformations
+ * Schema builder for lmao - extends arrow-builder's schema builder with feature flags and masking
  *
- * This module provides the S object that wraps Sury's schema API
- * with custom masking transformations for sensitive data.
- * Also supports feature flag definitions with .default().sync()/.async() pattern.
+ * This module re-exports the S object from arrow-builder and adds:
+ * - Feature flag support via .default().sync()/.async() pattern
+ * - Masking transformations for sensitive data
  */
 
+import {
+  S as ArrowS,
+  type BooleanSchemaWithMetadata,
+  type CategorySchemaWithMetadata,
+  type EnumSchemaWithMetadata,
+  type NumberSchemaWithMetadata,
+  type TextSchemaWithMetadata,
+} from '@smoothbricks/arrow-builder';
 import * as Sury from '@sury/sury';
 import type {
-  BooleanSchemaWithMetadata,
-  CategorySchemaWithMetadata,
-  EnumSchemaWithMetadata,
-  EnumUtf8Precomputed,
   FeatureFlagDefinition,
   FlagBuilderWithDefault,
   MaskTransform,
   MaskType,
-  NumberSchemaWithMetadata,
   SchemaBuilder,
   SchemaOrFlagBuilder,
-  TextSchemaWithMetadata,
 } from './types.js';
-
-/**
- * Pre-compute UTF-8 bytes for enum values at schema definition time.
- *
- * This is a COLD PATH operation that happens once per schema definition.
- * The pre-computed bytes are stored on the schema metadata and used
- * during Arrow conversion to avoid re-encoding enum strings.
- *
- * @param values - Array of enum string values
- * @returns Pre-computed UTF-8 data ready for Arrow dictionary
- */
-function precomputeEnumUtf8(values: readonly string[]): EnumUtf8Precomputed {
-  const encoder = new TextEncoder();
-
-  // Encode each value
-  const bytes = values.map((v) => encoder.encode(v));
-
-  // Calculate total size and build offsets
-  const offsets = new Int32Array(values.length + 1);
-  offsets[0] = 0;
-  let totalSize = 0;
-  for (let i = 0; i < bytes.length; i++) {
-    totalSize += bytes[i].length;
-    offsets[i + 1] = totalSize;
-  }
-
-  // Build concatenated buffer
-  const concatenated = new Uint8Array(totalSize);
-  let offset = 0;
-  for (const b of bytes) {
-    concatenated.set(b, offset);
-    offset += b.length;
-  }
-
-  return { bytes, concatenated, offsets };
-}
 
 /**
  * Create a flag builder that wraps a Sury schema
@@ -141,7 +107,7 @@ const maskingTransforms: Record<MaskType, MaskTransform> = {
 };
 
 /**
- * Schema builder that wraps Sury with our custom API
+ * Schema builder that wraps arrow-builder's S with feature flag support
  *
  * Provides a clean API while leveraging Sury's performance:
  * - 94,828 ops/ms validation (fastest in JavaScript)
@@ -165,15 +131,8 @@ const schemaBuilderImpl: SchemaBuilder = {
    * - S.refine(S.number(), x => x > 0) - with validation
    */
   number: () => {
-    // IMPORTANT: Use Object.create to clone with prototype chain intact
-    // This avoids mutating the shared Sury.number singleton while preserving
-    // the prototype methods needed for Sury.union() and other schema operations
-    const schema = createSchemaWithFlagBuilder(
-      Object.create(Object.getPrototypeOf(Sury.number), Object.getOwnPropertyDescriptors(Sury.number)),
-    );
-    // Attach number metadata for code generation by mutating the cloned object
-    (schema as unknown as NumberSchemaWithMetadata).__schema_type = 'number';
-    return schema as SchemaOrFlagBuilder<number> & NumberSchemaWithMetadata;
+    const schema = ArrowS.number();
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<number> & NumberSchemaWithMetadata;
   },
 
   /**
@@ -184,15 +143,8 @@ const schemaBuilderImpl: SchemaBuilder = {
    * - S.boolean().default(false).sync() - feature flag
    */
   boolean: () => {
-    // IMPORTANT: Use Object.create to clone with prototype chain intact
-    // This avoids mutating the shared Sury.boolean singleton while preserving
-    // the prototype methods needed for Sury.union() and other schema operations
-    const schema = createSchemaWithFlagBuilder(
-      Object.create(Object.getPrototypeOf(Sury.boolean), Object.getOwnPropertyDescriptors(Sury.boolean)),
-    );
-    // Attach boolean metadata for code generation by mutating the cloned object
-    (schema as unknown as BooleanSchemaWithMetadata).__schema_type = 'boolean';
-    return schema as SchemaOrFlagBuilder<boolean> & BooleanSchemaWithMetadata;
+    const schema = ArrowS.boolean();
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<boolean> & BooleanSchemaWithMetadata;
   },
 
   /**
@@ -202,7 +154,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    * - SchemaBuilder.optional(SchemaBuilder.string()) - string | undefined
    */
   optional: <T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined> => {
-    return Sury.optional(schema) as Sury.Schema<T | undefined, T | undefined>;
+    return ArrowS.optional(schema);
   },
 
   /**
@@ -214,8 +166,7 @@ const schemaBuilderImpl: SchemaBuilder = {
   union: <T extends readonly [Sury.Schema<unknown, unknown>, ...Sury.Schema<unknown, unknown>[]]>(
     schemas: T,
   ): Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>> => {
-    const schemaArray = [...schemas] as [Sury.Schema<unknown, unknown>, ...Sury.Schema<unknown, unknown>[]];
-    return Sury.union(schemaArray) as Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>>;
+    return ArrowS.union(schemas);
   },
 
   /**
@@ -242,30 +193,7 @@ const schemaBuilderImpl: SchemaBuilder = {
   enum: <T extends readonly string[]>(
     values: T,
   ): SchemaOrFlagBuilder<T[number]> & EnumSchemaWithMetadata<T[number]> => {
-    if (values.length === 0) {
-      throw new Error('Enum must have at least one value');
-    }
-    if (values.length > 256) {
-      throw new Error('Enum can have at most 256 values (Uint8Array limit: indices 0-255)');
-    }
-
-    // Use refine to validate string is one of the allowed values
-    // The callback receives (value, fail) where fail.fail(message) throws validation error
-    const schema = Sury.refine(Sury.string, (value, fail): T[number] => {
-      if (!values.includes(value)) {
-        fail.fail(`Value must be one of: ${values.join(', ')}`);
-      }
-      return value as T[number];
-    }) as Sury.Schema<T[number], string>;
-
-    // Attach enum metadata for code generation by mutating the object
-    const schemaWithMetadata = schema as unknown as EnumSchemaWithMetadata<T[number]>;
-    schemaWithMetadata.__schema_type = 'enum';
-    schemaWithMetadata.__enum_values = values;
-    // Pre-compute UTF-8 bytes at schema definition time (cold path)
-    // This avoids re-encoding enum strings during Arrow conversion
-    schemaWithMetadata.__enum_utf8 = precomputeEnumUtf8(values);
-
+    const schema = ArrowS.enum(values);
     return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<T[number]> & EnumSchemaWithMetadata<T[number]>;
   },
 
@@ -284,17 +212,8 @@ const schemaBuilderImpl: SchemaBuilder = {
    * buffer.attr_userId[idx] = internString(userId); // Returns Uint32 index
    */
   category: (): SchemaOrFlagBuilder<string> & CategorySchemaWithMetadata => {
-    // IMPORTANT: Use Object.create to clone with prototype chain intact
-    // This avoids mutating the shared Sury.string singleton while preserving
-    // the prototype methods needed for Sury.union() and other schema operations
-    const schema = createSchemaWithFlagBuilder(
-      Object.create(Object.getPrototypeOf(Sury.string), Object.getOwnPropertyDescriptors(Sury.string)),
-    );
-
-    // Attach category metadata for code generation by mutating the cloned object
-    (schema as unknown as CategorySchemaWithMetadata).__schema_type = 'category';
-
-    return schema as SchemaOrFlagBuilder<string> & CategorySchemaWithMetadata;
+    const schema = ArrowS.category();
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & CategorySchemaWithMetadata;
   },
 
   /**
@@ -312,17 +231,8 @@ const schemaBuilderImpl: SchemaBuilder = {
    * buffer.attr_errorMsg[idx] = rawString; // No interning
    */
   text: (): SchemaOrFlagBuilder<string> & TextSchemaWithMetadata => {
-    // IMPORTANT: Use Object.create to clone with prototype chain intact
-    // This avoids mutating the shared Sury.string singleton while preserving
-    // the prototype methods needed for Sury.union() and other schema operations
-    const schema = createSchemaWithFlagBuilder(
-      Object.create(Object.getPrototypeOf(Sury.string), Object.getOwnPropertyDescriptors(Sury.string)),
-    );
-
-    // Attach text metadata for code generation by mutating the cloned object
-    (schema as unknown as TextSchemaWithMetadata).__schema_type = 'text';
-
-    return schema as SchemaOrFlagBuilder<string> & TextSchemaWithMetadata;
+    const schema = ArrowS.text();
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & TextSchemaWithMetadata;
   },
 
   /**

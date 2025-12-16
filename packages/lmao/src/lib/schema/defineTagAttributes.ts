@@ -8,11 +8,10 @@
  * - Extension composition
  */
 
-import { getSchemaFields } from '@smoothbricks/arrow-builder';
 import * as S from '@sury/sury';
 import type { ExtendedSchema } from './extend.js';
 import { createExtendedSchema } from './extend.js';
-import type { InferTagAttributes, TagAttributeSchema } from './types.js';
+import { getSchemaFields, type InferTagAttributes, type TagAttributeSchema } from './types.js';
 
 /**
  * Brand symbol for DefinedTagAttributes - used to detect this type in conditionals.

@@ -14,12 +14,14 @@ describe('ColumnBuffer setter methods', () => {
   test('should generate setter methods for each column', () => {
     const buffer = createGeneratedColumnBuffer(mockSchema as any, 10);
 
-    // Check that setter methods exist
-    expect(typeof buffer.status).toBe('function');
-    expect(typeof buffer.userId).toBe('function');
-    expect(typeof buffer.errorMsg).toBe('function');
-    expect(typeof buffer.count).toBe('function');
-    expect(typeof buffer.isActive).toBe('function');
+    // Check that setter methods exist (runtime-generated, need cast)
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated methods
+    const b = buffer as any;
+    expect(typeof b.status).toBe('function');
+    expect(typeof b.userId).toBe('function');
+    expect(typeof b.errorMsg).toBe('function');
+    expect(typeof b.count).toBe('function');
+    expect(typeof b.isActive).toBe('function');
   });
 
   test('setter should write value and return this for chaining', () => {

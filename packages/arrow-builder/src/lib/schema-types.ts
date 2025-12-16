@@ -2,10 +2,22 @@
  * Schema type definitions for arrow-builder
  *
  * Arrow-builder is a low-level columnar buffer engine that works with
- * generic schemas provided by consumer packages.
+ * Sury schemas that have __schema_type metadata attached.
  */
 
 import type * as Sury from '@sury/sury';
+
+// Re-export schema metadata types from the schema module
+export type {
+  BooleanSchemaWithMetadata,
+  CategorySchemaWithMetadata,
+  EnumSchemaWithMetadata,
+  EnumUtf8Precomputed,
+  NumberSchemaWithMetadata,
+  SchemaType,
+  SchemaWithMetadata,
+  TextSchemaWithMetadata,
+} from './schema/types.js';
 
 /**
  * Tag attribute schema - maps field names to Sury schemas
@@ -17,20 +29,6 @@ import type * as Sury from '@sury/sury';
 export type TagAttributeSchema = {
   [key: string]: Sury.Schema<unknown, unknown> | ((...args: unknown[]) => unknown);
 };
-
-/**
- * Schema type marker for columnar storage
- */
-export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
-
-/**
- * Schema with metadata attached
- * Used to determine which TypedArray to create
- */
-export interface SchemaWithMetadata {
-  __schema_type?: SchemaType;
-  __enum_values?: readonly string[];
-}
 
 /**
  * Get schema field entries, filtering out methods that may be added by consumer packages.

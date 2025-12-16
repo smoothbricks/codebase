@@ -1,19 +1,33 @@
 /**
  * Type guard functions for runtime type checking
  *
- * These functions provide type-safe runtime validation for various types used in the system.
- * They follow the TypeScript type predicate pattern: `(value: unknown): value is Type`
+ * Re-exports schema type guards from arrow-builder and adds lmao-specific guards.
  */
 
 import type * as arrow from 'apache-arrow';
+
+// Re-export schema type guards from arrow-builder
+export {
+  getEnumUtf8,
+  getEnumValues,
+  getSchemaType,
+  isEnumSchemaWithMetadata,
+  isSchemaWithMetadata,
+} from '@smoothbricks/arrow-builder';
+
+import type { SchemaType } from '@smoothbricks/arrow-builder';
+// Import for use in this file
+import { getSchemaType } from '@smoothbricks/arrow-builder';
 import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
-import type {
-  EnumSchemaWithMetadata,
-  EnumUtf8Precomputed,
-  FeatureFlagDefinition,
-  LmaoSchemaType,
-  SchemaWithMetadata,
-} from './types.js';
+import type { FeatureFlagDefinition } from './types.js';
+
+/**
+ * Alias for getSchemaType for backward compatibility
+ * @deprecated Use getSchemaType instead
+ */
+export function getLmaoSchemaType(value: unknown): SchemaType | undefined {
+  return getSchemaType(value);
+}
 
 /**
  * Type guard to check if a value is an Arrow builder
@@ -27,85 +41,6 @@ export function isArrowBuilder(value: unknown): value is arrow.Builder {
     'append' in value &&
     typeof (value as Record<string, unknown>).append === 'function'
   );
-}
-
-/**
- * Valid LMAO schema types
- */
-const LMAO_SCHEMA_TYPES: readonly LmaoSchemaType[] = ['enum', 'category', 'text', 'number', 'boolean'];
-
-/**
- * Type guard to check if a value is a SchemaWithMetadata
- * This is used to safely access __schema_type metadata on schemas
- */
-export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadata {
-  if (value === null || typeof value !== 'object') {
-    return false;
-  }
-
-  const obj = value as Record<string, unknown>;
-
-  // __schema_type is optional, but if present must be a valid type
-  if ('__schema_type' in obj) {
-    return LMAO_SCHEMA_TYPES.includes(obj.__schema_type as LmaoSchemaType);
-  }
-
-  // If __schema_type is not present, it's still valid (just unknown type)
-  return true;
-}
-
-/**
- * Type guard to check if a value is an EnumSchemaWithMetadata
- * This is used to safely access enum values metadata
- */
-export function isEnumSchemaWithMetadata(value: unknown): value is EnumSchemaWithMetadata {
-  if (!isSchemaWithMetadata(value)) {
-    return false;
-  }
-
-  const obj = value as SchemaWithMetadata;
-
-  return (
-    obj.__schema_type === 'enum' &&
-    '__enum_values' in obj &&
-    Array.isArray((obj as EnumSchemaWithMetadata).__enum_values)
-  );
-}
-
-/**
- * Get the LMAO schema type from a value, returning undefined if not found
- * Safe alternative to casting to access __schema_type
- */
-export function getLmaoSchemaType(value: unknown): LmaoSchemaType | undefined {
-  if (isSchemaWithMetadata(value)) {
-    return value.__schema_type;
-  }
-  return undefined;
-}
-
-/**
- * Get enum values from a schema, returning undefined if not an enum schema
- * Safe alternative to casting to access __enum_values
- */
-export function getEnumValues(value: unknown): readonly string[] | undefined {
-  if (isEnumSchemaWithMetadata(value)) {
-    return value.__enum_values;
-  }
-  return undefined;
-}
-
-/**
- * Get pre-computed UTF-8 bytes for enum values
- * Returns undefined if not an enum schema or if UTF-8 bytes weren't pre-computed
- *
- * Per string storage design: enum UTF-8 bytes are pre-computed at schema definition
- * time (cold path) so Arrow conversion just copies the pre-built dictionary data.
- */
-export function getEnumUtf8(value: unknown): EnumUtf8Precomputed | undefined {
-  if (isEnumSchemaWithMetadata(value) && '__enum_utf8' in value) {
-    return (value as EnumSchemaWithMetadata).__enum_utf8;
-  }
-  return undefined;
 }
 
 /**
