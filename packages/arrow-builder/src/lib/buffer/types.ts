@@ -11,7 +11,7 @@
  *
  * ## Naming Conventions
  *
- * - System properties use `_` prefix: `_writeIndex`, `_capacity`, `_next`, `_timestamps`, `_operations`
+ * - System properties use `_` prefix: `_capacity`, `_next`, `_timestamps`, `_operations`
  * - User columns have NO prefix, just suffixes: `userId_nulls`, `userId_values`, `userId` (alias)
  *
  * This prevents collisions between user-defined field names and system internals.
@@ -26,6 +26,11 @@
  * [null bitmap bytes | padding to 64-byte cache line | value bytes]
  *
  * This ensures cache-aligned access while maintaining memory locality.
+ *
+ * ## Write Position Tracking
+ *
+ * Write position is tracked by ColumnWriter, NOT by ColumnBuffer.
+ * This allows multiple writers to share a buffer or write to different regions.
  */
 export interface ColumnBuffer {
   // System columns - prefixed with _ to avoid collision with user columns
@@ -43,9 +48,13 @@ export interface ColumnBuffer {
   [key: `${string}_values`]: ColumnValueType;
 
   // Buffer management - prefixed with _ to avoid collision with user columns
-  _writeIndex: number; // Current write position (0 to capacity-1)
   _capacity: number; // Logical capacity for bounds checking
   _next?: ColumnBuffer; // Chain to next buffer when overflow
+
+  // Generated column setter methods
+  // Each schema field gets a setter: buffer.fieldName(position, value) => this
+  // These are generated at runtime by columnBufferGenerator.ts
+  [key: string]: unknown;
 }
 
 /**

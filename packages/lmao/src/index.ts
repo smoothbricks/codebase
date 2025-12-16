@@ -1,10 +1,13 @@
 // Main integration API
 
+// Fixed position writers (TagWriter writes to position 0, ResultWriter to position 1)
+export type { ResultWriter, TagWriter } from './lib/codegen/fixedPositionWriterGenerator.js';
+export { createResultWriter, createTagWriter } from './lib/codegen/fixedPositionWriterGenerator.js';
 export type { GeneratedScope, ScopeClass } from './lib/codegen/scopeGenerator.js';
 export { createScope, createScopeWithInheritance, generateScopeClass } from './lib/codegen/scopeGenerator.js';
 // Code generation
-export type { BaseSpanLogger, ChainableTagAPI } from './lib/codegen/spanLoggerGenerator.js';
-export { createSpanLoggerClass, generateSpanLoggerClass } from './lib/codegen/spanLoggerGenerator.js';
+export type { BaseSpanLogger } from './lib/codegen/spanLoggerGenerator.js';
+export { createSpanLogger, createSpanLoggerClass } from './lib/codegen/spanLoggerGenerator.js';
 // Arrow conversion (lmao-specific - uses SpanBuffer)
 export * from './lib/convertToArrow.js';
 // Flush scheduler

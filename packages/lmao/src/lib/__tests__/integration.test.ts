@@ -295,7 +295,8 @@ describe('Schema Integration Patterns', () => {
         ctx.log.debug('Debug message');
         ctx.log.warn('Warning message');
         ctx.log.error('Error message');
-        ctx.log.message('info', 'Custom message');
+        // Note: ctx.log.message() was removed - use level-specific methods instead
+        ctx.log.info('Custom message');
 
         return ctx.ok({ success: true });
       });
@@ -355,8 +356,8 @@ describe('Schema Integration Patterns', () => {
         ctx.tag.requestId('req-123').operation('INSERT').duration(50.0);
 
         const childResult = await ctx.span('child-task', async (childCtx) => {
-          // Child span with chained tags
-          childCtx.log.tag.operation('SELECT').query('SELECT * FROM users').duration(5.2).httpStatus(200);
+          // Child span with chained tags - tag is on childCtx directly, not on childCtx.log
+          childCtx.tag.operation('SELECT').query('SELECT * FROM users').duration(5.2).httpStatus(200);
 
           return { found: true };
         });
@@ -554,9 +555,9 @@ describe('Schema Integration Patterns', () => {
         // Environment access and chained tags
         ctx.tag.requestId(ctx.requestId).userId(userData.email).region(ctx.env.awsRegion).operation('INSERT');
 
-        // Child span with chaining
+        // Child span with chaining - tag is on childCtx directly, not on childCtx.log
         const validation = await ctx.span('validate-user', async (childCtx) => {
-          childCtx.log.tag
+          childCtx.tag
             .operation('SELECT')
             .query('SELECT COUNT(*) FROM users WHERE email = ?')
             .duration(12.5)

@@ -3,6 +3,9 @@
  *
  * These are injected into generated code via the `dependencies` mechanism
  * to avoid regenerating identical code for every schema.
+ *
+ * Note: Generic null bitmap helpers (setNullBit, fillNullBitmapRange) are in
+ * @smoothbricks/arrow-builder's bufferHelpers - they're Arrow concepts, not span-specific.
  */
 
 /**

@@ -28,7 +28,7 @@
 import { type ColumnBufferExtension, getColumnBufferClass } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
 import { spanBufferHelpers } from './spanBufferHelpers.js';
-import { createTraceId, generateTraceId, type TraceId } from './traceId.js';
+import { generateTraceId, type TraceId } from './traceId.js';
 import type { SpanBuffer, TaskContext } from './types.js';
 
 // ============================================================================
@@ -153,6 +153,13 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
         this.timestamps = this._timestamps;
         this.operations = this._operations;
         
+        // Write index for tracking current position
+        // NOTE: Per architecture, _writeIndex should be tracked by ColumnWriter (SpanLogger),
+        // not by ColumnBuffer. However, SpanBuffer maintains this for backwards compatibility
+        // with existing tests and code that directly access buffer.writeIndex.
+        // TODO: Migrate to SpanLogger-only write tracking when ready.
+        this._writeIndex = 0;
+        
         // Track buffer creation
         task.module.spanBufferCapacityStats.totalBuffersCreated++;
       `,
@@ -256,21 +263,14 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
 export function createSpanBuffer(
   schema: TagAttributeSchema,
   taskContext: TaskContext,
-  traceId?: TraceId | string,
+  traceId?: TraceId,
   capacity = 64,
 ): SpanBuffer {
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const alignedCapacity = (capacity + 7) & ~7;
 
-  // Resolve traceId
-  let resolvedTraceId: string;
-  if (traceId === undefined) {
-    resolvedTraceId = generateTraceId();
-  } else if (typeof traceId === 'string') {
-    resolvedTraceId = createTraceId(traceId);
-  } else {
-    resolvedTraceId = traceId;
-  }
+  // Use provided TraceId or generate a new one
+  const resolvedTraceId: string = traceId ?? generateTraceId();
 
   const SpanBufferClass = getSpanBufferClass(schema);
   return new SpanBufferClass(alignedCapacity, taskContext, undefined, false, resolvedTraceId);

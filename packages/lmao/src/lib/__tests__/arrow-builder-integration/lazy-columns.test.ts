@@ -24,18 +24,19 @@ describe('True Lazy Initialization', () => {
     expect(buffer._timestamps).toBeInstanceOf(BigInt64Array);
     expect(buffer._operations).toBeInstanceOf(Uint8Array);
 
-    // Access ONE column (category = Array now, not Uint32Array)
-    const userIdColumn = buffer['userId'];
+    // Access ONE column via _values suffix (category = Array now, not Uint32Array)
+    // Note: buffer.userId is a setter method, buffer.userId_values is the getter
+    const userIdColumn = buffer['userId_values'];
     expect(Array.isArray(userIdColumn)).toBe(true);
 
     // Now check that OTHER columns were NOT allocated
     // Getters are on the prototype, not the instance
     const proto = Object.getPrototypeOf(buffer);
-    const descriptor = Object.getOwnPropertyDescriptor(proto, 'requestId');
+    const descriptor = Object.getOwnPropertyDescriptor(proto, 'requestId_values');
     expect(descriptor?.get).toBeDefined(); // Should be a getter on prototype
 
     // After access, the getter should be replaced with the value
-    const requestIdColumn = buffer['requestId'];
+    const requestIdColumn = buffer['requestId_values'];
     expect(Array.isArray(requestIdColumn)).toBe(true);
   });
 
@@ -47,8 +48,8 @@ describe('True Lazy Initialization', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
-    // Access userId column (category = Array now)
-    const userIdColumn = buffer['userId'];
+    // Access userId column via _values suffix (category = Array now)
+    const userIdColumn = buffer['userId_values'];
     expect(Array.isArray(userIdColumn)).toBe(true);
 
     // Check that userId's null bitmap was allocated (by accessing it)
@@ -72,15 +73,16 @@ describe('True Lazy Initialization', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 1024);
 
-    // Only access 2 of 5 columns
-    buffer['col1'][0] = 1;
-    buffer['col3'][0] = 3;
+    // Only access 2 of 5 columns (use _values suffix for the array)
+    (buffer['col1_values'] as Float64Array)[0] = 1;
+    (buffer['col3_values'] as Float64Array)[0] = 3;
 
     // col2, col4, col5 should still be getters on prototype (not accessed yet)
+    // Note: use _values suffix to check the getter (not the setter method)
     const proto = Object.getPrototypeOf(buffer);
-    const col2Desc = Object.getOwnPropertyDescriptor(proto, 'col2');
-    const col4Desc = Object.getOwnPropertyDescriptor(proto, 'col4');
-    const col5Desc = Object.getOwnPropertyDescriptor(proto, 'col5');
+    const col2Desc = Object.getOwnPropertyDescriptor(proto, 'col2_values');
+    const col4Desc = Object.getOwnPropertyDescriptor(proto, 'col4_values');
+    const col5Desc = Object.getOwnPropertyDescriptor(proto, 'col5_values');
 
     expect(col2Desc?.get).toBeDefined();
     expect(col4Desc?.get).toBeDefined();
@@ -95,17 +97,17 @@ describe('True Lazy Initialization', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
-    // Before access: should be getter on prototype
+    // Before access: should be getter on prototype (use _values suffix)
     const proto = Object.getPrototypeOf(buffer);
-    const beforeDesc = Object.getOwnPropertyDescriptor(proto, 'field1');
+    const beforeDesc = Object.getOwnPropertyDescriptor(proto, 'field1_values');
     expect(beforeDesc?.get).toBeDefined();
 
-    // Access the column (category = Array now)
-    const column = buffer['field1'];
+    // Access the column via _values suffix (category = Array now)
+    const column = buffer['field1_values'];
     expect(Array.isArray(column)).toBe(true);
 
     // After access: the property should still work (getter returns cached value from symbol-keyed storage)
-    const afterValue = buffer['field1'];
+    const afterValue = buffer['field1_values'];
     expect(afterValue).toBe(column); // Same instance returned
     expect(Array.isArray(afterValue)).toBe(true);
   });
@@ -129,8 +131,8 @@ describe('Lazy Column Initialization', () => {
     expect(buffer._timestamps).toBeInstanceOf(BigInt64Array);
     expect(buffer._operations).toBeInstanceOf(Uint8Array);
 
-    // Access one attribute column - should allocate it lazily on first access
-    const userIdColumn = buffer['userId'];
+    // Access one attribute column via _values suffix - should allocate it lazily on first access
+    const userIdColumn = buffer['userId_values'] as string[];
     // Category stores raw strings in Array
     expect(Array.isArray(userIdColumn)).toBe(true);
     expect(userIdColumn.length).toBeGreaterThan(0);
@@ -141,7 +143,7 @@ describe('Lazy Column Initialization', () => {
     expect(userIdNulls.length).toBeGreaterThan(0);
 
     // Verify lazy allocation worked by checking that multiple accesses return same object
-    expect(buffer['userId']).toBe(userIdColumn);
+    expect(buffer['userId_values']).toBe(userIdColumn);
     expect(buffer.userId_nulls).toBe(userIdNulls);
   });
 
@@ -157,16 +159,16 @@ describe('Lazy Column Initialization', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
-    // Access each column and verify type
+    // Access each column via _values suffix and verify type
     // Per spec 01a:
     // - enum: Uint8Array (small enums) or Uint16Array/Uint32Array (larger)
-    // - category: Uint32Array with string interning (indices)
-    // - text: Uint32Array with raw storage (indices into TextStringStorage)
-    expect(buffer['smallEnum']).toBeInstanceOf(Uint8Array);
-    expect(Array.isArray(buffer['category'])).toBe(true); // Category stores raw strings
-    expect(Array.isArray(buffer['text'])).toBe(true); // Text stores raw strings
-    expect(buffer['num']).toBeInstanceOf(Float64Array);
-    expect(buffer['bool']).toBeInstanceOf(Uint8Array);
+    // - category: Array<string> (raw strings, no hot-path interning)
+    // - text: Array<string> (raw strings)
+    expect(buffer['smallEnum_values']).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buffer['category_values'])).toBe(true); // Category stores raw strings
+    expect(Array.isArray(buffer['text_values'])).toBe(true); // Text stores raw strings
+    expect(buffer['num_values']).toBeInstanceOf(Float64Array);
+    expect(buffer['bool_values']).toBeInstanceOf(Uint8Array);
   });
 
   it('should allocate small enum as Uint8Array', () => {
@@ -179,8 +181,8 @@ describe('Lazy Column Initialization', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
-    // Should use Uint8Array for <= 255 values
-    expect(buffer['maxEnum']).toBeInstanceOf(Uint8Array);
+    // Should use Uint8Array for <= 255 values (use _values suffix)
+    expect(buffer['maxEnum_values']).toBeInstanceOf(Uint8Array);
   });
 
   it('should work correctly when writing to lazily-allocated columns', () => {
@@ -192,17 +194,17 @@ describe('Lazy Column Initialization', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
-    // Write to columns (triggering lazy allocation)
-    // Category stores Uint32Array indices (not strings directly)
-    const userIdColumn = buffer['userId'] as Uint32Array;
-    const countColumn = buffer['count'] as Float64Array;
+    // Write to columns via _values suffix (triggering lazy allocation)
+    // Category stores strings in Array (no hot-path interning)
+    const userIdColumn = buffer['userId_values'] as string[];
+    const countColumn = buffer['count_values'] as Float64Array;
 
-    // Write an interned index for category (simulating how the system works)
-    userIdColumn[0] = 42; // This would be an interned string index
+    // Write a string value for category (raw strings stored directly)
+    userIdColumn[0] = 'user-123';
     countColumn[0] = 45.67;
 
     // Verify values
-    expect(userIdColumn[0]).toBe(42);
+    expect(userIdColumn[0]).toBe('user-123');
     expect(countColumn[0]).toBe(45.67);
   });
 
@@ -214,11 +216,11 @@ describe('Lazy Column Initialization', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
-    // First access
-    const column1 = buffer['userId'];
+    // First access (use _values suffix)
+    const column1 = buffer['userId_values'];
 
     // Second access - should return same array
-    const column2 = buffer['userId'];
+    const column2 = buffer['userId_values'];
 
     // Should be the exact same object
     expect(column1).toBe(column2);

@@ -75,9 +75,11 @@ describe('Buffer Chaining', () => {
       const buffer = createSpanBuffer(schema, taskContext);
       const nextBuffer = createNextBuffer(buffer);
 
-      // Should have same attribute columns
-      expect(Array.isArray(nextBuffer['userId'])).toBe(true); // category (raw strings)expect(Array.isArray(nextBuffer['requestId'])).toBe(true); // category (raw strings)expect(nextBuffer['operation']).toBeInstanceOf(Uint8Array);
-      expect(nextBuffer['duration']).toBeInstanceOf(Float64Array);
+      // Should have same attribute columns (use _values suffix to access storage)
+      expect(Array.isArray(nextBuffer['userId_values'])).toBe(true); // category (raw strings)
+      expect(Array.isArray(nextBuffer['requestId_values'])).toBe(true); // category (raw strings)
+      expect(nextBuffer['operation_values']).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer['duration_values']).toBeInstanceOf(Float64Array);
 
       // Should have core columns
       expect(nextBuffer.timestamps).toBeInstanceOf(BigInt64Array);

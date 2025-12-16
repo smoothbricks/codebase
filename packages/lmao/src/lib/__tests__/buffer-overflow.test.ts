@@ -237,7 +237,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         // Child span with many writes
         await ctx.span('child-span', async (childCtx) => {
           for (let i = 0; i < 100; i++) {
-            childCtx.log.tag.requestId(`child-${i}`).userId(`user-${i}`);
+            childCtx.tag.requestId(`child-${i}`).userId(`user-${i}`);
           }
         });
 
@@ -274,7 +274,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         for (let childNum = 0; childNum < 5; childNum++) {
           await ctx.span(`child-${childNum}`, async (childCtx) => {
             for (let i = 0; i < 100; i++) {
-              childCtx.log.tag.requestId(`child-${childNum}-req-${i}`).userId(`user-${i}`);
+              childCtx.tag.requestId(`child-${childNum}-req-${i}`).userId(`user-${i}`);
             }
           });
         }
@@ -538,6 +538,99 @@ describe('Buffer Overflow and Capacity Management', () => {
       if (result.success) {
         expect(result.value.recovered).toBe(true);
         expect(result.value.writes).toBe(100);
+      }
+    });
+
+    it('should correctly write fluent attributes across 128+ log entries with overflow', async () => {
+      const moduleContext = createModuleContext({
+        moduleMetadata: {
+          gitSha: 'abc123',
+          filePath: 'src/services/test.ts',
+          moduleName: 'TestService',
+        },
+        tagAttributes: dbAttributes,
+      });
+
+      const testTask = moduleContext.task('test-fluent-overflow', async (ctx) => {
+        const NUM_ENTRIES = 128;
+        const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
+
+        // Save root buffer BEFORE any writes (ctx.log._buffer will change on overflow)
+        const rootBuffer = ctx.log._buffer;
+
+        // Write 128 log entries, each with fluent attribute chaining
+        for (let i = 0; i < NUM_ENTRIES; i++) {
+          ctx.log
+            .info(`Message ${i}`)
+            .requestId(`req-${i}`)
+            .userId(`user-${i}`)
+            .operation(operations[i % 4])
+            .duration(i * 10);
+        }
+
+        // SpanLogger tracks _writeIndex
+        const logger = ctx.log;
+
+        // Collect all entries from buffer chain
+        // We know there are NUM_ENTRIES entries starting at row 2 of root buffer
+        const entries: Array<{
+          requestId: string;
+          userId: string;
+          operation: number;
+          duration: number;
+        }> = [];
+
+        let currentBuffer: typeof rootBuffer | undefined = rootBuffer;
+        let entriesCollected = 0;
+        let bufferNum = 0;
+
+        while (currentBuffer && entriesCollected < NUM_ENTRIES) {
+          bufferNum++;
+          // Skip rows 0-1 (tag and result rows) in root buffer only
+          const startRow = bufferNum === 1 ? 2 : 0;
+          const endRow = currentBuffer.capacity;
+
+          for (let row = startRow; row < endRow && entriesCollected < NUM_ENTRIES; row++) {
+            entries.push({
+              requestId: currentBuffer.requestId_values?.[row] as string,
+              userId: currentBuffer.userId_values?.[row] as string,
+              operation: currentBuffer.operation_values?.[row] as number,
+              duration: currentBuffer.duration_values?.[row] as number,
+            });
+            entriesCollected++;
+          }
+
+          currentBuffer = currentBuffer._next as typeof rootBuffer | undefined;
+        }
+
+        return ctx.ok({
+          entriesWritten: entries.length,
+          entries,
+        });
+      });
+
+      const requestCtx = createRequestContext(
+        { requestId: 'req-fluent-overflow-test' },
+        featureFlags,
+        flagEvaluator,
+        environmentConfig,
+      );
+
+      const result = await testTask(requestCtx);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.value.entriesWritten).toBe(128);
+
+        // Verify each entry has correct attributes
+        const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'];
+        for (let i = 0; i < 128; i++) {
+          const entry = result.value.entries[i];
+          expect(entry.requestId).toBe(`req-${i}`);
+          expect(entry.userId).toBe(`user-${i}`);
+          // Enum values are stored as indices
+          expect(entry.operation).toBe(i % 4);
+          expect(entry.duration).toBe(i * 10);
+        }
       }
     });
   });

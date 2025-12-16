@@ -617,24 +617,24 @@ export function createLibraryModule<
 }
 
 /**
- * Create a remapped tag API that wraps the original SpanLogger
+ * Create a remapped tag proxy for library use
  *
- * WHY: Library task functions receive ctx.log with clean method names,
+ * WHY: Library task functions receive ctx.tag with clean method names,
  * but the underlying buffer uses prefixed column names.
  *
  * HOW: Uses a Proxy to intercept method calls and remap them to prefixed columns.
  * This approach has minimal overhead since Proxy is well-optimized in V8.
  *
- * @param originalLog - The SpanLogger with prefixed method names
+ * @param originalTag - The tag API with prefixed method names (ctx.tag)
  * @param prefixMapping - Mapping from clean names to prefixed names
  * @returns Proxy that remaps clean method calls to prefixed methods
  */
 function createRemappedTagProxy<T extends TagAttributeSchema>(
-  originalLog: SpanContext<TagAttributeSchema, FeatureFlagSchema>['log'],
+  originalTag: SpanContext<TagAttributeSchema, FeatureFlagSchema>['tag'],
   prefixMapping: PrefixMapping,
-): SpanContext<T, FeatureFlagSchema>['log'] {
+): SpanContext<T, FeatureFlagSchema>['tag'] {
   // Create proxy for the tag API
-  const tagProxy = new Proxy(originalLog.tag, {
+  const tagProxy: SpanContext<T, FeatureFlagSchema>['tag'] = new Proxy(originalTag as object, {
     get(target, prop: string) {
       // Check if this is a clean name that needs remapping
       const prefixedName = prefixMapping[prop];
@@ -666,35 +666,30 @@ function createRemappedTagProxy<T extends TagAttributeSchema>(
       }
       return value;
     },
-  });
+  }) as SpanContext<T, FeatureFlagSchema>['tag'];
 
-  // Create proxy for the entire log object
-  return new Proxy(originalLog, {
-    get(target, prop: string) {
-      if (prop === 'tag') {
-        return tagProxy;
-      }
+  return tagProxy;
+}
 
-      // Handle scope method - remap attribute keys
-      if (prop === 'scope') {
-        return (attributes: Record<string, unknown>) => {
-          const remappedAttributes: Record<string, unknown> = {};
-          for (const [key, value] of Object.entries(attributes)) {
-            const prefixedKey = prefixMapping[key] || key;
-            remappedAttributes[prefixedKey] = value;
-          }
-          target.scope(remappedAttributes as Partial<Record<string, unknown>>);
-        };
-      }
-
-      // Pass through other methods
-      const value = (target as unknown as Record<string, unknown>)[prop];
-      if (typeof value === 'function') {
-        return value.bind(target);
-      }
-      return value;
-    },
-  }) as SpanContext<T, FeatureFlagSchema>['log'];
+/**
+ * Create a remapped scope function for library use
+ *
+ * @param originalScope - The scope function (ctx.scope)
+ * @param prefixMapping - Mapping from clean names to prefixed names
+ * @returns Function that remaps attribute keys before calling scope
+ */
+function createRemappedScopeFunction<T extends TagAttributeSchema>(
+  originalScope: SpanContext<TagAttributeSchema, FeatureFlagSchema>['scope'],
+  prefixMapping: PrefixMapping,
+): SpanContext<T, FeatureFlagSchema>['scope'] {
+  return (attributes: Record<string, unknown>) => {
+    const remappedAttributes: Record<string, unknown> = {};
+    for (const [key, value] of Object.entries(attributes)) {
+      const prefixedKey = prefixMapping[key] || key;
+      remappedAttributes[prefixedKey] = value;
+    }
+    originalScope(remappedAttributes as Partial<Record<string, unknown>>);
+  };
 }
 
 /**
@@ -780,13 +775,18 @@ export function moduleContextFactory<
     // Get the underlying task wrapper from the module context
     const underlyingTask = moduleContext.task(name, async (ctx, ...args: Args) => {
       // Create remapped context for the library function
-      // The ctx.log here has prefixed methods (http_status), but we need clean methods (status)
-      const remappedLog = createRemappedTagProxy<T>(ctx.log, prefixMapping);
+      // The ctx.tag here has prefixed methods (http_status), but we need clean methods (status)
+      const remappedTag = createRemappedTagProxy<T>(ctx.tag, prefixMapping);
 
-      // Create a new context with the remapped log
+      // Remap the scope function to use clean attribute names
+      const remappedScope = createRemappedScopeFunction<T>(ctx.scope, prefixMapping);
+
+      // Create a new context with the remapped tag and scope
+      // ctx.log remains unchanged (it's just the SpanLogger for logging)
       const remappedCtx: SpanContext<T, FF, Env> = {
         ...ctx,
-        log: remappedLog,
+        tag: remappedTag,
+        scope: remappedScope,
       } as SpanContext<T, FF, Env>;
 
       // Call the library function with the remapped context

@@ -8,7 +8,14 @@
  * - Task wrappers with span buffers
  */
 
-import { type BaseSpanLogger, type ChainableTagAPI, createSpanLoggerClass } from './codegen/spanLoggerGenerator.js';
+import {
+  createResultWriter,
+  createTagWriter,
+  type ResultWriter,
+  type TagWriter,
+} from './codegen/fixedPositionWriterGenerator.js';
+import { createScope, createScopeWithInheritance, type GeneratedScope } from './codegen/scopeGenerator.js';
+import { type BaseSpanLogger, createSpanLogger } from './codegen/spanLoggerGenerator.js';
 import { ModuleContext } from './moduleContext.js';
 import type { EvaluationContext, FeatureFlagSchema, InferFeatureFlags } from './schema/defineFeatureFlags.js';
 import { FeatureFlagEvaluator, type FlagColumnWriters, type FlagEvaluator } from './schema/evaluator.js';
@@ -17,7 +24,11 @@ import type { InferTagAttributes, TagAttributeSchema } from './schema/types.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from './spanBuffer.js';
 import { TaskContext } from './taskContext.js';
 import { getTimestampNanos } from './timestamp.js';
+import type { TraceId } from './traceId.js';
 import type { BufferCapacityStats, SpanBuffer } from './types.js';
+
+// Re-export TagWriter and ResultWriter types for external use
+export type { ResultWriter, TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 
 /**
  * Discriminated union representing a successful operation result.
@@ -90,35 +101,28 @@ export type Result<V, E = unknown> = SuccessResult<V> | ErrorResult<E>;
  *
  * Per specs/01h_entry_types_and_logging_primitives.md:
  * - Writes span-ok or span-err entry to buffer
- * - Supports .with() for attributes and .message() for text
+ * - Supports .with() for attributes and individual setters
  * - Returns final result after writing to buffer
  *
- * This class extends the base Result type to support method chaining
- * while maintaining proper TypeScript type narrowing.
+ * This class uses ResultWriter internally for attribute writing while
+ * maintaining proper TypeScript type narrowing via SuccessResult interface.
  */
 class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessResult<V> {
   readonly success = true as const;
   readonly value: V;
-  private buffer: SpanBuffer;
-  private entryIndex: number;
+  private _writer: ResultWriter<T>;
 
-  constructor(
-    buffer: SpanBuffer,
-    value: V,
-    _schema: T, // Needed for generic type inference
-  ) {
+  constructor(buffer: SpanBuffer, value: V, schema: T) {
     this.value = value;
 
-    // Row 1 is ALWAYS the span-end row (fixed layout)
-    // No need to find buffer with space - row 1 is pre-allocated
-    this.buffer = buffer;
-    this.entryIndex = 1; // ALWAYS row 1
-
     // Overwrite the pre-initialized span-exception with span-ok
-    this.buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+    buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
 
     // Write timestamp (nanoseconds since epoch)
-    this.buffer.timestamps[1] = getTimestampNanos();
+    buffer.timestamps[1] = getTimestampNanos();
+
+    // Create ResultWriter for fluent attribute setting (writes to position 1)
+    this._writer = createResultWriter(schema, buffer, value, false);
 
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
   }
@@ -128,10 +132,7 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    * Example: ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
    */
   with(attributes: Partial<InferTagAttributes<T>>): this {
-    // Write each attribute to its column (use field name directly)
-    for (const [key, value] of Object.entries(attributes)) {
-      writeToColumn(this.buffer, key, value, this.entryIndex);
-    }
+    this._writer.with(attributes);
     return this;
   }
 
@@ -140,7 +141,11 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    * Example: ctx.ok(result).message('User created successfully')
    */
   message(text: string): this {
-    writeToColumn(this.buffer, 'resultMessage', text, this.entryIndex);
+    // Use the writer's setter if available, otherwise fallback
+    const writer = this._writer as ResultWriter<T, V, never> & { resultMessage?: (v: string) => unknown };
+    if (typeof writer.resultMessage === 'function') {
+      writer.resultMessage(text);
+    }
     return this;
   }
 
@@ -149,41 +154,43 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    * Example: ctx.ok(result).line(42)
    */
   line(lineNumber: number): this {
-    writeToColumn(this.buffer, 'lineNumber', lineNumber, this.entryIndex);
+    // Use the writer's setter if available, otherwise fallback
+    const writer = this._writer as ResultWriter<T, V, never> & { lineNumber?: (v: number) => unknown };
+    if (typeof writer.lineNumber === 'function') {
+      writer.lineNumber(lineNumber);
+    }
     return this;
   }
 }
 
 /**
  * Fluent error result with chaining support
+ *
+ * Uses ResultWriter internally for attribute writing while
+ * maintaining proper TypeScript type narrowing via ErrorResult interface.
  */
 class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<E> {
   readonly success = false as const;
   readonly error: { code: string; details: E };
-  private buffer: SpanBuffer;
-  private entryIndex: number;
+  private _writer: ResultWriter<T>;
 
-  constructor(
-    buffer: SpanBuffer,
-    code: string,
-    details: E,
-    _schema: T, // Needed for generic type inference
-  ) {
+  constructor(buffer: SpanBuffer, code: string, details: E, schema: T) {
     this.error = { code, details };
 
-    // Row 1 is ALWAYS the span-end row (fixed layout)
-    // No need to find buffer with space - row 1 is pre-allocated
-    this.buffer = buffer;
-    this.entryIndex = 1; // ALWAYS row 1
-
     // Overwrite the pre-initialized span-exception with span-err
-    this.buffer.operations[1] = ENTRY_TYPE_SPAN_ERR;
+    buffer.operations[1] = ENTRY_TYPE_SPAN_ERR;
 
     // Write timestamp (nanoseconds since epoch)
-    this.buffer.timestamps[1] = getTimestampNanos();
+    buffer.timestamps[1] = getTimestampNanos();
 
-    // Write error code
-    writeToColumn(this.buffer, 'errorCode', code, this.entryIndex);
+    // Create ResultWriter for fluent attribute setting (writes to position 1)
+    this._writer = createResultWriter(schema, buffer, details, true);
+
+    // Write error code using the writer if available
+    const writer = this._writer as ResultWriter<T, never, E> & { errorCode?: (v: string) => unknown };
+    if (typeof writer.errorCode === 'function') {
+      writer.errorCode(code);
+    }
 
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
   }
@@ -193,10 +200,7 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
    * Example: ctx.err('ERROR', details).with({ userId: 'u1' })
    */
   with(attributes: Partial<InferTagAttributes<T>>): this {
-    // Write each attribute to its column (use field name directly)
-    for (const [key, value] of Object.entries(attributes)) {
-      writeToColumn(this.buffer, key, value, this.entryIndex);
-    }
+    this._writer.with(attributes);
     return this;
   }
 
@@ -205,7 +209,11 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
    * Example: ctx.err('ERROR', details).message('Operation failed')
    */
   message(text: string): this {
-    writeToColumn(this.buffer, 'resultMessage', text, this.entryIndex);
+    // Use the writer's setter if available
+    const writer = this._writer as ResultWriter<T, never, E> & { resultMessage?: (v: string) => unknown };
+    if (typeof writer.resultMessage === 'function') {
+      writer.resultMessage(text);
+    }
     return this;
   }
 
@@ -214,7 +222,11 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
    * Example: ctx.err('ERROR', details).line(42)
    */
   line(lineNumber: number): this {
-    writeToColumn(this.buffer, 'lineNumber', lineNumber, this.entryIndex);
+    // Use the writer's setter if available
+    const writer = this._writer as ResultWriter<T, never, E> & { lineNumber?: (v: number) => unknown };
+    if (typeof writer.lineNumber === 'function') {
+      writer.lineNumber(lineNumber);
+    }
     return this;
   }
 }
@@ -515,67 +527,22 @@ export interface FluentLogEntry {
  * For span attributes, use `ctx.tag` directly (not `ctx.log.tag`).
  * For scoped attributes, use `ctx.scope` directly (not `ctx.log.scope`).
  *
+ * Logging methods return `this` for fluent chaining of attribute setters:
  * @example
  * ```typescript
- * ctx.log.info('Processing user').line(42);
+ * ctx.log.info('Processing user').userId('u123');
  * ctx.log.warn('Slow operation');
  * ```
  */
-export interface SpanLogger<T extends TagAttributeSchema> {
-  /**
-   * Internal tag API - use `ctx.tag` instead
-   * @internal Exposed on ctx.tag for cleaner API
-   */
-  readonly tag: ChainableTagAPI<T>;
-
-  /**
-   * Get the Scope instance directly
-   * @internal Used internally for scope inheritance via _getScopeValues()
-   */
-  _getScope(): import('./codegen/scopeGenerator.js').GeneratedScope;
-
-  /**
-   * Internal method to set scoped attributes. Called by ctx.scope().
-   * @internal
-   */
-  _setScope(attributes: Partial<InferTagAttributes<T>>): void;
-
-  /**
-   * Log a message entry with specified level
-   *
-   * @param level - Log level (info, debug, warn, error)
-   * @param message - Log message text
-   * @returns Fluent builder for .line() chaining
-   */
-  message(level: 'info' | 'debug' | 'warn' | 'error', message: string): FluentLogEntry;
-
-  /**
-   * Log an info message
-   * @param message - Log message text
-   * @returns Fluent builder for .line() chaining
-   */
-  info(message: string): FluentLogEntry;
-
-  /**
-   * Log a debug message
-   * @param message - Log message text
-   * @returns Fluent builder for .line() chaining
-   */
-  debug(message: string): FluentLogEntry;
-
-  /**
-   * Log a warning message
-   * @param message - Log message text
-   * @returns Fluent builder for .line() chaining
-   */
-  warn(message: string): FluentLogEntry;
-
-  /**
-   * Log an error message
-   * @param message - Log message text
-   * @returns Fluent builder for .line() chaining
-   */
-  error(message: string): FluentLogEntry;
+export interface SpanLogger<T extends TagAttributeSchema> extends BaseSpanLogger<T> {
+  // BaseSpanLogger provides:
+  // - info(message: string): this
+  // - debug(message: string): this
+  // - warn(message: string): this
+  // - error(message: string): this
+  // - _getScope(): GeneratedScope
+  // - _setScope(attributes): void
+  // Plus fluent attribute setters from ColumnWriter
 }
 
 /**
@@ -638,7 +605,7 @@ export interface SpanContext<T extends TagAttributeSchema, FF extends FeatureFla
    * ctx.tag.userId('u1').requestId('r1').operation('INSERT');
    * ctx.tag.with({ userId: 'u1', requestId: 'r1' });
    */
-  readonly tag: ChainableTagAPI<T>;
+  readonly tag: TagWriter<T>;
 
   /**
    * Logging API for structured log messages
@@ -1003,14 +970,23 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 }
 
 /**
+ * Get buffer with space function type
+ * @deprecated Use createNextBuffer directly via ColumnWriter overflow handling
+ */
+export type GetBufferWithSpaceFn = (buffer: SpanBuffer) => { buffer: SpanBuffer; didOverflow: boolean };
+
+/**
  * Find buffer with space, creating chained buffer if needed
  *
  * Per specs/01b_columnar_buffer_architecture.md:
  * - Buffer chaining handles overflow gracefully
  * - Tracks overflow stats for self-tuning
  * - CPU branch predictor friendly
+ *
+ * @deprecated Use createNextBuffer directly via ColumnWriter overflow handling.
+ * This function is kept for backward compatibility with library.ts.
  */
-function getBufferWithSpace(inputBuffer: SpanBuffer): { buffer: SpanBuffer; didOverflow: boolean } {
+export function getBufferWithSpace(inputBuffer: SpanBuffer): { buffer: SpanBuffer; didOverflow: boolean } {
   const originalBuffer = inputBuffer;
   let currentBuffer = inputBuffer;
   let didOverflow = false;
@@ -1173,85 +1149,37 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
 }
 
 /**
- * Get buffer with space function type
- */
-type GetBufferWithSpaceFn = (buffer: SpanBuffer) => { buffer: SpanBuffer; didOverflow: boolean };
-
-/**
- * Cache for generated SpanLogger classes
- * Per-schema cache to avoid regenerating the same class
- */
-const spanLoggerClassCache = new WeakMap<
-  TagAttributeSchema,
-  new (
-    buffer: SpanBuffer,
-    getBufferWithSpace: GetBufferWithSpaceFn,
-    scopeInstance: import('./codegen/scopeGenerator.js').GeneratedScope,
-  ) => BaseSpanLogger<TagAttributeSchema>
->();
-
-/**
- * Create span logger with typed tag methods and method chaining
- * Writes to TypedArray columnar buffers in memory (hot path)
+ * Helper function to create a SpanLogger with inherited scope values.
  *
- * Per specs/01g_trace_context_api_codegen.md and 01j_module_context_and_spanlogger_generation.md:
- * - Uses runtime class generation with new Function() for zero-overhead prototype methods
- * - Tag getter creates a new entry and returns a chainable API
- * - All chained methods write to the SAME row
- * - Zero allocations: returns same object instance
- *
- * Per user requirements:
- * - Uses separate generated Scope class for attribute inheritance
- * - Scope instance is created per span context
- * - Child spans inherit parent's scope values via _getScopeValues()
+ * Uses the imported createSpanLogger from spanLoggerGenerator.js and
+ * handles scope creation and inheritance.
  *
  * @param schema - Tag attribute schema with field definitions
  * @param buffer - SpanBuffer to write entries to (per-span instance)
  * @param inheritedScopeValues - Scoped values inherited from parent span (from _getScopeValues())
  * @returns SpanLogger with typed methods matching schema
  */
-function createSpanLogger<T extends TagAttributeSchema>(
+function createSpanLoggerWithScope<T extends TagAttributeSchema>(
   schema: T,
   buffer: SpanBuffer,
   inheritedScopeValues?: Record<string, unknown>,
-): SpanLogger<T> {
-  // Import Scope generator (dynamic import for tree-shaking)
-  const { createScope, createScopeWithInheritance } = require('./codegen/scopeGenerator.js');
-
+): BaseSpanLogger<T> {
   // Create Scope instance (separate from column storage)
-  const scopeInstance =
+  const scopeInstance: GeneratedScope =
     inheritedScopeValues && Object.keys(inheritedScopeValues).length > 0
       ? createScopeWithInheritance(schema, inheritedScopeValues)
       : createScope(schema);
 
-  // Get or create the generated SpanLogger class (cold path - happens once per schema)
-  let SpanLoggerClass = spanLoggerClassCache.get(schema);
-
-  if (!SpanLoggerClass) {
-    SpanLoggerClass = createSpanLoggerClass(schema);
-    spanLoggerClassCache.set(schema, SpanLoggerClass);
-  }
-
-  // TypeScript doesn't know the WeakMap guarantees non-null after set
-  // So we add an assertion here
-  if (!SpanLoggerClass) {
-    throw new Error('Failed to create SpanLogger class');
-  }
-
-  // Create instance (hot path - happens once per span)
-  const logger = new SpanLoggerClass(
-    buffer,
-    getBufferWithSpace,
-    scopeInstance, // Pass Scope instance instead of plain object
-  );
+  // Create the SpanLogger using the imported function
+  const logger = createSpanLogger(schema, buffer, scopeInstance, createNextBuffer);
 
   // If scoped values were inherited, pre-fill the buffer
   // The _setScope() method will update both the Scope instance and pre-fill buffer
   if (inheritedScopeValues && Object.keys(inheritedScopeValues).length > 0) {
-    logger._setScope(inheritedScopeValues);
+    logger._setScope(inheritedScopeValues as Partial<InferTagAttributes<T>>);
   }
 
-  return logger as SpanLogger<T>;
+  return logger as BaseSpanLogger<T>;
 }
 
 /**
@@ -1401,7 +1329,9 @@ export function createModuleContext<
 
         // Create span buffer with traceId from request context
         // Per specs/01b - traceId is constant across all spans in a trace
-        const spanBuffer = createSpanBuffer(schemaOnly, taskContext, requestCtx.traceId);
+        // Note: RequestContext.traceId is typed as string for API flexibility,
+        // but it's actually a TraceId (generated by generateTraceId or validated externally)
+        const spanBuffer = createSpanBuffer(schemaOnly, taskContext, requestCtx.traceId as TraceId);
 
         // Connect feature flag evaluator to buffer for analytics
         // The evaluator is a FeatureFlagEvaluator instance, we need to set columnWriters
@@ -1418,16 +1348,17 @@ export function createModuleContext<
         const parentLogger = (requestCtx as RequestContext<FF, Env> & { log?: SpanLogger<T> }).log;
         const inheritedScopeValues = parentLogger?._getScope?.()._getScopeValues() || {};
 
-        // Create span logger with typed tag methods (with inherited scope values)
-        const spanLogger = createSpanLogger(schemaOnly, spanBuffer, inheritedScopeValues);
+        // Create span logger with typed logging methods (with inherited scope values)
+        const spanLogger = createSpanLoggerWithScope(schemaOnly, spanBuffer, inheritedScopeValues);
+
+        // Create tag writer for span attributes (writes to row 0)
+        const tagAPI = createTagWriter(schemaOnly, spanBuffer);
 
         // Create span context
-        // Note: spanLogger.tag returns the chainable tag API
-        // We expose it directly on ctx.tag for cleaner API: ctx.tag.userId() instead of ctx.log.tag.userId()
         const spanContext: SpanContext<T, FF, Env> = {
           ...requestCtx,
-          tag: spanLogger.tag as ChainableTagAPI<T>,
-          log: spanLogger,
+          tag: tagAPI,
+          log: spanLogger as SpanLogger<T>,
 
           scope(attributes: Partial<InferTagAttributes<T>>): void {
             // Delegate to the internal _setScope method on spanLogger
@@ -1454,7 +1385,10 @@ export function createModuleContext<
             const parentScopeValues = spanLogger._getScope()._getScopeValues();
 
             // Create child context with its own logger (with inherited scope values)
-            const childLogger = createSpanLogger(schemaOnly, childBuffer, parentScopeValues);
+            const childLogger = createSpanLoggerWithScope(schemaOnly, childBuffer, parentScopeValues);
+
+            // Create tag writer for child span attributes (writes to row 0)
+            const childTagAPI = createTagWriter(schemaOnly, childBuffer);
 
             // Create a new feature flag evaluator bound to the CHILD buffer.
             // This ensures ff-access/ff-usage entries are logged to the correct span.
@@ -1468,8 +1402,8 @@ export function createModuleContext<
             const childContext: SpanContext<T, FF, Env> = {
               ...spanContext,
               ff: childFf,
-              tag: childLogger.tag as ChainableTagAPI<T>,
-              log: childLogger,
+              tag: childTagAPI,
+              log: childLogger as SpanLogger<T>,
               scope(attrs: Partial<InferTagAttributes<T>>): void {
                 childLogger._setScope(attrs);
               },

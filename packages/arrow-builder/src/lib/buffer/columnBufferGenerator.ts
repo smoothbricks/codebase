@@ -93,12 +93,20 @@ export interface ColumnBufferExtension {
 }
 
 /**
+ * Storage info for a schema field - determines how values are stored
+ */
+interface ColumnStorageInfo {
+  constructorName: string;
+  bytesPerElement: number;
+  isBitPacked: boolean;
+  schemaType: import('../schema-types.js').SchemaType | undefined;
+  enumValues?: readonly string[];
+}
+
+/**
  * Get TypedArray constructor name and byte size for a schema field
  */
-function getTypedArrayInfo(
-  schema: TagAttributeSchema,
-  fieldName: string,
-): { constructorName: string; bytesPerElement: number; isBitPacked: boolean } {
+function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): ColumnStorageInfo {
   const fieldSchema = schema[fieldName];
   const schemaWithMetadata = fieldSchema as import('../schema-types.js').SchemaWithMetadata;
   const schemaType = schemaWithMetadata?.__schema_type;
@@ -110,37 +118,96 @@ function getTypedArrayInfo(
 
     // Uint8Array can hold 0-255 indices (256 values total)
     if (enumCount === 0 || enumCount <= 256) {
-      return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: false };
+      return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: false, schemaType, enumValues };
     }
     if (enumCount <= 65536) {
-      return { constructorName: 'Uint16Array', bytesPerElement: 2, isBitPacked: false };
+      return { constructorName: 'Uint16Array', bytesPerElement: 2, isBitPacked: false, schemaType, enumValues };
     }
-    return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false };
+    return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, enumValues };
   }
 
   if (schemaType === 'category') {
     // Hot path: Store raw JavaScript strings (zero conversion cost)
     // Cold path: Arrow conversion builds sorted dictionary
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false };
+    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType };
   }
 
   if (schemaType === 'text') {
     // Hot path: Store raw JavaScript strings (zero conversion cost)
     // Cold path: Arrow conversion calculates if dictionary saves space
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false };
+    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType };
   }
 
   if (schemaType === 'number') {
-    return { constructorName: 'Float64Array', bytesPerElement: 8, isBitPacked: false };
+    return { constructorName: 'Float64Array', bytesPerElement: 8, isBitPacked: false, schemaType };
   }
 
   if (schemaType === 'boolean') {
     // Boolean: bit-packed storage (8 booleans per byte) for Arrow compatibility
-    return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true };
+    return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true, schemaType };
   }
 
   // Default to Uint32Array
-  return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false };
+  return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType };
+}
+
+/**
+ * Generate the value assignment code for a setter method.
+ *
+ * Returns the code that assigns the value to the column storage.
+ * The code has access to: `storage` (the column storage object), `pos` (position), `val` (value).
+ *
+ * WHY different strategies per type:
+ * - enum: Compile-time lookup map for O(1) string→index conversion (no indexOf at runtime)
+ * - boolean: Bit-packed storage using bitwise operations
+ * - category/text: Direct string array assignment (no conversion)
+ * - number: Direct Float64Array assignment
+ */
+function generateSetterValueAssignment(info: ColumnStorageInfo, columnName: string): string {
+  const { schemaType, isBitPacked, enumValues } = info;
+
+  if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
+    // Enum: Use pre-generated lookup map for O(1) conversion
+    // The lookup map is generated in preamble and named ${columnName}_enumMap
+    return `storage.values[pos] = ${columnName}_enumMap[val] ?? 0;`;
+  }
+
+  if (isBitPacked) {
+    // Boolean: Bit-packed storage (8 values per byte)
+    // Arrow format: 1 = valid/true, 0 = null/false
+    return [
+      'const byteIdx = pos >>> 3;',
+      '      const bitIdx = pos & 7;',
+      '      if (val) {',
+      '        storage.values[byteIdx] |= (1 << bitIdx);',
+      '      } else {',
+      '        storage.values[byteIdx] &= ~(1 << bitIdx);',
+      '      }',
+    ].join('\n');
+  }
+
+  if (schemaType === 'category' || schemaType === 'text') {
+    // String array: Direct assignment
+    return 'storage.values[pos] = val;';
+  }
+
+  if (schemaType === 'number') {
+    // Float64Array: Direct assignment
+    return 'storage.values[pos] = val;';
+  }
+
+  // Default: Direct assignment (for any TypedArray)
+  return 'storage.values[pos] = val;';
+}
+
+/**
+ * Generate the null bit setting code.
+ *
+ * Arrow format: null bitmap uses 1 = valid (not null), 0 = null
+ * This sets the bit to 1 (marking the value as valid/present).
+ */
+function generateNullBitSetting(): string {
+  return 'storage.nulls[pos >>> 3] |= (1 << (pos & 7));';
 }
 
 /**
@@ -179,7 +246,7 @@ export function generateColumnBufferClass(
   constructorCode.push('    this._operations = new Uint8Array(alignedCapacity);');
   constructorCode.push('');
   constructorCode.push('    // Buffer management (system properties use _ prefix)');
-  constructorCode.push('    this._writeIndex = 0;');
+  constructorCode.push('    // NOTE: _writeIndex is tracked by ColumnWriter, not ColumnBuffer');
   constructorCode.push('    this._capacity = requestedCapacity;');
   constructorCode.push('    this._next = undefined;');
 
@@ -187,10 +254,13 @@ export function generateColumnBufferClass(
   const symbolDeclarations: string[] = [];
   const allocatorFunctions: string[] = [];
   const getterMethods: string[] = [];
+  const setterMethods: string[] = [];
+  const enumMaps: string[] = [];
 
   for (const fieldName of schemaFields) {
     const columnName = fieldName; // User columns have no prefix
-    const { constructorName, bytesPerElement, isBitPacked } = getTypedArrayInfo(schema, fieldName);
+    const storageInfo = getTypedArrayInfo(schema, fieldName);
+    const { constructorName, bytesPerElement, isBitPacked, schemaType, enumValues } = storageInfo;
 
     // Symbol declaration
     symbolDeclarations.push(`  const ${columnName}_sym = Symbol('${columnName}');`);
@@ -255,6 +325,26 @@ export function generateColumnBufferClass(
     getterMethods.push(`    get ${columnName}_nulls() { return allocate_${columnName}(this).nulls; }`);
     getterMethods.push(`    get ${columnName}_values() { return allocate_${columnName}(this).values; }`);
     getterMethods.push(`    get ${columnName}() { return allocate_${columnName}(this).values; }`);
+
+    // Generate enum lookup map if this is an enum type
+    if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
+      // Generate a frozen object for O(1) string→index lookup at runtime
+      // This is much faster than indexOf() for hot path writes
+      const mapEntries = enumValues.map((val, idx) => `'${val}': ${idx}`).join(', ');
+      enumMaps.push(`  const ${columnName}_enumMap = Object.freeze({ ${mapEntries} });`);
+    }
+
+    // Setter method: buffer.columnName(position, value) => this
+    // Allocates column lazily on first write, sets value and null bit
+    const valueAssignment = generateSetterValueAssignment(storageInfo, columnName);
+    const nullBitSetting = generateNullBitSetting();
+
+    setterMethods.push(`    ${columnName}(pos, val) {
+      const storage = allocate_${columnName}(this);
+      ${valueAssignment}
+      ${nullBitSetting}
+      return this;
+    }`);
   }
 
   // Build constructor signature with optional extension params
@@ -288,6 +378,10 @@ ${extension.methods
   // Build preamble if provided
   const preambleCode = extension?.preamble ? `\n  // Extension preamble\n${extension.preamble}\n` : '';
 
+  // Build enum maps section if any enums exist
+  const enumMapsCode =
+    enumMaps.length > 0 ? `\n  // Enum lookup maps (O(1) string→index)\n${enumMaps.join('\n')}\n` : '';
+
   // Generate the complete class code
   // Note: 'helpers' is injected by getColumnBufferClass() via new Function('helpers', code)
   // The generated code is NOT an IIFE - it's the body of a function that receives helpers
@@ -302,7 +396,7 @@ ${symbolDeclarations.join('\n')}
 
   // Allocator functions for lazy columns
 ${allocatorFunctions.join('\n')}
-${preambleCode}
+${enumMapsCode}${preambleCode}
   class ${className} {
     constructor(${constructorSignature}) {
 ${constructorCode.join('\n')}
@@ -322,6 +416,10 @@ ${constructorCode.join('\n')}
 
     // Lazy column getters
 ${getterMethods.join('\n')}
+
+    // Column setter methods: buffer.column(position, value) => this
+    // Each setter allocates the column lazily on first write
+${setterMethods.join('\n')}
 ${extensionMethods}
   }
 

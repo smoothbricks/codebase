@@ -2,7 +2,6 @@
 
 exports[`generateSpanLoggerClass snapshots snapshot: empty schema 1`] = `
 "
-(function() {
   'use strict';
 
   // Inline getTimestampNanos for performance (zero function call overhead)
@@ -86,7 +85,6 @@ exports[`generateSpanLoggerClass snapshots snapshot: empty schema 1`] = `
       }
 
       const idx = this._buffer.writeIndex;
-      const self = this;
 
       // Write entry type
       this._buffer.operations[idx] = entryType;
@@ -98,9 +96,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: empty schema 1`] = `
       const messageColumn = this._buffer.logMessage_values;
       if (messageColumn) {
         messageColumn[idx] = message;
-        const byteIndex = idx >>> 3;
-        const bitOffset = idx & 7;
-        this._buffer.logMessage_nulls[byteIndex] |= (1 << bitOffset);
+        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
       }
 
       // Apply scoped attributes - UNROLLED per-column
@@ -109,20 +105,20 @@ exports[`generateSpanLoggerClass snapshots snapshot: empty schema 1`] = `
       // Increment write index
       this._buffer.writeIndex++;
 
-      // Return fluent object for .line() chaining
-      // The idx captured above is the row we just wrote to
+      // Return fluent object for attribute chaining
+      // Capture buffer reference directly (not via self._buffer) so it's stable
+      // even if another log call happens before fluent methods are called
+      const buf = this._buffer;
       return {
         line(lineNumber) {
-          // Write lineNumber to lineNumber column at the captured idx
-          const lineCol = self._buffer.lineNumber_values;
+          const lineCol = buf.lineNumber_values;
           if (lineCol) {
             lineCol[idx] = lineNumber;
-            // Mark as non-null
-            const byteIndex = idx >>> 3;
-            const bitOffset = idx & 7;
-            self._buffer.lineNumber_nulls[byteIndex] |= (1 << bitOffset);
+            helpers.setNullBit(buf.lineNumber_nulls, idx);
           }
-        }
+          return this;
+        },
+        
       };
     }
     
@@ -159,13 +155,11 @@ exports[`generateSpanLoggerClass snapshots snapshot: empty schema 1`] = `
   }
 
   return GeneratedSpanLogger;
-})()
 "
 `;
 
 exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
 "
-(function() {
   'use strict';
 
   // Inline getTimestampNanos for performance (zero function call overhead)
@@ -366,46 +360,16 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
           values[i] = attributes.userId;
         }
 
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.userId_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.userId_nulls, startIdx, endIdx);
       }
 
       if ('operation' in attributes && attributes.operation !== null && attributes.operation !== undefined) {
         // Fill values with SIMD-friendly TypedArray.fill()
         this._buffer.operation_values.fill(getEnumIndex_operation(attributes.operation), startIdx, endIdx);
 
-        // Bulk fill null bitmap: full bytes get 0xFF, partial last byte gets individual bits
-        const nullBitmap = this._buffer.operation_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        // Set full bytes to 0xFF (all bits valid)
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          // For partial first byte, only set bits >= startIdx % 8
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          }
-          // For partial last byte, only set bits < endIdx % 8 (or all if endIdx % 8 === 0)
-          else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          }
-          // Full byte - set all bits
-          else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.operation_nulls, startIdx, endIdx);
       }
 
       if ('errorMsg' in attributes && attributes.errorMsg !== null && attributes.errorMsg !== undefined) {
@@ -415,89 +379,21 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
           values[i] = attributes.errorMsg;
         }
 
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.errorMsg_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.errorMsg_nulls, startIdx, endIdx);
       }
 
       if ('count' in attributes && attributes.count !== null && attributes.count !== undefined) {
         // Fill values with SIMD-friendly TypedArray.fill()
         this._buffer.count_values.fill(attributes.count, startIdx, endIdx);
 
-        // Bulk fill null bitmap: full bytes get 0xFF, partial last byte gets individual bits
-        const nullBitmap = this._buffer.count_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        // Set full bytes to 0xFF (all bits valid)
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          // For partial first byte, only set bits >= startIdx % 8
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          }
-          // For partial last byte, only set bits < endIdx % 8 (or all if endIdx % 8 === 0)
-          else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          }
-          // Full byte - set all bits
-          else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.count_nulls, startIdx, endIdx);
       }
 
       if ('enabled' in attributes && attributes.enabled !== null && attributes.enabled !== undefined) {
-        // Bit-packed boolean bulk fill
-        const values = this._buffer.enabled_values;
-        const fillByte = attributes.enabled ? 0xFF : 0x00;
-        const startByte = startIdx >>> 3;
-        const endByte = (endIdx - 1) >>> 3;
-
-        // Fill full bytes
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && (startIdx & 7) !== 0) {
-            // Partial first byte
-            const mask = 0xFF << (startIdx & 7);
-            if (attributes.enabled) {
-              values[byteIdx] |= mask;
-            } else {
-              values[byteIdx] &= ~mask;
-            }
-          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-            // Partial last byte
-            const mask = (1 << (endIdx & 7)) - 1;
-            if (attributes.enabled) {
-              values[byteIdx] |= mask;
-            } else {
-              values[byteIdx] &= ~mask;
-            }
-          } else {
-            values[byteIdx] = fillByte;
-          }
-        }
-
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.enabled_nulls;
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && (startIdx & 7) !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
-          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        helpers.fillBooleanBitmapRange(this._buffer.enabled_values, startIdx, endIdx, attributes.enabled);
+        helpers.fillNullBitmapRange(this._buffer.enabled_nulls, startIdx, endIdx);
       }
     }
 
@@ -522,20 +418,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
             values[i] = scopeValue;
           }
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.userId_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.userId_nulls, startIdx, endIdx);
         }
       }
 
@@ -545,20 +429,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
           // Fill values with SIMD-friendly TypedArray.fill()
           this._buffer.operation_values.fill(getEnumIndex_operation(scopeValue), startIdx, endIdx);
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.operation_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.operation_nulls, startIdx, endIdx);
         }
       }
 
@@ -571,20 +443,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
             values[i] = scopeValue;
           }
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.errorMsg_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.errorMsg_nulls, startIdx, endIdx);
         }
       }
 
@@ -594,63 +454,16 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
           // Fill values with SIMD-friendly TypedArray.fill()
           this._buffer.count_values.fill(scopeValue, startIdx, endIdx);
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.count_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.count_nulls, startIdx, endIdx);
         }
       }
 
       {
         const scopeValue = this._scope.enabled;
         if (scopeValue !== null && scopeValue !== undefined) {
-          // Bit-packed boolean bulk fill
-          const values = this._buffer.enabled_values;
-          const fillByte = scopeValue ? 0xFF : 0x00;
-          const startByte = startIdx >>> 3;
-          const endByte = (endIdx - 1) >>> 3;
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && (startIdx & 7) !== 0) {
-              const mask = 0xFF << (startIdx & 7);
-              if (scopeValue) {
-                values[byteIdx] |= mask;
-              } else {
-                values[byteIdx] &= ~mask;
-              }
-            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-              const mask = (1 << (endIdx & 7)) - 1;
-              if (scopeValue) {
-                values[byteIdx] |= mask;
-              } else {
-                values[byteIdx] &= ~mask;
-              }
-            } else {
-              values[byteIdx] = fillByte;
-            }
-          }
-
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.enabled_nulls;
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && (startIdx & 7) !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
-            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          helpers.fillBooleanBitmapRange(this._buffer.enabled_values, startIdx, endIdx, scopeValue);
+          helpers.fillNullBitmapRange(this._buffer.enabled_nulls, startIdx, endIdx);
         }
       }
     }
@@ -670,7 +483,6 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
       }
 
       const idx = this._buffer.writeIndex;
-      const self = this;
 
       // Write entry type
       this._buffer.operations[idx] = entryType;
@@ -682,9 +494,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
       const messageColumn = this._buffer.logMessage_values;
       if (messageColumn) {
         messageColumn[idx] = message;
-        const byteIndex = idx >>> 3;
-        const bitOffset = idx & 7;
-        this._buffer.logMessage_nulls[byteIndex] |= (1 << bitOffset);
+        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
       }
 
       // Apply scoped attributes - UNROLLED per-column
@@ -693,9 +503,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
         const scopeValue = this._scope.userId;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.userId_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.userId_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.userId_nulls, idx);
         }
       }
 
@@ -703,9 +511,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
         const scopeValue = this._scope.operation;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.operation_values[idx] = getEnumIndex_operation(scopeValue);
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.operation_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.operation_nulls, idx);
         }
       }
 
@@ -713,9 +519,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
         const scopeValue = this._scope.errorMsg;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.errorMsg_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.errorMsg_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.errorMsg_nulls, idx);
         }
       }
 
@@ -723,9 +527,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
         const scopeValue = this._scope.count;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.count_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.count_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.count_nulls, idx);
         }
       }
 
@@ -740,26 +542,61 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
           } else {
             this._buffer.enabled_values[byteIndex] &= ~(1 << bitOffset);
           }
-          this._buffer.enabled_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.enabled_nulls, idx);
         }
       }
 
       // Increment write index
       this._buffer.writeIndex++;
 
-      // Return fluent object for .line() chaining
-      // The idx captured above is the row we just wrote to
+      // Return fluent object for attribute chaining
+      // Capture buffer reference directly (not via self._buffer) so it's stable
+      // even if another log call happens before fluent methods are called
+      const buf = this._buffer;
       return {
         line(lineNumber) {
-          // Write lineNumber to lineNumber column at the captured idx
-          const lineCol = self._buffer.lineNumber_values;
+          const lineCol = buf.lineNumber_values;
           if (lineCol) {
             lineCol[idx] = lineNumber;
-            // Mark as non-null
-            const byteIndex = idx >>> 3;
-            const bitOffset = idx & 7;
-            self._buffer.lineNumber_nulls[byteIndex] |= (1 << bitOffset);
+            helpers.setNullBit(buf.lineNumber_nulls, idx);
           }
+          return this;
+        },
+        
+        userId(value) {
+          buf.userId_values[idx] = value;
+          helpers.setNullBit(buf.userId_nulls, idx);
+          return this;
+        },
+
+        operation(value) {
+          buf.operation_values[idx] = getEnumIndex_operation(value);
+          helpers.setNullBit(buf.operation_nulls, idx);
+          return this;
+        },
+
+        errorMsg(value) {
+          buf.errorMsg_values[idx] = value;
+          helpers.setNullBit(buf.errorMsg_nulls, idx);
+          return this;
+        },
+
+        count(value) {
+          buf.count_values[idx] = value;
+          helpers.setNullBit(buf.count_nulls, idx);
+          return this;
+        },
+
+        enabled(value) {
+          const byteIndex = idx >>> 3;
+          const bitOffset = idx & 7;
+          if (value) {
+            buf.enabled_values[byteIndex] |= (1 << bitOffset);
+          } else {
+            buf.enabled_values[byteIndex] &= ~(1 << bitOffset);
+          }
+          helpers.setNullBit(buf.enabled_nulls, idx);
+          return this;
         }
       };
     }
@@ -797,13 +634,11 @@ exports[`generateSpanLoggerClass snapshots snapshot: all field types 1`] = `
   }
 
   return GeneratedSpanLogger;
-})()
 "
 `;
 
 exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] = `
 "
-(function() {
   'use strict';
 
   // Inline getTimestampNanos for performance (zero function call overhead)
@@ -928,52 +763,16 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
         // Fill values with SIMD-friendly TypedArray.fill()
         this._buffer.httpMethod_values.fill(getEnumIndex_httpMethod(attributes.httpMethod), startIdx, endIdx);
 
-        // Bulk fill null bitmap: full bytes get 0xFF, partial last byte gets individual bits
-        const nullBitmap = this._buffer.httpMethod_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        // Set full bytes to 0xFF (all bits valid)
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          // For partial first byte, only set bits >= startIdx % 8
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          }
-          // For partial last byte, only set bits < endIdx % 8 (or all if endIdx % 8 === 0)
-          else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          }
-          // Full byte - set all bits
-          else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.httpMethod_nulls, startIdx, endIdx);
       }
 
       if ('status' in attributes && attributes.status !== null && attributes.status !== undefined) {
         // Fill values with SIMD-friendly TypedArray.fill()
         this._buffer.status_values.fill(getEnumIndex_status(attributes.status), startIdx, endIdx);
 
-        // Bulk fill null bitmap: full bytes get 0xFF, partial last byte gets individual bits
-        const nullBitmap = this._buffer.status_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        // Set full bytes to 0xFF (all bits valid)
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          // For partial first byte, only set bits >= startIdx % 8
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          }
-          // For partial last byte, only set bits < endIdx % 8 (or all if endIdx % 8 === 0)
-          else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          }
-          // Full byte - set all bits
-          else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.status_nulls, startIdx, endIdx);
       }
     }
 
@@ -995,20 +794,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
           // Fill values with SIMD-friendly TypedArray.fill()
           this._buffer.httpMethod_values.fill(getEnumIndex_httpMethod(scopeValue), startIdx, endIdx);
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.httpMethod_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.httpMethod_nulls, startIdx, endIdx);
         }
       }
 
@@ -1018,20 +805,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
           // Fill values with SIMD-friendly TypedArray.fill()
           this._buffer.status_values.fill(getEnumIndex_status(scopeValue), startIdx, endIdx);
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.status_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.status_nulls, startIdx, endIdx);
         }
       }
     }
@@ -1051,7 +826,6 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
       }
 
       const idx = this._buffer.writeIndex;
-      const self = this;
 
       // Write entry type
       this._buffer.operations[idx] = entryType;
@@ -1063,9 +837,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
       const messageColumn = this._buffer.logMessage_values;
       if (messageColumn) {
         messageColumn[idx] = message;
-        const byteIndex = idx >>> 3;
-        const bitOffset = idx & 7;
-        this._buffer.logMessage_nulls[byteIndex] |= (1 << bitOffset);
+        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
       }
 
       // Apply scoped attributes - UNROLLED per-column
@@ -1074,9 +846,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
         const scopeValue = this._scope.httpMethod;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.httpMethod_values[idx] = getEnumIndex_httpMethod(scopeValue);
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.httpMethod_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.httpMethod_nulls, idx);
         }
       }
 
@@ -1084,28 +854,37 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
         const scopeValue = this._scope.status;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.status_values[idx] = getEnumIndex_status(scopeValue);
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.status_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.status_nulls, idx);
         }
       }
 
       // Increment write index
       this._buffer.writeIndex++;
 
-      // Return fluent object for .line() chaining
-      // The idx captured above is the row we just wrote to
+      // Return fluent object for attribute chaining
+      // Capture buffer reference directly (not via self._buffer) so it's stable
+      // even if another log call happens before fluent methods are called
+      const buf = this._buffer;
       return {
         line(lineNumber) {
-          // Write lineNumber to lineNumber column at the captured idx
-          const lineCol = self._buffer.lineNumber_values;
+          const lineCol = buf.lineNumber_values;
           if (lineCol) {
             lineCol[idx] = lineNumber;
-            // Mark as non-null
-            const byteIndex = idx >>> 3;
-            const bitOffset = idx & 7;
-            self._buffer.lineNumber_nulls[byteIndex] |= (1 << bitOffset);
+            helpers.setNullBit(buf.lineNumber_nulls, idx);
           }
+          return this;
+        },
+        
+        httpMethod(value) {
+          buf.httpMethod_values[idx] = getEnumIndex_httpMethod(value);
+          helpers.setNullBit(buf.httpMethod_nulls, idx);
+          return this;
+        },
+
+        status(value) {
+          buf.status_values[idx] = getEnumIndex_status(value);
+          helpers.setNullBit(buf.status_nulls, idx);
+          return this;
         }
       };
     }
@@ -1143,13 +922,11 @@ exports[`generateSpanLoggerClass snapshots snapshot: enum with many values 1`] =
   }
 
   return GeneratedSpanLogger;
-})()
 "
 `;
 
 exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`] = `
 "
-(function() {
   'use strict';
 
   // Inline getTimestampNanos for performance (zero function call overhead)
@@ -1318,20 +1095,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
           values[i] = attributes.userId;
         }
 
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.userId_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.userId_nulls, startIdx, endIdx);
       }
 
       if ('sessionId' in attributes && attributes.sessionId !== null && attributes.sessionId !== undefined) {
@@ -1341,20 +1106,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
           values[i] = attributes.sessionId;
         }
 
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.sessionId_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.sessionId_nulls, startIdx, endIdx);
       }
 
       if ('requestBody' in attributes && attributes.requestBody !== null && attributes.requestBody !== undefined) {
@@ -1364,20 +1117,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
           values[i] = attributes.requestBody;
         }
 
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.requestBody_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.requestBody_nulls, startIdx, endIdx);
       }
 
       if ('errorMessage' in attributes && attributes.errorMessage !== null && attributes.errorMessage !== undefined) {
@@ -1387,20 +1128,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
           values[i] = attributes.errorMessage;
         }
 
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.errorMessage_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.errorMessage_nulls, startIdx, endIdx);
       }
     }
 
@@ -1425,20 +1154,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
             values[i] = scopeValue;
           }
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.userId_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.userId_nulls, startIdx, endIdx);
         }
       }
 
@@ -1451,20 +1168,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
             values[i] = scopeValue;
           }
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.sessionId_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.sessionId_nulls, startIdx, endIdx);
         }
       }
 
@@ -1477,20 +1182,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
             values[i] = scopeValue;
           }
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.requestBody_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.requestBody_nulls, startIdx, endIdx);
         }
       }
 
@@ -1503,20 +1196,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
             values[i] = scopeValue;
           }
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.errorMessage_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.errorMessage_nulls, startIdx, endIdx);
         }
       }
     }
@@ -1536,7 +1217,6 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
       }
 
       const idx = this._buffer.writeIndex;
-      const self = this;
 
       // Write entry type
       this._buffer.operations[idx] = entryType;
@@ -1548,9 +1228,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
       const messageColumn = this._buffer.logMessage_values;
       if (messageColumn) {
         messageColumn[idx] = message;
-        const byteIndex = idx >>> 3;
-        const bitOffset = idx & 7;
-        this._buffer.logMessage_nulls[byteIndex] |= (1 << bitOffset);
+        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
       }
 
       // Apply scoped attributes - UNROLLED per-column
@@ -1559,9 +1237,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
         const scopeValue = this._scope.userId;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.userId_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.userId_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.userId_nulls, idx);
         }
       }
 
@@ -1569,9 +1245,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
         const scopeValue = this._scope.sessionId;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.sessionId_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.sessionId_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.sessionId_nulls, idx);
         }
       }
 
@@ -1579,9 +1253,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
         const scopeValue = this._scope.requestBody;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.requestBody_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.requestBody_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.requestBody_nulls, idx);
         }
       }
 
@@ -1589,28 +1261,49 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
         const scopeValue = this._scope.errorMessage;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.errorMessage_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.errorMessage_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.errorMessage_nulls, idx);
         }
       }
 
       // Increment write index
       this._buffer.writeIndex++;
 
-      // Return fluent object for .line() chaining
-      // The idx captured above is the row we just wrote to
+      // Return fluent object for attribute chaining
+      // Capture buffer reference directly (not via self._buffer) so it's stable
+      // even if another log call happens before fluent methods are called
+      const buf = this._buffer;
       return {
         line(lineNumber) {
-          // Write lineNumber to lineNumber column at the captured idx
-          const lineCol = self._buffer.lineNumber_values;
+          const lineCol = buf.lineNumber_values;
           if (lineCol) {
             lineCol[idx] = lineNumber;
-            // Mark as non-null
-            const byteIndex = idx >>> 3;
-            const bitOffset = idx & 7;
-            self._buffer.lineNumber_nulls[byteIndex] |= (1 << bitOffset);
+            helpers.setNullBit(buf.lineNumber_nulls, idx);
           }
+          return this;
+        },
+        
+        userId(value) {
+          buf.userId_values[idx] = value;
+          helpers.setNullBit(buf.userId_nulls, idx);
+          return this;
+        },
+
+        sessionId(value) {
+          buf.sessionId_values[idx] = value;
+          helpers.setNullBit(buf.sessionId_nulls, idx);
+          return this;
+        },
+
+        requestBody(value) {
+          buf.requestBody_values[idx] = value;
+          helpers.setNullBit(buf.requestBody_nulls, idx);
+          return this;
+        },
+
+        errorMessage(value) {
+          buf.errorMessage_values[idx] = value;
+          helpers.setNullBit(buf.errorMessage_nulls, idx);
+          return this;
         }
       };
     }
@@ -1648,13 +1341,11 @@ exports[`generateSpanLoggerClass snapshots snapshot: category and text fields 1`
   }
 
   return GeneratedSpanLogger;
-})()
 "
 `;
 
 exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 1`] = `
 "
-(function() {
   'use strict';
 
   // Inline getTimestampNanos for performance (zero function call overhead)
@@ -1818,138 +1509,26 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
         // Fill values with SIMD-friendly TypedArray.fill()
         this._buffer.count_values.fill(attributes.count, startIdx, endIdx);
 
-        // Bulk fill null bitmap: full bytes get 0xFF, partial last byte gets individual bits
-        const nullBitmap = this._buffer.count_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        // Set full bytes to 0xFF (all bits valid)
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          // For partial first byte, only set bits >= startIdx % 8
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          }
-          // For partial last byte, only set bits < endIdx % 8 (or all if endIdx % 8 === 0)
-          else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          }
-          // Full byte - set all bits
-          else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.count_nulls, startIdx, endIdx);
       }
 
       if ('duration' in attributes && attributes.duration !== null && attributes.duration !== undefined) {
         // Fill values with SIMD-friendly TypedArray.fill()
         this._buffer.duration_values.fill(attributes.duration, startIdx, endIdx);
 
-        // Bulk fill null bitmap: full bytes get 0xFF, partial last byte gets individual bits
-        const nullBitmap = this._buffer.duration_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        // Set full bytes to 0xFF (all bits valid)
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          // For partial first byte, only set bits >= startIdx % 8
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          }
-          // For partial last byte, only set bits < endIdx % 8 (or all if endIdx % 8 === 0)
-          else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          }
-          // Full byte - set all bits
-          else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.duration_nulls, startIdx, endIdx);
       }
 
       if ('isValid' in attributes && attributes.isValid !== null && attributes.isValid !== undefined) {
-        // Bit-packed boolean bulk fill
-        const values = this._buffer.isValid_values;
-        const fillByte = attributes.isValid ? 0xFF : 0x00;
-        const startByte = startIdx >>> 3;
-        const endByte = (endIdx - 1) >>> 3;
-
-        // Fill full bytes
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && (startIdx & 7) !== 0) {
-            // Partial first byte
-            const mask = 0xFF << (startIdx & 7);
-            if (attributes.isValid) {
-              values[byteIdx] |= mask;
-            } else {
-              values[byteIdx] &= ~mask;
-            }
-          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-            // Partial last byte
-            const mask = (1 << (endIdx & 7)) - 1;
-            if (attributes.isValid) {
-              values[byteIdx] |= mask;
-            } else {
-              values[byteIdx] &= ~mask;
-            }
-          } else {
-            values[byteIdx] = fillByte;
-          }
-        }
-
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.isValid_nulls;
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && (startIdx & 7) !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
-          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        helpers.fillBooleanBitmapRange(this._buffer.isValid_values, startIdx, endIdx, attributes.isValid);
+        helpers.fillNullBitmapRange(this._buffer.isValid_nulls, startIdx, endIdx);
       }
 
       if ('isEnabled' in attributes && attributes.isEnabled !== null && attributes.isEnabled !== undefined) {
-        // Bit-packed boolean bulk fill
-        const values = this._buffer.isEnabled_values;
-        const fillByte = attributes.isEnabled ? 0xFF : 0x00;
-        const startByte = startIdx >>> 3;
-        const endByte = (endIdx - 1) >>> 3;
-
-        // Fill full bytes
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && (startIdx & 7) !== 0) {
-            // Partial first byte
-            const mask = 0xFF << (startIdx & 7);
-            if (attributes.isEnabled) {
-              values[byteIdx] |= mask;
-            } else {
-              values[byteIdx] &= ~mask;
-            }
-          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-            // Partial last byte
-            const mask = (1 << (endIdx & 7)) - 1;
-            if (attributes.isEnabled) {
-              values[byteIdx] |= mask;
-            } else {
-              values[byteIdx] &= ~mask;
-            }
-          } else {
-            values[byteIdx] = fillByte;
-          }
-        }
-
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.isEnabled_nulls;
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && (startIdx & 7) !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
-          } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        helpers.fillBooleanBitmapRange(this._buffer.isEnabled_values, startIdx, endIdx, attributes.isEnabled);
+        helpers.fillNullBitmapRange(this._buffer.isEnabled_nulls, startIdx, endIdx);
       }
     }
 
@@ -1971,20 +1550,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
           // Fill values with SIMD-friendly TypedArray.fill()
           this._buffer.count_values.fill(scopeValue, startIdx, endIdx);
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.count_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.count_nulls, startIdx, endIdx);
         }
       }
 
@@ -1994,106 +1561,24 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
           // Fill values with SIMD-friendly TypedArray.fill()
           this._buffer.duration_values.fill(scopeValue, startIdx, endIdx);
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.duration_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.duration_nulls, startIdx, endIdx);
         }
       }
 
       {
         const scopeValue = this._scope.isValid;
         if (scopeValue !== null && scopeValue !== undefined) {
-          // Bit-packed boolean bulk fill
-          const values = this._buffer.isValid_values;
-          const fillByte = scopeValue ? 0xFF : 0x00;
-          const startByte = startIdx >>> 3;
-          const endByte = (endIdx - 1) >>> 3;
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && (startIdx & 7) !== 0) {
-              const mask = 0xFF << (startIdx & 7);
-              if (scopeValue) {
-                values[byteIdx] |= mask;
-              } else {
-                values[byteIdx] &= ~mask;
-              }
-            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-              const mask = (1 << (endIdx & 7)) - 1;
-              if (scopeValue) {
-                values[byteIdx] |= mask;
-              } else {
-                values[byteIdx] &= ~mask;
-              }
-            } else {
-              values[byteIdx] = fillByte;
-            }
-          }
-
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.isValid_nulls;
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && (startIdx & 7) !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
-            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          helpers.fillBooleanBitmapRange(this._buffer.isValid_values, startIdx, endIdx, scopeValue);
+          helpers.fillNullBitmapRange(this._buffer.isValid_nulls, startIdx, endIdx);
         }
       }
 
       {
         const scopeValue = this._scope.isEnabled;
         if (scopeValue !== null && scopeValue !== undefined) {
-          // Bit-packed boolean bulk fill
-          const values = this._buffer.isEnabled_values;
-          const fillByte = scopeValue ? 0xFF : 0x00;
-          const startByte = startIdx >>> 3;
-          const endByte = (endIdx - 1) >>> 3;
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && (startIdx & 7) !== 0) {
-              const mask = 0xFF << (startIdx & 7);
-              if (scopeValue) {
-                values[byteIdx] |= mask;
-              } else {
-                values[byteIdx] &= ~mask;
-              }
-            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-              const mask = (1 << (endIdx & 7)) - 1;
-              if (scopeValue) {
-                values[byteIdx] |= mask;
-              } else {
-                values[byteIdx] &= ~mask;
-              }
-            } else {
-              values[byteIdx] = fillByte;
-            }
-          }
-
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.isEnabled_nulls;
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && (startIdx & 7) !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx & 7));
-            } else if (byteIdx === endByte && (endIdx & 7) !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx & 7)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          helpers.fillBooleanBitmapRange(this._buffer.isEnabled_values, startIdx, endIdx, scopeValue);
+          helpers.fillNullBitmapRange(this._buffer.isEnabled_nulls, startIdx, endIdx);
         }
       }
     }
@@ -2113,7 +1598,6 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
       }
 
       const idx = this._buffer.writeIndex;
-      const self = this;
 
       // Write entry type
       this._buffer.operations[idx] = entryType;
@@ -2125,9 +1609,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
       const messageColumn = this._buffer.logMessage_values;
       if (messageColumn) {
         messageColumn[idx] = message;
-        const byteIndex = idx >>> 3;
-        const bitOffset = idx & 7;
-        this._buffer.logMessage_nulls[byteIndex] |= (1 << bitOffset);
+        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
       }
 
       // Apply scoped attributes - UNROLLED per-column
@@ -2136,9 +1618,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
         const scopeValue = this._scope.count;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.count_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.count_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.count_nulls, idx);
         }
       }
 
@@ -2146,9 +1626,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
         const scopeValue = this._scope.duration;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.duration_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.duration_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.duration_nulls, idx);
         }
       }
 
@@ -2163,7 +1641,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
           } else {
             this._buffer.isValid_values[byteIndex] &= ~(1 << bitOffset);
           }
-          this._buffer.isValid_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.isValid_nulls, idx);
         }
       }
 
@@ -2178,26 +1656,61 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
           } else {
             this._buffer.isEnabled_values[byteIndex] &= ~(1 << bitOffset);
           }
-          this._buffer.isEnabled_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.isEnabled_nulls, idx);
         }
       }
 
       // Increment write index
       this._buffer.writeIndex++;
 
-      // Return fluent object for .line() chaining
-      // The idx captured above is the row we just wrote to
+      // Return fluent object for attribute chaining
+      // Capture buffer reference directly (not via self._buffer) so it's stable
+      // even if another log call happens before fluent methods are called
+      const buf = this._buffer;
       return {
         line(lineNumber) {
-          // Write lineNumber to lineNumber column at the captured idx
-          const lineCol = self._buffer.lineNumber_values;
+          const lineCol = buf.lineNumber_values;
           if (lineCol) {
             lineCol[idx] = lineNumber;
-            // Mark as non-null
-            const byteIndex = idx >>> 3;
-            const bitOffset = idx & 7;
-            self._buffer.lineNumber_nulls[byteIndex] |= (1 << bitOffset);
+            helpers.setNullBit(buf.lineNumber_nulls, idx);
           }
+          return this;
+        },
+        
+        count(value) {
+          buf.count_values[idx] = value;
+          helpers.setNullBit(buf.count_nulls, idx);
+          return this;
+        },
+
+        duration(value) {
+          buf.duration_values[idx] = value;
+          helpers.setNullBit(buf.duration_nulls, idx);
+          return this;
+        },
+
+        isValid(value) {
+          const byteIndex = idx >>> 3;
+          const bitOffset = idx & 7;
+          if (value) {
+            buf.isValid_values[byteIndex] |= (1 << bitOffset);
+          } else {
+            buf.isValid_values[byteIndex] &= ~(1 << bitOffset);
+          }
+          helpers.setNullBit(buf.isValid_nulls, idx);
+          return this;
+        },
+
+        isEnabled(value) {
+          const byteIndex = idx >>> 3;
+          const bitOffset = idx & 7;
+          if (value) {
+            buf.isEnabled_values[byteIndex] |= (1 << bitOffset);
+          } else {
+            buf.isEnabled_values[byteIndex] &= ~(1 << bitOffset);
+          }
+          helpers.setNullBit(buf.isEnabled_nulls, idx);
+          return this;
         }
       };
     }
@@ -2235,13 +1748,11 @@ exports[`generateSpanLoggerClass snapshots snapshot: numeric and boolean fields 
   }
 
   return GeneratedSpanLogger;
-})()
 "
 `;
 
 exports[`generateSpanLoggerClass snapshots snapshot: custom class name 1`] = `
 "
-(function() {
   'use strict';
 
   // Inline getTimestampNanos for performance (zero function call overhead)
@@ -2321,20 +1832,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: custom class name 1`] = `
           values[i] = attributes.userId;
         }
 
-        // Bulk fill null bitmap
-        const nullBitmap = this._buffer.userId_nulls;
-        const startByte = Math.floor(startIdx / 8);
-        const endByte = Math.floor((endIdx - 1) / 8);
-
-        for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-          if (byteIdx === startByte && startIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-          } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-            nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-          } else {
-            nullBitmap[byteIdx] = 0xFF;
-          }
-        }
+        // Bulk fill null bitmap using helper
+        helpers.fillNullBitmapRange(this._buffer.userId_nulls, startIdx, endIdx);
       }
     }
 
@@ -2359,20 +1858,8 @@ exports[`generateSpanLoggerClass snapshots snapshot: custom class name 1`] = `
             values[i] = scopeValue;
           }
 
-          // Bulk fill null bitmap
-          const nullBitmap = this._buffer.userId_nulls;
-          const startByte = Math.floor(startIdx / 8);
-          const endByte = Math.floor((endIdx - 1) / 8);
-
-          for (let byteIdx = startByte; byteIdx <= endByte; byteIdx++) {
-            if (byteIdx === startByte && startIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= (0xFF << (startIdx % 8));
-            } else if (byteIdx === endByte && endIdx % 8 !== 0) {
-              nullBitmap[byteIdx] |= ((1 << (endIdx % 8)) - 1);
-            } else {
-              nullBitmap[byteIdx] = 0xFF;
-            }
-          }
+          // Bulk fill null bitmap using helper
+          helpers.fillNullBitmapRange(this._buffer.userId_nulls, startIdx, endIdx);
         }
       }
     }
@@ -2392,7 +1879,6 @@ exports[`generateSpanLoggerClass snapshots snapshot: custom class name 1`] = `
       }
 
       const idx = this._buffer.writeIndex;
-      const self = this;
 
       // Write entry type
       this._buffer.operations[idx] = entryType;
@@ -2404,9 +1890,7 @@ exports[`generateSpanLoggerClass snapshots snapshot: custom class name 1`] = `
       const messageColumn = this._buffer.logMessage_values;
       if (messageColumn) {
         messageColumn[idx] = message;
-        const byteIndex = idx >>> 3;
-        const bitOffset = idx & 7;
-        this._buffer.logMessage_nulls[byteIndex] |= (1 << bitOffset);
+        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
       }
 
       // Apply scoped attributes - UNROLLED per-column
@@ -2415,28 +1899,31 @@ exports[`generateSpanLoggerClass snapshots snapshot: custom class name 1`] = `
         const scopeValue = this._scope.userId;
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.userId_values[idx] = scopeValue;
-          const byteIndex = idx >>> 3;  // Math.floor(idx / 8)
-          const bitOffset = idx & 7;     // idx % 8
-          this._buffer.userId_nulls[byteIndex] |= (1 << bitOffset);
+          helpers.setNullBit(this._buffer.userId_nulls, idx);
         }
       }
 
       // Increment write index
       this._buffer.writeIndex++;
 
-      // Return fluent object for .line() chaining
-      // The idx captured above is the row we just wrote to
+      // Return fluent object for attribute chaining
+      // Capture buffer reference directly (not via self._buffer) so it's stable
+      // even if another log call happens before fluent methods are called
+      const buf = this._buffer;
       return {
         line(lineNumber) {
-          // Write lineNumber to lineNumber column at the captured idx
-          const lineCol = self._buffer.lineNumber_values;
+          const lineCol = buf.lineNumber_values;
           if (lineCol) {
             lineCol[idx] = lineNumber;
-            // Mark as non-null
-            const byteIndex = idx >>> 3;
-            const bitOffset = idx & 7;
-            self._buffer.lineNumber_nulls[byteIndex] |= (1 << bitOffset);
+            helpers.setNullBit(buf.lineNumber_nulls, idx);
           }
+          return this;
+        },
+        
+        userId(value) {
+          buf.userId_values[idx] = value;
+          helpers.setNullBit(buf.userId_nulls, idx);
+          return this;
         }
       };
     }
@@ -2474,6 +1961,5 @@ exports[`generateSpanLoggerClass snapshots snapshot: custom class name 1`] = `
   }
 
   return CustomSpanLogger;
-})()
 "
 `;

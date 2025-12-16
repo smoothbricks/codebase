@@ -198,9 +198,11 @@ export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
     let columnWriters: FlagColumnWriters | undefined;
 
     if (bufferOrColumnWriters && 'writeEntryType' in bufferOrColumnWriters) {
-      columnWriters = bufferOrColumnWriters;
-    } else {
-      buffer = bufferOrColumnWriters || null;
+      // It's FlagColumnWriters
+      columnWriters = bufferOrColumnWriters as FlagColumnWriters;
+    } else if (bufferOrColumnWriters) {
+      // It's SpanBuffer
+      buffer = bufferOrColumnWriters as SpanBuffer;
     }
 
     const state: GeneratedEvaluatorState<T> = {
