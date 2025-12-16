@@ -29,7 +29,7 @@ describe('EvaluatorGenerator', () => {
       const code = generateEvaluatorClass(schema.schema);
 
       // Should be a valid IIFE wrapper
-      expect(code).toContain('(function(validateFlagValue, getTimestampMicros');
+      expect(code).toContain('(function(validateFlagValue, getTimestampNanos');
       expect(code).toContain("'use strict'");
       expect(code).toContain('class GeneratedEvaluator');
 

@@ -19,6 +19,76 @@ import type { TagAttributeSchema } from '../schema-types.js';
 import type { ColumnBuffer } from './types.js';
 
 /**
+ * Extension options for injecting custom code into generated ColumnBuffer classes.
+ *
+ * WHY: Consumers (like lmao's SpanBuffer) need to add domain-specific properties
+ * and methods to the generated class. Adding properties AFTER class instantiation
+ * breaks V8 hidden class optimization. This extension mechanism allows injecting
+ * code directly into the generated class for optimal performance.
+ */
+export interface ColumnBufferExtension {
+  /**
+   * Additional code to add to the constructor (after system columns are initialized).
+   * Has access to `this` and any constructorParams.
+   * @example
+   * ```
+   * this.traceId = traceId;
+   * this.spanId = spanIdentity;
+   * this.children = [];
+   * ```
+   */
+  constructorCode?: string;
+
+  /**
+   * Additional methods to add to the class body.
+   * @example
+   * ```
+   * isParentOf(other) {
+   *   return this.traceId === other.traceId;
+   * }
+   * ```
+   */
+  methods?: string;
+
+  /**
+   * Additional code to add before the class definition.
+   * Useful for helper functions, symbols, constants, etc.
+   * These can reference dependencies by name (they're in scope).
+   * @example
+   * ```
+   * const SPAN_STATE = { PENDING: 0, OK: 1, ERR: 2 };
+   * ```
+   */
+  preamble?: string;
+
+  /**
+   * Constructor parameters beyond requestedCapacity.
+   * These are added AFTER requestedCapacity in the constructor signature.
+   * @example "traceId, spanIdentity, taskContext"
+   */
+  constructorParams?: string;
+
+  /**
+   * Runtime dependencies to inject into the generated class closure.
+   * Keys become variable names available in preamble, constructorCode, and methods.
+   * Values are the actual runtime objects/functions.
+   *
+   * NOTE: Dependencies are NOT included in the cache key - they should be
+   * stable singleton values (like module-level functions).
+   *
+   * @example
+   * ```
+   * dependencies: {
+   *   copyThreadIdTo: copyThreadIdTo,
+   *   textEncoder: new TextEncoder()
+   * }
+   * // Then in constructorCode: "copyThreadIdTo(this._identity, 0);"
+   * ```
+   */
+  dependencies?: Record<string, unknown>;
+}
+
+/**
  * Get TypedArray constructor name and byte size for a schema field
  */
 function getTypedArrayInfo(
@@ -87,7 +157,11 @@ function getTypedArrayInfo(
  * Each instance stores its lazy-allocated arrays in private symbol-keyed properties.
  * This avoids the closure-sharing bug where all instances share the same arrays.
  */
-export function generateColumnBufferClass(schema: TagAttributeSchema, className = 'GeneratedColumnBuffer'): string {
+export function generateColumnBufferClass(
+  schema: TagAttributeSchema,
+  className = 'GeneratedColumnBuffer',
+  extension?: ColumnBufferExtension,
+): string {
   const schemaFields = Object.keys(schema);
 
   // Generate constructor code for eager system columns
@@ -179,6 +253,37 @@ export function generateColumnBufferClass(schema: TagAttributeSchema, className 
     getterMethods.push(`    get ${columnName}() { return allocate_${columnName}(this).values; }`);
   }
 
+  // Build constructor signature with optional extension params
+  const constructorSignature = extension?.constructorParams
+    ? `requestedCapacity, ${extension.constructorParams}`
+    : 'requestedCapacity';
+
+  // Add extension constructor code if provided
+  if (extension?.constructorCode) {
+    constructorCode.push('');
+    constructorCode.push('    // Extension constructor code');
+    // Indent extension code properly (each line gets 4 spaces)
+    const extensionLines = extension.constructorCode
+      .trim()
+      .split('\n')
+      .map((line) => '    ' + line.trim());
+    constructorCode.push(...extensionLines);
+  }
+
+  // Build extension methods if provided
+  const extensionMethods = extension?.methods
+    ? `
+    // Extension methods
+${extension.methods
+  .trim()
+  .split('\n')
+  .map((line) => '    ' + line)
+  .join('\n')}`
+    : '';
+
+  // Build preamble if provided
+  const preambleCode = extension?.preamble ? `\n  // Extension preamble\n${extension.preamble}\n` : '';
+
   // Generate the complete class code
   const classCode = `
 (function() {
@@ -202,9 +307,9 @@ ${symbolDeclarations.join('\n')}
 
   // Allocator functions for lazy columns
 ${allocatorFunctions.join('\n')}
-
+${preambleCode}
   class ${className} {
-    constructor(requestedCapacity) {
+    constructor(${constructorSignature}) {
 ${constructorCode.join('\n')}
     }
 
@@ -222,6 +327,7 @@ ${constructorCode.join('\n')}
 
     // Lazy column getters
 ${getterMethods.join('\n')}
+${extensionMethods}
   }
 
   return ${className};
@@ -233,32 +339,69 @@ ${getterMethods.join('\n')}
 
 /**
  * Cache for generated ColumnBuffer classes.
- * Key: JSON-serialized schema (stable across identical schemas)
+ * Key: JSON-serialized schema + extension (stable across identical configurations)
  * Value: Generated class constructor
  */
-const classCache = new Map<string, new (capacity: number) => ColumnBuffer>();
+const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => ColumnBuffer>();
 
 /**
- * Create or retrieve a cached ColumnBuffer class for the given schema
+ * Create a stable cache key from schema and extension options.
+ * Both are serialized to JSON for stable key generation.
+ */
+function createCacheKey(schema: TagAttributeSchema, extension?: ColumnBufferExtension): string {
+  if (!extension) {
+    return JSON.stringify(schema);
+  }
+  return JSON.stringify({ schema, extension });
+}
+
+/**
+ * Create or retrieve a cached ColumnBuffer class for the given schema and extension
  *
  * This is the cold-path function called at module initialization time.
- * The generated class is cached per schema to avoid regenerating for every buffer.
+ * The generated class is cached per schema+extension to avoid regenerating for every buffer.
+ *
+ * @param schema - The tag attribute schema defining columns
+ * @param extension - Optional extension for injecting constructor code, methods, etc.
+ * @returns The generated class constructor
  */
-export function getColumnBufferClass(schema: TagAttributeSchema): new (capacity: number) => ColumnBuffer {
-  // Create cache key from schema (stable serialization)
-  const cacheKey = JSON.stringify(schema);
+export function getColumnBufferClass(
+  schema: TagAttributeSchema,
+  extension?: ColumnBufferExtension,
+): new (
+  capacity: number,
+  ...args: unknown[]
+) => ColumnBuffer {
+  // Create cache key from schema and extension (stable serialization)
+  // NOTE: dependencies are NOT part of cache key - they should be stable singletons
+  const cacheKey = createCacheKey(schema, extension);
 
   // Check cache first
   let BufferClass = classCache.get(cacheKey);
 
   if (!BufferClass) {
     // Generate class code
-    const classCode = generateColumnBufferClass(schema).trim();
+    const classCode = generateColumnBufferClass(schema, 'GeneratedColumnBuffer', extension).trim();
 
     // Compile with new Function()
+    // If dependencies are provided, inject them as function parameters
     // This is safe because we control the code generation
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-    BufferClass = new Function(`return ${classCode}`)() as new (capacity: number) => ColumnBuffer;
+    if (extension?.dependencies && Object.keys(extension.dependencies).length > 0) {
+      const depNames = Object.keys(extension.dependencies);
+      const depValues = depNames.map((name) => extension.dependencies![name]);
+      // Create function that takes dependencies as parameters and returns the class
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+      const factory = new Function(...depNames, `return ${classCode}`) as (
+        ...args: unknown[]
+      ) => new (
+        capacity: number,
+        ...args: unknown[]
+      ) => ColumnBuffer;
+      BufferClass = factory(...depValues);
+    } else {
+      // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+      BufferClass = new Function(`return ${classCode}`)() as new (capacity: number, ...args: unknown[]) => ColumnBuffer;
+    }
 
     // Cache for future use
     classCache.set(cacheKey, BufferClass);
@@ -271,8 +414,19 @@ export function getColumnBufferClass(schema: TagAttributeSchema): new (capacity:
  * Create a ColumnBuffer instance using a generated class
  *
  * Uses direct properties for zero-indirection access.
+ *
+ * @param schema - The tag attribute schema defining columns
+ * @param requestedCapacity - Initial buffer capacity (defaults to 64)
+ * @param extension - Optional extension for injecting constructor code, methods, etc.
+ * @param constructorArgs - Additional constructor arguments (passed to extension constructor code)
+ * @returns A new ColumnBuffer instance
  */
-export function createGeneratedColumnBuffer(schema: TagAttributeSchema, requestedCapacity = 64): ColumnBuffer {
-  const BufferClass = getColumnBufferClass(schema);
-  return new BufferClass(requestedCapacity);
+export function createGeneratedColumnBuffer(
+  schema: TagAttributeSchema,
+  requestedCapacity = 64,
+  extension?: ColumnBufferExtension,
+  ...constructorArgs: unknown[]
+): ColumnBuffer {
+  const BufferClass = getColumnBufferClass(schema, extension);
+  return new BufferClass(requestedCapacity, ...constructorArgs);
 }

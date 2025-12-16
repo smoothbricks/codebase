@@ -3,52 +3,150 @@
  *
  * These types extend the generic ColumnBuffer from arrow-builder
  * with span-specific fields and tracing concepts.
+ *
+ * **Unified SpanBuffer Memory Layout**
+ *
+ * SpanBuffer uses a unified memory layout per specs/01b_columnar_buffer_architecture.md:
+ * - Single `_system` ArrayBuffer contains timestamps + operations + identity
+ * - Identity stored inline (root/child) or shared reference (chained)
+ * - Parent ancestry via pointer (not copied bytes)
+ * - O(1) isParentOf/isChildOf via pointer comparison
  */
 
-import type { BufferCapacityStats, ColumnBuffer } from '@smoothbricks/arrow-builder';
-import type { TagAttributeSchema } from './schema/types.js';
+import type { ColumnBuffer } from '@smoothbricks/arrow-builder';
+import type { TaskContext } from './taskContext.js';
+import type { TraceId } from './traceId.js';
 
-/**
- * Module context shared across all tasks in same module
- */
-export interface ModuleContext {
-  moduleId: number;
-  gitSha: string;
-  filePath: string;
-
-  // Tag attribute schema for this module
-  tagAttributes: TagAttributeSchema;
-
-  // Self-tuning capacity stats
-  spanBufferCapacityStats: BufferCapacityStats;
-}
-
-/**
- * Task context combines module + task-specific data
- */
-export interface TaskContext {
-  module: ModuleContext;
-  spanNameId: number;
-  lineNumber: number;
-}
+// Re-export context classes
+export { ModuleContext } from './moduleContext.js';
+export { TaskContext } from './taskContext.js';
 
 /**
  * SpanBuffer - lmao-specific extension of ColumnBuffer
  *
  * Adds span tree structure and task context to the base ColumnBuffer.
+ *
+ * **Unified Memory Layout (per specs/01b_columnar_buffer_architecture.md)**
+ *
+ * Single `_system` ArrayBuffer contains:
+ * - timestamps (BigInt64Array) at offset 0
+ * - operations (Uint8Array) at offset capacity * 8
+ * - identity (Uint8Array) at offset capacity * 9 (for root/child, not chained)
+ *
+ * Identity layout:
+ * - ROOT: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
+ * - CHILD: [threadId(8)][spanId(4)] (12 bytes, parent via pointer)
+ * - CHAINED: shares identity reference from first buffer
+ *
+ * Parent ancestry is via `parent` pointer, not copied bytes.
+ * This makes isParentOf/isChildOf O(1) pointer comparisons.
  */
 export interface SpanBuffer extends ColumnBuffer {
-  // Tree structure (lmao-specific for span hierarchy)
+  // ============================================================================
+  // Unified System ArrayBuffer
+  // ============================================================================
+
+  /**
+   * The unified ArrayBuffer containing timestamps, operations, and identity.
+   * Layout: [timestamps (8*capacity)] [operations (1*capacity)] [identity (variable)]
+   */
+  readonly _system: ArrayBuffer;
+
+  /**
+   * Identity bytes (Uint8Array view into _system or shared reference for chained).
+   * - Root: 13 + traceId.length bytes at offset capacity * 9
+   * - Child: 12 bytes at offset capacity * 9
+   * - Chained: shared reference to first buffer's identity
+   */
+  readonly _identity: Uint8Array;
+
+  // ============================================================================
+  // Identity Getters (read from _identity bytes)
+  // ============================================================================
+
+  /**
+   * Span ID (32-bit unsigned integer).
+   * Read from _identity bytes 8-11 (little-endian).
+   */
+  readonly spanId: number;
+
+  /**
+   * Thread ID (64-bit unsigned integer as BigInt).
+   * Read from _identity bytes 0-7 (little-endian).
+   * Used for Arrow conversion (cold path).
+   */
+  readonly threadId: bigint;
+
+  /**
+   * Trace ID for this span.
+   * For root spans: decoded from _identity bytes [12]=len, [13+]=traceId
+   * For child/chained spans: walks up parent chain to root
+   */
+  readonly traceId: TraceId;
+
+  /**
+   * Whether this span has a parent.
+   * Equivalent to `parent !== undefined`.
+   */
+  readonly hasParent: boolean;
+
+  /**
+   * Parent's spanId (0 if no parent).
+   * Derived from parent?.spanId.
+   */
+  readonly parentSpanId: number;
+
+  // ============================================================================
+  // Tree Structure
+  // ============================================================================
+
+  /**
+   * Child spans (lmao-specific for span hierarchy).
+   */
   children: SpanBuffer[];
+
+  /**
+   * Parent span buffer.
+   * Used to derive traceId, parentSpanId, and for isParentOf/isChildOf.
+   */
   parent?: SpanBuffer;
 
-  // Distributed span ID components
-  threadId: bigint; // 64-bit random, set from worker context at span creation
-  spanId: number; // 32-bit incrementing counter within this process
-  traceId: string; // Root trace ID (constant per span)
+  // ============================================================================
+  // Context
+  // ============================================================================
 
-  // Reference to task context (lmao-specific)
+  /**
+   * Reference to task context (lmao-specific).
+   */
   task: TaskContext;
+
+  // ============================================================================
+  // Methods
+  // ============================================================================
+
+  /**
+   * Check if this span is the parent of another span.
+   * O(1) pointer comparison: `this === other.parent`
+   */
+  isParentOf(other: SpanBuffer): boolean;
+
+  /**
+   * Check if this span is a child of another span.
+   * O(1) pointer comparison: `this.parent === other`
+   */
+  isChildOf(other: SpanBuffer): boolean;
+
+  /**
+   * Copy threadId bytes (8 bytes) to destination at offset.
+   * Used for Arrow conversion (cold path).
+   */
+  copyThreadIdTo(dest: Uint8Array, offset: number): void;
+
+  /**
+   * Copy parent's threadId bytes (8 bytes) to destination.
+   * If no parent, fills with zeros.
+   */
+  copyParentThreadIdTo(dest: Uint8Array, offset: number): void;
 }
 
 // Re-export useful arrow-builder types for convenience

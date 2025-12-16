@@ -19,7 +19,8 @@ import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 import type { TagAttributeSchema } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import type { SpanBuffer, TaskContext } from '../types.js';
+import type { SpanBuffer } from '../types.js';
+import { createTestTaskContext } from './test-helpers.js';
 
 // Test schema
 const testSchema = defineTagAttributes({
@@ -398,26 +399,6 @@ describe('FluentResult Type Compatibility', () => {
  * - Row 2+: events (ctx.log.* appends here)
  */
 describe('Fixed Row Layout', () => {
-  // Helper to create a test task context
-  function createTestTaskContext(schema: TagAttributeSchema): TaskContext {
-    return {
-      module: {
-        moduleId: 1,
-        gitSha: 'abc123',
-        filePath: 'test.ts',
-        tagAttributes: schema,
-        spanBufferCapacityStats: {
-          currentCapacity: 64,
-          totalWrites: 0,
-          overflowWrites: 0,
-          totalBuffersCreated: 0,
-        },
-      },
-      spanNameId: 1,
-      lineNumber: 10,
-    };
-  }
-
   it('should have span-start at row 0 after task begins', async () => {
     // Track the buffer via a captured reference
     const capturedBuffer: SpanBuffer | null = null;

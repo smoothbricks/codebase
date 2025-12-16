@@ -1,7 +1,11 @@
 import { describe, expect, it } from 'bun:test';
-import type { TagAttributeSchema } from '@smoothbricks/lmao';
-import { createEmptySpanBuffer, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
-import type { TaskContext } from '../../types.js';
+import { ModuleContext } from '../../moduleContext.js';
+import { S } from '../../schema/builder.js';
+import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
+import type { TagAttributeSchema } from '../../schema/types.js';
+import { createSpanBuffer } from '../../spanBuffer.js';
+import { TaskContext } from '../../taskContext.js';
+import { createTraceId } from '../../traceId.js';
 
 /**
  * Type helper to extract schema fields from ExtendedSchema
@@ -21,34 +25,22 @@ describe('Buffer Foundation', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
-    return {
-      module: {
-        moduleId: 1,
-        gitSha: 'abc123',
-        filePath: 'test.ts',
-        tagAttributes,
-        spanBufferCapacityStats: {
-          currentCapacity: 64,
-          totalWrites: 0,
-          overflowWrites: 0,
-          totalBuffersCreated: 0,
-        },
-      },
-      spanNameId: 1,
-      lineNumber: 10,
-    };
+    const moduleContext = new ModuleContext(1, 'abc123', 'test.ts', tagAttributes);
+    return new TaskContext(moduleContext, 1, 10);
   }
 
-  it('creates empty SpanBuffer with TypedArrays', () => {
+  it('creates SpanBuffer with TypedArrays', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
-    const threadId = BigInt('0x123456789ABCDEF0');
+    const traceId = createTraceId('trace-123');
 
-    const buf = createEmptySpanBuffer(1, threadId, 'trace-123', schema, taskContext, undefined, 64);
+    const buf = createSpanBuffer(schema, taskContext, traceId, 64);
 
-    expect(buf.spanId).toBe(1);
-    expect(buf.threadId).toBe(threadId);
-    expect(buf.traceId).toBe('trace-123');
+    // Span identity assertions (unified memory layout)
+    expect(typeof buf.spanId).toBe('number');
+    expect(buf.spanId).toBeGreaterThan(0);
+    expect(buf.hasParent).toBe(false);
+    expect(buf.traceId).toBe(traceId);
 
     // Check TypedArrays are created
     expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
@@ -77,7 +69,7 @@ describe('Buffer Foundation', () => {
     const buf = createSpanBuffer(schema, taskContext, 'trace-999');
 
     expect(buf.spanId).toBeGreaterThan(0);
-    expect(buf.threadId).toBeDefined();
+    expect(buf.hasParent).toBe(false);
     expect(buf.parent).toBeUndefined();
     expect(buf.children).toHaveLength(0);
   });
@@ -85,17 +77,15 @@ describe('Buffer Foundation', () => {
   it('tracks buffer creation in capacity stats', () => {
     const taskContext = createTestTaskContext();
     const schema = taskContext.module.tagAttributes;
-    const threadId = BigInt('0x123456789ABCDEF0');
 
     const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
 
-    createEmptySpanBuffer(1, threadId, 'trace-456', schema, taskContext, undefined, 64);
+    createSpanBuffer(schema, taskContext, 'trace-456', 64);
 
     expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
   });
 
   it('handles different schema sizes', () => {
-    const taskContext = createTestTaskContext();
     // Define a larger schema
     const largeSchema = defineTagAttributes({
       field1: S.category(), // Category string
@@ -109,18 +99,23 @@ describe('Buffer Foundation', () => {
     const { validate, parse, safeParse, extend, ...schemaFields } = largeSchema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
 
-    const threadId = BigInt('0x123456789ABCDEF0');
-    const buf = createEmptySpanBuffer(1, threadId, 'trace-789', tagAttributes, taskContext, undefined, 64);
+    // Create task context with larger schema
+    const moduleContext = new ModuleContext(2, 'abc123', 'test.ts', tagAttributes);
+    const taskContext = new TaskContext(moduleContext, 1, 10);
+
+    const buf = createSpanBuffer(tagAttributes, taskContext, 'trace-789', 64);
 
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them
     // Access them directly to trigger allocation and verify they exist
-    expect(Array.isArray(buf['attr_field1_values'])).toBe(true); // category (raw strings)expect(buf['attr_field1_nulls']).toBeInstanceOf(Uint8Array); // null bitmap
+    expect(Array.isArray(buf['attr_field1_values'])).toBe(true); // category (raw strings)
+    expect(buf['attr_field1_nulls']).toBeInstanceOf(Uint8Array); // null bitmap
     expect(buf['attr_field2_values']).toBeInstanceOf(Float64Array); // number
     expect(buf['attr_field2_nulls']).toBeInstanceOf(Uint8Array);
     expect(buf['attr_field3_values']).toBeInstanceOf(Uint8Array); // boolean
     expect(buf['attr_field3_nulls']).toBeInstanceOf(Uint8Array);
-    expect(Array.isArray(buf['attr_field4_values'])).toBe(true); // category (raw strings)expect(buf['attr_field4_nulls']).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buf['attr_field4_values'])).toBe(true); // text (raw strings)
+    expect(buf['attr_field4_nulls']).toBeInstanceOf(Uint8Array);
     expect(buf['attr_field5_values']).toBeInstanceOf(Float64Array); // number
     expect(buf['attr_field5_nulls']).toBeInstanceOf(Uint8Array);
   });

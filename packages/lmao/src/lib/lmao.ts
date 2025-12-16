@@ -8,14 +8,16 @@
  * - Task wrappers with span buffers
  */
 
-import { type BaseSpanLogger, createSpanLoggerClass } from './codegen/spanLoggerGenerator.js';
+import { type BaseSpanLogger, type ChainableTagAPI, createSpanLoggerClass } from './codegen/spanLoggerGenerator.js';
+import { ModuleContext } from './moduleContext.js';
 import type { EvaluationContext, FeatureFlagSchema, InferFeatureFlags } from './schema/defineFeatureFlags.js';
 import { FeatureFlagEvaluator, type FlagColumnWriters, type FlagEvaluator } from './schema/evaluator.js';
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
 import type { InferTagAttributes, TagAttributeSchema } from './schema/types.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from './spanBuffer.js';
+import { TaskContext } from './taskContext.js';
 import { getTimestampNanos } from './timestamp.js';
-import type { BufferCapacityStats, ModuleContext, SpanBuffer, TaskContext } from './types.js';
+import type { BufferCapacityStats, SpanBuffer } from './types.js';
 
 /**
  * Discriminated union representing a successful operation result.
@@ -467,44 +469,6 @@ export function createRequestContext<FF extends FeatureFlagSchema, Env extends R
     env: environmentConfig,
   };
 }
-
-/**
- * Chainable tag API type for span attributes
- *
- * Writes to row 0 (span-start) with overwrite semantics.
- * All methods return `this` for zero-allocation chaining.
- *
- * @example
- * ```typescript
- * // Direct attribute methods (chainable)
- * ctx.tag.userId('u1').requestId('r1').operation('INSERT');
- *
- * // Bulk attribute setting
- * ctx.tag.with({ userId: 'u1', requestId: 'r1' });
- * ```
- */
-export type ChainableTagAPI<T extends TagAttributeSchema> = {
-  /**
-   * Set multiple attributes at once (chainable)
-   *
-   * @param attributes - Object with attribute values to set
-   * @returns The tag API for chaining
-   *
-   * @example
-   * ctx.tag.with({ userId: 'u1', requestId: 'r1' }).operation('INSERT');
-   */
-  with(attributes: Partial<InferTagAttributes<T>>): ChainableTagAPI<T>;
-} & {
-  /**
-   * Set individual attributes (chainable)
-   *
-   * Each attribute from the schema gets a typed method.
-   *
-   * @example
-   * ctx.tag.userId('u1').requestId('r1').operation('INSERT');
-   */
-  [K in keyof InferTagAttributes<T>]: (value: InferTagAttributes<T>[K]) => ChainableTagAPI<T>;
-};
 
 /**
  * Span logger context - provides logging API for spans
@@ -1345,19 +1309,12 @@ export function createModuleContext<
   const schemaOnly = mergeWithSystemSchema(userSchemaOnly) as T;
 
   // Create module context with string-interned module ID
-  // Module ID is the file path, interned for efficient storage
-  const moduleContext: ModuleContext = {
-    moduleId: moduleIdInterner.intern(moduleMetadata.filePath),
-    gitSha: moduleMetadata.gitSha,
-    filePath: moduleMetadata.filePath,
-    tagAttributes: schemaOnly,
-    spanBufferCapacityStats: {
-      currentCapacity: 64, // Start with cache-friendly size (see specs/01b_columnar_buffer_architecture.md)
-      totalWrites: 0,
-      overflowWrites: 0,
-      totalBuffersCreated: 0,
-    },
-  };
+  const moduleContext = new ModuleContext(
+    moduleIdInterner.intern(moduleMetadata.filePath),
+    moduleMetadata.gitSha,
+    moduleMetadata.filePath,
+    schemaOnly,
+  );
 
   return {
     task<Args extends unknown[], Result>(
@@ -1366,11 +1323,11 @@ export function createModuleContext<
     ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result> {
       return async (requestCtx: RequestContext<FF, Env>, ...args: Args): Promise<Result> => {
         // Create task context with string-interned span name
-        const taskContext: TaskContext = {
-          module: moduleContext,
-          spanNameId: spanNameInterner.intern(name),
-          lineNumber: 0, // Would be set by code generation
-        };
+        const taskContext = new TaskContext(
+          moduleContext,
+          spanNameInterner.intern(name),
+          0, // lineNumber would be set by code generation
+        );
 
         // Create span buffer with traceId from request context
         // Per specs/01b - traceId is constant across all spans in a trace

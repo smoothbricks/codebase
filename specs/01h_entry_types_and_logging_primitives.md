@@ -536,6 +536,128 @@ The `ctx.log` API is for explicit logging during execution, while `ctx.ok()`/`ct
 use the same underlying entry type system. Each span's log instance references its own buffer, avoiding traceid+spanid
 appends and keeping logs neatly sorted in Arrow output.
 
+## Fluent Result API
+
+The `ctx.ok()` and `ctx.err()` methods return fluent result objects that support method chaining while maintaining
+TypeScript type narrowing for Result pattern consumption.
+
+### FluentSuccessResult
+
+Returned by `ctx.ok(value)`. Implements the `SuccessResult<V>` interface with additional chaining methods:
+
+```typescript
+class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessResult<V> {
+  readonly success = true;
+  readonly value: V;
+
+  // Chain additional attributes onto the span-ok entry
+  with(attributes: Partial<InferTagAttributes<T>>): this;
+
+  // Add a result message
+  message(text: string): this;
+}
+```
+
+### FluentErrorResult
+
+Returned by `ctx.err(code, details)`. Implements the `ErrorResult<E>` interface with additional chaining methods:
+
+```typescript
+class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<E> {
+  readonly success = false;
+  readonly error: { code: string; details: E };
+
+  // Chain additional attributes onto the span-err entry
+  with(attributes: Partial<InferTagAttributes<T>>): this;
+
+  // Add an error message
+  message(text: string): this;
+}
+```
+
+### Buffer Layout
+
+Both fluent result types write to **row 1** (the pre-allocated span-end row):
+
+- Row 1 is pre-initialized as `span-exception` at span creation
+- `ctx.ok()` overwrites row 1 with `span-ok` entry type
+- `ctx.err()` overwrites row 1 with `span-err` entry type
+- Chained `.with()` and `.message()` calls write attributes to the same row 1
+
+### Usage Examples
+
+```typescript
+// Simple success - just the value
+return ctx.ok(user);
+
+// Success with attributes
+return ctx.ok(user).with({ rowsAffected: 1, cacheHit: false });
+
+// Success with message
+return ctx.ok(user).message('User created successfully');
+
+// Success with both attributes and message
+return ctx.ok(user).with({ rowsAffected: 1, duration: 42.5 }).message('User created successfully');
+
+// Simple error - code and details
+return ctx.err('NOT_FOUND', { userId: 'user-123' });
+
+// Error with additional attributes
+return ctx.err('VALIDATION_FAILED', { field: 'email' }).with({
+  attemptedValue: userData.email,
+  validationRule: 'unique_constraint',
+});
+
+// Error with message
+return ctx.err('NOT_FOUND', { userId }).message('User not found in database');
+
+// Error with both attributes and message
+return ctx
+  .err('VALIDATION_FAILED', { field: 'email' })
+  .with({ validationRule: 'format' })
+  .message('Invalid email format provided');
+```
+
+### Result Pattern Compatibility
+
+The fluent result objects are fully compatible with TypeScript's discriminated union narrowing:
+
+```typescript
+const result = await userService.createUser(ctx, userData);
+
+if (result.success) {
+  // TypeScript knows: result is FluentSuccessResult
+  // result.value is available
+  console.log('Created user:', result.value.id);
+} else {
+  // TypeScript knows: result is FluentErrorResult
+  // result.error.code and result.error.details are available
+  console.log('Failed:', result.error.code, result.error.details);
+}
+```
+
+### Error Code Storage
+
+When `ctx.err(code, details)` is called, the error code is automatically written to the `attr_errorCode` column. This
+enables efficient querying of errors by code:
+
+```sql
+SELECT * FROM traces
+WHERE entry_type = 'span-err'
+  AND attr_errorCode = 'VALIDATION_FAILED';
+```
+
+### Message Storage
+
+Both `.message()` methods write to the `attr_resultMessage` column, enabling message-based queries:
+
+```sql
+SELECT span_name, attr_resultMessage, attr_errorCode
+FROM traces
+WHERE entry_type IN ('span-ok', 'span-err')
+  AND attr_resultMessage IS NOT NULL;
+```
+
 ## Low-Level Logging API
 
 The entry type system is implemented through low-level column writers that directly populate trace buffers:

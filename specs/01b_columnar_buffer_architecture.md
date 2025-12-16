@@ -144,28 +144,29 @@ subsequent timestamps.
 
 ### Timestamp Precision Guarantees
 
-**Storage Format**: All timestamps stored as microseconds (μs) in `Float64Array` during hot path.
+**Storage Format**: All timestamps stored as nanoseconds (ns) in `BigInt64Array` during hot path.
 
 **Precision by Platform**:
 
-- **Browser**: ~5μs resolution from `performance.now()`, stored as microseconds
-- **Node.js**: Nanosecond resolution from `process.hrtime.bigint()`, truncated to microseconds for consistency
-- **Fallback**: Millisecond resolution from `Date.now()` when high-resolution timers unavailable
+- **Browser**: ~5μs resolution from `performance.now()`, stored as nanoseconds
+- **Node.js**: Nanosecond resolution from `process.hrtime.bigint()`, stored directly as nanoseconds
+- **Fallback**: Millisecond resolution from `Date.now()` when high-resolution timers unavailable, converted to
+  nanoseconds
 
-**Safe Range**: `Float64Array` can exactly represent integers up to `Number.MAX_SAFE_INTEGER` (2^53 - 1):
+**Safe Range**: `BigInt64Array` can exactly represent nanoseconds for all practical purposes:
 
-- Maximum safe microsecond timestamp: `9,007,199,254,740,991` microseconds
-- Equivalent date: ~September 2255 (over 230 years from Unix epoch)
-- **Conclusion**: BigInt→Number conversion is SAFE for all practical trace timestamps
+- Maximum nanosecond timestamp: ~292 years from epoch (signed 64-bit)
+- Well beyond any practical trace lifetime
+- **Conclusion**: BigInt storage provides full nanosecond precision without loss
 
-**Why Microseconds**:
+**Why Nanoseconds**:
 
-- `Float64Array` can exactly represent microseconds until year 2255
-- Sub-millisecond precision enables detailed performance analysis
-- Compatible with ClickHouse's `DateTime64(6)` type
-- Matches OpenTelemetry's timestamp precision recommendation
+- `BigInt64Array` provides full nanosecond precision without truncation
+- Sub-microsecond precision enables detailed performance analysis
+- Compatible with ClickHouse's `DateTime64(9)` type
+- Matches Arrow's native timestamp precision
 
-**Arrow Format**: During cold path conversion, timestamps converted to Arrow `TimestampMicrosecond` type.
+**Arrow Format**: During cold path conversion, timestamps converted to Arrow `TimestampNanosecond` type.
 
 ### Date.now() Usage Guidelines
 
@@ -239,10 +240,10 @@ function createRequestContext(params: RequestParams): RequestContext {
 }
 
 // All subsequent timestamps derived from anchor
-function getTimestamp(ctx: RequestContext): number {
-  // Returns microseconds since epoch
+function getTimestamp(ctx: RequestContext): bigint {
+  // Returns nanoseconds since epoch
   // performance.now() - anchorPerfNow gives elapsed ms with sub-ms precision
-  return ctx.anchorEpochMicros + (performance.now() - ctx.anchorPerfNow) * 1000;
+  return ctx.anchorEpochNanos + BigInt(Math.round((performance.now() - ctx.anchorPerfNow) * 1_000_000));
 }
 ```
 
@@ -291,39 +292,39 @@ function createRequestContext(params: RequestParams): RequestContext {
 }
 
 // All subsequent timestamps derived from anchor
-function getTimestamp(ctx: RequestContext): number {
-  // Returns microseconds since epoch
-  // hrtime.bigint() gives nanoseconds, convert to microseconds
+function getTimestamp(ctx: RequestContext): bigint {
+  // Returns nanoseconds since epoch
+  // hrtime.bigint() gives nanoseconds directly
   const elapsedNanos = process.hrtime.bigint() - ctx.anchorHrTime;
-  return ctx.anchorEpochMicros + Number(elapsedNanos / 1000n);
+  return ctx.anchorEpochNanos + elapsedNanos;
 }
 ```
 
 **Benefits**:
 
-- Nanosecond precision available from hrtime, stored as microseconds
+- Nanosecond precision available from hrtime, stored directly as nanoseconds
 - No `Date.now()` calls during span execution
 - Single anchor ensures all timestamps in trace are comparable
 
 ### Arrow Timestamp Format
 
-Timestamps are stored as microseconds since epoch in Float64Array during the hot path, then converted to Arrow's
-TimestampMicrosecond type during cold path conversion:
+Timestamps are stored as nanoseconds since epoch in BigInt64Array during the hot path, then converted to Arrow's
+TimestampNanosecond type during cold path conversion:
 
 ```typescript
-// Hot path: Float64Array storage (microseconds since epoch)
-buffer.timestamps[idx] = getTimestamp(ctx); // e.g., 1704067200000000
+// Hot path: BigInt64Array storage (nanoseconds since epoch)
+buffer.timestamps[idx] = getTimestamp(ctx); // e.g., 1704067200000000000n
 
 // Cold path: Arrow conversion
-const arrowTimestamps = arrow.TimestampMicrosecond.from(buffer.timestamps.subarray(0, buffer.writeIndex));
+const arrowTimestamps = arrow.TimestampNanosecond.from(buffer.timestamps.subarray(0, buffer.writeIndex));
 ```
 
-**Why Microseconds**:
+**Why Nanoseconds**:
 
-- `Float64Array` can exactly represent microseconds up to year 285,616
-- Sub-millisecond precision enables detailed performance analysis
-- Compatible with ClickHouse's `DateTime64(6)` type
-- Matches OpenTelemetry's timestamp precision
+- `BigInt64Array` provides full nanosecond precision without loss
+- Sub-microsecond precision enables detailed performance analysis
+- Compatible with ClickHouse's `DateTime64(9)` type
+- Matches Arrow's native timestamp precision
 
 ### Why Flattened RequestContext
 
@@ -378,7 +379,7 @@ several key benefits:
 // Uint8Array (operations column): 64 × 1 = 64 bytes → no alignment needed
 // Uint16Array (small bitmaps): 64 × 2 = 128 bytes → no alignment needed
 // Uint32Array (string indices): 64 × 4 = 256 bytes → no alignment needed
-// Float64Array (timestamps): 64 × 8 = 512 bytes → no alignment needed
+// BigInt64Array (timestamps): 64 × 8 = 512 bytes → no alignment needed
 
 // Example with smaller capacity showing alignment impact:
 // Uint8Array: 16 × 1 = 16 bytes → aligned to 64 bytes = 64 elements (4x increase!)
@@ -388,6 +389,17 @@ several key benefits:
 **Memory vs Performance Trade-off**: Cache alignment increases memory usage for small arrays but provides significant
 performance benefits. By starting with 64 elements, we minimize unexpected capacity increases while maintaining
 cache-friendly allocation patterns.
+
+**Capacity Constraint - Multiple of 8**: Buffer capacity MUST always be a multiple of 8. This constraint enables:
+
+1. **Byte-aligned null bitmaps**: Each buffer's null bitmap starts at a byte boundary when concatenating multiple
+   buffers
+2. **Bulk bitmap operations**: Use `TypedArray.set()` for byte-level copying instead of bit-by-bit loops
+3. **Efficient Arrow conversion**: When building Arrow tables from multiple buffers, null bitmaps can be bulk-copied
+
+The constraint is enforced in `createSpanBuffer()` and `createNextBuffer()` via `(capacity + 7) & ~7` alignment. Since
+the default capacity is 64 and self-tuning uses powers of 2 (8, 16, 32, 64, 128, 256, 512, 1024), this constraint is
+naturally satisfied, but the explicit alignment ensures correctness for any input.
 
 **Critical Design Decision - Equal Length Constraint**: The most important constraint is that ALL TypedArrays in a
 SpanBuffer must have exactly the same length. This enables:
@@ -401,7 +413,7 @@ SpanBuffer must have exactly the same length. This enables:
 cache-aligned:
 
 - Uint8Array gets optimal 1 cache line alignment
-- Larger types (Uint16Array, Uint32Array, Float64Array) are also aligned (or over-aligned)
+- Larger types (Uint16Array, Uint32Array, BigInt64Array) are also aligned (or over-aligned)
 - All arrays have identical element count, preserving columnar storage requirements
 
 **Performance Impact**: In high-throughput logging scenarios, this alignment can improve memory bandwidth utilization by
@@ -432,7 +444,7 @@ columns.
 
 **Immediately Allocated (Core Columns)**:
 
-- `timestamps: Float64Array` - Every entry has a timestamp
+- `timestamps: BigInt64Array` - Every entry has a timestamp
 - `operations: Uint8Array` - Every entry has an operation/entry type
 
 **Lazily Allocated (via Lazy Getters)**:
@@ -489,7 +501,7 @@ class GeneratedColumnBuffer {
   constructor(requestedCapacity) {
     const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
     this._alignedCapacity = alignedCapacity;
-    this.timestamps = new Float64Array(alignedCapacity);
+    this.timestamps = new BigInt64Array(alignedCapacity);
     this.operations = new Uint8Array(alignedCapacity);
     this.writeIndex = 0;
     this.capacity = requestedCapacity;
@@ -535,12 +547,12 @@ Consider a schema with 20 attributes where a typical span only uses 3:
 
 ```typescript
 // Without lazy initialization (ALL columns allocated):
-// 2 core columns: Float64Array(64) + Uint8Array(64) = 576 bytes
+// 2 core columns: BigInt64Array(64) + Uint8Array(64) = 576 bytes
 // 20 attr columns: 20 × (Uint32Array(64) + null bitmap) = 20 × (256 + 8) = 5,280 bytes
 // Total: 5,856 bytes per span
 
 // With lazy getters (ONLY used columns allocated):
-// 2 core columns: Float64Array(64) + Uint8Array(64) = 576 bytes (always)
+// 2 core columns: BigInt64Array(64) + Uint8Array(64) = 576 bytes (always)
 // 20 lazy getter closures: ~0 bytes (generated code, shared across instances)
 // 3 used attr columns with shared ArrayBuffers:
 //   - Each: ceil(64/8) = 8 bytes (nulls) + padding + 256 bytes (values) ≈ 272 bytes
@@ -560,7 +572,7 @@ Consider a schema with 20 attributes where a typical span only uses 3:
 ```typescript
 interface SpanBuffer {
   // Core columns - always present (allocated immediately in constructor)
-  timestamps: Float64Array; // Every operation appends timestamp
+  timestamps: BigInt64Array; // Every operation appends timestamp (nanoseconds)
   operations: Uint8Array; // Operation type: tag, ok, err, etc.
 
   // Attribute columns - DIRECT PROPERTIES with LAZY GETTERS (no nested Record!)
@@ -874,6 +886,674 @@ WHERE parent_thread_id IS NULL AND parent_span_id IS NULL;
 | **Arrow output** | Separate columns (not Struct)        | Direct column filtering, no unpacking    |
 | **JS compat**    | 64-bit BigInt + 32-bit number        | No BigInt in hot path                    |
 
+## Unified SpanBuffer Memory Layout
+
+**Purpose**: Combine identity and system columns into a single ArrayBuffer allocation for maximum cache efficiency,
+minimal allocations, and zero conditional logic for system column access.
+
+### Design Principles
+
+1. **Single `_system` ArrayBuffer** per buffer containing timestamps, operations, and identity (for non-chained)
+2. **System columns FIRST** - timestamps and operations at fixed offsets 0 and `capacity * 8`
+3. **Identity AFTER system columns** - variable size depending on buffer type (root vs child vs chained)
+4. **Parent pointer for ancestry** - no copied parent identity bytes, just walk the `parent` reference
+5. **Chained buffers share identity** - overflow buffers point to the same `_identity` view as their root
+
+### Buffer Type Layouts
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ ROOT SPAN BUFFER                                                                │
+│                                                                                 │
+│ _system: ArrayBuffer                                                            │
+│ ┌────────────────────────┬──────────────────┬────────────────────────────────┐  │
+│ │ timestamps             │ operations       │ identity                       │  │
+│ │ BigInt64Array          │ Uint8Array       │ [threadId][spanId][len][trace] │  │
+│ │ 8 * capacity bytes     │ 1 * capacity     │ 8 + 4 + 1 + traceId.length     │  │
+│ └────────────────────────┴──────────────────┴────────────────────────────────┘  │
+│  offset: 0                capacity * 8       capacity * 9                       │
+│                                                                                 │
+│ Views:                                                                          │
+│   timestamps ──► BigInt64Array(this._system, 0, capacity)                       │
+│   operations ──► Uint8Array(this._system, capacity * 8, capacity)               │
+│   _identity  ──► Uint8Array(this._system, capacity * 9, 13 + traceId.length)    │
+│                                                                                 │
+│ Identity layout (13 + traceId.length bytes):                                    │
+│   [0-7]   threadId    (8 bytes, crypto-secure random, same for all spans)       │
+│   [8-11]  spanId      (4 bytes, Uint32, incrementing counter)                   │
+│   [12]    traceIdLen  (1 byte, length of traceId string)                        │
+│   [13+]   traceId     (1-128 bytes, ASCII string)                               │
+│                                                                                 │
+│ Properties:                                                                     │
+│   parent: undefined (root has no parent)                                        │
+│   children: SpanBuffer[]                                                        │
+│   task: TaskContext                                                             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ CHILD SPAN BUFFER                                                               │
+│                                                                                 │
+│ _system: ArrayBuffer                                                            │
+│ ┌────────────────────────┬──────────────────┬─────────────────┐                 │
+│ │ timestamps             │ operations       │ identity        │                 │
+│ │ BigInt64Array          │ Uint8Array       │ [threadId][span]│                 │
+│ │ 8 * capacity bytes     │ 1 * capacity     │ 8 + 4 = 12 bytes│                 │
+│ └────────────────────────┴──────────────────┴─────────────────┘                 │
+│  offset: 0                capacity * 8       capacity * 9                       │
+│                                                                                 │
+│ Views:                                                                          │
+│   timestamps ──► BigInt64Array(this._system, 0, capacity)                       │
+│   operations ──► Uint8Array(this._system, capacity * 8, capacity)               │
+│   _identity  ──► Uint8Array(this._system, capacity * 9, 12)                     │
+│                                                                                 │
+│ Identity layout (12 bytes):                                                     │
+│   [0-7]   threadId    (8 bytes, same as process threadId)                       │
+│   [8-11]  spanId      (4 bytes, Uint32, incrementing counter)                   │
+│                                                                                 │
+│ Properties:                                                                     │
+│   parent ──────────────► (parent SpanBuffer - for traceId + parentSpanId)       │
+│   children: SpanBuffer[]                                                        │
+│   task: TaskContext                                                             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│ CHAINED SPAN BUFFER (overflow)                                                  │
+│                                                                                 │
+│ _system: ArrayBuffer (NO identity - smallest allocation!)                       │
+│ ┌────────────────────────┬──────────────────┐                                   │
+│ │ timestamps             │ operations       │                                   │
+│ │ BigInt64Array          │ Uint8Array       │                                   │
+│ │ 8 * capacity bytes     │ 1 * capacity     │                                   │
+│ └────────────────────────┴──────────────────┘                                   │
+│  offset: 0                capacity * 8                                          │
+│                                                                                 │
+│ Views:                                                                          │
+│   timestamps ──► BigInt64Array(this._system, 0, capacity)                       │
+│   operations ──► Uint8Array(this._system, capacity * 8, capacity)               │
+│   _identity  ──────────────► (first buffer's _identity - shared reference!)     │
+│                                                                                 │
+│ Properties:                                                                     │
+│   parent ──────────────► (same as first buffer's parent)                        │
+│   children: [] (only root buffer tracks children)                               │
+│   task: TaskContext                                                             │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Memory Savings
+
+| Buffer Type | Old Design (separate allocations)                   | New Design (unified \_system)          |
+| ----------- | --------------------------------------------------- | -------------------------------------- |
+| Root        | 25 bytes identity + timestamps AB + ops AB          | Single AB: capacity\*9 + 13 + traceLen |
+| Child       | 25 bytes identity + timestamps AB + ops AB          | Single AB: capacity\*9 + 12            |
+| Chained     | 25 bytes identity (copied) + timestamps AB + ops AB | Single AB: capacity\*9 (no identity!)  |
+
+**Key savings:**
+
+- Root/Child: 2 fewer ArrayBuffer allocations per span
+- Chained: 12-141 bytes saved (no identity bytes at all) + zero copy
+- All: Better cache locality (identity adjacent to hot system columns)
+
+### Why System Columns BEFORE Identity
+
+Placing timestamps and operations at the START of the buffer means:
+
+1. **Fixed offsets for ALL buffer types** - timestamps always at 0, ops always at `capacity * 8`
+2. **Zero conditional logic** - same view creation code for root, child, and chained
+3. **Chained is just truncated** - same layout prefix, just shorter (no identity suffix)
+
+```typescript
+// SAME code for root, child, AND chained:
+this.timestamps = new BigInt64Array(this._system, 0, capacity);
+this.operations = new Uint8Array(this._system, capacity * 8, capacity);
+
+// Only non-chained buffers have identity after system columns:
+if (!isChained) {
+  const identityOffset = capacity * 9;
+  this._identity = new Uint8Array(this._system, identityOffset, identitySize);
+}
+```
+
+### Parent-Based Ancestry (No Copied Parent Identity)
+
+Instead of copying 12 bytes of parent identity into each child, we use the existing `parent` reference:
+
+```typescript
+get hasParent(): boolean {
+  return this.parent !== undefined;
+}
+
+get parentSpanId(): number {
+  return this.parent?.spanId ?? 0;
+}
+
+get traceId(): string {
+  if (this.parent) {
+    return this.parent.traceId;  // Walk up to root
+  }
+  // Root: decode from _identity
+  const len = this._identity[12];
+  return String.fromCharCode(...this._identity.subarray(13, 13 + len));
+}
+
+// MASSIVE WIN: isParentOf becomes pointer comparison!
+isParentOf(other: SpanBuffer): boolean {
+  return this === other.parent;
+}
+
+isChildOf(other: SpanBuffer): boolean {
+  return this.parent === other;
+}
+```
+
+**Benefits:**
+
+- `isParentOf` is now O(1) pointer comparison instead of 12-byte loop
+- No 12 bytes copied per child span
+- `traceId` walks to root (spans rarely deep, typically 3-5 levels)
+
+### spanId at Fixed Offset
+
+The `spanId` getter works identically for root and child because threadId and spanId are at the same offsets:
+
+```typescript
+// Identity layout for both root and child:
+//   [0-7]   threadId (8 bytes)
+//   [8-11]  spanId (4 bytes)
+//   ... (root has traceIdLen + traceId after, child stops here)
+
+get spanId(): number {
+  const b = this._identity;
+  return b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
+}
+```
+
+### Thread ID Generation
+
+Thread ID is generated **once per process/worker** at startup:
+
+```typescript
+function generateThreadId(): Uint8Array {
+  const threadId = new Uint8Array(8);
+  crypto.getRandomValues(threadId); // Crypto-secure
+  return threadId;
+}
+
+// Cached once per worker/process
+const PROCESS_THREAD_ID: Uint8Array = generateThreadId();
+
+// Thread-local span counter
+let nextSpanId: number = 1;
+```
+
+### Constructor Implementation
+
+```typescript
+class SpanBuffer {
+  readonly _system: ArrayBuffer;
+  readonly _identity: Uint8Array;
+  readonly timestamps: BigInt64Array;
+  readonly operations: Uint8Array;
+
+  parent?: SpanBuffer;
+  children: SpanBuffer[];
+  next?: SpanBuffer;
+  task: TaskContext;
+  writeIndex: number;
+  capacity: number;
+
+  constructor(
+    capacity: number,
+    task: TaskContext,
+    parent?: SpanBuffer,
+    isChained = false,
+    traceId?: string // Only for root spans
+  ) {
+    this.capacity = capacity;
+    this.task = task;
+    this.writeIndex = 0;
+    this.children = [];
+
+    const systemSize = capacity * 9; // timestamps (8*cap) + operations (1*cap)
+
+    if (isChained && parent) {
+      // CHAINED: share identity, only allocate system columns
+      this._identity = parent._identity; // Shared reference!
+      this.parent = parent.parent; // Same ancestry
+
+      this._system = new ArrayBuffer(systemSize);
+    } else if (parent) {
+      // CHILD: own 12-byte identity (threadId + spanId)
+      this.parent = parent;
+      parent.children.push(this);
+
+      const identitySize = 12;
+      this._system = new ArrayBuffer(systemSize + identitySize);
+      this._identity = new Uint8Array(this._system, systemSize, identitySize);
+
+      // Set threadId
+      this._identity.set(PROCESS_THREAD_ID, 0);
+      // Set spanId
+      const spanId = nextSpanId++;
+      this._identity[8] = spanId & 0xff;
+      this._identity[9] = (spanId >> 8) & 0xff;
+      this._identity[10] = (spanId >> 16) & 0xff;
+      this._identity[11] = (spanId >> 24) & 0xff;
+    } else {
+      // ROOT: identity with traceId
+      this.parent = undefined;
+
+      const traceBytes = traceId ? new TextEncoder().encode(traceId) : new Uint8Array(0);
+      const identitySize = 13 + traceBytes.length; // threadId + spanId + len + traceId
+      this._system = new ArrayBuffer(systemSize + identitySize);
+      this._identity = new Uint8Array(this._system, systemSize, identitySize);
+
+      // Set threadId
+      this._identity.set(PROCESS_THREAD_ID, 0);
+      // Set spanId
+      const spanId = nextSpanId++;
+      this._identity[8] = spanId & 0xff;
+      this._identity[9] = (spanId >> 8) & 0xff;
+      this._identity[10] = (spanId >> 16) & 0xff;
+      this._identity[11] = (spanId >> 24) & 0xff;
+      // Set traceId length and bytes
+      this._identity[12] = traceBytes.length;
+      this._identity.set(traceBytes, 13);
+    }
+
+    // System columns at FIXED offsets (same for ALL buffer types)
+    this.timestamps = new BigInt64Array(this._system, 0, capacity);
+    this.operations = new Uint8Array(this._system, capacity * 8, capacity);
+  }
+}
+```
+
+### Getters (Cold Path - Lazy DataView)
+
+```typescript
+// spanId at fixed offset 8-11 for both root and child
+get spanId(): number {
+  const b = this._identity;
+  return b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
+}
+
+get hasParent(): boolean {
+  return this.parent !== undefined;
+}
+
+get parentSpanId(): number {
+  return this.parent?.spanId ?? 0;
+}
+
+get traceId(): string {
+  if (this.parent) {
+    return this.parent.traceId;  // Walk up
+  }
+  // Root: decode from identity
+  const len = this._identity[12];
+  return String.fromCharCode(...this._identity.subarray(13, 13 + len));
+}
+
+// Copy threadId bytes for Arrow conversion
+copyThreadIdTo(dest: Uint8Array, offset: number): void {
+  dest.set(this._identity.subarray(0, 8), offset);
+}
+```
+
+### External Prototype Methods
+
+Methods are defined externally and assigned to prototype for smaller generated code:
+
+```typescript
+// Defined once, shared by all SpanBuffer instances
+const spanBufferMethods = {
+  isParentOf(this: SpanBuffer, other: SpanBuffer): boolean {
+    return this === other.parent; // Pointer comparison!
+  },
+
+  isChildOf(this: SpanBuffer, other: SpanBuffer): boolean {
+    return this.parent === other; // Pointer comparison!
+  },
+
+  copyThreadIdTo(this: SpanBuffer, dest: Uint8Array, offset: number): void {
+    dest.set(this._identity.subarray(0, 8), offset);
+  },
+};
+
+// Assign to prototype
+Object.assign(SpanBuffer.prototype, spanBufferMethods);
+```
+
+### Performance Characteristics
+
+**Construction (root span):**
+
+- 1 ArrayBuffer allocation (systemSize + 13 + traceId.length)
+- 3 TypedArray view creations (timestamps, operations, \_identity)
+- 1 Uint8Array.set() for threadId (8 bytes)
+- 4 byte writes for spanId
+- 1 byte write for traceId length
+- 1 Uint8Array.set() for traceId bytes
+
+**Construction (child span):**
+
+- 1 ArrayBuffer allocation (systemSize + 12)
+- 3 TypedArray view creations
+- 1 Uint8Array.set() for threadId (8 bytes)
+- 4 byte writes for spanId
+- 1 pointer assignment to parent
+
+**Construction (chained overflow):**
+
+- 1 ArrayBuffer allocation (systemSize only - smallest!)
+- 2 TypedArray view creations (timestamps, operations)
+- 1 pointer assignment for \_identity (shared!)
+- 1 pointer assignment for parent
+
+**Comparison:**
+
+- `isParentOf`: O(1) pointer comparison
+- `isChildOf`: O(1) pointer comparison
+- No byte loops, no DataView creation
+
+**traceId access:**
+
+- Root: O(1) decode from \_identity
+- Child depth N: O(N) pointer walks (typically N=3-5)
+
+## TraceId: Branded String Type
+
+**Purpose**: Provide a type-safe, validated trace identifier that is shared by reference across all spans in a trace,
+avoiding string copies.
+
+### Design Principles
+
+1. **Shared Reference**: TraceId is a string that is passed by reference to all spans in a trace - no copying
+2. **Validated**: Non-empty, max 128 characters, ASCII only (fast regex validation)
+3. **Branded Type**: TypeScript branded type prevents accidental string assignment
+4. **W3C Compatible**: `generateTraceId()` produces W3C Trace Context format (32 hex characters)
+
+### Type Definition
+
+```typescript
+/**
+ * TraceId is a branded string type for type safety.
+ * The brand prevents accidental assignment of arbitrary strings.
+ */
+type TraceId = string & { readonly __brand: 'TraceId' };
+
+/**
+ * Maximum length for trace IDs.
+ * 128 chars is generous - W3C format is 32 chars.
+ */
+const MAX_TRACE_ID_LENGTH = 128;
+
+/**
+ * Regex for validation - ASCII printable characters only.
+ * Regex validation is 2x faster than character loop.
+ */
+const TRACE_ID_REGEX = /^[\x20-\x7E]+$/;
+```
+
+### Validation
+
+```typescript
+/**
+ * Validate and create a TraceId from a string.
+ *
+ * Validation rules:
+ * - Non-empty
+ * - Max 128 characters
+ * - ASCII printable only (0x20-0x7E)
+ *
+ * @throws Error if validation fails
+ */
+function createTraceId(value: string): TraceId {
+  if (!value || value.length === 0) {
+    throw new Error('TraceId cannot be empty');
+  }
+  if (value.length > MAX_TRACE_ID_LENGTH) {
+    throw new Error(`TraceId exceeds max length of ${MAX_TRACE_ID_LENGTH}`);
+  }
+  if (!TRACE_ID_REGEX.test(value)) {
+    throw new Error('TraceId must contain only ASCII printable characters');
+  }
+  return value as TraceId;
+}
+```
+
+**Why Regex Validation**:
+
+- Regex `test()` is ~2x faster than iterating characters
+- Single call vs loop with multiple comparisons
+- V8 optimizes regex well
+
+### Generation (W3C Format)
+
+```typescript
+/**
+ * Generate a new TraceId in W3C Trace Context format.
+ *
+ * Format: 32 lowercase hexadecimal characters (128 bits)
+ * Example: "4bf92f3577b34da6a3ce929d0e0e4736"
+ */
+function generateTraceId(): TraceId {
+  const bytes = new Uint8Array(16);
+  crypto.getRandomValues(bytes);
+
+  // Convert to hex string (lowercase, no dashes)
+  let hex = '';
+  for (let i = 0; i < 16; i++) {
+    hex += bytes[i].toString(16).padStart(2, '0');
+  }
+  return hex as TraceId;
+}
+```
+
+### Usage Pattern
+
+```typescript
+// At request boundary - generate or accept trace ID
+const traceId = request.headers['x-trace-id'] ? createTraceId(request.headers['x-trace-id']) : generateTraceId();
+
+// Pass to all spans by reference (no copy)
+const rootSpan = createSpanBuffer(schema, taskContext, traceId);
+const childSpan = createChildSpanBuffer(rootSpan); // Inherits same traceId reference
+
+// All spans in trace share the SAME string reference
+console.log(rootSpan.traceId === childSpan.traceId); // true (same reference)
+```
+
+### SpanBuffer Integration
+
+```typescript
+interface SpanBuffer {
+  // TraceId is a shared string reference (zero-copy across spans)
+  traceId: TraceId;
+
+  // SpanIdentity is per-span (25-byte ArrayBuffer)
+  spanId: SpanIdentity;
+
+  // Comparison methods check BOTH traceId AND spanId
+  isParentOf(other: SpanBuffer): boolean;
+  isChildOf(other: SpanBuffer): boolean;
+}
+
+// Implementation
+function isParentOf(this: SpanBuffer, other: SpanBuffer): boolean {
+  // Fast string reference comparison first
+  if (this.traceId !== other.traceId) return false;
+  // Then SpanIdentity comparison
+  return this.spanId.isParentOf(other.spanId);
+}
+```
+
+### Benefits
+
+| Aspect              | Plain String        | Branded TraceId             |
+| ------------------- | ------------------- | --------------------------- |
+| **Type Safety**     | Any string accepted | Compile-time type checking  |
+| **Validation**      | None                | Enforced at creation        |
+| **Reference Share** | May be copied       | Guaranteed shared reference |
+| **Generation**      | Ad-hoc              | Standardized W3C format     |
+| **Interop**         | Format varies       | Compatible with trace tools |
+
+## ColumnBuffer Extension Mechanism
+
+**Purpose**: Enable arrow-builder to provide extensible buffer generation while allowing lmao to inject span-specific
+functionality without tight coupling.
+
+### Design Overview
+
+The `createColumnBufferClass()` function in arrow-builder accepts callback options that allow injecting:
+
+1. **Constructor code**: Additional initialization logic
+2. **Methods**: Instance methods added to the generated class
+3. **Preamble**: Code executed before class definition (for imports, helpers)
+
+This enables V8-optimized class generation with a fixed hidden class shape.
+
+### Extension Options Interface
+
+```typescript
+interface ColumnBufferExtensionOptions {
+  /**
+   * Code to inject into the constructor body.
+   * Has access to `this` and constructor parameters.
+   */
+  constructorCode?: string;
+
+  /**
+   * Methods to add to the generated class.
+   * Key is method name, value is the method body code.
+   */
+  methods?: Record<string, string>;
+
+  /**
+   * Code to execute before the class definition.
+   * Useful for importing helpers or defining constants.
+   */
+  preamble?: string;
+
+  /**
+   * Additional properties to declare on the class.
+   * These become part of the fixed hidden class shape.
+   */
+  properties?: Array<{
+    name: string;
+    type: 'property' | 'getter' | 'setter';
+    code: string;
+  }>;
+}
+```
+
+### Usage Example (lmao extending arrow-builder)
+
+```typescript
+// In lmao: Create SpanBuffer class by extending ColumnBuffer
+const SpanBufferClass = createColumnBufferClass(schema, {
+  preamble: `
+    const { createRootSpanIdentity, createChildSpanIdentity } = require('./spanIdentity');
+  `,
+
+  constructorCode: `
+    // Initialize span-specific fields
+    this.traceId = traceId;
+    this.spanId = parentIdentity 
+      ? parentIdentity.createChild(nextSpanId++)
+      : createRootSpanIdentity();
+    this.children = [];
+    this.parent = parent;
+  `,
+
+  properties: [
+    { name: 'traceId', type: 'property', code: 'null' },
+    { name: 'spanId', type: 'property', code: 'null' },
+    { name: 'children', type: 'property', code: '[]' },
+    { name: 'parent', type: 'property', code: 'null' },
+  ],
+
+  methods: {
+    isParentOf: `
+      return this.traceId === other.traceId && this.spanId.isParentOf(other.spanId);
+    `,
+    isChildOf: `
+      return this.traceId === other.traceId && this.spanId.isChildOf(other.spanId);
+    `,
+  },
+});
+```
+
+### Generated Class Structure
+
+```typescript
+// Generated by arrow-builder with lmao extensions
+class GeneratedSpanBuffer {
+  // --- Core ColumnBuffer properties (from arrow-builder) ---
+  timestamps: BigInt64Array;
+  operations: Uint8Array;
+  writeIndex: number;
+  capacity: number;
+
+  // --- Lazy attribute columns (from schema) ---
+  // attr_userId_nulls, attr_userId_values, etc.
+
+  // --- Extension properties (from lmao) ---
+  traceId: TraceId;
+  spanId: SpanIdentity;
+  children: SpanBuffer[];
+  parent: SpanBuffer | null;
+
+  constructor(capacity, traceId, parentIdentity, parent) {
+    // Core initialization (arrow-builder)
+    this._alignedCapacity = getCacheAlignedCapacity(capacity);
+    this.timestamps = new BigInt64Array(this._alignedCapacity);
+    this.operations = new Uint8Array(this._alignedCapacity);
+    this.writeIndex = 0;
+    this.capacity = capacity;
+
+    // Extension initialization (lmao)
+    this.traceId = traceId;
+    this.spanId = parentIdentity ? parentIdentity.createChild(nextSpanId++) : createRootSpanIdentity();
+    this.children = [];
+    this.parent = parent;
+  }
+
+  // Extension methods (lmao)
+  isParentOf(other) {
+    return this.traceId === other.traceId && this.spanId.isParentOf(other.spanId);
+  }
+
+  isChildOf(other) {
+    return this.traceId === other.traceId && this.spanId.isChildOf(other.spanId);
+  }
+}
+```
+
+### V8 Hidden Class Optimization
+
+The extension mechanism ensures a **fixed hidden class shape**:
+
+1. All properties declared upfront in constructor
+2. No dynamic property addition after construction
+3. Methods on prototype (not instance)
+4. Consistent property order across all instances
+
+This enables V8 to:
+
+- Create optimized hidden class once
+- Use inline caching for property access
+- Avoid dictionary mode fallback
+
+### Benefits of Extension Mechanism
+
+| Aspect               | Without Extension            | With Extension                |
+| -------------------- | ---------------------------- | ----------------------------- |
+| **Package Coupling** | lmao must fork arrow-builder | Clean extension via callbacks |
+| **Hidden Class**     | May vary per use case        | Fixed shape, V8 optimized     |
+| **Code Generation**  | Duplicate logic              | Single codegen with injection |
+| **Maintenance**      | Two codebases to update      | Single source of truth        |
+| **Type Safety**      | Manual type alignment        | Generated types match runtime |
+
 **Why This Design**:
 
 - **Zero indirection**: Direct property access is faster than nested Record lookup
@@ -1020,74 +1700,168 @@ function createChildSpan(parentBuffer: SpanBuffer, label: string, childFn: SpanF
 - **Clean Arrow output**: Prefix stripped during Arrow conversion for queryable column names
 - **Flexible storage**: Different TypedArray types for different data types
 
-## Cache-Aligned Attribute Column Generation
+## Eager vs Lazy Column Allocation
+
+SpanBuffer uses a two-tier allocation strategy:
+
+### System Columns (EAGER)
+
+System columns are allocated immediately in the constructor because they're written on every entry:
 
 ```typescript
-/**
- * Generate attribute columns with consistent capacity for columnar storage
- *
- * DESIGN PRINCIPLES:
- * 1. EQUAL LENGTH: All generated arrays use the same alignedCapacity
- * 2. TYPE SAFETY: Each field type maps to an appropriate TypedArray
- * 3. NAMING: 'attr_' prefix prevents conflicts with SpanBuffer internal fields
- * 4. CACHE ALIGNMENT: alignedCapacity is pre-calculated for optimal memory layout
- *
- * TYPE MAPPING RATIONALE:
- * - string/categorical/enum → Uint32Array: Store string registry indices (4 bytes = good balance)
- * - number → Float64Array: Full precision for numeric values (8 bytes)
- * - integer → Int32Array: Signed integers up to 2^31 (4 bytes)
- * - boolean → Uint8Array: Minimal storage for true/false (1 byte)
- * - duration → Float32Array: Sufficient precision for timing (4 bytes)
- *
- * @param schema - TagAttributeSchema defining field names and types
- * @param alignedCapacity - Pre-calculated cache-aligned capacity (same for all arrays)
- * @returns Object with attr_* properties containing TypedArrays of equal length
- */
-function generateAttributeColumns<T extends TagAttributeSchema>(
-  schema: T,
-  alignedCapacity: number // Single capacity for ALL arrays (already cache-aligned)
-): Record<string, TypedArray> {
-  const attributeColumns: Record<string, TypedArray> = {};
+// In constructor - always allocated
+this.timestamps = new BigInt64Array(alignedCapacity);
+this.operations = new Uint8Array(alignedCapacity);
+```
 
-  for (const [fieldName, fieldConfig] of Object.entries(schema.fields)) {
-    const columnName = `attr_${fieldName}`;
+### User Attribute Columns (LAZY by default)
 
-    // ALL arrays use the SAME aligned capacity (equal length requirement)
-    let typedArray: TypedArray;
-    switch (fieldConfig.type) {
-      case 'string':
-      case 'categorical':
-      case 'enum':
-        // String registry indices stored as Uint32Array
-        typedArray = new Uint32Array(alignedCapacity);
-        break;
-      case 'number':
-        // Numbers stored as Float64Array
-        typedArray = new Float64Array(alignedCapacity);
-        break;
-      case 'integer':
-        // Integers stored as Int32Array
-        typedArray = new Int32Array(alignedCapacity);
-        break;
-      case 'boolean':
-        // Booleans stored as Uint8Array
-        typedArray = new Uint8Array(alignedCapacity);
-        break;
-      case 'duration':
-        // Durations stored as Float32Array
-        typedArray = new Float32Array(alignedCapacity);
-        break;
-      default:
-        // Fallback to Uint32Array for unknown types
-        typedArray = new Uint32Array(alignedCapacity);
-    }
+User attribute columns use lazy getters because most spans only use a subset of schema attributes:
 
-    attributeColumns[columnName] = typedArray;
-  }
+```typescript
+// Generated lazy getter - allocates on first access
+get attr_userId_nulls() { return allocate_attr_userId(this).nulls; }
+get attr_userId_values() { return allocate_attr_userId(this).values; }
+get attr_userId() { return allocate_attr_userId(this).values; }
+```
 
-  return attributeColumns;
+The allocator creates a shared ArrayBuffer for both nulls and values:
+
+```typescript
+function allocate_attr_userId(self) {
+  if (self[attr_userId_sym]) return self[attr_userId_sym];
+  const capacity = self._alignedCapacity;
+  const nullBitmapSize = Math.ceil(capacity / 8);
+  const alignedNullOffset = Math.ceil(nullBitmapSize / 4) * 4; // Align to element size
+  const totalSize = alignedNullOffset + capacity * 4;
+  const buffer = new ArrayBuffer(totalSize);
+  const storage = {
+    buffer: buffer,
+    nulls: new Uint8Array(buffer, 0, nullBitmapSize),
+    values: new Uint32Array(buffer, alignedNullOffset, capacity),
+  };
+  self[attr_userId_sym] = storage;
+  return storage;
 }
 ```
+
+### Self-Tuning Promotion
+
+Columns that are used in ≥80% of spans automatically promote from lazy to eager allocation. This happens during
+background flush (cold path) with zero hot-path impact.
+
+See [Buffer Self-Tuning: Lazy-to-Eager Column Promotion](./01b2_buffer_self_tuning.md#lazy-to-eager-column-promotion)
+for full details including:
+
+- Stats tracking via `ModuleContext.lazyColumnStats`
+- Promotion criteria (100 samples minimum, 80% usage threshold)
+- Class recompilation via `new Function()`
+- In-flight buffer handling
+
+### Type Mapping
+
+| Schema Type | TypedArray       | Bytes/Element | Notes                                |
+| ----------- | ---------------- | ------------- | ------------------------------------ |
+| `enum`      | Uint8/16/32Array | 1/2/4         | Size based on enum value count       |
+| `category`  | Array (JS)       | ~8 + string   | Raw strings, dict built in cold path |
+| `text`      | Array (JS)       | ~8 + string   | Raw strings, no dictionary           |
+| `number`    | Float64Array     | 8             | Full precision                       |
+| `boolean`   | Uint8Array       | 1             | Bit-packed (8 per byte)              |
+
+## Deferred String Interning Pattern
+
+**Key Design Decision**: String columns (both `S.category()` and `S.text()`) store raw JavaScript strings in arrays on
+the hot path, deferring dictionary building to the cold path during Arrow conversion.
+
+### Why Deferred Interning?
+
+The original design considered using `Uint32Array` with string interning on the hot path:
+
+```typescript
+// ❌ ORIGINAL APPROACH (not implemented)
+// Hot path would call Map.get/set on every string write
+buffer.attr_userId_values[idx] = categoryInterner.intern(value); // Map lookup per write
+```
+
+**The actual implementation** stores raw strings directly:
+
+```typescript
+// ✅ ACTUAL IMPLEMENTATION - Deferred interning
+// Hot path: Zero-cost string reference storage
+buffer.attr_userId_strings[idx] = value; // Just array assignment, zero overhead
+
+// Cold path: Dictionary building during Arrow conversion
+const dictionary = [...new Set(strings)].sort();
+const indices = strings.map((s) => stringToIndex.get(s));
+```
+
+### Hot Path: Raw String Storage
+
+String columns use `string[]` arrays instead of `Uint32Array`:
+
+```typescript
+class CategoryColumn {
+  private strings: string[] = []; // Just JS string references
+
+  // HOT PATH: Just store reference (zero work)
+  write(idx: number, value: string): void {
+    this.strings[idx] = value; // No Map lookup, no interning, no UTF-8 conversion
+  }
+}
+```
+
+### Cold Path: Dictionary Building During Arrow Conversion
+
+Dictionary encoding happens during the background flush:
+
+```typescript
+// COLD PATH: Build sorted dictionary + create Arrow column
+toArrow(): ArrowColumn {
+  // 1. Collect unique strings
+  const uniqueStrings = new Set<string>();
+  for (const str of this.strings) {
+    if (str != null) uniqueStrings.add(str);
+  }
+
+  // 2. Sort for query optimization (binary search in ClickHouse)
+  const dictionary = [...uniqueStrings].sort();
+  const stringToIndex = new Map(dictionary.map((s, i) => [s, i]));
+
+  // 3. Build indices (remap to sorted positions)
+  const indices = new Uint32Array(this.strings.length);
+  for (let i = 0; i < this.strings.length; i++) {
+    if (this.strings[i] != null) {
+      indices[i] = stringToIndex.get(this.strings[i])!;
+    }
+  }
+
+  // 4. Clear strings to prevent unbounded memory growth
+  this.strings = [];
+
+  return { type: 'dictionary', indices, dictionary };
+}
+```
+
+### Tradeoffs
+
+| Aspect                | Hot Path Interning          | Deferred Interning (Actual)       |
+| --------------------- | --------------------------- | --------------------------------- |
+| **Hot path cost**     | O(1) Map lookup per write   | O(1) array assignment             |
+| **Hot path allocs**   | Potential Map resize        | Zero                              |
+| **Memory during log** | Uint32Array (4 bytes/entry) | String refs (~8 bytes/entry + GC) |
+| **Cold path cost**    | O(1) slice                  | O(n log n) sort + O(n) index      |
+| **Code complexity**   | Global interner state       | Per-flush, stateless              |
+| **Memory cleanup**    | Interner grows forever      | Cleared each flush                |
+
+**Why Deferred Wins**:
+
+1. **Simpler hot path code**: No Map operations, just array assignment
+2. **No global state**: Each flush is independent, no interner cleanup needed
+3. **Better memory bounds**: String arrays cleared after each flush
+4. **V8 optimization**: Simple array assignment optimizes better than Map.get()
+
+**See Also**: [Buffer Performance Optimizations](./01b1_buffer_performance_optimizations.md) for detailed CATEGORY vs
+TEXT string handling strategies.
 
 ## Tag Operation Implementation
 
@@ -1104,9 +1878,9 @@ function generateAttributeColumns<T extends TagAttributeSchema>(
 const tagOperations = {
   requestId: (buffer: SpanBuffer, value: string) => {
     // ALWAYS write to row 0 (span-start row) - overwrite semantics
-    // Accessing attr_requestId_values triggers lazy allocation (if first write)
-    const internedIndex = categoryInterner.intern(value);
-    buffer.attr_requestId_values[0] = internedIndex; // Direct TypedArray access
+    // Accessing attr_requestId_strings triggers lazy allocation (if first write)
+    // NOTE: Stores RAW STRING, not interned index (deferred interning pattern)
+    buffer.attr_requestId_strings[0] = value; // Direct array assignment
     buffer.attr_requestId_nulls[0] |= 1; // Set bit 0 as valid (Arrow format)
 
     // Return this for chaining
@@ -1115,17 +1889,17 @@ const tagOperations = {
 
   userId: (buffer: SpanBuffer, value: string) => {
     // Same pattern - always row 0, direct property access
-    const internedIndex = categoryInterner.intern(value);
-    buffer.attr_userId_values[0] = internedIndex;
+    // Raw string storage - dictionary built during Arrow conversion
+    buffer.attr_userId_strings[0] = value;
     buffer.attr_userId_nulls[0] |= 1;
     return this;
   },
 };
 
 // Usage: ctx.tag writes to row 0
-ctx.tag.requestId('req-123'); // Writes to attr_requestId_values[0]
-ctx.tag.userId('user-456'); // Writes to attr_userId_values[0]
-ctx.tag.requestId('req-789'); // OVERWRITES attr_requestId_values[0] - last write wins!
+ctx.tag.requestId('req-123'); // Stores raw string at attr_requestId_strings[0]
+ctx.tag.userId('user-456'); // Stores raw string at attr_userId_strings[0]
+ctx.tag.requestId('req-789'); // OVERWRITES attr_requestId_strings[0] - last write wins!
 ```
 
 ### ctx.scope - Separate Generated Class (NOT stored in buffer columns)
@@ -1200,9 +1974,9 @@ const logOperations = {
     buffer.timestamps[index] = getTimestamp(buffer.task.requestContext);
     buffer.operations[index] = ENTRY_TYPE_INFO;
 
-    // Message attribute via direct property access (triggers lazy allocation)
-    const msgIndex = textStorage.store(message);
-    buffer.attr_message_values[index] = msgIndex;
+    // Message attribute - DEFERRED INTERNING: store raw string
+    // Dictionary building happens during Arrow conversion (cold path)
+    buffer.attr_message_strings[index] = message; // Just array assignment
     const byteIdx = Math.floor(index / 8);
     const bitOffset = index % 8;
     buffer.attr_message_nulls[byteIdx] |= 1 << bitOffset;
@@ -1211,9 +1985,10 @@ const logOperations = {
     const scopeValues = scope._getScopeValues();
     for (const [fieldName, value] of Object.entries(scopeValues)) {
       if (value !== undefined) {
-        const valuesKey = `attr_${fieldName}_values`;
+        const stringsKey = `attr_${fieldName}_strings`;
         const nullsKey = `attr_${fieldName}_nulls`;
-        buffer[valuesKey][index] = processValue(value, fieldName);
+        // Raw string storage for string types (deferred interning)
+        buffer[stringsKey][index] = value;
         buffer[nullsKey][byteIdx] |= 1 << bitOffset;
       }
     }
@@ -1239,7 +2014,7 @@ ctx.log.debug('Details...'); // Writes to row 3, writeIndex → 4
 - **Progressive enrichment**: Set initial values early, refine with more context later
 - **Clear separation**: Tags (span attributes) vs logs (events) have distinct semantics
 - **Separate Scope class**: Scope values stored separately, not mixed with buffer columns
-- **Hot path optimization**: Direct TypedArray access via lazy getters
+- **Deferred interning**: String columns store raw strings, dictionary built on cold path
 - **Null tracking**: Arrow-format null bitmaps (1=valid, 0=null)
 
 ## Self-Tuning Capacity Management
@@ -1458,7 +2233,7 @@ await processUser({ userId: '123' });
 
 // What MUST happen (unavoidable):
 // 1. Allocate SpanBuffer object
-//    - Core columns: timestamps (Float64Array), operations (Uint8Array)
+//    - Core columns: timestamps (BigInt64Array), operations (Uint8Array)
 //    - Children array (empty)
 //    - writeIndex = 0
 // 2. Create SpanLogger instance
@@ -1481,7 +2256,7 @@ The hottest path. Zero allocations allowed:
 ctx.tag.userId('123'); // ctx.tag directly on context
 
 // What happens (lazy getters handle allocation):
-buffer.timestamps[index] = performance.now(); // Float64 write
+buffer.timestamps[index] = getTimestamp(ctx); // BigInt64 write
 buffer.operations[index] = ENTRY_TYPE.TAG; // Uint8 write
 
 // Accessing lazy getter triggers allocation on first access
@@ -1503,12 +2278,12 @@ index++;
 
 ### Summary Table
 
-| Phase           | Frequency       | Allocations Allowed  | Key Operations                         |
-| --------------- | --------------- | -------------------- | -------------------------------------- |
-| Module Init     | Once per module | Unlimited            | Class generation, schema compilation   |
-| Task Definition | Once per task   | Minimal              | String interning, closure creation     |
-| Span Creation   | Every execution | Buffer + logger only | TypedArray allocation, object creation |
-| Per-Entry Write | Every log call  | **ZERO**             | Direct TypedArray writes only          |
+| Phase           | Frequency       | Allocations Allowed  | Key Operations                             |
+| --------------- | --------------- | -------------------- | ------------------------------------------ |
+| Module Init     | Once per module | Unlimited            | Class generation, schema compilation       |
+| Task Definition | Once per task   | Minimal              | Span name interning, closure creation      |
+| Span Creation   | Every execution | Buffer + logger only | TypedArray/array allocation, object create |
+| Per-Entry Write | Every log call  | **ZERO**             | Direct array writes (strings deferred)     |
 
 ## Background Processing Pipeline
 
@@ -1529,8 +2304,20 @@ index++;
 - **`TypedArray.slice()`**: Creates a NEW ArrayBuffer with copied data
 - **`TypedArray.subarray()`**: Creates a VIEW into the same ArrayBuffer (no copy)
 - **Null bitmap transformation**: Converts our per-column format to Arrow's packed format
-- **String resolution**: Category/text indices must be looked up in interners
-- **Dictionary building**: Arrow builders accumulate values before finalizing
+- **String dictionary building**: Raw strings from `string[]` arrays are deduplicated and sorted
+- **UTF-8 encoding**: Strings converted to UTF-8 bytes during dictionary construction
+
+**Deferred String Processing** (cold path only):
+
+String columns store raw JavaScript strings in `string[]` arrays during the hot path. During Arrow conversion:
+
+1. Unique strings collected via `Set`
+2. Dictionary sorted for query optimization
+3. Index mapping built (`string → index`)
+4. Indices written to `Uint32Array`
+5. UTF-8 encoding applied (with SIEVE caching for repeated strings)
+
+This work happens in the background thread, not during logging.
 
 ```typescript
 // COPY: slice() creates new ArrayBuffer (avoid on hot path!)
@@ -1581,7 +2368,7 @@ function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.Rec
     : createNullUint32Column(buffer.writeIndex); // null for root spans
 
   // Timestamp and operation columns (zero-copy views)
-  arrowVectors.timestamp = arrow.Float64Vector.from(
+  arrowVectors.timestamp = arrow.TimestampNanosecond.from(
     buffer.timestamps.subarray(0, buffer.writeIndex) // subarray() = zero-copy view
   );
   arrowVectors.operation = arrow.Utf8Vector.from(buffer.operations.subarray(0, buffer.writeIndex));

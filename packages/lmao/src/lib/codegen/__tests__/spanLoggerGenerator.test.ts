@@ -3,11 +3,13 @@
  */
 
 import { beforeEach, describe, expect, it } from 'bun:test';
+import { createTestTaskContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
-import type { ModuleContext, SpanBuffer, TaskContext } from '../../types.js';
+import type { SpanBuffer } from '../../types.js';
+import { createScope } from '../scopeGenerator.js';
 import {
   createSpanLoggerClass,
   type GetBufferWithSpaceFn,
@@ -16,7 +18,7 @@ import {
   type TextStorage,
 } from '../spanLoggerGenerator.js';
 
-// Mock implementations
+// Mock implementations for string interning (these are real dependencies, not mocks of SpanBuffer)
 class MockStringInterner implements StringInterner {
   private strings: string[] = [];
   private indices = new Map<string, number>();
@@ -62,36 +64,9 @@ class MockTextStorage implements TextStorage {
   }
 }
 
-function createMockSpanBuffer(): SpanBuffer {
-  const moduleContext: ModuleContext = {
-    moduleId: 0,
-    gitSha: 'test',
-    filePath: 'test.ts',
-    tagAttributes: {},
-    spanBufferCapacityStats: {
-      currentCapacity: 64,
-      totalWrites: 0,
-      overflowWrites: 0,
-      totalBuffersCreated: 0,
-    },
-  };
-
-  const taskContext: TaskContext = {
-    module: moduleContext,
-    spanNameId: 0,
-    lineNumber: 0,
-  };
-
-  return {
-    spanId: 1,
-    traceId: 'test-trace',
-    timestamps: new Float64Array(64),
-    operations: new Uint8Array(64),
-    children: [],
-    task: taskContext,
-    writeIndex: 0,
-    capacity: 64,
-  } as SpanBuffer;
+function createTestBuffer(schema: TagAttributeSchema = {}): SpanBuffer {
+  const taskContext = createTestTaskContext(schema);
+  return createSpanBuffer(schema, taskContext);
 }
 
 const mockGetBufferWithSpace: GetBufferWithSpaceFn = (buffer) => ({
@@ -226,7 +201,7 @@ describe('createSpanLoggerClass', () => {
   beforeEach(() => {
     categoryInterner = new MockStringInterner();
     textStorage = new MockTextStorage();
-    buffer = createMockSpanBuffer();
+    buffer = createTestBuffer();
   });
 
   describe('success cases', () => {
@@ -236,7 +211,8 @@ describe('createSpanLoggerClass', () => {
       });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, 0, 0, undefined);
+      // Constructor: (buffer, getBufferWithSpace, scopeInstance)
+      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, undefined);
 
       // Should have tag property
       expect(logger).toHaveProperty('tag');
@@ -255,7 +231,8 @@ describe('createSpanLoggerClass', () => {
       (buffer as any).attr_userId_values = new Array(64).fill('');
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, 0, 0, undefined);
+      // Constructor: (buffer, getBufferWithSpace, scopeInstance)
+      const logger = new SpanLoggerClass(buffer, mockGetBufferWithSpace, undefined);
 
       // Access tag to create entry
       const tag = logger.tag;
@@ -270,14 +247,14 @@ describe('createSpanLoggerClass', () => {
       });
 
       // Use createSpanBuffer to get a properly generated buffer with lazy getters
-      const properBuffer = createSpanBuffer(schema, buffer.task);
-      properBuffer.task.module.tagAttributes = schema;
+      const properBuffer = createSpanBuffer(schema as any, buffer.task);
+      properBuffer.task.module.tagAttributes = schema as any;
 
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      // Create mock scope instance
-      const mockScope = { requestId: null, userId: null, _getScopeValues: () => ({ requestId: null, userId: null }) };
-      // New constructor: (buffer, getBufferWithSpace, anchorEpochMicros, anchorPerfNow, scopeInstance)
-      const logger = new SpanLoggerClass(properBuffer, mockGetBufferWithSpace, 0, 0, mockScope);
+      const SpanLoggerClass = createSpanLoggerClass(schema as any);
+      // Create proper scope instance using scopeGenerator
+      const scopeInstance = createScope(schema as any);
+      // Constructor: (buffer, getBufferWithSpace, scopeInstance)
+      const logger = new SpanLoggerClass(properBuffer, mockGetBufferWithSpace, scopeInstance);
 
       // Should be able to call scope without error
       expect(() => {

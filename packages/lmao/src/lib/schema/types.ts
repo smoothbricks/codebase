@@ -170,6 +170,7 @@ export type LmaoSchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean'
  */
 export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> & {
   __schema_type?: LmaoSchemaType;
+  __enum_values?: readonly string[];
 };
 
 /**

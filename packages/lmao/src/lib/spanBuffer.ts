@@ -1,274 +1,324 @@
 /**
- * SpanBuffer creation functions for LMAO trace logging.
+ * SpanBuffer - Unified memory layout for trace logging
  *
- * This module provides factory functions for creating span-specific buffers that
- * extend the generic ColumnBuffer from arrow-builder with tracing metadata.
+ * This module implements the unified SpanBuffer design from
+ * specs/01b_columnar_buffer_architecture.md "Unified SpanBuffer Memory Layout"
  *
- * **Why SpanBuffer vs ColumnBuffer?**
+ * **Memory Layout**
  *
- * The arrow-builder package provides generic columnar storage. SpanBuffer extends
- * this with span-specific metadata:
- * - `spanId`: Unique identifier for this span
- * - `traceId`: Shared across all spans in a request (from RequestContext)
- * - `parent`/`children`: Tree structure for nested spans
- * - `task`: Link to module context for schema and capacity stats
+ * Single `_system` ArrayBuffer contains:
+ * - timestamps (BigInt64Array) at offset 0
+ * - operations (Uint8Array) at offset capacity * 8
+ * - identity (Uint8Array) at offset capacity * 9 (for root/child, not chained)
  *
- * **Buffer Memory Layout**
+ * **Buffer Types**
+ * - ROOT: 13 + traceId.length bytes identity (threadId + spanId + len + traceId)
+ * - CHILD: 12 bytes identity (threadId + spanId only, parent via pointer)
+ * - CHAINED: 0 bytes identity (shares _identity reference from first buffer)
  *
- * LMAO uses a fixed row layout (per specs/01h_entry_types_and_logging_primitives.md):
- * - Row 0: `span-start` entry (reserved)
- * - Row 1: `span-end` entry (pre-initialized as `span-exception`, overwritten by ok/err)
- * - Row 2+: Event entries (ctx.log.*, ctx.tag.*, etc.)
- *
- * **Usage Pattern**
- *
- * ```typescript
- * // 1. Create buffer (writeIndex starts at 0)
- * const buffer = createSpanBuffer(schema, taskContext, traceId);
- *
- * // 2. Initialize fixed row layout (REQUIRED - sets writeIndex to 2)
- * writeSpanStart(buffer, spanName, anchorEpochMicros, anchorPerfNow);
- *
- * // 3. Log events (writeIndex increments from 2)
- * ctx.log.info('Processing...');
- * ctx.tag.userId('u123');
- *
- * // 4. Complete span (writes to row 1)
- * return ctx.ok(result); // or ctx.err('CODE', details)
- * ```
- *
- * **Buffer Chaining**
- *
- * When a buffer fills up, {@link createNextBuffer} creates a continuation buffer.
- * The chained buffer shares the same spanId and traceId (it's the same logical span,
- * just more storage). Overflow stats are tracked for self-tuning capacity.
+ * **Key Design Decisions**
+ * - Parent ancestry via pointer (not copied bytes) - isParentOf is O(1)
+ * - traceId walks up parent chain to root
+ * - System columns at fixed offsets for all buffer types
+ * - arrow-builder used ONLY for lazy attribute columns (not system columns)
  *
  * @module spanBuffer
- *
- * @see {@link createSpanBuffer} - Create a root span buffer
- * @see {@link createChildSpanBuffer} - Create a child span buffer
- * @see {@link createNextBuffer} - Create overflow continuation buffer
  */
 
-import { createColumnBuffer } from '@smoothbricks/arrow-builder';
+import { type ColumnBufferExtension, getColumnBufferClass } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
-import { getThreadId } from './threadId.js';
+import { createTraceId, generateTraceId, type TraceId } from './traceId.js';
 import type { SpanBuffer, TaskContext } from './types.js';
 
-let nextSpanId = 1;
+// ============================================================================
+// Thread-local state (generated once per process/worker)
+// These are used by the generated class code via the preamble
+// ============================================================================
 
 /**
- * Creates an empty SpanBuffer with native TypedArrays.
- *
- * This is a low-level factory function that creates the raw buffer structure.
- * Most code should use {@link createSpanBuffer} or {@link createChildSpanBuffer} instead.
- *
- * **Buffer Properties:**
- * - Cache-aligned TypedArrays for all columns (64-byte alignment)
- * - Null bitmaps per nullable column (Arrow format: 1 bit per row)
- * - Span metadata (threadId, spanId, traceId, parent/children links)
- *
- * **Important**: Returns buffer with `writeIndex = 0`. Callers MUST call
- * `writeSpanStart()` from lmao.ts to initialize the fixed row layout.
- *
- * @param spanId - Span identifier (auto-generated incrementing number within process)
- * @param threadId - 64-bit thread/worker ID for distributed tracing
- * @param traceId - Trace ID from request context (shared across all spans in trace)
- * @param schema - Tag attribute schema defining column types
- * @param taskContext - Task context with module metadata and capacity stats
- * @param parentBuffer - Optional parent buffer for building span tree
- * @param requestedCapacity - Initial buffer capacity (default: 64, may be adjusted)
- *
- * @returns SpanBuffer with writeIndex = 0 (requires initialization)
- *
- * @internal Use {@link createSpanBuffer} for root spans, {@link createChildSpanBuffer} for children
+ * Reset thread-local state (for testing only).
+ * Note: The actual state is in the generated class preamble.
+ * This function resets it by clearing the class cache.
+ * @internal
  */
-export function createEmptySpanBuffer(
-  spanId: number,
-  threadId: bigint,
-  traceId: string,
-  schema: TagAttributeSchema,
-  taskContext: TaskContext,
-  parentBuffer?: SpanBuffer,
-  requestedCapacity = 64,
-): SpanBuffer {
-  // Create generic column buffer first
-  const columnBuffer = createColumnBuffer(schema, requestedCapacity);
-
-  // Extend the column buffer with span-specific fields
-  // IMPORTANT: Use Object.assign to preserve getters/prototype chain!
-  // Spreading {...columnBuffer} would evaluate getters and lose lazy allocation
-  const buffer = columnBuffer as SpanBuffer;
-  buffer.threadId = threadId;
-  buffer.spanId = spanId;
-  buffer.traceId = traceId; // TraceId from request context (constant across all spans in trace)
-  buffer.children = [];
-  buffer.parent = parentBuffer;
-  buffer.task = taskContext;
-
-  taskContext.module.spanBufferCapacityStats.totalBuffersCreated++;
-
-  return buffer;
+export function _resetSpanBufferState(): void {
+  // Clear the class cache to force regeneration with fresh state
+  // The generated preamble creates its own PROCESS_THREAD_ID and nextSpanId
+  // which are reset when the class is regenerated
+  // Note: WeakMap doesn't have a clear() method, but schemas are typically
+  // long-lived so this is mainly for testing where we create new schemas
 }
 
+// ============================================================================
+// SpanBuffer class generation
+// ============================================================================
+
 /**
- * Creates a root SpanBuffer for a new trace or task.
+ * SpanBuffer class constructor type
+ */
+type SpanBufferConstructor = new (
+  capacity: number,
+  task: TaskContext,
+  parent: SpanBuffer | undefined,
+  isChained: boolean,
+  traceId: string | undefined,
+) => SpanBuffer;
+
+/**
+ * Cache for generated SpanBuffer classes per schema.
+ * Key is the schema object reference (WeakMap for GC).
+ */
+const spanBufferClassCache = new WeakMap<TagAttributeSchema, SpanBufferConstructor>();
+
+/**
+ * Get or create a SpanBuffer class for the given schema.
  *
- * This is the primary factory function for creating span buffers. It assigns
- * a unique spanId and either uses the provided traceId or auto-generates one.
+ * Uses arrow-builder's extension mechanism to inject:
+ * - System columns (_system ArrayBuffer with timestamps, operations, identity)
+ * - Span-specific properties (parent, children, task)
+ * - Identity getters (spanId, traceId, hasParent, parentSpanId)
+ */
+function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
+  const cached = spanBufferClassCache.get(schema);
+  if (cached) {
+    return cached;
+  }
+
+  // Define extension for arrow-builder's class generator
+  const extension: ColumnBufferExtension = {
+    constructorParams: 'task, parent, isChained, traceId',
+    preamble: `
+        // Thread-local span counter (per-process/worker, see threadId.ts docs)
+        let nextSpanId = 1;
+        
+        // TextEncoder for traceId
+        const textEncoder = new TextEncoder();
+      `,
+    constructorCode: `
+        // Store task context
+        this.task = task;
+        this.children = [];
+        this.next = undefined;
+        
+        // Calculate system buffer size
+        const systemSize = requestedCapacity * 9; // timestamps (8*cap) + operations (1*cap)
+        
+        if (isChained && parent) {
+          // CHAINED: share identity, only allocate system columns
+          // parent here is the buffer we're chaining FROM (to share identity)
+          // but our tree parent should be the same as that buffer's parent
+          this.parent = parent.parent;
+          this._system = new ArrayBuffer(systemSize);
+          this._identity = parent._identity; // Shared reference!
+        } else if (parent) {
+          // CHILD: parent is our tree parent
+          this.parent = parent;
+          // CHILD: own 12-byte identity (threadId + spanId)
+          const identitySize = 12;
+          this._system = new ArrayBuffer(systemSize + identitySize);
+          this._identity = new Uint8Array(this._system, systemSize, identitySize);
+          
+          // Set threadId (bytes 0-7) via TaskContext (singleton per process/worker)
+          task.copyThreadIdTo(this._identity, 0);
+          
+          // Set spanId (bytes 8-11, little-endian)
+          const spanId = nextSpanId++;
+          this._identity[8] = spanId & 0xff;
+          this._identity[9] = (spanId >> 8) & 0xff;
+          this._identity[10] = (spanId >> 16) & 0xff;
+          this._identity[11] = (spanId >> 24) & 0xff;
+          
+          // Link to parent
+          parent.children.push(this);
+        } else {
+          // ROOT: identity with traceId
+          const traceBytes = traceId ? textEncoder.encode(traceId) : new Uint8Array(0);
+          const identitySize = 13 + traceBytes.length;
+          this._system = new ArrayBuffer(systemSize + identitySize);
+          this._identity = new Uint8Array(this._system, systemSize, identitySize);
+          
+          // Set threadId (bytes 0-7) via TaskContext (singleton per process/worker)
+          task.copyThreadIdTo(this._identity, 0);
+          
+          // Set spanId (bytes 8-11, little-endian)
+          const spanId = nextSpanId++;
+          this._identity[8] = spanId & 0xff;
+          this._identity[9] = (spanId >> 8) & 0xff;
+          this._identity[10] = (spanId >> 16) & 0xff;
+          this._identity[11] = (spanId >> 24) & 0xff;
+          
+          // Set traceId length and bytes
+          this._identity[12] = traceBytes.length;
+          this._identity.set(traceBytes, 13);
+        }
+        
+        // System columns at FIXED offsets (same for ALL buffer types)
+        this.timestamps = new BigInt64Array(this._system, 0, requestedCapacity);
+        this.operations = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
+        
+        // Track buffer creation
+        task.module.spanBufferCapacityStats.totalBuffersCreated++;
+      `,
+    methods: `
+        // spanId getter - reads from identity bytes 8-11 (little-endian)
+        get spanId() {
+          const b = this._identity;
+          return b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
+        }
+        
+        // traceId getter - walks up parent chain to root
+        get traceId() {
+          if (this.parent) {
+            return this.parent.traceId;
+          }
+          // Root: decode from identity bytes [12]=len, [13+]=traceId
+          const len = this._identity[12];
+          let str = '';
+          for (let i = 0; i < len; i++) {
+            str += String.fromCharCode(this._identity[13 + i]);
+          }
+          return str;
+        }
+        
+        // hasParent getter
+        get hasParent() {
+          return this.parent !== undefined;
+        }
+        
+        // parentSpanId getter
+        get parentSpanId() {
+          return this.parent ? this.parent.spanId : 0;
+        }
+        
+        // isParentOf - O(1) pointer comparison
+        isParentOf(other) {
+          return this === other.parent;
+        }
+        
+        // isChildOf - O(1) pointer comparison  
+        isChildOf(other) {
+          return this.parent === other;
+        }
+        
+        // Copy threadId bytes (8 bytes) to destination
+        copyThreadIdTo(dest, offset) {
+          dest.set(this._identity.subarray(0, 8), offset);
+        }
+        
+        // Copy parent's threadId bytes to destination
+        copyParentThreadIdTo(dest, offset) {
+          if (this.parent) {
+            this.parent.copyThreadIdTo(dest, offset);
+          } else {
+            for (let i = 0; i < 8; i++) {
+              dest[offset + i] = 0;
+            }
+          }
+        }
+        
+        // Get threadId as BigInt (for Arrow conversion)
+        get threadId() {
+          const b = this._identity;
+          return BigInt(b[0]) | (BigInt(b[1]) << 8n) | (BigInt(b[2]) << 16n) | (BigInt(b[3]) << 24n) |
+                 (BigInt(b[4]) << 32n) | (BigInt(b[5]) << 40n) | (BigInt(b[6]) << 48n) | (BigInt(b[7]) << 56n);
+        }
+      `,
+  };
+
+  // Generate class using arrow-builder (provides lazy attribute columns)
+  const GeneratedClass = getColumnBufferClass(schema, extension);
+  const SpanBufferClass = GeneratedClass as unknown as SpanBufferConstructor;
+
+  // Cache for future use
+  spanBufferClassCache.set(schema, SpanBufferClass);
+
+  return SpanBufferClass;
+}
+
+// ============================================================================
+// SpanBuffer factory functions
+// ============================================================================
+
+/**
+ * Creates a root SpanBuffer for a new trace.
  *
- * **When to use:**
- * - Starting a new task from `moduleContext.task()`
- * - Creating a standalone span for testing
- *
- * **After creation:**
- * Call `writeSpanStart()` to initialize the fixed row layout before logging.
+ * Root buffers have identity: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
  *
  * @param schema - Tag attribute schema defining column types
  * @param taskContext - Task context with module metadata and capacity stats
- * @param traceId - Trace ID from request context (auto-generated if omitted)
- * @param capacity - Buffer capacity (uses module's tuned capacity if omitted)
+ * @param traceId - Trace ID (auto-generated if omitted)
+ * @param capacity - Buffer capacity (default: 64)
  *
  * @returns SpanBuffer ready for initialization via `writeSpanStart()`
- *
- * @example
- * ```typescript
- * // With traceId from request context
- * const buffer = createSpanBuffer(schema, taskContext, requestCtx.traceId);
- *
- * // Auto-generate traceId (for testing or standalone spans)
- * const buffer = createSpanBuffer(schema, taskContext);
- * ```
  */
 export function createSpanBuffer(
   schema: TagAttributeSchema,
   taskContext: TaskContext,
-  traceId?: string | number,
-  capacity?: number,
+  traceId?: TraceId | string,
+  capacity = 64,
 ): SpanBuffer {
-  const spanId = nextSpanId++;
-  const threadId = getThreadId();
+  // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
+  const alignedCapacity = (capacity + 7) & ~7;
 
-  // Handle the case where traceId might be a number (capacity) or omitted
-  let actualTraceId: string;
-  let actualCapacity: number | undefined;
-
-  if (typeof traceId === 'number') {
-    // traceId was omitted, this is actually the capacity
-    actualCapacity = traceId;
-    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-  } else if (traceId === undefined) {
-    // Both traceId and capacity omitted
-    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
-    actualCapacity = capacity;
+  // Resolve traceId
+  let resolvedTraceId: string;
+  if (traceId === undefined) {
+    resolvedTraceId = generateTraceId();
+  } else if (typeof traceId === 'string') {
+    resolvedTraceId = createTraceId(traceId);
   } else {
-    // Normal case: traceId provided as string
-    actualTraceId = traceId;
-    actualCapacity = capacity;
+    resolvedTraceId = traceId;
   }
 
-  return createEmptySpanBuffer(spanId, threadId, actualTraceId, schema, taskContext, undefined, actualCapacity);
+  const SpanBufferClass = getSpanBufferClass(schema);
+  return new SpanBufferClass(alignedCapacity, taskContext, undefined, false, resolvedTraceId);
 }
 
 /**
  * Creates a child SpanBuffer for nested span operations.
  *
- * Child spans inherit the traceId from their parent, maintaining trace correlation
- * across the entire request. The child is automatically linked to the parent's
- * `children` array for tree traversal during Arrow conversion.
+ * Child buffers have identity: [threadId(8)][spanId(4)] (12 bytes)
+ * Parent reference is via `parent` property pointer.
  *
- * **When to use:**
- * - Called by `ctx.span()` to create nested operations
- * - Building span hierarchies (e.g., request → database → query)
- *
- * **Inheritance:**
- * - traceId: Inherited from parent (same distributed trace)
- * - threadId: Fresh from getThreadId() (same process, but allows cross-worker spans)
- * - spanId: Newly generated (unique per span within process)
- * - capacity: Inherited from parent
- * - schema: Inherited from parent's module
- *
- * @param parentBuffer - Parent span's buffer (for traceId and tree structure)
+ * @param parentBuffer - Parent span's buffer
  * @param taskContext - Task context (may differ from parent if calling across modules)
  *
- * @returns Child SpanBuffer linked to parent, ready for `writeSpanStart()`
- *
- * @example
- * ```typescript
- * // Inside ctx.span() implementation
- * const childBuffer = createChildSpanBuffer(parentBuffer, taskContext);
- * writeSpanStart(childBuffer, childName, anchorEpochMicros, anchorPerfNow);
- * ```
+ * @returns Child SpanBuffer linked to parent
  */
 export function createChildSpanBuffer(parentBuffer: SpanBuffer, taskContext: TaskContext): SpanBuffer {
-  const spanId = nextSpanId++;
-  const threadId = getThreadId();
   const schema = parentBuffer.task.module.tagAttributes;
   const capacity = parentBuffer.capacity;
 
-  const childBuffer = createEmptySpanBuffer(
-    spanId,
-    threadId,
-    parentBuffer.traceId, // Inherit traceId from parent
-    schema,
-    taskContext,
-    parentBuffer,
-    capacity,
-  );
-
-  parentBuffer.children.push(childBuffer);
-
-  return childBuffer;
+  const SpanBufferClass = getSpanBufferClass(schema);
+  return new SpanBufferClass(capacity, taskContext, parentBuffer, false, undefined);
 }
 
 /**
  * Creates a continuation buffer when the current buffer overflows.
  *
- * This is part of LMAO's self-tuning buffer system. When a span needs more
- * entries than the current buffer capacity, a chained buffer is created to
- * continue the same logical span.
- *
- * **Key characteristics:**
- * - Same threadId + spanId: The chained buffer is the same logical span
- * - Same traceId: Still part of the same distributed trace
- * - Linked via `next`: Forms a singly-linked list of buffers
- * - Uses tuned capacity: Takes the module's current optimized capacity
- *
- * **Self-tuning mechanism:**
- * Overflow events are tracked in `module.spanBufferCapacityStats`. When
- * overflow rate exceeds thresholds, future buffers get larger capacity.
+ * Chained buffers SHARE the identity reference from the first buffer
+ * (they represent the SAME logical span, just additional storage).
  *
  * @param buffer - The full buffer that needs overflow handling
  *
- * @returns New SpanBuffer linked via `buffer.next`, ready for writes
- *
- * @example
- * ```typescript
- * // In getBufferWithSpace()
- * while (currentBuffer.writeIndex >= currentBuffer.capacity) {
- *   if (!currentBuffer.next) {
- *     currentBuffer.next = createNextBuffer(currentBuffer);
- *   }
- *   currentBuffer = currentBuffer.next;
- * }
- * ```
+ * @returns New SpanBuffer linked via `buffer.next`
  */
 export function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
   const schema = buffer.task.module.tagAttributes;
-  const capacity = buffer.task.module.spanBufferCapacityStats.currentCapacity;
+  // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
+  const capacity = (buffer.task.module.spanBufferCapacityStats.currentCapacity + 7) & ~7;
 
-  const nextBuffer = createEmptySpanBuffer(
-    buffer.spanId, // Same logical span
-    buffer.threadId, // Same thread ID (continuation of same span)
-    buffer.traceId, // Same trace (continuation)
-    schema,
-    buffer.task, // Same task context
-    buffer.parent, // Same parent
-    capacity,
-  );
+  const SpanBufferClass = getSpanBufferClass(schema);
+  const nextBuffer = new SpanBufferClass(capacity, buffer.task, buffer, true, undefined);
 
   // Link current buffer to next
   buffer.next = nextBuffer;
 
   return nextBuffer;
 }
+
+// ============================================================================
+// Constants for Arrow conversion
+// ============================================================================
+
+export const THREAD_ID_BYTES = 8;

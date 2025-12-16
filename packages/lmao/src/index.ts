@@ -2,8 +2,8 @@
 
 export type { GeneratedScope, ScopeClass } from './lib/codegen/scopeGenerator.js';
 export { createScope, createScopeWithInheritance, generateScopeClass } from './lib/codegen/scopeGenerator.js';
-// Code generation (re-export BaseSpanLogger only, ChainableTagAPI already exported from lmao.js)
-export type { BaseSpanLogger } from './lib/codegen/spanLoggerGenerator.js';
+// Code generation
+export type { BaseSpanLogger, ChainableTagAPI } from './lib/codegen/spanLoggerGenerator.js';
 export { createSpanLoggerClass, generateSpanLoggerClass } from './lib/codegen/spanLoggerGenerator.js';
 // Arrow conversion (lmao-specific - uses SpanBuffer)
 export * from './lib/convertToArrow.js';
@@ -24,7 +24,15 @@ export * from './lib/schema/types.js';
 // SpanBuffer creation (lmao-specific buffer management)
 export * from './lib/spanBuffer.js';
 // Thread ID generation for distributed span identification
-export { _resetThreadId, getThreadId } from './lib/threadId.js';
+export {
+  _resetThreadId,
+  copyThreadIdTo,
+  getThreadId,
+  THREAD_ID_BYTES,
+  writeThreadIdToUint64Array,
+} from './lib/threadId.js';
+// Trace ID (branded string type)
+export { createTraceId, generateTraceId, isValidTraceId, MAX_TRACE_ID_LENGTH, type TraceId } from './lib/traceId.js';
 // LMAO types (SpanBuffer, ModuleContext, TaskContext)
 export * from './lib/types.js';
 // UTF-8 cache (SIEVE-based for Arrow conversion)

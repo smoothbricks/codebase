@@ -10,10 +10,11 @@
  */
 
 import { beforeEach, describe, expect, test } from 'bun:test';
-import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '@smoothbricks/lmao';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
-import type { ModuleContext, SpanBuffer, TaskContext } from '../../types.js';
+import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
+import type { SpanBuffer, TaskContext } from '../../types.js';
+import { createTestTaskContext } from '../test-helpers.js';
 
 /**
  * Mock string interner for testing
@@ -45,24 +46,7 @@ class MockStringInterner {
  * Create mock task context for testing
  */
 function createMockTaskContext(schema: TagAttributeSchema): TaskContext {
-  const moduleContext: ModuleContext = {
-    moduleId: 1,
-    gitSha: 'test-sha',
-    filePath: 'test-file.ts',
-    tagAttributes: schema,
-    spanBufferCapacityStats: {
-      currentCapacity: 64,
-      totalWrites: 0,
-      overflowWrites: 0,
-      totalBuffersCreated: 0,
-    },
-  };
-
-  return {
-    module: moduleContext,
-    spanNameId: 1,
-    lineNumber: 42,
-  };
+  return createTestTaskContext(schema, { lineNumber: 42 });
 }
 
 /**
@@ -536,8 +520,9 @@ describe('Arrow Table Conversion', () => {
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
 
-      const originalThreadId = buffer.threadId;
-      const originalSpanId = buffer.spanId;
+      // Extract primitive values for comparison (unified memory layout)
+      const originalThreadId = buffer.threadId; // bigint
+      const originalSpanId = buffer.spanId; // number
 
       writeRow(buffer, {
         timestamp: 1000n,
@@ -548,6 +533,8 @@ describe('Arrow Table Conversion', () => {
       const nextBuffer = createNextBuffer(buffer);
 
       // Chained buffer should have same threadId and spanId (continuation)
+      // Chained buffers share the same _identity ArrayBuffer
+      expect(nextBuffer.spanId).toBe(buffer.spanId);
       expect(nextBuffer.threadId).toBe(originalThreadId);
       expect(nextBuffer.spanId).toBe(originalSpanId);
 

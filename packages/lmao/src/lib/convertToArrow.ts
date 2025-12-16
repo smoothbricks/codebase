@@ -57,6 +57,33 @@ function countNulls(nullBitmap: Uint8Array, length: number): number {
   return count;
 }
 
+/**
+ * Clear a range of bits in a null bitmap (set them to 0 = null).
+ *
+ * PRECONDITION: startBit must be byte-aligned (startBit % 8 === 0).
+ * This is guaranteed because buffer capacities are always multiples of 8,
+ * and this function is called with rowOffset which accumulates by writeIndex
+ * where writeIndex <= capacity for full buffers.
+ */
+function clearBitRange(bitmap: Uint8Array, startBit: number, count: number): void {
+  if (count === 0) return;
+
+  const startByte = startBit >>> 3;
+  const fullBytes = count >>> 3;
+  const remainingBits = count & 7;
+
+  // Clear full bytes
+  if (fullBytes > 0) {
+    bitmap.fill(0, startByte, startByte + fullBytes);
+  }
+
+  // Clear remaining bits in the last partial byte
+  if (remainingBits > 0) {
+    const mask = (1 << remainingBits) - 1; // Bits 0 to remainingBits-1
+    bitmap[startByte + fullBytes] &= ~mask;
+  }
+}
+
 function encodeUtf8Strings(strings: readonly string[]): Uint8Array {
   const encoder = new TextEncoder();
   const encoded = strings.map((s) => encoder.encode(s));
@@ -107,30 +134,42 @@ function concatenateNullBitmaps(
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
   const bitmapBytes = Math.ceil(totalRows / 8);
   const nullBitmap = new Uint8Array(bitmapBytes);
-  nullBitmap.fill(0xff);
+  nullBitmap.fill(0xff); // Default all valid
 
+  // Buffer chains: all buffers except the last are full (writeIndex == capacity).
+  // If capacity is a multiple of 8, each buffer starts at a byte boundary.
   let rowOffset = 0;
   let nullCount = 0;
 
   for (const buf of buffers) {
     const sourceBitmap = buf[nullsName];
+    const rowCount = buf.writeIndex;
+
     if (sourceBitmap) {
-      for (let i = 0; i < buf.writeIndex; i++) {
-        const sourceByte = Math.floor(i / 8);
-        const sourceBit = i % 8;
-        const isValid = (sourceBitmap[sourceByte] & (1 << sourceBit)) !== 0;
+      const byteOffset = rowOffset >>> 3; // rowOffset / 8
+      const fullBytes = rowCount >>> 3;
+      const remainingBits = rowCount & 7;
 
-        const targetRow = rowOffset + i;
-        const targetByte = Math.floor(targetRow / 8);
-        const targetBit = targetRow % 8;
-
-        if (!isValid) {
-          nullBitmap[targetByte] &= ~(1 << targetBit);
-          nullCount++;
-        }
+      // Bulk copy full bytes
+      if (fullBytes > 0) {
+        nullBitmap.set(sourceBitmap.subarray(0, fullBytes), byteOffset);
+      }
+      // Handle remaining bits in last partial byte
+      if (remainingBits > 0) {
+        const srcLastByte = sourceBitmap[fullBytes];
+        const mask = (1 << remainingBits) - 1;
+        nullBitmap[byteOffset + fullBytes] = (nullBitmap[byteOffset + fullBytes] & ~mask) | (srcLastByte & mask);
+      }
+      // Count nulls (bits that are 0)
+      for (let i = 0; i < rowCount; i++) {
+        const byte = i >>> 3;
+        const bit = i & 7;
+        if ((sourceBitmap[byte] & (1 << bit)) === 0) nullCount++;
       }
     }
-    rowOffset += buf.writeIndex;
+    // If no sourceBitmap, leave as 0xff (all valid)
+
+    rowOffset += rowCount;
   }
 
   return { nullBitmap, nullCount };
@@ -515,9 +554,8 @@ function buildDefaultSystemVectors(
   const allTimestamps = new BigInt64Array(totalRows);
   let timestampOffset = 0;
   for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      allTimestamps[timestampOffset + i] = buf.timestamps[i];
-    }
+    // Use set() with subarray - bulk copy
+    allTimestamps.set(buf.timestamps.subarray(0, buf.writeIndex), timestampOffset);
     timestampOffset += buf.writeIndex;
   }
   vectors.push(
@@ -542,9 +580,8 @@ function buildDefaultSystemVectors(
   let rowOffset = 0;
   for (const buf of buffers) {
     const traceIdIndex = traceIdMap.get(buf.traceId)!;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      traceIdIndices[rowOffset + i] = traceIdIndex;
-    }
+    // Use fill() - constant value per buffer
+    traceIdIndices.fill(traceIdIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
 
@@ -571,13 +608,11 @@ function buildDefaultSystemVectors(
   );
 
   // thread_id (Uint64) - separate column
+  // threadId is constant per buffer, use fill()
   const threadIds = new BigUint64Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const threadId = buf.threadId;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      threadIds[rowOffset + i] = threadId;
-    }
+    threadIds.fill(buf.threadId, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
   vectors.push(
@@ -596,10 +631,8 @@ function buildDefaultSystemVectors(
   const spanIds = new Uint32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const spanId = buf.spanId;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      spanIds[rowOffset + i] = spanId;
-    }
+    // Use fill() - constant value per buffer
+    spanIds.fill(buf.spanId, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
   vectors.push(
@@ -615,22 +648,18 @@ function buildDefaultSystemVectors(
   );
 
   // parent_thread_id (Uint64, nullable) - separate column
+  // parentThreadId is constant per buffer (from parent pointer), use fill()
   const parentThreadIds = new BigUint64Array(totalRows);
   const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
   parentThreadIdNulls.fill(0xff);
   let parentThreadIdNullCount = 0;
   rowOffset = 0;
   for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      const rowIdx = rowOffset + i;
-      if (buf.parent) {
-        parentThreadIds[rowIdx] = buf.parent.threadId;
-      } else {
-        const byteIdx = Math.floor(rowIdx / 8);
-        const bitOffset = rowIdx % 8;
-        parentThreadIdNulls[byteIdx] &= ~(1 << bitOffset);
-        parentThreadIdNullCount++;
-      }
+    if (buf.parent) {
+      parentThreadIds.fill(buf.parent.threadId, rowOffset, rowOffset + buf.writeIndex);
+    } else {
+      clearBitRange(parentThreadIdNulls, rowOffset, buf.writeIndex);
+      parentThreadIdNullCount += buf.writeIndex;
     }
     rowOffset += buf.writeIndex;
   }
@@ -654,16 +683,12 @@ function buildDefaultSystemVectors(
   let parentSpanIdNullCount = 0;
   rowOffset = 0;
   for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      const rowIdx = rowOffset + i;
-      if (buf.parent) {
-        parentSpanIds[rowIdx] = buf.parent.spanId;
-      } else {
-        const byteIdx = Math.floor(rowIdx / 8);
-        const bitOffset = rowIdx % 8;
-        parentSpanIdNulls[byteIdx] &= ~(1 << bitOffset);
-        parentSpanIdNullCount++;
-      }
+    if (buf.hasParent) {
+      // Use fill() - constant value per buffer
+      parentSpanIds.fill(buf.parentSpanId, rowOffset, rowOffset + buf.writeIndex);
+    } else {
+      clearBitRange(parentSpanIdNulls, rowOffset, buf.writeIndex);
+      parentSpanIdNullCount += buf.writeIndex;
     }
     rowOffset += buf.writeIndex;
   }
@@ -684,9 +709,9 @@ function buildDefaultSystemVectors(
   const entryTypeIndices = new Int8Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      entryTypeIndices[rowOffset + i] = buf.operations[i];
-    }
+    // Use set() with subarray - bulk copy
+    // Note: operations is Uint8Array but entryTypeIndices is Int8Array, same underlying representation
+    entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), rowOffset);
     rowOffset += buf.writeIndex;
   }
   const entryTypeDictData = arrow.makeData({
@@ -721,9 +746,8 @@ function buildDefaultSystemVectors(
   rowOffset = 0;
   for (const buf of buffers) {
     const moduleIndex = moduleIdMap.get(buf.task.module.moduleId)!;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      moduleIndices[rowOffset + i] = moduleIndex;
-    }
+    // Use fill() - constant value per buffer
+    moduleIndices.fill(moduleIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
 
@@ -759,9 +783,8 @@ function buildDefaultSystemVectors(
   rowOffset = 0;
   for (const buf of buffers) {
     const spanNameIndex = spanNameIdMap.get(buf.task.spanNameId)!;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      spanNameIndices[rowOffset + i] = spanNameIndex;
-    }
+    // Use fill() - constant value per buffer
+    spanNameIndices.fill(spanNameIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
 
@@ -1109,9 +1132,8 @@ function convertBuffersWithSharedDicts(
   const allTimestamps = new BigInt64Array(totalRows);
   let offset = 0;
   for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      allTimestamps[offset + i] = buf.timestamps[i];
-    }
+    // Use set() with subarray - bulk copy
+    allTimestamps.set(buf.timestamps.subarray(0, buf.writeIndex), offset);
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1131,9 +1153,8 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     const idx = traceIdDict.indexMap.get(buf.traceId) ?? 0;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      traceIdIndices[offset + i] = idx;
-    }
+    // Use fill() - constant value per buffer
+    traceIdIndices.fill(idx, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1159,13 +1180,11 @@ function convertBuffersWithSharedDicts(
   );
 
   // thread_id (Uint64) - separate column
+  // threadId is constant per buffer, use fill()
   const threadIds = new BigUint64Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const threadId = buf.threadId;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      threadIds[offset + i] = threadId;
-    }
+    threadIds.fill(buf.threadId, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1184,10 +1203,8 @@ function convertBuffersWithSharedDicts(
   const spanIds = new Uint32Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const spanId = buf.spanId;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      spanIds[offset + i] = spanId;
-    }
+    // Use fill() - constant value per buffer
+    spanIds.fill(buf.spanId, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1203,6 +1220,7 @@ function convertBuffersWithSharedDicts(
   );
 
   // parent_thread_id (Uint64, nullable) - separate column
+  // parentThreadId is constant per buffer (from parent pointer), use fill()
   const parentThreadIds = new BigUint64Array(totalRows);
   const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
   parentThreadIdNulls.fill(0xff);
@@ -1210,18 +1228,10 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     if (buf.parent) {
-      const parentThreadId = buf.parent.threadId;
-      for (let i = 0; i < buf.writeIndex; i++) {
-        parentThreadIds[offset + i] = parentThreadId;
-      }
+      parentThreadIds.fill(buf.parent.threadId, offset, offset + buf.writeIndex);
     } else {
-      for (let i = 0; i < buf.writeIndex; i++) {
-        const rowIdx = offset + i;
-        const byteIdx = rowIdx >>> 3;
-        const bitIdx = rowIdx & 7;
-        parentThreadIdNulls[byteIdx] &= ~(1 << bitIdx);
-        parentThreadIdNullCount++;
-      }
+      clearBitRange(parentThreadIdNulls, offset, buf.writeIndex);
+      parentThreadIdNullCount += buf.writeIndex;
     }
     offset += buf.writeIndex;
   }
@@ -1239,25 +1249,19 @@ function convertBuffersWithSharedDicts(
   );
 
   // parent_span_id (Uint32, nullable) - separate column
+  // Uses hasParent and parentSpanId directly on buffer
   const parentSpanIds = new Uint32Array(totalRows);
   const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
   parentSpanIdNulls.fill(0xff);
   let parentSpanIdNullCount = 0;
   offset = 0;
   for (const buf of buffers) {
-    if (buf.parent) {
-      const parentSpanId = buf.parent.spanId;
-      for (let i = 0; i < buf.writeIndex; i++) {
-        parentSpanIds[offset + i] = parentSpanId;
-      }
+    if (buf.hasParent) {
+      // Use fill() - constant value per buffer
+      parentSpanIds.fill(buf.parentSpanId, offset, offset + buf.writeIndex);
     } else {
-      for (let i = 0; i < buf.writeIndex; i++) {
-        const rowIdx = offset + i;
-        const byteIdx = rowIdx >>> 3;
-        const bitIdx = rowIdx & 7;
-        parentSpanIdNulls[byteIdx] &= ~(1 << bitIdx);
-        parentSpanIdNullCount++;
-      }
+      clearBitRange(parentSpanIdNulls, offset, buf.writeIndex);
+      parentSpanIdNullCount += buf.writeIndex;
     }
     offset += buf.writeIndex;
   }
@@ -1278,9 +1282,9 @@ function convertBuffersWithSharedDicts(
   const entryTypeIndices = new Int8Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    for (let i = 0; i < buf.writeIndex; i++) {
-      entryTypeIndices[offset + i] = buf.operations[i];
-    }
+    // Use set() with subarray - bulk copy
+    // Note: operations is Uint8Array but entryTypeIndices is Int8Array, same underlying representation
+    entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), offset);
     offset += buf.writeIndex;
   }
   const entryTypeDictData = arrow.makeData({
@@ -1310,9 +1314,8 @@ function convertBuffersWithSharedDicts(
   for (const buf of buffers) {
     const moduleName = moduleIdInterner.getString(buf.task.module.moduleId) || 'unknown';
     const idx = moduleDict.indexMap.get(moduleName) ?? 0;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      moduleIndices[offset + i] = idx;
-    }
+    // Use fill() - constant value per buffer
+    moduleIndices.fill(idx, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1343,9 +1346,8 @@ function convertBuffersWithSharedDicts(
   for (const buf of buffers) {
     const spanName = spanNameInterner.getString(buf.task.spanNameId) || 'unknown';
     const idx = spanNameDict.indexMap.get(spanName) ?? 0;
-    for (let i = 0; i < buf.writeIndex; i++) {
-      spanNameIndices[offset + i] = idx;
-    }
+    // Use fill() - constant value per buffer
+    spanNameIndices.fill(idx, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1496,6 +1498,7 @@ function convertBuffersWithSharedDicts(
         if (col instanceof Float64Array) {
           allValues.set(col.subarray(0, buf.writeIndex), rowOffset);
           if (srcNulls) {
+            // Copy null bits - still need per-bit loop for non-aligned copy
             for (let i = 0; i < buf.writeIndex; i++) {
               const srcByte = i >>> 3;
               const srcBit = i & 7;
@@ -1509,11 +1512,8 @@ function convertBuffersWithSharedDicts(
           }
         } else {
           // Column doesn't exist for this buffer - all nulls
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const rowIdx = rowOffset + i;
-            nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
-            nullCount++;
-          }
+          clearBitRange(nullBitmap, rowOffset, buf.writeIndex);
+          nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;
       }
@@ -1543,7 +1543,7 @@ function convertBuffersWithSharedDicts(
         const srcNulls = buf[nullsKey] as Uint8Array | undefined;
 
         if (col instanceof Uint8Array) {
-          // Copy boolean values bit by bit
+          // Copy boolean values bit by bit - can't avoid loop for bit-level operations
           for (let i = 0; i < buf.writeIndex; i++) {
             const srcByte = i >>> 3;
             const srcBit = i & 7;
@@ -1561,11 +1561,9 @@ function convertBuffersWithSharedDicts(
             }
           }
         } else {
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const rowIdx = rowOffset + i;
-            nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
-            nullCount++;
-          }
+          // Column doesn't exist for this buffer - all nulls
+          clearBitRange(nullBitmap, rowOffset, buf.writeIndex);
+          nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;
       }

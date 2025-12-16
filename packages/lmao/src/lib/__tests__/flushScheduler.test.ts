@@ -5,7 +5,9 @@
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
 import type { StringInterner } from '../convertToArrow.js';
 import { type FlushHandler, type FlushMetadata, FlushScheduler, type FlushSchedulerConfig } from '../flushScheduler.js';
-import type { ModuleContext, SpanBuffer, TaskContext } from '../types.js';
+import { createSpanBuffer } from '../spanBuffer.js';
+import type { SpanBuffer } from '../types.js';
+import { createTestTaskContext } from './test-helpers.js';
 
 // Mock StringInterner
 class MockStringInterner implements StringInterner {
@@ -26,45 +28,15 @@ class MockStringInterner implements StringInterner {
   }
 }
 
-function createMockSpanBuffer(): SpanBuffer {
-  const moduleContext: ModuleContext = {
-    moduleId: 0,
-    gitSha: 'test',
-    filePath: 'test.ts',
-    tagAttributes: {},
-    spanBufferCapacityStats: {
-      currentCapacity: 64,
-      totalWrites: 0,
-      overflowWrites: 0,
-      totalBuffersCreated: 0,
-    },
-  };
-
-  const taskContext: TaskContext = {
-    module: moduleContext,
-    spanNameId: 0,
-    lineNumber: 0,
-  };
-
-  const buffer = {
-    threadId: BigInt('0x123456789ABCDEF0'), // Mock 64-bit thread ID
-    spanId: 1,
-    traceId: 'test-trace',
-    timestamps: new BigInt64Array(64),
-    operations: new Uint8Array(64),
-    nullBitmaps: {},
-    children: [],
-    task: taskContext,
-    writeIndex: 5, // Some rows written
-    capacity: 64,
-  } as SpanBuffer;
-
-  // Initialize timestamp values to avoid undefined errors
+function createTestBuffer(): SpanBuffer {
+  const taskContext = createTestTaskContext({});
+  const buffer = createSpanBuffer({}, taskContext);
+  // Write some test data
+  buffer.writeIndex = 5;
   for (let i = 0; i < buffer.writeIndex; i++) {
-    buffer.timestamps[i] = BigInt(Date.now()) * 1_000_000n; // Convert ms to nanoseconds
-    buffer.operations[i] = 1; // entry type: span-start
+    buffer.timestamps[i] = BigInt(Date.now()) * 1_000_000n;
+    buffer.operations[i] = 1;
   }
-
   return buffer;
 }
 
@@ -96,7 +68,7 @@ describe('FlushScheduler', () => {
   describe('register', () => {
     describe('success cases', () => {
       it('should register a buffer for automatic flushing', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
 
         expect(() => {
           scheduler.register(buffer);
@@ -104,7 +76,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should start scheduler when first buffer is registered', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         scheduler.register(buffer);
 
         // Scheduler should be running (internal state check)
@@ -112,9 +84,9 @@ describe('FlushScheduler', () => {
       });
 
       it('should register multiple buffers', () => {
-        const buffer1 = createMockSpanBuffer();
-        const buffer2 = createMockSpanBuffer();
-        const buffer3 = createMockSpanBuffer();
+        const buffer1 = createTestBuffer();
+        const buffer2 = createTestBuffer();
+        const buffer3 = createTestBuffer();
 
         scheduler.register(buffer1);
         scheduler.register(buffer2);
@@ -126,7 +98,7 @@ describe('FlushScheduler', () => {
 
     describe('edge cases', () => {
       it('should handle registering same buffer multiple times', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
 
         scheduler.register(buffer);
         scheduler.register(buffer);
@@ -136,7 +108,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle buffer with zero writeIndex', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         buffer.writeIndex = 0;
 
         scheduler.register(buffer);
@@ -144,7 +116,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle buffer at full capacity', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         buffer.writeIndex = buffer.capacity;
 
         scheduler.register(buffer);
@@ -154,7 +126,7 @@ describe('FlushScheduler', () => {
 
     describe('failure cases', () => {
       it('should handle buffer with invalid writeIndex', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         buffer.writeIndex = -1;
 
         expect(() => {
@@ -163,7 +135,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle buffer with writeIndex > capacity', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         buffer.writeIndex = buffer.capacity + 100;
 
         expect(() => {
@@ -172,7 +144,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle buffer with missing properties', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         delete (buffer as any).timestamps;
 
         expect(() => {
@@ -185,7 +157,7 @@ describe('FlushScheduler', () => {
   describe('unregister', () => {
     describe('success cases', () => {
       it('should unregister a buffer', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         scheduler.register(buffer);
 
         expect(() => {
@@ -194,7 +166,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should stop scheduler when all buffers are unregistered', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         scheduler.register(buffer);
         scheduler.unregister(buffer);
 
@@ -202,7 +174,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should unregister multiple buffers', () => {
-        const buffers = [createMockSpanBuffer(), createMockSpanBuffer(), createMockSpanBuffer()];
+        const buffers = [createTestBuffer(), createTestBuffer(), createTestBuffer()];
 
         buffers.forEach((b) => scheduler.register(b));
         buffers.forEach((b) => scheduler.unregister(b));
@@ -213,7 +185,7 @@ describe('FlushScheduler', () => {
 
     describe('edge cases', () => {
       it('should handle unregistering buffer that was never registered', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
 
         expect(() => {
           scheduler.unregister(buffer);
@@ -221,7 +193,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle unregistering same buffer multiple times', () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         scheduler.register(buffer);
 
         scheduler.unregister(buffer);
@@ -315,7 +287,7 @@ describe('FlushScheduler', () => {
   describe('flush', () => {
     describe('success cases', () => {
       it('should manually trigger a flush', async () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         scheduler.register(buffer);
 
         await scheduler.flush();
@@ -325,7 +297,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should flush with correct metadata', async () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         scheduler.register(buffer);
 
         await scheduler.flush();
@@ -335,8 +307,8 @@ describe('FlushScheduler', () => {
       });
 
       it('should flush multiple buffers together', async () => {
-        const buffer1 = createMockSpanBuffer();
-        const buffer2 = createMockSpanBuffer();
+        const buffer1 = createTestBuffer();
+        const buffer2 = createTestBuffer();
 
         // Make buffers share the same module context to ensure schema compatibility
         buffer2.task = buffer1.task;
@@ -361,7 +333,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle flush with empty buffers', async () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         buffer.writeIndex = 0;
 
         scheduler.register(buffer);
@@ -372,7 +344,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle concurrent flush calls', async () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         scheduler.register(buffer);
 
         await Promise.all([scheduler.flush(), scheduler.flush(), scheduler.flush()]);
@@ -389,7 +361,7 @@ describe('FlushScheduler', () => {
 
         const errorScheduler = new FlushScheduler(errorHandler, moduleIdInterner, spanNameInterner);
 
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         errorScheduler.register(buffer);
 
         // Should complete without throwing (error is caught and logged)
@@ -402,7 +374,7 @@ describe('FlushScheduler', () => {
       });
 
       it('should handle flush with corrupted buffer', async () => {
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         delete (buffer as any).timestamps;
 
         scheduler.register(buffer);
@@ -421,7 +393,7 @@ describe('FlushScheduler', () => {
 
         const rejectedScheduler = new FlushScheduler(rejectedHandler, moduleIdInterner, spanNameInterner);
 
-        const buffer = createMockSpanBuffer();
+        const buffer = createTestBuffer();
         rejectedScheduler.register(buffer);
 
         // Should complete without throwing (error is caught and logged)

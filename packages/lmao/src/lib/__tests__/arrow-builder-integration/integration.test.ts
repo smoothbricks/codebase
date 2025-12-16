@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { createAttributeColumns } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
 import { createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
-import type { TaskContext } from '../../types.js';
+import { createTestTaskContext } from '../test-helpers.js';
 
 /**
  * Type helper to extract schema fields from ExtendedSchema
@@ -11,26 +11,6 @@ import type { TaskContext } from '../../types.js';
 type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
 
 describe('Buffer Integration', () => {
-  // Helper to create a test task context
-  function createTestTaskContext(schema: TagAttributeSchema): TaskContext {
-    return {
-      module: {
-        moduleId: 1,
-        gitSha: 'abc123',
-        filePath: 'test.ts',
-        tagAttributes: schema,
-        spanBufferCapacityStats: {
-          currentCapacity: 64,
-          totalWrites: 0,
-          overflowWrites: 0,
-          totalBuffersCreated: 0,
-        },
-      },
-      spanNameId: 1,
-      lineNumber: 10,
-    };
-  }
-
   it('generates TypedArray columns with proper names for defined schema', () => {
     const schema = defineTagAttributes({
       userId: S.category(), // Category: user IDs repeat

@@ -355,6 +355,27 @@ class AdaptiveFlushBuffer {
 }
 ```
 
+## Capacity Constraints
+
+### Multiple of 8 Requirement
+
+**All buffer capacities MUST be multiples of 8.** This constraint enables efficient null bitmap operations:
+
+1. **Byte-aligned concatenation**: When converting multiple buffers to Arrow, null bitmaps can be bulk-copied with
+   `TypedArray.set()` instead of bit-by-bit loops
+2. **Efficient clearing**: Clearing null bits for a buffer's rows uses `TypedArray.fill(0)` for full bytes
+3. **Simple offset math**: `rowOffset / 8` gives exact byte offset, no bit shifting needed at boundaries
+
+The constraint is enforced in `createSpanBuffer()` and `createNextBuffer()`:
+
+```typescript
+// Align capacity to multiple of 8
+const alignedCapacity = (requestedCapacity + 7) & ~7;
+```
+
+Since self-tuning uses powers of 2 (8, 16, 32, 64, 128, 256, 512, 1024), this constraint is naturally satisfied. The
+explicit alignment ensures correctness for any custom capacity input.
+
 ## Initial Capacity Selection
 
 ### Environment-Based Defaults

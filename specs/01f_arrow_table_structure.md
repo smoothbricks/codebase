@@ -144,7 +144,7 @@ const timestampArrays = buffers.map((buf) => buf.timestamps.subarray(0, buf.writ
 const allTimestamps = concatenateTypedArrays(timestampArrays);
 
 return arrow.makeData({
-  type: new arrow.TimestampMicrosecond(),
+  type: new arrow.TimestampNanosecond(),
   offset: 0,
   length: allTimestamps.length,
   data: allTimestamps, // Single concatenated array
@@ -205,17 +205,24 @@ system becomes a row in the final table, enabling rich analytical queries while 
 
 ### Core System Columns (Always Present)
 
-| Column Name        | Type                 | Description                                                      | Example Values                                                                                                                                |
-| ------------------ | -------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timestamp`        | `timestamp[μs]`      | When event occurred (microseconds, Float64 SAFE until year 2255) | `2024-01-01T10:00:00.000123Z`                                                                                                                 |
-| `trace_id`         | `dictionary<string>` | Request correlation across services                              | `'req-abc123'`, `'X-Request-Id-456'`                                                                                                          |
-| `thread_id`        | `uint64`             | Thread/worker identifier (64-bit random, generated once)         | `0x1a2b3c4d5e6f7890`                                                                                                                          |
-| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                | `1`, `2`, `42`                                                                                                                                |
-| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                       | `0x1a2b3c4d5e6f7890` or `null`                                                                                                                |
-| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                           | `1`, `2` or `null`                                                                                                                            |
-| `entry_type`       | `dictionary<string>` | Log entry type                                                   | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'tag'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
-| `module`           | `dictionary<string>` | Module name                                                      | `'UserController'`, `'DatabaseService'`                                                                                                       |
-| `label`            | `dictionary<string>` | Span name OR log message template (see Label Column section)     | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`                                                                    |
+| Column Name        | Type                 | Description                                                  | Example Values                                                                                                                                |
+| ------------------ | -------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)          | `2024-01-01T10:00:00.000000123Z`                                                                                                              |
+| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)     | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                                                          |
+| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread) | `0x1a2b3c4d5e6f7890`                                                                                                                          |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)            | `1`, `2`, `42`                                                                                                                                |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                   | `0x1a2b3c4d5e6f7890` or `null`                                                                                                                |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                       | `1`, `2` or `null`                                                                                                                            |
+| `entry_type`       | `dictionary<string>` | Log entry type                                               | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'tag'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
+| `module`           | `dictionary<string>` | Module name                                                  | `'UserController'`, `'DatabaseService'`                                                                                                       |
+| `label`            | `dictionary<string>` | Span name OR log message template (see Label Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`                                                                    |
+
+**Note on Span Identification**:
+
+- `trace_id`: Branded `TraceId` string, validated (non-empty, max 128 chars, ASCII). Shared by reference across all
+  spans in a trace (zero-copy).
+- `thread_id` + `span_id`: Extracted from `SpanIdentity` 25-byte ArrayBuffer during Arrow conversion.
+- `parent_thread_id` + `parent_span_id`: Also from `SpanIdentity`, null for root spans (hasParent flag = 0).
 
 ## Span Definition
 
@@ -257,22 +264,55 @@ This happens in several scenarios:
 - **Distributed services**: Same trace spanning multiple machines
 - **Serverless**: Multiple Lambda invocations for the same request
 
-### Chosen Approach: Separate Columns
+### Chosen Approach: SpanIdentity + TraceId
 
-LMAO uses separate columns for span identification, providing maximum query flexibility and performance:
+LMAO uses a combination of `SpanIdentity` (25-byte ArrayBuffer) and `TraceId` (branded string) for span identification.
+In the Arrow output, these are expanded to separate columns for query flexibility:
 
-| Column             | Type                | Description                                           |
-| ------------------ | ------------------- | ----------------------------------------------------- |
-| `thread_id`        | `uint64`            | Thread/worker identifier (64-bit random, once/thread) |
-| `span_id`          | `uint32`            | Unit of work within thread (incrementing counter)     |
-| `parent_thread_id` | `uint64` (nullable) | Parent span's thread                                  |
-| `parent_span_id`   | `uint32` (nullable) | Parent span's ID                                      |
+| Column             | Type                 | Description                                           |
+| ------------------ | -------------------- | ----------------------------------------------------- |
+| `trace_id`         | `dictionary<string>` | Request correlation (W3C format, shared by reference) |
+| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure, once/thread) |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)     |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread                                  |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID                                      |
+
+### SpanIdentity Memory Layout
+
+In memory, span identification is packed into a 25-byte `SpanIdentity` ArrayBuffer:
+
+```
+SpanIdentity (25 bytes):
+┌──────────────────────────────────────────────────────────────────────────┐
+│ Byte 0:      flags           (bit 0 = hasParent)                         │
+│ Bytes 1-8:   threadId        (8 bytes, crypto-secure random)             │
+│ Bytes 9-12:  spanId          (4 bytes, thread-local counter)             │
+│ Bytes 13-20: parentThreadId  (8 bytes, zeroed if root)                   │
+│ Bytes 21-24: parentSpanId    (4 bytes, zeroed if root)                   │
+└──────────────────────────────────────────────────────────────────────────┘
+```
+
+### TraceId: Branded String
+
+`TraceId` is a branded string type that is:
+
+- **Shared by reference**: All spans in a trace reference the same string (zero-copy)
+- **Validated**: Non-empty, max 128 characters, ASCII only
+- **W3C Compatible**: `generateTraceId()` produces 32 lowercase hex characters
+
+```typescript
+type TraceId = string & { readonly __brand: 'TraceId' };
+
+// All spans share the same reference
+rootSpan.traceId === childSpan.traceId; // true (same string reference)
+```
 
 ### Global Uniqueness
 
 **Within a trace**: `(thread_id, span_id)` is unique **Globally**: `(trace_id, thread_id, span_id)` is globally unique
 
-- `thread_id` provides cross-process uniqueness (64-bit random)
+- `trace_id` correlates spans across services (W3C Trace Context compatible)
+- `thread_id` provides cross-process uniqueness (crypto-secure 64-bit random)
 - `span_id` provides within-thread ordering (32-bit counter)
 
 ### Parent Reference
@@ -282,17 +322,26 @@ To find a parent span, you need:
 - Same `trace_id` (parent is always in same trace)
 - Match `thread_id = parent_thread_id` AND `span_id = parent_span_id`
 
+SpanBuffer provides convenience methods:
+
+```typescript
+// These check BOTH traceId equality AND SpanIdentity relationship
+spanA.isParentOf(spanB); // true if spanA is spanB's parent
+spanB.isChildOf(spanA); // true if spanB is spanA's child
+```
+
 ### Why This Design
 
 **Performance (Hot Path)**:
 
 - `span_id` is just `i++` - no random generation, no BigInt operations per span
-- Thread ID generated once at worker startup (cold path)
-- No crypto overhead per span creation
+- Thread ID generated once at worker startup using crypto-secure random (cold path)
+- TraceId shared by reference - no string copies per span
+- SpanIdentity comparison uses simple byte loop (6x faster than DataView)
 
 **Collision Resistance**:
 
-- 64-bit random thread ID provides strong collision resistance
+- Crypto-secure 64-bit thread ID provides strong collision resistance
 - Birthday paradox: ~4 billion processes before 50% collision probability
 - Combined with 32-bit local counter: effectively unlimited spans per thread
 
@@ -310,8 +359,9 @@ To find a parent span, you need:
 
 **JavaScript Compatibility**:
 
-- `thread_id` (64-bit): Generated once as BigInt at worker startup
+- `thread_id` (64-bit): Stored as raw bytes in SpanIdentity, converted to BigUint64 for Arrow
 - `span_id` (32-bit): Fits in `number`, used per span (no BigInt in hot path)
+- `trace_id`: Plain string reference (branded for type safety)
 
 ### Thread-Local Counter Design (CRITICAL)
 
@@ -410,6 +460,48 @@ ORDER BY span_id;
 -- trace_id: req-2, span_id: 3    (started req-2 while req-1 async waiting)
 -- trace_id: req-1, span_id: 4    (back to req-1)
 -- trace_id: req-2, span_id: 5    (req-2 continues)
+```
+
+### SpanIdentity to Arrow Conversion
+
+During Arrow conversion, the `SpanIdentity` 25-byte ArrayBuffer is expanded to separate columns:
+
+```typescript
+function convertSpanIdentityToArrowColumns(spanId: SpanIdentity, rowCount: number): ArrowColumns {
+  // Thread ID: extract 8 bytes, convert to BigUint64
+  const threadIdBytes = spanId.threadId; // Uint8Array view of bytes 1-8
+  const threadIdView = new DataView(threadIdBytes.buffer, threadIdBytes.byteOffset, 8);
+  const threadIdValue = threadIdView.getBigUint64(0, true); // little-endian
+  const threadIdData = new BigUint64Array(rowCount).fill(threadIdValue);
+
+  // Span ID: direct 32-bit value
+  const spanIdData = new Uint32Array(rowCount).fill(spanId.spanId);
+
+  // Parent columns (nullable based on hasParent flag)
+  if (spanId.hasParent) {
+    const parentThreadIdBytes = spanId.parentThreadId;
+    const parentThreadIdView = new DataView(parentThreadIdBytes.buffer, parentThreadIdBytes.byteOffset, 8);
+    const parentThreadIdValue = parentThreadIdView.getBigUint64(0, true);
+    const parentThreadIdData = new BigUint64Array(rowCount).fill(parentThreadIdValue);
+    const parentSpanIdData = new Uint32Array(rowCount).fill(spanId.parentSpanId);
+
+    return {
+      thread_id: { data: threadIdData, nullBitmap: null },
+      span_id: { data: spanIdData, nullBitmap: null },
+      parent_thread_id: { data: parentThreadIdData, nullBitmap: null },
+      parent_span_id: { data: parentSpanIdData, nullBitmap: null },
+    };
+  } else {
+    // Root span: parent columns are all null
+    const nullBitmap = new Uint8Array(Math.ceil(rowCount / 8)); // All zeros = all null
+    return {
+      thread_id: { data: threadIdData, nullBitmap: null },
+      span_id: { data: spanIdData, nullBitmap: null },
+      parent_thread_id: { data: new BigUint64Array(rowCount), nullBitmap, nullCount: rowCount },
+      parent_span_id: { data: new Uint32Array(rowCount), nullBitmap, nullCount: rowCount },
+    };
+  }
+}
 ```
 
 ### Library-Specific Attribute Columns (Sparse/Nullable)
@@ -802,31 +894,31 @@ then uses high-resolution timers for all subsequent timestamps. See
 - **Browser**: `performance.now()` deltas from anchor
   - ~5μs resolution for sub-millisecond precision
   - No `Date.now()` calls per span
-  - Stored as `timestamp[μs]` (microsecond) in Arrow
+  - Stored as `timestamp[ns]` (nanosecond) in Arrow
 - **Node.js**: `process.hrtime.bigint()` deltas from anchor
-  - Nanosecond precision available, truncated to microseconds
-  - Stored as microseconds for consistency
-  - Arrow type: `timestamp[μs]` (microsecond)
+  - Nanosecond precision available, stored directly
+  - Full nanosecond precision preserved
+  - Arrow type: `timestamp[ns]` (nanosecond)
 - **Fallback**: `Date.now()` (millisecond precision)
   - Used when high-resolution timing is unavailable
-  - Arrow type: `timestamp[ms]` (millisecond)
+  - Converted to nanoseconds for consistency
+  - Arrow type: `timestamp[ns]` (nanosecond)
 
-**Hot Path Storage**: All timestamps stored as `Float64Array` (microseconds since epoch) during logging. No object
+**Hot Path Storage**: All timestamps stored as `BigInt64Array` (nanoseconds since epoch) during logging. No object
 allocations, no `Date.now()` calls per entry.
 
-**Cold Path Conversion**: Converted to Arrow `TimestampMicrosecond` type, compatible with ClickHouse `DateTime64(6)`.
+**Cold Path Conversion**: Converted to Arrow `TimestampNanosecond` type, compatible with ClickHouse `DateTime64(9)`.
 
 **Precision Guarantees**:
 
-- **Storage**: Microseconds stored as `Float64Array`
-- **Safe Range**: Float64 can exactly represent integers up to `Number.MAX_SAFE_INTEGER` (2^53 - 1)
-  - Maximum safe microsecond value: 9,007,199,254,740,991 μs
-  - Equivalent date: ~September 2255
-  - **Conclusion**: BigInt→Number conversion is SAFE for all practical timestamps
-- **Why Microseconds**:
-  - Sub-millisecond precision for performance analysis
-  - Compatible with ClickHouse `DateTime64(6)`
-  - Matches OpenTelemetry recommendation
+- **Storage**: Nanoseconds stored as `BigInt64Array`
+- **Safe Range**: BigInt64 can represent nanoseconds for ~292 years from epoch (signed 64-bit)
+  - Well beyond any practical trace lifetime
+  - **Conclusion**: Full nanosecond precision preserved without loss
+- **Why Nanoseconds**:
+  - Sub-microsecond precision for detailed performance analysis
+  - Compatible with ClickHouse `DateTime64(9)`
+  - Matches Arrow's native timestamp precision
 
 **Date.now() Usage**:
 
@@ -946,7 +1038,10 @@ This Arrow table structure integrates with:
 - **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**: Foundational entry type system
   and low-level logging API
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Direct conversion from SpanBuffer columns
-  with `attr_` prefix stripping
+  with `attr_` prefix stripping. Also documents:
+  - **SpanIdentity**: 25-byte ArrayBuffer with comparison methods (`equals()`, `isParentOf()`, `isChildOf()`)
+  - **TraceId**: Branded string type with validation and W3C format generation
+  - **ColumnBuffer Extension**: Mechanism for lmao to inject span-specific code into arrow-builder generated classes
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Prefixed columns from different libraries
   cleanly separated
 - **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Runtime generation of APIs that populate these

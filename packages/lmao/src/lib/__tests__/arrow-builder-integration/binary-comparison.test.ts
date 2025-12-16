@@ -18,7 +18,8 @@ import { convertToArrowTable } from '../../convertToArrow.js';
 import { S } from '../../schema/builder.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
-import type { ModuleContext, SpanBuffer, TaskContext } from '../../types.js';
+import type { SpanBuffer, TaskContext } from '../../types.js';
+import { createTestTaskContext } from '../test-helpers.js';
 
 /**
  * Mock string interner for testing
@@ -50,24 +51,7 @@ class MockStringInterner {
  * Create mock task context for testing
  */
 function createMockTaskContext(schema: TagAttributeSchema): TaskContext {
-  const moduleContext: ModuleContext = {
-    moduleId: 0,
-    gitSha: 'test-sha',
-    filePath: 'test-file.ts',
-    tagAttributes: schema,
-    spanBufferCapacityStats: {
-      currentCapacity: 64,
-      totalWrites: 0,
-      overflowWrites: 0,
-      totalBuffersCreated: 0,
-    },
-  };
-
-  return {
-    module: moduleContext,
-    spanNameId: 0,
-    lineNumber: 42,
-  };
+  return createTestTaskContext(schema, { lineNumber: 42 });
 }
 
 /**
