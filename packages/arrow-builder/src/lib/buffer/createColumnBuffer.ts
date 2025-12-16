@@ -15,6 +15,7 @@
 import type { TagAttributeSchema } from '../schema-types.js';
 import { createGeneratedColumnBuffer } from './columnBufferGenerator.js';
 import type { ColumnBuffer } from './types.js';
+import { DEFAULT_BUFFER_CAPACITY } from './types.js';
 
 /**
  * Create generic ColumnBuffer using runtime class generation
@@ -49,7 +50,10 @@ import type { ColumnBuffer } from './types.js';
  * @param requestedCapacity - Requested buffer capacity
  * @returns Generic ColumnBuffer with timestamps, operations, and direct attribute columns
  */
-export function createColumnBuffer(schema: TagAttributeSchema, requestedCapacity = 64): ColumnBuffer {
+export function createColumnBuffer(
+  schema: TagAttributeSchema,
+  requestedCapacity = DEFAULT_BUFFER_CAPACITY,
+): ColumnBuffer {
   return createGeneratedColumnBuffer(schema, requestedCapacity);
 }
 

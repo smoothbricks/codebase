@@ -90,6 +90,24 @@ export type TypedArray =
 export type ColumnValueType = TypedArray | string[];
 
 /**
+ * Default initial buffer capacity.
+ *
+ * Set to 8 (minimal aligned size) because:
+ * 1. Most spans are small: span-start (row 0), span-ok/err (row 1), and 1-3 log events
+ *    fit comfortably in 8 rows, covering >80% of spans without overflow.
+ * 2. Memory efficiency: Starting at 8 instead of 64 reduces initial allocation by 8×.
+ *    For applications with thousands of concurrent spans, this significantly reduces
+ *    memory pressure.
+ * 3. Multiple of 8: Required for null bitmap byte-alignment (see specs/01b).
+ * 4. Self-tuning: Modules that need more capacity will trigger buffer chaining on
+ *    first overflow, and the self-tuning system learns to allocate larger initial
+ *    capacity for that module.
+ *
+ * @see specs/01b_columnar_buffer_architecture.md "Initial Capacity: 8 Elements"
+ */
+export const DEFAULT_BUFFER_CAPACITY = 8;
+
+/**
  * Capacity stats for buffer size tuning
  * Generic stats that any use case can build upon
  */

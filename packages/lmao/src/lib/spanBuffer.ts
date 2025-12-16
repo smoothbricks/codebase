@@ -25,7 +25,7 @@
  * @module spanBuffer
  */
 
-import { type ColumnBufferExtension, getColumnBufferClass } from '@smoothbricks/arrow-builder';
+import { type ColumnBufferExtension, DEFAULT_BUFFER_CAPACITY, getColumnBufferClass } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
 import { spanBufferHelpers } from './spanBufferHelpers.js';
 import { generateTraceId, type TraceId } from './traceId.js';
@@ -256,7 +256,7 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
  * @param schema - Tag attribute schema defining column types
  * @param taskContext - Task context with module metadata and capacity stats
  * @param traceId - Trace ID (auto-generated if omitted)
- * @param capacity - Buffer capacity (default: 64)
+ * @param capacity - Buffer capacity (default: DEFAULT_BUFFER_CAPACITY)
  *
  * @returns SpanBuffer ready for initialization via `writeSpanStart()`
  */
@@ -264,7 +264,7 @@ export function createSpanBuffer(
   schema: TagAttributeSchema,
   taskContext: TaskContext,
   traceId?: TraceId,
-  capacity = 64,
+  capacity = DEFAULT_BUFFER_CAPACITY,
 ): SpanBuffer {
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const alignedCapacity = (capacity + 7) & ~7;

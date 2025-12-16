@@ -223,7 +223,8 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
+      // Need capacity for 9 test values
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 16);
 
       const testValues = [true, false, true, false, true, false, true, false, true];
       for (const value of testValues) {
@@ -539,7 +540,8 @@ describe('Arrow IPC Round-Trip', () => {
       };
 
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
+      // Need capacity for 10 values
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 16);
 
       // Only one null in 10 values
       const values = [1, 2, 3, null, 5, 6, 7, 8, 9, 10];

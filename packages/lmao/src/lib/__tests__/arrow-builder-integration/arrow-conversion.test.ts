@@ -693,7 +693,8 @@ describe('Arrow Table Conversion', () => {
     test('maps all entry type codes correctly', () => {
       const schema: TagAttributeSchema = {};
       const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
+      // Need capacity for 11 entry types
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 16);
 
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');

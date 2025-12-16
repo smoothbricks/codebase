@@ -374,21 +374,28 @@ several key benefits:
 **Example Alignment Calculations**:
 
 ```typescript
-// Starting with 64 elements (cache-friendly initial capacity):
+// With default capacity of 8 elements (minimal aligned size for typical spans):
 
-// Uint8Array (operations column): 64 × 1 = 64 bytes → no alignment needed
-// Uint16Array (small bitmaps): 64 × 2 = 128 bytes → no alignment needed
-// Uint32Array (string indices): 64 × 4 = 256 bytes → no alignment needed
-// BigInt64Array (timestamps): 64 × 8 = 512 bytes → no alignment needed
+// Uint8Array (operations column): 8 × 1 = 8 bytes
+// Uint16Array (small bitmaps): 8 × 2 = 16 bytes
+// Uint32Array (string indices): 8 × 4 = 32 bytes
+// BigInt64Array (timestamps): 8 × 8 = 64 bytes → exactly one cache line
 
-// Example with smaller capacity showing alignment impact:
-// Uint8Array: 16 × 1 = 16 bytes → aligned to 64 bytes = 64 elements (4x increase!)
-// Uint16Array: 16 × 2 = 32 bytes → aligned to 64 bytes = 32 elements (2x increase!)
+// Self-tuning grows to 16, 32, 64, 128, etc. as needed
+// 64 elements: BigInt64Array = 512 bytes → 8 cache lines
 ```
 
-**Memory vs Performance Trade-off**: Cache alignment increases memory usage for small arrays but provides significant
-performance benefits. By starting with 64 elements, we minimize unexpected capacity increases while maintaining
-cache-friendly allocation patterns.
+**Initial Capacity: 8 Elements (Minimal Aligned Size)**
+
+The default capacity is 8 elements, not 64, for important reasons:
+
+1. **Most spans are small**: Typical spans have span-start (row 0), span-ok/err (row 1), and 1-3 log events. 8 rows
+   covers >80% of spans without overflow.
+2. **Memory efficiency**: Starting at 8 instead of 64 reduces initial allocation by 8×. For applications with thousands
+   of concurrent spans, this significantly reduces memory pressure.
+3. **Multiple of 8 constraint**: 8 is the minimum capacity that satisfies the null bitmap byte-alignment requirement.
+4. **Self-tuning handles growth**: Modules that need more capacity will trigger buffer chaining on first overflow, and
+   the self-tuning system will learn to allocate larger initial capacity for that module.
 
 **Capacity Constraint - Multiple of 8**: Buffer capacity MUST always be a multiple of 8. This constraint enables:
 
@@ -398,7 +405,7 @@ cache-friendly allocation patterns.
 3. **Efficient Arrow conversion**: When building Arrow tables from multiple buffers, null bitmaps can be bulk-copied
 
 The constraint is enforced in `createSpanBuffer()` and `createNextBuffer()` via `(capacity + 7) & ~7` alignment. Since
-the default capacity is 64 and self-tuning uses powers of 2 (8, 16, 32, 64, 128, 256, 512, 1024), this constraint is
+the default capacity is 8 and self-tuning uses powers of 2 (8, 16, 32, 64, 128, 256, 512, 1024), this constraint is
 naturally satisfied, but the explicit alignment ensures correctness for any input.
 
 **Critical Design Decision - Equal Length Constraint**: The most important constraint is that ALL TypedArrays in a

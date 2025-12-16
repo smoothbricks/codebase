@@ -12,7 +12,7 @@
 
 import type * as Sury from '@sury/sury';
 import { getSchemaFields, type SchemaWithMetadata, type TagAttributeSchema } from '../schema-types.js';
-import type { TypedArray, TypedArrayConstructor } from './types.js';
+import { DEFAULT_BUFFER_CAPACITY, type TypedArray, type TypedArrayConstructor } from './types.js';
 
 /**
  * Create TypedArray columns for attribute columns based on schema
@@ -20,7 +20,10 @@ import type { TypedArray, TypedArrayConstructor } from './types.js';
  * User columns have no prefix - the column name IS the field name.
  * Returns a record of TypedArrays with cache-aligned capacity.
  */
-export function createAttributeColumns(schema: TagAttributeSchema, capacity = 64): Record<string, TypedArray> {
+export function createAttributeColumns(
+  schema: TagAttributeSchema,
+  capacity = DEFAULT_BUFFER_CAPACITY,
+): Record<string, TypedArray> {
   const columns: Record<string, TypedArray> = {};
 
   // Use getSchemaFields to filter out methods (validate, parse, etc.)

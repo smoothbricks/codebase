@@ -4,7 +4,7 @@
  * @module moduleContext
  */
 
-import type { BufferCapacityStats } from '@smoothbricks/arrow-builder';
+import { type BufferCapacityStats, DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
 
 /**
@@ -13,7 +13,7 @@ import type { TagAttributeSchema } from './schema/types.js';
 export class ModuleContext {
   /** Self-tuning buffer capacity stats (initialized with defaults) */
   readonly spanBufferCapacityStats: BufferCapacityStats = {
-    currentCapacity: 64, // Cache-friendly size (see specs/01b_columnar_buffer_architecture.md)
+    currentCapacity: DEFAULT_BUFFER_CAPACITY,
     totalWrites: 0,
     overflowWrites: 0,
     totalBuffersCreated: 0,

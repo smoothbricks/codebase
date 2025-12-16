@@ -17,7 +17,7 @@
 
 import { getSchemaFields, type TagAttributeSchema } from '../schema-types.js';
 import { bufferHelpers } from './bufferHelpers.js';
-import type { ColumnBuffer } from './types.js';
+import { type ColumnBuffer, DEFAULT_BUFFER_CAPACITY } from './types.js';
 
 // Re-export for consumers
 export { getAlignedCapacity } from './bufferHelpers.js';
@@ -513,14 +513,14 @@ export function getColumnBufferClass(
  * Uses direct properties for zero-indirection access.
  *
  * @param schema - The tag attribute schema defining columns
- * @param requestedCapacity - Initial buffer capacity (defaults to 64)
+ * @param requestedCapacity - Initial buffer capacity (defaults to DEFAULT_BUFFER_CAPACITY)
  * @param extension - Optional extension for injecting constructor code, methods, etc.
  * @param constructorArgs - Additional constructor arguments (passed to extension constructor code)
  * @returns A new ColumnBuffer instance
  */
 export function createGeneratedColumnBuffer(
   schema: TagAttributeSchema,
-  requestedCapacity = 64,
+  requestedCapacity = DEFAULT_BUFFER_CAPACITY,
   extension?: ColumnBufferExtension,
   ...constructorArgs: unknown[]
 ): ColumnBuffer {

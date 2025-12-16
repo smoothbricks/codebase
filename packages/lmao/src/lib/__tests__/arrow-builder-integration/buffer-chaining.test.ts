@@ -1,4 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
+import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
 import { createNextBuffer, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
 import type { TaskContext } from '../../types.js';
@@ -68,7 +69,8 @@ describe('Buffer Chaining', () => {
 
       // Chained buffer should start at 0
       expect(nextBuffer.writeIndex).toBe(0);
-      expect(nextBuffer.capacity).toBe(64);
+      // Uses currentCapacity from stats (default)
+      expect(nextBuffer.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });
 
     it('should maintain schema structure in chained buffer', () => {
@@ -169,19 +171,19 @@ describe('Buffer Chaining', () => {
 
     it('should handle capacity changes between chained buffers', () => {
       const buffer1 = createSpanBuffer(schema, taskContext);
-      expect(buffer1.capacity).toBe(64);
+      expect(buffer1.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
-      // Simulate capacity tuning
-      taskContext.module.spanBufferCapacityStats.currentCapacity = 128;
+      // Simulate capacity tuning - double it
+      taskContext.module.spanBufferCapacityStats.currentCapacity = DEFAULT_BUFFER_CAPACITY * 2;
 
       const buffer2 = createNextBuffer(buffer1);
-      expect(buffer2.capacity).toBe(128);
+      expect(buffer2.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
-      // Change capacity again
-      taskContext.module.spanBufferCapacityStats.currentCapacity = 256;
+      // Change capacity again - double again
+      taskContext.module.spanBufferCapacityStats.currentCapacity = DEFAULT_BUFFER_CAPACITY * 4;
 
       const buffer3 = createNextBuffer(buffer2);
-      expect(buffer3.capacity).toBe(256);
+      expect(buffer3.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
     });
   });
 });

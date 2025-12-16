@@ -342,15 +342,25 @@ describe('Buffer Overflow and Capacity Management', () => {
       });
 
       const testTask = moduleContext.task('test-boundary', async (ctx) => {
-        // Write exactly 64 entries (initial capacity)
-        for (let i = 0; i < 64; i++) {
-          ctx.tag.requestId(`req-${i}`);
+        // Save root buffer BEFORE any writes (ctx.log._buffer may change on overflow)
+        const rootBuffer = ctx.log._buffer;
+
+        // With default capacity=8, we have rows 0-1 reserved (span-start, span-end)
+        // So we can write 6 log entries before hitting capacity (rows 2-7)
+        // Writing more will trigger buffer chaining (overflow)
+        for (let i = 0; i < 10; i++) {
+          ctx.log.info(`log-${i}`);
         }
 
-        // Write one more to trigger overflow
-        ctx.tag.requestId('req-64');
+        // Count buffer chain length starting from root
+        let bufferCount = 0;
+        let currentBuffer: typeof rootBuffer | undefined = rootBuffer;
+        while (currentBuffer) {
+          bufferCount++;
+          currentBuffer = currentBuffer._next;
+        }
 
-        return ctx.ok({ written: 65 });
+        return ctx.ok({ written: 10, bufferCount });
       });
 
       const requestCtx = createRequestContext(
@@ -363,7 +373,10 @@ describe('Buffer Overflow and Capacity Management', () => {
       const result = await testTask(requestCtx);
       expect(result.success).toBe(true);
       if (result.success) {
-        expect(result.value.written).toBe(65);
+        expect(result.value.written).toBe(10);
+        // With capacity=8 and 10 log entries (starting at row 2), we need overflow
+        // Row 0: span-start, Row 1: span-ok, Rows 2-7: first 6 logs, then chain for remaining 4
+        expect(result.value.bufferCount).toBeGreaterThanOrEqual(2); // At least root + 1 chained buffer
       }
     });
   });
@@ -537,7 +550,7 @@ describe('Buffer Overflow and Capacity Management', () => {
       }
     });
 
-    it('should correctly write fluent attributes across 128+ log entries with overflow', async () => {
+    it('should correctly write fluent attributes across 128 log entries with overflow', async () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
@@ -555,6 +568,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         const rootBuffer = ctx.log._buffer;
 
         // Write 128 log entries, each with fluent attribute chaining
+        // With default capacity=8, this will trigger many overflows
         for (let i = 0; i < NUM_ENTRIES; i++) {
           ctx.log
             .info(`Message ${i}`)
@@ -562,6 +576,14 @@ describe('Buffer Overflow and Capacity Management', () => {
             .userId(`user-${i}`)
             .operation(operations[i % 4])
             .duration(i * 10);
+        }
+
+        // Count buffer chain length to verify overflow occurred
+        let bufferCount = 0;
+        let countBuffer: typeof rootBuffer | undefined = rootBuffer;
+        while (countBuffer) {
+          bufferCount++;
+          countBuffer = countBuffer._next;
         }
 
         // Collect all entries from buffer chain
@@ -599,6 +621,7 @@ describe('Buffer Overflow and Capacity Management', () => {
         return ctx.ok({
           entriesWritten: entries.length,
           entries,
+          bufferCount,
         });
       });
 
@@ -613,6 +636,10 @@ describe('Buffer Overflow and Capacity Management', () => {
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.value.entriesWritten).toBe(128);
+
+        // With capacity=8: 6 entries fit in root buffer (rows 2-7), then 122 more need chaining
+        // 122 / 8 = ~16 more buffers needed, so total should be ~17+ buffers
+        expect(result.value.bufferCount).toBeGreaterThanOrEqual(17);
 
         // Verify each entry has correct attributes
         for (let i = 0; i < 128; i++) {

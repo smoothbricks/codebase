@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { ModuleContext } from '../../moduleContext.js';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
@@ -34,7 +35,7 @@ describe('Buffer Foundation', () => {
     const schema = taskContext.module.tagAttributes;
     const traceId = createTraceId('trace-123');
 
-    const buf = createSpanBuffer(schema, taskContext, traceId, 64);
+    const buf = createSpanBuffer(schema, taskContext, traceId); // Uses DEFAULT_BUFFER_CAPACITY
 
     // Span identity assertions (unified memory layout)
     expect(typeof buf.spanId).toBe('number');
@@ -58,7 +59,7 @@ describe('Buffer Foundation', () => {
     // Metadata
     expect(buf.children).toBeInstanceOf(Array);
     expect(buf.writeIndex).toBe(0);
-    expect(buf.capacity).toBe(64);
+    expect(buf.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     expect(buf.task).toBe(taskContext);
   });
 
