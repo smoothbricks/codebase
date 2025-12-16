@@ -7,4 +7,4 @@
 export * from './index.js';
 
 // Override with Node.js-specific timestamp implementation
-export { createTimeAnchor, getTimestampMicros } from './lib/timestamp.node.js';
+export { getTimestampNanos, Nanoseconds } from './lib/timestamp.node.js';

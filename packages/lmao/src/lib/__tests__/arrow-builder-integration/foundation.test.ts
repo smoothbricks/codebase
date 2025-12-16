@@ -46,12 +46,12 @@ describe('Buffer Foundation', () => {
 
     const buf = createEmptySpanBuffer(1, threadId, 'trace-123', schema, taskContext, undefined, 64);
 
-    expect(buf.localSpanId).toBe(1);
+    expect(buf.spanId).toBe(1);
     expect(buf.threadId).toBe(threadId);
     expect(buf.traceId).toBe('trace-123');
 
     // Check TypedArrays are created
-    expect(buf.timestamps).toBeInstanceOf(Float64Array);
+    expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
     expect(buf.operations).toBeInstanceOf(Uint8Array);
 
     // Check null bitmaps exist for each attribute (Arrow format: 1 Uint8Array per column)
@@ -76,7 +76,7 @@ describe('Buffer Foundation', () => {
 
     const buf = createSpanBuffer(schema, taskContext, 'trace-999');
 
-    expect(buf.localSpanId).toBeGreaterThan(0);
+    expect(buf.spanId).toBeGreaterThan(0);
     expect(buf.threadId).toBeDefined();
     expect(buf.parent).toBeUndefined();
     expect(buf.children).toHaveLength(0);

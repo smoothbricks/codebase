@@ -14,7 +14,7 @@ import { FeatureFlagEvaluator, type FlagColumnWriters, type FlagEvaluator } from
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
 import type { InferTagAttributes, TagAttributeSchema } from './schema/types.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from './spanBuffer.js';
-import { createTimeAnchor, getTimestampMicros } from './timestamp.js';
+import { getTimestampNanos } from './timestamp.js';
 import type { BufferCapacityStats, ModuleContext, SpanBuffer, TaskContext } from './types.js';
 
 /**
@@ -104,8 +104,6 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
     buffer: SpanBuffer,
     value: V,
     _schema: T, // Needed for generic type inference
-    anchorEpochMicros: number,
-    anchorPerfNow: number,
   ) {
     this.value = value;
 
@@ -117,8 +115,8 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
     // Overwrite the pre-initialized span-exception with span-ok
     this.buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
 
-    // Write timestamp using anchor for high precision
-    this.buffer.timestamps[1] = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+    // Write timestamp (nanoseconds since epoch)
+    this.buffer.timestamps[1] = getTimestampNanos();
 
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
   }
@@ -160,8 +158,6 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
     code: string,
     details: E,
     _schema: T, // Needed for generic type inference
-    anchorEpochMicros: number,
-    anchorPerfNow: number,
   ) {
     this.error = { code, details };
 
@@ -173,8 +169,8 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
     // Overwrite the pre-initialized span-exception with span-err
     this.buffer.operations[1] = ENTRY_TYPE_SPAN_ERR;
 
-    // Write timestamp using anchor for high precision
-    this.buffer.timestamps[1] = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+    // Write timestamp (nanoseconds since epoch)
+    this.buffer.timestamps[1] = getTimestampNanos();
 
     // Write error code
     writeToColumn(this.buffer, 'attr_errorCode', code, this.entryIndex);
@@ -266,12 +262,13 @@ class StringInterner {
 }
 
 /**
- * Global string interners
- * One per string type to keep dictionaries separate
+ * Global string interners for SYSTEM columns only
+ *
+ * - USER attribute columns (category/text) store strings directly in string[] arrays
+ * - SYSTEM columns (moduleId, spanName) use interning for efficiency
  *
  * Exported for Arrow table conversion
  */
-export const categoryInterner = new StringInterner();
 export const moduleIdInterner = new StringInterner();
 export const spanNameInterner = new StringInterner();
 
@@ -294,7 +291,6 @@ function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
     const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
 
     // TODO: Use system tracer for self-tracing capacity tuning events
-    // For now, removed console.log to avoid hot path overhead
 
     stats.currentCapacity = newCapacity;
     resetStats(stats);
@@ -306,7 +302,6 @@ function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
     const newCapacity = Math.max(8, stats.currentCapacity / 2);
 
     // TODO: Use system tracer for self-tracing capacity tuning events
-    // For now, removed console.log to avoid hot path overhead
 
     stats.currentCapacity = newCapacity;
     resetStats(stats);
@@ -373,20 +368,6 @@ export interface RequestContext<FF extends FeatureFlagSchema = FeatureFlagSchema
 
   /** Unique trace ID linking all spans in this request's distributed trace */
   readonly traceId: string;
-
-  /**
-   * Epoch time in microseconds when the request started.
-   * Used as anchor point for high-precision timestamp calculations.
-   * @internal Combined with anchorPerfNow for efficient timestamp generation
-   */
-  readonly anchorEpochMicros: number;
-
-  /**
-   * High-resolution performance counter value when request started.
-   * Combined with anchorEpochMicros for microsecond-precision timestamps.
-   * @internal Used internally for timestamp delta calculations
-   */
-  readonly anchorPerfNow: number;
 
   /**
    * Feature flag evaluator with typed flag access.
@@ -478,15 +459,10 @@ export function createRequestContext<FF extends FeatureFlagSchema, Env extends R
     undefined, // Column writers set later when span context is created
   ) as FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
 
-  // Create time anchor ONCE per request for high-precision timestamps
-  const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
-
   return {
     requestId: params.requestId,
     userId: params.userId,
     traceId: generateTraceId(),
-    anchorEpochMicros,
-    anchorPerfNow,
     ff: ffEvaluator,
     env: environmentConfig,
   };
@@ -568,10 +544,10 @@ export interface SpanLogger<T extends TagAttributeSchema> {
   scope(attributes: Partial<InferTagAttributes<T>>): void;
 
   /**
-   * Get current scoped attributes (for inheritance)
-   * @internal Used internally for scope inheritance to child spans
+   * Get the Scope instance directly
+   * @internal Used internally for scope inheritance via _getScopeValues()
    */
-  getScopedAttributes(): Record<string, unknown>;
+  _getScope(): import('./codegen/scopeGenerator.js').GeneratedScope;
 
   /**
    * Log a message entry with specified level
@@ -826,7 +802,7 @@ export const ENTRY_TYPE_TAG = 3;
 
 /**
  * Generic message entry type.
- * @deprecated Use level-specific types: ENTRY_TYPE_INFO, ENTRY_TYPE_DEBUG, ENTRY_TYPE_WARN, or ENTRY_TYPE_ERROR
+ * Prefer level-specific types: ENTRY_TYPE_INFO, ENTRY_TYPE_DEBUG, ENTRY_TYPE_WARN, or ENTRY_TYPE_ERROR
  */
 export const ENTRY_TYPE_MESSAGE = 4;
 
@@ -890,48 +866,43 @@ export const ENTRY_TYPE_NAMES = [
  * - String interning for category columns
  * - Direct TypedArray writes (no allocations)
  */
-function createFlagColumnWriters(
-  buffer: SpanBuffer,
-  anchorEpochMicros: number,
-  anchorPerfNow: number,
-): FlagColumnWriters {
+function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
   return {
     writeEntryType(type: 'ff-access' | 'ff-usage'): void {
       // Write entry type code to operation column
       const typeCode = type === 'ff-access' ? ENTRY_TYPE_FF_ACCESS : ENTRY_TYPE_FF_USAGE;
       buffer.operations[buffer.writeIndex] = typeCode;
 
-      // Write timestamp using anchor for high precision (microseconds)
-      buffer.timestamps[buffer.writeIndex] = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+      // Write timestamp (nanoseconds since epoch)
+      buffer.timestamps[buffer.writeIndex] = getTimestampNanos();
     },
 
     writeFfName(name: string): void {
-      // Write to attr_ffName column with string interning
-      const column = buffer['attr_ffName' as keyof SpanBuffer];
-      if (column && column instanceof Uint32Array) {
-        column[buffer.writeIndex] = categoryInterner.intern(name);
+      // Write to attr_ffName column (raw string, no interning)
+      const column = buffer['attr_ffName' as keyof SpanBuffer] as string[] | undefined;
+      if (column && Array.isArray(column)) {
+        column[buffer.writeIndex] = name;
       }
     },
 
     writeFfValue(value: string | number | boolean | null): void {
-      // Write to attr_ffValue column
-      // For mixed types, serialize to string and intern
-      const column = buffer['attr_ffValue' as keyof SpanBuffer];
-      if (column && column instanceof Uint32Array) {
+      // Write to attr_ffValue column (raw string, no interning)
+      const column = buffer['attr_ffValue' as keyof SpanBuffer] as string[] | undefined;
+      if (column && Array.isArray(column)) {
         const strValue = value === null ? 'null' : String(value);
-        column[buffer.writeIndex] = categoryInterner.intern(strValue);
+        column[buffer.writeIndex] = strValue;
       }
     },
 
     writeAction(action?: string): void {
-      // Write to attr_action column
-      const column = buffer['attr_action' as keyof SpanBuffer];
-      if (column && column instanceof Uint32Array) {
+      // Write to attr_action column (raw string, no interning)
+      const column = buffer['attr_action' as keyof SpanBuffer] as string[] | undefined;
+      if (column && Array.isArray(column)) {
         const idx = buffer.writeIndex;
         if (action) {
-          column[idx] = categoryInterner.intern(action);
+          column[idx] = action;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.nullBitmaps['attr_action'];
+          const nullBitmap = buffer.attr_action_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -942,14 +913,14 @@ function createFlagColumnWriters(
     },
 
     writeOutcome(outcome?: string): void {
-      // Write to attr_outcome column
-      const column = buffer['attr_outcome' as keyof SpanBuffer];
-      if (column && column instanceof Uint32Array) {
+      // Write to attr_outcome column (raw string, no interning)
+      const column = buffer['attr_outcome' as keyof SpanBuffer] as string[] | undefined;
+      if (column && Array.isArray(column)) {
         const idx = buffer.writeIndex;
         if (outcome) {
-          column[idx] = categoryInterner.intern(outcome);
+          column[idx] = outcome;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.nullBitmaps['attr_outcome'];
+          const nullBitmap = buffer.attr_outcome_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -962,13 +933,13 @@ function createFlagColumnWriters(
     writeContextAttributes(context: EvaluationContext): void {
       const idx = buffer.writeIndex;
 
-      // Write context attributes to their respective columns with string interning
+      // Write context attributes to their respective columns (raw strings, no interning)
       if (context.userId) {
-        const column = buffer['attr_contextUserId' as keyof SpanBuffer];
-        if (column && column instanceof Uint32Array) {
-          column[idx] = categoryInterner.intern(context.userId);
+        const column = buffer['attr_contextUserId' as keyof SpanBuffer] as string[] | undefined;
+        if (column && Array.isArray(column)) {
+          column[idx] = context.userId;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.nullBitmaps['attr_contextUserId'];
+          const nullBitmap = buffer.attr_contextUserId_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -978,11 +949,11 @@ function createFlagColumnWriters(
       }
 
       if (context.requestId) {
-        const column = buffer['attr_contextRequestId' as keyof SpanBuffer];
-        if (column && column instanceof Uint32Array) {
-          column[idx] = categoryInterner.intern(context.requestId);
+        const column = buffer['attr_contextRequestId' as keyof SpanBuffer] as string[] | undefined;
+        if (column && Array.isArray(column)) {
+          column[idx] = context.requestId;
           // Mark as non-null in bitmap
-          const nullBitmap = buffer.nullBitmaps['attr_contextRequestId'];
+          const nullBitmap = buffer.attr_contextRequestId_nulls;
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
             const bitOffset = idx % 8;
@@ -1043,59 +1014,19 @@ function getBufferWithSpace(inputBuffer: SpanBuffer): { buffer: SpanBuffer; didO
  * - Row 1: span-end (pre-initialized as exception, overwritten by ok/err)
  * - Row 2+: events (ctx.log.* appends here)
  */
-function writeSpanStart(buffer: SpanBuffer, spanName: string, anchorEpochMicros: number, anchorPerfNow: number): void {
+function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
   // Row 0: span-start (fixed layout)
   buffer.operations[0] = ENTRY_TYPE_SPAN_START;
-  buffer.timestamps[0] = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+  buffer.timestamps[0] = getTimestampNanos();
   writeToColumn(buffer, 'attr_spanName', spanName, 0);
 
   // Row 1: pre-initialize as span-exception (will be overwritten on ok/err)
   buffer.operations[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-  buffer.timestamps[1] = 0; // Will be set on completion
+  buffer.timestamps[1] = 0n; // Will be set on completion
 
   // Events start at row 2
   buffer.writeIndex = 2;
 }
-
-/**
- * Text string storage - raw strings without interning
- * Separate from category interning to avoid dictionary overhead for unique strings
- */
-class TextStringStorage {
-  private strings: string[] = [];
-
-  /**
-   * Store a text string and return its index
-   * No deduplication - every string gets a new index
-   */
-  store(str: string): number {
-    const idx = this.strings.length;
-    this.strings.push(str);
-    return idx;
-  }
-
-  /**
-   * Get string by index
-   */
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-
-  /**
-   * Get all strings for Arrow column
-   */
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-}
-
-/**
- * Global text string storage
- * One instance for all text columns
- *
- * Exported for Arrow table conversion
- */
-export const textStringStorage = new TextStringStorage();
 
 /**
  * Write a value to a TypedArray column
@@ -1110,12 +1041,12 @@ export const textStringStorage = new TextStringStorage();
  * - Direct TypedArray writes (hot path)
  */
 function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, index: number): void {
-  const column = buffer[columnName as keyof SpanBuffer];
+  const column = buffer[(columnName + '_values') as keyof SpanBuffer];
 
   if (!column || !ArrayBuffer.isView(column)) return;
 
   // Get null bitmap for this column (Arrow format: 1 Uint8Array per column)
-  const nullBitmap = buffer.nullBitmaps[columnName as `attr_${string}`];
+  const nullBitmap = buffer[(columnName + '_nulls') as keyof SpanBuffer] as Uint8Array | undefined;
 
   // Handle null/undefined - store 0 and clear null bitmap bit
   if (value === null || value === undefined) {
@@ -1150,7 +1081,7 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
   const schema = buffer.task.module.tagAttributes;
   const fieldSchema = schema[fieldName];
   const schemaWithMetadata = fieldSchema as import('./schema/types.js').SchemaWithMetadata;
-  const lmaoType = schemaWithMetadata?.__lmao_type;
+  const lmaoType = schemaWithMetadata?.__schema_type;
 
   // Write based on column type and schema metadata
   if (column instanceof Uint8Array) {
@@ -1162,7 +1093,7 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
     } else if (typeof value === 'string' && lmaoType === 'enum') {
       // Enum: map string to index using enum values from schema
       const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
-      const enumValues = enumSchema?.__lmao_enum_values;
+      const enumValues = enumSchema?.__enum_values;
 
       if (enumValues) {
         const enumIndex = enumValues.indexOf(value);
@@ -1177,7 +1108,7 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
       column[index] = value;
     } else if (typeof value === 'string' && lmaoType === 'enum') {
       const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
-      const enumValues = enumSchema?.__lmao_enum_values;
+      const enumValues = enumSchema?.__enum_values;
 
       if (enumValues) {
         const enumIndex = enumValues.indexOf(value);
@@ -1187,20 +1118,18 @@ function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, i
       }
     }
   } else if (column instanceof Uint32Array) {
-    // Category or text types (both use Uint32Array but different storage)
+    // Numeric indices for enum columns
+    if (typeof value === 'number') {
+      column[index] = value;
+    } else if (typeof value === 'string') {
+      // Should not happen - enums are mapped to numbers in generated code
+      // But handle gracefully by writing 0
+      column[index] = 0;
+    }
+  } else if (Array.isArray(column)) {
+    // Category or text types (string arrays with new storage design)
     if (typeof value === 'string') {
-      // CRITICAL: Check __lmao_type metadata to distinguish category vs text
-      if (lmaoType === 'text') {
-        // TEXT: raw storage without interning (specs/01a)
-        column[index] = textStringStorage.store(value);
-      } else if (lmaoType === 'category') {
-        // CATEGORY: string interning for repeated values (specs/01a)
-        column[index] = categoryInterner.intern(value);
-      } else {
-        // Fallback: treat as category (safe default)
-        column[index] = categoryInterner.intern(value);
-      }
-    } else if (typeof value === 'number') {
+      // Write raw string (no interning on hot path)
       column[index] = value;
     }
   } else if (column instanceof Float64Array) {
@@ -1222,12 +1151,8 @@ const spanLoggerClassCache = new WeakMap<
   TagAttributeSchema,
   new (
     buffer: SpanBuffer,
-    categoryInterner: StringInterner,
-    textStorage: TextStringStorage,
     getBufferWithSpace: GetBufferWithSpaceFn,
-    anchorEpochMicros: number,
-    anchorPerfNow: number,
-    initialScopedAttributes?: Record<string, unknown>,
+    scopeInstance: import('./codegen/scopeGenerator.js').GeneratedScope,
   ) => BaseSpanLogger<TagAttributeSchema>
 >();
 
@@ -1241,20 +1166,30 @@ const spanLoggerClassCache = new WeakMap<
  * - All chained methods write to the SAME row
  * - Zero allocations: returns same object instance
  *
+ * Per user requirements:
+ * - Uses separate generated Scope class for attribute inheritance
+ * - Scope instance is created per span context
+ * - Child spans inherit parent's scope values via _getScopeValues()
+ *
  * @param schema - Tag attribute schema with field definitions
  * @param buffer - SpanBuffer to write entries to (per-span instance)
- * @param inheritedScopedAttributes - Scoped attributes inherited from parent span
- * @param anchorEpochMicros - Epoch time in microseconds when anchor was created
- * @param anchorPerfNow - High-precision time when anchor was created
+ * @param inheritedScopeValues - Scoped values inherited from parent span (from _getScopeValues())
  * @returns SpanLogger with typed methods matching schema
  */
 function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
   buffer: SpanBuffer,
-  inheritedScopedAttributes?: Record<string, unknown>,
-  anchorEpochMicros?: number,
-  anchorPerfNow?: number,
+  inheritedScopeValues?: Record<string, unknown>,
 ): SpanLogger<T> {
+  // Import Scope generator (dynamic import for tree-shaking)
+  const { createScope, createScopeWithInheritance } = require('./codegen/scopeGenerator.js');
+
+  // Create Scope instance (separate from column storage)
+  const scopeInstance =
+    inheritedScopeValues && Object.keys(inheritedScopeValues).length > 0
+      ? createScopeWithInheritance(schema, inheritedScopeValues)
+      : createScope(schema);
+
   // Get or create the generated SpanLogger class (cold path - happens once per schema)
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
 
@@ -1272,17 +1207,14 @@ function createSpanLogger<T extends TagAttributeSchema>(
   // Create instance (hot path - happens once per span)
   const logger = new SpanLoggerClass(
     buffer,
-    categoryInterner,
-    textStringStorage,
     getBufferWithSpace,
-    anchorEpochMicros ?? 0,
-    anchorPerfNow ?? 0,
-    inheritedScopedAttributes || {},
+    scopeInstance, // Pass Scope instance instead of plain object
   );
 
-  // If scoped attributes were inherited, pre-fill the buffer
-  if (inheritedScopedAttributes && Object.keys(inheritedScopedAttributes).length > 0) {
-    logger.scope(inheritedScopedAttributes);
+  // If scoped values were inherited, pre-fill the buffer
+  // The scope() method will update both the Scope instance and pre-fill buffer
+  if (inheritedScopeValues && Object.keys(inheritedScopeValues).length > 0) {
+    logger.scope(inheritedScopeValues);
   }
 
   return logger as SpanLogger<T>;
@@ -1447,30 +1379,20 @@ export function createModuleContext<
         // Connect feature flag evaluator to buffer for analytics
         // The evaluator is a FeatureFlagEvaluator instance, we need to set columnWriters
         if (requestCtx.ff instanceof FeatureFlagEvaluator) {
-          (requestCtx.ff as FeatureFlagEvaluator<FF>)['columnWriters'] = createFlagColumnWriters(
-            spanBuffer,
-            requestCtx.anchorEpochMicros,
-            requestCtx.anchorPerfNow,
-          );
+          (requestCtx.ff as FeatureFlagEvaluator<FF>)['columnWriters'] = createFlagColumnWriters(spanBuffer);
         }
 
         // Write span-start entry (row 0) and pre-initialize span-end (row 1)
         // writeIndex is set to 2 after this call
-        writeSpanStart(spanBuffer, name, requestCtx.anchorEpochMicros, requestCtx.anchorPerfNow);
+        writeSpanStart(spanBuffer, name);
 
-        // Inherit scoped attributes from parent context if available
+        // Inherit scoped values from parent context if available
         // Per specs/01i_span_scope_attributes.md - tasks inherit scoped attributes from calling context
-        const inheritedScopedAttributes =
-          (requestCtx as RequestContext<FF, Env> & { log?: SpanLogger<T> }).log?.getScopedAttributes() || {};
+        const parentLogger = (requestCtx as RequestContext<FF, Env> & { log?: SpanLogger<T> }).log;
+        const inheritedScopeValues = parentLogger?._getScope?.()._getScopeValues() || {};
 
-        // Create span logger with typed tag methods (with inherited scoped attributes)
-        const spanLogger = createSpanLogger(
-          schemaOnly,
-          spanBuffer,
-          inheritedScopedAttributes,
-          requestCtx.anchorEpochMicros,
-          requestCtx.anchorPerfNow,
-        );
+        // Create span logger with typed tag methods (with inherited scope values)
+        const spanLogger = createSpanLogger(schemaOnly, spanBuffer, inheritedScopeValues);
 
         // Create span context
         // Note: spanLogger.tag returns the chainable tag API
@@ -1481,24 +1403,11 @@ export function createModuleContext<
           log: spanLogger,
 
           ok<V>(value: V): FluentSuccessResult<V, T> {
-            return new FluentSuccessResult<V, T>(
-              spanBuffer,
-              value,
-              schemaOnly,
-              requestCtx.anchorEpochMicros,
-              requestCtx.anchorPerfNow,
-            );
+            return new FluentSuccessResult<V, T>(spanBuffer, value, schemaOnly);
           },
 
           err<E>(code: string, error: E): FluentErrorResult<E, T> {
-            return new FluentErrorResult<E, T>(
-              spanBuffer,
-              code,
-              error,
-              schemaOnly,
-              requestCtx.anchorEpochMicros,
-              requestCtx.anchorPerfNow,
-            );
+            return new FluentErrorResult<E, T>(spanBuffer, code, error, schemaOnly);
           },
 
           async span<R>(childName: string, childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R> {
@@ -1506,20 +1415,14 @@ export function createModuleContext<
             const childBuffer = createChildSpanBuffer(spanBuffer, taskContext);
 
             // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
-            writeSpanStart(childBuffer, childName, requestCtx.anchorEpochMicros, requestCtx.anchorPerfNow);
+            writeSpanStart(childBuffer, childName);
 
-            // Inherit scoped attributes from parent span
+            // Inherit scoped values from parent span via Scope instance
             // Per specs/01i_span_scope_attributes.md - child spans inherit parent's scoped attributes
-            const parentScopedAttributes = spanLogger.getScopedAttributes();
+            const parentScopeValues = spanLogger._getScope()._getScopeValues();
 
-            // Create child context with its own logger (with inherited scoped attributes)
-            const childLogger = createSpanLogger(
-              schemaOnly,
-              childBuffer,
-              parentScopedAttributes,
-              requestCtx.anchorEpochMicros,
-              requestCtx.anchorPerfNow,
-            );
+            // Create child context with its own logger (with inherited scope values)
+            const childLogger = createSpanLogger(schemaOnly, childBuffer, parentScopeValues);
 
             // Create a new feature flag evaluator bound to the CHILD buffer.
             // This ensures ff-access/ff-usage entries are logged to the correct span.
@@ -1543,7 +1446,7 @@ export function createModuleContext<
             } catch (error) {
               // Write span-exception to row 1 (fixed layout)
               // Row 1 was pre-initialized as exception, just update timestamp
-              childBuffer.timestamps[1] = getTimestampMicros(requestCtx.anchorEpochMicros, requestCtx.anchorPerfNow);
+              childBuffer.timestamps[1] = getTimestampNanos();
 
               // Write exception details to row 1
               const errorMessage = error instanceof Error ? error.message : String(error);
@@ -1566,7 +1469,7 @@ export function createModuleContext<
         } catch (error) {
           // Write span-exception to row 1 (fixed layout)
           // Row 1 was pre-initialized as exception, just update timestamp
-          spanBuffer.timestamps[1] = getTimestampMicros(requestCtx.anchorEpochMicros, requestCtx.anchorPerfNow);
+          spanBuffer.timestamps[1] = getTimestampNanos();
 
           // Write exception details to row 1
           const errorMessage = error instanceof Error ? error.message : String(error);

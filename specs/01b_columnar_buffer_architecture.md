@@ -142,6 +142,64 @@ subsequent timestamps.
 4. **DST/NTP safe** - Anchor per trace, traces are short-lived
 5. **Cross-platform** - Same API, different implementations
 
+### Timestamp Precision Guarantees
+
+**Storage Format**: All timestamps stored as microseconds (μs) in `Float64Array` during hot path.
+
+**Precision by Platform**:
+
+- **Browser**: ~5μs resolution from `performance.now()`, stored as microseconds
+- **Node.js**: Nanosecond resolution from `process.hrtime.bigint()`, truncated to microseconds for consistency
+- **Fallback**: Millisecond resolution from `Date.now()` when high-resolution timers unavailable
+
+**Safe Range**: `Float64Array` can exactly represent integers up to `Number.MAX_SAFE_INTEGER` (2^53 - 1):
+
+- Maximum safe microsecond timestamp: `9,007,199,254,740,991` microseconds
+- Equivalent date: ~September 2255 (over 230 years from Unix epoch)
+- **Conclusion**: BigInt→Number conversion is SAFE for all practical trace timestamps
+
+**Why Microseconds**:
+
+- `Float64Array` can exactly represent microseconds until year 2255
+- Sub-millisecond precision enables detailed performance analysis
+- Compatible with ClickHouse's `DateTime64(6)` type
+- Matches OpenTelemetry's timestamp precision recommendation
+
+**Arrow Format**: During cold path conversion, timestamps converted to Arrow `TimestampMicrosecond` type.
+
+### Date.now() Usage Guidelines
+
+**CRITICAL**: `Date.now()` has different usage rules depending on context:
+
+**For Trace Timestamps** (Performance-Critical Path):
+
+- ❌ **NEVER use `Date.now()` for span/log timestamps**
+- ✅ **ALWAYS use anchored approach**: `getTimestampMicros(anchorEpochMicros, anchorPerfNow)`
+- Why: Anchored timestamps provide sub-millisecond precision and avoid repeated system calls
+
+**For Scheduling/Background Tasks** (Non-Performance-Critical):
+
+- ✅ **OK to use `Date.now()` for scheduling**: Background flush intervals, timeout calculations
+- ✅ **OK for file naming**: `traces-${Date.now()}.parquet`
+- ✅ **OK for logging system metadata**: Capacity tuning events, system diagnostics
+- Why: Millisecond precision acceptable, system clock alignment desired
+
+**Example**:
+
+```typescript
+// ✅ CORRECT: Trace timestamps use anchored approach
+buffer.timestamps[idx] = getTimestampMicros(ctx.anchorEpochMicros, ctx.anchorPerfNow);
+
+// ❌ WRONG: Don't use Date.now() for trace timestamps
+buffer.timestamps[idx] = Date.now() * 1000; // No sub-ms precision, repeated syscalls
+
+// ✅ CORRECT: Scheduling uses Date.now()
+const nextFlushTime = Date.now() + flushIntervalMs;
+
+// ✅ CORRECT: File naming uses Date.now()
+const filename = `traces-${Date.now()}.parquet`;
+```
+
 ### Browser Implementation
 
 ```typescript
@@ -322,7 +380,7 @@ several key benefits:
 // Uint32Array (string indices): 64 × 4 = 256 bytes → no alignment needed
 // Float64Array (timestamps): 64 × 8 = 512 bytes → no alignment needed
 
-// Legacy example with 16 elements (shows why we increased initial capacity):
+// Example with smaller capacity showing alignment impact:
 // Uint8Array: 16 × 1 = 16 bytes → aligned to 64 bytes = 64 elements (4x increase!)
 // Uint16Array: 16 × 2 = 32 bytes → aligned to 64 bytes = 32 elements (2x increase!)
 ```
@@ -351,9 +409,11 @@ cache-aligned:
 
 ## Lazy Column Initialization
 
-**Memory Optimization**: Attribute columns (`attr_*`) use the `LazyColumn` class - ONE object per column that handles
-lazy TypedArray allocation, lazy null bitmap allocation, AND scope value storage. This provides significant memory
-savings for sparse columns while supporting the scope attribute pattern.
+**Memory Optimization**: Attribute columns (`attr_*`) use **lazy getters** that allocate shared ArrayBuffers on first
+access. This provides significant memory savings for sparse columns.
+
+**Important**: Scope values are stored in a SEPARATE Scope class (see 01i_span_scope_attributes.md), NOT in the buffer
+columns.
 
 ### Why Lazy Initialization
 
@@ -366,7 +426,7 @@ savings for sparse columns while supporting the scope attribute pattern.
 3. **Schema Flexibility**: Modules can define comprehensive schemas with many optional attributes without paying memory
    cost for unused ones.
 
-4. **Scope Value Support**: LazyColumn stores scope values without allocating TypedArrays until needed.
+4. **Shared ArrayBuffer**: Each column uses ONE ArrayBuffer for both nulls and values, partitioned with cache alignment.
 
 ### What Gets Allocated When
 
@@ -375,166 +435,151 @@ savings for sparse columns while supporting the scope attribute pattern.
 - `timestamps: Float64Array` - Every entry has a timestamp
 - `operations: Uint8Array` - Every entry has an operation/entry type
 
-**Lazily Allocated (via LazyColumn)**:
+**Lazily Allocated (via Lazy Getters)**:
 
-- `_values: TypedArray | string[]` - Only allocated on first `.values` access or when scope changes
-- `_nullBitmap: Uint8Array` - Only allocated on first `.nullBitmap` access or `.set()` call
-- `_scopeValue` - Stored immediately, NO allocation
+- `attr_X_values: TypedArray` - Allocated on first getter access
+- `attr_X_nulls: Uint8Array` - Same allocator as values (shares ArrayBuffer)
+- Both use the SAME underlying ArrayBuffer, partitioned with cache alignment
 
-### LazyColumn Class
+**Scope Values** (SEPARATE from buffer):
 
-Each attribute column is represented by ONE `LazyColumn` object that manages all column state:
+- Stored in Scope class instances (see 01i_span_scope_attributes.md)
+- NOT stored in buffer columns
+- Applied to buffer columns during writes or pre-fill operations
+
+### Lazy Getter Implementation (Generated via `new Function()`)
+
+The actual implementation generates a concrete SpanBuffer class with lazy getters for each column:
 
 ```typescript
-class LazyColumn<T extends TypedArray | string[]> {
-  private _values: T | null = null;
-  private _nullBitmap: Uint8Array | null = null;
-  private _scopeValue: number | string | boolean | null = null;
+// Generated at module creation time (cold path)
+// Example for userId attribute:
 
-  readonly capacity: number;
-  readonly ArrayType: TypedArrayConstructor | ArrayConstructor;
+// Symbol for per-instance storage
+const attr_userId_sym = Symbol('attr_userId');
 
-  constructor(capacity: number, ArrayType: TypedArrayConstructor | ArrayConstructor) {
-    this.capacity = capacity;
-    this.ArrayType = ArrayType;
+// Allocator function (called by getters)
+function allocate_attr_userId(self) {
+  if (self[attr_userId_sym]) return self[attr_userId_sym];
+
+  const capacity = self._alignedCapacity;
+  const nullBitmapSize = Math.ceil(capacity / 8);
+
+  // Cache-align null bitmap end for optimal values array placement
+  const bytesPerElement = 4; // Uint32Array
+  const alignedNullOffset = Math.ceil(nullBitmapSize / bytesPerElement) * bytesPerElement;
+
+  const totalSize = alignedNullOffset + capacity * bytesPerElement;
+
+  // ONE ArrayBuffer for both nulls and values
+  const buffer = new ArrayBuffer(totalSize);
+
+  const storage = {
+    buffer: buffer,
+    nulls: new Uint8Array(buffer, 0, nullBitmapSize),
+    values: new Uint32Array(buffer, alignedNullOffset, capacity),
+  };
+
+  self[attr_userId_sym] = storage;
+  return storage;
+}
+
+// Generated class with lazy getters
+class GeneratedColumnBuffer {
+  constructor(requestedCapacity) {
+    const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
+    this._alignedCapacity = alignedCapacity;
+    this.timestamps = new Float64Array(alignedCapacity);
+    this.operations = new Uint8Array(alignedCapacity);
+    this.writeIndex = 0;
+    this.capacity = requestedCapacity;
   }
 
-  // For black-box testing
-  get isInitialized(): boolean {
-    return this._values !== null;
+  // Lazy getters for userId column
+  get attr_userId_nulls() {
+    return allocate_attr_userId(this).nulls;
+  }
+  get attr_userId_values() {
+    return allocate_attr_userId(this).values;
+  }
+  get attr_userId() {
+    return allocate_attr_userId(this).values;
+  } // Shorthand
+
+  // ... same pattern for all schema attributes
+
+  // Helpers to check allocation without triggering it
+  getColumnIfAllocated(columnName) {
+    const sym = columnSymbols[columnName];
+    return sym ? this[sym]?.values : undefined;
   }
 
-  get hasScopeValue(): boolean {
-    return this._scopeValue !== null;
-  }
-
-  // Get scope value - for ctx.scope getters to read
-  get scopeValue(): number | string | boolean | null {
-    return this._scopeValue;
-  }
-
-  // Set scope value - NO ALLOCATION (unless second scope call)
-  setScope(value: number | string | boolean): void {
-    if (this._scopeValue !== null && this._values === null) {
-      // Second scope call with different value - must allocate NOW
-      // to preserve the old scope value in rows 0..writeIndex
-      this._allocateAndFillWithScope();
-    }
-    this._scopeValue = value;
-  }
-
-  private _allocateAndFillWithScope(): void {
-    this._values = new this.ArrayType(this.capacity) as T;
-    if (this._scopeValue !== null) {
-      (this._values as any).fill(this._scopeValue);
-    }
-  }
-
-  // Get null bitmap - allocate lazily
-  get nullBitmap(): Uint8Array {
-    if (!this._nullBitmap) {
-      this._nullBitmap = new Uint8Array(Math.ceil(this.capacity / 8));
-    }
-    return this._nullBitmap;
-  }
-
-  // Hot path - allocate values on first direct write
-  get values(): T {
-    if (!this._values) {
-      this._allocateAndFillWithScope();
-    }
-    return this._values!;
-  }
-
-  // Set a value at a specific index (hot path)
-  set(index: number, value: number | string | boolean): void {
-    this.values[index] = value as any;
-    // Set null bitmap bit (value is present)
-    const byteIndex = Math.floor(index / 8);
-    const bitOffset = index % 8;
-    this.nullBitmap[byteIndex] |= 1 << bitOffset;
-  }
-
-  // Cold path - Arrow conversion
-  getValuesForArrow(writeIndex: number): T | null {
-    if (this._values) {
-      // Was written to directly - zero-copy subarray
-      return (this._values as any).subarray(0, writeIndex) as T;
-    }
-    if (this._scopeValue !== null) {
-      // Never written directly, but has scope value
-      // Allocate NOW (cold path) and fill
-      const arr = new this.ArrayType(writeIndex) as T;
-      (arr as any).fill(this._scopeValue);
-      return arr;
-    }
-    // No data, no scope - null column
-    return null;
-  }
-
-  // Get null bitmap for Arrow conversion (cold path)
-  getNullBitmapForArrow(writeIndex: number): Uint8Array | null {
-    if (this._nullBitmap) {
-      const neededBytes = Math.ceil(writeIndex / 8);
-      return this._nullBitmap.subarray(0, neededBytes);
-    }
-    if (this._scopeValue !== null) {
-      // Scope value means all rows have values - create full bitmap
-      const neededBytes = Math.ceil(writeIndex / 8);
-      const bitmap = new Uint8Array(neededBytes);
-      bitmap.fill(0xff);
-      const extraBits = writeIndex % 8;
-      if (extraBits > 0) {
-        bitmap[neededBytes - 1] &= (1 << extraBits) - 1;
-      }
-      return bitmap;
-    }
-    return null;
+  getNullsIfAllocated(columnName) {
+    const sym = columnSymbols[columnName];
+    return sym ? this[sym]?.nulls : undefined;
   }
 }
 ```
+
+**Key Design Points**:
+
+1. **Shared ArrayBuffer**: Each column uses ONE ArrayBuffer for both nulls and values
+2. **Cache Alignment**: Null bitmap end is aligned to value type's element size
+3. **Per-Instance Storage**: Symbol-keyed properties ensure each buffer instance has its own arrays
+4. **Zero Indirection**: Direct property access (`buffer.attr_userId_values[i]`)
+5. **V8 Optimization**: Generated classes optimize well with hidden classes and inline caching
 
 ### Memory Impact Example
 
 Consider a schema with 20 attributes where a typical span only uses 3:
 
 ```typescript
-// Without lazy initialization:
-// 20 columns × 64 elements × 4 bytes/element = 5,120 bytes per span
-// + 20 null bitmaps × 8 bytes = 160 bytes
-// Total: 5,280 bytes per span
+// Without lazy initialization (ALL columns allocated):
+// 2 core columns: Float64Array(64) + Uint8Array(64) = 576 bytes
+// 20 attr columns: 20 × (Uint32Array(64) + null bitmap) = 20 × (256 + 8) = 5,280 bytes
+// Total: 5,856 bytes per span
 
-// With LazyColumn:
-// 2 core columns (timestamps + operations) = 576 bytes (always)
-// 20 LazyColumn objects (no TypedArrays) = ~400 bytes (small objects)
-// 3 used attr columns × 64 × 4 = 768 bytes (on demand)
-// 3 null bitmaps × 8 bytes = 24 bytes (on demand)
-// Total: ~1,768 bytes per span (67% memory savings!)
+// With lazy getters (ONLY used columns allocated):
+// 2 core columns: Float64Array(64) + Uint8Array(64) = 576 bytes (always)
+// 20 lazy getter closures: ~0 bytes (generated code, shared across instances)
+// 3 used attr columns with shared ArrayBuffers:
+//   - Each: ceil(64/8) = 8 bytes (nulls) + padding + 256 bytes (values) ≈ 272 bytes
+//   - Total: 3 × 272 = 816 bytes (on demand)
+// Total: ~1,392 bytes per span (76% memory savings!)
+//
+// Note: Each column's nulls and values share ONE ArrayBuffer, reducing allocations
 ```
 
 ## Base SpanBuffer Interface
 
 **Purpose**: Provide a generic interface that can be extended with schema-generated columns.
 
-**CRITICAL**: LazyColumn instances are **direct properties** on the SpanBuffer (no nested `columns: Record<...>`). This
-design provides zero indirection for hot path access.
+**CRITICAL**: Column properties are **direct properties** on the SpanBuffer via lazy getters (no nested
+`columns: Record<...>`). This design provides zero indirection for hot path access.
 
 ```typescript
 interface SpanBuffer {
-  // Core columns - always present (allocated immediately)
+  // Core columns - always present (allocated immediately in constructor)
   timestamps: Float64Array; // Every operation appends timestamp
   operations: Uint8Array; // Operation type: tag, ok, err, etc.
 
-  // Attribute columns - DIRECT PROPERTIES on buffer (NOT nested in a Record!)
-  // Each LazyColumn handles: values, null bitmap, AND scope value
-  // Schema-generated: one direct property per attribute
-  attr_userId: LazyColumn<Uint32Array>;
-  attr_requestId: LazyColumn<Uint32Array>;
-  attr_orderId: LazyColumn<Uint32Array>;
-  attr_http_status: LazyColumn<Uint16Array>;
-  attr_http_method: LazyColumn<Uint32Array>;
-  attr_logMessage: LazyColumn<string[]>;
-  // ... etc - one direct property per schema attribute
+  // Attribute columns - DIRECT PROPERTIES with LAZY GETTERS (no nested Record!)
+  // Each attribute has TWO properties sharing ONE ArrayBuffer:
+  // - attr_X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
+  // - attr_X_values: TypedArray for actual values
+  // Schema-generated via new Function() at module creation time
+  attr_userId_nulls: Uint8Array; // Lazy getter
+  attr_userId_values: Uint32Array; // Lazy getter
+  attr_userId: Uint32Array; // Shorthand getter (alias for _values)
+
+  attr_requestId_nulls: Uint8Array;
+  attr_requestId_values: Uint32Array;
+  attr_requestId: Uint32Array;
+
+  attr_http_status_nulls: Uint8Array;
+  attr_http_status_values: Uint16Array;
+  attr_http_status: Uint16Array;
+  // ... same pattern for all schema attributes
 
   // Tree structure
   children: SpanBuffer[];
@@ -546,34 +591,308 @@ interface SpanBuffer {
   capacity: number; // Logical capacity for bounds checking
   next?: SpanBuffer; // Chain to next buffer when overflow (part of self-tuning)
 
-  spanId: number; // Incremental ID for THIS SpanBuffer (assigned at creation)
+  // Span Identification (see "Distributed Span ID Design" section below)
+  // A span represents a unit of work within a single thread of execution.
+  threadId: bigint; // 64-bit random ID, set from worker context (same for all spans in worker)
+  spanId: number; // 32-bit THREAD-LOCAL counter - "nth span on this thread", NOT "nth span in trace"
   traceId: string; // Root trace ID (constant per span, no TypedArray needed)
 
-  // NOTE: Each span gets its own buffer, so traceId and spanId are constant
+  // Helpers (don't trigger allocation)
+  getColumnIfAllocated(columnName: string): TypedArray | undefined;
+  getNullsIfAllocated(columnName: string): Uint8Array | undefined;
+
+  // NOTE: Each span gets its own buffer, so traceId and span IDs are constant
   // No need for traceId/spanId TypedArrays - they're the same for every row in this buffer
   // This keeps logs sorted and enables efficient Arrow conversion
+  //
+  // Span Definition: A span represents a unit of work within a single thread of execution.
+  // This justifies having both threadId and spanId as separate concepts.
+  //
+  // Span ID Design: threadId + spanId form a globally unique identifier
+  // - threadId: 64-bit BigInt, generated once per worker/process, shared across all spans
+  // - spanId: 32-bit THREAD-LOCAL counter, incremented per span on this thread (cheap i++)
+  //   NOTE: spanId is NOT per-trace! It's "nth span on this thread" across ALL traces.
+  //   Use timestamps if you need trace-relative ordering.
+  // - Parent reference: derived from parent SpanBuffer's threadId + spanId
+  //
+  // Global Uniqueness:
+  // - Within a trace: (threadId, spanId) is unique
+  // - Globally: (traceId, threadId, spanId) is globally unique
 }
 
 // Access pattern - DIRECT property access, zero indirection:
-buffer.attr_userId.set(idx, value); // ✅ Direct access
-buffer.attr_userId.setScope(value); // ✅ Direct access
-const scope = buffer.attr_userId.scopeValue; // ✅ Direct read
+buffer.attr_userId_values[idx] = value; // ✅ Direct TypedArray access
+buffer.attr_userId_nulls[byteIdx] |= bitmask; // ✅ Direct bitmap access
+buffer.attr_userId[idx] = value; // ✅ Shorthand (alias for _values)
+
+// Check allocation without triggering it:
+const values = buffer.getColumnIfAllocated('attr_userId'); // Returns undefined if not allocated
 
 // NOT this pattern (extra indirection via nested Record):
-// buffer.columns.attr_userId.set(idx, value);  // ❌ One extra lookup
+// buffer.columns.attr_userId[idx] = value;  // ❌ One extra lookup
 ```
+
+## Span Definition
+
+> **A span represents a unit of work within a single thread of execution.**
+
+This definition is the foundation of LMAO's span identification design. Unlike OpenTelemetry which defines a span as
+simply a "unit of work" with random 64-bit IDs, LMAO explicitly ties spans to their thread of execution.
+
+### Comparison to OpenTelemetry
+
+| Aspect              | OpenTelemetry                | LMAO                                               |
+| ------------------- | ---------------------------- | -------------------------------------------------- |
+| **Span Definition** | "Unit of work"               | "Unit of work within a single thread of execution" |
+| **Span ID**         | Random 64-bit                | `(thread_id, span_id)` composite                   |
+| **Generation**      | Crypto random per span       | `thread_id` once per thread, `span_id++` per span  |
+| **Hot Path Cost**   | Random generation + BigInt   | Simple `i++` increment                             |
+| **Thread Concept**  | None (spans are independent) | Explicit (spans belong to threads)                 |
+| **Timeline View**   | Requires timestamp sorting   | `span_id` gives within-thread ordering             |
+
+## Distributed Span ID Design
+
+### Problem: Span ID Collisions in Distributed Tracing
+
+A simple incrementing `span_id: number` works for single-process tracing, but causes collisions in distributed
+scenarios:
+
+```
+Machine A: trace_id="req-123", span_id=1, 2, 3...
+Machine B: trace_id="req-123", span_id=1, 2, 3... ← collision!
+```
+
+This occurs with:
+
+- **Worker threads**: `pmap()` distributing work across threads
+- **Distributed services**: Same trace spanning multiple machines
+- **Serverless**: Multiple Lambda invocations for the same request
+
+### Solution: Separate Columns (threadId + spanId)
+
+The span ID is split into two components with different lifecycles:
+
+```typescript
+// Generated ONCE per worker/process at startup (cold path)
+const threadId: bigint = generateRandom64Bit();
+
+interface SpanBuffer {
+  threadId: bigint; // Reference to worker's 64-bit random ID
+  spanId: number; // 32-bit incrementing counter (i++ per span)
+  parent?: SpanBuffer; // Tree link to derive parent IDs
+}
+```
+
+### Arrow Column Schema
+
+| Column             | Type                 | Description                                           |
+| ------------------ | -------------------- | ----------------------------------------------------- |
+| `trace_id`         | `dictionary<string>` | Request correlation across services                   |
+| `thread_id`        | `uint64`             | Thread/worker identifier (64-bit random, once/thread) |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)     |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread                                  |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID                                      |
+
+### Global Uniqueness
+
+- **Within a trace**: `(thread_id, span_id)` is unique
+- **Globally**: `(trace_id, thread_id, span_id)` is globally unique
+
+### Parent Reference
+
+To find a parent span, you need:
+
+- Same `trace_id` (parent is always in same trace)
+- Match `thread_id = parent_thread_id` AND `span_id = parent_span_id`
+
+### Why This Design?
+
+**Hot Path Performance**:
+
+- `spanId = nextSpanId++` is a simple increment (no BigInt, no crypto)
+- No random generation per span
+- No 64-bit arithmetic in the hot path
+
+**Cold Path Efficiency**:
+
+- `threadId` generated once at worker startup using `crypto.getRandomValues()`
+- BigInt conversion happens once, not per span
+- Arrow conversion references the same `threadId` for all spans in a buffer
+
+**Collision Resistance**:
+
+- 64-bit random thread ID: ~4 billion threads before 50% collision (birthday paradox)
+- Combined with 32-bit local counter: effectively unlimited unique spans
+- In practice, collision probability is negligible
+
+**Query Flexibility**:
+
+- Separate columns allow efficient querying by `thread_id` alone
+- No struct unpacking needed for common queries
+- Direct column filtering in WHERE clauses
+
+### Thread-Local Counter Design (CRITICAL)
+
+**The `span_id` is a THREAD-LOCAL counter**, not a per-trace counter:
+
+```
+Main thread (thread_id: 0xAAA): span_id 1, 2, 3, 4, 5...  (all traces combined)
+Worker A (thread_id: 0xBBB): span_id 1, 2, 3...           (all traces combined)
+Worker B (thread_id: 0xCCC): span_id 1, 2...              (all traces combined)
+```
+
+**What `span_id` IS**:
+
+- A simple `i++` counter local to each thread/worker
+- Each thread starts at 1 and increments independently
+- Counts ALL spans created on that thread, across ALL traces
+- Zero coordination between threads
+
+**What `span_id` is NOT**:
+
+- ❌ NOT a global counter shared across threads (would need synchronization)
+- ❌ NOT a per-trace counter (would require Map lookups and cleanup)
+- ❌ NOT semantically "nth span in this trace"
+
+**Semantic Meaning**:
+
+- `span_id` means "nth span created on this thread" (across all traces)
+- If you need trace-relative ordering, use timestamps
+- The tuple `(thread_id, span_id)` is globally unique, that's what matters
+
+**Why This Design**:
+
+- **Zero overhead**: Just `i++`, nothing else
+- **No synchronization**: Each thread has its own counter
+- **No Map lookups**: No per-trace state to manage
+- **No cleanup logic**: No trace completion tracking needed
+- **Still globally unique**: `(thread_id, span_id)` never collides
+
+### Runtime Representation
+
+```typescript
+// Worker initialization (ONCE at startup)
+const workerThreadId = generateRandom64Bit(); // crypto.getRandomValues() → BigInt
+
+// Thread-local counter - each thread/worker has its own counter
+// NOT per-trace, NOT global - just a simple i++ per thread
+// Increments across ALL traces on this thread
+let nextSpanId = 1;
+
+function createSpanBuffer(/* ... */): SpanBuffer {
+  return {
+    threadId: workerThreadId, // Reference to worker's threadId (same for all spans on this thread)
+    spanId: nextSpanId++, // Just i++ (cheap!) - nth span on THIS THREAD, not nth span in trace
+    parent: parentBuffer, // Tree link for parent ID derivation
+    // ... other fields
+  };
+}
+```
+
+### Arrow Conversion
+
+During cold path conversion to Arrow, span IDs become separate columns:
+
+```typescript
+// Arrow columns (separate, not a Struct)
+thread_id: Uint64; // buffer.threadId (BigInt → Uint64)
+span_id: Uint32; // buffer.spanId (number → Uint32)
+parent_thread_id: Uint64; // buffer.parent?.threadId (nullable)
+parent_span_id: Uint32; // buffer.parent?.spanId (nullable)
+```
+
+**Conversion efficiency**:
+
+- `threadId` BigInt conversion happens once per buffer (not per row)
+- `spanId` uses Uint32Array directly (no conversion needed)
+- Parent IDs derived from tree structure (no separate storage)
+
+### Cross-Thread Parent References
+
+Child spans on different threads can reference parent spans on other threads:
+
+```typescript
+// Parent span on Thread A
+const parentBuffer = {
+  threadId: 0x1a2b3c4d5e6f7890n, // Thread A's ID
+  spanId: 42,
+  // ...
+};
+
+// Child span on Thread B (via pmap or worker)
+const childBuffer = {
+  threadId: 0x9876543210fedcban, // Thread B's ID (different!)
+  spanId: 1,
+  parent: parentBuffer, // References parent on Thread A
+  // ...
+};
+
+// Arrow output (separate columns):
+// child: thread_id=0x9876543210fedcba, span_id=1, parent_thread_id=0x1a2b3c4d5e6f7890, parent_span_id=42
+```
+
+### Query Examples
+
+```sql
+-- Find all ancestors (recursive)
+WITH RECURSIVE ancestors AS (
+  SELECT * FROM spans
+  WHERE trace_id = @trace_id AND thread_id = @tid AND span_id = @sid
+  UNION ALL
+  SELECT s.* FROM spans s
+  JOIN ancestors a
+    ON s.trace_id = a.trace_id
+   AND s.thread_id = a.parent_thread_id
+   AND s.span_id = a.parent_span_id
+)
+SELECT * FROM ancestors;
+
+-- All spans from a specific thread (timeline view)
+SELECT * FROM spans
+WHERE trace_id = @trace_id AND thread_id = @tid
+ORDER BY span_id;
+
+-- Work distribution across threads
+SELECT thread_id, COUNT(*) as span_count
+FROM spans
+WHERE trace_id = @trace_id
+GROUP BY thread_id;
+
+-- Find root spans (null parent)
+SELECT * FROM spans
+WHERE parent_thread_id IS NULL AND parent_span_id IS NULL;
+```
+
+### Benefits Summary
+
+| Aspect           | Design Choice                        | Benefit                                  |
+| ---------------- | ------------------------------------ | ---------------------------------------- |
+| **Hot path**     | `spanId++`                           | Zero crypto/BigInt overhead per span     |
+| **Cold path**    | BigInt conversion once per buffer    | Minimal conversion overhead              |
+| **Collisions**   | 64-bit random thread ID              | Negligible collision probability         |
+| **Parent refs**  | Tree structure with SpanBuffer links | Cross-thread parents naturally supported |
+| **Arrow output** | Separate columns (not Struct)        | Direct column filtering, no unpacking    |
+| **JS compat**    | 64-bit BigInt + 32-bit number        | No BigInt in hot path                    |
 
 **Why This Design**:
 
 - **Zero indirection**: Direct property access is faster than nested Record lookup
+- **Lazy allocation**: Columns are only allocated on first access (via lazy getters)
+- **Shared ArrayBuffer**: Each column's nulls and values share ONE ArrayBuffer (cache-friendly)
 - **Per-span buffers**: Each span gets its own buffer for sorted logs and simple implementation
 - **No traceId/spanId arrays**: These are constant per buffer, stored as properties
-- **Single object per column**: LazyColumn handles values, null bitmap, AND scope value in one place
+- **Symbol-based storage**: Per-instance storage via Symbol keys (no closure sharing bugs)
 - **Minimal interface**: Only essential fields, no capacity/length bloat
 - **Shared references**: Module context shared across all tasks
 - **Tree structure**: Efficient parent-child span relationships
 - **Buffer chaining**: Handle overflow with linked buffers (part of self-tuning mechanism)
 - **Freelist consideration**: May keep pool of buffers if long-lived TypedArrays help V8's GC
+
+**Scope Values** (SEPARATE from buffer):
+
+Scope values are stored in a **separate Scope class** (see 01i_span_scope_attributes.md), NOT in buffer columns. The
+Scope class is generated via `new Function()` and contains only schema attributes with getters/setters. Scope values are
+applied to buffer columns during writes or pre-fill operations.
 
 ## Schema-Generated Buffer Extensions
 
@@ -583,7 +902,7 @@ const scope = buffer.attr_userId.scopeValue; // ✅ Direct read
 
 ```typescript
 // Generated from composed schema (HTTP + DB + user attributes)
-// Each attribute becomes a DIRECT LazyColumn property on buffer
+// Each attribute becomes DIRECT properties via lazy getters on buffer
 interface ComposedSpanBuffer extends SpanBuffer {
   // HTTP library attributes (attr_ prefix prevents conflicts with SpanBuffer internals)
   attr_http_status: Uint16Array; // HTTP status codes
@@ -610,86 +929,66 @@ interface ComposedSpanBuffer extends SpanBuffer {
 function createSpanBuffer<T extends TagAttributeSchema>(
   schema: T,
   taskContext: TaskContext,
+  traceId: string,
+  workerThreadId: bigint, // 64-bit random ID from worker context
   parentBuffer?: SpanBuffer // Optional parent buffer for tree linking
 ): SpanBuffer {
-  const spanId = nextGlobalSpanId++; // Assign unique ID at creation
-  return createEmptySpanBuffer(spanId, schema, taskContext, parentBuffer);
+  const spanId = nextSpanId++; // Simple increment (cheap!)
+  return createEmptySpanBuffer(spanId, traceId, workerThreadId, schema, taskContext, parentBuffer);
 }
+
+// Per-worker (thread-local) counter - NOT per-trace, NOT global
+// Each thread starts at 1 and increments independently across all traces
+let nextSpanId = 1;
 
 function createEmptySpanBuffer<T extends TagAttributeSchema>(
   spanId: number,
+  traceId: string,
+  workerThreadId: bigint,
   schema: T,
   taskContext: TaskContext,
   parentBuffer?: SpanBuffer
 ): SpanBuffer {
-  /**
-   * Cache line alignment utility - ensures TypedArrays are aligned to 64-byte boundaries
-   */
-  function getCacheAlignedCapacity(elementCount: number): number {
-    const CACHE_LINE_SIZE = 64;
-    const totalBytes = elementCount * 1; // Use 1-byte (worst case) for alignment
-    const alignedBytes = Math.ceil(totalBytes / CACHE_LINE_SIZE) * CACHE_LINE_SIZE;
-    return alignedBytes;
-  }
+  // Use runtime-generated class from arrow-builder
+  // The class has lazy getters for all attribute columns
+  const columnBuffer = createColumnBuffer(schema, taskContext.module.spanBufferCapacityStats.currentCapacity);
 
-  const requestedCapacity = taskContext.module.spanBufferCapacityStats.currentCapacity;
-  const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
+  // Extend with span-specific metadata
+  const buffer = columnBuffer as SpanBuffer;
 
-  // Start with core buffer properties
-  const buffer: SpanBuffer = {
-    spanId,
+  // Span ID: threadId + spanId form globally unique identifier
+  // A span represents a unit of work within a single thread of execution.
+  buffer.threadId = workerThreadId; // 64-bit, same for all spans in this worker
+  buffer.spanId = spanId; // 32-bit, incrementing per span on this thread
 
-    // Core columns - always allocated immediately
-    timestamps: new Float64Array(alignedCapacity),
-    operations: new Uint8Array(alignedCapacity),
+  buffer.traceId = traceId;
+  buffer.children = [];
+  buffer.parent = parentBuffer; // Tree link for parent ID derivation
 
-    // Tree structure
-    children: [],
-    parent: parentBuffer,
-    task: taskContext,
-
-    // Buffer management
-    writeIndex: 0,
-    capacity: requestedCapacity,
-    next: undefined,
-  } as SpanBuffer;
-
-  // Add LazyColumn as DIRECT properties on buffer (not nested in a Record)
-  for (const fieldName of Object.keys(schema.fields)) {
-    const columnName = `attr_${fieldName}` as keyof SpanBuffer;
-    const ArrayType = getArrayConstructorForField(schema.fields[fieldName]);
-    (buffer as any)[columnName] = new LazyColumn(alignedCapacity, ArrayType);
-  }
-
-  // If parentBuffer exists, inherit scope values
+  // Link to parent's children array
   if (parentBuffer) {
-    for (const fieldName of Object.keys(schema.fields)) {
-      const columnName = `attr_${fieldName}` as keyof SpanBuffer;
-      const parentColumn = parentBuffer[columnName] as LazyColumn<any>;
-      const childColumn = buffer[columnName] as LazyColumn<any>;
-
-      if (parentColumn?.hasScopeValue) {
-        // Copy scope value from parent to child
-        childColumn.setScope(parentColumn.scopeValue);
-      }
-    }
+    parentBuffer.children.push(buffer);
   }
 
   taskContext.module.spanBufferCapacityStats.totalBuffersCreated++;
   return buffer;
 }
 
-// Global span ID counter
-let nextGlobalSpanId = 1;
+// NOTE: Scope inheritance happens at the SpanLogger/context level via the Scope class,
+// NOT at the buffer level. The Scope class (_getScopeValues()) provides parent values
+// that are copied to child Scope instances and pre-filled into child buffers.
+// See 01i_span_scope_attributes.md for details.
 
 function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
   // Buffer chaining is part of the self-tuning mechanism (see 01b2_buffer_self_tuning.md)
   // When a buffer overflows, we chain to a new buffer for the SAME logical span
-  // The chained buffer inherits spanId and uses the same task context
+  // The chained buffer inherits threadId + spanId and uses the same task context
   return createEmptySpanBuffer(
-    buffer.spanId, // Same logical span
+    buffer.spanId, // Same logical span (same span ID)
+    buffer.traceId,
+    buffer.threadId, // Same thread ID (chained buffer is in same worker)
     getSchemaFromBuffer(buffer), // Re-use schema
-    buffer.task, // Re-use task context (includes traceId)
+    buffer.task, // Re-use task context
     buffer.parent // Parent is the same as the current buffer's parent
   );
 }
@@ -702,15 +1001,11 @@ function createChildSpan(parentBuffer: SpanBuffer, label: string, childFn: SpanF
   };
 
   // Each child span gets its own NEW buffer with its own spanId
-  // Scope values are inherited from parent via createEmptySpanBuffer
-  const childBuffer = createSpanBuffer(
-    getSchemaFromBuffer(parentBuffer), // Child inherits parent's schema
-    childTaskContext,
-    parentBuffer // Set parent reference (also triggers scope inheritance)
+  // NOTE: Scope values are inherited via Scope class, NOT buffer columns
+  const childBuffer = createChildSpanBuffer(
+    parentBuffer, // Links to parent and inherits traceId
+    childTaskContext
   );
-
-  // Link parent-child relationship in tree
-  parentBuffer.children.push(childBuffer);
 
   return childBuffer;
 }
@@ -803,17 +1098,16 @@ function generateAttributeColumns<T extends TagAttributeSchema>(
 ```typescript
 // ctx.tag writes to row 0 - OVERWRITES, not appends
 // Follows Datadog's span.set_tag() and OpenTelemetry's Span.setAttribute()
-// Uses LazyColumn.set() which handles both value AND null bitmap
-// LazyColumn is a DIRECT property on buffer (not nested in .columns)
+// Accesses lazy getters which trigger allocation on first write
+// Column properties are DIRECT on buffer (not nested in .columns)
 
 const tagOperations = {
   requestId: (buffer: SpanBuffer, value: string) => {
     // ALWAYS write to row 0 (span-start row) - overwrite semantics
-    // LazyColumn.set() handles:
-    // 1. Lazy allocation of TypedArray (if first write)
-    // 2. Writing the value
-    // 3. Setting the null bitmap bit
-    buffer.attr_requestId.set(0, hashString(value)); // Direct property access
+    // Accessing attr_requestId_values triggers lazy allocation (if first write)
+    const internedIndex = categoryInterner.intern(value);
+    buffer.attr_requestId_values[0] = internedIndex; // Direct TypedArray access
+    buffer.attr_requestId_nulls[0] |= 1; // Set bit 0 as valid (Arrow format)
 
     // Return this for chaining
     return this;
@@ -821,52 +1115,61 @@ const tagOperations = {
 
   userId: (buffer: SpanBuffer, value: string) => {
     // Same pattern - always row 0, direct property access
-    buffer.attr_userId.set(0, hashString(value));
+    const internedIndex = categoryInterner.intern(value);
+    buffer.attr_userId_values[0] = internedIndex;
+    buffer.attr_userId_nulls[0] |= 1;
     return this;
   },
 };
 
 // Usage: ctx.tag writes to row 0
-ctx.tag.requestId('req-123'); // Writes to attr_requestId[0]
-ctx.tag.userId('user-456'); // Writes to attr_userId[0]
-ctx.tag.requestId('req-789'); // OVERWRITES attr_requestId[0] - last write wins!
+ctx.tag.requestId('req-123'); // Writes to attr_requestId_values[0]
+ctx.tag.userId('user-456'); // Writes to attr_userId_values[0]
+ctx.tag.requestId('req-789'); // OVERWRITES attr_requestId_values[0] - last write wins!
 ```
 
-### ctx.scope - Compiled Class with Getters/Setters
+### ctx.scope - Separate Generated Class (NOT stored in buffer columns)
 
 ```typescript
-// ctx.scope is a compiled class with getters/setters for reading AND writing scope values
-// Scope values appear on ALL rows in Arrow output
-// LazyColumn is a DIRECT property on buffer (not nested in .columns)
+// ctx.scope is a SEPARATE generated class that stores scope values
+// Scope values are NOT stored in buffer columns - they're in the Scope instance
+// See 01i_span_scope_attributes.md for full details
 
 // Generated at module creation time (cold path) using new Function()
 class GeneratedScope {
-  constructor(private buffer: SpanBuffer) {}
+  // Private fields for each schema attribute (initialized to undefined)
+  _userId = undefined;
+  _requestId = undefined;
 
   // Getter - read scope value
-  get userId(): string | undefined {
-    return this.buffer.attr_userId.scopeValue as string | undefined;
+  get userId() {
+    return this._userId;
   }
 
-  // Setter - set scope value (NO allocation)
-  set userId(value: string) {
-    this.buffer.attr_userId.setScope(hashString(value));
+  // Setter - set scope value (just sets property, NO buffer allocation)
+  set userId(value) {
+    this._userId = value;
   }
 
-  get requestId(): string | undefined {
-    return this.buffer.attr_requestId.scopeValue as string | undefined;
+  get requestId() {
+    return this._requestId;
+  }
+  set requestId(value) {
+    this._requestId = value;
   }
 
-  set requestId(value: string) {
-    this.buffer.attr_requestId.setScope(hashString(value));
+  // Get all scope values for inheritance
+  _getScopeValues() {
+    return {
+      userId: this._userId,
+      requestId: this._requestId,
+    };
   }
-
-  // ... generated for each schema attribute
 }
 
 // Usage: ctx.scope uses property assignment syntax
-ctx.scope.userId = 'user-123'; // _scopeValue set, NO TypedArray allocated
-ctx.scope.requestId = 'req-456'; // _scopeValue set, NO TypedArray allocated
+ctx.scope.userId = 'user-123'; // Just sets _userId, NO TypedArray allocated
+ctx.scope.requestId = 'req-456'; // Just sets _requestId, NO TypedArray allocated
 
 // Reading scope values
 const currentUserId = ctx.scope.userId; // Returns 'user-123' or undefined
@@ -875,15 +1178,21 @@ if (ctx.scope.requestId !== undefined) {
 }
 ```
 
+**Scope values are applied to buffer columns during:**
+
+1. **Write operations** (`ctx.log.info()`) - scope values written to each row
+2. **Pre-fill operations** (child span creation) - parent scope values fill child buffer via TypedArray.fill()
+3. **Arrow conversion** (cold path) - scope values fill unallocated columns
+
 ### ctx.log - Appends New Rows (Events)
 
 ```typescript
 // ctx.log creates NEW rows starting at row 2 - APPENDS
 // Row 0 = span-start, Row 1 = completion, Row 2+ = events
-// LazyColumn is a DIRECT property on buffer (not nested in .columns)
+// Column properties are DIRECT on buffer via lazy getters
 
 const logOperations = {
-  info: (buffer: SpanBuffer, message: string, attributes?: Record<string, any>) => {
+  info: (buffer: SpanBuffer, message: string, scope: GeneratedScope, attributes?: Record<string, any>) => {
     // Append to current writeIndex (starts at 2)
     const index = buffer.writeIndex++;
 
@@ -891,8 +1200,23 @@ const logOperations = {
     buffer.timestamps[index] = getTimestamp(buffer.task.requestContext);
     buffer.operations[index] = ENTRY_TYPE_INFO;
 
-    // Message attribute via LazyColumn (direct property access)
-    buffer.attr_message.set(index, message);
+    // Message attribute via direct property access (triggers lazy allocation)
+    const msgIndex = textStorage.store(message);
+    buffer.attr_message_values[index] = msgIndex;
+    const byteIdx = Math.floor(index / 8);
+    const bitOffset = index % 8;
+    buffer.attr_message_nulls[byteIdx] |= 1 << bitOffset;
+
+    // Apply scope values (from Scope class, NOT stored in buffer)
+    const scopeValues = scope._getScopeValues();
+    for (const [fieldName, value] of Object.entries(scopeValues)) {
+      if (value !== undefined) {
+        const valuesKey = `attr_${fieldName}_values`;
+        const nullsKey = `attr_${fieldName}_nulls`;
+        buffer[valuesKey][index] = processValue(value, fieldName);
+        buffer[nullsKey][byteIdx] |= 1 << bitOffset;
+      }
+    }
 
     // Optional attributes
     if (attributes) {
@@ -914,9 +1238,9 @@ ctx.log.debug('Details...'); // Writes to row 3, writeIndex → 4
 - **No wasted rows**: Multiple tag calls don't bloat the buffer
 - **Progressive enrichment**: Set initial values early, refine with more context later
 - **Clear separation**: Tags (span attributes) vs logs (events) have distinct semantics
-- **Scope values**: Zero-allocation for values that appear on all rows
-- **Hot path optimization**: LazyColumn.set() is a single method call
-- **Null tracking**: LazyColumn handles bitmap internally
+- **Separate Scope class**: Scope values stored separately, not mixed with buffer columns
+- **Hot path optimization**: Direct TypedArray access via lazy getters
+- **Null tracking**: Arrow-format null bitmaps (1=valid, 0=null)
 
 ## Self-Tuning Capacity Management
 
@@ -967,11 +1291,10 @@ function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttrib
        * - Prevents dramatic memory inflation from cache alignment padding
        * - Self-tuning will adjust up/down based on actual usage patterns
        *
-       * HISTORICAL NOTE:
-       * Previously started at 16 elements, but cache alignment caused:
-       * - Uint8Array: 16 → 64 elements (4x memory increase!)
-       * - Uint16Array: 16 → 32 elements (2x memory increase!)
-       * Starting at 64 eliminates these unexpected capacity inflations.
+       * WHY 64 ELEMENTS:
+       * Starting at 64 eliminates unexpected capacity inflations from cache alignment.
+       * Smaller sizes (e.g., 16 elements) would get padded to 64 anyway for cache alignment,
+       * causing unexpected memory increases (16 → 64 for Uint8Array = 4x waste).
        */
       currentCapacity: 64, // Start with cache-friendly size - most tasks fit in 64 operations
       totalWrites: 0,
@@ -1157,13 +1480,18 @@ The hottest path. Zero allocations allowed:
 // HOTTEST PATH: Happens on EVERY tag/log call
 ctx.tag.userId('123'); // ctx.tag directly on context
 
-// What happens (LazyColumn.set() handles everything):
+// What happens (lazy getters handle allocation):
 buffer.timestamps[index] = performance.now(); // Float64 write
 buffer.operations[index] = ENTRY_TYPE.TAG; // Uint8 write
-buffer.attr_userId.set(index, internedStringIndex); // Direct property access (no .columns)
-// LazyColumn.set() internally does:
-//   this.values[index] = value;           // Uint32 write (lazy alloc on first access)
-//   this.nullBitmap[byteIdx] |= bitmask;  // Uint8 bitwise OR (lazy alloc on first access)
+
+// Accessing lazy getter triggers allocation on first access
+buffer.attr_userId_values[index] = internedStringIndex; // Uint32 write (lazy alloc on first access)
+
+// Set null bitmap bit (same ArrayBuffer as values)
+const byteIdx = Math.floor(index / 8);
+const bitOffset = index % 8;
+buffer.attr_userId_nulls[byteIdx] |= 1 << bitOffset; // Uint8 bitwise OR (same lazy alloc)
+
 index++;
 
 // What MUST NOT happen:
@@ -1225,8 +1553,8 @@ async function writeSpanBuffersToArrow(buffers: SpanBuffer[]) {
   logCapacityStats(buffers);
 
   // 2. Create Arrow RecordBatches from SpanBuffers
-  //    Uses LazyColumn.getValuesForArrow() and getNullBitmapForArrow()
-  const recordBatches = buffers.map((buffer) => createRecordBatch(buffer));
+  //    Uses buffer helper methods for checking allocation
+  const recordBatches = buffers.map((buffer) => createRecordBatch(buffer, scope));
 
   // 3. Create Arrow Table from multiple RecordBatches
   const arrowTable = new arrow.Table(recordBatches);
@@ -1235,18 +1563,71 @@ async function writeSpanBuffersToArrow(buffers: SpanBuffer[]) {
   await arrow.writeParquet(arrowTable, `traces-${Date.now()}.parquet`);
 }
 
-function createRecordBatch(buffer: SpanBuffer): arrow.RecordBatch {
+function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.RecordBatch {
   const tagAttributes = buffer.task.module.tagAttributes;
   const arrowVectors: Record<string, arrow.Vector> = {};
 
   // --- Core SpanBuffer Columns ---
-  // Use subarray() for zero-copy views into TypedArrays
-  arrowVectors.spanId = arrow.Int64Vector.from(generateSpanIds(buffer));
-  arrowVectors.parentId = arrow.Int64Vector.from(generateParentIds(buffer));
+  // Span ID columns (separate columns, not a Struct)
+  // threadId is constant per buffer, spanId is constant per buffer
+  // Parent IDs derived from buffer.parent tree link
+  arrowVectors.thread_id = createUint64Column(buffer.threadId, buffer.writeIndex);
+  arrowVectors.span_id = createUint32Column(buffer.spanId, buffer.writeIndex);
+  arrowVectors.parent_thread_id = buffer.parent
+    ? createUint64Column(buffer.parent.threadId, buffer.writeIndex)
+    : createNullUint64Column(buffer.writeIndex); // null for root spans
+  arrowVectors.parent_span_id = buffer.parent
+    ? createUint32Column(buffer.parent.spanId, buffer.writeIndex)
+    : createNullUint32Column(buffer.writeIndex); // null for root spans
+
+  // Timestamp and operation columns (zero-copy views)
   arrowVectors.timestamp = arrow.Float64Vector.from(
     buffer.timestamps.subarray(0, buffer.writeIndex) // subarray() = zero-copy view
   );
   arrowVectors.operation = arrow.Utf8Vector.from(buffer.operations.subarray(0, buffer.writeIndex));
+
+  // Helpers for span ID column creation (separate columns, not Struct)
+  function createUint64Column(value: bigint, length: number) {
+    // threadId BigInt conversion happens once (not per row)
+    return arrow.makeData({
+      type: new arrow.Uint64(),
+      length,
+      data: new BigUint64Array(length).fill(value),
+    });
+  }
+
+  function createUint32Column(value: number, length: number) {
+    // spanId fills Uint32Array directly
+    return arrow.makeData({
+      type: new arrow.Uint32(),
+      length,
+      data: new Uint32Array(length).fill(value),
+    });
+  }
+
+  function createNullUint64Column(length: number) {
+    // All nulls for root spans
+    const nullBitmap = new Uint8Array(Math.ceil(length / 8)); // All zeros = all null
+    return arrow.makeData({
+      type: new arrow.Uint64(),
+      length,
+      nullCount: length,
+      data: new BigUint64Array(length),
+      nullBitmap,
+    });
+  }
+
+  function createNullUint32Column(length: number) {
+    // All nulls for root spans
+    const nullBitmap = new Uint8Array(Math.ceil(length / 8)); // All zeros = all null
+    return arrow.makeData({
+      type: new arrow.Uint32(),
+      length,
+      nullCount: length,
+      data: new Uint32Array(length),
+      nullBitmap,
+    });
+  }
 
   // --- Module Metadata Columns (expanded from shared reference) ---
   arrowVectors.gitSha = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'gitSha'));
@@ -1256,27 +1637,45 @@ function createRecordBatch(buffer: SpanBuffer): arrow.RecordBatch {
   );
   arrowVectors.lineNumber = arrow.Int32Vector.from(getModuleMetadataColumn(buffer, 'lineNumber'));
 
-  // --- Attribute Columns (via LazyColumn) ---
+  // --- Attribute Columns (via lazy getters) ---
+  // Get scope values for columns that weren't directly written
+  const scopeValues = scope._getScopeValues();
+
   for (const [attrName, fieldConfig] of Object.entries(tagAttributes.fields)) {
-    const columnName = `attr_${attrName}` as `attr_${string}`;
-    const lazyColumn = buffer.columns[columnName];
+    const columnName = `attr_${attrName}`;
 
-    // Use LazyColumn's Arrow conversion methods
-    // - Returns null if column was never written AND has no scope value
-    // - Returns zero-copy subarray() if column was written directly
-    // - Allocates and fills if only scope value was set (cold path allocation)
-    const arrowData = lazyColumn.getValuesForArrow(buffer.writeIndex);
-    if (arrowData === null) {
-      // Column has no data and no scope value - skip it
-      continue;
+    // Check if column was allocated (without triggering allocation)
+    const values = buffer.getColumnIfAllocated(columnName);
+    const nulls = buffer.getNullsIfAllocated(columnName);
+
+    if (values) {
+      // Column was allocated - use zero-copy subarray
+      const arrowData = values.subarray(0, buffer.writeIndex);
+      const arrowNullBitmap = nulls ? nulls.subarray(0, Math.ceil(buffer.writeIndex / 8)) : null;
+
+      const arrowVector = createArrowVector(fieldConfig.type, arrowData, arrowNullBitmap);
+      arrowVectors[attrName] = arrowVector; // Strip attr_ prefix for clean column names
+    } else if (scopeValues[attrName] !== undefined) {
+      // Column NOT allocated but scope has value
+      // Allocate and fill NOW (cold path - only happens for scope-only columns)
+      const value = scopeValues[attrName];
+      const ArrayType = getArrayTypeForField(fieldConfig);
+      const arr = new ArrayType(buffer.writeIndex);
+      arr.fill(value);
+
+      // Create full null bitmap (all values present)
+      const neededBytes = Math.ceil(buffer.writeIndex / 8);
+      const bitmap = new Uint8Array(neededBytes);
+      bitmap.fill(0xff);
+      const extraBits = buffer.writeIndex % 8;
+      if (extraBits > 0) {
+        bitmap[neededBytes - 1] &= (1 << extraBits) - 1;
+      }
+
+      const arrowVector = createArrowVector(fieldConfig.type, arr, bitmap);
+      arrowVectors[attrName] = arrowVector;
     }
-
-    // Get null bitmap from the SAME LazyColumn object
-    const arrowNullBitmap = lazyColumn.getNullBitmapForArrow(buffer.writeIndex);
-
-    // Create Arrow Vector with null bitmap
-    const arrowVector = createArrowVector(fieldConfig.type, arrowData, arrowNullBitmap);
-    arrowVectors[attrName] = arrowVector; // Strip attr_ prefix for clean column names
+    // If neither allocated nor scope value: column omitted (zero cost)
   }
 
   return new arrow.RecordBatch(arrowVectors);
@@ -1316,9 +1715,10 @@ function logCapacityStats(buffers: SpanBuffer[]) {
 
 **Key Integration Points**:
 
-1. **LazyColumn API**: Each column uses `getValuesForArrow()` and `getNullBitmapForArrow()` for conversion
-2. **TypedArray subarray()**: Core columns and LazyColumn use subarray() for zero-copy views
-3. **Scope Value Handling**: Scope-only columns allocate and fill during cold path (not hot path)
+1. **Buffer helper methods**: Use `getColumnIfAllocated()` and `getNullsIfAllocated()` to check allocation without
+   triggering it
+2. **TypedArray subarray()**: Core columns and allocated attribute columns use subarray() for zero-copy views
+3. **Scope Value Handling**: Scope-only columns (from Scope class) allocate and fill during cold path (not hot path)
 4. **Attribute Prefix Stripping**: `attr_` prefixes removed during conversion for clean column names
 5. **String Registry Resolution**: Category/text indices resolve to actual strings during conversion
 
@@ -1328,31 +1728,35 @@ function logCapacityStats(buffers: SpanBuffer[]) {
 // IMPORTANT: Use subarray() for zero-copy conversion
 const view = buffer.timestamps.subarray(0, writeIndex); // Zero-copy VIEW into same ArrayBuffer
 
-// LazyColumn.getValuesForArrow() uses subarray() internally for written columns
-const arrowData = lazyColumn.getValuesForArrow(writeIndex);
-// If column was written: returns subarray() (zero-copy)
-// If only scope value: allocates new array and fills (cold path allocation)
-// If neither: returns null (column omitted)
+// Check if column was allocated without triggering allocation
+const values = buffer.getColumnIfAllocated('attr_userId');
+if (values) {
+  // Column was allocated - use zero-copy subarray
+  const arrowData = values.subarray(0, writeIndex);
+}
 
-// LazyColumn.getNullBitmapForArrow() also uses subarray() when possible
-const nullBitmap = lazyColumn.getNullBitmapForArrow(writeIndex);
+// If column wasn't allocated but scope has value:
+// - Allocate new array and fill (cold path allocation)
+// If neither allocated nor scope value:
+// - Column omitted entirely (zero cost)
 ```
 
 **Example Conversion**:
 
 ```typescript
-// SpanBuffer with LazyColumn (in-memory)    →  Arrow Table (queryable)
-// LazyColumn is DIRECT property on buffer (not nested in .columns)
-buffer.attr_http_status.values[0]            →  http_status: 200
-buffer.attr_db_query.values[0]               →  db_query: "SELECT * FROM users WHERE id = ?"
-buffer.attr_http_status.nullBitmap           →  Arrow validity bitmap: 0x01
-// LazyColumn with hasScopeValue but !isInitialized  →  allocate + fill at conversion
-// LazyColumn with !hasScopeValue && !isInitialized  →  Column omitted entirely (zero cost)
+// SpanBuffer with lazy getters (in-memory)    →  Arrow Table (queryable)
+// Column properties are DIRECT on buffer (not nested in .columns)
+buffer.attr_http_status_values[0]              →  http_status: 200
+buffer.attr_db_query_values[0]                 →  db_query: "SELECT * FROM users WHERE id = ?"
+buffer.attr_http_status_nulls                  →  Arrow validity bitmap: 0x01
+// Column allocated but not written → subarray() with existing null bitmap
+// Column not allocated + scope value → allocate + fill at conversion (cold path)
+// Column not allocated + no scope value → Column omitted entirely (zero cost)
 ```
 
 **See Also**:
 
-- **[Span Scope Attributes](./01i_span_scope_attributes.md)**: LazyColumn class definition and scope value handling
+- **[Span Scope Attributes](./01i_span_scope_attributes.md)**: Scope class definition and scope value handling
 - **Arrow Table Structure** (future document): Complete Arrow schema, examples with realistic trace data, ClickHouse
   query patterns
 - **Background Processing Pipeline** (future document): Detailed Arrow/Parquet conversion process, performance

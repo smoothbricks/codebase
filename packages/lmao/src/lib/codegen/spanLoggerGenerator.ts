@@ -8,7 +8,6 @@
  * - Direct buffer writes without intermediate objects
  */
 
-import type { Microseconds } from '@smoothbricks/arrow-builder';
 import { getEnumValues, getLmaoSchemaType } from '../schema/typeGuards.js';
 import type { InferTagAttributes, TagAttributeSchema } from '../schema/types.js';
 import { getSchemaFields } from '../schema/types.js';
@@ -582,8 +581,8 @@ function generateWriteMessageMethod(schemaFields: [string, unknown][], enumField
       // Write entry type
       this._buffer.operations[idx] = entryType;
 
-      // Write timestamp using anchor for high precision (microseconds)
-      this._buffer.timestamps[idx] = getTimestampMicros(this._anchorEpochMicros, this._anchorPerfNow);
+      // Write timestamp (nanoseconds since epoch)
+      this._buffer.timestamps[idx] = getTimestampNanos();
 
       // Write message to attr_logMessage column (raw string, no interning)
       const messageColumn = this._buffer.attr_logMessage_values;
@@ -643,20 +642,20 @@ export function generateSpanLoggerClass<T extends TagAttributeSchema>(
 (function() {
   'use strict';
 
-  // Inline getTimestampMicros for performance (zero function call overhead)
-  // Uses performance.now() which is browser-safe and provides sub-millisecond precision
-  function getTimestampMicros(anchorEpochMicros, anchorPerfNow) {
-    return anchorEpochMicros + (performance.now() * 1000 - anchorPerfNow);
+  // Inline getTimestampNanos for performance (zero function call overhead)
+  // performance.timeOrigin + performance.now() gives epoch milliseconds with sub-ms precision
+  // Convert to microseconds first (safe as Number), then to nanoseconds as BigInt
+  function getTimestampNanos() {
+    const epochMicros = Math.round((performance.timeOrigin + performance.now()) * 1000);
+    return BigInt(epochMicros) * 1000n;
   }
 
   ${enumMappings.join('\n')}
 
   class ${className} {
-    constructor(buffer, getBufferWithSpace, anchorEpochMicros, anchorPerfNow, scopeInstance) {
+    constructor(buffer, getBufferWithSpace, scopeInstance) {
       this._buffer = buffer;
       this._getBufferWithSpace = getBufferWithSpace;
-      this._anchorEpochMicros = anchorEpochMicros;
-      this._anchorPerfNow = anchorPerfNow;
       this._scope = scopeInstance;
     }
 
@@ -740,8 +739,6 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
 ): new (
   buffer: SpanBuffer,
   getBufferWithSpace: GetBufferWithSpaceFn,
-  anchorEpochMicros: Microseconds,
-  anchorPerfNow: Microseconds,
   scopeInstance: GeneratedScope,
 ) => BaseSpanLogger<T> {
   const classCode = generateSpanLoggerClass(schema).trim();
@@ -754,8 +751,6 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
   return GeneratedClass as new (
     buffer: SpanBuffer,
     getBufferWithSpace: GetBufferWithSpaceFn,
-    anchorEpochMicros: Microseconds,
-    anchorPerfNow: Microseconds,
     scopeInstance: GeneratedScope,
   ) => BaseSpanLogger<T>;
 }

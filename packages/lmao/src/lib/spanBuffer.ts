@@ -52,9 +52,10 @@
 
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
+import { getThreadId } from './threadId.js';
 import type { SpanBuffer, TaskContext } from './types.js';
 
-let nextGlobalSpanId = 1;
+let nextSpanId = 1;
 
 /**
  * Creates an empty SpanBuffer with native TypedArrays.
@@ -65,12 +66,13 @@ let nextGlobalSpanId = 1;
  * **Buffer Properties:**
  * - Cache-aligned TypedArrays for all columns (64-byte alignment)
  * - Null bitmaps per nullable column (Arrow format: 1 bit per row)
- * - Span metadata (spanId, traceId, parent/children links)
+ * - Span metadata (threadId, spanId, traceId, parent/children links)
  *
  * **Important**: Returns buffer with `writeIndex = 0`. Callers MUST call
  * `writeSpanStart()` from lmao.ts to initialize the fixed row layout.
  *
- * @param spanId - Unique span identifier (auto-generated incrementing number)
+ * @param spanId - Span identifier (auto-generated incrementing number within process)
+ * @param threadId - 64-bit thread/worker ID for distributed tracing
  * @param traceId - Trace ID from request context (shared across all spans in trace)
  * @param schema - Tag attribute schema defining column types
  * @param taskContext - Task context with module metadata and capacity stats
@@ -83,6 +85,7 @@ let nextGlobalSpanId = 1;
  */
 export function createEmptySpanBuffer(
   spanId: number,
+  threadId: bigint,
   traceId: string,
   schema: TagAttributeSchema,
   taskContext: TaskContext,
@@ -92,15 +95,16 @@ export function createEmptySpanBuffer(
   // Create generic column buffer first
   const columnBuffer = createColumnBuffer(schema, requestedCapacity);
 
-  // Extend with span-specific fields
-  const buffer: SpanBuffer = {
-    ...columnBuffer,
-    spanId,
-    traceId, // TraceId from request context (constant across all spans in trace)
-    children: [],
-    parent: parentBuffer,
-    task: taskContext,
-  };
+  // Extend the column buffer with span-specific fields
+  // IMPORTANT: Use Object.assign to preserve getters/prototype chain!
+  // Spreading {...columnBuffer} would evaluate getters and lose lazy allocation
+  const buffer = columnBuffer as SpanBuffer;
+  buffer.threadId = threadId;
+  buffer.spanId = spanId;
+  buffer.traceId = traceId; // TraceId from request context (constant across all spans in trace)
+  buffer.children = [];
+  buffer.parent = parentBuffer;
+  buffer.task = taskContext;
 
   taskContext.module.spanBufferCapacityStats.totalBuffersCreated++;
 
@@ -142,7 +146,8 @@ export function createSpanBuffer(
   traceId?: string | number,
   capacity?: number,
 ): SpanBuffer {
-  const spanId = nextGlobalSpanId++;
+  const spanId = nextSpanId++;
+  const threadId = getThreadId();
 
   // Handle the case where traceId might be a number (capacity) or omitted
   let actualTraceId: string;
@@ -151,10 +156,10 @@ export function createSpanBuffer(
   if (typeof traceId === 'number') {
     // traceId was omitted, this is actually the capacity
     actualCapacity = traceId;
-    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
   } else if (traceId === undefined) {
     // Both traceId and capacity omitted
-    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+    actualTraceId = `trace-${Date.now()}-${Math.random().toString(36).substring(2, 11)}`;
     actualCapacity = capacity;
   } else {
     // Normal case: traceId provided as string
@@ -162,7 +167,7 @@ export function createSpanBuffer(
     actualCapacity = capacity;
   }
 
-  return createEmptySpanBuffer(spanId, actualTraceId, schema, taskContext, undefined, actualCapacity);
+  return createEmptySpanBuffer(spanId, threadId, actualTraceId, schema, taskContext, undefined, actualCapacity);
 }
 
 /**
@@ -178,7 +183,8 @@ export function createSpanBuffer(
  *
  * **Inheritance:**
  * - traceId: Inherited from parent (same distributed trace)
- * - spanId: Newly generated (unique per span)
+ * - threadId: Fresh from getThreadId() (same process, but allows cross-worker spans)
+ * - spanId: Newly generated (unique per span within process)
  * - capacity: Inherited from parent
  * - schema: Inherited from parent's module
  *
@@ -195,12 +201,14 @@ export function createSpanBuffer(
  * ```
  */
 export function createChildSpanBuffer(parentBuffer: SpanBuffer, taskContext: TaskContext): SpanBuffer {
-  const spanId = nextGlobalSpanId++;
+  const spanId = nextSpanId++;
+  const threadId = getThreadId();
   const schema = parentBuffer.task.module.tagAttributes;
   const capacity = parentBuffer.capacity;
 
   const childBuffer = createEmptySpanBuffer(
     spanId,
+    threadId,
     parentBuffer.traceId, // Inherit traceId from parent
     schema,
     taskContext,
@@ -221,7 +229,7 @@ export function createChildSpanBuffer(parentBuffer: SpanBuffer, taskContext: Tas
  * continue the same logical span.
  *
  * **Key characteristics:**
- * - Same spanId: The chained buffer is the same logical span
+ * - Same threadId + spanId: The chained buffer is the same logical span
  * - Same traceId: Still part of the same distributed trace
  * - Linked via `next`: Forms a singly-linked list of buffers
  * - Uses tuned capacity: Takes the module's current optimized capacity
@@ -251,6 +259,7 @@ export function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
 
   const nextBuffer = createEmptySpanBuffer(
     buffer.spanId, // Same logical span
+    buffer.threadId, // Same thread ID (continuation of same span)
     buffer.traceId, // Same trace (continuation)
     schema,
     buffer.task, // Same task context

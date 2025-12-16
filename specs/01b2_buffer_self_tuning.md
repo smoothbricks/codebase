@@ -30,6 +30,8 @@ handles overflow gracefully while the system learns optimal capacity per module.
 6. **Per-Span Buffers** - Each span gets its own buffer, avoiding traceId/spanId TypedArrays
 7. **Buffer Chaining** - Graceful overflow handling while learning optimal capacity
 8. **Freelist Consideration** - May pool buffers if long-lived TypedArrays help V8's GC
+9. **Lazy-to-Eager Column Promotion** - Frequently-used columns automatically pre-allocate (see
+   [Column Promotion](#lazy-to-eager-column-promotion))
 
 ## Self-Tuning Architecture
 
@@ -730,6 +732,512 @@ describe('Self-tuning buffer', () => {
 });
 ```
 
+## Lazy-to-Eager Column Promotion
+
+### Overview
+
+Beyond capacity self-tuning, the system also adapts column access patterns. Columns start as lazy (memory-efficient) and
+automatically promote to eager (performance-optimized) when heavily used.
+
+**Key Insight**: Promotion happens during background flush (cold path), ensuring zero hot-path impact while optimizing
+for actual usage patterns.
+
+**Ownership**: This is LMAO's concern, not arrow-builder's. Arrow-builder provides the codegen infrastructure to support
+both eager and lazy columns, but LMAO owns the tracking, promotion logic, and class recompilation.
+
+### Stats Tracking (Cold Path)
+
+Per-column metrics are stored in `ModuleContext.lazyColumnStats` and updated during `backgroundFlush()`:
+
+```typescript
+interface LazyColumnStats {
+  totalSpanBuffersCreated: number; // How many SpanBuffers have been created for this module
+  perColumn: Map<string, ColumnStats>; // Per-column instantiation tracking
+}
+
+interface ColumnStats {
+  instantiationCount: number; // How many times this column was actually instantiated
+  instantiationRatio: number; // instantiationCount / totalSpanBuffersCreated
+  isEager: boolean; // Whether this column has been promoted to eager
+}
+```
+
+The tracking happens during flush, not during writes, ensuring zero performance impact on the hot path.
+
+### Implementation Location
+
+**LMAO Package** (`packages/lmao/src/lib/`):
+
+- `ModuleContext.lazyColumnStats` - Stats storage on module context
+- `backgroundFlush()` - Checks which columns were instantiated, updates stats
+- `promoteColumnsToEager()` - Recompiles SpanBuffer class when threshold reached
+- `getColumnBufferClass()` - Extended to accept eager column list
+
+**Arrow-Builder Package** (`packages/arrow-builder/src/lib/buffer/`):
+
+- `generateColumnBufferClass()` - Codegen supports both eager and lazy columns
+- `getColumnBufferClass()` - Cache key includes eager column list for separate classes
+
+### Tracking Mechanism
+
+The `generateColumnBufferClass()` already uses symbol-based lazy allocation via getters. To track instantiation:
+
+```typescript
+// In arrow-builder's columnBufferGenerator.ts
+// Add optional callback parameter for lazy column access tracking
+export function generateColumnBufferClass(
+  schema: TagAttributeSchema,
+  className = 'GeneratedColumnBuffer',
+  eagerColumns: string[] = [], // NEW: columns to generate as eager
+  onLazyAccess?: (columnName: string) => void // NEW: callback when lazy column accessed
+): string {
+  // ... existing code ...
+
+  // For each schema field, decide if eager or lazy
+  for (const fieldName of schemaFields) {
+    const columnName = `attr_${fieldName}`;
+    const isEager = eagerColumns.includes(fieldName);
+
+    if (isEager) {
+      // Generate as eager (allocate in constructor)
+      constructorCode.push(`    this.${columnName}_nulls = new Uint8Array(...);`);
+      constructorCode.push(`    this.${columnName}_values = new ${constructorName}(...);`);
+    } else {
+      // Generate as lazy (symbol + getter)
+      // Add tracking callback to allocator
+      allocatorFunctions.push(`
+  function allocate_${columnName}(self) {
+    if (self[${columnName}_sym]) return self[${columnName}_sym];
+
+    // TRACK: Notify that this column was instantiated
+    if (typeof onLazyAccess === 'function') {
+      onLazyAccess('${fieldName}');
+    }
+
+    // ... existing allocation code ...
+  }`);
+    }
+  }
+}
+```
+
+### LMAO Integration
+
+In `packages/lmao/src/lib/lmao.ts`:
+
+```typescript
+// Extend ModuleContext with lazy column stats
+export interface ModuleContext {
+  moduleId: number;
+  gitSha: string;
+  filePath: string;
+  tagAttributes: TagAttributeSchema;
+  spanBufferCapacityStats: BufferCapacityStats;
+
+  // NEW: Lazy column promotion tracking
+  lazyColumnStats: LazyColumnStats;
+
+  // NEW: Current SpanBuffer class (may be recompiled)
+  SpanBufferClass: new (capacity: number) => SpanBuffer;
+}
+
+// Initialize lazy column stats when creating module context
+function createModuleContext(...) {
+  const schemaFields = Object.keys(tagAttributes);
+
+  const lazyColumnStats: LazyColumnStats = {
+    totalSpanBuffersCreated: 0,
+    perColumn: new Map(
+      schemaFields.map(field => [
+        field,
+        { instantiationCount: 0, instantiationRatio: 0, isEager: false }
+      ])
+    )
+  };
+
+  // Track lazy column access
+  const onLazyAccess = (columnName: string) => {
+    const stats = lazyColumnStats.perColumn.get(columnName);
+    if (stats) {
+      stats.instantiationCount++;
+      stats.instantiationRatio = stats.instantiationCount / lazyColumnStats.totalSpanBuffersCreated;
+    }
+  };
+
+  // Generate initial SpanBuffer class (all lazy)
+  const SpanBufferClass = getColumnBufferClass(tagAttributes, [], onLazyAccess);
+
+  const moduleContext: ModuleContext = {
+    // ... existing fields ...
+    lazyColumnStats,
+    SpanBufferClass,
+  };
+
+  return moduleContext;
+}
+
+// Create SpanBuffer using module's current class
+function createSpanBuffer(schema, taskContext, traceId) {
+  const SpanBufferClass = taskContext.module.SpanBufferClass;
+  const buffer = new SpanBufferClass(capacity);
+
+  // Track buffer creation
+  taskContext.module.lazyColumnStats.totalSpanBuffersCreated++;
+
+  // ... rest of buffer initialization ...
+  return buffer;
+}
+```
+
+### Promotion Criteria
+
+A lazy column is promoted to eager when **ALL** of the following are true:
+
+1. **Statistical Significance**: `totalSpanBuffersCreated >= 100`
+   - Ensures we have enough data to make a confident decision
+   - Prevents premature promotion on small samples
+
+2. **High Usage Ratio**: `instantiationRatio >= 0.80`
+   - Column is used in 80% or more of spans
+   - Indicates the getter overhead outweighs memory savings
+
+3. **Not Already Promoted**: `!isEager`
+   - Prevents redundant recompilation
+
+### Recompilation via `new Function()`
+
+When promotion criteria are met, the system recompiles the SpanBuffer class:
+
+```typescript
+// In packages/lmao/src/lib/lmao.ts
+function promoteColumnsToEager(module: ModuleContext): boolean {
+  const stats = module.lazyColumnStats;
+
+  // Check if we have enough samples
+  if (stats.totalSpanBuffersCreated < 100) {
+    return false;
+  }
+
+  // Find columns to promote
+  const eagerColumns: string[] = [];
+  let hasPromotions = false;
+
+  for (const [columnName, columnStats] of stats.perColumn) {
+    if (shouldPromote(columnStats)) {
+      eagerColumns.push(columnName);
+      columnStats.isEager = true;
+      hasPromotions = true;
+    } else if (columnStats.isEager) {
+      // Already promoted, keep eager
+      eagerColumns.push(columnName);
+    }
+  }
+
+  // If no new promotions, skip recompilation
+  if (!hasPromotions) {
+    return false;
+  }
+
+  // Track lazy column access for the new class
+  const onLazyAccess = (columnName: string) => {
+    const columnStats = stats.perColumn.get(columnName);
+    if (columnStats) {
+      columnStats.instantiationCount++;
+      columnStats.instantiationRatio = columnStats.instantiationCount / stats.totalSpanBuffersCreated;
+    }
+  };
+
+  // Generate new SpanBuffer class with promoted columns
+  const newSpanBufferClass = getColumnBufferClass(module.tagAttributes, eagerColumns, onLazyAccess);
+
+  // Atomic replacement - new buffers will use the recompiled class
+  module.SpanBufferClass = newSpanBufferClass;
+
+  // Reset stats for next tuning cycle
+  stats.totalSpanBuffersCreated = 0;
+  for (const columnStats of stats.perColumn.values()) {
+    columnStats.instantiationCount = 0;
+    columnStats.instantiationRatio = 0;
+  }
+
+  return true;
+}
+
+function shouldPromote(stats: ColumnStats): boolean {
+  return stats.instantiationRatio >= 0.8 && !stats.isEager;
+}
+
+// Called during background flush (cold path)
+export function backgroundFlush(module: ModuleContext): void {
+  // Check if promotion is needed
+  if (promoteColumnsToEager(module)) {
+    // TODO: Log promotion event to system tracer
+    // For now, just track that it happened
+  }
+}
+```
+
+The new class is generated with the same structure, but promoted columns become eager properties initialized immediately
+rather than lazy getters.
+
+### Arrow-Builder Codegen Changes
+
+Update `packages/arrow-builder/src/lib/buffer/columnBufferGenerator.ts`:
+
+```typescript
+export function generateColumnBufferClass(
+  schema: TagAttributeSchema,
+  className = 'GeneratedColumnBuffer',
+  eagerColumns: string[] = [],
+  onLazyAccess?: (columnName: string) => void
+): string {
+  const schemaFields = Object.keys(schema);
+  const eagerColumnSet = new Set(eagerColumns);
+
+  // Generate constructor code
+  const constructorCode: string[] = [];
+
+  // System columns (ALWAYS EAGER)
+  constructorCode.push(`    // System columns (eager - written on every entry)`);
+  constructorCode.push(`    const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);`);
+  constructorCode.push(`    this._alignedCapacity = alignedCapacity;`);
+  constructorCode.push(`    this.timestamps = new Float64Array(alignedCapacity);`);
+  constructorCode.push(`    this.operations = new Uint8Array(alignedCapacity);`);
+  constructorCode.push(``);
+
+  // User attribute columns - EAGER or LAZY based on promotion
+  const eagerAttributeCode: string[] = [];
+  const lazySymbols: string[] = [];
+  const lazyAllocators: string[] = [];
+  const lazyGetters: string[] = [];
+
+  for (const fieldName of schemaFields) {
+    const columnName = `attr_${fieldName}`;
+    const { constructorName, bytesPerElement } = getTypedArrayInfo(schema, fieldName);
+    const isEager = eagerColumnSet.has(fieldName);
+
+    if (isEager) {
+      // EAGER: Allocate in constructor
+      eagerAttributeCode.push(`    // ${fieldName} (eager)`);
+
+      const nullBitmapSize = 'Math.ceil(alignedCapacity / 8)';
+      const alignedNullOffset = `Math.ceil(${nullBitmapSize} / ${bytesPerElement}) * ${bytesPerElement}`;
+      const totalSize = `${alignedNullOffset} + alignedCapacity * ${bytesPerElement}`;
+
+      eagerAttributeCode.push(`    {`);
+      eagerAttributeCode.push(`      const buffer = new ArrayBuffer(${totalSize});`);
+      eagerAttributeCode.push(`      this.${columnName}_nulls = new Uint8Array(buffer, 0, ${nullBitmapSize});`);
+      eagerAttributeCode.push(
+        `      this.${columnName}_values = new ${constructorName}(buffer, ${alignedNullOffset}, alignedCapacity);`
+      );
+      eagerAttributeCode.push(`    }`);
+    } else {
+      // LAZY: Symbol + getter
+      lazySymbols.push(`  const ${columnName}_sym = Symbol('${columnName}');`);
+      lazySymbols.push(`  columnSymbols['${columnName}'] = ${columnName}_sym;`);
+
+      // Allocator with tracking callback
+      const trackingCall = onLazyAccess
+        ? `    if (typeof onLazyAccess === 'function') onLazyAccess('${fieldName}');`
+        : '';
+
+      lazyAllocators.push(`
+  function allocate_${columnName}(self) {
+    if (self[${columnName}_sym]) return self[${columnName}_sym];
+${trackingCall}
+    const capacity = self._alignedCapacity;
+    const nullBitmapSize = Math.ceil(capacity / 8);
+    const alignedNullOffset = Math.ceil(nullBitmapSize / ${bytesPerElement}) * ${bytesPerElement};
+    const totalSize = alignedNullOffset + capacity * ${bytesPerElement};
+    const buffer = new ArrayBuffer(totalSize);
+    const storage = {
+      buffer: buffer,
+      nulls: new Uint8Array(buffer, 0, nullBitmapSize),
+      values: new ${constructorName}(buffer, alignedNullOffset, capacity)
+    };
+    self[${columnName}_sym] = storage;
+    return storage;
+  }`);
+
+      lazyGetters.push(`    get ${columnName}_nulls() { return allocate_${columnName}(this).nulls; }`);
+      lazyGetters.push(`    get ${columnName}_values() { return allocate_${columnName}(this).values; }`);
+      lazyGetters.push(`    get ${columnName}() { return allocate_${columnName}(this).values; }`);
+    }
+  }
+
+  if (eagerAttributeCode.length > 0) {
+    constructorCode.push(`    // Eager attribute columns`);
+    constructorCode.push(...eagerAttributeCode);
+    constructorCode.push(``);
+  }
+
+  constructorCode.push(`    // Buffer management`);
+  constructorCode.push(`    this.writeIndex = 0;`);
+  constructorCode.push(`    this.capacity = requestedCapacity;`);
+  constructorCode.push(`    this.next = undefined;`);
+
+  // ... rest of class generation with lazy symbols, allocators, getters ...
+}
+
+export function getColumnBufferClass(
+  schema: TagAttributeSchema,
+  eagerColumns: string[] = [],
+  onLazyAccess?: (columnName: string) => void
+): new (capacity: number) => ColumnBuffer {
+  // Cache key includes eager columns for separate class generation
+  const cacheKey = JSON.stringify({ schema, eagerColumns: eagerColumns.sort() });
+
+  let BufferClass = classCache.get(cacheKey);
+
+  if (!BufferClass) {
+    const classCode = generateColumnBufferClass(schema, 'GeneratedColumnBuffer', eagerColumns, onLazyAccess).trim();
+    BufferClass = new Function(`return ${classCode}`)() as new (capacity: number) => ColumnBuffer;
+    classCache.set(cacheKey, BufferClass);
+  }
+
+  return BufferClass;
+}
+```
+
+### In-Flight Buffer Handling
+
+The system handles the transition gracefully:
+
+- **Old buffers** continue using the original class with the original lazy/eager pattern
+- **New buffers** instantiate from the recompiled class with promoted columns as eager
+- **Natural convergence** occurs as old buffers flush and new ones are created
+
+No migration or data copying is needed. The system simply creates new SpanBuffer instances using the updated class.
+
+### Performance Trade-offs
+
+| Aspect             | Before (Lazy)             | After (Eager)          | Impact                 |
+| ------------------ | ------------------------- | ---------------------- | ---------------------- |
+| Memory per buffer  | Optimal (no allocation)   | +256-512 bytes         | Minimal for 80%+ usage |
+| Hot path access    | Getter overhead (~5-10ns) | Direct property (~1ns) | 5-10x faster           |
+| Best for           | <80% column usage         | ≥80% column usage      | Auto-optimizes         |
+| Recompilation cost | N/A                       | One-time, cold path    | Zero hot-path impact   |
+
+### Example: Promotion in Action
+
+```typescript
+// Initial state: All columns lazy
+const module = createModuleContext({
+  moduleMetadata: { gitSha: 'abc', filePath: 'user.ts', moduleName: 'user' },
+  tagAttributes: {
+    userId: S.category(),
+    requestId: S.category(),
+    sessionId: S.category(),
+    experimentId: S.category(),
+  },
+});
+
+// After 100 spans:
+// - userId: accessed in 95 buffers (95% ratio) → Promotes to eager
+// - requestId: accessed in 90 buffers (90% ratio) → Promotes to eager
+// - sessionId: accessed in 45 buffers (45% ratio) → Stays lazy
+// - experimentId: accessed in 10 buffers (10% ratio) → Stays lazy
+
+// Trigger promotion check (happens automatically during backgroundFlush)
+backgroundFlush(module);
+
+// New SpanBuffer class generated with:
+// - userId: eager (allocated in constructor)
+// - requestId: eager (allocated in constructor)
+// - sessionId: lazy (getter with symbol-based allocation)
+// - experimentId: lazy (getter with symbol-based allocation)
+```
+
+### Testing Promotion
+
+```typescript
+import { describe, expect, it } from 'bun:test';
+import { createModuleContext } from '../lmao.js';
+import { S } from '../schema/builder.js';
+
+describe('Lazy-to-eager column promotion', () => {
+  it('promotes high-usage columns to eager after 100 buffers', () => {
+    const module = createModuleContext({
+      moduleMetadata: { gitSha: 'test', filePath: 'test.ts', moduleName: 'test' },
+      tagAttributes: {
+        userId: S.category(),
+        sessionId: S.category(),
+      },
+    });
+
+    // Simulate 100 spans with userId used 90% of the time
+    for (let i = 0; i < 100; i++) {
+      const buffer = new module.SpanBufferClass(64);
+
+      // Access userId in 90% of buffers (triggers lazy instantiation)
+      if (i < 90) {
+        buffer.attr_userId_values[0] = i;
+      }
+
+      module.lazyColumnStats.totalSpanBuffersCreated++;
+    }
+
+    // Trigger promotion check
+    const didPromote = promoteColumnsToEager(module);
+
+    // Verify promotion
+    expect(didPromote).toBe(true);
+    expect(module.lazyColumnStats.perColumn.get('userId')?.isEager).toBe(true);
+    expect(module.lazyColumnStats.perColumn.get('userId')?.instantiationRatio).toBe(0.9);
+    expect(module.lazyColumnStats.perColumn.get('sessionId')?.isEager).toBe(false);
+  });
+
+  it('does not promote columns below 80% usage threshold', () => {
+    const module = createModuleContext({
+      moduleMetadata: { gitSha: 'test', filePath: 'test.ts', moduleName: 'test' },
+      tagAttributes: {
+        userId: S.category(),
+        sessionId: S.category(),
+      },
+    });
+
+    // Simulate 100 spans with userId used 75% of the time (below threshold)
+    for (let i = 0; i < 100; i++) {
+      const buffer = new module.SpanBufferClass(64);
+
+      if (i < 75) {
+        buffer.attr_userId_values[0] = i;
+      }
+
+      module.lazyColumnStats.totalSpanBuffersCreated++;
+    }
+
+    const didPromote = promoteColumnsToEager(module);
+
+    // No promotion should occur
+    expect(didPromote).toBe(false);
+    expect(module.lazyColumnStats.perColumn.get('userId')?.isEager).toBe(false);
+  });
+
+  it('requires 100 samples before promotion', () => {
+    const module = createModuleContext({
+      moduleMetadata: { gitSha: 'test', filePath: 'test.ts', moduleName: 'test' },
+      tagAttributes: {
+        userId: S.category(),
+      },
+    });
+
+    // Only 50 buffers (below minimum)
+    for (let i = 0; i < 50; i++) {
+      const buffer = new module.SpanBufferClass(64);
+      buffer.attr_userId_values[0] = i; // 100% usage
+      module.lazyColumnStats.totalSpanBuffersCreated++;
+    }
+
+    const didPromote = promoteColumnsToEager(module);
+
+    // No promotion due to insufficient samples
+    expect(didPromote).toBe(false);
+    expect(module.lazyColumnStats.perColumn.get('userId')?.isEager).toBe(false);
+  });
+});
+```
+
 ## Summary
 
 Self-tuning buffers provide:
@@ -742,10 +1250,11 @@ Self-tuning buffers provide:
 - **Per-span isolation** - Each span gets its own buffer for sorted output
 - **Buffer chaining** - Overflow handled gracefully while tuning learns optimal size
 - **Freelist optimization** - Consider pooling buffers if long-lived TypedArrays benefit V8 GC
+- **Column promotion** - Lazy columns automatically promote to eager when heavily used
 
 **Important Note**: This self-tuning is specifically designed for trace logging, where we have clear metrics (spans per
-module, overflow rates, utilization patterns). The tuning mechanism is part of the trace logging system, not a
-general-purpose buffer library. Each span's own buffer eliminates the need for traceId/spanId TypedArrays since they're
-constant per buffer.
+module, overflow rates, utilization patterns, column usage). The tuning mechanism is part of the trace logging system,
+not a general-purpose buffer library. Each span's own buffer eliminates the need for traceId/spanId TypedArrays since
+they're constant per buffer.
 
 The result: a logging system that "just works" whether you're on a Raspberry Pi or a 64-core server.

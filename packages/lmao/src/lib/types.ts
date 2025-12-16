@@ -42,7 +42,9 @@ export interface SpanBuffer extends ColumnBuffer {
   children: SpanBuffer[];
   parent?: SpanBuffer;
 
-  spanId: number; // Incremental ID for this span
+  // Distributed span ID components
+  threadId: bigint; // 64-bit random, set from worker context at span creation
+  spanId: number; // 32-bit incrementing counter within this process
   traceId: string; // Root trace ID (constant per span)
 
   // Reference to task context (lmao-specific)

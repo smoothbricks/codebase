@@ -1,92 +1,50 @@
+import { Nanoseconds } from '@smoothbricks/arrow-builder';
+
 /**
- * High-precision timestamp system (Generic/Browser implementation)
+ * High-precision timestamp system (Browser implementation)
  *
- * Provides microsecond-precision timestamps using `performance.now()` for browsers
- * and generic JavaScript environments. For Node.js with nanosecond precision,
- * import from `'@smoothbricks/lmao/node'` instead.
- *
- * **Why anchoring?**
- * - `Date.now()` has millisecond precision and can drift with system clock adjustments
- * - `performance.now()` has sub-millisecond precision but measures relative time
- * - By anchoring once per request, we get both absolute epoch time AND high precision
+ * Provides microsecond-precision timestamps using `performance.timeOrigin + performance.now()`.
+ * This is the simplified timestamp API that doesn't require manual anchoring.
  *
  * **How it works:**
- * 1. At request start: Capture `Date.now()` (absolute) and `performance.now()` (precise)
- * 2. For each timestamp: Calculate delta from `performance.now()` anchor
- * 3. Add delta to epoch anchor for high-precision absolute timestamp
+ * - `performance.timeOrigin` gives the epoch time (ms) when the page loaded
+ * - `performance.now()` gives high-precision time since page load
+ * - Combined, they give absolute epoch time with sub-millisecond precision
+ *
+ * **Precision:**
+ * - Browsers typically provide 5-20 microsecond precision
+ * - Returned nanoseconds will have 000 in last 3 digits (microsecond precision)
  *
  * @module timestamp
  *
  * @example
  * ```typescript
- * // At request start (once)
- * const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
+ * import { getTimestampNanos } from '@smoothbricks/lmao';
  *
- * // Later, get high-precision timestamps
- * const timestamp1 = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
- * await doSomeWork();
- * const timestamp2 = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
- *
- * console.log(`Work took ${timestamp2 - timestamp1} microseconds`);
+ * // Get current timestamp in nanoseconds
+ * buffer.timestamps[idx] = getTimestampNanos();
  * ```
  */
 
 /**
- * Creates a time anchor at the trace root (called ONCE per request).
+ * Gets the current timestamp in nanoseconds since Unix epoch.
  *
- * This captures both the absolute epoch time and the high-resolution performance
- * counter at the same instant. All subsequent timestamp calculations use these
- * anchor values for efficient delta calculation.
+ * Uses `performance.timeOrigin + performance.now()` for efficient, high-precision
+ * timestamp generation. No anchoring required.
  *
- * **Performance**: Returns flat primitives instead of a nested object for
- * zero-allocation spread when passing to child functions.
+ * **Performance**: Single function call, minimal overhead on hot path.
  *
- * @returns Object with anchor values for timestamp calculations
- * @returns {number} anchorEpochMicros - Epoch time in microseconds when anchor was created
- * @returns {number} anchorPerfNow - High-precision performance.now() value in microseconds
- *
- * @example
- * ```typescript
- * // In request context creation
- * const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
- *
- * // Pass to child contexts via spread
- * const childContext = { ...parentContext, anchorEpochMicros, anchorPerfNow };
- * ```
- */
-export function createTimeAnchor(): {
-  anchorEpochMicros: number;
-  anchorPerfNow: number;
-} {
-  const epochMicros = Date.now() * 1000;
-  const perfNowMicros = performance.now() * 1000; // Convert ms to microseconds
-
-  return {
-    anchorEpochMicros: epochMicros,
-    anchorPerfNow: perfNowMicros,
-  };
-}
-
-/**
- * Gets the current timestamp in microseconds since Unix epoch.
- *
- * Uses delta calculation from the anchor point for high precision without
- * repeated system calls. This function is designed for the hot path - it
- * performs ZERO allocations, just arithmetic operations.
- *
- * **Precision**: Sub-millisecond precision (typically 5-20 microseconds depending on browser)
- *
- * @param anchorEpochMicros - Epoch time in microseconds when anchor was created
- * @param anchorPerfNow - High-precision performance.now() value when anchor was created (microseconds)
- * @returns Current timestamp in microseconds since Unix epoch
+ * @returns Current timestamp in nanoseconds since Unix epoch
  *
  * @example
  * ```typescript
  * // Store timestamp in trace buffer
- * buffer.timestamps[idx] = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
+ * buffer.timestamps[idx] = getTimestampNanos();
  * ```
  */
-export function getTimestampMicros(anchorEpochMicros: number, anchorPerfNow: number): number {
-  const nowMicros = performance.now() * 1000;
-  return anchorEpochMicros + (nowMicros - anchorPerfNow);
+export function getTimestampNanos(): Nanoseconds {
+  return Nanoseconds.now();
 }
+
+// Re-export Nanoseconds for convenience
+export { Nanoseconds };

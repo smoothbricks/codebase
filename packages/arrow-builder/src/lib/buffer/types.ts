@@ -22,7 +22,7 @@
  */
 export interface ColumnBuffer {
   // Core columns - always present
-  timestamps: Float64Array; // Microsecond-precision timestamps (values are Microseconds branded type)
+  timestamps: BigInt64Array; // Nanosecond-precision timestamps since Unix epoch
   operations: Uint8Array; // Operation type: tag, ok, err, etc.
 
   // Attribute columns (generated from schema with attr_ prefix)
@@ -52,7 +52,9 @@ export type TypedArray =
   | Int16Array
   | Int32Array
   | Float32Array
-  | Float64Array;
+  | Float64Array
+  | BigInt64Array
+  | BigUint64Array;
 
 /**
  * Column value type - TypedArray or string array for category/text columns

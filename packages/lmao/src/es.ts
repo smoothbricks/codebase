@@ -8,4 +8,4 @@
 export * from './index.js';
 
 // Override with ES-specific timestamp implementation (performance.now)
-export { createTimeAnchor, getTimestampMicros } from './lib/timestamp.js';
+export { getTimestampNanos, Nanoseconds } from './lib/timestamp.js';

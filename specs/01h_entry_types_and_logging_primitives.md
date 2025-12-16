@@ -733,6 +733,7 @@ function getSpanDuration(buffer: SpanBuffer): number {
 ```sql
 -- Duration from fixed row positions
 SELECT
+  thread_id,
   span_id,
   span_name,
   entry_type,
@@ -740,7 +741,7 @@ SELECT
   max(timestamp) - min(timestamp) as duration_ms
 FROM traces
 WHERE entry_type IN ('span-start', 'span-ok', 'span-err', 'span-exception')
-GROUP BY span_id, span_name, entry_type;
+GROUP BY thread_id, span_id, span_name, entry_type;
 ```
 
 ## Entry Type Validation
@@ -749,7 +750,7 @@ The system enforces entry type constraints at the API level:
 
 ### Required Columns by Entry Type
 
-- **All entry types**: `timestamp`, `trace_id`, `span_id`, `entry_type`, `module`, `label`
+- **All entry types**: `timestamp`, `trace_id`, `thread_id`, `span_id`, `entry_type`, `module`, `label`
 - **Span lifecycle** (`span-start`, `span-ok`, `span-err`, `span-exception`): `label` contains span name
 - **Log level types** (`info`, `debug`, `warn`, `error`): `label` contains message TEMPLATE (format string, not
   interpolated)
@@ -774,7 +775,7 @@ The system enforces entry type constraints at the API level:
 ### Forbidden Combinations
 
 - **Span completion without start**: `span-ok`/`span-err`/`span-exception` must have matching `span-start`
-- **Orphaned spans**: All spans except root must have valid `parent_span_id`
+- **Orphaned spans**: All spans except root must have valid `parent_thread_id` and `parent_span_id`
 - **Mixed concerns**: Feature flag columns only valid with `ff-access`/`ff-usage` entry types
 
 ## Performance Characteristics

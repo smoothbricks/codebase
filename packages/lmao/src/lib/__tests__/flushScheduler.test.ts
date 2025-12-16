@@ -48,9 +48,9 @@ function createMockSpanBuffer(): SpanBuffer {
 
   const buffer = {
     threadId: BigInt('0x123456789ABCDEF0'), // Mock 64-bit thread ID
-    localSpanId: 1,
+    spanId: 1,
     traceId: 'test-trace',
-    timestamps: new Float64Array(64),
+    timestamps: new BigInt64Array(64),
     operations: new Uint8Array(64),
     nullBitmaps: {},
     children: [],
@@ -61,7 +61,7 @@ function createMockSpanBuffer(): SpanBuffer {
 
   // Initialize timestamp values to avoid undefined errors
   for (let i = 0; i < buffer.writeIndex; i++) {
-    buffer.timestamps[i] = Date.now();
+    buffer.timestamps[i] = BigInt(Date.now()) * 1_000_000n; // Convert ms to nanoseconds
     buffer.operations[i] = 1; // entry type: span-start
   }
 

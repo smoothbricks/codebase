@@ -628,7 +628,7 @@ describe('Fixed Row Layout', () => {
     const buffer = createSpanBuffer(schemaFields as TagAttributeSchema, taskContext);
 
     // Buffer should have timestamps array for duration calculation
-    expect(buffer.timestamps).toBeInstanceOf(Float64Array);
+    expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);
 
     // Buffer should have operations array for entry types
     expect(buffer.operations).toBeInstanceOf(Uint8Array);

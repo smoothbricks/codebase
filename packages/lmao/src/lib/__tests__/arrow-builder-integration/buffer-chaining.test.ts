@@ -94,7 +94,7 @@ describe('Buffer Chaining', () => {
       expect(nextBuffer['attr_duration']).toBeInstanceOf(Float64Array);
 
       // Should have core columns
-      expect(nextBuffer.timestamps).toBeInstanceOf(Float64Array);
+      expect(nextBuffer.timestamps).toBeInstanceOf(BigInt64Array);
       expect(nextBuffer.operations).toBeInstanceOf(Uint8Array);
     });
 

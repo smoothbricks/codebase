@@ -25,27 +25,6 @@ export interface StringInterner {
 
 /**
  * Zero-copy helper: Create Arrow Data from TypedArray without copying
- *
- * This demonstrates the zero-copy approach using arrow.makeData instead of builders.
- * For full zero-copy conversion, we'd need to handle buffer chaining, dictionaries,
- * and null bitmaps. Current implementation uses builders for simplicity in cold path.
- *
- * @param type - Arrow data type
- * @param data - TypedArray with data
- * @param length - Number of valid elements
- * @param nullBitmap - Optional null bitmap
- * @returns Arrow Data object (zero-copy)
- *
- * @example
- * ```typescript
- * // Zero-copy wrap a Float64Array as Arrow data
- * const data = createZeroCopyData(
- *   new arrow.Float64(),
- *   buffer.timestamps,
- *   buffer.writeIndex
- * );
- * const vector = arrow.makeVector(data);
- * ```
  */
 export function createZeroCopyData<T extends arrow.DataType>(
   type: T,
@@ -53,76 +32,197 @@ export function createZeroCopyData<T extends arrow.DataType>(
   length: number,
   nullBitmap?: Uint8Array,
 ): arrow.Data<T> {
-  // Use subarray() to create a VIEW into the same ArrayBuffer (zero-copy)
-  // slice() would create a COPY of the data to a new ArrayBuffer
   const slicedData = data.subarray(0, length);
+  const nullCount = nullBitmap ? countNulls(nullBitmap, length) : 0;
+  const slicedNullBitmap = nullBitmap ? nullBitmap.subarray(0, Math.ceil(length / 8)) : undefined;
 
-  // Create a vector from the sliced TypedArray using makeVector
-  // This properly wraps the buffer and creates valid Arrow Data with values
-  const vector = arrow.makeVector(slicedData);
-
-  // Extract the Data from the vector
-  // Note: Custom null bitmaps require using builders or lower-level APIs
-  // The nullBitmap parameter is used for nullCount calculation but the actual
-  // null bitmap in the returned Data comes from makeVector (all valid by default)
-  const vectorData = vector.data[0];
-
-  // If a null bitmap was provided, log that it's being used for reference
-  // but the actual Data uses makeVector's default (all valid)
-  if (nullBitmap) {
-    // The nullCount is calculated but not applied to the Data directly
-    // For full null bitmap support, use the builder-based conversion in convertToArrowTable
-    const _nullCount = countNulls(nullBitmap, length);
-    void _nullCount; // Acknowledge the calculation
-  }
-
-  // Cast through unknown to handle the generic type constraint
-  return vectorData as unknown as arrow.Data<T>;
+  return arrow.makeData({
+    type,
+    offset: 0,
+    length,
+    nullCount,
+    data: slicedData,
+    nullBitmap: slicedNullBitmap,
+  } as any) as arrow.Data<T>;
 }
 
-/**
- * Count nulls in a null bitmap
- *
- * @param nullBitmap - Null bitmap (bit-packed)
- * @param length - Number of elements
- * @returns Number of null values
- */
 function countNulls(nullBitmap: Uint8Array, length: number): number {
   let count = 0;
   for (let i = 0; i < length; i++) {
     const byteIndex = Math.floor(i / 8);
     const bitOffset = i % 8;
     const isNotNull = (nullBitmap[byteIndex] & (1 << bitOffset)) !== 0;
-    if (!isNotNull) {
-      count++;
-    }
+    if (!isNotNull) count++;
   }
   return count;
 }
 
-/**
- * Map schema field names to Arrow column names.
- *
- * Some fields are renamed during Arrow conversion to match the spec
- * while avoiding conflicts with API method names.
- *
- * @param fieldName - Schema field name (e.g., 'logMessage')
- * @returns Arrow column name (e.g., 'message')
- */
-function getArrowFieldName(fieldName: string): string {
-  // Map logMessage -> message per specs/01f_arrow_table_structure.md
-  // Named 'logMessage' in schema to avoid conflict with SpanLogger.message() method
-  if (fieldName === 'logMessage') {
-    return 'message';
+function encodeUtf8Strings(strings: readonly string[]): Uint8Array {
+  const encoder = new TextEncoder();
+  const encoded = strings.map((s) => encoder.encode(s));
+  const totalLength = encoded.reduce((sum, arr) => sum + arr.length, 0);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const arr of encoded) {
+    result.set(arr, offset);
+    offset += arr.length;
   }
+  return result;
+}
+
+function calculateUtf8Offsets(strings: readonly string[]): Int32Array {
+  const encoder = new TextEncoder();
+  const offsets = new Int32Array(strings.length + 1);
+  offsets[0] = 0;
+  for (let i = 0; i < strings.length; i++) {
+    const byteLength = encoder.encode(strings[i]).length;
+    offsets[i + 1] = offsets[i] + byteLength;
+  }
+  return offsets;
+}
+
+function concatenateTypedArrays<T extends TypedArray>(arrays: T[]): T {
+  if (arrays.length === 0) throw new Error('Cannot concatenate empty array list');
+  if (arrays.length === 1) return arrays[0];
+
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const result = new (arrays[0].constructor as any)(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.length;
+  }
+  return result;
+}
+
+function concatenateNullBitmaps(
+  buffers: SpanBuffer[],
+  columnName: `attr_${string}`,
+): { nullBitmap: Uint8Array | undefined; nullCount: number } {
+  const nullsName = `${columnName}_nulls` as const;
+  const hasAnyNulls = buffers.some((buf) => buf[nullsName] !== undefined);
+
+  if (!hasAnyNulls) return { nullBitmap: undefined, nullCount: 0 };
+
+  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  const bitmapBytes = Math.ceil(totalRows / 8);
+  const nullBitmap = new Uint8Array(bitmapBytes);
+  nullBitmap.fill(0xff);
+
+  let rowOffset = 0;
+  let nullCount = 0;
+
+  for (const buf of buffers) {
+    const sourceBitmap = buf[nullsName];
+    if (sourceBitmap) {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const sourceByte = Math.floor(i / 8);
+        const sourceBit = i % 8;
+        const isValid = (sourceBitmap[sourceByte] & (1 << sourceBit)) !== 0;
+
+        const targetRow = rowOffset + i;
+        const targetByte = Math.floor(targetRow / 8);
+        const targetBit = targetRow % 8;
+
+        if (!isValid) {
+          nullBitmap[targetByte] &= ~(1 << targetBit);
+          nullCount++;
+        }
+      }
+    }
+    rowOffset += buf.writeIndex;
+  }
+
+  return { nullBitmap, nullCount };
+}
+
+function getArrowFieldName(fieldName: string): string {
+  if (fieldName === 'logMessage') return 'message';
   return fieldName;
 }
 
-/**
- * System column builder function type
- * Allows lmao package to inject its own system columns (trace_id, span_id, etc.)
- * while keeping arrow-builder generic.
- */
+function buildSortedCategoryDictionary(
+  buffers: SpanBuffer[],
+  columnName: `attr_${string}`,
+): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } {
+  const valuesName = `${columnName}_values` as const;
+  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+
+  const uniqueStrings = new Set<string>();
+  for (const buf of buffers) {
+    const column = buf[valuesName];
+    if (column && Array.isArray(column)) {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const value = column[i];
+        if (value != null) uniqueStrings.add(value);
+      }
+    }
+  }
+
+  const dictionary = Array.from(uniqueStrings).sort();
+  const stringToIndex = new Map(dictionary.map((s, i) => [s, i]));
+
+  const indices = new Uint32Array(totalRows);
+  const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+
+  let rowOffset = 0;
+  for (const buf of buffers) {
+    const column = buf[valuesName];
+    if (column && Array.isArray(column)) {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const value = column[i];
+        indices[rowOffset + i] = value != null ? (stringToIndex.get(value) ?? 0) : 0;
+      }
+    }
+    rowOffset += buf.writeIndex;
+  }
+
+  return { dictionary, indices, nullBitmap, nullCount };
+}
+
+function buildTextDictionary(
+  buffers: SpanBuffer[],
+  columnName: `attr_${string}`,
+): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } | null {
+  const valuesName = `${columnName}_values` as const;
+  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+
+  const frequencyMap = new Map<string, number>();
+  for (const buf of buffers) {
+    const column = buf[valuesName];
+    if (column && Array.isArray(column)) {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const value = column[i];
+        if (value != null) frequencyMap.set(value, (frequencyMap.get(value) ?? 0) + 1);
+      }
+    }
+  }
+
+  if (frequencyMap.size === 0) {
+    return { dictionary: [], indices: new Uint32Array(totalRows), nullBitmap: undefined, nullCount: totalRows };
+  }
+
+  const dictionary = Array.from(frequencyMap.keys());
+  const stringToIndex = new Map(dictionary.map((s, i) => [s, i]));
+
+  const indices = new Uint32Array(totalRows);
+  const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+
+  let rowOffset = 0;
+  for (const buf of buffers) {
+    const column = buf[valuesName];
+    if (column && Array.isArray(column)) {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const value = column[i];
+        indices[rowOffset + i] = value != null ? (stringToIndex.get(value) ?? 0) : 0;
+      }
+    }
+    rowOffset += buf.writeIndex;
+  }
+
+  return { dictionary, indices, nullBitmap, nullCount };
+}
+
 export type SystemColumnBuilder = (
   buffer: SpanBuffer,
   buffers: SpanBuffer[],
@@ -130,32 +230,14 @@ export type SystemColumnBuilder = (
 ) => { fields: arrow.Field[]; vectors: arrow.Vector[] };
 
 /**
- * Convert SpanBuffer to Apache Arrow Table
- *
- * This is a cold-path operation that happens in background processing.
- * It creates a queryable Arrow table from the hot-path columnar buffers.
- *
- * Includes standard lmao system columns: timestamp, trace_id, span_id, parent_span_id,
- * entry_type, module, and span_name. Custom system columns can be provided via
- * the optional systemColumnBuilder parameter.
- *
- * @param buffer - SpanBuffer to convert
- * @param categoryInterner - String interner for category columns (unused - kept for API compatibility)
- * @param textStorage - Text string storage (unused - kept for API compatibility)
- * @param moduleIdInterner - Module ID interner
- * @param spanNameInterner - Span name interner
- * @param systemColumnBuilder - Optional function to build custom system columns
- * @returns Apache Arrow Table
+ * Convert SpanBuffer (and its overflow chain) to Arrow RecordBatch
  */
-export function convertToArrowTable(
+export function convertToRecordBatch(
   buffer: SpanBuffer,
-  categoryInterner: StringInterner,
-  textStorage: StringInterner,
   moduleIdInterner: StringInterner,
   spanNameInterner: StringInterner,
   systemColumnBuilder?: SystemColumnBuilder,
-): arrow.Table {
-  // Collect all buffers in the chain
+): arrow.RecordBatch {
   const buffers: SpanBuffer[] = [];
   let currentBuffer: SpanBuffer | undefined = buffer;
 
@@ -164,30 +246,36 @@ export function convertToArrowTable(
     currentBuffer = currentBuffer.next as SpanBuffer | undefined;
   }
 
-  // Calculate total row count
+  return convertBuffersToRecordBatch(buffers, moduleIdInterner, spanNameInterner, systemColumnBuilder);
+}
+
+function convertBuffersToRecordBatch(
+  buffers: SpanBuffer[],
+  moduleIdInterner: StringInterner,
+  spanNameInterner: StringInterner,
+  systemColumnBuilder?: SystemColumnBuilder,
+): arrow.RecordBatch {
+  if (buffers.length === 0) return new arrow.RecordBatch({});
+
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  if (totalRows === 0) return new arrow.RecordBatch({});
 
-  if (totalRows === 0) {
-    // Return empty table if no rows
-    return new arrow.Table();
-  }
-
-  // Build Arrow schema from buffer columns
-  const schema = buffer.task.module.tagAttributes;
+  const schema = buffers[0].task.module.tagAttributes;
   const fields: arrow.Field[] = [];
   let systemVectors: arrow.Vector[] = [];
 
-  // Build system columns (custom or default)
   if (systemColumnBuilder) {
-    const systemColumns = systemColumnBuilder(buffer, buffers, totalRows);
+    const systemColumns = systemColumnBuilder(buffers[0], buffers, totalRows);
     fields.push(...systemColumns.fields);
     systemVectors = systemColumns.vectors;
   } else {
-    // Default lmao system columns
-    fields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampMicrosecond() }));
+    fields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampNanosecond() }));
     fields.push(arrow.Field.new({ name: 'trace_id', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
-    fields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint64() }));
-    fields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint64(), nullable: true }));
+    // Span ID columns (separate columns instead of struct)
+    fields.push(arrow.Field.new({ name: 'thread_id', type: new arrow.Uint64() }));
+    fields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint32() }));
+    fields.push(arrow.Field.new({ name: 'parent_thread_id', type: new arrow.Uint64(), nullable: true }));
+    fields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint32(), nullable: true }));
     fields.push(
       arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()) }),
     );
@@ -195,18 +283,13 @@ export function convertToArrowTable(
     fields.push(
       arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
     );
-    // Note: 'logMessage' column is renamed to 'message' in Arrow output
-    // per specs/01f_arrow_table_structure.md (named logMessage to avoid SpanLogger.message() conflict)
   }
 
-  // Add attribute columns from schema
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
-    // Map logMessage -> message per spec (avoids SpanLogger.message() method conflict)
     const arrowFieldName = getArrowFieldName(fieldName);
 
     if (lmaoType === 'enum') {
-      // Enum: Dictionary with compile-time values
       fields.push(
         arrow.Field.new({
           name: arrowFieldName,
@@ -215,7 +298,6 @@ export function convertToArrowTable(
         }),
       );
     } else if (lmaoType === 'category') {
-      // Category: Dictionary with runtime-built values
       fields.push(
         arrow.Field.new({
           name: arrowFieldName,
@@ -224,286 +306,179 @@ export function convertToArrowTable(
         }),
       );
     } else if (lmaoType === 'text') {
-      // Text: Plain string column (no dictionary)
       fields.push(
         arrow.Field.new({
           name: arrowFieldName,
-          type: new arrow.Utf8(),
+          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'number') {
-      // Number: Float64
-      fields.push(
-        arrow.Field.new({
-          name: arrowFieldName,
-          type: new arrow.Float64(),
-          nullable: true,
-        }),
-      );
+      fields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Float64(), nullable: true }));
     } else if (lmaoType === 'boolean') {
-      // Boolean: Bool type
-      fields.push(
-        arrow.Field.new({
-          name: arrowFieldName,
-          type: new arrow.Bool(),
-          nullable: true,
-        }),
-      );
+      fields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Bool(), nullable: true }));
     }
   }
 
   const arrowSchema = new arrow.Schema(fields);
-
-  // Build vectors from buffers
   const vectors: arrow.Vector[] = [];
 
-  // Add system column vectors
   if (systemColumnBuilder) {
     vectors.push(...systemVectors);
   } else {
-    // Build default lmao system column vectors
     buildDefaultSystemVectors(buffers, vectors, moduleIdInterner, spanNameInterner);
   }
 
-  // Attribute columns
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
     const columnName = `attr_${fieldName}` as `attr_${string}`;
 
     if (lmaoType === 'enum') {
-      // Enum: Dictionary with compile-time values
       const enumValues = getEnumValues(fieldSchema) || [];
-      const enumBuilder = arrow.makeBuilder({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8()),
-        nullValues: [null],
-      });
+      const enumUtf8 = getEnumUtf8(fieldSchema);
+      const valuesName = `${columnName}_values` as const;
+      const valueArrays: Uint8Array[] = [];
 
       for (const buf of buffers) {
-        const column = buf[columnName];
-        const nullBitmap = buf.nullBitmaps[columnName];
-
+        const column = buf[valuesName];
         if (column && column instanceof Uint8Array) {
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const isNull = !isRowNonNull(nullBitmap, i);
-            if (isNull) {
-              enumBuilder.append(null);
-            } else {
-              const enumIndex = column[i];
-              const enumValue = enumValues[enumIndex] || '';
-              enumBuilder.append(enumValue);
-            }
-          }
+          valueArrays.push(column.subarray(0, buf.writeIndex));
         } else {
-          // Column doesn't exist, append nulls
-          for (let i = 0; i < buf.writeIndex; i++) {
-            enumBuilder.append(null);
-          }
+          valueArrays.push(new Uint8Array(buf.writeIndex));
         }
       }
 
-      vectors.push(enumBuilder.finish().toVector());
-    } else if (lmaoType === 'category') {
-      // Category: Build dictionary at conversion time using string interner
-      // Per spec: category columns store Uint32Array indices into categoryInterner
-      const categoryBuilder = arrow.makeBuilder({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
-        nullValues: [null],
+      const allIndices = concatenateTypedArrays(valueArrays);
+      const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+
+      const enumDictData = arrow.makeData({
+        type: new arrow.Utf8(),
+        offset: 0,
+        length: enumValues.length,
+        nullCount: 0,
+        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues as readonly string[]),
+        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
       });
 
-      for (const buf of buffers) {
-        const column = buf[columnName];
-        const nullBitmap = buf.nullBitmaps[columnName];
+      const enumData = arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8()),
+        offset: 0,
+        length: totalRows,
+        nullCount,
+        data: allIndices,
+        nullBitmap,
+        dictionary: arrow.makeVector(enumDictData),
+      });
 
-        if (column && column instanceof Uint32Array) {
-          // Column is Uint32Array with indices into categoryInterner
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const isNull = !isRowNonNull(nullBitmap, i);
-            if (isNull) {
-              categoryBuilder.append(null);
-            } else {
-              const idx = column[i];
-              const stringValue = categoryInterner.getString(idx) || '';
-              categoryBuilder.append(stringValue);
-            }
-          }
-        } else {
-          // Column doesn't exist, append nulls
-          for (let i = 0; i < buf.writeIndex; i++) {
-            categoryBuilder.append(null);
-          }
-        }
-      }
+      vectors.push(arrow.makeVector(enumData));
+    } else if (lmaoType === 'category') {
+      const { dictionary, indices, nullBitmap, nullCount } = buildSortedCategoryDictionary(buffers, columnName);
+      const { data: categoryUtf8Data, offsets: categoryUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
-      vectors.push(categoryBuilder.finish().toVector());
+      const categoryDictData = arrow.makeData({
+        type: new arrow.Utf8(),
+        offset: 0,
+        length: dictionary.length,
+        nullCount: 0,
+        valueOffsets: categoryUtf8Offsets,
+        data: categoryUtf8Data,
+      });
+
+      const categoryData = arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+        offset: 0,
+        length: totalRows,
+        nullCount,
+        data: indices,
+        nullBitmap,
+        dictionary: arrow.makeVector(categoryDictData),
+      });
+
+      vectors.push(arrow.makeVector(categoryData));
     } else if (lmaoType === 'text') {
-      // Text: Build dictionary only if it saves space (>128 bytes)
-      // Per vizanto's review: Calculate space savings before deciding dictionary vs plain UTF-8
-      // Per spec: text columns store Uint32Array indices into textStorage
+      const result = buildTextDictionary(buffers, columnName);
+      if (result) {
+        const { dictionary, indices, nullBitmap, nullCount } = result;
+        const { data: textUtf8Data, offsets: textUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
-      // First pass: collect strings and count occurrences
-      const stringOccurrences = new Map<string, number>();
-      let totalRows = 0;
-
-      for (const buf of buffers) {
-        const column = buf[columnName];
-        const nullBitmap = buf.nullBitmaps[columnName];
-
-        if (column && column instanceof Uint32Array) {
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const isNull = !isRowNonNull(nullBitmap, i);
-            if (!isNull) {
-              const idx = column[i];
-              const stringValue = textStorage.getString(idx) || '';
-              stringOccurrences.set(stringValue, (stringOccurrences.get(stringValue) || 0) + 1);
-              totalRows++;
-            }
-          }
-        }
-      }
-
-      // Calculate space savings with dictionary encoding
-      // Dictionary: (num_unique_strings * avg_string_length) + (total_rows * 4) bytes
-      // Plain UTF-8: total_rows * avg_string_length bytes
-      let totalStringBytes = 0;
-      let uniqueStringBytes = 0;
-
-      for (const [str, count] of stringOccurrences.entries()) {
-        const strBytes = str.length; // Approximation (UTF-8 can be more)
-        totalStringBytes += strBytes * count;
-        uniqueStringBytes += strBytes;
-      }
-
-      const dictionarySize = uniqueStringBytes + totalRows * 4; // 4 bytes per index
-      const plainSize = totalStringBytes;
-      const spaceSavings = plainSize - dictionarySize;
-
-      // Only use dictionary if it saves more than 128 bytes
-      const useDictionary = spaceSavings > 128;
-
-      if (useDictionary) {
-        // Build dictionary encoding
-        const textBuilder = arrow.makeBuilder({
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
-          nullValues: [null],
-        });
-
-        for (const buf of buffers) {
-          const column = buf[columnName];
-          const nullBitmap = buf.nullBitmaps[columnName];
-
-          if (column && column instanceof Uint32Array) {
-            for (let i = 0; i < buf.writeIndex; i++) {
-              const isNull = !isRowNonNull(nullBitmap, i);
-              if (isNull) {
-                textBuilder.append(null);
-              } else {
-                const idx = column[i];
-                const stringValue = textStorage.getString(idx) || '';
-                textBuilder.append(stringValue);
-              }
-            }
-          } else {
-            for (let i = 0; i < buf.writeIndex; i++) {
-              textBuilder.append(null);
-            }
-          }
-        }
-
-        vectors.push(textBuilder.finish().toVector());
-      } else {
-        // Use plain UTF-8 column (no dictionary)
-        const textBuilder = arrow.makeBuilder({
+        const textDictData = arrow.makeData({
           type: new arrow.Utf8(),
-          nullValues: [null],
+          offset: 0,
+          length: dictionary.length,
+          nullCount: 0,
+          valueOffsets: textUtf8Offsets,
+          data: textUtf8Data,
         });
 
-        for (const buf of buffers) {
-          const column = buf[columnName];
-          const nullBitmap = buf.nullBitmaps[columnName];
+        const textData = arrow.makeData({
+          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+          offset: 0,
+          length: totalRows,
+          nullCount,
+          data: indices,
+          nullBitmap,
+          dictionary: arrow.makeVector(textDictData),
+        });
 
-          if (column && column instanceof Uint32Array) {
-            for (let i = 0; i < buf.writeIndex; i++) {
-              const isNull = !isRowNonNull(nullBitmap, i);
-              if (isNull) {
-                textBuilder.append(null);
-              } else {
-                const idx = column[i];
-                const stringValue = textStorage.getString(idx) || '';
-                textBuilder.append(stringValue);
-              }
-            }
-          } else {
-            for (let i = 0; i < buf.writeIndex; i++) {
-              textBuilder.append(null);
-            }
-          }
-        }
-
-        vectors.push(textBuilder.finish().toVector());
+        vectors.push(arrow.makeVector(textData));
       }
     } else if (lmaoType === 'number') {
-      // Number: Float64
-      const numberBuilder = arrow.makeBuilder({
-        type: new arrow.Float64(),
-        nullValues: [null],
-      });
+      const valuesName = `${columnName}_values` as const;
+      const valueArrays: Float64Array[] = [];
 
       for (const buf of buffers) {
-        const column = buf[columnName];
-        const nullBitmap = buf.nullBitmaps[columnName];
-
+        const column = buf[valuesName];
         if (column && column instanceof Float64Array) {
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const isNull = !isRowNonNull(nullBitmap, i);
-            if (isNull) {
-              numberBuilder.append(null);
-            } else {
-              numberBuilder.append(column[i]);
-            }
-          }
+          valueArrays.push(column.subarray(0, buf.writeIndex));
         } else {
-          // Column doesn't exist, append nulls
-          for (let i = 0; i < buf.writeIndex; i++) {
-            numberBuilder.append(null);
-          }
+          valueArrays.push(new Float64Array(buf.writeIndex));
         }
       }
 
-      vectors.push(numberBuilder.finish().toVector());
-    } else if (lmaoType === 'boolean') {
-      // Boolean: Bool
-      const boolBuilder = arrow.makeBuilder({
-        type: new arrow.Bool(),
-        nullValues: [null],
+      const allValues = concatenateTypedArrays(valueArrays);
+      const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+
+      const numberData = arrow.makeData({
+        type: new arrow.Float64(),
+        offset: 0,
+        length: totalRows,
+        nullCount,
+        data: allValues,
+        nullBitmap,
       });
 
-      for (const buf of buffers) {
-        const column = buf[columnName];
-        const nullBitmap = buf.nullBitmaps[columnName];
+      vectors.push(arrow.makeVector(numberData));
+    } else if (lmaoType === 'boolean') {
+      const valuesName = `${columnName}_values` as const;
+      const valueArrays: Uint8Array[] = [];
 
+      for (const buf of buffers) {
+        const column = buf[valuesName];
         if (column && column instanceof Uint8Array) {
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const isNull = !isRowNonNull(nullBitmap, i);
-            if (isNull) {
-              boolBuilder.append(null);
-            } else {
-              boolBuilder.append(column[i] !== 0);
-            }
-          }
+          const requiredBytes = Math.ceil(buf.writeIndex / 8);
+          valueArrays.push(column.subarray(0, requiredBytes));
         } else {
-          // Column doesn't exist, append nulls
-          for (let i = 0; i < buf.writeIndex; i++) {
-            boolBuilder.append(null);
-          }
+          const requiredBytes = Math.ceil(buf.writeIndex / 8);
+          valueArrays.push(new Uint8Array(requiredBytes));
         }
       }
 
-      vectors.push(boolBuilder.finish().toVector());
+      const allValues = concatenateTypedArrays(valueArrays);
+      const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+
+      const boolData = arrow.makeData({
+        type: new arrow.Bool(),
+        offset: 0,
+        length: totalRows,
+        nullCount,
+        data: allValues,
+        nullBitmap,
+      });
+
+      vectors.push(arrow.makeVector(boolData));
     }
   }
 
-  // Create Arrow Table from schema and vectors
   const data = arrow.makeData({
     type: new arrow.Struct(arrowSchema.fields),
     length: totalRows,
@@ -511,251 +486,1172 @@ export function convertToArrowTable(
     children: vectors.map((v) => v.data[0]),
   });
 
-  const recordBatch = new arrow.RecordBatch(arrowSchema, data);
-  return new arrow.Table([recordBatch]);
+  return new arrow.RecordBatch(arrowSchema, data);
 }
 
 /**
- * Check if a row is non-null in the null bitmap
- * Arrow format: 1 = valid, 0 = null
- * If nullBitmap is undefined, the row is considered valid (non-null)
+ * Convert SpanBuffer (and its overflow chain) to Arrow Table
  */
-function isRowNonNull(nullBitmap: Uint8Array | undefined, rowIndex: number): boolean {
-  // If no null bitmap exists, treat all rows as valid (non-null)
-  if (!nullBitmap) return true;
-
-  const byteIndex = Math.floor(rowIndex / 8);
-  const bitOffset = rowIndex % 8;
-
-  // Out of range means null
-  if (byteIndex >= nullBitmap.length) return false;
-
-  return (nullBitmap[byteIndex] & (1 << bitOffset)) !== 0;
+export function convertToArrowTable(
+  buffer: SpanBuffer,
+  moduleIdInterner: StringInterner,
+  spanNameInterner: StringInterner,
+  systemColumnBuilder?: SystemColumnBuilder,
+): arrow.Table {
+  const batch = convertToRecordBatch(buffer, moduleIdInterner, spanNameInterner, systemColumnBuilder);
+  if (batch.numRows === 0) return new arrow.Table();
+  return new arrow.Table([batch]);
 }
 
-/**
- * Build default lmao system column vectors
- *
- * Creates standard trace logging columns: timestamp, trace_id, span_id, parent_span_id,
- * entry_type, module, and span_name.
- *
- * @param buffers - Array of SpanBuffers to convert
- * @param vectors - Array to append vectors to
- * @param moduleIdInterner - Module ID string interner
- * @param spanNameInterner - Span name string interner
- */
 function buildDefaultSystemVectors(
   buffers: SpanBuffer[],
   vectors: arrow.Vector[],
   moduleIdInterner: StringInterner,
   spanNameInterner: StringInterner,
 ): void {
-  // Timestamp vector (microseconds - matches storage format)
-  const timestampBuilder = arrow.makeBuilder({
-    type: new arrow.TimestampMicrosecond(),
-    nullValues: [null],
-  });
+  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
+  // Timestamp - BigInt64Array with nanoseconds
+  const allTimestamps = new BigInt64Array(totalRows);
+  let timestampOffset = 0;
   for (const buf of buffers) {
     for (let i = 0; i < buf.writeIndex; i++) {
-      timestampBuilder.append(buf.timestamps[i]);
+      allTimestamps[timestampOffset + i] = buf.timestamps[i];
     }
+    timestampOffset += buf.writeIndex;
   }
-  vectors.push(timestampBuilder.finish().toVector());
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.TimestampNanosecond(),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: allTimestamps,
+      }),
+    ),
+  );
 
-  // Trace ID vector (dictionary encoded)
-  const traceIdBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
-    nullValues: [null],
-  });
+  // Trace ID
+  const traceIdSet = new Set<string>();
+  for (const buf of buffers) traceIdSet.add(buf.traceId);
+  const traceIdArray = Array.from(traceIdSet);
+  const traceIdMap = new Map(traceIdArray.map((id, idx) => [id, idx]));
 
+  const traceIdIndices = new Int32Array(totalRows);
+  let rowOffset = 0;
   for (const buf of buffers) {
+    const traceIdIndex = traceIdMap.get(buf.traceId)!;
     for (let i = 0; i < buf.writeIndex; i++) {
-      traceIdBuilder.append(buf.traceId);
+      traceIdIndices[rowOffset + i] = traceIdIndex;
     }
+    rowOffset += buf.writeIndex;
   }
-  vectors.push(traceIdBuilder.finish().toVector());
 
-  // Span ID vector
-  const spanIdBuilder = arrow.makeBuilder({
-    type: new arrow.Uint64(),
-    nullValues: [null],
+  const traceIdDictData = arrow.makeData({
+    type: new arrow.Utf8(),
+    offset: 0,
+    length: traceIdArray.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(traceIdArray),
+    data: encodeUtf8Strings(traceIdArray),
   });
 
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: traceIdIndices,
+        dictionary: arrow.makeVector(traceIdDictData),
+      }),
+    ),
+  );
+
+  // thread_id (Uint64) - separate column
+  const threadIds = new BigUint64Array(totalRows);
+  rowOffset = 0;
   for (const buf of buffers) {
+    const threadId = buf.threadId;
     for (let i = 0; i < buf.writeIndex; i++) {
-      spanIdBuilder.append(BigInt(buf.spanId));
+      threadIds[rowOffset + i] = threadId;
     }
+    rowOffset += buf.writeIndex;
   }
-  vectors.push(spanIdBuilder.finish().toVector());
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint64(),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: threadIds,
+      }),
+    ),
+  );
 
-  // Parent span ID vector (nullable)
-  const parentSpanIdBuilder = arrow.makeBuilder({
-    type: new arrow.Uint64(),
-    nullValues: [null],
-  });
+  // span_id (Uint32) - separate column
+  const spanIds = new Uint32Array(totalRows);
+  rowOffset = 0;
+  for (const buf of buffers) {
+    const spanId = buf.spanId;
+    for (let i = 0; i < buf.writeIndex; i++) {
+      spanIds[rowOffset + i] = spanId;
+    }
+    rowOffset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint32(),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: spanIds,
+      }),
+    ),
+  );
 
+  // parent_thread_id (Uint64, nullable) - separate column
+  const parentThreadIds = new BigUint64Array(totalRows);
+  const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
+  parentThreadIdNulls.fill(0xff);
+  let parentThreadIdNullCount = 0;
+  rowOffset = 0;
   for (const buf of buffers) {
     for (let i = 0; i < buf.writeIndex; i++) {
+      const rowIdx = rowOffset + i;
       if (buf.parent) {
-        parentSpanIdBuilder.append(BigInt(buf.parent.spanId));
+        parentThreadIds[rowIdx] = buf.parent.threadId;
       } else {
-        parentSpanIdBuilder.append(null);
+        const byteIdx = Math.floor(rowIdx / 8);
+        const bitOffset = rowIdx % 8;
+        parentThreadIdNulls[byteIdx] &= ~(1 << bitOffset);
+        parentThreadIdNullCount++;
       }
     }
+    rowOffset += buf.writeIndex;
   }
-  vectors.push(parentSpanIdBuilder.finish().toVector());
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint64(),
+        offset: 0,
+        length: totalRows,
+        nullCount: parentThreadIdNullCount,
+        data: parentThreadIds,
+        nullBitmap: parentThreadIdNullCount > 0 ? parentThreadIdNulls : undefined,
+      }),
+    ),
+  );
 
-  // Entry type vector (dictionary with entry type names)
-  const entryTypeBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()),
-    nullValues: [null],
-  });
-
+  // parent_span_id (Uint32, nullable) - separate column
+  const parentSpanIds = new Uint32Array(totalRows);
+  const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
+  parentSpanIdNulls.fill(0xff);
+  let parentSpanIdNullCount = 0;
+  rowOffset = 0;
   for (const buf of buffers) {
     for (let i = 0; i < buf.writeIndex; i++) {
-      const entryTypeCode = buf.operations[i];
-      const entryTypeName = ENTRY_TYPE_NAMES[entryTypeCode] || 'unknown';
-      entryTypeBuilder.append(entryTypeName);
+      const rowIdx = rowOffset + i;
+      if (buf.parent) {
+        parentSpanIds[rowIdx] = buf.parent.spanId;
+      } else {
+        const byteIdx = Math.floor(rowIdx / 8);
+        const bitOffset = rowIdx % 8;
+        parentSpanIdNulls[byteIdx] &= ~(1 << bitOffset);
+        parentSpanIdNullCount++;
+      }
     }
+    rowOffset += buf.writeIndex;
   }
-  vectors.push(entryTypeBuilder.finish().toVector());
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint32(),
+        offset: 0,
+        length: totalRows,
+        nullCount: parentSpanIdNullCount,
+        data: parentSpanIds,
+        nullBitmap: parentSpanIdNullCount > 0 ? parentSpanIdNulls : undefined,
+      }),
+    ),
+  );
 
-  // Module vector (dictionary from moduleIdInterner)
-  const moduleBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
-    nullValues: [null],
-  });
-
+  // Entry type
+  const entryTypeIndices = new Int8Array(totalRows);
+  rowOffset = 0;
   for (const buf of buffers) {
-    const moduleName = moduleIdInterner.getString(buf.task.module.moduleId);
     for (let i = 0; i < buf.writeIndex; i++) {
-      moduleBuilder.append(moduleName || 'unknown');
+      entryTypeIndices[rowOffset + i] = buf.operations[i];
     }
+    rowOffset += buf.writeIndex;
   }
-  vectors.push(moduleBuilder.finish().toVector());
-
-  // Span name vector (dictionary from spanNameInterner)
-  const spanNameBuilder = arrow.makeBuilder({
-    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
-    nullValues: [null],
+  const entryTypeDictData = arrow.makeData({
+    type: new arrow.Utf8(),
+    offset: 0,
+    length: ENTRY_TYPE_NAMES.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
+    data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
   });
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: entryTypeIndices,
+        dictionary: arrow.makeVector(entryTypeDictData),
+      }),
+    ),
+  );
 
+  // Module
+  const moduleIdSet = new Set<number>();
+  for (const buf of buffers) moduleIdSet.add(buf.task.module.moduleId);
+  const moduleIdArray = Array.from(moduleIdSet);
+  const moduleNameArray = moduleIdArray.map((id) => moduleIdInterner.getString(id) || 'unknown');
+  const moduleIdMap = new Map(moduleIdArray.map((id, idx) => [id, idx]));
+
+  const moduleIndices = new Int32Array(totalRows);
+  rowOffset = 0;
   for (const buf of buffers) {
-    const spanName = spanNameInterner.getString(buf.task.spanNameId);
+    const moduleIndex = moduleIdMap.get(buf.task.module.moduleId)!;
     for (let i = 0; i < buf.writeIndex; i++) {
-      spanNameBuilder.append(spanName || 'unknown');
+      moduleIndices[rowOffset + i] = moduleIndex;
     }
+    rowOffset += buf.writeIndex;
   }
-  vectors.push(spanNameBuilder.finish().toVector());
+
+  const moduleDictData = arrow.makeData({
+    type: new arrow.Utf8(),
+    offset: 0,
+    length: moduleNameArray.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(moduleNameArray),
+    data: encodeUtf8Strings(moduleNameArray),
+  });
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: moduleIndices,
+        dictionary: arrow.makeVector(moduleDictData),
+      }),
+    ),
+  );
+
+  // Span name
+  const spanNameIdSet = new Set<number>();
+  for (const buf of buffers) spanNameIdSet.add(buf.task.spanNameId);
+  const spanNameIdArray = Array.from(spanNameIdSet);
+  const spanNameArray = spanNameIdArray.map((id) => spanNameInterner.getString(id) || 'unknown');
+  const spanNameIdMap = new Map(spanNameIdArray.map((id, idx) => [id, idx]));
+
+  const spanNameIndices = new Int32Array(totalRows);
+  rowOffset = 0;
+  for (const buf of buffers) {
+    const spanNameIndex = spanNameIdMap.get(buf.task.spanNameId)!;
+    for (let i = 0; i < buf.writeIndex; i++) {
+      spanNameIndices[rowOffset + i] = spanNameIndex;
+    }
+    rowOffset += buf.writeIndex;
+  }
+
+  const spanNameDictData = arrow.makeData({
+    type: new arrow.Utf8(),
+    offset: 0,
+    length: spanNameArray.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(spanNameArray),
+    data: encodeUtf8Strings(spanNameArray),
+  });
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: spanNameIndices,
+        dictionary: arrow.makeVector(spanNameDictData),
+      }),
+    ),
+  );
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Tree Conversion with Shared Dictionaries
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Calculate UTF-8 byte length without allocating
+ */
+function utf8ByteLength(str: string): number {
+  let bytes = 0;
+  for (let i = 0; i < str.length; i++) {
+    const c = str.charCodeAt(i);
+    if (c < 0x80) bytes += 1;
+    else if (c < 0x800) bytes += 2;
+    else if (c < 0xd800 || c >= 0xe000) bytes += 3;
+    else {
+      i++;
+      bytes += 4;
+    } // surrogate pair
+  }
+  return bytes;
 }
 
 /**
- * Convert SpanBuffer tree to Arrow Table (includes child spans)
- * Recursively collects all spans in the tree
+ * Dictionary builder for string columns.
  *
- * @param rootBuffer - Root span buffer
- * @param categoryInterner - Category string interner
- * @param textStorage - Text string storage
- * @param moduleIdInterner - Module ID interner
- * @param spanNameInterner - Span name interner
- * @param systemColumnBuilder - Optional system column builder (lmao-specific)
- * @returns Arrow Table containing all spans in tree
+ * Pass 1: Collect unique strings, track total UTF-8 byte length,
+ *         cache UTF-8 encoding on second occurrence.
+ * Finalize: Sort (for category), pre-allocate exact-size buffer,
+ *           encode remaining strings with encodeInto (zero allocation).
+ */
+class ColumnDictionary {
+  private strings = new Map<string, { utf8?: Uint8Array; count: number }>();
+  private totalUtf8Bytes = 0;
+  private encoder = new TextEncoder();
+
+  add(str: string): void {
+    const entry = this.strings.get(str);
+    if (entry) {
+      entry.count++;
+      if (entry.count === 2 && !entry.utf8) {
+        // Cache UTF-8 on second occurrence
+        entry.utf8 = this.encoder.encode(str);
+      }
+    } else {
+      // First occurrence - just track byte length (no allocation)
+      this.totalUtf8Bytes += utf8ByteLength(str);
+      this.strings.set(str, { count: 1 });
+    }
+  }
+
+  get size(): number {
+    return this.strings.size;
+  }
+
+  finalize(sort: boolean): { data: Uint8Array; offsets: Int32Array; indexMap: Map<string, number> } {
+    const uniqueCount = this.strings.size;
+
+    // Pre-allocate array with exact size
+    const keys = new Array<string>(uniqueCount);
+    let i = 0;
+    for (const key of this.strings.keys()) {
+      keys[i++] = key;
+    }
+    if (sort) keys.sort();
+
+    // Pre-allocate exact-size buffer
+    const data = new Uint8Array(this.totalUtf8Bytes);
+    const offsets = new Int32Array(uniqueCount + 1);
+    const indexMap = new Map<string, number>();
+
+    let offset = 0;
+    for (let i = 0; i < uniqueCount; i++) {
+      const str = keys[i];
+      const entry = this.strings.get(str)!;
+
+      offsets[i] = offset;
+      indexMap.set(str, i);
+
+      if (entry.utf8) {
+        // Cached - just copy
+        data.set(entry.utf8, offset);
+        offset += entry.utf8.length;
+      } else {
+        // Encode directly into final buffer (zero intermediate allocation)
+        const result = this.encoder.encodeInto(str, data.subarray(offset));
+        offset += result.written!;
+      }
+    }
+    offsets[uniqueCount] = offset;
+
+    return { data, offsets, indexMap };
+  }
+}
+
+/**
+ * Walk a SpanBuffer tree (depth-first pre-order), including overflow chains.
+ */
+function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): void {
+  let current: SpanBuffer | undefined = root;
+  while (current) {
+    visitor(current);
+    current = current.next as SpanBuffer | undefined;
+  }
+  for (const child of root.children) {
+    walkSpanTree(child, visitor);
+  }
+}
+
+/**
+ * Convert SpanBuffer tree to Arrow Table
+ *
+ * Two-pass conversion with shared dictionaries:
+ * - Pass 1: Walk tree, build dictionaries (collect unique strings, cache UTF-8)
+ * - Pass 2: Walk tree, convert each buffer to RecordBatch using shared dictionaries
  */
 export function convertSpanTreeToArrowTable(
   rootBuffer: SpanBuffer,
-  categoryInterner: StringInterner,
-  textStorage: StringInterner,
   moduleIdInterner: StringInterner,
   spanNameInterner: StringInterner,
-  systemColumnBuilder?: SystemColumnBuilder,
+  _systemColumnBuilder?: SystemColumnBuilder,
 ): arrow.Table {
-  // Collect all buffers in tree (depth-first)
-  const allBuffers: SpanBuffer[] = [];
+  const schema = rootBuffer.task.module.tagAttributes;
 
-  function collectBuffers(buffer: SpanBuffer): void {
-    allBuffers.push(buffer);
-    for (const child of buffer.children) {
-      collectBuffers(child);
-    }
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PASS 1: Build dictionaries
+  // ═══════════════════════════════════════════════════════════════════════════
+  const categoryBuilders = new Map<string, ColumnDictionary>();
+  const textBuilders = new Map<string, ColumnDictionary>();
+
+  for (const [fieldName, fieldSchema] of Object.entries(schema)) {
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+    if (lmaoType === 'category') categoryBuilders.set(fieldName, new ColumnDictionary());
+    if (lmaoType === 'text') textBuilders.set(fieldName, new ColumnDictionary());
   }
 
-  collectBuffers(rootBuffer);
+  // System column dictionaries
+  const traceIdBuilder = new ColumnDictionary();
+  const moduleBuilder = new ColumnDictionary();
+  const spanNameBuilder = new ColumnDictionary();
 
-  // Convert all buffers to a single table
-  // For simplicity, we'll convert each buffer separately and concatenate
-  const tables: arrow.Table[] = [];
+  let totalRows = 0;
+  walkSpanTree(rootBuffer, (buffer) => {
+    totalRows += buffer.writeIndex;
+    traceIdBuilder.add(buffer.traceId);
 
-  for (const buffer of allBuffers) {
-    const table = convertToArrowTable(
-      buffer,
-      categoryInterner,
-      textStorage,
-      moduleIdInterner,
-      spanNameInterner,
-      systemColumnBuilder,
-    );
+    // Add module and span name to their shared dictionaries
+    const moduleName = moduleIdInterner.getString(buffer.task.module.moduleId) || 'unknown';
+    const spanName = spanNameInterner.getString(buffer.task.spanNameId) || 'unknown';
+    moduleBuilder.add(moduleName);
+    spanNameBuilder.add(spanName);
 
-    if (table.numRows > 0) {
-      tables.push(table);
-    }
-  }
-
-  if (tables.length === 0) {
-    return new arrow.Table();
-  }
-
-  if (tables.length === 1) {
-    return tables[0];
-  }
-
-  // When combining multiple tables, they must have identical schemas
-  // Since different spans can have different tag attributes, we need to:
-  // 1. Merge all schemas to find the union of all columns
-  // 2. Convert each table's data to match the merged schema (adding nulls for missing columns)
-  // 3. Concatenate the aligned batches
-
-  // Collect all unique field names across all tables
-  const allFieldNames = new Set<string>();
-  for (const table of tables) {
-    for (const field of table.schema.fields) {
-      allFieldNames.add(field.name);
-    }
-  }
-
-  // Build merged data column by column
-  const allData: Record<string, unknown[]> = {};
-  for (const fieldName of allFieldNames) {
-    allData[fieldName] = [];
-  }
-
-  // For each table, extract data and append to merged columns
-  for (const table of tables) {
-    const numRows = table.numRows;
-    const fieldMap = new Map<string, arrow.Vector>();
-
-    // Build map of field name to vector
-    for (let i = 0; i < table.schema.fields.length; i++) {
-      const field = table.schema.fields[i];
-      fieldMap.set(field.name, table.getChildAt(i)!);
-    }
-
-    // For each merged field, extract data or add nulls
-    for (const fieldName of allFieldNames) {
-      const vector = fieldMap.get(fieldName);
-      if (vector) {
-        // Extract values from vector
-        for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
-          allData[fieldName].push(vector.get(rowIdx));
-        }
-      } else {
-        // Field doesn't exist in this table, add nulls
-        for (let rowIdx = 0; rowIdx < numRows; rowIdx++) {
-          allData[fieldName].push(null);
+    for (const [fieldName, builder] of categoryBuilders) {
+      const col = buffer[`attr_${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      if (col) {
+        for (let i = 0; i < buffer.writeIndex; i++) {
+          if (col[i] != null) builder.add(col[i]);
         }
       }
     }
+
+    for (const [fieldName, builder] of textBuilders) {
+      const col = buffer[`attr_${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      if (col) {
+        for (let i = 0; i < buffer.writeIndex; i++) {
+          if (col[i] != null) builder.add(col[i]);
+        }
+      }
+    }
+  });
+
+  if (totalRows === 0) return new arrow.Table();
+
+  // Finalize dictionaries
+  const traceIdDict = traceIdBuilder.finalize(false);
+  const moduleDict = moduleBuilder.finalize(true); // sorted
+  const spanNameDict = spanNameBuilder.finalize(true); // sorted
+  const categoryDicts = new Map<string, FinalizedDict>();
+  const textDicts = new Map<string, FinalizedDict>();
+
+  for (const [name, builder] of categoryBuilders) {
+    categoryDicts.set(name, builder.finalize(true)); // sorted for binary search
+  }
+  for (const [name, builder] of textBuilders) {
+    textDicts.set(name, builder.finalize(false)); // not sorted
   }
 
-  return arrow.tableFromArrays(allData);
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Build shared Arrow schema with stable dictionary IDs
+  // ═══════════════════════════════════════════════════════════════════════════
+  const arrowFields: arrow.Field[] = [];
+
+  // System columns - create types with explicit dictionary IDs
+  arrowFields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampNanosecond() }));
+  arrowFields.push(
+    arrow.Field.new({ name: 'trace_id', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 0) }),
+  );
+  // Span ID columns (separate columns instead of struct)
+  arrowFields.push(arrow.Field.new({ name: 'thread_id', type: new arrow.Uint64() }));
+  arrowFields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint32() }));
+  arrowFields.push(arrow.Field.new({ name: 'parent_thread_id', type: new arrow.Uint64(), nullable: true }));
+  arrowFields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint32(), nullable: true }));
+  arrowFields.push(
+    arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8(), 1) }),
+  );
+  arrowFields.push(
+    arrow.Field.new({ name: 'module', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 2) }),
+  );
+  arrowFields.push(
+    arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 3) }),
+  );
+
+  // Attribute columns - assign dictionary IDs starting at 4
+  let nextDictId = 4;
+  const attrDictIds = new Map<string, number>();
+  for (const [fieldName, fieldSchema] of Object.entries(schema)) {
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const arrowFieldName = getArrowFieldName(fieldName);
+
+    if (lmaoType === 'enum') {
+      attrDictIds.set(fieldName, nextDictId);
+      arrowFields.push(
+        arrow.Field.new({
+          name: arrowFieldName,
+          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8(), nextDictId++),
+          nullable: true,
+        }),
+      );
+    } else if (lmaoType === 'category') {
+      attrDictIds.set(fieldName, nextDictId);
+      arrowFields.push(
+        arrow.Field.new({
+          name: arrowFieldName,
+          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32(), nextDictId++),
+          nullable: true,
+        }),
+      );
+    } else if (lmaoType === 'text') {
+      attrDictIds.set(fieldName, nextDictId);
+      arrowFields.push(
+        arrow.Field.new({
+          name: arrowFieldName,
+          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32(), nextDictId++),
+          nullable: true,
+        }),
+      );
+    } else if (lmaoType === 'number') {
+      arrowFields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Float64(), nullable: true }));
+    } else if (lmaoType === 'boolean') {
+      arrowFields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Bool(), nullable: true }));
+    }
+  }
+
+  const arrowSchema = new arrow.Schema(arrowFields);
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PASS 2: Collect all buffers with non-zero rows
+  // ═══════════════════════════════════════════════════════════════════════════
+  const allBuffers: SpanBuffer[] = [];
+
+  walkSpanTree(rootBuffer, (buffer) => {
+    if (buffer.writeIndex > 0) {
+      allBuffers.push(buffer);
+    }
+  });
+
+  if (allBuffers.length === 0) return new arrow.Table();
+
+  // Build a single RecordBatch from all buffers
+  const batch = convertBuffersWithSharedDicts(
+    allBuffers,
+    arrowSchema,
+    traceIdDict,
+    moduleDict,
+    spanNameDict,
+    categoryDicts,
+    textDicts,
+    attrDictIds,
+    moduleIdInterner,
+    spanNameInterner,
+    schema,
+  );
+
+  return new arrow.Table([batch]);
+}
+
+type FinalizedDict = ReturnType<ColumnDictionary['finalize']>;
+
+/**
+ * Convert multiple buffers to a single RecordBatch using pre-built shared dictionaries
+ */
+function convertBuffersWithSharedDicts(
+  buffers: SpanBuffer[],
+  arrowSchema: arrow.Schema,
+  traceIdDict: FinalizedDict,
+  moduleDict: FinalizedDict,
+  spanNameDict: FinalizedDict,
+  categoryDicts: Map<string, FinalizedDict>,
+  textDicts: Map<string, FinalizedDict>,
+  _attrDictIds: Map<string, number>,
+  moduleIdInterner: StringInterner,
+  spanNameInterner: StringInterner,
+  lmaoSchema: Record<string, unknown>,
+): arrow.RecordBatch {
+  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  const vectors: arrow.Vector[] = [];
+
+  // Get types from the shared schema
+  const timestampType = arrowSchema.fields[0].type as arrow.TimestampNanosecond;
+  const traceIdType = arrowSchema.fields[1].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  // Span ID columns: thread_id (2), span_id (3), parent_thread_id (4), parent_span_id (5)
+  const entryTypeType = arrowSchema.fields[6].type as arrow.Dictionary<arrow.Utf8, arrow.Int8>;
+  const moduleType = arrowSchema.fields[7].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const spanNameType = arrowSchema.fields[8].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // System columns - concatenate data from all buffers
+  // ═══════════════════════════════════════════════════════════════════════════
+
+  // Timestamp - BigInt64Array with nanoseconds (zero-copy compatible)
+  const allTimestamps = new BigInt64Array(totalRows);
+  let offset = 0;
+  for (const buf of buffers) {
+    for (let i = 0; i < buf.writeIndex; i++) {
+      allTimestamps[offset + i] = buf.timestamps[i];
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: timestampType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: allTimestamps,
+      }),
+    ),
+  );
+
+  // Trace ID (using shared dictionary)
+  const traceIdIndices = new Int32Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    const idx = traceIdDict.indexMap.get(buf.traceId) ?? 0;
+    for (let i = 0; i < buf.writeIndex; i++) {
+      traceIdIndices[offset + i] = idx;
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: traceIdType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: traceIdIndices,
+        dictionary: arrow.makeVector(
+          arrow.makeData({
+            type: new arrow.Utf8(),
+            offset: 0,
+            length: traceIdDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: traceIdDict.offsets,
+            data: traceIdDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // thread_id (Uint64) - separate column
+  const threadIds = new BigUint64Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    const threadId = buf.threadId;
+    for (let i = 0; i < buf.writeIndex; i++) {
+      threadIds[offset + i] = threadId;
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint64(),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: threadIds,
+      }),
+    ),
+  );
+
+  // span_id (Uint32) - separate column
+  const spanIds = new Uint32Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    const spanId = buf.spanId;
+    for (let i = 0; i < buf.writeIndex; i++) {
+      spanIds[offset + i] = spanId;
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint32(),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: spanIds,
+      }),
+    ),
+  );
+
+  // parent_thread_id (Uint64, nullable) - separate column
+  const parentThreadIds = new BigUint64Array(totalRows);
+  const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
+  parentThreadIdNulls.fill(0xff);
+  let parentThreadIdNullCount = 0;
+  offset = 0;
+  for (const buf of buffers) {
+    if (buf.parent) {
+      const parentThreadId = buf.parent.threadId;
+      for (let i = 0; i < buf.writeIndex; i++) {
+        parentThreadIds[offset + i] = parentThreadId;
+      }
+    } else {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const rowIdx = offset + i;
+        const byteIdx = rowIdx >>> 3;
+        const bitIdx = rowIdx & 7;
+        parentThreadIdNulls[byteIdx] &= ~(1 << bitIdx);
+        parentThreadIdNullCount++;
+      }
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint64(),
+        offset: 0,
+        length: totalRows,
+        nullCount: parentThreadIdNullCount,
+        data: parentThreadIds,
+        nullBitmap: parentThreadIdNullCount > 0 ? parentThreadIdNulls : undefined,
+      }),
+    ),
+  );
+
+  // parent_span_id (Uint32, nullable) - separate column
+  const parentSpanIds = new Uint32Array(totalRows);
+  const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
+  parentSpanIdNulls.fill(0xff);
+  let parentSpanIdNullCount = 0;
+  offset = 0;
+  for (const buf of buffers) {
+    if (buf.parent) {
+      const parentSpanId = buf.parent.spanId;
+      for (let i = 0; i < buf.writeIndex; i++) {
+        parentSpanIds[offset + i] = parentSpanId;
+      }
+    } else {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const rowIdx = offset + i;
+        const byteIdx = rowIdx >>> 3;
+        const bitIdx = rowIdx & 7;
+        parentSpanIdNulls[byteIdx] &= ~(1 << bitIdx);
+        parentSpanIdNullCount++;
+      }
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Uint32(),
+        offset: 0,
+        length: totalRows,
+        nullCount: parentSpanIdNullCount,
+        data: parentSpanIds,
+        nullBitmap: parentSpanIdNullCount > 0 ? parentSpanIdNulls : undefined,
+      }),
+    ),
+  );
+
+  // Entry type
+  const entryTypeIndices = new Int8Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    for (let i = 0; i < buf.writeIndex; i++) {
+      entryTypeIndices[offset + i] = buf.operations[i];
+    }
+    offset += buf.writeIndex;
+  }
+  const entryTypeDictData = arrow.makeData({
+    type: new arrow.Utf8(),
+    offset: 0,
+    length: ENTRY_TYPE_NAMES.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
+    data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
+  });
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: entryTypeType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: entryTypeIndices,
+        dictionary: arrow.makeVector(entryTypeDictData),
+      }),
+    ),
+  );
+
+  // Module (using shared dictionary)
+  const moduleIndices = new Int32Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    const moduleName = moduleIdInterner.getString(buf.task.module.moduleId) || 'unknown';
+    const idx = moduleDict.indexMap.get(moduleName) ?? 0;
+    for (let i = 0; i < buf.writeIndex; i++) {
+      moduleIndices[offset + i] = idx;
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: moduleType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: moduleIndices,
+        dictionary: arrow.makeVector(
+          arrow.makeData({
+            type: new arrow.Utf8(),
+            offset: 0,
+            length: moduleDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: moduleDict.offsets,
+            data: moduleDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // Span name (using shared dictionary)
+  const spanNameIndices = new Int32Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    const spanName = spanNameInterner.getString(buf.task.spanNameId) || 'unknown';
+    const idx = spanNameDict.indexMap.get(spanName) ?? 0;
+    for (let i = 0; i < buf.writeIndex; i++) {
+      spanNameIndices[offset + i] = idx;
+    }
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: spanNameType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: spanNameIndices,
+        dictionary: arrow.makeVector(
+          arrow.makeData({
+            type: new arrow.Utf8(),
+            offset: 0,
+            length: spanNameDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: spanNameDict.offsets,
+            data: spanNameDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Attribute columns - concatenate from all buffers
+  // ═══════════════════════════════════════════════════════════════════════════
+  // System fields: timestamp, trace_id, thread_id, span_id, parent_thread_id, parent_span_id, entry_type, module, span_name
+  const SYSTEM_FIELDS_COUNT = 9;
+  let fieldIdx = SYSTEM_FIELDS_COUNT;
+
+  for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {
+    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const columnName = `attr_${fieldName}` as `attr_${string}`;
+    const valuesKey = `${columnName}_values` as keyof SpanBuffer;
+    const nullsKey = `${columnName}_nulls` as keyof SpanBuffer;
+
+    // Get the type from the shared schema
+    const fieldType = arrowSchema.fields[fieldIdx].type;
+
+    if (lmaoType === 'category') {
+      const dict = categoryDicts.get(fieldName)!;
+      const indices = new Uint32Array(totalRows);
+      const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+      let nullCount = 0;
+      let rowOffset = 0;
+
+      for (const buf of buffers) {
+        const col = buf[valuesKey] as string[] | undefined;
+        if (col) {
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const v = col[i];
+            const rowIdx = rowOffset + i;
+            if (v != null) {
+              indices[rowIdx] = dict.indexMap.get(v) ?? 0;
+              nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+            } else {
+              nullCount++;
+            }
+          }
+        } else {
+          nullCount += buf.writeIndex;
+        }
+        rowOffset += buf.writeIndex;
+      }
+
+      vectors.push(
+        arrow.makeVector(
+          arrow.makeData({
+            type: fieldType as arrow.Dictionary<arrow.Utf8, arrow.Uint32>,
+            offset: 0,
+            length: totalRows,
+            nullCount,
+            data: indices,
+            nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+            dictionary: arrow.makeVector(
+              arrow.makeData({
+                type: new arrow.Utf8(),
+                offset: 0,
+                length: dict.indexMap.size,
+                nullCount: 0,
+                valueOffsets: dict.offsets,
+                data: dict.data,
+              }),
+            ),
+          }),
+        ),
+      );
+    } else if (lmaoType === 'text') {
+      const dict = textDicts.get(fieldName)!;
+      const indices = new Uint32Array(totalRows);
+      const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+      let nullCount = 0;
+      let rowOffset = 0;
+
+      for (const buf of buffers) {
+        const col = buf[valuesKey] as string[] | undefined;
+        if (col) {
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const v = col[i];
+            const rowIdx = rowOffset + i;
+            if (v != null) {
+              indices[rowIdx] = dict.indexMap.get(v) ?? 0;
+              nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+            } else {
+              nullCount++;
+            }
+          }
+        } else {
+          nullCount += buf.writeIndex;
+        }
+        rowOffset += buf.writeIndex;
+      }
+
+      vectors.push(
+        arrow.makeVector(
+          arrow.makeData({
+            type: fieldType as arrow.Dictionary<arrow.Utf8, arrow.Uint32>,
+            offset: 0,
+            length: totalRows,
+            nullCount,
+            data: indices,
+            nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+            dictionary: arrow.makeVector(
+              arrow.makeData({
+                type: new arrow.Utf8(),
+                offset: 0,
+                length: dict.indexMap.size,
+                nullCount: 0,
+                valueOffsets: dict.offsets,
+                data: dict.data,
+              }),
+            ),
+          }),
+        ),
+      );
+    } else if (lmaoType === 'number') {
+      const allValues = new Float64Array(totalRows);
+      const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+      nullBitmap.fill(0xff);
+      let nullCount = 0;
+      let rowOffset = 0;
+
+      for (const buf of buffers) {
+        const col = buf[valuesKey];
+        const srcNulls = buf[nullsKey] as Uint8Array | undefined;
+
+        if (col instanceof Float64Array) {
+          allValues.set(col.subarray(0, buf.writeIndex), rowOffset);
+          if (srcNulls) {
+            for (let i = 0; i < buf.writeIndex; i++) {
+              const srcByte = i >>> 3;
+              const srcBit = i & 7;
+              const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
+              if (!isValid) {
+                const rowIdx = rowOffset + i;
+                nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+                nullCount++;
+              }
+            }
+          }
+        } else {
+          // Column doesn't exist for this buffer - all nulls
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const rowIdx = rowOffset + i;
+            nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+            nullCount++;
+          }
+        }
+        rowOffset += buf.writeIndex;
+      }
+
+      vectors.push(
+        arrow.makeVector(
+          arrow.makeData({
+            type: fieldType as arrow.Float64,
+            offset: 0,
+            length: totalRows,
+            nullCount,
+            data: allValues,
+            nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+          }),
+        ),
+      );
+    } else if (lmaoType === 'boolean') {
+      const requiredBytes = Math.ceil(totalRows / 8);
+      const allValues = new Uint8Array(requiredBytes);
+      const nullBitmap = new Uint8Array(requiredBytes);
+      nullBitmap.fill(0xff);
+      let nullCount = 0;
+      let rowOffset = 0;
+
+      for (const buf of buffers) {
+        const col = buf[valuesKey];
+        const srcNulls = buf[nullsKey] as Uint8Array | undefined;
+
+        if (col instanceof Uint8Array) {
+          // Copy boolean values bit by bit
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const srcByte = i >>> 3;
+            const srcBit = i & 7;
+            const value = (col[srcByte] & (1 << srcBit)) !== 0;
+            const rowIdx = rowOffset + i;
+            if (value) {
+              allValues[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+            }
+            if (srcNulls) {
+              const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
+              if (!isValid) {
+                nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+                nullCount++;
+              }
+            }
+          }
+        } else {
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const rowIdx = rowOffset + i;
+            nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+            nullCount++;
+          }
+        }
+        rowOffset += buf.writeIndex;
+      }
+
+      vectors.push(
+        arrow.makeVector(
+          arrow.makeData({
+            type: fieldType as arrow.Bool,
+            offset: 0,
+            length: totalRows,
+            nullCount,
+            data: allValues,
+            nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+          }),
+        ),
+      );
+    } else if (lmaoType === 'enum') {
+      const enumValues = getEnumValues(fieldSchema) || [];
+      const enumUtf8 = getEnumUtf8(fieldSchema);
+      const allIndices = new Uint8Array(totalRows);
+      const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+      nullBitmap.fill(0xff);
+      let nullCount = 0;
+      let rowOffset = 0;
+
+      for (const buf of buffers) {
+        const col = buf[valuesKey];
+        const srcNulls = buf[nullsKey] as Uint8Array | undefined;
+
+        if (col instanceof Uint8Array) {
+          allIndices.set(col.subarray(0, buf.writeIndex), rowOffset);
+          if (srcNulls) {
+            for (let i = 0; i < buf.writeIndex; i++) {
+              const srcByte = i >>> 3;
+              const srcBit = i & 7;
+              const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
+              if (!isValid) {
+                const rowIdx = rowOffset + i;
+                nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+                nullCount++;
+              }
+            }
+          }
+        } else {
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const rowIdx = rowOffset + i;
+            nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+            nullCount++;
+          }
+        }
+        rowOffset += buf.writeIndex;
+      }
+
+      const enumDictData = arrow.makeData({
+        type: new arrow.Utf8(),
+        offset: 0,
+        length: enumValues.length,
+        nullCount: 0,
+        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues as readonly string[]),
+        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
+      });
+
+      vectors.push(
+        arrow.makeVector(
+          arrow.makeData({
+            type: fieldType as arrow.Dictionary<arrow.Utf8, arrow.Uint8>,
+            offset: 0,
+            length: totalRows,
+            nullCount,
+            data: allIndices,
+            nullBitmap: nullCount > 0 ? nullBitmap : undefined,
+            dictionary: arrow.makeVector(enumDictData),
+          }),
+        ),
+      );
+    }
+
+    fieldIdx++;
+  }
+
+  const structData = arrow.makeData({
+    type: new arrow.Struct(arrowSchema.fields),
+    length: totalRows,
+    nullCount: 0,
+    children: vectors.map((v) => v.data[0]),
+  });
+
+  return new arrow.RecordBatch(arrowSchema, structData);
 }

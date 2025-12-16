@@ -189,7 +189,7 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 2. **Lazy column storage pattern** - Nulls and values share ONE ArrayBuffer per column
 3. **Null bitmap management** - Arrow-format null bitmaps with bit manipulation
 4. **Buffer capacity management** - Explicit capacity, no hidden resizing
-5. **Zero-copy Arrow conversion** - `arrow.makeData()` with direct TypedArray references
+5. **Zero-copy Arrow conversion utilities** - TypedArray concatenation, null bitmap merging helpers
 6. **Generic schema types** - Type definitions (enum, category, text, number, boolean)
 7. **Runtime class generation** - `generateColumnBufferClass()` using `new Function()`
 8. **Column buffer codegen utilities** - Create optimized buffer classes with direct properties
@@ -204,6 +204,7 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 - ❌ Masking functions (hash, url, sql, email)
 - ❌ Context propagation or hierarchy
 - ❌ System vs user column distinction
+- ❌ Tree structures (parent/child spans, buffer.children, buffer.next)
 - ❌ Any `@smoothbricks/lmao` dependency
 
 ### Lazy Column Storage Pattern
@@ -305,6 +306,9 @@ A high-level structured logging library providing excellent developer experience
 10. **System column management** - timestamps, operations (ALWAYS eager, never lazy)
 11. **Library integration** - Prefix-based attribute namespacing for third-party libraries
 12. **Background flush scheduling** - Adaptive flush timing based on buffer capacity
+13. **Tree walking** - Recursive traversal of SpanBuffer trees (parent/children/overflow chains)
+14. **Dictionary building** - Two-pass conversion: build dictionaries across tree, then convert to RecordBatches
+15. **Arrow Table creation** - Orchestrates conversion using shared dictionaries and `arrow.makeData()`
 
 ### System Columns vs User Attributes
 
@@ -368,12 +372,13 @@ Without lazy initialization (20 columns × 64 elements × 4 bytes):
   20 null bitmaps × 8 = 160 bytes
   Total: 5,280 bytes per span
 
-With lazy columns (system + 3 used attributes):
+With lazy getters (system + 3 used attributes):
   System columns: 64 × 8 + 64 × 1 = 576 bytes (always)
-  20 LazyColumn wrapper objects: ~400 bytes
-  3 used columns × 64 × 4 = 768 bytes
-  3 null bitmaps × 8 = 24 bytes
-  Total: ~1,768 bytes (67% savings!)
+  Lazy getter closures: ~0 bytes (shared code, symbols only)
+  3 used columns × (nulls + values via shared ArrayBuffer):
+    Each: ~272 bytes (8 nulls + padding + 256 values)
+    Total: 3 × 272 = 816 bytes (on demand)
+  Total: ~1,392 bytes (74% savings!)
 ```
 
 ### Scope Class: SEPARATE from Buffer Columns
@@ -442,12 +447,14 @@ SpanBuffer extends ColumnBuffer with span-specific metadata:
 
 ```typescript
 interface SpanBuffer extends ColumnBuffer {
-  // Span identity
-  spanId: number; // Unique span identifier
+  // Span identity (see 01b_columnar_buffer_architecture.md "Span Definition")
+  // A span represents a unit of work within a single thread of execution.
+  threadId: bigint; // 64-bit random, generated once per worker/process
+  spanId: number; // 32-bit counter, incremented per span on this thread
   traceId: string; // Shared across all spans in a request
 
   // Tree structure
-  parent?: SpanBuffer; // Parent span (for child spans)
+  parent?: SpanBuffer; // Parent span (for child spans) - provides parent_thread_id/parent_span_id
   children: SpanBuffer[]; // Child spans
 
   // Context link
@@ -585,7 +592,7 @@ packages/
         ├── lmao.ts                       # Main entry, context creation
         ├── spanBuffer.ts                 # SpanBuffer factory (extends ColumnBuffer)
         ├── types.ts                      # SpanBuffer, TaskContext interfaces
-        ├── convertToArrow.ts             # Arrow conversion orchestration
+        ├── convertToArrow.ts             # Tree walking, dictionary building, Arrow conversion
         └── flushScheduler.ts             # Background processing
 ```
 
@@ -605,6 +612,7 @@ packages/
 | **System Columns** | No concept                              | ALWAYS eager (timestamps, operations)        |
 | **Scope**          | No concept                              | SEPARATE class from buffer columns           |
 | **Codegen**        | `generateColumnBufferClass()`           | Extends with SpanLogger, Scope               |
+| **Tree Walking**   | No concept                              | Owns tree traversal and dictionary building  |
 | **Dependencies**   | apache-arrow only                       | arrow-builder + apache-arrow                 |
 
 ---
@@ -625,20 +633,23 @@ Is it logging/tracing specific?
 
 ### Concrete Examples
 
-| Feature                             | Package       | Why                          |
-| ----------------------------------- | ------------- | ---------------------------- |
-| Cache-aligned TypedArray allocation | arrow-builder | Generic optimization         |
-| Lazy column with shared ArrayBuffer | arrow-builder | Generic memory pattern       |
-| Null bitmap management              | arrow-builder | Generic Arrow format         |
-| Buffer capacity, no hidden resize   | arrow-builder | Generic allocation control   |
-| Runtime class generation            | arrow-builder | Generic V8 optimization      |
-| `attr_` prefix convention           | **lmao**      | Logging-specific naming      |
-| System columns (timestamps, ops)    | **lmao**      | Logging-specific hot path    |
-| Scope class generation              | **lmao**      | Logging-specific inheritance |
-| Entry types (span-start, info)      | **lmao**      | Logging-specific lifecycle   |
-| SpanLogger with typed methods       | **lmao**      | Logging-specific API         |
-| Masking functions                   | **lmao**      | Logging-specific privacy     |
-| Context flow                        | **lmao**      | Logging-specific hierarchy   |
+| Feature                             | Package       | Why                               |
+| ----------------------------------- | ------------- | --------------------------------- |
+| Cache-aligned TypedArray allocation | arrow-builder | Generic optimization              |
+| Lazy column with shared ArrayBuffer | arrow-builder | Generic memory pattern            |
+| Null bitmap management              | arrow-builder | Generic Arrow format              |
+| Buffer capacity, no hidden resize   | arrow-builder | Generic allocation control        |
+| Runtime class generation            | arrow-builder | Generic V8 optimization           |
+| `attr_` prefix convention           | **lmao**      | Logging-specific naming           |
+| System columns (timestamps, ops)    | **lmao**      | Logging-specific hot path         |
+| Scope class generation              | **lmao**      | Logging-specific inheritance      |
+| Entry types (span-start, info)      | **lmao**      | Logging-specific lifecycle        |
+| SpanLogger with typed methods       | **lmao**      | Logging-specific API              |
+| Masking functions                   | **lmao**      | Logging-specific privacy          |
+| Context flow                        | **lmao**      | Logging-specific hierarchy        |
+| Tree walking (span trees)           | **lmao**      | Logging-specific tree structure   |
+| Dictionary building across tree     | **lmao**      | Logging-specific Arrow conversion |
+| RecordBatch creation with dicts     | **lmao**      | Logging-specific Arrow output     |
 
 ---
 

@@ -83,8 +83,6 @@ export interface FlushSchedulerConfig {
 export class FlushScheduler {
   private config: Required<FlushSchedulerConfig>;
   private handler: FlushHandler;
-  private categoryInterner: StringInterner;
-  private textStorage: StringInterner;
   private moduleIdInterner: StringInterner;
   private spanNameInterner: StringInterner;
 
@@ -98,15 +96,11 @@ export class FlushScheduler {
 
   constructor(
     handler: FlushHandler,
-    categoryInterner: StringInterner,
-    textStorage: StringInterner,
     moduleIdInterner: StringInterner,
     spanNameInterner: StringInterner,
     config: FlushSchedulerConfig = {},
   ) {
     this.handler = handler;
-    this.categoryInterner = categoryInterner;
-    this.textStorage = textStorage;
     this.moduleIdInterner = moduleIdInterner;
     this.spanNameInterner = spanNameInterner;
 
@@ -314,13 +308,7 @@ export class FlushScheduler {
 
     for (const buffer of buffersToFlush) {
       try {
-        const table = convertSpanTreeToArrowTable(
-          buffer,
-          this.categoryInterner,
-          this.textStorage,
-          this.moduleIdInterner,
-          this.spanNameInterner,
-        );
+        const table = convertSpanTreeToArrowTable(buffer, this.moduleIdInterner, this.spanNameInterner);
 
         if (table.numRows > 0) {
           tables.push(table);
@@ -413,21 +401,12 @@ let globalScheduler: FlushScheduler | null = null;
  */
 export function getGlobalFlushScheduler(
   handler: FlushHandler,
-  categoryInterner: StringInterner,
-  textStorage: StringInterner,
   moduleIdInterner: StringInterner,
   spanNameInterner: StringInterner,
   config?: FlushSchedulerConfig,
 ): FlushScheduler {
   if (!globalScheduler) {
-    globalScheduler = new FlushScheduler(
-      handler,
-      categoryInterner,
-      textStorage,
-      moduleIdInterner,
-      spanNameInterner,
-      config,
-    );
+    globalScheduler = new FlushScheduler(handler, moduleIdInterner, spanNameInterner, config);
   }
   return globalScheduler;
 }

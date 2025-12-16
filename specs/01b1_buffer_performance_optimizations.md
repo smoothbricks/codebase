@@ -2,21 +2,25 @@
 
 > **📚 PART OF COLUMNAR BUFFER ARCHITECTURE**
 >
-> This document details the V8 and memory optimization tricks that make columnar buffers 10-100x faster than object-based logging. Read the [main overview](./01b_columnar_buffer_architecture_overview.md) first.
+> This document details the V8 and memory optimization tricks that make columnar buffers 10-100x faster than
+> object-based logging. Read the [main overview](./01b_columnar_buffer_architecture_overview.md) first.
 
 ## WHY: V8 Optimizations Matter
 
-JavaScript engines like V8 are highly optimized for specific patterns. By understanding these patterns, we can write code that's as fast as native implementations.
+JavaScript engines like V8 are highly optimized for specific patterns. By understanding these patterns, we can write
+code that's as fast as native implementations.
 
 ### The Cost of Objects
 
 Traditional logging creates objects:
+
 ```javascript
 // This looks innocent but is expensive
 logger.info({ userId: '123', action: 'login', timestamp: Date.now() });
 ```
 
 Problems:
+
 1. **Object allocation** - New memory, new garbage
 2. **Property bags** - Dynamic property lookup
 3. **Polymorphic access** - Different object shapes
@@ -26,10 +30,11 @@ Problems:
 ### TypedArrays: The Fast Path
 
 TypedArrays bypass all these costs:
+
 ```javascript
 // Direct memory access, no allocations
-buffer.timestamps[idx] = Date.now();  // 8 bytes written directly
-buffer.userIds[idx] = 123;           // 4 bytes written directly
+buffer.timestamps[idx] = Date.now(); // 8 bytes written directly
+buffer.userIds[idx] = 123; // 4 bytes written directly
 ```
 
 ## V8 Optimization Patterns
@@ -48,11 +53,11 @@ function writeToBuffer(buffer: any, index: number, value: any) {
 class SpanBuffer {
   timestamps: Float64Array;
   operations: Uint8Array;
-  
+
   writeTimestamp(idx: number, value: number) {
     this.timestamps[idx] = value; // V8 knows it's Float64Array
   }
-  
+
   writeOperation(idx: number, value: number) {
     this.operations[idx] = value; // V8 knows it's Uint8Array
   }
@@ -60,17 +65,16 @@ class SpanBuffer {
 ```
 
 **Implementation**:
+
 ```typescript
 // Generate specialized write methods
 function generateWriteMethods(schema: BufferSchema) {
   const methods: any = {};
-  
+
   for (const [name, type] of Object.entries(schema)) {
-    methods[`write_${name}`] = new Function('idx', 'value',
-      `this.${name}[idx] = value;`
-    );
+    methods[`write_${name}`] = new Function('idx', 'value', `this.${name}[idx] = value;`);
   }
-  
+
   return methods;
 }
 ```
@@ -86,7 +90,7 @@ class BadBuffer {
     this.timestamps = new Float64Array(64);
     // Properties added later cause hidden class transitions
   }
-  
+
   addColumn(name: string) {
     this[name] = new Uint32Array(64); // New hidden class!
   }
@@ -99,7 +103,7 @@ class GoodBuffer {
   readonly operations: Uint8Array;
   readonly attr_userId: Uint32Array;
   readonly attr_action: Uint32Array;
-  
+
   constructor(capacity: number) {
     // Single hidden class, never changes
     this.timestamps = new Float64Array(capacity);
@@ -126,7 +130,7 @@ class BufferWriter {
   writeUserId(buffer: SpanBuffer, idx: number, value: number) {
     buffer.attr_userId[idx] = value; // Inline cache hit
   }
-  
+
   writeAction(buffer: SpanBuffer, idx: number, value: number) {
     buffer.attr_action[idx] = value; // Different cache slot
   }
@@ -152,7 +156,7 @@ class AlignedBuffer {
     // Each array starts on cache line boundary
     this.timestamps = new Float64Array(alignedCapacity(capacity, 8));
     this.operations = new Uint8Array(alignedCapacity(capacity, 1));
-    
+
     // Ensure arrays are cache-aligned in memory
     if (this.timestamps.byteOffset % CACHE_LINE_SIZE !== 0) {
       console.warn('Array not cache-aligned, performance may suffer');
@@ -179,17 +183,17 @@ class RandomBuffer {
 // GOOD: Sequential access
 class SequentialBuffer {
   private writeIndex = 0;
-  
+
   write(data: LogEntry[]) {
     let idx = this.writeIndex;
-    
+
     for (const entry of data) {
-      this.timestamps[idx] = entry.timestamp;   // Sequential
-      this.operations[idx] = entry.operation;   // Sequential
-      this.attr_userId[idx] = entry.userId;     // Sequential
+      this.timestamps[idx] = entry.timestamp; // Sequential
+      this.operations[idx] = entry.operation; // Sequential
+      this.attr_userId[idx] = entry.userId; // Sequential
       idx++;
     }
-    
+
     this.writeIndex = idx;
   }
 }
@@ -200,60 +204,333 @@ class SequentialBuffer {
 ### The String Problem
 
 Strings are expensive:
+
 - Variable length = heap allocation
 - Comparison = byte-by-byte
 - No cache locality
 - GC pressure
+- UTF-8 conversion is CPU-intensive
 
-### Solution: String Interning
+### Three String Types, Three Strategies
+
+The system provides three string types with different performance/memory tradeoffs. **See
+[01a_trace_schema_system.md](./01a_trace_schema_system.md) for complete API documentation.**
+
+#### 1. ENUM: Pre-built Sorted Dictionary (Zero Hot-Path Cost)
+
+**Use Case**: Known values at compile time (entry types, log levels, status codes)
+
+**Key Insight**: All work done ONCE at startup. Hot path is just a Map lookup + array write.
 
 ```typescript
-class StringInterner {
-  private strings: string[] = [];
-  private indices = new Map<string, number>();
-  
-  intern(str: string): number {
-    let idx = this.indices.get(str);
-    
-    if (idx === undefined) {
-      idx = this.strings.length;
-      this.strings.push(str);
-      this.indices.set(str, idx);
-    }
-    
-    return idx;
-  }
-  
-  getString(idx: number): string {
-    return this.strings[idx];
-  }
-  
-  // Direct Arrow dictionary creation
-  toArrowDictionary(): ArrowDictionary {
-    return {
-      values: this.strings,
-      // Dictionary already built during logging!
-    };
-  }
-}
+// Schema definition
+const schema = {
+  entryType: S.enum(['span-start', 'span-ok', 'span-err', 'info', 'debug']),
+  logLevel: S.enum(['debug', 'info', 'warn', 'error']),
+};
 
-// Usage in buffer
-class OptimizedBuffer {
-  private interner = new StringInterner();
-  attr_action: Uint32Array; // Stores indices, not strings
-  
-  writeAction(idx: number, action: string) {
-    this.attr_action[idx] = this.interner.intern(action);
+// Implementation
+class EnumColumn {
+  // IMMUTABLE after construction
+  private readonly sortedDictionary: string[];
+  private readonly utf8Dictionary: Uint8Array[]; // Pre-encoded at startup
+  private readonly reverseMap: Map<string, number>;
+
+  // Mutable: per-entry indices
+  private values: Uint8Array;
+
+  constructor(possibleValues: string[], capacity: number) {
+    // ═══════════════════════════════════════════════════════════
+    // STARTUP (once): Sort + UTF-8 encode ALL values
+    // ═══════════════════════════════════════════════════════════
+    this.sortedDictionary = [...possibleValues].sort();
+    this.utf8Dictionary = this.sortedDictionary.map((s) => new TextEncoder().encode(s));
+    this.reverseMap = new Map(this.sortedDictionary.map((v, i) => [v, i]));
+    this.values = new Uint8Array(capacity);
+  }
+
+  // HOT PATH: Map lookup + array write (zero allocation)
+  write(idx: number, value: string): void {
+    const dictIdx = this.reverseMap.get(value);
+    if (dictIdx === undefined) {
+      throw new Error(`Invalid enum value: ${value}`);
+    }
+    this.values[idx] = dictIdx;
+  }
+
+  // COLD PATH: Zero work - everything pre-computed
+  toArrow(): ArrowColumn {
+    return {
+      type: 'dictionary',
+      indices: this.values.slice(0, this.writeIndex),
+      dictionary: this.utf8Dictionary, // Already sorted + UTF-8 encoded!
+    };
   }
 }
 ```
 
+**Why Sorted Dictionary:**
+
+- Enables binary search for "does value X exist?" queries
+- Arrow/Parquet can skip unused dictionary entries
+- ClickHouse can push down predicates efficiently
+
+**Performance Characteristics:** | Operation | Cost | Allocations | |-----------|------|-------------| | Startup | O(n
+log n) sort + O(n) UTF-8 encode | Dictionary arrays | | Hot path write | O(1) Map lookup + array write | Zero | | Cold
+path flush | O(1) slice | Index array copy |
+
+#### 2. CATEGORY: Direct String Storage + SIEVE-Cached UTF-8 (Repeated Values)
+
+**Use Case**: Runtime values that repeat (user IDs, actions, regions)
+
+**Key Insight**: Store raw strings in hot path (zero cost), build sorted dictionary with SIEVE-cached UTF-8 encoding in
+cold path.
+
+```typescript
+// Schema definition
+const schema = {
+  userId: S.category(), // Same users appear multiple times
+  action: S.category(), // 'login', 'logout', 'purchase' repeat
+  region: S.category(), // 'us-east-1', 'eu-west-1', limited set
+};
+
+// Implementation - same as TEXT for hot path!
+class CategoryColumn {
+  private strings: string[] = []; // Just JS string references
+
+  // HOT PATH: Just store reference (zero work)
+  write(idx: number, value: string): void {
+    this.strings[idx] = value;
+  }
+
+  // COLD PATH: Build SORTED dictionary + SIEVE-cached UTF-8
+  toArrow(): ArrowColumn {
+    // 1. Collect unique strings
+    const uniqueStrings = new Set<string>();
+    for (const str of this.strings) {
+      if (str != null) uniqueStrings.add(str);
+    }
+
+    // 2. Sort for query optimization (binary search)
+    const dictionary = [...uniqueStrings].sort();
+    const stringToIndex = new Map(dictionary.map((s, i) => [s, i]));
+
+    // 3. Build indices (remap to sorted positions)
+    const indices = new Uint32Array(this.strings.length);
+    for (let i = 0; i < this.strings.length; i++) {
+      if (this.strings[i] != null) {
+        indices[i] = stringToIndex.get(this.strings[i])!;
+      }
+    }
+
+    // 4. UTF-8 encode with SIEVE cache (globalUtf8Cache)
+    const { data, offsets } = globalUtf8Cache.encodeMany(dictionary);
+
+    // 5. Clear strings (per-flush bounded)
+    this.strings = [];
+
+    return { type: 'dictionary', indices, data, offsets };
+  }
+}
+```
+
+**SIEVE Cache for UTF-8 Encoding:**
+
+Uses SIEVE algorithm (NSDI'24) - simpler AND better than LRU:
+
+```typescript
+import { SieveCache } from '@neophi/sieve-cache';
+
+class Utf8Cache {
+  private cache: SieveCache<string, Uint8Array>;
+  private encoder = new TextEncoder();
+
+  constructor(maxSize = 4096) {
+    this.cache = new SieveCache(maxSize);
+  }
+
+  encode(str: string): Uint8Array {
+    const cached = this.cache.get(str);
+    if (cached) return cached;
+
+    const encoded = this.encoder.encode(str);
+    this.cache.set(str, encoded);
+    return encoded;
+  }
+
+  encodeMany(strings: string[]): { data: Uint8Array; offsets: Int32Array } {
+    // Encode all strings using cache, return concatenated + offsets
+  }
+}
+
+export const globalUtf8Cache = new Utf8Cache();
+```
+
+**Why SIEVE over LRU:**
+
+- ~9% lower miss ratio than LRU-K, ARC, 2Q (NSDI'24)
+- Simpler: single pointer scan vs linked list manipulation
+- No frequency counters or ghost queues needed
+- Better for skewed access patterns (common in web workloads)
+
+**Memory Growth Prevention:**
+
+| Mechanism          | What it bounds           | Default      |
+| ------------------ | ------------------------ | ------------ |
+| Per-flush clearing | String array cleared     | Every flush  |
+| SIEVE cache size   | UTF-8 encoded bytes      | 4096 entries |
+| SIEVE eviction     | Auto-removes cold values | On insert    |
+
+**Performance Characteristics:**
+
+| Operation       | Cost                         | Allocations       |
+| --------------- | ---------------------------- | ----------------- |
+| Hot path write  | O(1) array assignment        | Zero              |
+| Cold path flush | O(n log n) sort + O(n) UTF-8 | Dictionary arrays |
+| UTF-8 (cached)  | O(1) SIEVE get               | Zero              |
+| UTF-8 (miss)    | O(k) encode + O(1) SIEVE set | Uint8Array        |
+
+#### 3. TEXT: No Interning, Conditional Dictionary (Unique Values)
+
+**Use Case**: Strings that rarely repeat (error messages, SQL queries, stack traces)
+
+**Key Insight**: Don't bother interning - just store references. Decide dictionary encoding at flush time.
+
+```typescript
+// Schema definition
+const schema = {
+  errorMessage: S.text(), // Each error might be unique
+  sqlQuery: S.text(), // Parameterized queries vary
+  stackTrace: S.text(), // Unique per error location
+};
+
+// Implementation
+class TextColumn {
+  private strings: string[] = []; // Just JS string references
+
+  // HOT PATH: Just store reference (zero work)
+  write(idx: number, value: string): void {
+    this.strings[idx] = value;
+  }
+
+  // COLD PATH: 2-pass conditional dictionary
+  toArrow(): ArrowColumn {
+    // ═══════════════════════════════════════════════════════════
+    // PASS 1: Count occurrences + calculate sizes
+    // ═══════════════════════════════════════════════════════════
+    const occurrences = new Map<string, number>();
+    let totalUtf8Bytes = 0;
+
+    for (const str of this.strings) {
+      if (str === undefined) continue;
+      occurrences.set(str, (occurrences.get(str) || 0) + 1);
+      totalUtf8Bytes += this.utf8ByteLength(str);
+    }
+
+    const uniqueUtf8Bytes = [...occurrences.keys()].reduce((sum, s) => sum + this.utf8ByteLength(s), 0);
+
+    // ═══════════════════════════════════════════════════════════
+    // Calculate space savings
+    // ═══════════════════════════════════════════════════════════
+    const plainSize = totalUtf8Bytes + (this.strings.length + 1) * 4;
+    const dictSize = uniqueUtf8Bytes + (occurrences.size + 1) * 4 + this.strings.length * 4;
+    const savings = plainSize - dictSize;
+
+    // ═══════════════════════════════════════════════════════════
+    // PASS 2: Build Arrow column
+    // ═══════════════════════════════════════════════════════════
+    let result: ArrowColumn;
+
+    if (savings > 128) {
+      // Dictionary encoding (sorted for queries)
+      const sorted = [...occurrences.keys()].sort();
+      const indexMap = new Map(sorted.map((s, i) => [s, i]));
+
+      const indices = new Uint32Array(this.strings.length);
+      for (let i = 0; i < this.strings.length; i++) {
+        indices[i] = indexMap.get(this.strings[i])!;
+      }
+
+      result = {
+        type: 'dictionary',
+        indices,
+        dictionary: sorted.map((s) => new TextEncoder().encode(s)),
+      };
+    } else {
+      // Plain UTF-8 (no dictionary overhead)
+      result = {
+        type: 'utf8',
+        values: this.strings.map((s) => new TextEncoder().encode(s)),
+      };
+    }
+
+    // CRITICAL: Clear strings after flush to prevent unbounded growth
+    this.strings = [];
+
+    return result;
+  }
+
+  private utf8ByteLength(str: string): number {
+    // Fast approximation (exact would require encoding)
+    let len = 0;
+    for (let i = 0; i < str.length; i++) {
+      const code = str.charCodeAt(i);
+      if (code < 0x80) len += 1;
+      else if (code < 0x800) len += 2;
+      else len += 3;
+    }
+    return len;
+  }
+}
+```
+
+**Why No Hot-Path Interning:**
+
+- TEXT is for unique values - interner would have near-zero hit rate
+- LRU would just churn through unique values
+- Better to defer all work to cold path
+
+**Memory Growth Prevention:**
+
+- Strings cleared after each flush (`this.strings = []`)
+- No global interner - per-column, per-flush
+- GC can collect strings after flush completes
+
+**Performance Characteristics:** | Operation | Cost | Allocations | |-----------|------|-------------| | Hot path write
+| O(1) array assignment | Zero | | Cold path flush | O(n) count + O(n log n) sort + O(n) UTF-8 | Dictionary/values
+arrays | | Post-flush | Strings array cleared | Zero (GC releases) |
+
+### String Type Comparison
+
+| Aspect                | ENUM                      | CATEGORY                  | TEXT                 |
+| --------------------- | ------------------------- | ------------------------- | -------------------- |
+| **Hot path**          | Map lookup + array write  | Array assignment          | Array assignment     |
+| **Hot path cost**     | O(1)                      | O(1)                      | O(1)                 |
+| **Cold path**         | Zero (pre-computed)       | Sort + SIEVE-cached UTF-8 | 2-pass + conditional |
+| **Memory bound**      | Fixed (schema)            | Per-flush + SIEVE cache   | Per-flush (cleared)  |
+| **Dictionary sorted** | ✓ At startup              | ✓ At flush                | ✓ If used            |
+| **UTF-8 timing**      | At startup (pre-computed) | At flush (SIEVE cached)   | At flush             |
+| **Best for**          | Compile-time known        | Runtime repeated          | Unique/rare repeat   |
+
+### Memory Growth Prevention Summary
+
+| Type     | Bound Mechanism       | When Cleared      | Risk if Misused             |
+| -------- | --------------------- | ----------------- | --------------------------- |
+| ENUM     | Fixed at construction | Never (immutable) | None - compile-time known   |
+| CATEGORY | Per-flush + SIEVE     | After each flush  | High memory between flushes |
+| TEXT     | Per-flush             | After each flush  | High memory between flushes |
+
+**Note:** Both CATEGORY and TEXT now use the same hot-path strategy (array assignment). The difference is in cold-path
+dictionary building: CATEGORY always builds a sorted dictionary, TEXT only if it saves >128 bytes.
+
 ### Interning Benefits
 
-1. **Memory**: "login" stored once, not 10,000 times
+1. **Memory**: "login" stored once, not 10,000 times (CATEGORY)
 2. **Speed**: Integer comparison vs string comparison
-3. **Arrow**: Direct dictionary creation without scanning
-4. **Cache**: Integers fit in cache lines
+3. **Arrow**: Sorted dictionaries enable binary search queries
+4. **Cache**: Integers fit in CPU cache lines
+5. **Deferred UTF-8**: Expensive encoding only in cold path
+6. **Bounded growth**: LRU prevents memory exhaustion
 
 ## Memory Layout Optimization
 
@@ -271,14 +548,15 @@ const logs: LogEntry[] = []; // Random memory layout
 
 // GOOD: Struct of Arrays (SoA) - Our approach
 class ColumnarBuffer {
-  timestamps: Float64Array;  // All timestamps together
-  operations: Uint8Array;    // All operations together
-  userIds: Uint32Array;      // All userIds together
-  actions: Uint32Array;      // All actions together
+  timestamps: Float64Array; // All timestamps together
+  operations: Uint8Array; // All operations together
+  userIds: Uint32Array; // All userIds together
+  actions: Uint32Array; // All actions together
 }
 ```
 
-**WHY**: 
+**WHY**:
+
 - Cache efficiency: Reading all timestamps loads only timestamp data
 - SIMD potential: Process multiple values in parallel
 - Compression: Similar values are adjacent
@@ -290,17 +568,17 @@ Prevent allocation churn:
 ```typescript
 class BufferPool {
   private pools = new Map<number, TypedArray[]>();
-  
+
   acquire(size: number, ArrayType: any): TypedArray {
     const pool = this.pools.get(size) || [];
-    
+
     if (pool.length > 0) {
       return pool.pop()!;
     }
-    
+
     return new ArrayType(size);
   }
-  
+
   release(array: TypedArray) {
     const pool = this.pools.get(array.length) || [];
     pool.push(array);
@@ -311,19 +589,19 @@ class BufferPool {
 // Reuse arrays during growth
 class PooledBuffer {
   private pool = new BufferPool();
-  
+
   grow() {
     const newSize = this.capacity * 2;
-    
+
     // Acquire new arrays from pool
     const newTimestamps = this.pool.acquire(newSize, Float64Array);
-    
+
     // Copy data
     newTimestamps.set(this.timestamps);
-    
+
     // Release old array to pool
     this.pool.release(this.timestamps);
-    
+
     this.timestamps = newTimestamps;
   }
 }
@@ -338,18 +616,18 @@ class FastBuffer {
   // Hot path: Just array writes
   writeHot(timestamp: number, operation: number, userId: number) {
     const idx = this.writeIndex++;
-    
+
     // No function calls, no checks, just writes
     this.timestamps[idx] = timestamp;
     this.operations[idx] = operation;
     this.userIds[idx] = userId;
-    
+
     // Capacity check at end (predictable branch)
     if (idx === this.capacity - 1) {
       this._grow(); // Cold path
     }
   }
-  
+
   // Cold path: Growth, compaction, etc
   private _grow() {
     // Expensive operations isolated here
@@ -367,27 +645,27 @@ class BatchBuffer {
   write(entry: LogEntry) {
     // Check capacity, update index, etc
   }
-  
+
   // Batch write amortizes overhead
   writeBatch(entries: LogEntry[]) {
     const startIdx = this.writeIndex;
     const count = entries.length;
-    
+
     // Single capacity check
     if (startIdx + count >= this.capacity) {
       this._ensureCapacity(startIdx + count);
     }
-    
+
     // Tight loop, no per-item overhead
     for (let i = 0; i < count; i++) {
       const idx = startIdx + i;
       const entry = entries[i];
-      
+
       this.timestamps[idx] = entry.timestamp;
       this.operations[idx] = entry.operation;
       this.userIds[idx] = entry.userId;
     }
-    
+
     this.writeIndex = startIdx + count;
   }
 }
@@ -401,20 +679,20 @@ Handle sparse attributes efficiently:
 class NullBitmapBuffer {
   // Bit manipulation is fast
   private nullBitmap: Uint32Array;
-  
+
   setNull(idx: number, attrIndex: number) {
     const bitmapIdx = Math.floor(idx / 32);
     const bitPos = idx % 32;
     const attrBit = 1 << attrIndex;
-    
-    this.nullBitmap[bitmapIdx] |= (attrBit << bitPos);
+
+    this.nullBitmap[bitmapIdx] |= attrBit << bitPos;
   }
-  
+
   isNull(idx: number, attrIndex: number): boolean {
     const bitmapIdx = Math.floor(idx / 32);
     const bitPos = idx % 32;
     const attrBit = 1 << attrIndex;
-    
+
     return (this.nullBitmap[bitmapIdx] & (attrBit << bitPos)) !== 0;
   }
 }
@@ -429,15 +707,15 @@ class NullBitmapBuffer {
 function benchmarkWrites() {
   const buffer = new SpanBuffer(10000);
   const iterations = 1000000;
-  
+
   console.time('writes');
-  
+
   for (let i = 0; i < iterations; i++) {
     buffer.writeHot(Date.now(), 1, 123);
   }
-  
+
   console.timeEnd('writes');
-  
+
   const nanosPerWrite = (performance.now() * 1e6) / iterations;
   console.log(`${nanosPerWrite.toFixed(1)}ns per write`);
 }
@@ -446,17 +724,17 @@ function benchmarkWrites() {
 function benchmarkObjects() {
   const logs = [];
   const iterations = 1000000;
-  
+
   console.time('objects');
-  
+
   for (let i = 0; i < iterations; i++) {
     logs.push({
       timestamp: Date.now(),
       operation: 1,
-      userId: 123
+      userId: 123,
     });
   }
-  
+
   console.timeEnd('objects');
 }
 ```
@@ -467,20 +745,20 @@ function benchmarkObjects() {
 // Track memory usage
 function profileMemory() {
   const before = process.memoryUsage();
-  
+
   const buffer = new SpanBuffer(1000000);
-  
+
   // Fill buffer
   for (let i = 0; i < 1000000; i++) {
     buffer.write(Date.now(), 1, i);
   }
-  
+
   const after = process.memoryUsage();
-  
+
   console.log('Memory used:', {
     heap: (after.heapUsed - before.heapUsed) / 1024 / 1024 + ' MB',
     external: (after.external - before.external) / 1024 / 1024 + ' MB',
-    perEntry: (after.external - before.external) / 1000000 + ' bytes'
+    perEntry: (after.external - before.external) / 1000000 + ' bytes',
   });
 }
 ```
@@ -534,7 +812,7 @@ write(idx: number, value: number) {
 write(value: number) {
   const idx = this.writeIndex++;
   this.data[idx] = value;
-  
+
   // Single check at end
   if (idx === this.capacity - 1) {
     this._grow();
@@ -542,14 +820,206 @@ write(value: number) {
 }
 ```
 
+## Memory Lifecycle and Flush Strategy
+
+### The Flush Cycle
+
+Memory is managed in flush cycles. Each cycle:
+
+1. **Hot path**: Accumulate data in buffers (fast writes)
+2. **Flush trigger**: Capacity threshold, time interval, or explicit flush
+3. **Cold path**: Convert to Arrow, serialize, send
+4. **Cleanup**: Release memory for GC
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                           FLUSH CYCLE                                   │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  HOT PATH                    COLD PATH                    CLEANUP       │
+│  ─────────                   ─────────                    ───────       │
+│                                                                         │
+│  ┌──────────────┐           ┌──────────────┐            ┌────────────┐ │
+│  │ Write data   │  trigger  │ Convert to   │  send      │ Clear TEXT │ │
+│  │ to buffers   │──────────▶│ Arrow tables │───────────▶│ strings[]  │ │
+│  │              │           │              │            │            │ │
+│  │ ENUM: idx    │           │ ENUM: zero   │            │ CATEGORY:  │ │
+│  │ CATEGORY: idx│           │ CATEGORY:    │            │ reset flush│ │
+│  │ TEXT: string │           │  sort+UTF-8  │            │ state only │ │
+│  │              │           │ TEXT: 2-pass │            │            │ │
+│  └──────────────┘           └──────────────┘            └────────────┘ │
+│        │                                                       │        │
+│        │                                                       │        │
+│        └───────────────────────────────────────────────────────┘        │
+│                              REPEAT                                     │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### What Gets Cleared on Flush
+
+| Component                | What's Cleared                    | What Persists         | Why                                    |
+| ------------------------ | --------------------------------- | --------------------- | -------------------------------------- |
+| **ENUM dictionary**      | Nothing                           | Everything            | Immutable - pre-built at startup       |
+| **ENUM indices**         | Values array reset                | -                     | Ready for next flush                   |
+| **CATEGORY LRU cache**   | Nothing                           | String→entry mappings | Track occurrence counts across flushes |
+| **CATEGORY flush state** | `flushDictionary`, `flushIndices` | -                     | Per-flush dictionary rebuilt each time |
+| **CATEGORY UTF-8 cache** | Nothing                           | Hot value UTF-8 bytes | Avoid re-encoding hot values           |
+| **TEXT strings**         | `strings[]` array                 | -                     | No interning needed - per-flush        |
+| **TypedArrays**          | `writeIndex` reset to 0           | Array buffers         | Reuse allocations                      |
+
+### Memory Bounds
+
+```typescript
+interface MemoryBounds {
+  // ENUM: Fixed at schema definition
+  enum: {
+    dictionary: 'O(|values|) - known at compile time';
+    utf8Cache: 'O(|values|) - pre-encoded at startup';
+    indices: 'O(capacity) - Uint8Array per column';
+  };
+
+  // CATEGORY: Configurable LRU limits
+  category: {
+    lruCache: 'O(maxEntries) - configurable, default 10k';
+    utf8Cache: 'O(maxEntries/2) - only hot values';
+    flushDict: 'O(unique values in flush) - cleared after flush';
+    indices: 'O(capacity) - Uint32Array per column';
+  };
+
+  // TEXT: Per-flush, cleared after conversion
+  text: {
+    strings: 'O(entries in flush) - cleared after flush';
+    // No persistent storage between flushes
+  };
+
+  // Total bound
+  total: 'O(enumValues + categoryLruMax + textPerFlush + capacity × columns)';
+}
+```
+
+### Flush Triggers
+
+Flush is triggered by any of:
+
+1. **Capacity threshold** (default 80%): Buffer nearly full
+2. **Time interval** (default 10s): Periodic flush for freshness
+3. **Idle timeout** (default 5s): No writes for a while
+4. **Memory pressure**: Node.js `memoryUsage()` exceeds threshold
+5. **Explicit flush**: `scheduler.flush()` called
+
+```typescript
+class FlushScheduler {
+  private config = {
+    capacityThreshold: 0.8, // Flush at 80% capacity
+    maxIntervalMs: 10_000, // Max 10s between flushes
+    idleTimeoutMs: 5_000, // Flush after 5s idle
+    memoryThresholdMb: 512, // Flush if heap > 512MB
+  };
+
+  shouldFlush(buffer: SpanBuffer): boolean {
+    return (
+      buffer.writeIndex / buffer.capacity > this.config.capacityThreshold ||
+      Date.now() - this.lastFlushTime > this.config.maxIntervalMs ||
+      Date.now() - this.lastWriteTime > this.config.idleTimeoutMs ||
+      process.memoryUsage().heapUsed > this.config.memoryThresholdMb * 1024 * 1024
+    );
+  }
+}
+```
+
+### Per-Trace vs Global Interning
+
+**Decision: Global interning for CATEGORY, per-flush for TEXT**
+
+| Strategy              | CATEGORY                                       | TEXT                                 |
+| --------------------- | ---------------------------------------------- | ------------------------------------ |
+| **Scope**             | Global (shared across traces)                  | Per-flush (no sharing)               |
+| **Why**               | Same userIds, spanNames appear across requests | Error messages unique per occurrence |
+| **Lifetime**          | Process lifetime (LRU bounded)                 | Single flush cycle                   |
+| **Cross-flush dedup** | ✓ Same string → same index (if in LRU)         | ✗ New indices each flush             |
+
+**Why global for CATEGORY:**
+
+- Same userId appears in many requests → dedup saves memory
+- Same spanName ("create-user") across all requests → single dictionary entry
+- LRU bounds memory even with global scope
+
+**Why per-flush for TEXT:**
+
+- Error messages rarely repeat across flushes
+- Stack traces are unique per error occurrence
+- Global interner would just accumulate garbage
+
+### Preventing Unbounded Growth
+
+**The Problem:** Long-running servers can accumulate string data indefinitely, eventually exhausting memory.
+
+**The Solution:** Each string type has a different bounding mechanism:
+
+```typescript
+// ENUM: Bounded by schema (fixed at compile time)
+S.enum(['span-start', 'span-ok', 'span-err']); // Max 3 values, forever
+
+// CATEGORY: Bounded by LRU (configurable limit)
+new CategoryInterner({ maxEntries: 10_000, maxBytes: 10_000_000 });
+// - Max 10k unique strings
+// - Max 10MB total string bytes
+// - LRU eviction removes cold values
+
+// TEXT: Bounded per-flush (cleared after Arrow conversion)
+class TextColumn {
+  flush(): ArrowColumn {
+    const result = convert(this.strings);
+    this.strings = []; // CRITICAL: Clear after flush
+    return result;
+  }
+}
+```
+
+**Monitoring for Memory Issues:**
+
+```typescript
+// Add telemetry to detect memory problems
+class MemoryMonitor {
+  checkHealth(): HealthReport {
+    return {
+      categoryLruSize: categoryInterner.cache.size,
+      categoryEvictionRate: categoryInterner.evictionCount / categoryInterner.insertCount,
+      textStringsBeforeFlush: textColumn.strings.length,
+      heapUsedMb: process.memoryUsage().heapUsed / 1024 / 1024,
+    };
+  }
+
+  alert(): string[] {
+    const alerts = [];
+    const health = this.checkHealth();
+
+    // High eviction rate suggests CATEGORY misuse (unique values)
+    if (health.categoryEvictionRate > 0.5) {
+      alerts.push('CATEGORY eviction rate >50% - consider using TEXT for unique values');
+    }
+
+    // Large TEXT buffer suggests slow flush rate
+    if (health.textStringsBeforeFlush > 100_000) {
+      alerts.push('TEXT buffer >100k strings - consider more frequent flushes');
+    }
+
+    return alerts;
+  }
+}
+```
+
 ## Summary
 
 Buffer performance optimizations leverage:
+
 - **V8 hidden classes** - Stable object shapes
 - **Monomorphic access** - Predictable types
 - **Cache alignment** - CPU-friendly layout
-- **String interning** - Integer comparisons
+- **String interning** - Integer comparisons (ENUM, CATEGORY)
+- **LRU bounding** - Prevents unbounded memory growth (CATEGORY)
+- **Per-flush clearing** - Releases TEXT memory after conversion
 - **Sequential access** - Prefetch friendly
 - **Hot path isolation** - Fast common case
 
-Result: <100ns writes with zero allocations.
+Result: <100ns writes with zero allocations, bounded memory growth.

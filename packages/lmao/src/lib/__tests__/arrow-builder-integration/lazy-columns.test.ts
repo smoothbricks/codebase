@@ -21,7 +21,7 @@ describe('True Lazy Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Core columns are always allocated
-    expect(buffer.timestamps).toBeInstanceOf(Float64Array);
+    expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);
     expect(buffer.operations).toBeInstanceOf(Uint8Array);
 
     // Access ONE column (category = Array now, not Uint32Array)
@@ -126,7 +126,7 @@ describe('Lazy Column Initialization', () => {
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Core columns should be allocated immediately
-    expect(buffer.timestamps).toBeInstanceOf(Float64Array);
+    expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);
     expect(buffer.operations).toBeInstanceOf(Uint8Array);
 
     // Access one attribute column - should allocate it lazily on first access

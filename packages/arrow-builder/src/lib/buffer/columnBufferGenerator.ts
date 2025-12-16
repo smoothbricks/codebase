@@ -97,7 +97,7 @@ export function generateColumnBufferClass(schema: TagAttributeSchema, className 
   constructorCode.push('    // System columns (eager - written on every entry)');
   constructorCode.push('    const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);');
   constructorCode.push('    this._alignedCapacity = alignedCapacity;');
-  constructorCode.push('    this.timestamps = new Float64Array(alignedCapacity);');
+  constructorCode.push('    this.timestamps = new BigInt64Array(alignedCapacity);');
   constructorCode.push('    this.operations = new Uint8Array(alignedCapacity);');
   constructorCode.push('');
   constructorCode.push('    // Buffer management');

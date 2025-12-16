@@ -8,6 +8,185 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 2. **Realistic trace data examples** showing spans, tags, and console.log compatibility
 3. **ClickHouse query patterns** for common analytical use cases
 4. **Performance characteristics** of the columnar format
+5. **Zero-copy conversion patterns** for efficient cold-path processing
+6. **Arrow conversion interface** defining how lmao and arrow-builder coordinate during conversion
+
+## Zero-Copy Mandate
+
+**CRITICAL**: All Arrow conversions MUST use `arrow.makeData()` with direct TypedArray references. The builder pattern
+(`arrow.makeBuilder()`) is **PROHIBITED** because it copies every value during append operations.
+
+### Reference Pattern
+
+The correct zero-copy approach is demonstrated in `extern/arrow-js-ffi/src/vector.ts`:
+
+```typescript
+// CORRECT: Zero-copy with arrow.makeData()
+return arrow.makeData({
+  type: dataType,
+  offset: 0,
+  length: buffer.writeIndex,
+  nullCount,
+  data: buffer.timestamps.subarray(0, buffer.writeIndex), // Direct reference!
+  nullBitmap,
+});
+
+// WRONG: Builder pattern (copies data)
+const builder = arrow.makeBuilder({ type: dataType });
+for (let i = 0; i < length; i++) {
+  builder.append(values[i]); // ❌ Copies every value!
+}
+```
+
+**Why Zero-Copy Matters**:
+
+- **Performance**: Builder pattern iterates through every value, calling append() for each one
+- **Memory**: Creates intermediate buffers during build process
+- **GC Pressure**: Generates temporary objects that need collection
+- **Hot Path Optimization**: SpanBuffer already stores data in correct TypedArray format
+
+### Conversion Strategies by Column Type
+
+Different column types require different zero-copy strategies:
+
+#### 1. Primitive Types (Float64, Uint8, etc.)
+
+**Direct subarray() reference** - simplest case:
+
+```typescript
+// Number column (Float64Array)
+const data = buffer.attr_httpDuration.subarray(0, buffer.writeIndex);
+return arrow.makeData({
+  type: new arrow.Float64(),
+  offset: 0,
+  length: buffer.writeIndex,
+  nullCount,
+  data,
+  nullBitmap,
+});
+```
+
+#### 2. Dictionary-Encoded Types (category, enum)
+
+**makeData with dictionary vector**:
+
+```typescript
+// Category column (Uint32Array indices → dictionary)
+const indicesData = buffer.attr_httpMethod.subarray(0, buffer.writeIndex);
+const dictionaryStrings = categoryInterner.getStrings(); // ['GET', 'POST', 'PUT', ...]
+
+return arrow.makeData({
+  type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+  offset: 0,
+  length: buffer.writeIndex,
+  nullCount,
+  data: indicesData, // Raw indices TypedArray
+  nullBitmap,
+  dictionary: arrow.makeVector(dictionaryStrings), // String array to vector
+});
+```
+
+#### 3. String Types (text) - Conditional Dictionary
+
+**Space-aware strategy**: Use dictionary encoding only if it saves >128 bytes:
+
+```typescript
+// Calculate space savings
+const dictionarySize = uniqueStringBytes + totalRows * 4; // 4 bytes per index
+const plainSize = totalStringBytes;
+const useDictionary = plainSize - dictionarySize > 128;
+
+if (useDictionary) {
+  // Use dictionary encoding (same as category above)
+  return arrow.makeData({
+    type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+    data: indicesData,
+    dictionary: arrow.makeVector(uniqueStrings),
+    // ...
+  });
+} else {
+  // Use plain UTF-8 (requires building offset buffer)
+  const { valueOffsets, utf8Data } = buildUtf8Buffers(textStorage, indices);
+  return arrow.makeData({
+    type: new arrow.Utf8(),
+    data: utf8Data,
+    valueOffsets,
+    // ...
+  });
+}
+```
+
+### Buffer Concatenation for Chained Buffers
+
+When SpanBuffer chains need concatenation (buffer.next), use this helper:
+
+```typescript
+/**
+ * Concatenate multiple TypedArrays into a single array (zero-copy until final result)
+ *
+ * This is needed when converting chained SpanBuffers to a single Arrow column.
+ * Uses typed array .set() method which is optimized by VMs.
+ */
+function concatenateTypedArrays<T extends TypedArray>(arrays: T[]): T {
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const result = new (arrays[0].constructor as any)(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.length;
+  }
+  return result;
+}
+
+// Usage with buffer chain
+const buffers: SpanBuffer[] = collectBufferChain(rootBuffer);
+const timestampArrays = buffers.map((buf) => buf.timestamps.subarray(0, buf.writeIndex));
+const allTimestamps = concatenateTypedArrays(timestampArrays);
+
+return arrow.makeData({
+  type: new arrow.TimestampMicrosecond(),
+  offset: 0,
+  length: allTimestamps.length,
+  data: allTimestamps, // Single concatenated array
+  // ...
+});
+```
+
+**Note**: While concatenation requires one copy, it's still more efficient than the builder pattern which copies during
+every append() call.
+
+### Null Bitmap Construction
+
+Null bitmaps must be constructed from SpanBuffer null tracking:
+
+```typescript
+/**
+ * Build null bitmap from buffer's null tracking
+ * Arrow format: bit-packed, 1 = valid, 0 = null
+ */
+function buildNullBitmap(
+  buffer: SpanBuffer,
+  columnName: `attr_${string}`
+): { nullBitmap: Uint8Array | null; nullCount: number } {
+  const nullBitmap = buffer.nullBitmaps[columnName];
+  if (!nullBitmap) {
+    return { nullBitmap: null, nullCount: 0 }; // All valid
+  }
+
+  const validBits = nullBitmap.subarray(0, Math.ceil(buffer.writeIndex / 8));
+
+  // Count nulls (0 bits)
+  let nullCount = 0;
+  for (let i = 0; i < buffer.writeIndex; i++) {
+    const byteIndex = Math.floor(i / 8);
+    const bitOffset = i % 8;
+    const isValid = (validBits[byteIndex] & (1 << bitOffset)) !== 0;
+    if (!isValid) nullCount++;
+  }
+
+  return { nullBitmap: validBits, nullCount };
+}
+```
 
 ## Design Philosophy
 
@@ -20,20 +199,218 @@ system becomes a row in the final table, enabling rich analytical queries while 
 - **Nullable columns**: Sparse data handled efficiently with null values
 - **Dictionary encoding**: Repeated strings stored efficiently
 - **Type optimization**: Appropriate data types for storage and performance
+- **Zero-copy conversion**: Direct TypedArray references without intermediate copies
 
 ## Column Schema
 
 ### Core System Columns (Always Present)
 
-| Column Name      | Type                 | Description                                                                  | Example Values                                                                                                                                |
-| ---------------- | -------------------- | ---------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timestamp`      | `timestamp[μs]`      | When event occurred (microseconds since epoch, sub-ms precision from anchor) | `2024-01-01T10:00:00.000123Z`                                                                                                                 |
-| `trace_id`       | `dictionary<string>` | Root trace identifier                                                        | `'req-abc123'`, `'X-Request-Id-456'`                                                                                                          |
-| `span_id`        | `uint64`             | Span identifier                                                              | `1`, `2`, `3`                                                                                                                                 |
-| `parent_span_id` | `uint64`             | Parent span (nullable)                                                       | `1` or `null`                                                                                                                                 |
-| `entry_type`     | `dictionary<string>` | Log entry type                                                               | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'tag'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
-| `module`         | `dictionary<string>` | Module name                                                                  | `'UserController'`, `'DatabaseService'`                                                                                                       |
-| `label`          | `dictionary<string>` | Span name OR log message template (see Label Column section)                 | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`                                                                    |
+| Column Name        | Type                 | Description                                                      | Example Values                                                                                                                                |
+| ------------------ | -------------------- | ---------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------- |
+| `timestamp`        | `timestamp[μs]`      | When event occurred (microseconds, Float64 SAFE until year 2255) | `2024-01-01T10:00:00.000123Z`                                                                                                                 |
+| `trace_id`         | `dictionary<string>` | Request correlation across services                              | `'req-abc123'`, `'X-Request-Id-456'`                                                                                                          |
+| `thread_id`        | `uint64`             | Thread/worker identifier (64-bit random, generated once)         | `0x1a2b3c4d5e6f7890`                                                                                                                          |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                | `1`, `2`, `42`                                                                                                                                |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                       | `0x1a2b3c4d5e6f7890` or `null`                                                                                                                |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                           | `1`, `2` or `null`                                                                                                                            |
+| `entry_type`       | `dictionary<string>` | Log entry type                                                   | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'tag'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
+| `module`           | `dictionary<string>` | Module name                                                      | `'UserController'`, `'DatabaseService'`                                                                                                       |
+| `label`            | `dictionary<string>` | Span name OR log message template (see Label Column section)     | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`                                                                    |
+
+## Span Definition
+
+> **A span represents a unit of work within a single thread of execution.**
+
+This definition is the foundation of LMAO's span identification design. Unlike OpenTelemetry which defines a span as
+simply a "unit of work" with random 64-bit IDs, LMAO explicitly ties spans to their thread of execution. This enables:
+
+- **Cheap span creation**: Just `span_id++` instead of random generation
+- **Thread timeline visibility**: See how async concurrency interleaves requests
+- **Cross-thread tracing**: Parent spans can be on different threads
+
+### Comparison to OpenTelemetry
+
+| Aspect              | OpenTelemetry                | LMAO                                               |
+| ------------------- | ---------------------------- | -------------------------------------------------- |
+| **Span Definition** | "Unit of work"               | "Unit of work within a single thread of execution" |
+| **Span ID**         | Random 64-bit                | `(thread_id, span_id)` composite                   |
+| **Generation**      | Crypto random per span       | `thread_id` once per thread, `span_id++` per span  |
+| **Hot Path Cost**   | Random generation + BigInt   | Simple `i++` increment                             |
+| **Thread Concept**  | None (spans are independent) | Explicit (spans belong to threads)                 |
+| **Timeline View**   | Requires timestamp sorting   | `span_id` gives within-thread ordering             |
+
+## Distributed Span ID Design
+
+### Problem: Span ID Collisions in Distributed Tracing
+
+In distributed tracing, the same `trace_id` can exist across multiple machines/workers. If each uses a simple
+incrementing counter (`span_id++`), collisions occur:
+
+```
+Machine A: trace_id="req-123", span_id=1, 2, 3...
+Machine B: trace_id="req-123", span_id=1, 2, 3... ← collision!
+```
+
+This happens in several scenarios:
+
+- **Worker threads**: `pmap()` distributing work across threads
+- **Distributed services**: Same trace spanning multiple machines
+- **Serverless**: Multiple Lambda invocations for the same request
+
+### Chosen Approach: Separate Columns
+
+LMAO uses separate columns for span identification, providing maximum query flexibility and performance:
+
+| Column             | Type                | Description                                           |
+| ------------------ | ------------------- | ----------------------------------------------------- |
+| `thread_id`        | `uint64`            | Thread/worker identifier (64-bit random, once/thread) |
+| `span_id`          | `uint32`            | Unit of work within thread (incrementing counter)     |
+| `parent_thread_id` | `uint64` (nullable) | Parent span's thread                                  |
+| `parent_span_id`   | `uint32` (nullable) | Parent span's ID                                      |
+
+### Global Uniqueness
+
+**Within a trace**: `(thread_id, span_id)` is unique **Globally**: `(trace_id, thread_id, span_id)` is globally unique
+
+- `thread_id` provides cross-process uniqueness (64-bit random)
+- `span_id` provides within-thread ordering (32-bit counter)
+
+### Parent Reference
+
+To find a parent span, you need:
+
+- Same `trace_id` (parent is always in same trace)
+- Match `thread_id = parent_thread_id` AND `span_id = parent_span_id`
+
+### Why This Design
+
+**Performance (Hot Path)**:
+
+- `span_id` is just `i++` - no random generation, no BigInt operations per span
+- Thread ID generated once at worker startup (cold path)
+- No crypto overhead per span creation
+
+**Collision Resistance**:
+
+- 64-bit random thread ID provides strong collision resistance
+- Birthday paradox: ~4 billion processes before 50% collision probability
+- Combined with 32-bit local counter: effectively unlimited spans per thread
+
+**Query Flexibility**:
+
+- Separate columns allow efficient querying by `thread_id` alone
+- No struct unpacking needed for common queries
+- Direct column filtering in WHERE clauses
+
+**Cross-Thread Parent Support**:
+
+- Child span on thread B can reference parent span on thread A
+- Natural for `pmap()` and worker scenarios
+- `parent_thread_id` + `parent_span_id` identifies the parent
+
+**JavaScript Compatibility**:
+
+- `thread_id` (64-bit): Generated once as BigInt at worker startup
+- `span_id` (32-bit): Fits in `number`, used per span (no BigInt in hot path)
+
+### Thread-Local Counter Design (CRITICAL)
+
+**The `span_id` is a THREAD-LOCAL counter**, not a per-trace counter:
+
+```
+Main thread (thread_id: 0xAAA): span_id 1, 2, 3, 4, 5...  (all traces combined)
+Worker A (thread_id: 0xBBB): span_id 1, 2, 3...           (all traces combined)
+Worker B (thread_id: 0xCCC): span_id 1, 2...              (all traces combined)
+```
+
+**What `span_id` IS**:
+
+- A simple `i++` counter local to each thread/worker
+- Each thread starts at 1 and increments independently
+- Counts ALL spans created on that thread, across ALL traces
+- Zero coordination between threads
+
+**What `span_id` is NOT**:
+
+- ❌ NOT a global counter shared across threads (would need synchronization)
+- ❌ NOT a per-trace counter (would require Map lookups and cleanup)
+- ❌ NOT semantically "nth span in this trace"
+
+**Semantic Meaning**:
+
+- `span_id` means "nth span created on this thread" (across all traces)
+- If you need trace-relative ordering, use timestamps
+- The tuple `(thread_id, span_id)` is globally unique, that's what matters
+
+**Why This Design**:
+
+- **Zero overhead**: Just `i++`, nothing else
+- **No synchronization**: Each thread has its own counter
+- **No Map lookups**: No per-trace state to manage
+- **No cleanup logic**: No trace completion tracking needed
+- **Still globally unique**: `(thread_id, span_id)` never collides
+- **Thread timeline visibility**: See exactly how async concurrency interleaves different traces on a thread
+
+### Collision Math
+
+For the 64-bit thread ID (birthday paradox):
+
+- 2^32 (~4 billion) threads → 50% collision probability
+- 2^20 (~1 million) threads → 0.00003% collision probability
+- In practice, collision is negligible for any realistic deployment
+
+### Query Examples
+
+```sql
+-- Find all ancestors (recursive)
+WITH RECURSIVE ancestors AS (
+  SELECT * FROM spans
+  WHERE trace_id = @trace_id AND thread_id = @tid AND span_id = @sid
+  UNION ALL
+  SELECT s.* FROM spans s
+  JOIN ancestors a
+    ON s.trace_id = a.trace_id
+   AND s.thread_id = a.parent_thread_id
+   AND s.span_id = a.parent_span_id
+)
+SELECT * FROM ancestors;
+
+-- All spans from a specific thread (timeline view)
+SELECT * FROM spans
+WHERE trace_id = @trace_id AND thread_id = @tid
+ORDER BY span_id;
+
+-- Work distribution across threads
+SELECT thread_id, COUNT(*) as span_count
+FROM spans
+WHERE trace_id = @trace_id
+GROUP BY thread_id;
+
+-- Find root spans (null parent)
+SELECT * FROM spans
+WHERE parent_thread_id IS NULL AND parent_span_id IS NULL;
+
+-- Join parent-child relationships
+SELECT child.*, parent.label as parent_label
+FROM spans child
+LEFT JOIN spans parent ON
+  child.trace_id = parent.trace_id AND
+  child.parent_thread_id = parent.thread_id AND
+  child.parent_span_id = parent.span_id
+WHERE child.trace_id = 'req-123';
+
+-- Thread timeline: see how async concurrency interleaves requests
+SELECT trace_id, span_id, timestamp
+FROM spans
+WHERE thread_id = 0x1a2b3c4d5e6f7890
+ORDER BY span_id;
+-- Result shows interleaved request handling:
+-- trace_id: req-1, span_id: 1    (started req-1)
+-- trace_id: req-1, span_id: 2    (child span)
+-- trace_id: req-2, span_id: 3    (started req-2 while req-1 async waiting)
+-- trace_id: req-1, span_id: 4    (back to req-1)
+-- trace_id: req-2, span_id: 5    (req-2 continues)
+```
 
 ### Library-Specific Attribute Columns (Sparse/Nullable)
 
@@ -59,6 +436,16 @@ system becomes a row in the final table, enabling rich analytical queries while 
 
 This example shows a complete user registration request with multiple spans, HTTP calls, database operations, and
 console.log compatibility traces.
+
+**Note on Span IDs**: For readability, this example shows only the `span_id` component (1, 2, 3...). In the actual Arrow
+output, span identification uses separate columns: `thread_id` (uint64), `span_id` (uint32), `parent_thread_id` (uint64,
+nullable), and `parent_span_id` (uint32, nullable). For single-process traces, all spans share the same `thread_id`:
+
+```
+-- Example table representation:
+thread_id: 0x1a2b3c4d5e6f7890, span_id: 1, parent_thread_id: null, parent_span_id: null
+thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890, parent_span_id: 1
+```
 
 | trace_id     | span_id | parent_span_id | timestamp                  | entry_type   | module                | label                                           | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
 | ------------ | ------- | -------------- | -------------------------- | ------------ | --------------------- | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
@@ -417,7 +804,7 @@ then uses high-resolution timers for all subsequent timestamps. See
   - No `Date.now()` calls per span
   - Stored as `timestamp[μs]` (microsecond) in Arrow
 - **Node.js**: `process.hrtime.bigint()` deltas from anchor
-  - Nanosecond precision available
+  - Nanosecond precision available, truncated to microseconds
   - Stored as microseconds for consistency
   - Arrow type: `timestamp[μs]` (microsecond)
 - **Fallback**: `Date.now()` (millisecond precision)
@@ -429,12 +816,30 @@ allocations, no `Date.now()` calls per entry.
 
 **Cold Path Conversion**: Converted to Arrow `TimestampMicrosecond` type, compatible with ClickHouse `DateTime64(6)`.
 
+**Precision Guarantees**:
+
+- **Storage**: Microseconds stored as `Float64Array`
+- **Safe Range**: Float64 can exactly represent integers up to `Number.MAX_SAFE_INTEGER` (2^53 - 1)
+  - Maximum safe microsecond value: 9,007,199,254,740,991 μs
+  - Equivalent date: ~September 2255
+  - **Conclusion**: BigInt→Number conversion is SAFE for all practical timestamps
+- **Why Microseconds**:
+  - Sub-millisecond precision for performance analysis
+  - Compatible with ClickHouse `DateTime64(6)`
+  - Matches OpenTelemetry recommendation
+
+**Date.now() Usage**:
+
+- ❌ **NEVER** use `Date.now()` for trace timestamps (use anchored approach)
+- ✅ **OK** to use `Date.now()` for scheduling, file naming, system metadata
+
 **Benefits**:
 
 - Zero allocations per timestamp
 - Sub-millisecond precision enables detailed performance analysis
 - All spans in trace share same anchor (comparable, consistent)
 - DST/NTP safe - anchor per trace, traces are short-lived
+- Safe numeric conversion until year 2255
 
 ### Storage Efficiency
 
@@ -459,6 +864,81 @@ allocations, no `Date.now()` calls per entry.
 - **Hierarchical structure**: Span relationships enable trace reconstruction
 - **Multi-dimensional**: Can slice by module, user, time, or entry type
 
+## Arrow Conversion Interface
+
+The conversion from LMAO's trace buffers to Arrow tables uses a **two-pass tree conversion** approach for optimal memory
+efficiency and shared dictionaries.
+
+**For complete details on the two-pass approach, dictionary building, and UTF-8 caching, see:**
+**[Tree Walker and Arrow Conversion](./01k_tree_walker_and_arrow_conversion.md)**
+
+### Key Concepts
+
+- **Two-pass conversion**: Pass 1 builds dictionaries, Pass 2 creates RecordBatches
+- **No intermediate buffer collection**: Walk tree twice instead of collecting into an array
+- **Shared dictionaries**: All RecordBatches reference the same dictionary vectors
+- **UTF-8 caching**: Encode once, copy on reuse for repeated strings
+- **Depth-first pre-order traversal**: Parents before children (optimal for queries and compression)
+- **Buffer overflow handling**: Multiple buffers with same spanId yielded contiguously
+
+## Current Implementation Status
+
+**✅ ZERO-COPY IMPLEMENTATION COMPLETE**: The implementation in `packages/lmao/src/lib/convertToArrow.ts` uses
+`arrow.makeData()` exclusively.
+
+**Implementation Details**:
+
+1. ✅ `createZeroCopyData()` helper function - direct TypedArray wrapping with arrow.makeData()
+2. ✅ `concatenateTypedArrays()` helper - efficient buffer chain concatenation
+3. ✅ `concatenateNullBitmaps()` helper - null bitmap merging across buffers
+4. ✅ Primitive columns (number, boolean, timestamp) - direct subarray() + concatenation
+5. ✅ Dictionary columns (enum, category, text, trace_id, module, span_name, entry_type) - index arrays + dictionary
+   vectors
+6. ✅ System columns - all use zero-copy with direct TypedArray construction
+
+**Key Implementation Patterns**:
+
+### Primitive Columns (Float64, Uint8, etc.)
+
+```typescript
+// Collect value arrays from each buffer
+const valueArrays = buffers.map((buf) => buf.column.subarray(0, buf.writeIndex));
+// Concatenate (one copy, but still better than builder's per-value copy)
+const allValues = concatenateTypedArrays(valueArrays);
+const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+// Zero-copy wrap
+const data = arrow.makeData({ type, length, nullCount, data: allValues, nullBitmap });
+vectors.push(arrow.makeVector(data));
+```
+
+### Dictionary Columns (enum, category, text)
+
+```typescript
+// Collect index arrays
+const indexArrays = buffers.map((buf) => buf.column_values.subarray(0, buf.writeIndex));
+const allIndices = concatenateTypedArrays(indexArrays);
+const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
+// Create dictionary vector from interner
+const dictVector = arrow.makeVector(interner.getStrings());
+// Zero-copy wrap indices with dictionary
+const data = arrow.makeData({
+  type: new arrow.Dictionary(new arrow.Utf8(), indexType),
+  length,
+  nullCount,
+  data: allIndices,
+  nullBitmap,
+  dictionary: dictVector,
+});
+vectors.push(arrow.makeVector(data));
+```
+
+**Performance Benefits**:
+
+- **No per-value iteration**: Builder pattern called append() for every value
+- **Minimal allocation**: One concatenation vs builder's internal buffer growth
+- **Direct memory references**: TypedArrays passed directly to Arrow without copying
+- **Dictionary efficiency**: Indices already in correct format, just wrap with dictionary
+
 ## Integration Points
 
 This Arrow table structure integrates with:
@@ -471,7 +951,10 @@ This Arrow table structure integrates with:
   cleanly separated
 - **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Runtime generation of APIs that populate these
   Arrow columns
+- **[Tree Walker and Arrow Conversion](./01k_tree_walker_and_arrow_conversion.md)**: Two-pass tree conversion with
+  dictionary building, UTF-8 caching, and shared dictionaries across RecordBatches
 - **Background Processing Pipeline** (future document): Batch conversion process from buffers to Arrow/Parquet
+- **extern/arrow-js-ffi/src/vector.ts**: Reference implementation for zero-copy Arrow data construction
 
 The flat table structure enables rich analytical queries while maintaining the performance benefits of columnar storage
 and efficient null handling.

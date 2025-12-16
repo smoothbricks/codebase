@@ -13,7 +13,6 @@
  * - Inline caching works properly
  */
 
-import type { Microseconds } from '@smoothbricks/arrow-builder';
 import type { EvaluationContext, FeatureFlagSchema } from '../schema/defineFeatureFlags.js';
 import type {
   FlagColumnWriters,
@@ -32,8 +31,6 @@ export interface GeneratedEvaluatorState<T extends FeatureFlagSchema> {
   evaluationContext: EvaluationContext;
   evaluator: FlagEvaluator;
   buffer: SpanBuffer | null;
-  anchorEpochMicros: Microseconds;
-  anchorPerfNow: Microseconds;
   columnWriters?: FlagColumnWriters;
   accessedFlags: Set<string>;
   flagCache: Map<string, unknown>;
@@ -91,7 +88,7 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
   const flagGetters = flagNames.map((name) => generateFlagGetter(name)).join('\n');
 
   const classCode = `
-(function(validateFlagValue, getTimestampMicros, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
+(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
   'use strict';
 
   class ${className} {
@@ -208,15 +205,7 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
       const idx = state.buffer.writeIndex;
 
       state.buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-
-      // Time anchors must be initialized in RequestContext before feature flag evaluation
-      if (state.anchorEpochMicros === undefined || state.anchorPerfNow === undefined) {
-        throw new Error(
-          'Missing time anchor in evaluation state. ' +
-            'Anchors must be initialized in RequestContext before feature flag evaluation.'
-        );
-      }
-      state.buffer.timestamps[idx] = getTimestampMicros(state.anchorEpochMicros, state.anchorPerfNow);
+      state.buffer.timestamps[idx] = getTimestampNanos();
 
       // Write flag name (category column - stored as raw string)
       const ffNameColumn = state.buffer['attr_ffName_values'];
@@ -255,15 +244,7 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
       const idx = state.buffer.writeIndex;
 
       state.buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-
-      // Time anchors must be initialized in RequestContext before feature flag evaluation
-      if (state.anchorEpochMicros === undefined || state.anchorPerfNow === undefined) {
-        throw new Error(
-          'Missing time anchor in evaluation state. ' +
-            'Anchors must be initialized in RequestContext before feature flag evaluation.'
-        );
-      }
-      state.buffer.timestamps[idx] = getTimestampMicros(state.anchorEpochMicros, state.anchorPerfNow);
+      state.buffer.timestamps[idx] = getTimestampNanos();
 
       // Write flag name (category column - stored as raw string)
       const ffNameColumn = state.buffer['attr_ffName_values'];
@@ -397,7 +378,7 @@ export function createEvaluatorClass<T extends FeatureFlagSchema>(
   schema: T,
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   validateFlagValue: (value: unknown, schema: any, defaultValue: any) => any,
-  getTimestampMicros: (anchorEpochMicros: Microseconds, anchorPerfNow: Microseconds) => Microseconds,
+  getTimestampNanos: () => bigint,
   ENTRY_TYPE_FF_ACCESS: number,
   ENTRY_TYPE_FF_USAGE: number,
 ): new (
@@ -419,7 +400,7 @@ export function createEvaluatorClass<T extends FeatureFlagSchema>(
   const classFactory = new Function(`return ${classCode}`)();
 
   // Call the factory with dependencies to get the actual class
-  const GeneratedClass = classFactory(validateFlagValue, getTimestampMicros, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE);
+  const GeneratedClass = classFactory(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE);
 
   // Cache the generated class
   evaluatorClassCache.set(schema, GeneratedClass);

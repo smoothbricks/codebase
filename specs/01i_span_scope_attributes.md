@@ -32,142 +32,190 @@ Request Middleware: scope({ requestId, userId, endpoint, method })
 **Performance Optimization**: Scoped attributes use lazy columns - TypedArrays are NOT allocated until actually needed
 (direct write or Arrow conversion), meaning scope-only attributes have zero hot-path allocation overhead.
 
-## Implementation: Lazy Scope with Zero Hot-Path Allocation
+## Implementation: Separate Scope and Column Storage
 
-The critical insight: scope values should NOT force TypedArray allocation. We use lazy columns that store a scope value
-separately from the actual array data.
+The critical insight: scope values should be SEPARATE from column storage. We use a generated Scope class to hold
+values, and pre-fill child buffer columns via `TypedArray.fill()` for SIMD optimization.
 
-### LazyColumn Class
+### Scope Class (Generated at Module Creation)
+
+The Scope class is generated via `new Function()` and contains ONLY schema attributes (NOT system columns):
 
 ```typescript
-class LazyColumn<T extends TypedArray | string[]> {
-  private _values: T | null = null;
-  private _nullBitmap: Uint8Array | null = null;
-  private _scopeValue: number | string | boolean | null = null;
+// Generated once at module creation time (cold path)
+function generateScopeClass(schema: TagAttributeSchema): typeof GeneratedScope {
+  const fields = Object.keys(schema.fields)
+    .map(
+      (key) => `
+    _${key} = undefined;
+    get ${key}() { return this._${key}; }
+    set ${key}(value) { this._${key} = value; }
+  `
+    )
+    .join('\n');
 
-  readonly capacity: number;
-  readonly ArrayType: TypedArrayConstructor | ArrayConstructor;
+  const getScopeValuesBody = Object.keys(schema.fields)
+    .map((k) => `${k}: this._${k}`)
+    .join(', ');
 
-  constructor(capacity: number, ArrayType: TypedArrayConstructor | ArrayConstructor) {
-    this.capacity = capacity;
-    this.ArrayType = ArrayType;
-  }
-
-  // For black-box testing
-  get isInitialized(): boolean {
-    return this._values !== null;
-  }
-
-  get hasScopeValue(): boolean {
-    return this._scopeValue !== null;
-  }
-
-  // Get scope value - for ctx.scope getters to read
-  get scopeValue(): number | string | boolean | null {
-    return this._scopeValue;
-  }
-
-  // Set scope value - NO ALLOCATION
-  setScope(value: number | string | boolean): void {
-    if (this._scopeValue !== null && this._values === null) {
-      // Second scope call with different value - must allocate NOW
-      // to preserve the old scope value in rows 0..writeIndex
-      this._allocateAndFillWithScope();
-    }
-    this._scopeValue = value;
-  }
-
-  private _allocateAndFillWithScope(): void {
-    this._values = new this.ArrayType(this.capacity) as T;
-    if (this._scopeValue !== null) {
-      (this._values as any).fill(this._scopeValue);
-    }
-  }
-
-  // Get null bitmap - allocate lazily
-  get nullBitmap(): Uint8Array {
-    if (!this._nullBitmap) {
-      this._nullBitmap = new Uint8Array(Math.ceil(this.capacity / 8));
-    }
-    return this._nullBitmap;
-  }
-
-  // Hot path - allocate values on first direct write
-  get values(): T {
-    if (!this._values) {
-      this._allocateAndFillWithScope();
-    }
-    return this._values!;
-  }
-
-  // Set a value at a specific index (hot path)
-  set(index: number, value: number | string | boolean): void {
-    this.values[index] = value as any;
-    // Set null bitmap bit (value is present)
-    const byteIndex = Math.floor(index / 8);
-    const bitOffset = index % 8;
-    this.nullBitmap[byteIndex] |= 1 << bitOffset;
-  }
-
-  // Cold path - Arrow conversion
-  getValuesForArrow(writeIndex: number): T | null {
-    if (this._values) {
-      // Was written to directly - zero-copy subarray
-      return (this._values as any).subarray(0, writeIndex) as T;
-    }
-    if (this._scopeValue !== null) {
-      // Never written directly, but has scope value
-      // Allocate NOW (cold path) and fill
-      const arr = new this.ArrayType(writeIndex) as T;
-      (arr as any).fill(this._scopeValue);
-      return arr;
-    }
-    // No data, no scope - null column
-    return null;
-  }
-
-  // Get null bitmap for Arrow conversion (cold path)
-  getNullBitmapForArrow(writeIndex: number): Uint8Array | null {
-    if (this._nullBitmap) {
-      // Return only the bytes needed for writeIndex rows
-      const neededBytes = Math.ceil(writeIndex / 8);
-      return this._nullBitmap.subarray(0, neededBytes);
-    }
-    if (this._scopeValue !== null) {
-      // Scope value means all rows have values - create full bitmap
-      const neededBytes = Math.ceil(writeIndex / 8);
-      const bitmap = new Uint8Array(neededBytes);
-      bitmap.fill(0xff); // All bits set = all values present
-      // Clear extra bits in last byte
-      const extraBits = writeIndex % 8;
-      if (extraBits > 0) {
-        bitmap[neededBytes - 1] &= (1 << extraBits) - 1;
+  const classCode = `
+    return class GeneratedScope {
+      ${fields}
+      _getScopeValues() {
+        return { ${getScopeValuesBody} };
       }
-      return bitmap;
-    }
-    // No data, no scope - null column (no bitmap needed)
-    return null;
+    };
+  `;
+
+  return new Function(classCode)();
+}
+
+// Example generated class for { userId: utf8, requestId: utf8, orderId: utf8 }
+class GeneratedScope {
+  _userId = undefined;
+  get userId() {
+    return this._userId;
+  }
+  set userId(value) {
+    this._userId = value;
+  }
+
+  _requestId = undefined;
+  get requestId() {
+    return this._requestId;
+  }
+  set requestId(value) {
+    this._requestId = value;
+  }
+
+  _orderId = undefined;
+  get orderId() {
+    return this._orderId;
+  }
+  set orderId(value) {
+    this._orderId = value;
+  }
+
+  _getScopeValues() {
+    return {
+      userId: this._userId,
+      requestId: this._requestId,
+      orderId: this._orderId,
+    };
   }
 }
 ```
 
+### Column Storage with Lazy Getters (Generated via `new Function()`)
+
+The actual implementation does NOT use a LazyColumn class. Instead, SpanBuffer is generated via `new Function()` with:
+
+1. **Direct properties** for each column: `attr_X_nulls` and `attr_X_values`
+2. **Lazy getters** that allocate shared ArrayBuffer on first access
+3. **Symbol-based storage** to ensure each buffer instance has its own arrays
+
+```typescript
+// Generated SpanBuffer class (via new Function() at module creation time)
+// Each attribute gets TWO getters sharing ONE ArrayBuffer
+
+// Example for userId attribute:
+// Symbol for private storage (per-instance)
+const attr_userId_sym = Symbol('attr_userId');
+
+// Allocator function (called by getters on first access)
+function allocate_attr_userId(self) {
+  if (self[attr_userId_sym]) return self[attr_userId_sym];
+
+  const capacity = self._alignedCapacity;
+  const nullBitmapSize = Math.ceil(capacity / 8);
+
+  // Align null bitmap end to cache line for optimal values array placement
+  const alignedNullOffset = Math.ceil(nullBitmapSize / 4) * 4; // For Uint32Array
+
+  const totalSize = alignedNullOffset + capacity * 4; // Uint32Array = 4 bytes/element
+
+  // ONE ArrayBuffer for both nulls and values
+  const buffer = new ArrayBuffer(totalSize);
+
+  const storage = {
+    buffer: buffer,
+    nulls: new Uint8Array(buffer, 0, nullBitmapSize),
+    values: new Uint32Array(buffer, alignedNullOffset, capacity),
+  };
+
+  self[attr_userId_sym] = storage;
+  return storage;
+}
+
+// Generated class:
+class GeneratedColumnBuffer {
+  constructor(requestedCapacity) {
+    const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
+    this._alignedCapacity = alignedCapacity;
+    this.timestamps = new Float64Array(alignedCapacity);
+    this.operations = new Uint8Array(alignedCapacity);
+    this.writeIndex = 0;
+    this.capacity = requestedCapacity;
+  }
+
+  // Lazy getters for userId column (allocated on first access)
+  get attr_userId_nulls() {
+    return allocate_attr_userId(this).nulls;
+  }
+  get attr_userId_values() {
+    return allocate_attr_userId(this).values;
+  }
+  get attr_userId() {
+    return allocate_attr_userId(this).values;
+  } // Shorthand
+
+  // ... same pattern for all other schema attributes
+
+  // Helper to check if column is allocated (without triggering allocation)
+  getColumnIfAllocated(columnName) {
+    const sym = columnSymbols[columnName];
+    return sym ? this[sym]?.values : undefined;
+  }
+
+  getNullsIfAllocated(columnName) {
+    const sym = columnSymbols[columnName];
+    return sym ? this[sym]?.nulls : undefined;
+  }
+}
+```
+
+**Key Benefits of This Design**:
+
+1. **Shared ArrayBuffer**: `attr_X_nulls` and `attr_X_values` use the SAME underlying ArrayBuffer, partitioned with
+   cache-aligned offsets
+2. **Zero Indirection**: Direct property access (`buffer.attr_userId_values[i]`) with no extra lookups
+3. **Lazy Allocation**: Unused columns never allocate memory (hot path optimization)
+4. **Per-Instance Storage**: Symbol-keyed storage ensures each buffer has its own arrays (no shared closure bugs)
+5. **V8 Optimization**: `new Function()` generates concrete classes that V8 can optimize with hidden classes
+
 ### Allocation Triggers
 
-TypedArray allocation happens:
+TypedArray allocation happens when lazy getters are first accessed:
 
-1. **Direct write** (e.g., `ctx.tag.userId()`) - accesses `.values`, triggers allocation + scope fill
-2. **Second scope call** - must preserve old scope value, triggers allocation + fill
-3. **Cold path Arrow conversion** - if still lazy but has scope value, allocate and fill
+1. **Direct write** (e.g., `ctx.tag.userId('value')`) - accesses `buffer.attr_userId_values`, triggers lazy getter →
+   allocates shared ArrayBuffer
+2. **Scope pre-fill** (child span creation) - accesses column getters to fill with parent scope values → allocates if
+   not yet allocated
+3. **Null bitmap write** - accessing `buffer.attr_userId_nulls` triggers same allocator as values (both use shared
+   ArrayBuffer)
 
-First `ctx.scope.X = value` assignment = just sets `_scopeValue`, NO allocation.
+First `ctx.scope.X = value` assignment = just sets property on Scope object, NO buffer allocation.
+
+**Important**: The lazy getters ensure allocation happens at most ONCE per column per buffer instance. Subsequent
+accesses return the already-allocated arrays.
 
 ## API Design
 
 ### ctx.scope as Compiled Class with Getters/Setters
 
-The `ctx.scope` API is a `new Function()` compiled class (like ctx.tag) that provides:
+The `ctx.scope` API is a `new Function()` compiled class that provides:
 
-- **Setters**: `ctx.scope.userId = '123'` → sets scope value on the LazyColumn
+- **Setters**: `ctx.scope.userId = '123'` → sets scope value on the Scope instance
 - **Getters**: `ctx.scope.userId` → returns the scope value (or undefined)
 
 This allows user code to:
@@ -176,28 +224,23 @@ This allows user code to:
 2. Read scope values: `const id = ctx.scope.userId`
 3. Check if set: `if (ctx.scope.userId !== undefined)`
 
+The Scope class is separate from the buffer - it ONLY stores schema attributes:
+
 ```typescript
-// Generated at module creation time (cold path)
-class GeneratedScope {
-  constructor(private buffer: SpanBuffer) {}
+// Generated at module creation time (cold path) - see implementation above
+// Each TraceContext has its own Scope instance:
+class TraceContext {
+  scope: GeneratedScope;
+  buffer: SpanBuffer;
+  tag: GeneratedTag;
+  log: GeneratedLog;
+  // ...
 
-  get userId(): string | undefined {
-    return this.buffer.attr_userId.scopeValue;
+  constructor(buffer: SpanBuffer, scopeClass: typeof GeneratedScope) {
+    this.buffer = buffer;
+    this.scope = new scopeClass(); // New Scope instance per context
+    // ...
   }
-
-  set userId(value: string) {
-    this.buffer.attr_userId.setScope(value);
-  }
-
-  get requestId(): string | undefined {
-    return this.buffer.attr_requestId.scopeValue;
-  }
-
-  set requestId(value: string) {
-    this.buffer.attr_requestId.setScope(value);
-  }
-
-  // ... generated for each schema attribute
 }
 ```
 
@@ -207,9 +250,9 @@ class GeneratedScope {
 // ctx.tag - writes to row 0 only, NOT inherited
 ctx.tag.userId('123'); // Allocates column, writes to row 0
 
-// ctx.scope - sets scope value, inherited to children, appears on ALL rows
-ctx.scope.userId = '123'; // Just sets _scopeValue, NO allocation
-ctx.scope.requestId = 'req-1'; // Just sets _scopeValue, NO allocation
+// ctx.scope - sets scope value, inherited to children, pre-fills child columns
+ctx.scope.userId = '123'; // Just sets Scope property, NO allocation
+ctx.scope.requestId = 'req-1'; // Just sets Scope property, NO allocation
 
 // Reading scope values
 const currentUserId = ctx.scope.userId; // Returns '123' or undefined
@@ -218,21 +261,21 @@ if (ctx.scope.requestId !== undefined) {
 }
 ```
 
-Both tag and scope support method chaining for setting multiple values:
+Both tag and scope use separate assignments for multiple values:
 
 ```typescript
-// Method chaining still works for setting
+// tag - method chaining for fluent API
 ctx.tag.status(200).method('POST');
 
-// For scope, use separate assignments or Object.assign pattern
+// scope - property assignments
 ctx.scope.userId = '123';
 ctx.scope.requestId = 'req-1';
 ctx.scope.orderId = 'ord-456';
 ```
 
-### Scope Inheritance
+### Scope Inheritance with Pre-filling
 
-Child spans inherit parent's scope values:
+Child spans inherit parent's scope values and PRE-FILL buffer columns for SIMD optimization:
 
 ```typescript
 // Parent span
@@ -240,170 +283,229 @@ ctx.scope.userId = 'u1';
 ctx.scope.requestId = 'r1';
 
 await ctx.span('child-operation', async (childCtx) => {
-  // childCtx has NEW LazyColumns, each with inherited _scopeValue
-  // No TypedArrays allocated yet
+  // childCtx has:
+  // 1. NEW Scope instance with copied values from parent
+  // 2. NEW buffer columns that can be PRE-FILLED with scope values
 
   // Can read inherited scope values
   console.log(childCtx.scope.userId); // 'u1' (inherited from parent)
   console.log(childCtx.scope.requestId); // 'r1' (inherited from parent)
 
-  childCtx.scope.orderId = 'ord-1'; // Add to scope, still no allocation
+  childCtx.scope.orderId = 'ord-1'; // Add to scope - no column allocation yet
 
-  childCtx.log.info('processing'); // Only allocates attr_logMessage
-  // attr_userId, attr_requestId, attr_orderId still lazy
+  childCtx.log.info('processing'); // Allocates attr_logMessage column
+  // attr_userId, attr_requestId columns pre-filled from parent scope
+  // attr_orderId not pre-filled yet (set after child creation)
 
-  // At Arrow conversion: all three columns materialized with scope values
+  // At Arrow conversion: userId and requestId use pre-filled arrays (zero-copy)
+  // orderId needs to be filled on-demand
 });
 ```
 
-### Implementation of Scope Inheritance
+### Implementation of Scope Inheritance with Pre-filling
+
+Key insight: Pre-fill child buffer columns when creating child span, enabling SIMD optimization:
 
 ```typescript
-function createChildSpanBuffer(parentBuffer: SpanBuffer, schema: TagAttributeSchema): SpanBuffer {
+function createChildSpanContext(
+  parentCtx: TraceContext,
+  spanName: string,
+  scopeClass: typeof GeneratedScope,
+): TraceContext {
   const childBuffer = createEmptySpanBuffer(/* ... */);
 
-  // Copy parent's scope values to child's LazyColumns
-  // LazyColumn instances are direct properties on the buffer (no nested Record)
-  for (const fieldName of Object.keys(schema.fields)) {
-    const columnName = `attr_${fieldName}` as keyof SpanBuffer;
-    const parentColumn = parentBuffer[columnName] as LazyColumn<any>;
-    const childColumn = childBuffer[columnName] as LazyColumn<any>;
+  // Create child scope and copy parent's scope values
+  const childScope = new scopeClass();
+  const parentScopeValues = parentCtx.scope._getScopeValues();
 
-    if (parentColumn.hasScopeValue) {
-      // Access internal scope value for inheritance
-      childColumn.setScope(parentColumn.scopeValue);
+  // Pre-fill child buffer columns with parent scope values (SIMD optimized)
+  // This happens BEFORE user code runs, so columns are ready for writing
+  for (const [fieldName, value] of Object.entries(parentScopeValues)) {
+    if (value !== undefined) {
+      // Copy to child scope
+      childScope[fieldName] = value;
+
+      // PRE-FILL child buffer column with TypedArray.fill() (SIMD optimized)
+      // Accessing the lazy getter triggers allocation of the shared ArrayBuffer
+      const valuesArray = childBuffer[`attr_${fieldName}_values`];
+      const nullsArray = childBuffer[`attr_${fieldName}_nulls`];
+
+      // Pre-fill values from row 0 to buffer capacity
+      valuesArray.fill(value);
+
+      // Mark all rows as valid in null bitmap (0xFF = all bits set)
+      const fullBytes = Math.floor(childBuffer.capacity / 8);
+      nullsArray.fill(0xff, 0, fullBytes);
+      // Handle remaining bits in last byte
+      const remainingBits = childBuffer.capacity % 8;
+      if (remainingBits > 0) {
+        nullsArray[fullBytes] = (1 << remainingBits) - 1;
+      }
     }
   }
 
-  return childBuffer;
+  return new TraceContext(childBuffer, childScope, scopeClass);
+}
+  }
+
+  return new TraceContext(childBuffer, childScope, scopeClass);
 }
 ```
 
-### SpanBuffer with Direct LazyColumn Properties
+**Pre-filling Benefits**:
 
-Each SpanBuffer has LazyColumn instances as **direct properties** (no nested Record) for zero indirection:
-
-```typescript
-interface SpanBuffer {
-  // Core columns - always allocated (used for every entry)
-  timestamps: Float64Array;
-  operations: Uint8Array;
-
-  // Attribute columns - DIRECT PROPERTIES on buffer (no nested Record!)
-  // Each LazyColumn handles: values, null bitmap, AND scope value
-  // This design provides zero indirection for hot path access
-  attr_userId: LazyColumn<Uint32Array>;
-  attr_requestId: LazyColumn<Uint32Array>;
-  attr_orderId: LazyColumn<Uint32Array>;
-  attr_logMessage: LazyColumn<string[]>;
-  // ... one direct property per schema attribute
-
-  // Tree structure
-  children: SpanBuffer[];
-  parent?: SpanBuffer;
-  task: TaskContext;
-
-  // Buffer management
-  writeIndex: number;
-  capacity: number;
-  next?: SpanBuffer;
-
-  spanId: number;
-  traceId: string;
-}
-
-// Access pattern - DIRECT property access, no indirection:
-buffer.attr_userId.set(idx, value); // ✅ Direct - zero indirection
-buffer.attr_userId.setScope(value); // ✅ Direct - zero indirection
-const scope = buffer.attr_userId.scopeValue; // ✅ Direct read
-
-// NOT this pattern (extra indirection):
-// buffer.columns.attr_userId.set(idx, value);  // ❌ Nested - one extra lookup
-```
+1. **SIMD Optimization**: `TypedArray.fill()` uses highly optimized SIMD instructions
+2. **Zero-Copy on Arrow Conversion**: Pre-filled columns are already materialized, no cold-path allocation
+3. **Cache-Friendly**: Contiguous memory writes improve cache utilization
+4. **Predictable Performance**: No deferred allocation surprises during Arrow conversion
 
 ## Hot Path Behavior
 
-```typescript
-ctx.scope.userId = 'u1'; // _scopeValue = 'u1', NO allocation
-ctx.scope.requestId = 'r1'; // _scopeValue = 'r1', NO allocation
-ctx.log.info('step 1'); // Allocates attr_logMessage ONLY
-ctx.log.info('step 2'); // Writes to attr_logMessage
-ctx.log.info('step 3'); // Writes to attr_logMessage
+### Parent Span (No Pre-filling)
 
-// buffer.attr_userId: _values = null, _scopeValue = 'u1'
-// buffer.attr_requestId: _values = null, _scopeValue = 'r1'
-// buffer.attr_logMessage: _values = ['step 1', 'step 2', 'step 3', ...]
+```typescript
+ctx.scope.userId = 'u1'; // Sets Scope property, NO buffer allocation
+ctx.scope.requestId = 'r1'; // Sets Scope property, NO buffer allocation
+ctx.log.info('step 1'); // Triggers attr_logMessage lazy getter → allocates ArrayBuffer
+// Scope values applied at write time (userId, requestId columns allocated too)
+ctx.log.info('step 2'); // Writes to already-allocated attr_logMessage
+ctx.log.info('step 3'); // Writes to already-allocated attr_logMessage
+
+// Scope: { userId: 'u1', requestId: 'r1' }
+// buffer[attr_userId_sym]: allocated during first log.info (scope applied)
+// buffer[attr_requestId_sym]: allocated during first log.info (scope applied)
+// buffer[attr_logMessage_sym]: allocated during first log.info
+```
+
+### Child Span (Pre-filled from Parent)
+
+```typescript
+await ctx.span('child', async (childCtx) => {
+  // Child span creation:
+  // 1. New Scope instance with parent values copied
+  // 2. SpanLogger.scope() called to pre-fill buffer with parent scope values
+  //    - Accesses attr_userId_values getter → triggers allocation
+  //    - Uses TypedArray.fill() to pre-fill entire capacity
+  //    - Same for attr_requestId
+
+  // Child buffer state after creation:
+  // childCtx.buffer[attr_userId_sym]: allocated and pre-filled with 'u1'
+  // childCtx.buffer[attr_requestId_sym]: allocated and pre-filled with 'r1'
+
+  childCtx.scope.orderId = 'ord-1'; // Sets Scope property only, NO allocation yet
+
+  childCtx.log.info('step 1'); // Writes to pre-filled userId/requestId columns
+  // Allocates attr_logMessage
+  // orderId column allocated now (scope applied at write)
+  childCtx.log.info('step 2'); // Writes to all allocated columns
+
+  // Final state:
+  // Scope: { userId: 'u1', requestId: 'r1', orderId: 'ord-1' }
+  // childCtx.buffer[attr_userId_sym]: pre-filled ArrayBuffer (SIMD optimized)
+  // childCtx.buffer[attr_requestId_sym]: pre-filled ArrayBuffer (SIMD optimized)
+  // childCtx.buffer[attr_orderId_sym]: allocated on first log.info (scope applied)
+  // childCtx.buffer[attr_logMessage_sym]: allocated on first log.info
+});
 ```
 
 ## Cold Path: Arrow Conversion
 
 ```typescript
-function convertToArrow(buffer: SpanBuffer, schema: TagAttributeSchema): ArrowData {
-  const columns: Record<string, TypedArray | string[]> = {};
+function convertToArrow(buffer: SpanBuffer, scope: GeneratedScope, schema: TagAttributeSchema): ArrowData {
+  const columns: Record<string, TypedArray> = {};
   const nullBitmaps: Record<string, Uint8Array> = {};
 
-  // Iterate over schema fields - LazyColumns are direct properties on buffer
+  // Iterate over schema fields
+  const scopeValues = scope._getScopeValues();
+
   for (const fieldName of Object.keys(schema.fields)) {
     const columnName = `attr_${fieldName}`;
-    const lazyColumn = buffer[columnName as keyof SpanBuffer] as LazyColumn<any>;
 
-    const arrowData = lazyColumn.getValuesForArrow(buffer.writeIndex);
-    if (arrowData !== null) {
-      columns[columnName] = arrowData;
-      // Get null bitmap from the SAME LazyColumn object
-      const nullBitmap = lazyColumn.getNullBitmapForArrow(buffer.writeIndex);
-      if (nullBitmap) {
-        nullBitmaps[columnName] = nullBitmap;
+    // Check if column was allocated (without triggering allocation)
+    const values = buffer.getColumnIfAllocated(columnName);
+    const nulls = buffer.getNullsIfAllocated(columnName);
+
+    if (values) {
+      // Column was allocated - use zero-copy subarray
+      columns[columnName] = values.subarray(0, buffer.writeIndex);
+
+      if (nulls) {
+        const neededBytes = Math.ceil(buffer.writeIndex / 8);
+        nullBitmaps[columnName] = nulls.subarray(0, neededBytes);
       }
+    } else if (scopeValues[fieldName] !== undefined) {
+      // Column NOT allocated but scope has value
+      // Allocate and fill NOW (cold path - only happens for parent spans with scope-only columns)
+      const value = scopeValues[fieldName];
+      const ArrayType = getArrayTypeForField(schema.fields[fieldName]);
+      const arr = new ArrayType(buffer.writeIndex);
+      arr.fill(value);
+      columns[columnName] = arr;
+
+      // Create full null bitmap (all values present)
+      const neededBytes = Math.ceil(buffer.writeIndex / 8);
+      const bitmap = new Uint8Array(neededBytes);
+      bitmap.fill(0xff);
+      const extraBits = buffer.writeIndex % 8;
+      if (extraBits > 0) {
+        bitmap[neededBytes - 1] &= (1 << extraBits) - 1;
+      }
+      nullBitmaps[columnName] = bitmap;
     }
+    // If neither allocated nor scope value: column omitted (zero cost)
   }
 
-  // Zero-copy for directly written columns
-  // Allocate + fill for scope-only columns
+  // Zero-copy for pre-filled or directly written columns
+  // Allocate + fill for scope-only columns (parent span case - rare)
   return buildArrowData(columns, nullBitmaps);
 }
 ```
 
-**Result in Arrow table**:
+**Result in Arrow table** (child span with pre-filled columns):
 
 ```
-| row | timestamp | logMessage | userId | requestId |
-|-----|-----------|------------|--------|-----------|
-| 0   | 1000      | null       | u1     | r1        |  <- span-start
-| 1   | 2000      | null       | u1     | r1        |  <- span-end
-| 2   | 1100      | 'step 1'   | u1     | r1        |  <- event
-| 3   | 1200      | 'step 2'   | u1     | r1        |  <- event
-| 4   | 1300      | 'step 3'   | u1     | r1        |  <- event
+| row | timestamp | logMessage | userId | requestId | orderId |
+|-----|-----------|------------|--------|-----------|---------|
+| 0   | 1000      | null       | u1     | r1        | ord-1   |  <- span-start
+| 1   | 2000      | null       | u1     | r1        | ord-1   |  <- span-end
+| 2   | 1100      | 'step 1'   | u1     | r1        | ord-1   |  <- event
+| 3   | 1200      | 'step 2'   | u1     | r1        | ord-1   |  <- event
 ```
 
-Scope values appear on EVERY row - but the TypedArray was only allocated in the cold path.
+**Performance characteristics**:
 
-## Edge Case: Double Scope
+- **userId, requestId**: Pre-filled during child span creation (SIMD optimized) → zero-copy subarray
+- **orderId**: Set after child creation → allocate and fill at Arrow conversion (cold path)
+- **logMessage**: Written directly → zero-copy subarray
 
-Rare case where scope is set twice for same attribute:
+## Scope Value Changes
+
+Changing a scope value is straightforward - it just updates the Scope object:
 
 ```typescript
-ctx.scope.userId = 'u1'; // _scopeValue = 'u1', no allocation
-ctx.log.info('msg1'); // Row 2, only touches logMessage
-ctx.log.info('msg2'); // Row 3, only touches logMessage
-ctx.scope.userId = 'u2'; // SECOND scope assignment!
-// Must allocate NOW to preserve 'u1' in rows 0-3
-// Fill 0..writeIndex with 'u1'
-// Set _scopeValue = 'u2' for remainder
-ctx.log.info('msg3'); // Row 4, only touches logMessage
+ctx.scope.userId = 'u1'; // Sets Scope property
+ctx.log.info('msg1'); // Row 2
+ctx.log.info('msg2'); // Row 3
+ctx.scope.userId = 'u2'; // Updates Scope property
+ctx.log.info('msg3'); // Row 4
 ```
 
-**Arrow output**:
+**Arrow output behavior**:
+
+Since scope values are read at Arrow conversion time, ALL rows will have the LATEST scope value:
 
 ```
 | row | logMessage | userId |
 |-----|------------|--------|
-| 0   | null       | u1     |  <- rows 0-3 have old value
-| 1   | null       | u1     |
-| 2   | 'msg1'     | u1     |
-| 3   | 'msg2'     | u1     |
-| 4   | 'msg3'     | u2     |  <- row 4+ have new value
+| 0   | null       | u2     |  <- Latest scope value
+| 1   | null       | u2     |
+| 2   | 'msg1'     | u2     |
+| 3   | 'msg2'     | u2     |
+| 4   | 'msg3'     | u2     |
 ```
+
+**Important**: If you need different values per row, use `ctx.tag` which writes to row 0 immediately, or write directly
+to the column. Scope is designed for values that apply to the ENTIRE span.
 
 ## Usage Patterns
 
@@ -552,15 +654,18 @@ export const get = task('http-get', async (ctx, url, options = {}) => {
 
 ### Summary Table
 
-| Operation                         | Allocation      | Cost                                      |
-| --------------------------------- | --------------- | ----------------------------------------- |
-| First `scope.X = value`           | None            | O(1) - just set \_scopeValue              |
-| Second `scope.X = value`          | Yes             | O(n) - allocate + fill to writeIndex      |
-| `scope.X` (getter)                | None            | O(1) - just return \_scopeValue           |
-| `tag.X(value)`                    | Yes             | O(n) - allocate + fill with scope + write |
-| `log.info(msg)`                   | Only logMessage | O(1) - single column write                |
-| Arrow conversion (scope column)   | Yes if lazy     | O(n) - allocate + fill                    |
-| Arrow conversion (written column) | None            | O(1) - zero-copy subarray                 |
+| Operation                            | Allocation      | Cost                                   |
+| ------------------------------------ | --------------- | -------------------------------------- |
+| First `scope.X = value` (parent)     | None            | O(1) - just set Scope property         |
+| Second `scope.X = value` (parent)    | None            | O(1) - just update Scope property      |
+| `scope.X` (getter)                   | None            | O(1) - just return Scope property      |
+| Child span creation with scope       | Yes (pre-fill)  | O(n\*m) - SIMD fill for m scope values |
+| `tag.X(value)`                       | Yes             | O(n) - allocate + write                |
+| `log.info(msg)` (parent)             | Only logMessage | O(1) - single column write             |
+| `log.info(msg)` (child, pre-filled)  | Only logMessage | O(1) - write to pre-filled columns     |
+| Arrow conversion (pre-filled column) | None            | O(1) - zero-copy subarray              |
+| Arrow conversion (scope-only column) | Yes             | O(n) - allocate + fill                 |
+| Arrow conversion (written column)    | None            | O(1) - zero-copy subarray              |
 
 ### Comparison with Repetitive Tagging
 
@@ -575,24 +680,36 @@ ctx.log.info('Step 3');
 // Total: Multiple allocations, 6 attribute writes + 3 log operations
 
 // WITH scope - O(1) per log operation after initial setup
-ctx.scope.userId = 'user123'; // One-time setup, NO allocation
-ctx.scope.requestId = 'req456'; // One-time setup, NO allocation
-ctx.log.info('Step 1'); // userId, requestId already scoped
-ctx.log.info('Step 2'); // userId, requestId already scoped
-ctx.log.info('Step 3'); // userId, requestId already scoped
-// Total: 0 allocations during hot path, scope columns filled at Arrow conversion
+ctx.scope.userId = 'user123'; // One-time setup, NO allocation (parent span)
+ctx.scope.requestId = 'req456'; // One-time setup, NO allocation (parent span)
+ctx.log.info('Step 1'); // userId, requestId filled at Arrow conversion
+ctx.log.info('Step 2'); // userId, requestId filled at Arrow conversion
+ctx.log.info('Step 3'); // userId, requestId filled at Arrow conversion
+// Total: 0 allocations during hot path, scope columns filled at Arrow conversion (cold path)
+
+// WITH scope - child spans get pre-filled columns (SIMD optimized)
+await ctx.span('child', async (childCtx) => {
+  // Child buffer PRE-FILLED with userId, requestId during span creation (SIMD)
+  childCtx.log.info('Step 1'); // Writes to pre-filled columns (already allocated)
+  childCtx.log.info('Step 2'); // Writes to pre-filled columns (already allocated)
+  childCtx.log.info('Step 3'); // Writes to pre-filled columns (already allocated)
+  // Total: One-time SIMD pre-fill at span creation, zero allocation during hot path
+});
 ```
 
 ### Comparison with ctx.tag
 
-| Aspect                | ctx.tag               | ctx.scope                       |
-| --------------------- | --------------------- | ------------------------------- |
-| Writes to row 0       | Yes                   | No (unless also using tag)      |
-| Appears on all rows   | No (row 0 only)       | Yes (at Arrow conversion)       |
-| Allocates on call     | Yes                   | No (first assignment)           |
-| Inherited by children | No                    | Yes                             |
-| Can read value        | No                    | Yes (via getter)                |
-| Use case              | Span-level attributes | Request context flowing through |
+| Aspect                 | ctx.tag               | ctx.scope                                       |
+| ---------------------- | --------------------- | ----------------------------------------------- |
+| Writes to row 0        | Yes                   | No (unless also using tag)                      |
+| Appears on all rows    | No (row 0 only)       | Yes (at Arrow conversion)                       |
+| Allocates on call      | Yes                   | No (just sets Scope property)                   |
+| Pre-fills child buffer | No                    | Yes (SIMD optimized)                            |
+| Inherited by children  | No                    | Yes                                             |
+| Can read value         | No                    | Yes (via getter)                                |
+| Use case               | Span-level attributes | Request context flowing through                 |
+| Performance (parent)   | Immediate allocation  | Deferred to Arrow conversion                    |
+| Performance (child)    | Not applicable        | Pre-filled via SIMD, zero-copy on Arrow convert |
 
 ## Integration with Existing Systems
 
@@ -632,16 +749,24 @@ if (ctx.ff.advancedValidation) {
 Scoped attributes are handled efficiently during background processing:
 
 ```typescript
-// Arrow conversion recognizes lazy columns (direct properties on buffer)
-const createArrowVectors = (spanBuffer) => {
+// Arrow conversion uses buffer helper methods and scope values
+const createArrowVectors = (spanBuffer, scope) => {
+  const scopeValues = scope._getScopeValues();
+
   return {
     // Standard columns - zero-copy
-    timestamp: arrow.Float64Vector.from(spanBuffer.timestamps.slice(0, spanBuffer.writeIndex)),
+    timestamp: arrow.Float64Vector.from(spanBuffer.timestamps.subarray(0, spanBuffer.writeIndex)),
 
-    // Scoped attributes - filled at conversion time (many duplicate values compress well)
-    // LazyColumns are DIRECT properties on buffer (no nested .columns)
-    user_id: arrow.Utf8Vector.from(spanBuffer.attr_userId.getValuesForArrow(spanBuffer.writeIndex)),
-    request_id: arrow.Utf8Vector.from(spanBuffer.attr_requestId.getValuesForArrow(spanBuffer.writeIndex)),
+    // Scoped attributes - check if allocated, fill from scope if not
+    // Column properties are DIRECT on buffer via lazy getters (no nested .columns)
+    user_id: arrow.Utf8Vector.from(
+      spanBuffer.getColumnIfAllocated('attr_userId')?.subarray(0, spanBuffer.writeIndex) ??
+        fillArray(new Uint32Array(spanBuffer.writeIndex), scopeValues.userId)
+    ),
+    request_id: arrow.Utf8Vector.from(
+      spanBuffer.getColumnIfAllocated('attr_requestId')?.subarray(0, spanBuffer.writeIndex) ??
+        fillArray(new Uint32Array(spanBuffer.writeIndex), scopeValues.requestId)
+    ),
   };
 };
 
@@ -651,19 +776,23 @@ const createArrowVectors = (spanBuffer) => {
 
 ## Benefits Summary
 
-1. **Zero Hot-Path Allocation**: Scoped attributes don't allocate TypedArrays until Arrow conversion
-2. **Consistency**: Impossible to forget important contextual attributes
-3. **Clean Code**: Business logic focuses on domain concerns, not logging boilerplate
-4. **Hierarchical Context**: Child spans automatically inherit parent context
-5. **Memory Efficient**: Lazy columns defer allocation to cold path
-6. **Compression Friendly**: Repeated scoped values compress extremely well in Parquet
-7. **Type Safe**: Full TypeScript inference for scoped attribute names and types
-8. **Middleware Integration**: Perfect fit for request-level context setup
-9. **Readable Scope**: Can read scope values via getters (e.g., `ctx.scope.userId`)
-10. **Zero Indirection**: LazyColumn properties are direct on SpanBuffer (no nested Record)
+1. **Separate Scope Storage**: Scope values stored in dedicated Scope class, not mixed with buffer columns
+2. **Zero Parent Allocation**: Parent span scope sets properties only, NO buffer allocation
+3. **SIMD Pre-filling**: Child buffers pre-filled with `TypedArray.fill()` for optimal performance
+4. **Consistency**: Impossible to forget important contextual attributes
+5. **Clean Code**: Business logic focuses on domain concerns, not logging boilerplate
+6. **Hierarchical Context**: Child spans automatically inherit parent context via pre-filling
+7. **Predictable Performance**: Pre-filling eliminates deferred allocation surprises
+8. **Compression Friendly**: Repeated scoped values compress extremely well in Parquet
+9. **Type Safe**: Full TypeScript inference for scoped attribute names and types
+10. **Middleware Integration**: Perfect fit for request-level context setup
+11. **Readable Scope**: Can read scope values via getters (e.g., `ctx.scope.userId`)
+12. **Zero Indirection**: Column properties are direct on SpanBuffer via lazy getters (no nested Record)
+13. **Cache-Friendly**: Pre-filling creates contiguous memory writes for better cache utilization
 
 This scope-based approach transforms logging from a repetitive, error-prone task into a clean, consistent, and
-performant operation that scales naturally with complex request flows.
+performant operation that scales naturally with complex request flows. The separation of scope storage from column
+storage enables SIMD optimization for child span creation while maintaining zero allocation for parent spans.
 
 ## Integration Points
 
@@ -671,8 +800,8 @@ This span scope attributes system integrates with:
 
 - **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides the foundational context
   creation and inheritance mechanisms
-- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: LazyColumn implementation for deferred
-  allocation
+- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Lazy getter implementation for deferred
+  column allocation
 - **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Shows how the `ctx.scope` API is generated at
   runtime
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Demonstrates how libraries can use scoped

@@ -2,7 +2,12 @@
 
 ## 📚 BEFORE WRITING CODE, READ THESE SPECS:
 
-### Core System (Read First)
+### Package Architecture (Read FIRST!)
+
+- **Package Architecture**: specs/00_package_architecture.md - Defines arrow-builder vs lmao responsibilities,
+  dependency direction, what each package OWNS and MUST NOT know about
+
+### Core System
 
 - **System Overview**: specs/01_trace_logging_system.md - Architecture overview & hot/cold path design
 - **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, tag attributes, feature flags
@@ -34,74 +39,76 @@
 
 ## 🏗️ PACKAGE ARCHITECTURE - TWO SIBLING PACKAGES:
 
-### @packages/arrow-builder - Low-Level Buffer Engine
+> **See specs/00_package_architecture.md for complete details including WHY each decision was made.**
 
-**Purpose**: Fast memory layouts and Arrow-ready storage (hot path)
+### @packages/arrow-builder - Low-Level Alternative to apache-arrow
+
+**Purpose**: Explicit, visible allocations for Arrow table construction (NOT Apache Arrow's hidden resizing!)
 
 **Owns**:
 
-- Cache-aligned TypedArray buffer creation (specs/01b, 01b_overview, 01b1)
-- Null bitmap management
-- Self-tuning capacity & buffer chaining (specs/01b2)
-- String interning for categories
-- Equal-length array enforcement
-- Zero-copy conversion to Arrow format (specs/01f)
-- SpanBuffer, TypedArray types, ModuleContext, TaskContext
+- Cache-aligned TypedArray buffer creation (64-byte alignment)
+- Lazy column storage pattern (nulls + values share ONE ArrayBuffer per column)
+- Null bitmap management (Arrow format)
+- Runtime class generation via `new Function()` for V8 optimization
+- Schema extensibility via composition (NOT inheritance)
+- Zero-copy Arrow conversion
 
-**Does NOT know about**:
+**CRITICAL - Does NOT know about**:
 
-- Fluent APIs (ctx.tag, ctx.log)
-- Schema ergonomics (S.enum/category/text)
-- Feature flags
-- Context propagation
-- Entry type semantics
+- ❌ Logging/tracing concepts (spans, traces, contexts)
+- ❌ Entry types (info, warn, error, span-start)
+- ❌ The `attr_` prefix convention
+- ❌ Scope or scoped attributes
+- ❌ System vs user column distinction
+- ❌ Any `@smoothbricks/lmao` dependency
 
 **Key Files**:
 
-- `src/lib/buffer/types.ts` - Buffer interfaces
-- `src/lib/buffer/createBuilders.ts` - TypedArray column creation
-- `src/lib/buffer/createSpanBuffer.ts` - Buffer allocation
-- `src/lib/buffer/convertToArrow.ts` - Zero-copy Arrow table conversion
+- `src/lib/buffer/types.ts` - ColumnBuffer interface
+- `src/lib/buffer/columnBufferGenerator.ts` - new Function() codegen for lazy columns
+- `src/lib/buffer/createColumnBuffer.ts` - Buffer factory
+- `src/lib/schema-types.ts` - Generic schema types
 
 ### @packages/lmao - High-Level Logging/Runtime
 
-**Purpose**: Developer ergonomics and schema-aware orchestration
+**Purpose**: Developer ergonomics with zero-allocation hot path
 
 **Owns**:
 
-- Schema system (S.enum/category/text) (specs/01a)
-- Tag attribute definitions with masking
-- Feature flag evaluation (specs/01a)
-- Context propagation (request→module→task→span) (specs/01c)
+- Schema DSL (S.enum/category/text/number/boolean) (specs/01a)
+- Tag attribute definitions with masking and `attr_` prefix
+- **System columns (timestamps, operations) - ALWAYS eager, never lazy**
+- **Scope class generation - SEPARATE from buffer columns**
+- SpanBuffer creation (extends ColumnBuffer with span metadata)
 - SpanLogger/ctx API generation (specs/01g, 01j)
 - Fluent logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/01h)
-- Span scope attributes (specs/01i)
+- Context propagation (request→module→task→span) (specs/01c)
+- Feature flag evaluation (specs/01a)
 - Library integration & prefixing (specs/01e)
-- Entry type orchestration (specs/01h)
-- AI agent integration (specs/01d)
 
-**Does NOT**:
+**Key Architectural Decisions**:
 
-- Create raw TypedArrays (calls arrow-builder)
-- Manage buffer capacity/chaining
-- Handle Arrow conversion
+- System columns NEVER lazy (written every entry, zero conditionals)
+- User attribute columns lazy by default (sparse data)
+- Scope is a SEPARATE generated class (NOT stored in lazy columns)
+- Direct properties on SpanBuffer (attr*$name_nulls + attr*$name_values)
 
 **Key Files**:
 
 - `src/lib/schema/` - Schema builders, tag attributes, feature flags
-- `src/lib/lmao.ts` - Main integration, context creation, task wrappers
-- `src/lib/codegen/spanLoggerGenerator.ts` - Runtime SpanLogger class generation
-- `src/lib/library.ts` - Library integration with prefix support
-- `src/lib/flushScheduler.ts` - Background flush scheduler
+- `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation
+- `src/lib/codegen/scopeGenerator.ts` - Scope class generation (SEPARATE from buffer)
+- `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer)
+- `src/lib/lmao.ts` - Main integration, context creation
+- `src/lib/types.ts` - SpanBuffer, TaskContext interfaces
 
-**Relationship**: Lmao calls arrow-builder functions to write bytes, arrow-builder imports lmao types for schema
-metadata.
+**Relationship**: lmao depends on arrow-builder. arrow-builder MUST NOT depend on lmao.
 
 ## 🚫 CRITICAL RULES:
 
 - **Hot Path**: TypedArray assignments ONLY in arrow-builder. No Arrow builders, no objects!
-- **Package Imports**: arrow-builder can import from `@smoothbricks/lmao`, lmao can import from
-  `@smoothbricks/arrow-builder`
+- **Package Imports**: lmao can import from `@smoothbricks/arrow-builder`. arrow-builder MUST NOT import from lmao!
 - **DO NOT**: Use Apache Arrow builders in hot path - only TypedArray assignments per
   specs/01b_columnar_buffer_architecture.md
 - **⚠️ SEARCH BEFORE IMPLEMENTING**: Before writing ANY new code, ALWAYS search for existing implementations in BOTH

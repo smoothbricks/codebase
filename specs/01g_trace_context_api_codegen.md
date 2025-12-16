@@ -143,33 +143,46 @@ class TraceContext {
 
 ## Scope API Code Generation
 
-### ctx.scope as Compiled Class with Getters/Setters
+### ctx.scope as SEPARATE Compiled Class (NOT stored in buffer columns)
 
-The `ctx.scope` API is a `new Function()` compiled class (like ctx.tag) that provides getters and setters for each
-schema attribute. This allows user code to both read and write scope values.
+The `ctx.scope` API is a `new Function()` compiled class that is **SEPARATE from buffer columns**. Scope values are
+stored as plain JavaScript properties in the Scope instance, not in TypedArrays.
+
+This separation enables:
+
+1. **Zero allocation on scope set** - just sets a property
+2. **SIMD pre-filling** - child spans can use TypedArray.fill() with parent scope values
+3. **Clean inheritance** - \_getScopeValues() extracts all values for copying to child spans
 
 ```typescript
 // Generated at module creation time (cold path)
 function generateScopeClass(schema: Schema): typeof ScopeAPI {
-  const getterSetterCode = Object.keys(schema)
+  // Generate private fields and accessors for each schema attribute
+  const privateFields = Object.keys(schema)
+    .map((key) => `_${key} = undefined;`)
+    .join('\n');
+
+  const accessors = Object.keys(schema)
     .map(
       (key) => `
-    get ${key}() {
-      return this.buffer.attr_${key}.scopeValue;
-    }
-    set ${key}(value) {
-      this.buffer.attr_${key}.setScope(value);
-    }
+    get ${key}() { return this._${key}; }
+    set ${key}(value) { this._${key} = value; }
   `
     )
     .join('\n');
 
+  // Generate _getScopeValues() for inheritance
+  const getScopeValuesBody = Object.keys(schema)
+    .map((k) => `${k}: this._${k}`)
+    .join(', ');
+
   const classCode = `
     return class GeneratedScope {
-      constructor(buffer) {
-        this.buffer = buffer;
+      ${privateFields}
+      ${accessors}
+      _getScopeValues() {
+        return { ${getScopeValuesBody} };
       }
-      ${getterSetterCode}
     };
   `;
 
@@ -178,25 +191,37 @@ function generateScopeClass(schema: Schema): typeof ScopeAPI {
 
 // Example generated class for a schema with userId and requestId:
 class GeneratedScope {
-  constructor(private buffer: SpanBuffer) {}
+  // Private fields (plain JavaScript, NOT TypedArrays)
+  _userId = undefined;
+  _requestId = undefined;
 
-  get userId(): string | undefined {
-    return this.buffer.attr_userId.scopeValue as string | undefined;
+  get userId() {
+    return this._userId;
+  }
+  set userId(value) {
+    this._userId = value;
   }
 
-  set userId(value: string) {
-    this.buffer.attr_userId.setScope(value);
+  get requestId() {
+    return this._requestId;
+  }
+  set requestId(value) {
+    this._requestId = value;
   }
 
-  get requestId(): string | undefined {
-    return this.buffer.attr_requestId.scopeValue as string | undefined;
-  }
-
-  set requestId(value: string) {
-    this.buffer.attr_requestId.setScope(value);
+  // Extract all values for child span inheritance
+  _getScopeValues() {
+    return {
+      userId: this._userId,
+      requestId: this._requestId,
+    };
   }
 }
 ```
+
+**Key Design Point**: The Scope class does NOT reference the buffer at all. Scope values are applied to buffer columns
+during write operations or pre-fill operations, NOT stored in the buffer. See 01i_span_scope_attributes.md for the full
+scope lifecycle.
 
 ### Usage Pattern
 
@@ -420,17 +445,29 @@ The generated column writers directly populate Arrow-compatible TypedArrays:
 ```typescript
 // Arrow conversion uses EXISTING SpanBuffer TypedArrays directly (zero-copy)
 const createArrowVectors = (spanBuffer: SpanBuffer) => {
+  const writeIndex = spanBuffer.writeIndex;
   return {
     // Zero-copy: slice existing cache-aligned TypedArrays to actual write length
-    timestamp: arrow.Float64Vector.from(spanBuffer.timestamps.slice(0, spanBuffer.writeIndex)),
-    span_id: arrow.Int64Vector.from(generateSpanIds(spanBuffer)),
-    entry_type: arrow.Utf8Vector.from(spanBuffer.operations.slice(0, spanBuffer.writeIndex)),
+    timestamp: arrow.Float64Vector.from(spanBuffer.timestamps.slice(0, writeIndex)),
+
+    // Span identification columns (separate columns, not Struct)
+    // thread_id and span_id are constant per buffer, filled for each row
+    thread_id: createUint64Column(spanBuffer.threadId, writeIndex),
+    span_id: createUint32Column(spanBuffer.spanId, writeIndex),
+    parent_thread_id: spanBuffer.parent
+      ? createUint64Column(spanBuffer.parent.threadId, writeIndex)
+      : createNullUint64Column(writeIndex),
+    parent_span_id: spanBuffer.parent
+      ? createUint32Column(spanBuffer.parent.spanId, writeIndex)
+      : createNullUint32Column(writeIndex),
+
+    entry_type: arrow.Utf8Vector.from(spanBuffer.operations.slice(0, writeIndex)),
 
     // Generated attribute columns - zero-copy from existing arrays
-    http_status: arrow.Int32Vector.from(spanBuffer.attr_http_status.slice(0, spanBuffer.writeIndex)),
-    http_method: arrow.Utf8Vector.from(spanBuffer.attr_http_method.slice(0, spanBuffer.writeIndex)),
-    http_url: arrow.Utf8Vector.from(spanBuffer.attr_http_url.slice(0, spanBuffer.writeIndex)),
-    http_duration: arrow.Float64Vector.from(spanBuffer.attr_http_duration.slice(0, spanBuffer.writeIndex)),
+    http_status: arrow.Int32Vector.from(spanBuffer.attr_http_status.slice(0, writeIndex)),
+    http_method: arrow.Utf8Vector.from(spanBuffer.attr_http_method.slice(0, writeIndex)),
+    http_url: arrow.Utf8Vector.from(spanBuffer.attr_http_url.slice(0, writeIndex)),
+    http_duration: arrow.Float64Vector.from(spanBuffer.attr_http_duration.slice(0, writeIndex)),
   };
 };
 ```
@@ -440,7 +477,7 @@ const createArrowVectors = (spanBuffer: SpanBuffer) => {
 ### Dynamic Schema Updates
 
 - Hot-reload schema changes without restarting
-- Backward compatibility with existing traces
+- Schema evolution with version compatibility for stored traces
 - Schema versioning and migration support
 
 ### Advanced Type Features

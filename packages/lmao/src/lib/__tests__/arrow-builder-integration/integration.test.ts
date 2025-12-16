@@ -71,7 +71,7 @@ describe('Buffer Integration', () => {
     const buf = createSpanBuffer(tagAttributes, taskContext, capacity);
 
     // Core TypedArrays exist
-    expect(buf.timestamps).toBeInstanceOf(Float64Array);
+    expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
     expect(buf.operations).toBeInstanceOf(Uint8Array);
 
     // Attribute columns exist with correct types

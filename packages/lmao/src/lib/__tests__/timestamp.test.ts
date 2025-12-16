@@ -1,53 +1,65 @@
 import { describe, expect, it } from 'bun:test';
 
-import { createTimeAnchor, getTimestampMicros } from '../timestamp.js';
+import { getTimestampNanos, Nanoseconds } from '../timestamp.js';
 
 describe('ES Timestamp (performance.now)', () => {
-  describe('createTimeAnchor', () => {
-    it('should return anchor with epoch and perf values', () => {
-      const anchor = createTimeAnchor();
-      expect(anchor.anchorEpochMicros).toBeGreaterThan(0);
-      expect(anchor.anchorPerfNow).toBeGreaterThan(0);
-      // Epoch should be roughly Date.now() * 1000
-      expect(anchor.anchorEpochMicros).toBeCloseTo(Date.now() * 1000, -4); // within 10ms
+  describe('getTimestampNanos', () => {
+    it('should return a bigint', () => {
+      const ts = getTimestampNanos();
+      expect(typeof ts).toBe('bigint');
     });
 
-    it('should return flat object (not nested)', () => {
-      const anchor = createTimeAnchor();
-      expect(typeof anchor.anchorEpochMicros).toBe('number');
-      expect(typeof anchor.anchorPerfNow).toBe('number');
-      expect(Object.keys(anchor)).toEqual(['anchorEpochMicros', 'anchorPerfNow']);
+    it('should return increasing timestamps', async () => {
+      const ts1 = getTimestampNanos();
+      await new Promise((r) => setTimeout(r, 10));
+      const ts2 = getTimestampNanos();
+
+      expect(ts2).toBeGreaterThan(ts1);
+      // Should be roughly 10_000_000 nanoseconds apart (10ms)
+      const diff = ts2 - ts1;
+      expect(diff).toBeGreaterThan(5_000_000n); // > 5ms
+      expect(diff).toBeLessThan(50_000_000n); // < 50ms
+    });
+
+    it('should return timestamps close to epoch time in nanoseconds', () => {
+      const ts = getTimestampNanos();
+      const expectedNanos = BigInt(Date.now()) * 1_000_000n;
+      // Should be within 1 second of Date.now()
+      const diff = ts > expectedNanos ? ts - expectedNanos : expectedNanos - ts;
+      expect(diff).toBeLessThan(1_000_000_000n); // within 1 second
+    });
+
+    it('should be efficient (no allocations beyond BigInt)', () => {
+      // Just verify it doesn't throw and returns bigint
+      for (let i = 0; i < 1000; i++) {
+        const ts = getTimestampNanos();
+        expect(typeof ts).toBe('bigint');
+      }
     });
   });
 
-  describe('getTimestampMicros', () => {
-    it('should return increasing timestamps', async () => {
-      const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
-      const ts1 = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
-      await new Promise((r) => setTimeout(r, 10));
-      const ts2 = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
-
-      expect(ts2).toBeGreaterThan(ts1);
-      // Should be roughly 10000 microseconds apart (10ms)
-      expect(ts2 - ts1).toBeGreaterThan(5000);
-      expect(ts2 - ts1).toBeLessThan(50000);
+  describe('Nanoseconds namespace', () => {
+    it('should export now() function', () => {
+      const ts = Nanoseconds.now();
+      expect(typeof ts).toBe('bigint');
     });
 
-    it('should return timestamps in microseconds (16 digits)', () => {
-      const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
-      const ts = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
-      const digits = Math.floor(ts).toString().length;
-      expect(digits).toBeGreaterThanOrEqual(15);
-      expect(digits).toBeLessThanOrEqual(17);
+    it('should export fromMillis()', () => {
+      const ms = 1000;
+      const ns = Nanoseconds.fromMillis(ms);
+      expect(ns).toBe(1_000_000_000n);
     });
 
-    it('should be zero-allocation (just arithmetic)', () => {
-      const { anchorEpochMicros, anchorPerfNow } = createTimeAnchor();
-      // Just verify it doesn't throw and returns a number
-      for (let i = 0; i < 1000; i++) {
-        const ts = getTimestampMicros(anchorEpochMicros, anchorPerfNow);
-        expect(typeof ts).toBe('number');
-      }
+    it('should export toMillis()', () => {
+      const ns = Nanoseconds.fromMillis(1234);
+      const ms = Nanoseconds.toMillis(ns);
+      expect(ms).toBe(1234);
+    });
+
+    it('should export unsafe()', () => {
+      const raw = 123456789n;
+      const ns = Nanoseconds.unsafe(raw);
+      expect(ns).toBe(raw);
     });
   });
 });

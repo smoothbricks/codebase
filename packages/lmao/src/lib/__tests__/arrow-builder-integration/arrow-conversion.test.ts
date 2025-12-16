@@ -71,7 +71,7 @@ function createMockTaskContext(schema: TagAttributeSchema): TaskContext {
 function writeRow(
   buffer: SpanBuffer,
   data: {
-    timestamp: number;
+    timestamp: bigint;
     operation: number;
     attributes?: Record<string, unknown>;
   },
@@ -198,7 +198,7 @@ describe('Arrow Table Conversion', () => {
 
       // Write a row
       writeRow(buffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 3, // tag
         attributes: {
           count: 42,
@@ -246,7 +246,7 @@ describe('Arrow Table Conversion', () => {
       // Write multiple rows
       for (let i = 0; i < 5; i++) {
         writeRow(buffer, {
-          timestamp: 1000 + i,
+          timestamp: 1000n + BigInt(i),
           operation: 3,
           attributes: { value: i * 10 },
         });
@@ -281,19 +281,19 @@ describe('Arrow Table Conversion', () => {
 
       // Write rows with mix of null and non-null
       writeRow(buffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 3,
         attributes: { value: 42 },
       });
 
       writeRow(buffer, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 3,
         attributes: { value: null },
       });
 
       writeRow(buffer, {
-        timestamp: 3000,
+        timestamp: 3000n,
         operation: 3,
         attributes: { value: 100 },
       });
@@ -324,7 +324,7 @@ describe('Arrow Table Conversion', () => {
       // Write rows with all nulls
       for (let i = 0; i < 3; i++) {
         writeRow(buffer, {
-          timestamp: 1000 + i,
+          timestamp: 1000n + BigInt(i),
           operation: 3,
           attributes: { optional: null },
         });
@@ -358,19 +358,19 @@ describe('Arrow Table Conversion', () => {
 
       // Write rows with enum values (stored as indices 0, 1, 2)
       writeRow(buffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 3,
         attributes: { status: 0 }, // 'pending'
       });
 
       writeRow(buffer, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 3,
         attributes: { status: 2 }, // 'completed'
       });
 
       writeRow(buffer, {
-        timestamp: 3000,
+        timestamp: 3000n,
         operation: 3,
         attributes: { status: 1 }, // 'active'
       });
@@ -400,19 +400,19 @@ describe('Arrow Table Conversion', () => {
 
       // Write rows with category values (stored as raw strings on hot path)
       writeRow(buffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 3,
         attributes: { userId: 'user-123' },
       });
 
       writeRow(buffer, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 3,
         attributes: { userId: 'user-456' },
       });
 
       writeRow(buffer, {
-        timestamp: 3000,
+        timestamp: 3000n,
         operation: 3,
         attributes: { userId: 'user-123' }, // Repeated
       });
@@ -442,19 +442,19 @@ describe('Arrow Table Conversion', () => {
 
       // Write text messages (stored as raw strings on hot path)
       writeRow(buffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 3,
         attributes: { message: 'First message' },
       });
 
       writeRow(buffer, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 3,
         attributes: { message: 'Second message' },
       });
 
       writeRow(buffer, {
-        timestamp: 3000,
+        timestamp: 3000n,
         operation: 3,
         attributes: { message: 'Third message' },
       });
@@ -487,7 +487,7 @@ describe('Arrow Table Conversion', () => {
       // Fill first buffer
       for (let i = 0; i < 3; i++) {
         writeRow(buffer, {
-          timestamp: 1000 + i,
+          timestamp: 1000n + BigInt(i),
           operation: 3,
           attributes: { value: i },
         });
@@ -499,7 +499,7 @@ describe('Arrow Table Conversion', () => {
       // Fill chained buffer
       for (let i = 0; i < 2; i++) {
         writeRow(nextBuffer, {
-          timestamp: 2000 + i,
+          timestamp: 2000n + BigInt(i),
           operation: 3,
           attributes: { value: 10 + i },
         });
@@ -537,22 +537,22 @@ describe('Arrow Table Conversion', () => {
       spanNameInterner.intern('test-span');
 
       const originalThreadId = buffer.threadId;
-      const originalLocalSpanId = buffer.localSpanId;
+      const originalSpanId = buffer.spanId;
 
       writeRow(buffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 3,
         attributes: { value: 1 },
       });
 
       const nextBuffer = createNextBuffer(buffer);
 
-      // Chained buffer should have same threadId and localSpanId (continuation)
+      // Chained buffer should have same threadId and spanId (continuation)
       expect(nextBuffer.threadId).toBe(originalThreadId);
-      expect(nextBuffer.localSpanId).toBe(originalLocalSpanId);
+      expect(nextBuffer.spanId).toBe(originalSpanId);
 
       writeRow(nextBuffer, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 3,
         attributes: { value: 2 },
       });
@@ -560,16 +560,14 @@ describe('Arrow Table Conversion', () => {
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       const batch = table.batches[0];
+      const threadIdVector = batch.getChild('thread_id');
       const spanIdVector = batch.getChild('span_id');
 
-      // Both rows should have same span_id struct (thread + local)
-      const spanId0 = spanIdVector?.get(0) as { thread: bigint; local: number };
-      const spanId1 = spanIdVector?.get(1) as { thread: bigint; local: number };
-
-      expect(spanId0.thread).toBe(originalThreadId);
-      expect(spanId0.local).toBe(originalLocalSpanId);
-      expect(spanId1.thread).toBe(originalThreadId);
-      expect(spanId1.local).toBe(originalLocalSpanId);
+      // Both rows should have same thread_id and span_id
+      expect(threadIdVector?.get(0)).toBe(originalThreadId);
+      expect(threadIdVector?.get(1)).toBe(originalThreadId);
+      expect(spanIdVector?.get(0)).toBe(originalSpanId);
+      expect(spanIdVector?.get(1)).toBe(originalSpanId);
     });
   });
 
@@ -589,7 +587,7 @@ describe('Arrow Table Conversion', () => {
 
       // Write to parent
       writeRow(parentBuffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 5, // span-start
         attributes: { value: 1 },
       });
@@ -600,20 +598,20 @@ describe('Arrow Table Conversion', () => {
 
       // Write to child
       writeRow(childBuffer, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 5, // span-start
         attributes: { value: 2 },
       });
 
       writeRow(childBuffer, {
-        timestamp: 3000,
+        timestamp: 3000n,
         operation: 6, // span-ok
         attributes: { value: 3 },
       });
 
       // Close parent
       writeRow(parentBuffer, {
-        timestamp: 4000,
+        timestamp: 4000n,
         operation: 6, // span-ok
         attributes: { value: 4 },
       });
@@ -623,30 +621,32 @@ describe('Arrow Table Conversion', () => {
       // Should have rows from both parent and child
       expect(table.numRows).toBe(4);
 
-      // Verify parent-child relationship via span IDs
+      // Verify parent-child relationship via span IDs (now separate columns)
       const batch = table.batches[0];
+      const threadIdVector = batch.getChild('thread_id');
       const spanIdVector = batch.getChild('span_id');
+      const parentThreadIdVector = batch.getChild('parent_thread_id');
       const parentSpanIdVector = batch.getChild('parent_span_id');
 
-      // Get span_id struct for parent (rows 0-1) and child (rows 2-3)
-      const parentSpanId = spanIdVector?.get(0) as { thread: bigint; local: number };
-      const childSpanId = spanIdVector?.get(2) as { thread: bigint; local: number };
+      // Get thread_id and span_id for parent (rows 0-1) and child (rows 2-3)
+      const parentThreadId = threadIdVector?.get(0) as bigint;
+      const parentSpanId = spanIdVector?.get(0) as number;
+      const childSpanId = spanIdVector?.get(2) as number;
 
-      // Parent rows should have null parent_span_id
+      // Parent rows should have null parent_thread_id and parent_span_id
+      expect(parentThreadIdVector?.get(0)).toBe(null);
       expect(parentSpanIdVector?.get(0)).toBe(null);
+      expect(parentThreadIdVector?.get(1)).toBe(null);
       expect(parentSpanIdVector?.get(1)).toBe(null);
 
-      // Child rows' parent_span_id should match parent's span_id (by value, not reference)
-      const childParentSpanId0 = parentSpanIdVector?.get(2) as { thread: bigint; local: number };
-      const childParentSpanId1 = parentSpanIdVector?.get(3) as { thread: bigint; local: number };
+      // Child rows' parent IDs should match parent's span IDs
+      expect(parentThreadIdVector?.get(2)).toBe(parentThreadId);
+      expect(parentSpanIdVector?.get(2)).toBe(parentSpanId);
+      expect(parentThreadIdVector?.get(3)).toBe(parentThreadId);
+      expect(parentSpanIdVector?.get(3)).toBe(parentSpanId);
 
-      expect(childParentSpanId0.thread).toBe(parentSpanId.thread);
-      expect(childParentSpanId0.local).toBe(parentSpanId.local);
-      expect(childParentSpanId1.thread).toBe(parentSpanId.thread);
-      expect(childParentSpanId1.local).toBe(parentSpanId.local);
-
-      // Child span should have different localSpanId from parent
-      expect(childSpanId.local).not.toBe(parentSpanId.local);
+      // Child span should have different spanId from parent
+      expect(childSpanId).not.toBe(parentSpanId);
     });
 
     test('converts deep span hierarchy', () => {
@@ -663,7 +663,7 @@ describe('Arrow Table Conversion', () => {
       spanNameInterner.intern('span');
 
       writeRow(root, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 5,
         attributes: { depth: 0 },
       });
@@ -673,7 +673,7 @@ describe('Arrow Table Conversion', () => {
       const child1 = createChildSpanBuffer(root, child1Context);
 
       writeRow(child1, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 5,
         attributes: { depth: 1 },
       });
@@ -683,7 +683,7 @@ describe('Arrow Table Conversion', () => {
       const child2 = createChildSpanBuffer(child1, child2Context);
 
       writeRow(child2, {
-        timestamp: 3000,
+        timestamp: 3000n,
         operation: 5,
         attributes: { depth: 2 },
       });
@@ -726,7 +726,7 @@ describe('Arrow Table Conversion', () => {
 
       for (const entryType of entryTypes) {
         writeRow(buffer, {
-          timestamp: 1000,
+          timestamp: 1000n,
           operation: entryType.code,
         });
       }
@@ -753,7 +753,7 @@ describe('Arrow Table Conversion', () => {
       spanNameInterner.intern('test-span');
 
       writeRow(buffer, {
-        timestamp: 1000,
+        timestamp: 1000n,
         operation: 5,
       });
 
@@ -761,7 +761,7 @@ describe('Arrow Table Conversion', () => {
       const childBuffer = createChildSpanBuffer(buffer, childContext);
 
       writeRow(childBuffer, {
-        timestamp: 2000,
+        timestamp: 2000n,
         operation: 5,
       });
 

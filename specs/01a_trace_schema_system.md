@@ -20,6 +20,403 @@ requirements. The system optimizes each type appropriately rather than forcing t
 | **Feature Flags**         | Schema + evaluator  | Always   | Cached + analytics | A/B testing, rollouts |
 | **Environment Variables** | Plain object        | Never    | Property access    | Infrastructure config |
 
+### String Type Performance Characteristics
+
+LMAO provides three distinct string types with different storage strategies optimized for different access patterns:
+
+| Type         | Storage (Hot Path)       | Dictionary (Cold Path)           | Memory Growth     | Use Case                     |
+| ------------ | ------------------------ | -------------------------------- | ----------------- | ---------------------------- |
+| **ENUM**     | Uint8Array (1 byte)      | Pre-allocated, sorted at startup | Bounded (fixed)   | Known compile-time values    |
+| **CATEGORY** | Uint32Array indices (4B) | Sorted, from LRU cache           | Bounded (LRU)     | Values that often repeat     |
+| **TEXT**     | JS string array          | Conditional (saves >128B)        | Per-flush bounded | Unique values, rarely repeat |
+
+#### 1. ENUM - Known Values at Compile Time
+
+**Storage Strategy:**
+
+- **Initialization (ONCE at startup)**:
+  - Sort all enum values lexicographically
+  - Allocate UTF-8 bytes for ALL values immediately
+  - Build reverse Map<string, index> for O(1) lookup
+  - Dictionary is IMMUTABLE after construction
+- **Hot path**: Uint8Array write via Map lookup (zero allocation)
+- **Cold path**: Zero work - dictionary already sorted and UTF-8 encoded
+
+**Why Sorted Dictionary:**
+
+- Enables binary search for "does value X exist?" queries
+- Arrow/Parquet can skip dictionary entries not present in data
+- ClickHouse can push down predicates more efficiently
+
+**Code Generation:**
+
+```typescript
+// Schema definition
+entryType: S.enum(['span-start', 'span-ok', 'span-err']);
+
+// At construction time (ONCE):
+// 1. Sort: ['span-err', 'span-ok', 'span-start']
+// 2. Encode UTF-8 for each value
+// 3. Build reverse map: { 'span-err': 0, 'span-ok': 1, 'span-start': 2 }
+
+// Generated hot-path code (compile-time mapping)
+function writeEntryType(buffer, idx, value) {
+  // Map lookup, NOT switch - supports any enum size
+  buffer.attr_entryType_values[idx] = ENTRY_TYPE_MAP.get(value);
+}
+
+// Arrow conversion (zero work - already done)
+function toArrowDictionary() {
+  return {
+    indices: buffer.attr_entryType_values.slice(0, writeIndex),
+    dictionary: PRE_ENCODED_UTF8_DICTIONARY, // Already sorted, already UTF-8
+  };
+}
+```
+
+**Memory Characteristics:**
+
+- ✓ Bounded growth (fixed at schema definition)
+- ✓ Zero allocations during hot path
+- ✓ Pre-sorted dictionary enables binary search queries
+- ✓ UTF-8 bytes allocated ONCE, reused for every Arrow flush
+
+**Limits:**
+
+- Max 256 values (Uint8Array: 0-255)
+- Use Uint16Array for 256-65536 values
+- Use Uint32Array for >65536 values (rare)
+
+#### 2. CATEGORY - Values Often Repeat (LIMITED CARDINALITY)
+
+**Storage Strategy:**
+
+- **Hot path**: Store raw JS strings directly in buffer array (zero cost, just reference assignment)
+- **Cold path**: Build SORTED Arrow Dictionary, UTF-8 encode with SIEVE cache
+- **Memory**: Per-flush bounded (strings cleared after Arrow conversion)
+
+**Why Sorted Dictionary:**
+
+- Enables binary search for "does value X exist?" queries
+- Consistent ordering across flushes for efficient Parquet merging
+- ClickHouse can push down predicates on dictionary values
+
+**Hot Path (Zero Overhead):**
+
+```typescript
+// Category columns store raw JS strings - just like TEXT
+// The ONLY difference is cold-path dictionary building strategy
+class CategoryColumn {
+  private strings: string[] = [];
+
+  write(idx: number, value: string): void {
+    // FASTEST possible: just store the reference
+    // No Map lookup, no interning, no UTF-8 conversion
+    this.strings[idx] = value;
+  }
+}
+```
+
+**Cold Path (Arrow Conversion with SIEVE Cache):**
+
+During Arrow conversion, category columns build a sorted dictionary and use SIEVE-cached UTF-8 encoding:
+
+```typescript
+// In convertToArrow.ts - cold path only
+function buildSortedCategoryDictionary(buffers, columnName) {
+  // 1. Collect all unique strings from all buffers
+  const uniqueStrings = new Set<string>();
+  for (const buf of buffers) {
+    const strings = buf[columnName];
+    for (let i = 0; i < buf.writeIndex; i++) {
+      if (strings[i] != null) uniqueStrings.add(strings[i]);
+    }
+  }
+
+  // 2. Sort dictionary alphabetically (enables binary search queries)
+  const dictionary = [...uniqueStrings].sort();
+
+  // 3. Build string → index mapping for remapping values
+  const stringToIndex = new Map(dictionary.map((s, i) => [s, i]));
+
+  // 4. Build indices array (remap original strings to sorted indices)
+  const indices = new Uint32Array(totalRows);
+  // ... remap each string to its sorted index
+
+  return { dictionary, indices };
+}
+
+// UTF-8 encoding uses global SIEVE cache
+const { data, offsets } = globalUtf8Cache.encodeMany(dictionary);
+```
+
+**SIEVE Cache for UTF-8 Encoding:**
+
+Uses SIEVE algorithm (NSDI'24) instead of LRU - simpler AND better:
+
+```typescript
+import { SieveCache } from '@neophi/sieve-cache';
+
+class Utf8Cache {
+  private cache: SieveCache<string, Uint8Array>;
+  private encoder = new TextEncoder();
+
+  encode(str: string): Uint8Array {
+    const cached = this.cache.get(str);
+    if (cached) return cached;
+
+    const encoded = this.encoder.encode(str);
+    this.cache.set(str, encoded);
+    return encoded;
+  }
+
+  encodeMany(strings: string[]): { data: Uint8Array; offsets: Int32Array } {
+    // Encode all strings (using cache), build concatenated buffer + offsets
+    // ...
+  }
+}
+
+// Global cache provides cross-conversion benefits
+export const globalUtf8Cache = new Utf8Cache(4096);
+```
+
+**Why SIEVE over LRU:**
+
+- ~9% lower miss ratio than LRU-K, ARC, and 2Q (NSDI'24 paper)
+- Simpler implementation (no frequency counters or ghost queues)
+- Single pointer scan vs LRU's linked list manipulation
+- Better for web workloads with skewed access patterns
+
+**Memory Growth Prevention:**
+
+| Mechanism          | What it bounds                   | Default             |
+| ------------------ | -------------------------------- | ------------------- |
+| Per-flush clearing | String array cleared after flush | Every flush         |
+| SIEVE cache size   | UTF-8 encoded bytes cache        | 4096 entries        |
+| SIEVE eviction     | Automatic removal of cold values | On insert when full |
+
+**Use Cases:**
+
+```typescript
+userId: S.category(); // ✓ Same users appear multiple times
+action: S.category(); // ✓ 'login', 'logout', 'purchase' repeat
+region: S.category(); // ✓ 'us-east-1', 'eu-west-1', limited set
+moduleName: S.category(); // ✓ Limited number of modules
+spanName: S.category(); // ✓ Same span names repeat
+```
+
+**Anti-patterns (use TEXT instead):**
+
+```typescript
+requestId: S.category(); // ✗ Every request has unique ID - will thrash LRU
+timestamp: S.category(); // ✗ Every log has unique timestamp
+uuid: S.category(); // ✗ UUIDs are unique by definition
+```
+
+#### 3. TEXT - Unique Values, Rarely Repeat
+
+**Storage Strategy:**
+
+- **Hot path**: Store raw JS strings in array (no interning, no UTF-8 conversion)
+- **Cold path**: 2-pass Arrow conversion with conditional dictionary encoding
+- **Memory**: Bounded per-flush (strings cleared after Arrow conversion)
+
+**Why No Hot-Path Interning:** TEXT columns are designed for unique/high-cardinality values. Interning would:
+
+- Waste memory (cache fills with unique values that never repeat)
+- Add overhead (Map lookups for values that won't be found)
+- Provide no benefit (dictionary encoding decided at flush time anyway)
+
+**Hot Path (Zero Overhead):**
+
+```typescript
+class TextColumn {
+  private strings: string[] = []; // Just JS string references
+
+  write(idx: number, value: string): void {
+    // FASTEST possible: just store the reference
+    // No Map lookup, no UTF-8 conversion, no interning
+    this.strings[idx] = value;
+  }
+}
+```
+
+**Cold Path (2-Pass Arrow Conversion):**
+
+The cold path decides whether dictionary encoding saves space:
+
+```typescript
+interface ConversionResult {
+  type: 'dictionary' | 'plain';
+  data: Uint8Array; // UTF-8 bytes (dictionary values OR all values)
+  indices?: Uint32Array; // Only if dictionary encoding
+  offsets: Int32Array; // Arrow string offsets
+}
+
+function convertTextColumn(strings: string[]): ConversionResult {
+  // ═══════════════════════════════════════════════════════════
+  // PASS 1: Count occurrences and calculate sizes
+  // ═══════════════════════════════════════════════════════════
+  const occurrences = new Map<string, number>();
+  let totalUtf8Bytes = 0;
+
+  for (const str of strings) {
+    occurrences.set(str, (occurrences.get(str) || 0) + 1);
+    totalUtf8Bytes += utf8ByteLength(str);
+  }
+
+  const uniqueCount = occurrences.size;
+  const uniqueUtf8Bytes = sumUtf8Lengths(occurrences.keys());
+
+  // ═══════════════════════════════════════════════════════════
+  // Calculate space savings from dictionary encoding
+  // ═══════════════════════════════════════════════════════════
+  // Plain:      totalUtf8Bytes + (strings.length + 1) * 4 [offsets]
+  // Dictionary: uniqueUtf8Bytes + (uniqueCount + 1) * 4 [offsets]
+  //             + strings.length * 4 [indices]
+
+  const plainSize = totalUtf8Bytes + (strings.length + 1) * 4;
+  const dictionarySize = uniqueUtf8Bytes + (uniqueCount + 1) * 4 + strings.length * 4;
+  const spaceSavings = plainSize - dictionarySize;
+
+  // ═══════════════════════════════════════════════════════════
+  // PASS 2: Build Arrow column based on decision
+  // ═══════════════════════════════════════════════════════════
+
+  // Threshold: 128 bytes minimum savings to justify dictionary overhead
+  // - Below threshold: complexity not worth it
+  // - Above threshold: meaningful space reduction
+  if (spaceSavings > 128) {
+    // Dictionary encoding: sort for query optimization
+    const sortedUnique = [...occurrences.keys()].sort();
+    const stringToIndex = new Map(sortedUnique.map((s, i) => [s, i]));
+
+    // Build indices array
+    const indices = new Uint32Array(strings.length);
+    for (let i = 0; i < strings.length; i++) {
+      indices[i] = stringToIndex.get(strings[i])!;
+    }
+
+    // Encode dictionary values to UTF-8
+    const { data, offsets } = encodeStringsToUtf8(sortedUnique);
+
+    return { type: 'dictionary', data, indices, offsets };
+  } else {
+    // Plain UTF-8: no dictionary indirection
+    // Note: NO sorting for plain columns (maintains insertion order)
+    const { data, offsets } = encodeStringsToUtf8(strings);
+
+    return { type: 'plain', data, offsets };
+  }
+}
+```
+
+**Space Savings Examples:**
+
+| Scenario                         | Unique | Total | Plain Size | Dict Size | Savings | Decision      |
+| -------------------------------- | ------ | ----- | ---------- | --------- | ------- | ------------- |
+| 100 identical "error" strings    | 1      | 100   | 505 B      | 413 B     | 92 B    | Plain (< 128) |
+| 1000 identical "error" strings   | 1      | 1000  | 5005 B     | 4013 B    | 992 B   | Dictionary    |
+| 100 unique UUIDs (36 chars each) | 100    | 100   | 4004 B     | 4404 B    | -400 B  | Plain         |
+| 100 strings, 10 unique           | 10     | 100   | 5005 B     | 905 B     | 4100 B  | Dictionary    |
+
+**Memory Growth Prevention:**
+
+TEXT columns are **bounded per-flush**:
+
+```typescript
+class TextColumn {
+  private strings: string[] = [];
+
+  // Called during Arrow conversion (cold path)
+  flush(): ArrowColumn {
+    const result = convertTextColumn(this.strings);
+
+    // CRITICAL: Clear strings after flush
+    // Memory is released, GC can collect
+    this.strings = [];
+
+    return result;
+  }
+}
+```
+
+**What happens during flush:**
+
+1. All strings converted to Arrow format (dictionary or plain UTF-8)
+2. String array cleared (`this.strings = []`)
+3. JS GC can collect the original strings
+4. Arrow data is serialized/sent (then Arrow buffers released)
+
+**No Global Interner Needed:** Unlike CATEGORY, TEXT has no global interner because:
+
+- Values rarely repeat (interner would have poor hit rate)
+- Dictionary decision is per-flush (no cross-flush deduplication needed)
+- Memory naturally bounded by flush interval
+
+**Use Cases:**
+
+```typescript
+errorMessage: S.text(); // ✓ Each error might be unique
+sqlQuery: S.text(); // ✓ Parameterized queries vary widely
+stackTrace: S.text(); // ✓ Unique per error location
+requestBody: S.text(); // ✓ JSON payloads are unique
+maskedUrl: S.text(); // ✓ URLs are mostly unique
+requestId: S.text(); // ✓ Better than CATEGORY for unique IDs
+```
+
+### String Type Decision Matrix
+
+```typescript
+// ENUM: Known values at compile time (≤256 common, ≤65536 max)
+entryType: S.enum(['span-start', 'span-ok', 'span-err']);
+logLevel: S.enum(['debug', 'info', 'warn', 'error']);
+httpMethod: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']);
+
+// CATEGORY: Runtime values that repeat (limited cardinality)
+userId: S.category(); // Users appear in multiple spans
+action: S.category(); // Same actions repeat ('login', 'checkout')
+region: S.category(); // Limited AWS regions ('us-east-1', etc.)
+moduleName: S.category(); // Limited number of code modules
+tableName: S.category(); // Database tables are reused
+
+// TEXT: Unique values (high cardinality)
+errorMessage: S.text(); // Error messages are often unique
+sqlQuery: S.text(); // SQL queries vary widely
+stackTrace: S.text(); // Stack traces are unique per error
+requestId: S.text(); // Request IDs are unique by design
+uuid: S.text(); // UUIDs are unique by definition
+```
+
+### Performance and Memory Tradeoffs
+
+**ENUM:**
+
+- ✓ Zero hot path allocations
+- ✓ Bounded memory (fixed at schema definition)
+- ✓ 1 byte per value (Uint8Array)
+- ✓ Fastest queries (pre-sorted dictionary, binary search)
+- ✓ UTF-8 allocated ONCE at startup
+- ✗ Must know all values at compile time
+
+**CATEGORY:**
+
+- ✓ Bounded memory (LRU eviction, configurable limits)
+- ✓ Fast hot path (Map lookup + integer write)
+- ✓ Smart UTF-8 caching (only after 2+ occurrences)
+- ✓ Sorted dictionary for query optimization
+- ⚠ 4 bytes per value (Uint32Array indices)
+- ⚠ LRU eviction means same string may get different index across flushes
+
+**TEXT:**
+
+- ✓ Zero hot path overhead (just store string reference)
+- ✓ Bounded memory (per-flush, cleared after Arrow conversion)
+- ✓ Optimal cold path (dictionary only if saves >128 bytes)
+- ✓ No LRU thrashing for unique values
+- ⚠ String storage in JS heap (not TypedArray)
+- ⚠ All strings re-encoded to UTF-8 each flush
+
 ## Tag Attribute Schema Definition
 
 **Purpose**: Define structured data that can be logged to spans with type safety and automatic masking.
@@ -138,12 +535,19 @@ const tagAttributes = defineTagAttributes({
 
 ```typescript
 // Core system columns
+// See 01b_columnar_buffer_architecture.md "Span Definition" for span ID design details
 const systemSchema = defineTagAttributes({
   // Trace structure
-  timestamp: S.number(), // Microseconds since epoch
+  timestamp: S.number(), // Microseconds since epoch (Float64Array, SAFE until year 2255)
   traceId: S.category(), // Request trace ID
-  spanId: S.number(), // Span identifier
-  parentSpanId: S.number(), // Parent span (nullable)
+
+  // Span identification (separate columns for query flexibility)
+  // A span represents a unit of work within a single thread of execution.
+  threadId: S.bigint(), // 64-bit random, generated once per worker/process
+  spanId: S.number(), // 32-bit counter, unit of work within thread
+  parentThreadId: S.bigint().nullable(), // Parent span's thread (null for root spans)
+  parentSpanId: S.number().nullable(), // Parent span's ID (null for root spans)
+
   entryType: S.enum([
     // Entry type enum
     'span-start',
@@ -216,6 +620,299 @@ ctx.ff.track('darkMode').action('path-a'); // Logs ff-usage entry
 ctx.ff.track('darkMode').action('path-b'); // Logs another ff-usage
 ```
 
+### Relationship to Scope Attributes
+
+Feature flags use two distinct but related concepts for context management:
+
+1. **Scope Attributes** (`ctx.scope`): For automatic inclusion in log entries
+2. **Evaluation Context**: For flag decision-making
+
+These can overlap but serve different purposes:
+
+| Concern            | Scope Attributes                          | Evaluation Context           |
+| ------------------ | ----------------------------------------- | ---------------------------- |
+| **Purpose**        | Logging context                           | Flag decision-making         |
+| **Applied to**     | All entries automatically                 | Flag evaluation only         |
+| **Set via**        | `ctx.scope.key = value`                   | `forContext({ ... })`        |
+| **Typical values** | userId, requestId, region                 | userId, userPlan, experiment |
+| **Can overlap**    | Yes - derive FF context from scope values |
+
+### Scope-to-FF Integration via forContext()
+
+**Key Design**: The `forContext()` method creates a NEW context with a NEW evaluator bound to scope values. This
+enables:
+
+- FF evaluators to target specific users/contexts
+- Prototype-based context creation for V8 hidden-class optimization
+- Clean scope propagation without dynamic property assignment
+
+**Pattern: forContext() creates child context with scope-bound evaluator**
+
+```typescript
+// Root context has DefaultFlagEvaluator (no user context yet)
+const rootCtx = createRequestContext({
+  requestId: 'req-123',
+  featureFlagSchema,
+  evaluator,
+  env,
+});
+
+// When scope.userId is set, create child context with FF re-evaluated
+const userCtx = rootCtx.forContext({ userId: 'user-123' });
+// userCtx.ff is now a NEW evaluator created via:
+// rootCtx.ff.forContext({ userId: 'user-123' })
+
+// The new evaluator can target that specific user
+const { premiumFeatures } = userCtx.ff; // Evaluated WITH userId context!
+
+// Log entries include scope values automatically
+userCtx.log.info('Processing'); // Auto-includes userId from scope
+
+if (premiumFeatures) {
+  userCtx.ff.track('premiumFeatures').outcome('enabled');
+}
+```
+
+**Why forContext() instead of mutating scope?**
+
+- **Immutability**: Parent context unchanged, child gets new evaluator
+- **V8 optimization**: Prototype-based context creation maintains stable hidden classes
+- **Fresh cache**: Child evaluator has fresh cache (deduplication per context)
+- **Clear ownership**: Each context owns its evaluator instance
+
+### FeatureFlagEvaluator.forContext() Method Signature
+
+The `forContext()` method is the primary API for creating child evaluators with additional context:
+
+```typescript
+interface FeatureFlagEvaluator<T extends FeatureFlagSchema> {
+  // Flag access - returns primitive values directly (boolean, number, string)
+  readonly [K in keyof T]: InferFlagType<T[K]> | undefined;
+
+  // Track flag usage - returns chainable API with SAME methods as ctx.tag
+  track(flagName: keyof T): FlagTracker<Tag>;
+
+  /**
+   * Create child evaluator with additional/updated evaluation context.
+   * Returns a NEW evaluator instance with:
+   * - Merged evaluation context (additional overrides parent)
+   * - Fresh accessedFlags Set (deduplication per context)
+   * - Fresh flagCache Map (no stale values from parent)
+   * - Same backend evaluator reference (shared)
+   * - Same schema reference (shared)
+   */
+  forContext(additional: Partial<EvaluationContext>): FeatureFlagEvaluator<T>;
+
+  // Get the current evaluation context (read-only)
+  readonly evaluationContext: Readonly<EvaluationContext>;
+}
+```
+
+**Implementation (in evaluator.ts)**:
+
+```typescript
+function forContext(additional: Partial<EvaluationContext>): FeatureFlagEvaluator<T> {
+  return createEvaluatorProxy({
+    ...state,
+    evaluationContext: { ...state.evaluationContext, ...additional },
+    // Fresh caches for deduplication in new context
+    accessedFlags: new Set(),
+    flagCache: new Map(),
+    // buffer inherited from parent (can be overridden with withBuffer)
+  });
+}
+```
+
+### V8 Hidden Class Optimization for Context Creation
+
+When creating child contexts via `forContext()`, we use prototype-based creation to maintain V8 hidden class stability:
+
+```typescript
+// GOOD: Prototype-based context creation - stable hidden class
+function forContext(additional: Partial<EvaluationContext>): SpanContext {
+  // Create child with stable prototype chain
+  const child = Object.create(this); // Inherits parent prototype
+
+  // Only set properties that differ
+  child.ff = this.ff.forContext(additional);
+  child.scope = { ...this.scope, ...additional }; // Merged scope
+
+  return child;
+}
+
+// BAD: Object spread - creates new hidden class each time
+function forContextBad(additional: Partial<EvaluationContext>): SpanContext {
+  return {
+    ...this, // New hidden class!
+    ff: this.ff.forContext(additional),
+    scope: { ...this.scope, ...additional },
+  };
+}
+```
+
+**V8 Hidden Class Benefits**:
+
+- **Monomorphic property access**: V8 can inline property lookups when objects share hidden classes
+- **Inline cache hits**: Same hidden class = same inline cache, no polymorphic dispatch
+- **Lower GC pressure**: Prototype chain avoids copying all properties
+- **Stable shapes**: Child contexts share parent's hidden class
+
+**Implementation Pattern**:
+
+```typescript
+class RequestContext {
+  // Define all properties with stable types
+  readonly traceId: string;
+  readonly requestId: string;
+  readonly ff: FeatureFlagEvaluator;
+  readonly env: Env;
+  readonly scope: EvaluationContext;
+
+  // Prototype method for child creation
+  forContext(additional: Partial<EvaluationContext>): RequestContext {
+    // Create via prototype for V8 optimization
+    const child = Object.create(Object.getPrototypeOf(this));
+
+    // Copy OWN properties (not prototype methods)
+    Object.assign(child, this);
+
+    // Override scope and ff with new values
+    child.scope = { ...this.scope, ...additional };
+    child.ff = this.ff.forContext(additional);
+
+    return child;
+  }
+}
+```
+
+### Context Flow: How Scope Values Flow to FF Evaluation
+
+```
+Request Boundary                    Middleware                         Business Logic
+─────────────────────────────────────────────────────────────────────────────────────────
+
+createRequestContext()              ctx.forContext({ userId })         childCtx.ff.premiumFeatures
+        │                                     │                                  │
+        ▼                                     ▼                                  ▼
+┌─────────────────┐              ┌─────────────────────────┐         ┌─────────────────────┐
+│ RequestContext  │              │ UserContext             │         │ FF Evaluation       │
+│                 │              │                         │         │                     │
+│ ff: evaluator   │──forContext──│ ff: evaluator.forCtx()  │────────▶│ context: { userId } │
+│ scope: {}       │    ({ userId })  scope: { userId }     │         │ ✓ user targeting    │
+│                 │              │                         │         │ ✓ A/B tests         │
+└─────────────────┘              └─────────────────────────┘         └─────────────────────┘
+        │                                     │
+        │                                     │
+   No user context                    User identified
+   (batch job start)                  (after auth middleware)
+```
+
+**Pattern: Derive FF context from scope values in spans**
+
+```typescript
+// Set scope at middleware - automatically included in all logs
+ctx.scope.userId = req.user?.id;
+ctx.scope.region = req.region;
+
+// Option 1: Use forContext() at context level (recommended)
+const userCtx = ctx.forContext({ userId: ctx.scope.userId, userPlan: user.plan });
+await userCtx.span('processUser', async (childCtx) => {
+  const { premiumFeatures } = childCtx.ff; // Evaluated with userId + userPlan
+  // ...
+});
+
+// Option 2: Pass additionalContext to span (alternative pattern)
+await ctx.span(
+  'processUser',
+  {
+    additionalContext: {
+      userId: ctx.scope.userId, // Use scope value for FF evaluation
+      userPlan: user.plan, // Add FF-specific context
+    },
+  },
+  async (childCtx) => {
+    const { premiumFeatures } = childCtx.ff; // Evaluated with full context
+
+    // userId automatically included in log from scope
+    childCtx.log.info('Processing'); // Auto-includes userId, region from scope
+
+    if (premiumFeatures) {
+      childCtx.ff.track('premiumFeatures').outcome('enabled');
+    }
+  }
+);
+```
+
+**Why separate?**
+
+- **Scope**: Set once, applied everywhere (DRY for logging)
+- **EvaluationContext**: Computed per-context based on what's needed for flag decisions
+- **Flexibility**: Not all scope values are relevant for FF evaluation, and vice versa
+- **Performance**: FF context is flat for V8 optimization (see below)
+
+### V8 Optimization Considerations
+
+The evaluator implementation is designed for V8's hidden class optimizations:
+
+**Evaluator Instances are Proxy Objects**
+
+```typescript
+// Each span gets a NEW evaluator instance (via forContext)
+const parentEvaluator = ffEvaluator.forContext(parentCtx);
+const childEvaluator = ffEvaluator.forContext(childCtx);
+
+// These are DIFFERENT instances with:
+// - Fresh per-span caches (accessedFlags, valueCache)
+// - Stable hidden class (same shape for V8)
+```
+
+**Creating New Instances with forContext() / withBuffer()**
+
+```typescript
+// Each creates a NEW instance
+const evaluator1 = ffEvaluator.forContext(ctx);
+const evaluator2 = evaluator1.forContext({ userId: 'user-123' });
+const evaluator3 = evaluator2.withBuffer(childBuffer);
+
+// Benefits:
+// - Fresh cache (no stale values)
+// - Stable shape (V8 can optimize property access)
+// - Immutability (parent evaluator unchanged)
+```
+
+**EvaluationContext is Flat for Single Hidden Class**
+
+```typescript
+// GOOD: Flat structure - single hidden class
+interface EvaluationContext {
+  userId?: string;
+  userPlan?: string;
+  region?: string;
+  experimentGroup?: string;
+  [key: string]: string | number | boolean | undefined;
+}
+
+// BAD: Nested objects - multiple hidden classes, slower property access
+interface BadEvaluationContext {
+  user: {
+    // Hidden class 1
+    id: string;
+    plan: string;
+  };
+  request: {
+    // Hidden class 2
+    region: string;
+  };
+}
+```
+
+**Performance Benefits**
+
+- **Flag access**: <0.1ms including proxy intercept, cache check, evaluation
+- **Minimal GC pressure**: Evaluator instances are lightweight, caches are Map/Set
+- **Monomorphic property access**: V8 can inline property lookups on flat context
+- **Cache locality**: All context fields in single object for better memory access
+
 ### Why This Design
 
 - **V8 optimized**: No wrapper objects, no hidden class polymorphism
@@ -271,9 +968,9 @@ await ctx.span('processUser', { userId: 'user-456' }, async (childCtx) => {
 });
 ```
 
-#### FeatureFlagEvaluator.withContext() Method
+#### FeatureFlagEvaluator.forContext() Method
 
-The evaluator provides a `withContext()` method to create child evaluators with additional context:
+The evaluator provides a `forContext()` method to create child evaluators with additional context:
 
 ```typescript
 interface FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> {
@@ -286,7 +983,7 @@ interface FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends TagAttri
 
   // Create child evaluator with additional/updated context
   // Returns a new evaluator instance with merged context
-  withContext(additional: Partial<EvaluationContext>): FeatureFlagEvaluator<T, Tag>;
+  forContext(additional: Partial<EvaluationContext>): FeatureFlagEvaluator<T, Tag>;
 
   // Get the current evaluation context (read-only)
   readonly evaluationContext: Readonly<EvaluationContext>;
@@ -300,7 +997,7 @@ interface FlagTracker<T extends TagAttributeSchema> {
 }
 ```
 
-**Why `withContext()` on the evaluator (not RequestContext)**:
+**Why `forContext()` on the evaluator (not RequestContext)**:
 
 - **Encapsulation**: The evaluator owns its context and knows how to merge it
 - **Immutability**: Returns a new evaluator, preserving the parent's context
@@ -321,7 +1018,7 @@ function createChildSpan(parentCtx, spanName, additionalContext, fn) {
   // 1. Additional context merged with parent context
   // 2. New buffer reference for logging
   const childFf = parentCtx.ff
-    .withContext(additionalContext) // Merge context
+    .forContext(additionalContext) // Merge context
     .withBuffer(childBuffer); // Bind to child buffer
 
   const childCtx = {

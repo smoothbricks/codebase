@@ -1,8 +1,7 @@
-import type { Microseconds } from '@smoothbricks/arrow-builder';
 import * as S from '@sury/sury';
 import { createEvaluatorClass, type GeneratedEvaluatorState } from '../codegen/evaluatorGenerator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../lmao.js';
-import { getTimestampMicros } from '../timestamp.js';
+import { getTimestampNanos } from '../timestamp.js';
 import type { SpanBuffer } from '../types.js';
 import type { EvaluationContext, FeatureFlagSchema } from './defineFeatureFlags.js';
 
@@ -146,7 +145,7 @@ function getOrCreateEvaluatorClass<T extends FeatureFlagSchema>(
     GeneratedClass = createEvaluatorClass(
       schema,
       validateFlagValue,
-      getTimestampMicros,
+      getTimestampNanos,
       ENTRY_TYPE_FF_ACCESS,
       ENTRY_TYPE_FF_USAGE,
     ) as unknown as new (
@@ -193,8 +192,6 @@ export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
     evaluationContext: EvaluationContext,
     evaluator: FlagEvaluator,
     bufferOrColumnWriters?: SpanBuffer | FlagColumnWriters | null,
-    anchorEpochMicros = 0 as Microseconds,
-    anchorPerfNow = 0 as Microseconds,
   ) {
     // Determine if we got FlagColumnWriters or SpanBuffer
     let buffer: SpanBuffer | null = null;
@@ -211,8 +208,6 @@ export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
       evaluationContext,
       evaluator,
       buffer,
-      anchorEpochMicros,
-      anchorPerfNow,
       columnWriters,
       accessedFlags: new Set(),
       flagCache: new Map(),

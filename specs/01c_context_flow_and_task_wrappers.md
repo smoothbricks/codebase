@@ -35,16 +35,29 @@ Request Context
         └── env: SAME EnvironmentConfig (passed through)
     └── ctx.span('process-user', { additionalContext: { userId } }) creates:
         ├── Child Span Context (process-user span buffer)
-        ├── ff: parentCtx.ff.withContext({ userId }).withBuffer(childBuffer)
+        ├── ff: parentCtx.ff.forContext({ userId }).withBuffer(childBuffer)
         │       → NEW evaluator with MERGED context (adds userId)
         └── ...
 ```
 
 **FF Evaluator Methods**:
 
+- `forContext(additional)`: Creates new evaluator with merged evaluation context AND fresh cache
 - `withBuffer(buffer)`: Creates new evaluator bound to span buffer (fresh cache)
-- `withContext(additional)`: Creates new evaluator with merged evaluation context
 - Both return NEW instances (immutable pattern, each span gets fresh cache)
+
+**Context-Level forContext() Method**:
+
+The `RequestContext` and `SpanContext` also have a `forContext()` method that creates a child context with a new FF
+evaluator. This is the recommended pattern for creating child contexts with different scope values:
+
+```typescript
+// Create child context with scope-bound FF evaluator
+const userCtx = ctx.forContext({ userId: 'user-123' });
+// Equivalent to:
+// - child.ff = ctx.ff.forContext({ userId: 'user-123' })
+// - child.scope = { ...ctx.scope, userId: 'user-123' }
+```
 
 ## Request-Level Context Creation
 
@@ -65,8 +78,20 @@ interface RequestContext {
   anchorPerfNow: number; // performance.now() at trace root (browser)
   // OR anchorHrTime: bigint;  // process.hrtime.bigint() at trace root (Node.js)
 
+  // Worker/Thread ID for distributed span identification
+  // See 01b_columnar_buffer_architecture.md "Distributed Span ID Design" section
+  threadId: bigint; // 64-bit random ID, generated once per worker/process
+
   ff: FeatureFlagEvaluator;
   env: Env;
+  scope: EvaluationContext; // Scope values for logging + FF evaluation
+
+  /**
+   * Create a child context with additional scope values.
+   * The child context gets a NEW FF evaluator bound to the merged scope.
+   * Uses prototype-based creation for V8 hidden class optimization.
+   */
+  forContext(additional: Partial<EvaluationContext>): RequestContext;
 }
 ```
 
@@ -76,6 +101,66 @@ interface RequestContext {
 - One less pointer chase per timestamp read
 - Simpler serialization if context crosses boundaries
 - Matches "flat deferred structure" design principle
+
+### Thread ID and Distributed Span Identification
+
+The `threadId` in RequestContext enables collision-resistant span identification in distributed tracing scenarios:
+
+**Problem**: Simple incrementing span IDs (`span_id++`) collide when the same trace spans multiple workers/processes.
+
+**Solution**: Separate columns for `thread_id` + `span_id`:
+
+- `thread_id`: 64-bit random BigInt, generated once per worker at startup
+- `span_id`: 32-bit incrementing counter, assigned per span creation
+
+> **A span represents a unit of work within a single thread of execution.** This justifies having both `thread_id` and
+> `span_id` as separate concepts.
+
+**Flow**:
+
+```
+Worker Startup
+    │
+    ├─► Generate workerThreadId: bigint (ONCE, crypto.getRandomValues())
+    │
+    ▼
+createRequestContext()
+    │
+    ├─► ctx.threadId = workerThreadId
+    │
+    ▼
+task('my-task', fn) execution
+    │
+    ├─► buffer.threadId = ctx.threadId
+    ├─► buffer.spanId = nextSpanId++
+    │
+    ▼
+ctx.span('child-span') creation
+    │
+    ├─► childBuffer.threadId = ctx.threadId (SAME thread)
+    ├─► childBuffer.spanId = nextSpanId++ (NEW span ID)
+    ├─► childBuffer.parent = parentBuffer (for parent ID derivation)
+```
+
+**Cross-Thread Scenario (pmap/workers)**: When work is distributed to another thread, the child span gets THAT thread's
+`threadId`:
+
+```
+Thread A: parentBuffer = { threadId: 0xAAA..., spanId: 1 }
+    │
+    └─► pmap() dispatches to Thread B
+        │
+        ▼
+Thread B: childBuffer = { threadId: 0xBBB..., spanId: 1, parent: parentBuffer }
+          Arrow output: parent_thread_id=0xAAA..., parent_span_id=1
+```
+
+**Benefits**:
+
+- No BigInt operations in hot path (spanId is just `i++`)
+- Cross-thread parent references naturally supported
+- Collision resistance via 64-bit random thread ID
+- Separate columns allow efficient querying by thread_id alone
 
 ### High-Precision Timestamp Design
 
@@ -89,7 +174,7 @@ The context captures a single time anchor at creation, enabling sub-millisecond 
 function getTimestamp(ctx: RequestContext): number {
   // Returns microseconds since epoch with sub-millisecond precision
   // Browser: ~5μs resolution from performance.now()
-  // Node.js: nanosecond precision from hrtime, stored as microseconds
+  // Node.js: nanosecond precision from hrtime, truncated to microseconds
   return ctx.anchorEpochMicros + (performance.now() - ctx.anchorPerfNow) * 1000;
 }
 ```
@@ -100,10 +185,30 @@ function getTimestamp(ctx: RequestContext): number {
 - Sub-millisecond precision for performance analysis
 - All spans in trace share same anchor (comparable timestamps)
 - DST/NTP safe - anchor per trace, traces are short-lived
+- Safe numeric conversion (Float64 SAFE until year 2255)
+
+**Precision Guarantees**:
+
+- **Storage**: Microseconds in `Float64Array` (hot path)
+- **Safe Range**: Float64 can exactly represent integers up to `Number.MAX_SAFE_INTEGER` (2^53 - 1)
+  - Maximum safe value: 9,007,199,254,740,991 microseconds
+  - Equivalent date: ~September 2255
+- **BigInt Conversion**: `Number(hrtime / 1000n)` is SAFE for all practical timestamps
+
+**Date.now() Usage Guidelines**:
+
+- ❌ **NEVER** use `Date.now()` for trace timestamps (use anchored `getTimestampMicros()`)
+- ✅ **OK** for scheduling: `const nextFlush = Date.now() + intervalMs`
+- ✅ **OK** for file naming: `traces-${Date.now()}.parquet`
+- ✅ **OK** for system metadata: Capacity tuning events, diagnostics
 
 ### Context Creation
 
 ```typescript
+// Worker-level thread ID (generated ONCE at worker/process startup)
+// See 01b_columnar_buffer_architecture.md "Distributed Span ID Design" for rationale
+const workerThreadId: bigint = generateRandom64Bit(); // crypto.getRandomValues() → BigInt
+
 // Create context at request boundary
 function createRequestContext(params: { requestId: string; userId?: string }): RequestContext {
   const epochMs = Date.now();
@@ -117,6 +222,11 @@ function createRequestContext(params: { requestId: string; userId?: string }): R
     // Capture time anchor ONCE at trace root
     anchorEpochMicros: epochMs * 1000,
     anchorPerfNow: perfNow,
+
+    // Thread ID for distributed span identification
+    // All spans created in this worker share the same threadId
+    // Combined with spanId (incrementing counter), this forms a collision-resistant span ID
+    threadId: workerThreadId,
 
     // Feature flag evaluator with user context
     // Buffer is null - will be bound when task creates a span via withBuffer()
@@ -215,7 +325,14 @@ function createTaskWrapper(moduleContext: ModuleContext, compiledTagOps: Compile
       const [originalCtx, ...restArgs] = args;
 
       // Create new SpanBuffer for this task execution
-      const buffer = createSpanBuffer(compiledTagOps.schema, taskModuleContext);
+      // threadId comes from context (set at worker startup)
+      // spanId is assigned by createSpanBuffer (simple i++)
+      const buffer = createSpanBuffer(
+        compiledTagOps.schema,
+        taskModuleContext,
+        originalCtx.traceId,
+        originalCtx.threadId // 64-bit thread ID from context
+      );
 
       // Create enhanced context once (single allocation)
       const enhancedCtx = {
@@ -343,15 +460,23 @@ specific user in a batch job).
 function createChildSpan(parentCtx: SpanContext, label: string, childFn: SpanFunction) {
   return async () => {
     // Create child buffer linked to parent
-    const childBuffer = createSpanBuffer(parentCtx.buffer.task.module.schema, {
-      ...parentCtx.buffer.task,
-      spanNameId: internString(label),
-      lineNumber: getCurrentLineNumber(),
-    });
+    // Child uses same threadId as parent (same worker)
+    // spanId is assigned fresh by createSpanBuffer
+    const childBuffer = createSpanBuffer(
+      parentCtx.buffer.task.module.schema,
+      {
+        ...parentCtx.buffer.task,
+        spanNameId: internString(label),
+        lineNumber: getCurrentLineNumber(),
+      },
+      parentCtx.traceId,
+      parentCtx.threadId, // Same thread ID as parent
+      parentCtx.buffer // Parent buffer for tree linking
+    );
 
-    // Link parent-child relationship
-    childBuffer.parent = parentCtx.buffer;
-    parentCtx.buffer.children.push(childBuffer);
+    // parent-child relationship is set by createSpanBuffer
+    // childBuffer.parent = parentCtx.buffer (set in createSpanBuffer)
+    // parentCtx.buffer.children.push(childBuffer) (set in createSpanBuffer)
 
     // Create child context
     const childEnhancedCtx = {
@@ -410,7 +535,7 @@ function createChildSpanWithContext(
     // 1. Additional context merged with parent context (if provided)
     // 2. Bound to child buffer for logging
     childEnhancedCtx.ff = options.additionalContext
-      ? parentCtx.ff.withContext(options.additionalContext).withBuffer(childBuffer)
+      ? parentCtx.ff.forContext(options.additionalContext).withBuffer(childBuffer)
       : parentCtx.ff.withBuffer(childBuffer);
 
     // Environment variables passed through unchanged
@@ -418,6 +543,45 @@ function createChildSpanWithContext(
 
     return await childFn(childEnhancedCtx);
   };
+}
+```
+
+### Alternative: Context-Level forContext() (Recommended)
+
+Instead of passing `additionalContext` to `span()`, use `ctx.forContext()` to create a child context first:
+
+```typescript
+// RECOMMENDED: Use forContext() at context level
+const userCtx = ctx.forContext({ userId: user.id, userPlan: user.plan });
+await userCtx.span('processUser', async (childCtx) => {
+  // childCtx.ff already has userId and userPlan in evaluation context
+  const { premiumFeatures } = childCtx.ff;
+  // ...
+});
+
+// This is cleaner than:
+await ctx.span(
+  'processUser',
+  { additionalContext: { userId: user.id, userPlan: user.plan } },
+  async (childCtx) => { ... }
+);
+```
+
+**V8 Optimization**: The `forContext()` method uses prototype-based context creation to maintain stable hidden classes:
+
+```typescript
+class SpanContext {
+  forContext(additional: Partial<EvaluationContext>): SpanContext {
+    // Use Object.create for prototype chain - maintains V8 hidden class
+    const child = Object.create(Object.getPrototypeOf(this));
+    Object.assign(child, this);
+
+    // Override scope and ff with merged values
+    child.scope = { ...this.scope, ...additional };
+    child.ff = this.ff.forContext(additional);
+
+    return child;
+  }
 }
 ```
 
@@ -456,7 +620,7 @@ export const processBatch = task('process-batch', async (ctx, users: User[]) => 
 - **Context isolation**: Each span gets its own context and buffer
 - **Feature flag correlation**: Flag access logged to the correct span's buffer
 - **Context inheritance**: Child FF evaluator inherits parent's evaluation context
-- **Context extension**: Child can add/override evaluation context via `withContext()`
+- **Context extension**: Child can add/override evaluation context via `forContext()`
 - **Fresh cache**: Each span's FF evaluator has its own cache (deduplication per span)
 - **Environment sharing**: Static config shared across all spans
 
@@ -561,7 +725,7 @@ export const processBatch = task('process-batch', async (ctx, users: User[]) => 
       { additionalContext: { userId: user.id, userPlan: user.plan } },
       async (childCtx) => {
         // childCtx.ff evaluates flags WITH userId and userPlan!
-        // The evaluator was created via: parentCtx.ff.withContext({...}).withBuffer(childBuffer)
+        // The evaluator was created via: parentCtx.ff.forContext({...}).withBuffer(childBuffer)
         const { premiumFeatures, betaAccess } = childCtx.ff;
 
         if (premiumFeatures) {
@@ -668,12 +832,14 @@ attributes that automatically propagate to all subsequent log entries and child 
 
 The scope attributes system provides:
 
-- **Zero-runtime-cost** attribute inclusion through lazy columns
-- **Hierarchical inheritance** from parent to child spans
+- **Zero-runtime-cost** attribute inclusion through lazy column getters
+- **Separate Scope class** that stores values apart from buffer columns
+- **Hierarchical inheritance** from parent to child spans via Scope.\_getScopeValues()
+- **SIMD pre-filling** of child buffers with TypedArray.fill()
 - **Middleware integration** for request-level context setup
 - **Clean business logic** that focuses on domain concerns rather than logging boilerplate
 - **Readable scope values** via compiled getters
-- **Zero indirection** with LazyColumn as direct properties on SpanBuffer
+- **Zero indirection** with column properties as direct lazy getters on SpanBuffer
 
 **Quick Example**:
 
