@@ -45,3 +45,6 @@ Thumbs.db
 
 # Jest
 test-output
+
+# TypeScript build info
+*.tsbuildinfo
