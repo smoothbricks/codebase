@@ -775,6 +775,17 @@ export interface ModuleContextBuilder<
     name: string,
     fn: TaskFunction<Args, Result, T, FF, Env>,
   ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
+
+  /**
+   * Buffer capacity stats for this module (for testing and monitoring).
+   *
+   * Exposes the self-tuning capacity statistics:
+   * - `currentCapacity`: Current tuned buffer capacity
+   * - `totalWrites`: Total writes since last tuning
+   * - `overflowWrites`: Writes that caused buffer overflow
+   * - `totalBuffersCreated`: Number of buffers created
+   */
+  readonly spanBufferCapacityStats: import('@smoothbricks/arrow-builder').BufferCapacityStats;
 }
 
 /**
@@ -1286,6 +1297,9 @@ export function createModuleContext<
   );
 
   return {
+    // Expose capacity stats for testing and monitoring
+    spanBufferCapacityStats: moduleContext.spanBufferCapacityStats,
+
     task<Args extends unknown[], Result>(
       name: string,
       fn: TaskFunction<Args, Result, T, FF, Env>,
