@@ -4,7 +4,15 @@
  * These functions provide type-safe runtime validation for schema metadata types.
  */
 
-import type { EnumSchemaWithMetadata, EnumUtf8Precomputed, SchemaType, SchemaWithMetadata } from './types.js';
+import type {
+  CategorySchemaWithMetadata,
+  EnumSchemaWithMetadata,
+  EnumUtf8Precomputed,
+  MaskTransform,
+  SchemaType,
+  SchemaWithMetadata,
+  TextSchemaWithMetadata,
+} from './types.js';
 
 /**
  * Valid schema types
@@ -81,6 +89,30 @@ export function getEnumValues(value: unknown): readonly string[] | undefined {
 export function getEnumUtf8(value: unknown): EnumUtf8Precomputed | undefined {
   if (isEnumSchemaWithMetadata(value) && '__enum_utf8' in value) {
     return (value as EnumSchemaWithMetadata).__enum_utf8;
+  }
+  return undefined;
+}
+
+/**
+ * Type guard to check if a schema has a mask transform
+ */
+export function hasMaskTransform(value: unknown): value is CategorySchemaWithMetadata | TextSchemaWithMetadata {
+  if (!isSchemaWithMetadata(value)) {
+    return false;
+  }
+
+  return (
+    '__mask_transform' in value && typeof (value as { __mask_transform?: unknown }).__mask_transform === 'function'
+  );
+}
+
+/**
+ * Get mask transform function from a schema
+ * Returns undefined if not present
+ */
+export function getMaskTransform(value: unknown): MaskTransform | undefined {
+  if (hasMaskTransform(value)) {
+    return (value as CategorySchemaWithMetadata | TextSchemaWithMetadata).__mask_transform;
   }
   return undefined;
 }

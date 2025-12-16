@@ -1,8 +1,34 @@
 import { describe, expect, it } from 'bun:test';
-import { createAttributeColumns } from '@smoothbricks/arrow-builder';
+import { createAttributeColumns, createColumnWriter, maskingTransforms } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
-import { createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
 import { createTestTaskContext } from '../test-helpers.js';
+
+/**
+ * Simple string interner for testing
+ */
+class TestStringInterner {
+  private strings: string[] = [];
+  private stringToIndex = new Map<string, number>();
+
+  intern(str: string): number {
+    let idx = this.stringToIndex.get(str);
+    if (idx === undefined) {
+      idx = this.strings.length;
+      this.strings.push(str);
+      this.stringToIndex.set(str, idx);
+    }
+    return idx;
+  }
+
+  getStrings(): readonly string[] {
+    return this.strings;
+  }
+
+  getString(idx: number): string | undefined {
+    return this.strings[idx];
+  }
+}
 
 /**
  * Type helper to extract schema fields from ExtendedSchema
@@ -112,8 +138,8 @@ describe('Buffer Integration', () => {
 
   it('handles masked fields in schema', () => {
     const schema = defineTagAttributes({
-      userId: S.masked('hash'),
-      email: S.masked('email'),
+      userId: S.category().mask('hash'),
+      email: S.text().mask('email'),
       plainText: S.text(), // Text: unmasked plain text
     });
 
@@ -125,11 +151,10 @@ describe('Buffer Integration', () => {
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
     // All should have TypedArray columns (use _values suffix)
-    // Masking is applied during serialization, not buffer creation
-    // Note: S.masked() creates a transformed Sury schema without __schema_type metadata
-    // This falls back to Uint32Array (default)
-    expect(buffer['userId_values']).toBeInstanceOf(Uint32Array); // masked hash (no metadata)
-    expect(buffer['email_values']).toBeInstanceOf(Uint32Array); // masked email (no metadata)
+    // Masking is applied during Arrow conversion (cold path), not buffer creation
+    // With chainable .mask(), the __schema_type metadata is preserved
+    expect(Array.isArray(buffer['userId_values'])).toBe(true); // category (raw strings) - masked during Arrow conversion
+    expect(Array.isArray(buffer['email_values'])).toBe(true); // text (raw strings) - masked during Arrow conversion
     expect(Array.isArray(buffer['plainText_values'])).toBe(true); // text (raw strings)
   });
 
@@ -147,5 +172,152 @@ describe('Buffer Integration', () => {
 
     // Should use Uint8Array for enums with ≤255 values (use _values suffix)
     expect(smallBuffer['operation_values']).toBeInstanceOf(Uint8Array);
+  });
+
+  it('applies masking during Arrow conversion for category fields', () => {
+    const schema = defineTagAttributes({
+      userId: S.category().mask('hash'),
+      plainUserId: S.category(), // No masking
+    });
+
+    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
+
+    // Create interners
+    const moduleIdInterner = new TestStringInterner();
+    const spanNameInterner = new TestStringInterner();
+    moduleIdInterner.intern('test-module');
+    spanNameInterner.intern('test-span');
+
+    const taskContext = createTestTaskContext(tagAttributes);
+    const buffer = createSpanBuffer(tagAttributes, taskContext);
+
+    // Use ColumnWriter fluent API to write values
+    const writer = createColumnWriter(tagAttributes, buffer);
+    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+    (writer as any).nextRow().userId('user-12345').plainUserId('user-12345');
+
+    // Set required system columns
+    buffer.timestamps[0] = 1000n;
+    buffer.operations[0] = 3; // tag entry type
+    buffer.writeIndex = 1;
+
+    // Convert to Arrow table
+    const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+
+    // Get the userId column (should be masked)
+    const userIdCol = table.getChild('userId');
+    expect(userIdCol).toBeDefined();
+
+    // Get the plainUserId column (should NOT be masked)
+    const plainUserIdCol = table.getChild('plainUserId');
+    expect(plainUserIdCol).toBeDefined();
+
+    // Verify the masked value matches the expected hash
+    const maskedValue = userIdCol?.get(0);
+    const expectedHash = maskingTransforms.hash('user-12345');
+    expect(maskedValue).toBe(expectedHash);
+
+    // Verify the unmasked value is unchanged
+    const unmaskedValue = plainUserIdCol?.get(0);
+    expect(unmaskedValue).toBe('user-12345');
+  });
+
+  it('applies masking during Arrow conversion for text fields', () => {
+    const schema = defineTagAttributes({
+      email: S.text().mask('email'),
+      sqlQuery: S.text().mask('sql'),
+      plainText: S.text(), // No masking
+    });
+
+    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
+
+    // Create interners
+    const moduleIdInterner = new TestStringInterner();
+    const spanNameInterner = new TestStringInterner();
+    moduleIdInterner.intern('test-module');
+    spanNameInterner.intern('test-span');
+
+    const taskContext = createTestTaskContext(tagAttributes);
+    const buffer = createSpanBuffer(tagAttributes, taskContext);
+
+    // Use ColumnWriter fluent API to write values
+    const writer = createColumnWriter(tagAttributes, buffer);
+    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+    (writer as any)
+      .nextRow()
+      .email('john@example.com')
+      .sqlQuery("SELECT * FROM users WHERE id = 123 AND name = 'test'")
+      .plainText('Plain unmasked text');
+
+    // Set required system columns
+    buffer.timestamps[0] = 1000n;
+    buffer.operations[0] = 3; // tag entry type
+    buffer.writeIndex = 1;
+
+    // Convert to Arrow table
+    const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+
+    // Get columns
+    const emailCol = table.getChild('email');
+    const sqlQueryCol = table.getChild('sqlQuery');
+    const plainTextCol = table.getChild('plainText');
+
+    // Verify email masking
+    const maskedEmail = emailCol?.get(0);
+    expect(maskedEmail).toBe(maskingTransforms.email('john@example.com'));
+    expect(maskedEmail).toMatch(/^j\*\*\*\*\*@example\.com$/);
+
+    // Verify SQL masking
+    const maskedSql = sqlQueryCol?.get(0);
+    expect(maskedSql).toBe(maskingTransforms.sql("SELECT * FROM users WHERE id = 123 AND name = 'test'"));
+    expect(maskedSql).toBe('SELECT * FROM users WHERE id = ? AND name = ?');
+
+    // Verify plain text is unchanged
+    const plainValue = plainTextCol?.get(0);
+    expect(plainValue).toBe('Plain unmasked text');
+  });
+
+  it('applies custom mask function during Arrow conversion', () => {
+    // Custom mask function that keeps first 4 chars and replaces rest with *
+    const customMask = (value: string) => value.slice(0, 4) + '*'.repeat(Math.max(0, value.length - 4));
+
+    const schema = defineTagAttributes({
+      secretKey: S.text().mask(customMask),
+    });
+
+    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
+
+    // Create interners
+    const moduleIdInterner = new TestStringInterner();
+    const spanNameInterner = new TestStringInterner();
+    moduleIdInterner.intern('test-module');
+    spanNameInterner.intern('test-span');
+
+    const taskContext = createTestTaskContext(tagAttributes);
+    const buffer = createSpanBuffer(tagAttributes, taskContext);
+
+    // Use ColumnWriter fluent API to write value
+    const writer = createColumnWriter(tagAttributes, buffer);
+    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+    (writer as any).nextRow().secretKey('sk_live_abcd1234efgh5678');
+
+    // Set required system columns
+    buffer.timestamps[0] = 1000n;
+    buffer.operations[0] = 3; // tag entry type
+    buffer.writeIndex = 1;
+
+    // Convert to Arrow table
+    const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+
+    // Get the column
+    const secretKeyCol = table.getChild('secretKey');
+
+    // Verify custom masking was applied
+    // Input is 24 chars, first 4 are kept, remaining 20 are replaced with *
+    const maskedValue = secretKeyCol?.get(0);
+    expect(maskedValue).toBe('sk_l********************');
   });
 });

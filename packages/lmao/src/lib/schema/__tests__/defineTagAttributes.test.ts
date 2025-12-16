@@ -18,7 +18,7 @@ describe('defineTagAttributes with Sury', () => {
   test('defines base attributes with Sury schemas', () => {
     const attrs = defineTagAttributes({
       requestId: S.category(),
-      userId: S.optional(S.masked('hash')),
+      userId: S.category().mask('hash'), // Masking applied during Arrow conversion, not validation
       timestamp: S.number(),
     });
 
@@ -133,14 +133,17 @@ describe('defineTagAttributes with Sury', () => {
     expect(result2.optional).toBeUndefined();
   });
 
-  test('masking transformations work', () => {
+  test('masking metadata is set on schema', () => {
+    // Masking is now applied during Arrow conversion, not validation
+    // This test verifies the mask metadata is correctly attached to schemas
     const schema = defineTagAttributes({
-      userId: S.masked('hash'),
-      email: S.masked('email'),
-      apiUrl: S.masked('url'),
-      query: S.masked('sql'),
+      userId: S.category().mask('hash'),
+      email: S.text().mask('email'),
+      apiUrl: S.text().mask('url'),
+      query: S.text().mask('sql'),
     });
 
+    // Validation should pass through values unchanged (masking happens at Arrow conversion)
     const result = schema.validate({
       userId: 'user-12345',
       email: 'john@example.com',
@@ -148,17 +151,17 @@ describe('defineTagAttributes with Sury', () => {
       query: "SELECT * FROM users WHERE id = 123 AND name = 'test'",
     });
 
-    // Hash masking creates hex hash
-    expect(result.userId).toMatch(/^0x[0-9a-f]{16}$/);
+    // Values should be unchanged at validation time
+    expect(result.userId).toBe('user-12345');
+    expect(result.email).toBe('john@example.com');
+    expect(result.apiUrl).toBe('https://api.example.com/users');
+    expect(result.query).toBe("SELECT * FROM users WHERE id = 123 AND name = 'test'");
 
-    // Email masking shows first char and domain
-    expect(result.email).toMatch(/^j\*\*\*\*\*@example\.com$/);
-
-    // URL masking hides domain
-    expect(result.apiUrl).toBe('https://*****/users');
-
-    // SQL masking replaces literals with ?
-    expect(result.query).toBe('SELECT * FROM users WHERE id = ? AND name = ?');
+    // Verify mask metadata exists on schemas (will be used during Arrow conversion)
+    expect((schema.userId as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    expect((schema.email as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    expect((schema.apiUrl as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    expect((schema.query as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
   });
 
   test('should reject field names starting with _', () => {
@@ -222,7 +225,7 @@ describe('defineTagAttributes with Sury', () => {
     });
 
     const withDb = withHttp.extend({
-      dbQuery: S.masked('sql'),
+      dbQuery: S.text().mask('sql'),
     });
 
     expect(withDb).toHaveProperty('requestId');
@@ -254,7 +257,7 @@ describe('defineTagAttributes with Sury', () => {
   test('complex nested schema validation', () => {
     const schema = defineTagAttributes({
       requestId: S.category(),
-      userId: S.optional(S.masked('hash')),
+      userId: S.optional(S.category()), // Masking would be: S.category().mask('hash')
       httpStatus: S.number(),
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
       metadata: S.optional(S.category()),
@@ -268,7 +271,7 @@ describe('defineTagAttributes with Sury', () => {
     });
 
     expect(result.requestId).toBe('req-abc-123');
-    expect(result.userId).toMatch(/^0x[0-9a-f]{16}$/);
+    expect(result.userId).toBe('user-456'); // No masking at validation time
     expect(result.httpStatus).toBe(201);
     expect(result.operation).toBe('CREATE');
     expect(result.metadata).toBeUndefined();

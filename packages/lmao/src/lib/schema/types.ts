@@ -10,24 +10,30 @@ import type * as Sury from '@sury/sury';
 // Re-export schema metadata types from arrow-builder (single source of truth)
 export type {
   BooleanSchemaWithMetadata,
+  CategorySchemaWithMask,
   CategorySchemaWithMetadata,
   EnumSchemaWithMetadata,
   EnumUtf8Precomputed,
+  MaskPreset,
+  MaskTransform,
   NumberSchemaWithMetadata,
   SchemaType,
   SchemaWithMetadata,
   TagAttributeSchema,
+  TextSchemaWithMask,
   TextSchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 
 // Re-export Sury's core types for external use
 export type { Input, Output, Schema } from '@sury/sury';
 
-// Import schema metadata types for use in InferTagAttributes
+// Import schema metadata types for use in InferTagAttributes and local type definitions
 import type {
   BooleanSchemaWithMetadata,
   CategorySchemaWithMetadata,
   EnumSchemaWithMetadata,
+  MaskPreset,
+  MaskTransform,
   NumberSchemaWithMetadata,
   TagAttributeSchema,
   TextSchemaWithMetadata,
@@ -109,12 +115,6 @@ export type InferTagAttributesInput<T extends TagAttributeSchema> = {
 };
 
 /**
- * Masking transformations for sensitive data
- * Applied during Arrow table serialization (background processing)
- */
-export type MaskType = 'hash' | 'url' | 'sql' | 'email';
-
-/**
  * Feature flag builder with default value support
  * Returned by S.string(), S.number(), S.boolean(), S.enum() when used for feature flags
  */
@@ -146,6 +146,20 @@ export interface FeatureFlagDefinition<T, EvalType extends 'sync' | 'async' = 's
 export type SchemaOrFlagBuilder<T> = Sury.Schema<T, unknown> & FlagBuilder<T>;
 
 /**
+ * Category schema with flag builder and mask method
+ */
+export type CategorySchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & {
+  mask(preset: MaskPreset | MaskTransform): CategorySchemaWithMetadata;
+};
+
+/**
+ * Text schema with flag builder and mask method
+ */
+export type TextSchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & {
+  mask(preset: MaskPreset | MaskTransform): TextSchemaWithMetadata;
+};
+
+/**
  * Schema builder interface that wraps Sury with custom API
  * Supports both tag attributes and feature flags
  */
@@ -171,18 +185,24 @@ export interface SchemaBuilder {
    * Storage: Uint32Array indices with string interning
    * Arrow: Dictionary built dynamically from interned strings
    * Use for: userIds, sessionIds, moduleNames, spanNames, table names
-   * Example: S.category (no arguments needed)
+   *
+   * Returns a schema with:
+   * - .default().sync()/.async() for feature flags
+   * - .mask(preset) for masking during Arrow conversion
    */
-  category(): SchemaOrFlagBuilder<string>;
+  category(): CategorySchemaOrFlagBuilder;
 
   /**
    * Text - Unique values that rarely repeat
    * Storage: Raw strings without interning
    * Arrow: Plain string column (no dictionary overhead)
    * Use for: Unique error messages, URLs, request bodies, masked queries
-   * Example: S.text (no arguments needed)
+   *
+   * Returns a schema with:
+   * - .default().sync()/.async() for feature flags
+   * - .mask(preset) for masking during Arrow conversion
    */
-  text(): SchemaOrFlagBuilder<string>;
+  text(): TextSchemaOrFlagBuilder;
 
   // Optional wrapper
   optional<T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined>;
@@ -191,15 +211,7 @@ export interface SchemaBuilder {
   union<T extends readonly [Sury.Schema<unknown, unknown>, ...Sury.Schema<unknown, unknown>[]]>(
     schemas: T,
   ): Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>>;
-
-  // String with masking transformation - can be applied to category or text
-  masked(type: MaskType): Sury.Schema<string, string>;
 }
-
-/**
- * Masking helper function type
- */
-export type MaskTransform = (value: string) => string;
 
 /**
  * Get schema field entries, filtering out methods added by defineTagAttributes

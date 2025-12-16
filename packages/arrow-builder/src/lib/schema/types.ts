@@ -19,6 +19,17 @@ import type * as Sury from '@sury/sury';
 export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
 
 /**
+ * Masking preset names
+ * Applied during Arrow conversion (cold path), NOT during hot path writes
+ */
+export type MaskPreset = 'hash' | 'url' | 'sql' | 'email';
+
+/**
+ * Custom masking transform function
+ */
+export type MaskTransform = (value: string) => string;
+
+/**
  * Pre-computed UTF-8 bytes for enum values
  * Built at schema definition time (cold path) for zero-cost Arrow conversion
  */
@@ -54,21 +65,47 @@ export type EnumSchemaWithMetadata<T extends string = string> = Sury.Schema<T, u
 };
 
 /**
+ * Base metadata for category schema
+ */
+interface CategoryMetadata {
+  __schema_type: 'category';
+  __mask_transform?: MaskTransform;
+}
+
+/**
  * Category schema with metadata
  * Storage: Uint32Array indices with string interning
  * Arrow: Dictionary built dynamically from interned strings
  */
-export type CategorySchemaWithMetadata = Sury.Schema<string, unknown> & {
-  __schema_type: 'category';
+export type CategorySchemaWithMetadata = Sury.Schema<string, unknown> & CategoryMetadata;
+
+/**
+ * Category schema with chainable mask method
+ */
+export type CategorySchemaWithMask = CategorySchemaWithMetadata & {
+  mask(preset: MaskPreset | MaskTransform): CategorySchemaWithMetadata;
 };
+
+/**
+ * Base metadata for text schema
+ */
+interface TextMetadata {
+  __schema_type: 'text';
+  __mask_transform?: MaskTransform;
+}
 
 /**
  * Text schema with metadata
  * Storage: Raw strings without interning
  * Arrow: Plain string column (no dictionary overhead)
  */
-export type TextSchemaWithMetadata = Sury.Schema<string, unknown> & {
-  __schema_type: 'text';
+export type TextSchemaWithMetadata = Sury.Schema<string, unknown> & TextMetadata;
+
+/**
+ * Text schema with chainable mask method
+ */
+export type TextSchemaWithMask = TextSchemaWithMetadata & {
+  mask(preset: MaskPreset | MaskTransform): TextSchemaWithMetadata;
 };
 
 /**

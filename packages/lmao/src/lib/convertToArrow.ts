@@ -8,7 +8,7 @@
  * - Zero-copy wrap TypedArrays as Arrow vectors
  */
 
-import type { TypedArray } from '@smoothbricks/arrow-builder';
+import { getMaskTransform, type TypedArray } from '@smoothbricks/arrow-builder';
 import * as arrow from 'apache-arrow';
 import { ENTRY_TYPE_NAMES } from './lmao.js';
 import { getEnumUtf8, getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
@@ -183,23 +183,32 @@ function getArrowFieldName(fieldName: string): string {
 function buildSortedCategoryDictionary(
   buffers: SpanBuffer[],
   columnName: string,
+  maskTransform?: (value: string) => string,
 ): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } {
   const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
-  const uniqueStrings = new Set<string>();
+  // Build mapping from original value to masked value (for dictionary lookup)
+  // and collect unique masked values for the dictionary
+  const uniqueMaskedStrings = new Set<string>();
+  const originalToMasked = new Map<string, string>();
+
   for (const buf of buffers) {
     const column = buf[valuesName];
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf.writeIndex; i++) {
         const value = column[i];
-        if (value != null) uniqueStrings.add(value);
+        if (value != null && !originalToMasked.has(value)) {
+          const maskedValue = maskTransform ? maskTransform(value) : value;
+          originalToMasked.set(value, maskedValue);
+          uniqueMaskedStrings.add(maskedValue);
+        }
       }
     }
   }
 
-  const dictionary = Array.from(uniqueStrings).sort();
-  const stringToIndex = new Map(dictionary.map((s, i) => [s, i]));
+  const dictionary = Array.from(uniqueMaskedStrings).sort();
+  const maskedToIndex = new Map(dictionary.map((s, i) => [s, i]));
 
   const indices = new Uint32Array(totalRows);
   const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
@@ -210,7 +219,12 @@ function buildSortedCategoryDictionary(
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf.writeIndex; i++) {
         const value = column[i];
-        indices[rowOffset + i] = value != null ? (stringToIndex.get(value) ?? 0) : 0;
+        if (value != null) {
+          const maskedValue = originalToMasked.get(value) ?? value;
+          indices[rowOffset + i] = maskedToIndex.get(maskedValue) ?? 0;
+        } else {
+          indices[rowOffset + i] = 0;
+        }
       }
     }
     rowOffset += buf.writeIndex;
@@ -222,17 +236,30 @@ function buildSortedCategoryDictionary(
 function buildTextDictionary(
   buffers: SpanBuffer[],
   columnName: string,
+  maskTransform?: (value: string) => string,
 ): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } | null {
   const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
+  // Build mapping from original value to masked value and track frequency of masked values
   const frequencyMap = new Map<string, number>();
+  const originalToMasked = new Map<string, string>();
+
   for (const buf of buffers) {
     const column = buf[valuesName];
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf.writeIndex; i++) {
         const value = column[i];
-        if (value != null) frequencyMap.set(value, (frequencyMap.get(value) ?? 0) + 1);
+        if (value != null) {
+          let maskedValue: string;
+          if (originalToMasked.has(value)) {
+            maskedValue = originalToMasked.get(value)!;
+          } else {
+            maskedValue = maskTransform ? maskTransform(value) : value;
+            originalToMasked.set(value, maskedValue);
+          }
+          frequencyMap.set(maskedValue, (frequencyMap.get(maskedValue) ?? 0) + 1);
+        }
       }
     }
   }
@@ -242,7 +269,7 @@ function buildTextDictionary(
   }
 
   const dictionary = Array.from(frequencyMap.keys());
-  const stringToIndex = new Map(dictionary.map((s, i) => [s, i]));
+  const maskedToIndex = new Map(dictionary.map((s, i) => [s, i]));
 
   const indices = new Uint32Array(totalRows);
   const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
@@ -253,7 +280,12 @@ function buildTextDictionary(
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf.writeIndex; i++) {
         const value = column[i];
-        indices[rowOffset + i] = value != null ? (stringToIndex.get(value) ?? 0) : 0;
+        if (value != null) {
+          const maskedValue = originalToMasked.get(value) ?? value;
+          indices[rowOffset + i] = maskedToIndex.get(maskedValue) ?? 0;
+        } else {
+          indices[rowOffset + i] = 0;
+        }
       }
     }
     rowOffset += buf.writeIndex;
@@ -411,7 +443,13 @@ function convertBuffersToRecordBatch(
 
       vectors.push(arrow.makeVector(enumData));
     } else if (lmaoType === 'category') {
-      const { dictionary, indices, nullBitmap, nullCount } = buildSortedCategoryDictionary(buffers, columnName);
+      // Get mask transform from schema metadata (if present)
+      const maskTransform = getMaskTransform(fieldSchema);
+      const { dictionary, indices, nullBitmap, nullCount } = buildSortedCategoryDictionary(
+        buffers,
+        columnName,
+        maskTransform,
+      );
       const { data: categoryUtf8Data, offsets: categoryUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
       const categoryDictData = arrow.makeData({
@@ -435,7 +473,9 @@ function convertBuffersToRecordBatch(
 
       vectors.push(arrow.makeVector(categoryData));
     } else if (lmaoType === 'text') {
-      const result = buildTextDictionary(buffers, columnName);
+      // Get mask transform from schema metadata (if present)
+      const maskTransform = getMaskTransform(fieldSchema);
+      const result = buildTextDictionary(buffers, columnName, maskTransform);
       if (result) {
         const { dictionary, indices, nullBitmap, nullCount } = result;
         const { data: textUtf8Data, offsets: textUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
@@ -938,11 +978,24 @@ export function convertSpanTreeToArrowTable(
   // ═══════════════════════════════════════════════════════════════════════════
   const categoryBuilders = new Map<string, ColumnDictionary>();
   const textBuilders = new Map<string, ColumnDictionary>();
+  // Store mask transforms and original->masked mappings per column
+  const categoryMaskTransforms = new Map<string, ((value: string) => string) | undefined>();
+  const textMaskTransforms = new Map<string, ((value: string) => string) | undefined>();
+  const categoryOriginalToMasked = new Map<string, Map<string, string>>();
+  const textOriginalToMasked = new Map<string, Map<string, string>>();
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
-    if (lmaoType === 'category') categoryBuilders.set(fieldName, new ColumnDictionary());
-    if (lmaoType === 'text') textBuilders.set(fieldName, new ColumnDictionary());
+    if (lmaoType === 'category') {
+      categoryBuilders.set(fieldName, new ColumnDictionary());
+      categoryMaskTransforms.set(fieldName, getMaskTransform(fieldSchema));
+      categoryOriginalToMasked.set(fieldName, new Map());
+    }
+    if (lmaoType === 'text') {
+      textBuilders.set(fieldName, new ColumnDictionary());
+      textMaskTransforms.set(fieldName, getMaskTransform(fieldSchema));
+      textOriginalToMasked.set(fieldName, new Map());
+    }
   }
 
   // System column dictionaries
@@ -963,18 +1016,38 @@ export function convertSpanTreeToArrowTable(
 
     for (const [fieldName, builder] of categoryBuilders) {
       const col = buffer[`${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      const maskTransform = categoryMaskTransforms.get(fieldName);
+      const originalToMasked = categoryOriginalToMasked.get(fieldName)!;
       if (col) {
         for (let i = 0; i < buffer.writeIndex; i++) {
-          if (col[i] != null) builder.add(col[i]);
+          const originalValue = col[i];
+          if (originalValue != null) {
+            let maskedValue = originalToMasked.get(originalValue);
+            if (maskedValue === undefined) {
+              maskedValue = maskTransform ? maskTransform(originalValue) : originalValue;
+              originalToMasked.set(originalValue, maskedValue);
+            }
+            builder.add(maskedValue);
+          }
         }
       }
     }
 
     for (const [fieldName, builder] of textBuilders) {
       const col = buffer[`${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      const maskTransform = textMaskTransforms.get(fieldName);
+      const originalToMasked = textOriginalToMasked.get(fieldName)!;
       if (col) {
         for (let i = 0; i < buffer.writeIndex; i++) {
-          if (col[i] != null) builder.add(col[i]);
+          const originalValue = col[i];
+          if (originalValue != null) {
+            let maskedValue = originalToMasked.get(originalValue);
+            if (maskedValue === undefined) {
+              maskedValue = maskTransform ? maskTransform(originalValue) : originalValue;
+              originalToMasked.set(originalValue, maskedValue);
+            }
+            builder.add(maskedValue);
+          }
         }
       }
     }
@@ -1090,6 +1163,8 @@ export function convertSpanTreeToArrowTable(
     moduleIdInterner,
     spanNameInterner,
     schema,
+    categoryOriginalToMasked,
+    textOriginalToMasked,
   );
 
   return new arrow.Table([batch]);
@@ -1112,6 +1187,8 @@ function convertBuffersWithSharedDicts(
   moduleIdInterner: StringInterner,
   spanNameInterner: StringInterner,
   lmaoSchema: Record<string, unknown>,
+  categoryOriginalToMasked: Map<string, Map<string, string>>,
+  textOriginalToMasked: Map<string, Map<string, string>>,
 ): arrow.RecordBatch {
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
   const vectors: arrow.Vector[] = [];
@@ -1390,6 +1467,7 @@ function convertBuffersWithSharedDicts(
 
     if (lmaoType === 'category') {
       const dict = categoryDicts.get(fieldName)!;
+      const originalToMasked = categoryOriginalToMasked.get(fieldName)!;
       const indices = new Uint32Array(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       let nullCount = 0;
@@ -1402,7 +1480,9 @@ function convertBuffersWithSharedDicts(
             const v = col[i];
             const rowIdx = rowOffset + i;
             if (v != null) {
-              indices[rowIdx] = dict.indexMap.get(v) ?? 0;
+              // Look up the masked value, then find its index in the dictionary
+              const maskedValue = originalToMasked.get(v) ?? v;
+              indices[rowIdx] = dict.indexMap.get(maskedValue) ?? 0;
               nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
             } else {
               nullCount++;
@@ -1438,6 +1518,7 @@ function convertBuffersWithSharedDicts(
       );
     } else if (lmaoType === 'text') {
       const dict = textDicts.get(fieldName)!;
+      const originalToMasked = textOriginalToMasked.get(fieldName)!;
       const indices = new Uint32Array(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       let nullCount = 0;
@@ -1450,7 +1531,9 @@ function convertBuffersWithSharedDicts(
             const v = col[i];
             const rowIdx = rowOffset + i;
             if (v != null) {
-              indices[rowIdx] = dict.indexMap.get(v) ?? 0;
+              // Look up the masked value, then find its index in the dictionary
+              const maskedValue = originalToMasked.get(v) ?? v;
+              indices[rowIdx] = dict.indexMap.get(maskedValue) ?? 0;
               nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
             } else {
               nullCount++;

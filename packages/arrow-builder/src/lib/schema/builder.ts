@@ -13,12 +13,77 @@
 import * as Sury from '@sury/sury';
 import type {
   BooleanSchemaWithMetadata,
+  CategorySchemaWithMask,
   CategorySchemaWithMetadata,
   EnumSchemaWithMetadata,
   EnumUtf8Precomputed,
+  MaskPreset,
+  MaskTransform,
   NumberSchemaWithMetadata,
+  TextSchemaWithMask,
   TextSchemaWithMetadata,
 } from './types.js';
+
+/**
+ * Masking preset implementations
+ * Applied during Arrow table serialization (cold path, NOT hot path)
+ */
+export const maskingTransforms: Record<MaskPreset, MaskTransform> = {
+  /**
+   * Hash masking - creates deterministic hash for IDs
+   * Maintains referential integrity while hiding actual values
+   */
+  hash: (value: string): string => {
+    // Simple hash for demo - use crypto.subtle.digest in production
+    let hash = 0;
+    for (let i = 0; i < value.length; i++) {
+      hash = (hash << 5) - hash + value.charCodeAt(i);
+      hash = hash & hash; // Convert to 32-bit integer
+    }
+    return `0x${Math.abs(hash).toString(16).padStart(16, '0')}`;
+  },
+
+  /**
+   * URL masking - hides domain while preserving path structure
+   * Useful for HTTP request logging
+   */
+  url: (value: string): string => {
+    try {
+      const url = new URL(value);
+      return `${url.protocol}//*****${url.pathname}${url.search}`;
+    } catch {
+      return '*****';
+    }
+  },
+
+  /**
+   * SQL masking - replaces literals with placeholders
+   * Preserves query structure for analysis
+   */
+  sql: (value: string): string => {
+    // Replace string literals and numbers with placeholders
+    return value.replace(/'[^']*'/g, '?').replace(/\b\d+\b/g, '?');
+  },
+
+  /**
+   * Email masking - shows first character and domain only
+   * Maintains uniqueness while protecting privacy
+   */
+  email: (value: string): string => {
+    const [local, domain] = value.split('@');
+    if (!domain) return '*****';
+    // Guard against empty local part (e.g., "@domain.com")
+    if (!local || local.length === 0) return `*****@${domain}`;
+    return `${local[0]}*****@${domain}`;
+  },
+};
+
+/**
+ * Resolve a mask preset name or custom function to a MaskTransform function
+ */
+function resolveMaskTransform(preset: MaskPreset | MaskTransform): MaskTransform {
+  return typeof preset === 'function' ? preset : maskingTransforms[preset];
+}
 
 /**
  * Pre-compute UTF-8 bytes for enum values at schema definition time.
@@ -88,16 +153,22 @@ export interface ArrowSchemaBuilder {
    * Storage: Uint32Array indices with string interning
    * Arrow: Dictionary built dynamically from interned strings
    * Use for: userIds, sessionIds, moduleNames, spanNames
+   *
+   * Returns a schema with a chainable .mask() method for applying
+   * masking transforms during Arrow conversion (cold path).
    */
-  category(): Sury.Schema<string, unknown> & CategorySchemaWithMetadata;
+  category(): Sury.Schema<string, unknown> & CategorySchemaWithMask;
 
   /**
    * Text - Unique values that rarely repeat
    * Storage: Raw strings without interning
    * Arrow: Plain string column (no dictionary overhead)
    * Use for: Error messages, URLs, request bodies
+   *
+   * Returns a schema with a chainable .mask() method for applying
+   * masking transforms during Arrow conversion (cold path).
    */
-  text(): Sury.Schema<string, unknown> & TextSchemaWithMetadata;
+  text(): Sury.Schema<string, unknown> & TextSchemaWithMask;
 
   /**
    * Wrap schema to make it optional
@@ -167,8 +238,20 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     const schema = Object.create(
       Object.getPrototypeOf(Sury.string),
       Object.getOwnPropertyDescriptors(Sury.string),
-    ) as Sury.Schema<string, unknown> & CategorySchemaWithMetadata;
+    ) as Sury.Schema<string, unknown> & CategorySchemaWithMask;
     schema.__schema_type = 'category';
+
+    // Add chainable .mask() method
+    schema.mask = (preset: MaskPreset | MaskTransform): CategorySchemaWithMetadata => {
+      // Clone to create a new schema with the mask transform
+      const maskedSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as Sury.Schema<string, unknown> & CategorySchemaWithMetadata;
+      maskedSchema.__mask_transform = resolveMaskTransform(preset);
+      return maskedSchema;
+    };
+
     return schema;
   },
 
@@ -177,8 +260,20 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     const schema = Object.create(
       Object.getPrototypeOf(Sury.string),
       Object.getOwnPropertyDescriptors(Sury.string),
-    ) as Sury.Schema<string, unknown> & TextSchemaWithMetadata;
+    ) as Sury.Schema<string, unknown> & TextSchemaWithMask;
     schema.__schema_type = 'text';
+
+    // Add chainable .mask() method
+    schema.mask = (preset: MaskPreset | MaskTransform): TextSchemaWithMetadata => {
+      // Clone to create a new schema with the mask transform
+      const maskedSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as Sury.Schema<string, unknown> & TextSchemaWithMetadata;
+      maskedSchema.__mask_transform = resolveMaskTransform(preset);
+      return maskedSchema;
+    };
+
     return schema;
   },
 
