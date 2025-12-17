@@ -1047,6 +1047,299 @@ class MemoryMonitor {
 }
 ```
 
+## String Interning and UTF-8 Caching Architecture
+
+The system uses a two-tier architecture for efficient string handling:
+
+1. **Global Interner (arrow-builder)**: Pre-encodes UTF-8 for compile-time known strings
+2. **SIEVE Cache (lmao)**: Bounded cache for runtime strings during Arrow conversion
+
+### StringInterner (arrow-builder owns)
+
+Located in `packages/arrow-builder/src/lib/arrow/interner.ts`.
+
+A global `Map<string, Uint8Array>` that caches UTF-8 pre-encoded bytes for known strings.
+
+```typescript
+// Internal implementation
+const strings = new Map<string, Uint8Array>();
+
+export function intern(str: string): Uint8Array {
+  let utf8 = strings.get(str);
+  if (!utf8) {
+    utf8 = encoder.encode(str);
+    strings.set(str, utf8);
+  }
+  return utf8;
+}
+
+export function getInterned(str: string): Uint8Array | undefined {
+  return strings.get(str);
+}
+```
+
+**When `intern()` is called** (all at startup/definition time, NOT hot path):
+
+- **Enum schema creation**: `S.enum(['A', 'B', 'C'])` calls `intern()` for all values
+- **Module context creation**: `new ModuleContext(...)` interns `filePath` and `gitSha`
+- **Task context creation**: `new TaskContext(...)` interns `spanName`
+
+**Why unbounded**: All interned values are source code constants (enum values, file paths, span names) that already
+exist in memory. The interner just caches their UTF-8 representations.
+
+**Usage pattern**:
+
+```typescript
+// At schema definition (startup)
+const schema = S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']);
+// → intern() called 4 times, UTF-8 bytes cached forever
+
+// At module creation (startup)
+const moduleCtx = new ModuleContext(
+  moduleId,
+  gitSha, // intern(gitSha) → UTF-8 bytes cached
+  filePath, // intern(filePath) → UTF-8 bytes cached
+  tagAttributes
+);
+
+// At task creation (per-request, but span names are finite)
+const taskCtx = new TaskContext(
+  moduleCtx,
+  'processOrder', // intern(spanName) → UTF-8 bytes cached
+  lineNumber
+);
+```
+
+### Utf8Cache (lmao owns)
+
+Located in `packages/lmao/src/lib/utf8Cache.ts`.
+
+A SIEVE-based cache for runtime strings (category/text column values like userIds, error messages) that implements the
+`Utf8Encoder` interface from arrow-builder.
+
+```typescript
+export class Utf8Cache implements Utf8Encoder {
+  private readonly cache: SieveCache<string, Uint8Array>;
+
+  encode(str: string): Uint8Array {
+    const cached = this.cache.get(str);
+    if (cached !== undefined) return cached;
+
+    const encoded = this.encoder.encode(str);
+    this.cache.set(str, encoded);
+    return encoded;
+  }
+
+  encodeMany(strings: readonly string[]): { data: Uint8Array; offsets: Int32Array } {
+    // Encode all strings using cache, return concatenated + offsets
+  }
+}
+
+export const globalUtf8Cache = new Utf8Cache(); // Singleton
+```
+
+**Characteristics**:
+
+- Bounded (default 4096 entries) with SIEVE eviction
+- Cross-flush benefit: repeated strings avoid re-encoding across conversions
+- Used during Arrow conversion (cold path), NOT during logging (hot path)
+- SIEVE algorithm: ~9% lower miss ratio than LRU-K, ARC, 2Q (NSDI'24)
+
+**Why separate from interner**: Runtime strings have high cardinality (userIds, error messages) and need bounded memory.
+The interner is for finite, known strings; the cache is for unbounded, runtime strings.
+
+### DictionaryBuilder (arrow-builder owns)
+
+Located in `packages/arrow-builder/src/lib/arrow/dictionary.ts`.
+
+Builds Arrow dictionaries efficiently with a 2nd-occurrence caching pattern:
+
+```typescript
+export class DictionaryBuilder {
+  private entries = new Map<string, TrackedEntry>();
+  private utf8Encoder: Utf8Encoder; // lmao passes globalUtf8Cache
+
+  add(str: string): void {
+    const existing = this.entries.get(str);
+    if (existing) {
+      existing.count++;
+      // Cache UTF-8 on 2nd occurrence if not already cached
+      if (existing.count === 2 && !existing.utf8) {
+        existing.utf8 = this.utf8Encoder.encode(str);
+      }
+      return;
+    }
+
+    // Check interner for pre-encoded UTF-8 (enum values, module names)
+    const interned = getInterned(str);
+    if (interned) {
+      this.entries.set(str, { utf8: interned, byteLength: interned.length, count: 1 });
+      return;
+    }
+
+    // 1st occurrence: just track byte length (no encoding yet)
+    const byteLength = utf8ByteLength(str);
+    this.entries.set(str, { byteLength, count: 1 });
+  }
+
+  finalize(sorted: boolean): FinalizedDictionary {
+    // For each string:
+    // - If utf8 cached (interned or 2nd occurrence): use cached bytes
+    // - If 1-time string: encodeInto() directly to output buffer
+    // Auto-selects index type (uint8/uint16/uint32) based on dictionary size
+  }
+}
+```
+
+**Lookup order**:
+
+1. Check global interner via `getInterned()` for pre-encoded UTF-8 (enums, span names)
+2. Fall back to encoder (lmao's `globalUtf8Cache`) with 2nd-occurrence pattern:
+   - 1st occurrence: just track byte length (no encoding)
+   - 2nd occurrence: encode and cache locally
+   - Finalize: use cached bytes or `encodeInto()` directly for one-time strings
+
+**Why 2nd-occurrence caching**: Most one-time strings (unique error messages, UUIDs) don't benefit from caching. By
+waiting until the 2nd occurrence, we avoid wasting memory on truly unique strings while still caching repeated values.
+
+### Pre-encoded UTF-8 in Contexts (lmao owns)
+
+Module and Task contexts store pre-encoded UTF-8 for frequently-used strings:
+
+```typescript
+// ModuleContext (created once per module at startup)
+class ModuleContext {
+  readonly utf8FilePath: Uint8Array; // intern(filePath)
+  readonly utf8GitSha: Uint8Array; // intern(gitSha)
+
+  constructor(moduleId, gitSha, filePath, tagAttributes) {
+    this.utf8FilePath = intern(filePath);
+    this.utf8GitSha = intern(gitSha);
+  }
+}
+
+// TaskContext (created per task/span)
+class TaskContext {
+  readonly utf8SpanName: Uint8Array; // intern(spanName)
+
+  constructor(module, spanName, lineNumber) {
+    this.utf8SpanName = intern(spanName);
+  }
+}
+```
+
+**Why pre-encode**: These strings are written to Arrow columns frequently. Pre-encoding at context creation means zero
+UTF-8 encoding cost during Arrow conversion.
+
+### Design Decisions
+
+#### 1. No ID Pools
+
+The interner caches UTF-8 bytes directly, not numeric IDs. This avoids:
+
+- Extra Map lookup at write time (string → ID)
+- Extra array lookup at conversion time (ID → string → UTF-8)
+- Complex lifecycle management (when to release IDs?)
+
+Direct string access is simpler: contexts hold the original strings, interner holds pre-encoded UTF-8.
+
+#### 2. Separate SIEVE Cache from Interner
+
+| Aspect      | Interner (arrow-builder)   | Utf8Cache (lmao)              |
+| ----------- | -------------------------- | ----------------------------- |
+| **Purpose** | Pre-encode known strings   | Cache runtime string encoding |
+| **Bounded** | No (finite source strings) | Yes (SIEVE, default 4096)     |
+| **Called**  | Startup/definition time    | Arrow conversion (cold path)  |
+| **Strings** | Enum values, paths, names  | userIds, errors, categories   |
+| **Memory**  | O(source code constants)   | O(cache max size)             |
+| **Package** | arrow-builder              | lmao                          |
+
+#### 3. Batch-Local Dictionary Remapping
+
+Arrow requires contiguous 0-based indices for dictionary encoding. Each batch builds its own dictionary during
+`finalize()`:
+
+```typescript
+// During finalize(), strings are sorted and assigned indices 0, 1, 2, ...
+const strings = [...this.entries.keys()];
+if (sorted) strings.sort();
+
+const indexMap = new Map<string, number>();
+for (let i = 0; i < strings.length; i++) {
+  indexMap.set(strings[i], i); // Fresh 0-based index per batch
+}
+```
+
+This means the same string may have different indices in different batches, which is correct for Arrow's dictionary
+encoding model.
+
+#### 4. Sorted Dictionaries
+
+`DictionaryBuilder.finalize(sorted: true)` produces alphabetically sorted dictionaries:
+
+- **Storage**: Better compression (similar strings adjacent)
+- **Querying**: Enables binary search for "does value X exist?"
+- **Batch merging**: Easier to merge sorted dictionaries from multiple batches
+
+### Package Ownership Summary
+
+| Component                   | Package       | Purpose                                      |
+| --------------------------- | ------------- | -------------------------------------------- |
+| `intern()`, `getInterned()` | arrow-builder | UTF-8 pre-encoding for known strings         |
+| `Utf8Encoder` interface     | arrow-builder | Contract for UTF-8 encoding                  |
+| `defaultUtf8Encoder`        | arrow-builder | Simple TextEncoder wrapper, no caching       |
+| `utf8ByteLength()`          | arrow-builder | Calculate UTF-8 length without encoding      |
+| `DictionaryBuilder`         | arrow-builder | Build Arrow dictionaries with 2nd-occ cache  |
+| `Utf8Cache`                 | lmao          | SIEVE-cached Utf8Encoder for runtime strings |
+| `globalUtf8Cache`           | lmao          | Singleton Utf8Cache instance                 |
+| Pre-encoded contexts        | lmao          | ModuleContext/TaskContext with utf8\* fields |
+
+### Data Flow During Arrow Conversion
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        ARROW CONVERSION (Cold Path)                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  String from buffer                                                          │
+│       │                                                                      │
+│       ▼                                                                      │
+│  ┌─────────────────┐                                                         │
+│  │ DictionaryBuilder│                                                        │
+│  │     .add(str)    │                                                        │
+│  └────────┬────────┘                                                         │
+│           │                                                                  │
+│           ▼                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │ 1. getInterned(str)                                              │        │
+│  │    ├─ HIT: Use pre-encoded UTF-8 (enum value, span name)        │        │
+│  │    └─ MISS: Continue to step 2                                   │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│           │                                                                  │
+│           ▼                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │ 2. Track occurrence count                                        │        │
+│  │    ├─ 1st occurrence: Track byteLength only (no encoding)       │        │
+│  │    └─ 2nd occurrence: utf8Encoder.encode(str) → cache locally   │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│           │                                                                  │
+│           ▼                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │ utf8Encoder = globalUtf8Cache (SIEVE)                           │        │
+│  │    ├─ HIT: Return cached Uint8Array                             │        │
+│  │    └─ MISS: TextEncoder.encode() → cache → return               │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│                                                                              │
+│  On finalize():                                                              │
+│  ┌─────────────────────────────────────────────────────────────────┐        │
+│  │ For each string:                                                 │        │
+│  │    ├─ If utf8 cached: Copy bytes to output                       │        │
+│  │    └─ If 1-time: encodeInto() directly (no cache pollution)     │        │
+│  └──────────────────────────────────────────────────────────────────┘        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
 ## Summary
 
 Buffer performance optimizations leverage:
@@ -1055,6 +1348,9 @@ Buffer performance optimizations leverage:
 - **Monomorphic access** - Predictable types
 - **Cache alignment** - CPU-friendly layout
 - **ENUM compile-time mapping** - Integer comparisons via switch statement
+- **Global string interner** - Pre-encoded UTF-8 for known strings (arrow-builder)
+- **SIEVE UTF-8 cache** - Bounded cache for runtime strings (lmao)
+- **2nd-occurrence caching** - Avoids encoding truly unique strings
 - **SIEVE bounding** - Prevents unbounded memory growth (CATEGORY)
 - **Per-flush clearing** - Releases TEXT memory after conversion
 - **Sequential access** - Prefetch friendly

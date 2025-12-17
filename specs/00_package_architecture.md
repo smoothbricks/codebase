@@ -193,6 +193,9 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 6. **Generic schema types** - Type definitions (enum, category, text, number, boolean)
 7. **Runtime class generation** - `generateColumnBufferClass()` using `new Function()`
 8. **Column buffer codegen utilities** - Create optimized buffer classes with direct properties
+9. **String interner** - Global `Map<string, Uint8Array>` for pre-encoding UTF-8 of known strings
+10. **Utf8Encoder interface** - Contract for UTF-8 encoding with `encode()`, `byteLength()`, `encodeInto()`
+11. **DictionaryBuilder** - Builds Arrow dictionaries with 2nd-occurrence caching pattern
 
 ### What arrow-builder MUST NOT know about
 
@@ -331,6 +334,9 @@ A high-level structured logging library providing excellent developer experience
 13. **Tree walking** - Recursive traversal of SpanBuffer trees (parent/children/overflow chains)
 14. **Dictionary building** - Two-pass conversion: build dictionaries across tree, then convert to RecordBatches
 15. **Arrow Table creation** - Orchestrates conversion using shared dictionaries and `arrow.makeData()`
+16. **Utf8Cache** - SIEVE-based cache implementing arrow-builder's `Utf8Encoder` interface
+17. **globalUtf8Cache singleton** - Shared cache for cross-flush UTF-8 encoding benefits
+18. **Pre-encoded contexts** - ModuleContext/TaskContext with `utf8FilePath`, `utf8GitSha`, `utf8SpanName`
 
 ### System Columns vs User Attributes
 
@@ -547,6 +553,98 @@ Both packages use `new Function()` for performance-critical code:
 
 ---
 
+## String Interning and UTF-8 Caching
+
+The system uses a two-tier architecture for efficient string-to-UTF-8 conversion:
+
+### Global Interner (arrow-builder)
+
+A simple `Map<string, Uint8Array>` for pre-encoding UTF-8 of known strings:
+
+```typescript
+// arrow-builder/src/lib/arrow/interner.ts
+export function intern(str: string): Uint8Array; // Encode and cache (or return cached)
+export function getInterned(str: string): Uint8Array | undefined; // Get if cached
+```
+
+**When called** (all at startup/definition time):
+
+- `S.enum(['A', 'B'])` → interns all enum values
+- `new ModuleContext(...)` → interns `filePath`, `gitSha`
+- `new TaskContext(...)` → interns `spanName`
+
+**Why in arrow-builder**: Pre-encoding UTF-8 is generic functionality. Any columnar data system benefits from avoiding
+repeated encoding of known strings. The interner has no knowledge of logging concepts.
+
+### Utf8Cache (lmao)
+
+A SIEVE-based bounded cache for runtime strings:
+
+```typescript
+// lmao/src/lib/utf8Cache.ts
+export class Utf8Cache implements Utf8Encoder {
+  encode(str: string): Uint8Array; // Check cache, encode if miss
+  encodeMany(strings: string[]): { data: Uint8Array; offsets: Int32Array };
+}
+export const globalUtf8Cache: Utf8Cache; // Singleton
+```
+
+**Why in lmao**: The SIEVE cache handles high-cardinality runtime strings (userIds, error messages) that need bounded
+memory. This is logging-specific - a generic columnar library wouldn't know the right cache size or eviction policy.
+
+### DictionaryBuilder (arrow-builder)
+
+Builds Arrow dictionaries with a 2nd-occurrence caching pattern:
+
+```typescript
+// arrow-builder/src/lib/arrow/dictionary.ts
+export class DictionaryBuilder {
+  constructor(utf8Encoder?: Utf8Encoder); // lmao passes globalUtf8Cache
+  add(str: string): void; // Check interner → track occurrence → maybe encode
+  finalize(sorted: boolean): FinalizedDictionary;
+}
+```
+
+**Lookup order in `add()`**:
+
+1. Check `getInterned(str)` for pre-encoded UTF-8 (enum values, span names)
+2. If not interned, track occurrence count:
+   - 1st occurrence: just track byte length
+   - 2nd occurrence: encode via `utf8Encoder` (lmao's cache) and store locally
+
+**Why in arrow-builder**: Dictionary building is generic Arrow functionality. The `Utf8Encoder` interface allows lmao to
+inject its SIEVE cache without arrow-builder knowing about caching strategies.
+
+### Pre-encoded UTF-8 in Contexts (lmao)
+
+```typescript
+class ModuleContext {
+  readonly utf8FilePath: Uint8Array; // intern(filePath) at construction
+  readonly utf8GitSha: Uint8Array; // intern(gitSha) at construction
+}
+
+class TaskContext {
+  readonly utf8SpanName: Uint8Array; // intern(spanName) at construction
+}
+```
+
+**Why in lmao**: Contexts are logging-specific. arrow-builder doesn't know about modules, tasks, or spans.
+
+### Package Ownership Summary
+
+| Component            | Package       | Why There                                 |
+| -------------------- | ------------- | ----------------------------------------- |
+| `intern()`           | arrow-builder | Generic UTF-8 caching for known strings   |
+| `getInterned()`      | arrow-builder | Used by DictionaryBuilder                 |
+| `Utf8Encoder`        | arrow-builder | Generic interface for encoding            |
+| `defaultUtf8Encoder` | arrow-builder | Simple non-caching implementation         |
+| `DictionaryBuilder`  | arrow-builder | Generic Arrow dictionary construction     |
+| `Utf8Cache`          | lmao          | SIEVE cache for runtime strings (bounded) |
+| `globalUtf8Cache`    | lmao          | Singleton for cross-conversion caching    |
+| Pre-encoded contexts | lmao          | Logging-specific context optimization     |
+
+---
+
 ## Package Dependencies
 
 ```json
@@ -602,11 +700,17 @@ Both packages use `new Function()` for performance-critical code:
 packages/
 ├── arrow-builder/
 │   └── src/lib/
+│       ├── arrow/
+│       │   ├── interner.ts               # intern(), getInterned() - UTF-8 pre-encoding
+│       │   ├── dictionary.ts             # DictionaryBuilder with 2nd-occurrence caching
+│       │   └── utf8.ts                   # Utf8Encoder interface, defaultUtf8Encoder
 │       ├── buffer/
 │       │   ├── columnBufferGenerator.ts  # new Function() codegen
 │       │   ├── createColumnBuffer.ts     # Buffer factory
 │       │   ├── types.ts                  # ColumnBuffer interface
 │       │   └── microseconds.ts           # Branded timestamp type
+│       ├── schema/
+│       │   └── builder.ts                # S.enum/category/text (calls intern() for enums)
 │       ├── schema-types.ts               # Generic schema types
 │       └── index.ts                      # Public exports
 │
@@ -622,6 +726,9 @@ packages/
         ├── lmao.ts                       # Main entry, context creation
         ├── spanBuffer.ts                 # SpanBuffer factory (extends ColumnBuffer)
         ├── types.ts                      # SpanBuffer, TaskContext interfaces
+        ├── moduleContext.ts              # ModuleContext with utf8FilePath, utf8GitSha
+        ├── taskContext.ts                # TaskContext with utf8SpanName
+        ├── utf8Cache.ts                  # Utf8Cache (SIEVE), globalUtf8Cache singleton
         ├── convertToArrow.ts             # Tree walking, dictionary building, Arrow conversion
         └── flushScheduler.ts             # Background processing
 ```
@@ -630,21 +737,23 @@ packages/
 
 ## Summary
 
-| Aspect             | arrow-builder                           | lmao                                         |
-| ------------------ | --------------------------------------- | -------------------------------------------- |
-| **Purpose**        | Generic columnar buffer engine          | Structured logging library                   |
-| **Level**          | Low-level primitives                    | High-level API                               |
-| **Focus**          | Explicit allocations, memory efficiency | Developer experience, zero overhead hot path |
-| **Knowledge**      | Generic columnar data                   | Logging/tracing semantics                    |
-| **Allocations**    | Visible, controllable                   | Delegates to arrow-builder                   |
-| **Schema**         | Generic types, extensible metadata      | Extends with masking                         |
-| **Naming**         | User-defined column names               | `_` prefix for system, direct for user       |
-| **Lazy Columns**   | Provides pattern (shared ArrayBuffer)   | Uses for user attributes                     |
-| **System Columns** | No concept                              | ALWAYS eager (\_timestamps, \_operations)    |
-| **Scope**          | No concept                              | SEPARATE class from buffer columns           |
-| **Codegen**        | `generateColumnBufferClass()`           | Extends with SpanLogger, Scope               |
-| **Tree Walking**   | No concept                              | Owns tree traversal and dictionary building  |
-| **Dependencies**   | apache-arrow only                       | arrow-builder + apache-arrow                 |
+| Aspect               | arrow-builder                                | lmao                                         |
+| -------------------- | -------------------------------------------- | -------------------------------------------- |
+| **Purpose**          | Generic columnar buffer engine               | Structured logging library                   |
+| **Level**            | Low-level primitives                         | High-level API                               |
+| **Focus**            | Explicit allocations, memory efficiency      | Developer experience, zero overhead hot path |
+| **Knowledge**        | Generic columnar data                        | Logging/tracing semantics                    |
+| **Allocations**      | Visible, controllable                        | Delegates to arrow-builder                   |
+| **Schema**           | Generic types, extensible metadata           | Extends with masking                         |
+| **Naming**           | User-defined column names                    | `_` prefix for system, direct for user       |
+| **Lazy Columns**     | Provides pattern (shared ArrayBuffer)        | Uses for user attributes                     |
+| **System Columns**   | No concept                                   | ALWAYS eager (\_timestamps, \_operations)    |
+| **Scope**            | No concept                                   | SEPARATE class from buffer columns           |
+| **Codegen**          | `generateColumnBufferClass()`                | Extends with SpanLogger, Scope               |
+| **String Interning** | `intern()` for known strings (unbounded)     | `Utf8Cache` for runtime strings (SIEVE)      |
+| **UTF-8 Encoding**   | `Utf8Encoder` interface, `DictionaryBuilder` | `globalUtf8Cache`, pre-encoded contexts      |
+| **Tree Walking**     | No concept                                   | Owns tree traversal and dictionary building  |
+| **Dependencies**     | apache-arrow only                            | arrow-builder + apache-arrow                 |
 
 ---
 
@@ -664,23 +773,29 @@ Is it logging/tracing specific?
 
 ### Concrete Examples
 
-| Feature                              | Package       | Why                               |
-| ------------------------------------ | ------------- | --------------------------------- |
-| Cache-aligned TypedArray allocation  | arrow-builder | Generic optimization              |
-| Lazy column with shared ArrayBuffer  | arrow-builder | Generic memory pattern            |
-| Null bitmap management               | arrow-builder | Generic Arrow format              |
-| Buffer capacity, no hidden resize    | arrow-builder | Generic allocation control        |
-| Runtime class generation             | arrow-builder | Generic V8 optimization           |
-| `_` prefix for system properties     | **lmao**      | Logging-specific namespace mgmt   |
-| System columns (\_timestamps, \_ops) | **lmao**      | Logging-specific hot path         |
-| Scope class generation               | **lmao**      | Logging-specific inheritance      |
-| Entry types (span-start, info)       | **lmao**      | Logging-specific lifecycle        |
-| SpanLogger with typed methods        | **lmao**      | Logging-specific API              |
-| Masking functions                    | **lmao**      | Logging-specific privacy          |
-| Context flow                         | **lmao**      | Logging-specific hierarchy        |
-| Tree walking (span trees)            | **lmao**      | Logging-specific tree structure   |
-| Dictionary building across tree      | **lmao**      | Logging-specific Arrow conversion |
-| RecordBatch creation with dicts      | **lmao**      | Logging-specific Arrow output     |
+| Feature                              | Package       | Why                                   |
+| ------------------------------------ | ------------- | ------------------------------------- |
+| Cache-aligned TypedArray allocation  | arrow-builder | Generic optimization                  |
+| Lazy column with shared ArrayBuffer  | arrow-builder | Generic memory pattern                |
+| Null bitmap management               | arrow-builder | Generic Arrow format                  |
+| Buffer capacity, no hidden resize    | arrow-builder | Generic allocation control            |
+| Runtime class generation             | arrow-builder | Generic V8 optimization               |
+| `intern()` / `getInterned()`         | arrow-builder | Generic UTF-8 pre-encoding            |
+| `Utf8Encoder` interface              | arrow-builder | Generic encoding contract             |
+| `DictionaryBuilder`                  | arrow-builder | Generic Arrow dictionary construction |
+| `_` prefix for system properties     | **lmao**      | Logging-specific namespace mgmt       |
+| System columns (\_timestamps, \_ops) | **lmao**      | Logging-specific hot path             |
+| Scope class generation               | **lmao**      | Logging-specific inheritance          |
+| Entry types (span-start, info)       | **lmao**      | Logging-specific lifecycle            |
+| SpanLogger with typed methods        | **lmao**      | Logging-specific API                  |
+| Masking functions                    | **lmao**      | Logging-specific privacy              |
+| Context flow                         | **lmao**      | Logging-specific hierarchy            |
+| `Utf8Cache` (SIEVE)                  | **lmao**      | Logging-specific bounded caching      |
+| `globalUtf8Cache` singleton          | **lmao**      | Logging-specific cross-flush cache    |
+| Pre-encoded contexts (utf8\*)        | **lmao**      | Logging-specific context optimization |
+| Tree walking (span trees)            | **lmao**      | Logging-specific tree structure       |
+| Dictionary building across tree      | **lmao**      | Logging-specific Arrow conversion     |
+| RecordBatch creation with dicts      | **lmao**      | Logging-specific Arrow output         |
 
 ---
 
