@@ -1055,7 +1055,7 @@ export function convertSpanTreeToArrowTable(
     spanNameBuilder.add(spanName);
 
     for (const [fieldName, builder] of categoryBuilders) {
-      const col = buffer[`${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
       const maskTransform = categoryMaskTransforms.get(fieldName);
       const originalToMasked = categoryOriginalToMasked.get(fieldName)!;
       if (col) {
@@ -1074,7 +1074,7 @@ export function convertSpanTreeToArrowTable(
     }
 
     for (const [fieldName, builder] of textBuilders) {
-      const col = buffer[`${fieldName}_values` as keyof SpanBuffer] as string[] | undefined;
+      const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
       const maskTransform = textMaskTransforms.get(fieldName);
       const originalToMasked = textOriginalToMasked.get(fieldName)!;
       if (col) {
@@ -1538,9 +1538,6 @@ function convertBuffersWithSharedDicts(
   for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
     const columnName = fieldName; // User columns have no prefix
-    const valuesKey = `${columnName}_values` as keyof SpanBuffer;
-    const nullsKey = `${columnName}_nulls` as keyof SpanBuffer;
-
     // Get the type from the shared schema
     const fieldType = arrowSchema.fields[fieldIdx].type;
 
@@ -1553,7 +1550,7 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf[valuesKey] as string[] | undefined;
+        const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
         if (col) {
           for (let i = 0; i < buf.writeIndex; i++) {
             const v = col[i];
@@ -1604,7 +1601,7 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf[valuesKey] as string[] | undefined;
+        const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
         if (col) {
           for (let i = 0; i < buf.writeIndex; i++) {
             const v = col[i];
@@ -1654,8 +1651,8 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf[valuesKey];
-        const srcNulls = buf[nullsKey] as Uint8Array | undefined;
+        const col = buf.getColumnIfAllocated(columnName);
+        const srcNulls = buf.getNullsIfAllocated(columnName);
 
         if (col instanceof Float64Array) {
           allValues.set(col.subarray(0, buf.writeIndex), rowOffset);
@@ -1701,8 +1698,8 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf[valuesKey];
-        const srcNulls = buf[nullsKey] as Uint8Array | undefined;
+        const col = buf.getColumnIfAllocated(columnName);
+        const srcNulls = buf.getNullsIfAllocated(columnName);
 
         if (col instanceof Uint8Array) {
           // Copy boolean values bit by bit - can't avoid loop for bit-level operations
@@ -1752,8 +1749,8 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf[valuesKey];
-        const srcNulls = buf[nullsKey] as Uint8Array | undefined;
+        const col = buf.getColumnIfAllocated(columnName);
+        const srcNulls = buf.getNullsIfAllocated(columnName);
 
         if (col instanceof Uint8Array) {
           allIndices.set(col.subarray(0, buf.writeIndex), rowOffset);

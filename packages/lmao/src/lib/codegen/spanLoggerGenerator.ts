@@ -87,6 +87,30 @@ ${cases}
 }
 
 /**
+ * Generate override fluent setters for enum fields.
+ * These convert string values to numeric indices before writing to the buffer.
+ * The buffer expects numeric indices (after the enum map removal change).
+ */
+function generateEnumFluentSetters(enumFieldNames: Set<string>): string {
+  const setters: string[] = [];
+
+  for (const fieldName of enumFieldNames) {
+    setters.push(`
+    /**
+     * Override fluent setter for ${fieldName} to convert string → index.
+     * Buffer expects numeric index, not string value.
+     */
+    ${fieldName}(value) {
+      const idx = getEnumIndex_${fieldName}(value);
+      this._buffer.${fieldName}(this._writeIndex, idx);
+      return this;
+    }`);
+  }
+
+  return setters.join('\n');
+}
+
+/**
  * Generate _setScope() method code - UNROLLED per-column with BULK null bitmap fill
  * Uses TypedArray.fill() for values and fillNullBitmapRange helper for null bitmaps
  */
@@ -292,6 +316,7 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
   const setScopeMethod = generateSetScopeMethod(schemaFields, enumFieldNames);
   const prefillMethod = generatePrefillScopedAttributesMethod(schemaFields, enumFieldNames);
   const scopeWrites = generateScopeWritesForLogEntry(schemaFields, enumFieldNames);
+  const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
 
   return {
     constructorParams: 'scope, createNextBuffer',
@@ -494,8 +519,8 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
     }
 
     /**
-     * Get the Scope instance directly.
-     */
+      * Get the Scope instance directly.
+      */
     _getScope() {
       return this._scope;
     }
@@ -503,6 +528,9 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
     ${setScopeMethod}
 
     ${prefillMethod}
+
+    // Override fluent setters for enum fields to convert string → index
+    ${enumFluentSetters}
 `,
 
     dependencies: {

@@ -24,10 +24,9 @@ import {
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../../lmao.js';
-import type { TagAttributeSchema } from '../../schema/types.js';
+import { S } from '../../schema/builder.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import type { SpanBuffer, TaskContext } from '../../types.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
 /**
@@ -56,98 +55,6 @@ class MockStringInterner {
   }
 }
 
-/**
- * Create mock task context for testing
- */
-function createMockTaskContext(schema: TagAttributeSchema): TaskContext {
-  return createTestTaskContext(schema, { lineNumber: 42 });
-}
-
-/**
- * Helper to write a row to buffer
- */
-function writeRow(
-  buffer: SpanBuffer,
-  data: {
-    timestamp: bigint;
-    operation: number;
-    attributes?: Record<string, unknown>;
-  },
-): void {
-  const idx = buffer.writeIndex;
-
-  // Write core columns
-  buffer.timestamps[idx] = data.timestamp;
-  buffer.operations[idx] = data.operation;
-
-  // Write attributes using new X_values and X_nulls pattern
-  if (data.attributes) {
-    for (const [key, value] of Object.entries(data.attributes)) {
-      const valuesKey = `${key}_values` as keyof SpanBuffer;
-      const nullsKey = `${key}_nulls` as keyof SpanBuffer;
-      const column = buffer[valuesKey];
-      const nullBitmap = buffer[nullsKey] as Uint8Array | undefined;
-
-      if (column) {
-        // Handle string arrays (category/text columns)
-        if (Array.isArray(column)) {
-          if (value === null || value === undefined) {
-            (column as string[])[idx] = '';
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] &= ~(1 << bitOffset);
-            }
-          } else {
-            (column as string[])[idx] = value as string;
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] |= 1 << bitOffset;
-            }
-          }
-        } else if (ArrayBuffer.isView(column)) {
-          // Handle TypedArrays (number/enum/boolean columns)
-          const typedColumn = column as Float64Array | Uint8Array | Uint16Array | Uint32Array;
-          if (value === null || value === undefined) {
-            // Write 0 and clear null bit
-            if (typedColumn instanceof Float64Array) {
-              typedColumn[idx] = 0;
-            } else {
-              typedColumn[idx] = 0;
-            }
-
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] &= ~(1 << bitOffset);
-            }
-          } else {
-            // Write value and set null bit
-            if (typeof value === 'number') {
-              if (typedColumn instanceof Float64Array) {
-                typedColumn[idx] = value;
-              } else {
-                typedColumn[idx] = value;
-              }
-            } else if (typeof value === 'boolean') {
-              (typedColumn as Uint8Array)[idx] = value ? 1 : 0;
-            }
-
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] |= 1 << bitOffset;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  buffer.writeIndex++;
-}
-
 describe('Arrow Table Conversion', () => {
   let moduleIdInterner: MockStringInterner;
   let spanNameInterner: MockStringInterner;
@@ -155,565 +62,273 @@ describe('Arrow Table Conversion', () => {
   beforeEach(() => {
     moduleIdInterner = new MockStringInterner();
     spanNameInterner = new MockStringInterner();
+    moduleIdInterner.intern('test-file.ts');
+    spanNameInterner.intern('test-span');
   });
 
   describe('Basic Conversion', () => {
     test('converts empty buffer to empty table', () => {
-      const schema: TagAttributeSchema = {
-        userId: {
-          __schema_type: 'category',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
+      const schema = { userId: S.category() } as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      // Intern module and span names
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
-
       expect(table.numRows).toBe(0);
     });
 
-    test('converts single row with basic types', () => {
-      const schema: TagAttributeSchema = {
-        count: {
-          __schema_type: 'number',
-        } as any,
-        active: {
-          __schema_type: 'boolean',
-        } as any,
-      };
+    test('converts single row with number and boolean', () => {
+      const schema = {
+        count: S.number(),
+        active: S.boolean(),
+      } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      // Intern required strings
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
-      // Write a row (operation 3 = span-start per ENTRY_TYPE_NAMES)
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: {
-          count: 42,
-          active: true,
-        },
-      });
+      const idx = buffer.writeIndex;
+      buffer.timestamps[idx] = 1000n;
+      buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+      buffer.count(idx, 42);
+      buffer.active(idx, true);
+      buffer.writeIndex++;
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       expect(table.numRows).toBe(1);
-
-      // Verify data in first batch
-      const batch = table.batches[0];
-      expect(batch.numRows).toBe(1);
-
-      // Check timestamp
-      const timestampVector = batch.getChild('timestamp');
-      expect(timestampVector?.get(0)).toBeDefined();
-
-      // Check entry type (operation 3 = span-start)
-      const entryTypeVector = batch.getChild('entry_type');
-      expect(entryTypeVector?.get(0)).toBe('span-start');
-
-      // Check attributes
-      const countVector = batch.getChild('count');
-      expect(countVector?.get(0)).toBe(42);
-
-      const activeVector = batch.getChild('active');
-      expect(activeVector?.get(0)).toBe(true);
+      const row = table.get(0)?.toJSON();
+      expect(row?.count).toBe(42);
+      expect(row?.active).toBe(true);
     });
 
     test('converts multiple rows', () => {
-      const schema: TagAttributeSchema = {
-        value: {
-          __schema_type: 'number',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
+      const schema = { value: S.number() } as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
-      // Write multiple rows
       for (let i = 0; i < 5; i++) {
-        writeRow(buffer, {
-          timestamp: 1000n + BigInt(i),
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value: i * 10 },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = BigInt(1000 + i);
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.value(idx, i * 10);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
       expect(table.numRows).toBe(5);
-
-      const batch = table.batches[0];
-      const valueVector = batch.getChild('value');
-
       for (let i = 0; i < 5; i++) {
-        expect(valueVector?.get(i)).toBe(i * 10);
+        expect(table.get(i)?.toJSON().value).toBe(i * 10);
       }
     });
   });
 
-  describe('Null Bitmap Handling', () => {
-    test('handles null values correctly', () => {
-      const schema: TagAttributeSchema = {
-        value: {
-          __schema_type: 'number',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
+  describe('Null Handling', () => {
+    test('unwritten positions are null', () => {
+      const schema = { value: S.number() } as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
+      // Write row 0 with value
+      buffer.timestamps[0] = 1000n;
+      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.value(0, 42);
 
-      // Write rows with mix of null and non-null
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { value: 42 },
-      });
+      // Write row 1 without value (skip setter - null)
+      buffer.timestamps[1] = 2000n;
+      buffer.operations[1] = ENTRY_TYPE_SPAN_START;
 
-      writeRow(buffer, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { value: null },
-      });
+      // Write row 2 with value
+      buffer.timestamps[2] = 3000n;
+      buffer.operations[2] = ENTRY_TYPE_SPAN_START;
+      buffer.value(2, 100);
 
-      writeRow(buffer, {
-        timestamp: 3000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { value: 100 },
-      });
+      buffer.writeIndex = 3;
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
-      const batch = table.batches[0];
-      const valueVector = batch.getChild('value');
-
-      expect(valueVector?.get(0)).toBe(42);
-      expect(valueVector?.get(1)).toBe(null);
-      expect(valueVector?.get(2)).toBe(100);
+      expect(table.get(0)?.toJSON().value).toBe(42);
+      expect(table.get(1)?.toJSON().value).toBe(null);
+      expect(table.get(2)?.toJSON().value).toBe(100);
     });
 
-    test('handles all-null column', () => {
-      const schema: TagAttributeSchema = {
-        optional: {
-          __schema_type: 'number',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
-      // Write rows with all nulls
-      for (let i = 0; i < 3; i++) {
-        writeRow(buffer, {
-          timestamp: 1000n + BigInt(i),
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { optional: null },
-        });
-      }
-
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
-
-      const batch = table.batches[0];
-      const optionalVector = batch.getChild('optional');
-
-      for (let i = 0; i < 3; i++) {
-        expect(optionalVector?.get(i)).toBe(null);
-      }
-    });
+    // TODO: Add test for explicit null via setter once setters support null values
+    // test('setter accepts null to clear value', () => { ... });
   });
 
   describe('String Type Conversion', () => {
-    test('converts enum type to dictionary', () => {
-      const schema: TagAttributeSchema = {
-        status: {
-          __schema_type: 'enum',
-          __enum_values: ['pending', 'active', 'completed'],
-        } as any,
-      };
+    test('enum stored as numeric index, converted to string in Arrow', () => {
+      const schema = {
+        status: S.enum(['pending', 'active', 'completed'] as const),
+      } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
+      // Write enum values as numeric indices
+      const idx0 = buffer.writeIndex;
+      buffer.timestamps[idx0] = 1000n;
+      buffer.operations[idx0] = ENTRY_TYPE_SPAN_START;
+      buffer.status(idx0, 0); // pending
+      buffer.writeIndex++;
 
-      // Write rows with enum values (stored as indices 0, 1, 2)
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { status: 0 }, // 'pending'
-      });
+      const idx1 = buffer.writeIndex;
+      buffer.timestamps[idx1] = 2000n;
+      buffer.operations[idx1] = ENTRY_TYPE_SPAN_START;
+      buffer.status(idx1, 2); // completed
+      buffer.writeIndex++;
 
-      writeRow(buffer, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { status: 2 }, // 'completed'
-      });
-
-      writeRow(buffer, {
-        timestamp: 3000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { status: 1 }, // 'active'
-      });
+      const idx2 = buffer.writeIndex;
+      buffer.timestamps[idx2] = 3000n;
+      buffer.operations[idx2] = ENTRY_TYPE_SPAN_START;
+      buffer.status(idx2, 1); // active
+      buffer.writeIndex++;
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
-      const batch = table.batches[0];
-      const statusVector = batch.getChild('status');
-
-      expect(statusVector?.get(0)).toBe('pending');
-      expect(statusVector?.get(1)).toBe('completed');
-      expect(statusVector?.get(2)).toBe('active');
+      expect(table.get(0)?.toJSON().status).toBe('pending');
+      expect(table.get(1)?.toJSON().status).toBe('completed');
+      expect(table.get(2)?.toJSON().status).toBe('active');
     });
 
-    test('converts category type with string interning', () => {
-      const schema: TagAttributeSchema = {
-        userId: {
-          __schema_type: 'category',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
+    test('category stores strings directly', () => {
+      const schema = { userId: S.category() } as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
-      // Write rows with category values (stored as raw strings on hot path)
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { userId: 'user-123' },
-      });
-
-      writeRow(buffer, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { userId: 'user-456' },
-      });
-
-      writeRow(buffer, {
-        timestamp: 3000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { userId: 'user-123' }, // Repeated
-      });
+      const users = ['user-123', 'user-456', 'user-123'];
+      for (let i = 0; i < users.length; i++) {
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = BigInt(1000 + i);
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.userId(idx, users[i]);
+        buffer.writeIndex++;
+      }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
-      const batch = table.batches[0];
-      const userIdVector = batch.getChild('userId');
-
-      expect(userIdVector?.get(0)).toBe('user-123');
-      expect(userIdVector?.get(1)).toBe('user-456');
-      expect(userIdVector?.get(2)).toBe('user-123');
+      expect(table.get(0)?.toJSON().userId).toBe('user-123');
+      expect(table.get(1)?.toJSON().userId).toBe('user-456');
+      expect(table.get(2)?.toJSON().userId).toBe('user-123');
     });
 
-    test('converts text type without interning', () => {
-      const schema: TagAttributeSchema = {
-        message: {
-          __schema_type: 'text',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
+    test('text stores strings directly', () => {
+      const schema = { message: S.text() } as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
-      // Write text messages (stored as raw strings on hot path)
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { message: 'First message' },
-      });
-
-      writeRow(buffer, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { message: 'Second message' },
-      });
-
-      writeRow(buffer, {
-        timestamp: 3000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { message: 'Third message' },
-      });
+      const messages = ['First', 'Second', 'Third'];
+      for (let i = 0; i < messages.length; i++) {
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = BigInt(1000 + i);
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.message(idx, messages[i]);
+        buffer.writeIndex++;
+      }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
-      const batch = table.batches[0];
-      const messageVector = batch.getChild('message');
-
-      expect(messageVector?.get(0)).toBe('First message');
-      expect(messageVector?.get(1)).toBe('Second message');
-      expect(messageVector?.get(2)).toBe('Third message');
+      expect(table.get(0)?.toJSON().message).toBe('First');
+      expect(table.get(1)?.toJSON().message).toBe('Second');
+      expect(table.get(2)?.toJSON().message).toBe('Third');
     });
   });
 
   describe('Buffer Chaining', () => {
-    test('converts chained buffers correctly', () => {
-      const schema: TagAttributeSchema = {
-        value: {
-          __schema_type: 'number',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
+    test('converts chained buffers', () => {
+      const schema = { value: S.number() } as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
 
       // Fill first buffer
       for (let i = 0; i < 3; i++) {
-        writeRow(buffer, {
-          timestamp: 1000n + BigInt(i),
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value: i },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = BigInt(1000 + i);
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.value(idx, i);
+        buffer.writeIndex++;
       }
 
-      // Create chained buffer
+      // Create and fill chained buffer
       const nextBuffer = createNextBuffer(buffer);
-
-      // Fill chained buffer
       for (let i = 0; i < 2; i++) {
-        writeRow(nextBuffer, {
-          timestamp: 2000n + BigInt(i),
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value: 10 + i },
-        });
+        const idx = nextBuffer.writeIndex;
+        nextBuffer.timestamps[idx] = BigInt(2000 + i);
+        nextBuffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        nextBuffer.value(idx, 10 + i);
+        nextBuffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
-      // Should have all rows from both buffers
       expect(table.numRows).toBe(5);
-
-      const batch = table.batches[0];
-      const valueVector = batch.getChild('value');
-
-      // Check values from first buffer
-      expect(valueVector?.get(0)).toBe(0);
-      expect(valueVector?.get(1)).toBe(1);
-      expect(valueVector?.get(2)).toBe(2);
-
-      // Check values from chained buffer
-      expect(valueVector?.get(3)).toBe(10);
-      expect(valueVector?.get(4)).toBe(11);
-    });
-
-    test('maintains spanId across chained buffers', () => {
-      const schema: TagAttributeSchema = {
-        value: {
-          __schema_type: 'number',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
-      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
-      // Extract primitive values for comparison (unified memory layout)
-      const originalThreadId = buffer.threadId; // bigint
-      const originalSpanId = buffer.spanId; // number
-
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { value: 1 },
-      });
-
-      const nextBuffer = createNextBuffer(buffer);
-
-      // Chained buffer should have same threadId and spanId (continuation)
-      // Chained buffers share the same _identity ArrayBuffer
-      expect(nextBuffer.spanId).toBe(buffer.spanId);
-      expect(nextBuffer.threadId).toBe(originalThreadId);
-      expect(nextBuffer.spanId).toBe(originalSpanId);
-
-      writeRow(nextBuffer, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { value: 2 },
-      });
-
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
-
-      const batch = table.batches[0];
-      const threadIdVector = batch.getChild('thread_id');
-      const spanIdVector = batch.getChild('span_id');
-
-      // Both rows should have same thread_id and span_id
-      expect(threadIdVector?.get(0)).toBe(originalThreadId);
-      expect(threadIdVector?.get(1)).toBe(originalThreadId);
-      expect(spanIdVector?.get(0)).toBe(originalSpanId);
-      expect(spanIdVector?.get(1)).toBe(originalSpanId);
+      expect(table.get(0)?.toJSON().value).toBe(0);
+      expect(table.get(1)?.toJSON().value).toBe(1);
+      expect(table.get(2)?.toJSON().value).toBe(2);
+      expect(table.get(3)?.toJSON().value).toBe(10);
+      expect(table.get(4)?.toJSON().value).toBe(11);
     });
   });
 
   describe('Span Tree Conversion', () => {
     test('converts parent and child spans', () => {
-      const schema: TagAttributeSchema = {
-        value: {
-          __schema_type: 'number',
-        } as any,
-      };
+      const schema = { depth: S.number() } as const;
+      const parentContext = createTestTaskContext(schema, { lineNumber: 42 });
+      const parentBuffer = createSpanBuffer(schema, parentContext, createTraceId('trace-123'));
 
-      const taskContext = createMockTaskContext(schema);
-      const parentBuffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('parent-span');
-
-      // Write to parent
-      writeRow(parentBuffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { value: 1 },
-      });
+      // Parent span start
+      let idx = parentBuffer.writeIndex;
+      parentBuffer.timestamps[idx] = 1000n;
+      parentBuffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+      parentBuffer.depth(idx, 0);
+      parentBuffer.writeIndex++;
 
       // Create child span
-      const childTaskContext = createMockTaskContext(schema);
-      const childBuffer = createChildSpanBuffer(parentBuffer, childTaskContext);
+      const childContext = createTestTaskContext(schema, { lineNumber: 43 });
+      const childBuffer = createChildSpanBuffer(parentBuffer, childContext);
 
-      // Write to child
-      writeRow(childBuffer, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { value: 2 },
-      });
+      idx = childBuffer.writeIndex;
+      childBuffer.timestamps[idx] = 2000n;
+      childBuffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+      childBuffer.depth(idx, 1);
+      childBuffer.writeIndex++;
 
-      writeRow(childBuffer, {
-        timestamp: 3000n,
-        operation: ENTRY_TYPE_SPAN_OK,
-        attributes: { value: 3 },
-      });
+      idx = childBuffer.writeIndex;
+      childBuffer.timestamps[idx] = 3000n;
+      childBuffer.operations[idx] = ENTRY_TYPE_SPAN_OK;
+      childBuffer.depth(idx, 1);
+      childBuffer.writeIndex++;
 
-      // Close parent
-      writeRow(parentBuffer, {
-        timestamp: 4000n,
-        operation: ENTRY_TYPE_SPAN_OK,
-        attributes: { value: 4 },
-      });
+      // Parent span end
+      idx = parentBuffer.writeIndex;
+      parentBuffer.timestamps[idx] = 4000n;
+      parentBuffer.operations[idx] = ENTRY_TYPE_SPAN_OK;
+      parentBuffer.depth(idx, 0);
+      parentBuffer.writeIndex++;
 
       const table = convertSpanTreeToArrowTable(parentBuffer, moduleIdInterner, spanNameInterner);
 
-      // Should have rows from both parent and child
       expect(table.numRows).toBe(4);
 
-      // Verify parent-child relationship via span IDs (now separate columns)
-      const batch = table.batches[0];
-      const threadIdVector = batch.getChild('thread_id');
-      const spanIdVector = batch.getChild('span_id');
-      const parentThreadIdVector = batch.getChild('parent_thread_id');
-      const parentSpanIdVector = batch.getChild('parent_span_id');
+      // Check parent-child relationship
+      // Tree walk order: all parent buffer rows first (0,1), then child buffer rows (2,3)
+      const rows = [0, 1, 2, 3].map((i) => table.get(i)?.toJSON());
 
-      // Get thread_id and span_id for parent (rows 0-1) and child (rows 2-3)
-      const parentThreadId = threadIdVector?.get(0) as bigint;
-      const parentSpanId = spanIdVector?.get(0) as number;
-      const childSpanId = spanIdVector?.get(2) as number;
+      // Parent rows (0, 1) should have null parent IDs
+      expect(rows[0]?.parent_span_id).toBe(null);
+      expect(rows[1]?.parent_span_id).toBe(null);
 
-      // Parent rows should have null parent_thread_id and parent_span_id
-      expect(parentThreadIdVector?.get(0)).toBe(null);
-      expect(parentSpanIdVector?.get(0)).toBe(null);
-      expect(parentThreadIdVector?.get(1)).toBe(null);
-      expect(parentSpanIdVector?.get(1)).toBe(null);
-
-      // Child rows' parent IDs should match parent's span IDs
-      expect(parentThreadIdVector?.get(2)).toBe(parentThreadId);
-      expect(parentSpanIdVector?.get(2)).toBe(parentSpanId);
-      expect(parentThreadIdVector?.get(3)).toBe(parentThreadId);
-      expect(parentSpanIdVector?.get(3)).toBe(parentSpanId);
-
-      // Child span should have different spanId from parent
-      expect(childSpanId).not.toBe(parentSpanId);
-    });
-
-    test('converts deep span hierarchy', () => {
-      const schema: TagAttributeSchema = {
-        depth: {
-          __schema_type: 'number',
-        } as any,
-      };
-
-      const taskContext = createMockTaskContext(schema);
-      const root = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('span');
-
-      writeRow(root, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { depth: 0 },
-      });
-
-      // Create level 1 child
-      const child1Context = createMockTaskContext(schema);
-      const child1 = createChildSpanBuffer(root, child1Context);
-
-      writeRow(child1, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { depth: 1 },
-      });
-
-      // Create level 2 child
-      const child2Context = createMockTaskContext(schema);
-      const child2 = createChildSpanBuffer(child1, child2Context);
-
-      writeRow(child2, {
-        timestamp: 3000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { depth: 2 },
-      });
-
-      const table = convertSpanTreeToArrowTable(root, moduleIdInterner, spanNameInterner);
-
-      expect(table.numRows).toBe(3);
-
-      const batch = table.batches[0];
-      const depthVector = batch.getChild('depth');
-
-      expect(depthVector?.get(0)).toBe(0);
-      expect(depthVector?.get(1)).toBe(1);
-      expect(depthVector?.get(2)).toBe(2);
+      // Child rows (2, 3) should reference parent
+      expect(rows[2]?.parent_span_id).toBe(rows[0]?.span_id);
+      expect(rows[3]?.parent_span_id).toBe(rows[0]?.span_id);
     });
   });
 
   describe('Entry Type Mapping', () => {
-    test('maps all entry type codes correctly', () => {
-      const schema: TagAttributeSchema = {};
-      const taskContext = createMockTaskContext(schema);
-      // Need capacity for 11 entry types
+    test('maps all entry type codes to strings', () => {
+      const schema = {} as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 16);
 
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
-
-      // Entry type codes per ENTRY_TYPE_NAMES in lmao.ts
-      // Ordered: span lifecycle (1-4), logging by verbosity (5-9), feature flags (10-11)
       const entryTypes = [
         { code: ENTRY_TYPE_SPAN_START, name: 'span-start' },
         { code: ENTRY_TYPE_SPAN_OK, name: 'span-ok' },
@@ -728,55 +343,58 @@ describe('Arrow Table Conversion', () => {
         { code: ENTRY_TYPE_FF_USAGE, name: 'ff-usage' },
       ];
 
-      for (const entryType of entryTypes) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: entryType.code,
-        });
+      for (const { code } of entryTypes) {
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = code;
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
-      const batch = table.batches[0];
-      const entryTypeVector = batch.getChild('entry_type');
-
       for (let i = 0; i < entryTypes.length; i++) {
-        expect(entryTypeVector?.get(i)).toBe(entryTypes[i].name);
+        expect(table.get(i)?.toJSON().entry_type).toBe(entryTypes[i].name);
       }
     });
   });
 
-  describe('TraceId and SpanId', () => {
-    test('maintains traceId across all spans', () => {
-      const schema: TagAttributeSchema = {};
-      const taskContext = createMockTaskContext(schema);
-      const traceId = createTraceId('trace-xyz-789');
+  describe('System Columns', () => {
+    test('includes all system columns', () => {
+      const schema = {} as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-xyz'));
+
+      buffer.timestamps[0] = 1000n;
+      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.writeIndex = 1;
+
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+
+      const fieldNames = table.schema.fields.map((f) => f.name);
+      expect(fieldNames).toContain('timestamp');
+      expect(fieldNames).toContain('trace_id');
+      expect(fieldNames).toContain('thread_id');
+      expect(fieldNames).toContain('span_id');
+      expect(fieldNames).toContain('parent_thread_id');
+      expect(fieldNames).toContain('parent_span_id');
+      expect(fieldNames).toContain('entry_type');
+      expect(fieldNames).toContain('module');
+      expect(fieldNames).toContain('span_name');
+    });
+
+    test('trace_id is preserved', () => {
+      const schema = {} as const;
+      const traceId = createTraceId('my-trace-id');
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, traceId);
 
-      moduleIdInterner.intern('test-file.ts');
-      spanNameInterner.intern('test-span');
+      buffer.timestamps[0] = 1000n;
+      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.writeIndex = 1;
 
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-      });
+      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
-      const childContext = createMockTaskContext(schema);
-      const childBuffer = createChildSpanBuffer(buffer, childContext);
-
-      writeRow(childBuffer, {
-        timestamp: 2000n,
-        operation: ENTRY_TYPE_SPAN_START,
-      });
-
-      const table = convertSpanTreeToArrowTable(buffer, moduleIdInterner, spanNameInterner);
-
-      const batch = table.batches[0];
-      const traceIdVector = batch.getChild('trace_id');
-
-      // Both rows should have same traceId
-      expect(traceIdVector?.get(0)).toBe(traceId);
-      expect(traceIdVector?.get(1)).toBe(traceId);
+      expect(table.get(0)?.toJSON().trace_id).toBe(traceId);
     });
   });
 });

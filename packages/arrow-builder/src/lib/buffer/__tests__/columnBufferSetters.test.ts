@@ -50,13 +50,11 @@ describe('ColumnBuffer setter methods', () => {
 
     // Buffer now accepts numeric indices directly (string→index conversion
     // happens in the higher-level TagWriter, not in the buffer).
-    // TypeScript types expect strings for developer experience, but runtime
-    // accepts indices. Use type assertion to test low-level behavior.
-    const statusSetter = buffer.status as unknown as (pos: number, val: number) => void;
-    statusSetter(0, 0); // pending = 0
-    statusSetter(1, 1); // active = 1
-    statusSetter(2, 2); // completed = 2
-    statusSetter(3, 0); // default to 0
+    // Enum setters now accept number type directly.
+    buffer.status(0, 0); // pending = 0
+    buffer.status(1, 1); // active = 1
+    buffer.status(2, 2); // completed = 2
+    buffer.status(3, 0); // default to 0
 
     expect(buffer.status_values[0]).toBe(0);
     expect(buffer.status_values[1]).toBe(1);
@@ -105,7 +103,7 @@ describe('ColumnBuffer setter methods', () => {
     // Chain multiple setters at the same position
     // Note: status now takes numeric index (1 = 'active'), not string
     buffer.userId(0, 'user1');
-    (buffer.status as unknown as (pos: number, val: number) => typeof buffer)(0, 1); // active = 1
+    buffer.status(0, 1); // active = 1
     buffer.count(0, 5).isActive(0, true);
 
     expect(buffer.userId_values[0]).toBe('user1');
@@ -206,9 +204,9 @@ describe('Eager column support (__eager: true)', () => {
     expect(buffer.status_values).toBeDefined();
     expect(buffer.status_values instanceof Uint8Array).toBe(true);
 
-    // Write and verify using typed setters
-    buffer.status(0, 'a');
-    buffer.status(1, 'b');
+    // Write and verify using typed setters (enum setters accept numeric indices)
+    buffer.status(0, 0); // 'a' = 0
+    buffer.status(1, 1); // 'b' = 1
     expect(buffer.status_values[0]).toBe(0);
     expect(buffer.status_values[1]).toBe(1);
   });

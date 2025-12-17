@@ -17,7 +17,7 @@
 
 import { getSchemaFields, type TagAttributeSchema } from '../schema-types.js';
 import { bufferHelpers } from './bufferHelpers.js';
-import { type ColumnBuffer, DEFAULT_BUFFER_CAPACITY } from './types.js';
+import { type ColumnBuffer, DEFAULT_BUFFER_CAPACITY, type TypedColumnBuffer } from './types.js';
 
 // Re-export for consumers
 export { getAlignedCapacity } from './bufferHelpers.js';
@@ -180,9 +180,9 @@ function generateSetterValueAssignment(info: ColumnStorageInfo, columnName: stri
   const { schemaType, isBitPacked, enumValues } = info;
 
   if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
-    // Enum: Use pre-generated lookup map for O(1) conversion
-    // The lookup map is generated in preamble and named ${columnName}_enumMap
-    return `storage.values[pos] = ${columnName}_enumMap[val] ?? 0;`;
+    // Enum: Caller (TagWriter) has already converted string→index
+    // We receive the numeric index directly - just store it
+    return 'storage.values[pos] = val;';
   }
 
   if (isBitPacked) {
@@ -235,8 +235,9 @@ function generateSetterValueAssignmentEager(info: ColumnStorageInfo, columnName:
   const { schemaType, isBitPacked, enumValues } = info;
 
   if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
-    // Enum: Use pre-generated lookup map for O(1) conversion
-    return `this.${columnName}_values[pos] = ${columnName}_enumMap[val] ?? 0;`;
+    // Enum: Caller (TagWriter) has already converted string→index
+    // We receive the numeric index directly - just store it
+    return `this.${columnName}_values[pos] = val;`;
   }
 
   if (isBitPacked) {
@@ -302,22 +303,17 @@ export function generateColumnBufferClass(
   const allocatorFunctions: string[] = [];
   const getterMethods: string[] = [];
   const setterMethods: string[] = [];
-  const enumMaps: string[] = [];
   // Eager column constructor code (allocated immediately, no null bitmap)
   const eagerColumnConstructorCode: string[] = [];
 
   for (const fieldName of schemaFields) {
     const columnName = fieldName; // User columns have no prefix
     const storageInfo = getTypedArrayInfo(schema, fieldName);
-    const { constructorName, bytesPerElement, isBitPacked, schemaType, enumValues, isEager } = storageInfo;
+    const { constructorName, bytesPerElement, isBitPacked, isEager } = storageInfo;
 
-    // Generate enum lookup map if this is an enum type (needed for both eager and lazy)
-    if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
-      // Generate a frozen object for O(1) string→index lookup at runtime
-      // This is much faster than indexOf() for hot path writes
-      const mapEntries = enumValues.map((val, idx) => `'${val}': ${idx}`).join(', ');
-      enumMaps.push(`  const ${columnName}_enumMap = Object.freeze({ ${mapEntries} });`);
-    }
+    // NOTE: Enum string→index conversion happens in TagWriter (lmao package),
+    // not in the buffer. The buffer receives numeric indices directly.
+    // See generateSetterValueAssignment() for details.
 
     if (isEager) {
       // EAGER column: Allocate in constructor, no null bitmap
@@ -405,9 +401,10 @@ export function generateColumnBufferClass(
     }
 
     // Getter methods (native class getter syntax)
+    // NOTE: We only define ${columnName}_nulls and ${columnName}_values, NOT ${columnName}
+    // because the ${columnName}(pos, val) setter method uses that name.
     getterMethods.push(`    get ${columnName}_nulls() { return allocate_${columnName}(this).nulls; }`);
     getterMethods.push(`    get ${columnName}_values() { return allocate_${columnName}(this).values; }`);
-    getterMethods.push(`    get ${columnName}() { return allocate_${columnName}(this).values; }`);
   }
 
   // Re-iterate for setter methods (need to check eager status again)
@@ -474,9 +471,8 @@ ${extension.methods
   // Build preamble if provided
   const preambleCode = extension?.preamble ? `\n  // Extension preamble\n${extension.preamble}\n` : '';
 
-  // Build enum maps section if any enums exist
-  const enumMapsCode =
-    enumMaps.length > 0 ? `\n  // Enum lookup maps (O(1) string→index)\n${enumMaps.join('\n')}\n` : '';
+  // NOTE: Enum maps are no longer generated here.
+  // Enum string→index conversion happens in TagWriter (lmao package).
 
   // Generate the complete class code
   // Note: 'helpers' is injected by getColumnBufferClass() via new Function('helpers', code)
@@ -492,7 +488,7 @@ ${symbolDeclarations.join('\n')}
 
   // Allocator functions for lazy columns
 ${allocatorFunctions.join('\n')}
-${enumMapsCode}${preambleCode}
+${preambleCode}
   class ${className} {
     constructor(${constructorSignature}) {
 ${constructorCode.join('\n')}
@@ -553,13 +549,13 @@ function createCacheKey(schema: TagAttributeSchema, extension?: ColumnBufferExte
  * @param extension - Optional extension for injecting constructor code, methods, etc.
  * @returns The generated class constructor
  */
-export function getColumnBufferClass(
-  schema: TagAttributeSchema,
+export function getColumnBufferClass<S extends TagAttributeSchema>(
+  schema: S,
   extension?: ColumnBufferExtension,
 ): new (
   capacity: number,
   ...args: unknown[]
-) => ColumnBuffer {
+) => TypedColumnBuffer<S> {
   // Create cache key from schema and extension (stable serialization)
   // NOTE: dependencies are NOT part of cache key - they should be stable singletons
   const cacheKey = createCacheKey(schema, extension);
@@ -599,7 +595,12 @@ export function getColumnBufferClass(
     classCache.set(cacheKey, BufferClass);
   }
 
-  return BufferClass;
+  // Cast is safe because the generated class has all the typed setters and properties
+  // that TypedColumnBuffer<S> requires - we generate them from the same schema
+  return BufferClass as unknown as new (
+    capacity: number,
+    ...args: unknown[]
+  ) => TypedColumnBuffer<S>;
 }
 
 /**
@@ -611,14 +612,14 @@ export function getColumnBufferClass(
  * @param requestedCapacity - Initial buffer capacity (defaults to DEFAULT_BUFFER_CAPACITY)
  * @param extension - Optional extension for injecting constructor code, methods, etc.
  * @param constructorArgs - Additional constructor arguments (passed to extension constructor code)
- * @returns A new ColumnBuffer instance
+ * @returns A new ColumnBuffer instance with typed setters based on schema
  */
-export function createGeneratedColumnBuffer(
-  schema: TagAttributeSchema,
+export function createGeneratedColumnBuffer<S extends TagAttributeSchema>(
+  schema: S,
   requestedCapacity = DEFAULT_BUFFER_CAPACITY,
   extension?: ColumnBufferExtension,
   ...constructorArgs: unknown[]
-): ColumnBuffer {
+): TypedColumnBuffer<S> {
   const BufferClass = getColumnBufferClass(schema, extension);
   return new BufferClass(requestedCapacity, ...constructorArgs);
 }

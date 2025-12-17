@@ -138,7 +138,6 @@ export type TypedArrayConstructor =
 import type {
   BooleanSchemaWithMetadata,
   CategorySchemaWithMetadata,
-  EnumSchemaWithMetadata,
   NumberSchemaWithMetadata,
   SchemaWithMetadata,
   TextSchemaWithMetadata,
@@ -147,14 +146,17 @@ import type {
 /**
  * Infer the setter value type for a schema field.
  *
- * - enum: accepts string (enum value)
+ * - enum: accepts number (pre-computed index from enum mapping)
  * - category: accepts string
  * - text: accepts string
  * - number: accepts number
  * - boolean: accepts boolean
+ *
+ * Note: For enums, the buffer expects numeric indices. String→index conversion
+ * happens in higher-level APIs (SpanLogger, TagWriter, ResultWriter).
  */
-export type SetterValueType<S> = S extends EnumSchemaWithMetadata<infer T>
-  ? T // enum values as string literals
+export type SetterValueType<S> = S extends { __schema_type: 'enum' }
+  ? number // enum index (string→index conversion done by SpanLogger/TagWriter)
   : S extends CategorySchemaWithMetadata
     ? string
     : S extends TextSchemaWithMetadata
@@ -176,7 +178,7 @@ export type SetterValueType<S> = S extends EnumSchemaWithMetadata<infer T>
  * - number: Float64Array
  * - boolean: Uint8Array (bit-packed)
  */
-export type ValuesArrayType<S> = S extends EnumSchemaWithMetadata
+export type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
   ? Uint8Array
   : S extends CategorySchemaWithMetadata
     ? string[]
@@ -218,14 +220,11 @@ type FilterSchemaFields<T> = {
  * This slightly limits polymorphism but has no runtime impact.
  */
 export type TypedColumnBuffer<Schema> = ColumnBuffer & {
-  // Column value arrays (accessed via getters)
+  // Column value arrays (internal, use expose() to access with type safety)
   [K in keyof FilterSchemaFields<Schema> as `${K & string}_values`]: ValuesArrayType<FilterSchemaFields<Schema>[K]>;
 } & {
-  // Column null bitmaps (only for non-eager columns, but we include all for simplicity)
+  // Column null bitmaps (internal, use expose() to access with type safety)
   [K in keyof FilterSchemaFields<Schema> as `${K & string}_nulls`]: Uint8Array;
-} & {
-  // Alias getters (same as _values)
-  [K in keyof FilterSchemaFields<Schema> & string]: ValuesArrayType<FilterSchemaFields<Schema>[K]>;
 } & {
   // Setter methods: columnName(position, value) => TypedColumnBuffer<Schema>
   // Note: Can't use `this` because this is a type alias, not an interface
@@ -238,3 +237,36 @@ export type TypedColumnBuffer<Schema> = ColumnBuffer & {
   getColumnIfAllocated(columnName: string): ColumnValueType | undefined;
   getNullsIfAllocated(columnName: string): Uint8Array | undefined;
 };
+
+/**
+ * Exposed view of a TypedColumnBuffer with typed access to internal arrays.
+ * Use `expose()` to cast a buffer to this type for testing/inspection.
+ *
+ * Provides direct access to:
+ * - `${field}`: Values array (alias for `${field}_values`)
+ * - `${field}_values`: Values array
+ * - `${field}_nulls`: Null bitmap
+ */
+export type ExposedColumnBuffer<Schema> = TypedColumnBuffer<Schema> & {
+  // Alias getters for direct array access (same as _values)
+  // These shadow the setter methods for read-only access to underlying arrays
+  readonly [K in keyof FilterSchemaFields<Schema> & string]: ValuesArrayType<FilterSchemaFields<Schema>[K]>;
+};
+
+/**
+ * Expose internal column arrays for testing/inspection.
+ * Returns the same buffer with a type that allows direct array access.
+ *
+ * @example
+ * ```ts
+ * const buffer = createGeneratedColumnBuffer(schema, 10);
+ * buffer.status(0, 0);  // Write using setter
+ *
+ * const exposed = expose(buffer);
+ * exposed.status[0];     // Read values array directly
+ * exposed.status_nulls;  // Access null bitmap
+ * ```
+ */
+export function expose<S>(buffer: TypedColumnBuffer<S>): ExposedColumnBuffer<S> {
+  return buffer as ExposedColumnBuffer<S>;
+}

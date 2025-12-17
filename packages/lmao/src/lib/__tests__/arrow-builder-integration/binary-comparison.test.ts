@@ -17,10 +17,8 @@ import * as arrow from 'apache-arrow';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { ENTRY_TYPE_SPAN_START } from '../../lmao.js';
 import { S } from '../../schema/builder.js';
-import type { TagAttributeSchema } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import type { SpanBuffer, TaskContext } from '../../types.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
 /**
@@ -50,102 +48,6 @@ class MockStringInterner {
 }
 
 /**
- * Create mock task context for testing
- */
-function createMockTaskContext(schema: TagAttributeSchema): TaskContext {
-  return createTestTaskContext(schema, { lineNumber: 42 });
-}
-
-/**
- * Helper to write a row to buffer
- */
-function writeRow(
-  buffer: SpanBuffer,
-  data: {
-    timestamp: bigint;
-    operation: number;
-    attributes?: Record<string, unknown>;
-  },
-): void {
-  const idx = buffer.writeIndex;
-
-  // Write core columns
-  buffer.timestamps[idx] = data.timestamp;
-  buffer.operations[idx] = data.operation;
-
-  // Write attributes using X_values and X_nulls pattern
-  if (data.attributes) {
-    for (const [key, value] of Object.entries(data.attributes)) {
-      const valuesKey = `${key}_values` as keyof SpanBuffer;
-      const nullsKey = `${key}_nulls` as keyof SpanBuffer;
-      const column = buffer[valuesKey];
-      const nullBitmap = buffer[nullsKey] as Uint8Array | undefined;
-
-      if (column) {
-        // Handle string arrays (category/text columns)
-        if (Array.isArray(column)) {
-          if (value === null || value === undefined) {
-            (column as string[])[idx] = '';
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] &= ~(1 << bitOffset);
-            }
-          } else {
-            (column as string[])[idx] = value as string;
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] |= 1 << bitOffset;
-            }
-          }
-        } else if (ArrayBuffer.isView(column)) {
-          // Handle TypedArrays (number/enum/boolean columns)
-          const typedColumn = column as Float64Array | Uint8Array | Uint16Array | Uint32Array;
-          if (value === null || value === undefined) {
-            if (typedColumn instanceof Float64Array) {
-              typedColumn[idx] = 0;
-            } else if (typeof value !== 'boolean') {
-              typedColumn[idx] = 0;
-            }
-
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] &= ~(1 << bitOffset);
-            }
-          } else {
-            if (typeof value === 'number') {
-              if (typedColumn instanceof Float64Array) {
-                typedColumn[idx] = value;
-              } else {
-                typedColumn[idx] = value;
-              }
-            } else if (typeof value === 'boolean') {
-              const byteIndex = idx >>> 3;
-              const bitOffset = idx & 7;
-              if (value) {
-                (typedColumn as Uint8Array)[byteIndex] |= 1 << bitOffset;
-              } else {
-                (typedColumn as Uint8Array)[byteIndex] &= ~(1 << bitOffset);
-              }
-            }
-
-            if (nullBitmap) {
-              const byteIndex = Math.floor(idx / 8);
-              const bitOffset = idx % 8;
-              nullBitmap[byteIndex] |= 1 << bitOffset;
-            }
-          }
-        }
-      }
-    }
-  }
-
-  buffer.writeIndex++;
-}
-
-/**
  * Round-trip test: serialize to IPC, deserialize, verify data matches
  */
 function verifyRoundTrip(table: arrow.Table): arrow.Table {
@@ -169,6 +71,19 @@ function verifyRoundTrip(table: arrow.Table): arrow.Table {
   return roundTripped;
 }
 
+/**
+ * Set null bit at position (Arrow format: 1=valid, 0=null)
+ */
+function setNull(nullBitmap: Uint8Array, idx: number, isNull: boolean): void {
+  const byteIndex = Math.floor(idx / 8);
+  const bitOffset = idx % 8;
+  if (isNull) {
+    nullBitmap[byteIndex] &= ~(1 << bitOffset);
+  } else {
+    nullBitmap[byteIndex] |= 1 << bitOffset;
+  }
+}
+
 describe('Arrow IPC Round-Trip', () => {
   let moduleIdInterner: MockStringInterner;
   let spanNameInterner: MockStringInterner;
@@ -184,20 +99,18 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('serializes and deserializes correctly', () => {
     it('number columns survive round-trip', () => {
-      const schema: TagAttributeSchema = {
-        value: S.number(),
-      };
+      const schema = { value: S.number() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = [1.5, 2.5, 3.5, Number.NaN, 5.5];
       for (const value of testValues) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.value(idx, value);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -219,21 +132,19 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('boolean columns survive round-trip', () => {
-      const schema: TagAttributeSchema = {
-        flag: S.boolean(),
-      };
+      const schema = { flag: S.boolean() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       // Need capacity for 9 test values
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 16);
 
       const testValues = [true, false, true, false, true, false, true, false, true];
       for (const value of testValues) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { flag: value },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.flag(idx, value);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -245,22 +156,22 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('enum columns survive round-trip', () => {
-      const schema: TagAttributeSchema = {
-        status: S.enum(['pending', 'active', 'completed'] as const),
-      };
+      const schema = { status: S.enum(['pending', 'active', 'completed'] as const) } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      // Write enum indices
+      // Write enum indices (0=pending, 1=active, 2=completed)
+      // Note: Buffer setters accept numeric indices for enum columns at runtime,
+      // but TypeScript types expect string literals. Use type assertion for low-level tests.
       const testIndices = [0, 2, 1, 0, 2];
       const expectedStrings = ['pending', 'completed', 'active', 'pending', 'completed'];
-      for (const idx of testIndices) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { status: idx },
-        });
+      for (const enumIdx of testIndices) {
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, enumIdx);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -272,20 +183,18 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('category columns survive round-trip', () => {
-      const schema: TagAttributeSchema = {
-        userId: S.category(),
-      };
+      const schema = { userId: S.category() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = ['user-123', 'user-456', 'user-789', 'user-123', 'user-456'];
       for (const userId of testValues) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { userId },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.userId(idx, userId);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -297,20 +206,18 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('text columns survive round-trip', () => {
-      const schema: TagAttributeSchema = {
-        message: S.text(),
-      };
+      const schema = { message: S.text() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = ['First message', 'Second message', 'Third message', 'Second message', 'First message'];
       for (const value of testValues) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { message: value },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.message(idx, value);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -322,20 +229,26 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('nullable columns with nulls survive round-trip', () => {
-      const schema: TagAttributeSchema = {
-        value: S.number(),
-      };
+      const schema = { value: S.number() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = [1.0, null, 3.0, null, 5.0];
       for (const value of testValues) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        if (value !== null) {
+          buffer.value(idx, value);
+        } else {
+          // For null values, we need to explicitly mark as null in the bitmap
+          const nullBitmap = buffer.getNullsIfAllocated('value');
+          if (nullBitmap) {
+            setNull(nullBitmap, idx, true);
+          }
+        }
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -347,15 +260,15 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('mixed column types survive round-trip', () => {
-      const schema: TagAttributeSchema = {
+      const schema = {
         count: S.number(),
         active: S.boolean(),
         status: S.enum(['pending', 'active', 'completed'] as const),
         userId: S.category(),
         message: S.text(),
-      };
+      } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testData = [
@@ -365,11 +278,23 @@ describe('Arrow IPC Round-Trip', () => {
       ];
 
       for (const row of testData) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: row,
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+
+        if (row.count !== null) {
+          buffer.count(idx, row.count);
+        } else {
+          const nullBitmap = buffer.getNullsIfAllocated('count');
+          if (nullBitmap) {
+            setNull(nullBitmap, idx, true);
+          }
+        }
+        buffer.active(idx, row.active);
+        (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, row.status);
+        buffer.userId(idx, row.userId);
+        buffer.message(idx, row.message);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -401,16 +326,17 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('system columns survive round-trip', () => {
-      const schema: TagAttributeSchema = {};
+      const schema = {} as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Write a few rows with timestamps (BigInt64Array stores nanoseconds)
       const timestamps = [1000n, 1100n, 1200n];
       for (let i = 0; i < 3; i++) {
-        buffer.timestamps[buffer.writeIndex] = timestamps[i];
-        buffer.operations[buffer.writeIndex] = i;
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = timestamps[i];
+        buffer.operations[idx] = i;
         buffer.writeIndex++;
       }
 
@@ -442,13 +368,15 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('schema correctness', () => {
     it('system columns have correct nullability', () => {
-      const schema: TagAttributeSchema = {
-        userAttr: S.number(),
-      };
+      const schema = { userAttr: S.number() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-      writeRow(buffer, { timestamp: 1000n, operation: ENTRY_TYPE_SPAN_START });
+
+      const idx = buffer.writeIndex;
+      buffer.timestamps[idx] = 1000n;
+      buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+      buffer.writeIndex++;
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
@@ -470,19 +398,22 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('dictionary columns have correct type', () => {
-      const schema: TagAttributeSchema = {
+      const schema = {
         category: S.category(),
         text: S.text(),
         status: S.enum(['a', 'b'] as const),
-      };
+      } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-      writeRow(buffer, {
-        timestamp: 1000n,
-        operation: ENTRY_TYPE_SPAN_START,
-        attributes: { category: 'cat1', text: 'text1', status: 0 },
-      });
+
+      const idx = buffer.writeIndex;
+      buffer.timestamps[idx] = 1000n;
+      buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+      buffer.category(idx, 'cat1');
+      buffer.text(idx, 'text1');
+      (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, 0);
+      buffer.writeIndex++;
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
@@ -501,21 +432,26 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('null bitmap format', () => {
     it('uses Arrow format (1=valid, 0=null)', () => {
-      const schema: TagAttributeSchema = {
-        value: S.number(),
-      };
+      const schema = { value: S.number() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       // Write pattern: valid, null, valid, null, valid, null, valid, null
       const values = [1.0, null, 2.0, null, 3.0, null, 4.0, null];
       for (const value of values) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        if (value !== null) {
+          buffer.value(idx, value);
+        } else {
+          const nullBitmap = buffer.getNullsIfAllocated('value');
+          if (nullBitmap) {
+            setNull(nullBitmap, idx, true);
+          }
+        }
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -536,22 +472,27 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('handles sparse nulls correctly', () => {
-      const schema: TagAttributeSchema = {
-        value: S.number(),
-      };
+      const schema = { value: S.number() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       // Need capacity for 10 values
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 16);
 
       // Only one null in 10 values
       const values = [1, 2, 3, null, 5, 6, 7, 8, 9, 10];
       for (const value of values) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        if (value !== null) {
+          buffer.value(idx, value);
+        } else {
+          const nullBitmap = buffer.getNullsIfAllocated('value');
+          if (nullBitmap) {
+            setNull(nullBitmap, idx, true);
+          }
+        }
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -569,21 +510,19 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('omits null bitmap when no nulls', () => {
-      const schema: TagAttributeSchema = {
-        value: S.number(),
-      };
+      const schema = { value: S.number() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      // No nulls - write all valid values and set null bits
+      // No nulls - write all valid values
       const values = [1, 2, 3, 4, 5];
       for (const value of values) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { value },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.value(idx, value);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -600,20 +539,18 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('dictionary encoding', () => {
     it('preserves dictionary values through round-trip', () => {
-      const schema: TagAttributeSchema = {
-        category: S.category(),
-      };
+      const schema = { category: S.category() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testValues = ['alpha', 'beta', 'zebra', 'alpha', 'beta'];
       for (const category of testValues) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { category },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.category(idx, category);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
@@ -625,22 +562,20 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('handles repeated values efficiently', () => {
-      const schema: TagAttributeSchema = {
-        userId: S.category(),
-      };
+      const schema = { userId: S.category() } as const;
 
-      const taskContext = createMockTaskContext(schema);
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       // Use capacity of 128 to hold 100 rows without overflow
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'), 128);
 
       // Write same value many times
       const testValue = 'user-repeated';
       for (let i = 0; i < 100; i++) {
-        writeRow(buffer, {
-          timestamp: 1000n,
-          operation: ENTRY_TYPE_SPAN_START,
-          attributes: { userId: testValue },
-        });
+        const idx = buffer.writeIndex;
+        buffer.timestamps[idx] = 1000n;
+        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        buffer.userId(idx, testValue);
+        buffer.writeIndex++;
       }
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
