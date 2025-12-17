@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
-import { defineTagAttributes, S } from '@smoothbricks/lmao';
+import { createSpanBuffer, createTagWriter, defineTagAttributes, S } from '@smoothbricks/lmao';
+import { createTestTaskContext } from '../test-helpers.js';
 
 /**
  * Tests for lazy column initialization
@@ -248,5 +249,121 @@ describe('Lazy Column Initialization', () => {
 
     // Multiple accesses should return same array
     expect(buffer.userId_nulls).toBe(userIdNulls);
+  });
+});
+
+describe('SpanBuffer Lazy Column Allocation', () => {
+  it('should have eager columns allocated immediately and lazy columns undefined until accessed', () => {
+    const schema = defineTagAttributes({
+      userId: S.category(),
+      requestId: S.category(),
+      count: S.number(),
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+    });
+
+    // Extract schema fields
+    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const taskContext = createTestTaskContext(schemaFields);
+    const buffer = createSpanBuffer(schemaFields, taskContext, undefined, 8);
+
+    // Eager columns (system columns) should be allocated immediately
+    expect(buffer._timestamps).toBeDefined();
+    expect(buffer._timestamps).toBeInstanceOf(BigInt64Array);
+    expect(buffer._operations).toBeDefined();
+    expect(buffer._operations).toBeInstanceOf(Uint8Array);
+    // Also check public aliases
+    expect(buffer.timestamps).toBe(buffer._timestamps);
+    expect(buffer.operations).toBe(buffer._operations);
+
+    // Lazy columns (user attributes) should be undefined before access
+    expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('requestId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('count')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
+
+    // Access one lazy column - should trigger allocation
+    const userIdColumn = buffer.userId_values;
+    expect(Array.isArray(userIdColumn)).toBe(true);
+
+    // After access, the column should be allocated
+    expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
+    expect(buffer.getColumnIfAllocated('userId')).toBe(userIdColumn);
+
+    // Other columns should still be undefined
+    expect(buffer.getColumnIfAllocated('requestId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('count')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
+
+    // Access another column
+    const countColumn = buffer.count_values;
+    expect(countColumn).toBeInstanceOf(Float64Array);
+
+    // Now both accessed columns should be allocated
+    expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
+    expect(buffer.getColumnIfAllocated('count')).toBeDefined();
+    expect(buffer.getColumnIfAllocated('count')).toBe(countColumn);
+
+    // Unaccessed columns should still be undefined
+    expect(buffer.getColumnIfAllocated('requestId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
+  });
+
+  it('should allocate lazy columns when TagWriter writes to them', () => {
+    const schema = defineTagAttributes({
+      userId: S.category(),
+      requestId: S.category(),
+      count: S.number(),
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+    });
+
+    // Extract schema fields
+    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const taskContext = createTestTaskContext(schemaFields);
+    const buffer = createSpanBuffer(schemaFields, taskContext, undefined, 8);
+
+    // Lazy columns should be undefined before TagWriter access
+    expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('requestId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('count')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
+
+    // Create TagWriter and write to one column
+    const tagWriter = createTagWriter(schemaFields, buffer);
+    tagWriter.userId('user-123');
+
+    // After TagWriter write, the column should be allocated
+    expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
+    const userIdColumn = buffer.getColumnIfAllocated('userId') as string[];
+    expect(Array.isArray(userIdColumn)).toBe(true);
+    expect(userIdColumn[0]).toBe('user-123');
+
+    // Other columns should still be undefined
+    expect(buffer.getColumnIfAllocated('requestId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('count')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
+
+    // Write to another column via TagWriter
+    tagWriter.count(42);
+
+    // Now both columns should be allocated
+    expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
+    expect(buffer.getColumnIfAllocated('count')).toBeDefined();
+    const countColumn = buffer.getColumnIfAllocated('count') as Float64Array;
+    expect(countColumn).toBeInstanceOf(Float64Array);
+    expect(countColumn[0]).toBe(42);
+
+    // Unaccessed columns should still be undefined
+    expect(buffer.getColumnIfAllocated('requestId')).toBeUndefined();
+    expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
+
+    // Write to enum column via TagWriter
+    tagWriter.operation('CREATE');
+
+    // Enum column should now be allocated
+    expect(buffer.getColumnIfAllocated('operation')).toBeDefined();
+    const operationColumn = buffer.getColumnIfAllocated('operation') as Uint8Array;
+    expect(operationColumn).toBeInstanceOf(Uint8Array);
+    // Enum values are mapped to indices (CREATE = 0, READ = 1, etc.)
+    expect(operationColumn[0]).toBe(0);
   });
 });
