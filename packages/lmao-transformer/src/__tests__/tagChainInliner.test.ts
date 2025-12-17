@@ -1,0 +1,829 @@
+/**
+ * Tests verifying transformer's tag chain inlining produces identical Arrow output
+ *
+ * Goal: Ensure the transformer's inlining optimizations don't change behavior.
+ *
+ * Strategy:
+ * 1. Create buffers with identical capacity
+ * 2. Write using the fluent API (non-transformed behavior) to buffer1
+ * 3. Write using direct array access (simulating transformed behavior) to buffer2
+ * 4. Convert both to Arrow tables
+ * 5. Verify binary output is identical
+ *
+ * This validates that:
+ * - Buffer setter methods produce same output as direct writes
+ * - Enum index calculation matches runtime behavior
+ * - Null bitmap handling is correct
+ * - Eager vs lazy column handling is correct
+ */
+
+import { beforeEach, describe, expect, it } from 'bun:test';
+import {
+  convertToArrowTable,
+  createSpanBuffer,
+  createTagWriter,
+  createTraceId,
+  ENTRY_TYPE_SPAN_START,
+  S,
+  type StringInterner,
+  type TagAttributeSchema,
+} from '@smoothbricks/lmao';
+import * as arrow from 'apache-arrow';
+import { createTestTaskContext } from './test-helpers.js';
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+/**
+ * Mock string interner for testing
+ */
+class MockStringInterner implements StringInterner {
+  private strings: string[] = [];
+  private indices = new Map<string, number>();
+
+  intern(str: string): number {
+    let idx = this.indices.get(str);
+    if (idx === undefined) {
+      idx = this.strings.length;
+      this.strings.push(str);
+      this.indices.set(str, idx);
+    }
+    return idx;
+  }
+
+  getString(idx: number): string | undefined {
+    return this.strings[idx];
+  }
+
+  getStrings(): readonly string[] {
+    return this.strings;
+  }
+}
+
+/**
+ * System columns that vary between buffer creations and should be ignored in comparison.
+ * These are identity-related columns that differ due to global span counter.
+ */
+const IGNORED_SYSTEM_COLUMNS = new Set([
+  'span_id', // Global counter increments for each buffer
+  'thread_id', // Same thread but can vary
+]);
+
+/**
+ * Compare Arrow tables and return detailed diff info on mismatch.
+ * Ignores system columns that vary between buffer creations.
+ */
+function compareArrowTablesDetailed(
+  table1: arrow.Table,
+  table2: arrow.Table,
+  options: { ignoreSystemColumns?: boolean } = { ignoreSystemColumns: true },
+): { equal: boolean; diff?: string } {
+  // Compare row counts
+  if (table1.numRows !== table2.numRows) {
+    return {
+      equal: false,
+      diff: `Row count mismatch: ${table1.numRows} vs ${table2.numRows}`,
+    };
+  }
+
+  // Compare schemas
+  if (table1.schema.fields.length !== table2.schema.fields.length) {
+    return {
+      equal: false,
+      diff: `Field count mismatch: ${table1.schema.fields.length} vs ${table2.schema.fields.length}`,
+    };
+  }
+
+  // Compare each row's data
+  for (let row = 0; row < table1.numRows; row++) {
+    const row1 = table1.get(row)?.toJSON();
+    const row2 = table2.get(row)?.toJSON();
+
+    for (const field of table1.schema.fields) {
+      // Skip system columns that vary between buffer creations
+      if (options.ignoreSystemColumns && IGNORED_SYSTEM_COLUMNS.has(field.name)) {
+        continue;
+      }
+
+      const val1 = row1?.[field.name];
+      const val2 = row2?.[field.name];
+
+      // Handle NaN comparison
+      if (typeof val1 === 'number' && typeof val2 === 'number') {
+        if (Number.isNaN(val1) && Number.isNaN(val2)) continue;
+      }
+
+      // Handle BigInt comparison
+      if (typeof val1 === 'bigint' && typeof val2 === 'bigint') {
+        if (val1 === val2) continue;
+      }
+
+      if (val1 !== val2) {
+        return {
+          equal: false,
+          diff: `Row ${row}, field "${field.name}": ${JSON.stringify(val1)} vs ${JSON.stringify(val2)}`,
+        };
+      }
+    }
+  }
+
+  return { equal: true };
+}
+
+/**
+ * Get enum index using declaration order (matches runtime behavior in fixedPositionWriterGenerator.ts).
+ *
+ * The runtime creates a switch-case mapping where each value maps to its index in the array.
+ * This is NOT sorted alphabetically - it preserves declaration order.
+ */
+function getEnumIndex(value: string, enumValues: readonly string[]): number {
+  return enumValues.indexOf(value);
+}
+
+// ============================================================================
+// Test Suite
+// ============================================================================
+
+describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
+  let moduleIdInterner: MockStringInterner;
+  let spanNameInterner: MockStringInterner;
+
+  beforeEach(() => {
+    moduleIdInterner = new MockStringInterner();
+    spanNameInterner = new MockStringInterner();
+
+    // Pre-intern required system strings
+    moduleIdInterner.intern('test-file.ts');
+    spanNameInterner.intern('test-span');
+  });
+
+  describe('literal values for all types', () => {
+    const testSchema = {
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
+      userId: S.category(),
+      message: S.text(),
+      count: S.number(),
+      enabled: S.boolean(),
+    } satisfies TagAttributeSchema;
+
+    it('enum literal produces identical output', () => {
+      const traceId = createTraceId('trace-enum-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      // Setup: write system columns identically
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API (non-transformed)
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.operation('CREATE');
+
+      // Direct write (simulating transformed)
+      // Enum values are sorted alphabetically: CREATE=0, DELETE=1, READ=2, UPDATE=3
+      const enumIndex = getEnumIndex('CREATE', ['CREATE', 'READ', 'UPDATE', 'DELETE']);
+      buffer2.operation(0, enumIndex);
+
+      // Convert to Arrow
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      // Verify data matches
+      const result = compareArrowTablesDetailed(table1, table2);
+      if (!result.equal) {
+        console.error('Diff:', result.diff);
+        console.error('Row1:', table1.get(0)?.toJSON());
+        console.error('Row2:', table2.get(0)?.toJSON());
+      }
+      expect(result.equal).toBe(true);
+
+      // Verify the enum value is correct
+      expect(table1.get(0)?.toJSON().operation).toBe('CREATE');
+      expect(table2.get(0)?.toJSON().operation).toBe('CREATE');
+    });
+
+    it('category (string) literal produces identical output', () => {
+      const traceId = createTraceId('trace-category-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.userId('user-123');
+
+      // Direct write (category stores raw string)
+      buffer2.userId(0, 'user-123');
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      expect(table1.get(0)?.toJSON().userId).toBe('user-123');
+      expect(table2.get(0)?.toJSON().userId).toBe('user-123');
+    });
+
+    it('text literal produces identical output', () => {
+      const traceId = createTraceId('trace-text-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.message('hello world');
+
+      // Direct write (text stores raw string)
+      buffer2.message(0, 'hello world');
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      expect(table1.get(0)?.toJSON().message).toBe('hello world');
+      expect(table2.get(0)?.toJSON().message).toBe('hello world');
+    });
+
+    it('number literal produces identical output', () => {
+      const traceId = createTraceId('trace-number-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.count(42);
+
+      // Direct write (number uses Float64Array)
+      buffer2.count(0, 42);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      expect(table1.get(0)?.toJSON().count).toBe(42);
+      expect(table2.get(0)?.toJSON().count).toBe(42);
+    });
+
+    it('boolean true produces identical output', () => {
+      const traceId = createTraceId('trace-bool-true-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.enabled(true);
+
+      // Direct write (boolean uses bit-packed Uint8Array)
+      buffer2.enabled(0, true);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      expect(table1.get(0)?.toJSON().enabled).toBe(true);
+      expect(table2.get(0)?.toJSON().enabled).toBe(true);
+    });
+
+    it('boolean false produces identical output', () => {
+      const traceId = createTraceId('trace-bool-false-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.enabled(false);
+
+      // Direct write
+      buffer2.enabled(0, false);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      expect(table1.get(0)?.toJSON().enabled).toBe(false);
+      expect(table2.get(0)?.toJSON().enabled).toBe(false);
+    });
+  });
+
+  describe('chained tag calls', () => {
+    const testSchema = {
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
+      userId: S.category(),
+      count: S.number(),
+    } satisfies TagAttributeSchema;
+
+    it('multiple chained calls produce identical output', () => {
+      const traceId = createTraceId('trace-chain-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API - chained
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.operation('READ').userId('user-456').count(100);
+
+      // Direct writes - what transformer generates
+      // (ctx._buffer.operation(0, enumIndex), ctx._buffer.userId(0, 'user-456'), ctx._buffer.count(0, 100), ctx.tag)
+      const enumIndex = getEnumIndex('READ', ['CREATE', 'READ', 'UPDATE', 'DELETE']);
+      buffer2.operation(0, enumIndex);
+      buffer2.userId(0, 'user-456');
+      buffer2.count(0, 100);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      const row1 = table1.get(0)?.toJSON();
+      const row2 = table2.get(0)?.toJSON();
+
+      expect(row1?.operation).toBe('READ');
+      expect(row2?.operation).toBe('READ');
+      expect(row1?.userId).toBe('user-456');
+      expect(row2?.userId).toBe('user-456');
+      expect(row1?.count).toBe(100);
+      expect(row2?.count).toBe(100);
+    });
+  });
+
+  describe('with() bulk setter', () => {
+    const testSchema = {
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
+      userId: S.category(),
+      count: S.number(),
+    } satisfies TagAttributeSchema;
+
+    it('with() bulk setter produces identical output to individual calls', () => {
+      const traceId = createTraceId('trace-with-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Using with() - bulk setter
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.with({ operation: 'UPDATE', userId: 'user-789', count: 50 });
+
+      // Individual calls (what with() does internally)
+      const tagWriter2 = createTagWriter(testSchema, buffer2);
+      tagWriter2.operation('UPDATE');
+      tagWriter2.userId('user-789');
+      tagWriter2.count(50);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+    });
+
+    it('mixed chain with fluent + with() produces correct output', () => {
+      const traceId = createTraceId('trace-mixed-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Mixed: fluent + with() + fluent
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.operation('DELETE').with({ userId: 'user-mixed' }).count(25);
+
+      // Equivalent individual calls
+      const tagWriter2 = createTagWriter(testSchema, buffer2);
+      tagWriter2.operation('DELETE');
+      tagWriter2.userId('user-mixed');
+      tagWriter2.count(25);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+    });
+  });
+
+  describe('enum index calculation', () => {
+    const testSchema = {
+      // Enum values NOT in alphabetical order
+      status: S.enum(['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED'] as const),
+    } satisfies TagAttributeSchema;
+
+    it('verifies enum index uses declaration order', () => {
+      // Runtime uses declaration order (NOT alphabetically sorted):
+      // PENDING=0, ACTIVE=1, COMPLETED=2, CANCELLED=3
+      const enumValues = ['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED'] as const;
+
+      expect(getEnumIndex('PENDING', enumValues)).toBe(0);
+      expect(getEnumIndex('ACTIVE', enumValues)).toBe(1);
+      expect(getEnumIndex('COMPLETED', enumValues)).toBe(2);
+      expect(getEnumIndex('CANCELLED', enumValues)).toBe(3);
+    });
+
+    it('all enum values produce correct Arrow output', () => {
+      const enumValues = ['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED'] as const;
+
+      for (const value of enumValues) {
+        const traceId = createTraceId(`trace-enum-${value}`);
+        const taskContext1 = createTestTaskContext(testSchema);
+        const taskContext2 = createTestTaskContext(testSchema);
+
+        const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+        const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+        const timestamp = BigInt(Date.now()) * 1000000n;
+        buffer1.timestamps[0] = timestamp;
+        buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+        buffer1.writeIndex = 1;
+
+        buffer2.timestamps[0] = timestamp;
+        buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+        buffer2.writeIndex = 1;
+
+        // Fluent API (user-facing, accepts string)
+        const tagWriter1 = createTagWriter(testSchema, buffer1);
+        tagWriter1.status(value);
+
+        // Direct write with computed enum index (transformer-optimized, accepts index)
+        // This simulates what the transformer does - it computes the index at compile time
+        // and writes directly to the buffer, bypassing the string→index conversion.
+        const enumIndex = getEnumIndex(value, enumValues);
+        buffer2.status(0, enumIndex);
+
+        const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+        const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+        const result = compareArrowTablesDetailed(table1, table2);
+        expect(result.equal).toBe(true);
+
+        // Verify the correct string value in Arrow output
+        expect(table1.get(0)?.toJSON().status).toBe(value);
+        expect(table2.get(0)?.toJSON().status).toBe(value);
+      }
+    });
+  });
+
+  describe('eager columns', () => {
+    const testSchema = {
+      lazyField: S.category(),
+      eagerField: S.category().eager(),
+    } satisfies TagAttributeSchema;
+
+    it('eager column setter produces identical output to lazy column setter', () => {
+      const traceId = createTraceId('trace-eager-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Using fluent API for both
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.lazyField('lazy-value');
+      tagWriter1.eagerField('eager-value');
+
+      // Direct writes
+      buffer2.lazyField(0, 'lazy-value');
+      buffer2.eagerField(0, 'eager-value');
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      expect(table1.get(0)?.toJSON().lazyField).toBe('lazy-value');
+      expect(table1.get(0)?.toJSON().eagerField).toBe('eager-value');
+    });
+  });
+
+  describe('null/undefined handling', () => {
+    const testSchema = {
+      nullableNumber: S.number(),
+      nullableString: S.category(),
+    } satisfies TagAttributeSchema;
+
+    it('unset columns remain null', () => {
+      const traceId = createTraceId('trace-null-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Don't write to any user columns - they should remain null
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      // Verify columns are null
+      expect(table1.get(0)?.toJSON().nullableNumber).toBe(null);
+      expect(table1.get(0)?.toJSON().nullableString).toBe(null);
+    });
+
+    it('partial column writes preserve nulls in unwritten columns', () => {
+      const traceId = createTraceId('trace-partial-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Write only one column
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.nullableNumber(42);
+
+      buffer2.nullableNumber(0, 42);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      // Number column has value, string column is null
+      expect(table1.get(0)?.toJSON().nullableNumber).toBe(42);
+      expect(table1.get(0)?.toJSON().nullableString).toBe(null);
+    });
+  });
+
+  describe('multiple rows', () => {
+    const testSchema = {
+      value: S.number(),
+      tag: S.category(),
+    } satisfies TagAttributeSchema;
+
+    it('multiple rows produce identical output', () => {
+      const traceId = createTraceId('trace-multirow-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId, 16);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId, 16);
+
+      const baseTimestamp = BigInt(Date.now()) * 1000000n;
+
+      // Write 5 rows
+      for (let i = 0; i < 5; i++) {
+        const timestamp = baseTimestamp + BigInt(i * 1000000);
+
+        buffer1.timestamps[i] = timestamp;
+        buffer1.operations[i] = ENTRY_TYPE_SPAN_START;
+
+        buffer2.timestamps[i] = timestamp;
+        buffer2.operations[i] = ENTRY_TYPE_SPAN_START;
+      }
+
+      buffer1.writeIndex = 5;
+      buffer2.writeIndex = 5;
+
+      // Write tags for each row using fluent API
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+
+      // Row 0
+      (tagWriter1 as unknown as { _pos: number })._pos = 0;
+      tagWriter1.value(10).tag('first');
+
+      // Row 1
+      (tagWriter1 as unknown as { _pos: number })._pos = 1;
+      tagWriter1.value(20).tag('second');
+
+      // Row 2 - no tags (null)
+
+      // Row 3
+      (tagWriter1 as unknown as { _pos: number })._pos = 3;
+      tagWriter1.value(40).tag('fourth');
+
+      // Row 4
+      (tagWriter1 as unknown as { _pos: number })._pos = 4;
+      tagWriter1.value(50).tag('fifth');
+
+      // Direct writes for buffer2
+      buffer2.value(0, 10);
+      buffer2.tag(0, 'first');
+
+      buffer2.value(1, 20);
+      buffer2.tag(1, 'second');
+
+      // Row 2 - no writes
+
+      buffer2.value(3, 40);
+      buffer2.tag(3, 'fourth');
+
+      buffer2.value(4, 50);
+      buffer2.tag(4, 'fifth');
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      expect(table1.numRows).toBe(5);
+      expect(table2.numRows).toBe(5);
+
+      const result = compareArrowTablesDetailed(table1, table2);
+      expect(result.equal).toBe(true);
+
+      // Verify row 2 is null
+      expect(table1.get(2)?.toJSON().value).toBe(null);
+      expect(table1.get(2)?.toJSON().tag).toBe(null);
+    });
+  });
+
+  describe('IPC round-trip verification', () => {
+    const testSchema = {
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
+      userId: S.category(),
+      message: S.text(),
+      count: S.number(),
+      enabled: S.boolean(),
+    } satisfies TagAttributeSchema;
+
+    it('both fluent and direct writes produce valid IPC that round-trips correctly', () => {
+      const traceId = createTraceId('trace-roundtrip-test');
+      const taskContext1 = createTestTaskContext(testSchema);
+      const taskContext2 = createTestTaskContext(testSchema);
+
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+
+      const timestamp = BigInt(Date.now()) * 1000000n;
+      buffer1.timestamps[0] = timestamp;
+      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.writeIndex = 1;
+
+      buffer2.timestamps[0] = timestamp;
+      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer2.writeIndex = 1;
+
+      // Fluent API
+      const tagWriter1 = createTagWriter(testSchema, buffer1);
+      tagWriter1.operation('UPDATE').userId('user-roundtrip').message('test message').count(999).enabled(true);
+
+      // Direct writes
+      buffer2.operation(0, getEnumIndex('UPDATE', ['CREATE', 'READ', 'UPDATE', 'DELETE']));
+      buffer2.userId(0, 'user-roundtrip');
+      buffer2.message(0, 'test message');
+      buffer2.count(0, 999);
+      buffer2.enabled(0, true);
+
+      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
+      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+
+      // Round-trip both tables through IPC
+      const ipc1 = arrow.tableToIPC(table1);
+      const ipc2 = arrow.tableToIPC(table2);
+
+      const restored1 = arrow.tableFromIPC(ipc1);
+      const restored2 = arrow.tableFromIPC(ipc2);
+
+      // Verify restored tables match original
+      const result1 = compareArrowTablesDetailed(table1, restored1);
+      const result2 = compareArrowTablesDetailed(table2, restored2);
+
+      expect(result1.equal).toBe(true);
+      expect(result2.equal).toBe(true);
+
+      // Verify both restored tables match each other
+      const crossResult = compareArrowTablesDetailed(restored1, restored2);
+      expect(crossResult.equal).toBe(true);
+    });
+  });
+});

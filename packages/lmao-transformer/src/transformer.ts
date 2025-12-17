@@ -2,6 +2,7 @@ import { execSync } from 'child_process';
 import * as fs from 'fs';
 import path from 'path';
 import ts from 'typescript';
+import { tryTransformTagChain as tryTransformTagChainFromInliner } from './tagChainInliner.js';
 
 const LOG_METHODS = new Set(['info', 'debug', 'warn', 'error', 'trace']);
 const RESULT_METHODS = new Set(['ok', 'err']);
@@ -264,7 +265,26 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
       const processedCalls = new WeakSet<ts.CallExpression>();
 
       const visitor = (node: ts.Node): ts.Node => {
-        // Only interested in call expressions
+        // Check for ExpressionStatement containing a ctx.tag chain
+        // We handle this at the statement level so we can replace the whole statement with a block
+        if (ts.isExpressionStatement(node) && ts.isCallExpression(node.expression)) {
+          const callExpr = node.expression;
+          if (!processedCalls.has(callExpr)) {
+            const tagTransformed = tryTransformTagChainFromInliner(
+              callExpr,
+              sourceFile,
+              factory,
+              processedCalls,
+              typeChecker,
+            );
+            if (tagTransformed) {
+              // Return the block statement to replace the expression statement
+              return tagTransformed;
+            }
+          }
+        }
+
+        // Only interested in call expressions for other transformations
         if (!ts.isCallExpression(node)) {
           return ts.visitEachChild(node, visitor, context);
         }
@@ -302,12 +322,6 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
         const resultTransformed = tryTransformResultChain(node, sourceFile, factory, processedCalls, typeChecker);
         if (resultTransformed) {
           return ts.visitEachChild(resultTransformed, visitor, context);
-        }
-
-        // Check for ctx.tag fluent chain pattern - inline to direct buffer writes
-        const tagTransformed = tryTransformTagChain(node, factory, processedCalls, typeChecker);
-        if (tagTransformed) {
-          return ts.visitEachChild(tagTransformed, visitor, context);
         }
 
         return ts.visitEachChild(node, visitor, context);
@@ -747,316 +761,4 @@ function rebuildChain(base: ts.Expression, chain: ChainLink[], factory: ts.NodeF
 function getLineNumber(node: ts.Node, sourceFile: ts.SourceFile): number {
   const { line } = sourceFile.getLineAndCharacterOfPosition(node.getStart(sourceFile));
   return line + 1;
-}
-
-// ============================================================================
-// Tag Chain Inlining
-// ============================================================================
-
-/**
- * Type names that indicate a LMAO TagWriter type.
- */
-const LMAO_TAG_WRITER_TYPE_NAMES = new Set(['TagWriter', 'GeneratedTagWriter']);
-
-/**
- * Information about a schema field extracted from the type.
- */
-interface SchemaFieldInfo {
-  type: 'enum' | 'category' | 'text' | 'number' | 'boolean';
-  enumValues?: readonly string[];
-}
-
-/**
- * Information about a single tag method call in a chain.
- */
-interface TagCallInfo {
-  methodName: string;
-  argument: ts.Expression;
-  originalCall: ts.CallExpression;
-}
-
-/**
- * Information about a complete tag chain.
- */
-interface TagChainInfo {
-  /** The context expression (e.g., `ctx`) */
-  ctxExpression: ts.Expression;
-  /** All tag method calls in execution order */
-  tagCalls: TagCallInfo[];
-  /** Schema information extracted from the type (if available) */
-  schemaInfo: Map<string, SchemaFieldInfo> | null;
-}
-
-/**
- * Check if a type is a TagWriter type.
- */
-function isTagWriterType(type: ts.Type, typeChecker: ts.TypeChecker): boolean {
-  const typeName = typeChecker.typeToString(type);
-
-  for (const name of LMAO_TAG_WRITER_TYPE_NAMES) {
-    if (typeName === name || typeName.startsWith(`${name}<`)) {
-      return true;
-    }
-  }
-
-  const symbol = type.getSymbol();
-  if (symbol) {
-    const symbolName = symbol.getName();
-    if (LMAO_TAG_WRITER_TYPE_NAMES.has(symbolName)) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-/**
- * Extract schema field information from a TagWriter type using TypeChecker.
- */
-function extractSchemaFromTagType(tagType: ts.Type, typeChecker: ts.TypeChecker): Map<string, SchemaFieldInfo> | null {
-  const schemaInfo = new Map<string, SchemaFieldInfo>();
-
-  for (const prop of tagType.getProperties()) {
-    const propName = prop.getName();
-    // Skip internal properties
-    if (propName === 'with' || propName.startsWith('_')) {
-      continue;
-    }
-
-    const propType = typeChecker.getTypeOfSymbol(prop);
-    const callSigs = propType.getCallSignatures();
-    if (callSigs.length === 0) continue;
-
-    const params = callSigs[0].getParameters();
-    if (params.length === 0) continue;
-
-    const paramType = typeChecker.getTypeOfSymbol(params[0]);
-
-    // Check for enum type (union of string literals)
-    if (paramType.isUnion()) {
-      const stringLiteralTypes: string[] = [];
-      let allStringLiterals = true;
-
-      for (const t of paramType.types) {
-        if (t.isStringLiteral()) {
-          stringLiteralTypes.push(t.value);
-        } else {
-          allStringLiterals = false;
-        }
-      }
-
-      if (allStringLiterals && stringLiteralTypes.length > 0) {
-        schemaInfo.set(propName, {
-          type: 'enum',
-          enumValues: stringLiteralTypes,
-        });
-        continue;
-      }
-    }
-
-    // Check primitive types
-    const typeString = typeChecker.typeToString(paramType);
-    if (typeString === 'string') {
-      schemaInfo.set(propName, { type: 'category' }); // Default string type
-    } else if (typeString === 'number') {
-      schemaInfo.set(propName, { type: 'number' });
-    } else if (typeString === 'boolean') {
-      schemaInfo.set(propName, { type: 'boolean' });
-    }
-  }
-
-  return schemaInfo.size > 0 ? schemaInfo : null;
-}
-
-/**
- * Find the root of a tag chain and collect all method calls.
- *
- * Given: ctx.tag.operation('SELECT').userId('123')
- * Returns: { ctxExpression: ctx, tagCalls: [{operation, 'SELECT'}, {userId, '123'}] }
- */
-function findTagChainRoot(node: ts.CallExpression, typeChecker: ts.TypeChecker | undefined): TagChainInfo | null {
-  const tagCalls: TagCallInfo[] = [];
-  let current: ts.Expression = node;
-
-  // Walk up the chain collecting method calls
-  while (ts.isCallExpression(current)) {
-    const callExpr = current;
-    const expr = callExpr.expression;
-
-    if (!ts.isPropertyAccessExpression(expr)) {
-      return null;
-    }
-
-    const methodName = expr.name.text;
-
-    // Skip 'with' method - it takes an object, not a single value
-    if (methodName === 'with') {
-      return null;
-    }
-
-    // Check if we have a single argument
-    if (callExpr.arguments.length !== 1) {
-      return null;
-    }
-
-    tagCalls.push({
-      methodName,
-      argument: callExpr.arguments[0],
-      originalCall: callExpr,
-    });
-
-    current = expr.expression;
-  }
-
-  // Check if we've reached ctx.tag
-  if (!ts.isPropertyAccessExpression(current)) {
-    return null;
-  }
-
-  if (current.name.text !== 'tag') {
-    return null;
-  }
-
-  // Verify the type if we have a type checker
-  if (typeChecker) {
-    const tagType = typeChecker.getTypeAtLocation(current);
-    if (!isTagWriterType(tagType, typeChecker)) {
-      return null;
-    }
-
-    const ctxExpression = current.expression;
-    const schemaInfo = extractSchemaFromTagType(tagType, typeChecker);
-
-    return {
-      ctxExpression,
-      tagCalls: tagCalls.reverse(), // Reverse to get execution order
-      schemaInfo,
-    };
-  }
-
-  // Without type checker, accept based on structure
-  return {
-    ctxExpression: current.expression,
-    tagCalls: tagCalls.reverse(),
-    schemaInfo: null,
-  };
-}
-
-/**
- * Check if an expression is a literal that can be inlined.
- */
-function isInlineableLiteral(expr: ts.Expression): boolean {
-  return (
-    ts.isStringLiteral(expr) ||
-    ts.isNumericLiteral(expr) ||
-    expr.kind === ts.SyntaxKind.TrueKeyword ||
-    expr.kind === ts.SyntaxKind.FalseKeyword
-  );
-}
-
-/**
- * Get enum index for a value using sorted order (matching runtime behavior).
- * Enum values are sorted alphabetically for consistent indexing.
- */
-function getEnumIndex(value: string, enumValues: readonly string[]): number | null {
-  const sorted = [...enumValues].sort();
-  const index = sorted.indexOf(value);
-  return index >= 0 ? index : null;
-}
-
-/**
- * Generate inlined tag writes as a comma expression.
- *
- * Transforms: ctx.tag.operation('SELECT').userId('123')
- * Into: (ctx._buffer.operation(0, 2), ctx._buffer.userId(0, '123'), ctx.tag)
- *
- * The last element (ctx.tag) preserves the return value for chaining.
- */
-function generateInlinedTagWrites(
-  ctxExpression: ts.Expression,
-  tagCalls: TagCallInfo[],
-  schemaInfo: Map<string, SchemaFieldInfo> | null,
-  factory: ts.NodeFactory,
-): ts.Expression {
-  const expressions: ts.Expression[] = [];
-
-  // Generate buffer setter calls
-  // ctx._buffer
-  const bufferAccess = factory.createPropertyAccessExpression(ctxExpression, factory.createIdentifier('_buffer'));
-
-  for (const call of tagCalls) {
-    const { methodName, argument } = call;
-
-    // Determine the value to write
-    let valueExpr: ts.Expression;
-
-    const fieldInfo = schemaInfo?.get(methodName);
-
-    if (fieldInfo?.type === 'enum' && fieldInfo.enumValues && ts.isStringLiteral(argument)) {
-      // Compute enum index at compile time
-      const enumIndex = getEnumIndex(argument.text, fieldInfo.enumValues);
-      if (enumIndex !== null) {
-        valueExpr = factory.createNumericLiteral(enumIndex);
-      } else {
-        // Unknown enum value - keep as string (will error at runtime or be caught by TypeScript)
-        valueExpr = argument;
-      }
-    } else {
-      // Pass through the literal value
-      valueExpr = argument;
-    }
-
-    // Generate: ctx._buffer.methodName(0, value)
-    const setterCall = factory.createCallExpression(
-      factory.createPropertyAccessExpression(bufferAccess, factory.createIdentifier(methodName)),
-      undefined,
-      [factory.createNumericLiteral(0), valueExpr],
-    );
-
-    expressions.push(setterCall);
-  }
-
-  // Add ctx.tag as the final value to preserve return value for chaining
-  const tagAccess = factory.createPropertyAccessExpression(ctxExpression, factory.createIdentifier('tag'));
-  expressions.push(tagAccess);
-
-  // Create comma expression: (expr1, expr2, ..., exprN)
-  let result: ts.Expression = expressions[0];
-  for (let i = 1; i < expressions.length; i++) {
-    result = factory.createBinaryExpression(result, ts.SyntaxKind.CommaToken, expressions[i]);
-  }
-
-  // Wrap in parentheses for clarity
-  return factory.createParenthesizedExpression(result);
-}
-
-/**
- * Try to transform a ctx.tag fluent chain to inlined buffer writes.
- *
- * Before: ctx.tag.operation('SELECT').userId('123')
- * After:  (ctx._buffer.operation(0, 2), ctx._buffer.userId(0, '123'), ctx.tag)
- */
-function tryTransformTagChain(
-  node: ts.CallExpression,
-  factory: ts.NodeFactory,
-  processedCalls: WeakSet<ts.CallExpression>,
-  typeChecker: ts.TypeChecker | undefined,
-): ts.Expression | null {
-  // Find the tag chain root
-  const chainInfo = findTagChainRoot(node, typeChecker);
-  if (!chainInfo) return null;
-
-  // Check if we have any inlineable calls (all must have literal arguments)
-  const allLiterals = chainInfo.tagCalls.every((call) => isInlineableLiteral(call.argument));
-  if (!allLiterals) {
-    return null; // Can't inline if any argument is not a literal
-  }
-
-  // Mark all original calls as processed
-  for (const call of chainInfo.tagCalls) {
-    processedCalls.add(call.originalCall);
-  }
-
-  // Generate inlined code
-  return generateInlinedTagWrites(chainInfo.ctxExpression, chainInfo.tagCalls, chainInfo.schemaInfo, factory);
 }

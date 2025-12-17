@@ -405,87 +405,107 @@ const myTask = task('my-task', async (ctx) => {});`;
   });
 
   describe('ctx.tag chain inlining', () => {
-    it('should inline single tag call to buffer write', () => {
+    it('should inline single tag call to direct array writes', () => {
       const input = "ctx.tag.operation('SELECT');";
       const output = transform(input);
-      // Should transform to: (ctx._buffer.operation(0, 'SELECT'), ctx.tag)
-      expect(normalize(output)).toContain('ctx._buffer.operation(0,');
-      expect(normalize(output)).toContain(', ctx.tag)');
+      // Should transform to a block with direct array writes
+      expect(normalize(output)).toContain('ctx._buffer.operation_nulls[0] |= 1');
+      expect(normalize(output)).toContain('ctx._buffer.operation_values[0]');
     });
 
     it('should inline multiple tag calls in a chain', () => {
       const input = "ctx.tag.operation('SELECT').userId('user-123');";
       const output = transform(input);
-      // Should have both buffer writes
-      expect(normalize(output)).toContain('ctx._buffer.operation(0,');
-      expect(normalize(output)).toContain("ctx._buffer.userId(0, 'user-123')");
-      // Should end with ctx.tag for chaining
-      expect(normalize(output)).toContain(', ctx.tag)');
+      // Should have both buffer writes with null bitmaps
+      expect(normalize(output)).toContain('operation_nulls[0] |= 1');
+      expect(normalize(output)).toContain('operation_values[0]');
+      expect(normalize(output)).toContain('userId_nulls[0] |= 1');
+      expect(normalize(output)).toContain("userId_values[0] = 'user-123'");
     });
 
     it('should inline number values directly', () => {
       const input = 'ctx.tag.count(42);';
       const output = transform(input);
-      expect(normalize(output)).toContain('ctx._buffer.count(0, 42)');
+      expect(normalize(output)).toContain('count_nulls[0] |= 1');
+      expect(normalize(output)).toContain('count_values[0] = 42');
     });
 
     it('should inline boolean true', () => {
       const input = 'ctx.tag.enabled(true);';
       const output = transform(input);
-      expect(normalize(output)).toContain('ctx._buffer.enabled(0, true)');
+      // Without TypeChecker, boolean is treated as regular value write
+      // With TypeChecker, it would use bit-packed |= 1
+      expect(normalize(output)).toContain('enabled_nulls[0] |= 1');
+      expect(normalize(output)).toContain('enabled_values[0]');
+      expect(normalize(output)).toContain('true');
     });
 
     it('should inline boolean false', () => {
       const input = 'ctx.tag.disabled(false);';
       const output = transform(input);
-      expect(normalize(output)).toContain('ctx._buffer.disabled(0, false)');
+      // Without TypeChecker, boolean is treated as regular value write
+      // With TypeChecker, it would use bit-packed &= ~1
+      expect(normalize(output)).toContain('disabled_nulls[0] |= 1');
+      expect(normalize(output)).toContain('disabled_values[0]');
+      expect(normalize(output)).toContain('false');
     });
 
-    it('should NOT inline if argument is not a literal', () => {
+    it('should inline non-literal arguments with null checks', () => {
       const input = 'ctx.tag.userId(getUserId());';
       const output = transform(input);
-      // Should keep original form since getUserId() is not a literal
-      expect(normalize(output)).toContain('ctx.tag.userId(getUserId())');
-      expect(normalize(output)).not.toContain('ctx._buffer');
+      // Non-literals are wrapped in null check
+      expect(normalize(output)).toContain('const $$v0 = getUserId()');
+      expect(normalize(output)).toContain('if ($$v0 != null)');
+      expect(normalize(output)).toContain('userId_nulls[0] |= 1');
+      expect(normalize(output)).toContain('userId_values[0] = $$v0');
     });
 
     it('should inline literals and keep non-literals as method calls', () => {
       const input = "ctx.tag.operation('SELECT').userId(userId);";
       const output = transform(input);
-      // The literal 'SELECT' is inlined, but userId(userId) remains a method call on ctx.tag
-      expect(normalize(output)).toContain("ctx._buffer.operation(0, 'SELECT')");
-      expect(normalize(output)).toContain('.userId(userId)');
+      // When there's a non-literal argument, the new inliner handles it with null checks
+      // The null check wraps the variable write
+      expect(normalize(output)).toContain('operation_nulls[0] |= 1');
+      expect(normalize(output)).toContain('operation_values[0]');
+      expect(normalize(output)).toContain('userId');
     });
 
-    it('should NOT inline ctx.tag.with() calls', () => {
+    it('should inline ctx.tag.with() calls', () => {
       const input = "ctx.tag.with({ operation: 'SELECT', userId: '123' });";
       const output = transform(input);
-      // with() takes an object, not a single value - should not transform
-      expect(normalize(output)).toContain('ctx.tag.with({');
+      // with() is now inlined - each property becomes a direct write
+      expect(normalize(output)).toContain('operation_nulls[0] |= 1');
+      expect(normalize(output)).toContain('userId_nulls[0] |= 1');
     });
 
-    it('should handle tag chains assigned to variables', () => {
+    it('should NOT inline tag chains assigned to variables', () => {
       const input = "const t = ctx.tag.operation('SELECT');";
       const output = transform(input);
-      // Should still inline but preserve return value
-      expect(normalize(output)).toContain('ctx._buffer.operation(0,');
+      // Expression context (variable assignment) is NOT transformed
+      // We only transform statement context
+      expect(normalize(output)).toContain('ctx.tag.operation');
     });
 
     it('should handle deeply nested context expression', () => {
       const input = "this.ctx.tag.userId('123');";
       const output = transform(input);
-      expect(normalize(output)).toContain('this.ctx._buffer.userId(0,');
-      expect(normalize(output)).toContain(', this.ctx.tag)');
+      // New format uses direct array access with null bitmap
+      expect(normalize(output)).toContain('this.ctx._buffer.userId_nulls[0] |= 1');
+      expect(normalize(output)).toContain('this.ctx._buffer.userId_values[0]');
     });
 
     it('should handle tag chain with many calls', () => {
       const input = "ctx.tag.a('1').b('2').c('3').d('4');";
       const output = transform(input);
-      expect(normalize(output)).toContain("ctx._buffer.a(0, '1')");
-      expect(normalize(output)).toContain("ctx._buffer.b(0, '2')");
-      expect(normalize(output)).toContain("ctx._buffer.c(0, '3')");
-      expect(normalize(output)).toContain("ctx._buffer.d(0, '4')");
-      expect(normalize(output)).toContain(', ctx.tag)');
+      // New format uses direct array access with null bitmaps
+      expect(normalize(output)).toContain('a_nulls[0] |= 1');
+      expect(normalize(output)).toContain("a_values[0] = '1'");
+      expect(normalize(output)).toContain('b_nulls[0] |= 1');
+      expect(normalize(output)).toContain("b_values[0] = '2'");
+      expect(normalize(output)).toContain('c_nulls[0] |= 1');
+      expect(normalize(output)).toContain("c_values[0] = '3'");
+      expect(normalize(output)).toContain('d_nulls[0] |= 1');
+      expect(normalize(output)).toContain("d_values[0] = '4'");
     });
   });
 });

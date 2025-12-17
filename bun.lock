@@ -64,6 +64,8 @@
       "name": "@smoothbricks/lmao-transformer",
       "version": "0.0.1",
       "devDependencies": {
+        "@smoothbricks/lmao": "workspace:*",
+        "apache-arrow": "^21.1.0",
         "typescript": "^5.0.0",
       },
       "peerDependencies": {

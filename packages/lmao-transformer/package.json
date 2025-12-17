@@ -19,6 +19,8 @@
     "typescript": ">=4.7.0"
   },
   "devDependencies": {
+    "@smoothbricks/lmao": "workspace:*",
+    "apache-arrow": "^21.1.0",
     "typescript": "^5.0.0"
   },
   "nx": {
