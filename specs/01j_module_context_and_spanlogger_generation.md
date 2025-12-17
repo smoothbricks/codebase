@@ -39,9 +39,8 @@ function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttrib
 
 // Low-level API that takes pre-compiled tag operations
 function createModuleContextFromCompiled(moduleMetadata: ModuleMetadata, compiledTagOps: CompiledTagOperations) {
-  // Register module once, get shared reference
+  // Create module context with metadata
   const moduleContext: ModuleContext = {
-    moduleId: registerModule(moduleMetadata),
     gitSha: moduleMetadata.gitSha,
     packageName: moduleMetadata.packageName,
     packagePath: moduleMetadata.packagePath,

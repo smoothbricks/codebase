@@ -20,12 +20,7 @@
  * - moduleContextFactory() - Application API for composing libraries with prefixes
  */
 
-import type {
-  BaseSpanLogger,
-  GetBufferWithSpaceFn,
-  StringInterner,
-  TextStorage,
-} from './codegen/spanLoggerGenerator.js';
+import type { BaseSpanLogger } from './codegen/spanLoggerGenerator.js';
 import type { ModuleContextBuilder, RequestContext, SpanContext, TaskFunction } from './lmao.js';
 import {
   createModuleContext,
@@ -37,7 +32,7 @@ import {
 } from './lmao.js';
 import { S } from './schema/builder.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
-import { getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
+import { getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { TagAttributeSchema } from './schema/types.js';
 import { getSchemaFields } from './schema/types.js';
 import type { SpanBuffer } from './types.js';
@@ -173,7 +168,7 @@ function generateRemappedAttributeWriter(
   hasEnumMapping: boolean,
 ): string {
   const columnName = `attr_${prefixedColumnName}`;
-  const lmaoType = getLmaoSchemaType(schema);
+  const lmaoType = getSchemaType(schema);
 
   // For enums, use pre-generated mapping function (uses cleanName for function)
   // Generated code: ALWAYS writes to row 0 (span-start) with overwrite semantics
@@ -189,21 +184,25 @@ function generateRemappedAttributeWriter(
     }`;
   }
 
-  // For categories, use string interning
-  // Generated code: writes to row 0, interns string via _categoryInterner, marks non-null
+  // For categories, store strings directly
+  // Generated code: writes to row 0, stores string directly, marks non-null
   if (lmaoType === 'category') {
     return `
     ${cleanName}(value) {
       const idx = 0;
-      this._buffer.${columnName}_values[idx] = this._categoryInterner.intern(value);
+      if (value === null || value === undefined) {
+        this._buffer.${columnName}_nulls[0] &= ~1;
+        return this;
+      }
+      this._buffer.${columnName}_values[idx] = value;
       this._buffer.${columnName}_nulls[0] |= 1;
       return this;
     }`;
   }
 
-  // For text, use raw storage with null/undefined handling
+  // For text, store strings directly
   // Generated code: writes to row 0, handles null/undefined by clearing bit and returning early,
-  // stores text via _textStorage, marks non-null
+  // stores string directly, marks non-null
   if (lmaoType === 'text') {
     return `
     ${cleanName}(value) {
@@ -212,7 +211,7 @@ function generateRemappedAttributeWriter(
         this._buffer.${columnName}_nulls[0] &= ~1;
         return this;
       }
-      this._buffer.${columnName}_values[idx] = this._textStorage.store(value);
+      this._buffer.${columnName}_values[idx] = value;
       this._buffer.${columnName}_nulls[0] |= 1;
       return this;
     }`;
@@ -286,7 +285,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   const enumFieldNames = new Set<string>();
 
   for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const lmaoType = getSchemaType(fieldSchema);
     const enumValues = getEnumValues(fieldSchema);
 
     if (lmaoType === 'enum' && enumValues) {
@@ -304,7 +303,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   // Create schema type map for runtime type detection in scope()
   const schemaTypeMap = Object.fromEntries(
     schemaFields.map(([fieldName, fieldSchema]) => {
-      return [fieldName, getLmaoSchemaType(fieldSchema) || 'unknown'];
+      return [fieldName, getSchemaType(fieldSchema) || 'unknown'];
     }),
   );
 
@@ -346,12 +345,10 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   
   class ${className} {
     ` +
-    // Generated code: constructor stores buffer, interners, and scoped attributes
-    `constructor(buffer, categoryInterner, textStorage, getBufferWithSpace, initialScopedAttributes = {}) {
+    // Generated code: constructor stores buffer, createNextBuffer function, and scoped attributes
+    `constructor(buffer, createNextBuffer, initialScopedAttributes = {}) {
       this._buffer = buffer;
-      this._categoryInterner = categoryInterner;
-      this._textStorage = textStorage;
-      this._getBufferWithSpace = getBufferWithSpace;
+      this._createNextBuffer = createNextBuffer;
       this._scopedAttributes = initialScopedAttributes;
     }
     ` +
@@ -361,7 +358,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
     }
     ` +
     // Generated code: with() bulk attribute setting - maps clean names to prefixed columns,
-    // processes values based on type (category->intern, text->store), marks non-null (bit 0)
+    // stores values directly (strings stored as-is), marks non-null (bit 0)
     `with(attributes) {
       const idx = 0;
       for (const [cleanKey, value] of Object.entries(attributes)) {
@@ -369,16 +366,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
         const columnName = 'attr_' + prefixedKey;
         const column = this._buffer[columnName + '_values'];
         if (column && value !== null && value !== undefined) {
-          const fieldType = SCHEMA_TYPES[cleanKey];
-          let processedValue = value;
-          if (typeof value === 'string') {
-            if (fieldType === 'category') {
-              processedValue = this._categoryInterner.intern(value);
-            } else if (fieldType === 'text') {
-              processedValue = this._textStorage.store(value);
-            }
-          }
-          column[idx] = processedValue;
+          column[idx] = value;
           const nullBitmap = this._buffer[columnName + '_nulls'];
           if (nullBitmap) {
             nullBitmap[0] |= 1;
@@ -392,28 +380,16 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
     attributeWriters.join('\n') +
     `
     ` +
-    // Generated code: scope() stores processed values in _scopedAttributes,
+    // Generated code: scope() stores values in _scopedAttributes,
     // then pre-fills remaining buffer capacity so future log entries inherit these values
     `scope(attributes) {
       for (const [cleanKey, value] of Object.entries(attributes)) {
-        const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
-        const columnName = 'attr_' + prefixedKey;
-        const column = this._buffer[columnName + '_values'];
-        if (column && value !== null && value !== undefined) {
-          let processedValue = value;
-          const fieldType = SCHEMA_TYPES[cleanKey];
-          if (typeof value === 'string') {
-            if (fieldType === 'category') {
-              processedValue = this._categoryInterner.intern(value);
-            } else if (fieldType === 'text') {
-              processedValue = this._textStorage.store(value);
-            }
-          }
-          this._scopedAttributes[cleanKey] = processedValue;
+        if (value !== null && value !== undefined) {
+          this._scopedAttributes[cleanKey] = value;
         }
       }
       const startIdx = this._buffer.writeIndex;
-      const endIdx = this._buffer.capacity;
+      const endIdx = this._buffer._capacity;
       for (let idx = startIdx; idx < endIdx; idx++) {
         for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
           const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
@@ -435,14 +411,18 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
     // Generated code: _writeMessage() writes a log entry - ensures buffer has space,
     // writes entry type + timestamp + message, applies scoped attributes
     `_writeMessage(entryType, message) {
-      const result = this._getBufferWithSpace(this._buffer);
-      this._buffer = result.buffer;
+      // Check if buffer is full and create next buffer if needed
+      if (this._buffer.writeIndex >= this._buffer._capacity) {
+        const oldBuffer = this._buffer;
+        this._buffer = this._createNextBuffer(oldBuffer);
+        oldBuffer.next = this._buffer;
+      }
       const idx = this._buffer.writeIndex;
-      this._buffer.operations[idx] = entryType;
-      this._buffer.timestamps[idx] = getTimestampNanos();
+      this._buffer._operations[idx] = entryType;
+      this._buffer._timestamps[idx] = getTimestampNanos();
       const messageColumn = this._buffer.message_values;
       if (messageColumn) {
-        messageColumn[idx] = this._textStorage.store(message);
+        messageColumn[idx] = message;
         const nullBitmap = this._buffer.message_nulls;
         if (nullBitmap) {
           const byteIndex = Math.floor(idx / 8);
@@ -507,9 +487,7 @@ export function createRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   prefixMapping: PrefixMapping,
 ): new (
   buffer: SpanBuffer,
-  categoryInterner: StringInterner,
-  textStorage: TextStorage,
-  getBufferWithSpace: GetBufferWithSpaceFn,
+  createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
   initialScopedAttributes?: Record<string, unknown>,
 ) => BaseSpanLogger<T> {
   const classCode = generateRemappedSpanLoggerClass(cleanSchema, prefixMapping).trim();

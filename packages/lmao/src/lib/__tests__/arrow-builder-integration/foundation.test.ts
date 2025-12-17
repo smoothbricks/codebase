@@ -26,7 +26,7 @@ describe('Buffer Foundation', () => {
     const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
-    const moduleContext = new ModuleContext(1, 'abc123', '@test/pkg', 'src/test.ts', tagAttributes);
+    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', tagAttributes);
     return new TaskContext(moduleContext, 'test-span', 10);
   }
 
@@ -101,7 +101,7 @@ describe('Buffer Foundation', () => {
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
 
     // Create task context with larger schema
-    const moduleContext = new ModuleContext(2, 'abc123', '@test/pkg', 'src/test.ts', tagAttributes);
+    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', tagAttributes);
     const taskContext = new TaskContext(moduleContext, 'test-span', 10);
 
     const buf = createSpanBuffer(tagAttributes, taskContext, createTraceId('trace-789'), 64);

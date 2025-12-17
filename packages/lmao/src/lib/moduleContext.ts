@@ -34,7 +34,6 @@ export class ModuleContext {
   readonly gitShaEntry: PreEncodedEntry;
 
   constructor(
-    public readonly moduleId: number, // Keep this for now, we'll remove ID later
     public readonly gitSha: string,
     /** npm package name (e.g., '@smoothbricks/lmao') */
     public readonly packageName: string,

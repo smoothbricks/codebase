@@ -2058,7 +2058,6 @@ approach, especially if the background processor is a separate service (e.g., in
 ```typescript
 function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttributes: TagAttributeSchema }) {
   const moduleContext: ModuleContext = {
-    moduleId: registerModule(config.moduleMetadata),
     gitSha: config.moduleMetadata.gitSha,
     packageName: config.moduleMetadata.packageName,
     packagePath: config.moduleMetadata.packagePath,
@@ -2209,7 +2208,7 @@ const moduleContext = createModuleContext({
 //    - Pre-computes bitmap positions for each attribute
 //    - Creates type mapping for TypedArray selection
 // 3. Module registration
-//    - Assigns unique moduleId
+//    - Initializes module metadata (packageName, packagePath, gitSha)
 //    - Initializes capacity statistics
 ```
 
@@ -2479,20 +2478,22 @@ function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.Rec
 }
 
 function logCapacityStats(buffers: SpanBuffer[]) {
-  const seenModules = new Set<number>();
+  const seenModules = new Set<string>();
 
   for (const buffer of buffers) {
-    const moduleId = buffer.task.module.moduleId;
+    // Use packageName + packagePath as unique module identifier
+    const moduleKey = `${buffer.task.module.packageName}:${buffer.task.module.packagePath}`;
 
-    if (!seenModules.has(moduleId)) {
-      seenModules.add(moduleId);
+    if (!seenModules.has(moduleKey)) {
+      seenModules.add(moduleKey);
 
       const moduleStats = buffer.task.module.spanBufferCapacityStats;
       const efficiency = moduleStats.totalWrites / (moduleStats.totalBuffersCreated * moduleStats.currentCapacity);
       const overflowRatio = moduleStats.overflowWrites / moduleStats.totalWrites;
 
       systemTracer.tag.capacityStats({
-        moduleId: moduleId.toString(),
+        packageName: buffer.task.module.packageName,
+        packagePath: buffer.task.module.packagePath,
         currentCapacity: moduleStats.currentCapacity,
         totalWrites: moduleStats.totalWrites,
         overflowWrites: moduleStats.overflowWrites,

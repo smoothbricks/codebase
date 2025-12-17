@@ -12,14 +12,12 @@ import { TaskContext } from '../taskContext.js';
 export function createTestModuleContext(
   tagAttributes: TagAttributeSchema,
   options: {
-    moduleId?: number;
     gitSha?: string;
     packageName?: string;
     packagePath?: string;
   } = {},
 ): ModuleContext {
   return new ModuleContext(
-    options.moduleId ?? 1,
     options.gitSha ?? 'test-sha',
     options.packageName ?? '@test/package',
     options.packagePath ?? 'src/test.ts',
@@ -33,7 +31,6 @@ export function createTestModuleContext(
 export function createTestTaskContext(
   tagAttributes: TagAttributeSchema,
   options: {
-    moduleId?: number;
     gitSha?: string;
     packageName?: string;
     packagePath?: string;

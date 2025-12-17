@@ -849,9 +849,8 @@ In `packages/lmao/src/lib/lmao.ts`:
 ```typescript
 // Extend ModuleContext with lazy column stats
 export interface ModuleContext {
-  moduleId: number;
   gitSha: string;
-  package: string;
+  packageName: string;
   packagePath: string;
   tagAttributes: TagAttributeSchema;
   spanBufferCapacityStats: BufferCapacityStats;

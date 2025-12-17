@@ -42,7 +42,7 @@ import {
 } from 'apache-arrow';
 import { ENTRY_TYPE_NAMES } from './lmao.js';
 import type { ModuleContext } from './moduleContext.js';
-import { getEnumUtf8, getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
+import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
@@ -348,7 +348,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
   }
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
-    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
 
     if (lmaoType === 'enum') {
@@ -396,7 +396,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
   }
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
-    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const lmaoType = getSchemaType(fieldSchema);
     const columnName = fieldName; // User columns have no prefix
 
     if (lmaoType === 'enum') {
@@ -989,7 +989,7 @@ export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColum
   const textOriginalToMasked = new Map<string, Map<string, string>>();
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
-    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const lmaoType = getSchemaType(fieldSchema);
     if (lmaoType === 'category') {
       categoryBuilders.set(fieldName, new DictionaryBuilder(globalUtf8Cache));
       categoryMaskTransforms.set(fieldName, getMaskTransform(fieldSchema));
@@ -1122,7 +1122,7 @@ export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColum
   let nextDictId = 6;
   const attrDictIds = new Map<string, number>();
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
-    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
 
     if (lmaoType === 'enum') {
@@ -1564,7 +1564,7 @@ function convertBuffersWithSharedDicts(
   let fieldIdx = SYSTEM_FIELDS_COUNT;
 
   for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {
-    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const lmaoType = getSchemaType(fieldSchema);
     const columnName = fieldName; // User columns have no prefix
     // Get the type from the shared schema
     const fieldType = arrowSchema.fields[fieldIdx].type;

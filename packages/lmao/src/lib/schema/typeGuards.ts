@@ -15,26 +15,8 @@ export {
   isSchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 
-// Alias for backward compatibility
-import { isEnumSchema as isEnumSchemaImpl } from '@smoothbricks/arrow-builder';
-/**
- * @deprecated Use isEnumSchema instead
- */
-export const isEnumSchemaWithMetadata = isEnumSchemaImpl;
-
-import type { SchemaType } from '@smoothbricks/arrow-builder';
-// Import for use in this file
-import { getSchemaType } from '@smoothbricks/arrow-builder';
 import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
 import type { FeatureFlagDefinition } from './types.js';
-
-/**
- * Alias for getSchemaType for backward compatibility
- * @deprecated Use getSchemaType instead
- */
-export function getLmaoSchemaType(value: unknown): SchemaType | undefined {
-  return getSchemaType(value);
-}
 
 /**
  * Type guard to check if a value is an Arrow builder

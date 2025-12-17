@@ -1096,7 +1096,6 @@ const schema = S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']);
 
 // At module creation (startup)
 const moduleCtx = new ModuleContext(
-  moduleId,
   gitSha, // intern(gitSha) → UTF-8 bytes cached
   packageName, // intern(packageName) → UTF-8 bytes cached (e.g., '@mycompany/user-service')
   packagePath, // intern(packagePath) → UTF-8 bytes cached (e.g., 'src/services/user.ts')
@@ -1214,7 +1213,7 @@ class ModuleContext {
   readonly utf8PackagePath: Uint8Array; // intern(packagePath)
   readonly utf8GitSha: Uint8Array; // intern(gitSha)
 
-  constructor(moduleId, gitSha, packageName, packagePath, tagAttributes) {
+  constructor(gitSha, packageName, packagePath, tagAttributes) {
     this.utf8PackageName = intern(packageName);
     this.utf8PackagePath = intern(packagePath);
     this.utf8GitSha = intern(gitSha);

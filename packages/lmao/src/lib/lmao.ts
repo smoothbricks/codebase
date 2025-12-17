@@ -34,7 +34,7 @@ import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from './spa
 import { TaskContext } from './taskContext.js';
 import { getTimestampNanos } from './timestamp.js';
 import { generateTraceId, type TraceId } from './traceId.js';
-import type { BufferCapacityStats, SpanBuffer } from './types.js';
+import type { SpanBuffer } from './types.js';
 
 // Re-export TagWriter and ResultWriter types for external use
 export type { ResultWriter, TagWriter } from './codegen/fixedPositionWriterGenerator.js';
@@ -264,54 +264,6 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
     }
     return this;
   }
-}
-
-/**
- * Check if capacity should be tuned based on usage patterns
- *
- * Per specs/01b_columnar_buffer_architecture.md:
- * - Increase if >15% writes overflow
- * - Decrease if <5% writes overflow with many buffers
- * - Bounded growth: 8-1024 entries
- */
-function shouldTuneCapacity(stats: BufferCapacityStats): boolean {
-  const minSamples = 100; // Need enough data
-  if (stats.totalWrites < minSamples) return false;
-
-  const overflowRatio = stats.overflowWrites / stats.totalWrites;
-
-  // Increase if >15% writes overflow
-  if (overflowRatio > 0.15 && stats.currentCapacity < 1024) {
-    const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
-
-    // TODO: Use system tracer for self-tracing capacity tuning events
-
-    stats.currentCapacity = newCapacity;
-    resetStats(stats);
-    return true;
-  }
-
-  // Decrease if <5% writes overflow and we have many buffers
-  if (overflowRatio < 0.05 && stats.totalBuffersCreated >= 10 && stats.currentCapacity > 8) {
-    const newCapacity = Math.max(8, stats.currentCapacity / 2);
-
-    // TODO: Use system tracer for self-tracing capacity tuning events
-
-    stats.currentCapacity = newCapacity;
-    resetStats(stats);
-    return true;
-  }
-
-  return false;
-}
-
-/**
- * Reset stats after capacity tuning
- */
-function resetStats(stats: BufferCapacityStats): void {
-  stats.totalWrites = 0;
-  stats.overflowWrites = 0;
-  stats.totalBuffersCreated = 0;
 }
 
 /**
@@ -1149,51 +1101,6 @@ function createFlagColumnWriters<T extends TagAttributeSchema>(buffer: SpanBuffe
 }
 
 /**
- * Get buffer with space function type
- * @deprecated Use createNextBuffer directly via ColumnWriter overflow handling
- */
-export type GetBufferWithSpaceFn = (buffer: SpanBuffer) => { buffer: SpanBuffer; didOverflow: boolean };
-
-/**
- * Find buffer with space, creating chained buffer if needed
- *
- * Per specs/01b_columnar_buffer_architecture.md:
- * - Buffer chaining handles overflow gracefully
- * - Tracks overflow stats for self-tuning
- * - CPU branch predictor friendly
- *
- * @deprecated Use createNextBuffer directly via ColumnWriter overflow handling.
- * This function is kept for backward compatibility with library.ts.
- */
-export function getBufferWithSpace(inputBuffer: SpanBuffer): { buffer: SpanBuffer; didOverflow: boolean } {
-  const originalBuffer = inputBuffer;
-  let currentBuffer = inputBuffer;
-  let didOverflow = false;
-
-  // Find buffer with space (CPU branch predictor friendly)
-  while (currentBuffer.writeIndex >= currentBuffer.capacity) {
-    if (!currentBuffer.next) {
-      currentBuffer.next = createNextBuffer(currentBuffer);
-    }
-    // Type assertion: createNextBuffer always returns SpanBuffer
-    currentBuffer = currentBuffer.next as SpanBuffer;
-    didOverflow = true;
-  }
-
-  // Track stats for self-tuning
-  const stats = originalBuffer.task.module.spanBufferCapacityStats;
-  stats.totalWrites++;
-  if (didOverflow) {
-    stats.overflowWrites++;
-  }
-
-  // Check if capacity should be tuned
-  shouldTuneCapacity(stats);
-
-  return { buffer: currentBuffer, didOverflow };
-}
-
-/**
  * Write span-start entry to buffer at row 0 (fixed layout)
  * Pre-initialize row 1 as span-exception (will be overwritten by ok/err)
  * Set writeIndex to 2 (events start after reserved rows)
@@ -1351,10 +1258,8 @@ export function createModuleContext<
   // Per specs/01h and 01f - system columns always included
   const schemaOnly = mergeWithSystemSchema(userSchemaOnly) as T;
 
-  // Create module context - moduleId is deprecated, will be removed later
   // UTF-8 pre-encoding now happens in ModuleContext constructor
   const moduleContext = new ModuleContext(
-    0, // moduleId deprecated
     moduleMetadata.gitSha,
     moduleMetadata.packageName,
     moduleMetadata.packagePath,
@@ -1511,4 +1416,65 @@ export function createModuleContext<
       };
     },
   };
+}
+
+/**
+ * Track an overflow write and check if capacity should be tuned.
+ *
+ * Per specs/01b2_buffer_self_tuning.md:
+ * - Increase if >15% writes overflow
+ * - Decrease if <5% writes overflow with many buffers
+ * - Bounded growth: 8-1024 entries
+ *
+ * This function is called from generated SpanLogger code when buffer overflow occurs.
+ * Note: totalWrites is incremented inline in log methods - this only tracks overflow.
+ *
+ * @param stats - Buffer capacity statistics from ModuleContext
+ */
+export function trackOverflowAndTune(stats: import('@smoothbricks/arrow-builder').BufferCapacityStats): void {
+  // Only increment overflowWrites - totalWrites is incremented inline in log methods
+  stats.overflowWrites++;
+  shouldTuneCapacity(stats);
+}
+
+/**
+ * Check if capacity should be tuned based on usage patterns and update stats if needed.
+ *
+ * Per specs/01b2_buffer_self_tuning.md:
+ * - Increase if >15% writes overflow
+ * - Decrease if <5% writes overflow with many buffers
+ * - Bounded growth: 8-1024 entries
+ *
+ * @param stats - Buffer capacity statistics from ModuleContext
+ */
+function shouldTuneCapacity(stats: import('@smoothbricks/arrow-builder').BufferCapacityStats): void {
+  const minSamples = 100; // Need enough data
+  if (stats.totalWrites < minSamples) return;
+
+  const overflowRatio = stats.overflowWrites / stats.totalWrites;
+
+  // Increase if >15% writes overflow
+  if (overflowRatio > 0.15 && stats.currentCapacity < 1024) {
+    const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
+
+    // TODO: Use system tracer for self-tracing capacity tuning events
+
+    stats.currentCapacity = newCapacity;
+    stats.totalWrites = 0;
+    stats.overflowWrites = 0;
+    stats.totalBuffersCreated = 0;
+    return;
+  }
+
+  // Decrease if <5% writes overflow and we have many buffers
+  if (overflowRatio < 0.05 && stats.totalBuffersCreated >= 10 && stats.currentCapacity > 8) {
+    const newCapacity = Math.max(8, stats.currentCapacity / 2);
+
+    // TODO: Use system tracer for self-tracing capacity tuning events
+
+    stats.currentCapacity = newCapacity;
+    stats.totalWrites = 0;
+    stats.overflowWrites = 0;
+    stats.totalBuffersCreated = 0;
+  }
 }

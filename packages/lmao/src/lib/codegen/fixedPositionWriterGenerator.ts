@@ -20,7 +20,7 @@
  */
 
 import { bufferHelpers } from '@smoothbricks/arrow-builder';
-import { getEnumValues, getLmaoSchemaType } from '../schema/typeGuards.js';
+import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferTagAttributes, TagAttributeSchema } from '../schema/types.js';
 import { getSchemaFields } from '../schema/types.js';
 import type { SpanBuffer } from '../types.js';
@@ -117,7 +117,7 @@ ${cases}
  */
 function generateSetterMethod(fieldName: string, schema: unknown, hasEnumMapping: boolean): string {
   const columnName = fieldName;
-  const lmaoType = getLmaoSchemaType(schema);
+  const lmaoType = getSchemaType(schema);
 
   if (lmaoType === 'enum' && hasEnumMapping) {
     return `
@@ -180,7 +180,7 @@ export function generateFixedPositionWriterClass(
   const enumFieldNames = new Set<string>();
 
   for (const [fieldName, fieldSchema] of schemaFields) {
-    const lmaoType = getLmaoSchemaType(fieldSchema);
+    const lmaoType = getSchemaType(fieldSchema);
     const enumValues = getEnumValues(fieldSchema);
 
     if (lmaoType === 'enum' && enumValues) {
