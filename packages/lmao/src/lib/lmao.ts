@@ -245,73 +245,6 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
 }
 
 /**
- * String interning for category columns
- *
- * Per specs/01b1_buffer_performance_optimizations.md:
- * - Store strings once, reference by index
- * - Fast integer comparison vs string comparison
- * - Direct Arrow dictionary creation
- * - Cache-friendly integer storage
- */
-class StringInterner {
-  private strings: string[] = [];
-  private indices = new Map<string, number>();
-
-  /**
-   * Intern a string and return its index
-   * O(1) lookup via Map, O(1) insertion
-   */
-  intern(str: string): number {
-    let idx = this.indices.get(str);
-
-    if (idx === undefined) {
-      idx = this.strings.length;
-      this.strings.push(str);
-      this.indices.set(str, idx);
-    }
-
-    return idx;
-  }
-
-  /**
-   * Get string by index
-   * Used during Arrow conversion
-   */
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-
-  /**
-   * Get all strings for Arrow dictionary
-   */
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-
-  /**
-   * Get count of unique strings
-   */
-  size(): number {
-    return this.strings.length;
-  }
-}
-
-/**
- * Global string interners for SYSTEM columns only
- *
- * - USER attribute columns (category/text) store strings directly in string[] arrays
- * - SYSTEM columns (moduleId, label) use interning for efficiency
- *
- * Exported for Arrow table conversion
- */
-export const moduleIdInterner = new StringInterner();
-/**
- * Label interner for unified label column (span names, log message templates, feature flag names).
- * Per specs/01h_entry_types_and_logging_primitives.md "The `label` Column"
- */
-export const labelInterner = new StringInterner();
-
-/**
  * Check if capacity should be tuned based on usage patterns
  *
  * Per specs/01b_columnar_buffer_architecture.md:
@@ -940,8 +873,10 @@ export interface SpanContext<T extends TagAttributeSchema, FF extends FeatureFla
    * The buffer contains all trace data written during this span's execution.
    *
    * @example
+   * ```typescript
    * const result = await myTask(requestCtx, args);
-   * const table = convertToArrowTable(ctx.buffer, moduleIdInterner, labelInterner);
+   * const table = convertToArrowTable(ctx.buffer);
+   * ```
    */
   readonly buffer: SpanBuffer;
 }
@@ -1394,9 +1329,10 @@ export function createModuleContext<
   // Per specs/01h and 01f - system columns always included
   const schemaOnly = mergeWithSystemSchema(userSchemaOnly) as T;
 
-  // Create module context with string-interned module ID
+  // Create module context - moduleId is deprecated, will be removed later
+  // UTF-8 pre-encoding now happens in ModuleContext constructor
   const moduleContext = new ModuleContext(
-    moduleIdInterner.intern(moduleMetadata.filePath),
+    0, // moduleId deprecated, use utf8FilePath instead
     moduleMetadata.gitSha,
     moduleMetadata.filePath,
     schemaOnly,
@@ -1412,10 +1348,10 @@ export function createModuleContext<
       line?: number,
     ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result> {
       return async (requestCtx: RequestContext<FF, Env>, ...args: Args): Promise<Result> => {
-        // Create task context with string-interned label (span name)
+        // Create task context with span name
         const taskContext = new TaskContext(
           moduleContext,
-          labelInterner.intern(name),
+          name, // span name - UTF-8 pre-encoded in TaskContext constructor
           line ?? 0, // lineNumber from transformer injection
         );
 

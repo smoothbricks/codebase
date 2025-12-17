@@ -10,31 +10,8 @@ import {
 } from '@smoothbricks/lmao';
 import { createTestTaskContext } from '../test-helpers.js';
 
-/**
- * Simple string interner for testing
- */
-class TestStringInterner {
-  private strings: string[] = [];
-  private stringToIndex = new Map<string, number>();
-
-  intern(str: string): number {
-    let idx = this.stringToIndex.get(str);
-    if (idx === undefined) {
-      idx = this.strings.length;
-      this.strings.push(str);
-      this.stringToIndex.set(str, idx);
-    }
-    return idx;
-  }
-
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-}
+// TestStringInterner no longer needed - convertToArrowTable now uses direct string access
+// via buf.task.module.filePath and buf.task.spanName
 
 /**
  * Type helper to extract schema fields from ExtendedSchema
@@ -190,10 +167,10 @@ describe('Buffer Integration', () => {
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     // Create interners
-    const moduleIdInterner = new TestStringInterner();
-    const spanNameInterner = new TestStringInterner();
-    moduleIdInterner.intern('test-module');
-    spanNameInterner.intern('test-span');
+    // const moduleIdInterner = new TestStringInterner();
+    // const spanNameInterner = new TestStringInterner();
+    // moduleIdInterner.intern('test-module');
+    // spanNameInterner.intern('test-span');
 
     const taskContext = createTestTaskContext(tagAttributes);
     const buffer = createSpanBuffer(tagAttributes, taskContext);
@@ -209,7 +186,7 @@ describe('Buffer Integration', () => {
     buffer.writeIndex = 1;
 
     // Convert to Arrow table
-    const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+    const table = convertToArrowTable(buffer);
 
     // Get the userId column (should be masked)
     const userIdCol = table.getChild('userId');
@@ -240,10 +217,10 @@ describe('Buffer Integration', () => {
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     // Create interners
-    const moduleIdInterner = new TestStringInterner();
-    const spanNameInterner = new TestStringInterner();
-    moduleIdInterner.intern('test-module');
-    spanNameInterner.intern('test-span');
+    // const moduleIdInterner = new TestStringInterner();
+    // const spanNameInterner = new TestStringInterner();
+    // moduleIdInterner.intern('test-module');
+    // spanNameInterner.intern('test-span');
 
     const taskContext = createTestTaskContext(tagAttributes);
     const buffer = createSpanBuffer(tagAttributes, taskContext);
@@ -263,7 +240,7 @@ describe('Buffer Integration', () => {
     buffer.writeIndex = 1;
 
     // Convert to Arrow table
-    const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+    const table = convertToArrowTable(buffer);
 
     // Get columns
     const emailCol = table.getChild('email');
@@ -297,10 +274,10 @@ describe('Buffer Integration', () => {
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     // Create interners
-    const moduleIdInterner = new TestStringInterner();
-    const spanNameInterner = new TestStringInterner();
-    moduleIdInterner.intern('test-module');
-    spanNameInterner.intern('test-span');
+    // const moduleIdInterner = new TestStringInterner();
+    // const spanNameInterner = new TestStringInterner();
+    // moduleIdInterner.intern('test-module');
+    // spanNameInterner.intern('test-span');
 
     const taskContext = createTestTaskContext(tagAttributes);
     const buffer = createSpanBuffer(tagAttributes, taskContext);
@@ -316,7 +293,7 @@ describe('Buffer Integration', () => {
     buffer.writeIndex = 1;
 
     // Convert to Arrow table
-    const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+    const table = convertToArrowTable(buffer);
 
     // Get the column
     const secretKeyCol = table.getChild('secretKey');

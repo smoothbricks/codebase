@@ -29,41 +29,18 @@ import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../..
 import { createTraceId } from '../../traceId.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
-/**
- * Mock string interner for testing
- */
-class MockStringInterner {
-  private strings: string[] = [];
-  private indices = new Map<string, number>();
-
-  intern(str: string): number {
-    let idx = this.indices.get(str);
-    if (idx === undefined) {
-      idx = this.strings.length;
-      this.strings.push(str);
-      this.indices.set(str, idx);
-    }
-    return idx;
-  }
-
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-}
+// MockStringInterner no longer needed - convertToArrowTable now uses direct string access
+// via buf.task.module.filePath and buf.task.spanName
 
 describe('Arrow Table Conversion', () => {
-  let moduleIdInterner: MockStringInterner;
-  let spanNameInterner: MockStringInterner;
+  // let moduleIdInterner: MockStringInterner;
+  // let spanNameInterner: MockStringInterner;
 
   beforeEach(() => {
-    moduleIdInterner = new MockStringInterner();
-    spanNameInterner = new MockStringInterner();
-    moduleIdInterner.intern('test-file.ts');
-    spanNameInterner.intern('test-span');
+    // moduleIdInterner = new MockStringInterner();
+    // spanNameInterner = new MockStringInterner();
+    // moduleIdInterner.intern('test-file.ts');
+    // spanNameInterner.intern('test-span');
   });
 
   describe('Basic Conversion', () => {
@@ -72,7 +49,7 @@ describe('Arrow Table Conversion', () => {
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       expect(table.numRows).toBe(0);
     });
 
@@ -92,7 +69,7 @@ describe('Arrow Table Conversion', () => {
       buffer.active(idx, true);
       buffer.writeIndex++;
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.numRows).toBe(1);
       const row = table.get(0)?.toJSON();
@@ -113,7 +90,7 @@ describe('Arrow Table Conversion', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.numRows).toBe(5);
       for (let i = 0; i < 5; i++) {
@@ -144,7 +121,7 @@ describe('Arrow Table Conversion', () => {
 
       buffer.writeIndex = 3;
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.get(0)?.toJSON().value).toBe(42);
       expect(table.get(1)?.toJSON().value).toBe(null);
@@ -183,7 +160,7 @@ describe('Arrow Table Conversion', () => {
       buffer.status(idx2, 1); // active
       buffer.writeIndex++;
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.get(0)?.toJSON().status).toBe('pending');
       expect(table.get(1)?.toJSON().status).toBe('completed');
@@ -204,7 +181,7 @@ describe('Arrow Table Conversion', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.get(0)?.toJSON().userId).toBe('user-123');
       expect(table.get(1)?.toJSON().userId).toBe('user-456');
@@ -225,7 +202,7 @@ describe('Arrow Table Conversion', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.get(0)?.toJSON().message).toBe('First');
       expect(table.get(1)?.toJSON().message).toBe('Second');
@@ -258,7 +235,7 @@ describe('Arrow Table Conversion', () => {
         nextBuffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.numRows).toBe(5);
       expect(table.get(0)?.toJSON().value).toBe(0);
@@ -305,7 +282,7 @@ describe('Arrow Table Conversion', () => {
       parentBuffer.depth(idx, 0);
       parentBuffer.writeIndex++;
 
-      const table = convertSpanTreeToArrowTable(parentBuffer, moduleIdInterner, spanNameInterner);
+      const table = convertSpanTreeToArrowTable(parentBuffer);
 
       expect(table.numRows).toBe(4);
 
@@ -350,7 +327,7 @@ describe('Arrow Table Conversion', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       for (let i = 0; i < entryTypes.length; i++) {
         expect(table.get(i)?.toJSON().entry_type).toBe(entryTypes[i].name);
@@ -368,7 +345,7 @@ describe('Arrow Table Conversion', () => {
       buffer.operations[0] = ENTRY_TYPE_SPAN_START;
       buffer.writeIndex = 1;
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       const fieldNames = table.schema.fields.map((f) => f.name);
       expect(fieldNames).toContain('timestamp');
@@ -392,7 +369,7 @@ describe('Arrow Table Conversion', () => {
       buffer.operations[0] = ENTRY_TYPE_SPAN_START;
       buffer.writeIndex = 1;
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       expect(table.get(0)?.toJSON().trace_id).toBe(traceId);
     });

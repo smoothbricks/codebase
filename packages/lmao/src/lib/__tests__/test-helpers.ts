@@ -34,10 +34,10 @@ export function createTestTaskContext(
     moduleId?: number;
     gitSha?: string;
     filePath?: string;
-    spanNameId?: number;
+    spanName?: string;
     lineNumber?: number;
   } = {},
 ): TaskContext {
   const moduleContext = createTestModuleContext(tagAttributes, options);
-  return new TaskContext(moduleContext, options.spanNameId ?? 1, options.lineNumber ?? 0);
+  return new TaskContext(moduleContext, options.spanName ?? 'test-span', options.lineNumber ?? 0);
 }

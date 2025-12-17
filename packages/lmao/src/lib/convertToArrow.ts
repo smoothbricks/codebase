@@ -16,14 +16,6 @@ import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
 /**
- * String interner interface (matches lmao's implementation)
- */
-export interface StringInterner {
-  getStrings(): readonly string[];
-  getString(idx: number): string | undefined;
-}
-
-/**
  * Zero-copy helper: Create Arrow Data from TypedArray without copying
  */
 export function createZeroCopyData<T extends arrow.DataType>(
@@ -303,12 +295,7 @@ export type SystemColumnBuilder = (
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow RecordBatch
  */
-export function convertToRecordBatch(
-  buffer: SpanBuffer,
-  moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner,
-  systemColumnBuilder?: SystemColumnBuilder,
-): arrow.RecordBatch {
+export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): arrow.RecordBatch {
   const buffers: SpanBuffer[] = [];
   let currentBuffer: SpanBuffer | undefined = buffer;
 
@@ -317,13 +304,11 @@ export function convertToRecordBatch(
     currentBuffer = currentBuffer.next as SpanBuffer | undefined;
   }
 
-  return convertBuffersToRecordBatch(buffers, moduleIdInterner, spanNameInterner, systemColumnBuilder);
+  return convertBuffersToRecordBatch(buffers, systemColumnBuilder);
 }
 
 function convertBuffersToRecordBatch(
   buffers: SpanBuffer[],
-  moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner,
   systemColumnBuilder?: SystemColumnBuilder,
 ): arrow.RecordBatch {
   if (buffers.length === 0) return new arrow.RecordBatch({});
@@ -398,7 +383,7 @@ function convertBuffersToRecordBatch(
   if (systemColumnBuilder) {
     vectors.push(...systemVectors);
   } else {
-    buildDefaultSystemVectors(buffers, vectors, moduleIdInterner, spanNameInterner);
+    buildDefaultSystemVectors(buffers, vectors);
   }
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
@@ -572,23 +557,13 @@ function convertBuffersToRecordBatch(
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow Table
  */
-export function convertToArrowTable(
-  buffer: SpanBuffer,
-  moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner,
-  systemColumnBuilder?: SystemColumnBuilder,
-): arrow.Table {
-  const batch = convertToRecordBatch(buffer, moduleIdInterner, spanNameInterner, systemColumnBuilder);
+export function convertToArrowTable(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): arrow.Table {
+  const batch = convertToRecordBatch(buffer, systemColumnBuilder);
   if (batch.numRows === 0) return new arrow.Table();
   return new arrow.Table([batch]);
 }
 
-function buildDefaultSystemVectors(
-  buffers: SpanBuffer[],
-  vectors: arrow.Vector[],
-  moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner,
-): void {
+function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[]): void {
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
   // Timestamp - BigInt64Array with nanoseconds
@@ -776,17 +751,16 @@ function buildDefaultSystemVectors(
     ),
   );
 
-  // Module
-  const moduleIdSet = new Set<number>();
-  for (const buf of buffers) moduleIdSet.add(buf.task.module.moduleId);
-  const moduleIdArray = Array.from(moduleIdSet);
-  const moduleNameArray = moduleIdArray.map((id) => moduleIdInterner.getString(id) || 'unknown');
-  const moduleIdMap = new Map(moduleIdArray.map((id, idx) => [id, idx]));
+  // Module - using direct string access via buf.task.module.filePath
+  const moduleNameSet = new Set<string>();
+  for (const buf of buffers) moduleNameSet.add(buf.task.module.filePath);
+  const moduleNameArray = Array.from(moduleNameSet);
+  const moduleNameMap = new Map(moduleNameArray.map((name, idx) => [name, idx]));
 
   const moduleIndices = new Int32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const moduleIndex = moduleIdMap.get(buf.task.module.moduleId)!;
+    const moduleIndex = moduleNameMap.get(buf.task.module.filePath)!;
     // Use fill() - constant value per buffer
     moduleIndices.fill(moduleIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
@@ -849,17 +823,16 @@ function buildDefaultSystemVectors(
     ),
   );
 
-  // Span name
-  const spanNameIdSet = new Set<number>();
-  for (const buf of buffers) spanNameIdSet.add(buf.task.spanNameId);
-  const spanNameIdArray = Array.from(spanNameIdSet);
-  const spanNameArray = spanNameIdArray.map((id) => spanNameInterner.getString(id) || 'unknown');
-  const spanNameIdMap = new Map(spanNameIdArray.map((id, idx) => [id, idx]));
+  // Span name - now using direct string access
+  const spanNameSet = new Set<string>();
+  for (const buf of buffers) spanNameSet.add(buf.task.spanName);
+  const spanNameArray = Array.from(spanNameSet);
+  const spanNameMap = new Map(spanNameArray.map((name, idx) => [name, idx]));
 
   const spanNameIndices = new Int32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const spanNameIndex = spanNameIdMap.get(buf.task.spanNameId)!;
+    const spanNameIndex = spanNameMap.get(buf.task.spanName)!;
     // Use fill() - constant value per buffer
     spanNameIndices.fill(spanNameIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
@@ -1004,8 +977,6 @@ function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): 
  */
 export function convertSpanTreeToArrowTable(
   rootBuffer: SpanBuffer,
-  moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner,
   _systemColumnBuilder?: SystemColumnBuilder,
 ): arrow.Table {
   const schema = rootBuffer.task.module.tagAttributes;
@@ -1047,12 +1018,10 @@ export function convertSpanTreeToArrowTable(
     traceIdBuilder.add(buffer.traceId);
 
     // Add module, git SHA and span name to their shared dictionaries
-    const moduleName = moduleIdInterner.getString(buffer.task.module.moduleId) || 'unknown';
-    const gitSha = buffer.task.module.gitSha;
-    const spanName = spanNameInterner.getString(buffer.task.spanNameId) || 'unknown';
-    moduleBuilder.add(moduleName);
-    gitShaBuilder.add(gitSha);
-    spanNameBuilder.add(spanName);
+    // Using direct string access via buf.task.module.filePath and buf.task.spanName
+    moduleBuilder.add(buffer.task.module.filePath);
+    gitShaBuilder.add(buffer.task.module.gitSha);
+    spanNameBuilder.add(buffer.task.spanName);
 
     for (const [fieldName, builder] of categoryBuilders) {
       const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
@@ -1205,8 +1174,6 @@ export function convertSpanTreeToArrowTable(
     categoryDicts,
     textDicts,
     attrDictIds,
-    moduleIdInterner,
-    spanNameInterner,
     schema,
     categoryOriginalToMasked,
     textOriginalToMasked,
@@ -1230,8 +1197,6 @@ function convertBuffersWithSharedDicts(
   categoryDicts: Map<string, FinalizedDict>,
   textDicts: Map<string, FinalizedDict>,
   _attrDictIds: Map<string, number>,
-  moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner,
   lmaoSchema: Record<string, unknown>,
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
@@ -1432,12 +1397,11 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Module (using shared dictionary)
+  // Module (using shared dictionary) - direct string access via buf.task.module.filePath
   const moduleIndices = new Int32Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const moduleName = moduleIdInterner.getString(buf.task.module.moduleId) || 'unknown';
-    const idx = moduleDict.indexMap.get(moduleName) ?? 0;
+    const idx = moduleDict.indexMap.get(buf.task.module.filePath) ?? 0;
     // Use fill() - constant value per buffer
     moduleIndices.fill(idx, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;
@@ -1496,12 +1460,11 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Span name (using shared dictionary)
+  // Span name (using shared dictionary) - direct string access via buf.task.spanName
   const spanNameIndices = new Int32Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const spanName = spanNameInterner.getString(buf.task.spanNameId) || 'unknown';
-    const idx = spanNameDict.indexMap.get(spanName) ?? 0;
+    const idx = spanNameDict.indexMap.get(buf.task.spanName) ?? 0;
     // Use fill() - constant value per buffer
     spanNameIndices.fill(idx, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;

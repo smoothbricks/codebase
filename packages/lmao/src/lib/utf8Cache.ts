@@ -14,6 +14,7 @@
  */
 
 import { SieveCache } from '@neophi/sieve-cache';
+import type { Utf8Encoder } from '@smoothbricks/arrow-builder';
 
 /**
  * Default cache size for UTF-8 encoding
@@ -35,7 +36,7 @@ const DEFAULT_UTF8_CACHE_SIZE = 4096;
  * The cache is safe to use in async contexts since JS awaits don't
  * allow concurrent access to the same cache instance.
  */
-export class Utf8Cache {
+export class Utf8Cache implements Utf8Encoder {
   private readonly cache: SieveCache<string, Uint8Array>;
   private readonly encoder = new TextEncoder();
 
@@ -64,6 +65,44 @@ export class Utf8Cache {
     const encoded = this.encoder.encode(str);
     this.cache.set(str, encoded);
     return encoded;
+  }
+
+  /**
+   * Calculate UTF-8 byte length of a string
+   *
+   * Uses cache if available to avoid re-encoding.
+   *
+   * @param str - String to measure
+   * @returns UTF-8 byte length
+   */
+  byteLength(str: string): number {
+    // Check cache first - if encoded, we know the length
+    const cached = this.cache.get(str);
+    if (cached !== undefined) {
+      this.hits++;
+      return cached.length;
+    }
+
+    // Not cached - encode and cache it, then return length
+    this.misses++;
+    const encoded = this.encoder.encode(str);
+    this.cache.set(str, encoded);
+    return encoded.length;
+  }
+
+  /**
+   * Encode string directly into buffer at offset
+   *
+   * @param str - String to encode
+   * @param buffer - Target buffer
+   * @param offset - Offset in buffer to write at
+   * @returns Number of bytes written
+   */
+  encodeInto(str: string, buffer: Uint8Array, offset: number): number {
+    // Use encode() which leverages the cache
+    const encoded = this.encode(str);
+    buffer.set(encoded, offset);
+    return encoded.length;
   }
 
   /**

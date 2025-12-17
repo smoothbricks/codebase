@@ -15,6 +15,8 @@
  * @module taskContext
  */
 
+import { intern } from '@smoothbricks/arrow-builder';
+
 import type { ModuleContext } from './moduleContext.js';
 import { copyThreadIdTo } from './threadId.js';
 
@@ -22,11 +24,16 @@ import { copyThreadIdTo } from './threadId.js';
  * Task context passed to SpanBuffer constructors.
  */
 export class TaskContext {
+  /** Pre-encoded UTF-8 bytes for span name */
+  public readonly utf8SpanName: Uint8Array;
+
   constructor(
     public readonly module: ModuleContext,
-    public readonly spanNameId: number,
+    public readonly spanName: string,
     public readonly lineNumber: number,
-  ) {}
+  ) {
+    this.utf8SpanName = intern(spanName);
+  }
 
   /**
    * Copy this process/worker's thread ID bytes (8 bytes) to destination.

@@ -10,36 +10,12 @@ import { createSpanBuffer } from '../spanBuffer.js';
 import { createTraceId } from '../traceId.js';
 import { createTestTaskContext } from './test-helpers.js';
 
-class MockStringInterner {
-  private strings: string[] = [];
-  private indices = new Map<string, number>();
-
-  intern(str: string): number {
-    let idx = this.indices.get(str);
-    if (idx === undefined) {
-      idx = this.strings.length;
-      this.strings.push(str);
-      this.indices.set(str, idx);
-    }
-    return idx;
-  }
-
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-}
+// MockStringInterner no longer needed - convertToArrowTable now uses direct string access
+// via buf.task.module.filePath and buf.task.spanName
 
 describe('Debug Dictionary', () => {
   it('category and text columns should use separate dictionaries', () => {
-    const moduleIdInterner = new MockStringInterner();
-    const spanNameInterner = new MockStringInterner();
-
-    moduleIdInterner.intern('test-file.ts');
-    spanNameInterner.intern('test-span');
+    // No interners needed - direct string access is used
 
     const schema = {
       userId: S.category(),
@@ -65,7 +41,7 @@ describe('Debug Dictionary', () => {
     buffer.message(idx1, 'Second message');
     buffer.writeIndex++;
 
-    const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+    const table = convertToArrowTable(buffer);
 
     console.log(
       'Schema fields:',

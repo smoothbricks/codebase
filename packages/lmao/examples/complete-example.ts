@@ -18,13 +18,8 @@ import {
   defineTagAttributes,
   FlushScheduler,
   InMemoryFlagEvaluator,
-  labelInterner,
-  moduleIdInterner,
   S,
 } from '../src/index.js';
-
-// Note: labelInterner is the unified interner for span names, log message templates, and feature flag names.
-// It's passed to FlushScheduler as the 'spanNameInterner' parameter.
 
 // ====================
 // 1. Define Tag Attributes
@@ -98,7 +93,7 @@ const orderModule = createModuleContext({
 // 5. Setup FlushScheduler
 // ====================
 
-// FlushScheduler takes: handler, moduleIdInterner, spanNameInterner (labelInterner), config
+// FlushScheduler now uses direct string access - no interners needed
 const scheduler = new FlushScheduler(
   // Flush handler - receives Arrow table
   (table, metadata) => {
@@ -114,8 +109,6 @@ const scheduler = new FlushScheduler(
     // - Send to analytics service
     // - etc.
   },
-  moduleIdInterner,
-  labelInterner, // The unified label interner (used for span names, log messages, FF names)
   {
     maxFlushInterval: 5000, // Flush every 5 seconds
     capacityThreshold: 0.8, // Flush when 80% full

@@ -18,14 +18,9 @@ import {
   defineFeatureFlags,
   defineTagAttributes,
   InMemoryFlagEvaluator,
-  labelInterner,
-  moduleIdInterner,
   S,
   type SpanBuffer,
 } from '../src/index.js';
-
-// Note: The label interner is used for span names, log message templates, and feature flag names.
-// It's passed as the 'spanNameInterner' parameter to convertToArrowTable.
 
 // Define schema
 const schema = defineTagAttributes({
@@ -114,7 +109,8 @@ async function main() {
   console.log('\n--- ARROW TABLE ---\n');
 
   if (rootBuffer) {
-    const table = convertToArrowTable(rootBuffer, moduleIdInterner, labelInterner);
+    // convertToArrowTable now uses direct string access - no interners needed
+    const table = convertToArrowTable(rootBuffer);
 
     console.log('Schema:');
     for (const field of table.schema.fields) {

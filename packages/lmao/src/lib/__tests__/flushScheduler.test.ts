@@ -3,30 +3,10 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
-import type { StringInterner } from '../convertToArrow.js';
 import { type FlushHandler, type FlushMetadata, FlushScheduler, type FlushSchedulerConfig } from '../flushScheduler.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { SpanBuffer } from '../types.js';
 import { createTestTaskContext } from './test-helpers.js';
-
-// Mock StringInterner
-class MockStringInterner implements StringInterner {
-  private strings: string[] = [];
-
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-
-  intern(str: string): number {
-    const idx = this.strings.length;
-    this.strings.push(str);
-    return idx;
-  }
-}
 
 function createTestBuffer(): SpanBuffer {
   const taskContext = createTestTaskContext({});
@@ -44,8 +24,6 @@ describe('FlushScheduler', () => {
   let scheduler: FlushScheduler;
   let flushHandler: FlushHandler;
   let flushCalls: Array<{ metadata: FlushMetadata }>;
-  let moduleIdInterner: MockStringInterner;
-  let spanNameInterner: MockStringInterner;
 
   beforeEach(() => {
     flushCalls = [];
@@ -53,10 +31,7 @@ describe('FlushScheduler', () => {
       flushCalls.push({ metadata });
     });
 
-    moduleIdInterner = new MockStringInterner();
-    spanNameInterner = new MockStringInterner();
-
-    scheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner);
+    scheduler = new FlushScheduler(flushHandler);
   });
 
   afterEach(() => {
@@ -359,7 +334,7 @@ describe('FlushScheduler', () => {
           throw new Error('Flush failed');
         };
 
-        const errorScheduler = new FlushScheduler(errorHandler, moduleIdInterner, spanNameInterner);
+        const errorScheduler = new FlushScheduler(errorHandler);
 
         const buffer = createTestBuffer();
         errorScheduler.register(buffer);
@@ -391,7 +366,7 @@ describe('FlushScheduler', () => {
           throw new Error('Async error');
         };
 
-        const rejectedScheduler = new FlushScheduler(rejectedHandler, moduleIdInterner, spanNameInterner);
+        const rejectedScheduler = new FlushScheduler(rejectedHandler);
 
         const buffer = createTestBuffer();
         rejectedScheduler.register(buffer);
@@ -455,14 +430,14 @@ describe('FlushScheduler', () => {
           idleDetection: false,
         };
 
-        const customScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config);
+        const customScheduler = new FlushScheduler(flushHandler, config);
 
         expect(customScheduler).toBeDefined();
         customScheduler.stop();
       });
 
       it('should use default config when not provided', () => {
-        const defaultScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner);
+        const defaultScheduler = new FlushScheduler(flushHandler);
 
         expect(defaultScheduler).toBeDefined();
         defaultScheduler.stop();
@@ -473,7 +448,7 @@ describe('FlushScheduler', () => {
           maxFlushInterval: 20000,
         };
 
-        const partialScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config);
+        const partialScheduler = new FlushScheduler(flushHandler, config);
 
         expect(partialScheduler).toBeDefined();
         partialScheduler.stop();
@@ -487,7 +462,7 @@ describe('FlushScheduler', () => {
           minFlushInterval: 0,
         };
 
-        const zeroScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config);
+        const zeroScheduler = new FlushScheduler(flushHandler, config);
 
         expect(zeroScheduler).toBeDefined();
         zeroScheduler.stop();
@@ -499,7 +474,7 @@ describe('FlushScheduler', () => {
           minFlushInterval: Number.MAX_SAFE_INTEGER - 1,
         };
 
-        const largeScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config);
+        const largeScheduler = new FlushScheduler(flushHandler, config);
 
         expect(largeScheduler).toBeDefined();
         largeScheduler.stop();
@@ -509,9 +484,9 @@ describe('FlushScheduler', () => {
         const config1: FlushSchedulerConfig = { capacityThreshold: 0.0 };
         const config2: FlushSchedulerConfig = { capacityThreshold: 1.0 };
 
-        const scheduler1 = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config1);
+        const scheduler1 = new FlushScheduler(flushHandler, config1);
 
-        const scheduler2 = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config2);
+        const scheduler2 = new FlushScheduler(flushHandler, config2);
 
         expect(scheduler1).toBeDefined();
         expect(scheduler2).toBeDefined();
@@ -528,7 +503,7 @@ describe('FlushScheduler', () => {
           minFlushInterval: -500,
         };
 
-        const negativeScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config);
+        const negativeScheduler = new FlushScheduler(flushHandler, config);
 
         expect(negativeScheduler).toBeDefined();
         negativeScheduler.stop();
@@ -539,7 +514,7 @@ describe('FlushScheduler', () => {
           capacityThreshold: 1.5,
         };
 
-        const overScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config);
+        const overScheduler = new FlushScheduler(flushHandler, config);
 
         expect(overScheduler).toBeDefined();
         overScheduler.stop();
@@ -551,7 +526,7 @@ describe('FlushScheduler', () => {
           capacityThreshold: Number.NaN,
         };
 
-        const nanScheduler = new FlushScheduler(flushHandler, moduleIdInterner, spanNameInterner, config);
+        const nanScheduler = new FlushScheduler(flushHandler, config);
 
         expect(nanScheduler).toBeDefined();
         nanScheduler.stop();

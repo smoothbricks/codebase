@@ -21,31 +21,8 @@ import { createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
-/**
- * Mock string interner for testing
- */
-class MockStringInterner {
-  private strings: string[] = [];
-  private indices = new Map<string, number>();
-
-  intern(str: string): number {
-    let idx = this.indices.get(str);
-    if (idx === undefined) {
-      idx = this.strings.length;
-      this.strings.push(str);
-      this.indices.set(str, idx);
-    }
-    return idx;
-  }
-
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-}
+// MockStringInterner no longer needed - convertToArrowTable now uses direct string access
+// via buf.task.module.filePath and buf.task.spanName
 
 /**
  * Round-trip test: serialize to IPC, deserialize, verify data matches
@@ -85,17 +62,7 @@ function setNull(nullBitmap: Uint8Array, idx: number, isNull: boolean): void {
 }
 
 describe('Arrow IPC Round-Trip', () => {
-  let moduleIdInterner: MockStringInterner;
-  let spanNameInterner: MockStringInterner;
-
-  beforeEach(() => {
-    moduleIdInterner = new MockStringInterner();
-    spanNameInterner = new MockStringInterner();
-
-    // Pre-intern required system strings
-    moduleIdInterner.intern('test-file.ts');
-    spanNameInterner.intern('test-span');
-  });
+  // No interners needed - direct string access is used
 
   describe('serializes and deserializes correctly', () => {
     it('number columns survive round-trip', () => {
@@ -113,7 +80,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       // Verify data values match
@@ -147,7 +114,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < testValues.length; i++) {
@@ -174,7 +141,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < expectedStrings.length; i++) {
@@ -197,7 +164,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < testValues.length; i++) {
@@ -220,7 +187,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < testValues.length; i++) {
@@ -251,7 +218,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < testValues.length; i++) {
@@ -297,7 +264,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       // Verify first row
@@ -340,7 +307,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       // Verify system columns exist
@@ -378,7 +345,7 @@ describe('Arrow IPC Round-Trip', () => {
       buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
       buffer.writeIndex++;
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       // System columns that should NOT be nullable
       const nonNullableColumns = ['timestamp', 'trace_id', 'thread_id', 'span_id', 'entry_type', 'module', 'span_name'];
@@ -415,7 +382,7 @@ describe('Arrow IPC Round-Trip', () => {
       (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, 0);
       buffer.writeIndex++;
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       // Category and text should be Dictionary<Utf8, Uint32>
       const categoryField = table.schema.fields.find((f) => f.name === 'category');
@@ -454,7 +421,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       // Extract value column
       const valueColumnIndex = table.schema.fields.findIndex((f) => f.name === 'value');
@@ -495,7 +462,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       const valueColumnIndex = table.schema.fields.findIndex((f) => f.name === 'value');
       const valueVector = table.getChildAt(valueColumnIndex)!;
@@ -525,7 +492,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       const valueColumnIndex = table.schema.fields.findIndex((f) => f.name === 'value');
       const valueVector = table.getChildAt(valueColumnIndex)!;
@@ -553,7 +520,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
       const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < testValues.length; i++) {
@@ -578,7 +545,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.writeIndex++;
       }
 
-      const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
+      const table = convertToArrowTable(buffer);
 
       // Verify all 100 rows have the same value by accessing the column directly
       const userIdIndex = table.schema.fields.findIndex((f) => f.name === 'userId');

@@ -11,6 +11,7 @@
  */
 
 import * as Sury from '@sury/sury';
+import { intern } from '../arrow/interner.js';
 import type {
   EagerBooleanSchema,
   EagerCategorySchema,
@@ -99,10 +100,8 @@ function resolveMaskTransform(preset: MaskPreset | MaskTransform): MaskTransform
  * @returns Pre-computed UTF-8 data ready for Arrow dictionary
  */
 function precomputeEnumUtf8(values: readonly string[]): EnumUtf8Precomputed {
-  const encoder = new TextEncoder();
-
-  // Encode each value
-  const bytes = values.map((v) => encoder.encode(v));
+  // Use intern() to ensure all enum strings are globally interned for UTF-8 reuse
+  const bytes = values.map((v) => intern(v));
 
   // Calculate total size and build offsets
   const offsets = new Int32Array(values.length + 1);

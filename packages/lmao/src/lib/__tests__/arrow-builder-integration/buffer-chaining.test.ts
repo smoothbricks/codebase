@@ -116,7 +116,7 @@ describe('Buffer Chaining', () => {
     it('should handle buffer with parent correctly', () => {
       const parentBuffer = createSpanBuffer(schema, taskContext);
 
-      const childTaskContext = createTestTaskContext(schema, { spanNameId: 2 });
+      const childTaskContext = createTestTaskContext(schema, { spanName: 'child-span' });
 
       const childBuffer = createSpanBuffer(schema, childTaskContext);
       childBuffer.parent = parentBuffer;
@@ -136,7 +136,7 @@ describe('Buffer Chaining', () => {
       const buffer = createSpanBuffer(schema, taskContext);
 
       // Add a child to original buffer
-      const childTaskContext = createTestTaskContext(schema, { spanNameId: 2 });
+      const childTaskContext = createTestTaskContext(schema, { spanName: 'child-span' });
       const childBuffer = createSpanBuffer(schema, childTaskContext);
       buffer.children.push(childBuffer);
 

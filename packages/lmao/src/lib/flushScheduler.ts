@@ -8,7 +8,7 @@
  */
 
 import type * as arrow from 'apache-arrow';
-import { convertSpanTreeToArrowTable, type StringInterner } from './convertToArrow.js';
+import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import type { SpanBuffer } from './types.js';
 
 /**
@@ -83,8 +83,6 @@ export interface FlushSchedulerConfig {
 export class FlushScheduler {
   private config: Required<FlushSchedulerConfig>;
   private handler: FlushHandler;
-  private moduleIdInterner: StringInterner;
-  private spanNameInterner: StringInterner;
 
   private buffers = new Set<SpanBuffer>();
   private lastFlushTime = Date.now();
@@ -94,15 +92,8 @@ export class FlushScheduler {
   private memoryTimer?: NodeJS.Timeout;
   private isRunning = false;
 
-  constructor(
-    handler: FlushHandler,
-    moduleIdInterner: StringInterner,
-    spanNameInterner: StringInterner,
-    config: FlushSchedulerConfig = {},
-  ) {
+  constructor(handler: FlushHandler, config: FlushSchedulerConfig = {}) {
     this.handler = handler;
-    this.moduleIdInterner = moduleIdInterner;
-    this.spanNameInterner = spanNameInterner;
 
     // Apply defaults
     this.config = {
@@ -308,7 +299,7 @@ export class FlushScheduler {
 
     for (const buffer of buffersToFlush) {
       try {
-        const table = convertSpanTreeToArrowTable(buffer, this.moduleIdInterner, this.spanNameInterner);
+        const table = convertSpanTreeToArrowTable(buffer);
 
         if (table.numRows > 0) {
           tables.push(table);
@@ -399,14 +390,9 @@ let globalScheduler: FlushScheduler | null = null;
 /**
  * Get or create global flush scheduler
  */
-export function getGlobalFlushScheduler(
-  handler: FlushHandler,
-  moduleIdInterner: StringInterner,
-  spanNameInterner: StringInterner,
-  config?: FlushSchedulerConfig,
-): FlushScheduler {
+export function getGlobalFlushScheduler(handler: FlushHandler, config?: FlushSchedulerConfig): FlushScheduler {
   if (!globalScheduler) {
-    globalScheduler = new FlushScheduler(handler, moduleIdInterner, spanNameInterner, config);
+    globalScheduler = new FlushScheduler(handler, config);
   }
   return globalScheduler;
 }

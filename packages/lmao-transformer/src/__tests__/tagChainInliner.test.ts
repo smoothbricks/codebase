@@ -17,7 +17,7 @@
  * - Eager vs lazy column handling is correct
  */
 
-import { beforeEach, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import {
   convertToArrowTable,
   createSpanBuffer,
@@ -25,7 +25,6 @@ import {
   createTraceId,
   ENTRY_TYPE_SPAN_START,
   S,
-  type StringInterner,
   type TagAttributeSchema,
 } from '@smoothbricks/lmao';
 import * as arrow from 'apache-arrow';
@@ -34,32 +33,6 @@ import { createTestTaskContext } from './test-helpers.js';
 // ============================================================================
 // Test Helpers
 // ============================================================================
-
-/**
- * Mock string interner for testing
- */
-class MockStringInterner implements StringInterner {
-  private strings: string[] = [];
-  private indices = new Map<string, number>();
-
-  intern(str: string): number {
-    let idx = this.indices.get(str);
-    if (idx === undefined) {
-      idx = this.strings.length;
-      this.strings.push(str);
-      this.indices.set(str, idx);
-    }
-    return idx;
-  }
-
-  getString(idx: number): string | undefined {
-    return this.strings[idx];
-  }
-
-  getStrings(): readonly string[] {
-    return this.strings;
-  }
-}
 
 /**
  * System columns that vary between buffer creations and should be ignored in comparison.
@@ -146,18 +119,6 @@ function getEnumIndex(value: string, enumValues: readonly string[]): number {
 // ============================================================================
 
 describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
-  let moduleIdInterner: MockStringInterner;
-  let spanNameInterner: MockStringInterner;
-
-  beforeEach(() => {
-    moduleIdInterner = new MockStringInterner();
-    spanNameInterner = new MockStringInterner();
-
-    // Pre-intern required system strings
-    moduleIdInterner.intern('test-file.ts');
-    spanNameInterner.intern('test-span');
-  });
-
   describe('literal values for all types', () => {
     const testSchema = {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
@@ -195,8 +156,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       buffer2.operation(0, enumIndex);
 
       // Convert to Arrow
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       // Verify data matches
       const result = compareArrowTablesDetailed(table1, table2);
@@ -236,8 +197,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       // Direct write (category stores raw string)
       buffer2.userId(0, 'user-123');
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -270,8 +231,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       // Direct write (text stores raw string)
       buffer2.message(0, 'hello world');
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -304,8 +265,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       // Direct write (number uses Float64Array)
       buffer2.count(0, 42);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -338,8 +299,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       // Direct write (boolean uses bit-packed Uint8Array)
       buffer2.enabled(0, true);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -372,8 +333,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       // Direct write
       buffer2.enabled(0, false);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -418,8 +379,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       buffer2.userId(0, 'user-456');
       buffer2.count(0, 100);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -470,8 +431,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       tagWriter2.userId('user-789');
       tagWriter2.count(50);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -504,8 +465,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       tagWriter2.userId('user-mixed');
       tagWriter2.count(25);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -559,8 +520,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
         const enumIndex = getEnumIndex(value, enumValues);
         buffer2.status(0, enumIndex);
 
-        const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-        const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+        const table1 = convertToArrowTable(buffer1);
+        const table2 = convertToArrowTable(buffer2);
 
         const result = compareArrowTablesDetailed(table1, table2);
         expect(result.equal).toBe(true);
@@ -604,8 +565,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       buffer2.lazyField(0, 'lazy-value');
       buffer2.eagerField(0, 'eager-value');
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -640,8 +601,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
       // Don't write to any user columns - they should remain null
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -674,8 +635,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
       buffer2.nullableNumber(0, 42);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
@@ -752,8 +713,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       buffer2.value(4, 50);
       buffer2.tag(4, 'fifth');
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       expect(table1.numRows).toBe(5);
       expect(table2.numRows).toBe(5);
@@ -804,8 +765,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       buffer2.count(0, 999);
       buffer2.enabled(0, true);
 
-      const table1 = convertToArrowTable(buffer1, moduleIdInterner, spanNameInterner);
-      const table2 = convertToArrowTable(buffer2, moduleIdInterner, spanNameInterner);
+      const table1 = convertToArrowTable(buffer1);
+      const table2 = convertToArrowTable(buffer2);
 
       // Round-trip both tables through IPC
       const ipc1 = arrow.tableToIPC(table1);
