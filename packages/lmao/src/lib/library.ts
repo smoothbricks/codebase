@@ -21,7 +21,14 @@
  */
 
 import type { ModuleContextBuilder, RequestContext, SpanContext, TaskFunction } from './lmao.js';
-import { createModuleContext } from './lmao.js';
+import {
+  createModuleContext,
+  ENTRY_TYPE_DEBUG,
+  ENTRY_TYPE_ERROR,
+  ENTRY_TYPE_INFO,
+  ENTRY_TYPE_TRACE,
+  ENTRY_TYPE_WARN,
+} from './lmao.js';
 import { S } from './schema/builder.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import { getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
@@ -319,24 +326,27 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   // Create clean-to-prefixed mapping for with() and scope() methods
   const prefixMappingJson = JSON.stringify(prefixMapping);
 
-  // Entry type constants
-  const ENTRY_TYPE_INFO = 9;
-  const ENTRY_TYPE_DEBUG = 10;
-  const ENTRY_TYPE_WARN = 11;
-  const ENTRY_TYPE_ERROR = 12;
+  // Entry type constants (imported from lmao.ts at module level, used here for code gen)
+  // These values are inlined into the generated code string below
 
   // Generate the complete class
   const classCode = `
 (function() {
   'use strict';
   
-  // Inline getTimestampNanos for performance (zero function call overhead)
-  // performance.timeOrigin + performance.now() gives epoch milliseconds with sub-ms precision
-  // Convert to microseconds first (safe as Number), then to nanoseconds as BigInt
-  function getTimestampNanos() {
-    const epochMicros = Math.round((performance.timeOrigin + performance.now()) * 1000);
-    return BigInt(epochMicros) * 1000n;
-  }
+  // getTimestampNanos - platform-aware timestamp function
+  // Node.js: uses process.hrtime.bigint() for true nanosecond precision
+  // Browser: uses performance.timeOrigin + performance.now() for microsecond precision
+  const getTimestampNanos = (typeof process !== 'undefined' && process.hrtime)
+    ? (() => {
+        const anchorEpochNanos = BigInt(Date.now()) * 1000000n;
+        const anchorHrtime = process.hrtime.bigint();
+        return () => anchorEpochNanos + (process.hrtime.bigint() - anchorHrtime);
+      })()
+    : () => {
+        const epochMicros = Math.round((performance.timeOrigin + performance.now()) * 1000);
+        return BigInt(epochMicros) * 1000n;
+      };
   
   ${enumMappings.join('\n')}
   
@@ -461,14 +471,12 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
       // Write timestamp (nanoseconds since epoch)
       this._buffer.timestamps[idx] = getTimestampNanos();
 
-      // Write message to attr_logMessage column
-      // Named logMessage (not message) to avoid conflict with SpanLogger.message() method
-      // Converted to 'message' column in Arrow output per specs/01f_arrow_table_structure.md
-      const messageColumn = this._buffer.attr_logMessage_values;
-      if (messageColumn) {
-        messageColumn[idx] = this._textStorage.store(message);
+      // Write message to unified label column (log message template)
+      const labelColumn = this._buffer.label_values;
+      if (labelColumn) {
+        labelColumn[idx] = this._textStorage.store(message);
 
-        const nullBitmap = this._buffer.attr_logMessage_nulls;
+        const nullBitmap = this._buffer.label_nulls;
         if (nullBitmap) {
           const byteIndex = Math.floor(idx / 8);
           const bitOffset = idx % 8;
@@ -501,7 +509,8 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
         'info': ${ENTRY_TYPE_INFO},
         'debug': ${ENTRY_TYPE_DEBUG},
         'warn': ${ENTRY_TYPE_WARN},
-        'error': ${ENTRY_TYPE_ERROR}
+        'error': ${ENTRY_TYPE_ERROR},
+        'trace': ${ENTRY_TYPE_TRACE}
       };
       this._writeMessage(entryTypeMap[level] || ${ENTRY_TYPE_INFO}, message);
     }
@@ -520,6 +529,10 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
     
     error(message) {
       this._writeMessage(${ENTRY_TYPE_ERROR}, message);
+    }
+    
+    trace(message) {
+      this._writeMessage(${ENTRY_TYPE_TRACE}, message);
     }
   }
 
@@ -803,6 +816,7 @@ export function moduleContextFactory<
     // Type assertion needed because wrappedTask uses T (library schema) but return type uses TagAttributeSchema
     // This is intentional type erasure at the runtime boundary
     task: wrappedTask as ModuleContextBuilder<TagAttributeSchema, FF, Env>['task'],
+    spanBufferCapacityStats: moduleContext.spanBufferCapacityStats,
     operations: wrappedOperations,
     cleanSchema: schema,
     prefixMapping,

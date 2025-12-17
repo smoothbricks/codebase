@@ -295,12 +295,16 @@ class StringInterner {
  * Global string interners for SYSTEM columns only
  *
  * - USER attribute columns (category/text) store strings directly in string[] arrays
- * - SYSTEM columns (moduleId, spanName) use interning for efficiency
+ * - SYSTEM columns (moduleId, label) use interning for efficiency
  *
  * Exported for Arrow table conversion
  */
 export const moduleIdInterner = new StringInterner();
-export const spanNameInterner = new StringInterner();
+/**
+ * Label interner for unified label column (span names, log message templates, feature flag names).
+ * Per specs/01h_entry_types_and_logging_primitives.md "The `label` Column"
+ */
+export const labelInterner = new StringInterner();
 
 /**
  * Check if capacity should be tuned based on usage patterns
@@ -541,26 +545,6 @@ export interface FluentLogEntry {
 export type SpanLogger<T extends TagAttributeSchema> = BaseSpanLogger<T>;
 
 /**
- * Fluent span builder that supports .line() chaining
- *
- * Returned by ctx.span() to enable:
- * await ctx.span('name', fn).line(42)
- */
-export interface FluentSpan<R> extends Promise<R> {
-  /**
-   * Set the source code line number for this span entry.
-   *
-   * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
-   * - TypeScript transformer injects these calls at compile time
-   * - No runtime overhead - just a method call with literal number
-   *
-   * @param lineNumber - Source line number (0-65535)
-   * @returns The same promise, allowing: await ctx.span('x', fn).line(42)
-   */
-  line(lineNumber: number): Promise<R>;
-}
-
-/**
  * Span context provided to task functions
  *
  * This is what's provided to task functions and child spans.
@@ -673,7 +657,7 @@ export interface SpanContext<T extends TagAttributeSchema, FF extends FeatureFla
    *   return childCtx.ok({ valid: true });
    * }).line(42);
    */
-  span<R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): FluentSpan<R>;
+  span<R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>, line?: number): Promise<R>;
 }
 
 /**
@@ -837,6 +821,9 @@ export const ENTRY_TYPE_WARN = 11;
 /** Error log level entry - via ctx.log.error() */
 export const ENTRY_TYPE_ERROR = 12;
 
+/** Trace log level entry - via ctx.log.trace() */
+export const ENTRY_TYPE_TRACE = 13;
+
 /**
  * Human-readable names for entry types, indexed by entry type code.
  *
@@ -863,6 +850,7 @@ export const ENTRY_TYPE_NAMES = [
   'debug', // 10
   'warn', // 11
   'error', // 12
+  'trace', // 13
 ] as const;
 
 /**
@@ -885,8 +873,8 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
     },
 
     writeFfName(name: string): void {
-      // Write to ffName column (raw string, no interning)
-      const column = buffer['ffName_values' as keyof SpanBuffer] as string[] | undefined;
+      // Write to unified label column (feature flag name)
+      const column = buffer['label_values' as keyof SpanBuffer] as string[] | undefined;
       if (column && Array.isArray(column)) {
         column[buffer.writeIndex] = name;
       }
@@ -1034,7 +1022,7 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
   // Row 0: span-start (fixed layout)
   buffer.operations[0] = ENTRY_TYPE_SPAN_START;
   buffer.timestamps[0] = getTimestampNanos();
-  writeToColumn(buffer, 'spanName', spanName, 0);
+  buffer.label(0, spanName); // Unified label column for span name
 
   // Row 1: pre-initialize as span-exception (will be overwritten on ok/err)
   buffer.operations[1] = ENTRY_TYPE_SPAN_EXCEPTION;
@@ -1042,116 +1030,6 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
 
   // Events start at row 2
   buffer.writeIndex = 2;
-}
-
-/**
- * Write a value to a TypedArray column
- * Handles type conversion for different column types
- *
- * Per specs/01b1_buffer_performance_optimizations.md and 01a_trace_schema_system.md:
- * - THREE DISTINCT STRING TYPES:
- *   1. enum: Uint8Array with compile-time enum values (0-255)
- *   2. category: Uint32Array with runtime string interning
- *   3. text: Uint32Array with raw string storage (no interning)
- * - Null bitmap management per Arrow spec (1 = valid, 0 = null)
- * - Direct TypedArray writes (hot path)
- */
-function writeToColumn(buffer: SpanBuffer, columnName: string, value: unknown, index: number): void {
-  const column = buffer[(columnName + '_values') as keyof SpanBuffer];
-
-  if (!column || !ArrayBuffer.isView(column)) return;
-
-  // Get null bitmap for this column (Arrow format: 1 Uint8Array per column)
-  const nullBitmap = buffer[(columnName + '_nulls') as keyof SpanBuffer] as Uint8Array | undefined;
-
-  // Handle null/undefined - store 0 and clear null bitmap bit
-  if (value === null || value === undefined) {
-    if (column instanceof Uint8Array) {
-      column[index] = 0;
-    } else if (column instanceof Uint16Array) {
-      column[index] = 0;
-    } else if (column instanceof Uint32Array) {
-      column[index] = 0;
-    } else if (column instanceof Float64Array) {
-      column[index] = 0;
-    }
-
-    // Clear bit in bitmap (Arrow format: 0 = null, 1 = valid)
-    if (nullBitmap) {
-      const byteIndex = Math.floor(index / 8);
-      const bitOffset = index % 8;
-      nullBitmap[byteIndex] &= ~(1 << bitOffset);
-    }
-    return;
-  }
-
-  // Mark as non-null in bitmap (Arrow format: 1 = valid)
-  if (nullBitmap) {
-    const byteIndex = Math.floor(index / 8);
-    const bitOffset = index % 8;
-    nullBitmap[byteIndex] |= 1 << bitOffset;
-  }
-
-  // Get schema metadata to determine type (column name is same as field name)
-  const fieldName = columnName;
-  const schema = buffer.task.module.tagAttributes;
-  const fieldSchema = schema[fieldName];
-  const schemaWithMetadata = fieldSchema as import('./schema/types.js').SchemaWithMetadata;
-  const lmaoType = schemaWithMetadata?.__schema_type;
-
-  // Write based on column type and schema metadata
-  if (column instanceof Uint8Array) {
-    // Boolean or small enum types (0-255 values)
-    if (typeof value === 'boolean') {
-      column[index] = value ? 1 : 0;
-    } else if (typeof value === 'number') {
-      column[index] = value;
-    } else if (typeof value === 'string' && lmaoType === 'enum') {
-      // Enum: map string to index using enum values from schema
-      const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
-      const enumValues = enumSchema?.__enum_values;
-
-      if (enumValues) {
-        const enumIndex = enumValues.indexOf(value);
-        column[index] = enumIndex >= 0 ? enumIndex : 0;
-      } else {
-        column[index] = 0;
-      }
-    }
-  } else if (column instanceof Uint16Array) {
-    // Medium enum types (256-65535 values)
-    if (typeof value === 'number') {
-      column[index] = value;
-    } else if (typeof value === 'string' && lmaoType === 'enum') {
-      const enumSchema = schemaWithMetadata as import('./schema/types.js').EnumSchemaWithMetadata;
-      const enumValues = enumSchema?.__enum_values;
-
-      if (enumValues) {
-        const enumIndex = enumValues.indexOf(value);
-        column[index] = enumIndex >= 0 ? enumIndex : 0;
-      } else {
-        column[index] = 0;
-      }
-    }
-  } else if (column instanceof Uint32Array) {
-    // Numeric indices for enum columns
-    if (typeof value === 'number') {
-      column[index] = value;
-    } else if (typeof value === 'string') {
-      // Should not happen - enums are mapped to numbers in generated code
-      // But handle gracefully by writing 0
-      column[index] = 0;
-    }
-  } else if (Array.isArray(column)) {
-    // Category or text types (string arrays with new storage design)
-    if (typeof value === 'string') {
-      // Write raw string (no interning on hot path)
-      column[index] = value;
-    }
-  } else if (column instanceof Float64Array) {
-    // Number types - full precision
-    column[index] = typeof value === 'number' ? value : 0;
-  }
 }
 
 /**
@@ -1305,10 +1183,10 @@ export function createModuleContext<
       fn: TaskFunction<Args, Result, T, FF, Env>,
     ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result> {
       return async (requestCtx: RequestContext<FF, Env>, ...args: Args): Promise<Result> => {
-        // Create task context with string-interned span name
+        // Create task context with string-interned label (span name)
         const taskContext = new TaskContext(
           moduleContext,
-          spanNameInterner.intern(name),
+          labelInterner.intern(name),
           0, // lineNumber would be set by code generation
         );
 
@@ -1358,12 +1236,17 @@ export function createModuleContext<
             return new FluentErrorResult<E, T>(spanBuffer, code, error, schemaOnly);
           },
 
-          span<R>(childName: string, childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): FluentSpan<R> {
+          span<R>(childName: string, childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>, line?: number): Promise<R> {
             // Create child span buffer with Arrow builders
             const childBuffer = createChildSpanBuffer(spanBuffer, taskContext);
 
             // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
             writeSpanStart(childBuffer, childName);
+
+            // Write line number to row 0 if provided
+            if (line !== undefined) {
+              childBuffer.lineNumber(0, line);
+            }
 
             // Inherit scoped values from parent span via Scope instance
             // Per specs/01i_span_scope_attributes.md - child spans inherit parent's scoped attributes
@@ -1394,8 +1277,8 @@ export function createModuleContext<
               },
             };
 
-            // Execute child span with exception handling
-            const resultPromise = (async () => {
+            // Execute child span with exception handling and return the promise directly
+            return (async () => {
               try {
                 return await childFn(childContext);
               } catch (error) {
@@ -1407,24 +1290,15 @@ export function createModuleContext<
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 const errorStack = error instanceof Error ? error.stack : undefined;
 
-                writeToColumn(childBuffer, 'exceptionMessage', errorMessage, 1);
+                childBuffer.exceptionMessage(1, errorMessage);
                 if (errorStack) {
-                  writeToColumn(childBuffer, 'exceptionStack', errorStack, 1);
+                  childBuffer.exceptionStack(1, errorStack);
                 }
 
                 // Re-throw to propagate
                 throw error;
               }
             })();
-
-            // Create fluent span with .line() method
-            const fluentSpan = resultPromise as FluentSpan<R>;
-            fluentSpan.line = (lineNumber: number): Promise<R> => {
-              // Write lineNumber to attr_lineNumber column at row 0 (span-start)
-              writeToColumn(childBuffer, 'lineNumber', lineNumber, 0);
-              return resultPromise;
-            };
-            return fluentSpan;
           },
         };
 
@@ -1440,9 +1314,9 @@ export function createModuleContext<
           const errorMessage = error instanceof Error ? error.message : String(error);
           const errorStack = error instanceof Error ? error.stack : undefined;
 
-          writeToColumn(spanBuffer, 'exceptionMessage', errorMessage, 1);
+          spanBuffer.exceptionMessage(1, errorMessage);
           if (errorStack) {
-            writeToColumn(spanBuffer, 'exceptionStack', errorStack, 1);
+            spanBuffer.exceptionStack(1, errorStack);
           }
 
           // Re-throw to propagate

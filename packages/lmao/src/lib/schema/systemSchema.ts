@@ -2,8 +2,8 @@
  * System schema - base columns that all modules inherit
  *
  * Per specs/01h_entry_types_and_logging_primitives.md and 01f_arrow_table_structure.md:
- * - All system columns use attr_ prefix to prevent conflicts with SpanBuffer internals
  * - These columns are available in all traces regardless of user schema
+ * - The `label` column is UNIFIED for span names, log message templates, and feature flag names
  */
 
 import { S } from './builder.js';
@@ -13,22 +13,39 @@ import { defineTagAttributes } from './defineTagAttributes.js';
  * Base system schema that all modules inherit
  *
  * These columns support:
- * - Span lifecycle (spanName, lineNumber)
- * - Logging (logMessage) - stored as attr_logMessage to avoid conflict with SpanLogger.message()
+ * - Unified label (span name, log message template, or feature flag name based on entry type)
+ * - Source location (lineNumber)
  * - Error handling (errorCode, exceptionMessage, exceptionStack)
  * - Result messages (resultMessage)
- * - Feature flags (ffName, ffValue, action, outcome, contextUserId, contextRequestId)
+ * - Feature flags (ffValue, action, outcome, contextUserId, contextRequestId)
  */
 export const systemSchema = defineTagAttributes({
-  // Span lifecycle
-  spanName: S.category(),
+  /**
+   * Unified label column - serves different purposes based on entry type.
+   *
+   * Per specs/01h_entry_types_and_logging_primitives.md "The `label` Column":
+   * - span-start, span-ok, span-err, span-exception: Span name (e.g., 'create-user')
+   * - info, debug, warn, error, trace: Log message TEMPLATE (e.g., 'User ${userId} created')
+   * - ff-access, ff-usage: Feature flag name (e.g., 'darkMode')
+   * - tag: Span name (same as span lifecycle entries)
+   *
+   * Uses S.category() because:
+   * - Span names repeat across many traces
+   * - Log templates repeat (only values differ)
+   * - Flag names repeat across evaluations
+   * - String interning provides excellent compression
+   *
+   * NOTE: Log messages are FORMAT STRINGS, NOT interpolated! The template is stored
+   * verbatim, and values go in their own typed columns for queryability.
+   */
+  label: S.category(),
 
   /**
    * Source code line number for this entry.
    *
    * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
    * - Uint16 column (max 65535 lines per file)
-   * - TypeScript transformer injects `.line(N)` calls at compile time
+   * - TypeScript transformer injects line numbers at compile time
    * - No runtime overhead - just a method call with literal number
    * - Value of 0 means "line number not set"
    *
@@ -36,22 +53,8 @@ export const systemSchema = defineTagAttributes({
    * - Linking trace entries back to source code
    * - Debugging and error analysis
    * - IDE integration for "jump to line"
-   *
-   * @see .line() fluent method on span/logging APIs
    */
   lineNumber: S.number(),
-
-  /**
-   * Log message column for log entries (info/debug/warn/error).
-   *
-   * Per specs/01f_arrow_table_structure.md: Core system column for log messages.
-   * Named 'logMessage' (not 'message') to avoid conflict with SpanLogger.message() method.
-   * Stored as `attr_logMessage` in SpanBuffer, converted to 'message' column in Arrow output.
-   * Text type since log messages are typically unique strings.
-   *
-   * @see convertToArrowTable - Maps 'logMessage' -> 'message' during Arrow conversion
-   */
-  logMessage: S.text(),
 
   // Error handling
   errorCode: S.category(),
@@ -61,8 +64,7 @@ export const systemSchema = defineTagAttributes({
   // Result messages
   resultMessage: S.text(),
 
-  // Feature flags
-  ffName: S.category(),
+  // Feature flags (ffName is now part of unified `label` column)
   ffValue: S.category(), // Can be boolean, string, or number as string
   action: S.category(),
   outcome: S.category(),

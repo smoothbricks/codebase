@@ -17,20 +17,16 @@
  */
 
 import { type ColumnWriter, type ColumnWriterExtension, getColumnWriterClass } from '@smoothbricks/arrow-builder';
+// Import entry type constants from lmao.ts (single source of truth)
+import { ENTRY_TYPE_DEBUG, ENTRY_TYPE_ERROR, ENTRY_TYPE_INFO, ENTRY_TYPE_TRACE, ENTRY_TYPE_WARN } from '../lmao.js';
 import { getEnumValues, getLmaoSchemaType } from '../schema/typeGuards.js';
 import type { InferTagAttributes, TagAttributeSchema } from '../schema/types.js';
 import { getSchemaFields } from '../schema/types.js';
 import { createNextBuffer as createNextSpanBuffer } from '../spanBuffer.js';
+// Import timestamp function - will be injected as dependency
+import { getTimestampNanos } from '../timestamp.js';
 import type { SpanBuffer } from '../types.js';
 import type { GeneratedScope } from './scopeGenerator.js';
-
-/**
- * Entry type constants for operation tracking
- */
-const ENTRY_TYPE_INFO = 9;
-const ENTRY_TYPE_DEBUG = 10;
-const ENTRY_TYPE_WARN = 11;
-const ENTRY_TYPE_ERROR = 12;
 
 /**
  * SpanLogger interface with logging methods and schema-specific attribute setters.
@@ -48,6 +44,7 @@ export type BaseSpanLogger<T extends TagAttributeSchema> = ColumnWriter<T> & {
   debug(message: string): BaseSpanLogger<T>;
   warn(message: string): BaseSpanLogger<T>;
   error(message: string): BaseSpanLogger<T>;
+  trace(message: string): BaseSpanLogger<T>;
   _getScope(): GeneratedScope;
   _setScope(attributes: Partial<InferTagAttributes<T>>): void;
 };
@@ -279,17 +276,12 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
     constructorParams: 'scope, createNextBuffer',
 
     preamble: `
-  // Inline getTimestampNanos for performance (zero function call overhead)
-  function getTimestampNanos() {
-    const epochMicros = Math.round((performance.timeOrigin + performance.now()) * 1000);
-    return BigInt(epochMicros) * 1000n;
-  }
-
-  // Entry type constants
+  // Entry type constants (inlined from lmao.ts)
   const ENTRY_TYPE_INFO = ${ENTRY_TYPE_INFO};
   const ENTRY_TYPE_DEBUG = ${ENTRY_TYPE_DEBUG};
   const ENTRY_TYPE_WARN = ${ENTRY_TYPE_WARN};
   const ENTRY_TYPE_ERROR = ${ENTRY_TYPE_ERROR};
+  const ENTRY_TYPE_TRACE = ${ENTRY_TYPE_TRACE};
 
   ${enumMappings.join('\n')}
 `,
@@ -331,13 +323,13 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       const idx = this._writeIndex;
 
       // Write system columns
-      this._buffer._timestamps[idx] = getTimestampNanos();
+      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_INFO;
 
-      // Write message to logMessage column
-      if (this._buffer.logMessage_values) {
-        this._buffer.logMessage_values[idx] = message;
-        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
+      // Write message to unified label column (log message template)
+      if (this._buffer.label_values) {
+        this._buffer.label_values[idx] = message;
+        helpers.setNullBit(this._buffer.label_nulls, idx);
       }
 
       // Apply scoped attributes
@@ -353,12 +345,12 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this.nextRow();
       const idx = this._writeIndex;
 
-      this._buffer._timestamps[idx] = getTimestampNanos();
+      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_DEBUG;
 
-      if (this._buffer.logMessage_values) {
-        this._buffer.logMessage_values[idx] = message;
-        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
+      if (this._buffer.label_values) {
+        this._buffer.label_values[idx] = message;
+        helpers.setNullBit(this._buffer.label_nulls, idx);
       }
 
       ${scopeWrites}
@@ -373,12 +365,12 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this.nextRow();
       const idx = this._writeIndex;
 
-      this._buffer._timestamps[idx] = getTimestampNanos();
+      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_WARN;
 
-      if (this._buffer.logMessage_values) {
-        this._buffer.logMessage_values[idx] = message;
-        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
+      if (this._buffer.label_values) {
+        this._buffer.label_values[idx] = message;
+        helpers.setNullBit(this._buffer.label_nulls, idx);
       }
 
       ${scopeWrites}
@@ -393,12 +385,32 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this.nextRow();
       const idx = this._writeIndex;
 
-      this._buffer._timestamps[idx] = getTimestampNanos();
+      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_ERROR;
 
-      if (this._buffer.logMessage_values) {
-        this._buffer.logMessage_values[idx] = message;
-        helpers.setNullBit(this._buffer.logMessage_nulls, idx);
+      if (this._buffer.label_values) {
+        this._buffer.label_values[idx] = message;
+        helpers.setNullBit(this._buffer.label_nulls, idx);
+      }
+
+      ${scopeWrites}
+
+      return this;
+    }
+
+    /**
+     * Write a trace log entry.
+     */
+    trace(message) {
+      this.nextRow();
+      const idx = this._writeIndex;
+
+      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
+      this._buffer._operations[idx] = ENTRY_TYPE_TRACE;
+
+      if (this._buffer.label_values) {
+        this._buffer.label_values[idx] = message;
+        helpers.setNullBit(this._buffer.label_nulls, idx);
       }
 
       ${scopeWrites}
@@ -420,6 +432,7 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
 
     dependencies: {
       helpers: {
+        getTimestampNanos,
         setNullBit: (bitmap: Uint8Array, idx: number) => {
           bitmap[idx >>> 3] |= 1 << (idx & 7);
         },

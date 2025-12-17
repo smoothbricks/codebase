@@ -263,7 +263,8 @@ describe('null bitmap correctness', () => {
       const schema = defineTagAttributes({
         requestId: S.category(),
       }) as unknown as TagAttributeSchema;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+      // Need capacity > 9 to test writing at index 9
+      const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 16);
 
       const scopeInstance = createScope(schema);
       (scopeInstance as any).requestId = 'req-456';

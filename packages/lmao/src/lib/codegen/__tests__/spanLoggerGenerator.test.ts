@@ -12,6 +12,7 @@
 
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { createTestTaskContext } from '../../__tests__/test-helpers.js';
+import { ENTRY_TYPE_DEBUG, ENTRY_TYPE_ERROR, ENTRY_TYPE_INFO, ENTRY_TYPE_TRACE, ENTRY_TYPE_WARN } from '../../lmao.js';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
 import { getSchemaFields, type TagAttributeSchema } from '../../schema/types.js';
@@ -128,30 +129,27 @@ describe('createSpanLoggerClass', () => {
 
     it('should write entry type for info()', () => {
       logger.info('Test message');
-
-      // Entry type INFO = 9
-      expect(buffer._operations[2]).toBe(9);
+      expect(buffer._operations[2]).toBe(ENTRY_TYPE_INFO);
     });
 
     it('should write entry type for debug()', () => {
       logger.debug('Debug message');
-
-      // Entry type DEBUG = 10
-      expect(buffer._operations[2]).toBe(10);
+      expect(buffer._operations[2]).toBe(ENTRY_TYPE_DEBUG);
     });
 
     it('should write entry type for warn()', () => {
       logger.warn('Warning message');
-
-      // Entry type WARN = 11
-      expect(buffer._operations[2]).toBe(11);
+      expect(buffer._operations[2]).toBe(ENTRY_TYPE_WARN);
     });
 
     it('should write entry type for error()', () => {
       logger.error('Error message');
+      expect(buffer._operations[2]).toBe(ENTRY_TYPE_ERROR);
+    });
 
-      // Entry type ERROR = 12
-      expect(buffer._operations[2]).toBe(12);
+    it('should write entry type for trace()', () => {
+      logger.trace('Trace message');
+      expect(buffer._operations[2]).toBe(ENTRY_TYPE_TRACE);
     });
 
     it('should write timestamp for log entries', () => {
@@ -172,9 +170,9 @@ describe('createSpanLoggerClass', () => {
       logger.info('First').info('Second').warn('Third');
 
       expect(logger._writeIndex).toBe(4);
-      expect(buffer._operations[2]).toBe(9); // INFO
-      expect(buffer._operations[3]).toBe(9); // INFO
-      expect(buffer._operations[4]).toBe(11); // WARN
+      expect(buffer._operations[2]).toBe(ENTRY_TYPE_INFO);
+      expect(buffer._operations[3]).toBe(ENTRY_TYPE_INFO);
+      expect(buffer._operations[4]).toBe(ENTRY_TYPE_WARN);
     });
   });
 
