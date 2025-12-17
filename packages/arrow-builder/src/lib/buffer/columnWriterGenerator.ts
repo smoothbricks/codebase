@@ -173,14 +173,14 @@ export function generateColumnWriterClass(
   const constructorSignature = extension?.constructorParams ? `buffer, ${extension.constructorParams}` : 'buffer';
 
   // Build constructor body
+  // Generated structure: assigns _buffer and _writeIndex, then runs extension constructor code
   const constructorBody: string[] = [];
   constructorBody.push('      this._buffer = buffer;');
   constructorBody.push('      this._writeIndex = -1;');
 
-  // Add extension constructor code if provided
+  // Extension constructor code runs after _buffer/_writeIndex assignment
   if (extension?.constructorCode) {
     constructorBody.push('');
-    constructorBody.push('      // Extension constructor code');
     const extensionLines = extension.constructorCode
       .trim()
       .split('\n')
@@ -188,10 +188,9 @@ export function generateColumnWriterClass(
     constructorBody.push(...extensionLines);
   }
 
-  // Build extension methods if provided
+  // Build extension methods (additional methods injected by the caller)
   const extensionMethods = extension?.methods
     ? `
-    // Extension methods
 ${extension.methods
   .trim()
   .split('\n')
@@ -199,15 +198,20 @@ ${extension.methods
   .join('\n')}`
     : '';
 
-  // Build preamble if provided
+  // Build preamble (helper functions, constants, etc. before class definition)
   const preambleCode = extension?.preamble
     ? `
-  // Extension preamble
 ${extension.preamble}
 `
     : '';
 
   // Generate the complete class code
+  // Generated class structure:
+  // - constructor: assigns _buffer, _writeIndex (-1), then extension code
+  // - nextRow(): advances write position, handles overflow via _getNextBuffer()
+  // - _getNextBuffer(): returns next buffer in chain (override for custom behavior)
+  // - Schema column setters: one method per schema field
+  // - Extension methods (if any)
   const classCode = `
   'use strict';
 ${preambleCode}
@@ -216,12 +220,7 @@ ${preambleCode}
 ${constructorBody.join('\n')}
     }
 
-    /**
-     * Advance to next row. Handles overflow by getting next buffer.
-     * Must be called before writing any column values.
-     */
     nextRow() {
-      // Check overflow BEFORE incrementing
       if (this._writeIndex >= this._buffer._capacity - 1) {
         this._buffer = this._getNextBuffer();
         this._writeIndex = -1;
@@ -230,11 +229,6 @@ ${constructorBody.join('\n')}
       return this;
     }
 
-    /**
-     * Get the next buffer in the chain.
-     * Default implementation returns existing _next buffer.
-     * Override this method to implement custom buffer creation/pooling.
-     */
     _getNextBuffer() {
       if (!this._buffer._next) {
         throw new Error('Buffer overflow: no next buffer available. Override _getNextBuffer() to handle this.');
@@ -242,7 +236,6 @@ ${constructorBody.join('\n')}
       return this._buffer._next;
     }
 
-    // Schema column setters
 ${setterMethods.join('\n\n')}
 ${extensionMethods}
   }

@@ -169,93 +169,71 @@ function generateRemappedAttributeWriter(
   const lmaoType = getLmaoSchemaType(schema);
 
   // For enums, use pre-generated mapping function (uses cleanName for function)
+  // Generated code: ALWAYS writes to row 0 (span-start) with overwrite semantics
+  // Maps clean method name to prefixed column, marks value as non-null (bit 0)
   if (lmaoType === 'enum' && hasEnumMapping) {
     return `
     ${cleanName}(value) {
-      // ALWAYS write to row 0 (span-start) - overwrite semantics
-      // Clean method name: ${cleanName}, writes to prefixed column: ${columnName}
       const idx = 0;
       const enumIndex = getEnumIndex_${cleanName}(value);
       this._buffer.${columnName}_values[idx] = enumIndex;
-
-      // Mark as non-null (bit 0 for idx 0)
       this._buffer.${columnName}_nulls[0] |= 1;
-
       return this;
     }`;
   }
 
   // For categories, use string interning
+  // Generated code: writes to row 0, interns string via _categoryInterner, marks non-null
   if (lmaoType === 'category') {
     return `
     ${cleanName}(value) {
-      // ALWAYS write to row 0 (span-start) - overwrite semantics
-      // Clean method name: ${cleanName}, writes to prefixed column: ${columnName}
       const idx = 0;
       this._buffer.${columnName}_values[idx] = this._categoryInterner.intern(value);
-
-      // Mark as non-null (bit 0 for idx 0)
       this._buffer.${columnName}_nulls[0] |= 1;
-
       return this;
     }`;
   }
 
   // For text, use raw storage with null/undefined handling
+  // Generated code: writes to row 0, handles null/undefined by clearing bit and returning early,
+  // stores text via _textStorage, marks non-null
   if (lmaoType === 'text') {
     return `
     ${cleanName}(value) {
-      // ALWAYS write to row 0 (span-start) - overwrite semantics
-      // Clean method name: ${cleanName}, writes to prefixed column: ${columnName}
       const idx = 0;
-
-      // Handle null/undefined: clear null bitmap bit and return early
       if (value === null || value === undefined) {
-        this._buffer.${columnName}_nulls[0] &= ~1;  // Clear bit 0
+        this._buffer.${columnName}_nulls[0] &= ~1;
         return this;
       }
-
-      // Store the text value
       this._buffer.${columnName}_values[idx] = this._textStorage.store(value);
-
-      // Mark as non-null (bit 0 for idx 0)
       this._buffer.${columnName}_nulls[0] |= 1;
-
       return this;
     }`;
   }
 
   // Boolean: bit-packed storage (8 values per byte)
+  // Generated code: writes to row 0, bit 0 of byte 0 is index 0,
+  // sets or clears value bit, marks non-null
   if (lmaoType === 'boolean') {
     return `
     ${cleanName}(value) {
-      // ALWAYS write to row 0 (span-start) - overwrite semantics
-      // Clean method name: ${cleanName}, writes to prefixed column: ${columnName}
-      // Bit-packed: bit 0 of byte 0 is index 0
       if (value) {
         this._buffer.${columnName}_values[0] |= 1;
       } else {
         this._buffer.${columnName}_values[0] &= ~1;
       }
-
-      // Mark as non-null (bit 0 for idx 0)
       this._buffer.${columnName}_nulls[0] |= 1;
-
       return this;
     }`;
   }
 
   // Generic writer for other types (number)
+  // Generated code: writes to row 0, direct value assignment, marks non-null
   return `
     ${cleanName}(value) {
-      // ALWAYS write to row 0 (span-start) - overwrite semantics
-      // Clean method name: ${cleanName}, writes to prefixed column: ${columnName}
       const idx = 0;
       this._buffer.${columnName}_values[idx] = value;
-
-      // Mark as non-null (bit 0 for idx 0)
       this._buffer.${columnName}_nulls[0] |= 1;
-
       return this;
     }`;
 }
@@ -330,14 +308,15 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   // These values are inlined into the generated code string below
 
   // Generate the complete class
-  const classCode = `
-(function() {
+  // Generated code: IIFE wrapper for clean scope
+  const classCode =
+    `(function() {
   'use strict';
-  
-  // getTimestampNanos - platform-aware timestamp function
-  // Node.js: uses process.hrtime.bigint() for true nanosecond precision
-  // Browser: uses performance.timeOrigin + performance.now() for microsecond precision
-  const getTimestampNanos = (typeof process !== 'undefined' && process.hrtime)
+  ` +
+    // Generated code: getTimestampNanos - platform-aware timestamp function
+    // Node.js: uses process.hrtime.bigint() for true nanosecond precision
+    // Browser: uses performance.timeOrigin + performance.now() for microsecond precision
+    `const getTimestampNanos = (typeof process !== 'undefined' && process.hrtime)
     ? (() => {
         const anchorEpochNanos = BigInt(Date.now()) * 1000000n;
         const anchorHrtime = process.hrtime.bigint();
@@ -347,45 +326,44 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
         const epochMicros = Math.round((performance.timeOrigin + performance.now()) * 1000);
         return BigInt(epochMicros) * 1000n;
       };
-  
-  ${enumMappings.join('\n')}
-  
-  // Schema type map for runtime type detection
-  const SCHEMA_TYPES = ${JSON.stringify(schemaTypeMap)};
-  
-  // Prefix mapping: clean name -> prefixed name
-  const PREFIX_MAPPING = ${prefixMappingJson};
+  ` +
+    // Generated code: enum mapping functions (getEnumIndex_${fieldName})
+    enumMappings.join('\n') +
+    `
+  ` +
+    // Generated code: SCHEMA_TYPES - maps clean field names to lmao types for runtime type detection
+    `const SCHEMA_TYPES = ${JSON.stringify(schemaTypeMap)};
+  ` +
+    // Generated code: PREFIX_MAPPING - maps clean names to prefixed column names
+    `const PREFIX_MAPPING = ${prefixMappingJson};
   
   class ${className} {
-    constructor(buffer, categoryInterner, textStorage, getBufferWithSpace, initialScopedAttributes = {}) {
+    ` +
+    // Generated code: constructor stores buffer, interners, and scoped attributes
+    `constructor(buffer, categoryInterner, textStorage, getBufferWithSpace, initialScopedAttributes = {}) {
       this._buffer = buffer;
       this._categoryInterner = categoryInterner;
       this._textStorage = textStorage;
       this._getBufferWithSpace = getBufferWithSpace;
       this._scopedAttributes = initialScopedAttributes;
     }
-    
-    // Tag getter - returns chainable API that writes to row 0 (span-start)
-    get tag() {
+    ` +
+    // Generated code: tag getter returns this for chainable API (writes to row 0 = span-start)
+    `get tag() {
       return this;
     }
-    
-    // with() method for bulk attribute setting - writes to row 0
-    // Maps clean names to prefixed columns
-    with(attributes) {
+    ` +
+    // Generated code: with() bulk attribute setting - maps clean names to prefixed columns,
+    // processes values based on type (category->intern, text->store), marks non-null (bit 0)
+    `with(attributes) {
       const idx = 0;
-
       for (const [cleanKey, value] of Object.entries(attributes)) {
-        // Map clean name to prefixed column name
         const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
         const columnName = 'attr_' + prefixedKey;
         const column = this._buffer[columnName + '_values'];
-
         if (column && value !== null && value !== undefined) {
-          // Process value based on schema type
           const fieldType = SCHEMA_TYPES[cleanKey];
           let processedValue = value;
-
           if (typeof value === 'string') {
             if (fieldType === 'category') {
               processedValue = this._categoryInterner.intern(value);
@@ -393,35 +371,30 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
               processedValue = this._textStorage.store(value);
             }
           }
-
           column[idx] = processedValue;
-
-          // Mark as non-null (bit 0 for idx 0)
           const nullBitmap = this._buffer[columnName + '_nulls'];
           if (nullBitmap) {
             nullBitmap[0] |= 1;
           }
         }
       }
-
       return this;
     }
-    
-    // Attribute writer methods (generated from schema with prefix remapping)
-    ${attributeWriters.join('\n')}
-    
-    // Scoped attributes - maps clean names to prefixed columns
-    scope(attributes) {
+    ` +
+    // Generated code: individual attribute setters (one per schema field)
+    attributeWriters.join('\n') +
+    `
+    ` +
+    // Generated code: scope() stores processed values in _scopedAttributes,
+    // then pre-fills remaining buffer capacity so future log entries inherit these values
+    `scope(attributes) {
       for (const [cleanKey, value] of Object.entries(attributes)) {
         const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
         const columnName = 'attr_' + prefixedKey;
         const column = this._buffer[columnName + '_values'];
-
         if (column && value !== null && value !== undefined) {
-          // Process value based on schema type
           let processedValue = value;
           const fieldType = SCHEMA_TYPES[cleanKey];
-
           if (typeof value === 'string') {
             if (fieldType === 'category') {
               processedValue = this._categoryInterner.intern(value);
@@ -429,15 +402,11 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
               processedValue = this._textStorage.store(value);
             }
           }
-
           this._scopedAttributes[cleanKey] = processedValue;
         }
       }
-
-      // Pre-fill remaining buffer capacity with scoped attributes
       const startIdx = this._buffer.writeIndex;
       const endIdx = this._buffer.capacity;
-
       for (let idx = startIdx; idx < endIdx; idx++) {
         for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
           const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
@@ -445,8 +414,6 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
           const column = this._buffer[columnName + '_values'];
           if (column) {
             column[idx] = value;
-
-            // Mark as non-null
             const nullBitmap = this._buffer[columnName + '_nulls'];
             if (nullBitmap) {
               const byteIndex = Math.floor(idx / 8);
@@ -457,25 +424,18 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
         }
       }
     }
-    
-    // Message logging methods
-    _writeMessage(entryType, message) {
+    ` +
+    // Generated code: _writeMessage() writes a log entry - ensures buffer has space,
+    // writes entry type + timestamp + message, applies scoped attributes
+    `_writeMessage(entryType, message) {
       const result = this._getBufferWithSpace(this._buffer);
       this._buffer = result.buffer;
-
       const idx = this._buffer.writeIndex;
-
-      // Write entry type
       this._buffer.operations[idx] = entryType;
-
-      // Write timestamp (nanoseconds since epoch)
       this._buffer.timestamps[idx] = getTimestampNanos();
-
-      // Write message to unified message column (log message template)
       const messageColumn = this._buffer.message_values;
       if (messageColumn) {
         messageColumn[idx] = this._textStorage.store(message);
-
         const nullBitmap = this._buffer.message_nulls;
         if (nullBitmap) {
           const byteIndex = Math.floor(idx / 8);
@@ -483,15 +443,12 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
           nullBitmap[byteIndex] |= (1 << bitOffset);
         }
       }
-
-      // Apply scoped attributes (already processed)
       for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
         const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
         const columnName = 'attr_' + prefixedKey;
         const column = this._buffer[columnName + '_values'];
         if (column) {
           column[idx] = value;
-
           const nullBitmap = this._buffer[columnName + '_nulls'];
           if (nullBitmap) {
             const byteIndex = Math.floor(idx / 8);
@@ -500,11 +457,11 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
           }
         }
       }
-
       this._buffer.writeIndex++;
     }
-    
-    message(level, message) {
+    ` +
+    // Generated code: message() generic logging with level string mapping to entry type constants
+    `message(level, message) {
       const entryTypeMap = {
         'info': ${ENTRY_TYPE_INFO},
         'debug': ${ENTRY_TYPE_DEBUG},
@@ -514,31 +471,16 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
       };
       this._writeMessage(entryTypeMap[level] || ${ENTRY_TYPE_INFO}, message);
     }
-    
-    info(message) {
-      this._writeMessage(${ENTRY_TYPE_INFO}, message);
-    }
-    
-    debug(message) {
-      this._writeMessage(${ENTRY_TYPE_DEBUG}, message);
-    }
-    
-    warn(message) {
-      this._writeMessage(${ENTRY_TYPE_WARN}, message);
-    }
-    
-    error(message) {
-      this._writeMessage(${ENTRY_TYPE_ERROR}, message);
-    }
-    
-    trace(message) {
-      this._writeMessage(${ENTRY_TYPE_TRACE}, message);
-    }
+    ` +
+    // Generated code: convenience logging methods - each calls _writeMessage with entry type constant
+    `info(message) { this._writeMessage(${ENTRY_TYPE_INFO}, message); }
+    debug(message) { this._writeMessage(${ENTRY_TYPE_DEBUG}, message); }
+    warn(message) { this._writeMessage(${ENTRY_TYPE_WARN}, message); }
+    error(message) { this._writeMessage(${ENTRY_TYPE_ERROR}, message); }
+    trace(message) { this._writeMessage(${ENTRY_TYPE_TRACE}, message); }
   }
-
   return ${className};
-})()
-`;
+})()`;
 
   return classCode;
 }

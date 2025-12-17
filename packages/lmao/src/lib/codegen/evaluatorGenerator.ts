@@ -87,8 +87,9 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
   // Generate getter for each flag
   const flagGetters = flagNames.map((name) => generateFlagGetter(name)).join('\n');
 
-  const classCode = `
-(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
+  // Generated code: IIFE that takes dependencies as parameters and returns the class
+  const classCode =
+    `(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
   'use strict';
 
   class ${className} {
@@ -97,8 +98,9 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
     constructor(state) {
       this.#state = state;
     }
-
-    // Expose internal state as getters for introspection
+` +
+    // Generated code: expose internal state as getters/setters for introspection
+    `
     get schema() { return this.#state.schema; }
     get evaluationContext() { return this.#state.evaluationContext; }
     get evaluator() { return this.#state.evaluator; }
@@ -106,91 +108,67 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
     get columnWriters() { return this.#state.columnWriters; }
     set columnWriters(value) { this.#state.columnWriters = value; }
     set buffer(value) { this.#state.buffer = value; }
-
-    /**
-     * Get a flag value synchronously with caching and logging
-     * Returns undefined for falsy values, FlagContext wrapper for truthy values
-     */
+` +
+    // Generated code: #getFlag() - synchronous flag evaluation with caching and logging
+    // Checks cache first (deduplication), evaluates flag, logs access on first access,
+    // returns undefined for falsy values, wraps truthy values with track() method
+    `
     #getFlag(flagName) {
       const state = this.#state;
-
-      // Check cache first (deduplication - subsequent access in same span)
       if (state.flagCache.has(flagName)) {
         return state.flagCache.get(flagName);
       }
-
       const definition = state.schema[flagName];
-
-      // Evaluate flag
       const rawValue = state.evaluator.getSync(flagName, state.evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-
-      // Log access (only on first access in this span)
       if (!state.accessedFlags.has(flagName)) {
         this.#logAccess(flagName, rawValue);
         state.accessedFlags.add(flagName);
       }
-
-      // Return undefined for falsy values (false, 0, "", null, undefined)
       if (!value) {
         state.flagCache.set(flagName, undefined);
         return undefined;
       }
-
-      // Wrap truthy values with track() method
       const wrapped = this.#wrapValue(flagName, value);
       state.flagCache.set(flagName, wrapped);
       return wrapped;
     }
-
-    /**
-     * Wrap a truthy flag value with a track() method
-     */
+` +
+    // Generated code: #wrapValue() - wraps truthy flag value with track() method
+    // Returns object with value property and track() that calls #logUsage
+    `
     #wrapValue(flagName, value) {
       const self = this;
-
       if (typeof value === 'boolean') {
         return {
           value: true,
-          track(context) {
-            self.#logUsage(flagName, context);
-          }
+          track(context) { self.#logUsage(flagName, context); }
         };
       }
-
       if (typeof value === 'string') {
         return {
           value,
-          track(context) {
-            self.#logUsage(flagName, context);
-          }
+          track(context) { self.#logUsage(flagName, context); }
         };
       }
-
       if (typeof value === 'object' && value !== null) {
         return {
           ...value,
-          track(context) {
-            self.#logUsage(flagName, context);
-          }
+          track(context) { self.#logUsage(flagName, context); }
         };
       }
-
       return {
         value,
-        track(context) {
-          self.#logUsage(flagName, context);
-        }
+        track(context) { self.#logUsage(flagName, context); }
       };
     }
-
-    /**
-     * Log flag access to buffer or column writers
-     */
+` +
+    // Generated code: #logAccess() - logs flag access to buffer or column writers
+    // Supports FlagColumnWriters interface, falls back to direct SpanBuffer API
+    // Writes entry type, timestamp, flag name, and flag value
+    `
     #logAccess(flagName, value) {
       const state = this.#state;
-
-      // Support for FlagColumnWriters interface
       if (state.columnWriters) {
         state.columnWriters.writeEntryType('ff-access');
         state.columnWriters.writeFfName(flagName);
@@ -198,38 +176,28 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
         state.columnWriters.writeContextAttributes(state.evaluationContext);
         return;
       }
-
-      // New SpanBuffer API
       if (!state.buffer) return;
-
       const idx = state.buffer.writeIndex;
-
       state.buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
       state.buffer.timestamps[idx] = getTimestampNanos();
-
-      // Write flag name (category column - stored as raw string)
       const ffNameColumn = state.buffer['attr_ffName_values'];
       if (ffNameColumn && Array.isArray(ffNameColumn)) {
         ffNameColumn[idx] = flagName;
       }
-
-      // Write flag value (category column - stored as raw string)
       const ffValueColumn = state.buffer['attr_ffValue_values'];
       if (ffValueColumn && Array.isArray(ffValueColumn)) {
         const strValue = value === null || value === undefined ? 'null' : String(value);
         ffValueColumn[idx] = strValue;
       }
-
       state.buffer.writeIndex++;
     }
-
-    /**
-     * Log flag usage to buffer or column writers
-     */
+` +
+    // Generated code: #logUsage() - logs flag usage to buffer or column writers
+    // Supports FlagColumnWriters interface for action/outcome tracking
+    // Direct buffer writing only logs core FF columns (ffName)
+    `
     #logUsage(flagName, context) {
       const state = this.#state;
-
-      // Support for FlagColumnWriters interface
       if (state.columnWriters) {
         state.columnWriters.writeEntryType('ff-usage');
         state.columnWriters.writeFfName(flagName);
@@ -238,69 +206,51 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
         state.columnWriters.writeContextAttributes(state.evaluationContext);
         return;
       }
-
-      // Direct buffer writing only logs core FF columns (ffName)
-      // For action/outcome tracking, use FlagColumnWriters which knows the user's schema
       if (!state.buffer) return;
-
       const idx = state.buffer.writeIndex;
-
       state.buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
       state.buffer.timestamps[idx] = getTimestampNanos();
-
-      // Write flag name (category column - stored as raw string)
       const ffNameColumn = state.buffer['attr_ffName_values'];
       if (ffNameColumn && Array.isArray(ffNameColumn)) {
         ffNameColumn[idx] = flagName;
       }
-
-      // Note: action/outcome from context are not written here
-      // They require user-defined schema columns and should use FlagColumnWriters
-
       state.buffer.writeIndex++;
     }
-
-    /**
-     * Get async flag value
-     * Returns undefined when false, FlagContext when truthy
-     */
+` +
+    // Generated code: async get() - async flag evaluation with caching
+    // Returns undefined when false, FlagContext when truthy
+    `
     async get(flag) {
       const state = this.#state;
       const cacheKey = 'async_' + flag;
-
       if (state.flagCache.has(cacheKey)) {
         return state.flagCache.get(cacheKey);
       }
-
       const definition = state.schema[flag];
       const rawValue = await state.evaluator.getAsync(flag, state.evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-
       if (!state.accessedFlags.has(flag)) {
         this.#logAccess(flag, rawValue);
         state.accessedFlags.add(flag);
       }
-
       if (!value) {
         state.flagCache.set(cacheKey, undefined);
         return undefined;
       }
-
       const wrapped = this.#wrapValue(flag, value);
       state.flagCache.set(cacheKey, wrapped);
       return wrapped;
     }
-
-    /**
-     * Track flag usage. Prefer using flag.track() for the fluent API.
-     */
+` +
+    // Generated code: trackUsage() - manual usage tracking (prefer flag.track() fluent API)
+    `
     trackUsage(flag, context) {
       this.#logUsage(flag, context);
     }
-
-    /**
-     * Create child evaluator with additional context
-     */
+` +
+    // Generated code: forContext() - creates child evaluator with additional context
+    // Resets accessedFlags and flagCache for fresh tracking
+    `
     forContext(additional) {
       const state = this.#state;
       return new ${className}({
@@ -310,10 +260,9 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
         flagCache: new Map(),
       });
     }
-
-    /**
-     * Create evaluator bound to a different buffer
-     */
+` +
+    // Generated code: withBuffer() - creates evaluator bound to different buffer
+    `
     withBuffer(buffer) {
       const state = this.#state;
       return new ${className}({
@@ -323,16 +272,16 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
         flagCache: new Map(),
       });
     }
-
-    /**
-     * Get current evaluation context
-     */
+` +
+    // Generated code: getContext() - returns current evaluation context
+    `
     getContext() {
       return this.#state.evaluationContext;
     }
-
-    // Generated getters for each flag
-    ${flagGetters}
+` +
+    // Generated code: getters for each flag (generated from schema)
+    flagGetters +
+    `
   }
 
   return ${className};

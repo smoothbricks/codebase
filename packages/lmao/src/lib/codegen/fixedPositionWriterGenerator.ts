@@ -201,11 +201,12 @@ export function generateFixedPositionWriterClass(
   const constructorSignature = extension?.constructorParams ? `buffer, ${extension.constructorParams}` : 'buffer';
 
   // Build constructor body
+  // Generated structure: assigns _buffer and _pos, then runs extension constructor code if provided
   const constructorBody = ['    this._buffer = buffer;', `    this._pos = ${position};`];
 
   if (extension?.constructorCode) {
     constructorBody.push('');
-    constructorBody.push('    // Extension constructor code');
+    // Extension constructor code runs after _buffer/_pos assignment
     const extensionLines = extension.constructorCode
       .trim()
       .split('\n')
@@ -213,9 +214,9 @@ export function generateFixedPositionWriterClass(
     constructorBody.push(...extensionLines);
   }
 
-  // Build extension methods
+  // Build extension methods (additional methods injected by the caller)
   const extensionMethods = extension?.methods
-    ? '\n    // Extension methods\n' +
+    ? '\n' +
       extension.methods
         .trim()
         .split('\n')
@@ -223,6 +224,11 @@ export function generateFixedPositionWriterClass(
         .join('\n')
     : '';
 
+  // Generated class structure:
+  // - constructor: assigns _buffer, _pos, then extension code
+  // - with(): bulk attribute setting method
+  // - Individual setter methods for each schema field
+  // - Extension methods (if any)
   const classCode = `
   'use strict';
 
@@ -233,10 +239,8 @@ export function generateFixedPositionWriterClass(
 ${constructorBody.join('\n')}
     }
 
-    // Bulk attribute setting
     ${withMethod}
 
-    // Individual attribute setters
     ${setterMethods.join('\n')}
 ${extensionMethods}
   }
@@ -336,6 +340,9 @@ export function createTagWriter<T extends TagAttributeSchema>(schema: T, buffer:
 
 /**
  * ResultWriter extension - adds _result, _error, _isError properties
+ *
+ * Constructor sets _isError, _result, and _error based on the isError flag.
+ * Result/error values are already accessible via the properties set in constructor.
  */
 const resultWriterExtension: FixedPositionWriterExtension = {
   constructorParams: 'resultOrError, isError',
@@ -348,9 +355,6 @@ const resultWriterExtension: FixedPositionWriterExtension = {
       this._result = resultOrError;
       this._error = undefined;
     }
-  `,
-  methods: `
-    // Getters for result/error access (already set in constructor)
   `,
 };
 
