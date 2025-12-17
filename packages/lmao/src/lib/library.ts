@@ -471,12 +471,12 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
       // Write timestamp (nanoseconds since epoch)
       this._buffer.timestamps[idx] = getTimestampNanos();
 
-      // Write message to unified label column (log message template)
-      const labelColumn = this._buffer.label_values;
-      if (labelColumn) {
-        labelColumn[idx] = this._textStorage.store(message);
+      // Write message to unified message column (log message template)
+      const messageColumn = this._buffer.message_values;
+      if (messageColumn) {
+        messageColumn[idx] = this._textStorage.store(message);
 
-        const nullBitmap = this._buffer.label_nulls;
+        const nullBitmap = this._buffer.message_nulls;
         if (nullBitmap) {
           const byteIndex = Math.floor(idx / 8);
           const bitOffset = idx % 8;

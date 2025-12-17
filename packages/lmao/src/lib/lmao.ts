@@ -141,10 +141,11 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    * Example: ctx.ok(result).message('User created successfully')
    */
   message(text: string): this {
-    // Use the writer's setter if available, otherwise fallback
-    const writer = this._writer as ResultWriter<T, V, never> & { resultMessage?: (v: string) => unknown };
-    if (typeof writer.resultMessage === 'function') {
-      writer.resultMessage(text);
+    // Use the unified message column via the writer's message setter
+    // ResultWriter generates a message() method from the systemSchema
+    const writer = this._writer as ResultWriter<T, V, never> & { message?: (v: string) => unknown };
+    if (typeof writer.message === 'function') {
+      writer.message(text);
     }
     return this;
   }
@@ -209,10 +210,11 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
    * Example: ctx.err('ERROR', details).message('Operation failed')
    */
   message(text: string): this {
-    // Use the writer's setter if available
-    const writer = this._writer as ResultWriter<T, never, E> & { resultMessage?: (v: string) => unknown };
-    if (typeof writer.resultMessage === 'function') {
-      writer.resultMessage(text);
+    // Use the unified message column via the writer's message setter
+    // ResultWriter generates a message() method from the systemSchema
+    const writer = this._writer as ResultWriter<T, never, E> & { message?: (v: string) => unknown };
+    if (typeof writer.message === 'function') {
+      writer.message(text);
     }
     return this;
   }
@@ -795,47 +797,47 @@ export interface ModuleContextBuilder<
  * @see {@link ENTRY_TYPE_NAMES} for string representations
  */
 
-/** Feature flag access event - logged when a flag value is first read in a span */
-export const ENTRY_TYPE_FF_ACCESS = 1;
-
-/** Feature flag usage event - logged when a flag influences a code path decision */
-export const ENTRY_TYPE_FF_USAGE = 2;
-
-/** Tag attribute entry - logged via ctx.tag API */
-export const ENTRY_TYPE_TAG = 3;
-
-/**
- * Generic message entry type.
- * Prefer level-specific types: ENTRY_TYPE_INFO, ENTRY_TYPE_DEBUG, ENTRY_TYPE_WARN, or ENTRY_TYPE_ERROR
- */
-export const ENTRY_TYPE_MESSAGE = 4;
+// =============================================================================
+// Entry Type Constants
+// =============================================================================
+// Ordered by frequency/importance:
+// 1-4: Span lifecycle (most common - every span has start + end)
+// 5-9: Logging levels (ordered by verbosity: trace < debug < info < warn < error)
+// 10-11: Feature flags (least common)
+// =============================================================================
 
 /** Span start event - written at row 0 when a span begins */
-export const ENTRY_TYPE_SPAN_START = 5;
+export const ENTRY_TYPE_SPAN_START = 1;
 
 /** Span success completion - written to row 1 via ctx.ok() */
-export const ENTRY_TYPE_SPAN_OK = 6;
+export const ENTRY_TYPE_SPAN_OK = 2;
 
 /** Span error completion - written to row 1 via ctx.err() */
-export const ENTRY_TYPE_SPAN_ERR = 7;
+export const ENTRY_TYPE_SPAN_ERR = 3;
 
 /** Span exception - written to row 1 when an unhandled exception occurs */
-export const ENTRY_TYPE_SPAN_EXCEPTION = 8;
+export const ENTRY_TYPE_SPAN_EXCEPTION = 4;
 
-/** Info log level entry - via ctx.log.info() */
-export const ENTRY_TYPE_INFO = 9;
+/** Trace log level entry - via ctx.log.trace() (most verbose) */
+export const ENTRY_TYPE_TRACE = 5;
 
 /** Debug log level entry - via ctx.log.debug() */
-export const ENTRY_TYPE_DEBUG = 10;
+export const ENTRY_TYPE_DEBUG = 6;
+
+/** Info log level entry - via ctx.log.info() */
+export const ENTRY_TYPE_INFO = 7;
 
 /** Warning log level entry - via ctx.log.warn() */
-export const ENTRY_TYPE_WARN = 11;
+export const ENTRY_TYPE_WARN = 8;
 
 /** Error log level entry - via ctx.log.error() */
-export const ENTRY_TYPE_ERROR = 12;
+export const ENTRY_TYPE_ERROR = 9;
 
-/** Trace log level entry - via ctx.log.trace() */
-export const ENTRY_TYPE_TRACE = 13;
+/** Feature flag access event - logged when a flag value is first read in a span */
+export const ENTRY_TYPE_FF_ACCESS = 10;
+
+/** Feature flag usage event - logged when a flag influences a code path decision */
+export const ENTRY_TYPE_FF_USAGE = 11;
 
 /**
  * Human-readable names for entry types, indexed by entry type code.
@@ -851,19 +853,17 @@ export const ENTRY_TYPE_TRACE = 13;
  */
 export const ENTRY_TYPE_NAMES = [
   '', // 0 - unused
-  'ff-access', // 1
-  'ff-usage', // 2
-  'tag', // 3
-  'message', // 4
-  'span-start', // 5
-  'span-ok', // 6
-  'span-err', // 7
-  'span-exception', // 8
-  'info', // 9
-  'debug', // 10
-  'warn', // 11
-  'error', // 12
-  'trace', // 13
+  'span-start', // 1
+  'span-ok', // 2
+  'span-err', // 3
+  'span-exception', // 4
+  'trace', // 5 (most verbose)
+  'debug', // 6
+  'info', // 7
+  'warn', // 8
+  'error', // 9
+  'ff-access', // 10
+  'ff-usage', // 11
 ] as const;
 
 /**
@@ -886,11 +886,8 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
     },
 
     writeFfName(name: string): void {
-      // Write to unified label column (feature flag name)
-      const column = buffer['label_values' as keyof SpanBuffer] as string[] | undefined;
-      if (column && Array.isArray(column)) {
-        column[buffer.writeIndex] = name;
-      }
+      // Write to unified message column (feature flag name)
+      buffer.message(buffer.writeIndex, name);
     },
 
     writeFfValue(value: string | number | boolean | null): void {
@@ -902,75 +899,19 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
       }
     },
 
-    writeAction(action?: string): void {
-      // Write to action column (raw string, no interning)
-      const column = buffer['action_values' as keyof SpanBuffer] as string[] | undefined;
-      if (column && Array.isArray(column)) {
-        const idx = buffer.writeIndex;
-        if (action) {
-          column[idx] = action;
-          // Mark as non-null in bitmap
-          const nullBitmap = buffer.action_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+    // writeAction and writeOutcome removed - these should be user-defined scope attributes
+    // The evaluator generator still calls these but they're no-ops
+    writeAction(_action?: string): void {
+      // No-op: action should be a user-defined scope attribute, not a system column
     },
 
-    writeOutcome(outcome?: string): void {
-      // Write to outcome column (raw string, no interning)
-      const column = buffer['outcome_values' as keyof SpanBuffer] as string[] | undefined;
-      if (column && Array.isArray(column)) {
-        const idx = buffer.writeIndex;
-        if (outcome) {
-          column[idx] = outcome;
-          // Mark as non-null in bitmap
-          const nullBitmap = buffer.outcome_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+    writeOutcome(_outcome?: string): void {
+      // No-op: outcome should be a user-defined scope attribute, not a system column
     },
 
-    writeContextAttributes(context: EvaluationContext): void {
-      const idx = buffer.writeIndex;
-
-      // Write context attributes to their respective columns (raw strings, no interning)
-      if (context.userId) {
-        const column = buffer['contextUserId_values' as keyof SpanBuffer] as string[] | undefined;
-        if (column && Array.isArray(column)) {
-          column[idx] = context.userId;
-          // Mark as non-null in bitmap
-          const nullBitmap = buffer.contextUserId_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      if (context.requestId) {
-        const column = buffer['contextRequestId_values' as keyof SpanBuffer] as string[] | undefined;
-        if (column && Array.isArray(column)) {
-          column[idx] = context.requestId;
-          // Mark as non-null in bitmap
-          const nullBitmap = buffer.contextRequestId_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      // Increment write index after all writes
+    writeContextAttributes(_context: EvaluationContext): void {
+      // userId and requestId removed - these should be user-defined scope attributes
+      // Just increment write index to complete the entry
       buffer.writeIndex++;
     },
   };
@@ -1035,7 +976,7 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
   // Row 0: span-start (fixed layout)
   buffer.operations[0] = ENTRY_TYPE_SPAN_START;
   buffer.timestamps[0] = getTimestampNanos();
-  buffer.label(0, spanName); // Unified label column for span name
+  buffer.message(0, spanName); // Unified message column for span name
 
   // Row 1: pre-initialize as span-exception (will be overwritten on ok/err)
   buffer.operations[1] = ENTRY_TYPE_SPAN_EXCEPTION;
@@ -1315,7 +1256,7 @@ export function createModuleContext<
                 const errorMessage = error instanceof Error ? error.message : String(error);
                 const errorStack = error instanceof Error ? error.stack : undefined;
 
-                childBuffer.exceptionMessage(1, errorMessage);
+                childBuffer.message(1, errorMessage);
                 if (errorStack) {
                   childBuffer.exceptionStack(1, errorStack);
                 }
@@ -1339,7 +1280,7 @@ export function createModuleContext<
           const errorMessage = error instanceof Error ? error.message : String(error);
           const errorStack = error instanceof Error ? error.stack : undefined;
 
-          spanBuffer.exceptionMessage(1, errorMessage);
+          spanBuffer.message(1, errorMessage);
           if (errorStack) {
             spanBuffer.exceptionStack(1, errorStack);
           }

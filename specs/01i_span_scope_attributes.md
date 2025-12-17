@@ -740,7 +740,7 @@ ctx.scope.orderId = order.id;
 // Feature flag access includes scoped attributes
 if (ctx.ff.advancedValidation) {
   // Feature flag usage automatically includes userId, orderId in its trace entry
-  ctx.ff.trackUsage('advancedValidation', { action: 'validation_enabled' });
+  ctx.ff.track('advancedValidation');
 }
 ```
 

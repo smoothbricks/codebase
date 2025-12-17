@@ -46,9 +46,9 @@ SpanBuffer row layout:
 └──────────────────────────────────────────────────────────────────────────┘
 
 Span completion entry types (all written to row 1):
-  - span-ok (6):        Success, written by ctx.ok()
-  - span-err (7):       Expected business error, written by ctx.err()
-  - span-exception (8): Uncaught exception, pre-initialized at row 1
+  - span-ok (2):        Success, written by ctx.ok()
+  - span-err (3):       Expected business error, written by ctx.err()
+  - span-exception (4): Uncaught exception, pre-initialized at row 1
 ```
 
 ### Key Points
@@ -1680,10 +1680,10 @@ function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
   );
 }
 
-function createChildSpan(parentBuffer: SpanBuffer, label: string, childFn: SpanFunction) {
+function createChildSpan(parentBuffer: SpanBuffer, spanName: string, childFn: SpanFunction) {
   const childTaskContext: TaskContext = {
     module: parentBuffer.task.module,
-    spanNameId: internString(label),
+    spanNameId: internString(spanName),
     lineNumber: getCurrentLineNumber(), // Build tool injected
   };
 

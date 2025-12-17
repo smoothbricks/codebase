@@ -153,6 +153,8 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
         return;
       }
 
+      // Direct buffer writing only logs core FF columns (ffName)
+      // For action/outcome tracking, use FlagColumnWriters which knows the user's schema
       if (!state.buffer) return;
 
       const idx = state.buffer.writeIndex;
@@ -166,31 +168,8 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
         ffNameColumn[idx] = flagName;
       }
 
-      if (context?.action) {
-        const actionColumn = state.buffer['attr_action_values'];
-        if (actionColumn && Array.isArray(actionColumn)) {
-          actionColumn[idx] = context.action;
-          const nullBitmap = state.buffer.attr_action_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      if (context?.outcome) {
-        const outcomeColumn = state.buffer['attr_outcome_values'];
-        if (outcomeColumn && Array.isArray(outcomeColumn)) {
-          outcomeColumn[idx] = context.outcome;
-          const nullBitmap = state.buffer.attr_outcome_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+      // Note: action/outcome from context are not written here
+      // They require user-defined schema columns and should use FlagColumnWriters
 
       state.buffer.writeIndex++;
     }
@@ -431,6 +410,8 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
         return;
       }
 
+      // Direct buffer writing only logs core FF columns (ffName)
+      // For action/outcome tracking, use FlagColumnWriters which knows the user's schema
       if (!state.buffer) return;
 
       const idx = state.buffer.writeIndex;
@@ -444,31 +425,8 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
         ffNameColumn[idx] = flagName;
       }
 
-      if (context?.action) {
-        const actionColumn = state.buffer['attr_action_values'];
-        if (actionColumn && Array.isArray(actionColumn)) {
-          actionColumn[idx] = context.action;
-          const nullBitmap = state.buffer.attr_action_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      if (context?.outcome) {
-        const outcomeColumn = state.buffer['attr_outcome_values'];
-        if (outcomeColumn && Array.isArray(outcomeColumn)) {
-          outcomeColumn[idx] = context.outcome;
-          const nullBitmap = state.buffer.attr_outcome_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+      // Note: action/outcome from context are not written here
+      // They require user-defined schema columns and should use FlagColumnWriters
 
       state.buffer.writeIndex++;
     }
@@ -717,6 +675,8 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
         return;
       }
 
+      // Direct buffer writing only logs core FF columns (ffName)
+      // For action/outcome tracking, use FlagColumnWriters which knows the user's schema
       if (!state.buffer) return;
 
       const idx = state.buffer.writeIndex;
@@ -730,31 +690,8 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
         ffNameColumn[idx] = flagName;
       }
 
-      if (context?.action) {
-        const actionColumn = state.buffer['attr_action_values'];
-        if (actionColumn && Array.isArray(actionColumn)) {
-          actionColumn[idx] = context.action;
-          const nullBitmap = state.buffer.attr_action_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      if (context?.outcome) {
-        const outcomeColumn = state.buffer['attr_outcome_values'];
-        if (outcomeColumn && Array.isArray(outcomeColumn)) {
-          outcomeColumn[idx] = context.outcome;
-          const nullBitmap = state.buffer.attr_outcome_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+      // Note: action/outcome from context are not written here
+      // They require user-defined schema columns and should use FlagColumnWriters
 
       state.buffer.writeIndex++;
     }
@@ -999,6 +936,8 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
         return;
       }
 
+      // Direct buffer writing only logs core FF columns (ffName)
+      // For action/outcome tracking, use FlagColumnWriters which knows the user's schema
       if (!state.buffer) return;
 
       const idx = state.buffer.writeIndex;
@@ -1012,31 +951,8 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
         ffNameColumn[idx] = flagName;
       }
 
-      if (context?.action) {
-        const actionColumn = state.buffer['attr_action_values'];
-        if (actionColumn && Array.isArray(actionColumn)) {
-          actionColumn[idx] = context.action;
-          const nullBitmap = state.buffer.attr_action_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      if (context?.outcome) {
-        const outcomeColumn = state.buffer['attr_outcome_values'];
-        if (outcomeColumn && Array.isArray(outcomeColumn)) {
-          outcomeColumn[idx] = context.outcome;
-          const nullBitmap = state.buffer.attr_outcome_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+      // Note: action/outcome from context are not written here
+      // They require user-defined schema columns and should use FlagColumnWriters
 
       state.buffer.writeIndex++;
     }
@@ -1277,6 +1193,8 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
         return;
       }
 
+      // Direct buffer writing only logs core FF columns (ffName)
+      // For action/outcome tracking, use FlagColumnWriters which knows the user's schema
       if (!state.buffer) return;
 
       const idx = state.buffer.writeIndex;
@@ -1290,31 +1208,8 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
         ffNameColumn[idx] = flagName;
       }
 
-      if (context?.action) {
-        const actionColumn = state.buffer['attr_action_values'];
-        if (actionColumn && Array.isArray(actionColumn)) {
-          actionColumn[idx] = context.action;
-          const nullBitmap = state.buffer.attr_action_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      if (context?.outcome) {
-        const outcomeColumn = state.buffer['attr_outcome_values'];
-        if (outcomeColumn && Array.isArray(outcomeColumn)) {
-          outcomeColumn[idx] = context.outcome;
-          const nullBitmap = state.buffer.attr_outcome_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+      // Note: action/outcome from context are not written here
+      // They require user-defined schema columns and should use FlagColumnWriters
 
       state.buffer.writeIndex++;
     }

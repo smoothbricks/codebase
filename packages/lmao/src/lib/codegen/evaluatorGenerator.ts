@@ -239,6 +239,8 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
         return;
       }
 
+      // Direct buffer writing only logs core FF columns (ffName)
+      // For action/outcome tracking, use FlagColumnWriters which knows the user's schema
       if (!state.buffer) return;
 
       const idx = state.buffer.writeIndex;
@@ -252,31 +254,8 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
         ffNameColumn[idx] = flagName;
       }
 
-      if (context?.action) {
-        const actionColumn = state.buffer['attr_action_values'];
-        if (actionColumn && Array.isArray(actionColumn)) {
-          actionColumn[idx] = context.action;
-          const nullBitmap = state.buffer.attr_action_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
-
-      if (context?.outcome) {
-        const outcomeColumn = state.buffer['attr_outcome_values'];
-        if (outcomeColumn && Array.isArray(outcomeColumn)) {
-          outcomeColumn[idx] = context.outcome;
-          const nullBitmap = state.buffer.attr_outcome_nulls;
-          if (nullBitmap) {
-            const byteIndex = Math.floor(idx / 8);
-            const bitOffset = idx % 8;
-            nullBitmap[byteIndex] |= 1 << bitOffset;
-          }
-        }
-      }
+      // Note: action/outcome from context are not written here
+      // They require user-defined schema columns and should use FlagColumnWriters
 
       state.buffer.writeIndex++;
     }

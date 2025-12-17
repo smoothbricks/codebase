@@ -4,6 +4,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import { convertToArrowTable } from '../convertToArrow.js';
+import { ENTRY_TYPE_SPAN_START } from '../lmao.js';
 import { S } from '../schema/builder.js';
 import type { TagAttributeSchema } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
@@ -125,13 +126,13 @@ describe('Debug Dictionary', () => {
     // Write test data (raw strings - no interning on hot path)
     writeRow(buffer, {
       timestamp: 1000n,
-      operation: 3,
+      operation: ENTRY_TYPE_SPAN_START,
       attributes: { userId: 'user-123', message: 'First message' },
     });
 
     writeRow(buffer, {
       timestamp: 1000n,
-      operation: 3,
+      operation: ENTRY_TYPE_SPAN_START,
       attributes: { userId: 'user-456', message: 'Second message' },
     });
 

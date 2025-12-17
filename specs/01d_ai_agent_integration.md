@@ -11,9 +11,11 @@ The AI agent integration provides structured access to trace data for automated 
 
 ## Design Philosophy
 
-**Key Insight**: AI agents need structured access to trace data without consuming limited context windows. The MCP protocol provides tool-based access where detailed trace data is only loaded when specifically requested.
+**Key Insight**: AI agents need structured access to trace data without consuming limited context windows. The MCP
+protocol provides tool-based access where detailed trace data is only loaded when specifically requested.
 
 **Benefits**:
+
 - **Context efficiency**: Detailed trace data doesn't consume AI context until requested
 - **Standardized protocol**: Works with Claude Desktop, Cursor, VS Code Copilot, and other MCP clients
 - **Background processing**: Server watches trace files, AI queries on-demand
@@ -26,75 +28,76 @@ The AI agent integration provides structured access to trace data for automated 
 ```typescript
 // MCP server exposes trace querying tools
 const traceServer = new MCPServer({
-  name: "trace-analyzer",
-  version: "1.0.0"
+  name: 'trace-analyzer',
+  version: '1.0.0',
 });
 
 // Tool: Query traces by test run ID
 traceServer.addTool({
-  name: "get_traces_by_test_run",
-  description: "Get all traces for a specific test run",
+  name: 'get_traces_by_test_run',
+  description: 'Get all traces for a specific test run',
   inputSchema: {
-    type: "object",
+    type: 'object',
     properties: {
-      testRunId: { type: "string" }
-    }
+      testRunId: { type: 'string' },
+    },
   },
   handler: async ({ testRunId }) => {
     return await queryTraceDatabase({ testRunId });
-  }
+  },
 });
 
 // Tool: Query traces by span type
 traceServer.addTool({
-  name: "get_traces_by_span",
-  description: "Get traces filtered by span name/type",
+  name: 'get_traces_by_span',
+  description: 'Get traces filtered by span name/type',
   inputSchema: {
-    type: "object", 
+    type: 'object',
     properties: {
-      spanName: { type: "string" },
-      testRunId: { type: "string", optional: true },
-      timeRange: { type: "object", optional: true }
-    }
+      spanName: { type: 'string' },
+      testRunId: { type: 'string', optional: true },
+      timeRange: { type: 'object', optional: true },
+    },
   },
   handler: async ({ spanName, testRunId, timeRange }) => {
     return await queryTraceDatabase({ spanName, testRunId, timeRange });
-  }
+  },
 });
 
 // Tool: Get performance metrics
 traceServer.addTool({
-  name: "get_performance_metrics", 
-  description: "Get performance summary for a test run",
+  name: 'get_performance_metrics',
+  description: 'Get performance summary for a test run',
   inputSchema: {
-    type: "object",
+    type: 'object',
     properties: {
-      testRunId: { type: "string" }
-    }
+      testRunId: { type: 'string' },
+    },
   },
   handler: async ({ testRunId }) => {
     return await generatePerformanceReport(testRunId);
-  }
+  },
 });
 
 // Tool: Analyze feature flag usage
 traceServer.addTool({
-  name: "analyze_feature_flag_usage",
-  description: "Analyze feature flag access patterns in traces",
+  name: 'analyze_feature_flag_usage',
+  description: 'Analyze feature flag access patterns in traces',
   inputSchema: {
-    type: "object",
+    type: 'object',
     properties: {
-      testRunId: { type: "string" },
-      flagName: { type: "string", optional: true }
-    }
+      testRunId: { type: 'string' },
+      flagName: { type: 'string', optional: true },
+    },
   },
   handler: async ({ testRunId, flagName }) => {
     return await analyzeFeatureFlagUsage({ testRunId, flagName });
-  }
+  },
 });
 ```
 
 **Why This Design**:
+
 - **Tool-based access**: AI agents call specific functions rather than loading all data
 - **Flexible querying**: Multiple query patterns for different analysis needs
 - **Performance focus**: Dedicated tools for performance analysis
@@ -112,11 +115,14 @@ export default {
   setupFilesAfterEnv: ['<rootDir>/jest-trace-setup.js'],
   reporters: [
     'default',
-    ['jest-trace-reporter', { 
-      outputDir: './traces',
-      includeTestMetadata: true 
-    }]
-  ]
+    [
+      'jest-trace-reporter',
+      {
+        outputDir: './traces',
+        includeTestMetadata: true,
+      },
+    ],
+  ],
 };
 
 // Single test run ID for entire suite
@@ -130,10 +136,10 @@ beforeAll(() => {
 beforeEach(() => {
   const testCase = expect.getState().currentTestName;
   const testFile = expect.getState().testPath;
-  trace.setContext({ 
+  trace.setContext({
     testRunId: globalThis.__TEST_RUN_ID__,
     testCase,
-    testFile 
+    testFile,
   });
 });
 ```
@@ -153,20 +159,21 @@ plugin({
       console.log(`🔍 Test Run ID: ${testRunId}`);
       globalThis.__TEST_RUN_ID__ = testRunId;
     });
-    
+
     // Tag individual test cases
     build.onTestStart((testName, filePath) => {
       trace.setContext({
         testRunId: globalThis.__TEST_RUN_ID__,
         testCase: testName,
-        testFile: filePath
+        testFile: filePath,
       });
     });
-  }
+  },
 });
 ```
 
 **Why This Integration**:
+
 - **Single test run ID**: All tests in a suite share the same correlation ID
 - **Console visibility**: AI agents can see test run ID in console output
 - **Automatic tagging**: Test metadata automatically added to traces
@@ -193,7 +200,7 @@ Result: [
   // ... more traces
 ]
 
-AI: I see multiple email-send spans failing with SMTP timeouts across different test cases. 
+AI: I see multiple email-send spans failing with SMTP timeouts across different test cases.
     Let me check the pattern...
 MCP Tool Call: get_traces_by_span({ spanName: "email-send", testRunId: "test-run-abc123" })
 AI: All 15 failures are SMTP timeouts. Let me fix the retry logic and timeout configuration...
@@ -216,40 +223,40 @@ AI: All 15 failures are SMTP timeouts. Let me fix the retry logic and timeout co
 ```typescript
 // Production MCP server with OAuth
 const productionTraceServer = new MCPServer({
-  name: "production-trace-analyzer",
-  version: "1.0.0",
+  name: 'production-trace-analyzer',
+  version: '1.0.0',
   authentication: {
-    provider: "oauth2",
-    scopes: ["trace:read", "trace:decrypt"]
-  }
+    provider: 'oauth2',
+    scopes: ['trace:read', 'trace:decrypt'],
+  },
 });
 
 // Tool requires authentication
 traceServer.addTool({
-  name: "get_production_traces",
-  description: "Query production traces (requires authentication)",
+  name: 'get_production_traces',
+  description: 'Query production traces (requires authentication)',
   requiresAuth: true,
-  requiredScopes: ["trace:read"],
+  requiredScopes: ['trace:read'],
   handler: async ({ testRunId }, { user, scopes }) => {
     // Only return decrypted data if user has decrypt scope
-    const includeDecrypted = scopes.includes("trace:decrypt");
+    const includeDecrypted = scopes.includes('trace:decrypt');
     return await queryProductionTraces({ testRunId, includeDecrypted });
-  }
+  },
 });
 
 // Tool for performance analysis
 traceServer.addTool({
-  name: "analyze_production_performance",
-  description: "Analyze production performance patterns",
+  name: 'analyze_production_performance',
+  description: 'Analyze production performance patterns',
   requiresAuth: true,
-  requiredScopes: ["trace:read"],
+  requiredScopes: ['trace:read'],
   handler: async ({ timeRange, service }, { user }) => {
-    return await analyzeProductionPerformance({ 
-      timeRange, 
+    return await analyzeProductionPerformance({
+      timeRange,
       service,
-      userId: user.id // For audit logging
+      userId: user.id, // For audit logging
     });
-  }
+  },
 });
 ```
 
@@ -261,10 +268,10 @@ traceServer.addTool({
 interface ProductionTraceRecord {
   // Masked data - queryable for analytics
   maskedData: TraceRecord;
-  
+
   // Encrypted unmasked data - for authorized debugging
   encryptedData: ArrayBuffer; // Encrypted serialized blob
-  
+
   // Metadata for decryption access control
   encryptionKeyId: string;
   accessLevel: 'public' | 'internal' | 'sensitive';
@@ -272,34 +279,31 @@ interface ProductionTraceRecord {
 
 // MCP tool with conditional decryption
 traceServer.addTool({
-  name: "get_production_trace_details",
-  description: "Get detailed production trace with optional decryption",
+  name: 'get_production_trace_details',
+  description: 'Get detailed production trace with optional decryption',
   requiresAuth: true,
   handler: async ({ traceId, includeDecrypted }, { user, scopes }) => {
     const trace = await getProductionTrace(traceId);
-    
-    if (includeDecrypted && scopes.includes("trace:decrypt")) {
+
+    if (includeDecrypted && scopes.includes('trace:decrypt')) {
       // Decrypt sensitive data for authorized users
-      const decryptedData = await decryptTraceData(
-        trace.encryptedData, 
-        trace.encryptionKeyId,
-        user.id
-      );
-      
+      const decryptedData = await decryptTraceData(trace.encryptedData, trace.encryptionKeyId, user.id);
+
       return {
         ...trace.maskedData,
         decryptedData,
-        accessLevel: trace.accessLevel
+        accessLevel: trace.accessLevel,
       };
     }
-    
+
     // Return only masked data
     return trace.maskedData;
-  }
+  },
 });
 ```
 
 **Why This Architecture**:
+
 - **Analytics-ready**: Masked data can be queried without privacy concerns
 - **Debug capability**: Authorized users can decrypt full trace data when needed
 - **Compliance**: Meets privacy requirements while maintaining debugging capability
@@ -327,19 +331,19 @@ const distributedQuery = `
 
 // MCP tool for distributed trace analysis
 traceServer.addTool({
-  name: "get_distributed_trace",
-  description: "Get complete trace across all services",
+  name: 'get_distributed_trace',
+  description: 'Get complete trace across all services',
   inputSchema: {
-    type: "object",
+    type: 'object',
     properties: {
-      traceId: { type: "string" },
-      services: { type: "array", items: { type: "string" }, optional: true }
-    }
+      traceId: { type: 'string' },
+      services: { type: 'array', items: { type: 'string' }, optional: true },
+    },
   },
   handler: async ({ traceId, services }) => {
     // Use ClickHouse chDB or AWS Athena for cross-service queries
     return await queryDistributedTrace({ traceId, services });
-  }
+  },
 });
 
 // Deploy chDB on AWS Lambda for serverless trace queries
@@ -349,6 +353,7 @@ const lambdaTraceQuery = async (traceId: string) => {
 ```
 
 **Benefits**:
+
 - **Complete trace visibility**: See operations across all services
 - **Serverless querying**: chDB on Lambda provides cost-effective trace analysis
 - **Standard tooling**: Leverage existing analytics infrastructure
@@ -372,7 +377,7 @@ const lambdaTraceQuery = async (traceId: string) => {
       }
     },
     "production-trace-analyzer": {
-      "command": "node", 
+      "command": "node",
       "args": ["./dist/production-trace-mcp-server.js"],
       "env": {
         "TRACE_DATA_PATH": "/path/to/production/traces",
@@ -426,7 +431,7 @@ const AI_AGENT_PROMPTS = {
     ctx.tag.duration(45);           // Performance tracking
     ctx.tag.operation('SELECT');    // Enum validation
   `,
-  
+
   featureFlags: `
     Feature flag access patterns:
     
@@ -437,12 +442,10 @@ const AI_AGENT_PROMPTS = {
     const limit = await ctx.ff.get('userSpecificLimit');
     
     Usage tracking (for A/B testing):
-    ctx.ff.trackUsage('experimentalFeature', { 
-      action: 'used', 
-      outcome: 'success' 
-    });
+    ctx.ff.track('experimentalFeature');
+    // User-defined attributes can be added via chainable API
   `,
-  
+
   environmentVariables: `
     Environment variable access (zero overhead):
     
@@ -452,7 +455,7 @@ const AI_AGENT_PROMPTS = {
     Security: Environment values only appear in traces if explicitly logged:
     ctx.tag.region(region);                // Safe to log
     // ctx.tag.databaseUrl(dbUrl);         // Would be masked
-  `
+  `,
 };
 ```
 
@@ -466,4 +469,5 @@ const AI_AGENT_PROMPTS = {
 6. **Production Debugging**: Authorized access to production trace data
 7. **Context Efficiency**: Detailed data only loaded when specifically requested
 
-This integration enables AI agents to make informed decisions based on actual application behavior rather than just code analysis. 
+This integration enables AI agents to make informed decisions based on actual application behavior rather than just code
+analysis.

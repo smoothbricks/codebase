@@ -86,6 +86,18 @@ export type AsTagAttributeSchema<T> = {
 };
 
 /**
+ * Options for createExtendedSchema
+ */
+export interface CreateExtendedSchemaOptions {
+  /**
+   * Skip validation of reserved names.
+   * Only used internally for defining system schema columns.
+   * @internal
+   */
+  _skipReservedNameValidation?: boolean;
+}
+
+/**
  * Create an extendable schema wrapper
  *
  * This provides a fluent API for schema composition while maintaining
@@ -110,11 +122,17 @@ export type AsTagAttributeSchema<T> = {
  * ```
  *
  * @param schema - Tag attribute schema to make extendable
+ * @param options - Optional configuration (e.g., skip reserved name validation for system schema)
  * @returns Schema with .extend() method for chaining
  */
-export function createExtendedSchema<T extends TagAttributeSchema>(schema: T): ExtendedSchema<T> {
-  // Validate initial schema doesn't use reserved names
-  validateAttributeNames(schema);
+export function createExtendedSchema<T extends TagAttributeSchema>(
+  schema: T,
+  options?: CreateExtendedSchemaOptions,
+): ExtendedSchema<T> {
+  // Validate initial schema doesn't use reserved names (unless skipped for system schema)
+  if (!options?._skipReservedNameValidation) {
+    validateAttributeNames(schema);
+  }
 
   // Create proxy object that contains schema fields and .extend() method
   // This is safe because we're adding a method to a schema object
@@ -124,6 +142,7 @@ export function createExtendedSchema<T extends TagAttributeSchema>(schema: T): E
   proxy.extend = <U extends TagAttributeSchema>(extension: U): ExtendedSchema<T & U> => {
     const merged = extendSchema(schema, extension);
     // Recursively create extended schema from merged result
+    // Extensions should always validate reserved names
     return createExtendedSchema(merged);
   };
 

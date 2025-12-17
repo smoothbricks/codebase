@@ -117,9 +117,26 @@ export type DefinedTagAttributes<T extends TagAttributeSchema> = T &
     [key: string]: import('@sury/sury').Schema<unknown, unknown> | ((...args: unknown[]) => unknown);
   };
 
-export function defineTagAttributes<T extends TagAttributeSchema>(schema: T): DefinedTagAttributes<T> {
-  // Validate attribute names don't conflict with reserved names
-  validateAttributeNames(schema);
+/**
+ * Options for defineTagAttributes
+ */
+export interface DefineTagAttributesOptions {
+  /**
+   * Skip validation of reserved names.
+   * Only used internally for defining system schema columns.
+   * @internal
+   */
+  _skipReservedNameValidation?: boolean;
+}
+
+export function defineTagAttributes<T extends TagAttributeSchema>(
+  schema: T,
+  options?: DefineTagAttributesOptions,
+): DefinedTagAttributes<T> {
+  // Validate attribute names don't conflict with reserved names (unless skipped for system schema)
+  if (!options?._skipReservedNameValidation) {
+    validateAttributeNames(schema);
+  }
 
   // Convert to Sury object schema for validation using builder pattern
   // Use getSchemaFields to filter out methods (validate, parse, etc.)
@@ -132,7 +149,8 @@ export function defineTagAttributes<T extends TagAttributeSchema>(schema: T): De
   });
 
   // Create extendable schema with validation methods
-  const extendedSchema = createExtendedSchema(schema);
+  // Pass skip option to createExtendedSchema so it doesn't re-validate
+  const extendedSchema = createExtendedSchema(schema, options);
 
   // Add validation methods - cast to any to bypass type checking since we know the structure is correct
   return Object.assign(extendedSchema, {

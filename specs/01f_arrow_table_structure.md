@@ -205,17 +205,17 @@ system becomes a row in the final table, enabling rich analytical queries while 
 
 ### Core System Columns (Always Present)
 
-| Column Name        | Type                 | Description                                                  | Example Values                                                                                                                                |
-| ------------------ | -------------------- | ------------------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------- |
-| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)          | `2024-01-01T10:00:00.000000123Z`                                                                                                              |
-| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)     | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                                                          |
-| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread) | `0x1a2b3c4d5e6f7890`                                                                                                                          |
-| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)            | `1`, `2`, `42`                                                                                                                                |
-| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                   | `0x1a2b3c4d5e6f7890` or `null`                                                                                                                |
-| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                       | `1`, `2` or `null`                                                                                                                            |
-| `entry_type`       | `dictionary<string>` | Log entry type                                               | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'tag'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
-| `module`           | `dictionary<string>` | Module name                                                  | `'UserController'`, `'DatabaseService'`                                                                                                       |
-| `label`            | `dictionary<string>` | Span name OR log message template (see Label Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`                                                                    |
+| Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                                                       |
+| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
+| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)                                                           | `2024-01-01T10:00:00.000000123Z`                                                                                                     |
+| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)                                                      | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                                                 |
+| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread)                                                  | `0x1a2b3c4d5e6f7890`                                                                                                                 |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                                                             | `1`, `2`, `42`                                                                                                                       |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                                                       |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                                                   |
+| `entry_type`       | `dictionary<string>` | Log entry type                                                                                                | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
+| `module`           | `dictionary<string>` | Module name                                                                                                   | `'UserController'`, `'DatabaseService'`                                                                                              |
+| `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`, `'TypeError: x is not a function'`                       |
 
 **Note on Span Identification**:
 
@@ -441,7 +441,7 @@ SELECT * FROM spans
 WHERE parent_thread_id IS NULL AND parent_span_id IS NULL;
 
 -- Join parent-child relationships
-SELECT child.*, parent.label as parent_label
+SELECT child.*, parent.message as parent_message
 FROM spans child
 LEFT JOIN spans parent ON
   child.trace_id = parent.trace_id AND
@@ -520,7 +520,7 @@ function convertSpanIdentityToArrowColumns(spanId: SpanIdentity, rowCount: numbe
 | `business_metric` | `float64`            | Custom metric value (nullable)            | `42.7`, `1.0` or `null`                          |
 | `ff_value`        | `dictionary<string>` | Feature flag value (nullable, S.category) | `'true'`, `'false'`, `'blue'`, `'100'` or `null` |
 
-**Note**: Feature flag names are stored in the unified `label` column for `ff-access` and `ff-usage` entries. The
+**Note**: Feature flag names are stored in the unified `message` column for `ff-access` and `ff-usage` entries. The
 `ff_value` column uses `S.category()` (dictionary encoding) because flag values repeat frequently (e.g., `true`/`false`,
 `'blue'`/`'green'`/`'red'`, etc.).
 
@@ -539,7 +539,7 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 1, parent_thread_id: null, parent_span_i
 thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890, parent_span_id: 1
 ```
 
-| trace_id     | span_id | parent_span_id | timestamp                  | entry_type   | module                | label                                           | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
+| trace_id     | span_id | parent_span_id | timestamp                  | entry_type   | module                | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
 | ------------ | ------- | -------------- | -------------------------- | ------------ | --------------------- | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
 | `req-abc123` | 1       | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `UserController`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | 1       | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `UserController`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
@@ -565,21 +565,23 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890,
 | `req-abc123` | 1       | null           | `2024-01-01T10:00:00.251Z` | `info`       | `UserController`      | `Registration completed for ${userId}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | 1       | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `UserController`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 
-## The `label` System Column
+## The `message` System Column
 
 ### Unified Purpose
 
-The `label` column serves different purposes based on entry type:
+The `message` column serves different purposes based on entry type:
 
-- **For span entries** (`span-start`, `span-ok`, `span-err`, `span-exception`, `tag`): Contains the **span name**
+- **For span entries** (`span-start`, `span-ok`, `span-err`): Contains the **span name**
+- **For exception entries** (`span-exception`): Contains the **exception message**
 - **For log entries** (`info`, `debug`, `warn`, `error`): Contains the **message template**
 - **For feature flag entries** (`ff-access`, `ff-usage`): Contains the **flag name**
 
-| Entry Type                                                   | `label` Contains                                        |
-| ------------------------------------------------------------ | ------------------------------------------------------- |
-| `span-start`, `span-ok`, `span-err`, `span-exception`, `tag` | Span name (e.g., `'create-user'`)                       |
-| `info`, `debug`, `warn`, `error`                             | Log message template (e.g., `'User ${userId} created'`) |
-| `ff-access`, `ff-usage`                                      | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)  |
+| Entry Type                          | `message` Contains                                           |
+| ----------------------------------- | ------------------------------------------------------------ |
+| `span-start`, `span-ok`, `span-err` | Span name (e.g., `'create-user'`)                            |
+| `span-exception`                    | Exception message (e.g., `'TypeError: x is not a function'`) |
+| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User ${userId} created'`)      |
+| `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)       |
 
 ### Format String Pattern (CRITICAL)
 
@@ -595,12 +597,12 @@ The system stores:
 
 | Column           | Value                                              |
 | ---------------- | -------------------------------------------------- |
-| `label`          | `'User ${userId} created with ${itemCount} items'` |
+| `message`        | `'User ${userId} created with ${itemCount} items'` |
 | `attr_userId`    | `123`                                              |
 | `attr_itemCount` | `5`                                                |
 
-**The message is NOT interpolated.** The template string `'User ${userId} created...'` is stored verbatim in the `label`
-column, while the actual values (`123`, `5`) are stored in their respective typed attribute columns.
+**The message is NOT interpolated.** The template string `'User ${userId} created...'` is stored verbatim in the
+`message` column, while the actual values (`123`, `5`) are stored in their respective typed attribute columns.
 
 ### Why This Design?
 
@@ -608,10 +610,10 @@ column, while the actual values (`123`, `5`) are stored in their respective type
 
 ```typescript
 // In systemSchema:
-label: S.category(),  // Span name OR log message template
+message: S.category(),  // Span name, log message template, exception message, OR flag name
 ```
 
-The `label` column uses `S.category()` type, which means:
+The `message` column uses `S.category()` type, which means:
 
 - Templates are **string-interned** - each unique template stored once
 - Repeated log messages (even with different values) share the same interned template
@@ -623,19 +625,19 @@ Because templates are stored separately from values, you can:
 
 ```sql
 -- Find all occurrences of a specific log pattern
-SELECT * FROM traces WHERE label = 'User ${userId} created with ${itemCount} items';
+SELECT * FROM traces WHERE message = 'User ${userId} created with ${itemCount} items';
 
 -- Group by log template to find most frequent messages
-SELECT label, count(*) as occurrences
+SELECT message, count(*) as occurrences
 FROM traces
 WHERE entry_type IN ('info', 'debug', 'warn', 'error')
-GROUP BY label
+GROUP BY message
 ORDER BY occurrences DESC;
 
 -- Analyze specific template with different values
 SELECT attr_userId, attr_itemCount, timestamp
 FROM traces
-WHERE label = 'User ${userId} created with ${itemCount} items'
+WHERE message = 'User ${userId} created with ${itemCount} items'
 ORDER BY timestamp;
 ```
 
@@ -643,14 +645,14 @@ ORDER BY timestamp;
 
 Instead of separate `span_name`, `message`, and `ffName` columns (most always null), we have:
 
-- Single `label` column that's always populated for relevant entry types
+- Single `message` column that's always populated for relevant entry types
 - Reduces schema complexity
 - Better column utilization (less sparsity)
 - Consistent pattern across all entry types
 
 ### Example Data
 
-| entry_type   | label                                              | attr_userId | attr_itemCount |
+| entry_type   | message                                            | attr_userId | attr_itemCount |
 | ------------ | -------------------------------------------------- | ----------- | -------------- |
 | `span-start` | `'create-user'`                                    | `123`       | `null`         |
 | `info`       | `'User ${userId} created with ${itemCount} items'` | `123`       | `5`            |
@@ -670,7 +672,7 @@ console.log(`User ${userId} created with ${itemCount} items`);
 
 ```typescript
 ctx.log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount(5);
-// Stores: template in label, values in typed columns - structured, queryable
+// Stores: template in message, values in typed columns - structured, queryable
 ```
 
 ## Key Patterns in the Data
@@ -686,7 +688,7 @@ ctx.log.info('User ${userId} created with ${itemCount} items').userId(123).itemC
 
 - **Log levels with structure**: `ctx.log.info('Template ${var}').var(value)` → `entry_type='info'` with typed
   attributes
-- **Template storage**: Log message TEMPLATES stored in unified `label` column (NOT interpolated strings)
+- **Template storage**: Log message TEMPLATES stored in unified `message` column (NOT interpolated strings)
 - **Values in attribute columns**: Actual values stored separately in `attr_*` columns for type safety and queryability
 - **Optional attributes**: Structured data can accompany log messages
 - **Gradual migration**: Familiar log levels but with structured data instead of string concatenation
@@ -696,8 +698,8 @@ ctx.log.info('User ${userId} created with ${itemCount} items').userId(123).itemC
 The `entry_type` column uses a dictionary-encoded enum that covers all possible trace events. For complete definitions
 and low-level API details, see **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**.
 
-**Entry Types**: `span-start`, `span-ok`, `span-err`, `span-exception`, `tag`, `info`, `debug`, `warn`, `error`,
-`ff-access`, `ff-usage`
+**Entry Types**: `span-start`, `span-ok`, `span-err`, `span-exception`, `info`, `debug`, `warn`, `error`, `ff-access`,
+`ff-usage`
 
 **Key Benefits**:
 
@@ -787,14 +789,14 @@ SELECT
   span_id,
   parent_span_id,
   module,
-  label,
+  message,
   entry_type,
   timestamp,
   CASE
-    WHEN entry_type IN ('info', 'debug', 'warn', 'error') THEN label  -- Log template
+    WHEN entry_type IN ('info', 'debug', 'warn', 'error') THEN message  -- Log template
     WHEN http_url IS NOT NULL THEN concat('HTTP ', http_method, ' ', http_url)
     WHEN db_query IS NOT NULL THEN concat('DB: ', db_table)
-    ELSE label  -- Span name
+    ELSE message  -- Span name
   END as description
 FROM traces
 WHERE trace_id = 'req-abc123'
@@ -805,13 +807,13 @@ ORDER BY timestamp;
 
 ```sql
 -- Analyze structured logging usage patterns
--- Note: label contains MESSAGE TEMPLATES, not interpolated strings
+-- Note: message contains MESSAGE TEMPLATES, not interpolated strings
 SELECT
   module,
   entry_type as log_level,
   count(*) as message_count,
   count(DISTINCT trace_id) as trace_count,
-  count(DISTINCT label) as unique_templates,  -- Templates, not interpolated messages!
+  count(DISTINCT message) as unique_templates,  -- Templates, not interpolated messages!
   count(CASE WHEN http_status IS NOT NULL OR user_id IS NOT NULL THEN 1 END) as structured_entries
 FROM traces
 WHERE entry_type IN ('info', 'debug', 'warn', 'error')
@@ -820,12 +822,12 @@ ORDER BY message_count DESC;
 
 -- Find most common log message templates
 SELECT
-  label as template,
+  message as template,
   count(*) as occurrences,
   count(DISTINCT trace_id) as unique_traces
 FROM traces
 WHERE entry_type IN ('info', 'debug', 'warn', 'error')
-GROUP BY label
+GROUP BY message
 ORDER BY occurrences DESC
 LIMIT 20;
 ```
@@ -834,23 +836,23 @@ LIMIT 20;
 
 ```sql
 -- Feature flag usage and performance impact
--- Note: flag name is in the unified `label` column, value in `ff_value`
+-- Note: flag name is in the unified `message` column, value in `ff_value`
 SELECT
-  label as flag_name,
+  message as flag_name,
   ff_value,
   count(*) as access_count,
   count(DISTINCT trace_id) as trace_count,
   avg(CASE WHEN ff_value = 'true' THEN 1.0 ELSE 0.0 END) as enabled_ratio
 FROM traces
 WHERE entry_type = 'ff-access'
-GROUP BY label, ff_value
+GROUP BY message, ff_value
 ORDER BY access_count DESC;
 
 -- Correlation between feature flags and request performance by user plan
 WITH flag_traces AS (
-  SELECT DISTINCT trace_id, label as flag_name, ff_value, user_id
+  SELECT DISTINCT trace_id, message as flag_name, ff_value, user_id
   FROM traces
-  WHERE entry_type = 'ff-access' AND label = 'advancedValidation'
+  WHERE entry_type = 'ff-access' AND message = 'advancedValidation'
 ),
 user_plans AS (
   SELECT DISTINCT trace_id, user_plan

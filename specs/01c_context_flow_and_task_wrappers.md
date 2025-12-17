@@ -457,7 +457,7 @@ specific user in a batch job).
 ### Basic Child Span (Context Inherited)
 
 ```typescript
-function createChildSpan(parentCtx: SpanContext, label: string, childFn: SpanFunction) {
+function createChildSpan(parentCtx: SpanContext, spanName: string, childFn: SpanFunction) {
   return async () => {
     // Create child buffer linked to parent
     // Child uses same threadId as parent (same worker)
@@ -466,7 +466,7 @@ function createChildSpan(parentCtx: SpanContext, label: string, childFn: SpanFun
       parentCtx.buffer.task.module.schema,
       {
         ...parentCtx.buffer.task,
-        spanNameId: internString(label),
+        spanNameId: internString(spanName),
         lineNumber: getCurrentLineNumber(),
       },
       parentCtx.traceId,
@@ -508,7 +508,7 @@ interface SpanOptions {
 
 function createChildSpanWithContext(
   parentCtx: SpanContext,
-  label: string,
+  spanName: string,
   options: SpanOptions,
   childFn: SpanFunction
 ) {
@@ -516,7 +516,7 @@ function createChildSpanWithContext(
     // Create child buffer linked to parent
     const childBuffer = createSpanBuffer(parentCtx.buffer.task.module.schema, {
       ...parentCtx.buffer.task,
-      spanNameId: internString(label),
+      spanNameId: internString(spanName),
       lineNumber: getCurrentLineNumber(),
     });
 
@@ -604,7 +604,7 @@ export const processBatch = task('process-batch', async (ctx, users: User[]) => 
 
         if (premiumFeatures) {
           await enablePremiumForUser(user);
-          premiumFeatures.track({ outcome: 'enabled' });
+          premiumFeatures.track();
         }
       }
     );
@@ -639,7 +639,7 @@ export const createUser = task('create-user', async (ctx, userData: UserData) =>
     const result = await performAdvancedValidation(userData);
     // Track usage without repeating flag name
     advancedValidation.track({
-      outcome: result.success ? 'success' : 'failure',
+      result: result.success ? 'success' : 'failure',
     });
   }
 
@@ -673,7 +673,7 @@ export const processOrder = task('process-order', async (ctx, order: Order) => {
     const { strictValidation } = childCtx.ff;
 
     if (strictValidation) {
-      strictValidation.track({ outcome: 'order_validation' });
+      strictValidation.track();
     }
 
     if (order.items.length === 0) {
@@ -715,7 +715,7 @@ export const processBatch = task('process-batch', async (ctx, users: User[]) => 
   const { batchProcessing } = ctx.ff; // Evaluated without userId
 
   if (batchProcessing) {
-    batchProcessing.track({ outcome: 'batch_started' });
+    batchProcessing.track();
   }
 
   for (const user of users) {
@@ -730,12 +730,12 @@ export const processBatch = task('process-batch', async (ctx, users: User[]) => 
 
         if (premiumFeatures) {
           await enablePremiumForUser(user);
-          premiumFeatures.track({ outcome: 'enabled' });
+          premiumFeatures.track();
         }
 
         if (betaAccess) {
           await enrollInBeta(user);
-          betaAccess.track({ outcome: 'enrolled' });
+          betaAccess.track();
         }
 
         return childCtx.ok({ userId: user.id });
@@ -765,13 +765,13 @@ export const demonstrateDeduplication = task('demo', async (ctx) => {
 
     if (childFlag) {
       // track() always logs ff-usage (not deduplicated)
-      childFlag.track({ outcome: 'used-in-child' });
-      childFlag.track({ outcome: 'used-again' }); // Also logged
+      childFlag.track();
+      childFlag.track(); // Also logged
     }
   });
 
   if (featureA) {
-    featureA.track({ outcome: 'used-in-parent' }); // Logged to parent span
+    featureA.track(); // Logged to parent span
   }
 
   return ctx.ok({});

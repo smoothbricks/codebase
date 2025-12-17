@@ -71,7 +71,7 @@ describe('Span Scope Attributes', () => {
       const schema = defineTagAttributes({
         userId: S.category(),
         requestId: S.category(),
-        action: S.category(),
+        step: S.category(),
       });
 
       const module = createModuleContext({
@@ -92,7 +92,7 @@ describe('Span Scope Attributes', () => {
 
         // All subsequent operations should include scoped attributes
         ctx.log.info('Step 1');
-        ctx.tag.action('step2');
+        ctx.tag.step('step2');
         ctx.log.info('Step 3');
 
         return ctx.ok('done');

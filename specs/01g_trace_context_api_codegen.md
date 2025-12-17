@@ -76,25 +76,27 @@ interface GeneratedColumnWriters {
 Each entry type gets bound versions of the column writers:
 
 ```typescript
-// Generated for each entry type
+// Generated for tag API - writes directly to row 0 (span-start row)
+// Note: ctx.tag does NOT create a separate entry type - it updates span-start attributes
 class TagAPI {
-  constructor(private writers: GeneratedColumnWriters) {}
+  constructor(private buffer: SpanBuffer) {}
 
-  // Object-based API
-  (attributes: Partial<HttpLibrarySchema>): void {
+  // Object-based API - writes to row 0
+  (attributes: Partial<HttpLibrarySchema>): this {
     for (const [key, value] of Object.entries(attributes)) {
-      this.writers[`write${capitalize(key)}`]('tag', value);
+      this.buffer[`attr_${key}`][0] = value;  // Always row 0
     }
+    return this;
   }
 
   // Property-based API (generated for each schema property)
   httpStatus(value: number): this {
-    this.writers.writeHttpStatus('tag', value);
+    this.buffer.attr_httpStatus[0] = value;  // Always row 0
     return this;
   }
 
   httpMethod(value: string): this {
-    this.writers.writeHttpMethod('tag', value);
+    this.buffer.attr_httpMethod[0] = value;  // Always row 0
     return this;
   }
 
@@ -417,7 +419,7 @@ if (ctx.ff.advancedValidation) {
 }
 
 // Creates ff-usage entry
-ctx.ff.trackUsage('advancedValidation', { action: 'validation_performed' });
+ctx.ff.track('advancedValidation'); // User-defined attributes can be chained
 ```
 
 **Implementation Notes** (design TBD):

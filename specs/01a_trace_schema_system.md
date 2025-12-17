@@ -445,7 +445,7 @@ const baseAttributes = defineTagAttributes({
   // Feature flag operations use ff-access and ff-usage entry types
   // They write directly to span buffer via ctx.ff methods
   // Flag evaluation context stored in regular attribute columns
-  // Flag name stored in unified `label` column (same as span name / log template)
+  // Flag name stored in unified `message` column (same as span name / log template)
   // Only ffValue is FF-specific (S.category for efficient storage of repeated values)
 });
 ```
@@ -508,19 +508,19 @@ returns a chainable API just like `ctx.tag` and `ctx.log.info()`.
 
 ```typescript
 // Track flag usage with chainable attributes
-ctx.ff.track('darkMode').action('button-click').outcome('converted');
+ctx.ff.track('darkMode').variant(ctx.ff.darkMode);
 
-// Typical pattern: check flag, then track
+// Typical pattern: check flag, then track with user-defined attributes
 if (ctx.ff.darkMode) {
-  ctx.ff.track('darkMode').action('enabled-path');
+  ctx.ff.track('darkMode');
   applyDarkTheme();
 }
 
-// Track with multiple attributes (chainable)
-ctx.ff.track('buttonColor').variant(ctx.ff.buttonColor).action('clicked').outcome('checkout-started');
+// Track with multiple user-defined attributes (chainable)
+ctx.ff.track('buttonColor').variant(ctx.ff.buttonColor);
 
-// Track numeric flag usage
-ctx.ff.track('maxItems').action('pagination').requested(100).returned(ctx.ff.maxItems);
+// Track numeric flag usage with user-defined attributes
+ctx.ff.track('maxItems').requested(100).returned(ctx.ff.maxItems);
 ```
 
 ### Track Uses Same Schema as Tag
@@ -529,20 +529,20 @@ The `track()` method returns a chainable API that writes to the **same columns**
 tracking schema - this keeps the Arrow table structure unified and avoids column name collisions.
 
 ```typescript
-// Your tag attributes schema
+// Your tag attributes schema (user-defined)
 const tagAttributes = defineTagAttributes({
-  action: S.category(), // 'button-click', 'page-view', 'api-call'
-  outcome: S.category(), // 'converted', 'bounced', 'error'
+  variant: S.category(), // flag variant value
   userId: S.category(),
   duration: S.number(),
+  requested: S.number(),
+  returned: S.number(),
 });
 
 // track() returns chainable API with SAME methods as ctx.tag
 // Equivalent to:
 // 1. Write entry_type = FF_USAGE
-// 2. Write label = 'darkMode'  (unified label column - flag name)
-// 3. Write attr_action = 'button-click'  (from tag schema)
-// 4. Write attr_outcome = 'converted'    (from tag schema)
+// 2. Write message = 'darkMode'  (unified message column - flag name)
+// 3. Write user-defined attributes (from tag schema)
 ```
 
 **System columns** (defined in systemSchema):
@@ -563,42 +563,43 @@ const systemSchema = defineTagAttributes({
   parentSpanId: S.number().nullable(), // Parent span's ID (null for root spans)
 
   entryType: S.enum([
-    // Entry type enum
-    'span-start',
-    'span-ok',
-    'span-err',
-    'span-exception',
-    'info',
-    'debug',
-    'warn',
-    'error',
-    'tag',
-    'ff-access',
-    'ff-usage',
+    // Entry type enum (1-10, no gaps)
+    'span-start', // 1
+    'span-ok', // 2
+    'span-err', // 3
+    'span-exception', // 4
+    'info', // 5
+    'debug', // 6
+    'warn', // 7
+    'error', // 8
+    'ff-access', // 9
+    'ff-usage', // 10
   ]),
   module: S.category(), // Module name
 
-  // UNIFIED LABEL COLUMN - span name, log message template, OR flag name
-  label: S.category(), // See "The label System Column" below
+  // UNIFIED MESSAGE COLUMN - span name, log message template, exception message, result message, OR flag name
+  message: S.category(), // See "The message System Column" below
 
   // Feature flag value column
   ffValue: S.category(), // Flag value - uses category for efficient storage (values repeat: true/false, 'blue'/'green', etc.)
 });
 ```
 
-### The `label` System Column
+### The `message` System Column
 
-The `label` column is a **unified column** that serves different purposes based on entry type:
+The `message` column is a **unified column** that serves different purposes based on entry type:
 
-| Entry Type                                                   | What `label` Contains                                       |
-| ------------------------------------------------------------ | ----------------------------------------------------------- |
-| `span-start`, `span-ok`, `span-err`, `span-exception`, `tag` | **Span name** (e.g., `'create-user'`)                       |
-| `info`, `debug`, `warn`, `error`                             | **Log message template** (e.g., `'User ${userId} created'`) |
-| `ff-access`, `ff-usage`                                      | **Flag name** (e.g., `'darkMode'`, `'advancedValidation'`)  |
+| Entry Type                          | What `message` Contains                                     |
+| ----------------------------------- | ----------------------------------------------------------- |
+| `span-start`, `span-ok`, `span-err` | **Span name** (e.g., `'create-user'`)                       |
+| `span-exception`                    | **Exception message** (e.g., `'TypeError: x is not a fn'`)  |
+| `info`, `debug`, `warn`, `error`    | **Log message template** (e.g., `'User ${userId} created'`) |
+| `ff-access`, `ff-usage`             | **Flag name** (e.g., `'darkMode'`, `'advancedValidation'`)  |
 
 **Why unified?**
 
-1. **Simpler schema**: One column instead of separate `span_name`, `message`, and `ffName` columns (most would be null)
+1. **Simpler schema**: One column instead of separate `span_name`, `log_message`, `exception_message`, and `ff_name`
+   columns (most would be null)
 2. **Better storage**: `S.category()` means string interning - templates/names stored once
 3. **Efficient queries**: Find all logs matching a template pattern, or all accesses of a specific flag
 
@@ -609,12 +610,12 @@ The `label` column is a **unified column** that serves different purposes based 
 ctx.log.info('User ${userId} processed ${count} items').userId('user-123').count(42);
 
 // Stores:
-// - label: 'User ${userId} processed ${count} items'  (template, interned)
-// - attr_userId: 'user-123'                           (value, in typed column)
-// - attr_count: 42                                    (value, in typed column)
+// - message: 'User ${userId} processed ${count} items'  (template, interned)
+// - attr_userId: 'user-123'                             (value, in typed column)
+// - attr_count: 42                                      (value, in typed column)
 
 // NOT:
-// - label: 'User user-123 processed 42 items'  (interpolated - WRONG!)
+// - message: 'User user-123 processed 42 items'  (interpolated - WRONG!)
 ```
 
 The template string is stored verbatim. Values go in their typed attribute columns.
@@ -630,8 +631,8 @@ const enabled = ctx.ff.darkMode; // Logs ff-access entry
 const enabled2 = ctx.ff.darkMode; // No log - cached for this span
 
 // Tracking is always logged (not deduplicated)
-ctx.ff.track('darkMode').action('path-a'); // Logs ff-usage entry
-ctx.ff.track('darkMode').action('path-b'); // Logs another ff-usage
+ctx.ff.track('darkMode'); // Logs ff-usage entry
+ctx.ff.track('darkMode'); // Logs another ff-usage
 ```
 
 ### Relationship to Scope Attributes
@@ -683,7 +684,7 @@ const { premiumFeatures } = userCtx.ff; // Evaluated WITH userId context!
 userCtx.log.info('Processing'); // Auto-includes userId from scope
 
 if (premiumFeatures) {
-  userCtx.ff.track('premiumFeatures').outcome('enabled');
+  userCtx.ff.track('premiumFeatures');
 }
 ```
 
@@ -851,7 +852,7 @@ await ctx.span(
     childCtx.log.info('Processing'); // Auto-includes userId, region from scope
 
     if (premiumFeatures) {
-      childCtx.ff.track('premiumFeatures').outcome('enabled');
+      childCtx.ff.track('premiumFeatures');
     }
   }
 );
@@ -977,7 +978,7 @@ await ctx.span('processUser', { userId: 'user-456' }, async (childCtx) => {
 
   if (premiumEnabled) {
     // This user has premium features enabled
-    childCtx.ff.track('premiumFeatures').outcome('used');
+    childCtx.ff.track('premiumFeatures');
   }
 });
 ```
@@ -1217,7 +1218,7 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> 
 
     buffer.timestamps[idx] = getTimestampMicros(ctx.anchorEpochMicros, ctx.anchorPerfNow);
     buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-    buffer.label[idx] = internString(String(flagName)); // Unified label column
+    buffer.message[idx] = internString(String(flagName)); // Unified message column
 
     // Return chainable tracker using SAME schema as ctx.tag
     return this.createChainableTracker(idx);
@@ -1255,7 +1256,7 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> 
 
     buffer.timestamps[idx] = getTimestampMicros(this.ctx.anchorEpochMicros, this.ctx.anchorPerfNow);
     buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-    buffer.label[idx] = internString(flagName); // Unified label column
+    buffer.message[idx] = internString(flagName); // Unified message column
     buffer.attr_ffValue[idx] = internString(String(value)); // S.category for efficient storage
   }
 
@@ -1380,9 +1381,9 @@ instantiation cost.
 
 **Unified Schema**: The `track()` method uses the **same schema as `ctx.tag`**:
 
-- Same column names (`attr_action`, `attr_outcome`, not `attr_ff_action`)
+- Same column names (user-defined attributes like `attr_variant`, not `attr_ff_variant`)
 - Same Arrow table structure - no schema split
-- Flag name stored in unified `label` column (consistent with span names and log templates)
+- Flag name stored in unified `message` column (consistent with span names and log templates)
 - Only `ffValue` is FF-specific (S.category for efficient storage of repeated values like true/false)
 
 **Per-Span Caching**: Each accessor has fresh caches:
@@ -1442,7 +1443,7 @@ The singleton `ffEvaluator` is available in the module scope (created at app sta
 - Full context access: Evaluation can log, create spans, access env
 - V8 optimized: Returns primitives, no wrapper objects
 - Unified schema: `track()` uses same columns as `ctx.tag`
-- Consistent chainable API: `ctx.ff.track('flag').action('click').outcome('converted')`
+- Consistent chainable API: `ctx.ff.track('flag').variant(value)` (user-defined attributes)
 - Deduped ff-access logging: Only first access per span logged
 - Type-safe: TypeScript knows flag value types
 
@@ -1644,10 +1645,7 @@ export const createUser = task('create-user', async (ctx, userData: UserData) =>
   if (advancedValidation) {
     const result = await performAdvancedValidation(userData);
     // Track usage with chainable API
-    ctx.ff
-      .track('advancedValidation')
-      .action('validation')
-      .outcome(result.success ? 'success' : 'failure');
+    ctx.ff.track('advancedValidation');
   }
 
   // Environment access (just plain property access, no tracking)
@@ -1707,7 +1705,7 @@ export const processBatch = task('process-batch', async (ctx, users: User[]) => 
         if (premiumEnabled) {
           // This flag was evaluated knowing the user's plan
           await enablePremiumFeatures(user);
-          childCtx.ff.track('premiumFeatures').outcome('enabled');
+          childCtx.ff.track('premiumFeatures');
         }
       }
     );

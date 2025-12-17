@@ -366,10 +366,10 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_INFO;
 
-      // Write message to unified label column (log message template)
-      if (this._buffer.label_values) {
-        this._buffer.label_values[idx] = message;
-        helpers.setNullBit(this._buffer.label_nulls, idx);
+      // Write message to unified message column (log message template)
+      if (this._buffer.message_values) {
+        this._buffer.message_values[idx] = message;
+        helpers.setNullBit(this._buffer.message_nulls, idx);
       }
 
       // Apply scoped attributes
@@ -388,9 +388,9 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_DEBUG;
 
-      if (this._buffer.label_values) {
-        this._buffer.label_values[idx] = message;
-        helpers.setNullBit(this._buffer.label_nulls, idx);
+      if (this._buffer.message_values) {
+        this._buffer.message_values[idx] = message;
+        helpers.setNullBit(this._buffer.message_nulls, idx);
       }
 
       ${scopeWrites}
@@ -408,9 +408,9 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_WARN;
 
-      if (this._buffer.label_values) {
-        this._buffer.label_values[idx] = message;
-        helpers.setNullBit(this._buffer.label_nulls, idx);
+      if (this._buffer.message_values) {
+        this._buffer.message_values[idx] = message;
+        helpers.setNullBit(this._buffer.message_nulls, idx);
       }
 
       ${scopeWrites}
@@ -428,9 +428,9 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_ERROR;
 
-      if (this._buffer.label_values) {
-        this._buffer.label_values[idx] = message;
-        helpers.setNullBit(this._buffer.label_nulls, idx);
+      if (this._buffer.message_values) {
+        this._buffer.message_values[idx] = message;
+        helpers.setNullBit(this._buffer.message_nulls, idx);
       }
 
       ${scopeWrites}
@@ -448,9 +448,9 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_TRACE;
 
-      if (this._buffer.label_values) {
-        this._buffer.label_values[idx] = message;
-        helpers.setNullBit(this._buffer.label_nulls, idx);
+      if (this._buffer.message_values) {
+        this._buffer.message_values[idx] = message;
+        helpers.setNullBit(this._buffer.message_nulls, idx);
       }
 
       ${scopeWrites}

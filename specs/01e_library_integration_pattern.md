@@ -293,7 +293,7 @@ The final Arrow table has clean, collision-free columns:
 | `business_metric`  | `float64`            | Custom metric                   | User-defined        |
 | `ff_value`         | `dictionary<string>` | Feature flag value (S.category) | Feature flag system |
 
-**Note**: Feature flag names are stored in the unified `label` column for `ff-access` and `ff-usage` entries.
+**Note**: Feature flag names are stored in the unified `message` column for `ff-access` and `ff-usage` entries.
 
 ### ClickHouse Query Examples
 
@@ -321,14 +321,14 @@ GROUP BY user_id
 HAVING count(*) > 10;
 
 -- Feature flag usage analysis
--- Note: flag name is in the unified `label` column
+-- Note: flag name is in the unified `message` column
 SELECT
-  label as flag_name,
+  message as flag_name,
   count(*) as access_count,
   sum(if(ff_value = 'true', 1, 0)) as enabled_count
 FROM traces
 WHERE entry_type = 'ff-access'
-GROUP BY label
+GROUP BY message
 ORDER BY access_count DESC;
 ```
 

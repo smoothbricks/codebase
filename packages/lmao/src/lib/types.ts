@@ -61,10 +61,10 @@ export interface SpanBuffer extends ColumnBuffer {
   // ============================================================================
 
   /**
-   * Set unified label at position (category/string column).
-   * Used for span names, log message templates, and feature flag names.
+   * Set unified message at position (category/string column).
+   * Used for span names, log messages, exception messages, result messages, and FF names.
    */
-  label(pos: number, val: string): this;
+  message(pos: number, val: string): this;
 
   /** Set line number at position (number column) */
   lineNumber(pos: number, val: number): this;
@@ -72,29 +72,11 @@ export interface SpanBuffer extends ColumnBuffer {
   /** Set error code at position (category/string column) */
   errorCode(pos: number, val: string): this;
 
-  /** Set exception message at position (text/string column) */
-  exceptionMessage(pos: number, val: string): this;
-
   /** Set exception stack at position (text/string column) */
   exceptionStack(pos: number, val: string): this;
 
-  /** Set result message at position (text/string column) */
-  resultMessage(pos: number, val: string): this;
-
   /** Set feature flag value at position (category/string column) */
   ffValue(pos: number, val: string): this;
-
-  /** Set action at position (category/string column) */
-  action(pos: number, val: string): this;
-
-  /** Set outcome at position (category/string column) */
-  outcome(pos: number, val: string): this;
-
-  /** Set context user ID at position (category/string column) */
-  contextUserId(pos: number, val: string): this;
-
-  /** Set context request ID at position (category/string column) */
-  contextRequestId(pos: number, val: string): this;
 
   // ============================================================================
   // Unified System ArrayBuffer

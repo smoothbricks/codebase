@@ -19,16 +19,15 @@ import { defineTagAttributes } from '../schema/defineTagAttributes.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 import type { TagAttributeSchema } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
+import type { SpanBuffer } from '../types.js';
 import { createTestTaskContext } from './test-helpers.js';
 
 // Test schema
+// Note: resultMessage, exceptionMessage, errorCode, and exceptionStack are now system columns
+// (defined in systemSchema) - they don't need to be defined here
 const testSchema = defineTagAttributes({
   userId: S.category(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
-  errorCode: S.category(),
-  resultMessage: S.text(),
-  exceptionMessage: S.text(),
-  exceptionStack: S.text(),
   spanName: S.category(),
 });
 
@@ -398,7 +397,7 @@ describe('FluentResult Type Compatibility', () => {
  * - Row 2+: events (ctx.log.* appends here)
  */
 describe('Fixed Row Layout', () => {
-  it('should have span-start at row 0 after task begins', async () => {
+  it('should have span-start at row 0 and span-ok at row 1 after ctx.ok()', async () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
@@ -408,60 +407,22 @@ describe('Fixed Row Layout', () => {
       tagAttributes: testSchema,
     });
 
+    let capturedBuffer: SpanBuffer | undefined;
     const task = moduleCtx.task('test-task', async (ctx) => {
-      // Access ctx internals to capture buffer
-      // The buffer is created when task starts
+      capturedBuffer = ctx.buffer;
       return ctx.ok('done');
     });
 
     const requestCtx = createRequestContext({ requestId: 'req1', userId: 'user1' }, testFlags, mockEvaluator, {});
-    await task(requestCtx);
-
-    // Row 0 should have ENTRY_TYPE_SPAN_START (5)
-    // This is verified via the entry type constants
-    expect(ENTRY_TYPE_SPAN_START).toBe(5);
-  });
-
-  it('should pre-initialize row 1 as span-exception', async () => {
-    // Create a buffer directly to test the pre-initialization
-    const { validate, parse, safeParse, extend, ...schemaFields } = testSchema;
-    const taskContext = createTestTaskContext(schemaFields as TagAttributeSchema);
-    const buffer = createSpanBuffer(schemaFields as TagAttributeSchema, taskContext);
-
-    // Row 1 is NOT pre-initialized at createSpanBuffer level
-    // Pre-initialization happens in writeSpanStart (called by task wrapper)
-    // So a fresh buffer has writeIndex = 0
-    expect(buffer.writeIndex).toBe(0);
-
-    // The operations array should exist
-    expect(buffer.operations).toBeInstanceOf(Uint8Array);
-  });
-
-  it('should have span-ok at row 1 after ctx.ok()', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
-      },
-      tagAttributes: testSchema,
-    });
-
-    // We can verify the behavior through the FluentSuccessResult class
-    // which writes ENTRY_TYPE_SPAN_OK to row 1
-    const task = moduleCtx.task('test', async (ctx) => {
-      return ctx.ok('success');
-    });
-
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
     const result = await task(requestCtx);
 
     expect(result.success).toBe(true);
-    // The fact that ctx.ok() works confirms row 1 gets span-ok (6)
-    expect(ENTRY_TYPE_SPAN_OK).toBe(6);
+    expect(capturedBuffer).toBeDefined();
+    expect(capturedBuffer!.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer!.operations[1]).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
-  it('should have span-err at row 1 after ctx.err()', async () => {
+  it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
@@ -471,7 +432,9 @@ describe('Fixed Row Layout', () => {
       tagAttributes: testSchema,
     });
 
+    let capturedBuffer: SpanBuffer | undefined;
     const task = moduleCtx.task('test', async (ctx) => {
+      capturedBuffer = ctx.buffer;
       return ctx.err('ERROR_CODE', { detail: 'error detail' });
     });
 
@@ -479,11 +442,12 @@ describe('Fixed Row Layout', () => {
     const result = await task(requestCtx);
 
     expect(result.success).toBe(false);
-    // The fact that ctx.err() works confirms row 1 gets span-err (7)
-    expect(ENTRY_TYPE_SPAN_ERR).toBe(7);
+    expect(capturedBuffer).toBeDefined();
+    expect(capturedBuffer!.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer!.operations[1]).toBe(ENTRY_TYPE_SPAN_ERR);
   });
 
-  it('should keep span-exception at row 1 on thrown error', async () => {
+  it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
@@ -493,15 +457,18 @@ describe('Fixed Row Layout', () => {
       tagAttributes: testSchema,
     });
 
+    let capturedBuffer: SpanBuffer | undefined;
     const task = moduleCtx.task('test', async (ctx) => {
+      capturedBuffer = ctx.buffer;
       throw new Error('Unexpected failure');
     });
 
     const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
 
     await expect(task(requestCtx)).rejects.toThrow('Unexpected failure');
-    // When an exception is thrown, row 1 keeps span-exception (8)
-    expect(ENTRY_TYPE_SPAN_EXCEPTION).toBe(8);
+    expect(capturedBuffer).toBeDefined();
+    expect(capturedBuffer!.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer!.operations[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
   });
 
   it('should start writeIndex at 2 after span-start is written', async () => {

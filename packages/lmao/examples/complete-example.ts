@@ -12,27 +12,28 @@
  */
 
 import {
-  categoryInterner,
   createModuleContext,
   createRequestContext,
   defineFeatureFlags,
   defineTagAttributes,
   FlushScheduler,
   InMemoryFlagEvaluator,
+  labelInterner,
   moduleIdInterner,
   S,
-  spanNameInterner,
-  textStringStorage,
 } from '../src/index.js';
+
+// Note: labelInterner is the unified interner for span names, log message templates, and feature flag names.
+// It's passed to FlushScheduler as the 'spanNameInterner' parameter.
 
 // ====================
 // 1. Define Tag Attributes
 // ====================
 
 // Using the three string types per specs/01a_trace_schema_system.md:
-// - S.enum(): Known values at compile time → Uint8Array (1 byte)
-// - S.category(): Values that repeat → Uint32Array with string interning
-// - S.text(): Unique values → Uint32Array without interning
+// - S.enum(): Known values at compile time -> Uint8Array (1 byte)
+// - S.category(): Values that repeat -> Uint32Array with string interning
+// - S.text(): Unique values -> Uint32Array without interning
 
 const orderSchema = defineTagAttributes({
   // Enum: Known operations at compile time
@@ -97,6 +98,7 @@ const orderModule = createModuleContext({
 // 5. Setup FlushScheduler
 // ====================
 
+// FlushScheduler takes: handler, moduleIdInterner, spanNameInterner (labelInterner), config
 const scheduler = new FlushScheduler(
   // Flush handler - receives Arrow table
   (table, metadata) => {
@@ -112,10 +114,8 @@ const scheduler = new FlushScheduler(
     // - Send to analytics service
     // - etc.
   },
-  categoryInterner,
-  textStringStorage,
   moduleIdInterner,
-  spanNameInterner,
+  labelInterner, // The unified label interner (used for span names, log messages, FF names)
   {
     maxFlushInterval: 5000, // Flush every 5 seconds
     capacityThreshold: 0.8, // Flush when 80% full
@@ -252,6 +252,12 @@ const processPayment = orderModule.task('process-payment', async (ctx, orderId: 
   });
 
   ctx.log.info('Payment processing started');
+
+  // Simulate payment validation - amounts over 10000 are rejected
+  if (amount > 10000) {
+    ctx.log.scope({ httpStatus: 400 });
+    return ctx.err('AMOUNT_TOO_LARGE', { amount, maxAmount: 10000 });
+  }
 
   // Check experimental payment flow (async)
   const useExperimentalFlow = await ctx.ff.get('experimentalPaymentFlow');

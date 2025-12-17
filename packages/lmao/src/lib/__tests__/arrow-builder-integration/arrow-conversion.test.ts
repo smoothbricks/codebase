@@ -11,6 +11,19 @@
 
 import { beforeEach, describe, expect, test } from 'bun:test';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
+import {
+  ENTRY_TYPE_DEBUG,
+  ENTRY_TYPE_ERROR,
+  ENTRY_TYPE_FF_ACCESS,
+  ENTRY_TYPE_FF_USAGE,
+  ENTRY_TYPE_INFO,
+  ENTRY_TYPE_SPAN_ERR,
+  ENTRY_TYPE_SPAN_EXCEPTION,
+  ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_SPAN_START,
+  ENTRY_TYPE_TRACE,
+  ENTRY_TYPE_WARN,
+} from '../../lmao.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
@@ -181,10 +194,10 @@ describe('Arrow Table Conversion', () => {
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
 
-      // Write a row
+      // Write a row (operation 3 = span-start per ENTRY_TYPE_NAMES)
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 3, // tag
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: {
           count: 42,
           active: true,
@@ -203,9 +216,9 @@ describe('Arrow Table Conversion', () => {
       const timestampVector = batch.getChild('timestamp');
       expect(timestampVector?.get(0)).toBeDefined();
 
-      // Check entry type
+      // Check entry type (operation 3 = span-start)
       const entryTypeVector = batch.getChild('entry_type');
-      expect(entryTypeVector?.get(0)).toBe('tag');
+      expect(entryTypeVector?.get(0)).toBe('span-start');
 
       // Check attributes
       const countVector = batch.getChild('count');
@@ -232,7 +245,7 @@ describe('Arrow Table Conversion', () => {
       for (let i = 0; i < 5; i++) {
         writeRow(buffer, {
           timestamp: 1000n + BigInt(i),
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value: i * 10 },
         });
       }
@@ -267,19 +280,19 @@ describe('Arrow Table Conversion', () => {
       // Write rows with mix of null and non-null
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { value: 42 },
       });
 
       writeRow(buffer, {
         timestamp: 2000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { value: null },
       });
 
       writeRow(buffer, {
         timestamp: 3000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { value: 100 },
       });
 
@@ -310,7 +323,7 @@ describe('Arrow Table Conversion', () => {
       for (let i = 0; i < 3; i++) {
         writeRow(buffer, {
           timestamp: 1000n + BigInt(i),
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { optional: null },
         });
       }
@@ -344,19 +357,19 @@ describe('Arrow Table Conversion', () => {
       // Write rows with enum values (stored as indices 0, 1, 2)
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { status: 0 }, // 'pending'
       });
 
       writeRow(buffer, {
         timestamp: 2000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { status: 2 }, // 'completed'
       });
 
       writeRow(buffer, {
         timestamp: 3000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { status: 1 }, // 'active'
       });
 
@@ -386,19 +399,19 @@ describe('Arrow Table Conversion', () => {
       // Write rows with category values (stored as raw strings on hot path)
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { userId: 'user-123' },
       });
 
       writeRow(buffer, {
         timestamp: 2000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { userId: 'user-456' },
       });
 
       writeRow(buffer, {
         timestamp: 3000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { userId: 'user-123' }, // Repeated
       });
 
@@ -428,19 +441,19 @@ describe('Arrow Table Conversion', () => {
       // Write text messages (stored as raw strings on hot path)
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { message: 'First message' },
       });
 
       writeRow(buffer, {
         timestamp: 2000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { message: 'Second message' },
       });
 
       writeRow(buffer, {
         timestamp: 3000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { message: 'Third message' },
       });
 
@@ -473,7 +486,7 @@ describe('Arrow Table Conversion', () => {
       for (let i = 0; i < 3; i++) {
         writeRow(buffer, {
           timestamp: 1000n + BigInt(i),
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value: i },
         });
       }
@@ -485,7 +498,7 @@ describe('Arrow Table Conversion', () => {
       for (let i = 0; i < 2; i++) {
         writeRow(nextBuffer, {
           timestamp: 2000n + BigInt(i),
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value: 10 + i },
         });
       }
@@ -527,7 +540,7 @@ describe('Arrow Table Conversion', () => {
 
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { value: 1 },
       });
 
@@ -541,7 +554,7 @@ describe('Arrow Table Conversion', () => {
 
       writeRow(nextBuffer, {
         timestamp: 2000n,
-        operation: 3,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { value: 2 },
       });
 
@@ -576,7 +589,7 @@ describe('Arrow Table Conversion', () => {
       // Write to parent
       writeRow(parentBuffer, {
         timestamp: 1000n,
-        operation: 5, // span-start
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { value: 1 },
       });
 
@@ -587,20 +600,20 @@ describe('Arrow Table Conversion', () => {
       // Write to child
       writeRow(childBuffer, {
         timestamp: 2000n,
-        operation: 5, // span-start
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { value: 2 },
       });
 
       writeRow(childBuffer, {
         timestamp: 3000n,
-        operation: 6, // span-ok
+        operation: ENTRY_TYPE_SPAN_OK,
         attributes: { value: 3 },
       });
 
       // Close parent
       writeRow(parentBuffer, {
         timestamp: 4000n,
-        operation: 6, // span-ok
+        operation: ENTRY_TYPE_SPAN_OK,
         attributes: { value: 4 },
       });
 
@@ -652,7 +665,7 @@ describe('Arrow Table Conversion', () => {
 
       writeRow(root, {
         timestamp: 1000n,
-        operation: 5,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { depth: 0 },
       });
 
@@ -662,7 +675,7 @@ describe('Arrow Table Conversion', () => {
 
       writeRow(child1, {
         timestamp: 2000n,
-        operation: 5,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { depth: 1 },
       });
 
@@ -672,7 +685,7 @@ describe('Arrow Table Conversion', () => {
 
       writeRow(child2, {
         timestamp: 3000n,
-        operation: 5,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { depth: 2 },
       });
 
@@ -699,18 +712,20 @@ describe('Arrow Table Conversion', () => {
       moduleIdInterner.intern('test-file.ts');
       spanNameInterner.intern('test-span');
 
+      // Entry type codes per ENTRY_TYPE_NAMES in lmao.ts
+      // Ordered: span lifecycle (1-4), logging by verbosity (5-9), feature flags (10-11)
       const entryTypes = [
-        { code: 1, name: 'ff-access' },
-        { code: 2, name: 'ff-usage' },
-        { code: 3, name: 'tag' },
-        { code: 5, name: 'span-start' },
-        { code: 6, name: 'span-ok' },
-        { code: 7, name: 'span-err' },
-        { code: 8, name: 'span-exception' },
-        { code: 9, name: 'info' },
-        { code: 10, name: 'debug' },
-        { code: 11, name: 'warn' },
-        { code: 12, name: 'error' },
+        { code: ENTRY_TYPE_SPAN_START, name: 'span-start' },
+        { code: ENTRY_TYPE_SPAN_OK, name: 'span-ok' },
+        { code: ENTRY_TYPE_SPAN_ERR, name: 'span-err' },
+        { code: ENTRY_TYPE_SPAN_EXCEPTION, name: 'span-exception' },
+        { code: ENTRY_TYPE_TRACE, name: 'trace' },
+        { code: ENTRY_TYPE_DEBUG, name: 'debug' },
+        { code: ENTRY_TYPE_INFO, name: 'info' },
+        { code: ENTRY_TYPE_WARN, name: 'warn' },
+        { code: ENTRY_TYPE_ERROR, name: 'error' },
+        { code: ENTRY_TYPE_FF_ACCESS, name: 'ff-access' },
+        { code: ENTRY_TYPE_FF_USAGE, name: 'ff-usage' },
       ];
 
       for (const entryType of entryTypes) {
@@ -743,7 +758,7 @@ describe('Arrow Table Conversion', () => {
 
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 5,
+        operation: ENTRY_TYPE_SPAN_START,
       });
 
       const childContext = createMockTaskContext(schema);
@@ -751,7 +766,7 @@ describe('Arrow Table Conversion', () => {
 
       writeRow(childBuffer, {
         timestamp: 2000n,
-        operation: 5,
+        operation: ENTRY_TYPE_SPAN_START,
       });
 
       const table = convertSpanTreeToArrowTable(buffer, moduleIdInterner, spanNameInterner);

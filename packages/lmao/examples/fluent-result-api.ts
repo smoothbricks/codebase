@@ -15,15 +15,14 @@ import {
 } from '../src/index.js';
 
 // Define schema for user management operations
+// Note: resultMessage/exceptionMessage are not needed - use the unified .message() API
+// which writes to the system 'message' column
 const userSchema = defineTagAttributes({
   userId: S.category(),
   email: S.category(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
   duration: S.number(),
   errorCode: S.category(),
-  resultMessage: S.text(),
-  exceptionMessage: S.text(),
-  exceptionStack: S.text(),
 });
 
 const featureFlags = defineFeatureFlags({

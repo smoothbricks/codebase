@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'bun:test';
 import { createAttributeColumns, createColumnWriter, maskingTransforms } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from '@smoothbricks/lmao';
-import { convertToArrowTable, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
+import {
+  convertToArrowTable,
+  createSpanBuffer,
+  defineTagAttributes,
+  ENTRY_TYPE_SPAN_START,
+  S,
+} from '@smoothbricks/lmao';
 import { createTestTaskContext } from '../test-helpers.js';
 
 /**
@@ -199,7 +205,7 @@ describe('Buffer Integration', () => {
 
     // Set required system columns
     buffer.timestamps[0] = 1000n;
-    buffer.operations[0] = 3; // tag entry type
+    buffer.operations[0] = ENTRY_TYPE_SPAN_START;
     buffer.writeIndex = 1;
 
     // Convert to Arrow table
@@ -253,7 +259,7 @@ describe('Buffer Integration', () => {
 
     // Set required system columns
     buffer.timestamps[0] = 1000n;
-    buffer.operations[0] = 3; // tag entry type
+    buffer.operations[0] = ENTRY_TYPE_SPAN_START;
     buffer.writeIndex = 1;
 
     // Convert to Arrow table
@@ -306,7 +312,7 @@ describe('Buffer Integration', () => {
 
     // Set required system columns
     buffer.timestamps[0] = 1000n;
-    buffer.operations[0] = 3; // tag entry type
+    buffer.operations[0] = ENTRY_TYPE_SPAN_START;
     buffer.writeIndex = 1;
 
     // Convert to Arrow table

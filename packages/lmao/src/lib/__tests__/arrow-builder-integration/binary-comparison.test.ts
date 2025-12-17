@@ -15,6 +15,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import * as arrow from 'apache-arrow';
 import { convertToArrowTable } from '../../convertToArrow.js';
+import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_SPAN_START } from '../../lmao.js';
 import { S } from '../../schema/builder.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
@@ -194,7 +195,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const value of testValues) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value },
         });
       }
@@ -230,7 +231,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const value of testValues) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { flag: value },
         });
       }
@@ -257,7 +258,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const idx of testIndices) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { status: idx },
         });
       }
@@ -282,7 +283,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const userId of testValues) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { userId },
         });
       }
@@ -307,7 +308,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const value of testValues) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { message: value },
         });
       }
@@ -332,7 +333,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const value of testValues) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value },
         });
       }
@@ -366,7 +367,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const row of testData) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: row,
         });
       }
@@ -447,7 +448,7 @@ describe('Arrow IPC Round-Trip', () => {
 
       const taskContext = createMockTaskContext(schema);
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
-      writeRow(buffer, { timestamp: 1000n, operation: 1 });
+      writeRow(buffer, { timestamp: 1000n, operation: ENTRY_TYPE_SPAN_START });
 
       const table = convertToArrowTable(buffer, moduleIdInterner, spanNameInterner);
 
@@ -479,7 +480,7 @@ describe('Arrow IPC Round-Trip', () => {
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
       writeRow(buffer, {
         timestamp: 1000n,
-        operation: 1,
+        operation: ENTRY_TYPE_SPAN_START,
         attributes: { category: 'cat1', text: 'text1', status: 0 },
       });
 
@@ -512,7 +513,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const value of values) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value },
         });
       }
@@ -548,7 +549,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const value of values) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value },
         });
       }
@@ -580,7 +581,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const value of values) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { value },
         });
       }
@@ -610,7 +611,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (const category of testValues) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { category },
         });
       }
@@ -637,7 +638,7 @@ describe('Arrow IPC Round-Trip', () => {
       for (let i = 0; i < 100; i++) {
         writeRow(buffer, {
           timestamp: 1000n,
-          operation: 3,
+          operation: ENTRY_TYPE_SPAN_START,
           attributes: { userId: testValue },
         });
       }
