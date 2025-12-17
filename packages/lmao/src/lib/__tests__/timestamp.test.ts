@@ -2,6 +2,10 @@ import { describe, expect, it } from 'bun:test';
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 
+// Import browser module at top level to simulate it being cached (like in "Browser Timestamp" tests)
+// This tests that the cache-busting fix works even when the module is already cached
+await import('../timestamp.js');
+
 describe('Timestamp implementations and Nanoseconds.now assignment', () => {
   it('should set Nanoseconds.now to node implementation when node module is imported', async () => {
     // Dynamically import node module
@@ -19,12 +23,18 @@ describe('Timestamp implementations and Nanoseconds.now assignment', () => {
 
   it('should update Nanoseconds.now to browser implementation when browser module is imported after node', async () => {
     // First import node to set initial state
-    const nodeModule = await import('../timestamp.node.js');
+    // Use cache-busting query parameter to force fresh import (bypasses module cache)
+    // This ensures the module's top-level code executes and sets Nanoseconds.now
+    const nodeModule = await import(`../timestamp.node.js?v=${Date.now()}`);
     const nodeGetTimestamp = nodeModule.getTimestampNanos;
     expect(Nanoseconds.now).toBe(nodeGetTimestamp);
 
     // Then import browser - should replace Nanoseconds.now
-    const browserModule = await import('../timestamp.js');
+    // Use cache-busting query parameter to force fresh import (bypasses module cache)
+    // This ensures the module's top-level code executes and sets Nanoseconds.now
+    // Needed because if the browser module was already imported (e.g., in "Browser Timestamp" tests),
+    // the cached version won't re-execute its top-level code
+    const browserModule = await import(`../timestamp.js?v=${Date.now()}`);
     const browserGetTimestamp = browserModule.getTimestampNanos;
 
     // Verify Nanoseconds.now is now set to the browser implementation
