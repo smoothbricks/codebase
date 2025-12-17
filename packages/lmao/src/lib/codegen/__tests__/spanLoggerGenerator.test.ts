@@ -163,11 +163,13 @@ describe('createSpanLoggerClass', () => {
     it('should return this for fluent chaining', () => {
       const result = logger.info('Test message');
 
-      expect(result).toBe(logger);
+      // Result is typed as FluentLogEntry but at runtime it's the same object
+      expect(result as unknown).toBe(logger);
     });
 
     it('should support chaining logging methods', () => {
-      logger.info('First').info('Second').warn('Third');
+      // FluentLogEntry allows chaining back to logging methods
+      (logger.info('First') as unknown as typeof logger).info('Second').warn('Third');
 
       expect(logger._writeIndex).toBe(4);
       expect(buffer._operations[2]).toBe(ENTRY_TYPE_INFO);

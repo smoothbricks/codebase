@@ -351,6 +351,7 @@ function convertBuffersToRecordBatch(
       arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()) }),
     );
     fields.push(arrow.Field.new({ name: 'module', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
+    fields.push(arrow.Field.new({ name: 'git_sha', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
     fields.push(
       arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
     );
@@ -812,6 +813,42 @@ function buildDefaultSystemVectors(
     ),
   );
 
+  // Git SHA - extracted from module context
+  const gitShaSet = new Set<string>();
+  for (const buf of buffers) gitShaSet.add(buf.task.module.gitSha);
+  const gitShaArray = Array.from(gitShaSet);
+  const gitShaMap = new Map(gitShaArray.map((sha, idx) => [sha, idx]));
+
+  const gitShaIndices = new Int32Array(totalRows);
+  rowOffset = 0;
+  for (const buf of buffers) {
+    const gitShaIndex = gitShaMap.get(buf.task.module.gitSha)!;
+    // Use fill() - constant value per buffer
+    gitShaIndices.fill(gitShaIndex, rowOffset, rowOffset + buf.writeIndex);
+    rowOffset += buf.writeIndex;
+  }
+
+  const gitShaDictData = arrow.makeData({
+    type: new arrow.Utf8(),
+    offset: 0,
+    length: gitShaArray.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(gitShaArray),
+    data: encodeUtf8Strings(gitShaArray),
+  });
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: gitShaIndices,
+        dictionary: arrow.makeVector(gitShaDictData),
+      }),
+    ),
+  );
+
   // Span name
   const spanNameIdSet = new Set<number>();
   for (const buf of buffers) spanNameIdSet.add(buf.task.spanNameId);
@@ -1001,6 +1038,7 @@ export function convertSpanTreeToArrowTable(
   // System column dictionaries
   const traceIdBuilder = new ColumnDictionary();
   const moduleBuilder = new ColumnDictionary();
+  const gitShaBuilder = new ColumnDictionary();
   const spanNameBuilder = new ColumnDictionary();
 
   let totalRows = 0;
@@ -1008,10 +1046,12 @@ export function convertSpanTreeToArrowTable(
     totalRows += buffer.writeIndex;
     traceIdBuilder.add(buffer.traceId);
 
-    // Add module and span name to their shared dictionaries
+    // Add module, git SHA and span name to their shared dictionaries
     const moduleName = moduleIdInterner.getString(buffer.task.module.moduleId) || 'unknown';
+    const gitSha = buffer.task.module.gitSha;
     const spanName = spanNameInterner.getString(buffer.task.spanNameId) || 'unknown';
     moduleBuilder.add(moduleName);
+    gitShaBuilder.add(gitSha);
     spanNameBuilder.add(spanName);
 
     for (const [fieldName, builder] of categoryBuilders) {
@@ -1058,6 +1098,7 @@ export function convertSpanTreeToArrowTable(
   // Finalize dictionaries
   const traceIdDict = traceIdBuilder.finalize(false);
   const moduleDict = moduleBuilder.finalize(true); // sorted
+  const gitShaDict = gitShaBuilder.finalize(true); // sorted
   const spanNameDict = spanNameBuilder.finalize(true); // sorted
   const categoryDicts = new Map<string, FinalizedDict>();
   const textDicts = new Map<string, FinalizedDict>();
@@ -1091,11 +1132,14 @@ export function convertSpanTreeToArrowTable(
     arrow.Field.new({ name: 'module', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 2) }),
   );
   arrowFields.push(
-    arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 3) }),
+    arrow.Field.new({ name: 'git_sha', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 3) }),
+  );
+  arrowFields.push(
+    arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 4) }),
   );
 
-  // Attribute columns - assign dictionary IDs starting at 4
-  let nextDictId = 4;
+  // Attribute columns - assign dictionary IDs starting at 5
+  let nextDictId = 5;
   const attrDictIds = new Map<string, number>();
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
@@ -1156,6 +1200,7 @@ export function convertSpanTreeToArrowTable(
     arrowSchema,
     traceIdDict,
     moduleDict,
+    gitShaDict,
     spanNameDict,
     categoryDicts,
     textDicts,
@@ -1180,6 +1225,7 @@ function convertBuffersWithSharedDicts(
   arrowSchema: arrow.Schema,
   traceIdDict: FinalizedDict,
   moduleDict: FinalizedDict,
+  gitShaDict: FinalizedDict,
   spanNameDict: FinalizedDict,
   categoryDicts: Map<string, FinalizedDict>,
   textDicts: Map<string, FinalizedDict>,
@@ -1199,7 +1245,8 @@ function convertBuffersWithSharedDicts(
   // Span ID columns: thread_id (2), span_id (3), parent_thread_id (4), parent_span_id (5)
   const entryTypeType = arrowSchema.fields[6].type as arrow.Dictionary<arrow.Utf8, arrow.Int8>;
   const moduleType = arrowSchema.fields[7].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
-  const spanNameType = arrowSchema.fields[8].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const gitShaType = arrowSchema.fields[8].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const spanNameType = arrowSchema.fields[9].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // System columns - concatenate data from all buffers
@@ -1417,6 +1464,38 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
+  // Git SHA (using shared dictionary)
+  const gitShaIndices2 = new Int32Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    const gitSha = buf.task.module.gitSha;
+    const idx = gitShaDict.indexMap.get(gitSha) ?? 0;
+    // Use fill() - constant value per buffer
+    gitShaIndices2.fill(idx, offset, offset + buf.writeIndex);
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: gitShaType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: gitShaIndices2,
+        dictionary: arrow.makeVector(
+          arrow.makeData({
+            type: new arrow.Utf8(),
+            offset: 0,
+            length: gitShaDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: gitShaDict.offsets,
+            data: gitShaDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
   // Span name (using shared dictionary)
   const spanNameIndices = new Int32Array(totalRows);
   offset = 0;
@@ -1453,7 +1532,7 @@ function convertBuffersWithSharedDicts(
   // Attribute columns - concatenate from all buffers
   // ═══════════════════════════════════════════════════════════════════════════
   // System fields: timestamp, trace_id, thread_id, span_id, parent_thread_id, parent_span_id, entry_type, module, span_name
-  const SYSTEM_FIELDS_COUNT = 9;
+  const SYSTEM_FIELDS_COUNT = 10;
   let fieldIdx = SYSTEM_FIELDS_COUNT;
 
   for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {

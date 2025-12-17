@@ -658,6 +658,18 @@ export interface SpanContext<T extends TagAttributeSchema, FF extends FeatureFla
    * }).line(42);
    */
   span<R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>, line?: number): Promise<R>;
+
+  /**
+   * The underlying SpanBuffer for this context.
+   *
+   * Useful for Arrow table conversion after task completion.
+   * The buffer contains all trace data written during this span's execution.
+   *
+   * @example
+   * const result = await myTask(requestCtx, args);
+   * const table = convertToArrowTable(ctx.buffer, moduleIdInterner, labelInterner);
+   */
+  readonly buffer: SpanBuffer;
 }
 
 /**
@@ -1222,6 +1234,9 @@ export function createModuleContext<
           ...requestCtx,
           tag: tagAPI,
           log: spanLogger as SpanLogger<T>,
+          get buffer() {
+            return (tagAPI as unknown as { _buffer: SpanBuffer })._buffer;
+          },
 
           scope(attributes: Partial<InferTagAttributes<T>>): void {
             // Delegate to the internal _setScope method on spanLogger
@@ -1272,6 +1287,9 @@ export function createModuleContext<
               ff: childFf,
               tag: childTagAPI,
               log: childLogger as SpanLogger<T>,
+              get buffer() {
+                return (childTagAPI as unknown as { _buffer: SpanBuffer })._buffer;
+              },
               scope(attrs: Partial<InferTagAttributes<T>>): void {
                 childLogger._setScope(attrs);
               },

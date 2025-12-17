@@ -19,7 +19,8 @@
     "customConditions": ["development"],
     "paths": {
       "@smoothbricks/arrow-builder": ["./packages/arrow-builder/src/index.ts"],
-      "@smoothbricks/lmao": ["./packages/lmao/src/index.ts"]
+      "@smoothbricks/lmao": ["./packages/lmao/src/index.ts"],
+      "@smoothbricks/lmao-transformer": ["./packages/lmao-transformer/src/index.ts"]
     }
   }
 }

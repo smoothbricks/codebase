@@ -39,12 +39,33 @@ import type { GeneratedScope } from './scopeGenerator.js';
  * - info/debug/warn/error logging methods
  * - Scope management (_getScope, _setScope)
  */
+/**
+ * Fluent interface returned by log methods (info, debug, warn, error, trace).
+ * Includes system columns (line) plus all schema fields from T.
+ * Also includes logging methods for continued chaining (e.g., ctx.log.info('x').info('y'))
+ */
+export type FluentLogEntry<T extends TagAttributeSchema> = {
+  /**
+   * Set the source code line number for this log entry.
+   * Injected by the LMAO transformer.
+   */
+  line(lineNumber: number): FluentLogEntry<T>;
+  // Logging methods for continued chaining
+  info(message: string): FluentLogEntry<T>;
+  debug(message: string): FluentLogEntry<T>;
+  warn(message: string): FluentLogEntry<T>;
+  error(message: string): FluentLogEntry<T>;
+  trace(message: string): FluentLogEntry<T>;
+} & {
+  [K in keyof InferTagAttributes<T>]: (value: InferTagAttributes<T>[K]) => FluentLogEntry<T>;
+};
+
 export type BaseSpanLogger<T extends TagAttributeSchema> = ColumnWriter<T> & {
-  info(message: string): BaseSpanLogger<T>;
-  debug(message: string): BaseSpanLogger<T>;
-  warn(message: string): BaseSpanLogger<T>;
-  error(message: string): BaseSpanLogger<T>;
-  trace(message: string): BaseSpanLogger<T>;
+  info(message: string): FluentLogEntry<T>;
+  debug(message: string): FluentLogEntry<T>;
+  warn(message: string): FluentLogEntry<T>;
+  error(message: string): FluentLogEntry<T>;
+  trace(message: string): FluentLogEntry<T>;
   _getScope(): GeneratedScope;
   _setScope(attributes: Partial<InferTagAttributes<T>>): void;
 };
@@ -288,8 +309,10 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
 
     constructorCode: `
       // SpanLogger starts at writeIndex 1, so first nextRow() makes it 2
-      // Row 0 = tag, Row 1 = result, Rows 2+ = log entries
+      // (Rows 0 and 1 are reserved for span-start and span-end)
       this._writeIndex = 1;
+      // Sync buffer's writeIndex - needed for Arrow conversion
+      this._buffer.writeIndex = 2;
       this._scope = scope;
       this._createNextBuffer = createNextBuffer;
 `,
@@ -312,6 +335,23 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer = oldBuffer;
       
       return nextBuffer;
+    }
+
+    /**
+     * Override nextRow to sync buffer's writeIndex for Arrow conversion.
+     */
+    nextRow() {
+      // Check overflow BEFORE incrementing
+      if (this._writeIndex >= this._buffer._capacity - 1) {
+        this._buffer = this._getNextBuffer();
+        this._writeIndex = -1;
+        // Sync buffer writeIndex for new buffer
+        this._buffer.writeIndex = 0;
+      }
+      this._writeIndex++;
+      // Sync buffer's writeIndex - Arrow conversion uses this
+      this._buffer.writeIndex = this._writeIndex + 1;
+      return this;
     }
 
     /**
@@ -415,6 +455,20 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
 
       ${scopeWrites}
 
+      return this;
+    }
+
+    /**
+     * Set the source code line number for the current log entry.
+     * Injected by the LMAO transformer after info/debug/warn/error/trace calls.
+     * Writes to _writeIndex (the current row).
+     */
+    line(lineNumber) {
+      const idx = this._writeIndex;
+      if (this._buffer.lineNumber_values) {
+        this._buffer.lineNumber_values[idx] = lineNumber;
+        helpers.setNullBit(this._buffer.lineNumber_nulls, idx);
+      }
       return this;
     }
 

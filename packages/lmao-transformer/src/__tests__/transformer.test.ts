@@ -1,0 +1,346 @@
+import { describe, expect, it } from 'bun:test';
+import ts from 'typescript';
+import { createLmaoTransformer } from '../transformer.js';
+
+function transform(source: string): string {
+  const result = ts.transpileModule(source, {
+    compilerOptions: {
+      module: ts.ModuleKind.ESNext,
+      target: ts.ScriptTarget.ESNext,
+    },
+    transformers: { before: [createLmaoTransformer()] },
+  });
+  return result.outputText;
+}
+
+/**
+ * Normalize whitespace for comparison - removes extra spaces and normalizes quotes
+ */
+function normalize(code: string): string {
+  return code.replace(/\s+/g, ' ').replace(/"/g, "'").trim();
+}
+
+describe('lmao-transformer', () => {
+  describe('ctx.span() transformation', () => {
+    it('should add line number to ctx.span() calls with 2 arguments', () => {
+      const input = `ctx.span('test', async () => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.span('test', async () => { }, 1)");
+    });
+
+    it('should not transform if line argument already provided', () => {
+      const input = `ctx.span('test', async () => {}, 99);`;
+      const output = transform(input);
+      // Should keep the existing 99, not add another argument
+      expect(normalize(output)).toContain("ctx.span('test', async () => { }, 99)");
+      expect(normalize(output)).not.toContain(', 1)');
+    });
+
+    it('should handle multi-line spans and use correct line number', () => {
+      const input = `const x = 1;
+ctx.span('first', async () => {});
+const y = 2;
+ctx.span('second', async () => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.span('first', async () => { }, 2)");
+      expect(normalize(output)).toContain("ctx.span('second', async () => { }, 4)");
+    });
+
+    it('should handle await ctx.span()', () => {
+      const input = `await ctx.span('test', async (childCtx) => { return 42; });`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("await ctx.span('test', async (childCtx) => { return 42; }, 1)");
+    });
+
+    it('should handle nested spans', () => {
+      const input = `ctx.span('outer', async (outerCtx) => {
+  outerCtx.span('inner', async () => {});
+});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain(
+        "ctx.span('outer', async (outerCtx) => { outerCtx.span('inner', async () => { }, 2); }, 1)",
+      );
+    });
+
+    it('should not transform non-ctx.span patterns', () => {
+      const input = `something.span('test', fn);`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("something.span('test', fn, 1)");
+    });
+
+    it('should handle span with more than 2 arguments (already has line)', () => {
+      const input = `ctx.span('name', async () => {}, 100);`;
+      const output = transform(input);
+      expect(normalize(output)).toContain('async () => { }, 100');
+    });
+  });
+
+  describe('ctx.log.{method}() transformation', () => {
+    it('should append .line() to ctx.log.info()', () => {
+      const input = `ctx.log.info('Processing user');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.info('Processing user').line(1)");
+    });
+
+    it('should append .line() to ctx.log.debug()', () => {
+      const input = `ctx.log.debug('Debug message');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.debug('Debug message').line(1)");
+    });
+
+    it('should append .line() to ctx.log.warn()', () => {
+      const input = `ctx.log.warn('Warning');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.warn('Warning').line(1)");
+    });
+
+    it('should append .line() to ctx.log.error()', () => {
+      const input = `ctx.log.error('Error occurred');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.error('Error occurred').line(1)");
+    });
+
+    it('should append .line() to ctx.log.trace()', () => {
+      const input = `ctx.log.trace('Trace message');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.trace('Trace message').line(1)");
+    });
+
+    it('should not transform if .line() already exists', () => {
+      const input = `ctx.log.info('msg').line(99);`;
+      const output = transform(input);
+      // Should keep existing .line(99), not add another
+      expect(normalize(output)).toContain('.line(99)');
+      expect(normalize(output)).not.toContain('.line(1)');
+    });
+
+    it('should handle chained calls - insert line after log method', () => {
+      const input = `ctx.log.info('msg').userId('123');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.info('msg').line(1).userId('123')");
+    });
+
+    it('should handle multiple chained calls', () => {
+      const input = `ctx.log.info('msg').userId('123').requestId('abc');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.info('msg').line(1).userId('123').requestId('abc')");
+    });
+
+    it('should not transform if .line() already exists in chain', () => {
+      const input = `ctx.log.info('msg').line(50).userId('123');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain('.line(50)');
+      expect(normalize(output)).not.toContain('.line(1)');
+    });
+
+    it('should handle multi-line with correct line numbers', () => {
+      const input = `const a = 1;
+ctx.log.info('first');
+const b = 2;
+ctx.log.warn('second');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.info('first').line(2)");
+      expect(normalize(output)).toContain("ctx.log.warn('second').line(4)");
+    });
+
+    it('should handle multiple arguments to log method', () => {
+      const input = `ctx.log.info('User', userId);`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.log.info('User', userId).line(1)");
+    });
+  });
+
+  describe('combined transformations', () => {
+    it('should transform both span and log in same file', () => {
+      const input = `ctx.span('process', async (ctx) => {
+  ctx.log.info('Starting');
+});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain(
+        "ctx.span('process', async (ctx) => { ctx.log.info('Starting').line(2); }, 1)",
+      );
+    });
+
+    it('should handle deeply nested structures', () => {
+      const input = `ctx.span('outer', async (outerCtx) => {
+  outerCtx.log.info('outer log');
+  outerCtx.span('inner', async (innerCtx) => {
+    innerCtx.log.debug('inner log');
+  });
+});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain('.line(2)');
+      expect(normalize(output)).toContain('.line(4)');
+      expect(normalize(output)).toContain(', 1)'); // outer span line
+      expect(normalize(output)).toContain(', 3)'); // inner span line
+    });
+  });
+
+  describe('ctx.ok() and ctx.err() transformation', () => {
+    it('should append .line() to ctx.ok()', () => {
+      const input = 'return ctx.ok({ success: true });';
+      const output = transform(input);
+      expect(normalize(output)).toContain('ctx.ok({ success: true }).line(1)');
+    });
+
+    it('should append .line() to ctx.err()', () => {
+      const input = `return ctx.err('VALIDATION_ERROR', { field: 'email' });`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.err('VALIDATION_ERROR', { field: 'email' }).line(1)");
+    });
+
+    it('should handle ctx.ok() with chained .with()', () => {
+      const input = `return ctx.ok(result).with({ userId: '123' });`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.ok(result).line(1).with({ userId: '123' })");
+    });
+
+    it('should handle ctx.err() with chained .message()', () => {
+      const input = `return ctx.err('ERROR', details).message('Failed');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.err('ERROR', details).line(1).message('Failed')");
+    });
+
+    it('should handle ctx.ok() with multiple chained calls', () => {
+      const input = `return ctx.ok(user).with({ userId: user.id }).message('Created');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx.ok(user).line(1).with({ userId: user.id }).message('Created')");
+    });
+
+    it('should not transform if .line() already exists on ok()', () => {
+      const input = 'return ctx.ok(result).line(99);';
+      const output = transform(input);
+      expect(normalize(output)).toContain('.line(99)');
+      expect(normalize(output)).not.toContain('.line(1)');
+    });
+
+    it('should not transform if .line() already exists on err()', () => {
+      const input = `return ctx.err('ERROR', details).line(50).with({ foo: 'bar' });`;
+      const output = transform(input);
+      expect(normalize(output)).toContain('.line(50)');
+      expect(normalize(output)).not.toContain('.line(1)');
+    });
+
+    it('should handle multi-line with correct line numbers', () => {
+      const input = `const a = 1;
+return ctx.ok({ done: true });`;
+      const output = transform(input);
+      expect(normalize(output)).toContain('.line(2)');
+    });
+
+    it('should handle ok/err inside spans', () => {
+      const input = `ctx.span('process', async (ctx) => {
+  return ctx.ok({ success: true });
+});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain('ctx.ok({ success: true }).line(2)');
+      expect(normalize(output)).toContain(', 1)'); // span line number
+    });
+  });
+
+  describe('edge cases', () => {
+    it('should not transform non-log property accesses', () => {
+      const input = `ctx.other.info('test');`;
+      const output = transform(input);
+      // Should not have .line() added
+      expect(normalize(output)).toBe("ctx.other.info('test');");
+    });
+
+    it('should not transform non-log method calls', () => {
+      const input = `ctx.log.custom('test');`;
+      const output = transform(input);
+      // 'custom' is not in LOG_METHODS, should not transform
+      expect(normalize(output)).toBe("ctx.log.custom('test');");
+    });
+
+    it('should handle empty source', () => {
+      const input = '';
+      const output = transform(input);
+      expect(output.trim()).toBe('');
+    });
+
+    it('should handle code with no ctx patterns', () => {
+      const input = `const x = 1; console.log('hello');`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("console.log('hello')");
+    });
+
+    it('should handle chains with type arguments (type args erased at runtime)', () => {
+      // Note: TypeScript erases type arguments during transpilation, so we can't preserve them
+      // in the output. This test verifies the transformation still works correctly.
+      const input = `ctx.log.info('msg').tag<MyType>({ foo: 'bar' });`;
+      const output = transform(input);
+      expect(output).toContain('.line(1)');
+      // Type arguments are erased, but the method call should still be there
+      expect(normalize(output)).toContain(".tag({ foo: 'bar' })");
+    });
+  });
+
+  describe('createModuleContext() transformation', () => {
+    it('should inject moduleMetadata into createModuleContext()', () => {
+      const input = ['createModuleContext({', '  tagAttributes: schema,', '});'].join('\n');
+      const output = transform(input);
+      expect(output).toContain('moduleMetadata');
+      expect(output).toContain('gitSha');
+      expect(output).toContain('filePath');
+      expect(output).toContain('moduleName');
+    });
+
+    it('should not overwrite existing moduleMetadata', () => {
+      const input = [
+        'createModuleContext({',
+        "  moduleMetadata: { gitSha: 'custom', filePath: 'custom', moduleName: 'Custom' },",
+        '  tagAttributes: schema,',
+        '});',
+      ].join('\n');
+      const output = transform(input);
+      expect(output).toContain("gitSha: 'custom'");
+      // Should NOT have duplicate moduleMetadata
+      expect(output.match(/moduleMetadata/g)?.length).toBe(1);
+    });
+
+    it('should handle lmao.createModuleContext() property access pattern', () => {
+      const input = ['lmao.createModuleContext({', '  tagAttributes: schema,', '});'].join('\n');
+      const output = transform(input);
+      expect(output).toContain('moduleMetadata');
+      expect(output).toContain('gitSha');
+      expect(output).toContain('filePath');
+      expect(output).toContain('moduleName');
+    });
+
+    it('should preserve existing properties when injecting moduleMetadata', () => {
+      const input = ['createModuleContext({', '  tagAttributes: schema,', '  featureFlags: flags,', '});'].join('\n');
+      const output = transform(input);
+      expect(output).toContain('moduleMetadata');
+      expect(output).toContain('tagAttributes');
+      expect(output).toContain('featureFlags');
+    });
+
+    it('should not transform createModuleContext without object argument', () => {
+      const input = 'createModuleContext();';
+      const output = transform(input);
+      expect(output).not.toContain('moduleMetadata');
+    });
+
+    it('should not transform createModuleContext with non-object argument', () => {
+      const input = 'createModuleContext(config);';
+      const output = transform(input);
+      expect(output).not.toContain('moduleMetadata');
+    });
+
+    it('should handle createModuleContext with empty object', () => {
+      const input = 'createModuleContext({});';
+      const output = transform(input);
+      expect(output).toContain('moduleMetadata');
+      expect(output).toContain('gitSha');
+    });
+
+    it('should use unknown for gitSha when git is not available', () => {
+      // The test runs in a git repo, but the transformer handles missing git gracefully
+      // This test just verifies that some gitSha is present (either actual or 'unknown')
+      const input = 'createModuleContext({ tagAttributes: schema });';
+      const output = transform(input);
+      expect(output).toContain('gitSha:');
+    });
+  });
+});

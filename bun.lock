@@ -60,6 +60,16 @@
         "tslib": "^2.3.0",
       },
     },
+    "packages/lmao-transformer": {
+      "name": "@smoothbricks/lmao-transformer",
+      "version": "0.0.1",
+      "devDependencies": {
+        "typescript": "^5.0.0",
+      },
+      "peerDependencies": {
+        "typescript": ">=4.7.0",
+      },
+    },
     "packages/statebus": {
       "name": "@smoothbricks/statebus",
       "version": "0.8.0",
@@ -743,6 +753,8 @@
     "@smoothbricks/arrow-builder": ["@smoothbricks/arrow-builder@workspace:packages/arrow-builder"],
 
     "@smoothbricks/lmao": ["@smoothbricks/lmao@workspace:packages/lmao"],
+
+    "@smoothbricks/lmao-transformer": ["@smoothbricks/lmao-transformer@workspace:packages/lmao-transformer"],
 
     "@smoothbricks/statebus": ["@smoothbricks/statebus@workspace:packages/statebus"],
 
