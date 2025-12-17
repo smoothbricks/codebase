@@ -192,7 +192,8 @@ describe('DictionaryBuilder - Sorted Dictionaries', () => {
 
     expect(dict.indexMap.size).toBe(1);
     expect(dict.indexMap.get('hello')).toBe(0);
-    expect(dict.indexType).toBe('uint8');
+    expect(dict.indexArrayCtor).toBe(Uint8Array);
+    expect(dict.arrowIndexTypeCtor).toBe(arrow.Uint8);
   });
 
   it('handles duplicate values correctly', () => {
@@ -240,7 +241,8 @@ describe('DictionaryBuilder - Index Type Selection', () => {
     }
 
     const dict = builder.finalize(true);
-    expect(dict.indexType).toBe('uint8');
+    expect(dict.indexArrayCtor).toBe(Uint8Array);
+    expect(dict.arrowIndexTypeCtor).toBe(arrow.Uint8);
   });
 
   it('uses uint16 for medium dictionaries (256-65535 values)', () => {
@@ -252,7 +254,8 @@ describe('DictionaryBuilder - Index Type Selection', () => {
     }
 
     const dict = builder.finalize(true);
-    expect(dict.indexType).toBe('uint16');
+    expect(dict.indexArrayCtor).toBe(Uint16Array);
+    expect(dict.arrowIndexTypeCtor).toBe(arrow.Uint16);
   });
 
   it('large dictionary with >255 values uses uint16 indices', () => {
@@ -268,7 +271,8 @@ describe('DictionaryBuilder - Index Type Selection', () => {
 
     const dict = builder.finalize(true); // sorted
 
-    expect(dict.indexType).toBe('uint16');
+    expect(dict.indexArrayCtor).toBe(Uint16Array);
+    expect(dict.arrowIndexTypeCtor).toBe(arrow.Uint16);
     expect(dict.indexMap.size).toBe(300);
 
     // Create uint16 indices
@@ -419,7 +423,8 @@ describe('DictionaryBuilder - 2nd Occurrence Caching', () => {
 
     // Should only have 3 unique values
     expect(dict.indexMap.size).toBe(3);
-    expect(dict.indexType).toBe('uint8');
+    expect(dict.indexArrayCtor).toBe(Uint8Array);
+    expect(dict.arrowIndexTypeCtor).toBe(arrow.Uint8);
   });
 });
 

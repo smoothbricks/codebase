@@ -18,7 +18,7 @@ describe('True Lazy Initialization', () => {
       count: S.number(),
       active: S.boolean(),
     });
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Core columns are always allocated
@@ -46,7 +46,7 @@ describe('True Lazy Initialization', () => {
       userId: S.category(),
       requestId: S.category(),
     });
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Access userId column via _values suffix (category = Array now)
@@ -71,7 +71,7 @@ describe('True Lazy Initialization', () => {
       col4: S.number(),
       col5: S.number(),
     });
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 1024);
 
     // Only access 2 of 5 columns (use _values suffix for the array)
@@ -95,7 +95,7 @@ describe('True Lazy Initialization', () => {
       field1: S.category(),
       field2: S.number(),
     });
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Before access: should be getter on prototype (use _values suffix)
@@ -124,7 +124,7 @@ describe('Lazy Column Initialization', () => {
     });
 
     // Extract schema fields
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
 
     const buffer = createColumnBuffer(schemaFields, 64);
 
@@ -157,7 +157,7 @@ describe('Lazy Column Initialization', () => {
       bool: S.boolean(), // -> Uint8Array
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Access each column via _values suffix and verify type
@@ -179,7 +179,7 @@ describe('Lazy Column Initialization', () => {
       maxEnum: S.enum(enumValues),
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Should use Uint8Array for <= 255 values (use _values suffix)
@@ -192,7 +192,7 @@ describe('Lazy Column Initialization', () => {
       count: S.number(),
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Write to columns via _values suffix (triggering lazy allocation)
@@ -214,7 +214,7 @@ describe('Lazy Column Initialization', () => {
       userId: S.category(),
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // First access (use _values suffix)
@@ -233,7 +233,7 @@ describe('Lazy Column Initialization', () => {
       requestId: S.category(),
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const buffer = createColumnBuffer(schemaFields, 64);
 
     // Access one null bitmap
@@ -262,7 +262,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     });
 
     // Extract schema fields
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const taskContext = createTestTaskContext(schemaFields);
     const buffer = createSpanBuffer(schemaFields, taskContext, undefined, 8);
 
@@ -317,7 +317,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     });
 
     // Extract schema fields
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const taskContext = createTestTaskContext(schemaFields);
     const buffer = createSpanBuffer(schemaFields, taskContext, undefined, 8);
 

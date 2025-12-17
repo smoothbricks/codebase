@@ -564,7 +564,7 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should create buffer with proper structure for fixed layout', () => {
-    const { validate, parse, safeParse, extend, ...schemaFields } = testSchema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = testSchema;
     const taskContext = createTestTaskContext(schemaFields as TagAttributeSchema);
     const buffer = createSpanBuffer(schemaFields as TagAttributeSchema, taskContext);
 

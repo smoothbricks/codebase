@@ -23,7 +23,7 @@ describe('Buffer Foundation', () => {
     });
 
     // Extract just the schema fields (exclude methods like validate, parse, etc.)
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     const moduleContext = new ModuleContext(1, 'abc123', '@test/pkg', 'src/test.ts', tagAttributes);
@@ -97,7 +97,7 @@ describe('Buffer Foundation', () => {
     });
 
     // Extract just the schema fields (exclude methods)
-    const { validate, parse, safeParse, extend, ...schemaFields } = largeSchema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = largeSchema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
 
     // Create task context with larger schema

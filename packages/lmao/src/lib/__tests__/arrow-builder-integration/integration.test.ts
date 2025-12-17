@@ -28,7 +28,7 @@ describe('Buffer Integration', () => {
     });
 
     // Extract just the schema fields (exclude methods)
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     const capacity = 64;
@@ -52,7 +52,7 @@ describe('Buffer Integration', () => {
     });
 
     // Extract just the schema fields (exclude methods)
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     const taskContext = createTestTaskContext(tagAttributes);
@@ -82,7 +82,7 @@ describe('Buffer Integration', () => {
     });
 
     // Extract just the schema fields (exclude methods)
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     // Create buffer with schema
@@ -106,7 +106,7 @@ describe('Buffer Integration', () => {
     });
 
     // Extract just the schema fields (exclude methods)
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     const taskContext = createTestTaskContext(tagAttributes);
@@ -127,7 +127,7 @@ describe('Buffer Integration', () => {
     });
 
     // Extract just the schema fields (exclude methods)
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     const taskContext = createTestTaskContext(tagAttributes);
@@ -147,7 +147,7 @@ describe('Buffer Integration', () => {
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
     });
 
-    const { validate: v1, parse: p1, safeParse: s1, extend: e1, ...smallFields } = smallEnumSchema;
+    const { validate: _v1, parse: _p1, safeParse: _s1, extend: _e1, ...smallFields } = smallEnumSchema;
     const smallAttrs = smallFields as ExtractSchemaFields<typeof smallEnumSchema> & TagAttributeSchema;
 
     const smallContext = createTestTaskContext(smallAttrs);
@@ -163,7 +163,7 @@ describe('Buffer Integration', () => {
       plainUserId: S.category(), // No masking
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     // Create interners
@@ -213,7 +213,7 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // No masking
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     // Create interners
@@ -270,7 +270,7 @@ describe('Buffer Integration', () => {
       secretKey: S.text().mask(customMask),
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schema;
+    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
     const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
 
     // Create interners

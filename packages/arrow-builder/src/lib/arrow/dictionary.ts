@@ -7,27 +7,39 @@
  * 3. Determines index type (uint8/16/32) based on dictionary size
  */
 
+import { Uint8, Uint16, Uint32 } from 'apache-arrow';
 import { getInterned } from './interner.js';
 import type { SortedArray } from './sorted.js';
 import { defaultUtf8Encoder, type Utf8Encoder, utf8ByteLength } from './utf8.js';
 
-export interface FinalizedDictionary {
-  /** Concatenated UTF-8 bytes */
-  data: Uint8Array;
-  /** Arrow-format offsets (length = uniqueCount + 1) */
-  offsets: Int32Array;
-  /** Map from string value to sorted index */
-  indexMap: Map<string, number>;
-  /** Index type based on dictionary size */
-  indexType: 'uint8' | 'uint16' | 'uint32';
+/**
+ * Finalized dictionary with consistent shape for V8 optimization.
+ * Using a class ensures all instances share the same hidden class.
+ */
+export class FinalizedDictionary {
+  constructor(
+    /** Concatenated UTF-8 bytes */
+    public readonly data: Uint8Array,
+    /** Arrow-format offsets (length = uniqueCount + 1) */
+    public readonly offsets: Int32Array,
+    /** Map from string value to sorted index */
+    public readonly indexMap: Map<string, number>,
+    /** TypedArray constructor for creating index arrays */
+    public readonly indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
+    /** Arrow type constructor for creating Dictionary types */
+    public readonly arrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32,
+  ) {}
 }
 
 /**
  * Entry with pre-encoded UTF-8 bytes for direct dictionary creation.
+ * Using a class ensures consistent shape for V8 optimization.
  */
-export interface PreEncodedEntry {
-  str: string;
-  utf8: Uint8Array;
+export class PreEncodedEntry {
+  constructor(
+    public readonly str: string,
+    public readonly utf8: Uint8Array,
+  ) {}
 }
 
 /**
@@ -39,9 +51,9 @@ export interface PreEncodedEntry {
 export function createSortedDictionary(entries: SortedArray<PreEncodedEntry>): FinalizedDictionary {
   const uniqueCount = entries.length;
 
-  // Determine index type based on dictionary size
-  const indexType: 'uint8' | 'uint16' | 'uint32' =
-    uniqueCount <= 255 ? 'uint8' : uniqueCount <= 65535 ? 'uint16' : 'uint32';
+  // Determine index type constructors based on dictionary size
+  const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
 
   // Calculate total bytes needed
   let totalBytes = 0;
@@ -64,7 +76,7 @@ export function createSortedDictionary(entries: SortedArray<PreEncodedEntry>): F
   }
   offsets[uniqueCount] = offset;
 
-  return { data, offsets, indexMap, indexType };
+  return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexTypeCtor);
 }
 
 /**
@@ -76,9 +88,9 @@ export function createSortedDictionary(entries: SortedArray<PreEncodedEntry>): F
 export function createDictionary(entries: readonly PreEncodedEntry[]): FinalizedDictionary {
   const uniqueCount = entries.length;
 
-  // Determine index type based on dictionary size
-  const indexType: 'uint8' | 'uint16' | 'uint32' =
-    uniqueCount <= 255 ? 'uint8' : uniqueCount <= 65535 ? 'uint16' : 'uint32';
+  // Determine index type constructors based on dictionary size
+  const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
 
   // Calculate total bytes needed
   let totalBytes = 0;
@@ -101,7 +113,7 @@ export function createDictionary(entries: readonly PreEncodedEntry[]): Finalized
   }
   offsets[uniqueCount] = offset;
 
-  return { data, offsets, indexMap, indexType };
+  return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexTypeCtor);
 }
 
 interface TrackedEntry {
@@ -176,9 +188,9 @@ export class DictionaryBuilder {
     const strings = [...this.entries.keys()];
     if (sorted) strings.sort();
 
-    // Determine index type based on dictionary size
-    const indexType: 'uint8' | 'uint16' | 'uint32' =
-      uniqueCount <= 255 ? 'uint8' : uniqueCount <= 65535 ? 'uint16' : 'uint32';
+    // Determine index type constructors based on dictionary size
+    const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+    const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
 
     // Pre-allocate output buffers
     const data = new Uint8Array(this.totalBytes);
@@ -206,7 +218,7 @@ export class DictionaryBuilder {
     }
     offsets[uniqueCount] = offset;
 
-    return { data, offsets, indexMap, indexType };
+    return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexTypeCtor);
   }
 
   /**

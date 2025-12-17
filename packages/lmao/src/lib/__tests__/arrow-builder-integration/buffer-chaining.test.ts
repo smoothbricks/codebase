@@ -22,7 +22,13 @@ describe('Buffer Chaining', () => {
       duration: S.number(),
     });
 
-    const { validate, parse, safeParse, extend, ...schemaFields } = schemaDefinition;
+    const {
+      validate: _validate,
+      parse: _parse,
+      safeParse: _safeParse,
+      extend: _extend,
+      ...schemaFields
+    } = schemaDefinition;
     schema = schemaFields as ExtractSchemaFields<typeof schemaDefinition> & TagAttributeSchema;
 
     taskContext = createTestTaskContext(schema, { lineNumber: 10 });

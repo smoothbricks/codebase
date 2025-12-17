@@ -11,6 +11,7 @@
  */
 
 import * as Sury from '@sury/sury';
+import { Uint8, Uint16, Uint32 } from 'apache-arrow';
 import { intern } from '../arrow/interner.js';
 import type {
   EagerBooleanSchema,
@@ -238,9 +239,11 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     if (values.length === 0) {
       throw new Error('Enum must have at least one value');
     }
-    if (values.length > 256) {
-      throw new Error('Enum can have at most 256 values (Uint8Array limit: indices 0-255)');
-    }
+
+    // Determine index type based on enum size
+    const uniqueCount = values.length;
+    const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+    const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
 
     // Use refine to validate string is one of the allowed values
     const schema = Sury.refine(Sury.string, (value, fail): T[number] => {
@@ -254,6 +257,8 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     schema.__schema_type = 'enum';
     schema.__enum_values = values;
     schema.__enum_utf8 = precomputeEnumUtf8(values);
+    schema.__index_array_ctor = indexArrayCtor;
+    schema.__arrow_index_type_ctor = arrowIndexTypeCtor;
 
     // Add chainable .eager() method
     schema.eager = (): EagerEnumSchema<T[number]> => {

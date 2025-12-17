@@ -8,7 +8,7 @@ import {
   type BufferCapacityStats,
   DEFAULT_BUFFER_CAPACITY,
   intern,
-  type PreEncodedEntry,
+  PreEncodedEntry,
 } from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
 
@@ -43,8 +43,9 @@ export class ModuleContext {
     public readonly tagAttributes: TagAttributeSchema,
   ) {
     // Pre-encode and store as reusable entries for Arrow dictionary building
-    this.packageEntry = { str: packageName, utf8: intern(packageName) };
-    this.packagePathEntry = { str: packagePath, utf8: intern(packagePath) };
-    this.gitShaEntry = { str: gitSha, utf8: intern(gitSha) };
+    // Using class instances for V8 optimization (consistent hidden class shape)
+    this.packageEntry = new PreEncodedEntry(packageName, intern(packageName));
+    this.packagePathEntry = new PreEncodedEntry(packagePath, intern(packagePath));
+    this.gitShaEntry = new PreEncodedEntry(gitSha, intern(gitSha));
   }
 }

@@ -21,7 +21,6 @@ import {
 } from '@smoothbricks/arrow-builder';
 import {
   Bool,
-  type Data,
   Dictionary,
   Field,
   Float64,
@@ -46,6 +45,21 @@ import type { ModuleContext } from './moduleContext.js';
 import { getEnumUtf8, getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
 import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
+
+/**
+ * Dictionary build result with consistent shape for V8 optimization.
+ * Using a class ensures all instances share the same hidden class.
+ */
+class DictionaryBuildResult {
+  constructor(
+    public readonly dictionary: string[],
+    public readonly indices: Uint8Array | Uint16Array | Uint32Array,
+    public readonly indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
+    public readonly arrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32,
+    public readonly nullBitmap: Uint8Array | undefined,
+    public readonly nullCount: number,
+  ) {}
+}
 
 function encodeUtf8Strings(strings: readonly string[]): Uint8Array {
   const encoder = new TextEncoder();
@@ -161,7 +175,7 @@ function buildSortedCategoryDictionary(
   buffers: SpanBuffer[],
   columnName: string,
   maskTransform?: (value: string) => string,
-): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } {
+): DictionaryBuildResult {
   const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
@@ -187,7 +201,11 @@ function buildSortedCategoryDictionary(
   const dictionary = Array.from(uniqueMaskedStrings).sort();
   const maskedToIndex = new Map(dictionary.map((s, i) => [s, i]));
 
-  const indices = new Uint32Array(totalRows);
+  // Determine index type constructors based on dictionary size
+  const uniqueCount = dictionary.length;
+  const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+  const indices = new indexArrayCtor(totalRows);
   const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
   let rowOffset = 0;
@@ -207,14 +225,14 @@ function buildSortedCategoryDictionary(
     rowOffset += buf.writeIndex;
   }
 
-  return { dictionary, indices, nullBitmap, nullCount };
+  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);
 }
 
 function buildTextDictionary(
   buffers: SpanBuffer[],
   columnName: string,
   maskTransform?: (value: string) => string,
-): { dictionary: string[]; indices: Uint32Array; nullBitmap: Uint8Array | undefined; nullCount: number } | null {
+): DictionaryBuildResult | null {
   const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
@@ -246,13 +264,17 @@ function buildTextDictionary(
   }
 
   if (frequencyMap.size === 0) {
-    return { dictionary: [], indices: new Uint32Array(totalRows), nullBitmap: undefined, nullCount: totalRows };
+    return new DictionaryBuildResult([], new Uint32Array(totalRows), Uint32Array, Uint32, undefined, totalRows);
   }
 
   const dictionary = Array.from(frequencyMap.keys());
   const maskedToIndex = new Map(dictionary.map((s, i) => [s, i]));
 
-  const indices = new Uint32Array(totalRows);
+  // Determine index type constructors based on dictionary size
+  const uniqueCount = dictionary.length;
+  const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+  const indices = new indexArrayCtor(totalRows);
   const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
   let rowOffset = 0;
@@ -272,7 +294,7 @@ function buildTextDictionary(
     rowOffset += buf.writeIndex;
   }
 
-  return { dictionary, indices, nullBitmap, nullCount };
+  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);
 }
 
 export type SystemColumnBuilder = (
@@ -330,10 +352,14 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
     const arrowFieldName = getArrowFieldName(fieldName);
 
     if (lmaoType === 'enum') {
+      // Get constructors from schema metadata
+      const enumSchema = fieldSchema as { __arrow_index_type_ctor?: unknown };
+      const arrowIndexTypeCtor =
+        (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
       fields.push(
         Field.new({
           name: arrowFieldName,
-          type: new Dictionary(new Utf8(), new Uint8()),
+          type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
           nullable: true,
         }),
       );
@@ -376,19 +402,40 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
     if (lmaoType === 'enum') {
       const enumValues = getEnumValues(fieldSchema) || [];
       const enumUtf8 = getEnumUtf8(fieldSchema);
+      // Get constructors from schema metadata
+      const enumSchema = fieldSchema as { __index_array_ctor?: unknown; __arrow_index_type_ctor?: unknown };
+      const indexArrayCtor =
+        (enumSchema.__index_array_ctor as Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor) ??
+        Uint8Array;
+      const arrowIndexTypeCtor =
+        (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
       const valuesName = `${columnName}_values` as const;
-      const valueArrays: Uint8Array[] = [];
 
+      // Collect value arrays - need to handle different TypedArray types
+      const valueArrays: (Uint8Array | Uint16Array | Uint32Array)[] = [];
       for (const buf of buffers) {
         const column = buf[valuesName];
-        if (column && column instanceof Uint8Array) {
+        if (column && column instanceof indexArrayCtor) {
           valueArrays.push(column.subarray(0, buf.writeIndex));
         } else {
-          valueArrays.push(new Uint8Array(buf.writeIndex));
+          valueArrays.push(new indexArrayCtor(buf.writeIndex));
         }
       }
 
-      const allIndices = concatenateUint8Arrays(valueArrays);
+      // Concatenate arrays based on type
+      let allIndices: Uint8Array | Uint16Array | Uint32Array;
+      if (indexArrayCtor === Uint8Array) {
+        allIndices = concatenateUint8Arrays(valueArrays as Uint8Array[]);
+      } else {
+        const totalLength = valueArrays.reduce((sum, arr) => sum + arr.length, 0);
+        allIndices = new indexArrayCtor(totalLength);
+        let offset = 0;
+        for (const arr of valueArrays) {
+          allIndices.set(arr, offset);
+          offset += arr.length;
+        }
+      }
+
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
       const enumDictData = makeData({
@@ -401,7 +448,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
       });
 
       const enumData = makeData({
-        type: new Dictionary(new Utf8(), new Uint8()),
+        type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
         offset: 0,
         length: totalRows,
         nullCount,
@@ -414,7 +461,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
     } else if (lmaoType === 'category') {
       // Get mask transform from schema metadata (if present)
       const maskTransform = getMaskTransform(fieldSchema);
-      const { dictionary, indices, nullBitmap, nullCount } = buildSortedCategoryDictionary(
+      const { dictionary, indices, arrowIndexTypeCtor, nullBitmap, nullCount } = buildSortedCategoryDictionary(
         buffers,
         columnName,
         maskTransform,
@@ -431,7 +478,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
       });
 
       const categoryData = makeData({
-        type: new Dictionary(new Utf8(), new Uint32()),
+        type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
         offset: 0,
         length: totalRows,
         nullCount,
@@ -446,7 +493,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
       const maskTransform = getMaskTransform(fieldSchema);
       const result = buildTextDictionary(buffers, columnName, maskTransform);
       if (result) {
-        const { dictionary, indices, nullBitmap, nullCount } = result;
+        const { dictionary, indices, arrowIndexTypeCtor, nullBitmap, nullCount } = result;
         const { data: textUtf8Data, offsets: textUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
         const textDictData = makeData({
@@ -459,7 +506,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
         });
 
         const textData = makeData({
-          type: new Dictionary(new Utf8(), new Uint32()),
+          type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
           offset: 0,
           length: totalRows,
           nullCount,
@@ -1079,29 +1126,41 @@ export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColum
     const arrowFieldName = getArrowFieldName(fieldName);
 
     if (lmaoType === 'enum') {
+      // Get constructors from schema metadata
+      const enumSchema = fieldSchema as { __arrow_index_type_ctor?: unknown };
+      const arrowIndexTypeCtor =
+        (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
       attrDictIds.set(fieldName, nextDictId);
       arrowFields.push(
         Field.new({
           name: arrowFieldName,
-          type: new Dictionary(new Utf8(), new Uint8(), nextDictId++),
+          type: new Dictionary(new Utf8(), new arrowIndexTypeCtor(), nextDictId++),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'category') {
+      const dict = categoryDicts.get(fieldName);
+      if (!dict) {
+        throw new Error(`Category dictionary not found for field: ${fieldName}`);
+      }
       attrDictIds.set(fieldName, nextDictId);
       arrowFields.push(
         Field.new({
           name: arrowFieldName,
-          type: new Dictionary(new Utf8(), new Uint32(), nextDictId++),
+          type: new Dictionary(new Utf8(), new dict.arrowIndexTypeCtor(), nextDictId++),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'text') {
+      const dict = textDicts.get(fieldName);
+      if (!dict) {
+        throw new Error(`Text dictionary not found for field: ${fieldName}`);
+      }
       attrDictIds.set(fieldName, nextDictId);
       arrowFields.push(
         Field.new({
           name: arrowFieldName,
-          type: new Dictionary(new Utf8(), new Uint32(), nextDictId++),
+          type: new Dictionary(new Utf8(), new dict.arrowIndexTypeCtor(), nextDictId++),
           nullable: true,
         }),
       );
@@ -1516,7 +1575,7 @@ function convertBuffersWithSharedDicts(
       if (!dict || !originalToMasked) {
         throw new Error(`Category dictionary or mapping not found for field: ${fieldName}`);
       }
-      const indices = new Uint32Array(totalRows);
+      const indices = new dict.indexArrayCtor(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       let nullCount = 0;
       let rowOffset = 0;
@@ -1545,7 +1604,7 @@ function convertBuffersWithSharedDicts(
       vectors.push(
         makeVector(
           makeData({
-            type: fieldType as Dictionary<Utf8, Uint32>,
+            type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
             offset: 0,
             length: totalRows,
             nullCount,
@@ -1570,7 +1629,7 @@ function convertBuffersWithSharedDicts(
       if (!dict || !originalToMasked) {
         throw new Error(`Text dictionary or mapping not found for field: ${fieldName}`);
       }
-      const indices = new Uint32Array(totalRows);
+      const indices = new dict.indexArrayCtor(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       let nullCount = 0;
       let rowOffset = 0;
@@ -1599,7 +1658,7 @@ function convertBuffersWithSharedDicts(
       vectors.push(
         makeVector(
           makeData({
-            type: fieldType as Dictionary<Utf8, Uint32>,
+            type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
             offset: 0,
             length: totalRows,
             nullCount,
@@ -1717,7 +1776,14 @@ function convertBuffersWithSharedDicts(
     } else if (lmaoType === 'enum') {
       const enumValues = getEnumValues(fieldSchema) || [];
       const enumUtf8 = getEnumUtf8(fieldSchema);
-      const allIndices = new Uint8Array(totalRows);
+      // Get constructors from schema metadata
+      const enumSchema = fieldSchema as { __index_array_ctor?: unknown; __arrow_index_type_ctor?: unknown };
+      const indexArrayCtor =
+        (enumSchema.__index_array_ctor as Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor) ??
+        Uint8Array;
+      const arrowIndexTypeCtor =
+        (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
+      const allIndices = new indexArrayCtor(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       nullBitmap.fill(0xff);
       let nullCount = 0;
@@ -1727,7 +1793,7 @@ function convertBuffersWithSharedDicts(
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
 
-        if (col instanceof Uint8Array) {
+        if (col instanceof indexArrayCtor) {
           allIndices.set(col.subarray(0, buf.writeIndex), rowOffset);
           if (srcNulls) {
             for (let i = 0; i < buf.writeIndex; i++) {
@@ -1763,7 +1829,7 @@ function convertBuffersWithSharedDicts(
       vectors.push(
         makeVector(
           makeData({
-            type: fieldType as Dictionary<Utf8, Uint8>,
+            type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
             offset: 0,
             length: totalRows,
             nullCount,
