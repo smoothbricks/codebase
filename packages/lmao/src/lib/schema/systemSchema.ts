@@ -7,9 +7,10 @@
  */
 
 import type {
-  CategorySchemaWithMetadata,
-  NumberSchemaWithMetadata,
-  TextSchemaWithMetadata,
+  EagerCategorySchema,
+  LazyCategorySchema,
+  LazyNumberSchema,
+  LazyTextSchema,
 } from '@smoothbricks/arrow-builder';
 import { S as ArrowS } from '@smoothbricks/arrow-builder';
 import { type DefinedTagAttributes, defineTagAttributes } from './defineTagAttributes.js';
@@ -19,20 +20,20 @@ import type { TagAttributeSchema } from './types.js';
  * System schema field type - explicit type to avoid Sury's internal brand symbol leaking.
  */
 interface SystemSchemaFieldTypes {
-  message: CategorySchemaWithMetadata;
-  lineNumber: NumberSchemaWithMetadata;
-  errorCode: CategorySchemaWithMetadata;
-  exceptionStack: TextSchemaWithMetadata;
-  ffValue: CategorySchemaWithMetadata;
+  message: EagerCategorySchema;
+  lineNumber: LazyNumberSchema;
+  errorCode: LazyCategorySchema;
+  exceptionStack: LazyTextSchema;
+  ffValue: LazyCategorySchema;
 }
 
 // Use arrow-builder's S directly (not lmao's wrapped version) to get clean types
 // that don't include the flag builder methods - this avoids type inference issues.
-const messageSchema: CategorySchemaWithMetadata = ArrowS.category().eager();
-const lineNumberSchema: NumberSchemaWithMetadata = ArrowS.number();
-const errorCodeSchema: CategorySchemaWithMetadata = ArrowS.category();
-const exceptionStackSchema: TextSchemaWithMetadata = ArrowS.text();
-const ffValueSchema: CategorySchemaWithMetadata = ArrowS.category();
+const messageSchema: EagerCategorySchema = ArrowS.category().eager();
+const lineNumberSchema: LazyNumberSchema = ArrowS.number();
+const errorCodeSchema: LazyCategorySchema = ArrowS.category();
+const exceptionStackSchema: LazyTextSchema = ArrowS.text();
+const ffValueSchema: LazyCategorySchema = ArrowS.category();
 
 /**
  * Raw system schema fields object.

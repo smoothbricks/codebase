@@ -19,25 +19,19 @@ import type * as Sury from '@sury/sury';
 export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
 
 /**
- * Eager column metadata marker.
- *
- * When __eager is true:
- * - Column is allocated immediately in constructor (not lazily on first write)
- * - No null bitmap is created (column is always written for every entry)
- * - Saves memory and conditionals for columns written on every row
- *
- * Use for system columns like `message` that are written for every entry type.
- *
- * To mark a column as eager, use the `.eager()` chainable method:
- * ```typescript
- * const schema = defineTagAttributes({
- *   message: S.category().eager(),  // No null bitmap, allocated eagerly
- *   userId: S.category(),           // Normal lazy column with null bitmap
- * });
- * ```
+ * Eager brand marker - columns marked as eager are allocated immediately
+ * and have no null bitmap (column is always written for every entry).
  */
-export interface EagerColumnMetadata {
-  __eager?: boolean;
+export interface EagerBrand {
+  readonly __eager: true;
+}
+
+/**
+ * Lazy brand marker - columns marked as lazy are allocated on first write
+ * and have a null bitmap for sparse data.
+ */
+export interface LazyBrand {
+  readonly __eager?: never;
 }
 
 /**
@@ -68,93 +62,185 @@ export interface EnumUtf8Precomputed {
  * Base schema with metadata
  * Using intersection type since we can't extend Sury.Schema directly
  */
-export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> &
-  EagerColumnMetadata & {
-    __schema_type?: SchemaType;
-    __enum_values?: readonly string[];
-    __enum_utf8?: EnumUtf8Precomputed;
-  };
+export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> & {
+  __schema_type?: SchemaType;
+  __enum_values?: readonly string[];
+  __enum_utf8?: EnumUtf8Precomputed;
+  __eager?: boolean;
+};
+
+// =============================================================================
+// ENUM SCHEMA TYPES
+// =============================================================================
 
 /**
- * Enum schema with enum values metadata
- * Storage: Uint8Array (1 byte) with compile-time mapping
- * Arrow: Dictionary with pre-defined values (UTF-8 pre-computed at definition time)
+ * Base metadata for enum schema (shared between lazy and eager)
  */
-export type EnumSchemaWithMetadata<T extends string = string> = Sury.Schema<T, unknown> & {
+interface EnumMetadataBase {
   __schema_type: 'enum';
   __enum_values: readonly string[];
   /** Pre-computed UTF-8 bytes for zero-cost Arrow conversion */
   __enum_utf8: EnumUtf8Precomputed;
-};
+}
 
 /**
- * Base metadata for category schema
+ * Eager enum schema - allocated immediately, no null bitmap
+ * Storage: Uint8Array (1 byte) with compile-time mapping
+ * Arrow: Dictionary with pre-defined values (UTF-8 pre-computed at definition time)
  */
-export interface CategoryMetadata extends EagerColumnMetadata {
+export type EagerEnumSchema<T extends string = string> = Sury.Schema<T, unknown> & EnumMetadataBase & EagerBrand;
+
+/**
+ * Lazy enum schema with chainable eager method
+ * Storage: Uint8Array (1 byte) with compile-time mapping
+ * Arrow: Dictionary with pre-defined values (UTF-8 pre-computed at definition time)
+ */
+export type LazyEnumSchema<T extends string = string> = Sury.Schema<T, unknown> &
+  EnumMetadataBase &
+  LazyBrand & {
+    /**
+     * Mark this column as eager (always written, no null bitmap).
+     * Use for columns written on every entry.
+     */
+    eager(): EagerEnumSchema<T>;
+  };
+
+// =============================================================================
+// CATEGORY SCHEMA TYPES
+// =============================================================================
+
+/**
+ * Base metadata for category schema (shared between lazy and eager)
+ */
+interface CategoryMetadataBase {
   __schema_type: 'category';
   __mask_transform?: MaskTransform;
 }
 
 /**
- * Category schema with metadata
+ * Eager category schema - allocated immediately, no null bitmap
  * Storage: Uint32Array indices with string interning
  * Arrow: Dictionary built dynamically from interned strings
  */
-export type CategorySchemaWithMetadata = Sury.Schema<string, unknown> & CategoryMetadata;
+export type EagerCategorySchema = Sury.Schema<string, unknown> & CategoryMetadataBase & EagerBrand;
 
 /**
- * Category schema with chainable mask and eager methods
+ * Lazy category schema with chainable mask and eager methods
+ * Storage: Uint32Array indices with string interning
+ * Arrow: Dictionary built dynamically from interned strings
  */
-export type CategorySchemaWithMask = CategorySchemaWithMetadata & {
-  mask(preset: MaskPreset | MaskTransform): CategorySchemaWithMetadata;
-  /**
-   * Mark this column as eager (always written, no null bitmap).
-   * Use for columns written on every entry (like message).
-   */
-  eager(): CategorySchemaWithMetadata;
-};
+export type LazyCategorySchema = Sury.Schema<string, unknown> &
+  CategoryMetadataBase &
+  LazyBrand & {
+    /**
+     * Apply a masking transform during Arrow conversion (cold path).
+     * Returns a new lazy schema with the mask transform attached.
+     */
+    mask(preset: MaskPreset | MaskTransform): LazyCategorySchema;
+    /**
+     * Mark this column as eager (always written, no null bitmap).
+     * Use for columns written on every entry (like message).
+     */
+    eager(): EagerCategorySchema;
+  };
+
+// =============================================================================
+// TEXT SCHEMA TYPES
+// =============================================================================
 
 /**
- * Base metadata for text schema
+ * Base metadata for text schema (shared between lazy and eager)
  */
-export interface TextMetadata extends EagerColumnMetadata {
+interface TextMetadataBase {
   __schema_type: 'text';
   __mask_transform?: MaskTransform;
 }
 
 /**
- * Text schema with metadata
+ * Eager text schema - allocated immediately, no null bitmap
  * Storage: Raw strings without interning
  * Arrow: Plain string column (no dictionary overhead)
  */
-export type TextSchemaWithMetadata = Sury.Schema<string, unknown> & TextMetadata;
+export type EagerTextSchema = Sury.Schema<string, unknown> & TextMetadataBase & EagerBrand;
 
 /**
- * Text schema with chainable mask and eager methods
+ * Lazy text schema with chainable mask and eager methods
+ * Storage: Raw strings without interning
+ * Arrow: Plain string column (no dictionary overhead)
  */
-export type TextSchemaWithMask = TextSchemaWithMetadata & {
-  mask(preset: MaskPreset | MaskTransform): TextSchemaWithMetadata;
-  /**
-   * Mark this column as eager (always written, no null bitmap).
-   * Use for columns written on every entry.
-   */
-  eager(): TextSchemaWithMetadata;
-};
-
-/**
- * Number schema with metadata
- * Storage: Float64Array
- */
-export type NumberSchemaWithMetadata = Sury.Schema<number, unknown> &
-  EagerColumnMetadata & {
-    __schema_type: 'number';
+export type LazyTextSchema = Sury.Schema<string, unknown> &
+  TextMetadataBase &
+  LazyBrand & {
+    /**
+     * Apply a masking transform during Arrow conversion (cold path).
+     * Returns a new lazy schema with the mask transform attached.
+     */
+    mask(preset: MaskPreset | MaskTransform): LazyTextSchema;
+    /**
+     * Mark this column as eager (always written, no null bitmap).
+     * Use for columns written on every entry.
+     */
+    eager(): EagerTextSchema;
   };
 
+// =============================================================================
+// NUMBER SCHEMA TYPES
+// =============================================================================
+
 /**
- * Boolean schema with metadata
+ * Base metadata for number schema (shared between lazy and eager)
+ */
+interface NumberMetadataBase {
+  __schema_type: 'number';
+}
+
+/**
+ * Eager number schema - allocated immediately, no null bitmap
+ * Storage: Float64Array
+ */
+export type EagerNumberSchema = Sury.Schema<number, unknown> & NumberMetadataBase & EagerBrand;
+
+/**
+ * Lazy number schema with chainable eager method
+ * Storage: Float64Array
+ */
+export type LazyNumberSchema = Sury.Schema<number, unknown> &
+  NumberMetadataBase &
+  LazyBrand & {
+    /**
+     * Mark this column as eager (always written, no null bitmap).
+     * Use for columns written on every entry.
+     */
+    eager(): EagerNumberSchema;
+  };
+
+// =============================================================================
+// BOOLEAN SCHEMA TYPES
+// =============================================================================
+
+/**
+ * Base metadata for boolean schema (shared between lazy and eager)
+ */
+interface BooleanMetadataBase {
+  __schema_type: 'boolean';
+}
+
+/**
+ * Eager boolean schema - allocated immediately, no null bitmap
  * Storage: Uint8Array (0/1)
  */
-export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> &
-  EagerColumnMetadata & {
-    __schema_type: 'boolean';
+export type EagerBooleanSchema = Sury.Schema<boolean, unknown> & BooleanMetadataBase & EagerBrand;
+
+/**
+ * Lazy boolean schema with chainable eager method
+ * Storage: Uint8Array (0/1)
+ */
+export type LazyBooleanSchema = Sury.Schema<boolean, unknown> &
+  BooleanMetadataBase &
+  LazyBrand & {
+    /**
+     * Mark this column as eager (always written, no null bitmap).
+     * Use for columns written on every entry.
+     */
+    eager(): EagerBooleanSchema;
   };

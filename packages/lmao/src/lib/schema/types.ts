@@ -9,17 +9,25 @@ import type * as Sury from '@sury/sury';
 
 // Re-export schema metadata types from arrow-builder (single source of truth)
 export type {
-  BooleanSchemaWithMetadata,
-  CategorySchemaWithMetadata,
-  EnumSchemaWithMetadata,
+  // Eager schema types (allocated immediately, no null bitmap)
+  EagerBooleanSchema,
+  EagerCategorySchema,
+  EagerEnumSchema,
+  EagerNumberSchema,
+  EagerTextSchema,
+  // Metadata and utility types
   EnumUtf8Precomputed,
+  // Lazy schema types (default - allocated on first write)
+  LazyBooleanSchema,
+  LazyCategorySchema,
+  LazyEnumSchema,
+  LazyNumberSchema,
+  LazyTextSchema,
   MaskPreset,
   MaskTransform,
-  NumberSchemaWithMetadata,
   SchemaType,
   SchemaWithMetadata,
   TagAttributeSchema,
-  TextSchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 
 // Re-export Sury's core types for external use
@@ -27,14 +35,17 @@ export type { Input, Output, Schema } from '@sury/sury';
 
 // Import schema metadata types for use in InferTagAttributes and local type definitions
 import type {
-  BooleanSchemaWithMetadata,
-  CategorySchemaWithMask,
-  CategorySchemaWithMetadata,
-  EnumSchemaWithMetadata,
-  NumberSchemaWithMetadata,
+  EagerBooleanSchema,
+  EagerCategorySchema,
+  EagerEnumSchema,
+  EagerNumberSchema,
+  EagerTextSchema,
+  LazyBooleanSchema,
+  LazyCategorySchema,
+  LazyEnumSchema,
+  LazyNumberSchema,
+  LazyTextSchema,
   TagAttributeSchema,
-  TextSchemaWithMask,
-  TextSchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 // Import the brand symbol from defineTagAttributes for ExtractOriginalSchema detection
 import type { DEFINED_TAG_ATTRIBUTES_BRAND } from './defineTagAttributes.js';
@@ -87,19 +98,21 @@ type SchemaFieldKeys<T extends TagAttributeSchema> = keyof ExtractOriginalSchema
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
 export type InferTagAttributes<T extends TagAttributeSchema> = {
-  [K in SchemaFieldKeys<T>]: ExtractOriginalSchema<T>[K] extends EnumSchemaWithMetadata<infer E>
+  [K in SchemaFieldKeys<T>]: ExtractOriginalSchema<T>[K] extends LazyEnumSchema<infer E>
     ? E
-    : ExtractOriginalSchema<T>[K] extends CategorySchemaWithMetadata
-      ? string
-      : ExtractOriginalSchema<T>[K] extends TextSchemaWithMetadata
+    : ExtractOriginalSchema<T>[K] extends EagerEnumSchema<infer E2>
+      ? E2
+      : ExtractOriginalSchema<T>[K] extends LazyCategorySchema | EagerCategorySchema
         ? string
-        : ExtractOriginalSchema<T>[K] extends NumberSchemaWithMetadata
-          ? number
-          : ExtractOriginalSchema<T>[K] extends BooleanSchemaWithMetadata
-            ? boolean
-            : ExtractOriginalSchema<T>[K] extends Sury.Schema<infer Out, unknown>
-              ? Out
-              : never;
+        : ExtractOriginalSchema<T>[K] extends LazyTextSchema | EagerTextSchema
+          ? string
+          : ExtractOriginalSchema<T>[K] extends LazyNumberSchema | EagerNumberSchema
+            ? number
+            : ExtractOriginalSchema<T>[K] extends LazyBooleanSchema | EagerBooleanSchema
+              ? boolean
+              : ExtractOriginalSchema<T>[K] extends Sury.Schema<infer Out, unknown>
+                ? Out
+                : never;
 };
 
 /**
@@ -145,15 +158,15 @@ export type SchemaOrFlagBuilder<T> = Sury.Schema<T, unknown> & FlagBuilder<T>;
 
 /**
  * Category schema with flag builder, mask method, and eager method.
- * Extends arrow-builder's CategorySchemaWithMask which provides mask() and eager().
+ * Combines lmao's FlagBuilder with arrow-builder's LazyCategorySchema.
  */
-export type CategorySchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & CategorySchemaWithMask;
+export type CategorySchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & LazyCategorySchema;
 
 /**
  * Text schema with flag builder, mask method, and eager method.
- * Extends arrow-builder's TextSchemaWithMask which provides mask() and eager().
+ * Combines lmao's FlagBuilder with arrow-builder's LazyTextSchema.
  */
-export type TextSchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & TextSchemaWithMask;
+export type TextSchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & LazyTextSchema;
 
 /**
  * Schema builder interface that wraps Sury with custom API

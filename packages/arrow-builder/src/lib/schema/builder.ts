@@ -12,16 +12,19 @@
 
 import * as Sury from '@sury/sury';
 import type {
-  BooleanSchemaWithMetadata,
-  CategorySchemaWithMask,
-  CategorySchemaWithMetadata,
-  EnumSchemaWithMetadata,
+  EagerBooleanSchema,
+  EagerCategorySchema,
+  EagerEnumSchema,
+  EagerNumberSchema,
+  EagerTextSchema,
   EnumUtf8Precomputed,
+  LazyBooleanSchema,
+  LazyCategorySchema,
+  LazyEnumSchema,
+  LazyNumberSchema,
+  LazyTextSchema,
   MaskPreset,
   MaskTransform,
-  NumberSchemaWithMetadata,
-  TextSchemaWithMask,
-  TextSchemaWithMetadata,
 } from './types.js';
 
 /**
@@ -131,22 +134,25 @@ export interface ArrowSchemaBuilder {
   /**
    * Create number schema
    * Storage: Float64Array
+   * @returns Schema with chainable `.eager()` method
    */
-  number(): Sury.Schema<number, unknown> & NumberSchemaWithMetadata;
+  number(): LazyNumberSchema;
 
   /**
    * Create boolean schema
    * Storage: Uint8Array (0/1)
+   * @returns Schema with chainable `.eager()` method
    */
-  boolean(): Sury.Schema<boolean, unknown> & BooleanSchemaWithMetadata;
+  boolean(): LazyBooleanSchema;
 
   /**
    * Enum - Known values at compile time
    * Storage: Uint8Array (1 byte) with compile-time mapping
    * Arrow: Dictionary with pre-defined values
    * Use for: Operations, HTTP methods, entry types, status enums
+   * @returns Schema with chainable `.eager()` method
    */
-  enum<T extends readonly string[]>(values: T): Sury.Schema<T[number], string> & EnumSchemaWithMetadata<T[number]>;
+  enum<T extends readonly string[]>(values: T): LazyEnumSchema<T[number]>;
 
   /**
    * Category - Values that often repeat (limited cardinality)
@@ -157,7 +163,7 @@ export interface ArrowSchemaBuilder {
    * Returns a schema with a chainable .mask() method for applying
    * masking transforms during Arrow conversion (cold path).
    */
-  category(): Sury.Schema<string, unknown> & CategorySchemaWithMask;
+  category(): LazyCategorySchema;
 
   /**
    * Text - Unique values that rarely repeat
@@ -168,7 +174,7 @@ export interface ArrowSchemaBuilder {
    * Returns a schema with a chainable .mask() method for applying
    * masking transforms during Arrow conversion (cold path).
    */
-  text(): Sury.Schema<string, unknown> & TextSchemaWithMask;
+  text(): LazyTextSchema;
 
   /**
    * Wrap schema to make it optional
@@ -187,29 +193,49 @@ export interface ArrowSchemaBuilder {
  * Schema builder implementation
  */
 const schemaBuilderImpl: ArrowSchemaBuilder = {
-  number: () => {
+  number: (): LazyNumberSchema => {
     // Clone to avoid mutating the shared Sury.number singleton
     const schema = Object.create(
       Object.getPrototypeOf(Sury.number),
       Object.getOwnPropertyDescriptors(Sury.number),
-    ) as Sury.Schema<number, unknown> & NumberSchemaWithMetadata;
+    ) as LazyNumberSchema;
     schema.__schema_type = 'number';
+
+    // Add chainable .eager() method
+    schema.eager = (): EagerNumberSchema => {
+      const eagerSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as EagerNumberSchema;
+      (eagerSchema as { __eager: true }).__eager = true;
+      return eagerSchema;
+    };
+
     return schema;
   },
 
-  boolean: () => {
+  boolean: (): LazyBooleanSchema => {
     // Clone to avoid mutating the shared Sury.boolean singleton
     const schema = Object.create(
       Object.getPrototypeOf(Sury.boolean),
       Object.getOwnPropertyDescriptors(Sury.boolean),
-    ) as Sury.Schema<boolean, unknown> & BooleanSchemaWithMetadata;
+    ) as LazyBooleanSchema;
     schema.__schema_type = 'boolean';
+
+    // Add chainable .eager() method
+    schema.eager = (): EagerBooleanSchema => {
+      const eagerSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as EagerBooleanSchema;
+      (eagerSchema as { __eager: true }).__eager = true;
+      return eagerSchema;
+    };
+
     return schema;
   },
 
-  enum: <T extends readonly string[]>(
-    values: T,
-  ): Sury.Schema<T[number], string> & EnumSchemaWithMetadata<T[number]> => {
+  enum: <T extends readonly string[]>(values: T): LazyEnumSchema<T[number]> => {
     if (values.length === 0) {
       throw new Error('Enum must have at least one value');
     }
@@ -223,76 +249,86 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
         fail.fail(`Value must be one of: ${values.join(', ')}`);
       }
       return value as T[number];
-    }) as Sury.Schema<T[number], string> & EnumSchemaWithMetadata<T[number]>;
+    }) as LazyEnumSchema<T[number]>;
 
     // Attach enum metadata
     schema.__schema_type = 'enum';
     schema.__enum_values = values;
     schema.__enum_utf8 = precomputeEnumUtf8(values);
 
-    return schema;
-  },
-
-  category: () => {
-    // Clone to avoid mutating the shared Sury.string singleton
-    const schema = Object.create(
-      Object.getPrototypeOf(Sury.string),
-      Object.getOwnPropertyDescriptors(Sury.string),
-    ) as Sury.Schema<string, unknown> & CategorySchemaWithMask;
-    schema.__schema_type = 'category';
-
-    // Add chainable .mask() method
-    schema.mask = (preset: MaskPreset | MaskTransform): CategorySchemaWithMetadata => {
-      // Clone to create a new schema with the mask transform
-      const maskedSchema = Object.create(
-        Object.getPrototypeOf(schema),
-        Object.getOwnPropertyDescriptors(schema),
-      ) as Sury.Schema<string, unknown> & CategorySchemaWithMetadata;
-      maskedSchema.__mask_transform = resolveMaskTransform(preset);
-      return maskedSchema;
-    };
-
     // Add chainable .eager() method
-    schema.eager = (): CategorySchemaWithMetadata => {
-      // Clone to create a new schema marked as eager
+    schema.eager = (): EagerEnumSchema<T[number]> => {
       const eagerSchema = Object.create(
         Object.getPrototypeOf(schema),
         Object.getOwnPropertyDescriptors(schema),
-      ) as Sury.Schema<string, unknown> & CategorySchemaWithMetadata;
-      eagerSchema.__eager = true;
+      ) as EagerEnumSchema<T[number]>;
+      (eagerSchema as { __eager: true }).__eager = true;
       return eagerSchema;
     };
 
     return schema;
   },
 
-  text: () => {
+  category: (): LazyCategorySchema => {
     // Clone to avoid mutating the shared Sury.string singleton
     const schema = Object.create(
       Object.getPrototypeOf(Sury.string),
       Object.getOwnPropertyDescriptors(Sury.string),
-    ) as Sury.Schema<string, unknown> & TextSchemaWithMask;
-    schema.__schema_type = 'text';
+    ) as LazyCategorySchema;
+    schema.__schema_type = 'category';
 
     // Add chainable .mask() method
-    schema.mask = (preset: MaskPreset | MaskTransform): TextSchemaWithMetadata => {
+    schema.mask = (preset: MaskPreset | MaskTransform): LazyCategorySchema => {
       // Clone to create a new schema with the mask transform
       const maskedSchema = Object.create(
         Object.getPrototypeOf(schema),
         Object.getOwnPropertyDescriptors(schema),
-      ) as Sury.Schema<string, unknown> & TextSchemaWithMetadata;
+      ) as LazyCategorySchema;
       maskedSchema.__mask_transform = resolveMaskTransform(preset);
       return maskedSchema;
     };
 
     // Add chainable .eager() method
-    schema.eager = (): TextSchemaWithMetadata => {
+    schema.eager = (): EagerCategorySchema => {
       // Clone to create a new schema marked as eager
       const eagerSchema = Object.create(
         Object.getPrototypeOf(schema),
         Object.getOwnPropertyDescriptors(schema),
-      ) as Sury.Schema<string, unknown> & TextSchemaWithMetadata;
-      eagerSchema.__eager = true;
+      ) as EagerCategorySchema;
+      (eagerSchema as { __eager: true }).__eager = true;
+      return eagerSchema;
+    };
+
+    return schema;
+  },
+
+  text: (): LazyTextSchema => {
+    // Clone to avoid mutating the shared Sury.string singleton
+    const schema = Object.create(
+      Object.getPrototypeOf(Sury.string),
+      Object.getOwnPropertyDescriptors(Sury.string),
+    ) as LazyTextSchema;
+    schema.__schema_type = 'text';
+
+    // Add chainable .mask() method
+    schema.mask = (preset: MaskPreset | MaskTransform): LazyTextSchema => {
+      // Clone to create a new schema with the mask transform
+      const maskedSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as LazyTextSchema;
+      maskedSchema.__mask_transform = resolveMaskTransform(preset);
+      return maskedSchema;
+    };
+
+    // Add chainable .eager() method
+    schema.eager = (): EagerTextSchema => {
+      // Clone to create a new schema marked as eager
+      const eagerSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as EagerTextSchema;
+      (eagerSchema as { __eager: true }).__eager = true;
       return eagerSchema;
     };
 

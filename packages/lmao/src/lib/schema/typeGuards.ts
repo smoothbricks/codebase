@@ -11,9 +11,16 @@ export {
   getEnumUtf8,
   getEnumValues,
   getSchemaType,
-  isEnumSchemaWithMetadata,
+  isEnumSchema,
   isSchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
+
+// Alias for backward compatibility
+import { isEnumSchema as isEnumSchemaImpl } from '@smoothbricks/arrow-builder';
+/**
+ * @deprecated Use isEnumSchema instead
+ */
+export const isEnumSchemaWithMetadata = isEnumSchemaImpl;
 
 import type { SchemaType } from '@smoothbricks/arrow-builder';
 // Import for use in this file

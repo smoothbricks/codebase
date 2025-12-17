@@ -8,11 +8,11 @@
 
 import {
   S as ArrowS,
-  type BooleanSchemaWithMetadata,
-  type CategorySchemaWithMask,
-  type EnumSchemaWithMetadata,
-  type NumberSchemaWithMetadata,
-  type TextSchemaWithMask,
+  type LazyBooleanSchema,
+  type LazyCategorySchema,
+  type LazyEnumSchema,
+  type LazyNumberSchema,
+  type LazyTextSchema,
 } from '@smoothbricks/arrow-builder';
 import type * as Sury from '@sury/sury';
 import type { FeatureFlagDefinition, FlagBuilderWithDefault, SchemaBuilder, SchemaOrFlagBuilder } from './types.js';
@@ -71,7 +71,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    */
   number: () => {
     const schema = ArrowS.number();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<number> & NumberSchemaWithMetadata;
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<number> & LazyNumberSchema;
   },
 
   /**
@@ -83,7 +83,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    */
   boolean: () => {
     const schema = ArrowS.boolean();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<boolean> & BooleanSchemaWithMetadata;
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<boolean> & LazyBooleanSchema;
   },
 
   /**
@@ -129,11 +129,9 @@ const schemaBuilderImpl: SchemaBuilder = {
    * UTF-8 bytes are pre-computed at schema definition time (cold path) so
    * Arrow conversion just copies the pre-built dictionary data (zero re-encoding).
    */
-  enum: <T extends readonly string[]>(
-    values: T,
-  ): SchemaOrFlagBuilder<T[number]> & EnumSchemaWithMetadata<T[number]> => {
+  enum: <T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]> & LazyEnumSchema<T[number]> => {
     const schema = ArrowS.enum(values);
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<T[number]> & EnumSchemaWithMetadata<T[number]>;
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<T[number]> & LazyEnumSchema<T[number]>;
   },
 
   /**
@@ -151,9 +149,9 @@ const schemaBuilderImpl: SchemaBuilder = {
    * Hot path write:
    * buffer.attr_userId[idx] = internString(userId); // Returns Uint32 index
    */
-  category: (): SchemaOrFlagBuilder<string> & CategorySchemaWithMask => {
+  category: (): SchemaOrFlagBuilder<string> & LazyCategorySchema => {
     const schema = ArrowS.category();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & CategorySchemaWithMask;
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & LazyCategorySchema;
   },
 
   /**
@@ -171,9 +169,9 @@ const schemaBuilderImpl: SchemaBuilder = {
    * Hot path write:
    * buffer.attr_errorMsg[idx] = rawString; // No interning
    */
-  text: (): SchemaOrFlagBuilder<string> & TextSchemaWithMask => {
+  text: (): SchemaOrFlagBuilder<string> & LazyTextSchema => {
     const schema = ArrowS.text();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & TextSchemaWithMask;
+    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & LazyTextSchema;
   },
 };
 

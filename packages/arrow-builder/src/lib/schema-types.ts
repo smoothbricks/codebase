@@ -9,15 +9,30 @@ import type * as Sury from '@sury/sury';
 
 // Re-export schema metadata types from the schema module
 export type {
-  BooleanSchemaWithMetadata,
-  CategorySchemaWithMetadata,
-  EagerColumnMetadata,
-  EnumSchemaWithMetadata,
+  EagerBooleanSchema,
+  // Brands
+  EagerBrand,
+  EagerCategorySchema,
+  EagerEnumSchema,
+  EagerNumberSchema,
+  EagerTextSchema,
+  // Utility types
   EnumUtf8Precomputed,
-  NumberSchemaWithMetadata,
+  // Boolean schemas
+  LazyBooleanSchema,
+  LazyBrand,
+  // Category schemas
+  LazyCategorySchema,
+  // Enum schemas
+  LazyEnumSchema,
+  // Number schemas
+  LazyNumberSchema,
+  // Text schemas
+  LazyTextSchema,
+  MaskPreset,
+  MaskTransform,
   SchemaType,
   SchemaWithMetadata,
-  TextSchemaWithMetadata,
 } from './schema/types.js';
 
 /**

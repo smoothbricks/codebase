@@ -5,13 +5,14 @@
  */
 
 import type {
-  CategorySchemaWithMetadata,
-  EnumSchemaWithMetadata,
+  EagerEnumSchema,
   EnumUtf8Precomputed,
+  LazyCategorySchema,
+  LazyEnumSchema,
+  LazyTextSchema,
   MaskTransform,
   SchemaType,
   SchemaWithMetadata,
-  TextSchemaWithMetadata,
 } from './types.js';
 
 /**
@@ -40,10 +41,10 @@ export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadat
 }
 
 /**
- * Type guard to check if a value is an EnumSchemaWithMetadata
+ * Type guard to check if a value is an enum schema (LazyEnumSchema | EagerEnumSchema)
  * This is used to safely access enum values metadata
  */
-export function isEnumSchemaWithMetadata(value: unknown): value is EnumSchemaWithMetadata {
+export function isEnumSchema(value: unknown): value is LazyEnumSchema | EagerEnumSchema {
   if (!isSchemaWithMetadata(value)) {
     return false;
   }
@@ -53,7 +54,7 @@ export function isEnumSchemaWithMetadata(value: unknown): value is EnumSchemaWit
   return (
     obj.__schema_type === 'enum' &&
     '__enum_values' in obj &&
-    Array.isArray((obj as EnumSchemaWithMetadata).__enum_values)
+    Array.isArray((obj as LazyEnumSchema | EagerEnumSchema).__enum_values)
   );
 }
 
@@ -73,7 +74,7 @@ export function getSchemaType(value: unknown): SchemaType | undefined {
  * Safe alternative to casting to access __enum_values
  */
 export function getEnumValues(value: unknown): readonly string[] | undefined {
-  if (isEnumSchemaWithMetadata(value)) {
+  if (isEnumSchema(value)) {
     return value.__enum_values;
   }
   return undefined;
@@ -87,16 +88,17 @@ export function getEnumValues(value: unknown): readonly string[] | undefined {
  * time (cold path) so Arrow conversion just copies the pre-built dictionary data.
  */
 export function getEnumUtf8(value: unknown): EnumUtf8Precomputed | undefined {
-  if (isEnumSchemaWithMetadata(value) && '__enum_utf8' in value) {
-    return (value as EnumSchemaWithMetadata).__enum_utf8;
+  if (isEnumSchema(value) && '__enum_utf8' in value) {
+    return (value as LazyEnumSchema | EagerEnumSchema).__enum_utf8;
   }
   return undefined;
 }
 
 /**
- * Type guard to check if a schema has a mask transform
+ * Type guard to check if a schema has a mask transform.
+ * Only lazy category/text schemas have mask transforms (mask() returns lazy).
  */
-export function hasMaskTransform(value: unknown): value is CategorySchemaWithMetadata | TextSchemaWithMetadata {
+export function hasMaskTransform(value: unknown): value is LazyCategorySchema | LazyTextSchema {
   if (!isSchemaWithMetadata(value)) {
     return false;
   }
@@ -112,7 +114,7 @@ export function hasMaskTransform(value: unknown): value is CategorySchemaWithMet
  */
 export function getMaskTransform(value: unknown): MaskTransform | undefined {
   if (hasMaskTransform(value)) {
-    return (value as CategorySchemaWithMetadata | TextSchemaWithMetadata).__mask_transform;
+    return (value as LazyCategorySchema | LazyTextSchema).__mask_transform;
   }
   return undefined;
 }

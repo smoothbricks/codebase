@@ -136,11 +136,15 @@ export type TypedArrayConstructor =
 // ============================================================================
 
 import type {
-  BooleanSchemaWithMetadata,
-  CategorySchemaWithMetadata,
-  NumberSchemaWithMetadata,
+  EagerBooleanSchema,
+  EagerCategorySchema,
+  EagerNumberSchema,
+  EagerTextSchema,
+  LazyBooleanSchema,
+  LazyCategorySchema,
+  LazyNumberSchema,
+  LazyTextSchema,
   SchemaWithMetadata,
-  TextSchemaWithMetadata,
 } from '../schema/types.js';
 
 /**
@@ -157,13 +161,13 @@ import type {
  */
 export type SetterValueType<S> = S extends { __schema_type: 'enum' }
   ? number // enum index (string→index conversion done by SpanLogger/TagWriter)
-  : S extends CategorySchemaWithMetadata
+  : S extends LazyCategorySchema | EagerCategorySchema
     ? string
-    : S extends TextSchemaWithMetadata
+    : S extends LazyTextSchema | EagerTextSchema
       ? string
-      : S extends NumberSchemaWithMetadata
+      : S extends LazyNumberSchema | EagerNumberSchema
         ? number
-        : S extends BooleanSchemaWithMetadata
+        : S extends LazyBooleanSchema | EagerBooleanSchema
           ? boolean
           : S extends SchemaWithMetadata<infer T>
             ? T
@@ -180,13 +184,13 @@ export type SetterValueType<S> = S extends { __schema_type: 'enum' }
  */
 export type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
   ? Uint8Array
-  : S extends CategorySchemaWithMetadata
+  : S extends LazyCategorySchema | EagerCategorySchema
     ? string[]
-    : S extends TextSchemaWithMetadata
+    : S extends LazyTextSchema | EagerTextSchema
       ? string[]
-      : S extends NumberSchemaWithMetadata
+      : S extends LazyNumberSchema | EagerNumberSchema
         ? Float64Array
-        : S extends BooleanSchemaWithMetadata
+        : S extends LazyBooleanSchema | EagerBooleanSchema
           ? Uint8Array // bit-packed
           : string[] | TypedArray;
 
