@@ -1081,7 +1081,7 @@ export function getInterned(str: string): Uint8Array | undefined {
 **When `intern()` is called** (all at startup/definition time, NOT hot path):
 
 - **Enum schema creation**: `S.enum(['A', 'B', 'C'])` calls `intern()` for all values
-- **Module context creation**: `new ModuleContext(...)` interns `filePath` and `gitSha`
+- **Module context creation**: `new ModuleContext(...)` interns `packageName`, `packagePath`, and `gitSha`
 - **Task context creation**: `new TaskContext(...)` interns `spanName`
 
 **Why unbounded**: All interned values are source code constants (enum values, file paths, span names) that already
@@ -1098,7 +1098,8 @@ const schema = S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']);
 const moduleCtx = new ModuleContext(
   moduleId,
   gitSha, // intern(gitSha) → UTF-8 bytes cached
-  filePath, // intern(filePath) → UTF-8 bytes cached
+  packageName, // intern(packageName) → UTF-8 bytes cached (e.g., '@mycompany/user-service')
+  packagePath, // intern(packagePath) → UTF-8 bytes cached (e.g., 'src/services/user.ts')
   tagAttributes
 );
 
@@ -1209,11 +1210,13 @@ Module and Task contexts store pre-encoded UTF-8 for frequently-used strings:
 ```typescript
 // ModuleContext (created once per module at startup)
 class ModuleContext {
-  readonly utf8FilePath: Uint8Array; // intern(filePath)
+  readonly utf8PackageName: Uint8Array; // intern(packageName)
+  readonly utf8PackagePath: Uint8Array; // intern(packagePath)
   readonly utf8GitSha: Uint8Array; // intern(gitSha)
 
-  constructor(moduleId, gitSha, filePath, tagAttributes) {
-    this.utf8FilePath = intern(filePath);
+  constructor(moduleId, gitSha, packageName, packagePath, tagAttributes) {
+    this.utf8PackageName = intern(packageName);
+    this.utf8PackagePath = intern(packagePath);
     this.utf8GitSha = intern(gitSha);
   }
 }

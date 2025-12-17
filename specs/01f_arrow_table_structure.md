@@ -225,7 +225,8 @@ system becomes a row in the final table, enabling rich analytical queries while 
 | `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                                                       |
 | `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                                                   |
 | `entry_type`       | `dictionary<string>` | Log entry type                                                                                                | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
-| `module`           | `dictionary<string>` | Module name                                                                                                   | `'UserController'`, `'DatabaseService'`                                                                                              |
+| `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                                                  |
+| `package_path`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                                                   |
 | `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`, `'TypeError: x is not a function'`                       |
 
 **Note on Span Identification**:
@@ -234,6 +235,82 @@ system becomes a row in the final table, enabling rich analytical queries while 
   spans in a trace (zero-copy).
 - `thread_id` + `span_id`: Extracted from `SpanIdentity` 25-byte ArrayBuffer during Arrow conversion.
 - `parent_thread_id` + `parent_span_id`: Also from `SpanIdentity`, null for root spans (hasParent flag = 0).
+
+## Module Identification
+
+The `package_name` and `package_path` columns work together to identify the source location of each trace entry. This
+two-column design provides significant benefits over a single combined path:
+
+### Why `packageName` + `packagePath` (Not a Combined Path)
+
+1. **Cross-repo log aggregation**: When logs from multiple repositories or services are combined (e.g., in a data
+   warehouse), the package name provides a globally unique namespace. npm enforces package name uniqueness, so
+   `@mycompany/user-service` is unambiguous across all repos. A git-relative path like `src/services/user.ts` would be
+   ambiguous—many repos have files at that path.
+
+2. **Prefix compression via dictionary encoding**: The package name is stored once in the dictionary and referenced by
+   index. If a service logs 100 spans, the full package name string (e.g., `'@smoothbricks/lmao'`) is stored only once.
+   Each row just stores a 4-byte index. This typically saves 20-50 bytes per row compared to storing full paths.
+
+3. **Better queryability**: Filter by package without string parsing:
+
+   ```sql
+   -- Clean filter (uses dictionary index)
+   WHERE package_name = '@smoothbricks/lmao'
+
+   -- vs. string parsing (slower, error-prone)
+   WHERE module LIKE '@smoothbricks/lmao/%'
+   ```
+
+4. **Source lookup path**: To find actual source code from a trace entry:
+   - `package_name` → npm registry → git repo URL (via `repository` field in package.json)
+   - Git repo → find package location within monorepo (search for package.json with matching name)
+   - `package_path` → actual source file relative to that package.json
+
+5. **TypeScript transformer compatibility**: The TypeScript transformer computes both pieces via `findNearestPackage()`,
+   which returns both `packageName` and `packageDir`. Storing them separately avoids redundant string concatenation.
+
+### Why NOT Git-Based Identity
+
+We considered using git repository info (git root path, git SHA for identity) but rejected it:
+
+- **Not all code is in git repos**: Build artifacts, generated code, node_modules may not have git info
+- **Monorepos have one git root but many packages**: The git path doesn't uniquely identify a package
+- **Package name from `package.json` is the canonical npm identity**: Already defined, already unique
+- **Git SHA is for version tracking**: Answers "which version of the code?" not "which module?"
+  - We keep `gitSha` as a separate field for version tracking, not as part of module identity
+
+### ModuleMetadata Interface
+
+The `moduleMetadata` object passed to `createModuleContext()` contains:
+
+```typescript
+interface ModuleMetadata {
+  gitSha: string; // Git commit SHA for version tracking (NOT identity)
+  packageName: string; // npm package name from nearest package.json
+  packagePath: string; // Path within package, relative to package.json
+}
+```
+
+Example:
+
+```typescript
+moduleMetadata: {
+  gitSha: 'abc123def456...',
+  packageName: '@smoothbricks/lmao',
+  packagePath: 'src/services/user.ts',
+}
+```
+
+### ModuleContext Properties
+
+The `ModuleContext` (created at module initialization) stores:
+
+- `packageName: string` — npm package name from nearest package.json (e.g., `'@smoothbricks/lmao'`)
+- `packagePath: string` — Path within package, including file extension (e.g., `'src/services/user.ts'`)
+- `gitSha: string` — Git commit SHA for version tracking
+
+Both `packageName` and `packagePath` values are interned at module creation time for efficient dictionary encoding.
 
 ## Span Definition
 
@@ -550,31 +627,31 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 1, parent_thread_id: null, parent_span_i
 thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890, parent_span_id: 1
 ```
 
-| trace_id     | span_id | parent_span_id | timestamp                  | entry_type   | module                | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
-| ------------ | ------- | -------------- | -------------------------- | ------------ | --------------------- | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `UserController`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `UserController`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.005Z` | `info`       | `UserController`      | `Starting registration for ${userId}`           | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.010Z` | `span-start` | `ValidationService`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.015Z` | `tag`        | `ValidationService`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.045Z` | `tag`        | `ValidationService`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | 30.2          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.046Z` | `span-ok`    | `ValidationService`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.050Z` | `span-start` | `UserRepository`      | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.052Z` | `tag`        | `UserRepository`      | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.067Z` | `tag`        | `UserRepository`      | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | 15.3        | 0       | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.068Z` | `debug`      | `UserRepository`      | `User does not exist, proceeding with creation` | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.069Z` | `span-ok`    | `UserRepository`      | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.070Z` | `span-start` | `UserRepository`      | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.072Z` | `tag`        | `UserRepository`      | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.095Z` | `tag`        | `UserRepository`      | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | 23.1        | 1       | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.096Z` | `span-ok`    | `UserRepository`      | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.100Z` | `span-start` | `NotificationService` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.105Z` | `tag`        | `NotificationService` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.245Z` | `tag`        | `NotificationService` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | 140.3         | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.246Z` | `span-ok`    | `NotificationService` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.250Z` | `tag`        | `UserController`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | 1.0             | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.251Z` | `info`       | `UserController`      | `Registration completed for ${userId}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `UserController`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| trace_id     | span_id | parent_span_id | timestamp                  | entry_type   | package_name              | package_path                   | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
+| ------------ | ------- | -------------- | -------------------------- | ------------ | ------------------------- | ------------------------------ | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
+| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `@mycompany/user-service` | `src/controllers/user.ts`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
+| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.005Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Starting registration for ${userId}`           | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.010Z` | `span-start` | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.015Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.045Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | 30.2          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.046Z` | `span-ok`    | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.050Z` | `span-start` | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.052Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.067Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | 15.3        | 0       | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.068Z` | `debug`      | `@mycompany/user-service` | `src/repositories/user.ts`     | `User does not exist, proceeding with creation` | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.069Z` | `span-ok`    | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.070Z` | `span-start` | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.072Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.095Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | 23.1        | 1       | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.096Z` | `span-ok`    | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.100Z` | `span-start` | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.105Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.245Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | 140.3         | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.246Z` | `span-ok`    | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.250Z` | `tag`        | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | 1.0             | null     |
+| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for ${userId}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 
 ## The `message` System Column
 
@@ -751,8 +828,9 @@ SELECT
   count(*) as total_entries,
   count(CASE WHEN entry_type = 'span-start' THEN 1 END) as span_count
 FROM traces
-WHERE module = 'UserController'
-  AND span_name = 'register-user'
+WHERE package_name = '@mycompany/user-service'
+  AND package_path = 'src/controllers/user.ts'
+  AND message = 'register-user'
 GROUP BY trace_id
 ORDER BY total_duration_ms DESC
 LIMIT 10;
@@ -780,14 +858,15 @@ ORDER BY avg_duration DESC;
 ```sql
 -- HTTP error rates by service
 SELECT
-  module,
-  span_name,
+  package_name,
+  package_path,
+  message as span_name,
   count(*) as total_requests,
   count(CASE WHEN http_status >= 400 THEN 1 END) as error_count,
   (error_count / total_requests) * 100 as error_rate_percent
 FROM traces
 WHERE http_status IS NOT NULL
-GROUP BY module, span_name
+GROUP BY package_name, package_path, message
 HAVING total_requests > 100  -- Only services with significant traffic
 ORDER BY error_rate_percent DESC;
 ```
@@ -799,7 +878,8 @@ ORDER BY error_rate_percent DESC;
 SELECT
   span_id,
   parent_span_id,
-  module,
+  package_name,
+  package_path,
   message,
   entry_type,
   timestamp,
@@ -820,7 +900,8 @@ ORDER BY timestamp;
 -- Analyze structured logging usage patterns
 -- Note: message contains MESSAGE TEMPLATES, not interpolated strings
 SELECT
-  module,
+  package_name,
+  package_path,
   entry_type as log_level,
   count(*) as message_count,
   count(DISTINCT trace_id) as trace_count,
@@ -828,7 +909,7 @@ SELECT
   count(CASE WHEN http_status IS NOT NULL OR user_id IS NOT NULL THEN 1 END) as structured_entries
 FROM traces
 WHERE entry_type IN ('info', 'debug', 'warn', 'error')
-GROUP BY module, entry_type
+GROUP BY package_name, package_path, entry_type
 ORDER BY message_count DESC;
 
 -- Find most common log message templates
@@ -997,8 +1078,8 @@ efficiency and shared dictionaries.
 2. ✅ `concatenateTypedArrays()` helper - efficient buffer chain concatenation
 3. ✅ `concatenateNullBitmaps()` helper - null bitmap merging across buffers
 4. ✅ Primitive columns (number, boolean, timestamp) - direct subarray() + concatenation
-5. ✅ Dictionary columns (enum, category, text, trace_id, module, span_name, entry_type) - index arrays + dictionary
-   vectors
+5. ✅ Dictionary columns (enum, category, text, trace_id, package_name, package_path, span_name, entry_type) - index
+   arrays + dictionary vectors
 6. ✅ System columns - all use zero-copy with direct TypedArray construction
 
 **Key Implementation Patterns**:

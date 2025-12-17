@@ -214,7 +214,7 @@ export const globalUtf8Cache = new Utf8Cache(4096);
 userId: S.category(); // ✓ Same users appear multiple times
 action: S.category(); // ✓ 'login', 'logout', 'purchase' repeat
 region: S.category(); // ✓ 'us-east-1', 'eu-west-1', limited set
-moduleName: S.category(); // ✓ Limited number of modules
+spanName: S.category(); // ✓ Same span names repeat
 spanName: S.category(); // ✓ Same span names repeat
 ```
 
@@ -391,7 +391,7 @@ httpMethod: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']);
 userId: S.category(); // Users appear in multiple spans
 action: S.category(); // Same actions repeat ('login', 'checkout')
 region: S.category(); // Limited AWS regions ('us-east-1', etc.)
-moduleName: S.category(); // Limited number of code modules
+spanName: S.category(); // Same span names repeat across requests
 tableName: S.category(); // Database tables are reused
 
 // TEXT: Unique values (high cardinality)
@@ -575,7 +575,8 @@ const systemSchema = defineTagAttributes({
     'ff-access', // 9
     'ff-usage', // 10
   ]),
-  module: S.category(), // Module name
+  packageName: S.category(), // npm package name from package.json
+  packagePath: S.category(), // Path within package, relative to package.json
 
   // UNIFIED MESSAGE COLUMN - span name, log message template, exception message, result message, OR flag name
   message: S.category(), // See "The message System Column" below
@@ -1630,8 +1631,8 @@ interface SpanContext extends RequestContext {
 const { task } = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123...',
-    filePath: 'src/services/user.ts',
-    moduleName: 'UserService',
+    packageName: '@mycompany/user-service',
+    packagePath: 'src/services/user.ts',
   },
   tagAttributes: dbAttributes, // Use DB-specific attributes
 });

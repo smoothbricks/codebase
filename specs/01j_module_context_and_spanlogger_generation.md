@@ -23,8 +23,8 @@ const { task } = createModuleContext({
   // Transformer or build tool injects module metadata
   moduleMetadata: {
     gitSha: 'abc123...',
-    filePath: 'src/services/user.ts',
-    moduleName: 'UserService',
+    packageName: '@mycompany/user-service',
+    packagePath: 'src/services/user.ts',
   },
   tagAttributes: dbAttributes, // Use DB-specific attributes
 });
@@ -43,7 +43,8 @@ function createModuleContextFromCompiled(moduleMetadata: ModuleMetadata, compile
   const moduleContext: ModuleContext = {
     moduleId: registerModule(moduleMetadata),
     gitSha: moduleMetadata.gitSha,
-    filePath: moduleMetadata.filePath,
+    packageName: moduleMetadata.packageName,
+    packagePath: moduleMetadata.packagePath,
 
     // Initialize self-tuning capacity stats
     spanBufferCapacityStats: {
@@ -376,8 +377,8 @@ async function post(ctx: Ctx, url: string, data: any, options = {}) {
 // Module metadata
 const HTTP_MODULE_METADATA = {
   gitSha: 'abc123...',
-  filePath: '@my-company/http-tracing',
-  moduleName: 'HttpTracing',
+  packageName: '@my-company/http-tracing',
+  packagePath: 'src/index.ts',
 };
 
 // Factory call with custom span names
@@ -438,7 +439,9 @@ This module context system integrates seamlessly with the runtime context flow:
 // Module setup (build/startup time)
 const { task } = createModuleContext({
   moduleMetadata: {
-    /* ... */
+    gitSha: 'abc123...',
+    packageName: '@mycompany/user-service',
+    packagePath: 'src/services/user.ts',
   },
   tagAttributes: dbAttributes,
 });

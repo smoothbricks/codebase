@@ -851,7 +851,8 @@ In `packages/lmao/src/lib/lmao.ts`:
 export interface ModuleContext {
   moduleId: number;
   gitSha: string;
-  filePath: string;
+  package: string;
+  packagePath: string;
   tagAttributes: TagAttributeSchema;
   spanBufferCapacityStats: BufferCapacityStats;
 
@@ -1144,7 +1145,7 @@ No migration or data copying is needed. The system simply creates new SpanBuffer
 ```typescript
 // Initial state: All columns lazy
 const module = createModuleContext({
-  moduleMetadata: { gitSha: 'abc', filePath: 'user.ts', moduleName: 'user' },
+  moduleMetadata: { gitSha: 'abc', packageName: '@mycompany/app', packagePath: 'src/user.ts' },
   tagAttributes: {
     userId: S.category(),
     requestId: S.category(),
@@ -1179,7 +1180,7 @@ import { S } from '../schema/builder.js';
 describe('Lazy-to-eager column promotion', () => {
   it('promotes high-usage columns to eager after 100 buffers', () => {
     const module = createModuleContext({
-      moduleMetadata: { gitSha: 'test', filePath: 'test.ts', moduleName: 'test' },
+      moduleMetadata: { gitSha: 'test', packageName: '@test/app', packagePath: 'src/test.ts' },
       tagAttributes: {
         userId: S.category(),
         sessionId: S.category(),
@@ -1210,7 +1211,7 @@ describe('Lazy-to-eager column promotion', () => {
 
   it('does not promote columns below 80% usage threshold', () => {
     const module = createModuleContext({
-      moduleMetadata: { gitSha: 'test', filePath: 'test.ts', moduleName: 'test' },
+      moduleMetadata: { gitSha: 'test', packageName: '@test/app', packagePath: 'src/test.ts' },
       tagAttributes: {
         userId: S.category(),
         sessionId: S.category(),
@@ -1237,7 +1238,7 @@ describe('Lazy-to-eager column promotion', () => {
 
   it('requires 100 samples before promotion', () => {
     const module = createModuleContext({
-      moduleMetadata: { gitSha: 'test', filePath: 'test.ts', moduleName: 'test' },
+      moduleMetadata: { gitSha: 'test', packageName: '@test/app', packagePath: 'src/test.ts' },
       tagAttributes: {
         userId: S.category(),
       },

@@ -336,7 +336,8 @@ A high-level structured logging library providing excellent developer experience
 15. **Arrow Table creation** - Orchestrates conversion using shared dictionaries and `arrow.makeData()`
 16. **Utf8Cache** - SIEVE-based cache implementing arrow-builder's `Utf8Encoder` interface
 17. **globalUtf8Cache singleton** - Shared cache for cross-flush UTF-8 encoding benefits
-18. **Pre-encoded contexts** - ModuleContext/TaskContext with `utf8FilePath`, `utf8GitSha`, `utf8SpanName`
+18. **Pre-encoded contexts** - ModuleContext/TaskContext with `utf8PackageName`, `utf8PackagePath`, `utf8GitSha`,
+    `utf8SpanName`
 
 ### System Columns vs User Attributes
 
@@ -570,7 +571,7 @@ export function getInterned(str: string): Uint8Array | undefined; // Get if cach
 **When called** (all at startup/definition time):
 
 - `S.enum(['A', 'B'])` → interns all enum values
-- `new ModuleContext(...)` → interns `filePath`, `gitSha`
+- `new ModuleContext(...)` → interns `packageName`, `packagePath`, `gitSha`
 - `new TaskContext(...)` → interns `spanName`
 
 **Why in arrow-builder**: Pre-encoding UTF-8 is generic functionality. Any columnar data system benefits from avoiding
@@ -619,7 +620,8 @@ inject its SIEVE cache without arrow-builder knowing about caching strategies.
 
 ```typescript
 class ModuleContext {
-  readonly utf8FilePath: Uint8Array; // intern(filePath) at construction
+  readonly utf8PackageName: Uint8Array; // intern(packageName) at construction
+  readonly utf8PackagePath: Uint8Array; // intern(packagePath) at construction
   readonly utf8GitSha: Uint8Array; // intern(gitSha) at construction
 }
 
@@ -726,7 +728,7 @@ packages/
         ├── lmao.ts                       # Main entry, context creation
         ├── spanBuffer.ts                 # SpanBuffer factory (extends ColumnBuffer)
         ├── types.ts                      # SpanBuffer, TaskContext interfaces
-        ├── moduleContext.ts              # ModuleContext with utf8FilePath, utf8GitSha
+        ├── moduleContext.ts              # ModuleContext with utf8PackageName, utf8PackagePath, utf8GitSha
         ├── taskContext.ts                # TaskContext with utf8SpanName
         ├── utf8Cache.ts                  # Utf8Cache (SIEVE), globalUtf8Cache singleton
         ├── convertToArrow.ts             # Tree walking, dictionary building, Arrow conversion

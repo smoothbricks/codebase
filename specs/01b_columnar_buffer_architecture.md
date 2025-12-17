@@ -2060,7 +2060,8 @@ function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttrib
   const moduleContext: ModuleContext = {
     moduleId: registerModule(config.moduleMetadata),
     gitSha: config.moduleMetadata.gitSha,
-    filePath: config.moduleMetadata.filePath,
+    packageName: config.moduleMetadata.packageName,
+    packagePath: config.moduleMetadata.packagePath,
 
     // Initialize self-tuning capacity stats
     spanBufferCapacityStats: {
@@ -2194,7 +2195,7 @@ Heavy setup work happens once when a module is first loaded:
 ```typescript
 // COLD PATH: All expensive operations happen here, ONCE per module
 const moduleContext = createModuleContext({
-  moduleMetadata: { name: 'my-service', filePath: __filename },
+  moduleMetadata: { gitSha: 'abc123...', packageName: '@mycompany/my-service', packagePath: 'src/services/user.ts' },
   tagAttributes: mySchema,
 });
 
@@ -2424,8 +2425,10 @@ function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.Rec
   }
 
   // --- Module Metadata Columns (expanded from shared reference) ---
+  // See 01f_arrow_table_structure.md "Module Identification" section for rationale
   arrowVectors.gitSha = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'gitSha'));
-  arrowVectors.filePath = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'filePath'));
+  arrowVectors.package_name = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'packageName'));
+  arrowVectors.package_path = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'packagePath'));
   arrowVectors.functionName = arrow.Utf8Vector.from(
     getModuleMetadataColumn(buffer, 'functionNameId').map((id) => stringRegistry.get(id))
   );

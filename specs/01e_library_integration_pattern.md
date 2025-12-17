@@ -266,34 +266,37 @@ ctx.tag.method('POST'); // Writes to http_method column
 
 The final Arrow table has clean, collision-free columns:
 
-| Column             | Type                 | Description                     | Source              |
-| ------------------ | -------------------- | ------------------------------- | ------------------- |
-| `timestamp`        | `timestamp[ns]`      | Event timestamp                 | Core system         |
-| `trace_id`         | `dictionary<string>` | Trace identifier                | Core system         |
-| `thread_id`        | `uint64`             | Thread/worker identifier        | Core system         |
-| `span_id`          | `uint32`             | Unit of work within thread      | Core system         |
-| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread            | Core system         |
-| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID                | Core system         |
-| `entry_type`       | `dictionary<string>` | Log entry type                  | Core system         |
-| `module`           | `dictionary<string>` | Module name                     | Core system         |
-| `span_name`        | `dictionary<string>` | Span/task name                  | Core system         |
-| `message`          | `string`             | Log message                     | Core system         |
-| `http_status`      | `uint16`             | HTTP status code                | HTTP library        |
-| `http_method`      | `dictionary<string>` | HTTP method                     | HTTP library        |
-| `http_url`         | `string`             | Masked URL                      | HTTP library        |
-| `http_duration`    | `float32`            | HTTP request duration           | HTTP library        |
-| `db_query`         | `string`             | Masked SQL query                | Database library    |
-| `db_duration`      | `float32`            | Query duration                  | Database library    |
-| `db_rows`          | `uint32`             | Rows affected                   | Database library    |
-| `db_table`         | `dictionary<string>` | Table name                      | Database library    |
-| `redis_command`    | `dictionary<string>` | Redis command                   | Redis library       |
-| `redis_key`        | `string`             | Redis key                       | Redis library       |
-| `redis_duration`   | `float32`            | Redis operation duration        | Redis library       |
-| `user_id`          | `binary[8]`          | Hashed user ID                  | User-defined        |
-| `business_metric`  | `float64`            | Custom metric                   | User-defined        |
-| `ff_value`         | `dictionary<string>` | Feature flag value (S.category) | Feature flag system |
+| Column             | Type                 | Description                                   | Source              |
+| ------------------ | -------------------- | --------------------------------------------- | ------------------- |
+| `timestamp`        | `timestamp[ns]`      | Event timestamp                               | Core system         |
+| `trace_id`         | `dictionary<string>` | Trace identifier                              | Core system         |
+| `thread_id`        | `uint64`             | Thread/worker identifier                      | Core system         |
+| `span_id`          | `uint32`             | Unit of work within thread                    | Core system         |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread                          | Core system         |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID                              | Core system         |
+| `entry_type`       | `dictionary<string>` | Log entry type                                | Core system         |
+| `package_name`     | `dictionary<string>` | npm package name                              | Core system         |
+| `package_path`     | `dictionary<string>` | Path within package, relative to package.json | Core system         |
+| `message`          | `dictionary<string>` | Span name, log template, or flag name         | Core system         |
+| `http_status`      | `uint16`             | HTTP status code                              | HTTP library        |
+| `http_method`      | `dictionary<string>` | HTTP method                                   | HTTP library        |
+| `http_url`         | `string`             | Masked URL                                    | HTTP library        |
+| `http_duration`    | `float32`            | HTTP request duration                         | HTTP library        |
+| `db_query`         | `string`             | Masked SQL query                              | Database library    |
+| `db_duration`      | `float32`            | Query duration                                | Database library    |
+| `db_rows`          | `uint32`             | Rows affected                                 | Database library    |
+| `db_table`         | `dictionary<string>` | Table name                                    | Database library    |
+| `redis_command`    | `dictionary<string>` | Redis command                                 | Redis library       |
+| `redis_key`        | `string`             | Redis key                                     | Redis library       |
+| `redis_duration`   | `float32`            | Redis operation duration                      | Redis library       |
+| `user_id`          | `binary[8]`          | Hashed user ID                                | User-defined        |
+| `business_metric`  | `float64`            | Custom metric                                 | User-defined        |
+| `ff_value`         | `dictionary<string>` | Feature flag value (S.category)               | Feature flag system |
 
 **Note**: Feature flag names are stored in the unified `message` column for `ff-access` and `ff-usage` entries.
+
+See [Arrow Table Structure - Module Identification](./01f_arrow_table_structure.md#module-identification) for rationale
+on the `package` and `package_path` column design.
 
 ### ClickHouse Query Examples
 

@@ -287,7 +287,7 @@ The module context system provides:
 ```typescript
 // Module setup (build/startup time)
 const { task } = createModuleContext({
-  moduleMetadata: { gitSha: 'abc123...', filePath: 'src/services/user.ts' },
+  moduleMetadata: { gitSha: 'abc123...', packageName: '@mycompany/user-service', packagePath: 'src/services/user.ts' },
   tagAttributes: dbAttributes,
 });
 
