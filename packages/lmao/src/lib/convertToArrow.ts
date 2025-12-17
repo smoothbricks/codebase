@@ -17,6 +17,7 @@ import {
   type FinalizedDictionary,
   getMaskTransform,
   type PreEncodedEntry,
+  setBitRange,
   sortInPlace,
 } from '@smoothbricks/arrow-builder';
 import {
@@ -40,7 +41,7 @@ import {
   Utf8,
   type Vector,
 } from 'apache-arrow';
-import { ENTRY_TYPE_NAMES } from './lmao.js';
+import { ENTRY_TYPE_CAPACITY_STATS, ENTRY_TYPE_NAMES } from './lmao.js';
 import type { ModuleContext } from './moduleContext.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { SpanBuffer } from './types.js';
@@ -974,7 +975,11 @@ function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): 
  * - Pass 1: Walk tree, build dictionaries (collect unique strings, cache UTF-8)
  * - Pass 2: Walk tree, convert each buffer to RecordBatch using shared dictionaries
  */
-export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColumnBuilder?: SystemColumnBuilder): Table {
+export function convertSpanTreeToArrowTable(
+  rootBuffer: SpanBuffer,
+  _systemColumnBuilder?: SystemColumnBuilder,
+  modulesToLogStats?: Set<ModuleContext>,
+): Table {
   const schema = rootBuffer.task.module.tagAttributes;
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1011,9 +1016,9 @@ export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColum
   // Use a Set to deduplicate by ModuleContext identity (same module = same entries)
   const uniqueModules = new Set<ModuleContext>();
 
-  let totalRows = 0;
+  let spanRows = 0;
   walkSpanTree(rootBuffer, (buffer) => {
-    totalRows += buffer.writeIndex;
+    spanRows += buffer.writeIndex;
     traceIdBuilder.add(buffer.traceId);
     spanNameBuilder.add(buffer.task.spanName);
 
@@ -1065,7 +1070,9 @@ export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColum
     }
   });
 
-  if (totalRows === 0) return new Table();
+  if (spanRows === 0 && (!modulesToLogStats || modulesToLogStats.size === 0)) {
+    return new Table();
+  }
 
   // Finalize dictionaries
   const traceIdDict = traceIdBuilder.finalize(false);
@@ -1184,29 +1191,514 @@ export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColum
     }
   });
 
-  if (allBuffers.length === 0) return new Table();
-
   // Build a single RecordBatch from all buffers
-  const batch = convertBuffersWithSharedDicts(
-    allBuffers,
-    arrowSchema,
-    traceIdDict,
-    packageDict,
-    packagePathDict,
-    gitShaDict,
-    spanNameDict,
-    categoryDicts,
-    textDicts,
-    attrDictIds,
-    schema,
-    categoryOriginalToMasked,
-    textOriginalToMasked,
-  );
+  const batch =
+    allBuffers.length > 0
+      ? convertBuffersWithSharedDicts(
+          allBuffers,
+          arrowSchema,
+          traceIdDict,
+          packageDict,
+          packagePathDict,
+          gitShaDict,
+          spanNameDict,
+          categoryDicts,
+          textDicts,
+          attrDictIds,
+          schema,
+          categoryOriginalToMasked,
+          textOriginalToMasked,
+        )
+      : undefined;
 
-  return new Table([batch]);
+  // Create capacity stats RecordBatch if needed
+  if (modulesToLogStats && modulesToLogStats.size > 0) {
+    const capacityStatsBatch = createCapacityStatsRecordBatch(
+      modulesToLogStats,
+      arrowSchema,
+      traceIdDict,
+      packageDict,
+      packagePathDict,
+      gitShaDict,
+      spanNameDict,
+      categoryDicts,
+      textDicts,
+      schema,
+    );
+    if (batch) {
+      return new Table([batch, capacityStatsBatch]);
+    }
+    return new Table([capacityStatsBatch]);
+  }
+
+  if (batch) {
+    return new Table([batch]);
+  }
+  return new Table();
 }
 
 // Use FinalizedDictionary type from arrow-builder
+
+/**
+ * Create a RecordBatch with capacity stats entries for the given modules.
+ * Each module gets one row with its capacity statistics serialized as JSON in the message column.
+ */
+function createCapacityStatsRecordBatch(
+  modulesToLogStats: Set<ModuleContext>,
+  arrowSchema: Schema,
+  traceIdDict: FinalizedDictionary,
+  packageDict: FinalizedDictionary,
+  packagePathDict: FinalizedDictionary,
+  gitShaDict: FinalizedDictionary,
+  spanNameDict: FinalizedDictionary,
+  categoryDicts: Map<string, FinalizedDictionary>,
+  textDicts: Map<string, FinalizedDictionary>,
+  lmaoSchema: Record<string, unknown>,
+): RecordBatch {
+  const capacityStatsRows = modulesToLogStats.size;
+  if (capacityStatsRows === 0) {
+    return new RecordBatch({});
+  }
+
+  const modulesArray = Array.from(modulesToLogStats);
+  const vectors: Vector[] = [];
+
+  // Get types from the shared schema
+  const timestampType = arrowSchema.fields[0].type as TimestampNanosecond;
+  const traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8, Int32>;
+  const entryTypeType = arrowSchema.fields[6].type as Dictionary<Utf8, Int8>;
+  const packageType = arrowSchema.fields[7].type as Dictionary<Utf8, Int32>;
+  const packagePathType = arrowSchema.fields[8].type as Dictionary<Utf8, Int32>;
+  const gitShaType = arrowSchema.fields[9].type as Dictionary<Utf8, Int32>;
+  const spanNameType = arrowSchema.fields[10].type as Dictionary<Utf8, Int32>;
+
+  // Prepare capacity stats messages and add to message dictionary if it exists
+  const messageDict = categoryDicts.get('message');
+  const capacityStatsMessages = new Map<ModuleContext, number>(); // module -> message dict index
+  const nowNs = BigInt(Date.now()) * 1_000_000n;
+
+  if (messageDict) {
+    // Build stats JSON strings and find their indices in the message dictionary
+    for (const module of modulesArray) {
+      const stats = module.spanBufferCapacityStats;
+      const efficiency = stats.totalWrites / (stats.totalBuffersCreated * stats.currentCapacity);
+      const overflowRatio = stats.overflowWrites / stats.totalWrites;
+
+      const statsJson = JSON.stringify({
+        currentCapacity: stats.currentCapacity,
+        totalWrites: stats.totalWrites,
+        overflowWrites: stats.overflowWrites,
+        totalBuffers: stats.totalBuffersCreated,
+        efficiency,
+        overflowRatio,
+      });
+
+      const msgIdx = messageDict.indexMap.get(statsJson) ?? 0;
+      capacityStatsMessages.set(module, msgIdx);
+    }
+  }
+
+  // Timestamp - all current time
+  const timestamps = new BigInt64Array(capacityStatsRows);
+  timestamps.fill(nowNs);
+  vectors.push(
+    makeVector(
+      makeData({
+        type: timestampType,
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: timestamps,
+      }),
+    ),
+  );
+
+  // Trace ID - use 0 (first entry in dictionary) or first trace ID
+  const traceIdIndices = new Int32Array(capacityStatsRows);
+  traceIdIndices.fill(0);
+  vectors.push(
+    makeVector(
+      makeData({
+        type: traceIdType,
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: traceIdIndices,
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
+            offset: 0,
+            length: traceIdDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: traceIdDict.offsets,
+            data: traceIdDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // thread_id - all 0
+  const threadIds = new BigUint64Array(capacityStatsRows);
+  threadIds.fill(0n);
+  vectors.push(
+    makeVector(
+      makeData({
+        type: new Uint64(),
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: threadIds,
+      }),
+    ),
+  );
+
+  // span_id - all 0
+  const spanIds = new Uint32Array(capacityStatsRows);
+  spanIds.fill(0);
+  vectors.push(
+    makeVector(
+      makeData({
+        type: new Uint32(),
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: spanIds,
+      }),
+    ),
+  );
+
+  // parent_thread_id - all null
+  const parentThreadIds = new BigUint64Array(capacityStatsRows);
+  const parentThreadIdNulls = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+  parentThreadIdNulls.fill(0); // All null
+  vectors.push(
+    makeVector(
+      makeData({
+        type: new Uint64(),
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: capacityStatsRows,
+        data: parentThreadIds,
+        nullBitmap: parentThreadIdNulls,
+      }),
+    ),
+  );
+
+  // parent_span_id - all null
+  const parentSpanIds = new Uint32Array(capacityStatsRows);
+  const parentSpanIdNulls = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+  parentSpanIdNulls.fill(0); // All null
+  vectors.push(
+    makeVector(
+      makeData({
+        type: new Uint32(),
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: capacityStatsRows,
+        data: parentSpanIds,
+        nullBitmap: parentSpanIdNulls,
+      }),
+    ),
+  );
+
+  // Entry type - all CAPACITY_STATS
+  const entryTypeIndices = new Int8Array(capacityStatsRows);
+  entryTypeIndices.fill(ENTRY_TYPE_CAPACITY_STATS);
+  vectors.push(
+    makeVector(
+      makeData({
+        type: entryTypeType,
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: entryTypeIndices,
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
+            offset: 0,
+            length: ENTRY_TYPE_NAMES.length,
+            nullCount: 0,
+            valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
+            data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // Package name - from modules
+  const packageIndices = new Int32Array(capacityStatsRows);
+  for (let i = 0; i < capacityStatsRows; i++) {
+    const module = modulesArray[i];
+    const pkgIdx = packageDict.indexMap.get(module.packageName) ?? 0;
+    packageIndices[i] = pkgIdx;
+  }
+  vectors.push(
+    makeVector(
+      makeData({
+        type: packageType,
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: packageIndices,
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
+            offset: 0,
+            length: packageDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: packageDict.offsets,
+            data: packageDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // Package path - from modules
+  const packagePathIndices = new Int32Array(capacityStatsRows);
+  for (let i = 0; i < capacityStatsRows; i++) {
+    const module = modulesArray[i];
+    const pathIdx = packagePathDict.indexMap.get(module.packagePath) ?? 0;
+    packagePathIndices[i] = pathIdx;
+  }
+  vectors.push(
+    makeVector(
+      makeData({
+        type: packagePathType,
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: packagePathIndices,
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
+            offset: 0,
+            length: packagePathDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: packagePathDict.offsets,
+            data: packagePathDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // Git SHA - from modules
+  const gitShaIndices = new Int32Array(capacityStatsRows);
+  for (let i = 0; i < capacityStatsRows; i++) {
+    const module = modulesArray[i];
+    const idx = gitShaDict.indexMap.get(module.gitSha) ?? 0;
+    gitShaIndices[i] = idx;
+  }
+  vectors.push(
+    makeVector(
+      makeData({
+        type: gitShaType,
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: gitShaIndices,
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
+            offset: 0,
+            length: gitShaDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: gitShaDict.offsets,
+            data: gitShaDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // Span name - all 0
+  const spanNameIndices = new Int32Array(capacityStatsRows);
+  spanNameIndices.fill(0);
+  vectors.push(
+    makeVector(
+      makeData({
+        type: spanNameType,
+        offset: 0,
+        length: capacityStatsRows,
+        nullCount: 0,
+        data: spanNameIndices,
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
+            offset: 0,
+            length: spanNameDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: spanNameDict.offsets,
+            data: spanNameDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // Attribute columns - iterate through schema fields
+  const SYSTEM_FIELDS_COUNT = 10;
+  let fieldIdx = SYSTEM_FIELDS_COUNT;
+
+  for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {
+    const lmaoType = getSchemaType(fieldSchema);
+    const fieldType = arrowSchema.fields[fieldIdx].type;
+
+    if (lmaoType === 'category') {
+      const dict = categoryDicts.get(fieldName);
+      if (!dict) {
+        throw new Error(`Category dictionary not found for field: ${fieldName}`);
+      }
+      const indices = new dict.indexArrayCtor(capacityStatsRows);
+      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+      nullBitmap.fill(0); // Initialize as all null
+
+      if (fieldName === 'message' && messageDict) {
+        // Message column: fill with capacity stats JSON strings
+        for (let i = 0; i < capacityStatsRows; i++) {
+          const module = modulesArray[i];
+          const msgIdx = capacityStatsMessages.get(module) ?? 0;
+          indices[i] = msgIdx;
+        }
+        // Set all bits to 1 (non-null) for message column
+        setBitRange(nullBitmap, 0, capacityStatsRows);
+      }
+      // Other category columns remain all null (bits stay 0)
+
+      vectors.push(
+        makeVector(
+          makeData({
+            type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
+            offset: 0,
+            length: capacityStatsRows,
+            nullCount: fieldName === 'message' ? 0 : capacityStatsRows,
+            data: indices,
+            nullBitmap: fieldName === 'message' ? undefined : nullBitmap,
+            dictionary: makeVector(
+              makeData({
+                type: new Utf8(),
+                offset: 0,
+                length: dict.indexMap.size,
+                nullCount: 0,
+                valueOffsets: dict.offsets,
+                data: dict.data,
+              }),
+            ),
+          }),
+        ),
+      );
+    } else if (lmaoType === 'text') {
+      const dict = textDicts.get(fieldName);
+      if (!dict) {
+        throw new Error(`Text dictionary not found for field: ${fieldName}`);
+      }
+      const indices = new dict.indexArrayCtor(capacityStatsRows);
+      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+      nullBitmap.fill(0); // All null
+      vectors.push(
+        makeVector(
+          makeData({
+            type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
+            offset: 0,
+            length: capacityStatsRows,
+            nullCount: capacityStatsRows,
+            data: indices,
+            nullBitmap,
+            dictionary: makeVector(
+              makeData({
+                type: new Utf8(),
+                offset: 0,
+                length: dict.indexMap.size,
+                nullCount: 0,
+                valueOffsets: dict.offsets,
+                data: dict.data,
+              }),
+            ),
+          }),
+        ),
+      );
+    } else if (lmaoType === 'number') {
+      const allValues = new Float64Array(capacityStatsRows);
+      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+      nullBitmap.fill(0); // All null
+      vectors.push(
+        makeVector(
+          makeData({
+            type: fieldType as Float64,
+            offset: 0,
+            length: capacityStatsRows,
+            nullCount: capacityStatsRows,
+            data: allValues,
+            nullBitmap,
+          }),
+        ),
+      );
+    } else if (lmaoType === 'boolean') {
+      const allValues = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+      nullBitmap.fill(0); // All null
+      vectors.push(
+        makeVector(
+          makeData({
+            type: fieldType as Bool,
+            offset: 0,
+            length: capacityStatsRows,
+            nullCount: capacityStatsRows,
+            data: allValues,
+            nullBitmap,
+          }),
+        ),
+      );
+    } else if (lmaoType === 'enum') {
+      const enumValues = getEnumValues(fieldSchema) || [];
+      const enumUtf8 = getEnumUtf8(fieldSchema);
+      const enumSchema = fieldSchema as { __index_array_ctor?: unknown; __arrow_index_type_ctor?: unknown };
+      const indexArrayCtor =
+        (enumSchema.__index_array_ctor as Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor) ??
+        Uint8Array;
+      const arrowIndexTypeCtor =
+        (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
+      const allIndices = new indexArrayCtor(capacityStatsRows);
+      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+      nullBitmap.fill(0); // All null
+      const enumDictData = makeData({
+        type: new Utf8(),
+        offset: 0,
+        length: enumValues.length,
+        nullCount: 0,
+        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues as readonly string[]),
+        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
+      });
+      vectors.push(
+        makeVector(
+          makeData({
+            type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
+            offset: 0,
+            length: capacityStatsRows,
+            nullCount: capacityStatsRows,
+            data: allIndices,
+            nullBitmap,
+            dictionary: makeVector(enumDictData),
+          }),
+        ),
+      );
+    }
+
+    fieldIdx++;
+  }
+
+  const structData = makeData({
+    type: new Struct(arrowSchema.fields),
+    length: capacityStatsRows,
+    nullCount: 0,
+    children: vectors.map((v) => v.data[0]),
+  });
+
+  return new RecordBatch(arrowSchema, structData);
+}
 
 /**
  * Convert multiple buffers to a single RecordBatch using pre-built shared dictionaries

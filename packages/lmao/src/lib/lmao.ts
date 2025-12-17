@@ -1020,6 +1020,9 @@ export const ENTRY_TYPE_FF_ACCESS = 10;
 /** Feature flag usage event - logged when a flag influences a code path decision */
 export const ENTRY_TYPE_FF_USAGE = 11;
 
+/** Capacity stats event - logged periodically during Arrow conversion with buffer tuning statistics */
+export const ENTRY_TYPE_CAPACITY_STATS = 12;
+
 /**
  * Human-readable names for entry types, indexed by entry type code.
  *
@@ -1045,6 +1048,7 @@ export const ENTRY_TYPE_NAMES = [
   'error', // 9
   'ff-access', // 10
   'ff-usage', // 11
+  'capacity-stats', // 12
 ] as const;
 
 /**

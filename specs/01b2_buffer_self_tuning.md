@@ -1259,6 +1259,47 @@ describe('Lazy-to-eager column promotion', () => {
 });
 ```
 
+## Capacity Statistics Logging
+
+Capacity statistics are logged periodically (every 100 flushes by default) to provide visibility into buffer tuning
+performance. The flush scheduler tracks unique modules that have been flushed since the last stats log, and when the
+flush interval is reached, creates a separate RecordBatch with capacity stats entries.
+
+### How It Works
+
+1. **Module Tracking**: The `FlushScheduler` maintains a `Set<ModuleContext>` of all unique modules that have been
+   flushed since the last capacity stats log.
+
+2. **Flush Counter**: A global flush counter tracks how many flushes have occurred. When this counter reaches
+   `CAPACITY_STATS_FLUSH_INTERVAL` (default: 100), capacity stats are logged.
+
+3. **Separate RecordBatch**: Capacity stats are logged as a separate `RecordBatch` appended to the main span data
+   `RecordBatch`. This keeps the implementation clean - no need to pre-allocate vectors with extra capacity or handle
+   capacity stats in every column type's conversion logic.
+
+4. **Stats Format**: Each module gets one row with:
+   - `entry_type`: `capacity-stats`
+   - `package_name`, `package_path`, `git_sha`: From the module
+   - `message`: JSON string containing:
+     - `currentCapacity`: Current buffer capacity
+     - `totalWrites`: Total number of log writes
+     - `overflowWrites`: Number of writes that caused buffer overflow
+     - `totalBuffers`: Total buffers created
+     - `efficiency`: Calculated as `totalWrites / (totalBuffers * currentCapacity)`
+     - `overflowRatio`: Calculated as `overflowWrites / totalWrites`
+   - All other columns: null (capacity stats don't have trace/span context)
+
+5. **Reset After Logging**: After logging capacity stats, the flush counter and module tracking set are reset, starting
+   a new interval.
+
+### Benefits
+
+- **Periodic Logging**: Stats are logged every 100 flushes, avoiding overhead on every flush
+- **Clean Separation**: Capacity stats are in a separate RecordBatch, keeping the main conversion logic simple
+- **Efficient**: Uses bulk null bitmap operations (`setBitRange` for non-null columns, initialized correctly for null
+  columns)
+- **Queryable**: Stats are in the same Arrow table format, making them queryable alongside span data
+
 ## Summary
 
 Self-tuning buffers provide:
@@ -1272,6 +1313,7 @@ Self-tuning buffers provide:
 - **Buffer chaining** - Overflow handled gracefully while tuning learns optimal size
 - **Freelist optimization** - Consider pooling buffers if long-lived TypedArrays benefit V8 GC
 - **Column promotion** - Lazy columns automatically promote to eager when heavily used
+- **Capacity statistics** - Periodic logging of tuning metrics for observability
 
 **Important Note**: This self-tuning is specifically designed for trace logging, where we have clear metrics (spans per
 module, overflow rates, utilization patterns, column usage). The tuning mechanism is part of the trace logging system,

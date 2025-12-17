@@ -9,7 +9,14 @@
 
 import { type RecordBatch, Table } from 'apache-arrow';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
+import type { ModuleContext } from './moduleContext.js';
 import type { SpanBuffer } from './types.js';
+
+/**
+ * Number of flushes before logging capacity stats.
+ * Capacity stats are logged periodically to avoid overhead on every flush.
+ */
+const CAPACITY_STATS_FLUSH_INTERVAL = 100;
 
 /**
  * Flush handler function type
@@ -91,6 +98,12 @@ export class FlushScheduler {
   private idleTimer?: NodeJS.Timeout;
   private memoryTimer?: NodeJS.Timeout;
   private isRunning = false;
+
+  /** Flush counter for periodic capacity stats logging */
+  private _flushCount = 0;
+
+  /** Track unique modules that have been flushed since last capacity stats log */
+  private _modulesSinceLastStatsLog = new Set<ModuleContext>();
 
   constructor(handler: FlushHandler, config: FlushSchedulerConfig = {}) {
     this.handler = handler;
@@ -278,6 +291,28 @@ export class FlushScheduler {
     // Collect all buffers to flush
     const buffersToFlush = Array.from(this.buffers);
 
+    // Collect unique modules from buffers being flushed
+    const modulesInThisFlush = new Set<ModuleContext>();
+    for (const buffer of buffersToFlush) {
+      let currentBuffer: SpanBuffer | undefined = buffer;
+      while (currentBuffer) {
+        modulesInThisFlush.add(currentBuffer.task.module);
+        currentBuffer = currentBuffer.next as SpanBuffer | undefined;
+      }
+    }
+
+    // Add modules to tracking set
+    for (const module of modulesInThisFlush) {
+      this._modulesSinceLastStatsLog.add(module);
+    }
+
+    // Increment flush counter
+    this._flushCount++;
+
+    // Check if we should log capacity stats
+    const shouldLogCapacityStats = this._flushCount >= CAPACITY_STATS_FLUSH_INTERVAL;
+    const modulesToLogStatsForConversion = shouldLogCapacityStats ? new Set(this._modulesSinceLastStatsLog) : undefined;
+
     // Count total rows and buffers
     let totalRows = 0;
     let totalBuffers = 0;
@@ -292,14 +327,14 @@ export class FlushScheduler {
       }
     }
 
-    if (totalRows === 0) return;
+    if (totalRows === 0 && !shouldLogCapacityStats) return;
 
     // Convert all buffers to Arrow tables and concatenate
     const tables: Table[] = [];
 
     for (const buffer of buffersToFlush) {
       try {
-        const table = convertSpanTreeToArrowTable(buffer);
+        const table = convertSpanTreeToArrowTable(buffer, undefined, modulesToLogStatsForConversion);
 
         if (table.numRows > 0) {
           tables.push(table);
@@ -309,10 +344,20 @@ export class FlushScheduler {
       }
     }
 
-    if (tables.length === 0) return;
-
     // Concatenate all tables
     let combinedTable: Table;
+    if (tables.length === 0) {
+      // No tables but might have capacity stats - create empty table
+      // Capacity stats will be in the first table if any buffer had data
+      // If no buffers had data, we still need to handle capacity stats
+      // For now, return early - capacity stats will be logged on next flush with data
+      if (!shouldLogCapacityStats) return;
+      // If we should log stats but have no tables, we need to create a table with just capacity stats
+      // This is handled by convertSpanTreeToArrowTable returning a table with capacity stats batch
+      // But since we have no buffers, we can't call it. So we skip logging stats this time.
+      // Stats will be logged when there's actual data to flush.
+      return;
+    }
     if (tables.length === 1) {
       combinedTable = tables[0];
     } else {
@@ -350,6 +395,12 @@ export class FlushScheduler {
     try {
       await this.handler(combinedTable, metadata);
       this.lastFlushTime = now;
+
+      // Reset flush counter and module tracking if we logged capacity stats
+      if (shouldLogCapacityStats) {
+        this._flushCount = 0;
+        this._modulesSinceLastStatsLog.clear();
+      }
 
       // Reset buffers after successful flush to avoid duplicate re-processing
       for (const buffer of buffersToFlush) {

@@ -2343,10 +2343,7 @@ const view = buffer.timestamps.subarray(0, buffer.writeIndex);
 import * as arrow from 'apache-arrow';
 
 async function writeSpanBuffersToArrow(buffers: SpanBuffer[]) {
-  // 1. Log a snapshot of capacity stats for system monitoring
-  logCapacityStats(buffers);
-
-  // 2. Create Arrow RecordBatches from SpanBuffers
+  // 1. Create Arrow RecordBatches from SpanBuffers
   //    Uses buffer helper methods for checking allocation
   const recordBatches = buffers.map((buffer) => createRecordBatch(buffer, scope));
 
@@ -2475,35 +2472,6 @@ function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.Rec
   }
 
   return new arrow.RecordBatch(arrowVectors);
-}
-
-function logCapacityStats(buffers: SpanBuffer[]) {
-  const seenModules = new Set<string>();
-
-  for (const buffer of buffers) {
-    // Use packageName + packagePath as unique module identifier
-    const moduleKey = `${buffer.task.module.packageName}:${buffer.task.module.packagePath}`;
-
-    if (!seenModules.has(moduleKey)) {
-      seenModules.add(moduleKey);
-
-      const moduleStats = buffer.task.module.spanBufferCapacityStats;
-      const efficiency = moduleStats.totalWrites / (moduleStats.totalBuffersCreated * moduleStats.currentCapacity);
-      const overflowRatio = moduleStats.overflowWrites / moduleStats.totalWrites;
-
-      systemTracer.tag.capacityStats({
-        packageName: buffer.task.module.packageName,
-        packagePath: buffer.task.module.packagePath,
-        currentCapacity: moduleStats.currentCapacity,
-        totalWrites: moduleStats.totalWrites,
-        overflowWrites: moduleStats.overflowWrites,
-        totalBuffers: moduleStats.totalBuffersCreated,
-        efficiency,
-        overflowRatio,
-        timestamp: Date.now(),
-      });
-    }
-  }
 }
 ```
 
