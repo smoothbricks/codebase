@@ -3,6 +3,7 @@
  *
  * This example demonstrates:
  * - Creating request context with feature flags and environment
+ * - Using the new createTraceContext API for V8 hidden class optimization
  * - Defining tag attributes for structured logging
  * - Using task wrappers with typed span context
  * - Accessing feature flags and environment config
@@ -16,6 +17,7 @@
 import {
   createModuleContext,
   createRequestContext,
+  createTraceContext,
   defineFeatureFlags,
   defineTagAttributes,
   InMemoryFlagEvaluator,
@@ -139,7 +141,7 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
 
 // 7. Use in request handler
 async function handleRequest() {
-  // Create request context at request boundary
+  // Method 1: Use createRequestContext (backward-compatible)
   const requestCtx = createRequestContext(
     {
       requestId: 'req-' + Date.now(),
@@ -150,7 +152,7 @@ async function handleRequest() {
     environmentConfig,
   );
 
-  console.log('\n📊 Request context created:', {
+  console.log('\n📊 Request context created (via createRequestContext):', {
     requestId: requestCtx.requestId,
     traceId: requestCtx.traceId,
   });
@@ -173,6 +175,54 @@ async function handleRequest() {
   }
 }
 
-// Run example
+// 8. Alternative: Use createTraceContext (V8 optimized, new API)
+async function handleRequestWithTraceContext() {
+  // Method 2: Use createTraceContext for V8 hidden class optimization
+  // This avoids object spreads in child contexts, maintaining stable V8 hidden classes
+  const requestCtx = createTraceContext<
+    typeof featureFlags.schema,
+    typeof environmentConfig,
+    { requestId: string; userId: string; customProp: string }
+  >(
+    {
+      ff: { schema: featureFlags, evaluator: flagEvaluator },
+      env: environmentConfig,
+    },
+    {
+      requestId: 'req-' + Date.now(),
+      userId: 'user-456',
+      // Custom properties are directly accessible on the context
+      customProp: 'custom-value',
+    },
+  );
+
+  console.log('\n📊 Request context created (via createTraceContext):', {
+    requestId: requestCtx.requestId,
+    traceId: requestCtx.traceId,
+    // Custom properties are directly accessible
+    customProp: requestCtx.customProp,
+  });
+
+  // Execute task - same API as createRequestContext
+  // The task accepts RequestContext, createTraceContext returns a compatible type
+  const result = await createUser(requestCtx as unknown as Parameters<typeof createUser>[0], {
+    email: 'jane@example.com',
+    name: 'Jane Doe',
+  });
+
+  if (result.success) {
+    console.log('✅ User created successfully:', result.value);
+  } else {
+    console.error('❌ Failed to create user:', result.error);
+  }
+}
+
+// Run examples
 console.log('🚀 LMAO Integration Example - Columnar Buffer Storage\n');
-handleRequest().catch(console.error);
+console.log('Running with createRequestContext (backward-compatible)...');
+handleRequest()
+  .then(() => {
+    console.log('\nRunning with createTraceContext (V8 optimized)...');
+    return handleRequestWithTraceContext();
+  })
+  .catch(console.error);

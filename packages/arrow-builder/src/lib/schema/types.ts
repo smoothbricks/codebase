@@ -19,6 +19,28 @@ import type * as Sury from '@sury/sury';
 export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
 
 /**
+ * Eager column metadata marker.
+ *
+ * When __eager is true:
+ * - Column is allocated immediately in constructor (not lazily on first write)
+ * - No null bitmap is created (column is always written for every entry)
+ * - Saves memory and conditionals for columns written on every row
+ *
+ * Use for system columns like `message` that are written for every entry type.
+ *
+ * To mark a column as eager, use the `.eager()` chainable method:
+ * ```typescript
+ * const schema = defineTagAttributes({
+ *   message: S.category().eager(),  // No null bitmap, allocated eagerly
+ *   userId: S.category(),           // Normal lazy column with null bitmap
+ * });
+ * ```
+ */
+export interface EagerColumnMetadata {
+  __eager?: boolean;
+}
+
+/**
  * Masking preset names
  * Applied during Arrow conversion (cold path), NOT during hot path writes
  */
@@ -46,11 +68,12 @@ export interface EnumUtf8Precomputed {
  * Base schema with metadata
  * Using intersection type since we can't extend Sury.Schema directly
  */
-export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> & {
-  __schema_type?: SchemaType;
-  __enum_values?: readonly string[];
-  __enum_utf8?: EnumUtf8Precomputed;
-};
+export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> &
+  EagerColumnMetadata & {
+    __schema_type?: SchemaType;
+    __enum_values?: readonly string[];
+    __enum_utf8?: EnumUtf8Precomputed;
+  };
 
 /**
  * Enum schema with enum values metadata
@@ -67,7 +90,7 @@ export type EnumSchemaWithMetadata<T extends string = string> = Sury.Schema<T, u
 /**
  * Base metadata for category schema
  */
-interface CategoryMetadata {
+export interface CategoryMetadata extends EagerColumnMetadata {
   __schema_type: 'category';
   __mask_transform?: MaskTransform;
 }
@@ -80,16 +103,21 @@ interface CategoryMetadata {
 export type CategorySchemaWithMetadata = Sury.Schema<string, unknown> & CategoryMetadata;
 
 /**
- * Category schema with chainable mask method
+ * Category schema with chainable mask and eager methods
  */
 export type CategorySchemaWithMask = CategorySchemaWithMetadata & {
   mask(preset: MaskPreset | MaskTransform): CategorySchemaWithMetadata;
+  /**
+   * Mark this column as eager (always written, no null bitmap).
+   * Use for columns written on every entry (like message).
+   */
+  eager(): CategorySchemaWithMetadata;
 };
 
 /**
  * Base metadata for text schema
  */
-interface TextMetadata {
+export interface TextMetadata extends EagerColumnMetadata {
   __schema_type: 'text';
   __mask_transform?: MaskTransform;
 }
@@ -102,24 +130,31 @@ interface TextMetadata {
 export type TextSchemaWithMetadata = Sury.Schema<string, unknown> & TextMetadata;
 
 /**
- * Text schema with chainable mask method
+ * Text schema with chainable mask and eager methods
  */
 export type TextSchemaWithMask = TextSchemaWithMetadata & {
   mask(preset: MaskPreset | MaskTransform): TextSchemaWithMetadata;
+  /**
+   * Mark this column as eager (always written, no null bitmap).
+   * Use for columns written on every entry.
+   */
+  eager(): TextSchemaWithMetadata;
 };
 
 /**
  * Number schema with metadata
  * Storage: Float64Array
  */
-export type NumberSchemaWithMetadata = Sury.Schema<number, unknown> & {
-  __schema_type: 'number';
-};
+export type NumberSchemaWithMetadata = Sury.Schema<number, unknown> &
+  EagerColumnMetadata & {
+    __schema_type: 'number';
+  };
 
 /**
  * Boolean schema with metadata
  * Storage: Uint8Array (0/1)
  */
-export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> & {
-  __schema_type: 'boolean';
-};
+export type BooleanSchemaWithMetadata = Sury.Schema<boolean, unknown> &
+  EagerColumnMetadata & {
+    __schema_type: 'boolean';
+  };

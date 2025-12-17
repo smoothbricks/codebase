@@ -6,6 +6,15 @@
  * - Environment configuration
  * - Tag attributes with columnar storage
  * - Task wrappers with span buffers
+ *
+ * **V8 Hidden Class Optimization**
+ *
+ * This module uses prototype-based context creation to ensure stable hidden classes:
+ * - SpanContextProto defines methods ONCE on a shared prototype
+ * - createTraceContext() creates root contexts with Object.create(SpanContextProto)
+ * - ctx.span() creates child contexts with Object.create(this) to inherit user props
+ * - No object spreads ({...ctx}) - avoids hidden class pollution
+ * - Direct property assignments maintain V8 optimization
  */
 
 import {
@@ -24,7 +33,7 @@ import type { InferTagAttributes, TagAttributeSchema } from './schema/types.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from './spanBuffer.js';
 import { TaskContext } from './taskContext.js';
 import { getTimestampNanos } from './timestamp.js';
-import type { TraceId } from './traceId.js';
+import { generateTraceId, type TraceId } from './traceId.js';
 import type { BufferCapacityStats, SpanBuffer } from './types.js';
 
 // Re-export TagWriter and ResultWriter types for external use
@@ -234,14 +243,6 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
 }
 
 /**
- * Generate unique trace ID
- */
-function generateTraceId(): string {
-  // Simple implementation - can be replaced with more sophisticated ID generation
-  return `trace-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
-}
-
-/**
  * String interning for category columns
  *
  * Per specs/01b1_buffer_performance_optimizations.md:
@@ -403,7 +404,7 @@ export interface RequestContext<FF extends FeatureFlagSchema = FeatureFlagSchema
   readonly userId?: string;
 
   /** Unique trace ID linking all spans in this request's distributed trace */
-  readonly traceId: string;
+  readonly traceId: TraceId;
 
   /**
    * Feature flag evaluator with typed flag access.
@@ -418,6 +419,26 @@ export interface RequestContext<FF extends FeatureFlagSchema = FeatureFlagSchema
    * Contains application-level config like API endpoints, secrets, etc.
    */
   readonly env: Env;
+}
+
+/**
+ * System options for trace context creation.
+ *
+ * @typeParam FF - Feature flag schema type
+ * @typeParam Env - Environment configuration type
+ */
+export interface TraceContextSystemOpts<FF extends FeatureFlagSchema, Env extends Record<string, unknown>> {
+  /** Feature flag configuration */
+  ff: {
+    /** Feature flag schema created with `defineFeatureFlags()` */
+    schema: { schema: FF };
+    /** Backend evaluator that resolves flag values */
+    evaluator: FlagEvaluator;
+  };
+  /** Environment configuration object */
+  env: Env;
+  /** Optional trace ID (auto-generated if not provided) */
+  traceId?: TraceId;
 }
 
 /**
@@ -471,6 +492,7 @@ export interface RequestContext<FF extends FeatureFlagSchema = FeatureFlagSchema
  *
  * @see {@link RequestContext} - The returned context type
  * @see {@link createModuleContext} - Create module context with task wrappers
+ * @see {@link createTraceContext} - Newer prototype-based API
  */
 export function createRequestContext<FF extends FeatureFlagSchema, Env extends Record<string, unknown>>(
   params: {
@@ -482,25 +504,271 @@ export function createRequestContext<FF extends FeatureFlagSchema, Env extends R
   evaluator: FlagEvaluator,
   environmentConfig: Env,
 ): RequestContext<FF, Env> {
+  // Use the new createTraceContext internally
+  return createTraceContext<FF, Env>(
+    {
+      ff: { schema: featureFlagSchema, evaluator },
+      env: environmentConfig,
+    },
+    params,
+  );
+}
+
+// =============================================================================
+// Prototype-based Context System for V8 Hidden Class Optimization
+// =============================================================================
+// Per specs/01c_context_flow_and_task_wrappers.md:
+// - Methods are defined ONCE on a shared prototype
+// - Object.create() is used for inheritance (no object spreads)
+// - Properties are assigned directly for stable hidden classes
+// =============================================================================
+
+/**
+ * Internal symbol to mark contexts as prototype-based
+ * Used for type guards and instanceof-like checks
+ */
+const TRACE_CONTEXT_MARKER = Symbol.for('lmao.TraceContext');
+
+/**
+ * Base prototype for all trace contexts.
+ *
+ * Contains shared properties that all contexts inherit.
+ * This is used internally and should not be accessed directly.
+ */
+interface TraceContextBase<FF extends FeatureFlagSchema = FeatureFlagSchema, Env = Record<string, unknown>> {
+  /** Marker for prototype chain detection */
+  readonly [TRACE_CONTEXT_MARKER]: true;
+  /** Trace ID for this context */
+  traceId: TraceId;
+  /** Feature flag evaluator */
+  ff: FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
+  /** Environment configuration */
+  env: Env;
+  /** Allow dynamic user properties */
+  [key: string]: unknown;
+}
+
+/**
+ * The shared prototype object for TraceContext.
+ *
+ * Per V8 optimization guidelines:
+ * - Define methods ONCE on prototype, not per-instance
+ * - Use Object.create() for inheritance chains
+ * - Avoid object spreads which break hidden classes
+ */
+const TraceContextProto: TraceContextBase = {
+  [TRACE_CONTEXT_MARKER]: true,
+  traceId: undefined as unknown as TraceId,
+  ff: undefined as unknown as FeatureFlagEvaluator<FeatureFlagSchema> & InferFeatureFlags<FeatureFlagSchema>,
+  env: undefined as unknown as Record<string, unknown>,
+};
+
+/**
+ * Creates a trace context using prototype-based inheritance for V8 optimization.
+ *
+ * This is the recommended API for creating request contexts. It uses:
+ * - Object.create() for prototype chain (stable hidden classes)
+ * - Direct property assignment (no object spreads)
+ * - Shared prototype methods (single allocation)
+ *
+ * User properties are assigned directly to the context and are accessible
+ * on child spans through prototype inheritance.
+ *
+ * @typeParam FF - Feature flag schema type
+ * @typeParam Env - Environment configuration type
+ * @typeParam UserProps - User-defined properties type
+ *
+ * @param systemOpts - System configuration (ff, env, optional traceId)
+ * @param userProps - User-defined properties (requestId, userId, etc.)
+ *
+ * @returns A RequestContext with user props accessible directly
+ *
+ * @example
+ * ```typescript
+ * const ctx = createTraceContext(
+ *   {
+ *     ff: { schema: featureFlags, evaluator: flagEvaluator },
+ *     env: { apiUrl: 'https://api.example.com' },
+ *   },
+ *   { requestId: 'req-123', userId: 'user-456', customProp: 'value' }
+ * );
+ *
+ * // User props are directly accessible
+ * console.log(ctx.requestId); // 'req-123'
+ * console.log(ctx.customProp); // 'value'
+ * ```
+ *
+ * @see {@link createRequestContext} - Backward-compatible wrapper
+ */
+export function createTraceContext<
+  FF extends FeatureFlagSchema,
+  Env extends Record<string, unknown>,
+  UserProps extends Record<string, unknown> = { requestId: string; userId?: string },
+>(systemOpts: TraceContextSystemOpts<FF, Env>, userProps?: UserProps): RequestContext<FF, Env> & UserProps {
+  // Create evaluation context from user props
   const evaluationContext: EvaluationContext = {
-    userId: params.userId,
-    requestId: params.requestId,
+    userId: (userProps as Record<string, unknown>)?.userId as string | undefined,
+    requestId: (userProps as Record<string, unknown>)?.requestId as string | undefined,
   };
 
   // Create feature flag evaluator (buffer will be set by task wrapper)
   const ffEvaluator = new FeatureFlagEvaluator(
-    featureFlagSchema.schema,
+    systemOpts.ff.schema.schema,
     evaluationContext,
-    evaluator,
+    systemOpts.ff.evaluator,
     undefined, // Column writers set later when span context is created
   ) as FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
 
+  // Create context with prototype inheritance
+  // Use type assertion for initial assignment (properties are readonly after construction)
+  const ctx = Object.create(TraceContextProto) as TraceContextBase<FF, Env> & UserProps;
+
+  // Assign system properties directly (stable hidden class)
+  ctx.traceId = systemOpts.traceId ?? generateTraceId();
+  ctx.ff = ffEvaluator;
+  ctx.env = systemOpts.env;
+
+  // Assign user properties directly (accessible via prototype chain in children)
+  if (userProps) {
+    Object.assign(ctx, userProps);
+  }
+
+  // Return as readonly RequestContext (properties are readonly after construction)
+  return ctx as unknown as RequestContext<FF, Env> & UserProps;
+}
+
+// =============================================================================
+// SpanContext Prototype for V8 Hidden Class Optimization
+// =============================================================================
+
+/**
+ * Internal type for mutable SpanContext during construction.
+ * After construction, the context is returned as readonly SpanContext.
+ */
+interface MutableSpanContext<
+  T extends TagAttributeSchema,
+  FF extends FeatureFlagSchema,
+  Env = Record<string, unknown>,
+> {
+  [TRACE_CONTEXT_MARKER]: true;
+  traceId: TraceId;
+  ff: FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
+  env: Env;
+  tag: TagWriter<T>;
+  log: SpanLogger<T>;
+  _buffer: SpanBuffer;
+  _schema: T;
+  _spanLogger: BaseSpanLogger<T>;
+  buffer: SpanBuffer;
+  scope: (attributes: Partial<InferTagAttributes<T>>) => void;
+  ok: <V>(value: V) => FluentSuccessResult<V, T>;
+  err: <E>(code: string, error: E) => FluentErrorResult<E, T>;
+  span: <R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>, line?: number) => Promise<R>;
+  [key: string]: unknown;
+}
+
+/**
+ * Create the SpanContext prototype with shared methods.
+ *
+ * These methods are defined ONCE and inherited by all span contexts,
+ * avoiding per-instance function allocations.
+ *
+ * @internal
+ */
+function createSpanContextProto<
+  T extends TagAttributeSchema,
+  FF extends FeatureFlagSchema,
+  Env = Record<string, unknown>,
+>(schemaOnly: T, taskContext: TaskContext): object {
   return {
-    requestId: params.requestId,
-    userId: params.userId,
-    traceId: generateTraceId(),
-    ff: ffEvaluator,
-    env: environmentConfig,
+    [TRACE_CONTEXT_MARKER]: true,
+
+    // Buffer getter - returns _buffer
+    get buffer(): SpanBuffer {
+      return (this as MutableSpanContext<T, FF, Env>)._buffer;
+    },
+
+    // Scope method - delegates to spanLogger._setScope
+    scope(this: MutableSpanContext<T, FF, Env>, attributes: Partial<InferTagAttributes<T>>): void {
+      this._spanLogger._setScope(attributes);
+    },
+
+    // Ok method - creates FluentSuccessResult
+    ok<V>(this: MutableSpanContext<T, FF, Env>, value: V): FluentSuccessResult<V, T> {
+      return new FluentSuccessResult<V, T>(this._buffer, value, this._schema);
+    },
+
+    // Err method - creates FluentErrorResult
+    err<E>(this: MutableSpanContext<T, FF, Env>, code: string, error: E): FluentErrorResult<E, T> {
+      return new FluentErrorResult<E, T>(this._buffer, code, error, this._schema);
+    },
+
+    // Span method - creates child span with Object.create(this) for inheritance
+    span<R>(
+      this: MutableSpanContext<T, FF, Env>,
+      childName: string,
+      childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>,
+      line?: number,
+    ): Promise<R> {
+      // Create child span buffer with Arrow builders
+      const childBuffer = createChildSpanBuffer(this._buffer, taskContext);
+
+      // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
+      writeSpanStart(childBuffer, childName);
+
+      // Write line number to row 0 if provided
+      if (line !== undefined) {
+        childBuffer.lineNumber(0, line);
+      }
+
+      // Inherit scoped values from parent span via Scope instance
+      // Per specs/01i_span_scope_attributes.md - child spans inherit parent's scoped attributes
+      const parentScopeValues = this._spanLogger._getScope()._getScopeValues();
+
+      // Create child context with its own logger (with inherited scope values)
+      const childLogger = createSpanLoggerWithScope(schemaOnly, childBuffer, parentScopeValues);
+
+      // Create tag writer for child span attributes (writes to row 0)
+      const childTagAPI = createTagWriter(schemaOnly, childBuffer);
+
+      // Create a new feature flag evaluator bound to the CHILD buffer.
+      // This ensures ff-access/ff-usage entries are logged to the correct span.
+      const childFf = this.ff.withBuffer(childBuffer) as FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
+
+      // Use Object.create(this) for prototype inheritance
+      // Child inherits all user properties from parent via prototype chain
+      const childContext = Object.create(this) as MutableSpanContext<T, FF, Env>;
+
+      // Assign child-specific properties directly (stable hidden class)
+      childContext.ff = childFf;
+      childContext.tag = childTagAPI;
+      childContext.log = childLogger as SpanLogger<T>;
+      childContext._buffer = childBuffer;
+      childContext._spanLogger = childLogger;
+
+      // Execute child span with exception handling and return the promise directly
+      return (async () => {
+        try {
+          return await childFn(childContext as unknown as SpanContext<T, FF, Env>);
+        } catch (error) {
+          // Write span-exception to row 1 (fixed layout)
+          // Row 1 was pre-initialized as exception, just update timestamp
+          childBuffer.timestamps[1] = getTimestampNanos();
+
+          // Write exception details to row 1
+          const errorMessage = error instanceof Error ? error.message : String(error);
+          const errorStack = error instanceof Error ? error.stack : undefined;
+
+          childBuffer.message(1, errorMessage);
+          if (errorStack) {
+            childBuffer.exceptionStack(1, errorStack);
+          }
+
+          // Re-throw to propagate
+          throw error;
+        }
+      })();
+    },
   };
 }
 
@@ -1177,100 +1445,85 @@ export function createModuleContext<
         // Create tag writer for span attributes (writes to row 0)
         const tagAPI = createTagWriter(schemaOnly, spanBuffer);
 
-        // Create span context
-        const spanContext: SpanContext<T, FF, Env> = {
-          ...requestCtx,
-          tag: tagAPI,
-          log: spanLogger as SpanLogger<T>,
-          get buffer() {
-            return (tagAPI as unknown as { _buffer: SpanBuffer })._buffer;
-          },
+        // Create SpanContext prototype for this task (methods defined once per task wrapper)
+        const spanContextProto = createSpanContextProto<T, FF, Env>(schemaOnly, taskContext);
 
-          scope(attributes: Partial<InferTagAttributes<T>>): void {
-            // Delegate to the internal _setScope method on spanLogger
-            spanLogger._setScope(attributes);
-          },
+        // Create span context using prototype-based inheritance
+        // This avoids object spreads and maintains stable V8 hidden classes
+        const spanContext = Object.create(spanContextProto) as MutableSpanContext<T, FF, Env>;
 
-          ok<V>(value: V): FluentSuccessResult<V, T> {
-            return new FluentSuccessResult<V, T>(spanBuffer, value, schemaOnly);
-          },
+        // Copy user properties from requestCtx to spanContext
+        // Use Object.keys to get own properties (not inherited from prototype)
+        // Exclude internal properties that might conflict with SpanContext methods
+        const RESERVED_KEYS = new Set([
+          'ff',
+          'tag',
+          'log',
+          '_buffer',
+          '_schema',
+          '_spanLogger',
+          'buffer',
+          'scope',
+          'ok',
+          'err',
+          'span',
+          // SpanBuffer properties that might be present on parent contexts
+          'message',
+          'lineNumber',
+          'errorCode',
+          'exceptionStack',
+          'ffValue',
+          'timestamps',
+          'operations',
+          'writeIndex',
+          'capacity',
+          'next',
+          'spanId',
+          'traceId',
+          'hasParent',
+          'parentSpanId',
+          'parent',
+          'children',
+          'task',
+          '_system',
+          '_identity',
+          '_timestamps',
+          '_operations',
+          '_writeIndex',
+          '_capacity',
+          '_next',
+        ]);
+        const requestCtxAny = requestCtx as unknown as Record<string, unknown>;
+        const requestCtxKeys = Object.keys(requestCtxAny);
+        for (const key of requestCtxKeys) {
+          if (!RESERVED_KEYS.has(key)) {
+            (spanContext as Record<string, unknown>)[key] = requestCtxAny[key];
+          }
+        }
 
-          err<E>(code: string, error: E): FluentErrorResult<E, T> {
-            return new FluentErrorResult<E, T>(spanBuffer, code, error, schemaOnly);
-          },
+        // Also copy any properties from the prototype chain of requestCtx
+        // This handles cases where requestCtx was created with createTraceContext
+        for (const key in requestCtxAny) {
+          if (!RESERVED_KEYS.has(key) && !(key in spanContext) && !Object.hasOwn(requestCtxAny, key)) {
+            // Property is inherited from prototype, copy it
+            (spanContext as Record<string, unknown>)[key] = requestCtxAny[key];
+          }
+        }
 
-          span<R>(childName: string, childFn: (ctx: SpanContext<T, FF, Env>) => Promise<R>, line?: number): Promise<R> {
-            // Create child span buffer with Arrow builders
-            const childBuffer = createChildSpanBuffer(spanBuffer, taskContext);
-
-            // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
-            writeSpanStart(childBuffer, childName);
-
-            // Write line number to row 0 if provided
-            if (line !== undefined) {
-              childBuffer.lineNumber(0, line);
-            }
-
-            // Inherit scoped values from parent span via Scope instance
-            // Per specs/01i_span_scope_attributes.md - child spans inherit parent's scoped attributes
-            const parentScopeValues = spanLogger._getScope()._getScopeValues();
-
-            // Create child context with its own logger (with inherited scope values)
-            const childLogger = createSpanLoggerWithScope(schemaOnly, childBuffer, parentScopeValues);
-
-            // Create tag writer for child span attributes (writes to row 0)
-            const childTagAPI = createTagWriter(schemaOnly, childBuffer);
-
-            // Create a new feature flag evaluator bound to the CHILD buffer.
-            // This ensures ff-access/ff-usage entries are logged to the correct span.
-            // The withBuffer() method creates a fresh evaluator with:
-            // - Same schema and evaluation context
-            // - New buffer reference (child buffer)
-            // - Fresh accessedFlags set (so first access in child logs ff-access)
-            // - Fresh flagCache (child span gets its own cache)
-            const childFf = spanContext.ff.withBuffer(childBuffer) as FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
-
-            const childContext: SpanContext<T, FF, Env> = {
-              ...spanContext,
-              ff: childFf,
-              tag: childTagAPI,
-              log: childLogger as SpanLogger<T>,
-              get buffer() {
-                return (childTagAPI as unknown as { _buffer: SpanBuffer })._buffer;
-              },
-              scope(attrs: Partial<InferTagAttributes<T>>): void {
-                childLogger._setScope(attrs);
-              },
-            };
-
-            // Execute child span with exception handling and return the promise directly
-            return (async () => {
-              try {
-                return await childFn(childContext);
-              } catch (error) {
-                // Write span-exception to row 1 (fixed layout)
-                // Row 1 was pre-initialized as exception, just update timestamp
-                childBuffer.timestamps[1] = getTimestampNanos();
-
-                // Write exception details to row 1
-                const errorMessage = error instanceof Error ? error.message : String(error);
-                const errorStack = error instanceof Error ? error.stack : undefined;
-
-                childBuffer.message(1, errorMessage);
-                if (errorStack) {
-                  childBuffer.exceptionStack(1, errorStack);
-                }
-
-                // Re-throw to propagate
-                throw error;
-              }
-            })();
-          },
-        };
+        // Assign span-specific properties directly (stable hidden class)
+        spanContext.traceId = requestCtx.traceId;
+        spanContext.ff = requestCtx.ff;
+        spanContext.env = requestCtx.env;
+        spanContext.tag = tagAPI;
+        spanContext.log = spanLogger as SpanLogger<T>;
+        spanContext._buffer = spanBuffer;
+        spanContext._schema = schemaOnly;
+        spanContext._spanLogger = spanLogger;
 
         // Execute task function with exception handling
         try {
-          return await fn(spanContext, ...args);
+          // Cast to SpanContext for the task function call
+          return await fn(spanContext as unknown as SpanContext<T, FF, Env>, ...args);
         } catch (error) {
           // Write span-exception to row 1 (fixed layout)
           // Row 1 was pre-initialized as exception, just update timestamp

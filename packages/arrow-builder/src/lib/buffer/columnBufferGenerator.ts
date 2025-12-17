@@ -101,6 +101,11 @@ interface ColumnStorageInfo {
   isBitPacked: boolean;
   schemaType: import('../schema-types.js').SchemaType | undefined;
   enumValues?: readonly string[];
+  /**
+   * When true, column is allocated eagerly in constructor (no null bitmap).
+   * Used for columns written on every entry (like message).
+   */
+  isEager: boolean;
 }
 
 /**
@@ -110,6 +115,7 @@ function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): Colum
   const fieldSchema = schema[fieldName];
   const schemaWithMetadata = fieldSchema as import('../schema-types.js').SchemaWithMetadata;
   const schemaType = schemaWithMetadata?.__schema_type;
+  const isEager = schemaWithMetadata?.__eager === true;
 
   // Handle three string types
   if (schemaType === 'enum') {
@@ -118,37 +124,44 @@ function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): Colum
 
     // Uint8Array can hold 0-255 indices (256 values total)
     if (enumCount === 0 || enumCount <= 256) {
-      return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: false, schemaType, enumValues };
+      return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: false, schemaType, enumValues, isEager };
     }
     if (enumCount <= 65536) {
-      return { constructorName: 'Uint16Array', bytesPerElement: 2, isBitPacked: false, schemaType, enumValues };
+      return {
+        constructorName: 'Uint16Array',
+        bytesPerElement: 2,
+        isBitPacked: false,
+        schemaType,
+        enumValues,
+        isEager,
+      };
     }
-    return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, enumValues };
+    return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, enumValues, isEager };
   }
 
   if (schemaType === 'category') {
     // Hot path: Store raw JavaScript strings (zero conversion cost)
     // Cold path: Arrow conversion builds sorted dictionary
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType };
+    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
   }
 
   if (schemaType === 'text') {
     // Hot path: Store raw JavaScript strings (zero conversion cost)
     // Cold path: Arrow conversion calculates if dictionary saves space
-    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType };
+    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
   }
 
   if (schemaType === 'number') {
-    return { constructorName: 'Float64Array', bytesPerElement: 8, isBitPacked: false, schemaType };
+    return { constructorName: 'Float64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
   }
 
   if (schemaType === 'boolean') {
     // Boolean: bit-packed storage (8 booleans per byte) for Arrow compatibility
-    return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true, schemaType };
+    return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true, schemaType, isEager };
   }
 
   // Default to Uint32Array
-  return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType };
+  return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
 }
 
 /**
@@ -211,6 +224,39 @@ function generateNullBitSetting(): string {
 }
 
 /**
+ * Generate the value assignment code for an EAGER column setter method.
+ *
+ * Similar to generateSetterValueAssignment but uses direct property access
+ * instead of storage object (no null bitmap, no allocator).
+ *
+ * The code has access to: `this` (the buffer), `pos` (position), `val` (value).
+ */
+function generateSetterValueAssignmentEager(info: ColumnStorageInfo, columnName: string): string {
+  const { schemaType, isBitPacked, enumValues } = info;
+
+  if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
+    // Enum: Use pre-generated lookup map for O(1) conversion
+    return `this.${columnName}_values[pos] = ${columnName}_enumMap[val] ?? 0;`;
+  }
+
+  if (isBitPacked) {
+    // Boolean: Bit-packed storage (8 values per byte)
+    return [
+      'const byteIdx = pos >>> 3;',
+      '      const bitIdx = pos & 7;',
+      '      if (val) {',
+      '        this.' + columnName + '_values[byteIdx] |= (1 << bitIdx);',
+      '      } else {',
+      '        this.' + columnName + '_values[byteIdx] &= ~(1 << bitIdx);',
+      '      }',
+    ].join('\n');
+  }
+
+  // Direct assignment for category/text/number and default
+  return `this.${columnName}_values[pos] = val;`;
+}
+
+/**
  * Generate ColumnBuffer class code as a string
  *
  * Creates a concrete class with:
@@ -257,12 +303,48 @@ export function generateColumnBufferClass(
   const getterMethods: string[] = [];
   const setterMethods: string[] = [];
   const enumMaps: string[] = [];
+  // Eager column constructor code (allocated immediately, no null bitmap)
+  const eagerColumnConstructorCode: string[] = [];
 
   for (const fieldName of schemaFields) {
     const columnName = fieldName; // User columns have no prefix
     const storageInfo = getTypedArrayInfo(schema, fieldName);
-    const { constructorName, bytesPerElement, isBitPacked, schemaType, enumValues } = storageInfo;
+    const { constructorName, bytesPerElement, isBitPacked, schemaType, enumValues, isEager } = storageInfo;
 
+    // Generate enum lookup map if this is an enum type (needed for both eager and lazy)
+    if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
+      // Generate a frozen object for O(1) string→index lookup at runtime
+      // This is much faster than indexOf() for hot path writes
+      const mapEntries = enumValues.map((val, idx) => `'${val}': ${idx}`).join(', ');
+      enumMaps.push(`  const ${columnName}_enumMap = Object.freeze({ ${mapEntries} });`);
+    }
+
+    if (isEager) {
+      // EAGER column: Allocate in constructor, no null bitmap
+      // Used for columns written on every entry (like message)
+      // NOTE: We do NOT assign `this.${columnName} = this.${columnName}_values` here
+      // because the setter method `${columnName}(pos, val)` needs to be callable.
+      // The _values array is allocated, but access is through the setter method only.
+      if (constructorName === 'Array') {
+        // String array for category/text columns
+        eagerColumnConstructorCode.push(`    // Eager column: ${columnName} (no null bitmap)`);
+        eagerColumnConstructorCode.push(`    this.${columnName}_values = new Array(alignedCapacity);`);
+      } else if (isBitPacked) {
+        // Bit-packed boolean
+        eagerColumnConstructorCode.push(`    // Eager column: ${columnName} (bit-packed, no null bitmap)`);
+        eagerColumnConstructorCode.push(
+          `    this.${columnName}_values = new Uint8Array(Math.ceil(alignedCapacity / 8));`,
+        );
+      } else {
+        // TypedArray
+        eagerColumnConstructorCode.push(`    // Eager column: ${columnName} (no null bitmap)`);
+        eagerColumnConstructorCode.push(`    this.${columnName}_values = new ${constructorName}(alignedCapacity);`);
+      }
+      // Skip symbol/allocator/getter generation for eager columns - they use the setter method directly
+      continue;
+    }
+
+    // LAZY column: Symbol + allocator + getters (existing behavior)
     // Symbol declaration
     symbolDeclarations.push(`  const ${columnName}_sym = Symbol('${columnName}');`);
     symbolDeclarations.push(`  columnSymbols['${columnName}'] = ${columnName}_sym;`);
@@ -326,32 +408,45 @@ export function generateColumnBufferClass(
     getterMethods.push(`    get ${columnName}_nulls() { return allocate_${columnName}(this).nulls; }`);
     getterMethods.push(`    get ${columnName}_values() { return allocate_${columnName}(this).values; }`);
     getterMethods.push(`    get ${columnName}() { return allocate_${columnName}(this).values; }`);
+  }
 
-    // Generate enum lookup map if this is an enum type
-    if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
-      // Generate a frozen object for O(1) string→index lookup at runtime
-      // This is much faster than indexOf() for hot path writes
-      const mapEntries = enumValues.map((val, idx) => `'${val}': ${idx}`).join(', ');
-      enumMaps.push(`  const ${columnName}_enumMap = Object.freeze({ ${mapEntries} });`);
-    }
+  // Re-iterate for setter methods (need to check eager status again)
+  for (const fieldName of schemaFields) {
+    const columnName = fieldName;
+    const storageInfo = getTypedArrayInfo(schema, fieldName);
+    const { isEager } = storageInfo;
 
-    // Setter method: buffer.columnName(position, value) => this
-    // Allocates column lazily on first write, sets value and null bit
-    const valueAssignment = generateSetterValueAssignment(storageInfo, columnName);
-    const nullBitSetting = generateNullBitSetting();
+    if (isEager) {
+      // EAGER column setter: Direct property access, no allocator, no null bit
+      const valueAssignment = generateSetterValueAssignmentEager(storageInfo, columnName);
+      setterMethods.push(`    ${columnName}(pos, val) {
+      ${valueAssignment}
+      return this;
+    }`);
+    } else {
+      // LAZY column setter: Allocates column lazily on first write, sets value and null bit
+      const valueAssignment = generateSetterValueAssignment(storageInfo, columnName);
+      const nullBitSetting = generateNullBitSetting();
 
-    setterMethods.push(`    ${columnName}(pos, val) {
+      setterMethods.push(`    ${columnName}(pos, val) {
       const storage = allocate_${columnName}(this);
       ${valueAssignment}
       ${nullBitSetting}
       return this;
     }`);
+    }
   }
 
   // Build constructor signature with optional extension params
   const constructorSignature = extension?.constructorParams
     ? `requestedCapacity, ${extension.constructorParams}`
     : 'requestedCapacity';
+
+  // Add eager column initialization (before extension code)
+  if (eagerColumnConstructorCode.length > 0) {
+    constructorCode.push('');
+    constructorCode.push(...eagerColumnConstructorCode);
+  }
 
   // Add extension constructor code if provided
   if (extension?.constructorCode) {

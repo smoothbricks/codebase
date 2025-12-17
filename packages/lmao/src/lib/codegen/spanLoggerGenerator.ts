@@ -367,9 +367,12 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._operations[idx] = ENTRY_TYPE_INFO;
 
       // Write message to unified message column (log message template)
+      // For eager columns (like message), there's no null bitmap - the column is always present
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
-        helpers.setNullBit(this._buffer.message_nulls, idx);
+        if (this._buffer.message_nulls) {
+          helpers.setNullBit(this._buffer.message_nulls, idx);
+        }
       }
 
       // Apply scoped attributes
@@ -388,9 +391,13 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_DEBUG;
 
+      // Write message to unified message column (log message template)
+      // For eager columns (like message), there's no null bitmap - the column is always present
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
-        helpers.setNullBit(this._buffer.message_nulls, idx);
+        if (this._buffer.message_nulls) {
+          helpers.setNullBit(this._buffer.message_nulls, idx);
+        }
       }
 
       ${scopeWrites}
@@ -408,9 +415,13 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_WARN;
 
+      // Write message to unified message column (log message template)
+      // For eager columns (like message), there's no null bitmap - the column is always present
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
-        helpers.setNullBit(this._buffer.message_nulls, idx);
+        if (this._buffer.message_nulls) {
+          helpers.setNullBit(this._buffer.message_nulls, idx);
+        }
       }
 
       ${scopeWrites}
@@ -428,9 +439,13 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_ERROR;
 
+      // Write message to unified message column (log message template)
+      // For eager columns (like message), there's no null bitmap - the column is always present
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
-        helpers.setNullBit(this._buffer.message_nulls, idx);
+        if (this._buffer.message_nulls) {
+          helpers.setNullBit(this._buffer.message_nulls, idx);
+        }
       }
 
       ${scopeWrites}
@@ -448,9 +463,13 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_TRACE;
 
+      // Write message to unified message column (log message template)
+      // For eager columns (like message), there's no null bitmap - the column is always present
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
-        helpers.setNullBit(this._buffer.message_nulls, idx);
+        if (this._buffer.message_nulls) {
+          helpers.setNullBit(this._buffer.message_nulls, idx);
+        }
       }
 
       ${scopeWrites}
@@ -467,7 +486,9 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       const idx = this._writeIndex;
       if (this._buffer.lineNumber_values) {
         this._buffer.lineNumber_values[idx] = lineNumber;
-        helpers.setNullBit(this._buffer.lineNumber_nulls, idx);
+        if (this._buffer.lineNumber_nulls) {
+          helpers.setNullBit(this._buffer.lineNumber_nulls, idx);
+        }
       }
       return this;
     }

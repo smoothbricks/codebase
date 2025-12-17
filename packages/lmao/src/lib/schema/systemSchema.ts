@@ -6,65 +6,93 @@
  * - The `message` column is UNIFIED for span names, log message templates, exception messages, result messages, and feature flag names
  */
 
-import { S } from './builder.js';
-import { defineTagAttributes } from './defineTagAttributes.js';
+import type {
+  CategorySchemaWithMetadata,
+  NumberSchemaWithMetadata,
+  TextSchemaWithMetadata,
+} from '@smoothbricks/arrow-builder';
+import { S as ArrowS } from '@smoothbricks/arrow-builder';
+import { type DefinedTagAttributes, defineTagAttributes } from './defineTagAttributes.js';
+import type { TagAttributeSchema } from './types.js';
 
 /**
- * Base system schema that all modules inherit
- *
- * These columns support:
- * - Unified message (span name, log message template, exception message, result message, or feature flag name based on entry type)
- * - Source location (lineNumber)
- * - Error handling (errorCode, exceptionStack)
- * - Feature flags (ffValue)
+ * System schema field type - explicit type to avoid Sury's internal brand symbol leaking.
  */
-export const systemSchema = defineTagAttributes(
-  {
-    /**
-     * Unified message column - serves different purposes based on entry type.
-     *
-     * Per specs/01h_entry_types_and_logging_primitives.md:
-     * - span-start, span-ok, span-err: Span name (e.g., 'create-user')
-     * - span-exception: Exception message (e.g., 'Connection timeout')
-     * - info, debug, warn, error, trace: Log message TEMPLATE (e.g., 'User ${userId} created')
-     * - ff-access, ff-usage: Feature flag name (e.g., 'darkMode')
-     * - tag: Span name (same as span lifecycle entries)
-     *
-     * Uses S.category() because:
-     * - Span names repeat across many traces
-     * - Log templates repeat (only values differ)
-     * - Flag names repeat across evaluations
-     * - Exception messages often repeat (same error types)
-     * - String interning provides excellent compression
-     *
-     * NOTE: Log messages are FORMAT STRINGS, NOT interpolated! The template is stored
-     * verbatim, and values go in their own typed columns for queryability.
-     */
-    message: S.category(),
+interface SystemSchemaFieldTypes {
+  message: CategorySchemaWithMetadata;
+  lineNumber: NumberSchemaWithMetadata;
+  errorCode: CategorySchemaWithMetadata;
+  exceptionStack: TextSchemaWithMetadata;
+  ffValue: CategorySchemaWithMetadata;
+}
 
-    /**
-     * Source code line number for this entry.
-     *
-     * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
-     * - Uint16 column (max 65535 lines per file)
-     * - TypeScript transformer injects line numbers at compile time
-     * - No runtime overhead - just a method call with literal number
-     * - Value of 0 means "line number not set"
-     *
-     * Used for:
-     * - Linking trace entries back to source code
-     * - Debugging and error analysis
-     * - IDE integration for "jump to line"
-     */
-    lineNumber: S.number(),
+// Use arrow-builder's S directly (not lmao's wrapped version) to get clean types
+// that don't include the flag builder methods - this avoids type inference issues.
+const messageSchema: CategorySchemaWithMetadata = ArrowS.category().eager();
+const lineNumberSchema: NumberSchemaWithMetadata = ArrowS.number();
+const errorCodeSchema: CategorySchemaWithMetadata = ArrowS.category();
+const exceptionStackSchema: TextSchemaWithMetadata = ArrowS.text();
+const ffValueSchema: CategorySchemaWithMetadata = ArrowS.category();
 
-    // Error handling
-    errorCode: S.category(),
-    exceptionStack: S.text(),
+/**
+ * Raw system schema fields object.
+ * Using explicit type annotation to ensure proper type inference.
+ */
+const systemSchemaFields: SystemSchemaFieldTypes & TagAttributeSchema = {
+  /**
+   * Unified message column - serves different purposes based on entry type.
+   *
+   * Per specs/01h_entry_types_and_logging_primitives.md:
+   * - span-start, span-ok, span-err: Span name (e.g., 'create-user')
+   * - span-exception: Exception message (e.g., 'Connection timeout')
+   * - info, debug, warn, error, trace: Log message TEMPLATE (e.g., 'User ${userId} created')
+   * - ff-access, ff-usage: Feature flag name (e.g., 'darkMode')
+   * - tag: Span name (same as span lifecycle entries)
+   *
+   * Uses S.category().eager() because:
+   * - Message is ALWAYS written for every entry type (span name, log message, etc.)
+   * - Eager allocation eliminates null bitmap overhead (never null)
+   * - Span names repeat across many traces
+   * - Log templates repeat (only values differ)
+   * - Flag names repeat across evaluations
+   * - Exception messages often repeat (same error types)
+   * - String interning provides excellent compression
+   *
+   * NOTE: Log messages are FORMAT STRINGS, NOT interpolated! The template is stored
+   * verbatim, and values go in their own typed columns for queryability.
+   */
+  message: messageSchema,
 
-    // Feature flags (ffName is now part of unified `message` column)
-    ffValue: S.category(), // Can be boolean, string, or number as string
-  },
+  /**
+   * Source code line number for this entry.
+   *
+   * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
+   * - Uint16 column (max 65535 lines per file)
+   * - TypeScript transformer injects line numbers at compile time
+   * - No runtime overhead - just a method call with literal number
+   * - Value of 0 means "line number not set"
+   *
+   * Used for:
+   * - Linking trace entries back to source code
+   * - Debugging and error analysis
+   * - IDE integration for "jump to line"
+   */
+  lineNumber: lineNumberSchema,
+
+  // Error handling
+  errorCode: errorCodeSchema,
+  exceptionStack: exceptionStackSchema,
+
+  // Feature flags (ffName is now part of unified `message` column)
+  ffValue: ffValueSchema, // Can be boolean, string, or number as string
+};
+
+/**
+ * Base system schema that all modules inherit.
+ * Wrapped with defineTagAttributes for validation and extension support.
+ */
+export const systemSchema: DefinedTagAttributes<SystemSchemaFieldTypes & TagAttributeSchema> = defineTagAttributes(
+  systemSchemaFields,
   // Skip reserved name validation for system schema - `message` is a system column
   { _skipReservedNameValidation: true },
 );

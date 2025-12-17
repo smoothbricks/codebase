@@ -252,6 +252,17 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
       return maskedSchema;
     };
 
+    // Add chainable .eager() method
+    schema.eager = (): CategorySchemaWithMetadata => {
+      // Clone to create a new schema marked as eager
+      const eagerSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as Sury.Schema<string, unknown> & CategorySchemaWithMetadata;
+      eagerSchema.__eager = true;
+      return eagerSchema;
+    };
+
     return schema;
   },
 
@@ -272,6 +283,17 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
       ) as Sury.Schema<string, unknown> & TextSchemaWithMetadata;
       maskedSchema.__mask_transform = resolveMaskTransform(preset);
       return maskedSchema;
+    };
+
+    // Add chainable .eager() method
+    schema.eager = (): TextSchemaWithMetadata => {
+      // Clone to create a new schema marked as eager
+      const eagerSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as Sury.Schema<string, unknown> & TextSchemaWithMetadata;
+      eagerSchema.__eager = true;
+      return eagerSchema;
     };
 
     return schema;

@@ -10,7 +10,6 @@ import type * as Sury from '@sury/sury';
 // Re-export schema metadata types from arrow-builder (single source of truth)
 export type {
   BooleanSchemaWithMetadata,
-  CategorySchemaWithMask,
   CategorySchemaWithMetadata,
   EnumSchemaWithMetadata,
   EnumUtf8Precomputed,
@@ -20,7 +19,6 @@ export type {
   SchemaType,
   SchemaWithMetadata,
   TagAttributeSchema,
-  TextSchemaWithMask,
   TextSchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 
@@ -30,12 +28,12 @@ export type { Input, Output, Schema } from '@sury/sury';
 // Import schema metadata types for use in InferTagAttributes and local type definitions
 import type {
   BooleanSchemaWithMetadata,
+  CategorySchemaWithMask,
   CategorySchemaWithMetadata,
   EnumSchemaWithMetadata,
-  MaskPreset,
-  MaskTransform,
   NumberSchemaWithMetadata,
   TagAttributeSchema,
+  TextSchemaWithMask,
   TextSchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
 // Import the brand symbol from defineTagAttributes for ExtractOriginalSchema detection
@@ -146,18 +144,16 @@ export interface FeatureFlagDefinition<T, EvalType extends 'sync' | 'async' = 's
 export type SchemaOrFlagBuilder<T> = Sury.Schema<T, unknown> & FlagBuilder<T>;
 
 /**
- * Category schema with flag builder and mask method
+ * Category schema with flag builder, mask method, and eager method.
+ * Extends arrow-builder's CategorySchemaWithMask which provides mask() and eager().
  */
-export type CategorySchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & {
-  mask(preset: MaskPreset | MaskTransform): CategorySchemaWithMetadata;
-};
+export type CategorySchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & CategorySchemaWithMask;
 
 /**
- * Text schema with flag builder and mask method
+ * Text schema with flag builder, mask method, and eager method.
+ * Extends arrow-builder's TextSchemaWithMask which provides mask() and eager().
  */
-export type TextSchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & {
-  mask(preset: MaskPreset | MaskTransform): TextSchemaWithMetadata;
-};
+export type TextSchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & TextSchemaWithMask;
 
 /**
  * Schema builder interface that wraps Sury with custom API

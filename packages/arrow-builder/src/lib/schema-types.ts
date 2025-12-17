@@ -11,6 +11,7 @@ import type * as Sury from '@sury/sury';
 export type {
   BooleanSchemaWithMetadata,
   CategorySchemaWithMetadata,
+  EagerColumnMetadata,
   EnumSchemaWithMetadata,
   EnumUtf8Precomputed,
   NumberSchemaWithMetadata,

@@ -67,7 +67,8 @@ describe('Schema Integration Patterns', () => {
 
       expect(ctx.requestId).toBe('req-123');
       expect(ctx.userId).toBe('user-456');
-      expect(ctx.traceId).toMatch(/^trace-/);
+      // TraceId is now W3C format (32 hex chars) via generateTraceId from traceId.ts
+      expect(ctx.traceId).toMatch(/^[a-f0-9]{32}$/);
       expect(ctx.ff).toBeDefined();
       expect(ctx.env).toBe(environmentConfig);
     });
@@ -605,6 +606,132 @@ describe('Schema Integration Patterns', () => {
         expect(result.value.email).toBe('test@example.com');
         expect(result.value.name).toBe('Test User');
       }
+    });
+  });
+
+  describe('Prototype-based Context Inheritance', () => {
+    it('should preserve user properties in child spans via prototype chain', async () => {
+      const moduleContext = createModuleContext({
+        moduleMetadata: {
+          gitSha: 'abc123',
+          filePath: 'src/services/user.ts',
+          moduleName: 'UserService',
+        },
+        tagAttributes: dbAttributes,
+      });
+
+      let parentRequestId: string | undefined;
+      let childRequestId: string | undefined;
+      let parentUserId: string | undefined;
+      let childUserId: string | undefined;
+
+      const testTask = moduleContext.task('parent-task', async (ctx) => {
+        // Capture parent context properties
+        parentRequestId = ctx.requestId;
+        parentUserId = ctx.userId;
+
+        await ctx.span('child-task', async (childCtx) => {
+          // Capture child context properties - should inherit from parent
+          childRequestId = childCtx.requestId;
+          childUserId = childCtx.userId;
+
+          return childCtx.ok({ done: true });
+        });
+
+        return ctx.ok({ success: true });
+      });
+
+      const requestCtx = createRequestContext(
+        { requestId: 'req-inherit-test', userId: 'user-inherit-test' },
+        featureFlags,
+        flagEvaluator,
+        environmentConfig,
+      );
+
+      await testTask(requestCtx);
+
+      // Verify properties are inherited in child span
+      expect(parentRequestId).toBe('req-inherit-test');
+      expect(childRequestId).toBe('req-inherit-test');
+      expect(parentUserId).toBe('user-inherit-test');
+      expect(childUserId).toBe('user-inherit-test');
+    });
+
+    it('should preserve env config in child spans', async () => {
+      const moduleContext = createModuleContext({
+        moduleMetadata: {
+          gitSha: 'abc123',
+          filePath: 'src/services/user.ts',
+          moduleName: 'UserService',
+        },
+        tagAttributes: dbAttributes,
+      });
+
+      let parentEnv: Record<string, unknown> | undefined;
+      let childEnv: Record<string, unknown> | undefined;
+
+      const testTask = moduleContext.task('parent-task', async (ctx) => {
+        parentEnv = ctx.env;
+
+        await ctx.span('child-task', async (childCtx) => {
+          childEnv = childCtx.env;
+          return childCtx.ok({ done: true });
+        });
+
+        return ctx.ok({ success: true });
+      });
+
+      const requestCtx = createRequestContext(
+        { requestId: 'req-env-test' },
+        featureFlags,
+        flagEvaluator,
+        environmentConfig,
+      );
+
+      await testTask(requestCtx);
+
+      // Verify env is same object reference (not copied)
+      expect(parentEnv).toBe(environmentConfig);
+      expect(childEnv).toBe(environmentConfig);
+      expect((parentEnv as typeof environmentConfig)?.awsRegion).toBe('us-east-1');
+      expect((childEnv as typeof environmentConfig)?.awsRegion).toBe('us-east-1');
+    });
+
+    it('should have separate ff evaluators for parent and child spans', async () => {
+      const moduleContext = createModuleContext({
+        moduleMetadata: {
+          gitSha: 'abc123',
+          filePath: 'src/services/user.ts',
+          moduleName: 'UserService',
+        },
+        tagAttributes: dbAttributes,
+      });
+
+      let parentFf: unknown;
+      let childFf: unknown;
+
+      const testTask = moduleContext.task('parent-task', async (ctx) => {
+        parentFf = ctx.ff;
+
+        await ctx.span('child-task', async (childCtx) => {
+          childFf = childCtx.ff;
+          return childCtx.ok({ done: true });
+        });
+
+        return ctx.ok({ success: true });
+      });
+
+      const requestCtx = createRequestContext(
+        { requestId: 'req-ff-test' },
+        featureFlags,
+        flagEvaluator,
+        environmentConfig,
+      );
+
+      await testTask(requestCtx);
+
+      // Child should have its own ff evaluator (bound to child buffer)
+      expect(parentFf).not.toBe(childFf);
     });
   });
 });

@@ -10,6 +10,12 @@ const mockSchema = {
   isActive: { __schema_type: 'boolean' },
 } as const;
 
+// Schema with eager column (no null bitmap, allocated in constructor)
+const eagerSchema = {
+  message: { __schema_type: 'category', __eager: true },
+  userId: { __schema_type: 'category' },
+} as const;
+
 describe('ColumnBuffer setter methods', () => {
   test('should generate setter methods for each column', () => {
     const buffer = createGeneratedColumnBuffer(mockSchema as any, 10);
@@ -135,5 +141,108 @@ describe('ColumnBuffer setter methods', () => {
     expect(buffer.userId_values[0]).toBe('alice');
     expect(buffer.userId_values[1]).toBe('bob');
     expect(buffer.userId_values[2]).toBe('alice');
+  });
+});
+
+describe('Eager column support (__eager: true)', () => {
+  test('eager column should be allocated in constructor (not lazily)', () => {
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated code
+    const buffer = createGeneratedColumnBuffer(eagerSchema as any, 10);
+
+    // Eager column should have values property directly accessible
+    // WITHOUT triggering lazy allocation (it's already allocated)
+    expect(buffer.message_values).toBeDefined();
+    expect(Array.isArray(buffer.message_values)).toBe(true);
+    expect((buffer.message_values as string[]).length).toBe(16); // Aligned to 16
+  });
+
+  test('eager column should NOT have null bitmap', () => {
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated code
+    const buffer = createGeneratedColumnBuffer(eagerSchema as any, 10) as any;
+
+    // Eager columns don't have null bitmap (they're always written)
+    // getNullsIfAllocated should return undefined for eager columns
+    expect(buffer.getNullsIfAllocated('message')).toBeUndefined();
+  });
+
+  test('eager column setter should write without null bit', () => {
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated code
+    const buffer = createGeneratedColumnBuffer(eagerSchema as any, 10);
+
+    // Write to eager column
+    (buffer as any).message(0, 'test message');
+    (buffer as any).message(1, 'another message');
+
+    // Values should be written
+    expect(buffer.message_values[0]).toBe('test message');
+    expect(buffer.message_values[1]).toBe('another message');
+  });
+
+  test('lazy column alongside eager column should still have null bitmap', () => {
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated code
+    const buffer = createGeneratedColumnBuffer(eagerSchema as any, 10);
+
+    // Write to lazy column
+    (buffer as any).userId(0, 'user1');
+
+    // Lazy column should have null bitmap
+    expect(buffer.userId_nulls).toBeDefined();
+    expect(buffer.userId_nulls[0] & 1).toBe(1); // null bit set
+  });
+
+  test('eager column should work with enum type', () => {
+    const eagerEnumSchema = {
+      status: { __schema_type: 'enum', __enum_values: ['a', 'b', 'c'], __eager: true },
+    } as const;
+
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated code
+    const buffer = createGeneratedColumnBuffer(eagerEnumSchema as any, 10);
+
+    // Should be allocated
+    expect(buffer.status_values).toBeDefined();
+    expect(buffer.status_values instanceof Uint8Array).toBe(true);
+
+    // Write and verify
+    (buffer as any).status(0, 'a');
+    (buffer as any).status(1, 'b');
+    expect(buffer.status_values[0]).toBe(0);
+    expect(buffer.status_values[1]).toBe(1);
+  });
+
+  test('eager column should work with number type', () => {
+    const eagerNumberSchema = {
+      count: { __schema_type: 'number', __eager: true },
+    } as const;
+
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated code
+    const buffer = createGeneratedColumnBuffer(eagerNumberSchema as any, 10);
+
+    // Should be allocated as Float64Array
+    expect(buffer.count_values).toBeDefined();
+    expect(buffer.count_values instanceof Float64Array).toBe(true);
+
+    // Write and verify
+    (buffer as any).count(0, 42.5);
+    expect(buffer.count_values[0]).toBe(42.5);
+  });
+
+  test('eager column should work with boolean type', () => {
+    const eagerBoolSchema = {
+      active: { __schema_type: 'boolean', __eager: true },
+    } as const;
+
+    // biome-ignore lint/suspicious/noExplicitAny: testing runtime-generated code
+    const buffer = createGeneratedColumnBuffer(eagerBoolSchema as any, 10);
+
+    // Should be allocated as bit-packed Uint8Array
+    expect(buffer.active_values).toBeDefined();
+    expect(buffer.active_values instanceof Uint8Array).toBe(true);
+
+    // Write and verify
+    (buffer as any).active(0, true);
+    (buffer as any).active(1, false);
+    (buffer as any).active(2, true);
+    const values = buffer.active_values as Uint8Array;
+    expect(values[0] & 0b101).toBe(0b101); // bits 0 and 2 set
   });
 });
