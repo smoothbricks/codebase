@@ -1683,7 +1683,7 @@ function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
 function createChildSpan(parentBuffer: SpanBuffer, spanName: string, childFn: SpanFunction) {
   const childTaskContext: TaskContext = {
     module: parentBuffer.task.module,
-    spanNameId: internString(spanName),
+    spanName: spanName, // Raw string - dictionary built during Arrow conversion
     lineNumber: getCurrentLineNumber(), // Build tool injected
   };
 
@@ -2224,7 +2224,7 @@ const processUser = moduleContext.task('processUser', async (ctx) => {
 
 // What happens during task definition:
 // 1. TaskContext creation
-//    - spanNameId = internString('processUser')  // One-time string interning
+//    - spanName = 'processUser'  // Raw string stored, dict built in cold path
 //    - Reference to module context (no copy)
 // 2. Wrapper function creation
 //    - Captures task context in closure
@@ -2267,7 +2267,7 @@ buffer.timestamps[index] = getTimestamp(ctx); // BigInt64 write
 buffer.operations[index] = ENTRY_TYPE.TAG; // Uint8 write
 
 // Accessing lazy getter triggers allocation on first access
-buffer.attr_userId_values[index] = internedStringIndex; // Uint32 write (lazy alloc on first access)
+buffer.attr_userId_strings[index] = '123'; // Raw string write (lazy alloc on first access)
 
 // Set null bitmap bit (same ArrayBuffer as values)
 const byteIdx = Math.floor(index / 8);

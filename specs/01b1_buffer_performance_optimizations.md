@@ -896,7 +896,7 @@ Memory is managed in flush cycles. Each cycle:
 | ------------------------ | --------------------------------- | --------------------- | -------------------------------------- |
 | **ENUM dictionary**      | Nothing                           | Everything            | Immutable - pre-built at startup       |
 | **ENUM indices**         | Values array reset                | -                     | Ready for next flush                   |
-| **CATEGORY LRU cache**   | Nothing                           | String→entry mappings | Track occurrence counts across flushes |
+| **CATEGORY SIEVE cache** | Nothing                           | String→entry mappings | Track occurrence counts across flushes |
 | **CATEGORY flush state** | `flushDictionary`, `flushIndices` | -                     | Per-flush dictionary rebuilt each time |
 | **CATEGORY UTF-8 cache** | Nothing                           | Hot value UTF-8 bytes | Avoid re-encoding hot values           |
 | **TEXT strings**         | `strings[]` array                 | -                     | No interning needed - per-flush        |
@@ -913,9 +913,9 @@ interface MemoryBounds {
     indices: 'O(capacity) - Uint8Array per column';
   };
 
-  // CATEGORY: Configurable LRU limits
+  // CATEGORY: Configurable SIEVE limits
   category: {
-    lruCache: 'O(maxEntries) - configurable, default 10k';
+    sieveCache: 'O(maxEntries) - configurable, default 10k';
     utf8Cache: 'O(maxEntries/2) - only hot values';
     flushDict: 'O(unique values in flush) - cleared after flush';
     indices: 'O(capacity) - Uint32Array per column';
@@ -996,11 +996,13 @@ class FlushScheduler {
 // ENUM: Bounded by schema (fixed at compile time)
 S.enum(['span-start', 'span-ok', 'span-err']); // Max 3 values, forever
 
-// CATEGORY: Bounded by LRU (configurable limit)
-new CategoryInterner({ maxEntries: 10_000, maxBytes: 10_000_000 });
-// - Max 10k unique strings
-// - Max 10MB total string bytes
-// - LRU eviction removes cold values
+// CATEGORY: UTF-8 cache bounded by SIEVE (configurable limit)
+// Hot path stores raw strings, cold path builds dictionary
+// SIEVE cache speeds up UTF-8 encoding during Arrow conversion
+new CategoryUtf8Cache({ maxEntries: 10_000, maxBytes: 10_000_000 });
+// - Max 10k cached UTF-8 encodings
+// - Max 10MB total cache bytes
+// - SIEVE eviction removes cold values
 
 // TEXT: Bounded per-flush (cleared after Arrow conversion)
 class TextColumn {
@@ -1019,8 +1021,8 @@ class TextColumn {
 class MemoryMonitor {
   checkHealth(): HealthReport {
     return {
-      categoryLruSize: categoryInterner.cache.size,
-      categoryEvictionRate: categoryInterner.evictionCount / categoryInterner.insertCount,
+      categoryUtf8CacheSize: categoryUtf8Cache.cache.size,
+      categoryUtf8CacheEvictionRate: categoryUtf8Cache.evictionCount / categoryUtf8Cache.insertCount,
       textStringsBeforeFlush: textColumn.strings.length,
       heapUsedMb: process.memoryUsage().heapUsed / 1024 / 1024,
     };
@@ -1031,7 +1033,7 @@ class MemoryMonitor {
     const health = this.checkHealth();
 
     // High eviction rate suggests CATEGORY misuse (unique values)
-    if (health.categoryEvictionRate > 0.5) {
+    if (health.categoryUtf8CacheEvictionRate > 0.5) {
       alerts.push('CATEGORY eviction rate >50% - consider using TEXT for unique values');
     }
 
@@ -1052,8 +1054,8 @@ Buffer performance optimizations leverage:
 - **V8 hidden classes** - Stable object shapes
 - **Monomorphic access** - Predictable types
 - **Cache alignment** - CPU-friendly layout
-- **String interning** - Integer comparisons (ENUM, CATEGORY)
-- **LRU bounding** - Prevents unbounded memory growth (CATEGORY)
+- **ENUM compile-time mapping** - Integer comparisons via switch statement
+- **SIEVE bounding** - Prevents unbounded memory growth (CATEGORY)
 - **Per-flush clearing** - Releases TEXT memory after conversion
 - **Sequential access** - Prefetch friendly
 - **Hot path isolation** - Fast common case

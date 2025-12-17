@@ -68,21 +68,32 @@ return arrow.makeData({
 
 #### 2. Dictionary-Encoded Types (category, enum)
 
-**makeData with dictionary vector**:
+**makeData with dictionary vector** - dictionary built from raw strings in cold path:
 
 ```typescript
-// Category column (Uint32Array indices → dictionary)
-const indicesData = buffer.attr_httpMethod.subarray(0, buffer.writeIndex);
-const dictionaryStrings = categoryInterner.getStrings(); // ['GET', 'POST', 'PUT', ...]
+// Category column: raw strings stored in hot path, dictionary built here
+const rawStrings = buffer.attr_httpMethod_strings.slice(0, buffer.writeIndex);
+
+// Build dictionary from unique strings (COLD PATH - deferred interning)
+const uniqueStrings = [...new Set(rawStrings.filter((s) => s != null))].sort();
+const stringToIndex = new Map(uniqueStrings.map((s, i) => [s, i]));
+
+// Create indices by mapping raw strings to dictionary positions
+const indicesData = new Uint32Array(rawStrings.length);
+for (let i = 0; i < rawStrings.length; i++) {
+  if (rawStrings[i] != null) {
+    indicesData[i] = stringToIndex.get(rawStrings[i])!;
+  }
+}
 
 return arrow.makeData({
   type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
   offset: 0,
   length: buffer.writeIndex,
   nullCount,
-  data: indicesData, // Raw indices TypedArray
+  data: indicesData, // Indices built from raw strings
   nullBitmap,
-  dictionary: arrow.makeVector(dictionaryStrings), // String array to vector
+  dictionary: arrow.makeVector(uniqueStrings), // Sorted unique strings
 });
 ```
 

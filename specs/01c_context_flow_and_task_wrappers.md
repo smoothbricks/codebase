@@ -315,7 +315,7 @@ function createTaskWrapper(moduleContext: ModuleContext, compiledTagOps: Compile
     // Do expensive work ONCE at task definition time
     const taskModuleContext: TaskModuleContext = {
       module: moduleContext, // Shared reference
-      spanNameId: internString(spanName),
+      spanName: spanName, // Raw string - dictionary built during Arrow conversion
       lineNumber: getCurrentLineNumber(), // Build tool injected
       SpanLogger: compiledTagOps.SpanLogger, // Per-module SpanLogger class with compiled prototype
     };
@@ -466,7 +466,7 @@ function createChildSpan(parentCtx: SpanContext, spanName: string, childFn: Span
       parentCtx.buffer.task.module.schema,
       {
         ...parentCtx.buffer.task,
-        spanNameId: internString(spanName),
+        spanName: spanName, // Raw string - dictionary built during Arrow conversion
         lineNumber: getCurrentLineNumber(),
       },
       parentCtx.traceId,
@@ -516,7 +516,7 @@ function createChildSpanWithContext(
     // Create child buffer linked to parent
     const childBuffer = createSpanBuffer(parentCtx.buffer.task.module.schema, {
       ...parentCtx.buffer.task,
-      spanNameId: internString(spanName),
+      spanName: spanName, // Raw string - dictionary built during Arrow conversion
       lineNumber: getCurrentLineNumber(),
     });
 

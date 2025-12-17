@@ -1218,7 +1218,7 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> 
 
     buffer.timestamps[idx] = getTimestampMicros(ctx.anchorEpochMicros, ctx.anchorPerfNow);
     buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-    buffer.message[idx] = internString(String(flagName)); // Unified message column
+    buffer.message[idx] = String(flagName); // Unified message column
 
     // Return chainable tracker using SAME schema as ctx.tag
     return this.createChainableTracker(idx);
@@ -1256,8 +1256,8 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> 
 
     buffer.timestamps[idx] = getTimestampMicros(this.ctx.anchorEpochMicros, this.ctx.anchorPerfNow);
     buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-    buffer.message[idx] = internString(flagName); // Unified message column
-    buffer.attr_ffValue[idx] = internString(String(value)); // S.category for efficient storage
+    buffer.message[idx] = flagName; // Unified message column
+    buffer.attr_ffValue[idx] = String(value); // S.category - raw string, dict built in cold path
   }
 
   private createChainableTracker(idx: number): FlagTracker<Tag> {
