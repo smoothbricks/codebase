@@ -22,7 +22,7 @@ jobs:
     steps:
       # Step 1: GitHub adds "Set up job" automatically
       # Step 2
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
           filter: tree:0
           fetch-depth: 0
@@ -30,7 +30,7 @@ jobs:
       # --- Nix ----------------------------------------------------------------
 
       # Step 3
-      - uses: DeterminateSystems/nix-installer-action@main
+      - uses: DeterminateSystems/nix-installer-action@v21
         with:
           extra-conf: |
             keep-outputs = true
@@ -41,7 +41,7 @@ jobs:
       # Step 4
       # Cache Nix profiles, devenv and direnv
       - name: Cache Nix profiles, devenv and direnv
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ${{ env.NIX_STORE_NAR }}
@@ -63,7 +63,7 @@ jobs:
       # --- devenv shell -------------------------------------------------------
 
       # Step 6
-      - uses: cachix/cachix-action@v13
+      - uses: cachix/cachix-action@v16
         with:
           name: devenv
 
@@ -73,7 +73,7 @@ jobs:
 
       # Step 8
       - name: Cache node_modules
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: node_modules
           key: ${{ runner.os }}-node-${{ hashFiles('bun.lock') }}
@@ -88,11 +88,11 @@ jobs:
 
       # Step 10
       # Sets the base and head SHAs required for the nx affected commands
-      - uses: nrwl/nx-set-shas@v4
+      - uses: nrwl/nx-set-shas@v4.4.0
 
       # Step 11
       - name: Cache Nx
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: .nx/cache
           key: ${{ runner.os }}-nx-${{ github.sha }}
