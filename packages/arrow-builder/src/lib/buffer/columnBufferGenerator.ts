@@ -28,7 +28,7 @@
  * - Cache-friendly: nulls and values in same ArrayBuffer
  */
 
-import { getSchemaFields, type TagAttributeSchema } from '../schema-types.js';
+import { getSchemaFields, type SchemaType, type SchemaWithMetadata, type TagAttributeSchema } from '../schema-types.js';
 import { bufferHelpers } from './bufferHelpers.js';
 import { type ColumnBuffer, DEFAULT_BUFFER_CAPACITY, type TypedColumnBuffer } from './types.js';
 
@@ -112,7 +112,7 @@ interface ColumnStorageInfo {
   constructorName: string;
   bytesPerElement: number;
   isBitPacked: boolean;
-  schemaType: import('../schema-types.js').SchemaType | undefined;
+  schemaType: SchemaType | undefined;
   enumValues?: readonly string[];
   /** When true, column is allocated eagerly in constructor (no null bitmap). */
   isEager: boolean;
@@ -123,7 +123,7 @@ interface ColumnStorageInfo {
  */
 function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): ColumnStorageInfo {
   const fieldSchema = schema[fieldName];
-  const schemaWithMetadata = fieldSchema as import('../schema-types.js').SchemaWithMetadata;
+  const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata?.__schema_type;
   const isEager = schemaWithMetadata?.__eager === true;
 

@@ -3,7 +3,12 @@
   "compilerOptions": {
     "baseUrl": ".",
     "rootDir": "src",
-    "types": ["bun"]
+    "types": ["bun"],
+    "composite": false,
+    "noEmit": true,
+    "emitDeclarationOnly": false,
+    "declaration": false,
+    "declarationMap": false
   },
   "include": ["src/**/*.test.ts", "src/**/__tests__/*.ts"],
   "references": [

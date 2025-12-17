@@ -144,7 +144,6 @@ import type {
   LazyCategorySchema,
   LazyNumberSchema,
   LazyTextSchema,
-  SchemaWithMetadata,
 } from '../schema/types.js';
 
 /**
@@ -158,6 +157,9 @@ import type {
  *
  * Note: For enums, the buffer expects numeric indices. String→index conversion
  * happens in higher-level APIs (SpanLogger, TagWriter, ResultWriter).
+ *
+ * Matches the structure of ValuesArrayType - handles all known schema types
+ * explicitly without using SchemaWithMetadata<infer T> to avoid type inference issues.
  */
 export type SetterValueType<S> = S extends { __schema_type: 'enum' }
   ? number // enum index (string→index conversion done by SpanLogger/TagWriter)
@@ -169,9 +171,7 @@ export type SetterValueType<S> = S extends { __schema_type: 'enum' }
         ? number
         : S extends LazyBooleanSchema | EagerBooleanSchema
           ? boolean
-          : S extends SchemaWithMetadata<infer T>
-            ? T
-            : unknown;
+          : unknown;
 
 /**
  * Infer the values array type for a schema field.

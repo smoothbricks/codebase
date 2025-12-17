@@ -136,7 +136,7 @@ const createOrder = orderModule.task(
   ) => {
     // Set request-level scoped attributes
     // Per specs/01i - these propagate to all child operations
-    ctx.log.scope({
+    ctx.scope({
       userId: orderData.userId,
       requestId: ctx.requestId,
       httpMethod: 'POST',
@@ -150,7 +150,7 @@ const createOrder = orderModule.task(
     const itemCount = orderData.items.reduce((sum, item) => sum + item.quantity, 0);
 
     // Add order-specific scope
-    ctx.log.scope({
+    ctx.scope({
       orderAmount,
       itemCount,
     });
@@ -168,7 +168,7 @@ const createOrder = orderModule.task(
     // Create order in database
     const orderId = `ORD-${Date.now()}`;
 
-    ctx.log.scope({
+    ctx.scope({
       orderId,
       isValid: true,
     });
@@ -211,7 +211,7 @@ const validateOrder = orderModule.task(
         childCtx.log.info('Running advanced validation checks');
 
         // Add validation-specific scope
-        childCtx.log.scope({
+        childCtx.scope({
           operation: 'UPDATE_ORDER', // Can override parent scope
           sqlQuery: 'SELECT * FROM products WHERE id IN (...)',
         });
@@ -238,7 +238,7 @@ const validateOrder = orderModule.task(
 
 // Payment processing task - demonstrates async feature flags
 const processPayment = orderModule.task('process-payment', async (ctx, orderId: string, amount: number) => {
-  ctx.log.scope({
+  ctx.scope({
     orderId,
     orderAmount: amount,
     operation: 'PROCESS_PAYMENT',
@@ -248,7 +248,7 @@ const processPayment = orderModule.task('process-payment', async (ctx, orderId: 
 
   // Simulate payment validation - amounts over 10000 are rejected
   if (amount > 10000) {
-    ctx.log.scope({ httpStatus: 400 });
+    ctx.scope({ httpStatus: 400 });
     return ctx.err('AMOUNT_TOO_LARGE', { amount, maxAmount: 10000 });
   }
 
@@ -264,7 +264,7 @@ const processPayment = orderModule.task('process-payment', async (ctx, orderId: 
       // Simulate payment
       const paymentId = `PAY-${Date.now()}`;
 
-      childCtx.log.scope({
+      childCtx.scope({
         httpStatus: 200,
         httpMethod: 'POST',
       });
@@ -279,7 +279,7 @@ const processPayment = orderModule.task('process-payment', async (ctx, orderId: 
   // Simulate payment
   const paymentId = `PAY-${Date.now()}`;
 
-  ctx.log.scope({
+  ctx.scope({
     httpStatus: 200,
   });
 

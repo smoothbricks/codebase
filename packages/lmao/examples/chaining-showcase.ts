@@ -93,8 +93,8 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
   const payment = await ctx.span('call-payment-gateway', async (childCtx) => {
     const startTime = Date.now();
 
-    // Chaining in child spans
-    childCtx.log.tag.operation('INSERT').orderId(order.id).amount(order.total).status('processing');
+    // Chaining in child spans - use childCtx.tag (not .log.tag)
+    childCtx.tag.operation('INSERT').orderId(order.id).amount(order.total).status('processing');
 
     // Simulate API call
     await new Promise((resolve) => setTimeout(resolve, 50));
@@ -105,13 +105,13 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
     const duration = Date.now() - startTime;
 
     if (!paymentSucceeded) {
-      childCtx.log.tag.duration(duration).httpStatus(402).status('failed');
+      childCtx.tag.duration(duration).httpStatus(402).status('failed');
 
       return childCtx.err('INSUFFICIENT_FUNDS', { amount: order.total, limit: 10000 });
     }
 
     // Chain more after processing
-    childCtx.log.tag.duration(duration).httpStatus(200).status('completed');
+    childCtx.tag.duration(duration).httpStatus(200).status('completed');
 
     return childCtx.ok({ transactionId: 'txn-123', duration });
   });
@@ -160,7 +160,7 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
   // Feature flags work alongside chaining
   if (ctx.ff.fraudDetection) {
     await ctx.span('fraud-check', async (childCtx) => {
-      childCtx.log.tag.orderId(id).operation('SELECT').status('pending');
+      childCtx.tag.orderId(id).operation('SELECT').status('pending');
 
       // Fraud check logic...
       return childCtx.ok({ safe: true });

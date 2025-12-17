@@ -108,12 +108,8 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
 
   // Child span for validation with chained tags
   const validation = await ctx.span('validate-user', async (childCtx) => {
-    // Chaining works in child spans too
-    childCtx.log.tag
-      .operation('SELECT')
-      .query('SELECT COUNT(*) FROM users WHERE email = ?')
-      .duration(12.5)
-      .httpStatus(200);
+    // Chaining works in child spans too - use childCtx.tag (not .log.tag)
+    childCtx.tag.operation('SELECT').query('SELECT COUNT(*) FROM users WHERE email = ?').duration(12.5).httpStatus(200);
 
     // Simulate validation
     const existingUser = false;

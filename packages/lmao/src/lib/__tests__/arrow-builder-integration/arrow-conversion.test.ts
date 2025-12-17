@@ -141,7 +141,8 @@ describe('Arrow Table Conversion', () => {
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
-      // Write enum values as numeric indices
+      // Write enum values as numeric indices (buffer expects index, not string)
+      // SpanLogger/TagWriter do string→index conversion, but buffer tests use numeric indices
       const idx0 = buffer.writeIndex;
       buffer.timestamps[idx0] = 1000n;
       buffer.operations[idx0] = ENTRY_TYPE_SPAN_START;

@@ -137,7 +137,7 @@ const createUser = apiModule.task(
     },
   ) => {
     // Add business-specific scope (merges with middleware scope)
-    ctx.log.scope({
+    ctx.scope({
       operation: 'CREATE_USER',
       resourceId: userData.email,
     });
@@ -167,7 +167,7 @@ const createUser = apiModule.task(
     // Create user
     const userId = `user-${Date.now()}`;
 
-    ctx.log.scope({
+    ctx.scope({
       resourceId: userId,
       httpStatus: 201,
     });
@@ -191,7 +191,7 @@ const createUser = apiModule.task(
 const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
   // Only set business-specific scope
   // Middleware scope (requestId, endpoint, etc.) is already inherited
-  ctx.log.scope({
+  ctx.scope({
     operation: 'GET_USER',
     resourceId: userId,
   });
@@ -209,13 +209,13 @@ const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
 
   // ✅ Error case - TypeScript knows this returns FluentErrorResult
   if (!user) {
-    ctx.log.scope({ httpStatus: 404 });
+    ctx.scope({ httpStatus: 404 });
     ctx.log.info('User not found');
     return ctx.err('USER_NOT_FOUND', { userId });
   }
 
   // ✅ Success case - TypeScript knows this returns FluentSuccessResult
-  ctx.log.scope({ httpStatus: 200 });
+  ctx.scope({ httpStatus: 200 });
   ctx.log.info('User fetched successfully');
 
   return ctx.ok(user);
@@ -234,7 +234,7 @@ const updateUser = apiModule.task(
       email?: string;
     },
   ) => {
-    ctx.log.scope({
+    ctx.scope({
       operation: 'UPDATE_USER',
       resourceId: userId,
     });
@@ -260,7 +260,7 @@ const updateUser = apiModule.task(
     // Apply updates
     const updatedUser = { id: userId, ...updates };
 
-    ctx.log.scope({
+    ctx.scope({
       httpStatus: 200,
     });
 
