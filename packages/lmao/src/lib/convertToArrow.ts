@@ -8,73 +8,18 @@
  * - Zero-copy wrap TypedArrays as Arrow vectors
  */
 
-import { getMaskTransform, type TypedArray } from '@smoothbricks/arrow-builder';
+import {
+  clearBitRange,
+  countNulls,
+  DictionaryBuilder,
+  type FinalizedDictionary,
+  getMaskTransform,
+} from '@smoothbricks/arrow-builder';
 import * as arrow from 'apache-arrow';
 import { ENTRY_TYPE_NAMES } from './lmao.js';
 import { getEnumUtf8, getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
 import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
-
-/**
- * Zero-copy helper: Create Arrow Data from TypedArray without copying
- */
-export function createZeroCopyData<T extends arrow.DataType>(
-  type: T,
-  data: TypedArray,
-  length: number,
-  nullBitmap?: Uint8Array,
-): arrow.Data<T> {
-  const slicedData = data.subarray(0, length);
-  const nullCount = nullBitmap ? countNulls(nullBitmap, length) : 0;
-  const slicedNullBitmap = nullBitmap ? nullBitmap.subarray(0, Math.ceil(length / 8)) : undefined;
-
-  return arrow.makeData({
-    type,
-    offset: 0,
-    length,
-    nullCount,
-    data: slicedData,
-    nullBitmap: slicedNullBitmap,
-  } as any) as arrow.Data<T>;
-}
-
-function countNulls(nullBitmap: Uint8Array, length: number): number {
-  let count = 0;
-  for (let i = 0; i < length; i++) {
-    const byteIndex = Math.floor(i / 8);
-    const bitOffset = i % 8;
-    const isNotNull = (nullBitmap[byteIndex] & (1 << bitOffset)) !== 0;
-    if (!isNotNull) count++;
-  }
-  return count;
-}
-
-/**
- * Clear a range of bits in a null bitmap (set them to 0 = null).
- *
- * PRECONDITION: startBit must be byte-aligned (startBit % 8 === 0).
- * This is guaranteed because buffer capacities are always multiples of 8,
- * and this function is called with rowOffset which accumulates by writeIndex
- * where writeIndex <= capacity for full buffers.
- */
-function clearBitRange(bitmap: Uint8Array, startBit: number, count: number): void {
-  if (count === 0) return;
-
-  const startByte = startBit >>> 3;
-  const fullBytes = count >>> 3;
-  const remainingBits = count & 7;
-
-  // Clear full bytes
-  if (fullBytes > 0) {
-    bitmap.fill(0, startByte, startByte + fullBytes);
-  }
-
-  // Clear remaining bits in the last partial byte
-  if (remainingBits > 0) {
-    const mask = (1 << remainingBits) - 1; // Bits 0 to remainingBits-1
-    bitmap[startByte + fullBytes] &= ~mask;
-  }
-}
 
 function encodeUtf8Strings(strings: readonly string[]): Uint8Array {
   const encoder = new TextEncoder();
@@ -100,12 +45,30 @@ function calculateUtf8Offsets(strings: readonly string[]): Int32Array {
   return offsets;
 }
 
-function concatenateTypedArrays<T extends TypedArray>(arrays: T[]): T {
+/**
+ * Concatenate Uint8 arrays without type casting.
+ */
+function concatenateUint8Arrays(arrays: Uint8Array[]): Uint8Array {
   if (arrays.length === 0) throw new Error('Cannot concatenate empty array list');
   if (arrays.length === 1) return arrays[0];
-
   const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new (arrays[0].constructor as any)(totalLength);
+  const result = new Uint8Array(totalLength);
+  let offset = 0;
+  for (const arr of arrays) {
+    result.set(arr, offset);
+    offset += arr.length;
+  }
+  return result;
+}
+
+/**
+ * Concatenate Float64 arrays without type casting.
+ */
+function concatenateFloat64Arrays(arrays: Float64Array[]): Float64Array {
+  if (arrays.length === 0) throw new Error('Cannot concatenate empty array list');
+  if (arrays.length === 1) return arrays[0];
+  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
+  const result = new Float64Array(totalLength);
   let offset = 0;
   for (const arr of arrays) {
     result.set(arr, offset);
@@ -152,12 +115,8 @@ function concatenateNullBitmaps(
         const mask = (1 << remainingBits) - 1;
         nullBitmap[byteOffset + fullBytes] = (nullBitmap[byteOffset + fullBytes] & ~mask) | (srcLastByte & mask);
       }
-      // Count nulls (bits that are 0)
-      for (let i = 0; i < rowCount; i++) {
-        const byte = i >>> 3;
-        const bit = i & 7;
-        if ((sourceBitmap[byte] & (1 << bit)) === 0) nullCount++;
-      }
+      // Count nulls using countNulls from arrow-builder
+      nullCount += countNulls(sourceBitmap, rowCount);
     }
     // If no sourceBitmap, leave as 0xff (all valid)
 
@@ -405,7 +364,7 @@ function convertBuffersToRecordBatch(
         }
       }
 
-      const allIndices = concatenateTypedArrays(valueArrays);
+      const allIndices = concatenateUint8Arrays(valueArrays);
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
       const enumDictData = arrow.makeData({
@@ -500,7 +459,7 @@ function convertBuffersToRecordBatch(
         }
       }
 
-      const allValues = concatenateTypedArrays(valueArrays);
+      const allValues = concatenateFloat64Arrays(valueArrays);
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
       const numberData = arrow.makeData({
@@ -528,7 +487,7 @@ function convertBuffersToRecordBatch(
         }
       }
 
-      const allValues = concatenateTypedArrays(valueArrays);
+      const allValues = concatenateUint8Arrays(valueArrays);
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
       const boolData = arrow.makeData({
@@ -865,96 +824,6 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
 // ═══════════════════════════════════════════════════════════════════════════════
 
 /**
- * Calculate UTF-8 byte length without allocating
- */
-function utf8ByteLength(str: string): number {
-  let bytes = 0;
-  for (let i = 0; i < str.length; i++) {
-    const c = str.charCodeAt(i);
-    if (c < 0x80) bytes += 1;
-    else if (c < 0x800) bytes += 2;
-    else if (c < 0xd800 || c >= 0xe000) bytes += 3;
-    else {
-      i++;
-      bytes += 4;
-    } // surrogate pair
-  }
-  return bytes;
-}
-
-/**
- * Dictionary builder for string columns.
- *
- * Pass 1: Collect unique strings, track total UTF-8 byte length,
- *         cache UTF-8 encoding on second occurrence.
- * Finalize: Sort (for category), pre-allocate exact-size buffer,
- *           encode remaining strings with encodeInto (zero allocation).
- */
-class ColumnDictionary {
-  private strings = new Map<string, { utf8?: Uint8Array; count: number }>();
-  private totalUtf8Bytes = 0;
-  private encoder = new TextEncoder();
-
-  add(str: string): void {
-    const entry = this.strings.get(str);
-    if (entry) {
-      entry.count++;
-      if (entry.count === 2 && !entry.utf8) {
-        // Cache UTF-8 on second occurrence
-        entry.utf8 = this.encoder.encode(str);
-      }
-    } else {
-      // First occurrence - just track byte length (no allocation)
-      this.totalUtf8Bytes += utf8ByteLength(str);
-      this.strings.set(str, { count: 1 });
-    }
-  }
-
-  get size(): number {
-    return this.strings.size;
-  }
-
-  finalize(sort: boolean): { data: Uint8Array; offsets: Int32Array; indexMap: Map<string, number> } {
-    const uniqueCount = this.strings.size;
-
-    // Pre-allocate array with exact size
-    const keys = new Array<string>(uniqueCount);
-    let i = 0;
-    for (const key of this.strings.keys()) {
-      keys[i++] = key;
-    }
-    if (sort) keys.sort();
-
-    // Pre-allocate exact-size buffer
-    const data = new Uint8Array(this.totalUtf8Bytes);
-    const offsets = new Int32Array(uniqueCount + 1);
-    const indexMap = new Map<string, number>();
-
-    let offset = 0;
-    for (let i = 0; i < uniqueCount; i++) {
-      const str = keys[i];
-      const entry = this.strings.get(str)!;
-
-      offsets[i] = offset;
-      indexMap.set(str, i);
-
-      if (entry.utf8) {
-        // Cached - just copy
-        data.set(entry.utf8, offset);
-        offset += entry.utf8.length;
-      } else {
-        // Encode directly into final buffer (zero intermediate allocation)
-        const result = this.encoder.encodeInto(str, data.subarray(offset));
-        offset += result.written!;
-      }
-    }
-    offsets[uniqueCount] = offset;
-
-    return { data, offsets, indexMap };
-  }
-}
-
-/**
  * Walk a SpanBuffer tree (depth-first pre-order), including overflow chains.
  */
 function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): void {
@@ -982,10 +851,10 @@ export function convertSpanTreeToArrowTable(
   const schema = rootBuffer.task.module.tagAttributes;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // PASS 1: Build dictionaries
+  // PASS 1: Build dictionaries using DictionaryBuilder from arrow-builder
   // ═══════════════════════════════════════════════════════════════════════════
-  const categoryBuilders = new Map<string, ColumnDictionary>();
-  const textBuilders = new Map<string, ColumnDictionary>();
+  const categoryBuilders = new Map<string, DictionaryBuilder>();
+  const textBuilders = new Map<string, DictionaryBuilder>();
   // Store mask transforms and original->masked mappings per column
   const categoryMaskTransforms = new Map<string, ((value: string) => string) | undefined>();
   const textMaskTransforms = new Map<string, ((value: string) => string) | undefined>();
@@ -995,22 +864,22 @@ export function convertSpanTreeToArrowTable(
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
     if (lmaoType === 'category') {
-      categoryBuilders.set(fieldName, new ColumnDictionary());
+      categoryBuilders.set(fieldName, new DictionaryBuilder(globalUtf8Cache));
       categoryMaskTransforms.set(fieldName, getMaskTransform(fieldSchema));
       categoryOriginalToMasked.set(fieldName, new Map());
     }
     if (lmaoType === 'text') {
-      textBuilders.set(fieldName, new ColumnDictionary());
+      textBuilders.set(fieldName, new DictionaryBuilder(globalUtf8Cache));
       textMaskTransforms.set(fieldName, getMaskTransform(fieldSchema));
       textOriginalToMasked.set(fieldName, new Map());
     }
   }
 
-  // System column dictionaries
-  const traceIdBuilder = new ColumnDictionary();
-  const moduleBuilder = new ColumnDictionary();
-  const gitShaBuilder = new ColumnDictionary();
-  const spanNameBuilder = new ColumnDictionary();
+  // System column dictionaries - use DictionaryBuilder with globalUtf8Cache
+  const traceIdBuilder = new DictionaryBuilder(globalUtf8Cache);
+  const moduleBuilder = new DictionaryBuilder(globalUtf8Cache);
+  const gitShaBuilder = new DictionaryBuilder(globalUtf8Cache);
+  const spanNameBuilder = new DictionaryBuilder(globalUtf8Cache);
 
   let totalRows = 0;
   walkSpanTree(rootBuffer, (buffer) => {
@@ -1069,8 +938,8 @@ export function convertSpanTreeToArrowTable(
   const moduleDict = moduleBuilder.finalize(true); // sorted
   const gitShaDict = gitShaBuilder.finalize(true); // sorted
   const spanNameDict = spanNameBuilder.finalize(true); // sorted
-  const categoryDicts = new Map<string, FinalizedDict>();
-  const textDicts = new Map<string, FinalizedDict>();
+  const categoryDicts = new Map<string, FinalizedDictionary>();
+  const textDicts = new Map<string, FinalizedDictionary>();
 
   for (const [name, builder] of categoryBuilders) {
     categoryDicts.set(name, builder.finalize(true)); // sorted for binary search
@@ -1182,7 +1051,7 @@ export function convertSpanTreeToArrowTable(
   return new arrow.Table([batch]);
 }
 
-type FinalizedDict = ReturnType<ColumnDictionary['finalize']>;
+// Use FinalizedDictionary type from arrow-builder
 
 /**
  * Convert multiple buffers to a single RecordBatch using pre-built shared dictionaries
@@ -1190,12 +1059,12 @@ type FinalizedDict = ReturnType<ColumnDictionary['finalize']>;
 function convertBuffersWithSharedDicts(
   buffers: SpanBuffer[],
   arrowSchema: arrow.Schema,
-  traceIdDict: FinalizedDict,
-  moduleDict: FinalizedDict,
-  gitShaDict: FinalizedDict,
-  spanNameDict: FinalizedDict,
-  categoryDicts: Map<string, FinalizedDict>,
-  textDicts: Map<string, FinalizedDict>,
+  traceIdDict: FinalizedDictionary,
+  moduleDict: FinalizedDictionary,
+  gitShaDict: FinalizedDictionary,
+  spanNameDict: FinalizedDictionary,
+  categoryDicts: Map<string, FinalizedDictionary>,
+  textDicts: Map<string, FinalizedDictionary>,
   _attrDictIds: Map<string, number>,
   lmaoSchema: Record<string, unknown>,
   categoryOriginalToMasked: Map<string, Map<string, string>>,
