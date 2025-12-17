@@ -540,6 +540,10 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   let timestampOffset = 0;
   for (const buf of buffers) {
     // Use set() with subarray - bulk copy
+    // Defensive check: timestamps should always exist, but guard against corruption
+    if (!buf.timestamps) {
+      throw new Error(`Buffer missing timestamps property (writeIndex: ${buf.writeIndex})`);
+    }
     allTimestamps.set(buf.timestamps.subarray(0, buf.writeIndex), timestampOffset);
     timestampOffset += buf.writeIndex;
   }
@@ -696,6 +700,10 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   for (const buf of buffers) {
     // Use set() with subarray - bulk copy
     // Note: operations is Uint8Array but entryTypeIndices is Int8Array, same underlying representation
+    // Defensive check: operations should always exist, but guard against corruption
+    if (!buf.operations) {
+      throw new Error(`Buffer missing operations property (writeIndex: ${buf.writeIndex})`);
+    }
     entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), rowOffset);
     rowOffset += buf.writeIndex;
   }
@@ -1163,6 +1171,10 @@ function convertBuffersWithSharedDicts(
   let offset = 0;
   for (const buf of buffers) {
     // Use set() with subarray - bulk copy
+    // Defensive check: timestamps should always exist, but guard against corruption
+    if (!buf.timestamps) {
+      throw new Error(`Buffer missing timestamps property (writeIndex: ${buf.writeIndex})`);
+    }
     allTimestamps.set(buf.timestamps.subarray(0, buf.writeIndex), offset);
     offset += buf.writeIndex;
   }
@@ -1314,6 +1326,10 @@ function convertBuffersWithSharedDicts(
   for (const buf of buffers) {
     // Use set() with subarray - bulk copy
     // Note: operations is Uint8Array but entryTypeIndices is Int8Array, same underlying representation
+    // Defensive check: operations should always exist, but guard against corruption
+    if (!buf.operations) {
+      throw new Error(`Buffer missing operations property (writeIndex: ${buf.writeIndex})`);
+    }
     entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), offset);
     offset += buf.writeIndex;
   }

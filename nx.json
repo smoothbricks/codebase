@@ -17,7 +17,8 @@
       "options": {
         "command": "biome check --files-ignore-unknown=true {projectRoot}",
         "cwd": "{workspaceRoot}"
-      }
+      },
+      "dependsOn": ["typecheck-tests"]
     },
     "lint:fix": {
       "executor": "nx:run-commands",

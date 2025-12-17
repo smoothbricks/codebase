@@ -330,54 +330,97 @@ describe('FlushScheduler', () => {
 
     describe('failure cases', () => {
       it('should handle flush when handler throws error', async () => {
-        const errorHandler: FlushHandler = () => {
-          throw new Error('Flush failed');
+        const errorMessages: unknown[] = [];
+        const originalError = console.error;
+        console.error = (...args: unknown[]) => {
+          errorMessages.push(...args);
         };
 
-        const errorScheduler = new FlushScheduler(errorHandler);
+        try {
+          const errorHandler: FlushHandler = () => {
+            throw new Error('Flush failed');
+          };
 
-        const buffer = createTestBuffer();
-        errorScheduler.register(buffer);
+          const errorScheduler = new FlushScheduler(errorHandler);
 
-        // Should complete without throwing (error is caught and logged)
-        await errorScheduler.flush();
+          const buffer = createTestBuffer();
+          const originalWriteIndex = buffer.writeIndex;
+          errorScheduler.register(buffer);
 
-        // Verify it tried to flush (error logged but didn't propagate)
-        expect(buffer.writeIndex).toBeGreaterThan(0);
+          // Should complete without throwing (error is caught and logged)
+          await errorScheduler.flush();
 
-        errorScheduler.stop();
+          // Verify error was logged
+          expect(errorMessages.length).toBeGreaterThan(0);
+          expect(errorMessages.some((msg) => String(msg).includes('Error in flush handler'))).toBe(true);
+
+          // Verify buffers are NOT reset on failure (to avoid data loss)
+          expect(buffer.writeIndex).toBe(originalWriteIndex);
+
+          errorScheduler.stop();
+        } finally {
+          console.error = originalError;
+        }
       });
 
       it('should handle flush with corrupted buffer', async () => {
-        const buffer = createTestBuffer();
-        delete (buffer as any).timestamps;
+        const errorMessages: unknown[] = [];
+        const originalError = console.error;
+        console.error = (...args: unknown[]) => {
+          errorMessages.push(...args);
+        };
 
-        scheduler.register(buffer);
+        try {
+          const buffer = createTestBuffer();
+          delete (buffer as any).timestamps;
 
-        // Should complete without throwing (error is caught and logged)
-        await scheduler.flush();
+          scheduler.register(buffer);
 
-        // Flush should have been attempted
-        expect(true).toBe(true);
+          // Should complete without throwing (error is caught and logged)
+          await scheduler.flush();
+
+          // Verify error was logged for buffer conversion failure
+          expect(errorMessages.length).toBeGreaterThan(0);
+          expect(errorMessages.some((msg) => String(msg).includes('Error converting buffer to Arrow table'))).toBe(
+            true,
+          );
+        } finally {
+          console.error = originalError;
+        }
       });
 
       it('should handle handler that returns rejected promise', async () => {
-        const rejectedHandler: FlushHandler = async () => {
-          throw new Error('Async error');
+        const errorMessages: unknown[] = [];
+        const originalError = console.error;
+        console.error = (...args: unknown[]) => {
+          errorMessages.push(...args);
         };
 
-        const rejectedScheduler = new FlushScheduler(rejectedHandler);
+        try {
+          const rejectedHandler: FlushHandler = async () => {
+            throw new Error('Async error');
+          };
 
-        const buffer = createTestBuffer();
-        rejectedScheduler.register(buffer);
+          const rejectedScheduler = new FlushScheduler(rejectedHandler);
 
-        // Should complete without throwing (error is caught and logged)
-        await rejectedScheduler.flush();
+          const buffer = createTestBuffer();
+          const originalWriteIndex = buffer.writeIndex;
+          rejectedScheduler.register(buffer);
 
-        // Verify it tried to flush
-        expect(buffer.writeIndex).toBeGreaterThan(0);
+          // Should complete without throwing (error is caught and logged)
+          await rejectedScheduler.flush();
 
-        rejectedScheduler.stop();
+          // Verify error was logged
+          expect(errorMessages.length).toBeGreaterThan(0);
+          expect(errorMessages.some((msg) => String(msg).includes('Error in flush handler'))).toBe(true);
+
+          // Verify buffers are NOT reset on failure (to avoid data loss)
+          expect(buffer.writeIndex).toBe(originalWriteIndex);
+
+          rejectedScheduler.stop();
+        } finally {
+          console.error = originalError;
+        }
       });
     });
   });

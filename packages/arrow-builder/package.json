@@ -53,10 +53,7 @@
         "options": {
           "command": "bun test",
           "cwd": "packages/arrow-builder"
-        },
-        "dependsOn": [
-          "typecheck-tests"
-        ]
+        }
       }
     },
     "tags": [

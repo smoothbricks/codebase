@@ -57,10 +57,7 @@
         "options": {
           "command": "bun test",
           "cwd": "packages/lmao"
-        },
-        "dependsOn": [
-          "typecheck-tests"
-        ]
+        }
       }
     },
     "tags": [

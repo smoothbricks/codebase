@@ -153,8 +153,22 @@ Three distinct string types, each with different storage strategies:
 
 ## Build/Test Commands (Use Bun, Never npm/npx)
 
-- **Build**: x build lmao | **Test Single**: bun test path/to/file.test.ts | **Test Pattern**: bun test -t "pattern"
-- **Typecheck**: x typecheck lmao | **Format**: bun run format (auto-formats on git commit)
+### Build & Typecheck
+
+- **Build**: `nx build lmao` | **Typecheck**: `nx typecheck lmao` (typechecks source code)
+
+### Linting (ALWAYS run before tests!)
+
+- **Lint**: `nx lint lmao` - Runs biome check AND typechecks test files (typecheck-tests)
+- **Lint Fix**: `nx lint:fix lmao` - Auto-formats code
+- **⚠️ CRITICAL**: Agents MUST run `nx lint` before running tests to catch type errors early
+
+### Testing
+
+- **Test Single**: `bun test path/to/file.test.ts`
+- **Test Pattern**: `bun test -t "pattern"`
+- **Test All**: `nx test lmao` (runs all tests for a package)
+- **Note**: Tests no longer depend on typecheck-tests - linting handles that. Tests only depend on build.
 
 ## Implementation Patterns (See specs/01h_entry_types_and_logging_primitives.md)
 

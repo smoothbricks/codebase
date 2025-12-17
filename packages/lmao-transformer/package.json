@@ -43,10 +43,7 @@
         "options": {
           "command": "bun test",
           "cwd": "packages/lmao-transformer"
-        },
-        "dependsOn": [
-          "typecheck-tests"
-        ]
+        }
       }
     },
     "tags": [
