@@ -17,7 +17,7 @@ in {
   # https://devenv.sh/packages/
   packages = with pkgs; [
     # Pin Node.js version to match AWS Lambda runtime
-    nodejs_22
+    nodejs_24
     # Bun.sh for javascript dependencies
     bun
     # Git hooks and formatters
