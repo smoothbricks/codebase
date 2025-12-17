@@ -326,7 +326,10 @@ describe('Arrow IPC Round-Trip', () => {
       // Verify timestamps round-tripped correctly
       // Arrow's getter converts nanoseconds to a decimal, so access raw BigInt64Array
       const timestampIndex = roundTripped.schema.fields.findIndex((f) => f.name === 'timestamp');
-      const timestampVector = roundTripped.getChildAt(timestampIndex)!;
+      const timestampVector = roundTripped.getChildAt(timestampIndex);
+      if (!timestampVector) {
+        throw new Error('Timestamp vector not found');
+      }
       const rawTimestamps = timestampVector.data[0].values as BigInt64Array;
       for (let i = 0; i < 3; i++) {
         expect(rawTimestamps[i]).toBe(timestamps[i]);
@@ -435,7 +438,10 @@ describe('Arrow IPC Round-Trip', () => {
 
       // Extract value column
       const valueColumnIndex = table.schema.fields.findIndex((f) => f.name === 'value');
-      const valueVector = table.getChildAt(valueColumnIndex)!;
+      const valueVector = table.getChildAt(valueColumnIndex);
+      if (!valueVector) {
+        throw new Error('Value vector not found');
+      }
       const valueData = valueVector.data[0];
 
       // Verify null count
@@ -445,7 +451,7 @@ describe('Arrow IPC Round-Trip', () => {
       // Pattern: 01010101 = 0x55
       const nullBitmap = valueData.nullBitmap;
       expect(nullBitmap).toBeDefined();
-      expect(nullBitmap![0]).toBe(0b01010101);
+      expect(nullBitmap?.[0]).toBe(0b01010101);
     });
 
     it('handles sparse nulls correctly', () => {
@@ -475,7 +481,10 @@ describe('Arrow IPC Round-Trip', () => {
       const table = convertToArrowTable(buffer);
 
       const valueColumnIndex = table.schema.fields.findIndex((f) => f.name === 'value');
-      const valueVector = table.getChildAt(valueColumnIndex)!;
+      const valueVector = table.getChildAt(valueColumnIndex);
+      if (!valueVector) {
+        throw new Error('Value vector not found');
+      }
       const valueData = valueVector.data[0];
 
       expect(valueData.nullCount).toBe(1);
@@ -505,7 +514,10 @@ describe('Arrow IPC Round-Trip', () => {
       const table = convertToArrowTable(buffer);
 
       const valueColumnIndex = table.schema.fields.findIndex((f) => f.name === 'value');
-      const valueVector = table.getChildAt(valueColumnIndex)!;
+      const valueVector = table.getChildAt(valueColumnIndex);
+      if (!valueVector) {
+        throw new Error('Value vector not found');
+      }
       const valueData = valueVector.data[0];
 
       expect(valueData.nullCount).toBe(0);
@@ -559,7 +571,10 @@ describe('Arrow IPC Round-Trip', () => {
 
       // Verify all 100 rows have the same value by accessing the column directly
       const userIdIndex = table.schema.fields.findIndex((f) => f.name === 'userId');
-      const userIdVector = table.getChildAt(userIdIndex)!;
+      const userIdVector = table.getChildAt(userIdIndex);
+      if (!userIdVector) {
+        throw new Error('UserId vector not found');
+      }
 
       for (let i = 0; i < 100; i++) {
         expect(userIdVector.get(i)).toBe(testValue);

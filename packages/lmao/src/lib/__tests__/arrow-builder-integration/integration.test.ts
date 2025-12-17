@@ -64,8 +64,8 @@ describe('Buffer Integration', () => {
     expect(buf.operations).toBeInstanceOf(Uint8Array);
 
     // Attribute columns exist with correct types (use _values suffix)
-    expect(Array.isArray(buf['userId_values'])).toBe(true); // category (raw strings)
-    expect(buf['score_values']).toBeInstanceOf(Float64Array); // number
+    expect(Array.isArray(buf.userId_values)).toBe(true); // category (raw strings)
+    expect(buf.score_values).toBeInstanceOf(Float64Array); // number
 
     // Metadata
     expect(buf.capacity).toBe(capacity);
@@ -90,9 +90,9 @@ describe('Buffer Integration', () => {
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
     // Verify all attribute columns created as TypedArrays with correct types (use _values suffix)
-    expect(Array.isArray(buffer['requestId_values'])).toBe(true); // category (raw strings)
-    expect(buffer['httpStatus_values']).toBeInstanceOf(Float64Array); // number
-    expect(buffer['operation_values']).toBeInstanceOf(Uint8Array); // enum
+    expect(Array.isArray(buffer.requestId_values)).toBe(true); // category (raw strings)
+    expect(buffer.httpStatus_values).toBeInstanceOf(Float64Array); // number
+    expect(buffer.operation_values).toBeInstanceOf(Uint8Array); // enum
 
     // Verify task context is set
     expect(buffer.task).toBe(taskContext);
@@ -113,10 +113,10 @@ describe('Buffer Integration', () => {
     const buffer = createSpanBuffer(tagAttributes, taskContext);
 
     // Both should have TypedArray columns (use _values suffix)
-    expect(Array.isArray(buffer['required_values'])).toBe(true); // category (raw strings)
+    expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
     // Note: S.optional() wraps the inner schema, losing __schema_type metadata
     // This falls back to Uint32Array (default)
-    expect(buffer['optional_values']).toBeInstanceOf(Uint32Array);
+    expect(buffer.optional_values).toBeInstanceOf(Uint32Array);
   });
 
   it('handles masked fields in schema', () => {
@@ -136,9 +136,9 @@ describe('Buffer Integration', () => {
     // All should have TypedArray columns (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
     // With chainable .mask(), the __schema_type metadata is preserved
-    expect(Array.isArray(buffer['userId_values'])).toBe(true); // category (raw strings) - masked during Arrow conversion
-    expect(Array.isArray(buffer['email_values'])).toBe(true); // text (raw strings) - masked during Arrow conversion
-    expect(Array.isArray(buffer['plainText_values'])).toBe(true); // text (raw strings)
+    expect(Array.isArray(buffer.userId_values)).toBe(true); // category (raw strings) - masked during Arrow conversion
+    expect(Array.isArray(buffer.email_values)).toBe(true); // text (raw strings) - masked during Arrow conversion
+    expect(Array.isArray(buffer.plainText_values)).toBe(true); // text (raw strings)
   });
 
   it('selects correct enum TypedArray size based on value count', () => {
@@ -154,7 +154,7 @@ describe('Buffer Integration', () => {
     const smallBuffer = createSpanBuffer(smallAttrs, smallContext);
 
     // Should use Uint8Array for enums with ≤255 values (use _values suffix)
-    expect(smallBuffer['operation_values']).toBeInstanceOf(Uint8Array);
+    expect(smallBuffer.operation_values).toBeInstanceOf(Uint8Array);
   });
 
   it('applies masking during Arrow conversion for category fields', () => {

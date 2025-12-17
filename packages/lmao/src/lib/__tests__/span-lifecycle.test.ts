@@ -123,7 +123,7 @@ describe('Span Lifecycle', () => {
       tagAttributes: testSchema,
     });
 
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const task = moduleCtx.task('testTask', async (_ctx) => {
       throw new Error('Unexpected error');
     });
 
@@ -296,7 +296,7 @@ describe('Child Span Lifecycle', () => {
     });
 
     const task = moduleCtx.task('parentTask', async (ctx) => {
-      await ctx.span('childSpan', async (childCtx) => {
+      await ctx.span('childSpan', async (_childCtx) => {
         throw new Error('Child span error');
       });
     });
@@ -418,8 +418,8 @@ describe('Fixed Row Layout', () => {
 
     expect(result.success).toBe(true);
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer!.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer!.operations[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(capturedBuffer?.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer?.operations[1]).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
   it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
@@ -443,8 +443,8 @@ describe('Fixed Row Layout', () => {
 
     expect(result.success).toBe(false);
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer!.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer!.operations[1]).toBe(ENTRY_TYPE_SPAN_ERR);
+    expect(capturedBuffer?.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer?.operations[1]).toBe(ENTRY_TYPE_SPAN_ERR);
   });
 
   it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {
@@ -467,8 +467,8 @@ describe('Fixed Row Layout', () => {
 
     await expect(task(requestCtx)).rejects.toThrow('Unexpected failure');
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer!.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer!.operations[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+    expect(capturedBuffer?.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer?.operations[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
   });
 
   it('should start writeIndex at 2 after span-start is written', async () => {

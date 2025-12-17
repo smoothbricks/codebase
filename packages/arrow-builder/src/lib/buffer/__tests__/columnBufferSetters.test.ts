@@ -116,7 +116,7 @@ describe('ColumnBuffer setter methods', () => {
     const buffer = createGeneratedColumnBuffer(mockSchema, 10);
     // _writeIndex is tracked by ColumnWriter, not ColumnBuffer
     // Note: TypeScript now knows _writeIndex doesn't exist, which is correct
-    expect((buffer as unknown as Record<string, unknown>)['_writeIndex']).toBeUndefined();
+    expect((buffer as unknown as Record<string, unknown>)._writeIndex).toBeUndefined();
   });
 
   test('null bitmap should mark positions as valid when written', () => {

@@ -44,10 +44,10 @@ function benchmark(name: string, fn: () => void): BenchmarkResult {
 
 function printResults(results: BenchmarkResult[]): void {
   const separator = '='.repeat(70);
-  const runtime = typeof Bun !== 'undefined' ? 'Bun ' + Bun.version : 'Node ' + process.version;
-  console.log('\n' + separator);
-  console.log('Runtime: ' + runtime);
-  console.log('Iterations: ' + ITERATIONS.toLocaleString());
+  const runtime = typeof Bun !== 'undefined' ? `Bun ${Bun.version}` : `Node ${process.version}`;
+  console.log(`\n${separator}`);
+  console.log(`Runtime: ${runtime}`);
+  console.log(`Iterations: ${ITERATIONS.toLocaleString()}`);
   console.log(separator);
   console.log('');
   console.log('API'.padEnd(45) + 'Total (ms)'.padStart(12) + 'Per call (ns)'.padStart(15));
@@ -56,9 +56,9 @@ function printResults(results: BenchmarkResult[]): void {
   const baseline = results[0].perCallNs;
   for (const r of results) {
     const ratio = r.perCallNs / baseline;
-    const ratioStr = ratio === 1 ? '(baseline)' : '(' + ratio.toFixed(1) + 'x)';
+    const ratioStr = ratio === 1 ? '(baseline)' : `(${ratio.toFixed(1)}x)`;
     console.log(
-      r.name.padEnd(45) + r.totalMs.toFixed(2).padStart(12) + (r.perCallNs.toFixed(2) + ' ' + ratioStr).padStart(15),
+      r.name.padEnd(45) + r.totalMs.toFixed(2).padStart(12) + `${r.perCallNs.toFixed(2)} ${ratioStr}`.padStart(15),
     );
   }
   console.log('');
@@ -162,9 +162,9 @@ function runBenchmarks(): void {
   const writeHrtime = results.find((r) => r.name.includes('Write hrtime.bigint()'));
 
   if (writeF64 && writeBi64 && writeHrtime) {
-    console.log('  1. Float64Array (convert to BigInt in cold path): ' + writeF64.perCallNs.toFixed(2) + ' ns/call');
-    console.log('  2. BigInt64Array with performance API:            ' + writeBi64.perCallNs.toFixed(2) + ' ns/call');
-    console.log('  3. BigInt64Array with hrtime.bigint():            ' + writeHrtime.perCallNs.toFixed(2) + ' ns/call');
+    console.log(`  1. Float64Array (convert to BigInt in cold path): ${writeF64.perCallNs.toFixed(2)} ns/call`);
+    console.log(`  2. BigInt64Array with performance API:            ${writeBi64.perCallNs.toFixed(2)} ns/call`);
+    console.log(`  3. BigInt64Array with hrtime.bigint():            ${writeHrtime.perCallNs.toFixed(2)} ns/call`);
     console.log('');
     console.log(
       'Hot path overhead for BigInt64Array: ' +

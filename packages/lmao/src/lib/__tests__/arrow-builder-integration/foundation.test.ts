@@ -109,15 +109,15 @@ describe('Buffer Foundation', () => {
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them
     // Access them directly to trigger allocation and verify they exist
-    expect(Array.isArray(buf['field1_values'])).toBe(true); // category (raw strings)
-    expect(buf['field1_nulls']).toBeInstanceOf(Uint8Array); // null bitmap
-    expect(buf['field2_values']).toBeInstanceOf(Float64Array); // number
-    expect(buf['field2_nulls']).toBeInstanceOf(Uint8Array);
-    expect(buf['field3_values']).toBeInstanceOf(Uint8Array); // boolean
-    expect(buf['field3_nulls']).toBeInstanceOf(Uint8Array);
-    expect(Array.isArray(buf['field4_values'])).toBe(true); // text (raw strings)
-    expect(buf['field4_nulls']).toBeInstanceOf(Uint8Array);
-    expect(buf['field5_values']).toBeInstanceOf(Float64Array); // number
-    expect(buf['field5_nulls']).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buf.field1_values)).toBe(true); // category (raw strings)
+    expect(buf.field1_nulls).toBeInstanceOf(Uint8Array); // null bitmap
+    expect(buf.field2_values).toBeInstanceOf(Float64Array); // number
+    expect(buf.field2_nulls).toBeInstanceOf(Uint8Array);
+    expect(buf.field3_values).toBeInstanceOf(Uint8Array); // boolean
+    expect(buf.field3_nulls).toBeInstanceOf(Uint8Array);
+    expect(Array.isArray(buf.field4_values)).toBe(true); // text (raw strings)
+    expect(buf.field4_nulls).toBeInstanceOf(Uint8Array);
+    expect(buf.field5_values).toBeInstanceOf(Float64Array); // number
+    expect(buf.field5_nulls).toBeInstanceOf(Uint8Array);
   });
 });

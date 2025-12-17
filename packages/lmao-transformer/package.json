@@ -27,6 +27,7 @@
     "sourceRoot": "packages/lmao-transformer/src",
     "projectType": "library",
     "targets": {
+      "lint": {},
       "typecheck-tests": {
         "executor": "nx:run-commands",
         "options": {

@@ -401,7 +401,7 @@ describe('Arrow Binary Compatibility - Number Columns', () => {
 
     buffer.count(0, 42.5);
     buffer.count(1, 100);
-    buffer.count(2, -3.14159);
+    buffer.count(2, -Math.PI);
     buffer.count(3, 0);
     buffer.count(4, Number.MAX_SAFE_INTEGER);
 
@@ -427,7 +427,7 @@ describe('Arrow Binary Compatibility - Number Columns', () => {
 
     expect(roundTripped.get(0)?.toJSON().count).toBe(42.5);
     expect(roundTripped.get(1)?.toJSON().count).toBe(100);
-    expect(roundTripped.get(2)?.toJSON().count).toBe(-3.14159);
+    expect(roundTripped.get(2)?.toJSON().count).toBe(-Math.PI);
     expect(roundTripped.get(3)?.toJSON().count).toBe(0);
     expect(roundTripped.get(4)?.toJSON().count).toBe(Number.MAX_SAFE_INTEGER);
   });

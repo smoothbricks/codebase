@@ -1123,7 +1123,7 @@ function createFlagColumnWriters<T extends TagAttributeSchema>(buffer: SpanBuffe
       // Write to ffValue column (raw string, no interning)
       // Cast to record for dynamic access to internal column storage
       const bufferRecord = buffer as unknown as Record<string, unknown>;
-      const column = bufferRecord['ffValue_values'] as string[] | undefined;
+      const column = bufferRecord.ffValue_values as string[] | undefined;
       if (column && Array.isArray(column)) {
         const strValue = value === null ? 'null' : String(value);
         column[buffer.writeIndex] = strValue;
@@ -1386,8 +1386,10 @@ export function createModuleContext<
 
         // Connect feature flag evaluator to buffer for analytics
         // The evaluator is a FeatureFlagEvaluator instance, we need to set columnWriters
+        // The generated class has a setter for columnWriters
         if (requestCtx.ff instanceof FeatureFlagEvaluator) {
-          (requestCtx.ff as FeatureFlagEvaluator<FF>)['columnWriters'] = createFlagColumnWriters(spanBuffer);
+          // biome-ignore lint/suspicious/noExplicitAny: Generated class has columnWriters setter
+          (requestCtx.ff as any).columnWriters = createFlagColumnWriters(spanBuffer);
         }
 
         // Write span-start entry (row 0) and pre-initialize span-end (row 1)

@@ -502,7 +502,7 @@ describe('Schema Integration Patterns', () => {
         tagAttributes: dbAttributes,
       });
 
-      const processOrder = moduleContext.task('process-order', async (ctx, orderId: string, amount: number) => {
+      const processOrder = moduleContext.task('process-order', async (ctx, orderId: string, _amount: number) => {
         // Example from requirements: ctx.tag.orderId(order.id).amount(order.total)
         ctx.tag
           .requestId(ctx.requestId)

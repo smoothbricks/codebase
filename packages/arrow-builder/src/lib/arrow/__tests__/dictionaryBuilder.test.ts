@@ -156,7 +156,11 @@ describe('DictionaryBuilder - Sorted Dictionaries', () => {
     // Create indices based on the sorted dictionary
     const indices = new Uint8Array(values.length);
     for (let i = 0; i < values.length; i++) {
-      indices[i] = dict.indexMap.get(values[i])!;
+      const idx = dict.indexMap.get(values[i]);
+      if (idx === undefined) {
+        throw new Error(`Index not found for value: ${values[i]}`);
+      }
+      indices[i] = idx;
     }
 
     // Round-trip through IPC

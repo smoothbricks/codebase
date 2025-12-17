@@ -41,6 +41,7 @@
     "sourceRoot": "packages/lmao/src",
     "projectType": "library",
     "targets": {
+      "lint": {},
       "typecheck-tests": {
         "executor": "nx:run-commands",
         "options": {

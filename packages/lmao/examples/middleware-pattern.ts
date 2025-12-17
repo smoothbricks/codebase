@@ -91,7 +91,7 @@ interface Response {
  * This runs once per request and sets attributes that apply to ALL
  * subsequent operations in the request lifecycle.
  */
-function lmaoMiddleware(req: Request, res: Response, next: () => void) {
+function lmaoMiddleware(req: Request, _res: Response, next: () => void) {
   console.log(`\n🌐 ${req.method} ${req.path}`);
 
   // Create flag evaluator
@@ -334,8 +334,8 @@ async function main() {
 
   // Simulate Express app
   const mockResponse = {
-    status: (code: number) => mockResponse,
-    json: (data: unknown) => {},
+    status: (_code: number) => mockResponse,
+    json: (_data: unknown) => {},
   } as Response;
 
   // Request 1: POST /api/users

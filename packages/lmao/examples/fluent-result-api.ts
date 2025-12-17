@@ -87,7 +87,7 @@ const validateEmail = userModule.task('validateEmail', async (ctx, email: string
 });
 
 // Example 3: Exception handling
-const updateUser = userModule.task('updateUser', async (ctx, userId: string, updates: Record<string, unknown>) => {
+const updateUser = userModule.task('updateUser', async (ctx, userId: string, _updates: Record<string, unknown>) => {
   // Span-start entry is automatically written
 
   // Simulate exception

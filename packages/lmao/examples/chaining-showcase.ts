@@ -177,7 +177,7 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
 async function runExamples() {
   const requestCtx = createRequestContext(
     {
-      requestId: 'req-' + Date.now(),
+      requestId: `req-${Date.now()}`,
       userId: 'user-456',
     },
     featureFlags,

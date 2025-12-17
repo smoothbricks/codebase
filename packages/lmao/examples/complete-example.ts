@@ -331,7 +331,7 @@ async function main() {
   if (result.success) {
     console.log('\n✅ Order created successfully!');
     console.log('   Order ID:', result.value.orderId);
-    console.log('   Amount: $' + result.value.amount.toFixed(2));
+    console.log(`   Amount: $${result.value.amount.toFixed(2)}`);
   } else {
     console.log('\n❌ Order creation failed:');
     console.log('   Error:', result.error);

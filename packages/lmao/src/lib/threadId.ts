@@ -73,7 +73,10 @@ function ensureInitialized(): void {
  */
 export function copyThreadIdTo(dest: Uint8Array, offset: number): void {
   ensureInitialized();
-  dest.set(threadIdBytes!, offset);
+  if (!threadIdBytes) {
+    throw new Error('ThreadId bytes not initialized');
+  }
+  dest.set(threadIdBytes, offset);
 }
 
 /**
@@ -85,7 +88,10 @@ export function copyThreadIdTo(dest: Uint8Array, offset: number): void {
 export function getThreadId(): bigint {
   ensureInitialized();
   if (threadIdBigInt === null) {
-    const b = threadIdBytes!;
+    if (!threadIdBytes) {
+      throw new Error('ThreadId bytes not initialized');
+    }
+    const b = threadIdBytes;
     // Little-endian conversion to match identity byte layout
     threadIdBigInt =
       BigInt(b[0]) |
@@ -109,8 +115,11 @@ export function getThreadId(): bigint {
  */
 export function writeThreadIdToUint64Array(dest: BigUint64Array, index: number): void {
   ensureInitialized();
+  if (!threadIdBytes) {
+    throw new Error('ThreadId bytes not initialized');
+  }
   const byteView = new Uint8Array(dest.buffer, dest.byteOffset + index * 8, 8);
-  byteView.set(threadIdBytes!);
+  byteView.set(threadIdBytes);
 }
 
 /**

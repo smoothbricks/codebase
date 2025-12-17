@@ -27,7 +27,7 @@ describe('FlushScheduler', () => {
 
   beforeEach(() => {
     flushCalls = [];
-    flushHandler = mock((table, metadata) => {
+    flushHandler = mock((_table, metadata) => {
       flushCalls.push({ metadata });
     });
 
@@ -151,8 +151,12 @@ describe('FlushScheduler', () => {
       it('should unregister multiple buffers', () => {
         const buffers = [createTestBuffer(), createTestBuffer(), createTestBuffer()];
 
-        buffers.forEach((b) => scheduler.register(b));
-        buffers.forEach((b) => scheduler.unregister(b));
+        buffers.forEach((b) => {
+          scheduler.register(b);
+        });
+        buffers.forEach((b) => {
+          scheduler.unregister(b);
+        });
 
         expect(scheduler).toBeDefined();
       });

@@ -115,7 +115,7 @@ async function main() {
     // Convert to Arrow and print full table
     const table = convertToArrowTable(_buffer, moduleIdInterner, labelInterner);
 
-    console.log('\n' + '='.repeat(70));
+    console.log(`\n${'='.repeat(70)}`);
     console.log('ARROW TABLE');
     console.log('='.repeat(70));
 
@@ -141,7 +141,7 @@ async function main() {
       }
     }
 
-    console.log('\n' + '='.repeat(70));
+    console.log(`\n${'='.repeat(70)}`);
   } else {
     console.log('Error:', JSON.stringify(result.error));
   }

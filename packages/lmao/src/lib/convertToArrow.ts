@@ -209,7 +209,11 @@ function buildTextDictionary(
         if (value != null) {
           let maskedValue: string;
           if (originalToMasked.has(value)) {
-            maskedValue = originalToMasked.get(value)!;
+            const masked = originalToMasked.get(value);
+            if (masked === undefined) {
+              throw new Error(`Masked value not found for: ${value}`);
+            }
+            maskedValue = masked;
           } else {
             maskedValue = maskTransform ? maskTransform(value) : value;
             originalToMasked.set(value, maskedValue);
@@ -568,7 +572,10 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   const traceIdIndices = new Int32Array(totalRows);
   let rowOffset = 0;
   for (const buf of buffers) {
-    const traceIdIndex = traceIdMap.get(buf.traceId)!;
+    const traceIdIndex = traceIdMap.get(buf.traceId);
+    if (traceIdIndex === undefined) {
+      throw new Error(`TraceId index not found for: ${buf.traceId}`);
+    }
     // Use fill() - constant value per buffer
     traceIdIndices.fill(traceIdIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
@@ -737,7 +744,10 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   const packageIndices = new Int32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const packageIndex = packageMap.get(buf.task.module.packageName)!;
+    const packageIndex = packageMap.get(buf.task.module.packageName);
+    if (packageIndex === undefined) {
+      throw new Error(`Package index not found for: ${buf.task.module.packageName}`);
+    }
     // Use fill() - constant value per buffer
     packageIndices.fill(packageIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
@@ -773,7 +783,10 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   const packagePathIndices = new Int32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const modulePathIndex = modulePathMap.get(buf.task.module.packagePath)!;
+    const modulePathIndex = modulePathMap.get(buf.task.module.packagePath);
+    if (modulePathIndex === undefined) {
+      throw new Error(`Module path index not found for: ${buf.task.module.packagePath}`);
+    }
     // Use fill() - constant value per buffer
     packagePathIndices.fill(modulePathIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
@@ -809,7 +822,10 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   const gitShaIndices = new Int32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const gitShaIndex = gitShaMap.get(buf.task.module.gitSha)!;
+    const gitShaIndex = gitShaMap.get(buf.task.module.gitSha);
+    if (gitShaIndex === undefined) {
+      throw new Error(`GitSha index not found for: ${buf.task.module.gitSha}`);
+    }
     // Use fill() - constant value per buffer
     gitShaIndices.fill(gitShaIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
@@ -845,7 +861,10 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   const spanNameIndices = new Int32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const spanNameIndex = spanNameMap.get(buf.task.spanName)!;
+    const spanNameIndex = spanNameMap.get(buf.task.spanName);
+    if (spanNameIndex === undefined) {
+      throw new Error(`SpanName index not found for: ${buf.task.spanName}`);
+    }
     // Use fill() - constant value per buffer
     spanNameIndices.fill(spanNameIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
@@ -950,7 +969,10 @@ export function convertSpanTreeToArrowTable(
     for (const [fieldName, builder] of categoryBuilders) {
       const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
       const maskTransform = categoryMaskTransforms.get(fieldName);
-      const originalToMasked = categoryOriginalToMasked.get(fieldName)!;
+      const originalToMasked = categoryOriginalToMasked.get(fieldName);
+      if (!originalToMasked) {
+        throw new Error(`Category originalToMasked map not found for field: ${fieldName}`);
+      }
       if (col) {
         for (let i = 0; i < buffer.writeIndex; i++) {
           const originalValue = col[i];
@@ -969,7 +991,10 @@ export function convertSpanTreeToArrowTable(
     for (const [fieldName, builder] of textBuilders) {
       const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
       const maskTransform = textMaskTransforms.get(fieldName);
-      const originalToMasked = textOriginalToMasked.get(fieldName)!;
+      const originalToMasked = textOriginalToMasked.get(fieldName);
+      if (!originalToMasked) {
+        throw new Error(`Text originalToMasked map not found for field: ${fieldName}`);
+      }
       if (col) {
         for (let i = 0; i < buffer.writeIndex; i++) {
           const originalValue = col[i];
@@ -1491,8 +1516,11 @@ function convertBuffersWithSharedDicts(
     const fieldType = arrowSchema.fields[fieldIdx].type;
 
     if (lmaoType === 'category') {
-      const dict = categoryDicts.get(fieldName)!;
-      const originalToMasked = categoryOriginalToMasked.get(fieldName)!;
+      const dict = categoryDicts.get(fieldName);
+      const originalToMasked = categoryOriginalToMasked.get(fieldName);
+      if (!dict || !originalToMasked) {
+        throw new Error(`Category dictionary or mapping not found for field: ${fieldName}`);
+      }
       const indices = new Uint32Array(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       let nullCount = 0;
@@ -1542,8 +1570,11 @@ function convertBuffersWithSharedDicts(
         ),
       );
     } else if (lmaoType === 'text') {
-      const dict = textDicts.get(fieldName)!;
-      const originalToMasked = textOriginalToMasked.get(fieldName)!;
+      const dict = textDicts.get(fieldName);
+      const originalToMasked = textOriginalToMasked.get(fieldName);
+      if (!dict || !originalToMasked) {
+        throw new Error(`Text dictionary or mapping not found for field: ${fieldName}`);
+      }
       const indices = new Uint32Array(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       let nullCount = 0;

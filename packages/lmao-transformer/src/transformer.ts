@@ -1,6 +1,6 @@
-import { execSync } from 'child_process';
-import * as fs from 'fs';
-import path from 'path';
+import { execSync } from 'node:child_process';
+import * as fs from 'node:fs';
+import path from 'node:path';
 import ts from 'typescript';
 import { tryTransformTagChain as tryTransformTagChainFromInliner } from './tagChainInliner.js';
 
@@ -147,7 +147,7 @@ function tryTransformCreateModuleContextCall(
   node: ts.CallExpression,
   sourceFile: ts.SourceFile,
   factory: ts.NodeFactory,
-  projectRoot: string,
+  _projectRoot: string,
 ): ts.CallExpression | null {
   if (!isCreateModuleContextCall(node)) {
     return null;

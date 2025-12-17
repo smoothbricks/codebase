@@ -335,7 +335,7 @@ export function generateColumnBufferClass(
     const extensionLines = extension.constructorCode
       .trim()
       .split('\n')
-      .map((line) => '    ' + line.trim());
+      .map((line) => `    ${line.trim()}`);
     constructorCode.push(...extensionLines);
   }
 
@@ -347,7 +347,7 @@ export function generateColumnBufferClass(
     ? `\n${extension.methods
         .trim()
         .split('\n')
-        .map((line) => '    ' + line)
+        .map((line) => `    ${line}`)
         .join('\n')}`
     : '';
 

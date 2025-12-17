@@ -525,7 +525,7 @@ describe('Buffer Overflow and Capacity Management', () => {
 
           // Simulate an error
           throw new Error('Simulated error');
-        } catch (error) {
+        } catch (_error) {
           // Continue writing after error
           for (let i = 50; i < 100; i++) {
             ctx.tag.requestId(`req-${i}`);

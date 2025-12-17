@@ -93,7 +93,7 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
 
   // Environment access (just plain property access)
   const region = ctx.env.awsRegion;
-  const maxConnections = ctx.env.maxConnections;
+  const _maxConnections = ctx.env.maxConnections;
 
   // METHOD CHAINING: Each tag method returns the tag object for chaining
   ctx.tag.requestId(ctx.requestId).userId(userData.email).operation('INSERT').region(region);
@@ -140,7 +140,7 @@ async function handleRequest() {
   // Method 1: Use createRequestContext (backward-compatible)
   const requestCtx = createRequestContext(
     {
-      requestId: 'req-' + Date.now(),
+      requestId: `req-${Date.now()}`,
       userId: 'user-456',
     },
     featureFlags,
@@ -185,7 +185,7 @@ async function handleRequestWithTraceContext() {
       env: environmentConfig,
     },
     {
-      requestId: 'req-' + Date.now(),
+      requestId: `req-${Date.now()}`,
       userId: 'user-456',
       // Custom properties are directly accessible on the context
       customProp: 'custom-value',

@@ -21,10 +21,8 @@ import {
   defineFeatureFlags,
   defineTagAttributes,
   InMemoryFlagEvaluator,
-  moduleContextFactory,
   S,
 } from '../src/index.js';
-import type { SpanContext } from '../src/lib/lmao.js';
 
 // ============================================================================
 // 1. HTTP TRACING LIBRARY
@@ -210,7 +208,7 @@ function createCacheLibrary(prefix = 'cache') {
       return ctx.ok({ value, hit });
     }),
 
-    set: module.task('cache-set', async (ctx, key: string, value: unknown, ttl = 3600) => {
+    set: module.task('cache-set', async (ctx, key: string, _value: unknown, ttl = 3600) => {
       ctx.tag
         .operation('SET')
         .key(key)
@@ -352,7 +350,7 @@ async function runExample() {
 
   const requestCtx = createRequestContext(
     {
-      requestId: 'req-' + Date.now(),
+      requestId: `req-${Date.now()}`,
       userId: 'admin',
     },
     appFlags,
@@ -375,7 +373,7 @@ async function runExample() {
     console.log('❌ Error:', result.error);
   }
 
-  console.log('\n' + '='.repeat(70));
+  console.log(`\n${'='.repeat(70)}`);
   console.log('\n💡 Key Points Demonstrated:\n');
   console.log('1. ✅ HTTP library writes to: http_status, http_method, http_url, http_duration');
   console.log('2. ✅ DB library writes to: db_query, db_duration, db_table, db_operation, db_rowsAffected');

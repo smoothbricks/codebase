@@ -256,7 +256,7 @@ export class FlushScheduler {
       if (availableMemory < this.config.memoryPressureThreshold) {
         this.doFlush('memory').catch(console.error);
       }
-    } catch (error) {
+    } catch (_error) {
       // Ignore errors in memory detection
     }
   }
@@ -332,7 +332,7 @@ export class FlushScheduler {
       // Create combined table with explicit schema
       try {
         combinedTable = new Arrow.Table(schema, allBatches);
-      } catch (error) {
+      } catch (_error) {
         // If schemas don't match (shouldn't happen in production), just use first table
         // This can occur in tests where buffers from different modules are mixed
         console.warn('Unable to combine tables due to schema mismatch, using first table only');
