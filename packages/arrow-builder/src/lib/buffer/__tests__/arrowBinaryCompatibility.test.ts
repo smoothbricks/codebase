@@ -275,10 +275,53 @@ describe('Arrow Binary Compatibility - Enum Columns', () => {
     expect(roundTripped.get(4)?.toJSON().status).toBe('active');
   });
 
-  // TODO: S.enum().eager() not yet implemented
-  it.skip('handles eager enum columns', () => {
-    // When S.enum().eager() is implemented, uncomment and test
-    expect(true).toBe(true);
+  it('handles eager enum columns', () => {
+    const enumValues = ['PENDING', 'ACTIVE', 'DONE'] as const;
+    const schema = {
+      status: S.enum(enumValues).eager(),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 16);
+
+    // Eager columns are pre-allocated (no null bitmap)
+    expect(buffer.status_values).toBeDefined();
+    expect(buffer.status_values instanceof Uint8Array).toBe(true);
+
+    // Write indices directly
+    buffer.status(0, 0); // PENDING
+    buffer.status(1, 1); // ACTIVE
+    buffer.status(2, 2); // DONE
+    buffer.status(3, 1); // ACTIVE
+
+    const length = 4;
+    // Eager columns have no null bitmap, pass undefined
+    const vector = createEnumVector(buffer.status_values as Uint8Array, length, enumValues, undefined);
+
+    const arrowSchema = new arrow.Schema([
+      arrow.Field.new({
+        name: 'status',
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8()),
+        nullable: false, // Eager = not nullable
+      }),
+    ]);
+
+    const batch = new arrow.RecordBatch(
+      arrowSchema,
+      arrow.makeData({
+        type: new arrow.Struct(arrowSchema.fields),
+        length,
+        nullCount: 0,
+        children: [vector.data[0]],
+      }),
+    );
+
+    const table = new arrow.Table([batch]);
+    const roundTripped = roundTripVerify(table);
+
+    expect(roundTripped.get(0)?.toJSON().status).toBe('PENDING');
+    expect(roundTripped.get(1)?.toJSON().status).toBe('ACTIVE');
+    expect(roundTripped.get(2)?.toJSON().status).toBe('DONE');
+    expect(roundTripped.get(3)?.toJSON().status).toBe('ACTIVE');
   });
 });
 
@@ -389,10 +432,45 @@ describe('Arrow Binary Compatibility - Number Columns', () => {
     expect(roundTripped.get(4)?.toJSON().count).toBe(Number.MAX_SAFE_INTEGER);
   });
 
-  // TODO: S.number().eager() not yet implemented
-  it.skip('handles eager number columns', () => {
-    // When S.number().eager() is implemented, uncomment and test
-    expect(true).toBe(true);
+  it('handles eager number columns', () => {
+    const schema = {
+      count: S.number().eager(),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 16);
+
+    // Eager columns are pre-allocated (no null bitmap)
+    expect(buffer.count_values).toBeDefined();
+    expect(buffer.count_values instanceof Float64Array).toBe(true);
+
+    buffer.count(0, 1.5);
+    buffer.count(1, 2.5);
+    buffer.count(2, 3.5);
+
+    const length = 3;
+    // Eager columns have no null bitmap
+    const vector = createNumberVector(buffer.count_values as Float64Array, length, undefined);
+
+    const arrowSchema = new arrow.Schema([
+      arrow.Field.new({ name: 'count', type: new arrow.Float64(), nullable: false }),
+    ]);
+
+    const batch = new arrow.RecordBatch(
+      arrowSchema,
+      arrow.makeData({
+        type: new arrow.Struct(arrowSchema.fields),
+        length,
+        nullCount: 0,
+        children: [vector.data[0]],
+      }),
+    );
+
+    const table = new arrow.Table([batch]);
+    const roundTripped = roundTripVerify(table);
+
+    expect(roundTripped.get(0)?.toJSON().count).toBe(1.5);
+    expect(roundTripped.get(1)?.toJSON().count).toBe(2.5);
+    expect(roundTripped.get(2)?.toJSON().count).toBe(3.5);
   });
 });
 
@@ -443,10 +521,49 @@ describe('Arrow Binary Compatibility - Boolean Columns', () => {
     expect(roundTripped.get(8)?.toJSON().active).toBe(true);
   });
 
-  // TODO: S.boolean().eager() not yet implemented
-  it.skip('handles eager boolean columns', () => {
-    // When S.boolean().eager() is implemented, uncomment and test
-    expect(true).toBe(true);
+  it('handles eager boolean columns', () => {
+    const schema = {
+      active: S.boolean().eager(),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 16);
+
+    // Eager columns are pre-allocated (no null bitmap)
+    expect(buffer.active_values).toBeDefined();
+    expect(buffer.active_values instanceof Uint8Array).toBe(true);
+
+    buffer.active(0, true);
+    buffer.active(1, false);
+    buffer.active(2, true);
+    buffer.active(3, true);
+    buffer.active(4, false);
+
+    const length = 5;
+    // Eager columns have no null bitmap
+    const vector = createBooleanVector(buffer.active_values as Uint8Array, length, undefined);
+
+    const arrowSchema = new arrow.Schema([
+      arrow.Field.new({ name: 'active', type: new arrow.Bool(), nullable: false }),
+    ]);
+
+    const batch = new arrow.RecordBatch(
+      arrowSchema,
+      arrow.makeData({
+        type: new arrow.Struct(arrowSchema.fields),
+        length,
+        nullCount: 0,
+        children: [vector.data[0]],
+      }),
+    );
+
+    const table = new arrow.Table([batch]);
+    const roundTripped = roundTripVerify(table);
+
+    expect(roundTripped.get(0)?.toJSON().active).toBe(true);
+    expect(roundTripped.get(1)?.toJSON().active).toBe(false);
+    expect(roundTripped.get(2)?.toJSON().active).toBe(true);
+    expect(roundTripped.get(3)?.toJSON().active).toBe(true);
+    expect(roundTripped.get(4)?.toJSON().active).toBe(false);
   });
 });
 
@@ -543,10 +660,43 @@ describe('Arrow Binary Compatibility - Mixed Schema', () => {
     expect((buffer.active_values as Uint8Array)[0]).toBe(1);
   });
 
-  // TODO: S.number().eager() not yet implemented (S.category().eager() works)
-  it.skip('handles mixed eager and lazy columns', () => {
-    // When S.number().eager() is implemented, uncomment and test
-    expect(true).toBe(true);
+  it('handles mixed eager and lazy columns', () => {
+    const schema = {
+      message: S.text().eager(), // Eager - no null bitmap
+      userId: S.category(), // Lazy - has null bitmap
+      count: S.number().eager(), // Eager - no null bitmap
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 16);
+
+    // Eager columns pre-allocated
+    expect(buffer.message_values).toBeDefined();
+    expect(buffer.count_values).toBeDefined();
+
+    // Lazy column not yet allocated
+    expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();
+
+    // Write values
+    buffer.message(0, 'hello');
+    buffer.userId(0, 'user-1');
+    buffer.count(0, 42);
+
+    buffer.message(1, 'world');
+    // Skip userId at position 1 (will be null)
+    buffer.count(1, 100);
+
+    // After write, lazy column is allocated
+    expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
+
+    // Check values
+    expect(buffer.message_values[0]).toBe('hello');
+    expect(buffer.message_values[1]).toBe('world');
+    expect(buffer.userId_values[0]).toBe('user-1');
+    expect(buffer.count_values[0]).toBe(42);
+    expect(buffer.count_values[1]).toBe(100);
+
+    // Check null bitmap for lazy column
+    expect(buffer.userId_nulls[0] & 0b11).toBe(0b01); // Only bit 0 set
   });
 });
 
