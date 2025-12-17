@@ -258,14 +258,14 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
  * @param traceId - Trace ID (auto-generated if omitted)
  * @param capacity - Buffer capacity (default: DEFAULT_BUFFER_CAPACITY)
  *
- * @returns SpanBuffer ready for initialization via `writeSpanStart()`
+ * @returns SpanBuffer with typed setters for schema fields
  */
-export function createSpanBuffer(
-  schema: TagAttributeSchema,
+export function createSpanBuffer<T extends TagAttributeSchema>(
+  schema: T,
   taskContext: TaskContext,
   traceId?: TraceId,
   capacity = DEFAULT_BUFFER_CAPACITY,
-): SpanBuffer {
+): SpanBuffer<T> {
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const alignedCapacity = (capacity + 7) & ~7;
 
@@ -273,7 +273,7 @@ export function createSpanBuffer(
   const resolvedTraceId: string = traceId ?? generateTraceId();
 
   const SpanBufferClass = getSpanBufferClass(schema);
-  return new SpanBufferClass(alignedCapacity, taskContext, undefined, false, resolvedTraceId);
+  return new SpanBufferClass(alignedCapacity, taskContext, undefined, false, resolvedTraceId) as SpanBuffer<T>;
 }
 
 /**
@@ -285,14 +285,18 @@ export function createSpanBuffer(
  * @param parentBuffer - Parent span's buffer
  * @param taskContext - Task context (may differ from parent if calling across modules)
  *
- * @returns Child SpanBuffer linked to parent
+ * @returns Child SpanBuffer linked to parent, with same schema type as parent
  */
-export function createChildSpanBuffer(parentBuffer: SpanBuffer, taskContext: TaskContext): SpanBuffer {
-  const schema = parentBuffer.task.module.tagAttributes;
+export function createChildSpanBuffer<T extends TagAttributeSchema>(
+  parentBuffer: SpanBuffer<T>,
+  taskContext: TaskContext,
+): SpanBuffer<T> {
+  const schema = parentBuffer.task.module.tagAttributes as T;
   const capacity = parentBuffer.capacity;
 
   const SpanBufferClass = getSpanBufferClass(schema);
-  return new SpanBufferClass(capacity, taskContext, parentBuffer, false, undefined);
+  // Cast parentBuffer to base SpanBuffer for constructor, result back to SpanBuffer<T>
+  return new SpanBufferClass(capacity, taskContext, parentBuffer as SpanBuffer, false, undefined) as SpanBuffer<T>;
 }
 
 /**
@@ -303,15 +307,16 @@ export function createChildSpanBuffer(parentBuffer: SpanBuffer, taskContext: Tas
  *
  * @param buffer - The full buffer that needs overflow handling
  *
- * @returns New SpanBuffer linked via `buffer.next`
+ * @returns New SpanBuffer linked via `buffer.next`, with same schema type
  */
-export function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
-  const schema = buffer.task.module.tagAttributes;
+export function createNextBuffer<T extends TagAttributeSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
+  const schema = buffer.task.module.tagAttributes as T;
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const capacity = (buffer.task.module.spanBufferCapacityStats.currentCapacity + 7) & ~7;
 
   const SpanBufferClass = getSpanBufferClass(schema);
-  const nextBuffer = new SpanBufferClass(capacity, buffer.task, buffer, true, undefined);
+  // Cast buffer to base SpanBuffer for constructor, result back to SpanBuffer<T>
+  const nextBuffer = new SpanBufferClass(capacity, buffer.task, buffer as SpanBuffer, true, undefined) as SpanBuffer<T>;
 
   // Link current buffer to next
   buffer.next = nextBuffer;

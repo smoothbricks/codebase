@@ -322,9 +322,12 @@ export function getTagWriterClass<T extends TagAttributeSchema>(schema: T): new 
  * @param buffer - SpanBuffer to write to
  * @returns TagWriter instance bound to position 0
  */
-export function createTagWriter<T extends TagAttributeSchema>(schema: T, buffer: SpanBuffer): TagWriter<T> {
+export function createTagWriter<T extends TagAttributeSchema>(schema: T, buffer: SpanBuffer<T>): TagWriter<T> {
   const WriterClass = getTagWriterClass(schema);
-  return new WriterClass(buffer);
+  // Type assertion needed because WriterClass constructor expects SpanBuffer
+  // (non-generic) but we pass SpanBuffer<T>. This is safe because at runtime
+  // SpanBuffer<T> IS a SpanBuffer - the generic is only for compile-time typing.
+  return new WriterClass(buffer as unknown as SpanBuffer);
 }
 
 // ============================================================================

@@ -674,12 +674,21 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
  */
 export function createSpanLogger<T extends TagAttributeSchema>(
   schema: T,
-  buffer: SpanBuffer,
+  buffer: SpanBuffer<T>,
   scope: GeneratedScope,
-  createNextBuffer: (buffer: SpanBuffer) => SpanBuffer = createNextSpanBuffer,
+  createNextBuffer: (buffer: SpanBuffer<T>) => SpanBuffer<T> = createNextSpanBuffer as unknown as (
+    buffer: SpanBuffer<T>,
+  ) => SpanBuffer<T>,
 ): BaseSpanLogger<T> {
   const SpanLoggerClass = createSpanLoggerClass(schema);
-  return new SpanLoggerClass(buffer, scope, createNextBuffer);
+  // Type assertion needed because SpanLoggerClass constructor expects SpanBuffer
+  // (non-generic) but we pass SpanBuffer<T>. This is safe because at runtime
+  // SpanBuffer<T> IS a SpanBuffer - the generic is only for compile-time typing.
+  return new SpanLoggerClass(
+    buffer as unknown as SpanBuffer,
+    scope,
+    createNextBuffer as unknown as (buffer: SpanBuffer) => SpanBuffer,
+  );
 }
 
 // Re-export types that may be needed by consumers

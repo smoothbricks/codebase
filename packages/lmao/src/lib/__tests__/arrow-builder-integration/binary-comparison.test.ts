@@ -15,7 +15,7 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import * as arrow from 'apache-arrow';
 import { convertToArrowTable } from '../../convertToArrow.js';
-import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_SPAN_START } from '../../lmao.js';
+import { ENTRY_TYPE_SPAN_START } from '../../lmao.js';
 import { S } from '../../schema/builder.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';

@@ -280,15 +280,15 @@ function createCacheKey(schema: TagAttributeSchema, extension?: ColumnWriterExte
  *
  * @param schema - The tag attribute schema defining columns
  * @param extension - Optional extension for injecting constructor code, methods, etc.
- * @returns The generated class constructor
+ * @returns The generated class constructor with typed setter methods
  */
-export function getColumnWriterClass(
-  schema: TagAttributeSchema,
+export function getColumnWriterClass<T extends TagAttributeSchema>(
+  schema: T,
   extension?: ColumnWriterExtension,
 ): new (
   buffer: ColumnBuffer,
   ...args: unknown[]
-) => ColumnWriter {
+) => ColumnWriter<T> {
   const cacheKey = createCacheKey(schema, extension);
 
   let WriterClass = writerClassCache.get(cacheKey);
@@ -320,7 +320,11 @@ export function getColumnWriterClass(
     writerClassCache.set(cacheKey, WriterClass);
   }
 
-  return WriterClass;
+  // Cast is safe because the generated class has typed setters matching the schema T
+  return WriterClass as unknown as new (
+    buffer: ColumnBuffer,
+    ...args: unknown[]
+  ) => ColumnWriter<T>;
 }
 
 /**
@@ -330,14 +334,14 @@ export function getColumnWriterClass(
  * @param buffer - The ColumnBuffer to write to
  * @param extension - Optional extension for injecting constructor code, methods, etc.
  * @param constructorArgs - Additional constructor arguments (passed to extension constructor code)
- * @returns A new ColumnWriter instance
+ * @returns A new ColumnWriter instance with typed setter methods
  */
-export function createColumnWriter(
-  schema: TagAttributeSchema,
+export function createColumnWriter<T extends TagAttributeSchema>(
+  schema: T,
   buffer: ColumnBuffer,
   extension?: ColumnWriterExtension,
   ...constructorArgs: unknown[]
-): ColumnWriter {
+): ColumnWriter<T> {
   const WriterClass = getColumnWriterClass(schema, extension);
   return new WriterClass(buffer, ...constructorArgs);
 }

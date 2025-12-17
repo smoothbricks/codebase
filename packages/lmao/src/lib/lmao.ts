@@ -121,7 +121,7 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
   readonly value: V;
   private _writer: ResultWriter<T>;
 
-  constructor(buffer: SpanBuffer, value: V, schema: T) {
+  constructor(buffer: SpanBuffer<T>, value: V, schema: T) {
     this.value = value;
 
     // Overwrite the pre-initialized span-exception with span-ok
@@ -131,7 +131,8 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
     buffer.timestamps[1] = getTimestampNanos();
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
-    this._writer = createResultWriter(schema, buffer, value, false);
+    // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)
+    this._writer = createResultWriter(schema, buffer as unknown as SpanBuffer, value, false);
 
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
   }
@@ -184,7 +185,7 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
   readonly error: { code: string; details: E };
   private _writer: ResultWriter<T>;
 
-  constructor(buffer: SpanBuffer, code: string, details: E, schema: T) {
+  constructor(buffer: SpanBuffer<T>, code: string, details: E, schema: T) {
     this.error = { code, details };
 
     // Overwrite the pre-initialized span-exception with span-err
@@ -194,7 +195,8 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
     buffer.timestamps[1] = getTimestampNanos();
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
-    this._writer = createResultWriter(schema, buffer, details, true);
+    // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)
+    this._writer = createResultWriter(schema, buffer as unknown as SpanBuffer, details, true);
 
     // Write error code using the writer if available
     const writer = this._writer as ResultWriter<T, never, E> & { errorCode?: (v: string) => unknown };
@@ -656,10 +658,10 @@ interface MutableSpanContext<
   env: Env;
   tag: TagWriter<T>;
   log: SpanLogger<T>;
-  _buffer: SpanBuffer;
+  _buffer: SpanBuffer<T>;
   _schema: T;
   _spanLogger: BaseSpanLogger<T>;
-  buffer: SpanBuffer;
+  buffer: SpanBuffer<T>;
   scope: (attributes: Partial<InferTagAttributes<T>>) => void;
   ok: <V>(value: V) => FluentSuccessResult<V, T>;
   err: <E>(code: string, error: E) => FluentErrorResult<E, T>;
@@ -684,7 +686,7 @@ function createSpanContextProto<
     [TRACE_CONTEXT_MARKER]: true,
 
     // Buffer getter - returns _buffer
-    get buffer(): SpanBuffer {
+    get buffer(): SpanBuffer<T> {
       return (this as MutableSpanContext<T, FF, Env>)._buffer;
     },
 
@@ -733,7 +735,9 @@ function createSpanContextProto<
 
       // Create a new feature flag evaluator bound to the CHILD buffer.
       // This ensures ff-access/ff-usage entries are logged to the correct span.
-      const childFf = this.ff.withBuffer(childBuffer) as FeatureFlagEvaluator<FF> & InferFeatureFlags<FF>;
+      // Type assertion needed because withBuffer expects SpanBuffer (non-generic)
+      const childFf = this.ff.withBuffer(childBuffer as unknown as SpanBuffer) as FeatureFlagEvaluator<FF> &
+        InferFeatureFlags<FF>;
 
       // Use Object.create(this) for prototype inheritance
       // Child inherits all user properties from parent via prototype chain
@@ -1142,7 +1146,7 @@ export const ENTRY_TYPE_NAMES = [
  * - String interning for category columns
  * - Direct TypedArray writes (no allocations)
  */
-function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
+function createFlagColumnWriters<T extends TagAttributeSchema>(buffer: SpanBuffer<T>): FlagColumnWriters {
   return {
     writeEntryType(type: 'ff-access' | 'ff-usage'): void {
       // Write entry type code to operation column
@@ -1160,7 +1164,9 @@ function createFlagColumnWriters(buffer: SpanBuffer): FlagColumnWriters {
 
     writeFfValue(value: string | number | boolean | null): void {
       // Write to ffValue column (raw string, no interning)
-      const column = buffer['ffValue_values' as keyof SpanBuffer] as string[] | undefined;
+      // Cast to record for dynamic access to internal column storage
+      const bufferRecord = buffer as unknown as Record<string, unknown>;
+      const column = bufferRecord['ffValue_values'] as string[] | undefined;
       if (column && Array.isArray(column)) {
         const strValue = value === null ? 'null' : String(value);
         column[buffer.writeIndex] = strValue;
@@ -1240,7 +1246,7 @@ export function getBufferWithSpace(inputBuffer: SpanBuffer): { buffer: SpanBuffe
  * - Row 1: span-end (pre-initialized as exception, overwritten by ok/err)
  * - Row 2+: events (ctx.log.* appends here)
  */
-function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
+function writeSpanStart<T extends TagAttributeSchema>(buffer: SpanBuffer<T>, spanName: string): void {
   // Row 0: span-start (fixed layout)
   buffer.operations[0] = ENTRY_TYPE_SPAN_START;
   buffer.timestamps[0] = getTimestampNanos();
@@ -1267,7 +1273,7 @@ function writeSpanStart(buffer: SpanBuffer, spanName: string): void {
  */
 function createSpanLoggerWithScope<T extends TagAttributeSchema>(
   schema: T,
-  buffer: SpanBuffer,
+  buffer: SpanBuffer<T>,
   inheritedScopeValues?: Record<string, unknown>,
 ): BaseSpanLogger<T> {
   // Create Scope instance (separate from column storage)
