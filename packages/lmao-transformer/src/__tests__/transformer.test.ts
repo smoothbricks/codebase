@@ -403,4 +403,89 @@ const myTask = task('my-task', async (ctx) => {});`;
       expect(normalize(output)).toContain("task('my-task', async (ctx) => { }, 3)");
     });
   });
+
+  describe('ctx.tag chain inlining', () => {
+    it('should inline single tag call to buffer write', () => {
+      const input = "ctx.tag.operation('SELECT');";
+      const output = transform(input);
+      // Should transform to: (ctx._buffer.operation(0, 'SELECT'), ctx.tag)
+      expect(normalize(output)).toContain('ctx._buffer.operation(0,');
+      expect(normalize(output)).toContain(', ctx.tag)');
+    });
+
+    it('should inline multiple tag calls in a chain', () => {
+      const input = "ctx.tag.operation('SELECT').userId('user-123');";
+      const output = transform(input);
+      // Should have both buffer writes
+      expect(normalize(output)).toContain('ctx._buffer.operation(0,');
+      expect(normalize(output)).toContain("ctx._buffer.userId(0, 'user-123')");
+      // Should end with ctx.tag for chaining
+      expect(normalize(output)).toContain(', ctx.tag)');
+    });
+
+    it('should inline number values directly', () => {
+      const input = 'ctx.tag.count(42);';
+      const output = transform(input);
+      expect(normalize(output)).toContain('ctx._buffer.count(0, 42)');
+    });
+
+    it('should inline boolean true', () => {
+      const input = 'ctx.tag.enabled(true);';
+      const output = transform(input);
+      expect(normalize(output)).toContain('ctx._buffer.enabled(0, true)');
+    });
+
+    it('should inline boolean false', () => {
+      const input = 'ctx.tag.disabled(false);';
+      const output = transform(input);
+      expect(normalize(output)).toContain('ctx._buffer.disabled(0, false)');
+    });
+
+    it('should NOT inline if argument is not a literal', () => {
+      const input = 'ctx.tag.userId(getUserId());';
+      const output = transform(input);
+      // Should keep original form since getUserId() is not a literal
+      expect(normalize(output)).toContain('ctx.tag.userId(getUserId())');
+      expect(normalize(output)).not.toContain('ctx._buffer');
+    });
+
+    it('should inline literals and keep non-literals as method calls', () => {
+      const input = "ctx.tag.operation('SELECT').userId(userId);";
+      const output = transform(input);
+      // The literal 'SELECT' is inlined, but userId(userId) remains a method call on ctx.tag
+      expect(normalize(output)).toContain("ctx._buffer.operation(0, 'SELECT')");
+      expect(normalize(output)).toContain('.userId(userId)');
+    });
+
+    it('should NOT inline ctx.tag.with() calls', () => {
+      const input = "ctx.tag.with({ operation: 'SELECT', userId: '123' });";
+      const output = transform(input);
+      // with() takes an object, not a single value - should not transform
+      expect(normalize(output)).toContain('ctx.tag.with({');
+    });
+
+    it('should handle tag chains assigned to variables', () => {
+      const input = "const t = ctx.tag.operation('SELECT');";
+      const output = transform(input);
+      // Should still inline but preserve return value
+      expect(normalize(output)).toContain('ctx._buffer.operation(0,');
+    });
+
+    it('should handle deeply nested context expression', () => {
+      const input = "this.ctx.tag.userId('123');";
+      const output = transform(input);
+      expect(normalize(output)).toContain('this.ctx._buffer.userId(0,');
+      expect(normalize(output)).toContain(', this.ctx.tag)');
+    });
+
+    it('should handle tag chain with many calls', () => {
+      const input = "ctx.tag.a('1').b('2').c('3').d('4');";
+      const output = transform(input);
+      expect(normalize(output)).toContain("ctx._buffer.a(0, '1')");
+      expect(normalize(output)).toContain("ctx._buffer.b(0, '2')");
+      expect(normalize(output)).toContain("ctx._buffer.c(0, '3')");
+      expect(normalize(output)).toContain("ctx._buffer.d(0, '4')");
+      expect(normalize(output)).toContain(', ctx.tag)');
+    });
+  });
 });
