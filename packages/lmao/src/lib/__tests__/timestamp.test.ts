@@ -34,6 +34,10 @@ describe('Browser Timestamp (performance.now)', () => {
   });
 
   it('should set Nanoseconds.now', () => {
+    // Verify that Nanoseconds.now is set to the browser's getTimestampNanos function
+    // This ensures the browser timestamp implementation is correctly assigned
+    // Force module evaluation by calling getTimestampNanos to ensure assignment happened
+    getTimestampNanos();
     expect(Nanoseconds.now).toBe(getTimestampNanos);
   });
 });
