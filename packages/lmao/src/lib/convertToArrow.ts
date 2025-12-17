@@ -19,7 +19,28 @@ import {
   type PreEncodedEntry,
   sortInPlace,
 } from '@smoothbricks/arrow-builder';
-import * as arrow from 'apache-arrow';
+import {
+  Bool,
+  type Data,
+  Dictionary,
+  Field,
+  Float64,
+  Int8,
+  Int32,
+  makeData,
+  makeVector,
+  RecordBatch,
+  Schema,
+  Struct,
+  Table,
+  TimestampNanosecond,
+  Uint8,
+  Uint16,
+  Uint32,
+  Uint64,
+  Utf8,
+  type Vector,
+} from 'apache-arrow';
 import { ENTRY_TYPE_NAMES } from './lmao.js';
 import type { ModuleContext } from './moduleContext.js';
 import { getEnumUtf8, getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
@@ -258,12 +279,12 @@ export type SystemColumnBuilder = (
   buffer: SpanBuffer,
   buffers: SpanBuffer[],
   totalRows: number,
-) => { fields: arrow.Field[]; vectors: arrow.Vector[] };
+) => { fields: Field[]; vectors: Vector[] };
 
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow RecordBatch
  */
-export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): arrow.RecordBatch {
+export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
   const buffers: SpanBuffer[] = [];
   let currentBuffer: SpanBuffer | undefined = buffer;
 
@@ -275,44 +296,33 @@ export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: S
   return convertBuffersToRecordBatch(buffers, systemColumnBuilder);
 }
 
-function convertBuffersToRecordBatch(
-  buffers: SpanBuffer[],
-  systemColumnBuilder?: SystemColumnBuilder,
-): arrow.RecordBatch {
-  if (buffers.length === 0) return new arrow.RecordBatch({});
+function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
+  if (buffers.length === 0) return new RecordBatch({});
 
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
-  if (totalRows === 0) return new arrow.RecordBatch({});
+  if (totalRows === 0) return new RecordBatch({});
 
   const schema = buffers[0].task.module.tagAttributes;
-  const fields: arrow.Field[] = [];
-  let systemVectors: arrow.Vector[] = [];
+  const fields: Field[] = [];
+  let systemVectors: Vector[] = [];
 
   if (systemColumnBuilder) {
     const systemColumns = systemColumnBuilder(buffers[0], buffers, totalRows);
     fields.push(...systemColumns.fields);
     systemVectors = systemColumns.vectors;
   } else {
-    fields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampNanosecond() }));
-    fields.push(arrow.Field.new({ name: 'trace_id', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
+    fields.push(Field.new({ name: 'timestamp', type: new TimestampNanosecond() }));
+    fields.push(Field.new({ name: 'trace_id', type: new Dictionary(new Utf8(), new Int32()) }));
     // Span ID columns (separate columns instead of struct)
-    fields.push(arrow.Field.new({ name: 'thread_id', type: new arrow.Uint64() }));
-    fields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint32() }));
-    fields.push(arrow.Field.new({ name: 'parent_thread_id', type: new arrow.Uint64(), nullable: true }));
-    fields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint32(), nullable: true }));
-    fields.push(
-      arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()) }),
-    );
-    fields.push(
-      arrow.Field.new({ name: 'package_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
-    );
-    fields.push(
-      arrow.Field.new({ name: 'package_path', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
-    );
-    fields.push(arrow.Field.new({ name: 'git_sha', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
-    fields.push(
-      arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
-    );
+    fields.push(Field.new({ name: 'thread_id', type: new Uint64() }));
+    fields.push(Field.new({ name: 'span_id', type: new Uint32() }));
+    fields.push(Field.new({ name: 'parent_thread_id', type: new Uint64(), nullable: true }));
+    fields.push(Field.new({ name: 'parent_span_id', type: new Uint32(), nullable: true }));
+    fields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8()) }));
+    fields.push(Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new Int32()) }));
+    fields.push(Field.new({ name: 'package_path', type: new Dictionary(new Utf8(), new Int32()) }));
+    fields.push(Field.new({ name: 'git_sha', type: new Dictionary(new Utf8(), new Int32()) }));
+    fields.push(Field.new({ name: 'span_name', type: new Dictionary(new Utf8(), new Int32()) }));
   }
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
@@ -321,37 +331,37 @@ function convertBuffersToRecordBatch(
 
     if (lmaoType === 'enum') {
       fields.push(
-        arrow.Field.new({
+        Field.new({
           name: arrowFieldName,
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8()),
+          type: new Dictionary(new Utf8(), new Uint8()),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'category') {
       fields.push(
-        arrow.Field.new({
+        Field.new({
           name: arrowFieldName,
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+          type: new Dictionary(new Utf8(), new Uint32()),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'text') {
       fields.push(
-        arrow.Field.new({
+        Field.new({
           name: arrowFieldName,
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+          type: new Dictionary(new Utf8(), new Uint32()),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'number') {
-      fields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Float64(), nullable: true }));
+      fields.push(Field.new({ name: arrowFieldName, type: new Float64(), nullable: true }));
     } else if (lmaoType === 'boolean') {
-      fields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Bool(), nullable: true }));
+      fields.push(Field.new({ name: arrowFieldName, type: new Bool(), nullable: true }));
     }
   }
 
-  const arrowSchema = new arrow.Schema(fields);
-  const vectors: arrow.Vector[] = [];
+  const arrowSchema = new Schema(fields);
+  const vectors: Vector[] = [];
 
   if (systemColumnBuilder) {
     vectors.push(...systemVectors);
@@ -381,8 +391,8 @@ function convertBuffersToRecordBatch(
       const allIndices = concatenateUint8Arrays(valueArrays);
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
-      const enumDictData = arrow.makeData({
-        type: new arrow.Utf8(),
+      const enumDictData = makeData({
+        type: new Utf8(),
         offset: 0,
         length: enumValues.length,
         nullCount: 0,
@@ -390,17 +400,17 @@ function convertBuffersToRecordBatch(
         data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
       });
 
-      const enumData = arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8()),
+      const enumData = makeData({
+        type: new Dictionary(new Utf8(), new Uint8()),
         offset: 0,
         length: totalRows,
         nullCount,
         data: allIndices,
         nullBitmap,
-        dictionary: arrow.makeVector(enumDictData),
+        dictionary: makeVector(enumDictData),
       });
 
-      vectors.push(arrow.makeVector(enumData));
+      vectors.push(makeVector(enumData));
     } else if (lmaoType === 'category') {
       // Get mask transform from schema metadata (if present)
       const maskTransform = getMaskTransform(fieldSchema);
@@ -411,8 +421,8 @@ function convertBuffersToRecordBatch(
       );
       const { data: categoryUtf8Data, offsets: categoryUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
-      const categoryDictData = arrow.makeData({
-        type: new arrow.Utf8(),
+      const categoryDictData = makeData({
+        type: new Utf8(),
         offset: 0,
         length: dictionary.length,
         nullCount: 0,
@@ -420,17 +430,17 @@ function convertBuffersToRecordBatch(
         data: categoryUtf8Data,
       });
 
-      const categoryData = arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+      const categoryData = makeData({
+        type: new Dictionary(new Utf8(), new Uint32()),
         offset: 0,
         length: totalRows,
         nullCount,
         data: indices,
         nullBitmap,
-        dictionary: arrow.makeVector(categoryDictData),
+        dictionary: makeVector(categoryDictData),
       });
 
-      vectors.push(arrow.makeVector(categoryData));
+      vectors.push(makeVector(categoryData));
     } else if (lmaoType === 'text') {
       // Get mask transform from schema metadata (if present)
       const maskTransform = getMaskTransform(fieldSchema);
@@ -439,8 +449,8 @@ function convertBuffersToRecordBatch(
         const { dictionary, indices, nullBitmap, nullCount } = result;
         const { data: textUtf8Data, offsets: textUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
-        const textDictData = arrow.makeData({
-          type: new arrow.Utf8(),
+        const textDictData = makeData({
+          type: new Utf8(),
           offset: 0,
           length: dictionary.length,
           nullCount: 0,
@@ -448,17 +458,17 @@ function convertBuffersToRecordBatch(
           data: textUtf8Data,
         });
 
-        const textData = arrow.makeData({
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
+        const textData = makeData({
+          type: new Dictionary(new Utf8(), new Uint32()),
           offset: 0,
           length: totalRows,
           nullCount,
           data: indices,
           nullBitmap,
-          dictionary: arrow.makeVector(textDictData),
+          dictionary: makeVector(textDictData),
         });
 
-        vectors.push(arrow.makeVector(textData));
+        vectors.push(makeVector(textData));
       }
     } else if (lmaoType === 'number') {
       const valuesName = `${columnName}_values` as const;
@@ -476,8 +486,8 @@ function convertBuffersToRecordBatch(
       const allValues = concatenateFloat64Arrays(valueArrays);
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
-      const numberData = arrow.makeData({
-        type: new arrow.Float64(),
+      const numberData = makeData({
+        type: new Float64(),
         offset: 0,
         length: totalRows,
         nullCount,
@@ -485,7 +495,7 @@ function convertBuffersToRecordBatch(
         nullBitmap,
       });
 
-      vectors.push(arrow.makeVector(numberData));
+      vectors.push(makeVector(numberData));
     } else if (lmaoType === 'boolean') {
       const valuesName = `${columnName}_values` as const;
       const valueArrays: Uint8Array[] = [];
@@ -504,8 +514,8 @@ function convertBuffersToRecordBatch(
       const allValues = concatenateUint8Arrays(valueArrays);
       const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
-      const boolData = arrow.makeData({
-        type: new arrow.Bool(),
+      const boolData = makeData({
+        type: new Bool(),
         offset: 0,
         length: totalRows,
         nullCount,
@@ -513,30 +523,30 @@ function convertBuffersToRecordBatch(
         nullBitmap,
       });
 
-      vectors.push(arrow.makeVector(boolData));
+      vectors.push(makeVector(boolData));
     }
   }
 
-  const data = arrow.makeData({
-    type: new arrow.Struct(arrowSchema.fields),
+  const data = makeData({
+    type: new Struct(arrowSchema.fields),
     length: totalRows,
     nullCount: 0,
     children: vectors.map((v) => v.data[0]),
   });
 
-  return new arrow.RecordBatch(arrowSchema, data);
+  return new RecordBatch(arrowSchema, data);
 }
 
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow Table
  */
-export function convertToArrowTable(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): arrow.Table {
+export function convertToArrowTable(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): Table {
   const batch = convertToRecordBatch(buffer, systemColumnBuilder);
-  if (batch.numRows === 0) return new arrow.Table();
-  return new arrow.Table([batch]);
+  if (batch.numRows === 0) return new Table();
+  return new Table([batch]);
 }
 
-function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[]): void {
+function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): void {
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
   // Timestamp - BigInt64Array with nanoseconds
@@ -552,9 +562,9 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     timestampOffset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.TimestampNanosecond(),
+    makeVector(
+      makeData({
+        type: new TimestampNanosecond(),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -581,8 +591,8 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
 
-  const traceIdDictData = arrow.makeData({
-    type: new arrow.Utf8(),
+  const traceIdDictData = makeData({
+    type: new Utf8(),
     offset: 0,
     length: traceIdArray.length,
     nullCount: 0,
@@ -591,14 +601,14 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
   });
 
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    makeVector(
+      makeData({
+        type: new Dictionary(new Utf8(), new Int32()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: traceIdIndices,
-        dictionary: arrow.makeVector(traceIdDictData),
+        dictionary: makeVector(traceIdDictData),
       }),
     ),
   );
@@ -612,9 +622,9 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint64(),
+    makeVector(
+      makeData({
+        type: new Uint64(),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -632,9 +642,9 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint32(),
+    makeVector(
+      makeData({
+        type: new Uint32(),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -660,9 +670,9 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint64(),
+    makeVector(
+      makeData({
+        type: new Uint64(),
         offset: 0,
         length: totalRows,
         nullCount: parentThreadIdNullCount,
@@ -689,9 +699,9 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint32(),
+    makeVector(
+      makeData({
+        type: new Uint32(),
         offset: 0,
         length: totalRows,
         nullCount: parentSpanIdNullCount,
@@ -714,8 +724,8 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), rowOffset);
     rowOffset += buf.writeIndex;
   }
-  const entryTypeDictData = arrow.makeData({
-    type: new arrow.Utf8(),
+  const entryTypeDictData = makeData({
+    type: new Utf8(),
     offset: 0,
     length: ENTRY_TYPE_NAMES.length,
     nullCount: 0,
@@ -723,14 +733,14 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
   });
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()),
+    makeVector(
+      makeData({
+        type: new Dictionary(new Utf8(), new Int8()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: entryTypeIndices,
-        dictionary: arrow.makeVector(entryTypeDictData),
+        dictionary: makeVector(entryTypeDictData),
       }),
     ),
   );
@@ -753,8 +763,8 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
 
-  const packageDictData = arrow.makeData({
-    type: new arrow.Utf8(),
+  const packageDictData = makeData({
+    type: new Utf8(),
     offset: 0,
     length: packageArray.length,
     nullCount: 0,
@@ -762,14 +772,14 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     data: encodeUtf8Strings(packageArray),
   });
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    makeVector(
+      makeData({
+        type: new Dictionary(new Utf8(), new Int32()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: packageIndices,
-        dictionary: arrow.makeVector(packageDictData),
+        dictionary: makeVector(packageDictData),
       }),
     ),
   );
@@ -792,8 +802,8 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
 
-  const packagePathDictData = arrow.makeData({
-    type: new arrow.Utf8(),
+  const packagePathDictData = makeData({
+    type: new Utf8(),
     offset: 0,
     length: modulePathArray.length,
     nullCount: 0,
@@ -801,14 +811,14 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     data: encodeUtf8Strings(modulePathArray),
   });
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    makeVector(
+      makeData({
+        type: new Dictionary(new Utf8(), new Int32()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: packagePathIndices,
-        dictionary: arrow.makeVector(packagePathDictData),
+        dictionary: makeVector(packagePathDictData),
       }),
     ),
   );
@@ -831,8 +841,8 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
 
-  const gitShaDictData = arrow.makeData({
-    type: new arrow.Utf8(),
+  const gitShaDictData = makeData({
+    type: new Utf8(),
     offset: 0,
     length: gitShaArray.length,
     nullCount: 0,
@@ -840,14 +850,14 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     data: encodeUtf8Strings(gitShaArray),
   });
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    makeVector(
+      makeData({
+        type: new Dictionary(new Utf8(), new Int32()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: gitShaIndices,
-        dictionary: arrow.makeVector(gitShaDictData),
+        dictionary: makeVector(gitShaDictData),
       }),
     ),
   );
@@ -870,8 +880,8 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     rowOffset += buf.writeIndex;
   }
 
-  const spanNameDictData = arrow.makeData({
-    type: new arrow.Utf8(),
+  const spanNameDictData = makeData({
+    type: new Utf8(),
     offset: 0,
     length: spanNameArray.length,
     nullCount: 0,
@@ -879,14 +889,14 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     data: encodeUtf8Strings(spanNameArray),
   });
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+    makeVector(
+      makeData({
+        type: new Dictionary(new Utf8(), new Int32()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: spanNameIndices,
-        dictionary: arrow.makeVector(spanNameDictData),
+        dictionary: makeVector(spanNameDictData),
       }),
     ),
   );
@@ -917,10 +927,7 @@ function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): 
  * - Pass 1: Walk tree, build dictionaries (collect unique strings, cache UTF-8)
  * - Pass 2: Walk tree, convert each buffer to RecordBatch using shared dictionaries
  */
-export function convertSpanTreeToArrowTable(
-  rootBuffer: SpanBuffer,
-  _systemColumnBuilder?: SystemColumnBuilder,
-): arrow.Table {
+export function convertSpanTreeToArrowTable(rootBuffer: SpanBuffer, _systemColumnBuilder?: SystemColumnBuilder): Table {
   const schema = rootBuffer.task.module.tagAttributes;
 
   // ═══════════════════════════════════════════════════════════════════════════
@@ -1011,7 +1018,7 @@ export function convertSpanTreeToArrowTable(
     }
   });
 
-  if (totalRows === 0) return new arrow.Table();
+  if (totalRows === 0) return new Table();
 
   // Finalize dictionaries
   const traceIdDict = traceIdBuilder.finalize(false);
@@ -1048,33 +1055,21 @@ export function convertSpanTreeToArrowTable(
   // ═══════════════════════════════════════════════════════════════════════════
   // Build shared Arrow schema with stable dictionary IDs
   // ═══════════════════════════════════════════════════════════════════════════
-  const arrowFields: arrow.Field[] = [];
+  const arrowFields: Field[] = [];
 
   // System columns - create types with explicit dictionary IDs
-  arrowFields.push(arrow.Field.new({ name: 'timestamp', type: new arrow.TimestampNanosecond() }));
-  arrowFields.push(
-    arrow.Field.new({ name: 'trace_id', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 0) }),
-  );
+  arrowFields.push(Field.new({ name: 'timestamp', type: new TimestampNanosecond() }));
+  arrowFields.push(Field.new({ name: 'trace_id', type: new Dictionary(new Utf8(), new Int32(), 0) }));
   // Span ID columns (separate columns instead of struct)
-  arrowFields.push(arrow.Field.new({ name: 'thread_id', type: new arrow.Uint64() }));
-  arrowFields.push(arrow.Field.new({ name: 'span_id', type: new arrow.Uint32() }));
-  arrowFields.push(arrow.Field.new({ name: 'parent_thread_id', type: new arrow.Uint64(), nullable: true }));
-  arrowFields.push(arrow.Field.new({ name: 'parent_span_id', type: new arrow.Uint32(), nullable: true }));
-  arrowFields.push(
-    arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8(), 1) }),
-  );
-  arrowFields.push(
-    arrow.Field.new({ name: 'package_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 2) }),
-  );
-  arrowFields.push(
-    arrow.Field.new({ name: 'package_path', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 3) }),
-  );
-  arrowFields.push(
-    arrow.Field.new({ name: 'git_sha', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 4) }),
-  );
-  arrowFields.push(
-    arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 5) }),
-  );
+  arrowFields.push(Field.new({ name: 'thread_id', type: new Uint64() }));
+  arrowFields.push(Field.new({ name: 'span_id', type: new Uint32() }));
+  arrowFields.push(Field.new({ name: 'parent_thread_id', type: new Uint64(), nullable: true }));
+  arrowFields.push(Field.new({ name: 'parent_span_id', type: new Uint32(), nullable: true }));
+  arrowFields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8(), 1) }));
+  arrowFields.push(Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new Int32(), 2) }));
+  arrowFields.push(Field.new({ name: 'package_path', type: new Dictionary(new Utf8(), new Int32(), 3) }));
+  arrowFields.push(Field.new({ name: 'git_sha', type: new Dictionary(new Utf8(), new Int32(), 4) }));
+  arrowFields.push(Field.new({ name: 'span_name', type: new Dictionary(new Utf8(), new Int32(), 5) }));
 
   // Attribute columns - assign dictionary IDs starting at 6
   let nextDictId = 6;
@@ -1086,38 +1081,38 @@ export function convertSpanTreeToArrowTable(
     if (lmaoType === 'enum') {
       attrDictIds.set(fieldName, nextDictId);
       arrowFields.push(
-        arrow.Field.new({
+        Field.new({
           name: arrowFieldName,
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint8(), nextDictId++),
+          type: new Dictionary(new Utf8(), new Uint8(), nextDictId++),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'category') {
       attrDictIds.set(fieldName, nextDictId);
       arrowFields.push(
-        arrow.Field.new({
+        Field.new({
           name: arrowFieldName,
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32(), nextDictId++),
+          type: new Dictionary(new Utf8(), new Uint32(), nextDictId++),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'text') {
       attrDictIds.set(fieldName, nextDictId);
       arrowFields.push(
-        arrow.Field.new({
+        Field.new({
           name: arrowFieldName,
-          type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32(), nextDictId++),
+          type: new Dictionary(new Utf8(), new Uint32(), nextDictId++),
           nullable: true,
         }),
       );
     } else if (lmaoType === 'number') {
-      arrowFields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Float64(), nullable: true }));
+      arrowFields.push(Field.new({ name: arrowFieldName, type: new Float64(), nullable: true }));
     } else if (lmaoType === 'boolean') {
-      arrowFields.push(arrow.Field.new({ name: arrowFieldName, type: new arrow.Bool(), nullable: true }));
+      arrowFields.push(Field.new({ name: arrowFieldName, type: new Bool(), nullable: true }));
     }
   }
 
-  const arrowSchema = new arrow.Schema(arrowFields);
+  const arrowSchema = new Schema(arrowFields);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 2: Collect all buffers with non-zero rows
@@ -1130,7 +1125,7 @@ export function convertSpanTreeToArrowTable(
     }
   });
 
-  if (allBuffers.length === 0) return new arrow.Table();
+  if (allBuffers.length === 0) return new Table();
 
   // Build a single RecordBatch from all buffers
   const batch = convertBuffersWithSharedDicts(
@@ -1149,7 +1144,7 @@ export function convertSpanTreeToArrowTable(
     textOriginalToMasked,
   );
 
-  return new arrow.Table([batch]);
+  return new Table([batch]);
 }
 
 // Use FinalizedDictionary type from arrow-builder
@@ -1159,7 +1154,7 @@ export function convertSpanTreeToArrowTable(
  */
 function convertBuffersWithSharedDicts(
   buffers: SpanBuffer[],
-  arrowSchema: arrow.Schema,
+  arrowSchema: Schema,
   traceIdDict: FinalizedDictionary,
   packageDict: FinalizedDictionary,
   packagePathDict: FinalizedDictionary,
@@ -1171,21 +1166,21 @@ function convertBuffersWithSharedDicts(
   lmaoSchema: Record<string, unknown>,
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
-): arrow.RecordBatch {
+): RecordBatch {
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
-  const vectors: arrow.Vector[] = [];
+  const vectors: Vector[] = [];
 
   // Get types from the shared schema
   // Schema order: timestamp(0), trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
   //               entry_type(6), package(7), module_path(8), git_sha(9), span_name(10)
-  const timestampType = arrowSchema.fields[0].type as arrow.TimestampNanosecond;
-  const traceIdType = arrowSchema.fields[1].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const timestampType = arrowSchema.fields[0].type as TimestampNanosecond;
+  const traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8, Int32>;
   // Span ID columns: thread_id (2), span_id (3), parent_thread_id (4), parent_span_id (5)
-  const entryTypeType = arrowSchema.fields[6].type as arrow.Dictionary<arrow.Utf8, arrow.Int8>;
-  const packageType = arrowSchema.fields[7].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
-  const packagePathType = arrowSchema.fields[8].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
-  const gitShaType = arrowSchema.fields[9].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
-  const spanNameType = arrowSchema.fields[10].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const entryTypeType = arrowSchema.fields[6].type as Dictionary<Utf8, Int8>;
+  const packageType = arrowSchema.fields[7].type as Dictionary<Utf8, Int32>;
+  const packagePathType = arrowSchema.fields[8].type as Dictionary<Utf8, Int32>;
+  const gitShaType = arrowSchema.fields[9].type as Dictionary<Utf8, Int32>;
+  const spanNameType = arrowSchema.fields[10].type as Dictionary<Utf8, Int32>;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // System columns - concatenate data from all buffers
@@ -1204,8 +1199,8 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
+    makeVector(
+      makeData({
         type: timestampType,
         offset: 0,
         length: totalRows,
@@ -1225,16 +1220,16 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
+    makeVector(
+      makeData({
         type: traceIdType,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: traceIdIndices,
-        dictionary: arrow.makeVector(
-          arrow.makeData({
-            type: new arrow.Utf8(),
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
             offset: 0,
             length: traceIdDict.indexMap.size,
             nullCount: 0,
@@ -1255,9 +1250,9 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint64(),
+    makeVector(
+      makeData({
+        type: new Uint64(),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -1275,9 +1270,9 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint32(),
+    makeVector(
+      makeData({
+        type: new Uint32(),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -1303,9 +1298,9 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint64(),
+    makeVector(
+      makeData({
+        type: new Uint64(),
         offset: 0,
         length: totalRows,
         nullCount: parentThreadIdNullCount,
@@ -1333,9 +1328,9 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
-        type: new arrow.Uint32(),
+    makeVector(
+      makeData({
+        type: new Uint32(),
         offset: 0,
         length: totalRows,
         nullCount: parentSpanIdNullCount,
@@ -1358,8 +1353,8 @@ function convertBuffersWithSharedDicts(
     entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), offset);
     offset += buf.writeIndex;
   }
-  const entryTypeDictData = arrow.makeData({
-    type: new arrow.Utf8(),
+  const entryTypeDictData = makeData({
+    type: new Utf8(),
     offset: 0,
     length: ENTRY_TYPE_NAMES.length,
     nullCount: 0,
@@ -1367,14 +1362,14 @@ function convertBuffersWithSharedDicts(
     data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
   });
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
+    makeVector(
+      makeData({
         type: entryTypeType,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: entryTypeIndices,
-        dictionary: arrow.makeVector(entryTypeDictData),
+        dictionary: makeVector(entryTypeDictData),
       }),
     ),
   );
@@ -1388,16 +1383,16 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
+    makeVector(
+      makeData({
         type: packageType,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: packageIndices,
-        dictionary: arrow.makeVector(
-          arrow.makeData({
-            type: new arrow.Utf8(),
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
             offset: 0,
             length: packageDict.indexMap.size,
             nullCount: 0,
@@ -1418,16 +1413,16 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
+    makeVector(
+      makeData({
         type: packagePathType,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: packagePathIndices,
-        dictionary: arrow.makeVector(
-          arrow.makeData({
-            type: new arrow.Utf8(),
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
             offset: 0,
             length: packagePathDict.indexMap.size,
             nullCount: 0,
@@ -1450,16 +1445,16 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
+    makeVector(
+      makeData({
         type: gitShaType,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: gitShaIndices2,
-        dictionary: arrow.makeVector(
-          arrow.makeData({
-            type: new arrow.Utf8(),
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
             offset: 0,
             length: gitShaDict.indexMap.size,
             nullCount: 0,
@@ -1481,16 +1476,16 @@ function convertBuffersWithSharedDicts(
     offset += buf.writeIndex;
   }
   vectors.push(
-    arrow.makeVector(
-      arrow.makeData({
+    makeVector(
+      makeData({
         type: spanNameType,
         offset: 0,
         length: totalRows,
         nullCount: 0,
         data: spanNameIndices,
-        dictionary: arrow.makeVector(
-          arrow.makeData({
-            type: new arrow.Utf8(),
+        dictionary: makeVector(
+          makeData({
+            type: new Utf8(),
             offset: 0,
             length: spanNameDict.indexMap.size,
             nullCount: 0,
@@ -1548,17 +1543,17 @@ function convertBuffersWithSharedDicts(
       }
 
       vectors.push(
-        arrow.makeVector(
-          arrow.makeData({
-            type: fieldType as arrow.Dictionary<arrow.Utf8, arrow.Uint32>,
+        makeVector(
+          makeData({
+            type: fieldType as Dictionary<Utf8, Uint32>,
             offset: 0,
             length: totalRows,
             nullCount,
             data: indices,
             nullBitmap: nullCount > 0 ? nullBitmap : undefined,
-            dictionary: arrow.makeVector(
-              arrow.makeData({
-                type: new arrow.Utf8(),
+            dictionary: makeVector(
+              makeData({
+                type: new Utf8(),
                 offset: 0,
                 length: dict.indexMap.size,
                 nullCount: 0,
@@ -1602,17 +1597,17 @@ function convertBuffersWithSharedDicts(
       }
 
       vectors.push(
-        arrow.makeVector(
-          arrow.makeData({
-            type: fieldType as arrow.Dictionary<arrow.Utf8, arrow.Uint32>,
+        makeVector(
+          makeData({
+            type: fieldType as Dictionary<Utf8, Uint32>,
             offset: 0,
             length: totalRows,
             nullCount,
             data: indices,
             nullBitmap: nullCount > 0 ? nullBitmap : undefined,
-            dictionary: arrow.makeVector(
-              arrow.makeData({
-                type: new arrow.Utf8(),
+            dictionary: makeVector(
+              makeData({
+                type: new Utf8(),
                 offset: 0,
                 length: dict.indexMap.size,
                 nullCount: 0,
@@ -1658,9 +1653,9 @@ function convertBuffersWithSharedDicts(
       }
 
       vectors.push(
-        arrow.makeVector(
-          arrow.makeData({
-            type: fieldType as arrow.Float64,
+        makeVector(
+          makeData({
+            type: fieldType as Float64,
             offset: 0,
             length: totalRows,
             nullCount,
@@ -1708,9 +1703,9 @@ function convertBuffersWithSharedDicts(
       }
 
       vectors.push(
-        arrow.makeVector(
-          arrow.makeData({
-            type: fieldType as arrow.Bool,
+        makeVector(
+          makeData({
+            type: fieldType as Bool,
             offset: 0,
             length: totalRows,
             nullCount,
@@ -1756,8 +1751,8 @@ function convertBuffersWithSharedDicts(
         rowOffset += buf.writeIndex;
       }
 
-      const enumDictData = arrow.makeData({
-        type: new arrow.Utf8(),
+      const enumDictData = makeData({
+        type: new Utf8(),
         offset: 0,
         length: enumValues.length,
         nullCount: 0,
@@ -1766,15 +1761,15 @@ function convertBuffersWithSharedDicts(
       });
 
       vectors.push(
-        arrow.makeVector(
-          arrow.makeData({
-            type: fieldType as arrow.Dictionary<arrow.Utf8, arrow.Uint8>,
+        makeVector(
+          makeData({
+            type: fieldType as Dictionary<Utf8, Uint8>,
             offset: 0,
             length: totalRows,
             nullCount,
             data: allIndices,
             nullBitmap: nullCount > 0 ? nullBitmap : undefined,
-            dictionary: arrow.makeVector(enumDictData),
+            dictionary: makeVector(enumDictData),
           }),
         ),
       );
@@ -1783,12 +1778,12 @@ function convertBuffersWithSharedDicts(
     fieldIdx++;
   }
 
-  const structData = arrow.makeData({
-    type: new arrow.Struct(arrowSchema.fields),
+  const structData = makeData({
+    type: new Struct(arrowSchema.fields),
     length: totalRows,
     nullCount: 0,
     children: vectors.map((v) => v.data[0]),
   });
 
-  return new arrow.RecordBatch(arrowSchema, structData);
+  return new RecordBatch(arrowSchema, structData);
 }

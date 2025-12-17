@@ -7,7 +7,7 @@
  * - Background processing (cold path)
  */
 
-import type * as arrow from 'apache-arrow';
+import { type RecordBatch, Table } from 'apache-arrow';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import type { SpanBuffer } from './types.js';
 
@@ -15,7 +15,7 @@ import type { SpanBuffer } from './types.js';
  * Flush handler function type
  * Called when buffers are ready to be flushed
  */
-export type FlushHandler = (table: arrow.Table, metadata: FlushMetadata) => Promise<void> | void;
+export type FlushHandler = (table: Table, metadata: FlushMetadata) => Promise<void> | void;
 
 /**
  * Metadata about the flush operation
@@ -295,7 +295,7 @@ export class FlushScheduler {
     if (totalRows === 0) return;
 
     // Convert all buffers to Arrow tables and concatenate
-    const tables: arrow.Table[] = [];
+    const tables: Table[] = [];
 
     for (const buffer of buffersToFlush) {
       try {
@@ -312,15 +312,14 @@ export class FlushScheduler {
     if (tables.length === 0) return;
 
     // Concatenate all tables
-    let combinedTable: arrow.Table;
+    let combinedTable: Table;
     if (tables.length === 1) {
       combinedTable = tables[0];
     } else {
       // Concatenate by extracting all record batches
       // Use first table's schema as reference
-      const Arrow = await import('apache-arrow');
       const schema = tables[0].schema;
-      const allBatches: arrow.RecordBatch[] = [];
+      const allBatches: RecordBatch[] = [];
 
       for (const table of tables) {
         // Cast batches to the reference schema to ensure compatibility
@@ -331,7 +330,7 @@ export class FlushScheduler {
 
       // Create combined table with explicit schema
       try {
-        combinedTable = new Arrow.Table(schema, allBatches);
+        combinedTable = new Table(schema, allBatches);
       } catch (_error) {
         // If schemas don't match (shouldn't happen in production), just use first table
         // This can occur in tests where buffers from different modules are mixed
