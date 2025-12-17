@@ -13,6 +13,20 @@
  * - Monomorphic access: V8 knows exact types at each call site
  * - Inline caching: Property access optimized by V8
  * - Cache alignment: ArrayBuffers aligned to 64-byte boundaries
+ *
+ * ## Lazy Column Allocation Strategy
+ *
+ * Lazy columns use a simple undefined-check pattern:
+ * 1. Constructor defines `this._col_storage = undefined` for all lazy columns
+ * 2. First access to `col_nulls` or `col_values` triggers allocation
+ * 3. Allocation creates a shared ArrayBuffer for both nulls and values
+ * 4. Subsequent accesses return the cached arrays
+ *
+ * WHY this approach (vs symbols + closures):
+ * - Simpler code, easier to debug
+ * - No closure memory overhead
+ * - V8 optimizes undefined checks well
+ * - Cache-friendly: nulls and values in same ArrayBuffer
  */
 
 import { getSchemaFields, type TagAttributeSchema } from '../schema-types.js';
@@ -168,7 +182,7 @@ function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): Colum
  * Generate the value assignment code for a setter method.
  *
  * Returns the code that assigns the value to the column storage.
- * The code has access to: `storage` (the column storage object), `pos` (position), `val` (value).
+ * The code has access to: `this._${col}_values` or `storage.values`, `pos`, `val`.
  *
  * WHY different strategies per type:
  * - enum: Compile-time lookup map for O(1) string→index conversion (no indexOf at runtime)
@@ -176,13 +190,13 @@ function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): Colum
  * - category/text: Direct string array assignment (no conversion)
  * - number: Direct Float64Array assignment
  */
-function generateSetterValueAssignment(info: ColumnStorageInfo, columnName: string): string {
+function generateSetterValueAssignment(info: ColumnStorageInfo, _columnName: string, accessPrefix: string): string {
   const { schemaType, isBitPacked, enumValues } = info;
 
   if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
     // Enum: Caller (TagWriter) has already converted string→index
     // We receive the numeric index directly - just store it
-    return 'storage.values[pos] = val;';
+    return `${accessPrefix}_values[pos] = val;`;
   }
 
   if (isBitPacked) {
@@ -192,25 +206,15 @@ function generateSetterValueAssignment(info: ColumnStorageInfo, columnName: stri
       'const byteIdx = pos >>> 3;',
       '      const bitIdx = pos & 7;',
       '      if (val) {',
-      '        storage.values[byteIdx] |= (1 << bitIdx);',
+      `        ${accessPrefix}_values[byteIdx] |= (1 << bitIdx);`,
       '      } else {',
-      '        storage.values[byteIdx] &= ~(1 << bitIdx);',
+      `        ${accessPrefix}_values[byteIdx] &= ~(1 << bitIdx);`,
       '      }',
     ].join('\n');
   }
 
-  if (schemaType === 'category' || schemaType === 'text') {
-    // String array: Direct assignment
-    return 'storage.values[pos] = val;';
-  }
-
-  if (schemaType === 'number') {
-    // Float64Array: Direct assignment
-    return 'storage.values[pos] = val;';
-  }
-
-  // Default: Direct assignment (for any TypedArray)
-  return 'storage.values[pos] = val;';
+  // Direct assignment for category/text/number and default
+  return `${accessPrefix}_values[pos] = val;`;
 }
 
 /**
@@ -219,42 +223,8 @@ function generateSetterValueAssignment(info: ColumnStorageInfo, columnName: stri
  * Arrow format: null bitmap uses 1 = valid (not null), 0 = null
  * This sets the bit to 1 (marking the value as valid/present).
  */
-function generateNullBitSetting(): string {
-  return 'storage.nulls[pos >>> 3] |= (1 << (pos & 7));';
-}
-
-/**
- * Generate the value assignment code for an EAGER column setter method.
- *
- * Similar to generateSetterValueAssignment but uses direct property access
- * instead of storage object (no null bitmap, no allocator).
- *
- * The code has access to: `this` (the buffer), `pos` (position), `val` (value).
- */
-function generateSetterValueAssignmentEager(info: ColumnStorageInfo, columnName: string): string {
-  const { schemaType, isBitPacked, enumValues } = info;
-
-  if (schemaType === 'enum' && enumValues && enumValues.length > 0) {
-    // Enum: Caller (TagWriter) has already converted string→index
-    // We receive the numeric index directly - just store it
-    return `this.${columnName}_values[pos] = val;`;
-  }
-
-  if (isBitPacked) {
-    // Boolean: Bit-packed storage (8 values per byte)
-    return [
-      'const byteIdx = pos >>> 3;',
-      '      const bitIdx = pos & 7;',
-      '      if (val) {',
-      '        this.' + columnName + '_values[byteIdx] |= (1 << bitIdx);',
-      '      } else {',
-      '        this.' + columnName + '_values[byteIdx] &= ~(1 << bitIdx);',
-      '      }',
-    ].join('\n');
-  }
-
-  // Direct assignment for category/text/number and default
-  return `this.${columnName}_values[pos] = val;`;
+function generateNullBitSetting(accessPrefix: string): string {
+  return `${accessPrefix}_nulls[pos >>> 3] |= (1 << (pos & 7));`;
 }
 
 /**
@@ -271,9 +241,25 @@ function generateSetterValueAssignmentEager(info: ColumnStorageInfo, columnName:
  * - Lazy allocation saves memory for unused columns
  * - First access triggers allocation of shared ArrayBuffer for both _nulls and _values
  *
- * IMPORTANT: Per-instance storage via private symbol keys
- * Each instance stores its lazy-allocated arrays in private symbol-keyed properties.
- * This avoids the closure-sharing bug where all instances share the same arrays.
+ * ## Lazy Column Pattern
+ *
+ * Instead of symbols + closures, we use a simpler undefined-check pattern:
+ *
+ * ```javascript
+ * // Constructor: Initialize storage as undefined
+ * this._userId_storage = undefined;
+ *
+ * // Getter: Allocate on first access, cache in storage
+ * get userId_nulls() {
+ *   let s = this._userId_storage;
+ *   if (s === undefined) {
+ *     s = this._allocate_userId();  // Sets _storage and _nulls/_values
+ *   }
+ *   return s.nulls;
+ * }
+ * ```
+ *
+ * This is simpler than symbols + closures and V8 optimizes undefined checks well.
  */
 export function generateColumnBufferClass(
   schema: TagAttributeSchema,
@@ -298,116 +284,101 @@ export function generateColumnBufferClass(
   constructorCode.push('    this._capacity = requestedCapacity;');
   constructorCode.push('    this._next = undefined;');
 
-  // Generate symbol declarations and allocator functions for lazy columns
-  const symbolDeclarations: string[] = [];
-  const allocatorFunctions: string[] = [];
+  // Lazy column storage initialization and allocator methods
+  const lazyStorageInit: string[] = [];
+  const allocatorMethods: string[] = [];
   const getterMethods: string[] = [];
   const setterMethods: string[] = [];
   // Eager column constructor code (allocated immediately, no null bitmap)
   const eagerColumnConstructorCode: string[] = [];
+  // Track which columns are lazy for getColumnIfAllocated
+  const lazyColumnNames: string[] = [];
 
   for (const fieldName of schemaFields) {
     const columnName = fieldName; // User columns have no prefix
     const storageInfo = getTypedArrayInfo(schema, fieldName);
     const { constructorName, bytesPerElement, isBitPacked, isEager } = storageInfo;
 
-    // NOTE: Enum string→index conversion happens in TagWriter (lmao package),
-    // not in the buffer. The buffer receives numeric indices directly.
-    // See generateSetterValueAssignment() for details.
-
     if (isEager) {
       // EAGER column: Allocate in constructor, no null bitmap
-      // Used for columns written on every entry (like message)
-      // NOTE: We do NOT assign `this.${columnName} = this.${columnName}_values` here
-      // because the setter method `${columnName}(pos, val)` needs to be callable.
-      // The _values array is allocated, but access is through the setter method only.
       if (constructorName === 'Array') {
-        // String array for category/text columns
         eagerColumnConstructorCode.push(`    // Eager column: ${columnName} (no null bitmap)`);
-        eagerColumnConstructorCode.push(`    this.${columnName}_values = new Array(alignedCapacity);`);
+        eagerColumnConstructorCode.push(`    this._${columnName}_values = new Array(alignedCapacity);`);
       } else if (isBitPacked) {
-        // Bit-packed boolean
         eagerColumnConstructorCode.push(`    // Eager column: ${columnName} (bit-packed, no null bitmap)`);
         eagerColumnConstructorCode.push(
-          `    this.${columnName}_values = new Uint8Array(Math.ceil(alignedCapacity / 8));`,
+          `    this._${columnName}_values = new Uint8Array((alignedCapacity + 7) >>> 3);`,
         );
       } else {
-        // TypedArray
         eagerColumnConstructorCode.push(`    // Eager column: ${columnName} (no null bitmap)`);
-        eagerColumnConstructorCode.push(`    this.${columnName}_values = new ${constructorName}(alignedCapacity);`);
+        eagerColumnConstructorCode.push(`    this._${columnName}_values = new ${constructorName}(alignedCapacity);`);
       }
-      // Skip symbol/allocator/getter generation for eager columns - they use the setter method directly
+      // Eager columns still need getters to expose _values as values (public API)
+      getterMethods.push(`    get ${columnName}_values() { return this._${columnName}_values; }`);
+      // Skip lazy column setup for eager columns
       continue;
     }
 
-    // LAZY column: Symbol + allocator + getters (existing behavior)
-    // Symbol declaration
-    symbolDeclarations.push(`  const ${columnName}_sym = Symbol('${columnName}');`);
-    symbolDeclarations.push(`  columnSymbols['${columnName}'] = ${columnName}_sym;`);
+    // LAZY column: Initialize storage as undefined, allocate on first access
+    lazyColumnNames.push(columnName);
+    lazyStorageInit.push(`    this._${columnName}_nulls = undefined;`);
+    lazyStorageInit.push(`    this._${columnName}_values = undefined;`);
 
+    // Generate allocator method for this column
     if (isBitPacked) {
-      // Bit-packed boolean allocator: 8 values per byte
-      allocatorFunctions.push(`
-  function allocate_${columnName}(self) {
-    if (self[${columnName}_sym]) return self[${columnName}_sym];
-    const capacity = self._alignedCapacity;
-    const nullBitmapSize = Math.ceil(capacity / 8);
-    const valuesBitmapSize = Math.ceil(capacity / 8);
-    const totalSize = nullBitmapSize + valuesBitmapSize;
-    const buffer = new ArrayBuffer(totalSize);
-    const storage = {
-      buffer: buffer,
-      nulls: new Uint8Array(buffer, 0, nullBitmapSize),
-      values: new Uint8Array(buffer, nullBitmapSize, valuesBitmapSize)
-    };
-    self[${columnName}_sym] = storage;
-    return storage;
-  }`);
+      // Bit-packed boolean: 8 values per byte for both nulls and values
+      allocatorMethods.push(`
+    _allocate_${columnName}() {
+      const cap = this._alignedCapacity;
+      const bitmapSize = (cap + 7) >>> 3;  // Bits to bytes
+      const buf = new ArrayBuffer(bitmapSize + bitmapSize);  // nulls + values
+      this._${columnName}_nulls = new Uint8Array(buf, 0, bitmapSize);
+      this._${columnName}_values = new Uint8Array(buf, bitmapSize, bitmapSize);
+    }`);
     } else if (constructorName === 'Array') {
-      // String array allocator for category/text columns
-      // No ArrayBuffer needed - just JavaScript array
-      allocatorFunctions.push(`
-  function allocate_${columnName}(self) {
-    if (self[${columnName}_sym]) return self[${columnName}_sym];
-    const capacity = self._alignedCapacity;
-    const nullBitmapSize = Math.ceil(capacity / 8);
-    const nullBuffer = new ArrayBuffer(nullBitmapSize);
-    const storage = {
-      buffer: nullBuffer,
-      nulls: new Uint8Array(nullBuffer, 0, nullBitmapSize),
-      values: new Array(capacity)
-    };
-    self[${columnName}_sym] = storage;
-    return storage;
-  }`);
+      // String array: nulls is Uint8Array, values is JS Array
+      allocatorMethods.push(`
+    _allocate_${columnName}() {
+      const cap = this._alignedCapacity;
+      const nullSize = (cap + 7) >>> 3;
+      this._${columnName}_nulls = new Uint8Array(nullSize);
+      this._${columnName}_values = new Array(cap);
+    }`);
     } else {
-      // Regular TypedArray allocator: one element per array slot
-      allocatorFunctions.push(`
-  function allocate_${columnName}(self) {
-    if (self[${columnName}_sym]) return self[${columnName}_sym];
-    const capacity = self._alignedCapacity;
-    const nullBitmapSize = Math.ceil(capacity / 8);
-    const alignedNullOffset = Math.ceil(nullBitmapSize / ${bytesPerElement}) * ${bytesPerElement};
-    const totalSize = alignedNullOffset + capacity * ${bytesPerElement};
-    const buffer = new ArrayBuffer(totalSize);
-    const storage = {
-      buffer: buffer,
-      nulls: new Uint8Array(buffer, 0, nullBitmapSize),
-      values: new ${constructorName}(buffer, alignedNullOffset, capacity)
-    };
-    self[${columnName}_sym] = storage;
-    return storage;
-  }`);
+      // TypedArray: shared ArrayBuffer with aligned offset
+      // Layout: [null bitmap | padding | values]
+      allocatorMethods.push(`
+    _allocate_${columnName}() {
+      const cap = this._alignedCapacity;
+      const nullSize = (cap + 7) >>> 3;  // Bits to bytes
+      // Align values offset to element size (${bytesPerElement} bytes)
+      const alignedOffset = ((nullSize + ${bytesPerElement - 1}) >>> ${Math.log2(bytesPerElement)}) << ${Math.log2(bytesPerElement)};
+      const buf = new ArrayBuffer(alignedOffset + cap * ${bytesPerElement});
+      this._${columnName}_nulls = new Uint8Array(buf, 0, nullSize);
+      this._${columnName}_values = new ${constructorName}(buf, alignedOffset, cap);
+    }`);
     }
 
-    // Getter methods (native class getter syntax)
-    // NOTE: We only define ${columnName}_nulls and ${columnName}_values, NOT ${columnName}
-    // because the ${columnName}(pos, val) setter method uses that name.
-    getterMethods.push(`    get ${columnName}_nulls() { return allocate_${columnName}(this).nulls; }`);
-    getterMethods.push(`    get ${columnName}_values() { return allocate_${columnName}(this).values; }`);
+    // Getters trigger allocation on first access
+    getterMethods.push(`    get ${columnName}_nulls() {
+      let v = this._${columnName}_nulls;
+      if (v === undefined) {
+        this._allocate_${columnName}();
+        v = this._${columnName}_nulls;
+      }
+      return v;
+    }`);
+    getterMethods.push(`    get ${columnName}_values() {
+      let v = this._${columnName}_values;
+      if (v === undefined) {
+        this._allocate_${columnName}();
+        v = this._${columnName}_values;
+      }
+      return v;
+    }`);
   }
 
-  // Re-iterate for setter methods (need to check eager status again)
+  // Re-iterate for setter methods
   for (const fieldName of schemaFields) {
     const columnName = fieldName;
     const storageInfo = getTypedArrayInfo(schema, fieldName);
@@ -415,18 +386,18 @@ export function generateColumnBufferClass(
 
     if (isEager) {
       // EAGER column setter: Direct property access, no allocator, no null bit
-      const valueAssignment = generateSetterValueAssignmentEager(storageInfo, columnName);
+      const valueAssignment = generateSetterValueAssignment(storageInfo, columnName, `this._${columnName}`);
       setterMethods.push(`    ${columnName}(pos, val) {
       ${valueAssignment}
       return this;
     }`);
     } else {
-      // LAZY column setter: Allocates column lazily on first write, sets value and null bit
-      const valueAssignment = generateSetterValueAssignment(storageInfo, columnName);
-      const nullBitSetting = generateNullBitSetting();
+      // LAZY column setter: Trigger allocation via getter, set value and null bit
+      // Access via getter ensures allocation happens first
+      const valueAssignment = generateSetterValueAssignment(storageInfo, columnName, `this.${columnName}`);
+      const nullBitSetting = generateNullBitSetting(`this.${columnName}`);
 
       setterMethods.push(`    ${columnName}(pos, val) {
-      const storage = allocate_${columnName}(this);
       ${valueAssignment}
       ${nullBitSetting}
       return this;
@@ -439,7 +410,14 @@ export function generateColumnBufferClass(
     ? `requestedCapacity, ${extension.constructorParams}`
     : 'requestedCapacity';
 
-  // Add eager column initialization (before extension code)
+  // Add lazy column storage initialization
+  if (lazyStorageInit.length > 0) {
+    constructorCode.push('');
+    constructorCode.push('    // Lazy column storage (undefined until first access)');
+    constructorCode.push(...lazyStorageInit);
+  }
+
+  // Add eager column initialization
   if (eagerColumnConstructorCode.length > 0) {
     constructorCode.push('');
     constructorCode.push(...eagerColumnConstructorCode);
@@ -449,7 +427,6 @@ export function generateColumnBufferClass(
   if (extension?.constructorCode) {
     constructorCode.push('');
     constructorCode.push('    // Extension constructor code');
-    // Indent extension code properly (each line gets 4 spaces)
     const extensionLines = extension.constructorCode
       .trim()
       .split('\n')
@@ -471,23 +448,15 @@ ${extension.methods
   // Build preamble if provided
   const preambleCode = extension?.preamble ? `\n  // Extension preamble\n${extension.preamble}\n` : '';
 
-  // NOTE: Enum maps are no longer generated here.
-  // Enum string→index conversion happens in TagWriter (lmao package).
+  // Generate lazy column names array for runtime inspection
+  const lazyColumnNamesLiteral = JSON.stringify(lazyColumnNames);
 
   // Generate the complete class code
-  // Note: 'helpers' is injected by getColumnBufferClass() via new Function('helpers', code)
-  // The generated code is NOT an IIFE - it's the body of a function that receives helpers
   const classCode = `
   'use strict';
 
-  // Symbol registry for lazy column allocation checking
-  const columnSymbols = {};
-
-  // Symbol declarations for each lazy column
-${symbolDeclarations.join('\n')}
-
-  // Allocator functions for lazy columns
-${allocatorFunctions.join('\n')}
+  // Lazy column names for runtime inspection
+  const lazyColumnNames = ${lazyColumnNamesLiteral};
 ${preambleCode}
   class ${className} {
     constructor(${constructorSignature}) {
@@ -496,21 +465,23 @@ ${constructorCode.join('\n')}
 
     // Get column values if already allocated, without triggering allocation
     getColumnIfAllocated(columnName) {
-      const sym = columnSymbols[columnName];
-      return sym ? this[sym]?.values : undefined;
+      const key = '_' + columnName + '_values';
+      return this[key];
     }
 
     // Get column nulls bitmap if already allocated, without triggering allocation
     getNullsIfAllocated(columnName) {
-      const sym = columnSymbols[columnName];
-      return sym ? this[sym]?.nulls : undefined;
+      const key = '_' + columnName + '_nulls';
+      return this[key];
     }
 
-    // Lazy column getters
+    // Column allocator methods (lazy columns only)
+${allocatorMethods.join('\n')}
+
+    // Lazy column getters (trigger allocation on first access)
 ${getterMethods.join('\n')}
 
     // Column setter methods: buffer.column(position, value) => this
-    // Each setter allocates the column lazily on first write
 ${setterMethods.join('\n')}
 ${extensionMethods}
   }
