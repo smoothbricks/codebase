@@ -1,4 +1,5 @@
 import { execSync } from 'child_process';
+import * as fs from 'fs';
 import path from 'path';
 import ts from 'typescript';
 
@@ -90,10 +91,53 @@ function deriveModuleName(filePath: string): string {
 }
 
 /**
- * Get the relative path from project root.
+ * Find the nearest package.json by walking up from a file path.
+ * Returns { packageName, packageDir } or undefined if not found.
  */
-function getRelativePath(filePath: string, projectRoot: string): string {
-  return path.relative(projectRoot, filePath);
+function findNearestPackage(filePath: string): { packageName: string; packageDir: string } | undefined {
+  let currentDir = path.dirname(filePath);
+  const root = path.parse(currentDir).root;
+
+  while (currentDir !== root) {
+    const packageJsonPath = path.join(currentDir, 'package.json');
+    try {
+      const content = fs.readFileSync(packageJsonPath, 'utf-8');
+      const pkg = JSON.parse(content);
+      if (pkg.name) {
+        return { packageName: pkg.name, packageDir: currentDir };
+      }
+    } catch {
+      // package.json doesn't exist or is invalid, keep walking up
+    }
+    currentDir = path.dirname(currentDir);
+  }
+  return undefined;
+}
+
+/**
+ * Derive the module identifier from a file path.
+ * Format: @scope/package-name/path/to/file (without extension)
+ *
+ * Example:
+ *   filePath: /project/packages/lmao-transformer/examples/demo-source.ts
+ *   packageName: @smoothbricks/lmao-transformer
+ *   packageDir: /project/packages/lmao-transformer
+ *   Result: @smoothbricks/lmao-transformer/examples/demo-source
+ */
+function deriveModuleId(filePath: string): string {
+  const packageInfo = findNearestPackage(filePath);
+  if (!packageInfo) {
+    // Fallback to just the filename without extension
+    return path.basename(filePath, path.extname(filePath));
+  }
+
+  const { packageName, packageDir } = packageInfo;
+  const relativePath = path.relative(packageDir, filePath);
+  // Remove extension and normalize path separators
+  const withoutExt = relativePath.replace(/\.[^.]+$/, '');
+  const normalized = withoutExt.split(path.sep).join('/');
+
+  return `${packageName}/${normalized}`;
 }
 
 /**
@@ -163,18 +207,16 @@ function tryTransformCreateModuleContextCall(
   }
 
   const absoluteFilePath = sourceFile.fileName;
-  const relativeFilePath = getRelativePath(absoluteFilePath, projectRoot);
+  const moduleId = deriveModuleId(absoluteFilePath);
   const gitSha = getLastGitCommit(absoluteFilePath);
   const moduleName = deriveModuleName(absoluteFilePath);
 
   // Create the moduleMetadata object literal
+  // filePath is the module identifier (package-name/path/to/file)
   const moduleMetadataObject = factory.createObjectLiteralExpression(
     [
       factory.createPropertyAssignment(factory.createIdentifier('gitSha'), factory.createStringLiteral(gitSha)),
-      factory.createPropertyAssignment(
-        factory.createIdentifier('filePath'),
-        factory.createStringLiteral(relativeFilePath),
-      ),
+      factory.createPropertyAssignment(factory.createIdentifier('filePath'), factory.createStringLiteral(moduleId)),
       factory.createPropertyAssignment(factory.createIdentifier('moduleName'), factory.createStringLiteral(moduleName)),
     ],
     true, // multiLine
@@ -242,6 +284,12 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
         const spanTransformed = tryTransformSpanCall(node, sourceFile, factory, typeChecker);
         if (spanTransformed) {
           return ts.visitEachChild(spanTransformed, visitor, context);
+        }
+
+        // Check for task('name', fn) pattern (from module context)
+        const taskTransformed = tryTransformTaskCall(node, sourceFile, factory);
+        if (taskTransformed) {
+          return ts.visitEachChild(taskTransformed, visitor, context);
         }
 
         // Check for ctx.log.{method}() pattern - only at the TOP of a chain
@@ -361,6 +409,56 @@ function tryTransformSpanCall(
     if (!isLmaoContextType(receiverType, typeChecker)) {
       return null;
     }
+  }
+
+  const lineNumber = getLineNumber(node, sourceFile);
+
+  return factory.updateCallExpression(node, node.expression, node.typeArguments, [
+    ...node.arguments,
+    factory.createNumericLiteral(lineNumber),
+  ]);
+}
+
+/**
+ * Try to transform a task('name', fn) call to task('name', fn, lineNumber).
+ *
+ * This handles both:
+ * - module.task('name', fn) - property access pattern
+ * - task('name', fn) - destructured pattern: const { task } = createModuleContext(...)
+ *
+ * The line number is the definition location of the task.
+ */
+function tryTransformTaskCall(
+  node: ts.CallExpression,
+  sourceFile: ts.SourceFile,
+  factory: ts.NodeFactory,
+): ts.CallExpression | null {
+  const expr = node.expression;
+
+  // Check for either:
+  // 1. Property access: something.task(...)
+  // 2. Direct identifier: task(...)
+  let isTaskCall = false;
+
+  if (ts.isPropertyAccessExpression(expr)) {
+    isTaskCall = expr.name.text === 'task';
+  } else if (ts.isIdentifier(expr)) {
+    isTaskCall = expr.text === 'task';
+  }
+
+  if (!isTaskCall) {
+    return null;
+  }
+
+  // Check we have exactly 2 arguments (name, fn) - not already transformed
+  if (node.arguments.length !== 2) {
+    return null;
+  }
+
+  // First argument should be a string literal (task name)
+  const firstArg = node.arguments[0];
+  if (!ts.isStringLiteral(firstArg)) {
+    return null;
   }
 
   const lineNumber = getLineNumber(node, sourceFile);

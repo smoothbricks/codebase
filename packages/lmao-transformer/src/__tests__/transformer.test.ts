@@ -343,4 +343,64 @@ return ctx.ok({ done: true });`;
       expect(output).toContain('gitSha:');
     });
   });
+
+  describe('task() transformation', () => {
+    it('should add line number to task() calls with 2 arguments', () => {
+      const input = `module.task('processOrder', async (ctx) => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("module.task('processOrder', async (ctx) => { }, 1)");
+    });
+
+    it('should not transform if line argument already provided', () => {
+      const input = `module.task('processOrder', async (ctx) => {}, 99);`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("module.task('processOrder', async (ctx) => { }, 99)");
+      expect(normalize(output)).not.toContain(', 1)');
+    });
+
+    it('should handle multi-line task definitions', () => {
+      const input = `const x = 1;
+module.task('first', async (ctx) => {});
+const y = 2;
+module.task('second', async (ctx) => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("module.task('first', async (ctx) => { }, 2)");
+      expect(normalize(output)).toContain("module.task('second', async (ctx) => { }, 4)");
+    });
+
+    it('should handle exported task definitions', () => {
+      const input = `export const processOrder = module.task('processOrder', async (ctx) => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("module.task('processOrder', async (ctx) => { }, 1)");
+    });
+
+    it('should not transform non-task property accesses', () => {
+      const input = `module.notTask('test', async () => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("module.notTask('test', async () => { })");
+      expect(normalize(output)).not.toContain(', 1)');
+    });
+
+    it('should not transform task calls with non-string first argument', () => {
+      const input = 'module.task(getName(), async () => {});';
+      const output = transform(input);
+      // Should not add line number since first arg is not a string literal
+      expect(normalize(output)).toContain('module.task(getName(), async () => { })');
+    });
+
+    it('should handle destructured task() direct calls', () => {
+      // const { task } = createModuleContext(...); task('name', fn)
+      const input = `const processData = task('process-data', async (ctx) => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("task('process-data', async (ctx) => { }, 1)");
+    });
+
+    it('should handle destructured task() with correct line number', () => {
+      const input = `const x = 1;
+const y = 2;
+const myTask = task('my-task', async (ctx) => {});`;
+      const output = transform(input);
+      expect(normalize(output)).toContain("task('my-task', async (ctx) => { }, 3)");
+    });
+  });
 });

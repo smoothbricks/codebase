@@ -770,6 +770,7 @@ export interface ModuleContextBuilder<
   task<Args extends unknown[], Result>(
     name: string,
     fn: TaskFunction<Args, Result, T, FF, Env>,
+    line?: number,
   ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
 
   /**
@@ -1193,13 +1194,14 @@ export function createModuleContext<
     task<Args extends unknown[], Result>(
       name: string,
       fn: TaskFunction<Args, Result, T, FF, Env>,
+      line?: number,
     ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result> {
       return async (requestCtx: RequestContext<FF, Env>, ...args: Args): Promise<Result> => {
         // Create task context with string-interned label (span name)
         const taskContext = new TaskContext(
           moduleContext,
           labelInterner.intern(name),
-          0, // lineNumber would be set by code generation
+          line ?? 0, // lineNumber from transformer injection
         );
 
         // Create span buffer with traceId from request context
@@ -1217,6 +1219,11 @@ export function createModuleContext<
         // Write span-start entry (row 0) and pre-initialize span-end (row 1)
         // writeIndex is set to 2 after this call
         writeSpanStart(spanBuffer, name);
+
+        // Write line number to row 0 (span-start) if provided by transformer
+        if (line !== undefined) {
+          spanBuffer.lineNumber(0, line);
+        }
 
         // Inherit scoped values from parent context if available
         // Per specs/01i_span_scope_attributes.md - tasks inherit scoped attributes from calling context
