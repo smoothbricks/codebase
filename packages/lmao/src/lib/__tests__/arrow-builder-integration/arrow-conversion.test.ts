@@ -358,7 +358,6 @@ describe('Arrow Table Conversion', () => {
       expect(fieldNames).toContain('entry_type');
       expect(fieldNames).toContain('package_name');
       expect(fieldNames).toContain('package_path');
-      expect(fieldNames).toContain('span_name');
     });
 
     test('trace_id is preserved', () => {

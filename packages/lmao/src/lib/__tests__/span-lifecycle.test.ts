@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import {
   createModuleContext,
   createRequestContext,
@@ -332,6 +333,194 @@ describe('Child Span Lifecycle', () => {
     const result = await task(requestCtx);
 
     expect(result.success).toBe(true);
+  });
+
+  it('should create child span when task() is called from parent span context', async () => {
+    // This test verifies the bug fix: when moduleContext.task() is called from a parent
+    // SpanContext (has buffer property), it should create a child span, not a root span.
+    const moduleCtx = createModuleContext({
+      moduleMetadata: {
+        gitSha: 'abc123',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
+      },
+      tagAttributes: testSchema,
+    });
+
+    let parentBuffer: SpanBuffer | undefined;
+    let childBuffer: SpanBuffer | undefined;
+
+    const parentTask = moduleCtx.task('parent-task', async (ctx) => {
+      parentBuffer = ctx.buffer;
+
+      // Call child task from parent span context
+      // This should create a child span, not a root span
+      const childResult = await childTask(ctx);
+
+      return ctx.ok(childResult);
+    });
+
+    const childTask = moduleCtx.task('child-task', async (ctx) => {
+      childBuffer = ctx.buffer;
+
+      // Verify child span is linked to parent
+      expect(ctx.buffer.parent).toBeDefined();
+      expect(ctx.buffer.parent).toBe(parentBuffer);
+
+      // Verify child span inherits parent's schema
+      expect(ctx.buffer.task.module.tagAttributes).toBe(parentBuffer?.task.module.tagAttributes);
+
+      // Verify child span has different spanId but same traceId
+      expect(ctx.buffer.spanId).not.toBe(parentBuffer?.spanId);
+      expect(ctx.buffer.traceId).toBe(parentBuffer?.traceId);
+
+      return ctx.ok('child-done');
+    });
+
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const result = await parentTask(requestCtx);
+
+    expect(result.success).toBe(true);
+    expect(parentBuffer).toBeDefined();
+    expect(childBuffer).toBeDefined();
+    expect(childBuffer?.parent).toBe(parentBuffer);
+  });
+
+  it('should create proper parent-child hierarchy in Arrow conversion when task() called from parent', async () => {
+    // This test verifies that when task() is called from a parent span, the resulting
+    // child span appears correctly in Arrow conversion with proper parent_span_id relationships.
+    const moduleCtx = createModuleContext({
+      moduleMetadata: {
+        gitSha: 'abc123',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
+      },
+      tagAttributes: testSchema,
+    });
+
+    let rootBuffer: SpanBuffer | undefined;
+
+    const rootTask = moduleCtx.task('root-task', async (ctx) => {
+      rootBuffer = ctx.buffer;
+      ctx.tag.operation('CREATE');
+
+      // Call child task from root span context
+      await childTask(ctx);
+
+      return ctx.ok('root-done');
+    });
+
+    const childTask = moduleCtx.task('child-task', async (ctx) => {
+      ctx.tag.operation('READ');
+      return ctx.ok('child-done');
+    });
+
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    await rootTask(requestCtx);
+
+    expect(rootBuffer).toBeDefined();
+
+    // Convert to Arrow table to verify parent-child relationships
+    const table = convertSpanTreeToArrowTable(rootBuffer!);
+
+    // Should have at least 4 rows:
+    // - Row 0: root span-start
+    // - Row 1: root span-ok
+    // - Row 2: child span-start
+    // - Row 3: child span-ok
+    expect(table.numRows).toBeGreaterThanOrEqual(4);
+
+    const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+
+    // Find root span-start (entry_type = span-start, package_name matches)
+    // Note: span names are stored in the unified 'message' column, not a separate span_name column
+    const rootSpanStart = rows.find(
+      (r) => r?.entry_type === 'span-start' && r?.package_name === '@test/pkg' && r?.message === 'root-task',
+    );
+    const childSpanStart = rows.find(
+      (r) => r?.entry_type === 'span-start' && r?.package_name === '@test/pkg' && r?.message === 'child-task',
+    );
+
+    expect(rootSpanStart).toBeDefined();
+    expect(childSpanStart).toBeDefined();
+
+    // Root span should have null parent_span_id
+    expect(rootSpanStart?.parent_span_id).toBe(null);
+
+    // Child span should reference root span's span_id
+    expect(childSpanStart?.parent_span_id).toBe(rootSpanStart?.span_id);
+
+    // Both should have same trace_id
+    expect(rootSpanStart?.trace_id).toBe(childSpanStart?.trace_id);
+  });
+
+  it('should inherit parent schema when task() called from parent span', async () => {
+    // This test verifies that child spans created via task() inherit the parent's schema.
+    // When a task from one module is called from a parent span in another module,
+    // the child span should use the parent's schema, not its own module's schema.
+    const sharedSchema = defineTagAttributes({
+      userId: S.category(),
+      requestId: S.category(),
+      operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+    });
+
+    const parentModuleCtx = createModuleContext({
+      moduleMetadata: {
+        gitSha: 'abc123',
+        packageName: '@test/parent',
+        packagePath: '/test/parent.ts',
+      },
+      tagAttributes: sharedSchema,
+    });
+
+    const childModuleCtx = createModuleContext({
+      moduleMetadata: {
+        gitSha: 'abc123',
+        packageName: '@test/child',
+        packagePath: '/test/child.ts',
+      },
+      tagAttributes: sharedSchema, // Same schema - but different module context
+    });
+
+    let parentBuffer: SpanBuffer | undefined;
+    let childBuffer: SpanBuffer | undefined;
+
+    const parentTask = parentModuleCtx.task('parent-task', async (ctx) => {
+      parentBuffer = ctx.buffer;
+      ctx.tag.userId('user123').requestId('req456').operation('CREATE');
+
+      // Call child task from parent span context
+      // Child should inherit parent's schema (from parent buffer), not its own module's schema
+      await childTask(ctx);
+
+      return ctx.ok('parent-done');
+    });
+
+    const childTask = childModuleCtx.task('child-task', async (ctx) => {
+      childBuffer = ctx.buffer;
+
+      // Verify child span inherits parent's schema
+      // Even though childModuleCtx has its own schema, the child buffer should use parent's schema
+      // Note: The child buffer's schema comes from parentBuffer.task.module.tagAttributes
+      // (inherited via createChildSpanBuffer), not from childModuleCtx's schema
+      expect(ctx.buffer.task.module.tagAttributes).toEqual(parentBuffer?.task.module.tagAttributes);
+
+      // Child should be able to access parent's schema fields
+      ctx.tag.userId('user123').operation('READ');
+
+      return ctx.ok('child-done');
+    });
+
+    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    await parentTask(requestCtx);
+
+    expect(parentBuffer).toBeDefined();
+    expect(childBuffer).toBeDefined();
+    expect(childBuffer?.parent).toBe(parentBuffer);
+    // Child buffer's schema should be the same as parent's schema (inherited)
+    // Note: We use toEqual because the schemas are equal but may be different object references
+    // The important thing is that the child buffer can write to parent's schema fields
+    expect(childBuffer?.task.module.tagAttributes).toEqual(parentBuffer?.task.module.tagAttributes);
   });
 });
 

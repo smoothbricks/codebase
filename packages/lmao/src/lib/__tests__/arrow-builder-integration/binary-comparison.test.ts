@@ -321,7 +321,6 @@ describe('Arrow IPC Round-Trip', () => {
       expect(fieldNames).toContain('entry_type');
       expect(fieldNames).toContain('package_name');
       expect(fieldNames).toContain('package_path');
-      expect(fieldNames).toContain('span_name');
 
       // Verify timestamps round-tripped correctly
       // Arrow's getter converts nanoseconds to a decimal, so access raw BigInt64Array
@@ -360,7 +359,6 @@ describe('Arrow IPC Round-Trip', () => {
         'entry_type',
         'package_name',
         'package_path',
-        'span_name',
       ];
       for (const colName of nonNullableColumns) {
         const field = table.schema.fields.find((f) => f.name === colName);
