@@ -12,7 +12,7 @@
  * - Null bitmaps MUST use Arrow format (1=valid, 0=null)
  */
 
-import { beforeEach, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 import * as arrow from 'apache-arrow';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { ENTRY_TYPE_SPAN_START } from '../../lmao.js';

@@ -119,7 +119,8 @@ export type Result<V, E = unknown> = SuccessResult<V> | ErrorResult<E>;
 class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessResult<V> {
   readonly success = true as const;
   readonly value: V;
-  private _writer: ResultWriter<T>;
+  /** @internal - hidden from console.log via custom inspect */
+  #writer: ResultWriter<T>;
 
   constructor(buffer: SpanBuffer<T>, value: V, schema: T) {
     this.value = value;
@@ -132,9 +133,19 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
     // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)
-    this._writer = createResultWriter(schema, buffer as unknown as SpanBuffer, value, false);
+    this.#writer = createResultWriter(schema, buffer as unknown as SpanBuffer, value, false);
 
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
+  }
+
+  /** Clean output for console.log in Node.js */
+  [Symbol.for('nodejs.util.inspect.custom')](): { success: true; value: V } {
+    return { success: this.success, value: this.value };
+  }
+
+  /** Clean output for JSON.stringify */
+  toJSON(): { success: true; value: V } {
+    return { success: this.success, value: this.value };
   }
 
   /**
@@ -142,7 +153,7 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    * Example: ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
    */
   with(attributes: Partial<InferTagAttributes<T>>): this {
-    this._writer.with(attributes);
+    this.#writer.with(attributes);
     return this;
   }
 
@@ -153,7 +164,7 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
   message(text: string): this {
     // Use the unified message column via the writer's message setter
     // ResultWriter generates a message() method from the systemSchema
-    const writer = this._writer as ResultWriter<T, V, never> & { message?: (v: string) => unknown };
+    const writer = this.#writer as ResultWriter<T, V, never> & { message?: (v: string) => unknown };
     if (typeof writer.message === 'function') {
       writer.message(text);
     }
@@ -166,7 +177,7 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
    */
   line(lineNumber: number): this {
     // Use the writer's setter if available, otherwise fallback
-    const writer = this._writer as ResultWriter<T, V, never> & { lineNumber?: (v: number) => unknown };
+    const writer = this.#writer as ResultWriter<T, V, never> & { lineNumber?: (v: number) => unknown };
     if (typeof writer.lineNumber === 'function') {
       writer.lineNumber(lineNumber);
     }
@@ -183,7 +194,8 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
 class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<E> {
   readonly success = false as const;
   readonly error: { code: string; details: E };
-  private _writer: ResultWriter<T>;
+  /** @internal - hidden from console.log via custom inspect */
+  #writer: ResultWriter<T>;
 
   constructor(buffer: SpanBuffer<T>, code: string, details: E, schema: T) {
     this.error = { code, details };
@@ -196,10 +208,10 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
     // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)
-    this._writer = createResultWriter(schema, buffer as unknown as SpanBuffer, details, true);
+    this.#writer = createResultWriter(schema, buffer as unknown as SpanBuffer, details, true);
 
     // Write error code using the writer if available
-    const writer = this._writer as ResultWriter<T, never, E> & { errorCode?: (v: string) => unknown };
+    const writer = this.#writer as ResultWriter<T, never, E> & { errorCode?: (v: string) => unknown };
     if (typeof writer.errorCode === 'function') {
       writer.errorCode(code);
     }
@@ -207,12 +219,22 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
   }
 
+  /** Clean output for console.log in Node.js */
+  [Symbol.for('nodejs.util.inspect.custom')](): { success: false; error: { code: string; details: E } } {
+    return { success: this.success, error: this.error };
+  }
+
+  /** Clean output for JSON.stringify */
+  toJSON(): { success: false; error: { code: string; details: E } } {
+    return { success: this.success, error: this.error };
+  }
+
   /**
    * Set multiple attributes on the result entry
    * Example: ctx.err('ERROR', details).with({ userId: 'u1' })
    */
   with(attributes: Partial<InferTagAttributes<T>>): this {
-    this._writer.with(attributes);
+    this.#writer.with(attributes);
     return this;
   }
 
@@ -223,7 +245,7 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
   message(text: string): this {
     // Use the unified message column via the writer's message setter
     // ResultWriter generates a message() method from the systemSchema
-    const writer = this._writer as ResultWriter<T, never, E> & { message?: (v: string) => unknown };
+    const writer = this.#writer as ResultWriter<T, never, E> & { message?: (v: string) => unknown };
     if (typeof writer.message === 'function') {
       writer.message(text);
     }
@@ -236,7 +258,7 @@ class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<
    */
   line(lineNumber: number): this {
     // Use the writer's setter if available
-    const writer = this._writer as ResultWriter<T, never, E> & { lineNumber?: (v: number) => unknown };
+    const writer = this.#writer as ResultWriter<T, never, E> & { lineNumber?: (v: number) => unknown };
     if (typeof writer.lineNumber === 'function') {
       writer.lineNumber(lineNumber);
     }

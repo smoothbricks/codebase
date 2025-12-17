@@ -218,8 +218,6 @@ describe('createLibraryModule', () => {
         field: S.number(),
       });
 
-      const longName = 'a'.repeat(1000);
-
       const module = createLibraryModule({
         gitSha: 'test',
         packageName: '@test/pkg',
