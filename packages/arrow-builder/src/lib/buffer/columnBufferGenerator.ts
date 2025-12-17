@@ -228,6 +228,40 @@ function generateNullBitSetting(accessPrefix: string): string {
 }
 
 /**
+ * Generate the null bit clearing code (mark value as null).
+ *
+ * Arrow format: null bitmap uses 1 = valid (not null), 0 = null
+ * This clears the bit to 0 (marking the value as null).
+ *
+ * For lazy columns, we need to trigger allocation first by accessing the getter.
+ */
+function generateNullBitClearing(accessPrefix: string, _isBitPacked: boolean): string {
+  // Access the getter to trigger allocation, then clear the bit
+  return `${accessPrefix}_nulls[pos >>> 3] &= ~(1 << (pos & 7));`;
+}
+
+/**
+ * Get the default value literal for an eager column when null is passed.
+ *
+ * Since eager columns have no null bitmap, we write a default value.
+ * This means consumers cannot distinguish between "explicitly set to 0" vs "null".
+ */
+function getDefaultValueLiteral(info: ColumnStorageInfo): string {
+  const { schemaType, isBitPacked } = info;
+
+  if (isBitPacked || schemaType === 'boolean') {
+    return 'false'; // Boolean default
+  }
+  if (schemaType === 'enum' || schemaType === 'number') {
+    return '0'; // Numeric default
+  }
+  if (schemaType === 'category' || schemaType === 'text') {
+    return "''"; // Empty string default
+  }
+  return '0'; // Fallback
+}
+
+/**
  * Generate ColumnBuffer class code as a string
  *
  * Creates a concrete class with:
@@ -382,24 +416,34 @@ export function generateColumnBufferClass(
   for (const fieldName of schemaFields) {
     const columnName = fieldName;
     const storageInfo = getTypedArrayInfo(schema, fieldName);
-    const { isEager } = storageInfo;
+    const { isEager, isBitPacked } = storageInfo;
 
     if (isEager) {
-      // EAGER column setter: Direct property access, no allocator, no null bit
+      // EAGER column setter: Direct property access, no null bitmap
+      // Null values write default (0, '', false) - no way to distinguish from actual 0/''
       const valueAssignment = generateSetterValueAssignment(storageInfo, columnName, `this._${columnName}`);
+      const defaultValue = getDefaultValueLiteral(storageInfo);
+
       setterMethods.push(`    ${columnName}(pos, val) {
+      if (val == null) val = ${defaultValue};
       ${valueAssignment}
       return this;
     }`);
     } else {
-      // LAZY column setter: Trigger allocation via getter, set value and null bit
-      // Access via getter ensures allocation happens first
+      // LAZY column setter: Handle null values properly
+      // - null/undefined: allocate column, clear null bit (mark as null)
+      // - valid value: allocate column, set null bit, write value
       const valueAssignment = generateSetterValueAssignment(storageInfo, columnName, `this.${columnName}`);
       const nullBitSetting = generateNullBitSetting(`this.${columnName}`);
+      const nullBitClearing = generateNullBitClearing(`this.${columnName}`, isBitPacked);
 
       setterMethods.push(`    ${columnName}(pos, val) {
-      ${valueAssignment}
-      ${nullBitSetting}
+      if (val == null) {
+        ${nullBitClearing}
+      } else {
+        ${valueAssignment}
+        ${nullBitSetting}
+      }
       return this;
     }`);
     }

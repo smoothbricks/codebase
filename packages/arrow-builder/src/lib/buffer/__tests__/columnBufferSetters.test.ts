@@ -248,3 +248,97 @@ describe('Eager column support (__eager: true)', () => {
     expect(values[0] & 0b101).toBe(0b101); // bits 0 and 2 set
   });
 });
+
+describe('Null value support in setters', () => {
+  test('lazy column setter handles null by clearing null bit', () => {
+    const schema = {
+      userId: S.category(),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 10);
+
+    // Write a value first
+    buffer.userId(0, 'user-123');
+
+    // Check null bit is set (value is valid)
+    const nulls = buffer.userId_nulls;
+    expect(nulls[0] & 1).toBe(1); // bit 0 should be set
+
+    // Now write null to mark as null
+    buffer.userId(0, null as unknown as string);
+
+    // Check null bit is cleared (value is null)
+    expect(nulls[0] & 1).toBe(0); // bit 0 should be cleared
+  });
+
+  test('lazy column setter handles undefined by clearing null bit', () => {
+    const schema = {
+      count: S.number(),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 10);
+
+    // Write a value first
+    buffer.count(0, 42);
+    buffer.count(1, 100);
+
+    // Check null bits are set
+    const nulls = buffer.count_nulls;
+    expect(nulls[0] & 0b11).toBe(0b11); // bits 0 and 1 should be set
+
+    // Write undefined to position 0
+    buffer.count(0, undefined as unknown as number);
+
+    // Check bit 0 is cleared, bit 1 still set
+    expect(nulls[0] & 0b11).toBe(0b10); // bit 0 cleared, bit 1 set
+  });
+
+  test('eager column setter writes default value for null', () => {
+    const schema = {
+      message: S.text().eager(),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 10);
+
+    // Write a real value
+    buffer.message(0, 'hello');
+    expect(buffer.message_values[0]).toBe('hello');
+
+    // Write null - should write empty string (default)
+    buffer.message(0, null as unknown as string);
+    expect(buffer.message_values[0]).toBe('');
+  });
+
+  test('eager number column setter writes 0 for null', () => {
+    const schema = {
+      count: S.number().eager(),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 10);
+
+    // Write a real value
+    buffer.count(0, 42);
+    expect(buffer.count_values[0]).toBe(42);
+
+    // Write null - should write 0 (default)
+    buffer.count(0, null as unknown as number);
+    expect(buffer.count_values[0]).toBe(0);
+  });
+
+  test('lazy enum column handles null correctly', () => {
+    const schema = {
+      status: S.enum(['PENDING', 'ACTIVE', 'DONE']),
+    };
+
+    const buffer = createGeneratedColumnBuffer(schema, 10);
+
+    // Write a value
+    buffer.status(0, 1); // ACTIVE index
+    expect(buffer.status_nulls[0] & 1).toBe(1);
+    expect(buffer.status_values[0]).toBe(1);
+
+    // Write null
+    buffer.status(0, null as unknown as number);
+    expect(buffer.status_nulls[0] & 1).toBe(0); // null bit cleared
+  });
+});
