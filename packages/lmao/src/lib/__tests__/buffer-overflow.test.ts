@@ -39,8 +39,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -79,8 +79,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -114,8 +114,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -149,8 +149,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -184,8 +184,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -222,8 +222,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -263,8 +263,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -303,8 +303,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -335,8 +335,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -386,8 +386,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -435,8 +435,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -473,8 +473,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -510,8 +510,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -554,8 +554,8 @@ describe('Buffer Overflow and Capacity Management', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });

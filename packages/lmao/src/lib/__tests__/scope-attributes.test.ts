@@ -42,8 +42,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });
@@ -77,8 +77,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });
@@ -117,8 +117,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });
@@ -167,8 +167,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });
@@ -212,8 +212,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });
@@ -261,8 +261,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });
@@ -321,8 +321,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });
@@ -359,8 +359,8 @@ describe('Span Scope Attributes', () => {
       const module = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         tagAttributes: schema,
       });

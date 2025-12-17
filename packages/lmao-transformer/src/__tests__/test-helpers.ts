@@ -13,13 +13,15 @@ export function createTestModuleContext(
   options: {
     moduleId?: number;
     gitSha?: string;
-    filePath?: string;
+    packageName?: string;
+    packagePath?: string;
   } = {},
 ): ModuleContext {
   return new ModuleContext(
     options.moduleId ?? 1,
     options.gitSha ?? 'test-sha',
-    options.filePath ?? 'test.ts',
+    options.packageName ?? '@test/package',
+    options.packagePath ?? 'src/test.ts',
     tagAttributes,
   );
 }
@@ -32,11 +34,12 @@ export function createTestTaskContext(
   options: {
     moduleId?: number;
     gitSha?: string;
-    filePath?: string;
-    spanNameId?: number;
+    packageName?: string;
+    packagePath?: string;
+    spanName?: string;
     lineNumber?: number;
   } = {},
 ): TaskContext {
   const moduleContext = createTestModuleContext(tagAttributes, options);
-  return new TaskContext(moduleContext, options.spanNameId ?? 1, options.lineNumber ?? 0);
+  return new TaskContext(moduleContext, options.spanName ?? 'test-span', options.lineNumber ?? 0);
 }

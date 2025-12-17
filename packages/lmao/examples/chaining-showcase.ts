@@ -49,8 +49,8 @@ const flagEvaluator = new InMemoryFlagEvaluator({
 const { task } = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123def456',
-    filePath: 'src/services/order.ts',
-    moduleName: 'OrderService',
+    packageName: '@example/order-service',
+    packagePath: 'src/services/order.ts',
   },
   tagAttributes: orderAttributes,
 });

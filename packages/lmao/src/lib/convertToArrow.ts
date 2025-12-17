@@ -10,13 +10,18 @@
 
 import {
   clearBitRange,
+  compareStrings,
   countNulls,
+  createSortedDictionary,
   DictionaryBuilder,
   type FinalizedDictionary,
   getMaskTransform,
+  type PreEncodedEntry,
+  sortInPlace,
 } from '@smoothbricks/arrow-builder';
 import * as arrow from 'apache-arrow';
 import { ENTRY_TYPE_NAMES } from './lmao.js';
+import type { ModuleContext } from './moduleContext.js';
 import { getEnumUtf8, getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
 import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
@@ -294,7 +299,12 @@ function convertBuffersToRecordBatch(
     fields.push(
       arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8()) }),
     );
-    fields.push(arrow.Field.new({ name: 'module', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
+    fields.push(
+      arrow.Field.new({ name: 'package_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
+    );
+    fields.push(
+      arrow.Field.new({ name: 'package_path', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
+    );
     fields.push(arrow.Field.new({ name: 'git_sha', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }));
     fields.push(
       arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()) }),
@@ -710,28 +720,28 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
     ),
   );
 
-  // Module - using direct string access via buf.task.module.filePath
-  const moduleNameSet = new Set<string>();
-  for (const buf of buffers) moduleNameSet.add(buf.task.module.filePath);
-  const moduleNameArray = Array.from(moduleNameSet);
-  const moduleNameMap = new Map(moduleNameArray.map((name, idx) => [name, idx]));
+  // Package - using direct string access via buf.task.module.packageName
+  const packageSet = new Set<string>();
+  for (const buf of buffers) packageSet.add(buf.task.module.packageName);
+  const packageArray = Array.from(packageSet);
+  const packageMap = new Map(packageArray.map((name, idx) => [name, idx]));
 
-  const moduleIndices = new Int32Array(totalRows);
+  const packageIndices = new Int32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const moduleIndex = moduleNameMap.get(buf.task.module.filePath)!;
+    const packageIndex = packageMap.get(buf.task.module.packageName)!;
     // Use fill() - constant value per buffer
-    moduleIndices.fill(moduleIndex, rowOffset, rowOffset + buf.writeIndex);
+    packageIndices.fill(packageIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
 
-  const moduleDictData = arrow.makeData({
+  const packageDictData = arrow.makeData({
     type: new arrow.Utf8(),
     offset: 0,
-    length: moduleNameArray.length,
+    length: packageArray.length,
     nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(moduleNameArray),
-    data: encodeUtf8Strings(moduleNameArray),
+    valueOffsets: calculateUtf8Offsets(packageArray),
+    data: encodeUtf8Strings(packageArray),
   });
   vectors.push(
     arrow.makeVector(
@@ -740,8 +750,44 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: arrow.Vector[
         offset: 0,
         length: totalRows,
         nullCount: 0,
-        data: moduleIndices,
-        dictionary: arrow.makeVector(moduleDictData),
+        data: packageIndices,
+        dictionary: arrow.makeVector(packageDictData),
+      }),
+    ),
+  );
+
+  // Module Path - using direct string access via buf.task.module.packagePath
+  const modulePathSet = new Set<string>();
+  for (const buf of buffers) modulePathSet.add(buf.task.module.packagePath);
+  const modulePathArray = Array.from(modulePathSet);
+  const modulePathMap = new Map(modulePathArray.map((name, idx) => [name, idx]));
+
+  const packagePathIndices = new Int32Array(totalRows);
+  rowOffset = 0;
+  for (const buf of buffers) {
+    const modulePathIndex = modulePathMap.get(buf.task.module.packagePath)!;
+    // Use fill() - constant value per buffer
+    packagePathIndices.fill(modulePathIndex, rowOffset, rowOffset + buf.writeIndex);
+    rowOffset += buf.writeIndex;
+  }
+
+  const packagePathDictData = arrow.makeData({
+    type: new arrow.Utf8(),
+    offset: 0,
+    length: modulePathArray.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(modulePathArray),
+    data: encodeUtf8Strings(modulePathArray),
+  });
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32()),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: packagePathIndices,
+        dictionary: arrow.makeVector(packagePathDictData),
       }),
     ),
   );
@@ -875,22 +921,23 @@ export function convertSpanTreeToArrowTable(
     }
   }
 
-  // System column dictionaries - use DictionaryBuilder with globalUtf8Cache
+  // System column dictionaries
+  // For traceId and spanName, use DictionaryBuilder (values not pre-encoded)
   const traceIdBuilder = new DictionaryBuilder(globalUtf8Cache);
-  const moduleBuilder = new DictionaryBuilder(globalUtf8Cache);
-  const gitShaBuilder = new DictionaryBuilder(globalUtf8Cache);
   const spanNameBuilder = new DictionaryBuilder(globalUtf8Cache);
+
+  // For package, modulePath, gitSha - collect pre-encoded entries for direct dictionary creation
+  // Use a Set to deduplicate by ModuleContext identity (same module = same entries)
+  const uniqueModules = new Set<ModuleContext>();
 
   let totalRows = 0;
   walkSpanTree(rootBuffer, (buffer) => {
     totalRows += buffer.writeIndex;
     traceIdBuilder.add(buffer.traceId);
-
-    // Add module, git SHA and span name to their shared dictionaries
-    // Using direct string access via buf.task.module.filePath and buf.task.spanName
-    moduleBuilder.add(buffer.task.module.filePath);
-    gitShaBuilder.add(buffer.task.module.gitSha);
     spanNameBuilder.add(buffer.task.spanName);
+
+    // Collect unique ModuleContexts (already have pre-encoded entries)
+    uniqueModules.add(buffer.task.module);
 
     for (const [fieldName, builder] of categoryBuilders) {
       const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
@@ -935,8 +982,25 @@ export function convertSpanTreeToArrowTable(
 
   // Finalize dictionaries
   const traceIdDict = traceIdBuilder.finalize(false);
-  const moduleDict = moduleBuilder.finalize(true); // sorted
-  const gitShaDict = gitShaBuilder.finalize(true); // sorted
+
+  // Build dictionaries from pre-encoded ModuleContext entries
+  // Preallocate arrays, single iteration of set
+  const moduleCount = uniqueModules.size;
+  const packageEntries: PreEncodedEntry[] = new Array(moduleCount);
+  const packagePathEntries: PreEncodedEntry[] = new Array(moduleCount);
+  const gitShaEntries: PreEncodedEntry[] = new Array(moduleCount);
+  let idx = 0;
+  for (const m of uniqueModules) {
+    packageEntries[idx] = m.packageEntry;
+    packagePathEntries[idx] = m.packagePathEntry;
+    gitShaEntries[idx] = m.gitShaEntry;
+    idx++;
+  }
+
+  const cmp = (a: PreEncodedEntry, b: PreEncodedEntry) => compareStrings(a.str, b.str);
+  const packageDict = createSortedDictionary(sortInPlace(packageEntries, cmp));
+  const packagePathDict = createSortedDictionary(sortInPlace(packagePathEntries, cmp));
+  const gitShaDict = createSortedDictionary(sortInPlace(gitShaEntries, cmp));
   const spanNameDict = spanNameBuilder.finalize(true); // sorted
   const categoryDicts = new Map<string, FinalizedDictionary>();
   const textDicts = new Map<string, FinalizedDictionary>();
@@ -967,17 +1031,20 @@ export function convertSpanTreeToArrowTable(
     arrow.Field.new({ name: 'entry_type', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int8(), 1) }),
   );
   arrowFields.push(
-    arrow.Field.new({ name: 'module', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 2) }),
+    arrow.Field.new({ name: 'package_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 2) }),
   );
   arrowFields.push(
-    arrow.Field.new({ name: 'git_sha', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 3) }),
+    arrow.Field.new({ name: 'package_path', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 3) }),
   );
   arrowFields.push(
-    arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 4) }),
+    arrow.Field.new({ name: 'git_sha', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 4) }),
+  );
+  arrowFields.push(
+    arrow.Field.new({ name: 'span_name', type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Int32(), 5) }),
   );
 
-  // Attribute columns - assign dictionary IDs starting at 5
-  let nextDictId = 5;
+  // Attribute columns - assign dictionary IDs starting at 6
+  let nextDictId = 6;
   const attrDictIds = new Map<string, number>();
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getLmaoSchemaType(fieldSchema);
@@ -1037,7 +1104,8 @@ export function convertSpanTreeToArrowTable(
     allBuffers,
     arrowSchema,
     traceIdDict,
-    moduleDict,
+    packageDict,
+    packagePathDict,
     gitShaDict,
     spanNameDict,
     categoryDicts,
@@ -1060,7 +1128,8 @@ function convertBuffersWithSharedDicts(
   buffers: SpanBuffer[],
   arrowSchema: arrow.Schema,
   traceIdDict: FinalizedDictionary,
-  moduleDict: FinalizedDictionary,
+  packageDict: FinalizedDictionary,
+  packagePathDict: FinalizedDictionary,
   gitShaDict: FinalizedDictionary,
   spanNameDict: FinalizedDictionary,
   categoryDicts: Map<string, FinalizedDictionary>,
@@ -1074,13 +1143,16 @@ function convertBuffersWithSharedDicts(
   const vectors: arrow.Vector[] = [];
 
   // Get types from the shared schema
+  // Schema order: timestamp(0), trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
+  //               entry_type(6), package(7), module_path(8), git_sha(9), span_name(10)
   const timestampType = arrowSchema.fields[0].type as arrow.TimestampNanosecond;
   const traceIdType = arrowSchema.fields[1].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
   // Span ID columns: thread_id (2), span_id (3), parent_thread_id (4), parent_span_id (5)
   const entryTypeType = arrowSchema.fields[6].type as arrow.Dictionary<arrow.Utf8, arrow.Int8>;
-  const moduleType = arrowSchema.fields[7].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
-  const gitShaType = arrowSchema.fields[8].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
-  const spanNameType = arrowSchema.fields[9].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const packageType = arrowSchema.fields[7].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const packagePathType = arrowSchema.fields[8].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const gitShaType = arrowSchema.fields[9].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
+  const spanNameType = arrowSchema.fields[10].type as arrow.Dictionary<arrow.Utf8, arrow.Int32>;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // System columns - concatenate data from all buffers
@@ -1266,31 +1338,60 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Module (using shared dictionary) - direct string access via buf.task.module.filePath
-  const moduleIndices = new Int32Array(totalRows);
+  // Package (using shared dictionary)
+  const packageIndices = new Int32Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const idx = moduleDict.indexMap.get(buf.task.module.filePath) ?? 0;
-    // Use fill() - constant value per buffer
-    moduleIndices.fill(idx, offset, offset + buf.writeIndex);
+    const pkgIdx = packageDict.indexMap.get(buf.task.module.packageName) ?? 0;
+    packageIndices.fill(pkgIdx, offset, offset + buf.writeIndex);
     offset += buf.writeIndex;
   }
   vectors.push(
     arrow.makeVector(
       arrow.makeData({
-        type: moduleType,
+        type: packageType,
         offset: 0,
         length: totalRows,
         nullCount: 0,
-        data: moduleIndices,
+        data: packageIndices,
         dictionary: arrow.makeVector(
           arrow.makeData({
             type: new arrow.Utf8(),
             offset: 0,
-            length: moduleDict.indexMap.size,
+            length: packageDict.indexMap.size,
             nullCount: 0,
-            valueOffsets: moduleDict.offsets,
-            data: moduleDict.data,
+            valueOffsets: packageDict.offsets,
+            data: packageDict.data,
+          }),
+        ),
+      }),
+    ),
+  );
+
+  // Module path (using shared dictionary)
+  const packagePathIndices = new Int32Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    const pathIdx = packagePathDict.indexMap.get(buf.task.module.packagePath) ?? 0;
+    packagePathIndices.fill(pathIdx, offset, offset + buf.writeIndex);
+    offset += buf.writeIndex;
+  }
+  vectors.push(
+    arrow.makeVector(
+      arrow.makeData({
+        type: packagePathType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: packagePathIndices,
+        dictionary: arrow.makeVector(
+          arrow.makeData({
+            type: new arrow.Utf8(),
+            offset: 0,
+            length: packagePathDict.indexMap.size,
+            nullCount: 0,
+            valueOffsets: packagePathDict.offsets,
+            data: packagePathDict.data,
           }),
         ),
       }),

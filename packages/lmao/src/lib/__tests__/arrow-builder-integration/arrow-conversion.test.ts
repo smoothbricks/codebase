@@ -30,7 +30,7 @@ import { createTraceId } from '../../traceId.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
 // MockStringInterner no longer needed - convertToArrowTable now uses direct string access
-// via buf.task.module.filePath and buf.task.spanName
+// via buf.task.module.packageName, buf.task.module.packagePath, and buf.task.spanName
 
 describe('Arrow Table Conversion', () => {
   // let moduleIdInterner: MockStringInterner;
@@ -355,7 +355,8 @@ describe('Arrow Table Conversion', () => {
       expect(fieldNames).toContain('parent_thread_id');
       expect(fieldNames).toContain('parent_span_id');
       expect(fieldNames).toContain('entry_type');
-      expect(fieldNames).toContain('module');
+      expect(fieldNames).toContain('package_name');
+      expect(fieldNames).toContain('package_path');
       expect(fieldNames).toContain('span_name');
     });
 

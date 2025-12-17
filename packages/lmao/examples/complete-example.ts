@@ -83,8 +83,8 @@ const environmentConfig = {
 const orderModule = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123def456',
-    filePath: 'src/services/order-service.ts',
-    moduleName: 'order-service',
+    packageName: '@example/order-service',
+    packagePath: 'src/services/order-service.ts',
   },
   tagAttributes: orderSchema,
 });

@@ -28,8 +28,8 @@ describe('Type Narrowing with FluentResult', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -59,8 +59,8 @@ describe('Type Narrowing with FluentResult', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -91,8 +91,8 @@ describe('Type Narrowing with FluentResult', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -119,8 +119,8 @@ describe('Type Narrowing with FluentResult', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });

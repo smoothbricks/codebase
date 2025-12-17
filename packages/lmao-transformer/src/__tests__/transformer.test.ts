@@ -282,14 +282,14 @@ return ctx.ok({ done: true });`;
       const output = transform(input);
       expect(output).toContain('moduleMetadata');
       expect(output).toContain('gitSha');
-      expect(output).toContain('filePath');
-      expect(output).toContain('moduleName');
+      expect(output).toContain('packageName');
+      expect(output).toContain('packagePath');
     });
 
     it('should not overwrite existing moduleMetadata', () => {
       const input = [
         'createModuleContext({',
-        "  moduleMetadata: { gitSha: 'custom', filePath: 'custom', moduleName: 'Custom' },",
+        "  moduleMetadata: { gitSha: 'custom', packageName: 'custom', packagePath: 'custom' },",
         '  tagAttributes: schema,',
         '});',
       ].join('\n');
@@ -304,8 +304,8 @@ return ctx.ok({ done: true });`;
       const output = transform(input);
       expect(output).toContain('moduleMetadata');
       expect(output).toContain('gitSha');
-      expect(output).toContain('filePath');
-      expect(output).toContain('moduleName');
+      expect(output).toContain('packageName');
+      expect(output).toContain('packagePath');
     });
 
     it('should preserve existing properties when injecting moduleMetadata', () => {

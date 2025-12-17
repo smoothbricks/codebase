@@ -20,6 +20,12 @@
  * - moduleContextFactory() - Application API for composing libraries with prefixes
  */
 
+import type {
+  BaseSpanLogger,
+  GetBufferWithSpaceFn,
+  StringInterner,
+  TextStorage,
+} from './codegen/spanLoggerGenerator.js';
 import type { ModuleContextBuilder, RequestContext, SpanContext, TaskFunction } from './lmao.js';
 import {
   createModuleContext,
@@ -34,6 +40,7 @@ import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import { getEnumValues, getLmaoSchemaType } from './schema/typeGuards.js';
 import type { TagAttributeSchema } from './schema/types.js';
 import { getSchemaFields } from './schema/types.js';
+import type { SpanBuffer } from './types.js';
 
 /**
  * Library operation definition
@@ -499,12 +506,12 @@ export function createRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   cleanSchema: T,
   prefixMapping: PrefixMapping,
 ): new (
-  buffer: import('./types.js').SpanBuffer,
-  categoryInterner: import('./codegen/spanLoggerGenerator.js').StringInterner,
-  textStorage: import('./codegen/spanLoggerGenerator.js').TextStorage,
-  getBufferWithSpace: import('./codegen/spanLoggerGenerator.js').GetBufferWithSpaceFn,
+  buffer: SpanBuffer,
+  categoryInterner: StringInterner,
+  textStorage: TextStorage,
+  getBufferWithSpace: GetBufferWithSpaceFn,
   initialScopedAttributes?: Record<string, unknown>,
-) => import('./codegen/spanLoggerGenerator.js').BaseSpanLogger<T> {
+) => BaseSpanLogger<T> {
   const classCode = generateRemappedSpanLoggerClass(cleanSchema, prefixMapping).trim();
 
   // Use Function constructor to create the class (cold path - happens once per schema/prefix combo)
@@ -533,8 +540,8 @@ export function createLibraryModule<
   >,
 >(options: {
   gitSha: string;
-  filePath: string;
-  moduleName?: string;
+  packageName: string;
+  packagePath: string;
   schema: T;
   operations?: Ops;
 }): LibraryModule<T, FF, Env, Ops> {
@@ -549,8 +556,8 @@ export function createLibraryModule<
   const moduleContext = createModuleContext<T, FF, Env>({
     moduleMetadata: {
       gitSha: options.gitSha,
-      filePath: options.filePath,
-      moduleName: options.moduleName || options.filePath,
+      packageName: options.packageName,
+      packagePath: options.packagePath,
     },
     tagAttributes: cleanSchema,
   });
@@ -663,7 +670,7 @@ function createRemappedScopeFunction<T extends TagAttributeSchema>(
  * - All mapping happens at task creation time (cold path)
  *
  * @param prefix - Prefix to apply to all schema fields (e.g., 'http', 'db')
- * @param moduleMetadata - Library metadata (gitSha, filePath, moduleName)
+ * @param moduleMetadata - Library metadata (gitSha, packageName, packagePath)
  * @param schema - Clean library schema (without prefix)
  * @param operations - Library operations to wrap
  * @returns Module context builder with prefixed schema and remapped task wrappers
@@ -671,7 +678,7 @@ function createRemappedScopeFunction<T extends TagAttributeSchema>(
  * @example
  * const httpLib = moduleContextFactory(
  *   'http',
- *   { gitSha: 'abc', filePath: 'lib/http.ts', moduleName: 'http' },
+ *   { gitSha: 'abc', packageName: '@lib/http', packagePath: 'src/index.ts' },
  *   { status: S.number(), method: S.enum(['GET', 'POST']) }
  * );
  *
@@ -689,8 +696,8 @@ export function moduleContextFactory<
   prefix: string,
   moduleMetadata: {
     gitSha: string;
-    filePath: string;
-    moduleName: string;
+    packageName: string;
+    packagePath: string;
   },
   schema: T,
   operations?: Record<string, LibraryOperation<any[], any, T, FF, Env>>,
@@ -796,8 +803,8 @@ export function createHttpLibrary(prefix = 'http'): LibraryFactory<TagAttributeS
 
   const moduleMetadata = {
     gitSha: 'dev',
-    filePath: 'http-library',
-    moduleName: 'http',
+    packageName: '@smoothbricks/http-library',
+    packagePath: 'src/index.ts',
   };
 
   // Operations would be defined here
@@ -822,8 +829,8 @@ export function createDatabaseLibrary(prefix = 'db'): LibraryFactory<TagAttribut
 
   const moduleMetadata = {
     gitSha: 'dev',
-    filePath: 'db-library',
-    moduleName: 'database',
+    packageName: '@smoothbricks/db-library',
+    packagePath: 'src/index.ts',
   };
 
   const operations = {};

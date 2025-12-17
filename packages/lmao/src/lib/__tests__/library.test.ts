@@ -146,8 +146,9 @@ describe('createLibraryModule', () => {
 
       const module = createLibraryModule({
         gitSha: 'abc123',
-        filePath: 'lib/http.ts',
-        moduleName: 'http',
+        packageName: '@test/pkg',
+        packagePath: 'lib/http.ts',
+
         schema,
       });
 
@@ -163,8 +164,9 @@ describe('createLibraryModule', () => {
 
       const module = createLibraryModule({
         gitSha: 'test',
-        filePath: 'test.ts',
-        moduleName: 'test',
+        packageName: '@test/pkg',
+        packagePath: 'test.ts',
+
         schema,
       });
 
@@ -185,8 +187,9 @@ describe('createLibraryModule', () => {
 
       const module = createLibraryModule({
         gitSha: 'test',
-        filePath: 'test.ts',
-        moduleName: 'test',
+        packageName: '@test/pkg',
+        packagePath: 'test.ts',
+
         schema,
       });
 
@@ -201,8 +204,9 @@ describe('createLibraryModule', () => {
 
       const module = createLibraryModule({
         gitSha: 'test',
-        filePath: 'test.ts',
-        moduleName: 'test',
+        packageName: '@test/pkg',
+        packagePath: 'test.ts',
+
         schema,
       });
 
@@ -218,8 +222,9 @@ describe('createLibraryModule', () => {
 
       const module = createLibraryModule({
         gitSha: 'test',
-        filePath: 'test.ts',
-        moduleName: longName,
+        packageName: '@test/pkg',
+        packagePath: 'test.ts',
+
         schema,
       });
 
@@ -233,8 +238,9 @@ describe('createLibraryModule', () => {
 
       const module = createLibraryModule({
         gitSha: 'test',
-        filePath: '@scope/package/lib/file-name.ts',
-        moduleName: 'test',
+        packageName: '@test/pkg',
+        packagePath: '@scope/package/lib/file-name.ts',
+
         schema,
       });
 
@@ -250,23 +256,25 @@ describe('createLibraryModule', () => {
 
       const module = createLibraryModule({
         gitSha: '',
-        filePath: 'test.ts',
-        moduleName: 'test',
+        packageName: '@test/pkg',
+        packagePath: 'test.ts',
+
         schema,
       });
 
       expect(module).toBeDefined();
     });
 
-    it('should handle empty filePath', () => {
+    it('should handle empty packagePath', () => {
       const schema = defineTagAttributes({
         field: S.number(),
       });
 
       const module = createLibraryModule({
         gitSha: 'test',
-        filePath: '',
-        moduleName: 'test',
+        packageName: '@test/pkg',
+        packagePath: '',
+
         schema,
       });
 
@@ -281,8 +289,9 @@ describe('createLibraryModule', () => {
       expect(() => {
         createLibraryModule({
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
+
           schema,
         });
       }).not.toThrow();
@@ -301,8 +310,8 @@ describe('moduleContextFactory', () => {
         'http',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'http',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         schema,
       );
@@ -322,8 +331,8 @@ describe('moduleContextFactory', () => {
         'http',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'http',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         schema,
       );
@@ -337,8 +346,8 @@ describe('moduleContextFactory', () => {
         'test',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         defineTagAttributes({}),
       );
@@ -354,8 +363,8 @@ describe('moduleContextFactory', () => {
         'x',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         defineTagAttributes({ field: S.text() }),
       );
@@ -369,8 +378,8 @@ describe('moduleContextFactory', () => {
         longPrefix,
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         defineTagAttributes({}),
       );
@@ -383,8 +392,8 @@ describe('moduleContextFactory', () => {
         'test',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         defineTagAttributes({}),
         {},
@@ -400,8 +409,8 @@ describe('moduleContextFactory', () => {
         'test',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         defineTagAttributes({}),
         undefined,
@@ -416,8 +425,8 @@ describe('moduleContextFactory', () => {
         'prefix@#$%',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'test',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         defineTagAttributes({ field: S.text() }),
       );
@@ -639,8 +648,8 @@ describe('prefix remapping', () => {
         'http',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'http',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         schema,
       );
@@ -663,8 +672,8 @@ describe('prefix remapping', () => {
         'http',
         {
           gitSha: 'test',
-          filePath: 'test.ts',
-          moduleName: 'http',
+          packageName: '@test/pkg',
+          packagePath: 'test.ts',
         },
         schema,
       );

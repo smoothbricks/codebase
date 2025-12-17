@@ -39,8 +39,8 @@ const featureFlags = defineFeatureFlags({
 // After transformation this will have:
 //   moduleMetadata: {
 //     gitSha: '<actual git SHA>',
-//     filePath: 'packages/lmao-transformer/examples/demo-source.ts',
-//     moduleName: 'DemoSource'
+//     packageName: '@smoothbricks/lmao-transformer',
+//     packagePath: 'examples/demo-source.ts'
 //   }
 const { task } = createModuleContext({
   tagAttributes: schema,

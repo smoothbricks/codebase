@@ -96,8 +96,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -110,8 +110,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -138,8 +138,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -175,8 +175,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/test.ts',
-          moduleName: 'TestService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/test.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -209,8 +209,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/order.ts',
-          moduleName: 'OrderService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/order.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -249,8 +249,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -284,8 +284,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -311,8 +311,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -345,8 +345,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -379,8 +379,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -424,8 +424,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -465,8 +465,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -496,8 +496,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/order.ts',
-          moduleName: 'OrderService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/order.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -535,8 +535,8 @@ describe('Schema Integration Patterns', () => {
       const { task } = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -614,8 +614,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -661,8 +661,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });
@@ -701,8 +701,8 @@ describe('Schema Integration Patterns', () => {
       const moduleContext = createModuleContext({
         moduleMetadata: {
           gitSha: 'abc123',
-          filePath: 'src/services/user.ts',
-          moduleName: 'UserService',
+          packageName: '@test/pkg',
+          packagePath: 'src/services/user.ts',
         },
         tagAttributes: dbAttributes,
       });

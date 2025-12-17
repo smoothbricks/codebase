@@ -924,7 +924,7 @@ export type TaskFunction<
  * @example
  * ```typescript
  * const userModule = createModuleContext({
- *   moduleMetadata: { gitSha: 'abc123', filePath: 'user/service.ts', moduleName: 'user' },
+ *   moduleMetadata: { gitSha: 'abc123', package: '@myorg/users', packagePath: 'src/service.ts' },
  *   tagAttributes: userSchema,
  * });
  *
@@ -1254,8 +1254,8 @@ function createSpanLoggerWithScope<T extends TagAttributeSchema>(
  * @param options - Module configuration
  * @param options.moduleMetadata - Module identification for tracing
  * @param options.moduleMetadata.gitSha - Git SHA for version tracking
- * @param options.moduleMetadata.filePath - Source file path for debugging
- * @param options.moduleMetadata.moduleName - Human-readable module name
+ * @param options.moduleMetadata.package - npm package name (e.g., '@smoothbricks/lmao')
+ * @param options.moduleMetadata.packagePath - Path within package, relative to package.json
  * @param options.tagAttributes - Schema from `defineTagAttributes()` or plain object
  *
  * @returns Module context builder with `task()` method
@@ -1274,8 +1274,8 @@ function createSpanLoggerWithScope<T extends TagAttributeSchema>(
  * const orderModule = createModuleContext({
  *   moduleMetadata: {
  *     gitSha: process.env.GIT_SHA || 'dev',
- *     filePath: 'orders/service.ts',
- *     moduleName: 'orders',
+ *     package: '@myorg/orders',
+ *     packagePath: 'src/services/order.ts',
  *   },
  *   tagAttributes: orderSchema,
  * });
@@ -1305,8 +1305,8 @@ export function createModuleContext<
 >(options: {
   moduleMetadata: {
     gitSha: string;
-    filePath: string;
-    moduleName: string;
+    packageName: string;
+    packagePath: string;
   };
   tagAttributes: T;
 }): ModuleContextBuilder<T, FF, Env> {
@@ -1332,9 +1332,10 @@ export function createModuleContext<
   // Create module context - moduleId is deprecated, will be removed later
   // UTF-8 pre-encoding now happens in ModuleContext constructor
   const moduleContext = new ModuleContext(
-    0, // moduleId deprecated, use utf8FilePath instead
+    0, // moduleId deprecated
     moduleMetadata.gitSha,
-    moduleMetadata.filePath,
+    moduleMetadata.packageName,
+    moduleMetadata.packagePath,
     schemaOnly,
   );
 

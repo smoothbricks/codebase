@@ -11,7 +11,7 @@ import {
 import { createTestTaskContext } from '../test-helpers.js';
 
 // TestStringInterner no longer needed - convertToArrowTable now uses direct string access
-// via buf.task.module.filePath and buf.task.spanName
+// via buf.task.module.packageName, buf.task.module.packagePath, and buf.task.spanName
 
 /**
  * Type helper to extract schema fields from ExtendedSchema

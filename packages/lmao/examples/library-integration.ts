@@ -65,7 +65,8 @@ interface HttpResponse {
 function createHttpLibrary(prefix = 'http') {
   const module = createLibraryModule({
     gitSha: 'http-lib-v1.2.3',
-    filePath: '@acme/http-client/index.ts',
+    packageName: '@acme/http-client',
+    packagePath: 'src/index.ts',
     schema: httpSchema,
   });
 
@@ -127,7 +128,8 @@ const dbSchema = defineTagAttributes({
 function createDatabaseLibrary(prefix = 'db') {
   const module = createLibraryModule({
     gitSha: 'db-lib-v2.0.1',
-    filePath: '@acme/database/client.ts',
+    packageName: '@acme/database',
+    packagePath: 'src/client.ts',
     schema: dbSchema,
   });
 
@@ -190,7 +192,8 @@ const cacheSchema = defineTagAttributes({
 function createCacheLibrary(prefix = 'cache') {
   const module = createLibraryModule({
     gitSha: 'cache-lib-v1.0.0',
-    filePath: '@acme/cache/redis.ts',
+    packageName: '@acme/cache',
+    packagePath: 'src/redis.ts',
     schema: cacheSchema,
   });
 
@@ -260,8 +263,8 @@ const composedSchema = {
 const { task } = createModuleContext({
   moduleMetadata: {
     gitSha: 'app-v1.0.0',
-    filePath: 'src/services/user.ts',
-    moduleName: 'UserService',
+    packageName: '@example/user-service',
+    packagePath: 'src/services/user.ts',
   },
   tagAttributes: composedSchema,
 });

@@ -79,19 +79,6 @@ function getLastGitCommit(filePath: string): string {
 }
 
 /**
- * Derive a PascalCase module name from a file path.
- * e.g., 'src/services/user-service.ts' -> 'UserService'
- */
-function deriveModuleName(filePath: string): string {
-  const fileName = path.basename(filePath, path.extname(filePath));
-  // Convert kebab-case or snake_case to PascalCase
-  return fileName
-    .split(/[-_]/)
-    .map((part) => part.charAt(0).toUpperCase() + part.slice(1))
-    .join('');
-}
-
-/**
  * Find the nearest package.json by walking up from a file path.
  * Returns { packageName, packageDir } or undefined if not found.
  */
@@ -113,32 +100,6 @@ function findNearestPackage(filePath: string): { packageName: string; packageDir
     currentDir = path.dirname(currentDir);
   }
   return undefined;
-}
-
-/**
- * Derive the module identifier from a file path.
- * Format: @scope/package-name/path/to/file (without extension)
- *
- * Example:
- *   filePath: /project/packages/lmao-transformer/examples/demo-source.ts
- *   packageName: @smoothbricks/lmao-transformer
- *   packageDir: /project/packages/lmao-transformer
- *   Result: @smoothbricks/lmao-transformer/examples/demo-source
- */
-function deriveModuleId(filePath: string): string {
-  const packageInfo = findNearestPackage(filePath);
-  if (!packageInfo) {
-    // Fallback to just the filename without extension
-    return path.basename(filePath, path.extname(filePath));
-  }
-
-  const { packageName, packageDir } = packageInfo;
-  const relativePath = path.relative(packageDir, filePath);
-  // Remove extension and normalize path separators
-  const withoutExt = relativePath.replace(/\.[^.]+$/, '');
-  const normalized = withoutExt.split(path.sep).join('/');
-
-  return `${packageName}/${normalized}`;
 }
 
 /**
@@ -178,7 +139,7 @@ function hasModuleMetadataProperty(objectLiteral: ts.ObjectLiteralExpression): b
  *
  * After:
  *   createModuleContext({
- *     moduleMetadata: { gitSha: '...', filePath: '...', moduleName: '...' },
+ *     moduleMetadata: { gitSha: '...', packageName: '...', packagePath: '...' },
  *     tagAttributes: schema
  *   })
  */
@@ -208,17 +169,28 @@ function tryTransformCreateModuleContextCall(
   }
 
   const absoluteFilePath = sourceFile.fileName;
-  const moduleId = deriveModuleId(absoluteFilePath);
   const gitSha = getLastGitCommit(absoluteFilePath);
-  const moduleName = deriveModuleName(absoluteFilePath);
+  const packageInfo = findNearestPackage(absoluteFilePath);
+
+  // packageName: npm package name (e.g., '@smoothbricks/lmao')
+  // packagePath: path within package, relative to package.json (e.g., 'src/services/user.ts')
+  const packageName = packageInfo?.packageName ?? 'unknown';
+  const packagePath = packageInfo
+    ? path.relative(packageInfo.packageDir, absoluteFilePath)
+    : path.basename(absoluteFilePath);
 
   // Create the moduleMetadata object literal
-  // filePath is the module identifier (package-name/path/to/file)
   const moduleMetadataObject = factory.createObjectLiteralExpression(
     [
       factory.createPropertyAssignment(factory.createIdentifier('gitSha'), factory.createStringLiteral(gitSha)),
-      factory.createPropertyAssignment(factory.createIdentifier('filePath'), factory.createStringLiteral(moduleId)),
-      factory.createPropertyAssignment(factory.createIdentifier('moduleName'), factory.createStringLiteral(moduleName)),
+      factory.createPropertyAssignment(
+        factory.createIdentifier('packageName'),
+        factory.createStringLiteral(packageName),
+      ),
+      factory.createPropertyAssignment(
+        factory.createIdentifier('packagePath'),
+        factory.createStringLiteral(packagePath),
+      ),
     ],
     true, // multiLine
   );

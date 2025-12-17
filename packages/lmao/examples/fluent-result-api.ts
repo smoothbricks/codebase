@@ -40,8 +40,8 @@ const mockEvaluator = new InMemoryFlagEvaluator({
 const userModule = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123',
-    filePath: '/src/modules/user.ts',
-    moduleName: 'UserModule',
+    packageName: '@example/user-module',
+    packagePath: 'src/modules/user.ts',
   },
   tagAttributes: userSchema,
 });

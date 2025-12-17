@@ -45,8 +45,8 @@ describe('Span Lifecycle', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -68,8 +68,8 @@ describe('Span Lifecycle', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -92,8 +92,8 @@ describe('Span Lifecycle', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -117,8 +117,8 @@ describe('Span Lifecycle', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -138,8 +138,8 @@ describe('Fluent Result API', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -166,8 +166,8 @@ describe('Fluent Result API', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -190,8 +190,8 @@ describe('Fluent Result API', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -214,8 +214,8 @@ describe('Fluent Result API', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -238,8 +238,8 @@ describe('Fluent Result API', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -264,8 +264,8 @@ describe('Child Span Lifecycle', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -289,8 +289,8 @@ describe('Child Span Lifecycle', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -310,8 +310,8 @@ describe('Child Span Lifecycle', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -340,8 +340,8 @@ describe('FluentResult Type Compatibility', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -366,8 +366,8 @@ describe('FluentResult Type Compatibility', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -401,8 +401,8 @@ describe('Fixed Row Layout', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -426,8 +426,8 @@ describe('Fixed Row Layout', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -451,8 +451,8 @@ describe('Fixed Row Layout', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -478,8 +478,8 @@ describe('Fixed Row Layout', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -505,8 +505,8 @@ describe('Fixed Row Layout', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });
@@ -530,8 +530,8 @@ describe('Fixed Row Layout', () => {
     const moduleCtx = createModuleContext({
       moduleMetadata: {
         gitSha: 'abc123',
-        filePath: '/test/module.ts',
-        moduleName: 'TestModule',
+        packageName: '@test/pkg',
+        packagePath: '/test/module.ts',
       },
       tagAttributes: testSchema,
     });

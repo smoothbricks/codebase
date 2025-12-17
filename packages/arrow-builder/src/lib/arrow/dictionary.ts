@@ -8,6 +8,7 @@
  */
 
 import { getInterned } from './interner.js';
+import type { SortedArray } from './sorted.js';
 import { defaultUtf8Encoder, type Utf8Encoder, utf8ByteLength } from './utf8.js';
 
 export interface FinalizedDictionary {
@@ -19,6 +20,88 @@ export interface FinalizedDictionary {
   indexMap: Map<string, number>;
   /** Index type based on dictionary size */
   indexType: 'uint8' | 'uint16' | 'uint32';
+}
+
+/**
+ * Entry with pre-encoded UTF-8 bytes for direct dictionary creation.
+ */
+export interface PreEncodedEntry {
+  str: string;
+  utf8: Uint8Array;
+}
+
+/**
+ * Create a finalized dictionary from pre-sorted, pre-encoded entries.
+ * Use sortInPlace() to sort entries before calling this function.
+ *
+ * @param entries - SortedArray of {str, utf8} pairs (must be sorted and deduplicated)
+ */
+export function createSortedDictionary(entries: SortedArray<PreEncodedEntry>): FinalizedDictionary {
+  const uniqueCount = entries.length;
+
+  // Determine index type based on dictionary size
+  const indexType: 'uint8' | 'uint16' | 'uint32' =
+    uniqueCount <= 255 ? 'uint8' : uniqueCount <= 65535 ? 'uint16' : 'uint32';
+
+  // Calculate total bytes needed
+  let totalBytes = 0;
+  for (const { utf8 } of entries) {
+    totalBytes += utf8.length;
+  }
+
+  // Pre-allocate output buffers
+  const data = new Uint8Array(totalBytes);
+  const offsets = new Int32Array(uniqueCount + 1);
+  const indexMap = new Map<string, number>();
+
+  let offset = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const { str, utf8 } = entries[i];
+    offsets[i] = offset;
+    indexMap.set(str, i);
+    data.set(utf8, offset);
+    offset += utf8.length;
+  }
+  offsets[uniqueCount] = offset;
+
+  return { data, offsets, indexMap, indexType };
+}
+
+/**
+ * Create a finalized dictionary from unsorted, pre-encoded entries.
+ * For text columns that don't require sorted dictionaries.
+ *
+ * @param entries - Array of {str, utf8} pairs (assumed deduplicated)
+ */
+export function createDictionary(entries: readonly PreEncodedEntry[]): FinalizedDictionary {
+  const uniqueCount = entries.length;
+
+  // Determine index type based on dictionary size
+  const indexType: 'uint8' | 'uint16' | 'uint32' =
+    uniqueCount <= 255 ? 'uint8' : uniqueCount <= 65535 ? 'uint16' : 'uint32';
+
+  // Calculate total bytes needed
+  let totalBytes = 0;
+  for (const { utf8 } of entries) {
+    totalBytes += utf8.length;
+  }
+
+  // Pre-allocate output buffers
+  const data = new Uint8Array(totalBytes);
+  const offsets = new Int32Array(uniqueCount + 1);
+  const indexMap = new Map<string, number>();
+
+  let offset = 0;
+  for (let i = 0; i < entries.length; i++) {
+    const { str, utf8 } = entries[i];
+    offsets[i] = offset;
+    indexMap.set(str, i);
+    data.set(utf8, offset);
+    offset += utf8.length;
+  }
+  offsets[uniqueCount] = offset;
+
+  return { data, offsets, indexMap, indexType };
 }
 
 interface TrackedEntry {

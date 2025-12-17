@@ -50,8 +50,8 @@ const featureFlags = defineFeatureFlags({
 const apiModule = createModuleContext({
   moduleMetadata: {
     gitSha: 'abc123',
-    filePath: 'src/api/user-controller.ts',
-    moduleName: 'user-api',
+    packageName: '@example/user-api',
+    packagePath: 'src/api/user-controller.ts',
   },
   tagAttributes: apiSchema,
 });

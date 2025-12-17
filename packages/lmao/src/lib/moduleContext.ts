@@ -4,7 +4,12 @@
  * @module moduleContext
  */
 
-import { type BufferCapacityStats, DEFAULT_BUFFER_CAPACITY, intern } from '@smoothbricks/arrow-builder';
+import {
+  type BufferCapacityStats,
+  DEFAULT_BUFFER_CAPACITY,
+  intern,
+  type PreEncodedEntry,
+} from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
 
 /**
@@ -19,19 +24,27 @@ export class ModuleContext {
     totalBuffersCreated: 0,
   };
 
-  /** Pre-encoded UTF-8 bytes for filePath (avoids repeated encoding) */
-  readonly utf8FilePath: Uint8Array;
+  /** Pre-encoded entry for package (for Arrow dictionary building) */
+  readonly packageEntry: PreEncodedEntry;
 
-  /** Pre-encoded UTF-8 bytes for gitSha (avoids repeated encoding) */
-  readonly utf8GitSha: Uint8Array;
+  /** Pre-encoded entry for packagePath (for Arrow dictionary building) */
+  readonly packagePathEntry: PreEncodedEntry;
+
+  /** Pre-encoded entry for gitSha (for Arrow dictionary building) */
+  readonly gitShaEntry: PreEncodedEntry;
 
   constructor(
     public readonly moduleId: number, // Keep this for now, we'll remove ID later
     public readonly gitSha: string,
-    public readonly filePath: string,
+    /** npm package name (e.g., '@smoothbricks/lmao') */
+    public readonly packageName: string,
+    /** Path within package, relative to package.json (e.g., 'src/services/user.ts') */
+    public readonly packagePath: string,
     public readonly tagAttributes: TagAttributeSchema,
   ) {
-    this.utf8FilePath = intern(filePath);
-    this.utf8GitSha = intern(gitSha);
+    // Pre-encode and store as reusable entries for Arrow dictionary building
+    this.packageEntry = { str: packageName, utf8: intern(packageName) };
+    this.packagePathEntry = { str: packagePath, utf8: intern(packagePath) };
+    this.gitShaEntry = { str: gitSha, utf8: intern(gitSha) };
   }
 }

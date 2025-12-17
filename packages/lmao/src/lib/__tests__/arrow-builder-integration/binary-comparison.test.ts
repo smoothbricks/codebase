@@ -22,7 +22,7 @@ import { createTraceId } from '../../traceId.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
 // MockStringInterner no longer needed - convertToArrowTable now uses direct string access
-// via buf.task.module.filePath and buf.task.spanName
+// via buf.task.module.packageName, buf.task.module.packagePath, and buf.task.spanName
 
 /**
  * Round-trip test: serialize to IPC, deserialize, verify data matches
@@ -319,7 +319,8 @@ describe('Arrow IPC Round-Trip', () => {
       expect(fieldNames).toContain('parent_thread_id');
       expect(fieldNames).toContain('parent_span_id');
       expect(fieldNames).toContain('entry_type');
-      expect(fieldNames).toContain('module');
+      expect(fieldNames).toContain('package_name');
+      expect(fieldNames).toContain('package_path');
       expect(fieldNames).toContain('span_name');
 
       // Verify timestamps round-tripped correctly
@@ -348,7 +349,16 @@ describe('Arrow IPC Round-Trip', () => {
       const table = convertToArrowTable(buffer);
 
       // System columns that should NOT be nullable
-      const nonNullableColumns = ['timestamp', 'trace_id', 'thread_id', 'span_id', 'entry_type', 'module', 'span_name'];
+      const nonNullableColumns = [
+        'timestamp',
+        'trace_id',
+        'thread_id',
+        'span_id',
+        'entry_type',
+        'package_name',
+        'package_path',
+        'span_name',
+      ];
       for (const colName of nonNullableColumns) {
         const field = table.schema.fields.find((f) => f.name === colName);
         expect(field).toBeDefined();
