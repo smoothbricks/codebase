@@ -587,6 +587,8 @@ interface SpanBuffer {
   // Core columns - always present (allocated immediately in constructor)
   timestamps: BigInt64Array; // Every operation appends timestamp (nanoseconds)
   operations: Uint8Array; // Operation type: tag, ok, err, etc.
+  lineNumber_values: Int32Array; // Line numbers for each entry
+  lineNumber_nulls: Uint8Array; // Null bitmap for line numbers
 
   // Attribute columns - DIRECT PROPERTIES with LAZY GETTERS (no nested Record!)
   // Each attribute has TWO properties sharing ONE ArrayBuffer:
@@ -608,8 +610,13 @@ interface SpanBuffer {
 
   // Tree structure
   children: SpanBuffer[];
-  parent?: SpanBuffer; // Reference to parent SpanBuffer
-  opContext: OpContext; // Reference to op + module metadata
+  parent?: SpanBuffer; // Reference to parent SpanBuffer (child spans walk this for traceId)
+
+  // Dual module references for accurate source attribution
+  callsiteModule?: ModuleContext; // Caller's module (where span() was invoked) - for row 0's gitSha/packageName/packagePath
+  module: ModuleContext; // Op's module (what code is executing) - for rows 1+ gitSha/packageName/packagePath
+  spanName: string; // Span name for this invocation
+  // NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property on SpanBuffer
 
   // Buffer management
   writeIndex: number; // Current write position (0 to capacity-1)
@@ -644,6 +651,37 @@ interface SpanBuffer {
   // - Within a trace: (threadId, spanId) is unique
   // - Globally: (traceId, threadId, spanId) is globally unique
 }
+
+// ModuleContext - module-level metadata with flattened stats
+interface ModuleContext {
+  packageName: string; // npm package name from package.json
+  packagePath: string; // Path within package, relative to package.json
+  gitSha: string; // Git SHA at build time
+  prefix?: string; // Optional prefix for library integration
+  logSchema: LogSchema; // Schema definition for this module
+
+  // Self-tuning buffer capacity stats (flattened, not nested)
+  sb_capacity: number; // Current buffer capacity
+  sb_totalWrites: number; // Total writes for tuning decisions
+  sb_overflows: number; // Overflow count for tuning decisions
+  sb_totalCreated: number; // Total buffers created
+}
+
+// Access patterns from buffer:
+// Module metadata (row 0 uses callsiteModule, rows 1+ use module)
+buffer.callsiteModule.packageName; // Caller's '@mycompany/http' (for row 0)
+buffer.callsiteModule.gitSha; // Caller's 'abc123' (for row 0)
+buffer.module.packageName; // Op's '@mycompany/http' (for rows 1+)
+buffer.module.gitSha; // Op's 'abc123' (for rows 1+)
+
+// Self-tuning stats (flattened on module)
+buffer.module.sb_capacity; // 64
+buffer.module.sb_totalWrites; // 1234
+
+// Per-span invocation data (direct properties)
+buffer.spanName; // 'fetchData'
+buffer.lineNumber_values[0]; // 42 - line number for row 0 (NOT a property, TypedArray access)
+buffer.traceId; // Walks parent chain to root if child span
 
 // Access pattern - DIRECT property access, zero indirection:
 buffer.attr_userId_values[idx] = value; // ✅ Direct TypedArray access
@@ -940,7 +978,10 @@ minimal allocations, and zero conditional logic for system column access.
 │ Properties:                                                                     │
 │   parent: undefined (root has no parent)                                        │
 │   children: SpanBuffer[]                                                        │
-│   opContext: OpContext                                                          │
+│   callsiteModule: ModuleContext (caller's module for row 0 metadata)            │
+│   module: ModuleContext (Op's module for rows 1+ metadata)                      │
+│   spanName: string (per-span data)                                              │
+│   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property           │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -966,7 +1007,10 @@ minimal allocations, and zero conditional logic for system column access.
 │ Properties:                                                                     │
 │   parent ──────────────► (parent SpanBuffer - for traceId + parentSpanId)       │
 │   children: SpanBuffer[]                                                        │
-│   opContext: OpContext                                                          │
+│   callsiteModule: ModuleContext (caller's module for row 0 metadata)            │
+│   module: ModuleContext (Op's module for rows 1+ metadata)                      │
+│   spanName: string (per-span data)                                              │
+│   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property           │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -988,7 +1032,10 @@ minimal allocations, and zero conditional logic for system column access.
 │ Properties:                                                                     │
 │   parent ──────────────► (same as first buffer's parent)                        │
 │   children: [] (only root buffer tracks children)                               │
-│   opContext: OpContext                                                          │
+│   callsiteModule: ModuleContext (shared from first buffer)                      │
+│   module: ModuleContext (Op's module, shared reference)                         │
+│   spanName: string (per-span data)                                              │
+│   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property           │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1110,19 +1157,32 @@ class SpanBuffer {
   parent?: SpanBuffer;
   children: SpanBuffer[];
   next?: SpanBuffer;
-  opContext: OpContext;
+
+  // Per-span invocation data
+  // NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property on SpanBuffer
+  callsiteModule?: ModuleContext; // Caller's module (for row 0's gitSha/packageName/packagePath)
+  module: ModuleContext; // Op's module (for rows 1+ gitSha/packageName/packagePath)
+  spanName: string;
+
   writeIndex: number;
   capacity: number;
 
   constructor(
     capacity: number,
-    opContext: OpContext,
+    callsiteModule: ModuleContext, // Caller's module for row 0 metadata
+    opModule: ModuleContext, // Op's module for rows 1+ metadata
+    spanName: string,
+    // NOTE: lineNumber is NOT passed here - it's written directly to lineNumber_values[0]
+    // by the caller AFTER construction
     parent?: SpanBuffer,
     isChained = false,
     traceId?: string // Only for root spans
   ) {
     this.capacity = capacity;
-    this.opContext = opContext;
+    this.callsiteModule = callsiteModule;
+    this.module = opModule;
+    this.spanName = spanName;
+    // lineNumber is NOT stored as property - caller writes to lineNumber_values[0] directly
     this.writeIndex = 0;
     this.children = [];
 
@@ -1368,10 +1428,14 @@ function generateTraceId(): TraceId {
 // At request boundary - generate or accept trace ID
 const traceId = request.headers['x-trace-id'] ? createTraceId(request.headers['x-trace-id']) : generateTraceId();
 
-// Pass to all spans by reference (no copy)
+// Pass to root span, children walk parent chain
 // Op's internal wrapper creates the buffer
-const rootSpan = createSpanBuffer(schema, opContext, traceId);
-const childSpan = createChildSpanBuffer(rootSpan); // Inherits same traceId reference
+// lineNumber is written directly to lineNumber_values[0] inside _invoke(), NOT passed to createSpanBuffer
+const rootSpan = createSpanBuffer(callsiteModule, opModule, spanName, traceId);
+rootSpan.lineNumber_values[0] = lineNumber; // Direct TypedArray write
+
+const childSpan = createChildSpanBuffer(rootSpan, childCallsiteModule, childOpModule, childSpanName);
+childSpan.lineNumber_values[0] = childLineNumber; // Direct TypedArray write
 
 // All spans in trace share the SAME string reference
 console.log(rootSpan.traceId === childSpan.traceId); // true (same reference)
@@ -1618,35 +1682,48 @@ interface ComposedSpanBuffer extends SpanBuffer {
 
 // attr_ prefix prevents conflicts with SpanBuffer internal fields
 // Without prefix, user attribute "parent" would conflict with buffer.parent
-// Without prefix, user attribute "opContext" would conflict with buffer.opContext
+// Without prefix, user attribute "callsite" would conflict with buffer.callsite
 // Without prefix, user attribute "writeIndex" would conflict with buffer.writeIndex
 
-function createSpanBuffer<T extends TagAttributeSchema>(
+function createSpanBuffer<T extends LogSchema>(
   schema: T,
-  opContext: OpContext,
+  callsiteModule: ModuleContext, // Caller's module (for row 0's gitSha/packageName/packagePath)
+  opModule: ModuleContext, // Op's module (for rows 1+ gitSha/packageName/packagePath)
+  spanName: string,
   traceId: string,
   workerThreadId: bigint, // 64-bit random ID from worker context
   parentBuffer?: SpanBuffer // Optional parent buffer for tree linking
 ): SpanBuffer {
   const spanId = nextSpanId++; // Simple increment (cheap!)
-  return createEmptySpanBuffer(spanId, traceId, workerThreadId, schema, opContext, parentBuffer);
+  return createEmptySpanBuffer(
+    spanId,
+    traceId,
+    workerThreadId,
+    schema,
+    callsiteModule,
+    opModule,
+    spanName,
+    parentBuffer
+  );
 }
 
 // Per-worker (thread-local) counter - NOT per-trace, NOT global
 // Each thread starts at 1 and increments independently across all traces
 let nextSpanId = 1;
 
-function createEmptySpanBuffer<T extends TagAttributeSchema>(
+function createEmptySpanBuffer<T extends LogSchema>(
   spanId: number,
   traceId: string,
   workerThreadId: bigint,
   schema: T,
-  opContext: OpContext,
+  callsiteModule: ModuleContext, // Caller's module (for row 0's gitSha/packageName/packagePath)
+  opModule: ModuleContext, // Op's module (for rows 1+ gitSha/packageName/packagePath)
+  spanName: string,
   parentBuffer?: SpanBuffer
 ): SpanBuffer {
   // Use runtime-generated class from arrow-builder
   // The class has lazy getters for all attribute columns
-  const columnBuffer = createColumnBuffer(schema, opContext.module.spanBufferCapacityStats.currentCapacity);
+  const columnBuffer = createColumnBuffer(schema, opModule.sb_capacity);
 
   // Extend with span-specific metadata
   const buffer = columnBuffer as SpanBuffer;
@@ -1660,12 +1737,18 @@ function createEmptySpanBuffer<T extends TagAttributeSchema>(
   buffer.children = [];
   buffer.parent = parentBuffer; // Tree link for parent ID derivation
 
+  // Dual module references for accurate source attribution
+  buffer.callsiteModule = callsiteModule; // For row 0's gitSha/packageName/packagePath
+  buffer.module = opModule; // For rows 1+ gitSha/packageName/packagePath
+  buffer.spanName = spanName;
+  // NOTE: lineNumber is written directly to lineNumber_values[0] in _invoke(), NOT stored as property
+
   // Link to parent's children array
   if (parentBuffer) {
     parentBuffer.children.push(buffer);
   }
 
-  opContext.module.spanBufferCapacityStats.totalBuffersCreated++;
+  opModule.sb_totalCreated++;
   return buffer;
 }
 
@@ -1683,30 +1766,40 @@ function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
     buffer.traceId,
     buffer.threadId, // Same thread ID (chained buffer is in same worker)
     getSchemaFromBuffer(buffer), // Re-use schema
-    buffer.opContext, // Re-use op context
+    buffer.callsiteModule, // Re-use caller's module (for row 0 metadata)
+    buffer.module, // Re-use op's module (for rows 1+ metadata)
+    buffer.spanName, // Re-use span name
     buffer.parent // Parent is the same as the current buffer's parent
   );
 }
 
-function createChildSpan(parentBuffer: SpanBuffer, spanName: string, opFn: Op, ...args: unknown[]) {
+function createChildSpan(
+  parentBuffer: SpanBuffer,
+  callsiteModule: ModuleContext, // Caller's module (where span() was invoked)
+  opModule: ModuleContext, // Op's module (what code will execute)
+  spanName: string,
+  lineNumber: number, // Passed as argument, written directly to TypedArray
+  opFn: Op,
+  ...args: unknown[]
+) {
   // The op creates the buffer - this is key to the design
   // Op's internal wrapper creates buffers, not span() directly
-  const childOpContext: OpContext = {
-    module: parentBuffer.opContext.module,
-    spanName: spanName, // Raw string - dictionary built during Arrow conversion
-    lineNumber: getCurrentLineNumber(), // Build tool injected
-  };
 
   // Each child span gets its own NEW buffer with its own spanId
   // NOTE: Scope values are inherited via Scope class, NOT buffer columns
   const childBuffer = createChildSpanBuffer(
     parentBuffer, // Links to parent and inherits traceId
-    childOpContext
+    callsiteModule, // Caller's module for row 0's gitSha/packageName/packagePath
+    opModule, // Op's module for rows 1+ gitSha/packageName/packagePath
+    spanName
   );
 
+  // Write lineNumber directly to TypedArray for row 0 (NO intermediate object storage)
+  childBuffer.lineNumber_values[0] = lineNumber;
+
   // For prefixed libraries, buffer is wrapped with RemappedBufferView before registration
-  if (childOpContext.module.prefix) {
-    parentBuffer.children.push(new RemappedBufferView(childBuffer, childOpContext.module.prefix));
+  if (opModule.prefix) {
+    parentBuffer.children.push(new RemappedBufferView(childBuffer, opModule.prefix));
   } else {
     parentBuffer.children.push(childBuffer);
   }
@@ -1990,12 +2083,19 @@ if (ctx.scope.requestId !== undefined) {
 // Column properties are DIRECT on buffer via lazy getters
 
 const logOperations = {
-  info: (buffer: SpanBuffer, message: string, scope: GeneratedScope, attributes?: Record<string, any>) => {
+  info: (
+    ctx: SpanContext,
+    buffer: SpanBuffer,
+    message: string,
+    scope: GeneratedScope,
+    attributes?: Record<string, any>
+  ) => {
     // Append to current writeIndex (starts at 2)
     const index = buffer.writeIndex++;
 
     // Core columns - always written
-    buffer.timestamps[index] = getTimestamp(buffer.opContext.requestContext);
+    // ctx has anchorEpochMicros and anchorPerfNow from TraceContext
+    buffer.timestamps[index] = getTimestamp(ctx);
     buffer.operations[index] = ENTRY_TYPE_INFO;
 
     // Message attribute - DEFERRED INTERNING: store raw string
@@ -2073,36 +2173,34 @@ directly convert each attribute's TypedArray to an Arrow vector (no copying) is 
 approach, especially if the background processor is a separate service (e.g., in Rust).
 
 ```typescript
-function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttributes: TagAttributeSchema }) {
+function createModuleContext(config: { moduleMetadata: ModuleMetadata; logSchema: LogSchema }) {
   const moduleContext: ModuleContext = {
     gitSha: config.moduleMetadata.gitSha,
     packageName: config.moduleMetadata.packageName,
     packagePath: config.moduleMetadata.packagePath,
 
-    // Initialize self-tuning capacity stats
-    spanBufferCapacityStats: {
-      /**
-       * INITIAL CAPACITY: 64 elements chosen for cache alignment optimization
-       *
-       * RATIONALE FOR 64-ELEMENT START:
-       * - Uint8Array: 64 × 1 = 64 bytes (exactly 1 cache line - optimal)
-       * - Most small ops fit within 64 operations without overflow
-       * - Prevents dramatic memory inflation from cache alignment padding
-       * - Self-tuning will adjust up/down based on actual usage patterns
-       *
-       * WHY 64 ELEMENTS:
-       * Starting at 64 eliminates unexpected capacity inflations from cache alignment.
-       * Smaller sizes (e.g., 16 elements) would get padded to 64 anyway for cache alignment,
-       * causing unexpected memory increases (16 → 64 for Uint8Array = 4x waste).
-       */
-      currentCapacity: 64, // Start with cache-friendly size - most ops fit in 64 operations
-      totalWrites: 0,
-      overflowWrites: 0,
-      totalBuffersCreated: 0,
-    },
+    // Self-tuning capacity stats (flattened on ModuleContext)
+    /**
+     * INITIAL CAPACITY: 64 elements chosen for cache alignment optimization
+     *
+     * RATIONALE FOR 64-ELEMENT START:
+     * - Uint8Array: 64 × 1 = 64 bytes (exactly 1 cache line - optimal)
+     * - Most small ops fit within 64 operations without overflow
+     * - Prevents dramatic memory inflation from cache alignment padding
+     * - Self-tuning will adjust up/down based on actual usage patterns
+     *
+     * WHY 64 ELEMENTS:
+     * Starting at 64 eliminates unexpected capacity inflations from cache alignment.
+     * Smaller sizes (e.g., 16 elements) would get padded to 64 anyway for cache alignment,
+     * causing unexpected memory increases (16 → 64 for Uint8Array = 4x waste).
+     */
+    sb_capacity: 64, // Start with cache-friendly size - most ops fit in 64 operations
+    sb_totalWrites: 0,
+    sb_overflows: 0,
+    sb_totalCreated: 0,
   };
 
-  return { op: createOpWrapper(moduleContext, config.tagAttributes) };
+  return { op: createOpWrapper(moduleContext, config.logSchema) };
 }
 
 function appendToBuffer(buffer: SpanBuffer, data: any) {
@@ -2117,15 +2215,15 @@ function appendToBuffer(buffer: SpanBuffer, data: any) {
   // Hot path - always taken after loop
   const index = buffer.writeIndex++;
 
-  // Count stats ONCE for self-tuning
-  const stats = originalBuffer.opContext.module.spanBufferCapacityStats;
-  stats.totalWrites++;
+  // Count stats ONCE for self-tuning (flattened on module)
+  const module = originalBuffer.callsite.module;
+  module.sb_totalWrites++;
   if (buffer !== originalBuffer) {
-    stats.overflowWrites++; // Went to a chained buffer (triggers tuning)
+    module.sb_overflows++; // Went to a chained buffer (triggers tuning)
   }
 
   // Tune capacity if needed (see 01b2_buffer_self_tuning.md)
-  shouldTuneCapacity(stats);
+  shouldTuneCapacity(module);
 
   // Write data (no branches) - direct TypedArray assignments
   buffer.timestamps[index] = data.timestamp;
@@ -2136,57 +2234,57 @@ function appendToBuffer(buffer: SpanBuffer, data: any) {
 // NOTE: Since each span has its own buffer, traceId and spanId are NOT written per row
 // They're constant properties on the SpanBuffer itself, eliminating two TypedArray writes per operation
 
-function shouldTuneCapacity(stats: ModuleContext['spanBufferCapacityStats']): boolean {
+function shouldTuneCapacity(module: ModuleContext): boolean {
   const minSamples = 100; // Need enough data
-  if (stats.totalWrites < minSamples) return false;
+  if (module.sb_totalWrites < minSamples) return false;
 
-  const overflowRatio = stats.overflowWrites / stats.totalWrites;
+  const overflowRatio = module.sb_overflows / module.sb_totalWrites;
 
   // Increase if >15% writes overflow
-  if (overflowRatio > 0.15 && stats.currentCapacity < 1024) {
-    const newCapacity = Math.min(stats.currentCapacity * 2, 1024);
+  if (overflowRatio > 0.15 && module.sb_capacity < 1024) {
+    const newCapacity = Math.min(module.sb_capacity * 2, 1024);
 
     // Trace the tuning event as structured data!
     traceCapacityTuning({
       action: 'increase',
-      oldCapacity: stats.currentCapacity,
+      oldCapacity: module.sb_capacity,
       newCapacity,
       overflowRatio,
-      totalWrites: stats.totalWrites,
+      totalWrites: module.sb_totalWrites,
       reason: 'high_overflow',
     });
 
-    stats.currentCapacity = newCapacity;
-    resetStats(stats);
+    module.sb_capacity = newCapacity;
+    resetStats(module);
     return true;
   }
 
   // Decrease if <5% writes overflow and we have many buffers
-  if (overflowRatio < 0.05 && stats.totalBuffersCreated >= 10 && stats.currentCapacity > 8) {
-    const newCapacity = Math.max(8, stats.currentCapacity / 2);
+  if (overflowRatio < 0.05 && module.sb_totalCreated >= 10 && module.sb_capacity > 8) {
+    const newCapacity = Math.max(8, module.sb_capacity / 2);
 
     traceCapacityTuning({
       action: 'decrease',
-      oldCapacity: stats.currentCapacity,
+      oldCapacity: module.sb_capacity,
       newCapacity,
       overflowRatio,
-      totalWrites: stats.totalWrites,
-      totalBuffers: stats.totalBuffersCreated,
+      totalWrites: module.sb_totalWrites,
+      totalBuffers: module.sb_totalCreated,
       reason: 'low_utilization',
     });
 
-    stats.currentCapacity = newCapacity;
-    resetStats(stats);
+    module.sb_capacity = newCapacity;
+    resetStats(module);
     return true;
   }
 
   return false;
 }
 
-function resetStats(stats: ModuleContext['spanBufferCapacityStats']) {
-  stats.totalWrites = 0;
-  stats.overflowWrites = 0;
-  stats.totalBuffersCreated = 0;
+function resetStats(module: ModuleContext) {
+  module.sb_totalWrites = 0;
+  module.sb_overflows = 0;
+  module.sb_totalCreated = 0;
 }
 ```
 
@@ -2212,7 +2310,7 @@ Heavy setup work happens once when a module is first loaded:
 // COLD PATH: All expensive operations happen here, ONCE per module
 const moduleContext = createModuleContext({
   moduleMetadata: { gitSha: 'abc123...', packageName: '@mycompany/my-service', packagePath: 'src/services/user.ts' },
-  tagAttributes: mySchema,
+  logSchema: mySchema,
 });
 
 // What happens during module init:
@@ -2242,7 +2340,7 @@ const processUser = moduleContext.op(async ({ span, log, tag, ok, err }) => {
 // What happens during op definition:
 // 1. Op wrapper creation
 //    - Captures module context in closure
-// 2. Wrapper function that creates OpContext on invocation
+// 2. Wrapper function that creates SpanContext on invocation
 //    - spanName set when span('name', op, args) is called
 ```
 
@@ -2372,7 +2470,7 @@ async function writeSpanBuffersToArrow(buffers: SpanBuffer[]) {
 }
 
 function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.RecordBatch {
-  const tagAttributes = buffer.opContext.module.tagAttributes;
+  const logSchema = buffer.module.logSchema; // Use Op's module for schema
   const arrowVectors: Record<string, arrow.Vector> = {};
 
   // --- Core SpanBuffer Columns ---
@@ -2439,19 +2537,21 @@ function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.Rec
 
   // --- Module Metadata Columns (expanded from shared reference) ---
   // See 01f_arrow_table_structure.md "Module Identification" section for rationale
+  // Row 0 uses callsiteModule, rows 1+ use module
   arrowVectors.gitSha = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'gitSha'));
   arrowVectors.package_name = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'packageName'));
   arrowVectors.package_path = arrow.Utf8Vector.from(getModuleMetadataColumn(buffer, 'packagePath'));
   arrowVectors.functionName = arrow.Utf8Vector.from(
     getModuleMetadataColumn(buffer, 'functionNameId').map((id) => stringRegistry.get(id))
   );
-  arrowVectors.lineNumber = arrow.Int32Vector.from(getModuleMetadataColumn(buffer, 'lineNumber'));
+  // lineNumber comes from lineNumber_values TypedArray (NOT a property)
+  arrowVectors.lineNumber = arrow.Int32Vector.from(buffer.lineNumber_values.subarray(0, buffer.writeIndex));
 
   // --- Attribute Columns (via lazy getters) ---
   // Get scope values for columns that weren't directly written
   const scopeValues = scope._getScopeValues();
 
-  for (const [attrName, fieldConfig] of Object.entries(tagAttributes.fields)) {
+  for (const [attrName, fieldConfig] of Object.entries(logSchema.fields)) {
     const columnName = `attr_${attrName}`;
 
     // Check if column was allocated (without triggering allocation)

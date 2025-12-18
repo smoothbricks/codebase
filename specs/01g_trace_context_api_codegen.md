@@ -191,11 +191,11 @@ The trace context assembles all entry type APIs for destructuring:
 ```typescript
 // Generated trace context (destructurable)
 // Extra is spread in for user-defined fields (e.g., env with CF Worker bindings)
-type OpContext<Schema, Deps, FF, Extra = {}> = {
+type SpanContext<Schema, Deps, FF, Extra = {}> = {
   readonly tag: TagAPI<Schema>;
   readonly log: LogAPI<Schema>;
   readonly scope: ScopeAPI<Schema>;
-  readonly span: SpanFn<OpContext<Schema, Deps, FF, Extra>>;
+  readonly span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
   readonly deps: Deps;
   readonly ff: FeatureFlagEvaluator<FF>;
   readonly ok: <V>(value: V) => FluentSuccessResult<V>;
@@ -359,16 +359,20 @@ Libraries define their schema using `defineModule` and get fully typed APIs:
 > **See**: [Module Builder Pattern](./01l_module_builder_pattern.md) for the complete API design.
 
 ```typescript
-// Library defines module with schema (unprefixed)
+// Library defines module with logSchema (unprefixed)
 const httpLib = defineModule({
-  metadata: { packageName: '@my-company/http', packagePath: 'src/index.ts' },
-  schema: {
+  metadata: { packageName: '@my-company/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
+  logSchema: {
     status: S.number(),
     method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
     url: S.text(),
     duration: S.number(),
   },
-});
+  deps: {},
+  ff: {},
+})
+  .ctx<{ env: WorkerEnv }>({ env: null! })
+  .make();
 
 const { op } = httpLib;
 

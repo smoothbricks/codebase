@@ -17,7 +17,7 @@ This monorepo contains two distinct packages with clear separation of concerns:
 │                                                                  │
 │  • Schema DSL (S.enum/category/text/number/boolean)             │
 │  • Op + Span pattern (op wraps, span invokes)                   │
-│  • Context flow (request→module→op→span)                        │
+│  • Context flow (traceContext→module→op→span)                   │
 │  • SpanBuffer classes with direct properties ($name_*)          │
 │  • Scope classes (SEPARATE from buffer columns)                 │
 │  • Feature flag evaluation                                       │
@@ -99,7 +99,7 @@ const GET = op(async ({ span, log, tag, deps }, url: string) => {
 });
 
 // Root invocation - NAME provided at call site
-await httpRoot.span('GET', GET, 'https://example.com');
+await ctx.span('GET', GET, 'https://example.com');
 ```
 
 ### Why This Design?
@@ -109,8 +109,6 @@ await httpRoot.span('GET', GET, 'https://example.com');
 3. **Explicit span naming at call site**: More flexible - caller decides contextual name
 4. **Module binding via closure**: `op()` captures module metadata (gitSha, packageName, packagePath)
 5. **V8 friendly**: Op is a plain class with stable hidden class, no Proxy, no Function subclassing
-
-### Design Comparison
 
 | Aspect         | Alternative (rejected)      | Chosen Approach                 |
 | -------------- | --------------------------- | ------------------------------- |
@@ -385,7 +383,7 @@ A high-level structured logging library providing excellent developer experience
 
 - **Zero-allocation hot path**: Avoid string interpolation and object allocation during logging
 - **Schema-driven type safety**: Compile-time and runtime validation of logged data
-- **Context propagation**: Automatic trace correlation through request→op→span hierarchy
+- **Context propagation**: Automatic trace correlation through traceContext→op→span hierarchy
 - **System column optimization**: timestamps/operations are NEVER lazy
 
 ### What lmao OWNS
@@ -395,7 +393,7 @@ A high-level structured logging library providing excellent developer experience
 3. **Feature flag evaluation** - `defineFeatureFlags()` with sync/async evaluation
 4. **Op class** - Wraps functions with module binding, handles buffer creation
 5. **span() invocation** - Unified API for calling ops with contextual naming
-6. **Context flow** - Request context → Op execution → Span hierarchy
+6. **Context flow** - TraceContext → Op execution → Span hierarchy
 7. **SpanBuffer creation** - Extends arrow-builder's ColumnBuffer with span metadata
 8. **Scope class generation** - SEPARATE from buffer columns, holds inheritable values
 9. **SpanLogger generation** - Typed methods per schema field
@@ -414,369 +412,11 @@ A high-level structured logging library providing excellent developer experience
 
 ### System Columns vs User Attributes
 
-**CRITICAL DESIGN PRINCIPLE**: System columns and user attribute columns have fundamentally different performance
-requirements.
+**System columns** (timestamps, operations) are written on EVERY entry - ALWAYS eager, pre-allocated in constructor.
 
-#### System Columns (ALWAYS Eager)
+**User attribute columns** are sparse and optional - lazy by default, allocated only when first written.
 
-These columns are written on EVERY log entry and MUST have zero overhead:
-
-| Column        | Type            | Description                                     | Allocation       |
-| ------------- | --------------- | ----------------------------------------------- | ---------------- |
-| `_timestamps` | `BigInt64Array` | Nanosecond-precision anchored timestamps        | **ALWAYS eager** |
-| `_operations` | `Uint8Array`    | Entry type enum (span-start, info, error, etc.) | **ALWAYS eager** |
-
-**WHY never lazy**: Adding `if (values === null)` checks to the hottest path would add microseconds per entry. These
-columns are pre-allocated in the constructor.
-
-**Generated code** (system columns in constructor):
-
-```typescript
-class GeneratedSpanBuffer {
-  constructor(requestedCapacity) {
-    // System columns (EAGER - written on every entry)
-    // Note: _ prefix for system properties prevents namespace collisions
-    const alignedCapacity = getCacheAlignedCapacity(requestedCapacity);
-    this._capacity = alignedCapacity;
-    this._timestamps = new BigInt64Array(alignedCapacity); // Allocated HERE
-    this._operations = new Uint8Array(alignedCapacity); // Allocated HERE
-    this._writeIndex = 0;
-  }
-
-  // User attributes are LAZY getters (not in constructor)
-  // User columns use field names directly (no prefix)
-  get userId_values() {
-    return allocate_userId(this).values;
-  }
-}
-```
-
-#### User Attribute Columns (Lazy by Default)
-
-User-defined attributes from schema are sparse and optional:
-
-```typescript
-const mySchema = defineTagAttributes({
-  userId: S.category(), // May not be set on every span
-  orderId: S.category(), // Only on order-related spans
-  httpStatus: S.number(), // Only on HTTP spans
-  sqlQuery: S.text(), // Only on DB spans
-});
-```
-
-**WHY lazy**: In a schema with 20 attributes, a typical span uses 3-5. Lazy allocation saves 70-85% memory.
-
-**Memory impact example**:
-
-```
-Without lazy initialization (20 columns × 64 elements × 4 bytes):
-  20 columns × 64 × 4 = 5,120 bytes per span
-  20 null bitmaps × 8 = 160 bytes
-  Total: 5,280 bytes per span
-
-With lazy getters (system + 3 used attributes):
-  System columns: 64 × 8 + 64 × 1 = 576 bytes (always)
-  Lazy getter closures: ~0 bytes (shared code, symbols only)
-  3 used columns × (nulls + values via shared ArrayBuffer):
-    Each: ~272 bytes (8 nulls + padding + 256 values)
-    Total: 3 × 272 = 816 bytes (on demand)
-  Total: ~1,392 bytes (74% savings!)
-```
-
-### Scope Class: SEPARATE from Buffer Columns
-
-**WHY separate**: Scope values are per-span inheritable attributes. Buffer columns are per-entry storage.
-
-If scope values were stored IN lazy columns:
-
-- Scope changes would need to backfill all previous entries
-- Lazy columns would need to distinguish "unallocated" from "has scope value"
-- Arrow conversion would need complex logic for scope-filled vs written values
-
-**HOW lmao implements this**:
-
-```typescript
-// Scope: Plain JavaScript object (NOT TypedArrays)
-class GeneratedScope {
-  _userId = undefined;
-  _requestId = undefined;
-
-  get userId() {
-    return this._userId;
-  }
-  set userId(value) {
-    this._userId = value;
-  }
-
-  _getScopeValues() {
-    return { userId: this._userId, requestId: this._requestId };
-  }
-}
-
-// SpanBuffer: TypedArray columns for per-entry data
-class GeneratedSpanBuffer {
-  // System columns (eager, _ prefix prevents namespace collisions)
-  _timestamps: BigInt64Array;
-  _operations: Uint8Array;
-  _writeIndex: number;
-  _capacity: number;
-  _next?: SpanBuffer;
-
-  // User attributes (lazy getters, no prefix - clean API)
-  get userId_values() {
-    /* lazy allocation */
-  }
-  get userId_nulls() {
-    /* lazy allocation */
-  }
-}
-```
-
-**Arrow conversion** fills null positions with scope values:
-
-```typescript
-// During Arrow conversion (cold path)
-for (let i = 0; i < entryCount; i++) {
-  if (!isValid(nullBitmap, i)) {
-    // Entry has no explicit value - use scope value if available
-    if (scopeValues.userId !== undefined) {
-      arrowColumn[i] = scopeValues.userId;
-    }
-  }
-}
-```
-
-### SpanBuffer Structure
-
-SpanBuffer extends ColumnBuffer with span-specific metadata:
-
-```typescript
-interface SpanBuffer extends ColumnBuffer {
-  // Span identity (see 01b_columnar_buffer_architecture.md "Span Definition")
-  // A span represents a unit of work within a single thread of execution.
-  threadId: bigint; // 64-bit random, generated once per worker/process
-  spanId: number; // 32-bit counter, incremented per span on this thread
-  traceId: string; // Shared across all spans in a request
-
-  // Tree structure
-  parent?: SpanBuffer; // Parent span (for child spans) - provides parent_thread_id/parent_span_id
-  children: SpanBuffer[]; // Child spans
-
-  // Op context link
-  op: Op<any, any, any>; // The Op that created this buffer
-
-  // Buffer chaining (for overflow)
-  next?: SpanBuffer; // Continuation buffer when capacity exceeded
-}
-```
-
-### Direct Properties (Zero Indirection)
-
-**WHY**: V8's hidden class optimization works best with stable, known properties.
-
-```typescript
-// ❌ WRONG - Dynamic lookup, megamorphic
-buffer.columns['userId'].values[idx] = value;
-
-// ✅ CORRECT - Direct property, monomorphic
-buffer.userId_values[idx] = value;
-```
-
-The generated SpanBuffer class has direct properties for each column:
-
-- `${name}_nulls` - Uint8Array null bitmap
-- `${name}_values` - TypedArray for values
-- `${name}` - Alias for `_values` (convenience)
-
-System properties use `_` prefix to prevent collisions:
-
-- `_timestamps`, `_operations` - System columns
-- `_writeIndex`, `_capacity`, `_next` - Internal state
-
----
-
-## The Op Class
-
-The Op class is the core abstraction for traced operations. It:
-
-1. **Captures module binding** at definition time (gitSha, packageName, packagePath)
-2. **Creates SpanBuffer** when invoked via span()
-3. **Registers with parent** (RemappedBufferView if prefixed)
-4. **Handles try/catch** for span-exception entries
-
-Type parameters are ordered to match the function signature `(ctx, ...args) => Promise<Result>`:
-
-```typescript
-class Op<Ctx, Args extends unknown[], Result> {
-  // Captured at op() call time
-  readonly module: ModuleContext;
-  readonly fn: (ctx: Ctx, ...args: Args) => Promise<Result>;
-
-  constructor(module: ModuleContext, fn: (ctx: Ctx, ...args: Args) => Promise<Result>) {
-    this.module = module;
-    this.fn = fn;
-  }
-
-  // Called by span() - creates buffer, executes fn, handles errors
-  execute(parentCtx: SpanContext, spanName: string, lineNumber: number, ...args: Args): Promise<Result> {
-    // 1. Create SpanBuffer with this module's schema
-    const buffer = createSpanBuffer(
-      this.module.schema,
-      {
-        module: this.module,
-        spanName,
-        lineNumber,
-      },
-      parentCtx.traceId,
-      parentCtx.threadId,
-      parentCtx.buffer
-    );
-
-    // 2. Build destructurable context (satisfies Ctx constraint)
-    const ctx = {
-      span: (name, op, ...opArgs) => op.execute(/* ... */),
-      log: new SpanLogger(buffer),
-      tag: new TagAPI(buffer),
-      deps: this.module.deps, // Just Op references, no allocation!
-      ff: parentCtx.ff.withBuffer(buffer),
-      ...parentCtx.extra, // Spread user-defined Extra fields (e.g., env)
-    } as Ctx;
-
-    // 3. Execute with try/catch for span-exception
-    try {
-      return await this.fn(ctx, ...args);
-    } catch (error) {
-      buffer.writeException(error);
-      throw error;
-    }
-  }
-}
-```
-
-**Key insight**: `deps` is just references to Op instances. No per-span closures needed.
-
----
-
-## Runtime Code Generation
-
-Both packages use `new Function()` for performance-critical code:
-
-### arrow-builder generates:
-
-- `generateColumnBufferClass()` - Creates buffer class with:
-  - Eager system column allocation in constructor
-  - Lazy getters for attribute columns
-  - Per-instance storage via Symbol keys
-  - Cache-aligned capacity calculation
-
-### lmao generates:
-
-- `generateSpanLoggerClass()` - Creates SpanLogger with:
-  - Typed attribute methods (`userId(value)`, `httpStatus(code)`)
-  - Compile-time enum mapping (string → Uint8 index)
-  - Fluent API (methods return `this`)
-- `generateScopeClass()` - Creates Scope with:
-  - Private fields per attribute
-  - Getters/setters for type-safe access
-  - `_getScopeValues()` for inheritance
-- `generateTagAPIClass()` - Creates TagAPI with:
-  - Typed attribute methods for span attributes
-  - Fluent chaining
-
-**WHY `new Function()`**:
-
-- Generates monomorphic code that V8 can optimize
-- All property names known at generation time
-- Avoids megamorphic call sites from generic implementations
-- Hidden class stability - all properties defined in constructor
-
----
-
-## String Interning and UTF-8 Caching
-
-The system uses a two-tier architecture for efficient string-to-UTF-8 conversion:
-
-### Global Interner (arrow-builder)
-
-A simple `Map<string, Uint8Array>` for pre-encoding UTF-8 of known strings:
-
-```typescript
-// arrow-builder/src/lib/arrow/interner.ts
-export function intern(str: string): Uint8Array; // Encode and cache (or return cached)
-export function getInterned(str: string): Uint8Array | undefined; // Get if cached
-```
-
-**When called** (all at startup/definition time):
-
-- `S.enum(['A', 'B'])` → interns all enum values
-- `new ModuleContext(...)` → interns `packageName`, `packagePath`, `gitSha`
-
-**Why in arrow-builder**: Pre-encoding UTF-8 is generic functionality. Any columnar data system benefits from avoiding
-repeated encoding of known strings. The interner has no knowledge of logging concepts.
-
-### Utf8Cache (lmao)
-
-A SIEVE-based bounded cache for runtime strings:
-
-```typescript
-// lmao/src/lib/utf8Cache.ts
-export class Utf8Cache implements Utf8Encoder {
-  encode(str: string): Uint8Array; // Check cache, encode if miss
-  encodeMany(strings: string[]): { data: Uint8Array; offsets: Int32Array };
-}
-export const globalUtf8Cache: Utf8Cache; // Singleton
-```
-
-**Why in lmao**: The SIEVE cache handles high-cardinality runtime strings (userIds, error messages) that need bounded
-memory. This is logging-specific - a generic columnar library wouldn't know the right cache size or eviction policy.
-
-### DictionaryBuilder (arrow-builder)
-
-Builds Arrow dictionaries with a 2nd-occurrence caching pattern:
-
-```typescript
-// arrow-builder/src/lib/arrow/dictionary.ts
-export class DictionaryBuilder {
-  constructor(utf8Encoder?: Utf8Encoder); // lmao passes globalUtf8Cache
-  add(str: string): void; // Check interner → track occurrence → maybe encode
-  finalize(sorted: boolean): FinalizedDictionary;
-}
-```
-
-**Lookup order in `add()`**:
-
-1. Check `getInterned(str)` for pre-encoded UTF-8 (enum values, span names)
-2. If not interned, track occurrence count:
-   - 1st occurrence: just track byte length
-   - 2nd occurrence: encode via `utf8Encoder` (lmao's cache) and store locally
-
-**Why in arrow-builder**: Dictionary building is generic Arrow functionality. The `Utf8Encoder` interface allows lmao to
-inject its SIEVE cache without arrow-builder knowing about caching strategies.
-
-### Pre-encoded UTF-8 in Contexts (lmao)
-
-```typescript
-class ModuleContext {
-  readonly utf8PackageName: Uint8Array; // intern(packageName) at construction
-  readonly utf8PackagePath: Uint8Array; // intern(packagePath) at construction
-  readonly utf8GitSha: Uint8Array; // intern(gitSha) at construction
-}
-```
-
-**Why in lmao**: Contexts are logging-specific. arrow-builder doesn't know about modules or spans.
-
-### Package Ownership Summary
-
-| Component            | Package       | Why There                                 |
-| -------------------- | ------------- | ----------------------------------------- |
-| `intern()`           | arrow-builder | Generic UTF-8 caching for known strings   |
-| `getInterned()`      | arrow-builder | Used by DictionaryBuilder                 |
-| `Utf8Encoder`        | arrow-builder | Generic interface for encoding            |
-| `defaultUtf8Encoder` | arrow-builder | Simple non-caching implementation         |
-| `DictionaryBuilder`  | arrow-builder | Generic Arrow dictionary construction     |
-| `Utf8Cache`          | lmao          | SIEVE cache for runtime strings (bounded) |
-| `globalUtf8Cache`    | lmao          | Singleton for cross-conversion caching    |
-| Pre-encoded contexts | lmao          | Logging-specific context optimization     |
+See `01b_columnar_buffer_architecture.md` for implementation details.
 
 ---
 
@@ -787,8 +427,7 @@ class ModuleContext {
 {
   "name": "@smoothbricks/arrow-builder",
   "dependencies": {
-    "apache-arrow": "^21.1.0",  // For arrow.makeData types only
-    "@sury/sury": "..."          // For schema validation types
+    "apache-arrow": "^21.1.0" // For arrow.makeData types only
   }
   // NO @smoothbricks/lmao dependency!
 }
@@ -797,80 +436,10 @@ class ModuleContext {
 {
   "name": "@smoothbricks/lmao",
   "dependencies": {
-    "@smoothbricks/arrow-builder": "workspace:*",  // Uses arrow-builder
+    "@smoothbricks/arrow-builder": "workspace:*", // Uses arrow-builder
     "apache-arrow": "^21.1.0"
   }
 }
-```
-
----
-
-## Testing Strategy
-
-### arrow-builder tests
-
-- Generic buffer operations (allocation, capacity)
-- Lazy column allocation behavior
-- Null bitmap correctness
-- Arrow conversion for all supported types
-- Codegen output verification
-- **NO logging concepts in tests**
-
-### lmao tests
-
-- Schema validation and type safety
-- System column eager allocation
-- User attribute lazy allocation
-- Scope class generation and inheritance
-- Op creation and execution
-- span() invocation semantics
-- Line number injection
-- Context propagation correctness
-- SpanLogger method generation
-- Entry type semantics
-- **Uses arrow-builder, verifies logging behavior**
-
----
-
-## File Organization
-
-```
-packages/
-├── arrow-builder/
-│   └── src/lib/
-│       ├── arrow/
-│       │   ├── interner.ts               # intern(), getInterned() - UTF-8 pre-encoding
-│       │   ├── dictionary.ts             # DictionaryBuilder with 2nd-occurrence caching
-│       │   └── utf8.ts                   # Utf8Encoder interface, defaultUtf8Encoder
-│       ├── buffer/
-│       │   ├── columnBufferGenerator.ts  # new Function() codegen
-│       │   ├── createColumnBuffer.ts     # Buffer factory
-│       │   ├── types.ts                  # ColumnBuffer interface
-│       │   └── microseconds.ts           # Branded timestamp type
-│       ├── schema/
-│       │   └── builder.ts                # S.enum/category/text (calls intern() for enums)
-│       ├── schema-types.ts               # Generic schema types
-│       └── index.ts                      # Public exports
-│
-└── lmao/
-    └── src/lib/
-        ├── schema/                       # S.enum, S.category, etc.
-        │   ├── builder.ts                # Schema DSL
-        │   ├── types.ts                  # TagAttributeSchema
-        │   └── defineTagAttributes.ts    # Schema factory
-        ├── codegen/
-        │   ├── spanLoggerGenerator.ts    # SpanLogger codegen
-        │   ├── tagApiGenerator.ts        # TagAPI codegen
-        │   └── scopeGenerator.ts         # Scope class codegen
-        ├── op.ts                         # Op class - wraps functions with module binding
-        ├── span.ts                       # span() invocation logic
-        ├── lmao.ts                       # Main entry, context creation
-        ├── spanBuffer.ts                 # SpanBuffer factory (extends ColumnBuffer)
-        ├── types.ts                      # SpanBuffer, Op, SpanContext interfaces
-        ├── moduleContext.ts              # ModuleContext with utf8PackageName, utf8PackagePath, utf8GitSha
-        ├── utf8Cache.ts                  # Utf8Cache (SIEVE), globalUtf8Cache singleton
-        ├── convertToArrow.ts             # Tree walking, dictionary building, Arrow conversion
-        └── flushScheduler.ts             # Background processing
 ```
 
 ---
@@ -956,6 +525,5 @@ Is it logging/tracing specific?
 
 - [ ] Feature is logging/tracing specific
 - [ ] Uses arrow-builder primitives, doesn't duplicate them
-- [ ] Clear documentation of why it's not in arrow-builder
 - [ ] System columns remain eager (no lazy checks in hot path)
 - [ ] Scope values stay separate from buffer columns

@@ -43,7 +43,7 @@ The Scope class is generated via `new Function()` and contains ONLY schema attri
 
 ```typescript
 // Generated once at module creation time (cold path)
-function generateScopeClass(schema: TagAttributeSchema): typeof GeneratedScope {
+function generateScopeClass(schema: LogSchema): typeof GeneratedScope {
   const fields = Object.keys(schema.fields)
     .map(
       (key) => `
@@ -287,10 +287,10 @@ Key insight: Pre-fill child buffer columns when creating child span, enabling SI
 
 ```typescript
 function createChildSpanContext<Schema, Deps, FF, Extra>(
-  parentCtx: OpContext<Schema, Deps, FF, Extra>,
+  parentCtx: SpanContext<Schema, Deps, FF, Extra>,
   spanName: string,
   scopeClass: typeof GeneratedScope
-): OpContext<Schema, Deps, FF, Extra> {
+): SpanContext<Schema, Deps, FF, Extra> {
   const childBuffer = createEmptySpanBuffer(/* ... */);
 
   // Create child scope and copy parent's scope values
@@ -323,7 +323,7 @@ function createChildSpanContext<Schema, Deps, FF, Extra>(
     }
   }
 
-  return createOpContext(childBuffer, childScope, scopeClass);
+  return createSpanContext(childBuffer, childScope, scopeClass);
 }
 ```
 
@@ -392,7 +392,7 @@ const parentOp = op(async ({ scope, span }) => {
 ## Cold Path: Arrow Conversion
 
 ```typescript
-function convertToArrow(buffer: SpanBuffer, scope: GeneratedScope, schema: TagAttributeSchema): ArrowData {
+function convertToArrow(buffer: SpanBuffer, scope: GeneratedScope, schema: LogSchema): ArrowData {
   const columns: Record<string, TypedArray> = {};
   const nullBitmaps: Record<string, Uint8Array> = {};
 

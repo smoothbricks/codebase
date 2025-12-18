@@ -533,7 +533,7 @@ interface UserServiceAttributes {
 
 // Op context is typed with attribute schema (Schema, Deps, FF, Extra)
 const createUser = op(
-  async ({ tag, log, scope, ok }: OpContext<UserServiceAttributes, {}, {}, {}>, userData: UserData) => {
+  async ({ tag, log, scope, ok }: SpanContext<UserServiceAttributes, {}, {}, {}>, userData: UserData) => {
     // ===== tag - Span Attributes =====
     // Chainable attribute setters (destructured from context)
     tag
@@ -633,7 +633,7 @@ type narrowing for Result pattern consumption.
 Returned by `ok(value)`. Implements the `SuccessResult<V>` interface with additional chaining methods:
 
 ```typescript
-class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessResult<V> {
+class FluentSuccessResult<V, T extends LogSchema> implements SuccessResult<V> {
   readonly success = true;
   readonly value: V;
 
@@ -650,7 +650,7 @@ class FluentSuccessResult<V, T extends TagAttributeSchema> implements SuccessRes
 Returned by `err(code, details)`. Implements the `ErrorResult<E>` interface with additional chaining methods:
 
 ```typescript
-class FluentErrorResult<E, T extends TagAttributeSchema> implements ErrorResult<E> {
+class FluentErrorResult<E, T extends LogSchema> implements ErrorResult<E> {
   readonly success = false;
   readonly error: { code: string; details: E };
 

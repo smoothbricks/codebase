@@ -5,7 +5,7 @@
 The trace schema system provides type-safe, high-performance configuration and attribute management for the trace
 logging system. It handles three types of data:
 
-1. **Tag Attributes** - Structured data logged to spans
+1. **Log Schema** - Structured data logged to spans
 2. **Feature Flags** - Dynamic behavior configuration with analytics
 3. **Environment Variables** - Static deployment configuration
 
@@ -16,7 +16,7 @@ requirements. The system optimizes each type appropriately rather than forcing t
 
 | Type                      | Complexity          | Tracking | Performance        | Use Case              |
 | ------------------------- | ------------------- | -------- | ------------------ | --------------------- |
-| **Tag Attributes**        | Schema + validation | Always   | Columnar writes    | Structured span data  |
+| **Log Schema**            | Schema + validation | Always   | Columnar writes    | Structured span data  |
 | **Feature Flags**         | Schema + evaluator  | Always   | Cached + analytics | A/B testing, rollouts |
 | **Environment Variables** | Plain object        | Never    | Property access    | Infrastructure config |
 
@@ -431,28 +431,36 @@ uuid: S.text(); // UUIDs are unique by definition
 - ⚠ String storage in JS heap (not TypedArray)
 - ⚠ All strings re-encoded to UTF-8 each flush
 
-## Tag Attribute Schema Definition
+## Log Schema Definition
 
 **Purpose**: Define structured data that can be logged to spans with type safety and automatic masking.
 
 ```typescript
-// Base attributes available everywhere
-const baseAttributes = defineTagAttributes({
-  requestId: S.category(),
-  userId: S.category().mask('hash'),
-  timestamp: S.number(),
-
-  // Feature flag operations use ff-access and ff-usage entry types
-  // They write directly to span buffer via ctx.ff methods
-  // Flag evaluation context stored in regular attribute columns
-  // Flag name stored in unified `message` column (same as span name / log template)
-  // Only ffValue is FF-specific (S.category for efficient storage of repeated values)
-});
+// Define module with logSchema
+const httpModule = defineModule({
+  metadata: { packageName: '@mycompany/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
+  logSchema: {
+    requestId: S.category(),
+    userId: S.category().mask('hash'),
+    timestamp: S.number(),
+    status: S.number(),
+    method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
+    endpoint: S.category(),
+    errorMessage: S.text(),
+  },
+  deps: { db: dbModule },
+  ff: { premium: ff.boolean() },
+})
+  .ctx<{ env: WorkerEnv; requestId: string }>({
+    env: null!,
+    requestId: null!,
+  })
+  .make();
 ```
 
 **Why This Design**:
 
-- **Composable**: Base attributes can be extended for specific domains
+- **Composable**: Base logSchema can be extended for specific domains
 - **Type-safe**: Full TypeScript inference for tag operations
 - **Masking rules**: Sensitive data automatically masked during serialization
 - **Columnar storage**: Schema drives efficient TypedArray column generation
@@ -529,20 +537,20 @@ The `track()` method returns a chainable API that writes to the **same columns**
 tracking schema - this keeps the Arrow table structure unified and avoids column name collisions.
 
 ```typescript
-// Your tag attributes schema (user-defined)
-const tagAttributes = defineTagAttributes({
+// Your logSchema (user-defined)
+const logSchema = {
   variant: S.category(), // flag variant value
   userId: S.category(),
   duration: S.number(),
   requested: S.number(),
   returned: S.number(),
-});
+};
 
 // track() returns chainable API with SAME methods as ctx.tag
 // Equivalent to:
 // 1. Write entry_type = FF_USAGE
 // 2. Write message = 'darkMode'  (unified message column - flag name)
-// 3. Write user-defined attributes (from tag schema)
+// 3. Write user-defined attributes (from log schema)
 ```
 
 **System columns** (defined in systemSchema):
@@ -550,7 +558,7 @@ const tagAttributes = defineTagAttributes({
 ```typescript
 // Core system columns
 // See 01b_columnar_buffer_architecture.md "Span Definition" for span ID design details
-const systemSchema = defineTagAttributes({
+const systemSchema = {
   // Trace structure
   timestamp: S.number(), // Microseconds since epoch (Float64Array, SAFE until year 2255)
   traceId: S.category(), // Request trace ID
@@ -583,7 +591,7 @@ const systemSchema = defineTagAttributes({
 
   // Feature flag value column
   ffValue: S.category(), // Flag value - uses category for efficient storage (values repeat: true/false, 'blue'/'green', etc.)
-});
+};
 ```
 
 ### The `message` System Column
@@ -623,7 +631,7 @@ The template string is stored verbatim. Values go in their typed attribute colum
 
 See **[Arrow Table Structure](./01f_arrow_table_structure.md)** for detailed examples and query patterns.
 
-**All other attributes** come from your tag schema - same columns, same table structure.
+**All other attributes** come from your log schema - same columns, same table structure.
 
 ### Deduplication: One ff-access per Span
 
@@ -992,7 +1000,7 @@ await ctx.span('processUser', { userId: 'user-456' }, async (childCtx) => {
 The evaluator provides a `forContext()` method to create child evaluators with additional context:
 
 ```typescript
-interface FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> {
+interface FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends LogSchema> {
   // Flag access - returns primitive values directly (boolean, number, string)
   readonly [K in keyof T]: InferFlagType<T[K]>;
 
@@ -1009,8 +1017,8 @@ interface FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends TagAttri
 }
 
 // FlagTracker - chainable API using SAME schema as ctx.tag
-// Methods are generated from tagSchema, same columns as ctx.tag
-interface FlagTracker<T extends TagAttributeSchema> {
+// Methods are generated from logSchema, same columns as ctx.tag
+interface FlagTracker<T extends LogSchema> {
   // Same methods as ctx.tag - writes to same columns
   [K in keyof T]: (value: InferAttributeType<T[K]>) => FlagTracker<T>;
 }
@@ -1178,10 +1186,10 @@ App Startup                    Per-Request                     Per-Span
  * Holds schema and external evaluation client.
  * Stateless - all per-span state lives in the accessor returned by forContext().
  */
-class FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> {
+class FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends LogSchema> {
   constructor(
     private schema: T,
-    private tagSchema: Tag,
+    private logSchema: Tag,
     private externalClient: FlagEvaluationClient
   ) {}
 
@@ -1193,7 +1201,7 @@ class FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends TagAttribute
    * @returns FlagAccessor with property access for flags and track() method
    */
   forContext<FF extends FeatureFlagSchema, Env>(ctx: SpanContext<Tag, FF, Env>): FlagAccessor<T, Tag> {
-    return new FlagAccessor(this.schema, this.tagSchema, this.externalClient, ctx);
+    return new FlagAccessor(this.schema, this.logSchema, this.externalClient, ctx);
   }
 }
 
@@ -1201,14 +1209,14 @@ class FeatureFlagEvaluator<T extends FeatureFlagSchema, Tag extends TagAttribute
  * Per-span accessor returned by evaluator.forContext(ctx).
  * Holds reference to ctx for logging/spanning, plus per-span caches.
  */
-class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> {
+class FlagAccessor<T extends FeatureFlagSchema, Tag extends LogSchema> {
   // Per-span caches (fresh for each span)
   private accessedFlags = new Set<string>();
   private valueCache = new Map<string, boolean | number | string>();
 
   constructor(
     private schema: T,
-    private tagSchema: Tag,
+    private logSchema: Tag,
     private client: FlagEvaluationClient,
     private ctx: SpanContext<Tag, any, any>
   ) {
@@ -1278,8 +1286,8 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends TagAttributeSchema> 
     const buffer = this.ctx.buffer;
     const tracker = {} as FlagTracker<Tag>;
 
-    // Generate methods from tagSchema - SAME columns as ctx.tag
-    for (const attrName of Object.keys(this.tagSchema)) {
+    // Generate methods from logSchema - SAME columns as ctx.tag
+    for (const attrName of Object.keys(this.logSchema)) {
       const columnName = `attr_${attrName}`;
       (tracker as any)[attrName] = (value: unknown) => {
         if (buffer[columnName]) {
@@ -1345,7 +1353,7 @@ class LaunchDarklyClient implements FlagEvaluationClient {
 // App startup - create singleton evaluator
 const ffEvaluator = new FeatureFlagEvaluator(
   featureFlagSchema,
-  tagAttributeSchema,
+  logSchema,
   new LaunchDarklyClient(ldClient),
 );
 
@@ -1504,7 +1512,7 @@ class DefaultFlagValueClient implements FlagEvaluationClient {
 // Always available - created synchronously, no async init needed
 const defaultFfEvaluator = new FeatureFlagEvaluator(
   featureFlagSchema,
-  tagAttributeSchema,
+  logSchema,
   new DefaultFlagValueClient(featureFlagSchema)
 );
 ```
@@ -1557,7 +1565,7 @@ async function initializeApp(): Promise<FeatureFlagEvaluator> {
   // Create production evaluator with real (or fallback) client
   const ffEvaluator = new FeatureFlagEvaluator(
     featureFlagSchema,
-    tagAttributeSchema,
+    logSchema,
     ldClient.value,
   );
 
@@ -1641,91 +1649,99 @@ interface SpanContext<Schema, Deps, FF, Extra> extends TraceContext<FF, Extra> {
 ### Op Integration
 
 ```typescript
-// Define module with schema (see 01l_module_builder_pattern.md for full API)
-const userModule = defineModule({
-  metadata: {
-    gitSha: 'abc123...',
-    packageName: '@mycompany/user-service',
-    packagePath: 'src/services/user.ts',
+// Define module with logSchema
+const httpModule = defineModule({
+  metadata: { packageName: '@mycompany/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
+  logSchema: {
+    status: S.number(),
+    method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
+    endpoint: S.category(),
+    errorMessage: S.text(),
   },
-  schema: dbAttributes, // Module's tag attributes
-});
+  deps: { db: dbModule },
+  ff: { premium: ff.boolean() },
+})
+  .ctx<{ env: WorkerEnv; requestId: string }>({
+    env: null!,
+    requestId: null!,
+  })
+  .make();
 
-const { op } = userModule;
+const { op } = httpModule;
 
-export const createUser = op(async ({ span, log, tag, ok, err, ff, env, deps }, userData: UserData) => {
-  // Destructured ctx has: span, log, tag, ok, err, ff (feature flags), env (environment), deps
+export const createUser = op('createUser', async (ctx, userData: UserData) => {
+  // ctx is SpanContext with: span, log, tag, ok, err, ff (feature flags), env (environment), deps
 
   // Feature flag access - returns primitive value directly
-  const advancedValidation = ff.advancedValidation; // boolean, logs ff-access
+  const advancedValidation = ctx.ff.advancedValidation; // boolean, logs ff-access
 
   if (advancedValidation) {
     const result = await performAdvancedValidation(userData);
     // Track usage with chainable API
-    ff.track('advancedValidation');
+    ctx.ff.track('advancedValidation');
   }
 
   // Environment access (just plain property access, no tracking)
-  const region = env.awsRegion; // 'us-east-1'
-  const maxConnections = env.maxConnections; // 100
-  const dbUrl = env.databaseUrl; // Real postgres URL
+  const region = ctx.env.awsRegion; // 'us-east-1'
+  const maxConnections = ctx.env.maxConnections; // 100
+  const dbUrl = ctx.env.databaseUrl; // Real postgres URL
 
   // Span attributes - set context data at span start (via tag)
-  tag
+  ctx.tag
     .requestId(userData.requestId) // Sets bit 0, writes to attr_requestId column
     .userId(userData.id) // Sets bit 1, writes to attr_userId column
     .operation('INSERT'); // Sets bit 4, writes to attr_operation column
 
   // Or, object-based API for multiple attributes
-  tag({ requestId: userData.requestId, userId: userData.id, operation: 'INSERT' });
+  ctx.tag({ requestId: userData.requestId, userId: userData.id, operation: 'INSERT' });
 
   // Masking only happens if you explicitly log environment values
-  tag.region(region); // Safe to log
-  // tag.databaseUrl(dbUrl);  // Would be masked by tag schema
+  ctx.tag.region(region); // Safe to log
+  // ctx.tag.databaseUrl(dbUrl);  // Would be masked by log schema
 
   // Child spans create child SpanBuffers in tree structure
   // Child span inherits parent's FF evaluation context
-  const validation = await span('validate-user', validateUserOp, userData);
+  const validation = await ctx.span('validate-user', validateUserOp, userData);
   // validateUserOp is another op that handles validation logic
 
   if (!validation.success) {
-    return err('VALIDATION_FAILED', validation.error);
+    return ctx.err('VALIDATION_FAILED', validation.error);
   }
 
   const user = await db.createUser(userData);
-  return ok(user);
+  return ctx.ok(user);
 });
 
 // Example: Child span with ADDITIONAL evaluation context
-export const processBatch = op(async ({ span, ff, ok }, users: User[]) => {
+export const processBatch = op('processBatch', async (ctx, users: User[]) => {
   // Parent span - no specific user context yet
-  const batchEnabled = ff.batchProcessing; // Evaluated without userId
+  const batchEnabled = ctx.ff.batchProcessing; // Evaluated without userId
 
   for (const user of users) {
     // Child span with additional context - adds userId to evaluation
     // processUserOp is another op that handles per-user processing
-    await span('process-user', processUserOp, user);
+    await ctx.span('process-user', processUserOp, user);
   }
 
-  return ok({ processed: users.length });
+  return ctx.ok({ processed: users.length });
 });
 
 // processUserOp receives the user and can access ff with user context
-export const processUserOp = op(async ({ ff, deps }, user: User) => {
-  // ff evaluates flags WITH userId and userPlan context from span creation
-  const premiumEnabled = ff.premiumFeatures; // boolean
+export const processUserOp = op('processUser', async (ctx, user: User) => {
+  // ctx.ff evaluates flags WITH userId and userPlan context from span creation
+  const premiumEnabled = ctx.ff.premiumFeatures; // boolean
 
   if (premiumEnabled) {
     // This flag was evaluated knowing the user's plan
     await enablePremiumFeatures(user);
-    ff.track('premiumFeatures');
+    ctx.ff.track('premiumFeatures');
   }
 });
 ```
 
 ## Performance Characteristics
 
-### Tag Attributes
+### Log Schema Attributes
 
 - **Runtime**: <0.1ms per tag operation (TypedArray writes + bitmap)
 - **Memory**: Columnar storage with null bitmaps
@@ -1750,8 +1766,8 @@ export const processUserOp = op(async ({ ff, deps }, user: User) => {
 2. **Performance Optimization**: Each system optimized for its access patterns
 3. **Security by Default**: Sensitive data only appears in traces when explicitly logged
 4. **Analytics Integration**: Feature flags automatically tracked for product decisions
-5. **Composable Schemas**: Tag attributes can be extended and reused across modules
+5. **Composable Schemas**: Log schema can be extended and reused across modules
 6. **Zero Configuration Overhead**: Environment variables are just plain objects
 
-This design provides the right tool for each job - sophisticated analytics for feature flags, structured logging for tag
-attributes, and zero-overhead access for environment configuration.
+This design provides the right tool for each job - sophisticated analytics for feature flags, structured logging for log
+schema attributes, and zero-overhead access for environment configuration.

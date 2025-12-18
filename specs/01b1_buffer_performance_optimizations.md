@@ -1081,7 +1081,7 @@ export function getInterned(str: string): Uint8Array | undefined {
 
 - **Enum schema creation**: `S.enum(['A', 'B', 'C'])` calls `intern()` for all values
 - **Module context creation**: `new ModuleContext(...)` interns `packageName`, `packagePath`, and `gitSha`
-- **Task context creation**: `new TaskContext(...)` interns `spanName`
+- **Span buffer creation**: `createSpanBuffer(...)` interns `spanName`
 
 **Why unbounded**: All interned values are source code constants (enum values, file paths, span names) that already
 exist in memory. The interner just caches their UTF-8 representations.
@@ -1098,16 +1098,19 @@ const moduleCtx = new ModuleContext(
   gitSha, // intern(gitSha) → UTF-8 bytes cached
   packageName, // intern(packageName) → UTF-8 bytes cached (e.g., '@mycompany/user-service')
   packagePath, // intern(packagePath) → UTF-8 bytes cached (e.g., 'src/services/user.ts')
-  tagAttributes
+  logSchema
 );
 
 // At span creation (per-span, but span names are finite)
-// SpanName is passed to op via span('name', op, args)
-const opCtx = new OpContext(
-  moduleCtx,
-  'processOrder', // intern(spanName) → UTF-8 bytes cached
-  lineNumber
+// SpanName is passed to op via span(lineNumber, 'name', op, args)
+// lineNumber is written directly to lineNumber_values[0] inside _invoke()
+// spanName is interned for UTF-8 encoding
+const buffer = createSpanBuffer(
+  callsiteModule, // Caller's module for row 0 metadata
+  opModule, // Op's module for rows 1+ metadata
+  'processOrder' // intern(spanName) → UTF-8 bytes cached
 );
+buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write, NOT stored as property
 ```
 
 ### Utf8Cache (lmao owns)
@@ -1202,9 +1205,9 @@ export class DictionaryBuilder {
 **Why 2nd-occurrence caching**: Most one-time strings (unique error messages, UUIDs) don't benefit from caching. By
 waiting until the 2nd occurrence, we avoid wasting memory on truly unique strings while still caching repeated values.
 
-### Pre-encoded UTF-8 in Contexts (lmao owns)
+### Pre-encoded UTF-8 in ModuleContext (lmao owns)
 
-Module and Task contexts store pre-encoded UTF-8 for frequently-used strings:
+ModuleContext stores pre-encoded UTF-8 for frequently-used strings:
 
 ```typescript
 // ModuleContext (created once per module at startup)
@@ -1213,24 +1216,21 @@ class ModuleContext {
   readonly utf8PackagePath: Uint8Array; // intern(packagePath)
   readonly utf8GitSha: Uint8Array; // intern(gitSha)
 
-  constructor(gitSha, packageName, packagePath, tagAttributes) {
+  constructor(gitSha, packageName, packagePath, logSchema) {
     this.utf8PackageName = intern(packageName);
     this.utf8PackagePath = intern(packagePath);
     this.utf8GitSha = intern(gitSha);
   }
 }
 
-// OpContext (created per span execution)
-class OpContext {
-  readonly utf8SpanName: Uint8Array; // intern(spanName)
-
-  constructor(module, spanName, lineNumber) {
-    this.utf8SpanName = intern(spanName);
-  }
-}
+// SpanBuffer stores dual module references for source attribution:
+// - callsiteModule: Caller's module (for row 0's gitSha/packageName/packagePath)
+// - module: Op's module (for rows 1+ gitSha/packageName/packagePath)
+// spanName is interned during buffer creation
+// lineNumber is written directly to lineNumber_values TypedArray (NOT stored as property)
 ```
 
-**Why pre-encode**: These strings are written to Arrow columns frequently. Pre-encoding at context creation means zero
+**Why pre-encode**: These strings are written to Arrow columns frequently. Pre-encoding at module creation means zero
 UTF-8 encoding cost during Arrow conversion.
 
 ### Design Decisions
@@ -1294,7 +1294,7 @@ encoding model.
 | `DictionaryBuilder`         | arrow-builder | Build Arrow dictionaries with 2nd-occ cache  |
 | `Utf8Cache`                 | lmao          | SIEVE-cached Utf8Encoder for runtime strings |
 | `globalUtf8Cache`           | lmao          | Singleton Utf8Cache instance                 |
-| Pre-encoded contexts        | lmao          | ModuleContext/TaskContext with utf8\* fields |
+| Pre-encoded contexts        | lmao          | ModuleContext with utf8\* fields             |
 
 ### Data Flow During Arrow Conversion
 

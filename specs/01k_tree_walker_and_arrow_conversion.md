@@ -412,7 +412,7 @@ function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): 
  *
  * **Schema Requirement**: All root buffers must share the same schema. The application composes
  * all library schemas into a single ModuleContext at startup, so all buffers created from that
- * module share the same tagAttributes schema. This requirement is enforced at runtime.
+ * module share the same logSchema schema. This requirement is enforced at runtime.
  *
  * **Why Single RecordBatch**: Converting multiple root buffers (e.g., multiple HTTP requests)
  * into a single RecordBatch maximizes dictionary reuse - all buffers share the same dictionary
@@ -433,9 +433,9 @@ function convertSpanTreeToArrowTable(
 
   // Schema requirement: All buffers must share the same schema
   // This is enforced because the application composes all library schemas into one ModuleContext
-  const expectedSchema = rootBuffers[0].op.module.tagAttributes;
+  const expectedSchema = rootBuffers[0].op.module.logSchema;
   for (let i = 1; i < rootBuffers.length; i++) {
-    if (rootBuffers[i].op.module.tagAttributes !== expectedSchema) {
+    if (rootBuffers[i].op.module.logSchema !== expectedSchema) {
       throw new Error(
         `Schema mismatch: All buffers in a flush must share the same schema. ` +
           `Buffer 0 has schema from module ${rootBuffers[0].op.module.packageName}, ` +
@@ -663,7 +663,7 @@ interface TreeTraversable {
   threadId: bigint;
   spanId: number;
   parentSpanId: number;
-  op: OpContext;
+  op: SpanContext;
   getColumnIfAllocated(name: string): ColumnValueType | undefined;
   getNullsIfAllocated(name: string): Uint8Array | undefined;
 }
@@ -703,7 +703,7 @@ registration explicitly:
 // Inside op's wrapper (conceptual):
 async invoke(parentCtx, spanName, line, ...args) {
   // Op creates its own SpanBuffer with unprefixed schema
-  const ownBuffer = createSpanBuffer(unprefixedSchema, opContext, traceId);
+  const ownBuffer = createSpanBuffer(unprefixedSchema, callsite, traceId);
 
   // Op registers with parent - wrap with RemappedBufferView if prefixed
   if (prefix && parentCtx?.buffer) {

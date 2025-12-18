@@ -5,16 +5,84 @@
 The module context system provides the foundation for creating ops with generated TagAPI and SpanLogger classes. It
 handles:
 
-1. **Module-level configuration** shared across all ops in the same module
-2. **Op class generation** for traced operations with proper type parameters
-3. **TagAPI class generation** with typed attribute methods (for `tag`)
-4. **SpanLogger class generation** with log methods (for `log`)
-5. **Schema compilation** for both standard and library modules
-6. **User-extensible context** via `.ctx<Extra>()` for custom properties
+1. **ModuleContext** - module-level configuration shared across all ops
+2. **SpanBuffer** - per-span buffer with span name, line number, and module reference
+3. **Op class generation** for traced operations with proper type parameters
+4. **TagAPI class generation** with typed attribute methods (for `tag`)
+5. **SpanLogger class generation** with log methods (for `log`)
+6. **Schema compilation** for both standard and library modules
+7. **User-extensible context** via `.ctx<Extra>()` for custom properties
 
 This system operates at build/startup time to generate efficient runtime code with zero overhead.
 
-## Design Rationale: From ctx to Destructured Op Context
+## Context Hierarchy
+
+```
+ModuleContext (class) - ONE per module definition
+├── packageName: string
+├── packagePath: string
+├── gitSha: string
+├── packageEntry: PreEncodedEntry (UTF-8 cached)
+├── packagePathEntry: PreEncodedEntry (UTF-8 cached)
+├── gitShaEntry: PreEncodedEntry (UTF-8 cached)
+├── logSchema (tag attribute definitions)
+├── sb_capacity: number (buffer capacity)
+├── sb_totalWrites: number (total writes across all buffers)
+├── sb_overflows: number (overflow write count)
+└── sb_totalCreated: number (total buffers created)
+
+SpanBuffer - ONE per span
+├── callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
+├── module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
+├── spanName: string               ← span name for this invocation
+├── lineNumber_values: Int32Array  ← line numbers per row (written directly, NOT stored as property)
+├── parent?: SpanBuffer            ← reference to parent (child spans walk this for traceId)
+├── children: SpanBuffer[]         ← child spans
+└── columns, writeIndex, etc.
+
+SpanContext (interface) - user-facing, what ops receive
+├── tag: TagWriter<T>
+├── log: SpanLogger<T>
+├── scope()
+├── ok() / err()
+├── span()
+├── buffer (getter)
+├── ff: FeatureFlagEvaluator
+└── deps: Deps
+```
+
+**Key Design: Dual Module References for Source Attribution**
+
+Each SpanBuffer has TWO module references for different purposes:
+
+- **`callsiteModule`**: The caller's module - where `span()` was invoked. Used for **row 0 (span-start)** metadata
+  (`gitSha`, `packageName`, `packagePath`).
+- **`module`**: The Op's module - what code is executing. Used for **rows 1+ (span-ok/err/exception, logs)** metadata
+  (`gitSha`, `packageName`, `packagePath`).
+
+This enables accurate source attribution: the span-start entry records WHERE the span was invoked from (callsite), while
+subsequent entries record WHERE the code is actually executing (the Op's module).
+
+**Key Design: lineNumber is NEVER a property on any object**
+
+Line numbers flow directly from transformer injection to TypedArray writes:
+
+```typescript
+// Transformer output:
+await span(42, 'fetch-user', userLib.fetchUser, userId);
+//         ^^ lineNumber argument
+
+// Inside span():
+buffer.lineNumber_values[0] = 42; // Direct TypedArray write for row 0, that's it
+
+// For logs:
+log.info('Processing').line(55); // .line(N) writes to lineNumber_values[writeIndex]
+```
+
+The lineNumber is passed as an argument and written directly to `lineNumber_values` TypedArray at the appropriate row
+index. There is NO intermediate storage of lineNumber on any context object.
+
+## Design Rationale: From ctx to Destructured SpanContext
 
 ### Problem with ctx Parameter
 
@@ -29,7 +97,7 @@ const createUser = op(async (ctx, userData) => {
 });
 ```
 
-### Solution: Destructured Op Context
+### Solution: Destructured SpanContext
 
 The chosen design uses ops with destructuring:
 
@@ -55,13 +123,13 @@ const createUser = op(async ({ span, log, tag }, userData: UserData) => {
 **Purpose**: Set up module-level configuration shared across all ops in the module.
 
 ```typescript
-// Define module with schema, dependencies, feature flags, and user context
+// Define module with logSchema, dependencies, feature flags, and user context
 const userModule = defineModule({
   metadata: {
     packageName: '@my-company/user-service',
     packagePath: 'src/user.ts',
   },
-  schema: {
+  logSchema: {
     userId: S.category(),
     operation: S.enum(['CREATE', 'UPDATE', 'DELETE']),
   },
@@ -81,7 +149,7 @@ const { op } = userModule;
 **Key Design: `.ctx<Extra>()`**
 
 The `.ctx<Extra>()` method specifies user-extensible context properties beyond the built-in `span`, `log`, `tag`,
-`deps`, and `ff`. These properties are spread into OpContext and can be destructured by ops.
+`deps`, and `ff`. These properties are spread into SpanContext and can be destructured by ops.
 
 ### Internal Implementation
 
@@ -92,31 +160,53 @@ interface ModuleMetadata {
   gitSha?: string; // Optional - injected by transformer at build time
 }
 
-function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; schema: Schema; deps?: Deps; ff?: FF }) {
-  // Compile schema to generate TagAPI and SpanLogger classes
-  const compiledTagOps = compileTagOperations(config.schema);
+class ModuleContext {
+  // Metadata (strings)
+  packageName: string;
+  packagePath: string;
+  gitSha: string;
+
+  // Pre-encoded UTF-8 for zero-copy writes
+  packageEntry: PreEncodedEntry;
+  packagePathEntry: PreEncodedEntry;
+  gitShaEntry: PreEncodedEntry;
+
+  // Log schema definition
+  logSchema: LogSchema;
+
+  // Generated classes
+  TagAPI: TagAPIClass;
+  SpanLogger: SpanLoggerClass;
+
+  // Self-tuning buffer stats (flat properties, not nested object)
+  sb_capacity: number = 64;
+  sb_totalWrites: number = 0;
+  sb_overflows: number = 0;
+  sb_totalCreated: number = 0;
+}
+
+function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; logSchema: Schema; deps?: Deps; ff?: FF }) {
+  // Compile logSchema to generate TagAPI and SpanLogger classes
+  const compiledTagOps = compileTagOperations(config.logSchema);
 
   // Create module context
-  const moduleContext: ModuleContext = {
-    metadata: config.metadata,
+  const moduleContext = new ModuleContext();
+  moduleContext.packageName = config.metadata.packageName;
+  moduleContext.packagePath = config.metadata.packagePath;
+  moduleContext.gitSha = config.metadata.gitSha || '';
+  moduleContext.logSchema = config.logSchema;
+  moduleContext.TagAPI = compiledTagOps.TagAPI;
+  moduleContext.SpanLogger = compiledTagOps.SpanLogger;
 
-    // Compiled classes
-    TagAPI: compiledTagOps.TagAPI,
-    SpanLogger: compiledTagOps.SpanLogger,
-    compiledSchema: compiledTagOps.schema,
-
-    // Self-tuning capacity stats
-    spanBufferCapacityStats: {
-      currentCapacity: 64,
-      totalWrites: 0,
-      overflowWrites: 0,
-      totalBuffersCreated: 0,
-    },
-  };
+  // Pre-encode metadata for zero-copy writes
+  const encoder = new TextEncoder();
+  moduleContext.packageEntry = { utf8: encoder.encode(config.metadata.packageName) };
+  moduleContext.packagePathEntry = { utf8: encoder.encode(config.metadata.packagePath) };
+  moduleContext.gitShaEntry = { utf8: encoder.encode(config.metadata.gitSha || '') };
 
   return {
     metadata: config.metadata,
-    schema: config.schema,
+    logSchema: config.logSchema,
     deps: config.deps || {},
     ff: config.ff || {},
 
@@ -125,8 +215,8 @@ function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; sche
       return {
         // Op factory - creates Op instances with full context type
         op: <Args extends unknown[], Result>(
-          fn: (ctx: OpContext<Schema, Deps, FF, Extra>, ...args: Args) => Promise<Result>
-        ): Op<OpContext<Schema, Deps, FF, Extra>, Args, Result> => new Op(moduleContext, fn),
+          fn: (ctx: SpanContext<Schema, Deps, FF, Extra>, ...args: Args) => Promise<Result>
+        ): Op<SpanContext<Schema, Deps, FF, Extra>, Args, Result> => new Op(moduleContext, fn),
 
         // Fluent API for composition
         prefix<P extends string>(p: P) {
@@ -135,6 +225,11 @@ function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; sche
 
         use(wiredDeps: WiredDeps) {
           return createRootContext(this, wiredDeps);
+        },
+
+        // Create trace context at request entry
+        traceContext(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra> {
+          return createTraceContext(moduleContext, params);
         },
       };
     },
@@ -150,26 +245,35 @@ signature `(ctx, ...args) => Promise<Result>`:
 ```typescript
 class Op<Ctx, Args extends unknown[], Result> {
   constructor(
-    private module: ModuleContext,
+    readonly name: string, // For Op metrics (invocations, errors, duration)
+    private module: ModuleContext, // For gitSha/packageName/packagePath attribution
     private fn: (ctx: Ctx, ...args: Args) => Promise<Result>
   ) {}
 
   /**
    * Internal invocation - called by span()
+   *
+   * @param traceCtx - The root trace context
+   * @param parentBuffer - Parent span's buffer (null for root)
+   * @param callsiteModule - The CALLER's module (where span() was invoked)
+   * @param spanName - Name decided by caller
+   * @param lineNumber - Line number where span() was called (injected by transformer, passed directly)
+   * @param args - User arguments to the op
    */
   async _invoke(
     traceCtx: TraceContext,
     parentBuffer: SpanBuffer | null,
+    callsiteModule: ModuleContext,
     spanName: string,
+    lineNumber: number,
     args: Args
   ): Promise<Result> {
-    // 1. Create SpanBuffer
-    const buffer = createSpanBuffer(
-      this.module.compiledSchema,
-      this.module.metadata,
-      traceCtx.traceId,
-      traceCtx.threadId
-    );
+    // 1. Create SpanBuffer with callsiteModule reference
+    //    - callsiteModule: where span() was called (for row 0's gitSha/packageName/packagePath)
+    //    - this.module: the Op's module (for rows 1+ gitSha/packageName/packagePath)
+    const buffer = parentBuffer
+      ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
+      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.traceId);
 
     // 2. Link to parent
     if (parentBuffer) {
@@ -177,27 +281,39 @@ class Op<Ctx, Args extends unknown[], Result> {
       buffer.parent = parentBuffer;
     }
 
-    // 3. Write span-start
-    buffer.writeSpanStart(spanName);
+    // 3. Write span-start (row 0)
+    //    - Uses callsiteModule for gitSha/packageName/packagePath
+    //    - lineNumber written DIRECTLY to lineNumber_values[0] (NO intermediate object storage)
+    buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write
+    buffer.writeSpanStart(); // Writes timestamp, operation, uses callsiteModule for metadata
 
-    // 4. Create OpContext (satisfies Ctx constraint)
+    // 4. Create SpanContext (satisfies Ctx constraint)
+    //    span() captures the CURRENT module (this.module) as callsiteModule for child spans
     const opCtx = {
-      span: (name, childOp, ...childArgs) => childOp._invoke(traceCtx, buffer, name, childArgs),
+      span: (childLineNumber, name, childOp, ...childArgs) =>
+        childOp._invoke(traceCtx, buffer, this.module, name, childLineNumber, childArgs),
       log: new this.module.SpanLogger(buffer),
       tag: new this.module.TagAPI(buffer),
       deps: this.module.boundDeps,
       ff: traceCtx.ff.withBuffer(buffer),
+      ok: (value) => ({ success: true, value }),
+      err: (error) => ({ success: false, error }),
+      scope: (attrs) => buffer.setScope(attrs),
+      get buffer() {
+        return buffer;
+      },
       // Spread Extra properties from TraceContext (e.g., env, requestId, userId)
       ...extractExtraFromTraceContext(traceCtx),
     } as Ctx;
 
     // 5. Execute with try/catch
+    //    Rows 1+ use this.module for gitSha/packageName/packagePath
     try {
       const result = await this.fn(opCtx, ...args);
-      buffer.writeSpanOk();
+      buffer.writeSpanOk(); // Row 1 - uses module metadata
       return result;
     } catch (error) {
-      buffer.writeSpanException(error);
+      buffer.writeSpanException(error); // Row 1 - uses module metadata
       throw error;
     }
   }
@@ -211,23 +327,19 @@ The TagAPI class provides typed attribute methods for `tag`:
 ### Standard Compilation
 
 ```typescript
-function compileTagOperations(tagAttributes: TagAttributeSchema) {
-  const attributeNames = Object.keys(tagAttributes);
-  const TagAPI = generateTagAPIClass(attributeNames, attributeNames, tagAttributes);
-  const SpanLogger = generateSpanLoggerClass(attributeNames, tagAttributes);
+function compileTagOperations(logSchema: LogSchema) {
+  const attributeNames = Object.keys(logSchema);
+  const TagAPI = generateTagAPIClass(attributeNames, attributeNames, logSchema);
+  const SpanLogger = generateSpanLoggerClass(attributeNames, logSchema);
 
-  return {
-    schema: tagAttributes,
-    TagAPI,
-    SpanLogger,
-  };
+  return { logSchema, TagAPI, SpanLogger };
 }
 ```
 
 ### Library Compilation (Prefixed)
 
 ```typescript
-function compilePrefixedTagOperations(cleanSchema: TagAttributeSchema, prefix: string) {
+function compilePrefixedTagOperations(cleanSchema: LogSchema, prefix: string) {
   const cleanNames = Object.keys(cleanSchema);
   const prefixedNames = cleanNames.map((name) => `${prefix}_${name}`);
   const prefixedSchema = createPrefixedSchema(cleanSchema, prefix);
@@ -236,7 +348,7 @@ function compilePrefixedTagOperations(cleanSchema: TagAttributeSchema, prefix: s
   const LibrarySpanLogger = generateSpanLoggerClass(cleanNames, prefixedSchema);
 
   return {
-    schema: prefixedSchema,
+    logSchema: prefixedSchema,
     TagAPI: LibraryTagAPI,
     SpanLogger: LibrarySpanLogger,
   };
@@ -246,7 +358,7 @@ function compilePrefixedTagOperations(cleanSchema: TagAttributeSchema, prefix: s
 ### TagAPI Generation Logic
 
 ```typescript
-function generateTagAPIClass(methodNames: string[], columnNames: string[], schema: TagAttributeSchema) {
+function generateTagAPIClass(methodNames: string[], columnNames: string[], schema: LogSchema) {
   // Generate individual attribute methods
   const attributeMethods = methodNames
     .map(
@@ -352,7 +464,7 @@ class LibraryTagAPI extends BaseTagAPI {
 The SpanLogger handles log methods (info/debug/warn/error):
 
 ```typescript
-function generateSpanLoggerClass(attributeNames: string[], schema: TagAttributeSchema) {
+function generateSpanLoggerClass(attributeNames: string[], schema: LogSchema) {
   // Generate with() method body for attributes
   const withBody = attributeNames
     .map(
@@ -403,16 +515,16 @@ function generateSpanLoggerClass(attributeNames: string[], schema: TagAttributeS
 }
 ```
 
-## OpContext Type Definition
+## SpanContext Type Definition
 
 The context destructured by op functions. The `Extra` type parameter allows user-defined fields (like `env` with CF
 Worker bindings):
 
 ```typescript
-// Full OpContext type - Extra is spread in for user extensibility
-type OpContext<Schema, Deps, FF, Extra = {}> = {
+// Full SpanContext type - Extra is spread in for user extensibility
+type SpanContext<Schema, Deps, FF, Extra = {}> = {
   // Invoke another op as child span (6 overloads, see span() docs)
-  span: SpanFn<OpContext<Schema, Deps, FF, Extra>>;
+  span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
 
   // Log messages
   log: SpanLogger;
@@ -425,6 +537,16 @@ type OpContext<Schema, Deps, FF, Extra = {}> = {
 
   // Feature flags (logs access to current span)
   ff: FeatureFlagEvaluator<FF>;
+
+  // Result helpers
+  ok<T>(value: T): OkResult<T>;
+  err<E>(error: E): ErrResult<E>;
+
+  // Scoped attributes
+  scope(attributes: Partial<Schema>): void;
+
+  // Access to underlying buffer (advanced use)
+  buffer: SpanBuffer;
 } & Extra; // User-defined fields spread in (e.g., env, services)
 
 // SpanFn type with 6 overloads (3 with line number from transformer, 3 without)
@@ -445,9 +567,9 @@ type SpanFn<CurrentCtx> = {
 };
 
 // Functions can pick what they need
-type LoggingContext = Pick<OpContext<{}, {}, {}>, 'log'>;
-type TaggingContext<S> = Pick<OpContext<S, {}, {}>, 'tag'>;
-type MinimalContext<S> = Pick<OpContext<S, {}, {}>, 'span' | 'log' | 'tag'>;
+type LoggingContext = Pick<SpanContext<{}, {}, {}>, 'log'>;
+type TaggingContext<S> = Pick<SpanContext<S, {}, {}>, 'tag'>;
+type MinimalContext<S> = Pick<SpanContext<S, {}, {}>, 'span' | 'log' | 'tag'>;
 ```
 
 ## Op Definition Pattern
@@ -524,7 +646,7 @@ const processOrder = op(async ({ span, log, tag, deps, ff }, order: Order) => {
 
 ## Library Definition with defineModule
 
-Libraries define their schema and dependencies:
+Libraries define their logSchema and dependencies:
 
 ```typescript
 // @my-company/http-tracing/src/index.ts
@@ -536,7 +658,7 @@ export const httpLib = defineModule({
     packageName: '@my-company/http-tracing',
     packagePath: 'src/index.ts',
   },
-  schema: {
+  logSchema: {
     status: S.number(),
     method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
     url: S.text().masked('url'),
@@ -619,7 +741,7 @@ An ESLint rule should prevent capturing `tag` or `log` in variables.
 
 - **Build/Startup**: Schema compilation and class generation (~1-5ms per module)
 - **Runtime**: Zero overhead for method calls - all mapping pre-computed
-- **Memory**: Shared module context across all ops in same module
+- **Memory**: Shared ModuleContext across all ops in same module
 
 ### Generated Code Efficiency
 
@@ -638,12 +760,20 @@ setAttribute(name, value) {
 }
 ```
 
+### SpanBuffer Efficiency
+
+- **Dual module references**: `callsiteModule` for row 0's gitSha/packageName/packagePath, `module` for rows 1+
+- **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `lineNumber_values[0]` (NO
+  intermediate object storage, NO lineNumber property on any context)
+- **Interned span names**: `spanName` is interned for dictionary encoding during Arrow conversion
+- **Reference to ModuleContext**: References to shared module metadata (no duplication)
+
 ## Integration Points
 
 This module context and op generation system integrates with:
 
-- **[Context Flow and Op Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides OpContext and span() mechanics
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides SpanContext and span() mechanics
 - **[Module Builder Pattern](./01l_module_builder_pattern.md)**: High-level API for defineModule + op()
-- **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes TagAttributeSchema definitions
+- **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes LogSchema definitions
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for prefixed columns
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generated classes write to SpanBuffer

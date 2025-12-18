@@ -306,7 +306,7 @@ The `FlushScheduler` manages background flushing of multiple root buffers (one p
 
 4. **Schema Requirement**: All buffers in a flush must share the same schema. This is guaranteed because:
    - The application composes all library schemas into a single `ModuleContext` at startup
-   - All buffers created from that module share the same `module.tagAttributes` schema
+   - All buffers created from that module share the same `module.logSchema` schema
    - The conversion function validates this requirement and throws if schemas differ
 
 **Flush Cycle**:
@@ -860,10 +860,10 @@ The `generateColumnBufferClass()` already uses symbol-based lazy allocation via 
 // In arrow-builder's columnBufferGenerator.ts
 // Add optional callback parameter for lazy column access tracking
 export function generateColumnBufferClass(
-  schema: TagAttributeSchema,
+  schema: LogSchema,
   className = 'GeneratedColumnBuffer',
-  eagerColumns: string[] = [], // NEW: columns to generate as eager
-  onLazyAccess?: (columnName: string) => void // NEW: callback when lazy column accessed
+  eagerColumns: string[] = [], // columns to generate as eager
+  onLazyAccess?: (columnName: string) => void // callback when lazy column accessed
 ): string {
   // ... existing code ...
 
@@ -905,19 +905,24 @@ export interface ModuleContext {
   gitSha: string;
   packageName: string;
   packagePath: string;
-  tagAttributes: TagAttributeSchema;
-  spanBufferCapacityStats: BufferCapacityStats;
+  logSchema: LogSchema;
 
-  // NEW: Lazy column promotion tracking
+  // Self-tuning buffer capacity stats (flattened)
+  sb_capacity: number;
+  sb_totalWrites: number;
+  sb_overflows: number;
+  sb_totalCreated: number;
+
+  // Lazy column promotion tracking
   lazyColumnStats: LazyColumnStats;
 
-  // NEW: Current SpanBuffer class (may be recompiled)
+  // Current SpanBuffer class (may be recompiled)
   SpanBufferClass: new (capacity: number) => SpanBuffer;
 }
 
 // Initialize lazy column stats when creating module context
 function createModuleContext(...) {
-  const schemaFields = Object.keys(tagAttributes);
+  const schemaFields = Object.keys(logSchema);
 
   const lazyColumnStats: LazyColumnStats = {
     totalSpanBuffersCreated: 0,
@@ -939,7 +944,7 @@ function createModuleContext(...) {
   };
 
   // Generate initial SpanBuffer class (all lazy)
-  const SpanBufferClass = getColumnBufferClass(tagAttributes, [], onLazyAccess);
+  const SpanBufferClass = getColumnBufferClass(logSchema, [], onLazyAccess);
 
   const moduleContext: ModuleContext = {
     // ... existing fields ...
@@ -952,12 +957,12 @@ function createModuleContext(...) {
 
 // Create SpanBuffer using module's current class
 // Called by op's internal wrapper, not span() directly
-function createSpanBuffer(schema, opContext, traceId) {
-  const SpanBufferClass = opContext.module.SpanBufferClass;
+function createSpanBuffer(schema, callsite, traceId) {
+  const SpanBufferClass = callsite.module.SpanBufferClass;
   const buffer = new SpanBufferClass(capacity);
 
   // Track buffer creation
-  opContext.module.lazyColumnStats.totalSpanBuffersCreated++;
+  callsite.module.lazyColumnStats.totalSpanBuffersCreated++;
 
   // ... rest of buffer initialization ...
   return buffer;
@@ -1023,7 +1028,7 @@ function promoteColumnsToEager(module: ModuleContext): boolean {
   };
 
   // Generate new SpanBuffer class with promoted columns
-  const newSpanBufferClass = getColumnBufferClass(module.tagAttributes, eagerColumns, onLazyAccess);
+  const newSpanBufferClass = getColumnBufferClass(module.logSchema, eagerColumns, onLazyAccess);
 
   // Atomic replacement - new buffers will use the recompiled class
   module.SpanBufferClass = newSpanBufferClass;
@@ -1061,7 +1066,7 @@ Update `packages/arrow-builder/src/lib/buffer/columnBufferGenerator.ts`:
 
 ```typescript
 export function generateColumnBufferClass(
-  schema: TagAttributeSchema,
+  schema: LogSchema,
   className = 'GeneratedColumnBuffer',
   eagerColumns: string[] = [],
   onLazyAccess?: (columnName: string) => void
@@ -1155,7 +1160,7 @@ ${trackingCall}
 }
 
 export function getColumnBufferClass(
-  schema: TagAttributeSchema,
+  schema: LogSchema,
   eagerColumns: string[] = [],
   onLazyAccess?: (columnName: string) => void
 ): new (capacity: number) => ColumnBuffer {
@@ -1199,7 +1204,7 @@ No migration or data copying is needed. The system simply creates new SpanBuffer
 // Initial state: All columns lazy
 const module = createModuleContext({
   moduleMetadata: { gitSha: 'abc', packageName: '@mycompany/app', packagePath: 'src/user.ts' },
-  tagAttributes: {
+  logSchema: {
     userId: S.category(),
     requestId: S.category(),
     sessionId: S.category(),
@@ -1234,7 +1239,7 @@ describe('Lazy-to-eager column promotion', () => {
   it('promotes high-usage columns to eager after 100 buffers', () => {
     const module = createModuleContext({
       moduleMetadata: { gitSha: 'test', packageName: '@test/app', packagePath: 'src/test.ts' },
-      tagAttributes: {
+      logSchema: {
         userId: S.category(),
         sessionId: S.category(),
       },
@@ -1265,7 +1270,7 @@ describe('Lazy-to-eager column promotion', () => {
   it('does not promote columns below 80% usage threshold', () => {
     const module = createModuleContext({
       moduleMetadata: { gitSha: 'test', packageName: '@test/app', packagePath: 'src/test.ts' },
-      tagAttributes: {
+      logSchema: {
         userId: S.category(),
         sessionId: S.category(),
       },
@@ -1292,7 +1297,7 @@ describe('Lazy-to-eager column promotion', () => {
   it('requires 100 samples before promotion', () => {
     const module = createModuleContext({
       moduleMetadata: { gitSha: 'test', packageName: '@test/app', packagePath: 'src/test.ts' },
-      tagAttributes: {
+      logSchema: {
         userId: S.category(),
       },
     });

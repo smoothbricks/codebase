@@ -9,8 +9,10 @@ creating traced operations. This design provides:
 2. **Caller-controlled span naming** - `span('name', op, ...args)` lets callers name spans contextually
 3. **Zero-allocation deps** - Dependencies are plain object references, not per-call closures
 4. **Type-safe composition** - Compile-time collision detection and dependency validation
-5. **User-extensible context** - `.ctx<Extra>()` allows adding custom properties like `env`, `requestId`, `userId`
+5. **User-extensible context** - `.ctx<Extra>(defaults)` allows adding custom properties like `env`, `requestId`,
+   `userId`
 6. **Module-owned TraceContext creation** - `module.traceContext()` creates the root context with type-safe Extra
+7. **Transformer-injected metadata** - `metadata` is filled in by the TypeScript transformer at compile time
 
 ## Design Rationale
 
@@ -80,7 +82,7 @@ Explicit deps with TypeScript catches collisions at compile time:
 ```typescript
 // TypeScript error on collision
 const appModule = defineModule({
-  schema: { userId: S.category() },
+  logSchema: { userId: S.category() },
   deps: { http: httpModule, db: dbModule }, // Collision detected!
 });
 ```
@@ -100,10 +102,10 @@ The op pattern addresses all these concerns:
 
 ```typescript
 // Define module with schema, dependencies, and feature flags
-// metadata is injected by TypeScript transformer
+// metadata is injected by TypeScript transformer at compile time
 const httpModule = defineModule({
-  metadata: { packageName: '@mycompany/http', packagePath: 'src/index.ts' }, // Transformer injects
-  schema: {
+  metadata: { packageName: '@mycompany/http', packagePath: 'src/index.ts', gitSha: 'abc123' },
+  logSchema: {
     status: S.number(),
     method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
     url: S.text(),
@@ -113,25 +115,33 @@ const httpModule = defineModule({
     retry: retryModule,
   },
   ff: {
-    premiumApi: ff.boolean(),
+    premium: ff.boolean(),
+    newFeature: ff.boolean({ default: true }),
   },
-}).ctx<{
-  env: { apiTimeout: number; region: string };
-  requestId: string; // User-defined, NOT a system prop
-  userId?: string; // User-defined, NOT a system prop
-}>();
+})
+  .ctx<{
+    env: { apiTimeout: number; region: string };
+    requestId: string;
+    userId?: string;
+  }>({
+    env: null!, // null! = required in traceContext()
+    requestId: null!, // null! = required
+    userId: undefined, // Has default, optional in traceContext()
+  })
+  .make(); // Optional finalizer
 ```
 
-**Key Design: `.ctx<Extra>()`**
+**Key Design: `.ctx<Extra>(defaults)`**
 
-The `.ctx<Extra>()` method specifies user-extensible context properties beyond the built-in `span`, `log`, `tag`,
-`deps`, and `ff`. This is where you add environment bindings, request identifiers, or other request-scoped data:
+The `.ctx<Extra>(defaults)` method specifies user-extensible context properties beyond the built-in `span`, `log`,
+`tag`, `deps`, and `ff`. Properties with `null!` as default are required in `traceContext()`, while properties with
+non-null defaults are optional:
 
 ```typescript
 // Cloudflare Worker bindings example
 const workerModule = defineModule({
-  metadata: { packageName: '@mycompany/worker', packagePath: 'src/index.ts' }, // Transformer injects
-  schema: { ... },
+  // metadata injected by transformer
+  logSchema: { ... },
   deps: { ... },
   ff: { ... },
 }).ctx<{
@@ -140,16 +150,20 @@ const workerModule = defineModule({
     R2: R2Bucket;
     AI: AIBinding;
   };
-  requestId: string;  // User-defined in Extra
-  userId?: string;    // User-defined in Extra
-}>();
+  requestId: string;
+  userId?: string;
+}>({
+  env: null!,           // Required - no default
+  requestId: null!,     // Required - no default
+  userId: undefined,    // Optional - has default
+}).make();
 
 // Create trace context at request entry
 const ctx = workerModule.traceContext({
-  ff: ffEvaluator,
+  // Required props (no default)
   env: workerEnv,
   requestId: request.headers.get('x-request-id')!,
-  userId: session?.userId,
+  // userId is optional - defaults to undefined
 });
 
 // The Extra type flows through to all ops created from this module
@@ -161,6 +175,73 @@ const processRequest = op(async ({ env, log, requestId }) => {
   // requestId available via Extra
 });
 ```
+
+### The `null!` Convention
+
+The `null!` pattern indicates a required property with no default:
+
+```typescript
+.ctx<{
+  env: WorkerEnv;       // Required
+  requestId: string;    // Required
+  userId?: string;      // Optional
+}>({
+  env: null!,           // null! = must be provided in traceContext()
+  requestId: null!,     // null! = must be provided in traceContext()
+  userId: undefined,    // undefined = optional, has default
+})
+```
+
+This gives clear compile-time errors when required properties are missing from `traceContext()`.
+
+### The `.make()` Finalizer
+
+The `.make()` method is an optional finalizer that accepts configuration:
+
+```typescript
+// With custom ff evaluator
+const module = defineModule({ ... })
+  .ctx<Extra>({ ... })
+  .make({ ffEvaluator: ldEvaluator });
+
+// Without custom ff evaluator (uses DefaultValueFlagEvaluator)
+const module = defineModule({ ... })
+  .ctx<Extra>({ ... })
+  .make();
+
+// Omitting .make() entirely also uses DefaultValueFlagEvaluator
+const module = defineModule({ ... })
+  .ctx<Extra>({ ... });
+```
+
+The `DefaultValueFlagEvaluator` simply returns the default values from the `ff` schema.
+
+### Transformer-Injected Metadata
+
+The `metadata` property is filled in by the TypeScript transformer at compile time:
+
+```typescript
+// What you write:
+const myModule = defineModule({
+  logSchema: { userId: S.category() },
+});
+
+// What the transformer produces:
+const myModule = defineModule({
+  metadata: {
+    packageName: '@mycompany/my-package',
+    packagePath: 'src/modules/my-module.ts',
+    gitSha: 'abc123def',
+  },
+  logSchema: { userId: S.category() },
+});
+```
+
+The transformer reads:
+
+- `packageName` from the nearest `package.json`
+- `packagePath` from the source file location relative to package root
+- `gitSha` from git (optional, may be omitted in development)
 
 ### Defining Ops
 
@@ -196,16 +277,125 @@ const GET = op(async ({ span, log, tag, deps }, url: string) => {
 });
 ```
 
-### Creating Root Context
+### Batch Op Definitions
+
+Multiple ops can be defined in a single call:
 
 ```typescript
-// Wire dependencies with prefixes at composition time
-const httpRoot = httpModule.prefix('http').use({
-  retry: retryModule.prefix('http_retry').use(),
+const { op } = httpModule;
+
+// Single op definition
+const singleOp = op('fetchUser', async ({ tag }, userId: string) => {
+  tag.userId(userId);
+  return fetchUser(userId);
 });
 
-// Root invocation via span()
-const result = await httpRoot.span('fetch-users', GET, 'https://api.example.com/users');
+// Batch op definition - returns typed object
+const ops = op({
+  fetchUser: async ({ tag }, userId: string) => {
+    tag.userId(userId);
+    return fetchUser(userId);
+  },
+  updateUser: async ({ tag, span }, userId: string, data: UserData) => {
+    tag.userId(userId);
+    await span('validate', validateOp, data);
+    return updateUser(userId, data);
+  },
+});
+
+// Use individual ops
+await span('fetch', ops.fetchUser, 'user-123');
+await span('update', ops.updateUser, 'user-123', userData);
+```
+
+### Creating TraceContext
+
+TraceContext is the root context created at request entry points:
+
+```typescript
+// Create trace context via module
+const ctx = httpModule.traceContext({
+  // Required props (from null! defaults)
+  env: workerEnv,
+  requestId: req.headers.get('x-request-id')!,
+  // Optional props (have defaults)
+  userId: session?.userId, // Can omit - defaults to undefined
+  // ff can override the module's ffEvaluator
+  ff: customFfEvaluator,
+});
+
+// Invoke first op via ctx.span()
+await ctx.span('handle-request', handleRequestOp, req);
+```
+
+### System Props in TraceContext
+
+These properties are auto-generated and cannot be overridden via Extra:
+
+```typescript
+interface TraceContext<FF, Extra> {
+  // Auto-generated system properties
+  traceId: string; // UUID for this trace
+  anchorEpochMicros: number; // Epoch timestamp when trace started
+  anchorPerfNow: number; // performance.now() when trace started
+  threadId: bigint; // 64-bit worker/process identifier
+  ff: FeatureFlagEvaluator<FF>;
+  span: RootSpanFn<FF, Extra>;
+} & Extra; // User-defined properties
+
+// Reserved keys that Extra cannot contain (compile-time enforcement)
+type ReservedTraceContextKeys =
+  | 'traceId'
+  | 'anchorEpochMicros'
+  | 'anchorPerfNow'
+  | 'threadId'
+  | 'ff'
+  | 'span';
+```
+
+## Module Interface
+
+The module returned by `defineModule().ctx().make()`:
+
+```typescript
+interface Module<Schema, Deps, FF, Extra> {
+  readonly metadata: ModuleMetadata;
+
+  // Buffer metrics (flattened names)
+  sb_capacity: number;
+  sb_totalWrites: number;
+  sb_overflows: number;
+  sb_totalCreated: number;
+
+  // Create root TraceContext
+  traceContext(params: TraceContextParams<FF, Extra>): TraceContext<FF, Extra>;
+
+  // Single op definition
+  op<Args extends unknown[], R>(
+    name: string,
+    fn: (ctx: SpanContext<Schema, Deps, FF, Extra>, ...args: Args) => Promise<R>
+  ): Op<SpanContext<Schema, Deps, FF, Extra>, Args, R>;
+
+  // Batch op definition
+  op<T extends OpRecord>(definitions: T): BatchResult<T>;
+
+  // Prefix application for library composition
+  prefix<P extends string>(prefix: P): PrefixedModule<Schema, Deps, FF, Extra, P>;
+
+  // Wire dependencies
+  use(wiredDeps: WiredDeps<Deps>): BoundModule<Schema, Deps, FF, Extra>;
+}
+
+interface ModuleMetadata {
+  packageName: string; // npm package name (injected by transformer)
+  packagePath: string; // Path within package (injected by transformer)
+  gitSha?: string; // Git commit SHA (optional, injected by transformer)
+}
+
+type OpRecord = Record<string, (...args: any[]) => Promise<any>>;
+type BatchResult<T extends OpRecord> = {
+  [K in keyof T]: Op<SpanContext, Parameters<T[K]>, Awaited<ReturnType<T[K]>>>;
+};
 ```
 
 ## The Op Pattern Explained
@@ -225,19 +415,20 @@ const myOp = op(async ({ span, log, tag }, arg1, arg2) => {
 // myOp is an Op instance that knows:
 // - Its source module (for observability)
 // - How to create its span buffer
-// - How to set up the OpContext
+// - How to set up the SpanContext
 ```
 
 ### What span() Does
 
-When `span('name', op, ...args)` is called:
+When `span(lineNumber, 'name', op, ...args)` is called (lineNumber injected by transformer):
 
-1. **Creates SpanBuffer** with the op's module schema (unprefixed internally)
-2. **Registers with parent** via children array (RemappedBufferView if prefixed)
-3. **Writes span-start entry** with the caller-provided name
-4. **Creates OpContext** with `{ span, log, tag, deps, ff }` plus user `Extra` properties
-5. **Executes user function** with try/catch for span-exception
-6. **Writes span-ok or span-exception** on completion
+1. **Creates SpanBuffer** with `callsiteModule` (caller's module) and `module` (Op's module)
+2. **Writes lineNumber** directly to `lineNumber_values[0]` (NO intermediate object storage)
+3. **Registers with parent** via children array (RemappedBufferView if prefixed)
+4. **Writes span-start entry** using `callsiteModule` for gitSha/packageName/packagePath
+5. **Creates SpanContext** with `{ span, log, tag, deps, ff }` plus user `Extra` properties
+6. **Executes user function** with try/catch for span-exception
+7. **Writes span-ok or span-exception** using `module` for gitSha/packageName/packagePath
 
 ```typescript
 // Caller provides contextual name
@@ -395,12 +586,8 @@ const handleRequest = op(async ({ span, log, deps }, req: Request) => {
 ```typescript
 // Application module composes libraries
 const appModule = defineModule({
-  metadata: {
-    gitSha: process.env.GIT_SHA,
-    packageName: '@mycompany/api-server',
-    packagePath: 'src/app.ts',
-  },
-  schema: {
+  // metadata injected by transformer
+  logSchema: {
     endpoint: S.category(),
     status: S.number(),
   },
@@ -411,16 +598,22 @@ const appModule = defineModule({
   ff: {
     premiumApi: ff.boolean(),
   },
-}).ctx<{
-  env: { region: string; KV: KVNamespace };
-  requestId: string;
-  userId?: string;
-}>();
+})
+  .ctx<{
+    env: { region: string; KV: KVNamespace };
+    requestId: string;
+    userId?: string;
+  }>({
+    env: null!,
+    requestId: null!,
+    userId: undefined,
+  })
+  .make();
 
 const { op } = appModule;
 
 const handleRequest = op(async ({ span, log, tag, deps, requestId, userId }, req: Request) => {
-  // requestId and userId are available via Extra - user-defined, NOT system props
+  // requestId and userId are available via Extra
   tag.endpoint(req.path);
   log.info('Processing request');
 
@@ -455,23 +648,23 @@ Multiple consumers can share a dependency instance:
 ```typescript
 // GraphQL library needs HTTP
 const graphqlModule = defineModule({
-  metadata: { packageName: '@mycompany/graphql', packagePath: 'src/index.ts' },
-  schema: {
+  // metadata injected by transformer
+  logSchema: {
     query: S.text(),
     operationName: S.category(),
   },
   deps: {
-    http: httpModule,  // GraphQL uses HTTP
+    http: httpModule, // GraphQL uses HTTP
   },
 });
 
 // Application uses both GraphQL and HTTP directly
 const appModule = defineModule({
-  metadata: { ... },
-  schema: { userId: S.category() },
+  // metadata injected by transformer
+  logSchema: { userId: S.category() },
   deps: {
     graphql: graphqlModule,
-    http: httpModule,  // App also uses HTTP
+    http: httpModule, // App also uses HTTP
   },
 });
 
@@ -481,87 +674,14 @@ const httpInstance = httpModule.prefix('http').use({
 });
 
 const appRoot = appModule.use({
-  http: httpInstance,                              // App's HTTP
+  http: httpInstance, // App's HTTP
   graphql: graphqlModule.prefix('graphql').use({
-    http: httpInstance,                            // GraphQL's HTTP = SAME!
+    http: httpInstance, // GraphQL's HTTP = SAME!
   }),
 });
 
 // Result: Both write to http_status, http_method, etc.
 // No duplicate graphql_http_status columns!
-```
-
-## TraceContext and Module.traceContext()
-
-### TraceContext Type
-
-`TraceContext` is the root context created at request entry points. It combines system properties with user-defined
-`Extra` properties:
-
-```typescript
-// Reserved keys that Extra cannot contain (compile-time enforcement)
-type ReservedTraceContextKeys = keyof {
-  traceId: unknown;
-  anchorEpochMicros: unknown;
-  anchorPerfNow: unknown;
-  threadId: unknown;
-  ff: unknown;
-  span: unknown;
-};
-
-// TraceContext = System props + Extra
-type TraceContext<FF, Extra> = {
-  // System properties (always present)
-  traceId: string;
-  anchorEpochMicros: number;
-  anchorPerfNow: number;
-  threadId: bigint;
-  ff: FeatureFlagEvaluator<FF>;
-  span: RootSpanFn<FF, Extra>;
-} & Extra; // User-defined properties (e.g., requestId, userId, env)
-```
-
-**Key Design**: `requestId` and `userId` are NOT system properties - they are user-defined in `Extra` via
-`.ctx<Extra>()`. This allows applications to define whatever request-scoped data they need.
-
-### Module.traceContext() Method
-
-The module provides `traceContext()` to create a type-safe root context:
-
-```typescript
-// At request entry - create trace context
-const ctx = appModule.traceContext({
-  ff: ffEvaluator,
-  env: workerEnv,
-  requestId: req.headers.get('x-request-id')!,
-  userId: session?.userId,
-});
-
-// Invoke first op via ctx.span()
-await ctx.span('handle-request', handleRequestOp, req);
-```
-
-### Reserved Keys Enforcement
-
-TypeScript prevents Extra from containing reserved keys at compile time:
-
-```typescript
-// ✅ Valid - user-defined properties
-const appModule = defineModule({ ... }).ctx<{
-  env: { region: string };
-  requestId: string;
-  userId?: string;
-}>();
-
-// ❌ Compile error - traceId is reserved
-const badModule = defineModule({ ... }).ctx<{
-  traceId: string;  // Error: 'traceId' is a reserved TraceContext key
-}>();
-
-// ❌ Compile error - ff is reserved
-const badModule2 = defineModule({ ... }).ctx<{
-  ff: { custom: true };  // Error: 'ff' is a reserved TraceContext key
-}>();
 ```
 
 ## Type System
@@ -586,14 +706,14 @@ class Op<Ctx, Args extends unknown[], Result> {
 **Why this order?** The type params `<Ctx, Args, Result>` match how you read the function signature: context first, then
 arguments, then return type.
 
-### OpContext Type
+### SpanContext Type
 
 The full context type passed to op functions. It combines built-in properties with user-extensible `Extra`:
 
 ```typescript
-type OpContext<Schema, Deps, FF, Extra> = {
+type SpanContext<Schema, Deps, FF, Extra> = {
   // Invoke child op - supports multiple overloads (see span() section)
-  span: SpanFn<OpContext<Schema, Deps, FF, Extra>>;
+  span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
 
   // Logging
   log: LogAPI;
@@ -612,42 +732,65 @@ type OpContext<Schema, Deps, FF, Extra> = {
 **Key Design**: `Extra` is spread into the context type, so `{ env: { region: string } }` becomes a direct property on
 the context that you can destructure: `({ env }) => ...`.
 
-### Module Type
+### Source Attribution via Dual Module References
+
+Source attribution is handled by storing TWO module references on each SpanBuffer:
+
+- **`callsiteModule`**: The caller's module (where `span()` was invoked) - used for row 0's `gitSha`, `packageName`,
+  `packagePath`
+- **`module`**: The Op's module (what code is executing) - used for rows 1+ `gitSha`, `packageName`, `packagePath`
+
+**CRITICAL: lineNumber is NEVER a property on any object.** It flows directly from transformer injection to TypedArray:
 
 ```typescript
-interface Module<Schema, Deps, FF, Extra> {
-  readonly metadata: ModuleMetadata;
-  readonly schema: Schema;
-  readonly deps: Deps;
-  readonly ff: FF;
+// Transformer output:
+await span(42, 'fetch-user', userLib.fetchUser, userId);
+//         ^^ lineNumber argument
 
-  // Create root TraceContext - entry point for traces
-  traceContext(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra>;
-
-  // Op factory - creates typed Op instances
-  op<Args extends unknown[], Result>(
-    fn: (ctx: OpContext<Schema, Deps, FF, Extra>, ...args: Args) => Promise<Result>
-  ): Op<OpContext<Schema, Deps, FF, Extra>, Args, Result>;
-
-  // Prefix application for library composition
-  prefix<P extends string>(prefix: P): PrefixedModule<Schema, Deps, FF, Extra, P>;
-
-  // Wire dependencies
-  use(wiredDeps: WiredDeps<Deps>): BoundModule<Schema, Deps, FF, Extra>;
-}
-
-// defineModule returns a builder, .ctx<Extra>() finalizes types
-interface ModuleBuilder<Schema, Deps, FF> {
-  // Add user-extensible context properties
-  ctx<Extra extends Record<string, unknown>>(): Module<Schema, Deps, FF, Extra>;
-}
-
-interface ModuleMetadata {
-  packageName: string; // npm package name (injected by transformer)
-  packagePath: string; // Path within package (injected by transformer)
-  gitSha?: string; // Git commit SHA (optional, injected by transformer)
-}
+// Inside span():
+buffer.lineNumber_values[0] = 42; // Direct TypedArray write for row 0
 ```
+
+For logs (rows 1+), the transformer appends `.line(N)` which writes to `lineNumber_values[writeIndex]`.
+
+### Collision Detection
+
+```typescript
+// Type-level collision detection
+type DetectCollision<A, B> = Extract<keyof A, keyof B> extends never ? never : Extract<keyof A, keyof B>;
+
+// Produces compile error on collision
+type WiredDeps<Deps> = {
+  [K in keyof Deps]: Deps[K] extends Module<infer S, infer D> ? PrefixedModule<S, D, string> : never;
+};
+```
+
+## Buffer Metrics
+
+Modules track buffer metrics with flattened names on ModuleContext:
+
+```typescript
+interface ModuleContext {
+  // Module metadata
+  packageName: string;
+  packagePath: string;
+  gitSha: string;
+  logSchema: LogSchema;
+
+  // Buffer metrics (flattened, not nested)
+  sb_capacity: number; // Current buffer capacity
+  sb_totalWrites: number; // Total entries written across all buffers
+  sb_overflows: number; // Number of buffer overflow events
+  sb_totalCreated: number; // Total buffers created
+}
+
+// Access from buffer (dual module references):
+buffer.callsiteModule.sb_capacity; // Caller's module stats
+buffer.module.sb_capacity; // Op's module stats (typically what you want)
+buffer.module.sb_totalWrites;
+```
+
+These metrics are exposed on the module for monitoring and debugging.
 
 ## Op Metrics Tracking
 
@@ -697,7 +840,7 @@ async _invoke(requestCtx, parentBuffer, spanName, args) {
   const startIdx = buffer.count;  // Remember where span-start was written
 
   try {
-    const result = await this.fn(opContext, ...args);
+    const result = await this.fn(ctx, ...args);  // ctx is SpanContext
     // span-ok already written, read timestamps
     const duration = buffer.timestamp[buffer.count - 1] - buffer.timestamp[startIdx];
     this.okDurationNs += duration;
@@ -731,18 +874,6 @@ const myOp = op(async ({ log, tag }, data: Data) => {
 });
 ```
 
-### Collision Detection
-
-```typescript
-// Type-level collision detection
-type DetectCollision<A, B> = Extract<keyof A, keyof B> extends never ? never : Extract<keyof A, keyof B>;
-
-// Produces compile error on collision
-type WiredDeps<Deps> = {
-  [K in keyof Deps]: Deps[K] extends Module<infer S, infer D> ? PrefixedModule<S, D, string> : never;
-};
-```
-
 ## Context Flow
 
 ### Op Invocation
@@ -756,7 +887,7 @@ await span('fetch-users', GET, 'https://example.com');
 1. **Create SpanBuffer** with module's prefixed schema
 2. **Link to parent** buffer (if nested)
 3. **Write span-start** with name from caller
-4. **Create OpContext** = `{ span, log, tag, deps, ff }` + Extra properties
+4. **Create SpanContext** = `{ span, log, tag, deps, ff }` + Extra properties
 5. **Execute op function** with context + arguments
 6. **Write span-ok** or **span-exception** on completion
 
@@ -767,7 +898,6 @@ At the application entry point, use `module.traceContext()`:
 ```typescript
 // Create trace context via module - type-safe Extra properties
 const ctx = appModule.traceContext({
-  ff: ffEvaluator,
   env: workerEnv,
   requestId: req.headers.get('x-request-id')!,
   userId: session?.userId,
@@ -854,7 +984,7 @@ await span('retry-attempt', retry, 1);
 ```typescript
 // Explicit deps with collision detection
 const appModule = defineModule({
-  schema: { userId: S.category() },
+  logSchema: { userId: S.category() },
   deps: { http: httpModule, db: dbModule },
 });
 
@@ -874,6 +1004,7 @@ const appRoot = appModule.use({
 6. **Shared instances** - Multiple consumers share dependency instances
 7. **Easy testing** - Simple mocking via wired deps
 8. **Clean library authoring** - Schema once, prefix at use time
+9. **Transformer-injected metadata** - Zero boilerplate for package info
 
 ## Integration with Other Specs
 

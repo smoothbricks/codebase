@@ -162,7 +162,7 @@ registration. `span()` just invokes the op and passes metadata (name, line numbe
 // Inside op's wrapper (conceptual):
 async invoke(parentCtx, spanName, line, ...args) {
   // 1. Create SpanBuffer with module's UNPREFIXED schema
-  const ownBuffer = createSpanBuffer(unprefixedSchema, opContext, traceId);
+  const ownBuffer = createSpanBuffer(unprefixedSchema, callsite, traceId);
 
   // 2. Register with parent - wrap with RemappedBufferView if prefixed
   if (prefix && parentCtx?.buffer) {
@@ -407,15 +407,15 @@ const appRoot = appModule.use({
 The pattern provides compile-time collision detection:
 
 ```typescript
-// OLD PATTERN (spread) - SILENT COLLISION:
+// BAD PATTERN (spread) - SILENT COLLISION:
 const { op } = createModuleContext({
-  tagAttributes: {
-    ...httpLib.tagAttributes, // http_status: number
-    ...processLib.tagAttributes, // http_status: string -- SILENTLY OVERWRITES!
+  logSchema: {
+    ...httpLib.logSchema, // http_status: number
+    ...processLib.logSchema, // http_status: string -- SILENTLY OVERWRITES!
   },
 });
 
-// NEW PATTERN (defineModule) - COMPILE-TIME ERROR:
+// CORRECT PATTERN (defineModule) - COMPILE-TIME ERROR:
 const appModule = defineModule({
   schema: { ... },
   deps: {
@@ -483,7 +483,7 @@ When Arrow conversion walks the tree:
 
 ```typescript
 // Root buffer's schema has prefixed columns
-const schema = rootBuffer.op.module.tagAttributes;
+const schema = rootBuffer.op.module.logSchema;
 // { userId, http_status, http_method, db_query, ... }
 
 walkSpanTree(rootBuffer, (buffer) => {

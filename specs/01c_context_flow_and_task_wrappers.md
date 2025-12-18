@@ -5,11 +5,85 @@
 The context flow system manages how trace context, feature flags, and user-extensible properties flow through the
 application. It provides:
 
-1. **Hierarchical context creation** from request → op → child span
+1. **Hierarchical context creation** from trace → op → child span
 2. **Op wrapper pattern** that creates span-aware contexts
 3. **Performance optimization** through single allocation and direct references
 4. **Type-safe context destructuring** with automatic span correlation
 5. **User-extensible context** via `.ctx<Extra>()` for custom properties like env bindings
+
+## Context Hierarchy
+
+```
+ModuleContext (class) - ONE per module definition
+├── packageName: string
+├── packagePath: string
+├── gitSha: string
+├── packageEntry: PreEncodedEntry (UTF-8 cached)
+├── packagePathEntry: PreEncodedEntry (UTF-8 cached)
+├── gitShaEntry: PreEncodedEntry (UTF-8 cached)
+├── logSchema (tag attribute definitions)
+├── sb_capacity: number (buffer capacity)
+├── sb_totalWrites: number (total writes across all buffers)
+├── sb_overflows: number (overflow write count)
+└── sb_totalCreated: number (total buffers created)
+
+SpanBuffer - ONE per span
+├── callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
+├── module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
+├── spanName: string               ← span name for this invocation
+├── lineNumber_values: Int32Array  ← line numbers per row (written directly, NOT stored as property)
+├── parent?: SpanBuffer            ← reference to parent (child spans walk this for traceId)
+├── children: SpanBuffer[]         ← child spans
+├── traceId (getter)               ← root stores it, children walk parent chain
+└── columns, writeIndex, etc.
+
+SpanContext (interface) - user-facing, what ops receive
+├── tag: TagWriter<T>
+├── log: SpanLogger<T>
+├── scope()
+├── ok() / err()
+├── span()
+├── buffer (getter)
+├── ff: FeatureFlagEvaluator
+└── deps: Deps
+```
+
+**Dual Module References - Row 0 vs Rows 1+:**
+
+- **Row 0 (span-start)**: Uses `callsiteModule` for `gitSha`, `packageName`, `packagePath`
+- **Rows 1+ (span-ok/err/exception, logs)**: Uses `module` for `gitSha`, `packageName`, `packagePath`
+
+This design enables accurate source attribution - the span-start entry records WHERE the span was invoked from, while
+subsequent entries record WHERE the code is actually executing.
+
+**lineNumber is NEVER a property on any object:**
+
+Line numbers flow directly from transformer injection to TypedArray writes:
+
+```typescript
+// Transformer output:
+await span(42, 'fetch-user', userLib.fetchUser, userId);
+//         ^^ lineNumber argument
+
+// Inside span():
+buffer.lineNumber_values[0] = 42; // Direct TypedArray write for row 0
+
+// For logs (rows 1+):
+log.info('Processing').line(55); // .line(N) writes to lineNumber_values[writeIndex]
+```
+
+**Access chain:**
+
+```typescript
+buffer.callsiteModule.packageName; // Caller's module metadata (for row 0)
+buffer.callsiteModule.gitSha; // Caller's git SHA (for row 0)
+buffer.module.packageName; // Op's module metadata (for rows 1+)
+buffer.module.gitSha; // Op's git SHA (for rows 1+)
+buffer.module.sb_capacity; // Self-tuning stats
+buffer.spanName; // Span name (direct property)
+buffer.lineNumber_values[0]; // Line number for row 0 (written directly, NO lineNumber property)
+buffer.traceId; // Walks parent chain to root if child span
+```
 
 ## Design Rationale: From ctx Parameter to Destructured Context
 
@@ -63,7 +137,12 @@ await span('fetch-user', request, '/users/123', { method: 'GET' });
 **Key Insight**: Each span needs its own buffer for proper trace correlation. The op wrapper handles buffer creation,
 entry writing, and context setup automatically.
 
-**Context Hierarchy**:
+**TraceContext vs SpanContext**:
+
+- `TraceContext` is created via `module.traceContext()` at request entry
+- `SpanContext` is what op functions receive
+- TraceContext has system props: `traceId`, `anchorEpochMicros`, `anchorPerfNow`, `threadId`
+- SpanContext has: `tag`, `log`, `scope`, `ok`, `err`, `span`, `buffer`, `ff`, `deps`
 
 ```
 TraceContext (created via module.traceContext())
@@ -77,7 +156,7 @@ TraceContext (created via module.traceContext())
 ├── requestId: string (Extra - user-defined)
 ├── userId?: string (Extra - user-defined)
 └── ctx.span('create-user', createUserOp, userData) creates:
-    ├── Op Context (create-user span buffer)
+    ├── SpanContext (create-user span buffer)
     ├── tag: TagAPI (writes to create-user buffer)
     ├── log: SpanLogger (logs to create-user buffer)
     ├── span: ChildSpanCreator (creates child spans)
@@ -87,7 +166,7 @@ TraceContext (created via module.traceContext())
     ├── requestId: SAME from TraceContext (Extra props passed through)
     ├── userId: SAME from TraceContext (Extra props passed through)
     └── span('validate-user', validateOp) creates:
-        ├── Child Op Context (validate-user span buffer)
+        ├── Child SpanContext (validate-user span buffer)
         ├── tag: TagAPI (writes to validate-user buffer)
         ├── log: SpanLogger (logs to validate-user buffer)
         ├── span: ChildSpanCreator (for nested ops)
@@ -96,7 +175,7 @@ TraceContext (created via module.traceContext())
         └── Extra props: SAME (env, requestId, userId)
 ```
 
-**Op Context Properties**:
+**SpanContext Properties**:
 
 - `span(name, op, ...args)`: Invoke an op as a child span
 - `log`: SpanLogger for info/debug/warn/error
@@ -137,8 +216,8 @@ interface TraceContext<FF, Extra> {
 ```
 
 **Key Design**: `requestId` and `userId` are NOT system properties - they are user-defined in `Extra` via
-`.ctx<Extra>()`. The `Extra` type comes from the module's `.ctx<Extra>()` declaration and is spread into OpContext when
-ops execute.
+`.ctx<Extra>()`. The `Extra` type comes from the module's `.ctx<Extra>()` declaration and is spread into SpanContext
+when ops execute.
 
 ### Context Creation via Module.traceContext()
 
@@ -186,7 +265,7 @@ An **Op** is a traced operation. It's created via the `op()` factory from a modu
 ```typescript
 const httpModule = defineModule({
   metadata: { packageName: '@my-company/http', packagePath: 'src/index.ts' },
-  schema: { status: S.number(), method: S.enum(['GET', 'POST']) },
+  logSchema: { status: S.number(), method: S.enum(['GET', 'POST']) },
   deps: { retry: retryModule },
   ff: { premiumApi: ff.boolean() },
 }).ctx<{ env: { apiTimeout: number } }>();
@@ -212,7 +291,8 @@ The `Op<Ctx, Args, Result>` type parameters match the function signature order:
 ```typescript
 class Op<Ctx, Args extends unknown[], Result> {
   constructor(
-    private module: ModuleContext,
+    readonly name: string, // For Op metrics (invocations, errors, duration)
+    private module: ModuleContext, // For gitSha/packageName/packagePath attribution
     // fn MUST use the type parameters, not hardcoded types
     private fn: (ctx: Ctx, ...args: Args) => Promise<Result>
   ) {}
@@ -221,36 +301,45 @@ class Op<Ctx, Args extends unknown[], Result> {
    * Internal invocation - called by span()
    * @param traceCtx - The root trace context
    * @param parentBuffer - Parent span's buffer (null for root)
+   * @param callsiteModule - The CALLER's module (where span() was invoked)
    * @param spanName - Name decided by caller
+   * @param lineNumber - Line number where span() was called (injected by transformer, passed directly)
    * @param args - User arguments to the op
    */
   async _invoke(
     traceCtx: TraceContext,
     parentBuffer: SpanBuffer | null,
+    callsiteModule: ModuleContext,
     spanName: string,
+    lineNumber: number,
     args: Args
   ): Promise<Result> {
-    // 1. Create SpanBuffer with this module's schema (unprefixed internally)
-    const buffer = createSpanBuffer(
-      this.module.compiledSchema,
-      this.module.metadata,
-      traceCtx.traceId,
-      traceCtx.threadId
-    );
+    // 1. Create SpanBuffer with callsiteModule reference:
+    //    - callsiteModule: where span() was called (for row 0's gitSha/packageName/packagePath)
+    //    - this.module: the Op's module (for rows 1+ gitSha/packageName/packagePath)
+    // - Root: stores traceId in identity bytes
+    // - Child: walks parent chain for traceId (no duplication)
+    const buffer = parentBuffer
+      ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
+      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.traceId);
 
     // 2. Register with parent's children (RemappedBufferView if prefixed)
     if (parentBuffer) {
       parentBuffer.children.push(this.module.prefix ? new RemappedBufferView(buffer, this.module.prefixMap) : buffer);
-      buffer.parent = parentBuffer;
     }
 
-    // 3. Write span-start entry
-    buffer.writeSpanStart(spanName, getCurrentLineNumber());
+    // 3. Write span-start entry (row 0)
+    //    - Uses callsiteModule for gitSha/packageName/packagePath
+    //    - lineNumber written DIRECTLY to lineNumber_values[0] (NO intermediate object)
+    buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write
+    buffer.writeSpanStart(); // Writes timestamp, operation, uses callsiteModule for metadata
 
-    // 4. Set up context with destructurable properties
+    // 4. Set up SpanContext with destructurable properties
     // Built-in properties + Extra from .ctx<Extra>()
+    // span() captures the CURRENT module (this.module) as callsiteModule for child spans
     const opCtx = {
-      span: createSpanFn(traceCtx, buffer),
+      span: (childLineNumber, name, childOp, ...childArgs) =>
+        childOp._invoke(traceCtx, buffer, this.module, name, childLineNumber, childArgs),
       log: new this.module.SpanLogger(buffer),
       tag: new this.module.TagAPI(buffer),
       deps: this.module.boundDeps, // Plain object of Op references
@@ -260,12 +349,13 @@ class Op<Ctx, Args extends unknown[], Result> {
     } as Ctx;
 
     // 5. Execute user function with try/catch for span-exception
+    //    Rows 1+ use this.module for gitSha/packageName/packagePath
     try {
       const result = await this.fn(opCtx, ...args);
-      buffer.writeSpanOk();
+      buffer.writeSpanOk(); // Row 1 - uses module metadata
       return result;
     } catch (error) {
-      buffer.writeSpanException(error);
+      buffer.writeSpanException(error); // Row 1 - uses module metadata
       throw error;
     }
   }
@@ -275,19 +365,21 @@ class Op<Ctx, Args extends unknown[], Result> {
 ### Why This Design
 
 1. **Span name at call site**: `span('retry-attempt', retry, 1)` - caller provides contextually meaningful name
-2. **Module captures metadata**: Op knows its source package/file for observability
+2. **Dual module references**: `callsiteModule` for row 0's gitSha/packageName/packagePath, `module` for rows 1+
 3. **Zero allocation deps**: `deps` is a plain object, not closures created per call
 4. **V8 hidden class friendly**: Op is a simple class with fixed structure
 5. **Single Ctx type param**: Op carries full Ctx requirement, contravariance at span() ensures compatibility
+6. **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `lineNumber_values[0]` (NO
+   lineNumber property on any context object)
 
-## OpContext Interface
+## SpanContext Interface
 
 The context passed to op functions combines built-in properties with user-extensible `Extra`:
 
 ```typescript
-type OpContext<Schema, Deps, FF, Extra> = {
+type SpanContext<Schema, Deps, FF, Extra> = {
   // Invoke another op as a child span - supports multiple overloads
-  span: SpanFn<OpContext<Schema, Deps, FF, Extra>>;
+  span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
 
   // Log messages (info/debug/warn/error)
   log: LogAPI;
@@ -300,6 +392,16 @@ type OpContext<Schema, Deps, FF, Extra> = {
 
   // Feature flags (logs access to current span)
   ff: FeatureFlagEvaluator<FF>;
+
+  // Result helpers
+  ok<T>(value: T): OkResult<T>;
+  err<E>(error: E): ErrResult<E>;
+
+  // Scoped attributes
+  scope(attributes: Partial<Schema>): void;
+
+  // Access to underlying buffer (advanced use)
+  buffer: SpanBuffer;
 } & Extra; // User-extensible properties via .ctx<Extra>()
 ```
 
@@ -360,11 +462,14 @@ const createUser = op(async ({ span, log, tag }, userData: UserData) => {
 
 ### How span() Works
 
-1. **Name provided by caller**: The first argument is the span name - caller decides contextually
-2. **Op provided by caller**: Second argument is the Op instance to invoke
-3. **Args passed through**: Remaining arguments go to the op function
-4. **Buffer linking**: Child buffer registered with parent's children array
-5. **RemappedBufferView**: If op has prefix, view maps prefixed columns for Arrow
+1. **lineNumber as first argument**: Injected by transformer as first argument to span()
+2. **Name provided by caller**: The span name - caller decides contextually
+3. **Op provided by caller**: The Op instance to invoke
+4. **Args passed through**: Remaining arguments go to the op function
+5. **lineNumber written directly**: Written to `lineNumber_values[0]` inside \_invoke() (NO intermediate object storage)
+6. **SpanBuffer created with callsiteModule**: `callsiteModule` for row 0's metadata, `module` for rows 1+
+7. **Buffer linking**: Child buffer registered with parent's children array
+8. **RemappedBufferView**: If op has prefix, view maps prefixed columns for Arrow
 
 ### Example: Multiple Child Spans
 
@@ -587,13 +692,15 @@ const processOrder = op(async ({ span, log, tag, deps, ff, env }, order: Order) 
 
 ### Op Invocation
 
-- **Buffer creation**: One SpanBuffer per span (pooled/reused)
-- **Context creation**: One OpContext object per invocation
+- **Buffer creation**: One SpanBuffer per span with `callsiteModule` reference
+- **lineNumber**: Passed as argument to span(), written directly to `lineNumber_values[0]` (NO lineNumber property on
+  any object)
+- **SpanContext creation**: One SpanContext object per invocation
 - **No closure allocation**: deps is shared object reference
 
 ### Memory Usage
 
-- **Shared references**: Module context and deps shared across all ops
+- **Shared references**: ModuleContext and deps shared across all ops
 - **Direct buffer access**: TagAPI/SpanLogger hold buffer reference directly
 - **Buffer management**: Self-tuning capacity per module
 
@@ -610,18 +717,33 @@ This context flow system integrates with:
 
 ## Line Number System
 
-The `lineNumber` column allows linking trace entries back to source code:
+**CRITICAL: lineNumber is NEVER a property on any object.** It flows directly from transformer injection to TypedArray
+writes:
 
-- **Storage**: Uint16 column (max 65535 lines per file)
-- **Injection**: TypeScript transformer injects `.line(N)` calls at compile time
-- **Overhead**: Zero runtime overhead - just a method call with literal
+- **Injection**: TypeScript transformer injects line numbers at compile time
+- **Storage**: Written directly to `lineNumber_values` TypedArray at the appropriate row index
+- **No intermediate object**: lineNumber is NOT stored on any context object - just passed as argument and written to
+  TypedArray
+- **Overhead**: Zero runtime overhead - literal passed to span(), written directly to TypedArray
 
 ```typescript
 // Source code:
 log.info('Processing user');
 await span('validate', validateUser, userData);
 
-// Transformed:
-log.info('Processing user').line(42);
-await span('validate', validateUser, userData).line(43);
+// Transformed (line number injected):
+log.info('Processing user').line(42); // .line(N) appended to log calls
+await span(43, 'validate', validateUser, userData); // line number FIRST for span()
 ```
+
+**Row-based lineNumber storage:**
+
+- **Row 0 (span-start)**: lineNumber argument written directly to `lineNumber_values[0]` inside `_invoke()`
+- **Rows 1+ (logs, span-ok/err)**: lineNumber written to `lineNumber_values[writeIndex]` via `.line(N)` calls
+
+**SpanBuffer stores:**
+
+- `callsiteModule`: The caller's ModuleContext (for row 0's gitSha/packageName/packagePath)
+- `module`: The Op's ModuleContext (for rows 1+ gitSha/packageName/packagePath)
+- `spanName`: The contextual name provided by caller
+- `lineNumber_values`: Int32Array for line numbers per row (NOT a lineNumber property)
