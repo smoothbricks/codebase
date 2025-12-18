@@ -33,8 +33,9 @@
 
 ### Integration & Output
 
-- **Library Pattern**: specs/01e_library_integration_pattern.md - Third-party library integration with prefixing
+- **Module Builder Pattern**: specs/01l_module_builder_pattern.md - `defineModule()`, `.prefix()`, `.use()` API
   [**LMAO**]
+- **Library Integration**: specs/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
 - **AI Agent Integration**: specs/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
 
 ## 🏗️ PACKAGE ARCHITECTURE - TWO SIBLING PACKAGES:
@@ -223,12 +224,13 @@ Unified enum for ALL trace events:
 - **Dual API**: Object-based (ctx.tag({ userId: "123" })) and property-based (ctx.tag.userId("123"))
 - **Zero allocation**: Fluent methods return this, no intermediate objects
 
-## Library Integration (See specs/01e_library_integration_pattern.md)
+## Library Integration (See specs/01l_module_builder_pattern.md & 01e)
 
-- Libraries define clean schemas without prefixes
-- Prefixing happens at composition time
-- Example: Library writes ctx.tag.status(200) → becomes http_status column
-- Avoids naming conflicts across libraries
+- Libraries use `defineModule({ metadata, schema, deps })` to define their schema
+- Tasks are defined via `const { task } = myLib; export const myTask = task('name', fn)`
+- Prefix applied at use time: `httpLib.prefix('http').use({ retry: retryLib.prefix('http_retry').use() })`
+- Dependencies pre-bound: `ctx.deps.retry.attempt(1)` instead of `retryTask(ctx, 1)`
+- RemappedBufferView maps prefixed names to unprefixed columns for Arrow conversion
 
 ## Span Scope Attributes (See specs/01i_span_scope_attributes.md)
 
@@ -306,10 +308,10 @@ Unified enum for ALL trace events:
 ### Library Integration (@packages/lmao/src/lib/library.ts)
 
 - ✅ `prefixSchema()` - Add prefix to all schema fields
-- ✅ `createLibraryModule()` - Library module factory
-- ✅ `moduleContextFactory()` - Compose libraries with prefixes
-- ✅ `createHttpLibrary()` - Example HTTP library
-- ✅ `createDatabaseLibrary()` - Example database library
+- ✅ `generateRemappedBufferViewClass()` - Generate view for Arrow conversion
+- ✅ `generateRemappedSpanLoggerClass()` - Generate SpanLogger with prefix mapping
+- ✅ `moduleContextFactory()` - Current library composition API (see spec 01l for new `defineModule` pattern)
+- 🚧 `defineModule()` - New fluent API for module definition (spec 01l - implementation pending)
 
 ### Background Processing (@packages/lmao/src/lib/flushScheduler.ts)
 

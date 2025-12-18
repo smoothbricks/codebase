@@ -718,11 +718,11 @@ parentBuffer.children.push(remappedView); // Register the view, not raw buffer
 
 **Call sites requiring explicit registration** (as of this spec):
 
-| Location                              | Description                          |
-| ------------------------------------- | ------------------------------------ |
-| `lmao.ts` - `span()` method           | Inline child span creation           |
-| `lmao.ts` - `task()` wrapper          | Cross-module child span              |
-| `library.ts` - `moduleContextFactory` | Library task with RemappedBufferView |
+| Location                     | Description                          |
+| ---------------------------- | ------------------------------------ |
+| `lmao.ts` - `span()` method  | Inline child span creation           |
+| `lmao.ts` - `task()` wrapper | Cross-module child span              |
+| `library.ts` - `.use()` impl | Library task with RemappedBufferView |
 
 ## Multiple Root Buffers → Single RecordBatch
 
@@ -734,19 +734,25 @@ dictionary vectors.
 
 **All buffers in a flush must share the same schema.** This is enforced because:
 
-1. **Application Composition**: The application composes all library schemas into a single `ModuleContext` at startup:
+1. **Application Composition**: The application declares dependencies on libraries and wires them with prefixes:
 
    ```typescript
-   const composedSchema = {
-     ...httpLib.module.schema,
-     ...dbLib.module.schema,
-     ...appSchema,
-   };
-   const { task } = createModuleContext({ tagAttributes: composedSchema });
+   // Define module with dependencies (see 01l_module_builder_pattern.md)
+   const appModule = defineModule({
+     metadata: { ... },
+     schema: appSchema,
+     deps: { http: httpLib, db: dbLib },
+   });
+
+   // Wire dependencies with prefixes at use time
+   const appRoot = appModule.use({
+     http: httpLib.prefix('http').use(),
+     db: dbLib.prefix('db').use(),
+   });
    ```
 
-2. **Per-Module Schema**: Each `ModuleContext` has one unified schema (`module.tagAttributes`). All buffers created from
-   that module share the same schema.
+2. **Per-Module Schema**: Each module has one unified schema. All buffers created from that module share the same
+   schema. Library buffers use RemappedBufferView to map prefixed names to unprefixed columns.
 
 3. **Runtime Enforcement**: The conversion function validates that all root buffers share the same schema, throwing an
    error if they differ.

@@ -319,26 +319,37 @@ interface InfoAPI {
 
 ### Library Integration Pattern
 
-Libraries define their schema and get fully typed APIs:
+Libraries define their schema using `defineModule` and get fully typed APIs:
+
+> **See**: [Module Builder Pattern](./01l_module_builder_pattern.md) for the complete API design.
 
 ```typescript
-// Library defines schema
-const httpLibrary = createLibrary('http', {
-  httpStatus: 'number',
-  httpMethod: 'string',
-  httpUrl: 'string',
-  httpDuration: 'number',
+// Library defines module with schema (unprefixed)
+const httpLib = defineModule({
+  metadata: { packageName: '@my-company/http', packagePath: 'src/index.ts' },
+  schema: {
+    status: S.number(),
+    method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
+    url: S.text(),
+    duration: S.number(),
+  },
 });
 
-// Usage is fully typed
-const httpTask = httpLibrary.task('api-call', async (ctx) => {
+const { task } = httpLib;
+
+// Usage is fully typed - library uses clean names
+export const apiCall = task('api-call', async (ctx) => {
   // TypeScript knows these properties exist and their types
-  ctx.tag({ httpMethod: 'GET', httpUrl: 'https://api.example.com' });
-  ctx.info('Making API call', { httpMethod: 'GET' });
-
-  // Property-based API is also typed
-  ctx.tag.httpStatus(200).httpDuration(45.2);
+  ctx.tag.method('GET').url('https://api.example.com');
+  ctx.log.info('Making API call');
+  ctx.tag.status(200).duration(45.2);
+  return ctx.ok({ success: true });
 });
+
+// Consumer applies prefix at use time:
+// const httpRoot = httpLib.prefix('http').use();
+// await apiCall(httpRoot);
+// Result: writes to http_status, http_method, http_url, http_duration columns
 ```
 
 ## Implementation Details (Design TBD)

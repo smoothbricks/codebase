@@ -8,8 +8,11 @@ avoiding attribute name conflicts. It solves the challenge of:
 1. **Clean library authoring**: Libraries write unprefixed code (`ctx.tag.status(200)`)
 2. **Collision avoidance**: Final columns are prefixed (`http_status`, `db_status`)
 3. **Zero hot path overhead**: Library writes directly to its own SpanBuffer with unprefixed columns
-4. **Type safety**: Full TypeScript inference through composition
+4. **Type safety**: Full TypeScript inference through explicit dependency injection
 5. **Tree traversal compatibility**: RemappedBufferView allows Arrow conversion to access prefixed names
+
+> **Note**: This spec describes the runtime mechanics of library integration. For the high-level API design
+> (`defineModule`, `.prefix()`, `.use()`), see [Module Builder Pattern](./01l_module_builder_pattern.md).
 
 ## Design Philosophy
 
@@ -45,7 +48,7 @@ Instead of trying to remap writes at runtime (which adds hot-path overhead), we:
 
 1. **Library creates its own SpanBuffer** with unprefixed schema (`{ status, method }`)
 2. **Library's ctx.\_buffer** points to this unprefixed buffer - transformed code works directly
-3. **RemappedBufferView** wraps the library buffer, mapping prefixed → unprefixed for tree traversal
+3. **RemappedBufferView** wraps the library buffer, mapping prefixed -> unprefixed for tree traversal
 4. **Parent's children array** contains the RemappedBufferView (not the raw buffer)
 
 ```
@@ -153,7 +156,7 @@ function generateRemappedBufferViewClass(
 SpanBuffer constructors do NOT auto-register with parent. Registration is explicit:
 
 ```typescript
-// In library's task wrapper:
+// In library's task wrapper (inside .use() implementation):
 const ownBuffer = createSpanBuffer(unprefixedSchema, taskContext, traceId);
 
 if (prefix && parentCtx?.buffer) {
@@ -175,188 +178,215 @@ This explicit registration enables:
 2. Testing scenarios where auto-registration is undesirable
 3. Clear control flow for debugging
 
-## Core Library Pattern
+## Library Definition with defineModule
+
+Libraries use `defineModule()` to define their schema and dependencies:
 
 ```typescript
-// @trace-system/core - provides the pattern for all libraries
-export function createLibraryModule<T extends TagAttributeSchema>(unprefixedSchema: T, prefix?: string) {
-  // Generate RemappedBufferView class once (cold path)
-  const RemappedViewClass = prefix
-    ? generateRemappedBufferViewClass(createPrefixMapping(unprefixedSchema, prefix))
-    : null;
+// @my-company/http-tracing/src/index.ts
+import { defineModule, S } from '@smoothbricks/lmao';
 
-  return {
-    // Prefixed schema for application composition
-    tagAttributes: prefix ? applyPrefix(unprefixedSchema, prefix) : unprefixedSchema,
-
-    // Unprefixed schema for library's own buffer creation
-    unprefixedSchema,
-
-    createTask: <Args extends any[]>(
-      spanName: string,
-      taskFn: (ctx: ContextWithUnprefixedTags<T>, ...args: Args) => any
-    ) => {
-      return async (parentCtx: RequestContext, ...args: Args) => {
-        // Create library's own buffer with unprefixed schema
-        const taskContext = new TaskContext(moduleContext, spanName);
-        const ownBuffer = createSpanBuffer(unprefixedSchema, taskContext, parentCtx.traceId);
-
-        // Register with parent (remapped if prefixed)
-        if (parentCtx.buffer) {
-          if (RemappedViewClass) {
-            parentCtx.buffer.children.push(new RemappedViewClass(ownBuffer));
-          } else {
-            parentCtx.buffer.children.push(ownBuffer);
-          }
-        }
-
-        // Create context with unprefixed buffer
-        const ctx = createSpanContext(ownBuffer, unprefixedSchema, parentCtx);
-
-        // Library code writes to unprefixed columns
-        return await taskFn(ctx, ...args);
-      };
-    },
-  };
-}
-```
-
-## Library Implementation Examples
-
-### HTTP Tracing Library
-
-```typescript
-// @my-company/http-tracing
-const cleanHttpSchema = defineTagAttributes({
-  status: S.number(),
-  method: S.category(),
-  url: S.text().masked('url'),
-  duration: S.number(),
-});
-
-export function createHttpLibrary(prefix: string = 'http') {
-  const module = createLibraryModule(cleanHttpSchema, prefix);
-
-  return {
-    ...module,
-
-    // Provide actual traced operations
-    operations: {
-      async request(ctx: Context, options: RequestOptions) {
-        return await module.createTask('http-request', async (ctx, opts) => {
-          const startTime = performance.now();
-
-          // Clean, unprefixed API - but writes to prefixed columns
-          ctx.tag.method(opts.method);
-          ctx.tag.url(opts.url);
-
-          try {
-            const response = await fetch(opts.url, opts);
-            ctx.tag.status(response.status);
-            ctx.tag.duration(performance.now() - startTime);
-            return ctx.ok(response);
-          } catch (error) {
-            ctx.tag.status(0);
-            ctx.tag.duration(performance.now() - startTime);
-            return ctx.err('HTTP_ERROR', error);
-          }
-        })(ctx, options);
-      },
-    },
-  };
-}
-```
-
-### Database Tracing Library
-
-```typescript
-// @my-company/db-tracing
-const cleanDbSchema = defineTagAttributes({
-  query: S.text().masked('sql'),
-  duration: S.number(),
-  rows: S.number().optional(),
-  table: S.category(),
-});
-
-export function createDatabaseLibrary(prefix: string = 'db') {
-  const module = createLibraryModule(cleanDbSchema, prefix);
-
-  return {
-    ...module,
-
-    operations: {
-      async query(ctx: Context, sql: string) {
-        return await module.createTask('db-query', async (ctx, query) => {
-          const startTime = performance.now();
-
-          ctx.tag.query(query);
-          ctx.tag.table(extractTableName(query));
-
-          try {
-            const result = await db.query(query);
-            ctx.tag.duration(performance.now() - startTime);
-            ctx.tag.rows(result.rowCount);
-            return ctx.ok(result);
-          } catch (error) {
-            ctx.tag.duration(performance.now() - startTime);
-            return ctx.err('DB_ERROR', error);
-          }
-        })(ctx, sql);
-      },
-    },
-  };
-}
-```
-
-## User Composition
-
-### Clean Composition Without Conflicts
-
-```typescript
-const httpLib = createHttpLibrary('http');
-const dbLib = createDatabaseLibrary('db');
-const redisLib = createRedisLibrary('redis');
-
-// Compose all library schemas with user-defined attributes
-const { task } = createModuleContext({
-  tagAttributes: {
-    // Library schemas (prefixed)
-    ...httpLib.tagAttributes, // { http_status: number, http_method: string, http_url: string, http_duration: number }
-    ...dbLib.tagAttributes, // { db_query: string, db_duration: number, db_rows?: number, db_table: string }
-    ...redisLib.tagAttributes, // { redis_command: string, redis_key: string, redis_duration: number }
-
-    // User's own attributes (unprefixed)
-    user_id: S.category().masked('hash'),
-    business_metric: S.number(),
-    custom_flag: S.boolean(),
+// Define the library's schema (unprefixed)
+export const httpLib = defineModule({
+  metadata: {
+    packageName: '@my-company/http-tracing',
+    packagePath: 'src/index.ts',
+  },
+  schema: {
+    status: S.number(),
+    method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
+    url: S.text().masked('url'),
+    duration: S.number(),
+  },
+  deps: {
+    retry: retryLib, // Declare dependency on retry library
   },
 });
+
+// Define tasks using the module's task factory
+const { task } = httpLib;
+
+export const GET = task('http-get', async (ctx, url: string, options?: RequestInit) => {
+  const startTime = performance.now();
+
+  ctx.tag.method('GET');
+  ctx.tag.url(url);
+
+  try {
+    const response = await fetch(url, options);
+    ctx.tag.status(response.status);
+    ctx.tag.duration(performance.now() - startTime);
+
+    // Use dependency - ctx is pre-bound
+    if (!response.ok) {
+      await ctx.deps.retry.attempt(1);
+    }
+
+    return ctx.ok(response);
+  } catch (error) {
+    ctx.tag.status(0);
+    ctx.tag.duration(performance.now() - startTime);
+    return ctx.err('HTTP_ERROR', error);
+  }
+});
+
+export const POST = task('http-post', async (ctx, url: string, body: unknown) => {
+  // Similar implementation...
+});
 ```
 
-### Type Safety Enforcement
+## Application Composition
+
+Applications wire libraries with prefixes using the fluent API:
 
 ```typescript
-// TypeScript prevents composition of incompatible libraries
-const httpLib = createHttpLibrary('http'); // status: number
-const processLib = createProcessLibrary('http'); // ❌ Same prefix with different types
+// Application code
+import { httpLib, GET, POST } from '@my-company/http-tracing';
+import { dbLib, query } from '@my-company/db-tracing';
+import { retryLib } from '@my-company/retry';
 
-// This would fail at compile time:
+// Wire dependencies with prefixes
+const httpRoot = httpLib.prefix('http').use({
+  retry: retryLib.prefix('http_retry').use(),
+});
+
+const dbRoot = dbLib.prefix('db').use();
+
+// Invoke tasks with root context
+const response = await GET(httpRoot, 'https://api.example.com/data');
+const users = await query(dbRoot, 'SELECT * FROM users');
+```
+
+### Application Module with Dependencies
+
+For applications that compose multiple libraries:
+
+```typescript
+import { defineModule, S } from '@smoothbricks/lmao';
+import { httpLib, GET } from '@my-company/http-tracing';
+import { dbLib, query } from '@my-company/db-tracing';
+
+// Application defines its own schema and declares library dependencies
+const appModule = defineModule({
+  metadata: {
+    gitSha: process.env.GIT_SHA,
+    packageName: '@my-company/api-server',
+    packagePath: 'src/app.ts',
+  },
+  schema: {
+    userId: S.category(),
+    requestId: S.category(),
+    endpoint: S.category(),
+  },
+  deps: {
+    http: httpLib,
+    db: dbLib,
+  },
+});
+
+const { task } = appModule;
+
+export const handleRequest = task('handle-request', async (ctx, req: Request) => {
+  ctx.tag.userId(req.userId);
+  ctx.tag.requestId(req.id);
+  ctx.tag.endpoint(req.path);
+
+  // Dependencies have ctx pre-bound - just call with args
+  const users = await ctx.deps.db.query('SELECT * FROM users');
+  const external = await ctx.deps.http.GET(req.externalUrl);
+
+  return ctx.ok({ users, external });
+});
+
+// Wire all dependencies
+const appRoot = appModule.use({
+  http: httpLib.prefix('http').use({
+    retry: retryLib.prefix('http_retry').use(),
+  }),
+  db: dbLib.prefix('db').use(),
+});
+
+// Entry point
+await handleRequest(appRoot, incomingRequest);
+```
+
+## Shared Dependencies
+
+Multiple consumers can share the same dependency instance:
+
+```typescript
+// GraphQL library needs HTTP internally
+const graphqlLib = defineModule({
+  metadata: { packageName: '@my-company/graphql', packagePath: 'src/index.ts' },
+  schema: {
+    query: S.text(),
+    operationName: S.category(),
+  },
+  deps: {
+    http: httpLib,
+  },
+});
+
+// Application uses both GraphQL and HTTP directly
+const appModule = defineModule({
+  metadata: { ... },
+  schema: { userId: S.category() },
+  deps: {
+    graphql: graphqlLib,
+    http: httpLib,  // App also uses HTTP directly
+  },
+});
+
+// Wire so GraphQL and App share the SAME http instance
+const httpInstance = httpLib.prefix('http').use({
+  retry: retryLib.prefix('http_retry').use(),
+});
+
+const appRoot = appModule.use({
+  http: httpInstance,                              // App's direct HTTP
+  graphql: graphqlLib.prefix('graphql').use({
+    http: httpInstance,                            // GraphQL's HTTP = SAME instance!
+  }),
+});
+
+// Result: Both write to http_status, http_method, etc.
+// No duplicate graphql_http_status columns!
+```
+
+## Type Safety: Collision Detection
+
+The new pattern provides compile-time collision detection:
+
+```typescript
+// OLD PATTERN (spread) - SILENT COLLISION:
 const { task } = createModuleContext({
   tagAttributes: {
     ...httpLib.tagAttributes, // http_status: number
-    ...processLib.tagAttributes, // http_status: string ❌ Conflict!
+    ...processLib.tagAttributes, // http_status: string -- SILENTLY OVERWRITES!
   },
 });
 
-// Solution: Use different prefixes
-const processLib = createProcessLibrary('process'); // ✅ Different prefix
+// NEW PATTERN (defineModule) - COMPILE-TIME ERROR:
+const appModule = defineModule({
+  schema: { ... },
+  deps: {
+    http: httpLib,
+    process: processLib,
+  },
+});
+
+// When both use same prefix in .use(), TypeScript catches it:
+appModule.use({
+  http: httpLib.prefix('http').use(),
+  process: processLib.prefix('http').use(), // TYPE ERROR: collision on http_status
+});
 ```
 
 ## Performance Benefits
 
 ### Cold Path vs Hot Path Optimization
 
-**Cold Path** (Library Module Creation Time):
+**Cold Path** (Library Composition Time - `.prefix().use()`):
 
 - Schema analysis and prefix mapping
 - RemappedBufferView class generation via `new Function()`
@@ -498,6 +528,8 @@ ORDER BY access_count DESC;
 
 This pattern integrates with other components:
 
+- **[Module Builder Pattern](./01l_module_builder_pattern.md)**: High-level API design (`defineModule`, `.prefix()`,
+  `.use()`)
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Provides the schema definition and composition mechanisms
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generates prefixed TypedArray columns based
   on composed schemas
@@ -509,12 +541,13 @@ This pattern integrates with other components:
 ## Benefits Summary
 
 1. **Library Author Experience**: Clean, domain-focused APIs without global naming concerns
-2. **User Experience**: Simple composition with automatic conflict resolution
+2. **User Experience**: Simple composition with explicit dependency injection
 3. **Performance**: Zero hot path overhead through compile-time optimization
-4. **Type Safety**: Full TypeScript inference prevents composition errors
+4. **Type Safety**: Full TypeScript inference with compile-time collision detection
 5. **Ecosystem**: Enables rich third-party library ecosystem for tracing
 6. **Maintainability**: Modular pattern that scales to many libraries
 7. **Query Performance**: Clean, optimized columnar data for analytics
+8. **Shared Dependencies**: Multiple consumers can share a dependency instance
 
 This pattern enables a rich ecosystem of traced libraries while maintaining the performance and type safety goals of the
 overall system.

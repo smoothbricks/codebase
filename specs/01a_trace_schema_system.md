@@ -1627,15 +1627,17 @@ interface SpanContext extends RequestContext {
 ### Task Integration
 
 ```typescript
-// Module context with tag attributes
-const { task } = createModuleContext({
-  moduleMetadata: {
+// Define module with schema (see 01l_module_builder_pattern.md for full API)
+const userModule = defineModule({
+  metadata: {
     gitSha: 'abc123...',
     packageName: '@mycompany/user-service',
     packagePath: 'src/services/user.ts',
   },
-  tagAttributes: dbAttributes, // Use DB-specific attributes
+  schema: dbAttributes, // Module's tag attributes
 });
+
+const { task } = userModule;
 
 export const createUser = task('create-user', async (ctx, userData: UserData) => {
   // ctx has: tag, log, ok, err, span, ff (feature flags), env (environment)

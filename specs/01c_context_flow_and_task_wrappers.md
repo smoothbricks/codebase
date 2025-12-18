@@ -286,10 +286,12 @@ The module context system provides:
 
 ```typescript
 // Module setup (build/startup time)
-const { task } = createModuleContext({
-  moduleMetadata: { gitSha: 'abc123...', packageName: '@mycompany/user-service', packagePath: 'src/services/user.ts' },
-  tagAttributes: dbAttributes,
+const userModule = defineModule({
+  metadata: { gitSha: 'abc123...', packageName: '@mycompany/user-service', packagePath: 'src/services/user.ts' },
+  schema: dbAttributes,
 });
+
+const { task } = userModule;
 
 // Generated TagAPI provides typed methods
 export const createUser = task('create-user', async (ctx, userData) => {

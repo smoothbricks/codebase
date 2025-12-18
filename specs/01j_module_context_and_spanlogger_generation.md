@@ -17,33 +17,35 @@ This system operates at build/startup time to generate efficient runtime code wi
 
 **Purpose**: Set up module-level configuration that's shared across all tasks in the same module.
 
+> **Note**: For the high-level API design (`defineModule`, `.prefix()`, `.use()`), see
+> [Module Builder Pattern](./01l_module_builder_pattern.md). This section describes the internal implementation.
+
 ```typescript
-// Create module context with tag attributes
-const { task } = createModuleContext({
-  // Transformer or build tool injects module metadata
-  moduleMetadata: {
+// Define module with schema and dependencies
+const userModule = defineModule({
+  metadata: {
     gitSha: 'abc123...',
     packageName: '@mycompany/user-service',
     packagePath: 'src/services/user.ts',
   },
-  tagAttributes: dbAttributes, // Use DB-specific attributes
+  schema: dbAttributes, // Module's tag attributes
+  deps: {
+    db: dbLib, // Declare dependencies
+  },
 });
 
-// High-level API for standard modules
-function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttributes: TagAttributeSchema }) {
+const { task } = userModule;
+
+// Internal implementation
+function defineModule(config: { metadata: ModuleMetadata; schema: TagAttributeSchema; deps?: Record<string, Module> }) {
   // Standard case: method names = column names
-  const compiledTagOps = compileTagOperations(config.tagAttributes);
+  const compiledTagOps = compileTagOperations(config.schema);
 
-  return createModuleContextFromCompiled(config.moduleMetadata, compiledTagOps);
-}
-
-// Low-level API that takes pre-compiled tag operations
-function createModuleContextFromCompiled(moduleMetadata: ModuleMetadata, compiledTagOps: CompiledTagOperations) {
   // Create module context with metadata
   const moduleContext: ModuleContext = {
-    gitSha: moduleMetadata.gitSha,
-    packageName: moduleMetadata.packageName,
-    packagePath: moduleMetadata.packagePath,
+    gitSha: config.metadata.gitSha,
+    packageName: config.metadata.packageName,
+    packagePath: config.metadata.packagePath,
 
     // Initialize self-tuning capacity stats
     spanBufferCapacityStats: {
@@ -56,6 +58,14 @@ function createModuleContextFromCompiled(moduleMetadata: ModuleMetadata, compile
 
   return {
     task: createTaskWrapper(moduleContext, compiledTagOps),
+    metadata: config.metadata,
+    schema: config.schema,
+    deps: config.deps || {},
+
+    // Fluent API for composition
+    prefix(p: string) {
+      return createPrefixedModule(this, p);
+    },
   };
 }
 ```
@@ -322,48 +332,67 @@ type MinimalContext<TSchema> = Pick<TaskContext<TSchema>, 'tag' | 'log' | 'ok' |
 - **Generic attributes**: `TSchema` provides typed access to tag attributes
 - **OpenTelemetry alignment**: `ctx.tag` mirrors `Span.setAttribute()`
 
-## Library Factory Pattern
+## Library Definition Pattern
 
-For third-party libraries that need prefixed attributes and clean APIs:
+For third-party libraries that need prefixed attributes and clean APIs, use `defineModule`:
+
+> **See**: [Module Builder Pattern](./01l_module_builder_pattern.md) for the complete API design including dependency
+> injection and shared instances.
 
 ```typescript
-// Clean schema (no prefixes) - used for typing
-const HTTP_SCHEMA = {
-  status: S.number(),
-  method: S.category(),
-  url: S.text(),
-  duration: S.number(),
-};
+// @my-company/http-tracing/src/index.ts
+import { defineModule, S } from '@smoothbricks/lmao';
 
-// Define library-specific context type once
-type Ctx = TaskContext<typeof HTTP_SCHEMA>;
+// Define the library module with clean schema (no prefixes)
+export const httpLib = defineModule({
+  metadata: {
+    packageName: '@my-company/http-tracing',
+    packagePath: 'src/index.ts',
+  },
+  schema: {
+    status: S.number(),
+    method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
+    url: S.text().masked('url'),
+    duration: S.number(),
+  },
+  deps: {
+    retry: retryLib, // Declare dependency
+  },
+});
 
-// Define clean functions at top level - much cleaner typing
-async function get(ctx: Ctx, url: string, options = {}) {
+// Define tasks using the module's task factory
+const { task } = httpLib;
+
+export const GET = task('http-get', async (ctx, url: string, options?: RequestInit) => {
   const startTime = performance.now();
 
-  ctx.tag.method('GET').url(url); // ✅ TypeScript knows these methods exist
+  ctx.tag.method('GET').url(url); // TypeScript knows these methods exist
 
   try {
-    const response = await fetch(url, { method: 'GET', ...options });
+    const response = await fetch(url, options);
     ctx.tag.status(response.status).duration(performance.now() - startTime);
+
+    // Use dependency - ctx is pre-bound
+    if (!response.ok) {
+      await ctx.deps.retry.attempt(1);
+    }
+
     return ctx.ok(response);
   } catch (error) {
     ctx.tag.duration(performance.now() - startTime);
     return ctx.err('HTTP_ERROR');
   }
-}
+});
 
-async function post(ctx: Ctx, url: string, data: any, options = {}) {
+export const POST = task('http-post', async (ctx, url: string, body: unknown) => {
   const startTime = performance.now();
 
-  ctx.tag.method('POST').url(url); // ✅ TypeScript knows these methods exist
+  ctx.tag.method('POST').url(url);
 
   try {
     const response = await fetch(url, {
       method: 'POST',
-      body: JSON.stringify(data),
-      ...options,
+      body: JSON.stringify(body),
     });
     ctx.tag.status(response.status).duration(performance.now() - startTime);
     return ctx.ok(response);
@@ -371,64 +400,22 @@ async function post(ctx: Ctx, url: string, data: any, options = {}) {
     ctx.tag.duration(performance.now() - startTime);
     return ctx.err('HTTP_ERROR');
   }
-}
+});
 
-// Module metadata
-const HTTP_MODULE_METADATA = {
-  gitSha: 'abc123...',
-  packageName: '@my-company/http-tracing',
-  packagePath: 'src/index.ts',
-};
-
-// Factory call with custom span names
-export const createHttpLibrary = moduleContextFactory(
-  'http', // prefix
-  HTTP_MODULE_METADATA, // module metadata
-  HTTP_SCHEMA, // clean schema
-  {
-    get: { fn: get, spanName: 'http-request' },
-    post: { fn: post, spanName: 'http-request' },
-    // Or different names:
-    // get: { fn: get, spanName: 'http-get' },
-    // post: { fn: post, spanName: 'http-post' }
-  }
-);
-
-// Implementation of moduleContextFactory
-function moduleContextFactory(
-  prefix: string,
-  moduleMetadata: ModuleMetadata,
-  cleanSchema: TagAttributeSchema,
-  functions: Record<string, { fn: Function; spanName: string }>
-) {
-  // Compile with prefix
-  const compiledTagOps = compilePrefixedTagOperations(cleanSchema, prefix);
-
-  // Create module context
-  const { task } = createModuleContextFromCompiled(moduleMetadata, compiledTagOps);
-
-  // Wrap each function with task wrapper using custom span names
-  const wrappedFunctions = Object.fromEntries(
-    Object.entries(functions).map(([name, { fn, spanName }]) => [
-      name,
-      task(spanName, fn), // Use library author's chosen span name
-    ])
-  );
-
-  // Return wrapped functions + schema for composition
-  return {
-    ...wrappedFunctions,
-    tagAttributes: compiledTagOps.schema, // Prefixed schema for user composition
-  };
-}
+// Application wires dependencies with prefixes at use time:
+// const httpRoot = httpLib.prefix('http').use({
+//   retry: retryLib.prefix('http_retry').use(),
+// });
+// await GET(httpRoot, 'https://api.example.com');
 ```
 
 **Why This Pattern**:
 
 - **Clean library APIs**: Libraries use `ctx.tag.status()` but write to `http_status` column
-- **Actual operations**: Libraries return real HTTP functions, not just schemas
-- **Custom span names**: Library authors control span naming conventions
-- **Schema composition**: Prefixed schema available for user composition with other libraries
+- **Explicit dependencies**: Libraries declare what they need via `deps`
+- **Prefix at use time**: Consumer applies prefix, not library author
+- **Pre-bound context**: Dependencies receive ctx automatically (`ctx.deps.retry.attempt(1)`)
+- **Type safety**: Full TypeScript inference for schema and dependencies
 
 ## Usage in Context Flow
 
@@ -436,14 +423,17 @@ This module context system integrates seamlessly with the runtime context flow:
 
 ```typescript
 // Module setup (build/startup time)
-const { task } = createModuleContext({
-  moduleMetadata: {
+const userModule = defineModule({
+  metadata: {
     gitSha: 'abc123...',
     packageName: '@mycompany/user-service',
     packagePath: 'src/services/user.ts',
   },
-  tagAttributes: dbAttributes,
+  schema: dbAttributes,
+  deps: { db: dbLib },
 });
+
+const { task } = userModule;
 
 // Runtime usage (request processing)
 export const createUser = task('create-user', async (ctx, userData) => {
@@ -453,8 +443,17 @@ export const createUser = task('create-user', async (ctx, userData) => {
   // ctx.log handles log messages with full TypeScript support
   ctx.log.info('Creating user').with({ email: userData.email });
 
+  // Use dependency with pre-bound context
+  await ctx.deps.db.query('INSERT INTO users...');
+
   return ctx.ok(user);
 });
+
+// Wire dependencies and invoke
+const userRoot = userModule.use({
+  db: dbLib.prefix('db').use(),
+});
+await createUser(userRoot, userData);
 ```
 
 ## Performance Characteristics
