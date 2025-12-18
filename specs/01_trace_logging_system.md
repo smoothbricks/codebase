@@ -486,6 +486,7 @@ The trace logging system integrates with these platform components:
 6. **[Library Integration Pattern](./01e_library_integration_pattern.md)** - Library attribute conflict resolution
 7. **[Arrow Table Structure](./01f_arrow_table_structure.md)** - Final queryable format
 8. **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)** - Runtime API generation
+9. **[TypeScript Transformer](./01o_typescript_transformer.md)** - Compile-time optimizations for V8
 
 ## Quick Reference: op() + span() Design
 
