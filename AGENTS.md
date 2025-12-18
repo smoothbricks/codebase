@@ -9,12 +9,15 @@
 
 ### Core System
 
-- **System Overview**: specs/01_trace_logging_system.md - Architecture overview & hot/cold path design
-- **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, tag attributes, feature flags
+- **System Overview**: specs/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8 Optimization
+  Patterns**
+- **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema, feature flags [**LMAO**]
+- **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern
   [**LMAO**]
-- **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - Request→Op→Span hierarchy, op() pattern [**LMAO**]
 - **Buffer Architecture**: specs/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
   [**ARROW-BUILDER**]
+- **TypeScript Transformer**: specs/01o_typescript_transformer.md - Compile-time V8 optimizations, span_op/span_fn
+  monomorphic methods [**LMAO-TRANSFORMER**]
 
 ### Buffer System Details (All in @packages/arrow-builder)
 
@@ -77,13 +80,13 @@
 **Owns**:
 
 - Schema DSL (S.enum/category/text/number/boolean) (specs/01a)
-- Tag attribute definitions with masking and `attr_` prefix
+- logSchema definitions with masking and `attr_` prefix
 - **System columns (timestamps, operations) - ALWAYS eager, never lazy**
 - **Scope class generation - SEPARATE from buffer columns**
 - SpanBuffer creation (extends ColumnBuffer with span metadata)
 - SpanLogger/ctx API generation (specs/01g, 01j)
 - Fluent logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/01h)
-- Context propagation (request→module→task→span) (specs/01c)
+- Context propagation (traceContext→module→op→span) (specs/01c)
 - Feature flag evaluation (specs/01a)
 - Library integration & prefixing (specs/01e)
 
@@ -96,7 +99,7 @@
 
 **Key Files**:
 
-- `src/lib/schema/` - Schema builders, tag attributes, feature flags
+- `src/lib/schema/` - Schema builders, logSchema, feature flags
 - `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation
 - `src/lib/codegen/scopeGenerator.ts` - Scope class generation (SEPARATE from buffer)
 - `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer)
@@ -118,9 +121,9 @@
   - Check `packages/arrow-builder/src/lib/` for low-level buffer operations
   - Look for existing helper functions, types, and patterns
   - **DO NOT re-implement what already exists** - reuse existing code
-  - **DO NOT create raw objects** - use `defineTagAttributes()` and `S` schema builder
-  - **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineTagAttributes` and
-    use it properly
+  - **DO NOT create raw objects** - use `defineLogSchema()` and `S` schema builder
+  - **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineLogSchema` and use
+    it properly
 
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/01a_trace_schema_system.md):
 
@@ -172,11 +175,11 @@ Three distinct string types, each with different storage strategies:
 
 ## Implementation Patterns (See specs/01h_entry_types_and_logging_primitives.md)
 
-- **Schema Definition**: ALWAYS use `defineTagAttributes()` with `S` builder:
+- **Schema Definition**: ALWAYS use `defineLogSchema()` with `S` builder:
 
   ```typescript
   // ✅ CORRECT
-  const schema = defineTagAttributes({
+  const schema = defineLogSchema({
     userId: S.category(),
     operation: S.enum(['CREATE', 'READ']),
     errorMsg: S.text(),
@@ -225,13 +228,15 @@ Unified enum for ALL trace events:
 
 ## Library Integration (See specs/01l_module_builder_pattern.md & 01e)
 
-- Libraries use `defineModule({ metadata, schema, deps })` to define their schema
-- Ops are defined via `const { op } = myLib; export const myOp = op(async ({ span, log, tag }, ...args) => {})`
+- Libraries use `defineModule({ metadata, logSchema, deps, ff }).ctx<Extra>(defaults).make()` to define their module
+- Ops are defined via
+  `const { op } = myModule; export const myOp = op('name', async ({ span, log, tag }, ...args) => {})`
 - Ops destructure context: `{ span, log, tag, deps, ff, env }` - take only what you need
 - Span names at call site: `await span('contextual-name', someOp, args)` - caller names spans
 - Deps can be destructured: `const { retry, auth } = deps`
 - Prefix applied at use time: `httpLib.prefix('http').use({ retry: retryLib.prefix('http_retry').use() })`
 - RemappedBufferView maps prefixed names to unprefixed columns for Arrow conversion
+- `.ctx<Extra>(defaults)` requires all keys enumerable for `new Function()` codegen (V8 hidden class optimization)
 
 ## Span Scope Attributes (See specs/01i_span_scope_attributes.md)
 
@@ -271,7 +276,7 @@ Unified enum for ALL trace events:
 - ✅ `S.text()` - Raw strings for unique values
 - ✅ `S.number()` - Float64Array storage
 - ✅ `S.boolean()` - Uint8Array (0/1) storage
-- ✅ `defineTagAttributes()` - Schema definition with validation
+- ✅ `defineLogSchema()` - Schema definition with validation
 - ✅ `defineFeatureFlags()` - Feature flag schema with sync/async evaluation
 - ✅ Schema extension with `.extend()` method
 - ✅ Masking transforms (hash, url, sql, email)
@@ -283,7 +288,7 @@ Unified enum for ALL trace events:
 - ✅ `createNextBuffer()` - Buffer chaining for overflow
 - ✅ `createAttributeColumns()` - Schema-based column creation
 - ✅ Null bitmap management (Arrow format)
-- ✅ Self-tuning capacity with overflow tracking
+- ✅ Self-tuning capacity with `sb_*` stats (sb_capacity, sb_totalWrites, sb_overflows, sb_totalCreated)
 - ✅ `convertToArrowTable()` - Zero-copy Arrow conversion
 - ✅ `convertSpanTreeToArrowTable()` - Recursive tree conversion
 
@@ -291,28 +296,29 @@ Unified enum for ALL trace events:
 
 - ✅ `generateSpanLoggerClass()` - Runtime class code generation
 - ✅ `createSpanLoggerClass()` - Compile and cache SpanLogger classes
-- ✅ Compile-time enum mapping in generated code
+- ✅ Compile-time enum mapping via switch-case (V8 JIT-inlined)
 - ✅ Prototype methods for zero-overhead tag writing
 - ✅ Scoped attributes with `scope()` method
 - ✅ Distinct entry types (info/debug/warn/error)
 
 ### Context & Integration (@packages/lmao/src/lib/)
 
-- ✅ `createRequestContext()` - Request-level context with ff/env
-- ✅ `createModuleContext()` - Module-level context with task wrapper
+- ✅ `createTraceContext()` - Root trace context with ff/env
+- ✅ `createModuleContext()` - Module-level context with op wrapper
 - ✅ `ctx.ok()` / `ctx.err()` - Fluent result API
-- ✅ `ctx.span()` - Child span creation
+- ✅ `ctx.span()` - Child span creation (polymorphic dispatcher)
+- ✅ `ctx.span_op()` / `ctx.span_fn()` - Monomorphic span methods (for transformer)
 - ✅ `ctx.tag` - Chainable tag API for span attributes
 - ✅ `ctx.log.scope()` - Scoped attribute propagation
 - ✅ Feature flag evaluation with analytics tracking
+- ✅ `callsiteModule` on SpanBuffer for dual module attribution (row 0 vs rows 1+)
 
 ### Library Integration (@packages/lmao/src/lib/library.ts)
 
 - ✅ `prefixSchema()` - Add prefix to all schema fields
 - ✅ `generateRemappedBufferViewClass()` - Generate view for Arrow conversion
 - ✅ `generateRemappedSpanLoggerClass()` - Generate SpanLogger with prefix mapping
-- ✅ `moduleContextFactory()` - Current library composition API (see spec 01l for new `defineModule` pattern)
-- 🚧 `defineModule()` - New fluent API for module definition (spec 01l - implementation pending)
+- ✅ `defineModule().ctx<Extra>(defaults).make()` - Fluent module definition API
 
 ### Background Processing (@packages/lmao/src/lib/flushScheduler.ts)
 
@@ -331,5 +337,6 @@ Unified enum for ALL trace events:
 - ✅ `textStringStorage` - Global text storage
 - ✅ `moduleIdInterner` - Module ID interning
 - ✅ `spanNameInterner` - Span name interning
+- ✅ `Utf8Cache` (SIEVE-based) - Bounded UTF-8 encoding cache for Arrow conversion
 
 **BEFORE IMPLEMENTING**: Search these modules first! Most functionality already exists.
