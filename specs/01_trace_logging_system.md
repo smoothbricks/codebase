@@ -280,6 +280,186 @@ The core trace logging system is implemented in `@packages/lmao` with buffer inf
 - Line number transformer integration
 - Context destructuring API
 
+## V8 Optimization Patterns
+
+The library is designed around V8's optimization characteristics. Understanding these patterns explains many design
+decisions.
+
+### 1. Hidden Classes and Inline Caching
+
+V8 creates "hidden classes" (also called "shapes" or "maps") for objects with the same property layout. Objects sharing
+a hidden class enable **inline caching** - V8 can remember the exact memory offset for each property, making access O(1)
+instead of dictionary lookup.
+
+**Pattern**: Define all properties in constructors, never add properties dynamically.
+
+```typescript
+// ✅ GOOD: All properties defined upfront
+class TraceContext {
+  constructor() {
+    this.traceId = undefined;
+    this.span = undefined;
+    this.ff = undefined;
+    this.env = undefined; // Even if undefined, declare it!
+  }
+}
+
+// ❌ BAD: Properties added dynamically break hidden class
+const ctx = {};
+ctx.traceId = 'abc'; // Hidden class transition #1
+ctx.span = spanFn; // Hidden class transition #2
+```
+
+**Application in LMAO**:
+
+- `new Function()` codegen generates classes with ALL properties in constructor
+- `.ctx<Extra>(defaults)` requires all keys to be enumerable for codegen
+- `Object.create(proto)` used instead of object spreads `{...ctx}`
+
+### 2. Monomorphic Call Sites
+
+V8 optimizes function calls that always receive the same types. A call site that sees multiple types becomes
+"polymorphic" (slower) or "megamorphic" (much slower, dictionary lookup).
+
+**Pattern**: Ensure hot-path functions always receive same-shaped objects.
+
+```typescript
+// ✅ GOOD: All SpanBuffers have same shape (from generated class)
+function writeTimestamp(buffer: SpanBuffer, idx: number, value: bigint) {
+  buffer._timestamps[idx] = value; // Monomorphic - same hidden class every time
+}
+
+// ❌ BAD: Different buffer shapes at same call site
+function writeTimestamp(buffer: any, idx: number, value: bigint) {
+  buffer.timestamps[idx] = value; // Polymorphic - could be any shape
+}
+```
+
+**Application in LMAO**:
+
+- Generated buffer classes have fixed shapes per schema
+- SpanContext prototype chain is consistent across all spans
+- Enum setters use switch-case (JIT-inlined) not Map.get()
+
+### 3. Runtime Codegen with `new Function()`
+
+V8 optimizes generated code the same as handwritten code. By generating specialized code at startup, we get:
+
+- Unrolled loops for known field counts
+- Direct property access without string lookups
+- Switch statements that become jump tables
+
+**Pattern**: Generate code at module initialization (cold path), execute it in hot path.
+
+```typescript
+// At module init (cold path):
+const SpanLoggerClass = new Function(
+  'return class SpanLogger { ' +
+    'userId(v) { this._buffer.userId(this._idx, v); return this; } ' +
+    'requestId(v) { this._buffer.requestId(this._idx, v); return this; } ' +
+    '}'
+)();
+
+// At runtime (hot path) - zero overhead:
+logger.userId('123').requestId('req-456');
+```
+
+**Application in LMAO**:
+
+- `SpanLogger` classes generated per schema
+- `ColumnBuffer` classes generated per schema
+- Enum mapping functions use generated switch-case
+- Scope `_setScope()` has unrolled per-field code
+
+### 4. Prototype-Based Context Inheritance
+
+`Object.create(proto)` is faster than object spreads `{...parent}` because:
+
+- No property enumeration
+- No copying - just prototype chain link
+- Maintains hidden class stability
+
+**Pattern**: Use prototype chain for context inheritance.
+
+```typescript
+// ✅ GOOD: Prototype inheritance
+const childCtx = Object.create(parentCtx);
+childCtx.spanName = 'child-op'; // Only override what changes
+
+// ❌ BAD: Object spread copies all properties
+const childCtx = { ...parentCtx, spanName: 'child-op' }; // Hidden class pollution
+```
+
+**Application in LMAO**:
+
+- `createTraceContext()` uses `Object.create(TraceContextProto)`
+- Child spans use `Object.create(parentCtx)`
+- User `Extra` properties inherit through prototype chain
+
+### 5. TypedArray Performance
+
+TypedArrays (Uint8Array, Float64Array, BigInt64Array) are faster than regular arrays for numeric data:
+
+- No type checking per access
+- Contiguous memory layout
+- Cache-friendly access patterns
+
+**Pattern**: Use TypedArrays for all numeric columns, align to cache lines.
+
+```typescript
+// ✅ GOOD: TypedArray with cache-aligned capacity
+const timestamps = new BigInt64Array(alignedCapacity); // 64-byte aligned
+timestamps[idx] = value; // Direct memory write
+
+// ❌ BAD: Regular array with boxing
+const timestamps: bigint[] = [];
+timestamps[idx] = value; // Boxing overhead
+```
+
+**Application in LMAO**:
+
+- All numeric columns use TypedArrays
+- Capacity aligned to 64-byte cache lines (8 elements × 8 bytes)
+- Null bitmaps use Uint8Array with bit operations
+
+### 6. Lazy Allocation Pattern
+
+For sparse data (user attributes), defer allocation until first write:
+
+**Pattern**: Getter-based lazy allocation with `undefined` check.
+
+```typescript
+// Generated code:
+get userId_values() {
+  let v = this._userId_values;
+  if (v === undefined) {
+    v = this._userId_values = new Array(this._capacity);
+    this._userId_nulls = new Uint8Array((this._capacity + 7) >>> 3);
+  }
+  return v;
+}
+```
+
+**Application in LMAO**:
+
+- System columns (`_timestamps`, `_operations`) always eager
+- User attribute columns lazy by default
+- `S.number().eager()` forces eager allocation for hot columns
+
+### Summary: Why These Patterns Matter
+
+| Pattern                | Without Optimization | With Optimization  | Speedup   |
+| ---------------------- | -------------------- | ------------------ | --------- |
+| Hidden class stability | Dictionary lookup    | Direct offset      | 10-100x   |
+| Monomorphic calls      | Polymorphic dispatch | Inline cached      | 2-10x     |
+| Generated code         | Interpreted loops    | JIT-compiled       | 5-50x     |
+| Prototype inheritance  | Object copy          | Pointer assignment | 10-100x   |
+| TypedArrays            | Boxed numbers        | Raw memory         | 2-5x      |
+| Lazy allocation        | Allocate all upfront | On-demand          | Memory 2x |
+
+These patterns compound - a logging call that would take 10μs with naive implementation takes <0.1μs with all
+optimizations applied.
+
 ## Future Experiments
 
 - **Buffer Performance**: Benchmark different columnar storage strategies (e.g., single TypedArray vs. multiple) for

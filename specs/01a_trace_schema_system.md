@@ -63,10 +63,24 @@ entryType: S.enum(['span-start', 'span-ok', 'span-err']);
 // 2. Encode UTF-8 for each value
 // 3. Build reverse map: { 'span-err': 0, 'span-ok': 1, 'span-start': 2 }
 
-// Generated hot-path code (compile-time mapping)
+// Generated hot-path code (compile-time switch for V8 optimization)
+function getEnumIndex_entryType(value) {
+  // Switch-case is JIT-inlined by V8 into jump tables
+  // Much faster than Map.get() which has function call + hash overhead
+  switch (value) {
+    case 'span-err':
+      return 0;
+    case 'span-ok':
+      return 1;
+    case 'span-start':
+      return 2;
+    default:
+      return 0;
+  }
+}
+
 function writeEntryType(buffer, idx, value) {
-  // Map lookup, NOT switch - supports any enum size
-  buffer.attr_entryType_values[idx] = ENTRY_TYPE_MAP.get(value);
+  buffer.attr_entryType_values[idx] = getEnumIndex_entryType(value);
 }
 
 // Arrow conversion (zero work - already done)

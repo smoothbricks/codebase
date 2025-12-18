@@ -486,6 +486,22 @@ const processUser = op(async ({ tag, log, scope, span, ok, err }, userData) => {
 - **V8 optimization**: Single object with stable hidden class for optimal JIT compilation
 - **Memory efficiency**: No intermediate objects or proxies
 
+**Transformer Optimization for `with()` Bulk Setter:**
+
+The `with()` bulk setter is syntactic sugar that the transformer can unroll into individual setter calls:
+
+```typescript
+// What you write:
+tag.with({ userId: 'user-123', requestId: 'req-456' });
+
+// What the transformer produces (unrolled for V8 inline caching):
+tag.userId('user-123').requestId('req-456');
+```
+
+This unrolling eliminates the object allocation and `Object.keys()` iteration at runtime, making `with()` zero-cost when
+the transformer is enabled. Without the transformer, `with()` still works but has minor overhead from iterating the
+object keys.
+
 This design achieves the fluent API ergonomics while maintaining the zero-overhead performance goals.
 
 ### Type Safety with Generics

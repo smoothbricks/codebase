@@ -176,9 +176,12 @@ const processRequest = op(async ({ env, log, requestId }) => {
 });
 ```
 
-### The `null!` Convention
+### The `null!` Convention and V8 Hidden Class Optimization
 
-The `null!` pattern indicates a required property with no default:
+The defaults object in `.ctx<Extra>(defaults)` serves **two critical purposes**:
+
+1. **Type-level**: `null!` = required in `traceContext()`, `undefined` = optional
+2. **Runtime**: `Object.keys(defaults)` provides fixed property list for `new Function()` codegen
 
 ```typescript
 .ctx<{
@@ -191,6 +194,36 @@ The `null!` pattern indicates a required property with no default:
   userId: undefined,    // undefined = optional, has default
 })
 ```
+
+**Why the defaults object matters for V8:**
+
+The actual values (`null!` vs `undefined`) don't matter at runtime - what matters is that **all keys are enumerable**.
+This enables codegen to iterate `Object.keys(defaults)` and generate a class with a fixed property layout:
+
+```typescript
+// At module definition time (cold path):
+const extraKeys = Object.keys(defaults); // ['env', 'requestId', 'userId']
+
+// Generated TraceContext class has FIXED hidden class shape:
+const generatedCode = `
+  class TraceContext {
+    constructor() {
+      // All properties defined upfront = stable V8 hidden class
+      this.traceId = undefined;
+      this.span = undefined;
+      this.ff = undefined;
+      ${extraKeys.map((k) => `this.${k} = undefined;`).join('\n')}
+    }
+  }
+`;
+```
+
+**V8 Hidden Class Optimization**: When all properties are defined in the constructor (not added dynamically later), V8
+creates a single hidden class that enables inline caching and fast property access. Objects created from this class
+share the same hidden class, making property access O(1) instead of dictionary lookup.
+
+**CRITICAL**: Omitting a key from the defaults object would break codegen - the generated class wouldn't have that
+property, causing V8 hidden class transitions when the property is later assigned.
 
 This gives clear compile-time errors when required properties are missing from `traceContext()`.
 
