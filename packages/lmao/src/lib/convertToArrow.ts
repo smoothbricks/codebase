@@ -11,13 +11,11 @@
 import {
   clearBitRange,
   compareStrings,
-  countNulls,
   createSortedDictionary,
   DictionaryBuilder,
   type FinalizedDictionary,
   getMaskTransform,
   type PreEncodedEntry,
-  setBitRange,
   sortInPlace,
 } from '@smoothbricks/arrow-builder';
 import {
@@ -26,7 +24,6 @@ import {
   Field,
   Float64,
   Int8,
-  Int32,
   makeData,
   makeVector,
   RecordBatch,
@@ -41,262 +38,23 @@ import {
   Utf8,
   type Vector,
 } from 'apache-arrow';
-import { ENTRY_TYPE_CAPACITY_STATS, ENTRY_TYPE_NAMES } from './lmao.js';
+import { createCapacityStatsRecordBatch } from './arrow/capacityStats.js';
+import { buildSortedCategoryDictionary, buildTextDictionary } from './arrow/dictionaries.js';
+import {
+  calculateUtf8Offsets,
+  concatenateFloat64Arrays,
+  concatenateNullBitmaps,
+  concatenateUint8Arrays,
+  encodeUtf8Strings,
+  getArrowFieldName,
+  walkSpanTree,
+} from './arrow/utils.js';
+import { ENTRY_TYPE_NAMES } from './lmao.js';
 import type { ModuleContext } from './moduleContext.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
+import { getSchemaFields, type TagAttributeSchema } from './schema/types.js';
 import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
-
-/**
- * Dictionary build result with consistent shape for V8 optimization.
- * Using a class ensures all instances share the same hidden class.
- */
-class DictionaryBuildResult {
-  constructor(
-    public readonly dictionary: string[],
-    public readonly indices: Uint8Array | Uint16Array | Uint32Array,
-    public readonly indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
-    public readonly arrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32,
-    public readonly nullBitmap: Uint8Array | undefined,
-    public readonly nullCount: number,
-  ) {}
-}
-
-function encodeUtf8Strings(strings: readonly string[]): Uint8Array {
-  const encoder = new TextEncoder();
-  const encoded = strings.map((s) => encoder.encode(s));
-  const totalLength = encoded.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const arr of encoded) {
-    result.set(arr, offset);
-    offset += arr.length;
-  }
-  return result;
-}
-
-function calculateUtf8Offsets(strings: readonly string[]): Int32Array {
-  const encoder = new TextEncoder();
-  const offsets = new Int32Array(strings.length + 1);
-  offsets[0] = 0;
-  for (let i = 0; i < strings.length; i++) {
-    const byteLength = encoder.encode(strings[i]).length;
-    offsets[i + 1] = offsets[i] + byteLength;
-  }
-  return offsets;
-}
-
-/**
- * Concatenate Uint8 arrays without type casting.
- */
-function concatenateUint8Arrays(arrays: Uint8Array[]): Uint8Array {
-  if (arrays.length === 0) throw new Error('Cannot concatenate empty array list');
-  if (arrays.length === 1) return arrays[0];
-  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new Uint8Array(totalLength);
-  let offset = 0;
-  for (const arr of arrays) {
-    result.set(arr, offset);
-    offset += arr.length;
-  }
-  return result;
-}
-
-/**
- * Concatenate Float64 arrays without type casting.
- */
-function concatenateFloat64Arrays(arrays: Float64Array[]): Float64Array {
-  if (arrays.length === 0) throw new Error('Cannot concatenate empty array list');
-  if (arrays.length === 1) return arrays[0];
-  const totalLength = arrays.reduce((sum, arr) => sum + arr.length, 0);
-  const result = new Float64Array(totalLength);
-  let offset = 0;
-  for (const arr of arrays) {
-    result.set(arr, offset);
-    offset += arr.length;
-  }
-  return result;
-}
-
-function concatenateNullBitmaps(
-  buffers: SpanBuffer[],
-  columnName: string,
-): { nullBitmap: Uint8Array | undefined; nullCount: number } {
-  const nullsName = `${columnName}_nulls` as const;
-  const hasAnyNulls = buffers.some((buf) => buf[nullsName] !== undefined);
-
-  if (!hasAnyNulls) return { nullBitmap: undefined, nullCount: 0 };
-
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
-  const bitmapBytes = Math.ceil(totalRows / 8);
-  const nullBitmap = new Uint8Array(bitmapBytes);
-  nullBitmap.fill(0xff); // Default all valid
-
-  // Buffer chains: all buffers except the last are full (writeIndex == capacity).
-  // If capacity is a multiple of 8, each buffer starts at a byte boundary.
-  let rowOffset = 0;
-  let nullCount = 0;
-
-  for (const buf of buffers) {
-    const sourceBitmap = buf[nullsName];
-    const rowCount = buf.writeIndex;
-
-    if (sourceBitmap) {
-      const byteOffset = rowOffset >>> 3; // rowOffset / 8
-      const fullBytes = rowCount >>> 3;
-      const remainingBits = rowCount & 7;
-
-      // Bulk copy full bytes
-      if (fullBytes > 0) {
-        nullBitmap.set(sourceBitmap.subarray(0, fullBytes), byteOffset);
-      }
-      // Handle remaining bits in last partial byte
-      if (remainingBits > 0) {
-        const srcLastByte = sourceBitmap[fullBytes];
-        const mask = (1 << remainingBits) - 1;
-        nullBitmap[byteOffset + fullBytes] = (nullBitmap[byteOffset + fullBytes] & ~mask) | (srcLastByte & mask);
-      }
-      // Count nulls using countNulls from arrow-builder
-      nullCount += countNulls(sourceBitmap, rowCount);
-    }
-    // If no sourceBitmap, leave as 0xff (all valid)
-
-    rowOffset += rowCount;
-  }
-
-  return { nullBitmap, nullCount };
-}
-
-function getArrowFieldName(fieldName: string): string {
-  if (fieldName === 'logMessage') return 'message';
-  return fieldName;
-}
-
-function buildSortedCategoryDictionary(
-  buffers: SpanBuffer[],
-  columnName: string,
-  maskTransform?: (value: string) => string,
-): DictionaryBuildResult {
-  const valuesName = `${columnName}_values` as const;
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
-
-  // Build mapping from original value to masked value (for dictionary lookup)
-  // and collect unique masked values for the dictionary
-  const uniqueMaskedStrings = new Set<string>();
-  const originalToMasked = new Map<string, string>();
-
-  for (const buf of buffers) {
-    const column = buf[valuesName];
-    if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
-        const value = column[i];
-        if (value != null && !originalToMasked.has(value)) {
-          const maskedValue = maskTransform ? maskTransform(value) : value;
-          originalToMasked.set(value, maskedValue);
-          uniqueMaskedStrings.add(maskedValue);
-        }
-      }
-    }
-  }
-
-  const dictionary = Array.from(uniqueMaskedStrings).sort();
-  const maskedToIndex = new Map(dictionary.map((s, i) => [s, i]));
-
-  // Determine index type constructors based on dictionary size
-  const uniqueCount = dictionary.length;
-  const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
-  const indices = new indexArrayCtor(totalRows);
-  const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
-
-  let rowOffset = 0;
-  for (const buf of buffers) {
-    const column = buf[valuesName];
-    if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
-        const value = column[i];
-        if (value != null) {
-          const maskedValue = originalToMasked.get(value) ?? value;
-          indices[rowOffset + i] = maskedToIndex.get(maskedValue) ?? 0;
-        } else {
-          indices[rowOffset + i] = 0;
-        }
-      }
-    }
-    rowOffset += buf.writeIndex;
-  }
-
-  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);
-}
-
-function buildTextDictionary(
-  buffers: SpanBuffer[],
-  columnName: string,
-  maskTransform?: (value: string) => string,
-): DictionaryBuildResult | null {
-  const valuesName = `${columnName}_values` as const;
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
-
-  // Build mapping from original value to masked value and track frequency of masked values
-  const frequencyMap = new Map<string, number>();
-  const originalToMasked = new Map<string, string>();
-
-  for (const buf of buffers) {
-    const column = buf[valuesName];
-    if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
-        const value = column[i];
-        if (value != null) {
-          let maskedValue: string;
-          if (originalToMasked.has(value)) {
-            const masked = originalToMasked.get(value);
-            if (masked === undefined) {
-              throw new Error(`Masked value not found for: ${value}`);
-            }
-            maskedValue = masked;
-          } else {
-            maskedValue = maskTransform ? maskTransform(value) : value;
-            originalToMasked.set(value, maskedValue);
-          }
-          frequencyMap.set(maskedValue, (frequencyMap.get(maskedValue) ?? 0) + 1);
-        }
-      }
-    }
-  }
-
-  if (frequencyMap.size === 0) {
-    return new DictionaryBuildResult([], new Uint32Array(totalRows), Uint32Array, Uint32, undefined, totalRows);
-  }
-
-  const dictionary = Array.from(frequencyMap.keys());
-  const maskedToIndex = new Map(dictionary.map((s, i) => [s, i]));
-
-  // Determine index type constructors based on dictionary size
-  const uniqueCount = dictionary.length;
-  const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
-  const indices = new indexArrayCtor(totalRows);
-  const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
-
-  let rowOffset = 0;
-  for (const buf of buffers) {
-    const column = buf[valuesName];
-    if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
-        const value = column[i];
-        if (value != null) {
-          const maskedValue = originalToMasked.get(value) ?? value;
-          indices[rowOffset + i] = maskedToIndex.get(maskedValue) ?? 0;
-        } else {
-          indices[rowOffset + i] = 0;
-        }
-      }
-    }
-    rowOffset += buf.writeIndex;
-  }
-
-  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);
-}
 
 export type SystemColumnBuilder = (
   buffer: SpanBuffer,
@@ -305,7 +63,11 @@ export type SystemColumnBuilder = (
 ) => { fields: Field[]; vectors: Vector[] };
 
 /**
- * Convert SpanBuffer (and its overflow chain) to Arrow RecordBatch
+ * Convert SpanBuffer (and its overflow chain) to Arrow RecordBatch.
+ *
+ * **Dictionary handling**: Each RecordBatch has its own dictionary data.
+ * Dictionaries are built from the data in this RecordBatch only and are not shared
+ * with other RecordBatches, even when combined into a Table.
  */
 export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
   const buffers: SpanBuffer[] = [];
@@ -319,6 +81,13 @@ export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: S
   return convertBuffersToRecordBatch(buffers, systemColumnBuilder);
 }
 
+/**
+ * Convert multiple buffers to a single RecordBatch.
+ *
+ * **Dictionary handling**: Each RecordBatch has its own dictionary data.
+ * Dictionaries are built from the data in this RecordBatch only and are not shared
+ * with other RecordBatches, even when combined into a Table.
+ */
 function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
   if (buffers.length === 0) return new RecordBatch({});
 
@@ -329,23 +98,58 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
   const fields: Field[] = [];
   let systemVectors: Vector[] = [];
 
+  // Build metadata columns first to determine correct index types
+  let traceIdArrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32 = Uint32;
+  let packageNameArrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32 = Uint32;
+  let packagePathArrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32 = Uint32;
+  let gitShaArrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32 = Uint32;
+
+  if (!systemColumnBuilder) {
+    // Determine index types by building dictionaries first
+    const traceIdSet = new Set<string>();
+    for (const buf of buffers) traceIdSet.add(buf.traceId);
+    const traceIdUniqueCount = traceIdSet.size;
+    traceIdArrowIndexTypeCtor = traceIdUniqueCount <= 255 ? Uint8 : traceIdUniqueCount <= 65535 ? Uint16 : Uint32;
+
+    const packageSet = new Set<string>();
+    for (const buf of buffers) packageSet.add(buf.task.module.packageName);
+    const packageUniqueCount = packageSet.size;
+    packageNameArrowIndexTypeCtor = packageUniqueCount <= 255 ? Uint8 : packageUniqueCount <= 65535 ? Uint16 : Uint32;
+
+    const modulePathSet = new Set<string>();
+    for (const buf of buffers) modulePathSet.add(buf.task.module.packagePath);
+    const packagePathUniqueCount = modulePathSet.size;
+    packagePathArrowIndexTypeCtor =
+      packagePathUniqueCount <= 255 ? Uint8 : packagePathUniqueCount <= 65535 ? Uint16 : Uint32;
+
+    const gitShaSet = new Set<string>();
+    for (const buf of buffers) gitShaSet.add(buf.task.module.gitSha || '');
+    const gitShaUniqueCount = gitShaSet.size;
+    gitShaArrowIndexTypeCtor = gitShaUniqueCount <= 255 ? Uint8 : gitShaUniqueCount <= 65535 ? Uint16 : Uint32;
+  }
+
   if (systemColumnBuilder) {
     const systemColumns = systemColumnBuilder(buffers[0], buffers, totalRows);
     fields.push(...systemColumns.fields);
     systemVectors = systemColumns.vectors;
   } else {
     fields.push(Field.new({ name: 'timestamp', type: new TimestampNanosecond() }));
-    fields.push(Field.new({ name: 'trace_id', type: new Dictionary(new Utf8(), new Int32()) }));
+    fields.push(Field.new({ name: 'trace_id', type: new Dictionary(new Utf8(), new traceIdArrowIndexTypeCtor()) }));
     // Span ID columns (separate columns instead of struct)
     fields.push(Field.new({ name: 'thread_id', type: new Uint64() }));
     fields.push(Field.new({ name: 'span_id', type: new Uint32() }));
     fields.push(Field.new({ name: 'parent_thread_id', type: new Uint64(), nullable: true }));
     fields.push(Field.new({ name: 'parent_span_id', type: new Uint32(), nullable: true }));
     fields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8()) }));
-    fields.push(Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new Int32()) }));
-    fields.push(Field.new({ name: 'package_path', type: new Dictionary(new Utf8(), new Int32()) }));
-    fields.push(Field.new({ name: 'git_sha', type: new Dictionary(new Utf8(), new Int32()) }));
-    fields.push(Field.new({ name: 'span_name', type: new Dictionary(new Utf8(), new Int32()) }));
+    fields.push(
+      Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new packageNameArrowIndexTypeCtor()) }),
+    );
+    fields.push(
+      Field.new({ name: 'package_path', type: new Dictionary(new Utf8(), new packagePathArrowIndexTypeCtor()) }),
+    );
+    fields.push(Field.new({ name: 'git_sha', type: new Dictionary(new Utf8(), new gitShaArrowIndexTypeCtor()) }));
+    // System attribute column: message (eager category)
+    fields.push(Field.new({ name: 'message', type: new Dictionary(new Utf8(), new Uint32()) }));
   }
 
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
@@ -387,17 +191,68 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
     }
   }
 
-  const arrowSchema = new Schema(fields);
   const vectors: Vector[] = [];
 
   if (systemColumnBuilder) {
     vectors.push(...systemVectors);
   } else {
-    buildDefaultSystemVectors(buffers, vectors);
+    buildMetadataColumns(buffers, vectors);
+
+    // System attribute column: message (eager category)
+    const maskTransform = undefined; // message has no masking
+    let { dictionary, indices, arrowIndexTypeCtor, nullBitmap } = buildSortedCategoryDictionary(
+      buffers,
+      'message',
+      maskTransform,
+    );
+    // Ensure dictionary has at least one entry (empty string) if no messages were written
+    if (dictionary.length === 0) {
+      dictionary = [''];
+    }
+    // Ensure nullBitmap is all 1s (all valid) for eager column
+    if (!nullBitmap) {
+      const bitmapBytes = Math.ceil(totalRows / 8);
+      nullBitmap = new Uint8Array(bitmapBytes);
+      nullBitmap.fill(0xff);
+    }
+
+    // Update message field type to match actual dictionary index type
+    const messageFieldIndex = fields.findIndex((f) => f.name === 'message');
+    if (messageFieldIndex !== -1) {
+      fields[messageFieldIndex] = Field.new({
+        name: 'message',
+        type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
+      });
+    }
+
+    const { data: messageUtf8Data, offsets: messageUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
+
+    const messageDictData = makeData({
+      type: new Utf8(),
+      offset: 0,
+      length: dictionary.length,
+      nullCount: 0,
+      valueOffsets: messageUtf8Offsets,
+      data: messageUtf8Data,
+    });
+
+    const messageData = makeData({
+      type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
+      offset: 0,
+      length: totalRows,
+      nullCount: 0, // message is eager, never null
+      data: indices,
+      nullBitmap, // Always include nullBitmap for message (even though nullCount is 0)
+      dictionary: makeVector(messageDictData),
+    });
+
+    vectors.push(makeVector(messageData));
   }
 
+  // Build user attribute vectors and update schema field types BEFORE creating schema
   for (const [fieldName, fieldSchema] of Object.entries(schema)) {
     const lmaoType = getSchemaType(fieldSchema);
+    const arrowFieldName = getArrowFieldName(fieldName);
     const columnName = fieldName; // User columns have no prefix
 
     if (lmaoType === 'enum') {
@@ -467,6 +322,17 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
         columnName,
         maskTransform,
       );
+
+      // Update field type to match actual dictionary index type (BEFORE Schema creation)
+      const fieldIndex = fields.findIndex((f) => f.name === arrowFieldName);
+      if (fieldIndex !== -1) {
+        fields[fieldIndex] = Field.new({
+          name: arrowFieldName,
+          type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
+          nullable: true,
+        });
+      }
+
       const { data: categoryUtf8Data, offsets: categoryUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
       const categoryDictData = makeData({
@@ -495,6 +361,17 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
       const result = buildTextDictionary(buffers, columnName, maskTransform);
       if (result) {
         const { dictionary, indices, arrowIndexTypeCtor, nullBitmap, nullCount } = result;
+
+        // Update field type to match actual dictionary index type (BEFORE Schema creation)
+        const fieldIndex = fields.findIndex((f) => f.name === arrowFieldName);
+        if (fieldIndex !== -1) {
+          fields[fieldIndex] = Field.new({
+            name: arrowFieldName,
+            type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
+            nullable: true,
+          });
+        }
+
         const { data: textUtf8Data, offsets: textUtf8Offsets } = globalUtf8Cache.encodeMany(dictionary);
 
         const textDictData = makeData({
@@ -575,6 +452,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
     }
   }
 
+  const arrowSchema = new Schema(fields);
   const data = makeData({
     type: new Struct(arrowSchema.fields),
     length: totalRows,
@@ -594,10 +472,21 @@ export function convertToArrowTable(buffer: SpanBuffer, systemColumnBuilder?: Sy
   return new Table([batch]);
 }
 
-function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): void {
+/**
+ * Build metadata columns (derived/computed from buffer properties) and core system columns (from _system ArrayBuffer).
+ *
+ * Metadata columns are computed from buffer properties:
+ * - trace_id, thread_id, span_id, parent_thread_id, parent_span_id: from _identity
+ * - package_name, package_path, git_sha: from task.module
+ *
+ * Core system columns are stored in _system ArrayBuffer:
+ * - timestamp: from buf.timestamps
+ * - entry_type: from buf.operations
+ */
+function buildMetadataColumns(buffers: SpanBuffer[], vectors: Vector[]): void {
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
 
-  // Timestamp - BigInt64Array with nanoseconds
+  // Core system column: Timestamp - BigInt64Array with nanoseconds (from _system ArrayBuffer)
   const allTimestamps = new BigInt64Array(totalRows);
   let timestampOffset = 0;
   for (const buf of buffers) {
@@ -621,13 +510,19 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
     ),
   );
 
-  // Trace ID
+  // Metadata column: Trace ID (computed from _identity)
   const traceIdSet = new Set<string>();
   for (const buf of buffers) traceIdSet.add(buf.traceId);
   const traceIdArray = Array.from(traceIdSet);
   const traceIdMap = new Map(traceIdArray.map((id, idx) => [id, idx]));
 
-  const traceIdIndices = new Int32Array(totalRows);
+  // Determine index type based on dictionary size
+  const traceIdUniqueCount = traceIdArray.length;
+  const traceIdIndexArrayCtor =
+    traceIdUniqueCount <= 255 ? Uint8Array : traceIdUniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const traceIdArrowIndexTypeCtor = traceIdUniqueCount <= 255 ? Uint8 : traceIdUniqueCount <= 65535 ? Uint16 : Uint32;
+
+  const traceIdIndices = new traceIdIndexArrayCtor(totalRows);
   let rowOffset = 0;
   for (const buf of buffers) {
     const traceIdIndex = traceIdMap.get(buf.traceId);
@@ -651,7 +546,7 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
   vectors.push(
     makeVector(
       makeData({
-        type: new Dictionary(new Utf8(), new Int32()),
+        type: new Dictionary(new Utf8(), new traceIdArrowIndexTypeCtor()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -730,7 +625,7 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
     ),
   );
 
-  // parent_span_id (Uint32, nullable) - separate column
+  // Metadata column: parent_span_id (Uint32, nullable) - computed from _identity
   const parentSpanIds = new Uint32Array(totalRows);
   const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
   parentSpanIdNulls.fill(0xff);
@@ -793,13 +688,19 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
     ),
   );
 
-  // Package - using direct string access via buf.task.module.packageName
+  // Metadata column: Package name (from task.module.packageName)
   const packageSet = new Set<string>();
   for (const buf of buffers) packageSet.add(buf.task.module.packageName);
   const packageArray = Array.from(packageSet);
   const packageMap = new Map(packageArray.map((name, idx) => [name, idx]));
 
-  const packageIndices = new Int32Array(totalRows);
+  // Determine index type based on dictionary size
+  const packageUniqueCount = packageArray.length;
+  const packageIndexArrayCtor =
+    packageUniqueCount <= 255 ? Uint8Array : packageUniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const packageArrowIndexTypeCtor = packageUniqueCount <= 255 ? Uint8 : packageUniqueCount <= 65535 ? Uint16 : Uint32;
+
+  const packageIndices = new packageIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
     const packageIndex = packageMap.get(buf.task.module.packageName);
@@ -822,7 +723,7 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
   vectors.push(
     makeVector(
       makeData({
-        type: new Dictionary(new Utf8(), new Int32()),
+        type: new Dictionary(new Utf8(), new packageArrowIndexTypeCtor()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -832,13 +733,20 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
     ),
   );
 
-  // Module Path - using direct string access via buf.task.module.packagePath
+  // Metadata column: Package path (from task.module.packagePath)
   const modulePathSet = new Set<string>();
   for (const buf of buffers) modulePathSet.add(buf.task.module.packagePath);
   const modulePathArray = Array.from(modulePathSet);
   const modulePathMap = new Map(modulePathArray.map((name, idx) => [name, idx]));
 
-  const packagePathIndices = new Int32Array(totalRows);
+  // Determine index type based on dictionary size
+  const packagePathUniqueCount = modulePathArray.length;
+  const packagePathIndexArrayCtor =
+    packagePathUniqueCount <= 255 ? Uint8Array : packagePathUniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const packagePathArrowIndexTypeCtor =
+    packagePathUniqueCount <= 255 ? Uint8 : packagePathUniqueCount <= 65535 ? Uint16 : Uint32;
+
+  const packagePathIndices = new packagePathIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
     const modulePathIndex = modulePathMap.get(buf.task.module.packagePath);
@@ -861,7 +769,7 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
   vectors.push(
     makeVector(
       makeData({
-        type: new Dictionary(new Utf8(), new Int32()),
+        type: new Dictionary(new Utf8(), new packagePathArrowIndexTypeCtor()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -871,13 +779,19 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
     ),
   );
 
-  // Git SHA - extracted from module context
+  // Metadata column: Git SHA (from task.module.gitSha)
   const gitShaSet = new Set<string>();
   for (const buf of buffers) gitShaSet.add(buf.task.module.gitSha);
   const gitShaArray = Array.from(gitShaSet);
   const gitShaMap = new Map(gitShaArray.map((sha, idx) => [sha, idx]));
 
-  const gitShaIndices = new Int32Array(totalRows);
+  // Determine index type based on dictionary size
+  const gitShaUniqueCount = gitShaArray.length;
+  const gitShaIndexArrayCtor =
+    gitShaUniqueCount <= 255 ? Uint8Array : gitShaUniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const gitShaArrowIndexTypeCtor = gitShaUniqueCount <= 255 ? Uint8 : gitShaUniqueCount <= 65535 ? Uint16 : Uint32;
+
+  const gitShaIndices = new gitShaIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
     const gitShaIndex = gitShaMap.get(buf.task.module.gitSha);
@@ -900,7 +814,7 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
   vectors.push(
     makeVector(
       makeData({
-        type: new Dictionary(new Utf8(), new Int32()),
+        type: new Dictionary(new Utf8(), new gitShaArrowIndexTypeCtor()),
         offset: 0,
         length: totalRows,
         nullCount: 0,
@@ -909,64 +823,11 @@ function buildDefaultSystemVectors(buffers: SpanBuffer[], vectors: Vector[]): vo
       }),
     ),
   );
-
-  // Span name - now using direct string access
-  const spanNameSet = new Set<string>();
-  for (const buf of buffers) spanNameSet.add(buf.task.spanName);
-  const spanNameArray = Array.from(spanNameSet);
-  const spanNameMap = new Map(spanNameArray.map((name, idx) => [name, idx]));
-
-  const spanNameIndices = new Int32Array(totalRows);
-  rowOffset = 0;
-  for (const buf of buffers) {
-    const spanNameIndex = spanNameMap.get(buf.task.spanName);
-    if (spanNameIndex === undefined) {
-      throw new Error(`SpanName index not found for: ${buf.task.spanName}`);
-    }
-    // Use fill() - constant value per buffer
-    spanNameIndices.fill(spanNameIndex, rowOffset, rowOffset + buf.writeIndex);
-    rowOffset += buf.writeIndex;
-  }
-
-  const spanNameDictData = makeData({
-    type: new Utf8(),
-    offset: 0,
-    length: spanNameArray.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(spanNameArray),
-    data: encodeUtf8Strings(spanNameArray),
-  });
-  vectors.push(
-    makeVector(
-      makeData({
-        type: new Dictionary(new Utf8(), new Int32()),
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: spanNameIndices,
-        dictionary: makeVector(spanNameDictData),
-      }),
-    ),
-  );
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Tree Conversion with Shared Dictionaries
 // ═══════════════════════════════════════════════════════════════════════════════
-
-/**
- * Walk a SpanBuffer tree (depth-first pre-order), including overflow chains.
- */
-function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): void {
-  let current: SpanBuffer | undefined = root;
-  while (current) {
-    visitor(current);
-    current = current.next as SpanBuffer | undefined;
-  }
-  for (const child of root.children) {
-    walkSpanTree(child, visitor);
-  }
-}
 
 /**
  * Convert SpanBuffer tree to Arrow Table
@@ -993,7 +854,8 @@ export function convertSpanTreeToArrowTable(
   const categoryOriginalToMasked = new Map<string, Map<string, string>>();
   const textOriginalToMasked = new Map<string, Map<string, string>>();
 
-  for (const [fieldName, fieldSchema] of Object.entries(schema)) {
+  // Use getSchemaFields to filter out methods (extend, validate, parse, safeParse)
+  for (const [fieldName, fieldSchema] of getSchemaFields(schema)) {
     const lmaoType = getSchemaType(fieldSchema);
     if (lmaoType === 'category') {
       categoryBuilders.set(fieldName, new DictionaryBuilder(globalUtf8Cache));
@@ -1007,10 +869,15 @@ export function convertSpanTreeToArrowTable(
     }
   }
 
-  // System column dictionaries
-  // For traceId and spanName, use DictionaryBuilder (values not pre-encoded)
+  // System attribute column: message (eager category, not in user schema)
+  // message is always present (eager allocation), so we need to handle it explicitly
+  categoryBuilders.set('message', new DictionaryBuilder(globalUtf8Cache));
+  categoryMaskTransforms.set('message', undefined); // message has no masking
+  categoryOriginalToMasked.set('message', new Map());
+
+  // Metadata column dictionaries
+  // For traceId (metadata), use DictionaryBuilder (values not pre-encoded)
   const traceIdBuilder = new DictionaryBuilder(globalUtf8Cache);
-  const spanNameBuilder = new DictionaryBuilder(globalUtf8Cache);
 
   // For package, modulePath, gitSha - collect pre-encoded entries for direct dictionary creation
   // Use a Set to deduplicate by ModuleContext identity (same module = same entries)
@@ -1020,7 +887,6 @@ export function convertSpanTreeToArrowTable(
   walkSpanTree(rootBuffer, (buffer) => {
     spanRows += buffer.writeIndex;
     traceIdBuilder.add(buffer.traceId);
-    spanNameBuilder.add(buffer.task.spanName);
 
     // Collect unique ModuleContexts (already have pre-encoded entries)
     uniqueModules.add(buffer.task.module);
@@ -1095,7 +961,6 @@ export function convertSpanTreeToArrowTable(
   const packageDict = createSortedDictionary(sortInPlace(packageEntries, cmp));
   const packagePathDict = createSortedDictionary(sortInPlace(packagePathEntries, cmp));
   const gitShaDict = createSortedDictionary(sortInPlace(gitShaEntries, cmp));
-  const spanNameDict = spanNameBuilder.finalize(true); // sorted
   const categoryDicts = new Map<string, FinalizedDictionary>();
   const textDicts = new Map<string, FinalizedDictionary>();
 
@@ -1106,29 +971,60 @@ export function convertSpanTreeToArrowTable(
     textDicts.set(name, builder.finalize(false)); // not sorted
   }
 
+  // Get messageDict from categoryDicts (message is handled as a category column)
+  // If no messages were written, create an empty dictionary
+  let messageDict = categoryDicts.get('message');
+  if (!messageDict) {
+    const messageBuilder = new DictionaryBuilder(globalUtf8Cache);
+    messageBuilder.add(''); // Single empty string entry
+    messageDict = messageBuilder.finalize(true); // sorted
+  }
+
   // ═══════════════════════════════════════════════════════════════════════════
   // Build shared Arrow schema with stable dictionary IDs
   // ═══════════════════════════════════════════════════════════════════════════
   const arrowFields: Field[] = [];
 
-  // System columns - create types with explicit dictionary IDs
+  // Core system columns and metadata columns - create types with explicit dictionary IDs
+  // Use dynamically determined index types from dictionaries (Uint8/Uint16/Uint32)
+
+  // Core system column: timestamp (from _system ArrayBuffer)
   arrowFields.push(Field.new({ name: 'timestamp', type: new TimestampNanosecond() }));
-  arrowFields.push(Field.new({ name: 'trace_id', type: new Dictionary(new Utf8(), new Int32(), 0) }));
+
+  // Metadata columns (computed from buffer properties):
+  arrowFields.push(
+    Field.new({ name: 'trace_id', type: new Dictionary(new Utf8(), new traceIdDict.arrowIndexTypeCtor(), 0) }),
+  );
   // Span ID columns (separate columns instead of struct)
   arrowFields.push(Field.new({ name: 'thread_id', type: new Uint64() }));
   arrowFields.push(Field.new({ name: 'span_id', type: new Uint32() }));
   arrowFields.push(Field.new({ name: 'parent_thread_id', type: new Uint64(), nullable: true }));
   arrowFields.push(Field.new({ name: 'parent_span_id', type: new Uint32(), nullable: true }));
-  arrowFields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8(), 1) }));
-  arrowFields.push(Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new Int32(), 2) }));
-  arrowFields.push(Field.new({ name: 'package_path', type: new Dictionary(new Utf8(), new Int32(), 3) }));
-  arrowFields.push(Field.new({ name: 'git_sha', type: new Dictionary(new Utf8(), new Int32(), 4) }));
-  arrowFields.push(Field.new({ name: 'span_name', type: new Dictionary(new Utf8(), new Int32(), 5) }));
 
-  // Attribute columns - assign dictionary IDs starting at 6
+  // Core system column: entry_type (from _system ArrayBuffer)
+  arrowFields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8(), 1) }));
+
+  // Metadata columns (from task.module):
+  arrowFields.push(
+    Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new packageDict.arrowIndexTypeCtor(), 2) }),
+  );
+  arrowFields.push(
+    Field.new({ name: 'package_path', type: new Dictionary(new Utf8(), new packagePathDict.arrowIndexTypeCtor(), 3) }),
+  );
+  arrowFields.push(
+    Field.new({ name: 'git_sha', type: new Dictionary(new Utf8(), new gitShaDict.arrowIndexTypeCtor(), 4) }),
+  );
+
+  // System attribute column: message (handled as category column, but positioned here in schema)
+  arrowFields.push(
+    Field.new({ name: 'message', type: new Dictionary(new Utf8(), new messageDict.arrowIndexTypeCtor(), 5) }),
+  );
+
+  // User attribute columns - assign dictionary IDs starting at 6
   let nextDictId = 6;
   const attrDictIds = new Map<string, number>();
-  for (const [fieldName, fieldSchema] of Object.entries(schema)) {
+  // Use getSchemaFields to filter out methods (extend, validate, parse, safeParse)
+  for (const [fieldName, fieldSchema] of getSchemaFields(schema)) {
     const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
 
@@ -1201,7 +1097,6 @@ export function convertSpanTreeToArrowTable(
           packageDict,
           packagePathDict,
           gitShaDict,
-          spanNameDict,
           categoryDicts,
           textDicts,
           attrDictIds,
@@ -1213,18 +1108,8 @@ export function convertSpanTreeToArrowTable(
 
   // Create capacity stats RecordBatch if needed
   if (modulesToLogStats && modulesToLogStats.size > 0) {
-    const capacityStatsBatch = createCapacityStatsRecordBatch(
-      modulesToLogStats,
-      arrowSchema,
-      traceIdDict,
-      packageDict,
-      packagePathDict,
-      gitShaDict,
-      spanNameDict,
-      categoryDicts,
-      textDicts,
-      schema,
-    );
+    const hasSpanData = batch !== undefined;
+    const capacityStatsBatch = createCapacityStatsRecordBatch(modulesToLogStats, arrowSchema, schema, hasSpanData);
     if (batch) {
       return new Table([batch, capacityStatsBatch]);
     }
@@ -1237,471 +1122,13 @@ export function convertSpanTreeToArrowTable(
   return new Table();
 }
 
-// Use FinalizedDictionary type from arrow-builder
-
 /**
- * Create a RecordBatch with capacity stats entries for the given modules.
- * Each module gets one row with its capacity statistics serialized as JSON in the message column.
- */
-function createCapacityStatsRecordBatch(
-  modulesToLogStats: Set<ModuleContext>,
-  arrowSchema: Schema,
-  traceIdDict: FinalizedDictionary,
-  packageDict: FinalizedDictionary,
-  packagePathDict: FinalizedDictionary,
-  gitShaDict: FinalizedDictionary,
-  spanNameDict: FinalizedDictionary,
-  categoryDicts: Map<string, FinalizedDictionary>,
-  textDicts: Map<string, FinalizedDictionary>,
-  lmaoSchema: Record<string, unknown>,
-): RecordBatch {
-  const capacityStatsRows = modulesToLogStats.size;
-  if (capacityStatsRows === 0) {
-    return new RecordBatch({});
-  }
-
-  const modulesArray = Array.from(modulesToLogStats);
-  const vectors: Vector[] = [];
-
-  // Get types from the shared schema
-  const timestampType = arrowSchema.fields[0].type as TimestampNanosecond;
-  const traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8, Int32>;
-  const entryTypeType = arrowSchema.fields[6].type as Dictionary<Utf8, Int8>;
-  const packageType = arrowSchema.fields[7].type as Dictionary<Utf8, Int32>;
-  const packagePathType = arrowSchema.fields[8].type as Dictionary<Utf8, Int32>;
-  const gitShaType = arrowSchema.fields[9].type as Dictionary<Utf8, Int32>;
-  const spanNameType = arrowSchema.fields[10].type as Dictionary<Utf8, Int32>;
-
-  // Prepare capacity stats messages and add to message dictionary if it exists
-  const messageDict = categoryDicts.get('message');
-  const capacityStatsMessages = new Map<ModuleContext, number>(); // module -> message dict index
-  const nowNs = BigInt(Date.now()) * 1_000_000n;
-
-  if (messageDict) {
-    // Build stats JSON strings and find their indices in the message dictionary
-    for (const module of modulesArray) {
-      const stats = module.spanBufferCapacityStats;
-      const efficiency = stats.totalWrites / (stats.totalBuffersCreated * stats.currentCapacity);
-      const overflowRatio = stats.overflowWrites / stats.totalWrites;
-
-      const statsJson = JSON.stringify({
-        currentCapacity: stats.currentCapacity,
-        totalWrites: stats.totalWrites,
-        overflowWrites: stats.overflowWrites,
-        totalBuffers: stats.totalBuffersCreated,
-        efficiency,
-        overflowRatio,
-      });
-
-      const msgIdx = messageDict.indexMap.get(statsJson) ?? 0;
-      capacityStatsMessages.set(module, msgIdx);
-    }
-  }
-
-  // Timestamp - all current time
-  const timestamps = new BigInt64Array(capacityStatsRows);
-  timestamps.fill(nowNs);
-  vectors.push(
-    makeVector(
-      makeData({
-        type: timestampType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: timestamps,
-      }),
-    ),
-  );
-
-  // Trace ID - use 0 (first entry in dictionary) or first trace ID
-  const traceIdIndices = new Int32Array(capacityStatsRows);
-  traceIdIndices.fill(0);
-  vectors.push(
-    makeVector(
-      makeData({
-        type: traceIdType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: traceIdIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: traceIdDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: traceIdDict.offsets,
-            data: traceIdDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // thread_id - all 0
-  const threadIds = new BigUint64Array(capacityStatsRows);
-  threadIds.fill(0n);
-  vectors.push(
-    makeVector(
-      makeData({
-        type: new Uint64(),
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: threadIds,
-      }),
-    ),
-  );
-
-  // span_id - all 0
-  const spanIds = new Uint32Array(capacityStatsRows);
-  spanIds.fill(0);
-  vectors.push(
-    makeVector(
-      makeData({
-        type: new Uint32(),
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: spanIds,
-      }),
-    ),
-  );
-
-  // parent_thread_id - all null
-  const parentThreadIds = new BigUint64Array(capacityStatsRows);
-  const parentThreadIdNulls = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-  parentThreadIdNulls.fill(0); // All null
-  vectors.push(
-    makeVector(
-      makeData({
-        type: new Uint64(),
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: capacityStatsRows,
-        data: parentThreadIds,
-        nullBitmap: parentThreadIdNulls,
-      }),
-    ),
-  );
-
-  // parent_span_id - all null
-  const parentSpanIds = new Uint32Array(capacityStatsRows);
-  const parentSpanIdNulls = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-  parentSpanIdNulls.fill(0); // All null
-  vectors.push(
-    makeVector(
-      makeData({
-        type: new Uint32(),
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: capacityStatsRows,
-        data: parentSpanIds,
-        nullBitmap: parentSpanIdNulls,
-      }),
-    ),
-  );
-
-  // Entry type - all CAPACITY_STATS
-  const entryTypeIndices = new Int8Array(capacityStatsRows);
-  entryTypeIndices.fill(ENTRY_TYPE_CAPACITY_STATS);
-  vectors.push(
-    makeVector(
-      makeData({
-        type: entryTypeType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: entryTypeIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: ENTRY_TYPE_NAMES.length,
-            nullCount: 0,
-            valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
-            data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Package name - from modules
-  const packageIndices = new Int32Array(capacityStatsRows);
-  for (let i = 0; i < capacityStatsRows; i++) {
-    const module = modulesArray[i];
-    const pkgIdx = packageDict.indexMap.get(module.packageName) ?? 0;
-    packageIndices[i] = pkgIdx;
-  }
-  vectors.push(
-    makeVector(
-      makeData({
-        type: packageType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: packageIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: packageDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: packageDict.offsets,
-            data: packageDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Package path - from modules
-  const packagePathIndices = new Int32Array(capacityStatsRows);
-  for (let i = 0; i < capacityStatsRows; i++) {
-    const module = modulesArray[i];
-    const pathIdx = packagePathDict.indexMap.get(module.packagePath) ?? 0;
-    packagePathIndices[i] = pathIdx;
-  }
-  vectors.push(
-    makeVector(
-      makeData({
-        type: packagePathType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: packagePathIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: packagePathDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: packagePathDict.offsets,
-            data: packagePathDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Git SHA - from modules
-  const gitShaIndices = new Int32Array(capacityStatsRows);
-  for (let i = 0; i < capacityStatsRows; i++) {
-    const module = modulesArray[i];
-    const idx = gitShaDict.indexMap.get(module.gitSha) ?? 0;
-    gitShaIndices[i] = idx;
-  }
-  vectors.push(
-    makeVector(
-      makeData({
-        type: gitShaType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: gitShaIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: gitShaDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: gitShaDict.offsets,
-            data: gitShaDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Span name - all 0
-  const spanNameIndices = new Int32Array(capacityStatsRows);
-  spanNameIndices.fill(0);
-  vectors.push(
-    makeVector(
-      makeData({
-        type: spanNameType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: spanNameIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: spanNameDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: spanNameDict.offsets,
-            data: spanNameDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Attribute columns - iterate through schema fields
-  const SYSTEM_FIELDS_COUNT = 10;
-  let fieldIdx = SYSTEM_FIELDS_COUNT;
-
-  for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {
-    const lmaoType = getSchemaType(fieldSchema);
-    const fieldType = arrowSchema.fields[fieldIdx].type;
-
-    if (lmaoType === 'category') {
-      const dict = categoryDicts.get(fieldName);
-      if (!dict) {
-        throw new Error(`Category dictionary not found for field: ${fieldName}`);
-      }
-      const indices = new dict.indexArrayCtor(capacityStatsRows);
-      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-      nullBitmap.fill(0); // Initialize as all null
-
-      if (fieldName === 'message' && messageDict) {
-        // Message column: fill with capacity stats JSON strings
-        for (let i = 0; i < capacityStatsRows; i++) {
-          const module = modulesArray[i];
-          const msgIdx = capacityStatsMessages.get(module) ?? 0;
-          indices[i] = msgIdx;
-        }
-        // Set all bits to 1 (non-null) for message column
-        setBitRange(nullBitmap, 0, capacityStatsRows);
-      }
-      // Other category columns remain all null (bits stay 0)
-
-      vectors.push(
-        makeVector(
-          makeData({
-            type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
-            offset: 0,
-            length: capacityStatsRows,
-            nullCount: fieldName === 'message' ? 0 : capacityStatsRows,
-            data: indices,
-            nullBitmap: fieldName === 'message' ? undefined : nullBitmap,
-            dictionary: makeVector(
-              makeData({
-                type: new Utf8(),
-                offset: 0,
-                length: dict.indexMap.size,
-                nullCount: 0,
-                valueOffsets: dict.offsets,
-                data: dict.data,
-              }),
-            ),
-          }),
-        ),
-      );
-    } else if (lmaoType === 'text') {
-      const dict = textDicts.get(fieldName);
-      if (!dict) {
-        throw new Error(`Text dictionary not found for field: ${fieldName}`);
-      }
-      const indices = new dict.indexArrayCtor(capacityStatsRows);
-      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-      nullBitmap.fill(0); // All null
-      vectors.push(
-        makeVector(
-          makeData({
-            type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
-            offset: 0,
-            length: capacityStatsRows,
-            nullCount: capacityStatsRows,
-            data: indices,
-            nullBitmap,
-            dictionary: makeVector(
-              makeData({
-                type: new Utf8(),
-                offset: 0,
-                length: dict.indexMap.size,
-                nullCount: 0,
-                valueOffsets: dict.offsets,
-                data: dict.data,
-              }),
-            ),
-          }),
-        ),
-      );
-    } else if (lmaoType === 'number') {
-      const allValues = new Float64Array(capacityStatsRows);
-      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-      nullBitmap.fill(0); // All null
-      vectors.push(
-        makeVector(
-          makeData({
-            type: fieldType as Float64,
-            offset: 0,
-            length: capacityStatsRows,
-            nullCount: capacityStatsRows,
-            data: allValues,
-            nullBitmap,
-          }),
-        ),
-      );
-    } else if (lmaoType === 'boolean') {
-      const allValues = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-      nullBitmap.fill(0); // All null
-      vectors.push(
-        makeVector(
-          makeData({
-            type: fieldType as Bool,
-            offset: 0,
-            length: capacityStatsRows,
-            nullCount: capacityStatsRows,
-            data: allValues,
-            nullBitmap,
-          }),
-        ),
-      );
-    } else if (lmaoType === 'enum') {
-      const enumValues = getEnumValues(fieldSchema) || [];
-      const enumUtf8 = getEnumUtf8(fieldSchema);
-      const enumSchema = fieldSchema as { __index_array_ctor?: unknown; __arrow_index_type_ctor?: unknown };
-      const indexArrayCtor =
-        (enumSchema.__index_array_ctor as Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor) ??
-        Uint8Array;
-      const arrowIndexTypeCtor =
-        (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
-      const allIndices = new indexArrayCtor(capacityStatsRows);
-      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-      nullBitmap.fill(0); // All null
-      const enumDictData = makeData({
-        type: new Utf8(),
-        offset: 0,
-        length: enumValues.length,
-        nullCount: 0,
-        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues as readonly string[]),
-        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
-      });
-      vectors.push(
-        makeVector(
-          makeData({
-            type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
-            offset: 0,
-            length: capacityStatsRows,
-            nullCount: capacityStatsRows,
-            data: allIndices,
-            nullBitmap,
-            dictionary: makeVector(enumDictData),
-          }),
-        ),
-      );
-    }
-
-    fieldIdx++;
-  }
-
-  const structData = makeData({
-    type: new Struct(arrowSchema.fields),
-    length: capacityStatsRows,
-    nullCount: 0,
-    children: vectors.map((v) => v.data[0]),
-  });
-
-  return new RecordBatch(arrowSchema, structData);
-}
-
-/**
- * Convert multiple buffers to a single RecordBatch using pre-built shared dictionaries
+ * Convert multiple buffers to a single RecordBatch using pre-built dictionaries.
+ *
+ * **Dictionary handling**: Each RecordBatch has its own dictionary data.
+ * While dictionaries are built in a first pass from all buffers, they are used to create
+ * a single RecordBatch. The resulting RecordBatch contains its own dictionary data and
+ * is not shared with other RecordBatches, even when combined into a Table.
  */
 function convertBuffersWithSharedDicts(
   buffers: SpanBuffer[],
@@ -1710,7 +1137,6 @@ function convertBuffersWithSharedDicts(
   packageDict: FinalizedDictionary,
   packagePathDict: FinalizedDictionary,
   gitShaDict: FinalizedDictionary,
-  spanNameDict: FinalizedDictionary,
   categoryDicts: Map<string, FinalizedDictionary>,
   textDicts: Map<string, FinalizedDictionary>,
   _attrDictIds: Map<string, number>,
@@ -1723,21 +1149,20 @@ function convertBuffersWithSharedDicts(
 
   // Get types from the shared schema
   // Schema order: timestamp(0), trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
-  //               entry_type(6), package(7), module_path(8), git_sha(9), span_name(10)
+  //               entry_type(6), package_name(7), package_path(8), git_sha(9), message(10)
   const timestampType = arrowSchema.fields[0].type as TimestampNanosecond;
-  const traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8, Int32>;
+  const traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8>;
   // Span ID columns: thread_id (2), span_id (3), parent_thread_id (4), parent_span_id (5)
   const entryTypeType = arrowSchema.fields[6].type as Dictionary<Utf8, Int8>;
-  const packageType = arrowSchema.fields[7].type as Dictionary<Utf8, Int32>;
-  const packagePathType = arrowSchema.fields[8].type as Dictionary<Utf8, Int32>;
-  const gitShaType = arrowSchema.fields[9].type as Dictionary<Utf8, Int32>;
-  const spanNameType = arrowSchema.fields[10].type as Dictionary<Utf8, Int32>;
+  const packageType = arrowSchema.fields[7].type as Dictionary<Utf8>;
+  const packagePathType = arrowSchema.fields[8].type as Dictionary<Utf8>;
+  const gitShaType = arrowSchema.fields[9].type as Dictionary<Utf8>;
 
   // ═══════════════════════════════════════════════════════════════════════════
-  // System columns - concatenate data from all buffers
+  // Core system columns and metadata columns - concatenate data from all buffers
   // ═══════════════════════════════════════════════════════════════════════════
 
-  // Timestamp - BigInt64Array with nanoseconds (zero-copy compatible)
+  // Core system column: Timestamp - BigInt64Array with nanoseconds (from _system ArrayBuffer, zero-copy compatible)
   const allTimestamps = new BigInt64Array(totalRows);
   let offset = 0;
   for (const buf of buffers) {
@@ -1761,8 +1186,8 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Trace ID (using shared dictionary)
-  const traceIdIndices = new Int32Array(totalRows);
+  // Metadata column: Trace ID (computed from _identity, using shared dictionary)
+  const traceIdIndices = new traceIdDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
     const idx = traceIdDict.indexMap.get(buf.traceId) ?? 0;
@@ -1792,7 +1217,7 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // thread_id (Uint64) - separate column
+  // Metadata column: thread_id (Uint64) - computed from _identity
   // threadId is constant per buffer, use fill()
   const threadIds = new BigUint64Array(totalRows);
   offset = 0;
@@ -1812,7 +1237,7 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // span_id (Uint32) - separate column
+  // Metadata column: span_id (Uint32) - computed from _identity
   const spanIds = new Uint32Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
@@ -1832,7 +1257,7 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // parent_thread_id (Uint64, nullable) - separate column
+  // Metadata column: parent_thread_id (Uint64, nullable) - computed from _identity
   // parentThreadId is constant per buffer (from parent pointer), use fill()
   const parentThreadIds = new BigUint64Array(totalRows);
   const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
@@ -1861,7 +1286,7 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // parent_span_id (Uint32, nullable) - separate column
+  // Metadata column: parent_span_id (Uint32, nullable) - computed from _identity
   // Uses hasParent and parentSpanId directly on buffer
   const parentSpanIds = new Uint32Array(totalRows);
   const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
@@ -1891,7 +1316,7 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Entry type
+  // Core system column: Entry type (from _system ArrayBuffer, buf.operations)
   const entryTypeIndices = new Int8Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
@@ -1925,8 +1350,8 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Package (using shared dictionary)
-  const packageIndices = new Int32Array(totalRows);
+  // Metadata column: Package name (from task.module.packageName, using shared dictionary)
+  const packageIndices = new packageDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
     const pkgIdx = packageDict.indexMap.get(buf.task.module.packageName) ?? 0;
@@ -1955,8 +1380,8 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Module path (using shared dictionary)
-  const packagePathIndices = new Int32Array(totalRows);
+  // Metadata column: Package path (from task.module.packagePath, using shared dictionary)
+  const packagePathIndices = new packagePathDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
     const pathIdx = packagePathDict.indexMap.get(buf.task.module.packagePath) ?? 0;
@@ -1985,8 +1410,8 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Git SHA (using shared dictionary)
-  const gitShaIndices2 = new Int32Array(totalRows);
+  // Metadata column: Git SHA (from task.module.gitSha, using shared dictionary)
+  const gitShaIndices2 = new gitShaDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
     const gitSha = buf.task.module.gitSha;
@@ -2017,48 +1442,93 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Span name (using shared dictionary) - direct string access via buf.task.spanName
-  const spanNameIndices = new Int32Array(totalRows);
-  offset = 0;
+  // ═══════════════════════════════════════════════════════════════════════════
+  // System attribute and user attribute columns - concatenate from all buffers
+  // ═══════════════════════════════════════════════════════════════════════════
+  // Schema order: Core system + metadata columns + system attribute columns:
+  //   Core system: timestamp(0), entry_type(6)
+  //   Metadata: trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
+  //             package_name(7), package_path(8), git_sha(9)
+  //   System attribute: message(10)
+  // Total: 11 columns before user attributes
+  const METADATA_AND_SYSTEM_COLUMNS_COUNT = 11;
+  let fieldIdx = METADATA_AND_SYSTEM_COLUMNS_COUNT;
+
+  // Use getSchemaFields to filter out methods (extend, validate, parse, safeParse)
+  const schemaFields = getSchemaFields(lmaoSchema as TagAttributeSchema);
+
+  // Validate that arrowSchema has the expected number of fields
+  // Note: message is NOT in schemaFields (it's a system column), so we need to account for it separately
+  const expectedFieldCount = METADATA_AND_SYSTEM_COLUMNS_COUNT + schemaFields.length;
+  if (arrowSchema.fields.length !== expectedFieldCount) {
+    throw new Error(
+      `Schema mismatch: arrowSchema has ${arrowSchema.fields.length} fields, expected ${expectedFieldCount} (${METADATA_AND_SYSTEM_COLUMNS_COUNT} metadata+system + ${schemaFields.length} schema fields). ` +
+        `Schema fields: ${schemaFields.map(([name]) => name).join(', ')}. ` +
+        `Arrow fields: ${arrowSchema.fields.map((f) => f.name).join(', ')}`,
+    );
+  }
+
+  // System attribute column: message (at fixed position 10, before user attributes)
+  const messageDict = categoryDicts.get('message');
+  const messageOriginalToMasked = categoryOriginalToMasked.get('message');
+  if (!messageDict || !messageOriginalToMasked) {
+    throw new Error('Message dictionary or mapping not found');
+  }
+  const messageFieldType = arrowSchema.fields[10].type as Dictionary<Utf8, Uint8 | Uint16 | Uint32>;
+  const messageIndices = new messageDict.indexArrayCtor(totalRows);
+  const messageNullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
+  let messageRowOffset = 0;
   for (const buf of buffers) {
-    const idx = spanNameDict.indexMap.get(buf.task.spanName) ?? 0;
-    // Use fill() - constant value per buffer
-    spanNameIndices.fill(idx, offset, offset + buf.writeIndex);
-    offset += buf.writeIndex;
+    const col = buf.getColumnIfAllocated('message') as string[] | undefined;
+    if (col) {
+      for (let i = 0; i < buf.writeIndex; i++) {
+        const v = col[i];
+        const rowIdx = messageRowOffset + i;
+        if (v != null) {
+          const maskedValue = messageOriginalToMasked.get(v) ?? v;
+          messageIndices[rowIdx] = messageDict.indexMap.get(maskedValue) ?? 0;
+          messageNullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+        }
+      }
+    }
+    messageRowOffset += buf.writeIndex;
   }
   vectors.push(
     makeVector(
       makeData({
-        type: spanNameType,
+        type: messageFieldType,
         offset: 0,
         length: totalRows,
-        nullCount: 0,
-        data: spanNameIndices,
+        nullCount: 0, // message is eager, never null
+        data: messageIndices,
+        nullBitmap: messageNullBitmap,
         dictionary: makeVector(
           makeData({
             type: new Utf8(),
             offset: 0,
-            length: spanNameDict.indexMap.size,
+            length: messageDict.indexMap.size,
             nullCount: 0,
-            valueOffsets: spanNameDict.offsets,
-            data: spanNameDict.data,
+            valueOffsets: messageDict.offsets,
+            data: messageDict.data,
           }),
         ),
       }),
     ),
   );
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Attribute columns - concatenate from all buffers
-  // ═══════════════════════════════════════════════════════════════════════════
-  // System fields: timestamp, trace_id, thread_id, span_id, parent_thread_id, parent_span_id, entry_type, module, span_name
-  const SYSTEM_FIELDS_COUNT = 10;
-  let fieldIdx = SYSTEM_FIELDS_COUNT;
-
-  for (const [fieldName, fieldSchema] of Object.entries(lmaoSchema)) {
+  for (const [fieldName, fieldSchema] of schemaFields) {
     const lmaoType = getSchemaType(fieldSchema);
     const columnName = fieldName; // User columns have no prefix
-    // Get the type from the shared schema
+
+    // Get the type from the shared schema (user attributes start after system columns)
+    if (fieldIdx >= arrowSchema.fields.length) {
+      throw new Error(
+        `Field index ${fieldIdx} out of bounds for field '${fieldName}'. ` +
+          `Arrow schema has ${arrowSchema.fields.length} fields, ` +
+          `schema has ${schemaFields.length} fields. ` +
+          `Processed ${fieldIdx - METADATA_AND_SYSTEM_COLUMNS_COUNT} user fields so far.`,
+      );
+    }
     const fieldType = arrowSchema.fields[fieldIdx].type;
 
     if (lmaoType === 'category') {

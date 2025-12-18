@@ -134,18 +134,6 @@ export class FlushScheduler {
   }
 
   /**
-   * Unregister a buffer
-   */
-  unregister(buffer: SpanBuffer): void {
-    this.buffers.delete(buffer);
-
-    // Stop scheduler if no buffers
-    if (this.buffers.size === 0 && this.isRunning) {
-      this.stop();
-    }
-  }
-
-  /**
    * Start the flush scheduler
    */
   start(): void {
@@ -456,3 +444,37 @@ export function resetGlobalFlushScheduler(): void {
     globalScheduler = null;
   }
 }
+
+/**
+ * Test utilities for accessing FlushScheduler internals
+ * @internal
+ */
+export const FlushSchedulerTestUtils = {
+  /**
+   * Get the flush timer for a scheduler instance (for testing)
+   */
+  getFlushTimer(scheduler: FlushScheduler): NodeJS.Timeout | undefined {
+    return (scheduler as unknown as { flushTimer?: NodeJS.Timeout }).flushTimer;
+  },
+
+  /**
+   * Set the flush timer for a scheduler instance (for testing)
+   */
+  setFlushTimer(scheduler: FlushScheduler, timer: NodeJS.Timeout | undefined): void {
+    (scheduler as unknown as { flushTimer?: NodeJS.Timeout }).flushTimer = timer;
+  },
+
+  /**
+   * Get the last activity time for a scheduler instance (for testing)
+   */
+  getLastActivityTime(scheduler: FlushScheduler): number | undefined {
+    return (scheduler as unknown as { lastActivityTime?: number }).lastActivityTime;
+  },
+
+  /**
+   * Set the last activity time for a scheduler instance (for testing)
+   */
+  setLastActivityTime(scheduler: FlushScheduler, time: number | null | undefined): void {
+    (scheduler as unknown as { lastActivityTime?: number | null }).lastActivityTime = time;
+  },
+};

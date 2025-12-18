@@ -34,7 +34,7 @@ import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from './spa
 import { TaskContext } from './taskContext.js';
 import { getTimestampNanos } from './timestamp.js';
 import { generateTraceId, type TraceId } from './traceId.js';
-import type { SpanBuffer } from './types.js';
+import type { BufferCapacityStats, SpanBuffer } from './types.js';
 
 // Re-export TagWriter and ResultWriter types for external use
 export type { ResultWriter, TagWriter } from './codegen/fixedPositionWriterGenerator.js';
@@ -965,7 +965,7 @@ export interface ModuleContextBuilder<
    * - `overflowWrites`: Writes that caused buffer overflow
    * - `totalBuffersCreated`: Number of buffers created
    */
-  readonly spanBufferCapacityStats: import('@smoothbricks/arrow-builder').BufferCapacityStats;
+  readonly spanBufferCapacityStats: BufferCapacityStats;
 }
 
 /**
@@ -1397,7 +1397,7 @@ export function createModuleContext<
  *
  * @param stats - Buffer capacity statistics from ModuleContext
  */
-export function trackOverflowAndTune(stats: import('@smoothbricks/arrow-builder').BufferCapacityStats): void {
+export function trackOverflowAndTune(stats: BufferCapacityStats): void {
   // Only increment overflowWrites - totalWrites is incremented inline in log methods
   stats.overflowWrites++;
   shouldTuneCapacity(stats);
@@ -1413,7 +1413,7 @@ export function trackOverflowAndTune(stats: import('@smoothbricks/arrow-builder'
  *
  * @param stats - Buffer capacity statistics from ModuleContext
  */
-function shouldTuneCapacity(stats: import('@smoothbricks/arrow-builder').BufferCapacityStats): void {
+function shouldTuneCapacity(stats: BufferCapacityStats): void {
   const minSamples = 100; // Need enough data
   if (stats.totalWrites < minSamples) return;
 

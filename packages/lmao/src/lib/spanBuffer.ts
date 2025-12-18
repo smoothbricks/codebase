@@ -25,7 +25,12 @@
  * @module spanBuffer
  */
 
-import { type ColumnBufferExtension, DEFAULT_BUFFER_CAPACITY, getColumnBufferClass } from '@smoothbricks/arrow-builder';
+import {
+  type ColumnBuffer,
+  type ColumnBufferExtension,
+  DEFAULT_BUFFER_CAPACITY,
+  getColumnBufferClass,
+} from '@smoothbricks/arrow-builder';
 import type { TagAttributeSchema } from './schema/types.js';
 import { spanBufferHelpers } from './spanBufferHelpers.js';
 import { generateTraceId, type TraceId } from './traceId.js';
@@ -49,6 +54,46 @@ export function _resetSpanBufferState(): void {
   // Note: WeakMap doesn't have a clear() method, but schemas are typically
   // long-lived so this is mainly for testing where we create new schemas
 }
+
+/**
+ * Test utilities for accessing generated buffer properties
+ * Works directly with SpanBuffer type from this module
+ * @internal
+ */
+export const SpanBufferTestUtils = {
+  /**
+   * Get a column's null bitmap (generated property)
+   */
+  getNullBitmap(buffer: SpanBuffer, columnName: string): Uint8Array | undefined {
+    const nullsName = `${columnName}_nulls` as keyof SpanBuffer;
+    return buffer[nullsName] as Uint8Array | undefined;
+  },
+
+  /**
+   * Set buffer capacity (for testing)
+   */
+  setCapacity(buffer: SpanBuffer, capacity: number): void {
+    buffer._capacity = capacity;
+  },
+
+  /**
+   * Set buffer writeIndex (for testing)
+   */
+  setWriteIndex(buffer: SpanBuffer, writeIndex: number): void {
+    buffer.writeIndex = writeIndex;
+  },
+
+  /**
+   * Get buffer writeIndex (for testing)
+   * Accepts ColumnBuffer (from ColumnWriter._buffer) but casts to SpanBuffer
+   * since at runtime all buffers are SpanBuffer instances
+   */
+  getWriteIndex(buffer: ColumnBuffer): number {
+    // At runtime, ColumnBuffer is actually SpanBuffer (SpanBuffer extends TypedColumnBuffer extends ColumnBuffer)
+    // Cast internally so callers don't need to
+    return (buffer as unknown as SpanBuffer).writeIndex;
+  },
+};
 
 // ============================================================================
 // SpanBuffer class generation

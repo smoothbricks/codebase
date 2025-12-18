@@ -11,6 +11,7 @@
 import { describe, expect, test } from 'bun:test';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
+import type { TagAttributeSchema } from '../../schema/types.js';
 import {
   createScope,
   createScopeWithInheritance,
@@ -342,7 +343,7 @@ describe('Scope Class Generation', () => {
 describe('generateScopeClassCode snapshots', () => {
   test('snapshot: empty schema', () => {
     const schema = defineTagAttributes({});
-    const code = generateScopeClassCode(schema as any);
+    const code = generateScopeClassCode(schema as TagAttributeSchema);
     expect(code).toMatchSnapshot();
   });
 
@@ -354,7 +355,7 @@ describe('generateScopeClassCode snapshots', () => {
       count: S.number(),
       enabled: S.boolean(),
     });
-    const code = generateScopeClassCode(schema as any);
+    const code = generateScopeClassCode(schema as TagAttributeSchema);
     expect(code).toMatchSnapshot();
   });
 
@@ -364,7 +365,7 @@ describe('generateScopeClassCode snapshots', () => {
       sessionId: S.category(),
       requestId: S.category(),
     });
-    const code = generateScopeClassCode(schema as any);
+    const code = generateScopeClassCode(schema as TagAttributeSchema);
     expect(code).toMatchSnapshot();
   });
 
@@ -375,7 +376,7 @@ describe('generateScopeClassCode snapshots', () => {
       isValid: S.boolean(),
       errorMessage: S.text(),
     });
-    const code = generateScopeClassCode(schema as any);
+    const code = generateScopeClassCode(schema as TagAttributeSchema);
     expect(code).toMatchSnapshot();
   });
 });

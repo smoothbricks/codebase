@@ -20,6 +20,7 @@ import type {
   FlagTrackContext,
   InferFeatureFlagsWithContext,
 } from '../schema/evaluator.js';
+import type { Schema } from '../schema/types.js';
 import type { SpanBuffer } from '../types.js';
 
 /**
@@ -304,8 +305,7 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
  */
 export function createEvaluatorClass<T extends FeatureFlagSchema>(
   schema: T,
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  validateFlagValue: (value: unknown, schema: any, defaultValue: any) => any,
+  validateFlagValue: (value: unknown, schema: Schema<unknown, unknown>, defaultValue: unknown) => unknown,
   getTimestampNanos: () => bigint,
   ENTRY_TYPE_FF_ACCESS: number,
   ENTRY_TYPE_FF_USAGE: number,

@@ -17,7 +17,7 @@ import { createTestTaskContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
 import type { TagAttributeSchema } from '../../schema/types.js';
-import { createSpanBuffer } from '../../spanBuffer.js';
+import { createSpanBuffer, SpanBufferTestUtils } from '../../spanBuffer.js';
 import type { SpanBuffer } from '../../types.js';
 import { createScope } from '../scopeGenerator.js';
 import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
@@ -56,10 +56,13 @@ describe('null bitmap correctness', () => {
 
       // Logger starts with _writeIndex = 1, so _setScope will fill from index 2 to capacity
       // Set scope - should fill from index 2 to capacity (64)
-      (logger as any)._setScope({ requestId: 'req-123' });
+      // _setScope is a public method on BaseSpanLogger
+      logger._setScope({ requestId: 'req-123' });
 
       // Check null bitmap for first byte
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       const bitsSet = getBitsSet(nulls, 8);
 
       // Bits 0,1 should NOT be set (before _writeIndex+1)
@@ -88,13 +91,16 @@ describe('null bitmap correctness', () => {
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
       // Override _writeIndex to -1 so _writeIndex+1 = 0 (fill entire buffer from 0)
-      (logger as any)._writeIndex = -1;
+      // _writeIndex is a public property on ColumnWriter
+      logger._writeIndex = -1;
 
       // Set scope - should fill indices 0-7
-      (logger as any)._setScope({ requestId: 'req-123' });
+      logger._setScope({ requestId: 'req-123' });
 
       // Check null bitmap - byte 0 should be 0xFF (all bits set)
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       expect(nulls[0]).toBe(0xff);
     });
 
@@ -103,20 +109,22 @@ describe('null bitmap correctness', () => {
         requestId: S.category(),
       }) as unknown as TagAttributeSchema;
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 16);
-      (buffer as any)._capacity = 13; // End at index 12 (exclusive), so fill 5-12
+      SpanBufferTestUtils.setCapacity(buffer, 13); // End at index 12 (exclusive), so fill 5-12
 
       const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
       // Set _writeIndex to 4 so _writeIndex+1 = 5
-      (logger as any)._writeIndex = 4;
+      logger._writeIndex = 4;
 
       // Set scope - should fill from index 5 to 12
-      (logger as any)._setScope({ requestId: 'req-123' });
+      logger._setScope({ requestId: 'req-123' });
 
       // Check null bitmap
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       const bitsSet = getBitsSet(nulls, 16);
 
       // Bits 0-4 should NOT be set
@@ -144,13 +152,15 @@ describe('null bitmap correctness', () => {
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
       // Override _writeIndex to -1 so _writeIndex+1 = 0
-      (logger as any)._writeIndex = -1;
+      logger._writeIndex = -1;
 
       // Set scope - should fill indices 0-23 (3 full bytes)
-      (logger as any)._setScope({ requestId: 'req-123' });
+      logger._setScope({ requestId: 'req-123' });
 
       // Check null bitmap - bytes 0,1,2 should all be 0xFF
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       expect(nulls[0]).toBe(0xff);
       expect(nulls[1]).toBe(0xff);
       expect(nulls[2]).toBe(0xff);
@@ -161,20 +171,22 @@ describe('null bitmap correctness', () => {
         requestId: S.category(),
       }) as unknown as TagAttributeSchema;
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 24);
-      (buffer as any)._capacity = 22; // End at index 21 (exclusive)
+      SpanBufferTestUtils.setCapacity(buffer, 22); // End at index 21 (exclusive)
 
       const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
       // Set _writeIndex to 2 so _writeIndex+1 = 3
-      (logger as any)._writeIndex = 2;
+      logger._writeIndex = 2;
 
       // Set scope - should fill indices 3-21
-      (logger as any)._setScope({ requestId: 'req-123' });
+      logger._setScope({ requestId: 'req-123' });
 
       // Check null bitmap
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       const bitsSet = getBitsSet(nulls, 24);
 
       // Bits 0-2 should NOT be set
@@ -199,20 +211,22 @@ describe('null bitmap correctness', () => {
         requestId: S.category(),
       }) as unknown as TagAttributeSchema;
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 8);
-      (buffer as any)._capacity = 6; // End at index 5 (exclusive), so fill 2-5
+      SpanBufferTestUtils.setCapacity(buffer, 6); // End at index 5 (exclusive), so fill 2-5
 
       const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
       // Set _writeIndex to 1 so _writeIndex+1 = 2
-      (logger as any)._writeIndex = 1;
+      logger._writeIndex = 1;
 
       // Set scope - should fill indices 2-5 only
-      (logger as any)._setScope({ requestId: 'req-123' });
+      logger._setScope({ requestId: 'req-123' });
 
       // Check null bitmap
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       const bitsSet = getBitsSet(nulls, 8);
 
       // Bits 0,1 should NOT be set
@@ -239,20 +253,22 @@ describe('null bitmap correctness', () => {
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
 
       const scopeInstance = createScope(schema);
-      // Set scope value directly
-      (scopeInstance as any).requestId = 'req-123';
+      // Set scope value directly (GeneratedScope has index signature)
+      scopeInstance.requestId = 'req-123';
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
       // Set _writeIndex to 4 so nextRow() makes it 5
-      (logger as any)._writeIndex = 4;
+      logger._writeIndex = 4;
 
       // Log a message - this should write scoped attributes at index 5
       logger.info('test message');
 
       // Check null bitmap - bit 5 should be set
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       expect(nulls[0] & (1 << 5)).toBe(1 << 5);
 
       // Check that bit 4 is NOT set (wasn't written)
@@ -267,19 +283,22 @@ describe('null bitmap correctness', () => {
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 16);
 
       const scopeInstance = createScope(schema);
-      (scopeInstance as any).requestId = 'req-456';
+      // Set scope value directly (GeneratedScope has index signature)
+      scopeInstance.requestId = 'req-456';
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
       // Set _writeIndex to 8 so nextRow() makes it 9
-      (logger as any)._writeIndex = 8;
+      logger._writeIndex = 8;
 
       // Log a message - this should write scoped attributes at index 9
       logger.info('test message');
 
       // Check null bitmap - bit 9 should be set (byte 1, bit 1)
-      const nulls = (buffer as any).requestId_nulls as Uint8Array;
+      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
+      expect(nulls).toBeDefined();
+      if (!nulls) throw new Error('Null bitmap should be defined');
       const byteIndex = 9 >>> 3; // = 1
       const bitOffset = 9 & 7; // = 1
       expect(nulls[byteIndex] & (1 << bitOffset)).toBe(1 << bitOffset);

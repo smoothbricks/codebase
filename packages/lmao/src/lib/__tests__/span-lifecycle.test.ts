@@ -366,13 +366,15 @@ describe('Child Span Lifecycle', () => {
       // Verify child span is linked to parent
       expect(ctx.buffer.parent).toBeDefined();
       expect(ctx.buffer.parent).toBe(parentBuffer);
+      expect(parentBuffer).toBeDefined();
+      const parent = parentBuffer as NonNullable<typeof parentBuffer>;
 
       // Verify child span inherits parent's schema
-      expect(ctx.buffer.task.module.tagAttributes).toBe(parentBuffer?.task.module.tagAttributes);
+      expect(ctx.buffer.task.module.tagAttributes).toBe(parent.task.module.tagAttributes);
 
       // Verify child span has different spanId but same traceId
-      expect(ctx.buffer.spanId).not.toBe(parentBuffer?.spanId);
-      expect(ctx.buffer.traceId).toBe(parentBuffer?.traceId);
+      expect(ctx.buffer.spanId).not.toBe(parent.spanId);
+      expect(ctx.buffer.traceId).toBe(parent.traceId);
 
       return ctx.ok('child-done');
     });
@@ -419,9 +421,12 @@ describe('Child Span Lifecycle', () => {
     await rootTask(requestCtx);
 
     expect(rootBuffer).toBeDefined();
+    if (!rootBuffer) {
+      throw new Error('rootBuffer is undefined');
+    }
 
     // Convert to Arrow table to verify parent-child relationships
-    const table = convertSpanTreeToArrowTable(rootBuffer!);
+    const table = convertSpanTreeToArrowTable(rootBuffer);
 
     // Should have at least 4 rows:
     // - Row 0: root span-start
@@ -433,7 +438,6 @@ describe('Child Span Lifecycle', () => {
     const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
 
     // Find root span-start (entry_type = span-start, package_name matches)
-    // Note: span names are stored in the unified 'message' column, not a separate span_name column
     const rootSpanStart = rows.find(
       (r) => r?.entry_type === 'span-start' && r?.package_name === '@test/pkg' && r?.message === 'root-task',
     );
@@ -503,7 +507,9 @@ describe('Child Span Lifecycle', () => {
       // Even though childModuleCtx has its own schema, the child buffer should use parent's schema
       // Note: The child buffer's schema comes from parentBuffer.task.module.tagAttributes
       // (inherited via createChildSpanBuffer), not from childModuleCtx's schema
-      expect(ctx.buffer.task.module.tagAttributes).toEqual(parentBuffer?.task.module.tagAttributes);
+      expect(parentBuffer).toBeDefined();
+      const parent = parentBuffer as NonNullable<typeof parentBuffer>;
+      expect(ctx.buffer.task.module.tagAttributes).toEqual(parent.task.module.tagAttributes);
 
       // Child should be able to access parent's schema fields
       ctx.tag.userId('user123').operation('READ');

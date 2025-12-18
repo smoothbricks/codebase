@@ -177,8 +177,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write values
     const writer = createColumnWriter(tagAttributes, buffer);
-    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-    (writer as any).nextRow().userId('user-12345').plainUserId('user-12345');
+    writer.nextRow().userId('user-12345').plainUserId('user-12345');
 
     // Set required system columns
     buffer.timestamps[0] = 1000n;
@@ -227,8 +226,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write values
     const writer = createColumnWriter(tagAttributes, buffer);
-    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-    (writer as any)
+    writer
       .nextRow()
       .email('john@example.com')
       .sqlQuery("SELECT * FROM users WHERE id = 123 AND name = 'test'")
@@ -284,8 +282,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write value
     const writer = createColumnWriter(tagAttributes, buffer);
-    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-    (writer as any).nextRow().secretKey('sk_live_abcd1234efgh5678');
+    writer.nextRow().secretKey('sk_live_abcd1234efgh5678');
 
     // Set required system columns
     buffer.timestamps[0] = 1000n;

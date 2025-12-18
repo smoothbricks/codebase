@@ -39,7 +39,8 @@ describe('prefixSchema', () => {
 
       expect(prefixed.db_operation).toHaveProperty('__schema_type', 'enum');
       expect(prefixed.db_operation).toHaveProperty('__enum_values');
-      expect((prefixed.db_operation as any).__enum_values).toEqual(['CREATE', 'DELETE']);
+      const enumSchema = prefixed.db_operation as { __enum_values?: readonly string[] };
+      expect(enumSchema.__enum_values).toEqual(['CREATE', 'DELETE']);
     });
 
     it('should work with different prefix strings', () => {
@@ -85,7 +86,7 @@ describe('prefixSchema', () => {
     });
 
     it('should handle schema with many fields', () => {
-      const schemaFields: Record<string, any> = {};
+      const schemaFields: Record<string, ReturnType<typeof S.number>> = {};
       for (let i = 0; i < 100; i++) {
         schemaFields[`field${i}`] = S.number();
       }
@@ -101,10 +102,10 @@ describe('prefixSchema', () => {
 
   describe('failure cases', () => {
     it('should handle schema with undefined fields gracefully', () => {
-      const schema: TagAttributeSchema = {
+      const schema = {
         validField: S.text(),
-        undefinedField: undefined as any,
-      };
+        undefinedField: undefined,
+      } as unknown as TagAttributeSchema;
 
       const prefixed = prefixSchema(schema, 'test');
 
@@ -114,9 +115,9 @@ describe('prefixSchema', () => {
     });
 
     it('should handle schema with null values', () => {
-      const schema: TagAttributeSchema = {
-        field: null as any,
-      };
+      const schema = {
+        field: null,
+      } as unknown as TagAttributeSchema;
 
       const prefixed = prefixSchema(schema, 'test');
 
@@ -175,9 +176,10 @@ describe('createLibraryModule', () => {
       expect(module.schema.field).toBe(schema.field);
 
       // But should NOT have validation methods (those are stripped)
-      expect((module.schema as any).validate).toBeUndefined();
-      expect((module.schema as any).parse).toBeUndefined();
-      expect((module.schema as any).safeParse).toBeUndefined();
+      const schemaObj = module.schema as { validate?: unknown; parse?: unknown; safeParse?: unknown };
+      expect(schemaObj.validate).toBeUndefined();
+      expect(schemaObj.parse).toBeUndefined();
+      expect(schemaObj.safeParse).toBeUndefined();
     });
 
     it('should create module with operations object', () => {

@@ -165,15 +165,121 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
+      const ipcBytes = arrow.tableToIPC(table);
+      const roundTripped = arrow.tableFromIPC(ipcBytes);
 
+      const originalBatch = table.batches[0];
+      const roundTrippedBatch = roundTripped.batches[0];
+
+      // Compare each column in detail
+      for (let colIdx = 0; colIdx < table.schema.fields.length; colIdx++) {
+        const originalCol = originalBatch.getChildAt(colIdx);
+        const roundTrippedCol = roundTrippedBatch.getChildAt(colIdx);
+
+        expect(roundTrippedCol).toBeDefined();
+        expect(originalCol?.type.toString()).toBe(roundTrippedCol?.type.toString());
+
+        if (originalCol && roundTrippedCol) {
+          const origData = originalCol.data[0];
+          const roundData = roundTrippedCol.data[0];
+
+          expect(roundData).toBeDefined();
+          expect(origData?.length).toBe(roundData?.length);
+          expect(origData?.nullCount).toBe(roundData?.nullCount);
+
+          // Compare null bitmaps
+          // Arrow may omit null bitmap when nullCount is 0, which is valid
+          // So we only compare if both exist, or if nullCount > 0
+          if (origData?.nullCount === 0 && roundData?.nullCount === 0) {
+            // When nullCount is 0, Arrow may omit the bitmap - both are valid
+            // Just verify both have nullCount 0
+            expect(origData.nullCount).toBe(0);
+            expect(roundData.nullCount).toBe(0);
+          } else if (origData?.nullBitmap && roundData?.nullBitmap) {
+            // When nullCount > 0, both must have bitmaps and they must match
+            const origBytes = Math.ceil(origData.length / 8);
+            const roundBytes = Math.ceil(roundData.length / 8);
+            const minBytes = Math.min(origBytes, roundBytes);
+            const origTrimmed = origData.nullBitmap.subarray(0, minBytes);
+            const roundTrimmed = roundData.nullBitmap.subarray(0, minBytes);
+            expect(origTrimmed).toEqual(roundTrimmed);
+          } else {
+            // One has bitmap, one doesn't - only valid if nullCount is 0
+            expect(origData?.nullCount).toBe(0);
+            expect(roundData?.nullCount).toBe(0);
+          }
+
+          // Compare data arrays (for non-dictionary columns)
+          const origDataBuffer = (origData as { data?: ArrayBufferView })?.data;
+          const roundDataBuffer = (roundData as { data?: ArrayBufferView })?.data;
+          if (origDataBuffer && roundDataBuffer && !(originalCol.type instanceof arrow.Dictionary)) {
+            expect(origDataBuffer).toEqual(roundDataBuffer);
+          }
+
+          // For dictionary columns, compare indices and dictionary
+          if (originalCol.type instanceof arrow.Dictionary && roundTrippedCol.type instanceof arrow.Dictionary) {
+            const origDict = originalCol.type.dictionary;
+            const roundDict = roundTrippedCol.type.dictionary;
+
+            // Compare dictionary values
+            if (origDict && roundDict) {
+              const origDictVector = (originalCol as { dictionary?: arrow.Vector })?.dictionary;
+              const roundDictVector = (roundTrippedCol as { dictionary?: arrow.Vector })?.dictionary;
+              expect(origDictVector?.length).toBe(roundDictVector?.length);
+
+              for (let i = 0; i < (origDictVector?.length || 0); i++) {
+                expect(origDictVector?.get(i)).toBe(roundDictVector?.get(i));
+              }
+            }
+
+            // Compare indices using the actual dictionary index type
+            if (origDataBuffer && roundDataBuffer) {
+              const origDictType = originalCol.type as arrow.Dictionary;
+              const indexType = origDictType.indices;
+
+              // Read indices based on the actual type (Uint8, Uint16, or Uint32)
+              let origIndices: Uint8Array | Uint16Array | Uint32Array;
+              let roundIndices: Uint8Array | Uint16Array | Uint32Array;
+
+              // Access buffer and byteOffset from ArrayBufferView
+              const origView = origDataBuffer as { buffer: ArrayBuffer; byteOffset: number };
+              const roundView = roundDataBuffer as { buffer: ArrayBuffer; byteOffset: number };
+
+              if (indexType.typeId === arrow.Type.Uint8) {
+                origIndices = new Uint8Array(origView.buffer, origView.byteOffset, origData.length);
+                roundIndices = new Uint8Array(roundView.buffer, roundView.byteOffset, roundData.length);
+              } else if (indexType.typeId === arrow.Type.Uint16) {
+                origIndices = new Uint16Array(origView.buffer, origView.byteOffset, origData.length);
+                roundIndices = new Uint16Array(roundView.buffer, roundView.byteOffset, roundData.length);
+              } else {
+                origIndices = new Uint32Array(origView.buffer, origView.byteOffset, origData.length);
+                roundIndices = new Uint32Array(roundView.buffer, roundView.byteOffset, roundData.length);
+              }
+
+              expect(origIndices).toEqual(roundIndices);
+            }
+          }
+
+          // Compare actual values
+          for (let i = 0; i < table.numRows; i++) {
+            const origVal = originalCol.get(i);
+            const roundVal = roundTrippedCol.get(i);
+            expect(roundVal).toBe(origVal);
+          }
+        }
+      }
+
+      // Final check: compare JSON output
       for (let i = 0; i < testValues.length; i++) {
+        const original = table.get(i)?.toJSON();
+        const restored = roundTripped.get(i)?.toJSON();
+        expect(restored).toEqual(original);
         expect(roundTripped.get(i)?.toJSON().userId).toBe(testValues[i]);
       }
     });
 
     it('text columns survive round-trip', () => {
-      const schema = { message: S.text() } as const;
+      const schema = { userMessage: S.text() } as const;
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -183,7 +289,7 @@ describe('Arrow IPC Round-Trip', () => {
         const idx = buffer.writeIndex;
         buffer.timestamps[idx] = 1000n;
         buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
-        buffer.message(idx, value);
+        buffer.userMessage(idx, value);
         buffer.writeIndex++;
       }
 
@@ -191,7 +297,7 @@ describe('Arrow IPC Round-Trip', () => {
       const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(roundTripped.get(i)?.toJSON().message).toBe(testValues[i]);
+        expect(roundTripped.get(i)?.toJSON().userMessage).toBe(testValues[i]);
       }
     });
 
@@ -232,16 +338,16 @@ describe('Arrow IPC Round-Trip', () => {
         active: S.boolean(),
         status: S.enum(['pending', 'active', 'completed'] as const),
         userId: S.category(),
-        message: S.text(),
+        userMessage: S.text(),
       } as const;
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
       const testData = [
-        { count: 42, active: true, status: 0, userId: 'user-123', message: 'First message' },
-        { count: 100, active: false, status: 1, userId: 'user-456', message: 'Second message' },
-        { count: null, active: true, status: 2, userId: 'user-123', message: 'First message' },
+        { count: 42, active: true, status: 0, userId: 'user-123', userMessage: 'First message' },
+        { count: 100, active: false, status: 1, userId: 'user-456', userMessage: 'Second message' },
+        { count: null, active: true, status: 2, userId: 'user-123', userMessage: 'First message' },
       ];
 
       for (const row of testData) {
@@ -260,7 +366,7 @@ describe('Arrow IPC Round-Trip', () => {
         buffer.active(idx, row.active);
         (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, row.status);
         buffer.userId(idx, row.userId);
-        buffer.message(idx, row.message);
+        buffer.userMessage(idx, row.userMessage);
         buffer.writeIndex++;
       }
 
@@ -273,7 +379,7 @@ describe('Arrow IPC Round-Trip', () => {
       expect(row0?.active).toBe(true);
       expect(row0?.status).toBe('pending');
       expect(row0?.userId).toBe('user-123');
-      expect(row0?.message).toBe('First message');
+      expect(row0?.userMessage).toBe('First message');
 
       // Verify second row
       const row1 = roundTripped.get(1)?.toJSON();
@@ -281,7 +387,7 @@ describe('Arrow IPC Round-Trip', () => {
       expect(row1?.active).toBe(false);
       expect(row1?.status).toBe('active');
       expect(row1?.userId).toBe('user-456');
-      expect(row1?.message).toBe('Second message');
+      expect(row1?.userMessage).toBe('Second message');
 
       // Verify third row with null
       const row2 = roundTripped.get(2)?.toJSON();
@@ -289,7 +395,7 @@ describe('Arrow IPC Round-Trip', () => {
       expect(row2?.active).toBe(true);
       expect(row2?.status).toBe('completed');
       expect(row2?.userId).toBe('user-123');
-      expect(row2?.message).toBe('First message');
+      expect(row2?.userMessage).toBe('First message');
     });
 
     it('system columns survive round-trip', () => {

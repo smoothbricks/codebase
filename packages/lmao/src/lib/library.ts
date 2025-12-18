@@ -60,9 +60,9 @@ export interface LibraryModule<
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema,
   Env = Record<string, unknown>,
-  Ops extends Record<string, LibraryOperation<any[], any, T, FF, Env>> = Record<
+  Ops extends Record<string, LibraryOperation<unknown[], unknown, T, FF, Env>> = Record<
     string,
-    LibraryOperation<any[], any, T, FF, Env>
+    LibraryOperation<unknown[], unknown, T, FF, Env>
   >,
 > {
   schema: T;
@@ -512,9 +512,9 @@ export function createLibraryModule<
   T extends TagAttributeSchema,
   FF extends FeatureFlagSchema = FeatureFlagSchema,
   Env = Record<string, unknown>,
-  Ops extends Record<string, LibraryOperation<any[], any, T, FF, Env>> = Record<
+  Ops extends Record<string, LibraryOperation<unknown[], unknown, T, FF, Env>> = Record<
     string,
-    LibraryOperation<any[], any, T, FF, Env>
+    LibraryOperation<unknown[], unknown, T, FF, Env>
   >,
 >(options: {
   gitSha: string;
@@ -678,10 +678,10 @@ export function moduleContextFactory<
     packagePath: string;
   },
   schema: T,
-  operations?: Record<string, LibraryOperation<any[], any, T, FF, Env>>,
+  operations?: Record<string, LibraryOperation<unknown[], unknown, T, FF, Env>>,
 ): ModuleContextBuilder<TagAttributeSchema, FF, Env> & {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Type erasure at runtime boundary; type safety enforced via LibraryOperation generics
-  operations: Record<string, (...args: any[]) => any>;
+  // Type erasure at runtime boundary; type safety enforced via LibraryOperation generics
+  operations: Record<string, (ctx: RequestContext<FF, Env>, ...args: unknown[]) => Promise<unknown>>;
   /** Clean schema (without prefix) - useful for type inference */
   cleanSchema: T;
   /** Prefix mapping from clean names to prefixed names */
@@ -730,8 +730,8 @@ export function moduleContextFactory<
   };
 
   // Wrap operations with remapped task wrappers
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Type erasure intentional at runtime boundary
-  const wrappedOperations: Record<string, (...args: any[]) => any> = {};
+  // Type erasure intentional at runtime boundary; type safety enforced via LibraryOperation generics
+  const wrappedOperations: Record<string, (ctx: RequestContext<FF, Env>, ...args: unknown[]) => Promise<unknown>> = {};
 
   if (operations) {
     for (const [opName, opDef] of Object.entries(operations)) {
@@ -762,7 +762,7 @@ export interface LibraryFactory<
     name: string,
     fn: TaskFunction<Args, Result, T, FF, Env>,
   ) => (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
-  operations: Record<string, (...args: unknown[]) => Promise<unknown>>;
+  operations: Record<string, (ctx: RequestContext<FF, Env>, ...args: unknown[]) => Promise<unknown>>;
 }
 
 /**

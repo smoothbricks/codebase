@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { createModuleContext, createRequestContext } from '../lmao.js';
 import { S } from '../schema/builder.js';
 import { defineTagAttributes } from '../schema/defineTagAttributes.js';
+import { SpanBufferTestUtils } from '../spanBuffer.js';
 
 /**
  * Tests for buffer overflow handling and capacity tuning
@@ -603,7 +604,9 @@ describe('Buffer Overflow and Capacity Management', () => {
           bufferNum++;
           // Skip rows 0-1 (tag and result rows) in root buffer only
           const startRow = bufferNum === 1 ? 2 : 0;
-          const endRow = currentBuffer._capacity;
+          // Use writeIndex to only iterate through actual written entries
+          // Utility handles ColumnBuffer -> SpanBuffer cast internally
+          const endRow = SpanBufferTestUtils.getWriteIndex(currentBuffer);
 
           for (let row = startRow; row < endRow && entriesCollected < NUM_ENTRIES; row++) {
             entries.push({

@@ -3,7 +3,13 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, mock } from 'bun:test';
-import { type FlushHandler, type FlushMetadata, FlushScheduler, type FlushSchedulerConfig } from '../flushScheduler.js';
+import {
+  type FlushHandler,
+  type FlushMetadata,
+  FlushScheduler,
+  type FlushSchedulerConfig,
+  FlushSchedulerTestUtils,
+} from '../flushScheduler.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { SpanBuffer } from '../types.js';
 import { createTestTaskContext } from './test-helpers.js';
@@ -120,79 +126,11 @@ describe('FlushScheduler', () => {
 
       it('should handle buffer with missing properties', () => {
         const buffer = createTestBuffer();
-        delete (buffer as any).timestamps;
+        // Create a partial buffer missing timestamps to test error handling
+        const { timestamps: _timestamps, ...partialBuffer } = buffer;
 
         expect(() => {
-          scheduler.register(buffer);
-        }).not.toThrow();
-      });
-    });
-  });
-
-  describe('unregister', () => {
-    describe('success cases', () => {
-      it('should unregister a buffer', () => {
-        const buffer = createTestBuffer();
-        scheduler.register(buffer);
-
-        expect(() => {
-          scheduler.unregister(buffer);
-        }).not.toThrow();
-      });
-
-      it('should stop scheduler when all buffers are unregistered', () => {
-        const buffer = createTestBuffer();
-        scheduler.register(buffer);
-        scheduler.unregister(buffer);
-
-        expect(scheduler).toBeDefined();
-      });
-
-      it('should unregister multiple buffers', () => {
-        const buffers = [createTestBuffer(), createTestBuffer(), createTestBuffer()];
-
-        buffers.forEach((b) => {
-          scheduler.register(b);
-        });
-        buffers.forEach((b) => {
-          scheduler.unregister(b);
-        });
-
-        expect(scheduler).toBeDefined();
-      });
-    });
-
-    describe('edge cases', () => {
-      it('should handle unregistering buffer that was never registered', () => {
-        const buffer = createTestBuffer();
-
-        expect(() => {
-          scheduler.unregister(buffer);
-        }).not.toThrow();
-      });
-
-      it('should handle unregistering same buffer multiple times', () => {
-        const buffer = createTestBuffer();
-        scheduler.register(buffer);
-
-        scheduler.unregister(buffer);
-        scheduler.unregister(buffer);
-        scheduler.unregister(buffer);
-
-        expect(scheduler).toBeDefined();
-      });
-    });
-
-    describe('failure cases', () => {
-      it('should handle null buffer gracefully', () => {
-        expect(() => {
-          scheduler.unregister(null as any);
-        }).not.toThrow();
-      });
-
-      it('should handle undefined buffer gracefully', () => {
-        expect(() => {
-          scheduler.unregister(undefined as any);
+          scheduler.register(partialBuffer as SpanBuffer);
         }).not.toThrow();
       });
     });
@@ -253,8 +191,8 @@ describe('FlushScheduler', () => {
       it('should not throw if timers fail to clear', () => {
         scheduler.start();
 
-        // Force internal state corruption
-        (scheduler as any).flushTimer = null;
+        // Force internal state corruption - accessing private property for testing
+        FlushSchedulerTestUtils.setFlushTimer(scheduler, undefined);
 
         expect(() => {
           scheduler.stop();
@@ -376,9 +314,10 @@ describe('FlushScheduler', () => {
 
         try {
           const buffer = createTestBuffer();
-          delete (buffer as any).timestamps;
+          // Create a partial buffer missing timestamps to test error handling
+          const { timestamps: _timestamps, ...partialBuffer } = buffer;
 
-          scheduler.register(buffer);
+          scheduler.register(partialBuffer as SpanBuffer);
 
           // Should complete without throwing (error is caught and logged)
           await scheduler.flush();
@@ -458,7 +397,7 @@ describe('FlushScheduler', () => {
 
     describe('failure cases', () => {
       it('should not throw even if internal state is corrupted', () => {
-        (scheduler as any).lastActivityTime = null;
+        FlushSchedulerTestUtils.setLastActivityTime(scheduler, null);
 
         expect(() => {
           scheduler.recordActivity();

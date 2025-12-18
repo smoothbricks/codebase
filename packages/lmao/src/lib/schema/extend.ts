@@ -78,14 +78,6 @@ export interface ExtendedSchema<T extends TagAttributeSchema> {
 export type UnwrapExtendedSchema<T> = T extends ExtendedSchema<infer S> ? S : T extends TagAttributeSchema ? T : never;
 
 /**
- * Type helper to convert any object to TagAttributeSchema by picking only schema properties
- * This strips out methods like 'extend', 'validate', etc.
- */
-export type AsTagAttributeSchema<T> = {
-  [K in keyof T as T[K] extends Function ? never : K]: T[K];
-};
-
-/**
  * Options for createExtendedSchema
  */
 export interface CreateExtendedSchemaOptions {

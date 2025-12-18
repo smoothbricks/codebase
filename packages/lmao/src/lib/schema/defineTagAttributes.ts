@@ -11,7 +11,7 @@
 import * as S from '@sury/sury';
 import type { ExtendedSchema } from './extend.js';
 import { createExtendedSchema } from './extend.js';
-import { getSchemaFields, type InferTagAttributes, type TagAttributeSchema } from './types.js';
+import { getSchemaFields, type InferTagAttributes, type Schema, type TagAttributeSchema } from './types.js';
 
 /**
  * Brand symbol for DefinedTagAttributes - used to detect this type in conditionals.
@@ -114,7 +114,7 @@ export type DefinedTagAttributes<T extends TagAttributeSchema> = T &
     readonly [DEFINED_TAG_ATTRIBUTES_BRAND]?: T;
   } & {
     // Index signature for assignability to TagAttributeSchema
-    [key: string]: import('@sury/sury').Schema<unknown, unknown> | ((...args: unknown[]) => unknown);
+    [key: string]: Schema<unknown, unknown> | ((...args: unknown[]) => unknown);
   };
 
 /**
