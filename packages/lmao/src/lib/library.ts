@@ -132,6 +132,148 @@ export function createPrefixMapping<T extends TagAttributeSchema>(schema: T, pre
   return mapping;
 }
 
+// ============================================================================
+// RemappedBufferView - Maps prefixed column names to unprefixed for tree traversal
+// ============================================================================
+
+/**
+ * Cache for generated RemappedBufferView classes.
+ * Key is a stable string representation of the mapping.
+ * This avoids regenerating classes for the same mapping.
+ */
+const remappedBufferViewClassCache = new Map<string, new (buffer: SpanBuffer) => SpanBuffer>();
+
+/**
+ * Create a stable cache key from a prefix mapping.
+ * Sorts keys to ensure consistent ordering.
+ */
+function createMappingCacheKey(mapping: Record<string, string>): string {
+  const sortedEntries = Object.entries(mapping).sort(([a], [b]) => a.localeCompare(b));
+  return JSON.stringify(sortedEntries);
+}
+
+/**
+ * Generate a RemappedBufferView class for library prefix support.
+ *
+ * WHY: Libraries write to unprefixed columns (status, method) but Arrow conversion
+ * iterates using prefixed names from the root schema (http_status, http_method).
+ * RemappedBufferView bridges this gap for tree traversal during cold-path Arrow conversion.
+ *
+ * HOW: Uses new Function() to generate a class at library composition time (cold path).
+ * The generated class wraps a SpanBuffer and remaps getColumnIfAllocated/getNullsIfAllocated
+ * calls from prefixed names to unprefixed names.
+ *
+ * WHAT: Returns a class constructor that:
+ * - Passes through tree traversal properties (children, next)
+ * - Passes through system columns (timestamps, operations, message, etc.)
+ * - Passes through identity properties (traceId, spanId, etc.)
+ * - Remaps getColumnIfAllocated() and getNullsIfAllocated() from prefixed→unprefixed
+ *
+ * Per specs/01e_library_integration_pattern.md:
+ * - Hot path: Library writes directly to unprefixed columns (zero overhead)
+ * - Cold path: Arrow conversion uses RemappedBufferView to access via prefixed names
+ *
+ * @param prefixToUnprefixedMapping - Maps prefixed names to unprefixed names
+ *   e.g., { 'http_status': 'status', 'http_method': 'method' }
+ *   NOTE: The mapping is prefixed→unprefixed (reverse of createPrefixMapping output)
+ *
+ * @returns Constructor for RemappedBufferView class
+ *
+ * @example
+ * ```typescript
+ * // Create mapping (prefixed → unprefixed)
+ * const mapping = { 'http_status': 'status', 'http_method': 'method' };
+ * const ViewClass = generateRemappedBufferViewClass(mapping);
+ *
+ * // Wrap library buffer
+ * const view = new ViewClass(libraryBuffer);
+ *
+ * // Access via prefixed name returns unprefixed column
+ * view.getColumnIfAllocated('http_status'); // Returns buffer.getColumnIfAllocated('status')
+ * ```
+ */
+export function generateRemappedBufferViewClass(
+  prefixToUnprefixedMapping: Record<string, string>,
+): new (
+  buffer: SpanBuffer,
+) => SpanBuffer {
+  // Check cache first
+  const cacheKey = createMappingCacheKey(prefixToUnprefixedMapping);
+  const cached = remappedBufferViewClassCache.get(cacheKey);
+  if (cached) {
+    return cached;
+  }
+
+  const mappingCode = JSON.stringify(prefixToUnprefixedMapping);
+
+  // Generate the class code
+  // Uses IIFE wrapper for clean scope, similar to generateRemappedSpanLoggerClass
+  const code = `(function() {
+  'use strict';
+  const mapping = ${mappingCode};
+  
+  class RemappedBufferView {
+    constructor(buffer) {
+      this._buffer = buffer;
+    }
+    
+    // Tree traversal (pass-through)
+    get children() { return this._buffer.children; }
+    get next() { return this._buffer.next; }
+    
+    // Row count
+    get writeIndex() { return this._buffer.writeIndex; }
+    
+    // System columns (NOT remapped - same in all buffers)
+    get timestamps() { return this._buffer.timestamps; }
+    get operations() { return this._buffer.operations; }
+    get message_values() { return this._buffer.message_values; }
+    get message_nulls() { return this._buffer.message_nulls; }
+    get lineNumber_values() { return this._buffer.lineNumber_values; }
+    get lineNumber_nulls() { return this._buffer.lineNumber_nulls; }
+    get errorCode_values() { return this._buffer.errorCode_values; }
+    get errorCode_nulls() { return this._buffer.errorCode_nulls; }
+    get exceptionStack_values() { return this._buffer.exceptionStack_values; }
+    get exceptionStack_nulls() { return this._buffer.exceptionStack_nulls; }
+    get ffValue_values() { return this._buffer.ffValue_values; }
+    get ffValue_nulls() { return this._buffer.ffValue_nulls; }
+    
+    // Identity (pass-through)
+    get traceId() { return this._buffer.traceId; }
+    get threadId() { return this._buffer.threadId; }
+    get spanId() { return this._buffer.spanId; }
+    get parentSpanId() { return this._buffer.parentSpanId; }
+    get _identity() { return this._buffer._identity; }
+    
+    // Metadata (pass-through)
+    get task() { return this._buffer.task; }
+    
+    // Remapped column access (for Arrow conversion iteration)
+    // Maps prefixed name → unprefixed name before calling underlying buffer
+    getColumnIfAllocated(name) {
+      const unprefixedName = mapping[name] ?? name;
+      return this._buffer.getColumnIfAllocated(unprefixedName);
+    }
+    
+    getNullsIfAllocated(name) {
+      const unprefixedName = mapping[name] ?? name;
+      return this._buffer.getNullsIfAllocated(unprefixedName);
+    }
+  }
+  
+  return RemappedBufferView;
+})()`;
+
+  // Compile the class using Function constructor (cold path - happens once per mapping)
+  // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
+  const GeneratedClass = new Function(`return ${code}`)() as new (buffer: SpanBuffer) => SpanBuffer;
+
+  // Cache for future use
+  remappedBufferViewClassCache.set(cacheKey, GeneratedClass);
+
+  return GeneratedClass;
+}
+
 /**
  * Generate enum value mapping code for remapped class
  * Creates a switch-case statement for compile-time enum mapping
@@ -715,12 +857,13 @@ export function moduleContextFactory<
       const remappedScope = createRemappedScopeFunction<T>(ctx.scope, prefixMapping);
 
       // Create a new context with the remapped tag and scope
-      // ctx.log remains unchanged (it's just the SpanLogger for logging)
-      const remappedCtx: SpanContext<T, FF, Env> = {
-        ...ctx,
-        tag: remappedTag,
-        scope: remappedScope,
-      } as SpanContext<T, FF, Env>;
+      // Use Object.create to preserve prototype methods (ok, err, span, buffer getter)
+      // Per V8 hidden class optimization - Object.create preserves prototype chain
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Type erasure at runtime boundary
+      const remappedCtx = Object.create(ctx) as SpanContext<T, FF, Env>;
+      // Override tag and scope with remapped versions
+      (remappedCtx as { tag: typeof remappedTag }).tag = remappedTag;
+      (remappedCtx as { scope: typeof remappedScope }).scope = remappedScope;
 
       // Call the library function with the remapped context
       return fn(remappedCtx, ...args);

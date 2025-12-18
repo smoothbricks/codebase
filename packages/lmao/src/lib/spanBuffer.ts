@@ -168,8 +168,9 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
           // Set spanId (bytes 8-11, little-endian) using injected helper
           sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
           
-          // Link to parent
-          parent.children.push(this);
+          // Parent reference kept for identity resolution (traceId walks up parent chain)
+          // Note: Registration with parent.children is EXPLICIT at call sites (not here)
+          // See specs/01k_tree_walker_and_arrow_conversion.md "Explicit Child Registration"
         } else {
           // ROOT: identity with traceId
           const traceBytes = traceId ? sbHelpers.textEncoder.encode(traceId) : new Uint8Array(0);

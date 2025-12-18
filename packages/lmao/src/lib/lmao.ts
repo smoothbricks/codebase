@@ -622,6 +622,10 @@ function createSpanContextProto<
       // Create child span buffer with Arrow builders
       const childBuffer = createChildSpanBuffer(this._buffer, taskContext);
 
+      // Explicit registration with parent's children array
+      // Per specs/01k_tree_walker_and_arrow_conversion.md "Explicit Child Registration"
+      this._buffer.children.push(childBuffer);
+
       // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
       writeSpanStart(childBuffer, childName);
 
@@ -1238,14 +1242,22 @@ export function createModuleContext<
         // This handles both regular module-to-module calls and library operations
         const parentCtx = requestCtx as RequestContext<FF, Env> & { buffer?: SpanBuffer };
         let spanBuffer: SpanBuffer<T>;
-        let effectiveSchema: T = schemaOnly;
 
         if (parentCtx.buffer) {
-          // Called from parent span - create child span with parent's schema
-          // Per specs/01b_columnar_buffer_architecture.md - child buffers inherit parent's schema
-          // The child buffer will have the parent's schema type, but we cast to T for type compatibility
-          spanBuffer = createChildSpanBuffer(parentCtx.buffer, taskContext) as SpanBuffer<T>;
-          effectiveSchema = parentCtx.buffer.task.module.tagAttributes as T;
+          // Called from parent span - create child span with THIS MODULE's schema
+          // Per specs/01e_library_integration_pattern.md - each module uses its own schema
+          // Child spans use their own module's schema for proper library isolation
+          // The parent-child relationship is only for tree structure, not schema inheritance
+          spanBuffer = createSpanBuffer(schemaOnly, taskContext, parentCtx.buffer.traceId);
+
+          // Set parent reference for tree structure (used by Arrow conversion)
+          // Cast needed because parent may have different schema type
+          spanBuffer.parent = parentCtx.buffer as unknown as SpanBuffer<T>;
+
+          // Explicit registration with parent's children array
+          // Per specs/01k_tree_walker_and_arrow_conversion.md "Explicit Child Registration"
+          // Cast needed because children array expects parent's schema type
+          (parentCtx.buffer.children as SpanBuffer[]).push(spanBuffer);
         } else {
           // Called from RequestContext - create root span with this module's schema
           // Per specs/01b - traceId is constant across all spans in a trace
@@ -1275,16 +1287,16 @@ export function createModuleContext<
         const inheritedScopeValues = parentLogger?._getScope?.()._getScopeValues() || {};
 
         // Create span logger with typed logging methods (with inherited scope values)
-        // Use effectiveSchema (which is schemaOnly for root spans, parent's schema for child spans)
-        const spanLogger = createSpanLoggerWithScope(effectiveSchema, spanBuffer, inheritedScopeValues);
+        // Each module uses its own schema (schemaOnly) - no schema inheritance from parent
+        const spanLogger = createSpanLoggerWithScope(schemaOnly, spanBuffer, inheritedScopeValues);
 
         // Create tag writer for span attributes (writes to row 0)
-        // Use effectiveSchema so child spans can write to parent's merged schema columns
-        const tagAPI = createTagWriter(effectiveSchema, spanBuffer);
+        // Each module uses its own schema for proper library isolation
+        const tagAPI = createTagWriter(schemaOnly, spanBuffer);
 
         // Create SpanContext prototype for this task (methods defined once per task wrapper)
-        // Use effectiveSchema so child spans have methods for parent's merged schema columns
-        const spanContextProto = createSpanContextProto<T, FF, Env>(effectiveSchema, taskContext);
+        // Each module uses its own schema for proper library isolation
+        const spanContextProto = createSpanContextProto<T, FF, Env>(schemaOnly, taskContext);
 
         // Create span context using prototype-based inheritance
         // This avoids object spreads and maintains stable V8 hidden classes
@@ -1355,7 +1367,7 @@ export function createModuleContext<
         spanContext.tag = tagAPI;
         spanContext.log = spanLogger as SpanLogger<T>;
         spanContext._buffer = spanBuffer;
-        spanContext._schema = effectiveSchema;
+        spanContext._schema = schemaOnly;
         spanContext._spanLogger = spanLogger;
 
         // Execute task function with exception handling

@@ -841,10 +841,29 @@ export function convertSpanTreeToArrowTable(
   _systemColumnBuilder?: SystemColumnBuilder,
   modulesToLogStats?: Set<ModuleContext>,
 ): Table {
-  const schema = rootBuffer.task.module.tagAttributes;
+  // ═══════════════════════════════════════════════════════════════════════════
+  // PASS 0: Collect ALL unique schema fields from ALL buffers in the tree
+  // Per specs/01k_tree_walker_and_arrow_conversion.md - child spans may have different schemas
+  // (e.g., library prefixed schemas like db_query, http_status, etc.)
+  // ═══════════════════════════════════════════════════════════════════════════
+  const mergedSchemaFields = new Map<string, unknown>();
 
-  // Cache schema fields once - reuse throughout conversion
-  const schemaFields = getSchemaFields(schema);
+  walkSpanTree(rootBuffer, (buffer) => {
+    const bufferSchema = buffer.task.module.tagAttributes;
+    const fields = getSchemaFields(bufferSchema);
+    for (const [fieldName, fieldSchema] of fields) {
+      // Only add if not already present (first buffer with this field wins)
+      if (!mergedSchemaFields.has(fieldName)) {
+        mergedSchemaFields.set(fieldName, fieldSchema);
+      }
+    }
+  });
+
+  // Convert merged schema fields to array format for iteration
+  const schemaFields: Array<[string, unknown]> = Array.from(mergedSchemaFields.entries());
+
+  // Create merged schema object from collected fields (for capacity stats and other uses)
+  const mergedSchema = Object.fromEntries(mergedSchemaFields) as Record<string, unknown>;
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 1: Build dictionaries using DictionaryBuilder from arrow-builder
@@ -1103,7 +1122,7 @@ export function convertSpanTreeToArrowTable(
           categoryDicts,
           textDicts,
           attrDictIds,
-          schema,
+          mergedSchema,
           schemaFields,
           categoryOriginalToMasked,
           textOriginalToMasked,
@@ -1113,7 +1132,12 @@ export function convertSpanTreeToArrowTable(
   // Create capacity stats RecordBatch if needed
   if (modulesToLogStats && modulesToLogStats.size > 0) {
     const hasSpanData = batch !== undefined;
-    const capacityStatsBatch = createCapacityStatsRecordBatch(modulesToLogStats, arrowSchema, schema, hasSpanData);
+    const capacityStatsBatch = createCapacityStatsRecordBatch(
+      modulesToLogStats,
+      arrowSchema,
+      mergedSchema,
+      hasSpanData,
+    );
     if (batch) {
       // Use the first batch's schema as the Table schema (Apache Arrow requirement)
       // The capacity stats batch schema should match, but if it doesn't, use batch's schema

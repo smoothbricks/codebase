@@ -265,6 +265,10 @@ describe('Arrow Table Conversion', () => {
       const childContext = createTestTaskContext(schema, { lineNumber: 43 });
       const childBuffer = createChildSpanBuffer(parentBuffer, childContext);
 
+      // Explicit registration with parent's children array
+      // Per specs/01k_tree_walker_and_arrow_conversion.md "Explicit Child Registration"
+      parentBuffer.children.push(childBuffer);
+
       idx = childBuffer.writeIndex;
       childBuffer.timestamps[idx] = 2000n;
       childBuffer.operations[idx] = ENTRY_TYPE_SPAN_START;
