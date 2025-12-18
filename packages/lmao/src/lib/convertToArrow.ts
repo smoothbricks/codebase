@@ -52,7 +52,7 @@ import {
 import { ENTRY_TYPE_NAMES } from './lmao.js';
 import type { ModuleContext } from './moduleContext.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
-import { getSchemaFields, type TagAttributeSchema } from './schema/types.js';
+import { getSchemaFields } from './schema/types.js';
 import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
@@ -843,6 +843,9 @@ export function convertSpanTreeToArrowTable(
 ): Table {
   const schema = rootBuffer.task.module.tagAttributes;
 
+  // Cache schema fields once - reuse throughout conversion
+  const schemaFields = getSchemaFields(schema);
+
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 1: Build dictionaries using DictionaryBuilder from arrow-builder
   // ═══════════════════════════════════════════════════════════════════════════
@@ -854,8 +857,8 @@ export function convertSpanTreeToArrowTable(
   const categoryOriginalToMasked = new Map<string, Map<string, string>>();
   const textOriginalToMasked = new Map<string, Map<string, string>>();
 
-  // Use getSchemaFields to filter out methods (extend, validate, parse, safeParse)
-  for (const [fieldName, fieldSchema] of getSchemaFields(schema)) {
+  // Use cached schemaFields to filter out methods (extend, validate, parse, safeParse)
+  for (const [fieldName, fieldSchema] of schemaFields) {
     const lmaoType = getSchemaType(fieldSchema);
     if (lmaoType === 'category') {
       categoryBuilders.set(fieldName, new DictionaryBuilder(globalUtf8Cache));
@@ -1023,8 +1026,8 @@ export function convertSpanTreeToArrowTable(
   // User attribute columns - assign dictionary IDs starting at 6
   let nextDictId = 6;
   const attrDictIds = new Map<string, number>();
-  // Use getSchemaFields to filter out methods (extend, validate, parse, safeParse)
-  for (const [fieldName, fieldSchema] of getSchemaFields(schema)) {
+  // Use cached schemaFields to filter out methods (extend, validate, parse, safeParse)
+  for (const [fieldName, fieldSchema] of schemaFields) {
     const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
 
@@ -1101,6 +1104,7 @@ export function convertSpanTreeToArrowTable(
           textDicts,
           attrDictIds,
           schema,
+          schemaFields,
           categoryOriginalToMasked,
           textOriginalToMasked,
         )
@@ -1111,7 +1115,9 @@ export function convertSpanTreeToArrowTable(
     const hasSpanData = batch !== undefined;
     const capacityStatsBatch = createCapacityStatsRecordBatch(modulesToLogStats, arrowSchema, schema, hasSpanData);
     if (batch) {
-      return new Table([batch, capacityStatsBatch]);
+      // Use the first batch's schema as the Table schema (Apache Arrow requirement)
+      // The capacity stats batch schema should match, but if it doesn't, use batch's schema
+      return new Table(batch.schema, [batch, capacityStatsBatch]);
     }
     return new Table([capacityStatsBatch]);
   }
@@ -1141,6 +1147,7 @@ function convertBuffersWithSharedDicts(
   textDicts: Map<string, FinalizedDictionary>,
   _attrDictIds: Map<string, number>,
   lmaoSchema: Record<string, unknown>,
+  schemaFields: Array<[string, unknown]>,
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
 ): RecordBatch {
@@ -1453,9 +1460,6 @@ function convertBuffersWithSharedDicts(
   // Total: 11 columns before user attributes
   const METADATA_AND_SYSTEM_COLUMNS_COUNT = 11;
   let fieldIdx = METADATA_AND_SYSTEM_COLUMNS_COUNT;
-
-  // Use getSchemaFields to filter out methods (extend, validate, parse, safeParse)
-  const schemaFields = getSchemaFields(lmaoSchema as TagAttributeSchema);
 
   // Validate that arrowSchema has the expected number of fields
   // Note: message is NOT in schemaFields (it's a system column), so we need to account for it separately

@@ -100,7 +100,8 @@ export function createCapacityStatsRecordBatch(
   let messageFieldIndex: number | undefined;
 
   if (hasSpanData) {
-    // Use the same schema as the main batch so RecordBatches can be combined
+    // We'll create a new schema from the vectors after they're built to ensure dictionary IDs match
+    // For now, store reference to arrowSchema for field order and types
     capacityStatsSchema = arrowSchema;
     timestampType = arrowSchema.fields[0].type as TimestampNanosecond;
     traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8>;
@@ -139,14 +140,11 @@ export function createCapacityStatsRecordBatch(
       }),
     );
 
-    // Add message column if it exists in the schema
-    const hasMessage = 'message' in lmaoSchema;
-    if (hasMessage) {
-      // Message will be dictionary-encoded, but we'll determine the type after building the dict
-      // For now, use Uint8 as placeholder (will be updated after building messageDict)
-      fields.push(Field.new({ name: 'message', type: new Dictionary(new Utf8(), new Uint8()) }));
-      messageFieldIndex = fields.length - 1;
-    }
+    // Message is always included as a system column (even if not in user schema)
+    // Message will be dictionary-encoded, but we'll determine the type after building the dict
+    // For now, use Uint8 as placeholder (will be updated after building messageDict)
+    fields.push(Field.new({ name: 'message', type: new Dictionary(new Utf8(), new Uint8()) }));
+    messageFieldIndex = fields.length - 1;
 
     capacityStatsSchema = new Schema(fields);
     timestampType = new TimestampNanosecond();
@@ -409,7 +407,41 @@ export function createCapacityStatsRecordBatch(
     ),
   );
 
-  // User attribute columns - only include if combining with span data (except message system attribute column)
+  // System attribute column: message (index 10) - handle separately before user attributes
+  if (hasSpanData && messageFieldIndex !== undefined) {
+    const messageField = arrowSchema.fields[messageFieldIndex];
+    if (messageField && messageField.name === 'message') {
+      const messageFieldType = messageField.type as Dictionary<Utf8, Uint8 | Uint16 | Uint32>;
+      const indices = new capacityStatsMessageDict.indexArrayCtor(capacityStatsRows);
+      for (let i = 0; i < capacityStatsRows; i++) {
+        indices[i] = capacityStatsMessageDict.indexMap.get(capacityStatsMessages[i]) ?? 0;
+      }
+
+      vectors.push(
+        makeVector(
+          makeData({
+            type: messageFieldType,
+            offset: 0,
+            length: capacityStatsRows,
+            nullCount: 0,
+            data: indices,
+            dictionary: makeVector(
+              makeData({
+                type: new Utf8(),
+                offset: 0,
+                length: capacityStatsMessageDict.indexMap.size,
+                nullCount: 0,
+                valueOffsets: capacityStatsMessageDict.offsets,
+                data: capacityStatsMessageDict.data,
+              }),
+            ),
+          }),
+        ),
+      );
+    }
+  }
+
+  // User attribute columns - only include if combining with span data
   if (hasSpanData) {
     // Iterate through attribute columns that actually exist in the span RecordBatch
     // (lazy columns that were never written to won't be in arrowSchema)
@@ -438,35 +470,8 @@ export function createCapacityStatsRecordBatch(
 
       const lmaoType = getSchemaType(fieldSchema);
 
-      // Handle message column specially: use Dictionary encoding (same schema as main batch)
-      // but with a separate dictionary that doesn't pollute the main message dictionary cache
+      // Skip message as it's already handled above
       if (lmaoFieldName === 'message') {
-        const indices = new capacityStatsMessageDict.indexArrayCtor(capacityStatsRows);
-        for (let i = 0; i < capacityStatsRows; i++) {
-          indices[i] = capacityStatsMessageDict.indexMap.get(capacityStatsMessages[i]) ?? 0;
-        }
-
-        vectors.push(
-          makeVector(
-            makeData({
-              type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>, // Keep Dictionary type
-              offset: 0,
-              length: capacityStatsRows,
-              nullCount: 0,
-              data: indices,
-              dictionary: makeVector(
-                makeData({
-                  type: new Utf8(),
-                  offset: 0,
-                  length: capacityStatsMessageDict.indexMap.size,
-                  nullCount: 0,
-                  valueOffsets: capacityStatsMessageDict.offsets,
-                  data: capacityStatsMessageDict.data,
-                }),
-              ),
-            }),
-          ),
-        );
         continue;
       }
 
@@ -647,12 +652,36 @@ export function createCapacityStatsRecordBatch(
     }
   }
 
+  // When hasSpanData is true, rebuild schema from the actual vector types
+  // This ensures dictionary IDs match exactly (Apache Arrow requires exact schema equivalence)
+  let finalSchema = capacityStatsSchema;
+  if (hasSpanData) {
+    if (vectors.length !== capacityStatsSchema.fields.length) {
+      throw new Error(
+        `Vector count (${vectors.length}) doesn't match schema field count (${capacityStatsSchema.fields.length})`,
+      );
+    }
+    // Rebuild schema from the actual vector types to ensure dictionary IDs match
+    const fields: Field[] = [];
+    for (let i = 0; i < vectors.length; i++) {
+      const vector = vectors[i];
+      const originalField = capacityStatsSchema.fields[i];
+      if (!originalField) {
+        throw new Error(`Missing field at index ${i} in capacity stats schema`);
+      }
+      // Use the actual type from the vector to ensure dictionary IDs match
+      const vectorType = vector.type;
+      fields.push(Field.new({ name: originalField.name, type: vectorType, nullable: originalField.nullable }));
+    }
+    finalSchema = new Schema(fields);
+  }
+
   const structData = makeData({
-    type: new Struct(capacityStatsSchema.fields),
+    type: new Struct(finalSchema.fields),
     length: capacityStatsRows,
     nullCount: 0,
     children: vectors.map((v) => v.data[0]),
   });
 
-  return new RecordBatch(capacityStatsSchema, structData);
+  return new RecordBatch(finalSchema, structData);
 }

@@ -25,6 +25,7 @@ import {
   ENTRY_TYPE_WARN,
 } from '../../lmao.js';
 import { S } from '../../schema/builder.js';
+import { mergeWithSystemSchema } from '../../schema/systemSchema.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
 import { createTestTaskContext } from '../test-helpers.js';
@@ -373,6 +374,103 @@ describe('Arrow Table Conversion', () => {
       const table = convertToArrowTable(buffer);
 
       expect(table.get(0)?.toJSON().trace_id).toBe(traceId);
+    });
+  });
+
+  describe('Capacity Stats Integration', () => {
+    test('includes both span entries and capacity stats entries in same table', () => {
+      const userSchema = {} as const;
+      const taskContext = createTestTaskContext(userSchema, { lineNumber: 42 });
+      // Merge with system schema to include message column
+      const mergedSchema = mergeWithSystemSchema(userSchema);
+      const buffer = createSpanBuffer(mergedSchema, taskContext, createTraceId('trace-123'));
+
+      // Write some span entries
+      buffer.timestamps[0] = 1000n;
+      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.message(0, 'test-span');
+      buffer.writeIndex = 1;
+
+      buffer.timestamps[1] = 2000n;
+      buffer.operations[1] = ENTRY_TYPE_INFO;
+      buffer.message(1, 'Test log message');
+      buffer.writeIndex = 2;
+
+      // Update capacity stats to have meaningful values
+      taskContext.module.spanBufferCapacityStats.currentCapacity = 128;
+      taskContext.module.spanBufferCapacityStats.totalWrites = 50;
+      taskContext.module.spanBufferCapacityStats.overflowWrites = 5;
+      taskContext.module.spanBufferCapacityStats.totalBuffersCreated = 2;
+
+      // Convert with modulesToLogStats
+      const modulesToLogStats = new Set([taskContext.module]);
+      const table = convertSpanTreeToArrowTable(buffer, undefined, modulesToLogStats);
+
+      // Should have both span entries (2) + capacity stats entry (1) = 3 rows total
+      expect(table.numRows).toBe(3);
+      expect(table.batches.length).toBe(2); // One batch for span data, one for capacity stats
+
+      // Verify span entries
+      const row0 = table.get(0)?.toJSON();
+      expect(row0?.entry_type).toBe('span-start');
+      expect(row0?.message).toBe('test-span');
+
+      const row1 = table.get(1)?.toJSON();
+      expect(row1?.entry_type).toBe('info');
+      expect(row1?.message).toBe('Test log message');
+
+      // Verify capacity stats entry
+      const row2 = table.get(2)?.toJSON();
+      expect(row2?.entry_type).toBe('capacity-stats');
+      expect(row2?.package_name).toBe('@test/package');
+      expect(row2?.package_path).toBe('src/test.ts');
+
+      // Verify message contains JSON stats
+      const statsMessage = row2?.message;
+      expect(statsMessage).toBeDefined();
+      expect(typeof statsMessage).toBe('string');
+
+      const stats = JSON.parse(statsMessage as string);
+      expect(stats).toHaveProperty('currentCapacity');
+      expect(stats).toHaveProperty('totalWrites');
+      expect(stats).toHaveProperty('overflowWrites');
+      expect(stats).toHaveProperty('totalBuffers');
+      expect(stats).toHaveProperty('efficiency');
+      expect(stats).toHaveProperty('overflowRatio');
+      expect(stats.currentCapacity).toBe(128);
+      expect(stats.totalWrites).toBe(50);
+      expect(stats.overflowWrites).toBe(5);
+      expect(stats.totalBuffers).toBe(2);
+    });
+
+    test('includes only capacity stats when no span data', () => {
+      const schema = {} as const;
+      const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
+
+      // Buffer has no entries (writeIndex = 0)
+      buffer.writeIndex = 0;
+
+      // Update capacity stats
+      taskContext.module.spanBufferCapacityStats.currentCapacity = 64;
+      taskContext.module.spanBufferCapacityStats.totalWrites = 10;
+      taskContext.module.spanBufferCapacityStats.overflowWrites = 0;
+      taskContext.module.spanBufferCapacityStats.totalBuffersCreated = 1;
+
+      // Convert with modulesToLogStats
+      const modulesToLogStats = new Set([taskContext.module]);
+      const table = convertSpanTreeToArrowTable(buffer, undefined, modulesToLogStats);
+
+      // Should have only capacity stats entry (1 row)
+      expect(table.numRows).toBe(1);
+      expect(table.batches.length).toBe(1); // Only capacity stats batch
+
+      const row0 = table.get(0)?.toJSON();
+      expect(row0?.entry_type).toBe('capacity-stats');
+
+      const stats = JSON.parse(row0?.message as string);
+      expect(stats.currentCapacity).toBe(64);
+      expect(stats.totalWrites).toBe(10);
     });
   });
 });
