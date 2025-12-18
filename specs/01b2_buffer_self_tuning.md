@@ -288,6 +288,58 @@ class MemoryAwareBuffer {
 
 ## Flush Strategy
 
+### FlushScheduler Design
+
+The `FlushScheduler` manages background flushing of multiple root buffers (one per HTTP request/trace) to Arrow tables.
+
+**Key Design Decisions**:
+
+1. **Array-Based Buffer Collection**: Uses `SpanBuffer[]` array for buffer collection. Buffers are added via
+   `register(buffer)` and the array is cleared after each flush.
+
+2. **No Individual Unregister**: The entire array is cleared after flush (`this.buffers = []`). This matches the flush
+   cycle - buffers are registered, flushed together, then cleared.
+
+3. **Single RecordBatch Per Flush**: All root buffers in a flush are converted to a **single RecordBatch** for maximum
+   dictionary reuse. This requires all buffers to share the same schema (enforced at runtime).
+
+4. **Schema Requirement**: All buffers in a flush must share the same schema. This is guaranteed because:
+   - The application composes all library schemas into a single `ModuleContext` at startup
+   - All buffers created from that module share the same `module.tagAttributes` schema
+   - The conversion function validates this requirement and throws if schemas differ
+
+**Flush Cycle**:
+
+```typescript
+class FlushScheduler {
+  private buffers: SpanBuffer[] = [];
+
+  register(buffer: SpanBuffer): void {
+    this.buffers.push(buffer);
+    // Start scheduler if not running
+  }
+
+  // Buffers cleared after flush
+
+  private async doFlush(): Promise<void> {
+    if (this.buffers.length === 0) return;
+
+    const buffersToFlush = this.buffers;
+    this.buffers = []; // Clear after collecting
+
+    // Convert all buffers to single RecordBatch
+    const table = convertSpanTreeToArrowTable(
+      buffersToFlush, // Array of root buffers
+      undefined,
+      modulesToLogStats
+    );
+
+    // Write table to storage
+    await this.flushHandler(table, metadata);
+  }
+}
+```
+
 ### Adaptive Flushing
 
 Balance latency vs memory usage:
@@ -1267,17 +1319,20 @@ flush interval is reached, creates a separate RecordBatch with capacity stats en
 
 ### How It Works
 
-1. **Module Tracking**: The `FlushScheduler` maintains a `Set<ModuleContext>` of all unique modules that have been
+1. **Buffer Collection**: The `FlushScheduler` maintains a `SpanBuffer[]` array of root buffers registered for flushing.
+   Buffers are added via `register(buffer)` and the array is cleared after each flush (no individual unregister needed).
+
+2. **Module Tracking**: During flush, the scheduler collects a `Set<ModuleContext>` of all unique modules that have been
    flushed since the last capacity stats log.
 
-2. **Flush Counter**: A global flush counter tracks how many flushes have occurred. When this counter reaches
+3. **Flush Counter**: A global flush counter tracks how many flushes have occurred. When this counter reaches
    `CAPACITY_STATS_FLUSH_INTERVAL` (default: 100), capacity stats are logged.
 
-3. **Separate RecordBatch**: Capacity stats are logged as a separate `RecordBatch` appended to the main span data
+4. **Separate RecordBatch**: Capacity stats are logged as a separate `RecordBatch` appended to the main span data
    `RecordBatch`. This keeps the implementation clean - no need to pre-allocate vectors with extra capacity or handle
    capacity stats in every column type's conversion logic.
 
-4. **Stats Format**: Each module gets one row with:
+5. **Stats Format**: Each module gets one row with:
    - `entry_type`: `capacity-stats`
    - `package_name`, `package_path`, `git_sha`: From the module
    - `message`: JSON string containing:
@@ -1289,7 +1344,7 @@ flush interval is reached, creates a separate RecordBatch with capacity stats en
      - `overflowRatio`: Calculated as `overflowWrites / totalWrites`
    - All other columns: null (capacity stats don't have trace/span context)
 
-5. **Reset After Logging**: After logging capacity stats, the flush counter and module tracking set are reset, starting
+6. **Reset After Logging**: After logging capacity stats, the flush counter and module tracking set are reset, starting
    a new interval.
 
 ### Benefits

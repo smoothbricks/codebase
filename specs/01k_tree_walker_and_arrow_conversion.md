@@ -384,9 +384,13 @@ The tree walking is a simple recursive function - no intermediate buffer collect
 /**
  * Walk span tree depth-first, calling visitor for each buffer.
  * Handles overflow chains (buffer.next) automatically.
+ *
+ * Note: Children may be RemappedBufferViews (for library integration).
+ * RemappedBufferView implements the same interface as SpanBuffer for
+ * read-only traversal - see 01e_library_integration_pattern.md.
  */
 function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): void {
-  // Visit this buffer
+  // Visit this buffer (or RemappedBufferView)
   visitor(root);
 
   // Visit overflow chain (same spanId, linked via .next)
@@ -397,45 +401,77 @@ function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): 
   }
 
   // Recursively visit children (depth-first)
+  // Children may be SpanBuffer or RemappedBufferView
   for (const child of root.children) {
     walkSpanTree(child, visitor);
   }
 }
 
 /**
- * Convert span tree to Arrow Table using two-pass approach.
+ * Convert multiple span trees to a single Arrow RecordBatch using two-pass approach.
  *
- * @param root - Root SpanBuffer of the tree
- * @param schema - Arrow schema for the output table
+ * **Schema Requirement**: All root buffers must share the same schema. The application composes
+ * all library schemas into a single ModuleContext at startup, so all buffers created from that
+ * module share the same tagAttributes schema. This requirement is enforced at runtime.
+ *
+ * **Why Single RecordBatch**: Converting multiple root buffers (e.g., multiple HTTP requests)
+ * into a single RecordBatch maximizes dictionary reuse - all buffers share the same dictionary
+ * vectors, reducing memory and improving query performance.
+ *
+ * @param rootBuffers - Array of root SpanBuffers (one per request/trace tree)
+ * @param schema - Arrow schema for the output table (from first root buffer's module)
  * @param utf8Cache - Shared UTF-8 cache (can be reused across conversions)
  */
-function convertSpanTreeToArrowTable(root: SpanBuffer, schema: arrow.Schema, utf8Cache: Utf8Cache): arrow.Table {
+function convertSpanTreeToArrowTable(
+  rootBuffers: SpanBuffer[],
+  schema: arrow.Schema,
+  utf8Cache: Utf8Cache
+): arrow.Table {
+  if (rootBuffers.length === 0) {
+    return new arrow.Table();
+  }
+
+  // Schema requirement: All buffers must share the same schema
+  // This is enforced because the application composes all library schemas into one ModuleContext
+  const expectedSchema = rootBuffers[0].task.module.tagAttributes;
+  for (let i = 1; i < rootBuffers.length; i++) {
+    if (rootBuffers[i].task.module.tagAttributes !== expectedSchema) {
+      throw new Error(
+        `Schema mismatch: All buffers in a flush must share the same schema. ` +
+          `Buffer 0 has schema from module ${rootBuffers[0].task.module.packageName}, ` +
+          `but buffer ${i} has schema from module ${rootBuffers[i].task.module.packageName}`
+      );
+    }
+  }
+
   // Collect dictionaries per string column
   const columnDicts = new Map<string, ColumnDictionary>();
   let totalRows = 0;
 
-  // Pass 1: Build dictionaries (uses shared utf8Cache)
-  walkSpanTree(root, (buffer) => {
-    totalRows += buffer.writeIndex;
+  // Pass 1: Build dictionaries from ALL root buffers (uses shared utf8Cache)
+  for (const rootBuffer of rootBuffers) {
+    walkSpanTree(rootBuffer, (buffer) => {
+      totalRows += buffer.writeIndex;
 
-    for (const field of schema.fields) {
-      if (isStringColumn(buffer, field.name)) {
-        let dict = columnDicts.get(field.name);
-        if (!dict) {
-          dict = new ColumnDictionary(utf8Cache); // Shared cache!
-          columnDicts.set(field.name, dict);
-        }
+      for (const field of schema.fields) {
+        if (isStringColumn(buffer, field.name)) {
+          let dict = columnDicts.get(field.name);
+          if (!dict) {
+            dict = new ColumnDictionary(utf8Cache); // Shared cache!
+            columnDicts.set(field.name, dict);
+          }
 
-        // Add all string values from this buffer
-        for (let i = 0; i < buffer.writeIndex; i++) {
-          const value = getStringValue(buffer, field.name, i);
-          if (value !== null) {
-            dict.add(value);
+          // Add all string values from this buffer
+          for (let i = 0; i < buffer.writeIndex; i++) {
+            const value = getStringValue(buffer, field.name, i);
+            if (value !== null) {
+              dict.add(value);
+            }
           }
         }
       }
-    }
-  });
+    });
+  }
 
   // Finalize dictionaries (uses same shared utf8Cache)
   const finalDicts = new Map<string, FinalizedDictionary>();
@@ -443,14 +479,22 @@ function convertSpanTreeToArrowTable(root: SpanBuffer, schema: arrow.Schema, utf
     finalDicts.set(name, finalizeDictionary(dict, utf8Cache));
   }
 
-  // Pass 2: Convert buffers to RecordBatches
-  const batches: arrow.RecordBatch[] = [];
-  walkSpanTree(root, (buffer) => {
-    batches.push(convertBufferToRecordBatch(buffer, schema, finalDicts));
-  });
+  // Pass 2: Collect all buffers from ALL root trees, convert to single RecordBatch
+  const allBuffers: SpanBuffer[] = [];
+  for (const rootBuffer of rootBuffers) {
+    walkSpanTree(rootBuffer, (buffer) => {
+      if (buffer.writeIndex > 0) {
+        allBuffers.push(buffer);
+      }
+    });
+  }
 
-  // Create Table from batches (all share same dictionaries)
-  return new arrow.Table(batches);
+  // Convert all buffers to a single RecordBatch with shared dictionaries
+  // This maximizes dictionary reuse across all requests/traces in the flush
+  const recordBatch = convertBuffersToRecordBatch(allBuffers, schema, finalDicts);
+
+  // Create Table from single RecordBatch
+  return new arrow.Table([recordBatch]);
 }
 ```
 
@@ -581,7 +625,140 @@ Traversal with overflow:
 
 This ensures all entries for a span are contiguous in the Arrow table.
 
-## Single Buffer Conversion
+### Library Integration: RemappedBufferView
+
+When libraries use prefixed schemas (see [Library Integration Pattern](./01e_library_integration_pattern.md)), the tree
+may contain **RemappedBufferView** objects instead of raw SpanBuffers:
+
+```
+Application Root Buffer (schema: { userId, http_status, http_method })
+│
+└── children[0]: RemappedBufferView  ← NOT a raw SpanBuffer
+        │
+        │   Maps prefixed → unprefixed:
+        │   - http_status → status
+        │   - http_method → method
+        │
+        └── wraps: HTTP Library Buffer (schema: { status, method })
+```
+
+**Why RemappedBufferView exists**:
+
+1. **Library code** is compiled with unprefixed column names (`status_values`)
+2. **Application schema** has prefixed columns (`http_status`)
+3. **Arrow conversion** iterates using application schema field names
+4. **RemappedBufferView** bridges the gap by mapping prefixed → unprefixed in `getColumnIfAllocated()`
+
+**Tree walker doesn't need to distinguish** - RemappedBufferView implements the same read-only interface:
+
+```typescript
+// Both SpanBuffer and RemappedBufferView support:
+interface TreeTraversable {
+  children: TreeTraversable[];
+  next: TreeTraversable | undefined;
+  writeIndex: number;
+  timestamps: BigInt64Array;
+  operations: Uint8Array;
+  traceId: TraceId;
+  threadId: bigint;
+  spanId: number;
+  parentSpanId: number;
+  task: TaskContext;
+  getColumnIfAllocated(name: string): ColumnValueType | undefined;
+  getNullsIfAllocated(name: string): Uint8Array | undefined;
+}
+```
+
+**Column access through RemappedBufferView**:
+
+```typescript
+// Arrow conversion iterates with prefixed names from root schema
+for (const [fieldName, _] of schemaFields) {
+  // fieldName = 'http_status'
+  const col = buffer.getColumnIfAllocated(fieldName);
+
+  // If buffer is RemappedBufferView:
+  // 1. Maps 'http_status' → 'status'
+  // 2. Calls ownBuffer.getColumnIfAllocated('status')
+  // 3. Returns the actual TypedArray
+
+  // If buffer is regular SpanBuffer (no http library columns):
+  // Returns undefined (column not allocated)
+}
+```
+
+**Nested library calls** work naturally - each library registers its own RemappedBufferView:
+
+```
+App Root → RemappedBufferView(HTTP) → RemappedBufferView(Auth) → Auth Buffer
+           http_status → status       auth_token → token
+```
+
+### Explicit Child Registration
+
+SpanBuffer constructors do **not** auto-register with parent's `children[]` array. Registration is explicit at call
+sites:
+
+```typescript
+// Standard child span (same schema as parent):
+const childBuffer = createChildSpanBuffer(parentBuffer, taskContext);
+parentBuffer.children.push(childBuffer); // Explicit registration
+
+// Library child span (different schema, needs remapping):
+const ownBuffer = createSpanBuffer(unprefixedSchema, taskContext, traceId);
+const remappedView = new RemappedViewClass(ownBuffer);
+parentBuffer.children.push(remappedView); // Register the view, not raw buffer
+```
+
+**Why explicit registration?**
+
+1. **Library integration**: Libraries must register RemappedBufferView, not raw buffer
+2. **Testing flexibility**: Tests can create buffers without polluting parent's children
+3. **Clear control flow**: No hidden side effects in constructors
+
+**Call sites requiring explicit registration** (as of this spec):
+
+| Location                              | Description                          |
+| ------------------------------------- | ------------------------------------ |
+| `lmao.ts` - `span()` method           | Inline child span creation           |
+| `lmao.ts` - `task()` wrapper          | Cross-module child span              |
+| `library.ts` - `moduleContextFactory` | Library task with RemappedBufferView |
+
+## Multiple Root Buffers → Single RecordBatch
+
+**Key Design Decision**: Multiple root buffers (e.g., multiple HTTP requests) are converted into a **single
+RecordBatch** rather than multiple RecordBatches. This maximizes dictionary reuse - all buffers share the same
+dictionary vectors.
+
+### Schema Requirement
+
+**All buffers in a flush must share the same schema.** This is enforced because:
+
+1. **Application Composition**: The application composes all library schemas into a single `ModuleContext` at startup:
+
+   ```typescript
+   const composedSchema = {
+     ...httpLib.module.schema,
+     ...dbLib.module.schema,
+     ...appSchema,
+   };
+   const { task } = createModuleContext({ tagAttributes: composedSchema });
+   ```
+
+2. **Per-Module Schema**: Each `ModuleContext` has one unified schema (`module.tagAttributes`). All buffers created from
+   that module share the same schema.
+
+3. **Runtime Enforcement**: The conversion function validates that all root buffers share the same schema, throwing an
+   error if they differ.
+
+### Benefits of Single RecordBatch
+
+- **Maximum Dictionary Reuse**: All buffers share the same dictionary vectors, reducing memory
+- **Better Query Performance**: Query engines can optimize dictionary lookups across all data
+- **Simpler Implementation**: No need to union schemas or handle missing columns
+- **Efficient Flushing**: One RecordBatch per flush cycle, matching the flush scheduler's design
+
+### Single Buffer Conversion
 
 For simple cases (single buffer, no tree), use `convertToRecordBatch`:
 
@@ -609,7 +786,7 @@ function convertToRecordBatch(
 }
 ```
 
-This is the building block used by `convertBufferToRecordBatch` in Pass 2.
+This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 
 ## Package Separation
 

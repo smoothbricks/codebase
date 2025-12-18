@@ -7,8 +7,9 @@ avoiding attribute name conflicts. It solves the challenge of:
 
 1. **Clean library authoring**: Libraries write unprefixed code (`ctx.tag.status(200)`)
 2. **Collision avoidance**: Final columns are prefixed (`http_status`, `db_status`)
-3. **Zero hot path overhead**: All mapping work happens at task creation time
+3. **Zero hot path overhead**: Library writes directly to its own SpanBuffer with unprefixed columns
 4. **Type safety**: Full TypeScript inference through composition
+5. **Tree traversal compatibility**: RemappedBufferView allows Arrow conversion to access prefixed names
 
 ## Design Philosophy
 
@@ -21,40 +22,200 @@ The tracing system handles prefixing transparently while maintaining maximum per
 - Process library: `status: string` (process states like "running", "failed")
 - Database library: `status: string` (connection states)
 
-**The Solution**: Libraries define clean schemas and get prefixed at composition time.
+**The Solution**: Libraries create their own SpanBuffer with unprefixed schema, then register a RemappedBufferView with
+the parent that maps prefixed names to unprefixed columns. This enables:
+
+- **Hot path**: Direct TypedArray writes to unprefixed columns (zero overhead)
+- **Cold path**: Arrow conversion uses RemappedBufferView to access columns via prefixed names
+
+## Core Architecture: RemappedBufferView
+
+### The Problem
+
+When a library task creates a child span:
+
+1. **Library's transformed code** writes to unprefixed columns: `ctx._buffer.status_values[0] = 200`
+2. **Parent's tree traversal** (Arrow conversion) iterates with prefixed names from root schema:
+   `getColumnIfAllocated('http_status')`
+3. **Application** may have its own `status` column with different meaning
+
+### The Solution: RemappedBufferView
+
+Instead of trying to remap writes at runtime (which adds hot-path overhead), we:
+
+1. **Library creates its own SpanBuffer** with unprefixed schema (`{ status, method }`)
+2. **Library's ctx.\_buffer** points to this unprefixed buffer - transformed code works directly
+3. **RemappedBufferView** wraps the library buffer, mapping prefixed → unprefixed for tree traversal
+4. **Parent's children array** contains the RemappedBufferView (not the raw buffer)
+
+```
+Application Root Buffer (schema: { userId, http_status, http_method, db_query })
+│
+├── children[0]: RemappedBufferView
+│   │   Maps: http_status → status, http_method → method
+│   │
+│   └── wraps: HTTP Library Buffer (schema: { status, method })
+│               │
+│               └── children[0]: RemappedBufferView (for nested auth library)
+│                       Maps: auth_token → token
+│                       └── wraps: Auth Library Buffer (schema: { token })
+│
+└── children[1]: App's own child span buffer (same schema as root)
+```
+
+### RemappedBufferView Implementation
+
+Generated via `new Function()` at library composition time (cold path):
+
+```typescript
+function generateRemappedBufferViewClass(
+  prefixToUnprefixedMapping: Record<string, string> // { 'http_status': 'status', ... }
+): new (buffer: SpanBuffer) => SpanBuffer {
+  const mappingCode = JSON.stringify(prefixToUnprefixedMapping);
+
+  const code = `
+    const mapping = ${mappingCode};
+    return class RemappedBufferView {
+      constructor(buffer) {
+        this._buffer = buffer;
+      }
+
+      // Tree traversal (pass-through)
+      get children() { return this._buffer.children; }
+      get next() { return this._buffer.next; }
+
+      // Row count
+      get writeIndex() { return this._buffer.writeIndex; }
+
+      // System columns (NOT remapped - same in all buffers)
+      get timestamps() { return this._buffer.timestamps; }
+      get operations() { return this._buffer.operations; }
+      get message_values() { return this._buffer.message_values; }
+      get message_nulls() { return this._buffer.message_nulls; }
+      get lineNumber_values() { return this._buffer.lineNumber_values; }
+      get lineNumber_nulls() { return this._buffer.lineNumber_nulls; }
+      get errorCode_values() { return this._buffer.errorCode_values; }
+      get errorCode_nulls() { return this._buffer.errorCode_nulls; }
+      get exceptionStack_values() { return this._buffer.exceptionStack_values; }
+      get exceptionStack_nulls() { return this._buffer.exceptionStack_nulls; }
+      get ffValue_values() { return this._buffer.ffValue_values; }
+      get ffValue_nulls() { return this._buffer.ffValue_nulls; }
+
+      // Identity (pass-through)
+      get traceId() { return this._buffer.traceId; }
+      get threadId() { return this._buffer.threadId; }
+      get spanId() { return this._buffer.spanId; }
+      get parentSpanId() { return this._buffer.parentSpanId; }
+      get _identity() { return this._buffer._identity; }
+
+      // Metadata (pass-through)
+      get task() { return this._buffer.task; }
+
+      // Remapped column access (for Arrow conversion iteration)
+      getColumnIfAllocated(name) {
+        const unprefixedName = mapping[name] ?? name;
+        return this._buffer.getColumnIfAllocated(unprefixedName);
+      }
+
+      getNullsIfAllocated(name) {
+        const unprefixedName = mapping[name] ?? name;
+        return this._buffer.getNullsIfAllocated(unprefixedName);
+      }
+    }
+  `;
+
+  return new Function(code)();
+}
+```
+
+### Why This Works
+
+**Hot Path (library code execution)**:
+
+- Library's `ctx._buffer` is the raw SpanBuffer with unprefixed columns
+- Transformed code writes directly: `ctx._buffer.status_values[0] = 200`
+- Zero overhead - direct TypedArray access
+
+**Cold Path (Arrow conversion)**:
+
+- Tree walker encounters RemappedBufferView in parent's `children[]`
+- Calls `view.getColumnIfAllocated('http_status')`
+- RemappedBufferView maps to `buffer.getColumnIfAllocated('status')`
+- Returns the actual TypedArray for that column
+
+**Columns the library doesn't own** (e.g., `userId` from app schema):
+
+- `view.getColumnIfAllocated('userId')` → `buffer.getColumnIfAllocated('userId')` → `undefined`
+- Arrow conversion handles `undefined` as null column - correct behavior
+
+## Explicit Child Registration
+
+SpanBuffer constructors do NOT auto-register with parent. Registration is explicit:
+
+```typescript
+// In library's task wrapper:
+const ownBuffer = createSpanBuffer(unprefixedSchema, taskContext, traceId);
+
+if (prefix && parentCtx?.buffer) {
+  // Create remapped view and register with parent
+  const remappedView = new RemappedViewClass(ownBuffer);
+  parentCtx.buffer.children.push(remappedView);
+} else if (parentCtx?.buffer) {
+  // No prefix - register buffer directly
+  parentCtx.buffer.children.push(ownBuffer);
+}
+
+// Library code uses raw buffer
+ctx._buffer = ownBuffer;
+```
+
+This explicit registration enables:
+
+1. Libraries to register RemappedBufferView instead of raw buffer
+2. Testing scenarios where auto-registration is undesirable
+3. Clear control flow for debugging
 
 ## Core Library Pattern
 
 ```typescript
 // @trace-system/core - provides the pattern for all libraries
-export function createLibraryModule<T extends TagAttributeSchema>(cleanSchema: T, prefix?: string) {
+export function createLibraryModule<T extends TagAttributeSchema>(unprefixedSchema: T, prefix?: string) {
+  // Generate RemappedBufferView class once (cold path)
+  const RemappedViewClass = prefix
+    ? generateRemappedBufferViewClass(createPrefixMapping(unprefixedSchema, prefix))
+    : null;
+
   return {
-    tagAttributes: prefix ? applyPrefix(cleanSchema, prefix) : cleanSchema,
+    // Prefixed schema for application composition
+    tagAttributes: prefix ? applyPrefix(unprefixedSchema, prefix) : unprefixedSchema,
+
+    // Unprefixed schema for library's own buffer creation
+    unprefixedSchema,
 
     createTask: <Args extends any[]>(
       spanName: string,
-      taskFn: (ctx: ContextWithCleanTags<T>, ...args: Args) => any
+      taskFn: (ctx: ContextWithUnprefixedTags<T>, ...args: Args) => any
     ) => {
-      if (prefix) {
-        // Do ALL the work HERE - cold path, at task creation time
-        const cleanNames = Object.keys(cleanSchema.fields);
-        const prefixedNames = cleanNames.map((name) => `${prefix}_${name}`);
+      return async (parentCtx: RequestContext, ...args: Args) => {
+        // Create library's own buffer with unprefixed schema
+        const taskContext = new TaskContext(moduleContext, spanName);
+        const ownBuffer = createSpanBuffer(unprefixedSchema, taskContext, parentCtx.traceId);
 
-        // Generate optimized wrapper function code
-        const mappingCode = cleanNames.map((cleanName, i) => `${cleanName}: ctx.tag.${prefixedNames[i]}`).join(', ');
-
-        const wrapperFunctionCode = `
-          return function(ctx, ...args) {
-            const libraryCtx = { ...ctx, tag: { ${mappingCode} } };
-            return taskFn(libraryCtx, ...args);
+        // Register with parent (remapped if prefixed)
+        if (parentCtx.buffer) {
+          if (RemappedViewClass) {
+            parentCtx.buffer.children.push(new RemappedViewClass(ownBuffer));
+          } else {
+            parentCtx.buffer.children.push(ownBuffer);
           }
-        `;
+        }
 
-        // Create the optimized function ONCE - not in hot path
-        return new Function('taskFn', wrapperFunctionCode)(taskFn);
-      } else {
-        return taskFn;
-      }
+        // Create context with unprefixed buffer
+        const ctx = createSpanContext(ownBuffer, unprefixedSchema, parentCtx);
+
+        // Library code writes to unprefixed columns
+        return await taskFn(ctx, ...args);
+      };
     },
   };
 }
@@ -195,71 +356,69 @@ const processLib = createProcessLibrary('process'); // ✅ Different prefix
 
 ### Cold Path vs Hot Path Optimization
 
-**Cold Path** (Task Creation Time):
+**Cold Path** (Library Module Creation Time):
 
 - Schema analysis and prefix mapping
-- JavaScript code generation via `new Function()`
-- Function compilation and optimization
+- RemappedBufferView class generation via `new Function()`
+- One-time class compilation and V8 optimization
 - Type inference and validation
 
 **Hot Path** (Task Execution Time):
 
-- Single object creation with pre-computed property references
-- Direct TypedArray writes to correct columns
-- No runtime conditionals or proxy overhead
+- Library creates its own SpanBuffer with unprefixed schema
+- Transformed code writes directly to TypedArrays: `ctx._buffer.status_values[0] = 200`
+- **Zero remapping overhead** - no proxy, no function calls for column access
 - Optimal V8 optimization (hidden classes, inline caches)
 
-### Generated Code Example
+### Why No Proxy?
 
-At module context creation time, we create a remapped `TagAPI` class:
+Previous approaches considered using JavaScript Proxy for remapping. This was rejected because:
+
+1. **Proxy traps on every property access** - hot path overhead
+2. **Breaks V8 hidden class optimization** - Proxy objects have dynamic shape
+3. **Unnecessary** - the RemappedBufferView is only needed for cold-path tree traversal
+
+### Transformed Code Example
+
+The lmao-transformer converts fluent tag calls to direct array writes:
 
 ```typescript
-// Library defines clean schema
-const cleanHttpSchema = {
-  status: S.number(),
-  method: S.category(),
-  url: S.text(),
-  duration: S.number(),
-};
+// Library source code (unprefixed):
+ctx.tag.status(200).method('POST');
 
-// Gets prefixed to avoid conflicts
-const prefixedSchema = {
-  http_status: S.number(),
-  http_method: S.category(),
-  http_url: S.text(),
-  http_duration: S.number(),
-};
+// Transformed (direct array access to unprefixed columns):
+{
+  ctx._buffer.status_nulls[0] |= 1;
+  ctx._buffer.status_values[0] = 200;
+  ctx._buffer.method_nulls[0] |= 1;
+  ctx._buffer.method_values[0] = 0; // enum index
+}
+```
 
-// At module context creation, generate remapped TagAPI class using new Function()
-const createRemappedTagAPI = (cleanNames, prefixedNames) => {
-  const attributeMethods = cleanNames
-    .map(
-      (cleanName, i) => `
-    ${cleanName}(value) {
-      this._writeTagEntry();
-      this.buffer.write${capitalize(prefixedNames[i])}(value);
-      return this;
-    }
-  `
-    )
-    .join('\n');
+Since `ctx._buffer` is the library's own buffer with unprefixed schema, these writes work directly.
 
-  // Generate the complete class at module context creation time
-  const RemappedTagAPI = new Function(
-    'BaseTagAPI',
-    `
-    return class extends BaseTagAPI {
-      ${attributeMethods}
-    }
-  `
-  )(TagAPI);
+### Arrow Conversion Example
 
-  return RemappedTagAPI;
-};
+When Arrow conversion walks the tree:
 
-// Library code uses clean names (directly on ctx.tag, not ctx.log.tag):
-ctx.tag.status(200); // Writes to http_status column
-ctx.tag.method('POST'); // Writes to http_method column
+```typescript
+// Root buffer's schema has prefixed columns
+const schema = rootBuffer.task.module.tagAttributes;
+// { userId, http_status, http_method, db_query, ... }
+
+walkSpanTree(rootBuffer, (buffer) => {
+  // For library's RemappedBufferView:
+  // buffer.getColumnIfAllocated('http_status')
+  //   → mapping['http_status'] = 'status'
+  //   → ownBuffer.getColumnIfAllocated('status')
+  //   → returns the actual TypedArray
+
+  for (const [fieldName, _] of schemaFields) {
+    const col = buffer.getColumnIfAllocated(fieldName);
+    // col is undefined for columns this buffer doesn't own
+    // col is the TypedArray for columns it does own
+  }
+});
 ```
 
 ## Arrow Table Output
