@@ -12,7 +12,7 @@
 - **System Overview**: specs/01_trace_logging_system.md - Architecture overview & hot/cold path design
 - **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, tag attributes, feature flags
   [**LMAO**]
-- **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - Request→Module→Task→Span hierarchy [**LMAO**]
+- **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - Request→Op→Span hierarchy, op() pattern [**LMAO**]
 - **Buffer Architecture**: specs/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
   [**ARROW-BUILDER**]
 
@@ -28,13 +28,12 @@
 
 - **Entry Types**: specs/01h_entry_types_and_logging_primitives.md - Unified entry type enum, fluent API
 - **Context API Codegen**: specs/01g_trace_context_api_codegen.md - Runtime code generation for tag methods
-- **Module Context**: specs/01j_module_context_and_spanlogger_generation.md - SpanLogger class generation
+- **Module Context**: specs/01j_module_context_and_spanlogger_generation.md - Op/SpanLogger class generation
 - **Span Scope**: specs/01i_span_scope_attributes.md - Scoped attributes for zero-overhead propagation
 
 ### Integration & Output
 
-- **Module Builder Pattern**: specs/01l_module_builder_pattern.md - `defineModule()`, `.prefix()`, `.use()` API
-  [**LMAO**]
+- **Module Builder Pattern**: specs/01l_module_builder_pattern.md - `defineModule()` + `op()` API [**LMAO**]
 - **Library Integration**: specs/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
 - **AI Agent Integration**: specs/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
 
@@ -227,9 +226,11 @@ Unified enum for ALL trace events:
 ## Library Integration (See specs/01l_module_builder_pattern.md & 01e)
 
 - Libraries use `defineModule({ metadata, schema, deps })` to define their schema
-- Tasks are defined via `const { task } = myLib; export const myTask = task('name', fn)`
+- Ops are defined via `const { op } = myLib; export const myOp = op(async ({ span, log, tag }, ...args) => {})`
+- Ops destructure context: `{ span, log, tag, deps, ff, env }` - take only what you need
+- Span names at call site: `await span('contextual-name', someOp, args)` - caller names spans
+- Deps can be destructured: `const { retry, auth } = deps`
 - Prefix applied at use time: `httpLib.prefix('http').use({ retry: retryLib.prefix('http_retry').use() })`
-- Dependencies pre-bound: `ctx.deps.retry.attempt(1)` instead of `retryTask(ctx, 1)`
 - RemappedBufferView maps prefixed names to unprefixed columns for Arrow conversion
 
 ## Span Scope Attributes (See specs/01i_span_scope_attributes.md)

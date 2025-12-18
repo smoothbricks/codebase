@@ -18,7 +18,8 @@ This is wrong. The system should adapt automatically.
 
 **Key Insight**: Self-tuning is part of the trace logging system, not a general-purpose buffer library. The tuning
 mechanism has clear metrics (overflow rate, utilization) from the specific use case of span logging. Buffer chaining
-handles overflow gracefully while the system learns optimal capacity per module.
+handles overflow gracefully while the system learns optimal capacity per module. The op's internal wrapper creates
+SpanBuffers, enabling per-op tuning.
 
 ### Self-Tuning Benefits
 
@@ -27,7 +28,7 @@ handles overflow gracefully while the system learns optimal capacity per module.
 3. **Memory Safety** - Never causes OOM
 4. **Optimal Throughput** - Balances memory vs performance
 5. **Environment Agnostic** - Same code everywhere
-6. **Per-Span Buffers** - Each span gets its own buffer, avoiding traceId/spanId TypedArrays
+6. **Per-Span Buffers** - Each span gets its own buffer (created by op wrapper), avoiding traceId/spanId TypedArrays
 7. **Buffer Chaining** - Graceful overflow handling while learning optimal capacity
 8. **Freelist Consideration** - May pool buffers if long-lived TypedArrays help V8's GC
 9. **Lazy-to-Eager Column Promotion** - Frequently-used columns automatically pre-allocate (see
@@ -950,12 +951,13 @@ function createModuleContext(...) {
 }
 
 // Create SpanBuffer using module's current class
-function createSpanBuffer(schema, taskContext, traceId) {
-  const SpanBufferClass = taskContext.module.SpanBufferClass;
+// Called by op's internal wrapper, not span() directly
+function createSpanBuffer(schema, opContext, traceId) {
+  const SpanBufferClass = opContext.module.SpanBufferClass;
   const buffer = new SpanBufferClass(capacity);
 
   // Track buffer creation
-  taskContext.module.lazyColumnStats.totalSpanBuffersCreated++;
+  opContext.module.lazyColumnStats.totalSpanBuffersCreated++;
 
   // ... rest of buffer initialization ...
   return buffer;
@@ -1311,11 +1313,26 @@ describe('Lazy-to-eager column promotion', () => {
 });
 ```
 
-## Capacity Statistics Logging
+## Buffer Statistics Logging
 
-Capacity statistics are logged periodically (every 100 flushes by default) to provide visibility into buffer tuning
-performance. The flush scheduler tracks unique modules that have been flushed since the last stats log, and when the
-flush interval is reached, creates a separate RecordBatch with capacity stats entries.
+Buffer statistics are logged periodically (every 100 flushes by default) to provide visibility into buffer tuning
+performance. Statistics use structured entry types with the `uint64_value` system column for efficient columnar storage.
+
+### Entry Types
+
+| Entry Type               | Description                                    | uint64_value              |
+| ------------------------ | ---------------------------------------------- | ------------------------- |
+| `buffer-writes`          | Total entries written across all buffers       | Count of log entries      |
+| `buffer-overflow-writes` | Entries written to overflow buffers            | Count of overflow entries |
+| `buffer-created`         | Number of SpanBuffers allocated                | Buffer count              |
+| `buffer-overflows`       | Times a buffer overflowed (triggered chaining) | Overflow event count      |
+
+### Why Structured Entry Types
+
+1. **Proper columnar data**: No JSON parsing needed - `uint64_value` is a native column type
+2. **Consistent with op metrics**: Same pattern as `op-invocations`, `op-errors`, etc.
+3. **Dictionary-encoded strings**: `package_name`, `entry_type` are already dictionary types - efficient storage
+4. **Single `uint64_value` column**: Reused across all metric types (ops, buffers, feature flags)
 
 ### How It Works
 
@@ -1323,37 +1340,56 @@ flush interval is reached, creates a separate RecordBatch with capacity stats en
    Buffers are added via `register(buffer)` and the array is cleared after each flush (no individual unregister needed).
 
 2. **Module Tracking**: During flush, the scheduler collects a `Set<ModuleContext>` of all unique modules that have been
-   flushed since the last capacity stats log.
+   flushed since the last stats log.
 
 3. **Flush Counter**: A global flush counter tracks how many flushes have occurred. When this counter reaches
-   `CAPACITY_STATS_FLUSH_INTERVAL` (default: 100), capacity stats are logged.
+   `BUFFER_STATS_FLUSH_INTERVAL` (default: 100), buffer stats are logged.
 
-4. **Separate RecordBatch**: Capacity stats are logged as a separate `RecordBatch` appended to the main span data
-   `RecordBatch`. This keeps the implementation clean - no need to pre-allocate vectors with extra capacity or handle
-   capacity stats in every column type's conversion logic.
+4. **Stats Emission**: When the interval is reached, each tracked module emits 4 entries (one per metric type) with:
+   - `timestamp`: Current time
+   - `thread_id`: Current thread
+   - `package_name`: Module's package name (dictionary-encoded)
+   - `entry_type`: One of `buffer-writes`, `buffer-overflow-writes`, `buffer-created`, `buffer-overflows`
+   - `uint64_value`: The metric value
+   - All other columns: null (buffer stats don't have trace/span context)
 
-5. **Stats Format**: Each module gets one row with:
-   - `entry_type`: `capacity-stats`
-   - `package_name`, `package_path`, `git_sha`: From the module
-   - `message`: JSON string containing:
-     - `currentCapacity`: Current buffer capacity
-     - `totalWrites`: Total number of log writes
-     - `overflowWrites`: Number of writes that caused buffer overflow
-     - `totalBuffers`: Total buffers created
-     - `efficiency`: Calculated as `totalWrites / (totalBuffers * currentCapacity)`
-     - `overflowRatio`: Calculated as `overflowWrites / totalWrites`
-   - All other columns: null (capacity stats don't have trace/span context)
+5. **Reset After Logging**: After logging buffer stats, the flush counter and module tracking set are reset.
 
-6. **Reset After Logging**: After logging capacity stats, the flush counter and module tracking set are reset, starting
-   a new interval.
+### Flush Output Example
+
+```
+timestamp | thread_id | package_name | entry_type              | uint64_value
+----------|-----------|--------------|-------------------------|---------------
+1000      | 1         | @myco/http   | period-start            | 0
+1000      | 1         | @myco/http   | buffer-writes           | 50000
+1000      | 1         | @myco/http   | buffer-overflow-writes  | 1200
+1000      | 1         | @myco/http   | buffer-created          | 47
+1000      | 1         | @myco/http   | buffer-overflows        | 3
+```
+
+### Query Example (ClickHouse)
+
+```sql
+SELECT
+  package_name,
+  anyIf(uint64_value, entry_type = 'buffer-writes') as total_writes,
+  anyIf(uint64_value, entry_type = 'buffer-overflow-writes') as overflow_writes,
+  anyIf(uint64_value, entry_type = 'buffer-overflow-writes') /
+    nullIf(anyIf(uint64_value, entry_type = 'buffer-writes'), 0) as overflow_rate,
+  anyIf(uint64_value, entry_type = 'buffer-created') as buffers_created,
+  anyIf(uint64_value, entry_type = 'buffer-overflows') as overflow_events
+FROM traces
+WHERE entry_type LIKE 'buffer-%'
+GROUP BY timestamp, package_name
+ORDER BY overflow_rate DESC
+```
 
 ### Benefits
 
-- **Periodic Logging**: Stats are logged every 100 flushes, avoiding overhead on every flush
-- **Clean Separation**: Capacity stats are in a separate RecordBatch, keeping the main conversion logic simple
-- **Efficient**: Uses bulk null bitmap operations (`setBitRange` for non-null columns, initialized correctly for null
-  columns)
-- **Queryable**: Stats are in the same Arrow table format, making them queryable alongside span data
+- **Native columnar storage**: `uint64_value` is a typed column, no JSON parsing overhead
+- **Efficient aggregation**: ClickHouse/DuckDB can use SIMD on `uint64_value` column
+- **Consistent pattern**: Same structure as op metrics (`op-invocations`, `op-errors`, etc.)
+- **Dictionary compression**: Entry type strings compress well (only 4 unique values)
 
 ## Summary
 
@@ -1368,7 +1404,7 @@ Self-tuning buffers provide:
 - **Buffer chaining** - Overflow handled gracefully while tuning learns optimal size
 - **Freelist optimization** - Consider pooling buffers if long-lived TypedArrays benefit V8 GC
 - **Column promotion** - Lazy columns automatically promote to eager when heavily used
-- **Capacity statistics** - Periodic logging of tuning metrics for observability
+- **Buffer statistics** - Periodic logging of tuning metrics via structured entry types
 
 **Important Note**: This self-tuning is specifically designed for trace logging, where we have clear metrics (spans per
 module, overflow rates, utilization patterns, column usage). The tuning mechanism is part of the trace logging system,

@@ -418,43 +418,55 @@ const AI_AGENT_PROMPTS = {
     CRITICAL: Always use trace logging instead of console.log.
     
     ❌ NEVER generate: console.log('Processing user request');
-    ✅ ALWAYS generate: ctx.withSpan('process-user-request', async () => { ... });
+    ✅ ALWAYS generate: await span('process-user-request', processRequestOp, ...args);
     
     Required patterns:
-    - Use task() wrapper for all operations
-    - Use ctx.tag.* for structured data
-    - Use ctx.ok() and ctx.err() for results
-    - Use ctx.span() for nested operations
+    - Use op() wrapper to define operations
+    - Use span('name', op, ...args) to execute with tracing
+    - Use tag.* for structured data
+    - Use ok() and err() for results
+    
+    Operation definition pattern:
+    const { op } = myModule;
+    const processUser = op(async ({ span, log, tag }, userId: string) => {
+      tag.userId(userId);           // Automatically hashed
+      tag.operation('SELECT');      // Enum validation
+      await span('fetch-data', fetchOp, userId);  // Nested operation
+      return ok({ processed: true });
+    });
     
     Schema examples:
-    ctx.tag.userId(user.id);        // Automatically hashed
-    ctx.tag.duration(45);           // Performance tracking
-    ctx.tag.operation('SELECT');    // Enum validation
+    tag.userId(user.id);            // Automatically hashed
+    tag.duration(45);               // Performance tracking
+    tag.operation('SELECT');        // Enum validation
   `,
 
   featureFlags: `
     Feature flag access patterns:
     
-    Sync flags (direct property access):
-    if (ctx.ff.advancedValidation) { ... }
-    
-    Async flags (method call):
-    const limit = await ctx.ff.get('userSpecificLimit');
-    
-    Usage tracking (for A/B testing):
-    ctx.ff.track('experimentalFeature');
-    // User-defined attributes can be added via chainable API
+    const myOp = op(async ({ ff, tag }) => {
+      // Sync flags (direct property access):
+      if (ff.advancedValidation) { ... }
+      
+      // Async flags (method call):
+      const limit = await ff.get('userSpecificLimit');
+      
+      // Usage tracking (for A/B testing):
+      ff.track('experimentalFeature');
+    });
   `,
 
   environmentVariables: `
     Environment variable access (zero overhead):
     
-    const region = ctx.env.awsRegion;      // Just property access
-    const dbUrl = ctx.env.databaseUrl;     // Real value for app use
-    
-    Security: Environment values only appear in traces if explicitly logged:
-    ctx.tag.region(region);                // Safe to log
-    // ctx.tag.databaseUrl(dbUrl);         // Would be masked
+    const myOp = op(async ({ env, tag }) => {
+      const region = env.awsRegion;      // Just property access
+      const dbUrl = env.databaseUrl;     // Real value for app use
+      
+      // Security: Environment values only appear in traces if explicitly logged:
+      tag.region(region);                // Safe to log
+      // tag.databaseUrl(dbUrl);         // Would be masked
+    });
   `,
 };
 ```
@@ -471,3 +483,18 @@ const AI_AGENT_PROMPTS = {
 
 This integration enables AI agents to make informed decisions based on actual application behavior rather than just code
 analysis.
+
+## Arrow Table Column Reference
+
+When querying trace data via MCP tools, the following columns are available:
+
+| Column                  | Description                                                             |
+| ----------------------- | ----------------------------------------------------------------------- |
+| `message`               | Op/span name (from `span('name', op, ...args)`) or log message template |
+| `package_name`          | npm package name of the module the op is bound to                       |
+| `package_path`          | Path within package where module was defined                            |
+| `entry_type`            | `span-start`, `span-ok`, `span-err`, `info`, `debug`, etc.              |
+| `trace_id`              | Request correlation ID                                                  |
+| `thread_id` + `span_id` | Unique span identifier                                                  |
+
+See [Arrow Table Structure](./01f_arrow_table_structure.md) for complete schema.

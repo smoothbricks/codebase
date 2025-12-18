@@ -16,11 +16,12 @@ This monorepo contains two distinct packages with clear separation of concerns:
 │              High-Level Structured Logging Library               │
 │                                                                  │
 │  • Schema DSL (S.enum/category/text/number/boolean)             │
-│  • Context flow (request→module→task→span)                      │
+│  • Op + Span pattern (op wraps, span invokes)                   │
+│  • Context flow (request→module→op→span)                        │
 │  • SpanBuffer classes with direct properties ($name_*)          │
 │  • Scope classes (SEPARATE from buffer columns)                 │
 │  • Feature flag evaluation                                       │
-│  • Fluent logging API (ctx.tag, ctx.log)                        │
+│  • Fluent logging API (tag, log destructured from ctx)          │
 │  • System columns (timestamps, operations) - ALWAYS eager       │
 │  • User attribute columns - lazy by default                     │
 └─────────────────────────────────────────────────────────────────┘
@@ -51,6 +52,74 @@ This monorepo contains two distinct packages with clear separation of concerns:
 
 - `lmao` depends on `arrow-builder` ✅
 - `arrow-builder` MUST NOT depend on `lmao` ❌
+
+---
+
+## Design Rationale: Why op() + span()?
+
+### Alternative Considered: task('name', fn)
+
+An alternative approach would define operations with names at definition time:
+
+```typescript
+// ALTERNATIVE (rejected): Name at definition time
+const { task } = httpModule;
+
+const GET = task('http-get', async (ctx, url: string) => {
+  ctx.tag.method('GET');
+  // ctx.deps.retry would be a bound closure created per-span
+  await ctx.deps.retry.attempt(1);
+  return ctx.ok(response);
+});
+
+// Invocation - name already baked in
+await GET(httpRoot, 'https://example.com');
+```
+
+**Why this approach was rejected**:
+
+1. **Per-span allocation for deps**: `ctx.deps.retry` would be a bound closure recreated for every span
+2. **Fixed span names**: The caller couldn't provide contextual names
+3. **ctx everywhere**: Passing `ctx` as first argument was verbose and cluttered business logic
+
+### Chosen Approach: op() + span()
+
+The chosen design separates **definition** (op) from **invocation** (span):
+
+```typescript
+// op() just wraps the function, capturing module binding
+const { op } = httpModule;
+
+const GET = op(async ({ span, log, tag, deps }, url: string) => {
+  // Destructure context for ergonomics
+  tag.method('GET');
+  // span() is the unified invocation - NAME provided at call site
+  const response = await span('fetch', fetchOp, url);
+  return response;
+});
+
+// Root invocation - NAME provided at call site
+await httpRoot.span('GET', GET, 'https://example.com');
+```
+
+### Why This Design?
+
+1. **Ergonomics**: Destructuring `{ span, log, tag, deps }` is cleaner than `ctx.` prefix everywhere
+2. **No per-span allocation for deps**: `deps` is just references to Op instances, not closures
+3. **Explicit span naming at call site**: More flexible - caller decides contextual name
+4. **Module binding via closure**: `op()` captures module metadata (gitSha, packageName, packagePath)
+5. **V8 friendly**: Op is a plain class with stable hidden class, no Proxy, no Function subclassing
+
+### Design Comparison
+
+| Aspect         | Alternative (rejected)      | Chosen Approach                 |
+| -------------- | --------------------------- | ------------------------------- |
+| Definition     | `task('name', fn)`          | `op(fn)`                        |
+| Invocation     | `await GET(ctx, args)`      | `await span('name', GET, args)` |
+| Context access | `ctx.tag.userId()`          | `tag.userId()` (destructured)   |
+| Dependencies   | `ctx.deps.retry.attempt(1)` | `span('retry', deps.retry, 1)`  |
+| Dep allocation | Per-span bound closures     | Zero - just Op references       |
+| Name timing    | Definition time             | Call site (invocation time)     |
 
 ---
 
@@ -93,9 +162,10 @@ const values = buffer.userId_values; // Allocates HERE, once, explicitly
 // lmao - logging-aware allocation strategy
 // System columns: ALWAYS eager (hot path critical)
 // User attributes: lazy by default (sparse data)
-const span = ctx.span('operation');
-span.log.info('Starting'); // _timestamps/_operations already allocated (eager)
-span.tag.userId('u123'); // userId column allocated on first use (lazy)
+const GET = op(async ({ span, log, tag }) => {
+  log.info('Starting'); // _timestamps/_operations already allocated (eager)
+  tag.userId('u123'); // userId column allocated on first use (lazy)
+});
 ```
 
 ---
@@ -140,6 +210,7 @@ break these optimizations.
 - **Direct properties**: `buffer.userId_values`, not `buffer.columns['userId'].values`
 - **Runtime codegen**: `new Function()` generates monomorphic code with stable call sites
 - **No dynamic property access**: All property names known at codegen time
+- **Op is a plain class**: Stable hidden class, no Proxy, no Function subclassing
 
 ### 4. Application-Agnostic Primitives (arrow-builder)
 
@@ -152,7 +223,7 @@ and prevents feature creep.
 - ✅ CSV-to-Arrow converter
 - ✅ Event sourcing buffer
 - ✅ Database query result caching
-- ❌ Structured logging (needs lmao's spans, scopes, entry types)
+- ❌ Structured logging (needs lmao's ops, spans, scopes, entry types)
 
 ### 5. Scope is SEPARATE from Buffer Columns (lmao)
 
@@ -199,7 +270,7 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 
 ### What arrow-builder MUST NOT know about
 
-- ❌ Logging or tracing concepts (spans, traces, contexts)
+- ❌ Logging or tracing concepts (ops, spans, traces, contexts)
 - ❌ Entry types (info, warn, error, span-start, span-end)
 - ❌ Scope or scoped attributes
 - ❌ Feature flags or evaluation contexts
@@ -314,7 +385,7 @@ A high-level structured logging library providing excellent developer experience
 
 - **Zero-allocation hot path**: Avoid string interpolation and object allocation during logging
 - **Schema-driven type safety**: Compile-time and runtime validation of logged data
-- **Context propagation**: Automatic trace correlation through request→task→span hierarchy
+- **Context propagation**: Automatic trace correlation through request→op→span hierarchy
 - **System column optimization**: timestamps/operations are NEVER lazy
 
 ### What lmao OWNS
@@ -322,22 +393,24 @@ A high-level structured logging library providing excellent developer experience
 1. **Schema DSL** - `S.enum()`, `S.category()`, `S.text()`, `S.number()`, `S.boolean()`
 2. **Tag attribute definitions** - Schema definitions with masking transforms
 3. **Feature flag evaluation** - `defineFeatureFlags()` with sync/async evaluation
-4. **Context flow** - Request context → Module context → Task context → Span context
-5. **SpanBuffer creation** - Extends arrow-builder's ColumnBuffer with span metadata
-6. **Scope class generation** - SEPARATE from buffer columns, holds inheritable values
-7. **SpanLogger generation** - Typed methods per schema field
-8. **Fluent logging API** - `ctx.tag.userId()`, `ctx.log.info()`, `ctx.ok()`, `ctx.err()`
-9. **Entry type semantics** - Span lifecycle (start/ok/err), log levels (info/debug/warn/error)
-10. **System column management** - timestamps, operations (ALWAYS eager, never lazy)
-11. **Library integration** - Prefix-based attribute namespacing for third-party libraries
-12. **Background flush scheduling** - Adaptive flush timing based on buffer capacity
-13. **Tree walking** - Recursive traversal of SpanBuffer trees (parent/children/overflow chains)
-14. **Dictionary building** - Two-pass conversion: build dictionaries across tree, then convert to RecordBatches
-15. **Arrow Table creation** - Orchestrates conversion using shared dictionaries and `arrow.makeData()`
-16. **Utf8Cache** - SIEVE-based cache implementing arrow-builder's `Utf8Encoder` interface
-17. **globalUtf8Cache singleton** - Shared cache for cross-flush UTF-8 encoding benefits
-18. **Pre-encoded contexts** - ModuleContext/TaskContext with `utf8PackageName`, `utf8PackagePath`, `utf8GitSha`,
-    `utf8SpanName`
+4. **Op class** - Wraps functions with module binding, handles buffer creation
+5. **span() invocation** - Unified API for calling ops with contextual naming
+6. **Context flow** - Request context → Op execution → Span hierarchy
+7. **SpanBuffer creation** - Extends arrow-builder's ColumnBuffer with span metadata
+8. **Scope class generation** - SEPARATE from buffer columns, holds inheritable values
+9. **SpanLogger generation** - Typed methods per schema field
+10. **Fluent logging API** - `tag.userId()`, `log.info()`, destructured from context
+11. **Entry type semantics** - Span lifecycle (start/ok/err), log levels (info/debug/warn/error)
+12. **System column management** - timestamps, operations (ALWAYS eager, never lazy)
+13. **Library integration** - Prefix-based attribute namespacing for third-party libraries
+14. **Background flush scheduling** - Adaptive flush timing based on buffer capacity
+15. **Tree walking** - Recursive traversal of SpanBuffer trees (parent/children/overflow chains)
+16. **Dictionary building** - Two-pass conversion: build dictionaries across tree, then convert to RecordBatches
+17. **Arrow Table creation** - Orchestrates conversion using shared dictionaries and `arrow.makeData()`
+18. **Utf8Cache** - SIEVE-based cache implementing arrow-builder's `Utf8Encoder` interface
+19. **globalUtf8Cache singleton** - Shared cache for cross-flush UTF-8 encoding benefits
+20. **Pre-encoded contexts** - ModuleContext with `utf8PackageName`, `utf8PackagePath`, `utf8GitSha`
+21. **Line number injection** - Transformer inserts line as first arg to span()
 
 ### System Columns vs User Attributes
 
@@ -489,8 +562,8 @@ interface SpanBuffer extends ColumnBuffer {
   parent?: SpanBuffer; // Parent span (for child spans) - provides parent_thread_id/parent_span_id
   children: SpanBuffer[]; // Child spans
 
-  // Context link
-  task: TaskContext; // Module context, capacity stats
+  // Op context link
+  op: Op<any, any, any>; // The Op that created this buffer
 
   // Buffer chaining (for overflow)
   next?: SpanBuffer; // Continuation buffer when capacity exceeded
@@ -522,6 +595,68 @@ System properties use `_` prefix to prevent collisions:
 
 ---
 
+## The Op Class
+
+The Op class is the core abstraction for traced operations. It:
+
+1. **Captures module binding** at definition time (gitSha, packageName, packagePath)
+2. **Creates SpanBuffer** when invoked via span()
+3. **Registers with parent** (RemappedBufferView if prefixed)
+4. **Handles try/catch** for span-exception entries
+
+Type parameters are ordered to match the function signature `(ctx, ...args) => Promise<Result>`:
+
+```typescript
+class Op<Ctx, Args extends unknown[], Result> {
+  // Captured at op() call time
+  readonly module: ModuleContext;
+  readonly fn: (ctx: Ctx, ...args: Args) => Promise<Result>;
+
+  constructor(module: ModuleContext, fn: (ctx: Ctx, ...args: Args) => Promise<Result>) {
+    this.module = module;
+    this.fn = fn;
+  }
+
+  // Called by span() - creates buffer, executes fn, handles errors
+  execute(parentCtx: SpanContext, spanName: string, lineNumber: number, ...args: Args): Promise<Result> {
+    // 1. Create SpanBuffer with this module's schema
+    const buffer = createSpanBuffer(
+      this.module.schema,
+      {
+        module: this.module,
+        spanName,
+        lineNumber,
+      },
+      parentCtx.traceId,
+      parentCtx.threadId,
+      parentCtx.buffer
+    );
+
+    // 2. Build destructurable context (satisfies Ctx constraint)
+    const ctx = {
+      span: (name, op, ...opArgs) => op.execute(/* ... */),
+      log: new SpanLogger(buffer),
+      tag: new TagAPI(buffer),
+      deps: this.module.deps, // Just Op references, no allocation!
+      ff: parentCtx.ff.withBuffer(buffer),
+      ...parentCtx.extra, // Spread user-defined Extra fields (e.g., env)
+    } as Ctx;
+
+    // 3. Execute with try/catch for span-exception
+    try {
+      return await this.fn(ctx, ...args);
+    } catch (error) {
+      buffer.writeException(error);
+      throw error;
+    }
+  }
+}
+```
+
+**Key insight**: `deps` is just references to Op instances. No per-span closures needed.
+
+---
+
 ## Runtime Code Generation
 
 Both packages use `new Function()` for performance-critical code:
@@ -544,6 +679,9 @@ Both packages use `new Function()` for performance-critical code:
   - Private fields per attribute
   - Getters/setters for type-safe access
   - `_getScopeValues()` for inheritance
+- `generateTagAPIClass()` - Creates TagAPI with:
+  - Typed attribute methods for span attributes
+  - Fluent chaining
 
 **WHY `new Function()`**:
 
@@ -572,7 +710,6 @@ export function getInterned(str: string): Uint8Array | undefined; // Get if cach
 
 - `S.enum(['A', 'B'])` → interns all enum values
 - `new ModuleContext(...)` → interns `packageName`, `packagePath`, `gitSha`
-- `new TaskContext(...)` → interns `spanName`
 
 **Why in arrow-builder**: Pre-encoding UTF-8 is generic functionality. Any columnar data system benefits from avoiding
 repeated encoding of known strings. The interner has no knowledge of logging concepts.
@@ -624,13 +761,9 @@ class ModuleContext {
   readonly utf8PackagePath: Uint8Array; // intern(packagePath) at construction
   readonly utf8GitSha: Uint8Array; // intern(gitSha) at construction
 }
-
-class TaskContext {
-  readonly utf8SpanName: Uint8Array; // intern(spanName) at construction
-}
 ```
 
-**Why in lmao**: Contexts are logging-specific. arrow-builder doesn't know about modules, tasks, or spans.
+**Why in lmao**: Contexts are logging-specific. arrow-builder doesn't know about modules or spans.
 
 ### Package Ownership Summary
 
@@ -689,6 +822,9 @@ class TaskContext {
 - System column eager allocation
 - User attribute lazy allocation
 - Scope class generation and inheritance
+- Op creation and execution
+- span() invocation semantics
+- Line number injection
 - Context propagation correctness
 - SpanLogger method generation
 - Entry type semantics
@@ -724,12 +860,14 @@ packages/
         │   └── defineTagAttributes.ts    # Schema factory
         ├── codegen/
         │   ├── spanLoggerGenerator.ts    # SpanLogger codegen
+        │   ├── tagApiGenerator.ts        # TagAPI codegen
         │   └── scopeGenerator.ts         # Scope class codegen
+        ├── op.ts                         # Op class - wraps functions with module binding
+        ├── span.ts                       # span() invocation logic
         ├── lmao.ts                       # Main entry, context creation
         ├── spanBuffer.ts                 # SpanBuffer factory (extends ColumnBuffer)
-        ├── types.ts                      # SpanBuffer, TaskContext interfaces
+        ├── types.ts                      # SpanBuffer, Op, SpanContext interfaces
         ├── moduleContext.ts              # ModuleContext with utf8PackageName, utf8PackagePath, utf8GitSha
-        ├── taskContext.ts                # TaskContext with utf8SpanName
         ├── utf8Cache.ts                  # Utf8Cache (SIEVE), globalUtf8Cache singleton
         ├── convertToArrow.ts             # Tree walking, dictionary building, Arrow conversion
         └── flushScheduler.ts             # Background processing
@@ -751,7 +889,8 @@ packages/
 | **Lazy Columns**     | Provides pattern (shared ArrayBuffer)        | Uses for user attributes                     |
 | **System Columns**   | No concept                                   | ALWAYS eager (\_timestamps, \_operations)    |
 | **Scope**            | No concept                                   | SEPARATE class from buffer columns           |
-| **Codegen**          | `generateColumnBufferClass()`                | Extends with SpanLogger, Scope               |
+| **Op/Span**          | No concept                                   | Op wraps fn, span() invokes                  |
+| **Codegen**          | `generateColumnBufferClass()`                | Extends with SpanLogger, TagAPI, Scope       |
 | **String Interning** | `intern()` for known strings (unbounded)     | `Utf8Cache` for runtime strings (SIEVE)      |
 | **UTF-8 Encoding**   | `Utf8Encoder` interface, `DictionaryBuilder` | `globalUtf8Cache`, pre-encoded contexts      |
 | **Tree Walking**     | No concept                                   | Owns tree traversal and dictionary building  |
@@ -766,7 +905,7 @@ packages/
 ```
 Is it logging/tracing specific?
 ├── YES → lmao
-│   Examples: spans, scopes, entry types, masking
+│   Examples: ops, spans, scopes, entry types, masking
 └── NO → Could a metrics app use it?
     ├── YES → arrow-builder
     │   Examples: TypedArray creation, null bitmaps, Arrow conversion
@@ -789,6 +928,8 @@ Is it logging/tracing specific?
 | System columns (\_timestamps, \_ops) | **lmao**      | Logging-specific hot path             |
 | Scope class generation               | **lmao**      | Logging-specific inheritance          |
 | Entry types (span-start, info)       | **lmao**      | Logging-specific lifecycle            |
+| Op class (module binding)            | **lmao**      | Logging-specific operation wrapping   |
+| span() invocation                    | **lmao**      | Logging-specific call-site naming     |
 | SpanLogger with typed methods        | **lmao**      | Logging-specific API                  |
 | Masking functions                    | **lmao**      | Logging-specific privacy              |
 | Context flow                         | **lmao**      | Logging-specific hierarchy            |
@@ -807,7 +948,7 @@ Is it logging/tracing specific?
 
 - [ ] Feature is generic (could be used by metrics, CSV parsing, etc.)
 - [ ] No dependency on lmao types or concepts
-- [ ] No knowledge of logging semantics (tags, spans, scopes)
+- [ ] No knowledge of logging semantics (tags, ops, spans, scopes)
 - [ ] Provides explicit allocation control (no hidden allocations)
 - [ ] Documentation doesn't mention logging/tracing
 

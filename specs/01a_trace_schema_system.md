@@ -666,11 +666,10 @@ enables:
 
 ```typescript
 // Root context has DefaultFlagEvaluator (no user context yet)
-const rootCtx = createRequestContext({
-  requestId: 'req-123',
-  featureFlagSchema,
-  evaluator,
+const rootCtx = appModule.traceContext({
+  ff: evaluator,
   env,
+  requestId: 'req-123',
 });
 
 // When scope.userId is set, create child context with FF re-evaluated
@@ -776,24 +775,28 @@ function forContextBad(additional: Partial<EvaluationContext>): SpanContext {
 **Implementation Pattern**:
 
 ```typescript
-class RequestContext {
-  // Define all properties with stable types
+// TraceContext = System props + Extra (user-defined via .ctx<Extra>())
+class TraceContextImpl<FF, Extra> {
+  // System properties (always present)
   readonly traceId: string;
-  readonly requestId: string;
-  readonly ff: FeatureFlagEvaluator;
-  readonly env: Env;
-  readonly scope: EvaluationContext;
+  readonly anchorEpochMicros: number;
+  readonly anchorPerfNow: number;
+  readonly threadId: bigint;
+  readonly ff: FeatureFlagEvaluator<FF>;
+  readonly span: RootSpanFn;
+
+  // Extra properties are spread from user-defined type
+  // e.g., env: Env, requestId: string, userId?: string
 
   // Prototype method for child creation
-  forContext(additional: Partial<EvaluationContext>): RequestContext {
+  forContext(additional: Partial<EvaluationContext>): TraceContextImpl<FF, Extra> {
     // Create via prototype for V8 optimization
     const child = Object.create(Object.getPrototypeOf(this));
 
     // Copy OWN properties (not prototype methods)
     Object.assign(child, this);
 
-    // Override scope and ff with new values
-    child.scope = { ...this.scope, ...additional };
+    // Override ff with new evaluator bound to additional context
     child.ff = this.ff.forContext(additional);
 
     return child;
@@ -807,11 +810,11 @@ class RequestContext {
 Request Boundary                    Middleware                         Business Logic
 ─────────────────────────────────────────────────────────────────────────────────────────
 
-createRequestContext()              ctx.forContext({ userId })         childCtx.ff.premiumFeatures
+module.traceContext()               ctx.forContext({ userId })         childCtx.ff.premiumFeatures
         │                                     │                                  │
         ▼                                     ▼                                  ▼
 ┌─────────────────┐              ┌─────────────────────────┐         ┌─────────────────────┐
-│ RequestContext  │              │ UserContext             │         │ FF Evaluation       │
+│ TraceContext    │              │ UserContext             │         │ FF Evaluation       │
 │                 │              │                         │         │                     │
 │ ff: evaluator   │──forContext──│ ff: evaluator.forCtx()  │────────▶│ context: { userId } │
 │ scope: {}       │    ({ userId })  scope: { userId }     │         │ ✓ user targeting    │
@@ -966,10 +969,10 @@ When creating a child span, the evaluation context may need to change:
 
 ```typescript
 // Request-level: no specific user yet (batch job processing multiple users)
-const requestCtx = createRequestContext({ requestId: 'req-123' });
+const traceCtx = appModule.traceContext({ ff: ffEvaluator, env, requestId: 'req-123' });
 
 // At this point, ctx.ff evaluates flags without userId context
-const batchEnabled = requestCtx.ff.batchProcessing; // Evaluated without userId
+const batchEnabled = traceCtx.ff.batchProcessing; // Evaluated without userId
 
 // Later, processing a specific user
 await ctx.span('processUser', { userId: 'user-456' }, async (childCtx) => {
@@ -1013,7 +1016,7 @@ interface FlagTracker<T extends TagAttributeSchema> {
 }
 ```
 
-**Why `forContext()` on the evaluator (not RequestContext)**:
+**Why `forContext()` on the evaluator (not TraceContext)**:
 
 - **Encapsulation**: The evaluator owns its context and knows how to merge it
 - **Immutability**: Returns a new evaluator, preserving the parent's context
@@ -1025,7 +1028,7 @@ interface FlagTracker<T extends TagAttributeSchema> {
 When `ctx.span()` is called with additional context:
 
 ```typescript
-// In task wrapper / span creation
+// In op wrapper / span creation
 function createChildSpan(parentCtx, spanName, additionalContext, fn) {
   // Create child buffer
   const childBuffer = createChildSpanBuffer(parentCtx.buffer, spanName);
@@ -1060,32 +1063,42 @@ await ctx.span('validateInput', async (childCtx) => {
 });
 ```
 
-#### RequestContext Structure (Flat)
+#### TraceContext Structure (Flat System Props + User Extra)
 
-The RequestContext remains flat for performance:
+The TraceContext uses flat system properties plus user-defined Extra:
 
 ```typescript
-interface RequestContext {
-  // Trace identifiers
+// System properties on TraceContext
+interface TraceContextSystem<FF> {
+  // Trace identifier
   traceId: string;
-  requestId: string;
 
   // Time anchoring for relative timestamps
   anchorEpochMicros: number;
   anchorPerfNow: number;
 
-  // Optional context that may be set later
-  userId?: string;
+  // Thread identifier for distributed tracing
+  threadId: bigint;
 
-  // Feature flag evaluator (bound to request-level buffer initially)
-  ff: FeatureFlagEvaluator<FeatureFlags>;
+  // Feature flag evaluator
+  ff: FeatureFlagEvaluator<FF>;
 
-  // Environment config (plain object, no tracking)
-  env: EnvironmentConfig;
+  // Root span creation
+  span: RootSpanFn;
 }
+
+// Full TraceContext = System + Extra (user-defined)
+type TraceContext<FF, Extra> = TraceContextSystem<FF> & Extra;
+
+// Example Extra (user-defined via .ctx<Extra>()):
+// {
+//   env: EnvironmentConfig;
+//   requestId: string;
+//   userId?: string;
+// }
 ```
 
-**Note**: No nested `timeAnchor: { epochMicros, perfNow }` - fields are flat for performance.
+**Note**: `requestId` and `userId` are NOT system props - they are user-defined in Extra via `.ctx<Extra>()`.
 
 ## Environment Variable Configuration
 
@@ -1336,7 +1349,7 @@ const ffEvaluator = new FeatureFlagEvaluator(
   new LaunchDarklyClient(ldClient),
 );
 
-// In task wrapper - bind to span context
+// In op wrapper - bind to span context
 function createSpanContext(parentCtx, buffer, ...): SpanContext {
   const ctx: SpanContext = {
     ...parentCtx,
@@ -1407,8 +1420,8 @@ instantiation cost.
 When creating child spans, just call `evaluator.forContext(childCtx)`:
 
 ```typescript
-// In span creation code
-function createChildSpan(parentCtx, spanName, fn) {
+// In span creation code (inside op wrapper)
+function createChildSpan(parentCtx, spanName, opFn, ...args) {
   const childBuffer = createChildSpanBuffer(parentCtx.buffer, spanName);
 
   const childCtx = {
@@ -1420,7 +1433,8 @@ function createChildSpan(parentCtx, spanName, fn) {
     ff: ffEvaluator.forContext(childCtx),
   };
 
-  return fn(childCtx);
+  // Op is invoked with the child context
+  return opFn.invoke(childCtx, spanName, ...args);
 }
 ```
 
@@ -1573,58 +1587,58 @@ With `DefaultFlagValueClient`:
 - Graceful fallback if real client fails
 - Tests don't need external services
 
-### Request Context Creation
+### Trace Context Creation via Module
 
 ```typescript
-// Create context at request boundary
-// Note: ff is NOT set here - it's set per-span in task wrapper
-function createRequestContext(params: { requestId: string; userId?: string }): RequestContext {
+// Create context at request boundary via module.traceContext()
+// This provides type-safe Extra properties
+const ctx = appModule.traceContext({
+  ff: ffEvaluator,
+  env: environmentConfig,
+  requestId: 'req-123',
+  userId: session?.userId,
+});
+
+// Internal implementation:
+function createTraceContext<FF, Extra>(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra> {
   const now = Date.now();
 
   return {
-    // Trace identifiers
+    // System properties
     traceId: generateTraceId(),
-    requestId: params.requestId,
-    userId: params.userId,
-
-    // Time anchoring (FLAT - not nested in timeAnchor object)
     anchorEpochMicros: now * 1000,
     anchorPerfNow: performance.now(),
-
-    // Environment config (plain object, no tracking)
-    env: environmentConfig,
-
-    // Note: ff is NOT here - added per-span via ffEvaluator.forContext(spanCtx)
-  };
+    threadId: workerThreadId,
+    ff: params.ff,
+    span: createRootSpanFn(this),
+    // Spread Extra properties (e.g., env, requestId, userId)
+    ...params,
+  } as TraceContext<FF, Extra>;
 }
 
-// Type definition - all fields flat at top level
-interface RequestContext {
+// Type definition - system props + Extra
+type TraceContext<FF, Extra> = {
   traceId: string;
-  requestId: string;
-  userId?: string;
-
-  // Time anchoring - FLAT for performance
   anchorEpochMicros: number;
   anchorPerfNow: number;
+  threadId: bigint;
+  ff: FeatureFlagEvaluator<FF>;
+  span: RootSpanFn;
+} & Extra;
 
-  // Environment config
-  env: typeof environmentConfig;
-}
-
-// SpanContext extends RequestContext with span-specific properties
-interface SpanContext extends RequestContext {
+// SpanContext extends TraceContext with span-specific properties
+interface SpanContext<Schema, Deps, FF, Extra> extends TraceContext<FF, Extra> {
   buffer: SpanBuffer;
   log: SpanLogger;
-  tag: TagAPI;
-  ff: FlagAccessor; // Bound to this span via ffEvaluator.forContext(this)
+  tag: TagAPI<Schema>;
+  deps: BoundDeps<Deps>;
   ok: <V>(value: V) => SuccessResult<V>;
   err: <E>(code: string, details: E) => ErrorResult<E>;
-  span: (name: string, fn: (ctx: SpanContext) => Promise<any>) => Promise<any>;
+  span: SpanFn;
 }
 ```
 
-### Task Integration
+### Op Integration
 
 ```typescript
 // Define module with schema (see 01l_module_builder_pattern.md for full API)
@@ -1637,84 +1651,75 @@ const userModule = defineModule({
   schema: dbAttributes, // Module's tag attributes
 });
 
-const { task } = userModule;
+const { op } = userModule;
 
-export const createUser = task('create-user', async (ctx, userData: UserData) => {
-  // ctx has: tag, log, ok, err, span, ff (feature flags), env (environment)
+export const createUser = op(async ({ span, log, tag, ok, err, ff, env, deps }, userData: UserData) => {
+  // Destructured ctx has: span, log, tag, ok, err, ff (feature flags), env (environment), deps
 
   // Feature flag access - returns primitive value directly
-  const advancedValidation = ctx.ff.advancedValidation; // boolean, logs ff-access
+  const advancedValidation = ff.advancedValidation; // boolean, logs ff-access
 
   if (advancedValidation) {
     const result = await performAdvancedValidation(userData);
     // Track usage with chainable API
-    ctx.ff.track('advancedValidation');
+    ff.track('advancedValidation');
   }
 
   // Environment access (just plain property access, no tracking)
-  const region = ctx.env.awsRegion; // 'us-east-1'
-  const maxConnections = ctx.env.maxConnections; // 100
-  const dbUrl = ctx.env.databaseUrl; // Real postgres URL
+  const region = env.awsRegion; // 'us-east-1'
+  const maxConnections = env.maxConnections; // 100
+  const dbUrl = env.databaseUrl; // Real postgres URL
 
-  // Span attributes - set context data at span start (via ctx.tag)
-  ctx.tag
-    .requestId(ctx.requestId) // Sets bit 0, writes to attr_requestId column
+  // Span attributes - set context data at span start (via tag)
+  tag
+    .requestId(userData.requestId) // Sets bit 0, writes to attr_requestId column
     .userId(userData.id) // Sets bit 1, writes to attr_userId column
     .operation('INSERT'); // Sets bit 4, writes to attr_operation column
 
   // Or, object-based API for multiple attributes
-  ctx.tag({ requestId: ctx.requestId, userId: userData.id, operation: 'INSERT' });
+  tag({ requestId: userData.requestId, userId: userData.id, operation: 'INSERT' });
 
   // Masking only happens if you explicitly log environment values
-  ctx.tag.region(region); // Safe to log
-  // ctx.tag.databaseUrl(dbUrl);  // Would be masked by tag schema
+  tag.region(region); // Safe to log
+  // tag.databaseUrl(dbUrl);  // Would be masked by tag schema
 
   // Child spans create child SpanBuffers in tree structure
   // Child span inherits parent's FF evaluation context
-  const validation = await ctx.span('validate-user', async (childCtx) => {
-    // childCtx.ff is a NEW evaluator instance bound to childCtx's buffer
-    // Same evaluation context as parent (no additional context needed here)
-    childCtx.tag.query('SELECT COUNT(*) FROM users WHERE email = ?'); // Sets bit 5
-    childCtx.tag.duration(12.5); // Sets bit 2
-
-    if (existingUser) {
-      return childCtx.err('USER_EXISTS').with({ email: userData.email });
-    }
-    return childCtx.ok({ valid: true });
-  });
+  const validation = await span('validate-user', validateUserOp, userData);
+  // validateUserOp is another op that handles validation logic
 
   if (!validation.success) {
-    return ctx.err('VALIDATION_FAILED', validation.error);
+    return err('VALIDATION_FAILED', validation.error);
   }
 
   const user = await db.createUser(userData);
-  return ctx.ok(user);
+  return ok(user);
 });
 
 // Example: Child span with ADDITIONAL evaluation context
-export const processBatch = task('process-batch', async (ctx, users: User[]) => {
+export const processBatch = op(async ({ span, ff, ok }, users: User[]) => {
   // Parent span - no specific user context yet
-  const batchEnabled = ctx.ff.batchProcessing; // Evaluated without userId
+  const batchEnabled = ff.batchProcessing; // Evaluated without userId
 
   for (const user of users) {
     // Child span with additional context - adds userId to evaluation
-    await ctx.span(
-      'process-user',
-      { additionalContext: { userId: user.id, userPlan: user.plan } },
-      async (childCtx) => {
-        // childCtx.ff evaluates flags WITH userId and userPlan context!
-        const premiumEnabled = childCtx.ff.premiumFeatures; // boolean
-
-        if (premiumEnabled) {
-          // This flag was evaluated knowing the user's plan
-          await enablePremiumFeatures(user);
-          childCtx.ff.track('premiumFeatures');
-        }
-      }
-    );
+    // processUserOp is another op that handles per-user processing
+    await span('process-user', processUserOp, user);
   }
 
-  return ctx.ok({ processed: users.length });
+  return ok({ processed: users.length });
+});
+
+// processUserOp receives the user and can access ff with user context
+export const processUserOp = op(async ({ ff, deps }, user: User) => {
+  // ff evaluates flags WITH userId and userPlan context from span creation
+  const premiumEnabled = ff.premiumFeatures; // boolean
+
+  if (premiumEnabled) {
+    // This flag was evaluated knowing the user's plan
+    await enablePremiumFeatures(user);
+    ff.track('premiumFeatures');
+  }
 });
 ```
 

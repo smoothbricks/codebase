@@ -216,18 +216,37 @@ system becomes a row in the final table, enabling rich analytical queries while 
 
 ### Core System Columns (Always Present)
 
-| Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                                                       |
-| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)                                                           | `2024-01-01T10:00:00.000000123Z`                                                                                                     |
-| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)                                                      | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                                                 |
-| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread)                                                  | `0x1a2b3c4d5e6f7890`                                                                                                                 |
-| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                                                             | `1`, `2`, `42`                                                                                                                       |
-| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                                                       |
-| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                                                   |
-| `entry_type`       | `dictionary<string>` | Log entry type                                                                                                | `'span-start'`, `'span-ok'`, `'span-err'`, `'span-exception'`, `'info'`, `'debug'`, `'warn'`, `'error'`, `'ff-access'`, `'ff-usage'` |
-| `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                                                  |
-| `package_path`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                                                   |
-| `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`, `'TypeError: x is not a function'`                       |
+| Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                                 |
+| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
+| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)                                                           | `2024-01-01T10:00:00.000000123Z`                                                                               |
+| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)                                                      | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                           |
+| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread)                                                  | `0x1a2b3c4d5e6f7890`                                                                                           |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                                                             | `1`, `2`, `42`                                                                                                 |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                                 |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                             |
+| `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                       |
+| `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                            |
+| `package_path`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                             |
+| `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`, `'TypeError: x is not a function'` |
+
+### Lazy System Columns (Sparse/Nullable)
+
+These system columns are allocated lazily (only when first written to) because they are used by specific entry types
+rather than every row.
+
+| Column Name    | Type     | Storage          | Description                                                       | Example Values                              |
+| -------------- | -------- | ---------------- | ----------------------------------------------------------------- | ------------------------------------------- |
+| `uint64_value` | `uint64` | `BigUint64Array` | Metric values (counts, durations) and user `.uint64()` API values | `1523`, `68535000000`, `0x1a2b3c4d5e6f7890` |
+
+**Why `uint64_value` is a Lazy System Column**:
+
+1. **Metrics as structured logs**: Same Arrow table, same flush path, same query tools - no separate metrics
+   infrastructure
+2. **Shared by metrics and users**: Both `op-invocations` (count) and user code
+   (`log.info('Done').uint64(bytesProcessed)`) use the same column
+3. **Sparse data**: Most trace rows don't have a uint64 value - only metrics rows and entries where `.uint64()` is
+   called
+4. **Storage efficiency**: `BigUint64Array` with null bitmap means zero overhead for rows that don't use it
 
 **Note on Span Identification**:
 
@@ -269,6 +288,23 @@ two-column design provides significant benefits over a single combined path:
 
 5. **TypeScript transformer compatibility**: The TypeScript transformer computes both pieces via `findNearestPackage()`,
    which returns both `packageName` and `packageDir`. Storing them separately avoids redundant string concatenation.
+
+### Relation to Operations (Ops)
+
+Module metadata comes from the op's bound module at runtime:
+
+```typescript
+const { op } = httpModule;
+
+const GET = op(async ({ span, log, tag }, url: string) => {
+  tag.method('GET');
+  await span('fetch', fetchOp, url); // Span name comes from call site
+});
+```
+
+- **`package_name`**: From the module the op is bound to (`httpModule`)
+- **`package_path`**: From where the module was defined (TypeScript transformer)
+- **Span names**: Come from `span('name', op, ...args)` call sites, stored in `message` column
 
 ### Why NOT Git-Based Identity
 
@@ -664,12 +700,15 @@ The `message` column serves different purposes based on entry type:
 - **For log entries** (`info`, `debug`, `warn`, `error`): Contains the **message template**
 - **For feature flag entries** (`ff-access`, `ff-usage`): Contains the **flag name**
 
-| Entry Type                          | `message` Contains                                           |
-| ----------------------------------- | ------------------------------------------------------------ |
-| `span-start`, `span-ok`, `span-err` | Span name (e.g., `'create-user'`)                            |
-| `span-exception`                    | Exception message (e.g., `'TypeError: x is not a function'`) |
-| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User ${userId} created'`)      |
-| `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)       |
+| Entry Type                          | `message` Contains                                           | `uint64_value` Contains     |
+| ----------------------------------- | ------------------------------------------------------------ | --------------------------- |
+| `span-start`, `span-ok`, `span-err` | Span name (e.g., `'create-user'`)                            | User `.uint64()` value      |
+| `span-exception`                    | Exception message (e.g., `'TypeError: x is not a function'`) | -                           |
+| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User ${userId} created'`)      | User `.uint64()` value      |
+| `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)       | -                           |
+| `period-start`                      | -                                                            | Period start timestamp (ns) |
+| `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                      | Metric value (count or ns)  |
+| `buffer-*` (all 4 buffer types)     | -                                                            | Metric value (count)        |
 
 ### Format String Pattern (CRITICAL)
 
@@ -678,7 +717,10 @@ The `message` column serves different purposes based on entry type:
 When you write:
 
 ```typescript
-ctx.log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount(5);
+// Inside an op function:
+const myOp = op(async ({ log }) => {
+  log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount(5);
+});
 ```
 
 The system stores:
@@ -759,7 +801,8 @@ console.log(`User ${userId} created with ${itemCount} items`);
 **LMAO (format strings):**
 
 ```typescript
-ctx.log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount(5);
+// Inside an op function:
+log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount(5);
 // Stores: template in message, values in typed columns - structured, queryable
 ```
 
@@ -774,8 +817,7 @@ ctx.log.info('User ${userId} created with ${itemCount} items').userId(123).itemC
 
 ### 2. Structured Logging via Entry Type Enum
 
-- **Log levels with structure**: `ctx.log.info('Template ${var}').var(value)` → `entry_type='info'` with typed
-  attributes
+- **Log levels with structure**: `log.info('Template ${var}').var(value)` → `entry_type='info'` with typed attributes
 - **Template storage**: Log message TEMPLATES stored in unified `message` column (NOT interpolated strings)
 - **Values in attribute columns**: Actual values stored separately in `attr_*` columns for type safety and queryability
 - **Optional attributes**: Structured data can accompany log messages
@@ -786,22 +828,74 @@ ctx.log.info('User ${userId} created with ${itemCount} items').userId(123).itemC
 The `entry_type` column uses a dictionary-encoded enum that covers all possible trace events. For complete definitions
 and low-level API details, see **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**.
 
-**Entry Types**: `span-start`, `span-ok`, `span-err`, `span-exception`, `info`, `debug`, `warn`, `error`, `ff-access`,
-`ff-usage`
+**Entry Types** (23 total):
+
+- **Span lifecycle** (4): `span-start`, `span-ok`, `span-err`, `span-exception`
+- **Log levels** (4): `info`, `debug`, `warn`, `error`
+- **Feature flags** (2): `ff-access`, `ff-usage`
+- **Metrics - Period** (1): `period-start`
+- **Metrics - Op** (8): `op-invocations`, `op-errors`, `op-exceptions`, `op-duration-total`, `op-duration-ok`,
+  `op-duration-err`, `op-duration-min`, `op-duration-max`
+- **Metrics - Buffer** (4): `buffer-writes`, `buffer-overflow-writes`, `buffer-created`, `buffer-overflows`
 
 **Key Benefits**:
 
-- **Dictionary encoding**: Entry type strings stored once, referenced by index
-- **Minimal overhead**: Adding new entry types costs almost nothing in Arrow
-- **Unified system**: All trace events use the same enum instead of separate columns
+- **Dictionary encoding**: Entry type strings stored once, referenced by index (1 byte per row)
+- **Self-documenting**: `op-invocations` is clearer than generic `metric` + `name` columns
+- **Unified system**: All trace events (including metrics) use the same table and flush path
 
-### 4. Library Integration
+### 4. Metrics as Structured Logs
+
+Metrics are emitted during flush cycles as structured log rows. This design avoids a separate metrics infrastructure -
+same Arrow table, same query tools, same export path.
+
+**Example Metrics Rows** (all from same flush have identical `timestamp`):
+
+| timestamp | thread_id | package_name | entry_type        | message | uint64_value |
+| --------- | --------- | ------------ | ----------------- | ------- | ------------ |
+| 1000      | 1         | @myco/http   | period-start      |         | 0            |
+| 1000      | 1         | @myco/http   | op-invocations    | GET     | 1523         |
+| 1000      | 1         | @myco/http   | op-errors         | GET     | 8            |
+| 1000      | 1         | @myco/http   | op-exceptions     | GET     | 4            |
+| 1000      | 1         | @myco/http   | op-duration-total | GET     | 68535000000  |
+| 1000      | 1         | @myco/http   | op-duration-ok    | GET     | 65000000000  |
+| 1000      | 1         | @myco/http   | op-duration-err   | GET     | 3535000000   |
+| 1000      | 1         | @myco/http   | op-duration-min   | GET     | 2100000      |
+| 1000      | 1         | @myco/http   | op-duration-max   | GET     | 1203500000   |
+| 1000      | 1         | @myco/http   | buffer-writes     |         | 50000        |
+| 1000      | 1         | @myco/http   | buffer-created    |         | 47           |
+
+**Why This Design**:
+
+1. **Same infrastructure**: No separate metrics store, exporter, or query language
+2. **Specific entry types**: `op-invocations` is self-documenting (vs generic `metric` + `name` columns)
+3. **Duration by outcome**: `op-duration-ok` vs `op-duration-err` reveals if errors are fast-fails or slow timeouts
+4. **Period boundaries**: `period-start` with nanosecond timestamp enables calculating period duration
+
+**Query Example**:
+
+```sql
+-- Op performance summary for last hour
+SELECT
+  message as op_name,
+  sum(CASE WHEN entry_type = 'op-invocations' THEN uint64_value END) as invocations,
+  sum(CASE WHEN entry_type = 'op-errors' THEN uint64_value END) as errors,
+  sum(CASE WHEN entry_type = 'op-duration-total' THEN uint64_value END) / 1e9 as total_seconds,
+  max(CASE WHEN entry_type = 'op-duration-max' THEN uint64_value END) / 1e6 as max_ms
+FROM traces
+WHERE entry_type LIKE 'op-%'
+  AND timestamp > now() - interval 1 hour
+GROUP BY message
+ORDER BY invocations DESC;
+```
+
+### 5. Library Integration
 
 - **HTTP entries**: Multiple rows for single request (start tag, end tag with duration)
 - **Database entries**: Query logged, then duration and row count added
 - **Attribute isolation**: Each library's attributes are cleanly separated in dedicated columns
 
-### 5. Feature Flag Integration via Entry Type Enum
+### 6. Feature Flag Integration via Entry Type Enum
 
 - **Flag evaluation**: `ff-access` entry types capture when flags are checked
 - **Usage tracking**: `ff-usage` entry types capture when flag-gated features are used
@@ -809,9 +903,9 @@ and low-level API details, see **[Entry Types and Logging Primitives](./01h_entr
 - **Type safety**: Feature flag context uses same typed attribute system as other entry types
 - **Query efficiency**: No JSON parsing needed - direct column access for flag context
 
-### 6. Sparse Data Efficiency
+### 7. Sparse Data Efficiency
 
-- **Core columns always present**: 8 system columns in every row
+- **Core columns always present**: 9 system columns in every row (8 eager + 1 lazy `uint64_value` when used)
 - **Attribute columns sparse**: Library-specific columns mostly null
 - **Efficient storage**: Arrow's null bitmap handles sparsity with minimal overhead
 - **Targeted information**: Each row contains only relevant attributes
@@ -969,6 +1063,74 @@ JOIN trace_performance tp ON ft.trace_id = tp.trace_id
 GROUP BY ft.ff_value, up.user_plan;
 ```
 
+### Op and Buffer Metrics Analysis
+
+```sql
+-- Op performance dashboard by package
+SELECT
+  package_name,
+  message as op_name,
+  sum(CASE WHEN entry_type = 'op-invocations' THEN uint64_value END) as invocations,
+  sum(CASE WHEN entry_type = 'op-errors' THEN uint64_value END) as errors,
+  sum(CASE WHEN entry_type = 'op-exceptions' THEN uint64_value END) as exceptions,
+  sum(CASE WHEN entry_type = 'op-duration-total' THEN uint64_value END) / 1e9 as total_sec,
+  sum(CASE WHEN entry_type = 'op-duration-ok' THEN uint64_value END) / 1e9 as ok_sec,
+  sum(CASE WHEN entry_type = 'op-duration-err' THEN uint64_value END) / 1e9 as err_sec,
+  max(CASE WHEN entry_type = 'op-duration-max' THEN uint64_value END) / 1e6 as max_ms,
+  min(CASE WHEN entry_type = 'op-duration-min' THEN uint64_value END) / 1e6 as min_ms
+FROM traces
+WHERE entry_type LIKE 'op-%'
+  AND timestamp > now() - interval 1 hour
+GROUP BY package_name, message
+ORDER BY invocations DESC;
+
+-- Error rate by op (errors are expected, exceptions are bugs)
+SELECT
+  message as op_name,
+  sum(CASE WHEN entry_type = 'op-invocations' THEN uint64_value END) as total,
+  sum(CASE WHEN entry_type = 'op-errors' THEN uint64_value END) as errors,
+  sum(CASE WHEN entry_type = 'op-exceptions' THEN uint64_value END) as exceptions,
+  errors * 100.0 / total as error_rate_pct,
+  exceptions * 100.0 / total as exception_rate_pct
+FROM traces
+WHERE entry_type IN ('op-invocations', 'op-errors', 'op-exceptions')
+GROUP BY message
+HAVING total > 100
+ORDER BY exception_rate_pct DESC;
+
+-- Latency analysis: are errors fast-fails or slow timeouts?
+SELECT
+  message as op_name,
+  sum(CASE WHEN entry_type = 'op-duration-ok' THEN uint64_value END) /
+    nullif(sum(CASE WHEN entry_type = 'op-invocations' THEN uint64_value END) -
+           sum(CASE WHEN entry_type = 'op-errors' THEN uint64_value END) -
+           sum(CASE WHEN entry_type = 'op-exceptions' THEN uint64_value END), 0) / 1e6 as avg_ok_ms,
+  sum(CASE WHEN entry_type = 'op-duration-err' THEN uint64_value END) /
+    nullif(sum(CASE WHEN entry_type = 'op-errors' THEN uint64_value END), 0) / 1e6 as avg_err_ms,
+  CASE
+    WHEN avg_err_ms < avg_ok_ms * 0.5 THEN 'fast-fail'
+    WHEN avg_err_ms > avg_ok_ms * 2 THEN 'slow-timeout'
+    ELSE 'similar'
+  END as error_pattern
+FROM traces
+WHERE entry_type LIKE 'op-%'
+GROUP BY message
+ORDER BY avg_err_ms DESC;
+
+-- Buffer health metrics
+SELECT
+  package_name,
+  sum(CASE WHEN entry_type = 'buffer-writes' THEN uint64_value END) as total_writes,
+  sum(CASE WHEN entry_type = 'buffer-overflow-writes' THEN uint64_value END) as overflow_writes,
+  sum(CASE WHEN entry_type = 'buffer-created' THEN uint64_value END) as buffers_created,
+  sum(CASE WHEN entry_type = 'buffer-overflows' THEN uint64_value END) as overflow_events,
+  overflow_writes * 100.0 / total_writes as overflow_pct
+FROM traces
+WHERE entry_type LIKE 'buffer-%'
+GROUP BY package_name
+ORDER BY overflow_pct DESC;
+```
+
 ## Performance Characteristics
 
 ### Timestamp Precision (High-Resolution Anchored Design)
@@ -979,7 +1141,7 @@ then uses high-resolution timers for all subsequent timestamps. See
 
 **Core Design**:
 
-- ONE `Date.now()` captured at trace root (RequestContext creation)
+- ONE `Date.now()` captured at trace root (TraceContext creation via `module.traceContext()`)
 - ONE high-resolution timer captured at trace root (`performance.now()` or `process.hrtime.bigint()`)
 - All subsequent timestamps: `anchorEpochMicros + (highResNow - anchorHighRes) * scale`
 

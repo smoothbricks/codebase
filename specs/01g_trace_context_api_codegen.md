@@ -15,36 +15,84 @@ property-based APIs.
 **Core Principles**:
 
 - **Unified backend**: All entry types use the same generated column writers
-- **Dual API patterns**: Support both `ctx.tag({ key: value })` and `ctx.tag.key(value)`
-- **Zero runtime overhead**: All expensive work happens at task creation time
+- **Dual API patterns**: Support both `tag({ key: value })` and `tag.key(value)`
+- **Zero runtime overhead**: All expensive work happens at op definition time
 - **Type safety**: Full TypeScript support with schema-driven types
+- **Destructured context**: Context properties available via destructuring in op signatures
+
+## Destructured Context Pattern
+
+The context is destructured directly in op signatures, eliminating `ctx.xxx` drilling:
+
+```typescript
+const GET = op(async ({ span, log, tag, deps, ff, env, scope }, url: string) => {
+  // All context properties available via destructuring
+
+  // Logging
+  log.info('Starting request');
+
+  // Span attributes (writes to row 0)
+  tag.method('GET').url(url);
+
+  // Scope (propagates to all entries)
+  scope({ requestId: req.id });
+
+  // Feature flags
+  const { premiumFeatures } = ff;
+
+  // Call other ops via span()
+  await span('fetch', fetchOp, url);
+
+  // Deps can be destructured too
+  const { retry, auth } = deps;
+  await span('auth', auth, token);
+});
+```
+
+### Context Properties Available via Destructuring
+
+| Property | Purpose                                       |
+| -------- | --------------------------------------------- |
+| `span`   | Invoke other ops: `span('name', op, ...args)` |
+| `log`    | Logging: `log.info()`, `log.warn()`, etc.     |
+| `tag`    | Span attributes: `tag.method('GET')`          |
+| `deps`   | Dependencies (Op instances)                   |
+| `ff`     | Feature flags                                 |
+| `env`    | Environment config                            |
+| `scope`  | Scoped attributes                             |
+| `ok`     | Success result helper                         |
+| `err`    | Error result helper                           |
 
 ## API Patterns
 
 ### Object-Based API (Primary)
 
 ```typescript
-// Console.log operations with optional structured data
-ctx.info('Starting user registration');
-ctx.info('User validation complete', { userId: '123', duration: 45.2 });
-ctx.debug('Database query', { query: 'SELECT * FROM users', rows: 5 });
-ctx.error('Connection failed', { host: 'db.example.com', retries: 3 });
+const processUser = op(async ({ log, tag }, userData) => {
+  // Console.log operations with optional structured data
+  log.info('Starting user registration');
+  log.info('User validation complete').with({ userId: '123', duration: 45.2 });
+  log.debug('Database query').with({ query: 'SELECT * FROM users', rows: 5 });
+  log.error('Connection failed').with({ host: 'db.example.com', retries: 3 });
 
-// Tag operations with structured data
-ctx.tag({ userId: '123', requestId: 'req_456' });
-ctx.tag({ httpStatus: 200, duration: 45.2, cacheHit: true });
+  // Tag operations with structured data
+  tag({ userId: '123', requestId: 'req_456' });
+  tag({ httpStatus: 200, duration: 45.2, cacheHit: true });
+});
 ```
 
 ### Property-Based API (Alternative)
 
 ```typescript
-// Individual property setters (generated from schema)
-ctx.tag.userId('123');
-ctx.tag.httpStatus(200);
-ctx.tag.duration(45.2);
+const processUser = op(async ({ tag }, userData) => {
+  // Individual property setters (generated from schema)
+  tag.userId('123');
+  tag.httpStatus(200);
+  tag.duration(45.2);
 
-// Can be chained
-ctx.tag.userId('123').httpStatus(200).duration(45.2);
+  // Can be chained
+  tag.userId('123').httpStatus(200).duration(45.2);
+});
 ```
 
 ## Codegen Architecture
@@ -77,7 +125,7 @@ Each entry type gets bound versions of the column writers:
 
 ```typescript
 // Generated for tag API - writes directly to row 0 (span-start row)
-// Note: ctx.tag does NOT create a separate entry type - it updates span-start attributes
+// Note: tag does NOT create a separate entry type - it updates span-start attributes
 class TagAPI {
   constructor(private buffer: SpanBuffer) {}
 
@@ -103,52 +151,69 @@ class TagAPI {
   // ... etc for all schema properties
 }
 
-class InfoAPI {
-  constructor(private writers: GeneratedColumnWriters) {}
+class LogAPI {
+  constructor(private buffer: SpanBuffer) {}
 
-  // Console.log compatible with optional attributes
-  (message: string, attributes?: Partial<HttpLibrarySchema>): void {
-    this.writers.writeMessage('info', message);
-    if (attributes) {
-      for (const [key, value] of Object.entries(attributes)) {
-        this.writers[`write${capitalize(key)}`]('info', value);
-      }
+  // Console.log compatible with fluent .with() for attributes
+  info(message: string): FluentLog {
+    this._writeLogEntry('info', message);
+    return this;
+  }
+
+  debug(message: string): FluentLog {
+    this._writeLogEntry('debug', message);
+    return this;
+  }
+
+  warn(message: string): FluentLog {
+    this._writeLogEntry('warn', message);
+    return this;
+  }
+
+  error(message: string): FluentLog {
+    this._writeLogEntry('error', message);
+    return this;
+  }
+
+  with(attributes: Partial<HttpLibrarySchema>): this {
+    for (const [key, value] of Object.entries(attributes)) {
+      this.writers[`write${capitalize(key)}`](value);
     }
+    return this;
   }
 }
 ```
 
 ### 3. Context Assembly
 
-The trace context assembles all entry type APIs:
+The trace context assembles all entry type APIs for destructuring:
 
 ```typescript
-// Generated trace context
-class TraceContext {
-  public readonly tag: TagAPI;
-  public readonly scope: ScopeAPI; // Compiled class with getters/setters
-  public readonly info: InfoAPI;
-  public readonly debug: DebugAPI;
-  public readonly warn: WarnAPI;
-  public readonly error: ErrorAPI;
+// Generated trace context (destructurable)
+// Extra is spread in for user-defined fields (e.g., env with CF Worker bindings)
+type OpContext<Schema, Deps, FF, Extra = {}> = {
+  readonly tag: TagAPI<Schema>;
+  readonly log: LogAPI<Schema>;
+  readonly scope: ScopeAPI<Schema>;
+  readonly span: SpanFn<OpContext<Schema, Deps, FF, Extra>>;
+  readonly deps: Deps;
+  readonly ff: FeatureFlagEvaluator<FF>;
+  readonly ok: <V>(value: V) => FluentSuccessResult<V>;
+  readonly err: <E>(code: string, details?: E) => FluentErrorResult<E>;
+} & Extra;
 
-  constructor(buffer: SpanBuffer, writers: GeneratedColumnWriters) {
-    this.tag = new TagAPI(writers);
-    this.scope = new ScopeAPI(buffer); // Scope needs buffer reference
-    this.info = new InfoAPI(writers);
-    this.debug = new DebugAPI(writers);
-    this.warn = new WarnAPI(writers);
-    this.error = new ErrorAPI(writers);
-  }
-}
+// Usage in op signature - destructure what you need
+const processUser = op(async ({ log, tag, scope, span, ok, err }, userData) => {
+  // Direct access to all context properties
+});
 ```
 
 ## Scope API Code Generation
 
-### ctx.scope as SEPARATE Compiled Class (NOT stored in buffer columns)
+### scope() as Function (NOT stored in buffer columns)
 
-The `ctx.scope` API is a `new Function()` compiled class that is **SEPARATE from buffer columns**. Scope values are
-stored as plain JavaScript properties in the Scope instance, not in TypedArrays.
+The `scope()` function is a `new Function()` compiled callable that is **SEPARATE from buffer columns**. Scope values
+are stored as plain JavaScript properties in the Scope instance, not in TypedArrays.
 
 This separation enables:
 
@@ -158,121 +223,82 @@ This separation enables:
 
 ```typescript
 // Generated at module creation time (cold path)
-function generateScopeClass(schema: Schema): typeof ScopeAPI {
-  // Generate private fields and accessors for each schema attribute
-  const privateFields = Object.keys(schema)
-    .map((key) => `_${key} = undefined;`)
-    .join('\n');
+function generateScopeFunction(schema: Schema): ScopeFunction {
+  // The scope function accepts an object of attributes
+  // and stores them for propagation to all entries
 
-  const accessors = Object.keys(schema)
-    .map(
-      (key) => `
-    get ${key}() { return this._${key}; }
-    set ${key}(value) { this._${key} = value; }
-  `
-    )
-    .join('\n');
-
-  // Generate _getScopeValues() for inheritance
-  const getScopeValuesBody = Object.keys(schema)
-    .map((k) => `${k}: this._${k}`)
-    .join(', ');
-
-  const classCode = `
-    return class GeneratedScope {
-      ${privateFields}
-      ${accessors}
-      _getScopeValues() {
-        return { ${getScopeValuesBody} };
-      }
-    };
-  `;
-
-  return new Function(classCode)();
+  return function scope(attributes: Partial<Schema>) {
+    for (const [key, value] of Object.entries(attributes)) {
+      this._scopeValues[key] = value;
+    }
+  };
 }
 
-// Example generated class for a schema with userId and requestId:
-class GeneratedScope {
-  // Private fields (plain JavaScript, NOT TypedArrays)
-  _userId = undefined;
-  _requestId = undefined;
+// Example usage in op:
+const handleRequest = op(async ({ scope, log }, req) => {
+  // Set scoped attributes via function call
+  scope({ requestId: req.id, userId: req.userId });
 
-  get userId() {
-    return this._userId;
-  }
-  set userId(value) {
-    this._userId = value;
-  }
-
-  get requestId() {
-    return this._requestId;
-  }
-  set requestId(value) {
-    this._requestId = value;
-  }
-
-  // Extract all values for child span inheritance
-  _getScopeValues() {
-    return {
-      userId: this._userId,
-      requestId: this._requestId,
-    };
-  }
-}
+  log.info('Processing'); // Includes requestId, userId
+});
 ```
 
-**Key Design Point**: The Scope class does NOT reference the buffer at all. Scope values are applied to buffer columns
-during write operations or pre-fill operations, NOT stored in the buffer. See 01i_span_scope_attributes.md for the full
-scope lifecycle.
+**Key Design Point**: The Scope function does NOT reference the buffer at all. Scope values are applied to buffer
+columns during write operations or pre-fill operations, NOT stored in the buffer. See 01i_span_scope_attributes.md for
+the full scope lifecycle.
 
 ### Usage Pattern
 
 ```typescript
-// Setting scope values (no allocation)
-ctx.scope.userId = 'user-123';
-ctx.scope.requestId = 'req-456';
+const handleRequest = op(async ({ scope, log, span }, req) => {
+  // Setting scope values (no allocation)
+  scope({ userId: 'user-123', requestId: 'req-456' });
 
-// Reading scope values (including inherited from parent)
-const currentUserId = ctx.scope.userId;
-if (ctx.scope.requestId !== undefined) {
-  console.log('Request ID is set:', ctx.scope.requestId);
-}
+  // All log entries include scoped attributes
+  log.info('Processing request'); // Includes userId, requestId
 
-// Child spans inherit scope values
-await ctx.span('child-operation', async (childCtx) => {
-  console.log(childCtx.scope.userId); // 'user-123' (inherited)
-  childCtx.scope.orderId = 'ord-789'; // Add to scope
+  // Child spans inherit scope values
+  await span('process-order', processOrder, order);
+});
+
+// Child op - inherits scope from parent
+const processOrder = op(async ({ scope, log }, order) => {
+  // Inherited: userId, requestId from parent scope
+  scope({ orderId: order.id }); // Add to scope
+
+  log.info('Processing order'); // Includes userId, requestId, orderId
 });
 ```
 
-### Key Differences from ctx.tag
+### Key Differences from tag
 
-| Aspect     | ctx.tag                               | ctx.scope                                       |
-| ---------- | ------------------------------------- | ----------------------------------------------- |
-| API Style  | Method calls: `ctx.tag.userId('123')` | Property assignment: `ctx.scope.userId = '123'` |
-| Can Read   | No                                    | Yes (via getter)                                |
-| Allocates  | Yes (on first write)                  | No (first assignment)                           |
-| Appears on | Row 0 only                            | ALL rows                                        |
-| Inherited  | No                                    | Yes                                             |
+| Aspect     | tag                                                           | scope                                     |
+| ---------- | ------------------------------------------------------------- | ----------------------------------------- |
+| API Style  | Method calls: `tag.userId('123')` or `tag({ userId: '123' })` | Function call: `scope({ userId: '123' })` |
+| Can Read   | No                                                            | No (write-only)                           |
+| Allocates  | Yes (on first write)                                          | No (first assignment)                     |
+| Appears on | Row 0 only                                                    | ALL rows                                  |
+| Inherited  | No                                                            | Yes                                       |
 
 ## Cold Path vs Hot Path Optimization
 
-### Cold Path (Task Creation Time)
+### Cold Path (Op Definition Time)
 
-All expensive operations happen once when the task is created:
+All expensive operations happen once when the op is defined:
 
 ```typescript
 // Cold path: Generate optimized functions
-function createTask(schema: Schema) {
+function createOp(schema: Schema) {
   // 1. Generate column writers using new Function()
   const writers = generateColumnWriters(schema);
 
   // 2. Create bound entry type API instances
-  const context = new TraceContext(writers);
+  const contextFactory = createContextFactory(writers);
 
-  // 3. Return optimized task function
+  // 3. Return optimized op function
   return (userFunction) => {
     return async (...args) => {
+      const context = contextFactory();
       // Hot path starts here...
       return userFunction(context, ...args);
     };
@@ -280,14 +306,16 @@ function createTask(schema: Schema) {
 }
 ```
 
-### Hot Path (Task Execution Time)
+### Hot Path (Op Execution Time)
 
-Zero overhead during task execution:
+Zero overhead during op execution:
 
 ```typescript
 // Hot path: Direct property access and function calls
-ctx.tag({ userId: '123' }); // → Direct column write
-ctx.info('Processing user', { userId: '123' }); // → Direct column writes
+const processUser = op(async ({ tag, log }, userData) => {
+  tag({ userId: '123' }); // → Direct column write
+  log.info('Processing user').with({ userId: '123' }); // → Direct column writes
+});
 ```
 
 ## Type Safety Integration
@@ -304,16 +332,23 @@ interface LibrarySchema {
 }
 
 // Generated TypeScript interfaces
-interface TagAPI {
-  (attributes: Partial<LibrarySchema>): void;
+interface TagAPI<T> {
+  (attributes: Partial<T>): TagAPI<T>;
   userId(value: string): this;
   httpStatus(value: number): this;
   duration(value: number): this;
   cacheHit(value: boolean): this;
 }
 
-interface InfoAPI {
-  (message: string, attributes?: Partial<LibrarySchema>): void;
+interface LogAPI<T> {
+  info(message: string): FluentLog<T>;
+  debug(message: string): FluentLog<T>;
+  warn(message: string): FluentLog<T>;
+  error(message: string): FluentLog<T>;
+}
+
+interface FluentLog<T> {
+  with(attributes: Partial<T>): FluentLog<T>;
 }
 ```
 
@@ -335,15 +370,15 @@ const httpLib = defineModule({
   },
 });
 
-const { task } = httpLib;
+const { op } = httpLib;
 
 // Usage is fully typed - library uses clean names
-export const apiCall = task('api-call', async (ctx) => {
+export const apiCall = op(async ({ tag, log, ok }) => {
   // TypeScript knows these properties exist and their types
-  ctx.tag.method('GET').url('https://api.example.com');
-  ctx.log.info('Making API call');
-  ctx.tag.status(200).duration(45.2);
-  return ctx.ok({ success: true });
+  tag.method('GET').url('https://api.example.com');
+  log.info('Making API call');
+  tag.status(200).duration(45.2);
+  return ok({ success: true });
 });
 
 // Consumer applies prefix at use time:
@@ -423,14 +458,16 @@ Feature flag entry types (`ff-access` and `ff-usage`) are handled automatically 
 low-level column writers:
 
 ```typescript
-// Clean user API - no logging methods exposed
-if (ctx.ff.advancedValidation) {
-  // Internally creates ff-access entry
-  // ...
-}
+const processUser = op(async ({ ff }, userData) => {
+  // Clean user API - no logging methods exposed
+  if (ff.advancedValidation) {
+    // Internally creates ff-access entry
+    // ...
+  }
 
-// Creates ff-usage entry
-ctx.ff.track('advancedValidation'); // User-defined attributes can be chained
+  // Creates ff-usage entry
+  ff.track('advancedValidation'); // User-defined attributes can be chained
+});
 ```
 
 **Implementation Notes** (design TBD):
@@ -448,8 +485,60 @@ This codegen system integrates with:
   type system and column writer patterns
 - **[Arrow Table Structure](./01f_arrow_table_structure.md)**: Generated APIs populate the final Arrow table structure
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Column writers populate buffer arrays
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Task lifecycle integrates with
-  generated APIs
+- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Op lifecycle integrates with generated
+  APIs
+
+## uint64 Method Generation
+
+### Overview
+
+The `.uint64(value: bigint)` method is generated on:
+
+- **TagAPI** - for `tag.userId('123').uint64(n)`
+- **SpanLogger** - for `log.info('msg').uint64(n)`
+- **Result helpers** - for `ok().uint64(n)`, `err().uint64(n)`
+
+### Generated Code Example
+
+```typescript
+// Generated on TagAPI, SpanLogger, and result helpers
+uint64(value) {
+  const idx = this._buffer.writeIndex - 1;  // Current entry
+  this._buffer.uint64_value_nulls[Math.floor(idx / 8)] |= (1 << (idx % 8));
+  this._buffer.uint64_value_values[idx] = value;
+  return this;
+}
+```
+
+### Usage Examples
+
+```typescript
+const processRecords = op(async ({ log, tag, ok }, records) => {
+  // Attach large integer to tag entry
+  tag.batchId(batchId).uint64(recordCount);
+
+  // Attach to log entry
+  log.info('Processing complete').uint64(bytesProcessed);
+
+  // Attach to result
+  return ok({ success: true }).uint64(totalRecords);
+});
+```
+
+### Why uint64?
+
+1. **Large integers**: JavaScript numbers lose precision above 2^53, BigInt handles full uint64 range
+2. **Metrics reuse**: Same column used by internal metrics (`op-invocations`, etc.) and user code
+3. **Lazy allocation**: `uint64_value` column only allocated when first written (most entries don't use it)
+
+### Storage
+
+| Property | Value                                               |
+| -------- | --------------------------------------------------- |
+| Column   | `uint64_value`                                      |
+| Type     | `BigUint64Array`                                    |
+| Lazy     | Yes (only allocated on first write)                 |
+| Nullable | Yes (null bitmap tracks which entries have a value) |
 
 ## Integration with Arrow Tables
 

@@ -5,7 +5,7 @@
 The Library Integration Pattern enables third-party libraries to provide traced operations with clean APIs while
 avoiding attribute name conflicts. It solves the challenge of:
 
-1. **Clean library authoring**: Libraries write unprefixed code (`ctx.tag.status(200)`)
+1. **Clean library authoring**: Libraries write unprefixed code (`tag.status(200)`)
 2. **Collision avoidance**: Final columns are prefixed (`http_status`, `db_status`)
 3. **Zero hot path overhead**: Library writes directly to its own SpanBuffer with unprefixed columns
 4. **Type safety**: Full TypeScript inference through explicit dependency injection
@@ -35,9 +35,9 @@ the parent that maps prefixed names to unprefixed columns. This enables:
 
 ### The Problem
 
-When a library task creates a child span:
+When a library op creates a child span:
 
-1. **Library's transformed code** writes to unprefixed columns: `ctx._buffer.status_values[0] = 200`
+1. **Library's transformed code** writes to unprefixed columns: `buffer.status_values[0] = 200`
 2. **Parent's tree traversal** (Arrow conversion) iterates with prefixed names from root schema:
    `getColumnIfAllocated('http_status')`
 3. **Application** may have its own `status` column with different meaning
@@ -47,7 +47,7 @@ When a library task creates a child span:
 Instead of trying to remap writes at runtime (which adds hot-path overhead), we:
 
 1. **Library creates its own SpanBuffer** with unprefixed schema (`{ status, method }`)
-2. **Library's ctx.\_buffer** points to this unprefixed buffer - transformed code works directly
+2. **Library's buffer** is used for direct writes - transformed code works directly
 3. **RemappedBufferView** wraps the library buffer, mapping prefixed -> unprefixed for tree traversal
 4. **Parent's children array** contains the RemappedBufferView (not the raw buffer)
 
@@ -112,7 +112,7 @@ function generateRemappedBufferViewClass(
       get _identity() { return this._buffer._identity; }
 
       // Metadata (pass-through)
-      get task() { return this._buffer.task; }
+      get op() { return this._buffer.op; }
 
       // Remapped column access (for Arrow conversion iteration)
       getColumnIfAllocated(name) {
@@ -135,8 +135,8 @@ function generateRemappedBufferViewClass(
 
 **Hot Path (library code execution)**:
 
-- Library's `ctx._buffer` is the raw SpanBuffer with unprefixed columns
-- Transformed code writes directly: `ctx._buffer.status_values[0] = 200`
+- Library's buffer is the raw SpanBuffer with unprefixed columns
+- Transformed code writes directly: `buffer.status_values[0] = 200`
 - Zero overhead - direct TypedArray access
 
 **Cold Path (Arrow conversion)**:
@@ -151,32 +151,74 @@ function generateRemappedBufferViewClass(
 - `view.getColumnIfAllocated('userId')` → `buffer.getColumnIfAllocated('userId')` → `undefined`
 - Arrow conversion handles `undefined` as null column - correct behavior
 
-## Explicit Child Registration
+## Op's Responsibility: Buffer Creation and Registration
 
-SpanBuffer constructors do NOT auto-register with parent. Registration is explicit:
+**Critical Design Point**: The **Op's internal wrapper** (not `span()`) is responsible for buffer creation and
+registration. `span()` just invokes the op and passes metadata (name, line number).
+
+### What the Op Wrapper Does
 
 ```typescript
-// In library's task wrapper (inside .use() implementation):
-const ownBuffer = createSpanBuffer(unprefixedSchema, taskContext, traceId);
+// Inside op's wrapper (conceptual):
+async invoke(parentCtx, spanName, line, ...args) {
+  // 1. Create SpanBuffer with module's UNPREFIXED schema
+  const ownBuffer = createSpanBuffer(unprefixedSchema, opContext, traceId);
 
-if (prefix && parentCtx?.buffer) {
-  // Create remapped view and register with parent
-  const remappedView = new RemappedViewClass(ownBuffer);
-  parentCtx.buffer.children.push(remappedView);
-} else if (parentCtx?.buffer) {
-  // No prefix - register buffer directly
-  parentCtx.buffer.children.push(ownBuffer);
+  // 2. Register with parent - wrap with RemappedBufferView if prefixed
+  if (prefix && parentCtx?.buffer) {
+    const remappedView = new RemappedViewClass(ownBuffer);
+    parentCtx.buffer.children.push(remappedView);
+  } else if (parentCtx?.buffer) {
+    parentCtx.buffer.children.push(ownBuffer);
+  }
+
+  // 3. Setup context with destructured helpers
+  const ctx = {
+    span: boundSpan,      // For child spans
+    log: boundLog,        // For logging
+    tag: tagProxy,        // For setting attributes
+    deps: boundDeps,      // Pre-bound dependencies
+  };
+
+  // 4. Execute user function with try/catch for span-exception
+  try {
+    return await userFn(ctx, ...args);
+  } catch (error) {
+    // Write span-exception entry
+    writeSpanException(ownBuffer, error);
+    throw error;
+  }
 }
-
-// Library code uses raw buffer
-ctx._buffer = ownBuffer;
 ```
 
-This explicit registration enables:
+### Why Op Owns Buffer Creation
 
-1. Libraries to register RemappedBufferView instead of raw buffer
-2. Testing scenarios where auto-registration is undesirable
-3. Clear control flow for debugging
+1. **Schema isolation**: Each library has its own schema - op knows its module's schema
+2. **Prefix mapping**: Op knows if it's prefixed and can create RemappedBufferView
+3. **Exception handling**: Op wrapper catches exceptions for proper span-exception logging
+4. **Dependency injection**: Op wrapper binds deps with their contexts
+
+### What span() Does (Minimal)
+
+```typescript
+// span() is just an invocation helper
+await span('fetch-data', GET, 'https://api.example.com');
+
+// Equivalent to:
+await GET.invoke(currentCtx, 'fetch-data', __LINE__, 'https://api.example.com');
+```
+
+`span()` passes:
+
+- Span name (for logging/tracing)
+- The op to invoke
+- Arguments for the op
+
+It does **NOT**:
+
+- Create buffers
+- Register children
+- Handle exceptions
 
 ## Library Definition with defineModule
 
@@ -187,7 +229,7 @@ Libraries use `defineModule()` to define their schema and dependencies:
 import { defineModule, S } from '@smoothbricks/lmao';
 
 // Define the library's schema (unprefixed)
-export const httpLib = defineModule({
+export const httpModule = defineModule({
   metadata: {
     packageName: '@my-company/http-tracing',
     packagePath: 'src/index.ts',
@@ -199,38 +241,42 @@ export const httpLib = defineModule({
     duration: S.number(),
   },
   deps: {
-    retry: retryLib, // Declare dependency on retry library
+    retry: retryModule, // Declare dependency on retry library
   },
 });
 
-// Define tasks using the module's task factory
-const { task } = httpLib;
+// Get op factory from module
+const { op } = httpModule;
 
-export const GET = task('http-get', async (ctx, url: string, options?: RequestInit) => {
+// Define ops - clean unprefixed API with destructured context
+export const GET = op(async ({ span, log, tag, deps }, url: string, options?: RequestInit) => {
   const startTime = performance.now();
 
-  ctx.tag.method('GET');
-  ctx.tag.url(url);
+  tag.method('GET');
+  tag.url(url);
+
+  // Destructure deps for ergonomics
+  const { retry } = deps;
 
   try {
     const response = await fetch(url, options);
-    ctx.tag.status(response.status);
-    ctx.tag.duration(performance.now() - startTime);
+    tag.status(response.status);
+    tag.duration(performance.now() - startTime);
 
-    // Use dependency - ctx is pre-bound
-    if (!response.ok) {
-      await ctx.deps.retry.attempt(1);
+    if (!response.ok && retry) {
+      // Use dependency via span()
+      await span('retry', retry.attempt, 1);
     }
 
-    return ctx.ok(response);
+    return response;
   } catch (error) {
-    ctx.tag.status(0);
-    ctx.tag.duration(performance.now() - startTime);
-    return ctx.err('HTTP_ERROR', error);
+    tag.status(0);
+    tag.duration(performance.now() - startTime);
+    throw error;
   }
 });
 
-export const POST = task('http-post', async (ctx, url: string, body: unknown) => {
+export const POST = op(async ({ span, log, tag, deps }, url: string, body: unknown) => {
   // Similar implementation...
 });
 ```
@@ -241,20 +287,20 @@ Applications wire libraries with prefixes using the fluent API:
 
 ```typescript
 // Application code
-import { httpLib, GET, POST } from '@my-company/http-tracing';
-import { dbLib, query } from '@my-company/db-tracing';
-import { retryLib } from '@my-company/retry';
+import { httpModule, GET, POST } from '@my-company/http-tracing';
+import { dbModule, query } from '@my-company/db-tracing';
+import { retryModule } from '@my-company/retry';
 
 // Wire dependencies with prefixes
-const httpRoot = httpLib.prefix('http').use({
-  retry: retryLib.prefix('http_retry').use(),
+const httpRoot = httpModule.prefix('http').use({
+  retry: retryModule.prefix('http_retry').use(),
 });
 
-const dbRoot = dbLib.prefix('db').use();
+const dbRoot = dbModule.prefix('db').use();
 
-// Invoke tasks with root context
-const response = await GET(httpRoot, 'https://api.example.com/data');
-const users = await query(dbRoot, 'SELECT * FROM users');
+// Invoke ops via span()
+const response = await httpRoot.span('fetch-users', GET, 'https://api.example.com/users');
+const users = await dbRoot.span('load-users', query, 'SELECT * FROM users');
 ```
 
 ### Application Module with Dependencies
@@ -263,8 +309,8 @@ For applications that compose multiple libraries:
 
 ```typescript
 import { defineModule, S } from '@smoothbricks/lmao';
-import { httpLib, GET } from '@my-company/http-tracing';
-import { dbLib, query } from '@my-company/db-tracing';
+import { httpModule, GET } from '@my-company/http-tracing';
+import { dbModule, query } from '@my-company/db-tracing';
 
 // Application defines its own schema and declares library dependencies
 const appModule = defineModule({
@@ -279,35 +325,38 @@ const appModule = defineModule({
     endpoint: S.category(),
   },
   deps: {
-    http: httpLib,
-    db: dbLib,
+    http: httpModule,
+    db: dbModule,
   },
 });
 
-const { task } = appModule;
+const { op } = appModule;
 
-export const handleRequest = task('handle-request', async (ctx, req: Request) => {
-  ctx.tag.userId(req.userId);
-  ctx.tag.requestId(req.id);
-  ctx.tag.endpoint(req.path);
+export const handleRequest = op(async ({ span, log, tag, deps }, req: Request) => {
+  tag.userId(req.userId);
+  tag.requestId(req.id);
+  tag.endpoint(req.path);
 
-  // Dependencies have ctx pre-bound - just call with args
-  const users = await ctx.deps.db.query('SELECT * FROM users');
-  const external = await ctx.deps.http.GET(req.externalUrl);
+  // Destructure deps for ergonomics
+  const { http, db } = deps;
 
-  return ctx.ok({ users, external });
+  // Invoke library ops via span()
+  const users = await span('query-users', db.query, 'SELECT * FROM users');
+  const external = await span('fetch-external', http.GET, req.externalUrl);
+
+  return { users, external };
 });
 
-// Wire all dependencies
+// Wire all dependencies with prefixes
 const appRoot = appModule.use({
-  http: httpLib.prefix('http').use({
-    retry: retryLib.prefix('http_retry').use(),
+  http: httpModule.prefix('http').use({
+    retry: retryModule.prefix('http_retry').use(),
   }),
-  db: dbLib.prefix('db').use(),
+  db: dbModule.prefix('db').use(),
 });
 
 // Entry point
-await handleRequest(appRoot, incomingRequest);
+await appRoot.span('handle-request', handleRequest, incomingRequest);
 ```
 
 ## Shared Dependencies
@@ -316,14 +365,14 @@ Multiple consumers can share the same dependency instance:
 
 ```typescript
 // GraphQL library needs HTTP internally
-const graphqlLib = defineModule({
+const graphqlModule = defineModule({
   metadata: { packageName: '@my-company/graphql', packagePath: 'src/index.ts' },
   schema: {
     query: S.text(),
     operationName: S.category(),
   },
   deps: {
-    http: httpLib,
+    http: httpModule,
   },
 });
 
@@ -332,19 +381,19 @@ const appModule = defineModule({
   metadata: { ... },
   schema: { userId: S.category() },
   deps: {
-    graphql: graphqlLib,
-    http: httpLib,  // App also uses HTTP directly
+    graphql: graphqlModule,
+    http: httpModule,  // App also uses HTTP directly
   },
 });
 
 // Wire so GraphQL and App share the SAME http instance
-const httpInstance = httpLib.prefix('http').use({
-  retry: retryLib.prefix('http_retry').use(),
+const httpInstance = httpModule.prefix('http').use({
+  retry: retryModule.prefix('http_retry').use(),
 });
 
 const appRoot = appModule.use({
   http: httpInstance,                              // App's direct HTTP
-  graphql: graphqlLib.prefix('graphql').use({
+  graphql: graphqlModule.prefix('graphql').use({
     http: httpInstance,                            // GraphQL's HTTP = SAME instance!
   }),
 });
@@ -355,11 +404,11 @@ const appRoot = appModule.use({
 
 ## Type Safety: Collision Detection
 
-The new pattern provides compile-time collision detection:
+The pattern provides compile-time collision detection:
 
 ```typescript
 // OLD PATTERN (spread) - SILENT COLLISION:
-const { task } = createModuleContext({
+const { op } = createModuleContext({
   tagAttributes: {
     ...httpLib.tagAttributes, // http_status: number
     ...processLib.tagAttributes, // http_status: string -- SILENTLY OVERWRITES!
@@ -370,15 +419,15 @@ const { task } = createModuleContext({
 const appModule = defineModule({
   schema: { ... },
   deps: {
-    http: httpLib,
-    process: processLib,
+    http: httpModule,
+    process: processModule,
   },
 });
 
 // When both use same prefix in .use(), TypeScript catches it:
 appModule.use({
-  http: httpLib.prefix('http').use(),
-  process: processLib.prefix('http').use(), // TYPE ERROR: collision on http_status
+  http: httpModule.prefix('http').use(),
+  process: processModule.prefix('http').use(), // TYPE ERROR: collision on http_status
 });
 ```
 
@@ -393,10 +442,10 @@ appModule.use({
 - One-time class compilation and V8 optimization
 - Type inference and validation
 
-**Hot Path** (Task Execution Time):
+**Hot Path** (Op Execution Time):
 
-- Library creates its own SpanBuffer with unprefixed schema
-- Transformed code writes directly to TypedArrays: `ctx._buffer.status_values[0] = 200`
+- Op creates its own SpanBuffer with unprefixed schema
+- Transformed code writes directly to TypedArrays: `buffer.status_values[0] = 200`
 - **Zero remapping overhead** - no proxy, no function calls for column access
 - Optimal V8 optimization (hidden classes, inline caches)
 
@@ -414,18 +463,19 @@ The lmao-transformer converts fluent tag calls to direct array writes:
 
 ```typescript
 // Library source code (unprefixed):
-ctx.tag.status(200).method('POST');
+tag.status(200);
+tag.method('POST');
 
 // Transformed (direct array access to unprefixed columns):
 {
-  ctx._buffer.status_nulls[0] |= 1;
-  ctx._buffer.status_values[0] = 200;
-  ctx._buffer.method_nulls[0] |= 1;
-  ctx._buffer.method_values[0] = 0; // enum index
+  buffer.status_nulls[0] |= 1;
+  buffer.status_values[0] = 200;
+  buffer.method_nulls[0] |= 1;
+  buffer.method_values[0] = 0; // enum index
 }
 ```
 
-Since `ctx._buffer` is the library's own buffer with unprefixed schema, these writes work directly.
+Since the op's buffer has unprefixed schema, these writes work directly.
 
 ### Arrow Conversion Example
 
@@ -433,7 +483,7 @@ When Arrow conversion walks the tree:
 
 ```typescript
 // Root buffer's schema has prefixed columns
-const schema = rootBuffer.task.module.tagAttributes;
+const schema = rootBuffer.op.module.tagAttributes;
 // { userId, http_status, http_method, db_query, ... }
 
 walkSpanTree(rootBuffer, (buffer) => {
@@ -533,8 +583,8 @@ This pattern integrates with other components:
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Provides the schema definition and composition mechanisms
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generates prefixed TypedArray columns based
   on composed schemas
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Implements the task wrapper pattern
-  that libraries build upon
+- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Implements the op wrapper pattern that
+  libraries build upon
 - **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Details the runtime code generation that creates
   the optimized library APIs
 

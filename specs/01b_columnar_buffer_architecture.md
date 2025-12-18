@@ -204,43 +204,46 @@ const filename = `traces-${Date.now()}.parquet`;
 ### Browser Implementation
 
 ```typescript
-// ONE Date.now() captured at trace root (RequestContext creation)
+// ONE Date.now() captured at trace root (TraceContext creation)
 // ONE performance.now() captured at trace root
 // All subsequent timestamps use delta calculation
 
-interface RequestContext {
+// TraceContext system props (Extra props defined via .ctx<Extra>())
+interface TraceContextSystem<FF> {
   traceId: string;
-  requestId: string;
-  userId?: string;
 
   // Time anchor - flat primitives, not nested object
   anchorEpochMicros: number; // Date.now() * 1000 at trace root
   anchorPerfNow: number; // performance.now() at trace root
 
-  ff: FeatureFlagEvaluator;
-  env: Env;
+  // Thread/worker ID for distributed tracing
+  threadId: bigint;
+
+  ff: FeatureFlagEvaluator<FF>;
+  span: RootSpanFn;
 }
 
-function createRequestContext(params: RequestParams): RequestContext {
+// Full TraceContext = System + Extra (user-defined)
+type TraceContext<FF, Extra> = TraceContextSystem<FF> & Extra;
+
+// Internal implementation of module.traceContext()
+function createTraceContext<FF, Extra>(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra> {
   const epochMs = Date.now();
   const perfNow = performance.now();
 
   return {
     traceId: generateTraceId(),
-    requestId: params.requestId,
-    userId: params.userId,
-
-    // Capture time anchor once at trace root
     anchorEpochMicros: epochMs * 1000,
     anchorPerfNow: perfNow,
-
-    ff: createFeatureFlagEvaluator(params),
-    env: params.env,
-  };
+    threadId: workerThreadId,
+    ff: params.ff,
+    span: createRootSpanFn(),
+    ...params, // Spread Extra (e.g., env, requestId, userId)
+  } as TraceContext<FF, Extra>;
 }
 
 // All subsequent timestamps derived from anchor
-function getTimestamp(ctx: RequestContext): bigint {
+function getTimestamp(ctx: TraceContext): bigint {
   // Returns nanoseconds since epoch
   // performance.now() - anchorPerfNow gives elapsed ms with sub-ms precision
   return ctx.anchorEpochNanos + BigInt(Math.round((performance.now() - ctx.anchorPerfNow) * 1_000_000));
@@ -260,39 +263,42 @@ function getTimestamp(ctx: RequestContext): bigint {
 // ONE process.hrtime.bigint() captured at trace root
 // All subsequent timestamps use hrtime delta
 
-interface RequestContext {
+// TraceContext system props (Extra props defined via .ctx<Extra>())
+interface TraceContextSystem<FF> {
   traceId: string;
-  requestId: string;
-  userId?: string;
 
   // Time anchor - flat primitives
   anchorEpochMicros: number; // Date.now() * 1000 at trace root
   anchorHrTime: bigint; // process.hrtime.bigint() at trace root
 
-  ff: FeatureFlagEvaluator;
-  env: Env;
+  // Thread/worker ID for distributed tracing
+  threadId: bigint;
+
+  ff: FeatureFlagEvaluator<FF>;
+  span: RootSpanFn;
 }
 
-function createRequestContext(params: RequestParams): RequestContext {
+// Full TraceContext = System + Extra (user-defined)
+type TraceContext<FF, Extra> = TraceContextSystem<FF> & Extra;
+
+// Internal implementation of module.traceContext()
+function createTraceContext<FF, Extra>(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra> {
   const epochMs = Date.now();
   const hrTime = process.hrtime.bigint();
 
   return {
     traceId: generateTraceId(),
-    requestId: params.requestId,
-    userId: params.userId,
-
-    // Capture time anchor once at trace root
     anchorEpochMicros: epochMs * 1000,
     anchorHrTime: hrTime,
-
-    ff: createFeatureFlagEvaluator(params),
-    env: params.env,
-  };
+    threadId: workerThreadId,
+    ff: params.ff,
+    span: createRootSpanFn(),
+    ...params, // Spread Extra (e.g., env, requestId, userId)
+  } as TraceContext<FF, Extra>;
 }
 
 // All subsequent timestamps derived from anchor
-function getTimestamp(ctx: RequestContext): bigint {
+function getTimestamp(ctx: TraceContext): bigint {
   // Returns nanoseconds since epoch
   // hrtime.bigint() gives nanoseconds directly
   const elapsedNanos = process.hrtime.bigint() - ctx.anchorHrTime;
@@ -326,20 +332,20 @@ const arrowTimestamps = arrow.TimestampNanosecond.from(buffer.timestamps.subarra
 - Compatible with ClickHouse's `DateTime64(9)` type
 - Matches Arrow's native timestamp precision
 
-### Why Flattened RequestContext
+### Why Flattened TraceContext
 
-The `RequestContext` uses flat primitives instead of nested objects:
+The `TraceContext` uses flat primitives instead of nested objects:
 
 ```typescript
 // ✅ CORRECT: Flat primitives
-interface RequestContext {
+interface TraceContext {
   anchorEpochMicros: number;
   anchorPerfNow: number;
   // ...
 }
 
 // ❌ WRONG: Nested object
-interface RequestContext {
+interface TraceContext {
   timeAnchor: {
     epochMicros: number;
     perfNow: number;
@@ -603,7 +609,7 @@ interface SpanBuffer {
   // Tree structure
   children: SpanBuffer[];
   parent?: SpanBuffer; // Reference to parent SpanBuffer
-  task: TaskContext; // Reference to task + module metadata
+  opContext: OpContext; // Reference to op + module metadata
 
   // Buffer management
   writeIndex: number; // Current write position (0 to capacity-1)
@@ -934,7 +940,7 @@ minimal allocations, and zero conditional logic for system column access.
 │ Properties:                                                                     │
 │   parent: undefined (root has no parent)                                        │
 │   children: SpanBuffer[]                                                        │
-│   task: TaskContext                                                             │
+│   opContext: OpContext                                                          │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -960,7 +966,7 @@ minimal allocations, and zero conditional logic for system column access.
 │ Properties:                                                                     │
 │   parent ──────────────► (parent SpanBuffer - for traceId + parentSpanId)       │
 │   children: SpanBuffer[]                                                        │
-│   task: TaskContext                                                             │
+│   opContext: OpContext                                                          │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
@@ -982,19 +988,19 @@ minimal allocations, and zero conditional logic for system column access.
 │ Properties:                                                                     │
 │   parent ──────────────► (same as first buffer's parent)                        │
 │   children: [] (only root buffer tracks children)                               │
-│   task: TaskContext                                                             │
+│   opContext: OpContext                                                          │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
 ### Memory Savings
 
-| Buffer Type | Old Design (separate allocations)                   | New Design (unified \_system)          |
+| Buffer Type | Separate Allocations (alternative)                  | Unified \_system (chosen)              |
 | ----------- | --------------------------------------------------- | -------------------------------------- |
 | Root        | 25 bytes identity + timestamps AB + ops AB          | Single AB: capacity\*9 + 13 + traceLen |
 | Child       | 25 bytes identity + timestamps AB + ops AB          | Single AB: capacity\*9 + 12            |
 | Chained     | 25 bytes identity (copied) + timestamps AB + ops AB | Single AB: capacity\*9 (no identity!)  |
 
-**Key savings:**
+**Key savings from unified approach:**
 
 - Root/Child: 2 fewer ArrayBuffer allocations per span
 - Chained: 12-141 bytes saved (no identity bytes at all) + zero copy
@@ -1104,19 +1110,19 @@ class SpanBuffer {
   parent?: SpanBuffer;
   children: SpanBuffer[];
   next?: SpanBuffer;
-  task: TaskContext;
+  opContext: OpContext;
   writeIndex: number;
   capacity: number;
 
   constructor(
     capacity: number,
-    task: TaskContext,
+    opContext: OpContext,
     parent?: SpanBuffer,
     isChained = false,
     traceId?: string // Only for root spans
   ) {
     this.capacity = capacity;
-    this.task = task;
+    this.opContext = opContext;
     this.writeIndex = 0;
     this.children = [];
 
@@ -1363,7 +1369,8 @@ function generateTraceId(): TraceId {
 const traceId = request.headers['x-trace-id'] ? createTraceId(request.headers['x-trace-id']) : generateTraceId();
 
 // Pass to all spans by reference (no copy)
-const rootSpan = createSpanBuffer(schema, taskContext, traceId);
+// Op's internal wrapper creates the buffer
+const rootSpan = createSpanBuffer(schema, opContext, traceId);
 const childSpan = createChildSpanBuffer(rootSpan); // Inherits same traceId reference
 
 // All spans in trace share the SAME string reference
@@ -1570,10 +1577,11 @@ This enables V8 to:
 - **No traceId/spanId arrays**: These are constant per buffer, stored as properties
 - **Symbol-based storage**: Per-instance storage via Symbol keys (no closure sharing bugs)
 - **Minimal interface**: Only essential fields, no capacity/length bloat
-- **Shared references**: Module context shared across all tasks
+- **Shared references**: Module context shared across all ops
 - **Tree structure**: Efficient parent-child span relationships
 - **Buffer chaining**: Handle overflow with linked buffers (part of self-tuning mechanism)
 - **Freelist consideration**: May keep pool of buffers if long-lived TypedArrays help V8's GC
+- **Op creates buffers**: The op's internal wrapper creates SpanBuffers, not span() directly
 
 **Scope Values** (SEPARATE from buffer):
 
@@ -1610,18 +1618,18 @@ interface ComposedSpanBuffer extends SpanBuffer {
 
 // attr_ prefix prevents conflicts with SpanBuffer internal fields
 // Without prefix, user attribute "parent" would conflict with buffer.parent
-// Without prefix, user attribute "task" would conflict with buffer.task
+// Without prefix, user attribute "opContext" would conflict with buffer.opContext
 // Without prefix, user attribute "writeIndex" would conflict with buffer.writeIndex
 
 function createSpanBuffer<T extends TagAttributeSchema>(
   schema: T,
-  taskContext: TaskContext,
+  opContext: OpContext,
   traceId: string,
   workerThreadId: bigint, // 64-bit random ID from worker context
   parentBuffer?: SpanBuffer // Optional parent buffer for tree linking
 ): SpanBuffer {
   const spanId = nextSpanId++; // Simple increment (cheap!)
-  return createEmptySpanBuffer(spanId, traceId, workerThreadId, schema, taskContext, parentBuffer);
+  return createEmptySpanBuffer(spanId, traceId, workerThreadId, schema, opContext, parentBuffer);
 }
 
 // Per-worker (thread-local) counter - NOT per-trace, NOT global
@@ -1633,12 +1641,12 @@ function createEmptySpanBuffer<T extends TagAttributeSchema>(
   traceId: string,
   workerThreadId: bigint,
   schema: T,
-  taskContext: TaskContext,
+  opContext: OpContext,
   parentBuffer?: SpanBuffer
 ): SpanBuffer {
   // Use runtime-generated class from arrow-builder
   // The class has lazy getters for all attribute columns
-  const columnBuffer = createColumnBuffer(schema, taskContext.module.spanBufferCapacityStats.currentCapacity);
+  const columnBuffer = createColumnBuffer(schema, opContext.module.spanBufferCapacityStats.currentCapacity);
 
   // Extend with span-specific metadata
   const buffer = columnBuffer as SpanBuffer;
@@ -1657,7 +1665,7 @@ function createEmptySpanBuffer<T extends TagAttributeSchema>(
     parentBuffer.children.push(buffer);
   }
 
-  taskContext.module.spanBufferCapacityStats.totalBuffersCreated++;
+  opContext.module.spanBufferCapacityStats.totalBuffersCreated++;
   return buffer;
 }
 
@@ -1669,20 +1677,22 @@ function createEmptySpanBuffer<T extends TagAttributeSchema>(
 function createNextBuffer(buffer: SpanBuffer): SpanBuffer {
   // Buffer chaining is part of the self-tuning mechanism (see 01b2_buffer_self_tuning.md)
   // When a buffer overflows, we chain to a new buffer for the SAME logical span
-  // The chained buffer inherits threadId + spanId and uses the same task context
+  // The chained buffer inherits threadId + spanId and uses the same op context
   return createEmptySpanBuffer(
     buffer.spanId, // Same logical span (same span ID)
     buffer.traceId,
     buffer.threadId, // Same thread ID (chained buffer is in same worker)
     getSchemaFromBuffer(buffer), // Re-use schema
-    buffer.task, // Re-use task context
+    buffer.opContext, // Re-use op context
     buffer.parent // Parent is the same as the current buffer's parent
   );
 }
 
-function createChildSpan(parentBuffer: SpanBuffer, spanName: string, childFn: SpanFunction) {
-  const childTaskContext: TaskContext = {
-    module: parentBuffer.task.module,
+function createChildSpan(parentBuffer: SpanBuffer, spanName: string, opFn: Op, ...args: unknown[]) {
+  // The op creates the buffer - this is key to the design
+  // Op's internal wrapper creates buffers, not span() directly
+  const childOpContext: OpContext = {
+    module: parentBuffer.opContext.module,
     spanName: spanName, // Raw string - dictionary built during Arrow conversion
     lineNumber: getCurrentLineNumber(), // Build tool injected
   };
@@ -1691,8 +1701,15 @@ function createChildSpan(parentBuffer: SpanBuffer, spanName: string, childFn: Sp
   // NOTE: Scope values are inherited via Scope class, NOT buffer columns
   const childBuffer = createChildSpanBuffer(
     parentBuffer, // Links to parent and inherits traceId
-    childTaskContext
+    childOpContext
   );
+
+  // For prefixed libraries, buffer is wrapped with RemappedBufferView before registration
+  if (childOpContext.module.prefix) {
+    parentBuffer.children.push(new RemappedBufferView(childBuffer, childOpContext.module.prefix));
+  } else {
+    parentBuffer.children.push(childBuffer);
+  }
 
   return childBuffer;
 }
@@ -1782,15 +1799,15 @@ the hot path, deferring dictionary building to the cold path during Arrow conver
 
 ### Why Deferred Interning?
 
-The original design considered using `Uint32Array` with string interning on the hot path:
+An alternative approach would use `Uint32Array` with string interning on the hot path:
 
 ```typescript
-// ❌ ORIGINAL APPROACH (not implemented)
+// ❌ ALTERNATIVE APPROACH (rejected)
 // Hot path would call Map.get/set on every string write
 buffer.attr_userId_values[idx] = categoryInterner.intern(value); // Map lookup per write
 ```
 
-**The actual implementation** stores raw strings directly:
+**The chosen implementation** stores raw strings directly:
 
 ```typescript
 // ✅ ACTUAL IMPLEMENTATION - Deferred interning
@@ -1978,7 +1995,7 @@ const logOperations = {
     const index = buffer.writeIndex++;
 
     // Core columns - always written
-    buffer.timestamps[index] = getTimestamp(buffer.task.requestContext);
+    buffer.timestamps[index] = getTimestamp(buffer.opContext.requestContext);
     buffer.operations[index] = ENTRY_TYPE_INFO;
 
     // Message attribute - DEFERRED INTERNING: store raw string
@@ -2069,7 +2086,7 @@ function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttrib
        *
        * RATIONALE FOR 64-ELEMENT START:
        * - Uint8Array: 64 × 1 = 64 bytes (exactly 1 cache line - optimal)
-       * - Most small tasks fit within 64 operations without overflow
+       * - Most small ops fit within 64 operations without overflow
        * - Prevents dramatic memory inflation from cache alignment padding
        * - Self-tuning will adjust up/down based on actual usage patterns
        *
@@ -2078,14 +2095,14 @@ function createModuleContext(config: { moduleMetadata: ModuleMetadata; tagAttrib
        * Smaller sizes (e.g., 16 elements) would get padded to 64 anyway for cache alignment,
        * causing unexpected memory increases (16 → 64 for Uint8Array = 4x waste).
        */
-      currentCapacity: 64, // Start with cache-friendly size - most tasks fit in 64 operations
+      currentCapacity: 64, // Start with cache-friendly size - most ops fit in 64 operations
       totalWrites: 0,
       overflowWrites: 0,
       totalBuffersCreated: 0,
     },
   };
 
-  return { task: createTaskWrapper(moduleContext, config.tagAttributes) };
+  return { op: createOpWrapper(moduleContext, config.tagAttributes) };
 }
 
 function appendToBuffer(buffer: SpanBuffer, data: any) {
@@ -2101,7 +2118,7 @@ function appendToBuffer(buffer: SpanBuffer, data: any) {
   const index = buffer.writeIndex++;
 
   // Count stats ONCE for self-tuning
-  const stats = originalBuffer.task.module.spanBufferCapacityStats;
+  const stats = originalBuffer.opContext.module.spanBufferCapacityStats;
   stats.totalWrites++;
   if (buffer !== originalBuffer) {
     stats.overflowWrites++; // Went to a chained buffer (triggers tuning)
@@ -2212,31 +2229,31 @@ const moduleContext = createModuleContext({
 //    - Initializes capacity statistics
 ```
 
-### Task Definition (COLD PATH - once per task)
+### Op Definition (COLD PATH - once per op)
 
-Task context creation is also cold path, but lighter than module init:
+Op context creation is also cold path, but lighter than module init:
 
 ```typescript
-// COLD PATH: Happens once when defining a task
-const processUser = moduleContext.task('processUser', async (ctx) => {
+// COLD PATH: Happens once when defining an op
+const processUser = moduleContext.op(async ({ span, log, tag, ok, err }) => {
   // ...
 });
 
-// What happens during task definition:
-// 1. TaskContext creation
-//    - spanName = 'processUser'  // Raw string stored, dict built in cold path
-//    - Reference to module context (no copy)
-// 2. Wrapper function creation
-//    - Captures task context in closure
+// What happens during op definition:
+// 1. Op wrapper creation
+//    - Captures module context in closure
+// 2. Wrapper function that creates OpContext on invocation
+//    - spanName set when span('name', op, args) is called
 ```
 
 ### Span Creation (HOT PATH - every span execution)
 
-This is where performance matters most. Keep allocations minimal:
+This is where performance matters most. Keep allocations minimal. **Key insight**: The op's internal wrapper creates the
+SpanBuffer, not the span() call directly.
 
 ```typescript
-// HOT PATH: Happens on EVERY call to processUser()
-await processUser({ userId: '123' });
+// HOT PATH: Happens on EVERY call to span('processUser', processUserOp, args)
+await rootCtx.span('processUser', processUserOp, { userId: '123' });
 
 // What MUST happen (unavoidable):
 // 1. Allocate SpanBuffer object
@@ -2288,7 +2305,7 @@ index++;
 | Phase           | Frequency       | Allocations Allowed  | Key Operations                             |
 | --------------- | --------------- | -------------------- | ------------------------------------------ |
 | Module Init     | Once per module | Unlimited            | Class generation, schema compilation       |
-| Task Definition | Once per task   | Minimal              | Span name interning, closure creation      |
+| Op Definition   | Once per op     | Minimal              | Closure creation, module context binding   |
 | Span Creation   | Every execution | Buffer + logger only | TypedArray/array allocation, object create |
 | Per-Entry Write | Every log call  | **ZERO**             | Direct array writes (strings deferred)     |
 
@@ -2355,7 +2372,7 @@ async function writeSpanBuffersToArrow(buffers: SpanBuffer[]) {
 }
 
 function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.RecordBatch {
-  const tagAttributes = buffer.task.module.tagAttributes;
+  const tagAttributes = buffer.opContext.module.tagAttributes;
   const arrowVectors: Record<string, arrow.Vector> = {};
 
   // --- Core SpanBuffer Columns ---

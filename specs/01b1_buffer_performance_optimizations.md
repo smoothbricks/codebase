@@ -413,8 +413,7 @@ export const globalUtf8Cache = new Utf8Cache();
 
 **Why No Hot-Path Interning for CATEGORY:**
 
-The original design considered interning strings on the hot path (Map lookup → integer index). This was rejected
-because:
+An alternative approach would intern strings on the hot path (Map lookup → integer index). This was rejected because:
 
 1. **Map lookups add latency**: Even O(1) Map.get() has overhead vs direct array assignment
 2. **Global state complexity**: A global interner requires careful lifecycle management
@@ -1102,8 +1101,9 @@ const moduleCtx = new ModuleContext(
   tagAttributes
 );
 
-// At task creation (per-request, but span names are finite)
-const taskCtx = new TaskContext(
+// At span creation (per-span, but span names are finite)
+// SpanName is passed to op via span('name', op, args)
+const opCtx = new OpContext(
   moduleCtx,
   'processOrder', // intern(spanName) → UTF-8 bytes cached
   lineNumber
@@ -1220,8 +1220,8 @@ class ModuleContext {
   }
 }
 
-// TaskContext (created per task/span)
-class TaskContext {
+// OpContext (created per span execution)
+class OpContext {
   readonly utf8SpanName: Uint8Array; // intern(spanName)
 
   constructor(module, spanName, lineNumber) {

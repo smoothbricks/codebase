@@ -433,13 +433,13 @@ function convertSpanTreeToArrowTable(
 
   // Schema requirement: All buffers must share the same schema
   // This is enforced because the application composes all library schemas into one ModuleContext
-  const expectedSchema = rootBuffers[0].task.module.tagAttributes;
+  const expectedSchema = rootBuffers[0].op.module.tagAttributes;
   for (let i = 1; i < rootBuffers.length; i++) {
-    if (rootBuffers[i].task.module.tagAttributes !== expectedSchema) {
+    if (rootBuffers[i].op.module.tagAttributes !== expectedSchema) {
       throw new Error(
         `Schema mismatch: All buffers in a flush must share the same schema. ` +
-          `Buffer 0 has schema from module ${rootBuffers[0].task.module.packageName}, ` +
-          `but buffer ${i} has schema from module ${rootBuffers[i].task.module.packageName}`
+          `Buffer 0 has schema from module ${rootBuffers[0].op.module.packageName}, ` +
+          `but buffer ${i} has schema from module ${rootBuffers[i].op.module.packageName}`
       );
     }
   }
@@ -663,7 +663,7 @@ interface TreeTraversable {
   threadId: bigint;
   spanId: number;
   parentSpanId: number;
-  task: TaskContext;
+  op: OpContext;
   getColumnIfAllocated(name: string): ColumnValueType | undefined;
   getNullsIfAllocated(name: string): Uint8Array | undefined;
 }
@@ -694,35 +694,43 @@ App Root → RemappedBufferView(HTTP) → RemappedBufferView(Auth) → Auth Buff
            http_status → status       auth_token → token
 ```
 
-### Explicit Child Registration
+### Op's Responsibility: Buffer Registration
 
-SpanBuffer constructors do **not** auto-register with parent's `children[]` array. Registration is explicit at call
-sites:
+SpanBuffer constructors do **not** auto-register with parent's `children[]` array. The **Op's wrapper** handles
+registration explicitly:
 
 ```typescript
-// Standard child span (same schema as parent):
-const childBuffer = createChildSpanBuffer(parentBuffer, taskContext);
-parentBuffer.children.push(childBuffer); // Explicit registration
+// Inside op's wrapper (conceptual):
+async invoke(parentCtx, spanName, line, ...args) {
+  // Op creates its own SpanBuffer with unprefixed schema
+  const ownBuffer = createSpanBuffer(unprefixedSchema, opContext, traceId);
 
-// Library child span (different schema, needs remapping):
-const ownBuffer = createSpanBuffer(unprefixedSchema, taskContext, traceId);
-const remappedView = new RemappedViewClass(ownBuffer);
-parentBuffer.children.push(remappedView); // Register the view, not raw buffer
+  // Op registers with parent - wrap with RemappedBufferView if prefixed
+  if (prefix && parentCtx?.buffer) {
+    const remappedView = new RemappedViewClass(ownBuffer);
+    parentCtx.buffer.children.push(remappedView); // Register the view, not raw buffer
+  } else if (parentCtx?.buffer) {
+    parentCtx.buffer.children.push(ownBuffer);
+  }
+
+  // ... execute user function
+}
 ```
 
-**Why explicit registration?**
+**Why op owns registration (not span())?**
 
-1. **Library integration**: Libraries must register RemappedBufferView, not raw buffer
-2. **Testing flexibility**: Tests can create buffers without polluting parent's children
-3. **Clear control flow**: No hidden side effects in constructors
+1. **Schema knowledge**: Op knows its module's schema and prefix mapping
+2. **RemappedBufferView creation**: Op creates the view if prefixed
+3. **Testing flexibility**: Ops can be tested without polluting parent's children
+4. **Clear control flow**: No hidden side effects - registration happens in op wrapper
 
-**Call sites requiring explicit registration** (as of this spec):
+**Where registration happens**:
 
-| Location                     | Description                          |
-| ---------------------------- | ------------------------------------ |
-| `lmao.ts` - `span()` method  | Inline child span creation           |
-| `lmao.ts` - `task()` wrapper | Cross-module child span              |
-| `library.ts` - `.use()` impl | Library task with RemappedBufferView |
+| Location              | Description                        |
+| --------------------- | ---------------------------------- |
+| Op's internal wrapper | Primary registration point         |
+| `span()` inline child | Delegates to op wrapper            |
+| Library `.use()` impl | Op wrapper with RemappedBufferView |
 
 ## Multiple Root Buffers → Single RecordBatch
 
@@ -741,13 +749,13 @@ dictionary vectors.
    const appModule = defineModule({
      metadata: { ... },
      schema: appSchema,
-     deps: { http: httpLib, db: dbLib },
+     deps: { http: httpModule, db: dbModule },
    });
 
    // Wire dependencies with prefixes at use time
    const appRoot = appModule.use({
-     http: httpLib.prefix('http').use(),
-     db: dbLib.prefix('db').use(),
+     http: httpModule.prefix('http').use(),
+     db: dbModule.prefix('db').use(),
    });
    ```
 

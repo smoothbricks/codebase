@@ -1,55 +1,113 @@
-# Module Context and TagAPI/SpanLogger Generation
+# Module Context and Op/SpanLogger Generation
 
 ## Overview
 
-The module context system provides the foundation for creating task wrappers with generated TagAPI and SpanLogger
-classes. It handles:
+The module context system provides the foundation for creating ops with generated TagAPI and SpanLogger classes. It
+handles:
 
-1. **Module-level configuration** shared across all tasks in the same module
-2. **TagAPI class generation** with typed attribute methods (for `ctx.tag`)
-3. **SpanLogger class generation** with log methods (for `ctx.log`)
-4. **Schema compilation** for both standard and library modules
-5. **Factory patterns** for clean library integration
+1. **Module-level configuration** shared across all ops in the same module
+2. **Op class generation** for traced operations with proper type parameters
+3. **TagAPI class generation** with typed attribute methods (for `tag`)
+4. **SpanLogger class generation** with log methods (for `log`)
+5. **Schema compilation** for both standard and library modules
+6. **User-extensible context** via `.ctx<Extra>()` for custom properties
 
 This system operates at build/startup time to generate efficient runtime code with zero overhead.
 
-## Module Context Definition
+## Design Rationale: From ctx to Destructured Op Context
 
-**Purpose**: Set up module-level configuration that's shared across all tasks in the same module.
+### Problem with ctx Parameter
 
-> **Note**: For the high-level API design (`defineModule`, `.prefix()`, `.use()`), see
-> [Module Builder Pattern](./01l_module_builder_pattern.md). This section describes the internal implementation.
+An alternative approach would pass a monolithic `ctx` object:
 
 ```typescript
-// Define module with schema and dependencies
+// Alternative approach (rejected): ctx drilling everywhere
+const createUser = op(async (ctx, userData) => {
+  ctx.tag.userId(userData.id);
+  ctx.log.info('Creating user');
+  await ctx.span('validate', validateUser, userData); // Pass ctx to everything
+});
+```
+
+### Solution: Destructured Op Context
+
+The chosen design uses ops with destructuring:
+
+```typescript
+// Destructure what you need
+const createUser = op(async ({ span, log, tag }, userData: UserData) => {
+  tag.userId(userData.id);
+  log.info('Creating user');
+  await span('validate', validateUser, userData); // span() handles context
+});
+```
+
+**Benefits**:
+
+- **No ctx drilling**: Just destructure what you need
+- **Span name at call site**: `span('validate', ...)` - caller names it
+- **Clean signatures**: `({ span, log, tag }, userData)` instead of `(ctx, userData)`
+- **Deps destructuring**: `const { retry, auth } = deps`
+- **User-extensible**: Add `env` or other properties via `.ctx<Extra>()`
+
+## Module Definition with defineModule()
+
+**Purpose**: Set up module-level configuration shared across all ops in the module.
+
+```typescript
+// Define module with schema, dependencies, feature flags, and user context
 const userModule = defineModule({
   metadata: {
-    gitSha: 'abc123...',
-    packageName: '@mycompany/user-service',
-    packagePath: 'src/services/user.ts',
+    packageName: '@my-company/user-service',
+    packagePath: 'src/user.ts',
   },
-  schema: dbAttributes, // Module's tag attributes
+  schema: {
+    userId: S.category(),
+    operation: S.enum(['CREATE', 'UPDATE', 'DELETE']),
+  },
   deps: {
-    db: dbLib, // Declare dependencies
+    db: dbLib,
+    cache: cacheLib,
   },
-});
+  ff: {
+    advancedValidation: ff.boolean(),
+  },
+}).ctx<{ env: { dbTimeout: number } }>();
 
-const { task } = userModule;
+// Destructure op factory
+const { op } = userModule;
+```
 
-// Internal implementation
-function defineModule(config: { metadata: ModuleMetadata; schema: TagAttributeSchema; deps?: Record<string, Module> }) {
-  // Standard case: method names = column names
+**Key Design: `.ctx<Extra>()`**
+
+The `.ctx<Extra>()` method specifies user-extensible context properties beyond the built-in `span`, `log`, `tag`,
+`deps`, and `ff`. These properties are spread into OpContext and can be destructured by ops.
+
+### Internal Implementation
+
+```typescript
+interface ModuleMetadata {
+  packageName: string;
+  packagePath: string;
+  gitSha?: string; // Optional - injected by transformer at build time
+}
+
+function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; schema: Schema; deps?: Deps; ff?: FF }) {
+  // Compile schema to generate TagAPI and SpanLogger classes
   const compiledTagOps = compileTagOperations(config.schema);
 
-  // Create module context with metadata
+  // Create module context
   const moduleContext: ModuleContext = {
-    gitSha: config.metadata.gitSha,
-    packageName: config.metadata.packageName,
-    packagePath: config.metadata.packagePath,
+    metadata: config.metadata,
 
-    // Initialize self-tuning capacity stats
+    // Compiled classes
+    TagAPI: compiledTagOps.TagAPI,
+    SpanLogger: compiledTagOps.SpanLogger,
+    compiledSchema: compiledTagOps.schema,
+
+    // Self-tuning capacity stats
     spanBufferCapacityStats: {
-      currentCapacity: 64, // Start with cache-friendly size
+      currentCapacity: 64,
       totalWrites: 0,
       overflowWrites: 0,
       totalBuffersCreated: 0,
@@ -57,73 +115,143 @@ function defineModule(config: { metadata: ModuleMetadata; schema: TagAttributeSc
   };
 
   return {
-    task: createTaskWrapper(moduleContext, compiledTagOps),
     metadata: config.metadata,
     schema: config.schema,
     deps: config.deps || {},
+    ff: config.ff || {},
 
-    // Fluent API for composition
-    prefix(p: string) {
-      return createPrefixedModule(this, p);
+    // Add user-extensible context properties
+    ctx<Extra>() {
+      return {
+        // Op factory - creates Op instances with full context type
+        op: <Args extends unknown[], Result>(
+          fn: (ctx: OpContext<Schema, Deps, FF, Extra>, ...args: Args) => Promise<Result>
+        ): Op<OpContext<Schema, Deps, FF, Extra>, Args, Result> => new Op(moduleContext, fn),
+
+        // Fluent API for composition
+        prefix<P extends string>(p: P) {
+          return createPrefixedModule(this, p);
+        },
+
+        use(wiredDeps: WiredDeps) {
+          return createRootContext(this, wiredDeps);
+        },
+      };
     },
   };
 }
 ```
 
-**Why This Design**:
+## Op Class Generation
 
-- **Shared module context**: All tasks in the same module share metadata and capacity stats
-- **Self-tuning**: Each module learns its optimal buffer capacity independently
-- **Build tool integration**: Module metadata injected automatically
-- **Type safety**: Full TypeScript inference maintained throughout
+The `op()` factory creates Op instances that wrap user functions. Type parameters are ordered to match the function
+signature `(ctx, ...args) => Promise<Result>`:
 
-## TagAPI and SpanLogger Class Generation
+```typescript
+class Op<Ctx, Args extends unknown[], Result> {
+  constructor(
+    private module: ModuleContext,
+    private fn: (ctx: Ctx, ...args: Args) => Promise<Result>
+  ) {}
 
-The `compileTagOperations` function creates the appropriate TagAPI class (for `ctx.tag`) based on the module type:
+  /**
+   * Internal invocation - called by span()
+   */
+  async _invoke(
+    traceCtx: TraceContext,
+    parentBuffer: SpanBuffer | null,
+    spanName: string,
+    args: Args
+  ): Promise<Result> {
+    // 1. Create SpanBuffer
+    const buffer = createSpanBuffer(
+      this.module.compiledSchema,
+      this.module.metadata,
+      traceCtx.traceId,
+      traceCtx.threadId
+    );
+
+    // 2. Link to parent
+    if (parentBuffer) {
+      parentBuffer.children.push(buffer);
+      buffer.parent = parentBuffer;
+    }
+
+    // 3. Write span-start
+    buffer.writeSpanStart(spanName);
+
+    // 4. Create OpContext (satisfies Ctx constraint)
+    const opCtx = {
+      span: (name, childOp, ...childArgs) => childOp._invoke(traceCtx, buffer, name, childArgs),
+      log: new this.module.SpanLogger(buffer),
+      tag: new this.module.TagAPI(buffer),
+      deps: this.module.boundDeps,
+      ff: traceCtx.ff.withBuffer(buffer),
+      // Spread Extra properties from TraceContext (e.g., env, requestId, userId)
+      ...extractExtraFromTraceContext(traceCtx),
+    } as Ctx;
+
+    // 5. Execute with try/catch
+    try {
+      const result = await this.fn(opCtx, ...args);
+      buffer.writeSpanOk();
+      return result;
+    } catch (error) {
+      buffer.writeSpanException(error);
+      throw error;
+    }
+  }
+}
+```
+
+## TagAPI Class Generation
+
+The TagAPI class provides typed attribute methods for `tag`:
 
 ### Standard Compilation
 
 ```typescript
-// Standard compilation: method names = column names
 function compileTagOperations(tagAttributes: TagAttributeSchema) {
   const attributeNames = Object.keys(tagAttributes);
   const TagAPI = generateTagAPIClass(attributeNames, attributeNames, tagAttributes);
+  const SpanLogger = generateSpanLoggerClass(attributeNames, tagAttributes);
 
   return {
     schema: tagAttributes,
     TagAPI,
+    SpanLogger,
   };
 }
 ```
 
-### Library Compilation
+### Library Compilation (Prefixed)
 
 ```typescript
-// Library compilation: clean method names → prefixed column names
 function compilePrefixedTagOperations(cleanSchema: TagAttributeSchema, prefix: string) {
   const cleanNames = Object.keys(cleanSchema);
   const prefixedNames = cleanNames.map((name) => `${prefix}_${name}`);
   const prefixedSchema = createPrefixedSchema(cleanSchema, prefix);
 
   const LibraryTagAPI = generateTagAPIClass(cleanNames, prefixedNames, prefixedSchema);
+  const LibrarySpanLogger = generateSpanLoggerClass(cleanNames, prefixedSchema);
 
   return {
     schema: prefixedSchema,
     TagAPI: LibraryTagAPI,
+    SpanLogger: LibrarySpanLogger,
   };
 }
 ```
 
-### Core Generation Logic
+### TagAPI Generation Logic
 
 ```typescript
-function generateTagAPIClass(methodNames, columnNames, schema) {
-  // Generate individual attribute methods for ctx.tag.attribute()
+function generateTagAPIClass(methodNames: string[], columnNames: string[], schema: TagAttributeSchema) {
+  // Generate individual attribute methods
   const attributeMethods = methodNames
     .map(
       (methodName, i) => `
     ${methodName}(value) {
-      this._writeTagEntry();
       this.buffer.write${capitalize(columnNames[i])}(value);
       return this;
     }
@@ -131,7 +259,7 @@ function generateTagAPIClass(methodNames, columnNames, schema) {
     )
     .join('\n');
 
-  // Generate callable body for ctx.tag({ ... }) object API
+  // Generate callable body for object API: tag({ status: 200 })
   const callableBody = methodNames
     .map(
       (methodName, i) => `
@@ -142,14 +270,12 @@ function generateTagAPIClass(methodNames, columnNames, schema) {
     )
     .join('\n');
 
-  // Create the complete TagAPI class
   return new Function(
     'BaseTagAPI',
     `
     return class extends BaseTagAPI {
-      // Callable for object-based API: ctx.tag({ ... })
+      // Object-based API: tag({ status: 200, method: 'GET' })
       call(attributes) {
-        this._writeTagEntry();
         ${callableBody}
         return this;
       }
@@ -157,31 +283,22 @@ function generateTagAPIClass(methodNames, columnNames, schema) {
       ${attributeMethods}
     }
   `
-  )(TagAPI);
+  )(BaseTagAPI);
 }
 ```
 
-**Why This Approach**:
-
-- **Zero runtime overhead**: All mapping happens at class generation time
-- **Cleaner API**: `ctx.tag.userId()` instead of `ctx.log.tag.userId()`
-- **Type safety**: Both standard and library cases maintain full TypeScript inference
-- **Dual API**: Both `ctx.tag({ ... })` and `ctx.tag.attr()` supported
-- **Separation of concerns**: Standard modules use simple API, libraries handle their own prefixing
-
 ## Generated Code Examples
 
-### Standard Module (no prefix)
+### Standard Module TagAPI
 
 ```typescript
-// Input: { user_id: S.category(), operation: S.enum(['INSERT', 'UPDATE', 'DELETE']) }
-// Generated TagAPI class (for ctx.tag):
+// Input: { userId: S.category(), operation: S.enum(['INSERT', 'UPDATE', 'DELETE']) }
+// Generated TagAPI:
 class StandardTagAPI extends BaseTagAPI {
-  // Object-based API: ctx.tag({ user_id: "123", operation: "INSERT" })
+  // Object API: tag({ userId: "123", operation: "INSERT" })
   call(attributes) {
-    this._writeTagEntry();
-    if (attributes.user_id !== undefined) {
-      this.buffer.writeUserId(attributes.user_id);
+    if (attributes.userId !== undefined) {
+      this.buffer.writeUserId(attributes.userId);
     }
     if (attributes.operation !== undefined) {
       this.buffer.writeOperation(attributes.operation);
@@ -189,77 +306,32 @@ class StandardTagAPI extends BaseTagAPI {
     return this;
   }
 
-  // Chainable API: ctx.tag.user_id("123")
-  user_id(value) {
-    this._writeTagEntry();
+  // Chainable API: tag.userId("123")
+  userId(value) {
     this.buffer.writeUserId(value);
     return this;
   }
 
   operation(value) {
-    this._writeTagEntry();
     this.buffer.writeOperation(value);
     return this;
   }
 }
 ```
 
-As `ctx.tag` writes a new entry (and so does `ctx.log.info()` etc) returning a fluent interface, we need an ESLint rule
-preventing users from capturing the fluent interface in a variable:
-
-```typescript
-let tag = ctx.tag; // INVALID capturing fluent interface
-tag.user_id(123); // INVALID USE via captured reference
-```
-
-### Library Module (with prefix 'http')
+### Library Module TagAPI (with prefix 'http')
 
 ```typescript
 // Input: { status: S.number(), method: S.category() }, prefix: 'http'
-// Generated TagAPI class:
+// Generated TagAPI:
 class LibraryTagAPI extends BaseTagAPI {
   call(attributes) {
-    this._writeTagEntry();
     if (attributes.status !== undefined) {
-      this.buffer.writeHttpStatus(attributes.status); // Clean attr → prefixed column
+      this.buffer.writeHttpStatus(attributes.status); // Clean → prefixed
     }
     if (attributes.method !== undefined) {
       this.buffer.writeHttpMethod(attributes.method);
     }
-    return this;
-  }
-
-  status(value) {
-    this._writeTagEntry();
-    this.buffer.writeHttpStatus(value); // Clean method → prefixed column
-    return this;
-  }
-
-  method(value) {
-    this._writeTagEntry();
-    this.buffer.writeHttpMethod(value);
-    return this;
-  }
-}
-```
-
-As `ctx.tag` writes a new entry (and so does `ctx.log.info()` etc) returning a fluent interface, we need an ESLint rule
-preventing users from capturing the fluent interface in a variable:
-
-```typescript
-let entry = ctx.log.info('entry'); // INVALID capturing fluent interface
-let tag = ctx.tag; // INVALID
-tag.user_id(123); // INVALID USE via captured reference
-```
-
-### Library Module (with prefix 'http')
-
-```typescript
-// Input: { status: S.number(), method: S.category() }, prefix: 'http'
-// Generated class:
-class LibrarySpanLogger extends BaseSpanLogger {
-  get tag() {
-    this._writeTagEntry();
     return this;
   }
 
@@ -272,78 +344,193 @@ class LibrarySpanLogger extends BaseSpanLogger {
     this.buffer.writeHttpMethod(value);
     return this;
   }
-
-  with(attributes) {
-    if (attributes.status !== undefined) {
-      this.buffer.writeHttpStatus(attributes.status); // Clean attr → prefixed column
-    }
-    if (attributes.method !== undefined) {
-      this.buffer.writeHttpMethod(attributes.method);
-    }
-    return this;
-  }
 }
 ```
 
-## TaskContext Type Definition
+## SpanLogger Class Generation
 
-The generic `TaskContext<TSchema>` type that task functions receive:
+The SpanLogger handles log methods (info/debug/warn/error):
 
 ```typescript
-// Generic task context type - exported from the main library
-type TaskContext<TSchema extends ValidAttributes<TSchema> = {}> = {
-  // Span attributes - chainable setters (directly on ctx, not ctx.log.tag)
-  tag: TagAPI<TSchema>;
+function generateSpanLoggerClass(attributeNames: string[], schema: TagAttributeSchema) {
+  // Generate with() method body for attributes
+  const withBody = attributeNames
+    .map(
+      (name) => `
+    if (attributes.${name} !== undefined) {
+      this.buffer.write${capitalize(name)}(attributes.${name});
+    }
+  `
+    )
+    .join('\n');
 
-  // Log messages - info/debug/warn/error with scope support
-  log: SpanLogger<TSchema>;
+  return new Function(
+    'BaseSpanLogger',
+    `
+    return class extends BaseSpanLogger {
+      info(message) {
+        this._writeLogEntry('info', message);
+        return this;
+      }
 
-  // Span completion methods
-  ok: (data?: any) => FluentResult;
-  err: (error: string) => FluentResult;
+      debug(message) {
+        this._writeLogEntry('debug', message);
+        return this;
+      }
+
+      warn(message) {
+        this._writeLogEntry('warn', message);
+        return this;
+      }
+
+      error(message) {
+        this._writeLogEntry('error', message);
+        return this;
+      }
+
+      with(attributes) {
+        ${withBody}
+        return this;
+      }
+
+      scope(attributes) {
+        this._prefillRemainingCapacity(attributes);
+        return this;
+      }
+    }
+  `
+  )(BaseSpanLogger);
+}
+```
+
+## OpContext Type Definition
+
+The context destructured by op functions. The `Extra` type parameter allows user-defined fields (like `env` with CF
+Worker bindings):
+
+```typescript
+// Full OpContext type - Extra is spread in for user extensibility
+type OpContext<Schema, Deps, FF, Extra = {}> = {
+  // Invoke another op as child span (6 overloads, see span() docs)
+  span: SpanFn<OpContext<Schema, Deps, FF, Extra>>;
+
+  // Log messages
+  log: SpanLogger;
+
+  // Span attributes (chainable)
+  tag: TagAPI<Schema>;
+
+  // Dependencies - can be destructured!
+  deps: Deps;
 
   // Feature flags (logs access to current span)
-  ff: FeatureFlagEvaluator;
+  ff: FeatureFlagEvaluator<FF>;
+} & Extra; // User-defined fields spread in (e.g., env, services)
 
-  // Environment variables (passed through)
-  env: EnvironmentConfig;
+// SpanFn type with 6 overloads (3 with line number from transformer, 3 without)
+type SpanFn<CurrentCtx> = {
+  // Op-only: span(name, op, ...args)
+  <Ctx, Args extends unknown[], Result>(name: string, op: Op<Ctx, Args, Result>, ...args: Args): Promise<Result>;
 
-  // Standard context properties
-  requestId: string;
-  userId?: string;
-  traceId: string;
+  // Context override + Op: span(name, ctx, op, ...args)
+  <Ctx, Args extends unknown[], Result>(
+    name: string,
+    ctx: Partial<Ctx>,
+    op: Op<Ctx, Args, Result>,
+    ...args: Args
+  ): Promise<Result>;
 
-  // Child span creation
-  span: <T>(name: string, fn: (ctx: TaskContext<TSchema>) => Promise<T>) => Promise<T>;
+  // Inline closure: span(name, fn)
+  <Result>(name: string, fn: (ctx: CurrentCtx) => Promise<Result>): Promise<Result>;
 };
 
-// Functions can duck-type by picking only what they need
-type TagContext<TSchema> = Pick<TaskContext<TSchema>, 'tag'>;
-type LoggingContext<TSchema> = Pick<TaskContext<TSchema>, 'log'>;
-type FeatureFlagContext = Pick<TaskContext, 'ff'>;
-type MinimalContext<TSchema> = Pick<TaskContext<TSchema>, 'tag' | 'log' | 'ok' | 'err'>;
+// Functions can pick what they need
+type LoggingContext = Pick<OpContext<{}, {}, {}>, 'log'>;
+type TaggingContext<S> = Pick<OpContext<S, {}, {}>, 'tag'>;
+type MinimalContext<S> = Pick<OpContext<S, {}, {}>, 'span' | 'log' | 'tag'>;
 ```
 
-**Design Benefits**:
+## Op Definition Pattern
 
-- **Type safety**: Full TypeScript inference for all context properties
-- **Cleaner API**: `ctx.tag` directly on context instead of `ctx.log.tag`
-- **Flexibility**: Functions can pick only the context properties they need
-- **Generic attributes**: `TSchema` provides typed access to tag attributes
-- **OpenTelemetry alignment**: `ctx.tag` mirrors `Span.setAttribute()`
+### Basic Op
 
-## Library Definition Pattern
+```typescript
+const { op } = userModule;
 
-For third-party libraries that need prefixed attributes and clean APIs, use `defineModule`:
+const createUser = op(async ({ span, log, tag }, userData: UserData) => {
+  tag.userId(userData.id).operation('INSERT');
+  log.info('Creating new user');
 
-> **See**: [Module Builder Pattern](./01l_module_builder_pattern.md) for the complete API design including dependency
-> injection and shared instances.
+  const validated = await span('validate', validateUser, userData);
+  if (!validated.success) {
+    return { success: false, error: validated.error };
+  }
+
+  const user = await span('save', saveUser, userData);
+  return { success: true, user };
+});
+```
+
+### Op with Dependencies
+
+```typescript
+const { op } = httpModule;
+
+const GET = op(async ({ span, log, tag, deps }, url: string) => {
+  const { retry, auth } = deps; // Destructure deps!
+
+  tag.method('GET').url(url);
+  log.info('Making GET request');
+
+  const token = await span('auth', auth.getToken);
+
+  try {
+    const res = await fetch(url, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    tag.status(res.status);
+    return res;
+  } catch (e) {
+    log.warn('Request failed, retrying');
+    await span('retry', retry, 1);
+    throw e;
+  }
+});
+```
+
+### Op with Feature Flags
+
+```typescript
+const processOrder = op(async ({ span, log, tag, deps, ff }, order: Order) => {
+  const { premiumProcessing, newPaymentFlow } = ff;
+
+  tag.orderId(order.id);
+
+  if (premiumProcessing) {
+    await span('premium-validate', deps.premiumValidation, order);
+    premiumProcessing.track();
+  }
+
+  if (newPaymentFlow) {
+    await span('new-payment', deps.newPayment, order);
+    newPaymentFlow.track();
+  } else {
+    await span('legacy-payment', deps.legacyPayment, order);
+  }
+
+  return { success: true };
+});
+```
+
+## Library Definition with defineModule
+
+Libraries define their schema and dependencies:
 
 ```typescript
 // @my-company/http-tracing/src/index.ts
 import { defineModule, S } from '@smoothbricks/lmao';
 
-// Define the library module with clean schema (no prefixes)
+// Define library module
 export const httpLib = defineModule({
   metadata: {
     packageName: '@my-company/http-tracing',
@@ -356,114 +543,83 @@ export const httpLib = defineModule({
     duration: S.number(),
   },
   deps: {
-    retry: retryLib, // Declare dependency
+    retry: retryLib,
   },
 });
 
-// Define tasks using the module's task factory
-const { task } = httpLib;
+// Get op factory
+const { op } = httpLib;
 
-export const GET = task('http-get', async (ctx, url: string, options?: RequestInit) => {
+// Define ops
+export const request = op(async ({ span, log, tag, deps }, url: string, opts: RequestInit) => {
   const startTime = performance.now();
 
-  ctx.tag.method('GET').url(url); // TypeScript knows these methods exist
+  tag.method(opts.method || 'GET').url(url);
+  log.info('Making HTTP request');
 
   try {
-    const response = await fetch(url, options);
-    ctx.tag.status(response.status).duration(performance.now() - startTime);
+    const response = await fetch(url, opts);
+    tag.status(response.status).duration(performance.now() - startTime);
 
-    // Use dependency - ctx is pre-bound
     if (!response.ok) {
-      await ctx.deps.retry.attempt(1);
+      const { retry } = deps;
+      await span('retry', retry, 1);
     }
 
-    return ctx.ok(response);
+    return response;
   } catch (error) {
-    ctx.tag.duration(performance.now() - startTime);
-    return ctx.err('HTTP_ERROR');
+    tag.duration(performance.now() - startTime);
+    log.error('Request failed');
+    throw error;
   }
 });
 
-export const POST = task('http-post', async (ctx, url: string, body: unknown) => {
-  const startTime = performance.now();
-
-  ctx.tag.method('POST').url(url);
-
-  try {
-    const response = await fetch(url, {
-      method: 'POST',
-      body: JSON.stringify(body),
-    });
-    ctx.tag.status(response.status).duration(performance.now() - startTime);
-    return ctx.ok(response);
-  } catch (error) {
-    ctx.tag.duration(performance.now() - startTime);
-    return ctx.err('HTTP_ERROR');
-  }
+export const GET = op(async ({ span }, url: string) => {
+  return await span('request', request, url, { method: 'GET' });
 });
 
-// Application wires dependencies with prefixes at use time:
-// const httpRoot = httpLib.prefix('http').use({
-//   retry: retryLib.prefix('http_retry').use(),
-// });
-// await GET(httpRoot, 'https://api.example.com');
+export const POST = op(async ({ span }, url: string, body: unknown) => {
+  return await span('request', request, url, {
+    method: 'POST',
+    body: JSON.stringify(body),
+  });
+});
 ```
 
-**Why This Pattern**:
-
-- **Clean library APIs**: Libraries use `ctx.tag.status()` but write to `http_status` column
-- **Explicit dependencies**: Libraries declare what they need via `deps`
-- **Prefix at use time**: Consumer applies prefix, not library author
-- **Pre-bound context**: Dependencies receive ctx automatically (`ctx.deps.retry.attempt(1)`)
-- **Type safety**: Full TypeScript inference for schema and dependencies
-
-## Usage in Context Flow
-
-This module context system integrates seamlessly with the runtime context flow:
+### Application Wiring
 
 ```typescript
-// Module setup (build/startup time)
-const userModule = defineModule({
-  metadata: {
-    gitSha: 'abc123...',
-    packageName: '@mycompany/user-service',
-    packagePath: 'src/services/user.ts',
-  },
-  schema: dbAttributes,
-  deps: { db: dbLib },
+// Application wires deps with prefixes
+const httpRoot = httpLib.prefix('http').use({
+  retry: retryLib.prefix('http_retry').use(),
 });
 
-const { task } = userModule;
-
-// Runtime usage (request processing)
-export const createUser = task('create-user', async (ctx, userData) => {
-  // ctx.tag is an instance of the generated TagAPI class
-  ctx.tag.userId(userData.id).operation('INSERT');
-
-  // ctx.log handles log messages with full TypeScript support
-  ctx.log.info('Creating user').with({ email: userData.email });
-
-  // Use dependency with pre-bound context
-  await ctx.deps.db.query('INSERT INTO users...');
-
-  return ctx.ok(user);
-});
-
-// Wire dependencies and invoke
-const userRoot = userModule.use({
-  db: dbLib.prefix('db').use(),
-});
-await createUser(userRoot, userData);
+// Invoke via span()
+const result = await httpRoot.span('fetch-users', GET, 'https://api.example.com/users');
 ```
+
+## ESLint Rule: No Capturing Fluent Interface
+
+Because `tag` writes entries, users must not capture the fluent interface:
+
+```typescript
+// INVALID - capturing fluent interface
+let tagRef = tag;
+tagRef.userId(123); // Won't work as expected
+
+// VALID - use directly
+tag.userId(123).operation('INSERT');
+```
+
+An ESLint rule should prevent capturing `tag` or `log` in variables.
 
 ## Performance Characteristics
 
 ### Build-Time vs Runtime Costs
 
-- **Build/Startup Time**: Schema compilation and class generation (~1-5ms per module)
+- **Build/Startup**: Schema compilation and class generation (~1-5ms per module)
 - **Runtime**: Zero overhead for method calls - all mapping pre-computed
-- **Memory**: Shared module context across all tasks in same module
-- **Type Safety**: Full TypeScript inference with no runtime type checking
+- **Memory**: Shared module context across all ops in same module
 
 ### Generated Code Efficiency
 
@@ -477,22 +633,17 @@ userId(value) {
 // vs hypothetical runtime mapping (overhead):
 setAttribute(name, value) {
   const columnName = this.schema.getColumnName(name);  // Runtime lookup
-  this.buffer[`write${columnName}`](value);           // Dynamic method call
+  this.buffer[`write${columnName}`](value);           // Dynamic method
   return this;
 }
 ```
 
-The generated approach eliminates all runtime overhead for attribute mapping.
-
 ## Integration Points
 
-This module context and SpanLogger generation system integrates with:
+This module context and op generation system integrates with:
 
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides the generated SpanLogger
-  classes used in task wrappers
-- **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes TagAttributeSchema definitions to generate
-  appropriate SpanLogger classes
-- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Uses the factory pattern for clean library
-  APIs with prefixed columns
-- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generated SpanLogger methods write to the
-  columnar SpanBuffer structure
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides OpContext and span() mechanics
+- **[Module Builder Pattern](./01l_module_builder_pattern.md)**: High-level API for defineModule + op()
+- **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes TagAttributeSchema definitions
+- **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for prefixed columns
+- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generated classes write to SpanBuffer
