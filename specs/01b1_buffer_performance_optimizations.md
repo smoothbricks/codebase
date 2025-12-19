@@ -3,7 +3,7 @@
 > **📚 PART OF COLUMNAR BUFFER ARCHITECTURE**
 >
 > This document details the V8 and memory optimization tricks that make columnar buffers 10-100x faster than
-> object-based logging. Read the [main overview](./01b_columnar_buffer_architecture_overview.md) first.
+> object-based logging. Read the [main overview](./01b_columnar_buffer_architecture.md) first.
 
 ## WHY: V8 Optimizations Matter
 

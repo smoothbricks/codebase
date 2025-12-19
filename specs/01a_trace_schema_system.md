@@ -593,7 +593,7 @@ const logSchema = {
 
 ```typescript
 // Core system columns (Arrow column names shown)
-// See 01b_columnar_buffer_architecture.md "Span Definition" for span ID design details
+// See 01b4_span_identity.md for span ID design details
 const systemSchema = {
   // Trace structure
   timestamp: S.number(), // Microseconds since epoch (Float64Array, SAFE until year 2255)
