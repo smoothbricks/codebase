@@ -96,6 +96,11 @@ integration. It consists of these main components:
 - Implements data-oriented storage with columnar TypedArrays and self-tuning capacity.
 - **Fixed Row Layout**: Row 0 = span-start (tag overwrites), Row 1 = completion (pre-initialized as span-exception), Row
   2+ = events (log appends).
+- **Exception Safety**: Row 1 pre-initialized as `span-exception` ensures valid data even if exception is never caught.
+- **Buffer Overflow**: Graceful chaining via `createNextBuffer()` when capacity exceeded - see
+  [Self-Tuning](./01b2_buffer_self_tuning.md) for capacity learning.
+- **Distributed Tracing**: `threadId` (64-bit random, once per worker) + `spanId` (32-bit counter) for collision-free
+  span identification across workers.
 - **High-Precision Timestamps**: Anchored design with sub-millisecond precision from performance.now()/hrtime.
 - **WHY**: Achieves <0.1ms runtime overhead and >90% storage compression by separating the hot path (writes) from the
   cold path (serialization).
@@ -113,6 +118,8 @@ integration. It consists of these main components:
 
 - **op()**: Wraps functions with module binding, captures gitSha/packageName/packagePath
 - **span()**: Unified invocation API - name provided at call site
+- **Dual Module Attribution**: `callsiteModule` for row 0 (where span was invoked), `module` for rows 1+ (where code
+  executes)
 - **Context destructuring**: `{ span, log, tag, deps }` for ergonomic access
 - **WHY**: Zero per-span allocation for deps, flexible naming, clean business logic
 
@@ -260,25 +267,6 @@ const GET = op(async ({ span, deps }, url: string) => {
 6. **System Self-Tracing**: The trace system traces its own optimization decisions
 7. **AI Agent Integration**: Structured access to trace data for automated analysis
 8. **Line Number Injection**: Transformer adds line as first arg to span()
-
-## Implementation Status
-
-The core trace logging system is implemented in `@packages/lmao` with buffer infrastructure in
-`@packages/arrow-builder`. Key features that are operational:
-
-- Schema system with `S.enum()`, `S.category()`, `S.text()`, `S.number()`, `S.boolean()`
-- Tag attribute definitions with masking transforms
-- Feature flag evaluation with analytics tracking
-- SpanLogger class generation with typed methods
-- Buffer chaining and self-tuning capacity management
-- Arrow table conversion via `convertToArrowTable()`
-
-**In Progress**:
-
-- Op class implementation
-- span() invocation semantics
-- Line number transformer integration
-- Context destructuring API
 
 ## V8 Optimization Patterns
 
