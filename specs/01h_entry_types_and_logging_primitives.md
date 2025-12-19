@@ -93,11 +93,11 @@ const processUser = op(async ({ log }, userData) => {
 
 The system stores:
 
-| Column        | Value                                       | Type         |
-| ------------- | ------------------------------------------- | ------------ |
-| `message`     | `'User ${userId} processed ${count} items'` | S.category() |
-| `attr_userId` | `'user-123'`                                | S.category() |
-| `attr_count`  | `42`                                        | S.number()   |
+| Column    | Value                                       | Type         |
+| --------- | ------------------------------------------- | ------------ |
+| `message` | `'User ${userId} processed ${count} items'` | S.category() |
+| `userId`  | `'user-123'`                                | S.category() |
+| `count`   | `42`                                        | S.number()   |
 
 **The message is NOT interpolated.** The template `'User ${userId} processed ${count} items'` is stored verbatim.
 
@@ -115,13 +115,13 @@ The system stores:
 3. **Analytics on Values**: Group and aggregate by the actual values:
 
    ```sql
-   SELECT attr_userId, count(*), avg(attr_count)
+   SELECT userId, count(*), avg(count)
    FROM traces
    WHERE message = 'User ${userId} processed ${count} items'
-   GROUP BY attr_userId;
+   GROUP BY userId;
    ```
 
-4. **Type Safety**: Values are stored in typed columns (`attr_count` as Float64, not as part of a string).
+4. **Type Safety**: Values are stored in typed columns (`count` as Float64, not as part of a string).
 
 **Contrast with Traditional Logging**:
 
@@ -161,9 +161,9 @@ const processUser = op(async ({ log }) => {
 ```typescript
 const processUser = op(async ({ tag, log }) => {
   // tag writes to row 0 (span-start) - OVERWRITES, not appends
-  tag.userId('user-123'); // Writes to attr_userId[0]
-  tag.requestId('req-456'); // Writes to attr_requestId[0]
-  tag.userId('user-999'); // Overwrites attr_userId[0]
+  tag.userId('user-123'); // Writes to userId_values[0]
+  tag.requestId('req-456'); // Writes to requestId_values[0]
+  tag.userId('user-999'); // Overwrites userId_values[0]
 
   // log creates new rows - APPENDS
   log.info('Processing...'); // Appends at row 2
@@ -390,12 +390,12 @@ class TagAPI {
   // Attribute methods compiled onto prototype at module context creation time
   // These directly write to TypedArrays for minimal overhead
   userId(value) {
-    this.buffer.attr_userId[0] = value;  // Always row 0
+    this.buffer.userId_values[0] = value;  // Always row 0
     return this; // Chainable!
   }
 
   httpStatus(value) {
-    this.buffer.attr_httpStatus[0] = value;
+    this.buffer.httpStatus_values[0] = value;
     return this;
   }
 }
@@ -443,20 +443,20 @@ const processUser = op(async ({ tag, log, scope, span, ok, err }, userData) => {
   tag({ userId: 'user-123', requestId: 'req-456', operation: 'CREATE' });
 
   // ===== LOG MESSAGES (log) =====
-  // FORMAT STRING PATTERN - template stored in message, values in attr_* columns
+  // FORMAT STRING PATTERN - template stored in message, values in typed columns
   // The message is NOT interpolated - template and values stored separately!
 
   log.info('Processing user ${userId}').with({ userId: 123 });
-  // Stores: message='Processing user ${userId}', attr_userId=123
+  // Stores: message='Processing user ${userId}', userId=123
 
   log.debug('Query on ${table} took ${duration}ms').with({ table: 'users', duration: 12.5 });
-  // Stores: message='Query on ${table} took ${duration}ms', attr_table='users', attr_duration=12.5
+  // Stores: message='Query on ${table} took ${duration}ms', table='users', duration=12.5
 
   log.warn('Rate limit ${current}/${max}').with({ current: 95, max: 100 });
-  // Stores: message='Rate limit ${current}/${max}', attr_current=95, attr_max=100
+  // Stores: message='Rate limit ${current}/${max}', current=95, max=100
 
   log.error('Connection to ${host} failed').with({ host: 'db.example.com' });
-  // Stores: message='Connection to ${host} failed', attr_host='db.example.com'
+  // Stores: message='Connection to ${host} failed', host='db.example.com'
 
   // ===== SCOPED ATTRIBUTES (scope) =====
   // Set once, propagates to all entries and child spans
@@ -742,13 +742,13 @@ if (result.success) {
 
 ### Error Code Storage
 
-When `err(code, details)` is called, the error code is automatically written to the `attr_errorCode` column. This
-enables efficient querying of errors by code:
+When `err(code, details)` is called, the error code is automatically written to the `errorCode` column. This enables
+efficient querying of errors by code:
 
 ```sql
 SELECT * FROM traces
 WHERE entry_type = 'span-err'
-  AND attr_errorCode = 'VALIDATION_FAILED';
+  AND errorCode = 'VALIDATION_FAILED';
 ```
 
 ### Message Storage
@@ -756,7 +756,7 @@ WHERE entry_type = 'span-err'
 Both `.message()` methods write to the unified `message` column, enabling message-based queries:
 
 ```sql
-SELECT span_name, message, attr_errorCode
+SELECT span_name, message, errorCode
 FROM traces
 WHERE entry_type IN ('span-ok', 'span-err')
   AND message IS NOT NULL;
@@ -854,7 +854,7 @@ function createSpanCompletion(entryType: 'span-ok' | 'span-err', result?: any, a
 ```typescript
 // IMPORTANT: messageTemplate is a FORMAT STRING, not an interpolated message!
 // Example: 'User ${userId} created' - the template is stored verbatim
-// Values like userId are written to their own attr_* columns
+// Values like userId are written to their own typed columns (userId_values)
 function createLogEntry(
   level: 'info' | 'debug' | 'warn' | 'error',
   messageTemplate: string, // FORMAT STRING - stored as-is, NOT interpolated
@@ -891,8 +891,8 @@ function createLogEntry(
 // No new entry type - just updating the span-start row
 function writeTagAttribute(buffer: SpanBuffer, columnName: string, value: any) {
   // ALWAYS write to row 0 (span-start row) - overwrite semantics
-  buffer[`attr_${columnName}`][0] = value;
-  buffer[`attr_${columnName}_nulls`][0] |= 1; // Mark as valid
+  buffer[`${columnName}_values`][0] = value;
+  buffer[`${columnName}_nulls`][0] |= 1; // Mark as valid
 }
 
 // Usage: tag.userId('123') → writeTagAttribute(buffer, 'userId', '123')

@@ -80,13 +80,13 @@ function getEnumIndex_entryType(value) {
 }
 
 function writeEntryType(buffer, idx, value) {
-  buffer.attr_entryType_values[idx] = getEnumIndex_entryType(value);
+  buffer.entryType_values[idx] = getEnumIndex_entryType(value);
 }
 
 // Arrow conversion (zero work - already done)
 function toArrowDictionary() {
   return {
-    indices: buffer.attr_entryType_values.slice(0, writeIndex),
+    indices: buffer.entryType_values.slice(0, writeIndex),
     dictionary: PRE_ENCODED_UTF8_DICTIONARY, // Already sorted, already UTF-8
   };
 }
@@ -634,8 +634,8 @@ ctx.log.info('User ${userId} processed ${count} items').userId('user-123').count
 
 // Stores:
 // - message: 'User ${userId} processed ${count} items'  (template, interned)
-// - attr_userId: 'user-123'                             (value, in typed column)
-// - attr_count: 42                                      (value, in typed column)
+// - userId: 'user-123'                                  (value, in typed column)
+// - count: 42                                           (value, in typed column)
 
 // NOT:
 // - message: 'User user-123 processed 42 items'  (interpolated - WRONG!)
@@ -1292,8 +1292,8 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends LogSchema> {
 
     buffer.timestamps[idx] = getTimestampMicros(this.ctx.anchorEpochMicros, this.ctx.anchorPerfNow);
     buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-    buffer.message[idx] = flagName; // Unified message column
-    buffer.attr_ffValue[idx] = String(value); // S.category - raw string, dict built in cold path
+    buffer.message_values[idx] = flagName; // Unified message column
+    buffer.ffValue_values[idx] = String(value); // S.category - raw string, dict built in cold path
   }
 
   private createChainableTracker(idx: number): FlagTracker<Tag> {
@@ -1302,10 +1302,10 @@ class FlagAccessor<T extends FeatureFlagSchema, Tag extends LogSchema> {
 
     // Generate methods from logSchema - SAME columns as ctx.tag
     for (const attrName of Object.keys(this.logSchema)) {
-      const columnName = `attr_${attrName}`;
+      const valuesName = `${attrName}_values`;
       (tracker as any)[attrName] = (value: unknown) => {
-        if (buffer[columnName]) {
-          buffer[columnName][idx] = serializeValue(value);
+        if (buffer[valuesName]) {
+          buffer[valuesName][idx] = serializeValue(value);
         }
         return tracker;
       };
@@ -1417,7 +1417,7 @@ instantiation cost.
 
 **Unified Schema**: The `track()` method uses the **same schema as `ctx.tag`**:
 
-- Same column names (user-defined attributes like `attr_variant`, not `attr_ff_variant`)
+- Same column names (user-defined attributes like `variant`, not `ff_variant`)
 - Same Arrow table structure - no schema split
 - Flag name stored in unified `message` column (consistent with span names and log templates)
 - Only `ffValue` is FF-specific (S.category for efficient storage of repeated values like true/false)
@@ -1702,9 +1702,9 @@ export const createUser = op('createUser', async (ctx, userData: UserData) => {
 
   // Span attributes - set context data at span start (via tag)
   ctx.tag
-    .requestId(userData.requestId) // Sets bit 0, writes to attr_requestId column
-    .userId(userData.id) // Sets bit 1, writes to attr_userId column
-    .operation('INSERT'); // Sets bit 4, writes to attr_operation column
+    .requestId(userData.requestId) // Sets bit 0, writes to requestId_values column
+    .userId(userData.id) // Sets bit 1, writes to userId_values column
+    .operation('INSERT'); // Sets bit 4, writes to operation_values column
 
   // Or, object-based API for multiple attributes
   ctx.tag({ requestId: userData.requestId, userId: userData.id, operation: 'INSERT' });

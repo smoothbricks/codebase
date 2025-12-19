@@ -101,15 +101,15 @@ class GoodBuffer {
   // All properties defined upfront
   readonly timestamps: BigInt64Array;
   readonly operations: Uint8Array;
-  readonly attr_userId: Uint32Array;
-  readonly attr_action: Uint32Array;
+  readonly userId_values: Uint32Array;
+  readonly action_values: Uint32Array;
 
   constructor(capacity: number) {
     // Single hidden class, never changes
     this.timestamps = new BigInt64Array(capacity);
     this.operations = new Uint8Array(capacity);
-    this.attr_userId = new Uint32Array(capacity);
-    this.attr_action = new Uint32Array(capacity);
+    this.userId_values = new Uint32Array(capacity);
+    this.action_values = new Uint32Array(capacity);
   }
 }
 ```
@@ -121,18 +121,18 @@ class GoodBuffer {
 ```typescript
 // BAD: Dynamic property access
 function writeAttribute(buffer: any, attr: string, idx: number, value: any) {
-  buffer[`attr_${attr}`][idx] = value; // Cache miss on different attrs
+  buffer[`${attr}_values`][idx] = value; // Cache miss on different attrs
 }
 
 // GOOD: Static property access
 class BufferWriter {
   // Each attribute gets its own method = stable call site
   writeUserId(buffer: SpanBuffer, idx: number, value: number) {
-    buffer.attr_userId[idx] = value; // Inline cache hit
+    buffer.userId_values[idx] = value; // Inline cache hit
   }
 
   writeAction(buffer: SpanBuffer, idx: number, value: number) {
-    buffer.attr_action[idx] = value; // Different cache slot
+    buffer.action_values[idx] = value; // Different cache slot
   }
 }
 ```
@@ -190,7 +190,7 @@ class SequentialBuffer {
     for (const entry of data) {
       this.timestamps[idx] = entry.timestamp; // Sequential
       this.operations[idx] = entry.operation; // Sequential
-      this.attr_userId[idx] = entry.userId; // Sequential
+      this.userId_values[idx] = entry.userId; // Sequential
       idx++;
     }
 

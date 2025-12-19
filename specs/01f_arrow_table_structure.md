@@ -55,7 +55,7 @@ Different column types require different zero-copy strategies:
 
 ```typescript
 // Number column (Float64Array)
-const data = buffer.attr_httpDuration.subarray(0, buffer.writeIndex);
+const data = buffer.httpDuration_values.subarray(0, buffer.writeIndex);
 return arrow.makeData({
   type: new arrow.Float64(),
   offset: 0,
@@ -72,7 +72,7 @@ return arrow.makeData({
 
 ```typescript
 // Category column: raw strings stored in hot path, dictionary built here
-const rawStrings = buffer.attr_httpMethod_strings.slice(0, buffer.writeIndex);
+const rawStrings = buffer.httpMethod_values.slice(0, buffer.writeIndex);
 
 // Build dictionary from unique strings (COLD PATH - deferred interning)
 const uniqueStrings = [...new Set(rawStrings.filter((s) => s != null))].sort();
@@ -175,10 +175,7 @@ Null bitmaps must be constructed from SpanBuffer null tracking:
  * Build null bitmap from buffer's null tracking
  * Arrow format: bit-packed, 1 = valid, 0 = null
  */
-function buildNullBitmap(
-  buffer: SpanBuffer,
-  columnName: `attr_${string}`
-): { nullBitmap: Uint8Array | null; nullCount: number } {
+function buildNullBitmap(buffer: SpanBuffer, columnName: string): { nullBitmap: Uint8Array | null; nullCount: number } {
   const nullBitmap = buffer.nullBitmaps[columnName];
   if (!nullBitmap) {
     return { nullBitmap: null, nullCount: 0 }; // All valid
@@ -725,11 +722,11 @@ const myOp = op(async ({ log }) => {
 
 The system stores:
 
-| Column           | Value                                              |
-| ---------------- | -------------------------------------------------- |
-| `message`        | `'User ${userId} created with ${itemCount} items'` |
-| `attr_userId`    | `123`                                              |
-| `attr_itemCount` | `5`                                                |
+| Column      | Value                                              |
+| ----------- | -------------------------------------------------- |
+| `message`   | `'User ${userId} created with ${itemCount} items'` |
+| `userId`    | `123`                                              |
+| `itemCount` | `5`                                                |
 
 **The message is NOT interpolated.** The template string `'User ${userId} created...'` is stored verbatim in the
 `message` column, while the actual values (`123`, `5`) are stored in their respective typed attribute columns.
@@ -765,7 +762,7 @@ GROUP BY message
 ORDER BY occurrences DESC;
 
 -- Analyze specific template with different values
-SELECT attr_userId, attr_itemCount, timestamp
+SELECT userId, itemCount, timestamp
 FROM traces
 WHERE message = 'User ${userId} created with ${itemCount} items'
 ORDER BY timestamp;
@@ -782,12 +779,12 @@ Instead of separate `span_name`, `message`, and `ffName` columns (most always nu
 
 ### Example Data
 
-| entry_type   | message                                            | attr_userId | attr_itemCount |
-| ------------ | -------------------------------------------------- | ----------- | -------------- |
-| `span-start` | `'create-user'`                                    | `123`       | `null`         |
-| `info`       | `'User ${userId} created with ${itemCount} items'` | `123`       | `5`            |
-| `debug`      | `'Processing batch for ${userId}'`                 | `123`       | `null`         |
-| `span-ok`    | `'create-user'`                                    | `123`       | `null`         |
+| entry_type   | message                                            | userId | itemCount |
+| ------------ | -------------------------------------------------- | ------ | --------- |
+| `span-start` | `'create-user'`                                    | `123`  | `null`    |
+| `info`       | `'User ${userId} created with ${itemCount} items'` | `123`  | `5`       |
+| `debug`      | `'Processing batch for ${userId}'`                 | `123`  | `null`    |
+| `span-ok`    | `'create-user'`                                    | `123`  | `null`    |
 
 ### Contrast with Traditional Logging
 
@@ -819,7 +816,7 @@ log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount
 
 - **Log levels with structure**: `log.info('Template ${var}').var(value)` → `entry_type='info'` with typed attributes
 - **Template storage**: Log message TEMPLATES stored in unified `message` column (NOT interpolated strings)
-- **Values in attribute columns**: Actual values stored separately in `attr_*` columns for type safety and queryability
+- **Values in attribute columns**: Actual values stored separately in typed columns for type safety and queryability
 - **Optional attributes**: Structured data can accompany log messages
 - **Gradual migration**: Familiar log levels but with structured data instead of string concatenation
 
@@ -1293,8 +1290,8 @@ This Arrow table structure integrates with:
 
 - **[Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md)**: Foundational entry type system
   and low-level logging API
-- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Direct conversion from SpanBuffer columns
-  with `attr_` prefix stripping. Also documents:
+- **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Direct conversion from SpanBuffer columns.
+  Also documents:
   - **SpanIdentity**: 25-byte ArrayBuffer with comparison methods (`equals()`, `isParentOf()`, `isChildOf()`)
   - **TraceId**: Branded string type with validation and W3C format generation
   - **ColumnBuffer Extension**: Mechanism for lmao to inject span-specific code into arrow-builder generated classes

@@ -132,19 +132,19 @@ class TagAPI {
   // Object-based API - writes to row 0
   (attributes: Partial<HttpLibrarySchema>): this {
     for (const [key, value] of Object.entries(attributes)) {
-      this.buffer[`attr_${key}`][0] = value;  // Always row 0
+      this.buffer[`${key}_values`][0] = value;  // Always row 0
     }
     return this;
   }
 
   // Property-based API (generated for each schema property)
   httpStatus(value: number): this {
-    this.buffer.attr_httpStatus[0] = value;  // Always row 0
+    this.buffer.httpStatus_values[0] = value;  // Always row 0
     return this;
   }
 
   httpMethod(value: string): this {
-    this.buffer.attr_httpMethod[0] = value;  // Always row 0
+    this.buffer.httpMethod_values[0] = value;  // Always row 0
     return this;
   }
 
@@ -570,10 +570,10 @@ const createArrowVectors = (spanBuffer: SpanBuffer) => {
     entry_type: arrow.Utf8Vector.from(spanBuffer.operations.slice(0, writeIndex)),
 
     // Generated attribute columns - zero-copy from existing arrays
-    http_status: arrow.Int32Vector.from(spanBuffer.attr_http_status.slice(0, writeIndex)),
-    http_method: arrow.Utf8Vector.from(spanBuffer.attr_http_method.slice(0, writeIndex)),
-    http_url: arrow.Utf8Vector.from(spanBuffer.attr_http_url.slice(0, writeIndex)),
-    http_duration: arrow.Float64Vector.from(spanBuffer.attr_http_duration.slice(0, writeIndex)),
+    http_status: arrow.Int32Vector.from(spanBuffer.httpStatus_values.slice(0, writeIndex)),
+    http_method: arrow.Utf8Vector.from(spanBuffer.httpMethod_values.slice(0, writeIndex)),
+    http_url: arrow.Utf8Vector.from(spanBuffer.httpUrl_values.slice(0, writeIndex)),
+    http_duration: arrow.Float64Vector.from(spanBuffer.httpDuration_values.slice(0, writeIndex)),
   };
 };
 ```

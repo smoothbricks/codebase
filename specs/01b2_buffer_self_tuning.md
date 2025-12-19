@@ -869,7 +869,7 @@ export function generateColumnBufferClass(
 
   // For each schema field, decide if eager or lazy
   for (const fieldName of schemaFields) {
-    const columnName = `attr_${fieldName}`;
+    const columnName = fieldName; // e.g., 'userId' → userId_values, userId_nulls
     const isEager = eagerColumns.includes(fieldName);
 
     if (isEager) {
@@ -1092,7 +1092,7 @@ export function generateColumnBufferClass(
   const lazyGetters: string[] = [];
 
   for (const fieldName of schemaFields) {
-    const columnName = `attr_${fieldName}`;
+    const columnName = fieldName; // e.g., 'userId' → userId_values, userId_nulls
     const { constructorName, bytesPerElement } = getTypedArrayInfo(schema, fieldName);
     const isEager = eagerColumnSet.has(fieldName);
 
@@ -1251,7 +1251,7 @@ describe('Lazy-to-eager column promotion', () => {
 
       // Access userId in 90% of buffers (triggers lazy instantiation)
       if (i < 90) {
-        buffer.attr_userId_values[0] = i;
+        buffer.userId_values[0] = i;
       }
 
       module.lazyColumnStats.totalSpanBuffersCreated++;
@@ -1281,7 +1281,7 @@ describe('Lazy-to-eager column promotion', () => {
       const buffer = new module.SpanBufferClass(64);
 
       if (i < 75) {
-        buffer.attr_userId_values[0] = i;
+        buffer.userId_values[0] = i;
       }
 
       module.lazyColumnStats.totalSpanBuffersCreated++;
@@ -1305,7 +1305,7 @@ describe('Lazy-to-eager column promotion', () => {
     // Only 50 buffers (below minimum)
     for (let i = 0; i < 50; i++) {
       const buffer = new module.SpanBufferClass(64);
-      buffer.attr_userId_values[0] = i; // 100% usage
+      buffer.userId_values[0] = i; // 100% usage
       module.lazyColumnStats.totalSpanBuffersCreated++;
     }
 

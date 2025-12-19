@@ -75,7 +75,6 @@
 
 - ❌ Logging/tracing concepts (spans, traces, contexts)
 - ❌ Entry types (info, warn, error, span-start)
-- ❌ The `attr_` prefix convention
 - ❌ Scope or scoped attributes
 - ❌ System vs user column distinction
 - ❌ Any `@smoothbricks/lmao` dependency
@@ -94,7 +93,7 @@
 **Owns**:
 
 - Schema DSL (S.enum/category/text/number/boolean) (specs/01a)
-- logSchema definitions with masking and `attr_` prefix
+- logSchema definitions with masking
 - **System columns (timestamps, operations) - ALWAYS eager, never lazy**
 - **Scope storage - plain object on buffer, NO codegen needed**
 - SpanBuffer creation (extends ColumnBuffer with span metadata)
@@ -109,7 +108,7 @@
 - System columns NEVER lazy (written every entry, zero conditionals)
 - User attribute columns lazy by default (sparse data)
 - Scope is a plain object (`buffer.scopeValues`) - filled at Arrow conversion via SIMD
-- Direct properties on SpanBuffer (attr*$name_nulls + attr*$name_values)
+- Direct properties on SpanBuffer (`$name_nulls` + `$name_values` for each schema field)
 
 **Key Files**:
 
@@ -153,9 +152,9 @@ Three distinct string types, each with different storage strategies:
 ### S.category - Repeated Values (Dictionary Encoded)
 
 - **When**: Values often repeat (limited cardinality)
-- **Storage**: Uint32Array indices with string interning
-- **Example**: buffer.attr_userId[idx] = internString(userId)
-- **Arrow**: Dictionary built dynamically from interned strings
+- **Storage**: Raw strings in hot path, dictionary built in cold path
+- **Example**: buffer.userId_values[idx] = userId (raw string stored, dict built at Arrow conversion)
+- **Arrow**: Dictionary built dynamically from unique values
 - **Use for**: userIds, sessionIds, moduleNames, spanNames, table names
 
 ### S.text - Unique Values (No Dictionary)
@@ -241,9 +240,9 @@ fc.assert(
 
 - **Buffer Creation**: arrow-builder provides TypedArray buffers, lmao wraps with logging API
 - **Hot Path Writes**: Direct TypedArray assignment only
-  - Enums: buffer.attr_operation[idx] = OPERATION_MAP[value] (compile-time lookup)
-  - Categories: buffer.attr_userId[idx] = internString(userId) (runtime interning)
-  - Text: buffer.attr_errorMsg[idx] = rawString (no interning)
+  - Enums: buffer.operation_values[idx] = OPERATION_MAP[value] (compile-time lookup)
+  - Categories: buffer.userId_values[idx] = rawString (raw string, dict built in cold path)
+  - Text: buffer.errorMsg_values[idx] = rawString (no interning)
 - **Method Chaining**: Return this from tag methods for fluent API: .userId(id).requestId(req)
 - **Per-Span Buffers**: Each span owns its columnar TypedArrays (Uint8Array, Float64Array, etc.)
 
