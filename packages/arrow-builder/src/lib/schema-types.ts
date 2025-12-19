@@ -7,6 +7,12 @@
 
 import type * as Sury from '@sury/sury';
 
+// Type alias for schema objects (Record<string, Schema>)
+export type SchemaFields = Record<string, Sury.Schema<unknown, unknown>>;
+
+// Re-export ColumnSchema for external use (class is both value and type)
+export { ColumnSchema, isColumnSchema } from './schema/ColumnSchema.js';
+
 // Re-export schema metadata types from the schema module
 export type {
   EagerBooleanSchema,
@@ -34,31 +40,3 @@ export type {
   SchemaType,
   SchemaWithMetadata,
 } from './schema/types.js';
-
-/**
- * Tag attribute schema - maps field names to Sury schemas
- *
- * NOTE: This uses an object type with index signature rather than Record<>
- * because consumer packages may add method properties (validate, parse, etc.)
- * which would conflict with Record<string, Schema>'s strict index signature.
- */
-export type TagAttributeSchema = {
-  [key: string]: Sury.Schema<unknown, unknown> | ((...args: unknown[]) => unknown);
-};
-
-/**
- * Get schema field entries, filtering out methods that may be added by consumer packages.
- *
- * Methods like validate, parse, safeParse, extend are added by consumer packages
- * (e.g., lmao's defineTagAttributes) but should not be treated as schema fields.
- *
- * @param schema - Tag attribute schema (possibly with methods)
- * @returns Array of [fieldName, fieldSchema] tuples, excluding functions
- */
-export function getSchemaFields<T extends TagAttributeSchema>(
-  schema: T,
-): Array<[string, Sury.Schema<unknown, unknown>]> {
-  return Object.entries(schema).filter(([_, value]) => typeof value !== 'function') as Array<
-    [string, Sury.Schema<unknown, unknown>]
-  >;
-}

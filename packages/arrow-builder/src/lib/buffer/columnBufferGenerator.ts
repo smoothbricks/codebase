@@ -28,7 +28,7 @@
  * - Cache-friendly: nulls and values in same ArrayBuffer
  */
 
-import { getSchemaFields, type SchemaType, type SchemaWithMetadata, type TagAttributeSchema } from '../schema-types.js';
+import { type ColumnSchema, isColumnSchema, type SchemaType, type SchemaWithMetadata } from '../schema-types.js';
 import { bufferHelpers } from './bufferHelpers.js';
 import { type ColumnBuffer, DEFAULT_BUFFER_CAPACITY, type TypedColumnBuffer } from './types.js';
 
@@ -121,8 +121,8 @@ interface ColumnStorageInfo {
 /**
  * Get TypedArray constructor name and byte size for a schema field
  */
-function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): ColumnStorageInfo {
-  const fieldSchema = schema[fieldName];
+function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStorageInfo {
+  const fieldSchema = schema.fields[fieldName];
   const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata?.__schema_type;
   const isEager = schemaWithMetadata?.__eager === true;
@@ -161,6 +161,10 @@ function getTypedArrayInfo(schema: TagAttributeSchema, fieldName: string): Colum
 
   if (schemaType === 'boolean') {
     return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: true, schemaType, isEager };
+  }
+
+  if (schemaType === 'bigUint64') {
+    return { constructorName: 'BigUint64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
   }
 
   return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
@@ -233,6 +237,7 @@ function getDefaultValueLiteral(info: ColumnStorageInfo): string {
   const { schemaType, isBitPacked } = info;
   if (isBitPacked || schemaType === 'boolean') return 'false';
   if (schemaType === 'enum' || schemaType === 'number') return '0';
+  if (schemaType === 'bigUint64') return '0n';
   if (schemaType === 'category' || schemaType === 'text') return "''";
   return '0';
 }
@@ -246,11 +251,19 @@ function getDefaultValueLiteral(info: ColumnStorageInfo): string {
  * 3. Eager columns - allocated in constructor, no null bitmap
  */
 export function generateColumnBufferClass(
-  schema: TagAttributeSchema,
+  schema: ColumnSchema,
   className = 'GeneratedColumnBuffer',
   extension?: ColumnBufferExtension,
 ): string {
-  const schemaFields = getSchemaFields(schema).map(([name]) => name);
+  // Schema should always be a ColumnSchema instance now (wrapped at API boundaries)
+  if (!isColumnSchema(schema)) {
+    throw new Error(
+      `Schema must be a ColumnSchema instance. Got: ${typeof schema}. ` +
+        'This should not happen - schemas are wrapped at API boundaries.',
+    );
+  }
+
+  const schemaFields = schema.fieldNames;
 
   // System columns + buffer management
   const constructorCode: string[] = [
@@ -375,15 +388,15 @@ return ${className};
  */
 const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => ColumnBuffer>();
 
-function createCacheKey(schema: TagAttributeSchema, extension?: ColumnBufferExtension): string {
-  if (!extension) return JSON.stringify(schema);
+function createCacheKey(schema: ColumnSchema, extension?: ColumnBufferExtension): string {
+  if (!extension) return JSON.stringify(schema.fields);
   return JSON.stringify({ schema, extension });
 }
 
 /**
  * Create or retrieve a cached ColumnBuffer class for the given schema and extension.
  */
-export function getColumnBufferClass<S extends TagAttributeSchema>(
+export function getColumnBufferClass<S extends ColumnSchema>(
   schema: S,
   extension?: ColumnBufferExtension,
 ): new (
@@ -426,7 +439,7 @@ export function getColumnBufferClass<S extends TagAttributeSchema>(
 /**
  * Create a ColumnBuffer instance using a generated class.
  */
-export function createGeneratedColumnBuffer<S extends TagAttributeSchema>(
+export function createGeneratedColumnBuffer<S extends ColumnSchema>(
   schema: S,
   requestedCapacity = DEFAULT_BUFFER_CAPACITY,
   extension?: ColumnBufferExtension,

@@ -17,7 +17,7 @@
  * 3. Return `this` for chaining: `writer.nextRow().userId("123").status("ok")`
  */
 
-import { getSchemaFields, type SchemaWithMetadata, type TagAttributeSchema } from '../schema-types.js';
+import type { ColumnSchema, SchemaWithMetadata } from '../schema-types.js';
 import type { ColumnBuffer } from './types.js';
 
 /**
@@ -102,7 +102,7 @@ export interface ColumnWriterExtension {
  * writer.nextRow().userId("u123").count(42);
  * ```
  */
-export type ColumnWriter<T extends TagAttributeSchema = TagAttributeSchema> = {
+export type ColumnWriter<T extends ColumnSchema = ColumnSchema> = {
   _buffer: ColumnBuffer;
   _writeIndex: number;
   nextRow(): ColumnWriter<T>;
@@ -114,8 +114,8 @@ export type ColumnWriter<T extends TagAttributeSchema = TagAttributeSchema> = {
 /**
  * Get the setter method body for a schema field type
  */
-function getSetterBody(schema: TagAttributeSchema, fieldName: string): string {
-  const fieldSchema = schema[fieldName];
+function getSetterBody(schema: ColumnSchema, fieldName: string): string {
+  const fieldSchema = schema.fields[fieldName];
   const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata?.__schema_type;
 
@@ -153,12 +153,12 @@ function getSetterBody(schema: TagAttributeSchema, fieldName: string): string {
  * 5. Fluent setter methods for each schema column
  */
 export function generateColumnWriterClass(
-  schema: TagAttributeSchema,
+  schema: ColumnSchema,
   className = 'GeneratedColumnWriter',
   extension?: ColumnWriterExtension,
 ): string {
-  // Use getSchemaFields to filter out methods (validate, parse, etc.)
-  const schemaFields = getSchemaFields(schema).map(([name]) => name);
+  // Get field names from ColumnSchema.fieldNames
+  const schemaFields = schema.fieldNames;
 
   // Generate setter methods for each schema field
   const setterMethods: string[] = [];
@@ -256,9 +256,9 @@ const writerClassCache = new Map<string, new (buffer: ColumnBuffer, ...args: unk
 /**
  * Create a stable cache key from schema and extension options.
  */
-function createCacheKey(schema: TagAttributeSchema, extension?: ColumnWriterExtension): string {
+function createCacheKey(schema: ColumnSchema, extension?: ColumnWriterExtension): string {
   if (!extension) {
-    return JSON.stringify(schema);
+    return JSON.stringify(schema.fields);
   }
   // Exclude dependencies from cache key - they should be stable singletons
   const { dependencies: _, ...extensionWithoutDeps } = extension;
@@ -275,7 +275,7 @@ function createCacheKey(schema: TagAttributeSchema, extension?: ColumnWriterExte
  * @param extension - Optional extension for injecting constructor code, methods, etc.
  * @returns The generated class constructor with typed setter methods
  */
-export function getColumnWriterClass<T extends TagAttributeSchema>(
+export function getColumnWriterClass<T extends ColumnSchema>(
   schema: T,
   extension?: ColumnWriterExtension,
 ): new (
@@ -329,7 +329,7 @@ export function getColumnWriterClass<T extends TagAttributeSchema>(
  * @param constructorArgs - Additional constructor arguments (passed to extension constructor code)
  * @returns A new ColumnWriter instance with typed setter methods
  */
-export function createColumnWriter<T extends TagAttributeSchema>(
+export function createColumnWriter<T extends ColumnSchema>(
   schema: T,
   buffer: ColumnBuffer,
   extension?: ColumnWriterExtension,

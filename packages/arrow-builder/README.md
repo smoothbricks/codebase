@@ -163,9 +163,9 @@ Create a columnar buffer with the specified schema and capacity.
 
 ```typescript
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
-import type { TagAttributeSchema } from '@smoothbricks/arrow-builder';
+import type { SchemaFields } from '@smoothbricks/arrow-builder';
 
-const schema: TagAttributeSchema = {
+const schema: SchemaFields = {
   userId: userIdSchema,
   timestamp: timestampSchema,
 };

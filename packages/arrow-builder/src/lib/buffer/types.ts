@@ -136,10 +136,12 @@ export type TypedArrayConstructor =
 // ============================================================================
 
 import type {
+  EagerBigUint64Schema,
   EagerBooleanSchema,
   EagerCategorySchema,
   EagerNumberSchema,
   EagerTextSchema,
+  LazyBigUint64Schema,
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyNumberSchema,
@@ -169,9 +171,11 @@ export type SetterValueType<S> = S extends { __schema_type: 'enum' }
       ? string
       : S extends LazyNumberSchema | EagerNumberSchema
         ? number
-        : S extends LazyBooleanSchema | EagerBooleanSchema
-          ? boolean
-          : unknown;
+        : S extends LazyBigUint64Schema | EagerBigUint64Schema
+          ? bigint
+          : S extends LazyBooleanSchema | EagerBooleanSchema
+            ? boolean
+            : unknown;
 
 /**
  * Infer the values array type for a schema field.
@@ -190,9 +194,11 @@ export type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
       ? string[]
       : S extends LazyNumberSchema | EagerNumberSchema
         ? Float64Array
-        : S extends LazyBooleanSchema | EagerBooleanSchema
-          ? Uint8Array // bit-packed
-          : string[] | TypedArray;
+        : S extends LazyBigUint64Schema | EagerBigUint64Schema
+          ? BigUint64Array
+          : S extends LazyBooleanSchema | EagerBooleanSchema
+            ? Uint8Array // bit-packed
+            : string[] | TypedArray;
 
 /**
  * Filter out function properties from a schema object.

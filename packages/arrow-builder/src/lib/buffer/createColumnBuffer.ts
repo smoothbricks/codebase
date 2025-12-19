@@ -12,7 +12,7 @@
  * nothing about application-specific concepts. Those are added by consumer packages.
  */
 
-import type { TagAttributeSchema } from '../schema-types.js';
+import type { ColumnSchema } from '../schema-types.js';
 import { createGeneratedColumnBuffer } from './columnBufferGenerator.js';
 import type { ColumnBuffer } from './types.js';
 import { DEFAULT_BUFFER_CAPACITY } from './types.js';
@@ -50,10 +50,7 @@ import { DEFAULT_BUFFER_CAPACITY } from './types.js';
  * @param requestedCapacity - Requested buffer capacity
  * @returns Generic ColumnBuffer with timestamps, operations, and direct attribute columns
  */
-export function createColumnBuffer(
-  schema: TagAttributeSchema,
-  requestedCapacity = DEFAULT_BUFFER_CAPACITY,
-): ColumnBuffer {
+export function createColumnBuffer(schema: ColumnSchema, requestedCapacity = DEFAULT_BUFFER_CAPACITY): ColumnBuffer {
   return createGeneratedColumnBuffer(schema, requestedCapacity);
 }
 
