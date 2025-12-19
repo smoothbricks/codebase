@@ -38,7 +38,7 @@ export type { Input, Output, Schema } from '@sury/sury';
 // Re-export LogSchema for external use
 export { isLogSchema, LogSchema } from './LogSchema.js';
 
-// Import schema metadata types for use in InferTagAttributes and local type definitions
+// Import schema metadata types for use in InferSchema and local type definitions
 import type {
   EagerBooleanSchema,
   EagerCategorySchema,
@@ -110,7 +110,7 @@ type SchemaFieldKeys<T> = T extends LogSchema<infer Fields>
  *
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
-export type InferTagAttributes<T extends LogSchema | SchemaFields> = {
+export type InferSchema<T extends LogSchema | SchemaFields> = {
   [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends LazyEnumSchema<infer E>
     ? E
     : ExtractSchemaFields<T>[K] extends EagerEnumSchema<infer E2>
@@ -128,15 +128,21 @@ export type InferTagAttributes<T extends LogSchema | SchemaFields> = {
                 : never;
 };
 
+/** @deprecated Use InferSchema instead */
+export type InferTagAttributes<T extends LogSchema | SchemaFields> = InferSchema<T>;
+
 /**
  * Extract TypeScript input types from log schema
  * Used for validation before transformation
  *
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
-export type InferTagAttributesInput<T extends LogSchema | SchemaFields> = {
+export type InferSchemaInput<T extends LogSchema | SchemaFields> = {
   [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends Sury.Schema<unknown, infer In> ? In : never;
 };
+
+/** @deprecated Use InferSchemaInput instead */
+export type InferTagAttributesInput<T extends LogSchema | SchemaFields> = InferSchemaInput<T>;
 
 /**
  * Feature flag builder with default value support

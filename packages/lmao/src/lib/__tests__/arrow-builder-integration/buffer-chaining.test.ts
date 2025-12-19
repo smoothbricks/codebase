@@ -1,12 +1,12 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import { createNextBuffer, createSpanBuffer, type defineLogSchema, S } from '@smoothbricks/lmao';
+import { createChildSpanBuffer, createNextBuffer, createSpanBuffer, type defineLogSchema, S } from '@smoothbricks/lmao';
+import type { ModuleContext } from '../../moduleContext.js';
 import type { DefinedLogSchema } from '../../schema/defineLogSchema.js';
-import type { TaskContext } from '../../types.js';
-import { createTestSchema, createTestTaskContext } from '../test-helpers.js';
+import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Chaining', () => {
-  let taskContext: TaskContext;
+  let module: ModuleContext;
   let schema: DefinedLogSchema<ReturnType<typeof defineLogSchema>['fields']>;
 
   beforeEach(() => {
@@ -18,12 +18,12 @@ describe('Buffer Chaining', () => {
       duration: S.number(),
     });
 
-    taskContext = createTestTaskContext(schema.fields, { lineNumber: 10 });
+    module = createTestModuleContext(schema);
   });
 
   describe('createNextBuffer', () => {
     it('should create a chained buffer with same spanId and traceId', () => {
-      const buffer = createSpanBuffer(schema, taskContext);
+      const buffer = createSpanBuffer(schema, module, 'test-span');
       const nextBuffer = createNextBuffer(buffer);
 
       // Should inherit spanId and traceId
@@ -41,10 +41,10 @@ describe('Buffer Chaining', () => {
     });
 
     it('should create buffer with current capacity from stats', () => {
-      const buffer = createSpanBuffer(schema, taskContext);
+      const buffer = createSpanBuffer(schema, module, 'test-span');
 
       // Update capacity stats
-      taskContext.module.sb_capacity = 128;
+      module.sb_capacity = 128;
 
       const nextBuffer = createNextBuffer(buffer);
 
@@ -53,7 +53,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should create independent writeIndex for chained buffer', () => {
-      const buffer = createSpanBuffer(schema, taskContext);
+      const buffer = createSpanBuffer(schema, module, 'test-span');
 
       // Write some data to original buffer
       buffer.writeIndex = 50;
@@ -67,7 +67,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should maintain schema structure in chained buffer', () => {
-      const buffer = createSpanBuffer(schema, taskContext);
+      const buffer = createSpanBuffer(schema, module, 'test-span');
       const nextBuffer = createNextBuffer(buffer);
 
       // Should have same attribute columns (use _values suffix to access storage)
@@ -82,7 +82,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should handle multiple chained buffers', () => {
-      const buffer1 = createSpanBuffer(schema, taskContext);
+      const buffer1 = createSpanBuffer(schema, module, 'test-span');
       const buffer2 = createNextBuffer(buffer1);
       const buffer3 = createNextBuffer(buffer2);
 
@@ -98,21 +98,18 @@ describe('Buffer Chaining', () => {
     });
 
     it('should increment totalBuffersCreated stat', () => {
-      const buffer = createSpanBuffer(schema, taskContext);
-      const initialCount = taskContext.module.sb_totalCreated;
+      const buffer = createSpanBuffer(schema, module, 'test-span');
+      const initialCount = module.sb_totalCreated;
 
       createNextBuffer(buffer);
 
-      expect(taskContext.module.sb_totalCreated).toBe(initialCount + 1);
+      expect(module.sb_totalCreated).toBe(initialCount + 1);
     });
 
     it('should handle buffer with parent correctly', () => {
-      const parentBuffer = createSpanBuffer(schema, taskContext);
+      const parentBuffer = createSpanBuffer(schema, module, 'test-span');
 
-      const childTaskContext = createTestTaskContext(schema.fields, { spanName: 'child-span' });
-
-      const childBuffer = createSpanBuffer(schema, childTaskContext);
-      childBuffer.parent = parentBuffer;
+      const childBuffer = createChildSpanBuffer(parentBuffer, module, 'child-span');
       parentBuffer.children.push(childBuffer);
 
       const nextChildBuffer = createNextBuffer(childBuffer);
@@ -126,11 +123,10 @@ describe('Buffer Chaining', () => {
     });
 
     it('should create empty children array for chained buffer', () => {
-      const buffer = createSpanBuffer(schema, taskContext);
+      const buffer = createSpanBuffer(schema, module, 'test-span');
 
       // Add a child to original buffer
-      const childTaskContext = createTestTaskContext(schema.fields, { spanName: 'child-span' });
-      const childBuffer = createSpanBuffer(schema, childTaskContext);
+      const childBuffer = createChildSpanBuffer(buffer, module, 'child-span');
       buffer.children.push(childBuffer);
 
       const nextBuffer = createNextBuffer(buffer);
@@ -142,17 +138,17 @@ describe('Buffer Chaining', () => {
 
   describe('Buffer Chaining Edge Cases', () => {
     it('should handle buffer at exact capacity', () => {
-      const buffer = createSpanBuffer(schema, taskContext, undefined, 10);
+      const buffer = createSpanBuffer(schema, module, 'test-span', undefined, 10);
       buffer.writeIndex = 10; // At exact capacity
 
       const nextBuffer = createNextBuffer(buffer);
 
       expect(nextBuffer.writeIndex).toBe(0);
-      expect(nextBuffer.capacity).toBe(taskContext.module.sb_capacity);
+      expect(nextBuffer.capacity).toBe(module.sb_capacity);
     });
 
     it('should preserve null bitmaps structure in chained buffer', () => {
-      const buffer = createSpanBuffer(schema, taskContext);
+      const buffer = createSpanBuffer(schema, module, 'test-span');
       const nextBuffer = createNextBuffer(buffer);
 
       // Should have null bitmaps for each attribute (direct properties)
@@ -163,17 +159,17 @@ describe('Buffer Chaining', () => {
     });
 
     it('should handle capacity changes between chained buffers', () => {
-      const buffer1 = createSpanBuffer(schema, taskContext);
+      const buffer1 = createSpanBuffer(schema, module, 'test-span');
       expect(buffer1.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
       // Simulate capacity tuning - double it
-      taskContext.module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 2;
+      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 2;
 
       const buffer2 = createNextBuffer(buffer1);
       expect(buffer2.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
       // Change capacity again - double again
-      taskContext.module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4;
+      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4;
 
       const buffer3 = createNextBuffer(buffer2);
       expect(buffer3.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);

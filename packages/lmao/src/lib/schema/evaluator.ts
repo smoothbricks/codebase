@@ -1,9 +1,9 @@
 import * as S from '@sury/sury';
-import { createEvaluatorClass, type GeneratedEvaluatorState } from '../codegen/evaluatorGenerator.js';
-import { getTimestampNanos } from '../timestamp.js';
-import type { SpanBuffer } from '../types.js';
-import type { EvaluationContext, FeatureFlagSchema } from './defineFeatureFlags.js';
-import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from './systemSchema.js';
+import { createEvaluatorClass } from '../codegen/evaluatorGenerator.js';
+import type { SpanContext } from '../spanContext.js';
+import type { FeatureFlagSchema } from './defineFeatureFlags.js';
+import { ENTRY_TYPE_FF_ACCESS } from './systemSchema.js';
+import type { InferSchema, LogSchema } from './types.js';
 
 /**
  * Type guard to validate flag value matches schema
@@ -26,17 +26,32 @@ export type FlagValue = string | number | boolean | null;
  *
  * This is implemented by the backend (database, LaunchDarkly, etc.)
  * and provides the actual flag values.
+ *
+ * @template T - LogSchema defining the evaluation context (scope values)
+ * @template FF - FeatureFlagSchema defining available flags
+ * @template Env - Environment type from module
  */
-export interface FlagEvaluator {
+export interface FlagEvaluator<
+  T extends LogSchema = LogSchema,
+  FF extends FeatureFlagSchema = FeatureFlagSchema,
+  Env = Record<string, unknown>,
+> {
   /**
    * Get a flag value synchronously (for cached/static flags)
    */
-  getSync<K extends string>(flag: K, context: EvaluationContext): FlagValue;
+  getSync<K extends string>(flag: K, context: Partial<InferSchema<T>>): FlagValue;
 
   /**
    * Get a flag value asynchronously (for dynamic flags)
    */
-  getAsync<K extends string>(flag: K, context: EvaluationContext): Promise<FlagValue>;
+  getAsync<K extends string>(flag: K, context: Partial<InferSchema<T>>): Promise<FlagValue>;
+
+  /**
+   * Create span-bound accessor from span context.
+   * Returns a FeatureFlagEvaluator with typed getters for each flag.
+   * Receives fully typed SpanContext from the module.
+   */
+  forContext?(ctx: SpanContext<T, FF, Env>): FeatureFlagEvaluator<FF, T, Env> & InferFeatureFlagsWithContext<FF>;
 }
 
 /**
@@ -50,7 +65,7 @@ export interface FlagColumnWriters {
   writeFfValue(value: FlagValue): void;
   writeAction(action?: string): void;
   writeOutcome(outcome?: string): void;
-  writeContextAttributes(context: EvaluationContext): void;
+  writeContextAttributes(context: Record<string, unknown>): void;
 }
 
 // ============================================================================
@@ -125,31 +140,28 @@ export type InferFeatureFlagsWithContext<T extends FeatureFlagSchema> = {
 const evaluatorClassCache = new WeakMap<
   FeatureFlagSchema,
   new (
-    state: GeneratedEvaluatorState<FeatureFlagSchema>,
+    spanContext: SpanContext<LogSchema, FeatureFlagSchema, unknown>,
+    evaluator: FlagEvaluator<LogSchema, FeatureFlagSchema, unknown>,
   ) => FeatureFlagEvaluator<FeatureFlagSchema>
 >();
 
 /**
  * Get or create a generated evaluator class for a schema
  */
-function getOrCreateEvaluatorClass<T extends FeatureFlagSchema>(
-  schema: T,
+function getOrCreateEvaluatorClass<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown>(
+  schema: FF,
 ): new (
-  state: GeneratedEvaluatorState<T>,
-) => FeatureFlagEvaluator<T> & InferFeatureFlagsWithContext<T> {
+  spanContext: SpanContext<T, FF, Env>,
+  evaluator: FlagEvaluator<T, FF, Env>,
+) => FeatureFlagEvaluator<FF> & InferFeatureFlagsWithContext<FF> {
   // Check cache first
   let GeneratedClass = evaluatorClassCache.get(schema);
 
   if (!GeneratedClass) {
     // Generate the class using new Function()
-    GeneratedClass = createEvaluatorClass(
-      schema,
-      validateFlagValue,
-      getTimestampNanos,
-      ENTRY_TYPE_FF_ACCESS,
-      ENTRY_TYPE_FF_USAGE,
-    ) as unknown as new (
-      state: GeneratedEvaluatorState<FeatureFlagSchema>,
+    GeneratedClass = createEvaluatorClass(schema, validateFlagValue, ENTRY_TYPE_FF_ACCESS) as unknown as new (
+      spanContext: SpanContext<LogSchema, FeatureFlagSchema, unknown>,
+      evaluator: FlagEvaluator<LogSchema, FeatureFlagSchema, unknown>,
     ) => FeatureFlagEvaluator<FeatureFlagSchema>;
 
     // Cache the generated class
@@ -157,8 +169,9 @@ function getOrCreateEvaluatorClass<T extends FeatureFlagSchema>(
   }
 
   return GeneratedClass as unknown as new (
-    state: GeneratedEvaluatorState<T>,
-  ) => FeatureFlagEvaluator<T> & InferFeatureFlagsWithContext<T>;
+    spanContext: SpanContext<T, FF, Env>,
+    evaluator: FlagEvaluator<T, FF, Env>,
+  ) => FeatureFlagEvaluator<FF> & InferFeatureFlagsWithContext<FF>;
 }
 
 /**
@@ -179,49 +192,18 @@ function getOrCreateEvaluatorClass<T extends FeatureFlagSchema>(
  * Note: The class constructor returns a generated class instance rather than this instance.
  * This is a valid JavaScript pattern for creating optimized instances with schema-specific properties.
  */
-export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
+export class FeatureFlagEvaluator<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown> {
   // These properties exist for type compatibility but actual implementation uses generated class
-  protected schema!: T;
-  protected evaluationContext!: EvaluationContext;
-  protected evaluator!: FlagEvaluator;
-  protected buffer!: SpanBuffer | null;
-  protected columnWriters?: FlagColumnWriters;
+  protected evaluator!: FlagEvaluator<T, FF, Env>;
 
-  constructor(
-    schema: T,
-    evaluationContext: EvaluationContext,
-    evaluator: FlagEvaluator,
-    bufferOrColumnWriters?: SpanBuffer | FlagColumnWriters | null,
-  ) {
-    // Determine if we got FlagColumnWriters or SpanBuffer
-    let buffer: SpanBuffer | null = null;
-    let columnWriters: FlagColumnWriters | undefined;
-
-    if (bufferOrColumnWriters && 'writeEntryType' in bufferOrColumnWriters) {
-      // It's FlagColumnWriters
-      columnWriters = bufferOrColumnWriters as FlagColumnWriters;
-    } else if (bufferOrColumnWriters) {
-      // It's SpanBuffer
-      buffer = bufferOrColumnWriters as SpanBuffer;
-    }
-
-    const state: GeneratedEvaluatorState<T> = {
-      schema,
-      evaluationContext,
-      evaluator,
-      buffer,
-      columnWriters,
-      accessedFlags: new Set(),
-      flagCache: new Map(),
-    };
-
+  constructor(schema: FF, spanContext: SpanContext<T, FF, Env>, evaluator: FlagEvaluator<T, FF, Env>) {
     // Get or create the generated class for this schema
-    const GeneratedClass = getOrCreateEvaluatorClass(schema);
+    const GeneratedClass = getOrCreateEvaluatorClass<FF, T, Env>(schema);
 
     // Return generated class instance instead of this instance
     // This is a valid JavaScript pattern - constructors can return objects
     // biome-ignore lint/correctness/noConstructorReturn: Valid pattern for generated class instances
-    return new GeneratedClass(state) as unknown as FeatureFlagEvaluator<T>;
+    return new GeneratedClass(spanContext, evaluator) as unknown as FeatureFlagEvaluator<FF, T, Env>;
   }
 
   // These methods exist for TypeScript type information only
@@ -236,19 +218,11 @@ export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
   }
 
   /** Track flag usage. Prefer using flag.track() for the fluent API. */
-  trackUsage<K extends keyof T>(_flag: K, _context?: FlagTrackContext): void {
+  trackUsage<K extends keyof FF>(_flag: K, _context?: FlagTrackContext): void {
     throw new Error('Should not be called - handled by generated class');
   }
 
-  forContext(_additional: Partial<EvaluationContext>): FeatureFlagEvaluator<T> {
-    throw new Error('Should not be called - handled by generated class');
-  }
-
-  withBuffer(_buffer: SpanBuffer): FeatureFlagEvaluator<T> {
-    throw new Error('Should not be called - handled by generated class');
-  }
-
-  getContext(): EvaluationContext {
+  forContext(_ctx: SpanContext<T, FF, Env>): FeatureFlagEvaluator<FF, T, Env> {
     throw new Error('Should not be called - handled by generated class');
   }
 }
@@ -256,22 +230,37 @@ export class FeatureFlagEvaluator<T extends FeatureFlagSchema> {
 /**
  * Simple in-memory flag evaluator for testing
  */
-export class InMemoryFlagEvaluator implements FlagEvaluator {
+export class InMemoryFlagEvaluator<
+  T extends LogSchema = LogSchema,
+  FF extends FeatureFlagSchema = FeatureFlagSchema,
+  Env = unknown,
+> implements FlagEvaluator<T, FF, Env>
+{
   private flags: Record<string, FlagValue> = {};
+  private ffSchema: FF;
 
-  constructor(initialFlags: Record<string, FlagValue> = {}) {
+  constructor(ffSchema: FF, initialFlags: Record<string, FlagValue> = {}) {
+    this.ffSchema = ffSchema;
     this.flags = initialFlags;
   }
 
-  getSync<K extends string>(flag: K, _context: EvaluationContext): FlagValue {
+  getSync<K extends string>(flag: K, _context: Partial<InferSchema<T>>): FlagValue {
     return this.flags[flag] ?? null;
   }
 
-  async getAsync<K extends string>(flag: K, _context: EvaluationContext): Promise<FlagValue> {
+  async getAsync<K extends string>(flag: K, _context: Partial<InferSchema<T>>): Promise<FlagValue> {
     return this.flags[flag] ?? null;
   }
 
   setFlag(flag: string, value: FlagValue): void {
     this.flags[flag] = value;
+  }
+
+  /**
+   * Create span-bound FeatureFlagEvaluator with typed getters
+   */
+  forContext(ctx: SpanContext<T, FF, Env>): FeatureFlagEvaluator<FF, T, Env> & InferFeatureFlagsWithContext<FF> {
+    return new FeatureFlagEvaluator(this.ffSchema, ctx, this) as FeatureFlagEvaluator<FF, T, Env> &
+      InferFeatureFlagsWithContext<FF>;
   }
 }

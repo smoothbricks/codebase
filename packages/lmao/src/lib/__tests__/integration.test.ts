@@ -55,7 +55,7 @@ describe('Schema Integration Patterns', () => {
 
   // Create flag evaluator with test values
   function createFlagEvaluator() {
-    return new InMemoryFlagEvaluator({
+    return new InMemoryFlagEvaluator(featureFlags.schema, {
       advancedValidation: true,
       maxRetries: 5,
       experimentalFeature: false,

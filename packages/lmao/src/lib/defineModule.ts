@@ -14,8 +14,13 @@
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { ModuleContext } from './moduleContext.js';
 import { Op } from './op.js';
-import type { EvaluationContext, FeatureFlagSchema } from './schema/defineFeatureFlags.js';
-import { FeatureFlagEvaluator, type FlagEvaluator, type FlagValue } from './schema/evaluator.js';
+import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
+import {
+  FeatureFlagEvaluator,
+  type FlagEvaluator,
+  type FlagValue,
+  type InferFeatureFlagsWithContext,
+} from './schema/evaluator.js';
 import { LogSchema } from './schema/LogSchema.js';
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
@@ -47,11 +52,19 @@ import type { SpanBuffer } from './types.js';
  * Per spec 01l lines 244-248:
  * - Used when .make() is called without ffEvaluator
  * - Simply returns the default values from the ff schema
+ * - forContext() creates a span-bound FeatureFlagEvaluator with typed getters
  */
-export class DefaultValueFlagEvaluator implements FlagEvaluator {
+export class DefaultValueFlagEvaluator<
+  T extends LogSchema = LogSchema,
+  FF extends FeatureFlagSchema = FeatureFlagSchema,
+  Env = unknown,
+> implements FlagEvaluator<T, FF, Env>
+{
   private defaults: Record<string, FlagValue>;
+  private ffSchema: FF;
 
-  constructor(ffSchema: FeatureFlagSchema | undefined) {
+  constructor(ffSchema: FF | undefined) {
+    this.ffSchema = ffSchema ?? ({} as FF);
     this.defaults = {};
     if (ffSchema) {
       for (const [key, def] of Object.entries(ffSchema)) {
@@ -62,12 +75,21 @@ export class DefaultValueFlagEvaluator implements FlagEvaluator {
     }
   }
 
-  getSync<K extends string>(flag: K, _context: EvaluationContext): FlagValue {
+  getSync<K extends string>(flag: K, _context: Record<string, unknown>): FlagValue {
     return this.defaults[flag] ?? null;
   }
 
-  async getAsync<K extends string>(flag: K, _context: EvaluationContext): Promise<FlagValue> {
+  async getAsync<K extends string>(flag: K, _context: Record<string, unknown>): Promise<FlagValue> {
     return this.defaults[flag] ?? null;
+  }
+
+  /**
+   * Create span-bound FeatureFlagEvaluator with typed getters
+   */
+  forContext(ctx: SpanContext<T, FF, Env>): FeatureFlagEvaluator<FF, T, Env> & InferFeatureFlagsWithContext<FF> {
+    // Create a FeatureFlagEvaluator with typed getters for the span
+    return new FeatureFlagEvaluator(this.ffSchema, ctx, this) as FeatureFlagEvaluator<FF, T, Env> &
+      InferFeatureFlagsWithContext<FF>;
   }
 }
 
@@ -175,9 +197,14 @@ export type OpRecord<Ctx> = Record<string, (ctx: Ctx, ...args: any[]) => Promise
 /**
  * Options for traceContext creation
  */
-export type TraceContextParams<FF extends FeatureFlagSchema, Extra extends Record<string, unknown>> = {
-  /** Optional ff evaluator override */
-  ff?: FeatureFlagEvaluator<FF>;
+export type TraceContextParams<
+  FF extends FeatureFlagSchema,
+  Extra extends Record<string, unknown>,
+  T extends LogSchema = LogSchema,
+  Env = unknown,
+> = {
+  /** Optional ff evaluator override (root evaluator) */
+  ff?: FlagEvaluator<T, FF, Env>;
   /** Optional trace ID (auto-generated if not provided) */
   traceId?: TraceId;
 } & Extra;
@@ -503,15 +530,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
       traceContext(params: TraceContextParams<FF, Extra>): TraceContext<FF, Extra> {
         const { ff: ffOverride, traceId: providedTraceId, ...userProps } = params;
 
-        // Create evaluation context from user props
-        const evaluationContext: EvaluationContext = {
-          userId: (userProps as Record<string, unknown>).userId as string | undefined,
-          requestId: (userProps as Record<string, unknown>).requestId as string | undefined,
-        };
-
-        // Create or use provided ff evaluator
-        const ffEval =
-          ffOverride ?? new FeatureFlagEvaluator(state.ff ?? ({} as FF), evaluationContext, evaluator, undefined);
+        // Use provided evaluator override or the module's root evaluator
+        // The root evaluator is a FlagEvaluator that can create span-bound evaluators via forContext()
+        const rootEvaluator = ffOverride ?? evaluator;
 
         // Generate system properties
         const traceId = providedTraceId ?? generateTraceId();
@@ -530,7 +551,7 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         ctx.anchorEpochMicros = anchorEpochMicros;
         ctx.anchorPerfNow = anchorPerfNow;
         ctx.threadId = threadId;
-        ctx.ff = ffEval;
+        ctx.ff = rootEvaluator;
 
         // Create root span function supporting both overloads
         const spanImpl = <Ctx, R, Args extends unknown[]>(

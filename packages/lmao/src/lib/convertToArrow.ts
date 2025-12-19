@@ -94,7 +94,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
   if (totalRows === 0) return new RecordBatch({});
 
-  const schema: LogSchema = buffers[0].task.module.logSchema;
+  const schema: LogSchema = buffers[0].module.logSchema;
 
   // Build vectors first, then derive schema from them
   // This ensures Field types and vector data types are identical (Arrow IPC requirement)
@@ -578,7 +578,7 @@ function buildMetadataColumnsWithFields(
   // Package name
   const packageSet = new Set<string>();
   for (const buf of buffers) {
-    packageSet.add(buf.task.module.packageName);
+    packageSet.add(buf.module.packageName);
     if (buf.callsiteModule) packageSet.add(buf.callsiteModule.packageName);
   }
   const packageArray = Array.from(packageSet);
@@ -594,9 +594,9 @@ function buildMetadataColumnsWithFields(
   const packageIndices = new packageIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.task.module.packageName;
+    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.module.packageName;
     const callsitePkgIdx = packageMap.get(callsitePkgName) ?? 0;
-    const opPkgIdx = packageMap.get(buf.task.module.packageName) ?? 0;
+    const opPkgIdx = packageMap.get(buf.module.packageName) ?? 0;
     packageIndices[rowOffset] = callsitePkgIdx;
     if (buf.writeIndex > 1) {
       packageIndices.fill(opPkgIdx, rowOffset + 1, rowOffset + buf.writeIndex);
@@ -627,7 +627,7 @@ function buildMetadataColumnsWithFields(
   // Package path
   const modulePathSet = new Set<string>();
   for (const buf of buffers) {
-    modulePathSet.add(buf.task.module.packagePath);
+    modulePathSet.add(buf.module.packagePath);
     if (buf.callsiteModule) modulePathSet.add(buf.callsiteModule.packagePath);
   }
   const modulePathArray = Array.from(modulePathSet);
@@ -644,9 +644,9 @@ function buildMetadataColumnsWithFields(
   const packagePathIndices = new packagePathIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.task.module.packagePath;
+    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.module.packagePath;
     const callsitePathIdx = modulePathMap.get(callsitePathName) ?? 0;
-    const opPathIdx = modulePathMap.get(buf.task.module.packagePath) ?? 0;
+    const opPathIdx = modulePathMap.get(buf.module.packagePath) ?? 0;
     packagePathIndices[rowOffset] = callsitePathIdx;
     if (buf.writeIndex > 1) {
       packagePathIndices.fill(opPathIdx, rowOffset + 1, rowOffset + buf.writeIndex);
@@ -677,7 +677,7 @@ function buildMetadataColumnsWithFields(
   // Git SHA
   const gitShaSet = new Set<string>();
   for (const buf of buffers) {
-    gitShaSet.add(buf.task.module.gitSha);
+    gitShaSet.add(buf.module.gitSha);
     if (buf.callsiteModule) gitShaSet.add(buf.callsiteModule.gitSha);
   }
   const gitShaArray = Array.from(gitShaSet);
@@ -693,9 +693,9 @@ function buildMetadataColumnsWithFields(
   const gitShaIndices = new gitShaIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.task.module.gitSha;
+    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.module.gitSha;
     const callsiteGitShaIdx = gitShaMap.get(callsiteGitSha) ?? 0;
-    const opGitShaIdx = gitShaMap.get(buf.task.module.gitSha) ?? 0;
+    const opGitShaIdx = gitShaMap.get(buf.module.gitSha) ?? 0;
     gitShaIndices[rowOffset] = callsiteGitShaIdx;
     if (buf.writeIndex > 1) {
       gitShaIndices.fill(opGitShaIdx, rowOffset + 1, rowOffset + buf.writeIndex);
@@ -760,7 +760,7 @@ export function convertSpanTreeToArrowTable(
   const mergedSchemaFields = new Map<string, unknown>();
 
   walkSpanTree(rootBuffer, (buffer) => {
-    const bufferSchema = buffer.task.module.logSchema;
+    const bufferSchema = buffer.module.logSchema;
     const fields = Array.from(bufferSchema.fieldEntries());
     for (const [fieldName, fieldSchema] of fields) {
       // Skip system schema fields - they are handled separately as system columns
@@ -828,7 +828,7 @@ export function convertSpanTreeToArrowTable(
 
     // Collect unique ModuleContexts (already have pre-encoded entries)
     // Include both task.module (for rows 1+) and callsiteModule (for row 0) if present
-    uniqueModules.add(buffer.task.module);
+    uniqueModules.add(buffer.module);
     if (buffer.callsiteModule) {
       uniqueModules.add(buffer.callsiteModule);
     }
@@ -1341,11 +1341,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task.module
-    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.task.module.packageName;
+    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.module.packageName;
     const callsitePkgIdx = packageDict.indexMap.get(callsitePkgName) ?? 0;
 
     // Op's module (task.module) for rows 1+
-    const opPkgIdx = packageDict.indexMap.get(buf.task.module.packageName) ?? 0;
+    const opPkgIdx = packageDict.indexMap.get(buf.module.packageName) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packageIndices[offset] = callsitePkgIdx;
@@ -1383,11 +1383,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task.module
-    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.task.module.packagePath;
+    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.module.packagePath;
     const callsitePathIdx = packagePathDict.indexMap.get(callsitePathName) ?? 0;
 
     // Op's module (task.module) for rows 1+
-    const opPathIdx = packagePathDict.indexMap.get(buf.task.module.packagePath) ?? 0;
+    const opPathIdx = packagePathDict.indexMap.get(buf.module.packagePath) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packagePathIndices[offset] = callsitePathIdx;
@@ -1425,11 +1425,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task.module
-    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.task.module.gitSha;
+    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.module.gitSha;
     const callsiteGitShaIdx = gitShaDict.indexMap.get(callsiteGitSha) ?? 0;
 
     // Op's module (task.module) for rows 1+
-    const opGitShaIdx = gitShaDict.indexMap.get(buf.task.module.gitSha) ?? 0;
+    const opGitShaIdx = gitShaDict.indexMap.get(buf.module.gitSha) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     gitShaIndices2[offset] = callsiteGitShaIdx;

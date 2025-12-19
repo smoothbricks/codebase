@@ -18,7 +18,7 @@ import {
 import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { SpanBuffer } from '../types.js';
-import { createTestTaskContext } from './test-helpers.js';
+import { createTestModuleContext } from './test-helpers.js';
 
 // Test schema
 // Note: resultMessage, exceptionMessage, errorCode, and exceptionStack are now system columns
@@ -245,7 +245,7 @@ describe('Child Span Lifecycle', () => {
       const parent = parentBuffer as NonNullable<typeof parentBuffer>;
 
       // Verify child span inherits parent's schema
-      expect(ctx.buffer.task.module.logSchema).toBe(parent.task.module.logSchema);
+      expect(ctx.buffer.module.logSchema).toBe(parent.module.logSchema);
 
       // Verify child span has different spanId but same traceId
       expect(ctx.buffer.spanId).not.toBe(parent.spanId);
@@ -374,11 +374,11 @@ describe('Child Span Lifecycle', () => {
 
       // Verify child span inherits parent's schema
       // Even though childModule has its own schema, the child buffer should use parent's schema
-      // Note: The child buffer's schema comes from parentBuffer.task.module.logSchema
+      // Note: The child buffer's schema comes from parentBuffer.module.logSchema
       // (inherited via createChildSpanBuffer), not from childModule's schema
       expect(parentBuffer).toBeDefined();
       const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-      expect(ctx.buffer.task.module.logSchema).toEqual(parent.task.module.logSchema);
+      expect(ctx.buffer.module.logSchema).toEqual(parent.module.logSchema);
 
       // Child should be able to access parent's schema fields
       ctx.tag.userId('user123').operation('READ');
@@ -406,7 +406,7 @@ describe('Child Span Lifecycle', () => {
     // Child buffer's schema should be the same as parent's schema (inherited)
     // Note: We use toEqual because the schemas are equal but may be different object references
     // The important thing is that the child buffer can write to parent's schema fields
-    expect(childBuffer?.task.module.logSchema).toEqual(parentBuffer?.task.module.logSchema);
+    expect(childBuffer?.module.logSchema).toEqual(parentBuffer?.module.logSchema);
   });
 });
 
@@ -569,8 +569,8 @@ describe('Fixed Row Layout', () => {
   it('should create buffer with proper structure for fixed layout', () => {
     // Use the LogSchema directly (not a plain object extraction)
     // testSchema is already a LogSchema from defineLogSchema()
-    const taskContext = createTestTaskContext(testSchema.fields);
-    const buffer = createSpanBuffer(testSchema, taskContext);
+    const module = createTestModuleContext(testSchema);
+    const buffer = createSpanBuffer(testSchema, module, 'test-span');
 
     // Buffer should have timestamps array for duration calculation
     expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);

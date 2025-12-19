@@ -11,7 +11,7 @@
  */
 
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { createTestTaskContext } from '../../__tests__/test-helpers.js';
+import { createTestModuleContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -27,8 +27,8 @@ import type { SpanBuffer } from '../../types.js';
 import { type BaseSpanLogger, createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
 function createTestBuffer(schema: LogSchema): SpanBuffer {
-  const taskContext = createTestTaskContext(schema.fields);
-  return createSpanBuffer(schema.fields, taskContext);
+  const module = createTestModuleContext(schema);
+  return createSpanBuffer(schema, module, 'test-span');
 }
 
 describe('createSpanLoggerClass', () => {

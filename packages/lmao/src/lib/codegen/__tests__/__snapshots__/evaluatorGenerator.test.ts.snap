@@ -1,42 +1,63 @@
 // Bun Snapshot v1, https://bun.sh/docs/test/snapshots
 
 exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
-"(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
+"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
   'use strict';
 
   class GeneratedEvaluator {
-    #state;
+    #spanContext;
+    #evaluator;
+    #schema;
 
-    constructor(state) {
-      this.#state = state;
+    constructor(spanContext, evaluator) {
+      this.#spanContext = spanContext;
+      this.#evaluator = evaluator;
+      // Schema passed as closure parameter at codegen time
+      this.#schema = SCHEMA;
     }
 
-    get schema() { return this.#state.schema; }
-    get evaluationContext() { return this.#state.evaluationContext; }
-    get evaluator() { return this.#state.evaluator; }
-    get buffer() { return this.#state.buffer; }
-    get columnWriters() { return this.#state.columnWriters; }
-    set columnWriters(value) { this.#state.columnWriters = value; }
-    set buffer(value) { this.#state.buffer = value; }
+    get evaluator() { return this.#evaluator; }
+
+    #hasLoggedAccess(flagName) {
+      let buf = this.#spanContext._buffer;
+      
+      while (buf) {
+        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // This ensures we check all written entries including the most recent
+        const limit = buf.writeIndex;
+        for (let i = limit - 1; i >= 0; i--) {
+          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+              buf.message_values && buf.message_values[i] === flagName) {
+            return true;
+          }
+        }
+        buf = buf.next;
+      }
+      return false;
+    }
 
     #getFlag(flagName) {
-      const state = this.#state;
-      if (state.flagCache.has(flagName)) {
-        return state.flagCache.get(flagName);
-      }
-      const definition = state.schema[flagName];
-      const rawValue = state.evaluator.getSync(flagName, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flagName];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      // Always evaluate - backend caches based on evaluationContext
+      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flagName)) {
-        this.#logAccess(flagName, rawValue);
-        state.accessedFlags.add(flagName);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flagName)) {
+        const log = ctx.log;
+        log.ffAccess(flagName, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(flagName, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flagName, value);
-      state.flagCache.set(flagName, wrapped);
       return wrapped;
     }
 
@@ -67,70 +88,36 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
     }
 
     #logAccess(flagName, value) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-access');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeFfValue(value);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      const ffValueColumn = state.buffer['attr_ffValue_values'];
-      if (ffValueColumn && Array.isArray(ffValueColumn)) {
-        const strValue = value === null || value === undefined ? 'null' : String(value);
-        ffValueColumn[idx] = strValue;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffAccess(flagName, value);
     }
 
     #logUsage(flagName, context) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-usage');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeAction(context?.action);
-        state.columnWriters.writeOutcome(context?.outcome);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffUsage(flagName, context);
     }
 
     async get(flag) {
-      const state = this.#state;
-      const cacheKey = 'async_' + flag;
-      if (state.flagCache.has(cacheKey)) {
-        return state.flagCache.get(cacheKey);
-      }
-      const definition = state.schema[flag];
-      const rawValue = await state.evaluator.getAsync(flag, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flag];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flag)) {
-        this.#logAccess(flag, rawValue);
-        state.accessedFlags.add(flag);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flag)) {
+        const log = ctx.log;
+        log.ffAccess(flag, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(cacheKey, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flag, value);
-      state.flagCache.set(cacheKey, wrapped);
       return wrapped;
     }
 
@@ -138,28 +125,8 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
       this.#logUsage(flag, context);
     }
 
-    forContext(additional) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        evaluationContext: { ...state.evaluationContext, ...additional },
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    withBuffer(buffer) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        buffer,
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    getContext() {
-      return this.#state.evaluationContext;
+    forContext(ctx) {
+      return new GeneratedEvaluator(ctx, this.#evaluator);
     }
 
     get debugMode() {
@@ -173,42 +140,63 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different types 1`] = `
-"(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
+"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
   'use strict';
 
   class GeneratedEvaluator {
-    #state;
+    #spanContext;
+    #evaluator;
+    #schema;
 
-    constructor(state) {
-      this.#state = state;
+    constructor(spanContext, evaluator) {
+      this.#spanContext = spanContext;
+      this.#evaluator = evaluator;
+      // Schema passed as closure parameter at codegen time
+      this.#schema = SCHEMA;
     }
 
-    get schema() { return this.#state.schema; }
-    get evaluationContext() { return this.#state.evaluationContext; }
-    get evaluator() { return this.#state.evaluator; }
-    get buffer() { return this.#state.buffer; }
-    get columnWriters() { return this.#state.columnWriters; }
-    set columnWriters(value) { this.#state.columnWriters = value; }
-    set buffer(value) { this.#state.buffer = value; }
+    get evaluator() { return this.#evaluator; }
+
+    #hasLoggedAccess(flagName) {
+      let buf = this.#spanContext._buffer;
+      
+      while (buf) {
+        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // This ensures we check all written entries including the most recent
+        const limit = buf.writeIndex;
+        for (let i = limit - 1; i >= 0; i--) {
+          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+              buf.message_values && buf.message_values[i] === flagName) {
+            return true;
+          }
+        }
+        buf = buf.next;
+      }
+      return false;
+    }
 
     #getFlag(flagName) {
-      const state = this.#state;
-      if (state.flagCache.has(flagName)) {
-        return state.flagCache.get(flagName);
-      }
-      const definition = state.schema[flagName];
-      const rawValue = state.evaluator.getSync(flagName, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flagName];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      // Always evaluate - backend caches based on evaluationContext
+      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flagName)) {
-        this.#logAccess(flagName, rawValue);
-        state.accessedFlags.add(flagName);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flagName)) {
+        const log = ctx.log;
+        log.ffAccess(flagName, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(flagName, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flagName, value);
-      state.flagCache.set(flagName, wrapped);
       return wrapped;
     }
 
@@ -239,70 +227,36 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
     }
 
     #logAccess(flagName, value) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-access');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeFfValue(value);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      const ffValueColumn = state.buffer['attr_ffValue_values'];
-      if (ffValueColumn && Array.isArray(ffValueColumn)) {
-        const strValue = value === null || value === undefined ? 'null' : String(value);
-        ffValueColumn[idx] = strValue;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffAccess(flagName, value);
     }
 
     #logUsage(flagName, context) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-usage');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeAction(context?.action);
-        state.columnWriters.writeOutcome(context?.outcome);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffUsage(flagName, context);
     }
 
     async get(flag) {
-      const state = this.#state;
-      const cacheKey = 'async_' + flag;
-      if (state.flagCache.has(cacheKey)) {
-        return state.flagCache.get(cacheKey);
-      }
-      const definition = state.schema[flag];
-      const rawValue = await state.evaluator.getAsync(flag, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flag];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flag)) {
-        this.#logAccess(flag, rawValue);
-        state.accessedFlags.add(flag);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flag)) {
+        const log = ctx.log;
+        log.ffAccess(flag, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(cacheKey, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flag, value);
-      state.flagCache.set(cacheKey, wrapped);
       return wrapped;
     }
 
@@ -310,28 +264,8 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
       this.#logUsage(flag, context);
     }
 
-    forContext(additional) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        evaluationContext: { ...state.evaluationContext, ...additional },
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    withBuffer(buffer) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        buffer,
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    getContext() {
-      return this.#state.evaluationContext;
+    forContext(ctx) {
+      return new GeneratedEvaluator(ctx, this.#evaluator);
     }
 
     get debugMode() {
@@ -353,42 +287,63 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
-"(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
+"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
   'use strict';
 
   class GeneratedEvaluator {
-    #state;
+    #spanContext;
+    #evaluator;
+    #schema;
 
-    constructor(state) {
-      this.#state = state;
+    constructor(spanContext, evaluator) {
+      this.#spanContext = spanContext;
+      this.#evaluator = evaluator;
+      // Schema passed as closure parameter at codegen time
+      this.#schema = SCHEMA;
     }
 
-    get schema() { return this.#state.schema; }
-    get evaluationContext() { return this.#state.evaluationContext; }
-    get evaluator() { return this.#state.evaluator; }
-    get buffer() { return this.#state.buffer; }
-    get columnWriters() { return this.#state.columnWriters; }
-    set columnWriters(value) { this.#state.columnWriters = value; }
-    set buffer(value) { this.#state.buffer = value; }
+    get evaluator() { return this.#evaluator; }
+
+    #hasLoggedAccess(flagName) {
+      let buf = this.#spanContext._buffer;
+      
+      while (buf) {
+        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // This ensures we check all written entries including the most recent
+        const limit = buf.writeIndex;
+        for (let i = limit - 1; i >= 0; i--) {
+          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+              buf.message_values && buf.message_values[i] === flagName) {
+            return true;
+          }
+        }
+        buf = buf.next;
+      }
+      return false;
+    }
 
     #getFlag(flagName) {
-      const state = this.#state;
-      if (state.flagCache.has(flagName)) {
-        return state.flagCache.get(flagName);
-      }
-      const definition = state.schema[flagName];
-      const rawValue = state.evaluator.getSync(flagName, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flagName];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      // Always evaluate - backend caches based on evaluationContext
+      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flagName)) {
-        this.#logAccess(flagName, rawValue);
-        state.accessedFlags.add(flagName);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flagName)) {
+        const log = ctx.log;
+        log.ffAccess(flagName, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(flagName, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flagName, value);
-      state.flagCache.set(flagName, wrapped);
       return wrapped;
     }
 
@@ -419,70 +374,36 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
     }
 
     #logAccess(flagName, value) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-access');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeFfValue(value);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      const ffValueColumn = state.buffer['attr_ffValue_values'];
-      if (ffValueColumn && Array.isArray(ffValueColumn)) {
-        const strValue = value === null || value === undefined ? 'null' : String(value);
-        ffValueColumn[idx] = strValue;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffAccess(flagName, value);
     }
 
     #logUsage(flagName, context) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-usage');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeAction(context?.action);
-        state.columnWriters.writeOutcome(context?.outcome);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffUsage(flagName, context);
     }
 
     async get(flag) {
-      const state = this.#state;
-      const cacheKey = 'async_' + flag;
-      if (state.flagCache.has(cacheKey)) {
-        return state.flagCache.get(cacheKey);
-      }
-      const definition = state.schema[flag];
-      const rawValue = await state.evaluator.getAsync(flag, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flag];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flag)) {
-        this.#logAccess(flag, rawValue);
-        state.accessedFlags.add(flag);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flag)) {
+        const log = ctx.log;
+        log.ffAccess(flag, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(cacheKey, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flag, value);
-      state.flagCache.set(cacheKey, wrapped);
       return wrapped;
     }
 
@@ -490,28 +411,8 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
       this.#logUsage(flag, context);
     }
 
-    forContext(additional) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        evaluationContext: { ...state.evaluationContext, ...additional },
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    withBuffer(buffer) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        buffer,
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    getContext() {
-      return this.#state.evaluationContext;
+    forContext(ctx) {
+      return new GeneratedEvaluator(ctx, this.#evaluator);
     }
 
     get asyncFeature() {
@@ -529,42 +430,63 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
-"(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
+"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
   'use strict';
 
   class CustomFeatureFlagEvaluator {
-    #state;
+    #spanContext;
+    #evaluator;
+    #schema;
 
-    constructor(state) {
-      this.#state = state;
+    constructor(spanContext, evaluator) {
+      this.#spanContext = spanContext;
+      this.#evaluator = evaluator;
+      // Schema passed as closure parameter at codegen time
+      this.#schema = SCHEMA;
     }
 
-    get schema() { return this.#state.schema; }
-    get evaluationContext() { return this.#state.evaluationContext; }
-    get evaluator() { return this.#state.evaluator; }
-    get buffer() { return this.#state.buffer; }
-    get columnWriters() { return this.#state.columnWriters; }
-    set columnWriters(value) { this.#state.columnWriters = value; }
-    set buffer(value) { this.#state.buffer = value; }
+    get evaluator() { return this.#evaluator; }
+
+    #hasLoggedAccess(flagName) {
+      let buf = this.#spanContext._buffer;
+      
+      while (buf) {
+        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // This ensures we check all written entries including the most recent
+        const limit = buf.writeIndex;
+        for (let i = limit - 1; i >= 0; i--) {
+          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+              buf.message_values && buf.message_values[i] === flagName) {
+            return true;
+          }
+        }
+        buf = buf.next;
+      }
+      return false;
+    }
 
     #getFlag(flagName) {
-      const state = this.#state;
-      if (state.flagCache.has(flagName)) {
-        return state.flagCache.get(flagName);
-      }
-      const definition = state.schema[flagName];
-      const rawValue = state.evaluator.getSync(flagName, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flagName];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      // Always evaluate - backend caches based on evaluationContext
+      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flagName)) {
-        this.#logAccess(flagName, rawValue);
-        state.accessedFlags.add(flagName);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flagName)) {
+        const log = ctx.log;
+        log.ffAccess(flagName, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(flagName, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flagName, value);
-      state.flagCache.set(flagName, wrapped);
       return wrapped;
     }
 
@@ -595,70 +517,36 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
     }
 
     #logAccess(flagName, value) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-access');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeFfValue(value);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      const ffValueColumn = state.buffer['attr_ffValue_values'];
-      if (ffValueColumn && Array.isArray(ffValueColumn)) {
-        const strValue = value === null || value === undefined ? 'null' : String(value);
-        ffValueColumn[idx] = strValue;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffAccess(flagName, value);
     }
 
     #logUsage(flagName, context) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-usage');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeAction(context?.action);
-        state.columnWriters.writeOutcome(context?.outcome);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffUsage(flagName, context);
     }
 
     async get(flag) {
-      const state = this.#state;
-      const cacheKey = 'async_' + flag;
-      if (state.flagCache.has(cacheKey)) {
-        return state.flagCache.get(cacheKey);
-      }
-      const definition = state.schema[flag];
-      const rawValue = await state.evaluator.getAsync(flag, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flag];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flag)) {
-        this.#logAccess(flag, rawValue);
-        state.accessedFlags.add(flag);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flag)) {
+        const log = ctx.log;
+        log.ffAccess(flag, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(cacheKey, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flag, value);
-      state.flagCache.set(cacheKey, wrapped);
       return wrapped;
     }
 
@@ -666,28 +554,8 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
       this.#logUsage(flag, context);
     }
 
-    forContext(additional) {
-      const state = this.#state;
-      return new CustomFeatureFlagEvaluator({
-        ...state,
-        evaluationContext: { ...state.evaluationContext, ...additional },
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    withBuffer(buffer) {
-      const state = this.#state;
-      return new CustomFeatureFlagEvaluator({
-        ...state,
-        buffer,
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    getContext() {
-      return this.#state.evaluationContext;
+    forContext(ctx) {
+      return new CustomFeatureFlagEvaluator(ctx, this.#evaluator);
     }
 
     get testFlag() {
@@ -701,42 +569,63 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
-"(function(validateFlagValue, getTimestampNanos, ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE) {
+"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
   'use strict';
 
   class GeneratedEvaluator {
-    #state;
+    #spanContext;
+    #evaluator;
+    #schema;
 
-    constructor(state) {
-      this.#state = state;
+    constructor(spanContext, evaluator) {
+      this.#spanContext = spanContext;
+      this.#evaluator = evaluator;
+      // Schema passed as closure parameter at codegen time
+      this.#schema = SCHEMA;
     }
 
-    get schema() { return this.#state.schema; }
-    get evaluationContext() { return this.#state.evaluationContext; }
-    get evaluator() { return this.#state.evaluator; }
-    get buffer() { return this.#state.buffer; }
-    get columnWriters() { return this.#state.columnWriters; }
-    set columnWriters(value) { this.#state.columnWriters = value; }
-    set buffer(value) { this.#state.buffer = value; }
+    get evaluator() { return this.#evaluator; }
+
+    #hasLoggedAccess(flagName) {
+      let buf = this.#spanContext._buffer;
+      
+      while (buf) {
+        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // This ensures we check all written entries including the most recent
+        const limit = buf.writeIndex;
+        for (let i = limit - 1; i >= 0; i--) {
+          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+              buf.message_values && buf.message_values[i] === flagName) {
+            return true;
+          }
+        }
+        buf = buf.next;
+      }
+      return false;
+    }
 
     #getFlag(flagName) {
-      const state = this.#state;
-      if (state.flagCache.has(flagName)) {
-        return state.flagCache.get(flagName);
-      }
-      const definition = state.schema[flagName];
-      const rawValue = state.evaluator.getSync(flagName, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flagName];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      // Always evaluate - backend caches based on evaluationContext
+      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flagName)) {
-        this.#logAccess(flagName, rawValue);
-        state.accessedFlags.add(flagName);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flagName)) {
+        const log = ctx.log;
+        log.ffAccess(flagName, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(flagName, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flagName, value);
-      state.flagCache.set(flagName, wrapped);
       return wrapped;
     }
 
@@ -767,70 +656,36 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
     }
 
     #logAccess(flagName, value) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-access');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeFfValue(value);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_ACCESS;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      const ffValueColumn = state.buffer['attr_ffValue_values'];
-      if (ffValueColumn && Array.isArray(ffValueColumn)) {
-        const strValue = value === null || value === undefined ? 'null' : String(value);
-        ffValueColumn[idx] = strValue;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffAccess(flagName, value);
     }
 
     #logUsage(flagName, context) {
-      const state = this.#state;
-      if (state.columnWriters) {
-        state.columnWriters.writeEntryType('ff-usage');
-        state.columnWriters.writeFfName(flagName);
-        state.columnWriters.writeAction(context?.action);
-        state.columnWriters.writeOutcome(context?.outcome);
-        state.columnWriters.writeContextAttributes(state.evaluationContext);
-        return;
-      }
-      if (!state.buffer) return;
-      const idx = state.buffer.writeIndex;
-      state.buffer.operations[idx] = ENTRY_TYPE_FF_USAGE;
-      state.buffer.timestamps[idx] = getTimestampNanos();
-      const ffNameColumn = state.buffer['attr_ffName_values'];
-      if (ffNameColumn && Array.isArray(ffNameColumn)) {
-        ffNameColumn[idx] = flagName;
-      }
-      state.buffer.writeIndex++;
+      const log = this.#spanContext.log;
+      log.ffUsage(flagName, context);
     }
 
     async get(flag) {
-      const state = this.#state;
-      const cacheKey = 'async_' + flag;
-      if (state.flagCache.has(cacheKey)) {
-        return state.flagCache.get(cacheKey);
-      }
-      const definition = state.schema[flag];
-      const rawValue = await state.evaluator.getAsync(flag, state.evaluationContext);
+      const ctx = this.#spanContext;
+      const definition = this.#schema[flag];
+      
+      // Read evaluation context from scopeValues
+      const evaluationContext = ctx.buffer.scopeValues || {};
+      
+      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      if (!state.accessedFlags.has(flag)) {
-        this.#logAccess(flag, rawValue);
-        state.accessedFlags.add(flag);
+      
+      // Deduplicate: only log first access per span
+      if (!this.#hasLoggedAccess(flag)) {
+        const log = ctx.log;
+        log.ffAccess(flag, rawValue);
       }
+      
       if (!value) {
-        state.flagCache.set(cacheKey, undefined);
         return undefined;
       }
+      
       const wrapped = this.#wrapValue(flag, value);
-      state.flagCache.set(cacheKey, wrapped);
       return wrapped;
     }
 
@@ -838,28 +693,8 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
       this.#logUsage(flag, context);
     }
 
-    forContext(additional) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        evaluationContext: { ...state.evaluationContext, ...additional },
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    withBuffer(buffer) {
-      const state = this.#state;
-      return new GeneratedEvaluator({
-        ...state,
-        buffer,
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      });
-    }
-
-    getContext() {
-      return this.#state.evaluationContext;
+    forContext(ctx) {
+      return new GeneratedEvaluator(ctx, this.#evaluator);
     }
 
     get flag1() {

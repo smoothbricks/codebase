@@ -6,7 +6,7 @@
 
 import { createResultWriter, type ResultWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
-import type { InferTagAttributes, LogSchema } from './schema/types.js';
+import type { InferSchema, LogSchema } from './schema/types.js';
 import { getTimestampNanos } from './timestamp.js';
 import type { SpanBuffer } from './types.js';
 
@@ -123,7 +123,7 @@ export class FluentSuccessResult<V, T extends LogSchema> implements SuccessResul
    * Set multiple attributes on the result entry
    * Example: ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
    */
-  with(attributes: Partial<InferTagAttributes<T>>): this {
+  with(attributes: Partial<InferSchema<T>>): this {
     this.#writer.with(attributes);
     return this;
   }
@@ -204,7 +204,7 @@ export class FluentErrorResult<E, T extends LogSchema> implements ErrorResult<E>
    * Set multiple attributes on the result entry
    * Example: ctx.err('ERROR', details).with({ userId: 'u1' })
    */
-  with(attributes: Partial<InferTagAttributes<T>>): this {
+  with(attributes: Partial<InferSchema<T>>): this {
     this.#writer.with(attributes);
     return this;
   }

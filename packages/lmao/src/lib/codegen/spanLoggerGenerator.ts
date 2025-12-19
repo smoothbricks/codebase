@@ -4,7 +4,7 @@
  * Per specs/01g_trace_context_api_codegen.md and 01j_module_context_and_spanlogger_generation.md:
  * - SpanLogger extends ColumnWriter from arrow-builder via codegen extension
  * - Handles log entries (rows 2+) - tag writing is in TagWriter (row 0)
- * - Uses nextRow() to advance position, then fluent setters write at _writeIndex
+ * - Uses _nextRow() to advance position, then fluent setters write at _writeIndex
  * - Compile-time enum mapping for 1-byte storage
  * - Direct buffer writes without intermediate objects
  *
@@ -13,19 +13,21 @@
  * - Row 1: result (ok/err) entry
  * - Rows 2+: log entries (info/debug/warn/error)
  *
- * SpanLogger starts with _writeIndex = 1, so first nextRow() makes it 2.
+ * SpanLogger starts with _writeIndex = 1, so first _nextRow() makes it 2.
  */
 
 import { type ColumnWriter, type ColumnWriterExtension, getColumnWriterClass } from '@smoothbricks/arrow-builder';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
+  ENTRY_TYPE_FF_ACCESS,
+  ENTRY_TYPE_FF_USAGE,
   ENTRY_TYPE_INFO,
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
-import type { InferTagAttributes, LogSchema } from '../schema/types.js';
+import type { InferSchema, LogSchema } from '../schema/types.js';
 import { createNextBuffer as createNextSpanBuffer } from '../spanBuffer.js';
 // Import timestamp function - will be injected as dependency
 import { getTimestampNanos } from '../timestamp.js';
@@ -35,7 +37,7 @@ import type { SpanBuffer } from '../types.js';
  * SpanLogger interface with logging methods and schema-specific attribute setters.
  *
  * Extends ColumnWriter<T> which provides:
- * - _buffer, _writeIndex, nextRow(), _getNextBuffer()
+ * - _buffer, _writeIndex, _nextRow(), _getNextBuffer()
  * - Fluent setter methods for each schema field
  *
  * SpanLogger adds:
@@ -60,7 +62,7 @@ export type FluentLogEntry<T extends LogSchema> = {
   error(message: string): FluentLogEntry<T>;
   trace(message: string): FluentLogEntry<T>;
 } & {
-  [K in keyof InferTagAttributes<T>]: (value: InferTagAttributes<T>[K]) => FluentLogEntry<T>;
+  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => FluentLogEntry<T>;
 };
 
 export type BaseSpanLogger<T extends LogSchema> = ColumnWriter<T> & {
@@ -70,7 +72,7 @@ export type BaseSpanLogger<T extends LogSchema> = ColumnWriter<T> & {
   error(message: string): FluentLogEntry<T>;
   trace(message: string): FluentLogEntry<T>;
   readonly scope: Readonly<Record<string, unknown>>;
-  _setScope(attributes: Partial<InferTagAttributes<T>>): void;
+  _setScope(attributes: Partial<InferSchema<T>>): void;
 };
 
 /**
@@ -238,6 +240,8 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
   const ENTRY_TYPE_WARN = ${ENTRY_TYPE_WARN};
   const ENTRY_TYPE_ERROR = ${ENTRY_TYPE_ERROR};
   const ENTRY_TYPE_TRACE = ${ENTRY_TYPE_TRACE};
+  const ENTRY_TYPE_FF_ACCESS = ${ENTRY_TYPE_FF_ACCESS};
+  const ENTRY_TYPE_FF_USAGE = ${ENTRY_TYPE_FF_USAGE};
 
   ${enumMappings.join('\n')}
 `,
@@ -253,7 +257,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 `,
 
     // Override _getNextBuffer to create new SpanBuffer on overflow.
-    // Called by nextRow() when buffer is full.
+    // Called by _nextRow() when buffer is full.
     // Track overflow and check if capacity should be tuned (per specs/01b2_buffer_self_tuning.md)
     // This happens on overflow to adapt quickly to workload changes
     // Link the chain
@@ -262,7 +266,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `
     _getNextBuffer() {
       const oldBuffer = this._buffer;
-      oldBuffer.task.module.sb_overflows++;
+      oldBuffer.module.sb_overflows++;
       this._inOverflow = true;
       const nextBuffer = this._createNextBuffer(oldBuffer);
       oldBuffer._next = nextBuffer;
@@ -273,11 +277,11 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     }
 
     ` +
-      // Override nextRow to sync buffer's writeIndex for Arrow conversion.
+      // Override _nextRow to sync buffer's writeIndex for Arrow conversion.
       // Check overflow BEFORE incrementing
       // Sync buffer writeIndex for new buffer
       // Sync buffer's writeIndex - Arrow conversion uses this
-      `nextRow() {
+      `_nextRow() {
       if (this._writeIndex >= this._buffer._capacity - 1) {
         this._buffer = this._getNextBuffer();
         this._writeIndex = -1;
@@ -297,7 +301,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // NOTE: Scope values are NOT written here - they are filled at Arrow conversion time
       // Track write for capacity tuning (per specs/01b2_buffer_self_tuning.md)
       `info(message) {
-      this.nextRow();
+      this._nextRow();
       const idx = this._writeIndex;
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_INFO;
@@ -307,9 +311,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.task.module.sb_totalWrites++;
+      this._buffer.module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.task.module.sb_overflowWrites++;
+        this._buffer.module.sb_overflowWrites++;
       }
       return this;
     }
@@ -317,7 +321,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     ` +
       // Write a debug log entry.
       `debug(message) {
-      this.nextRow();
+      this._nextRow();
       const idx = this._writeIndex;
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_DEBUG;
@@ -327,9 +331,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.task.module.sb_totalWrites++;
+      this._buffer.module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.task.module.sb_overflowWrites++;
+        this._buffer.module.sb_overflowWrites++;
       }
       return this;
     }
@@ -337,7 +341,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     ` +
       // Write a warn log entry.
       `warn(message) {
-      this.nextRow();
+      this._nextRow();
       const idx = this._writeIndex;
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_WARN;
@@ -347,9 +351,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.task.module.sb_totalWrites++;
+      this._buffer.module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.task.module.sb_overflowWrites++;
+        this._buffer.module.sb_overflowWrites++;
       }
       return this;
     }
@@ -357,7 +361,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     ` +
       // Write an error log entry.
       `error(message) {
-      this.nextRow();
+      this._nextRow();
       const idx = this._writeIndex;
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_ERROR;
@@ -367,9 +371,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.task.module.sb_totalWrites++;
+      this._buffer.module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.task.module.sb_overflowWrites++;
+        this._buffer.module.sb_overflowWrites++;
       }
       return this;
     }
@@ -377,7 +381,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     ` +
       // Write a trace log entry.
       `trace(message) {
-      this.nextRow();
+      this._nextRow();
       const idx = this._writeIndex;
       this._buffer._timestamps[idx] = helpers.getTimestampNanos();
       this._buffer._operations[idx] = ENTRY_TYPE_TRACE;
@@ -387,11 +391,60 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.task.module.sb_totalWrites++;
+      this._buffer.module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.task.module.sb_overflowWrites++;
+        this._buffer.module.sb_overflowWrites++;
       }
       return this;
+    }
+
+    ` +
+      // Write a feature flag access entry (internal method, not on public type).
+      // Called by FeatureFlagEvaluator to log flag access.
+      `ffAccess(flagName, value) {
+      this._nextRow();
+      const idx = this._writeIndex;
+      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
+      this._buffer._operations[idx] = ENTRY_TYPE_FF_ACCESS;
+      if (this._buffer.message_values) {
+        this._buffer.message_values[idx] = flagName;
+        if (this._buffer.message_nulls) {
+          helpers.setNullBit(this._buffer.message_nulls, idx);
+        }
+      }
+      if (this._buffer.ffValue_values) {
+        const strValue = value === null || value === undefined ? 'null' : String(value);
+        this._buffer.ffValue_values[idx] = strValue;
+        if (this._buffer.ffValue_nulls) {
+          helpers.setNullBit(this._buffer.ffValue_nulls, idx);
+        }
+      }
+      this._buffer.module.sb_totalWrites++;
+      if (this._inOverflow) {
+        this._buffer.module.sb_overflowWrites++;
+      }
+    }
+
+    ` +
+      // Write a feature flag usage entry (internal method, not on public type).
+      // Called by FeatureFlagEvaluator to log flag usage.
+      `ffUsage(flagName, context) {
+      this._nextRow();
+      const idx = this._writeIndex;
+      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
+      this._buffer._operations[idx] = ENTRY_TYPE_FF_USAGE;
+      if (this._buffer.message_values) {
+        this._buffer.message_values[idx] = flagName;
+        if (this._buffer.message_nulls) {
+          helpers.setNullBit(this._buffer.message_nulls, idx);
+        }
+      }
+      // Context attributes can be written to user schema columns if provided
+      // For now, just log the flag name - context can be added later if needed
+      this._buffer.module.sb_totalWrites++;
+      if (this._inOverflow) {
+        this._buffer.module.sb_overflowWrites++;
+      }
     }
 
     ` +

@@ -8,7 +8,8 @@
  */
 
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
-import type { FeatureFlagEvaluator } from './schema/evaluator.js';
+import type { FlagEvaluator } from './schema/evaluator.js';
+import type { LogSchema } from './schema/types.js';
 
 // =============================================================================
 // Reserved Keys
@@ -65,14 +66,17 @@ export type RootSpanFn = {
  * - System properties are auto-generated and cannot be overridden via Extra
  *
  * @typeParam FF - Feature flag schema type
+ * @typeParam T - LogSchema type (for typed evaluation context)
+ * @typeParam Env - Environment type
  */
-export interface TraceContextSystem<FF extends FeatureFlagSchema> {
+export interface TraceContextSystem<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown> {
   // System properties (always present, auto-generated)
   readonly traceId: string;
   readonly anchorEpochMicros: number; // Nanoseconds.now() / 1000n at trace root (microsecond precision)
   readonly anchorPerfNow: number; // performance.now() at trace root
   readonly threadId: bigint; // 64-bit random ID per worker/process
-  readonly ff: FeatureFlagEvaluator<FF>;
+  /** Root flag evaluator - use forContext(spanCtx) to get span-bound evaluator */
+  readonly ff: FlagEvaluator<T, FF, Env>;
   readonly span: RootSpanFn;
 }
 

@@ -21,7 +21,7 @@
 
 import { bufferHelpers } from '@smoothbricks/arrow-builder';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
-import type { InferTagAttributes, LogSchema } from '../schema/types.js';
+import type { InferSchema, LogSchema } from '../schema/types.js';
 import type { SpanBuffer } from '../types.js';
 
 /**
@@ -54,12 +54,12 @@ export type TagWriter<T extends LogSchema> = {
   /**
    * Bulk set multiple attributes at once.
    */
-  with(attributes: Partial<InferTagAttributes<T>>): TagWriter<T>;
+  with(attributes: Partial<InferSchema<T>>): TagWriter<T>;
 } & {
   /**
    * Individual attribute setters - each returns `this` for chaining.
    */
-  [K in keyof InferTagAttributes<T>]: (value: InferTagAttributes<T>[K]) => TagWriter<T>;
+  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => TagWriter<T>;
 };
 
 /**
@@ -86,12 +86,12 @@ export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
   /**
    * Bulk set multiple attributes at once.
    */
-  with(attributes: Partial<InferTagAttributes<T>>): ResultWriter<T, R, E>;
+  with(attributes: Partial<InferSchema<T>>): ResultWriter<T, R, E>;
 } & {
   /**
    * Individual attribute setters - each returns `this` for chaining.
    */
-  [K in keyof InferTagAttributes<T>]: (value: InferTagAttributes<T>[K]) => ResultWriter<T, R, E>;
+  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => ResultWriter<T, R, E>;
 };
 
 /**

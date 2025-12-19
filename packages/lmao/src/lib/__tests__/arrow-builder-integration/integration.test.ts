@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 import { createAttributeColumns, createColumnWriter, maskingTransforms } from '@smoothbricks/arrow-builder';
 import { convertToArrowTable, createSpanBuffer, defineLogSchema, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
-import { createTestSchema, createTestTaskContext } from '../test-helpers.js';
+import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
   it('generates TypedArray columns with proper names for defined schema', () => {
@@ -32,9 +32,9 @@ describe('Buffer Integration', () => {
       score: S.number(),
     });
 
-    const taskContext = createTestTaskContext(schema.fields);
+    const module = createTestModuleContext(schema);
     const capacity = 64;
-    const buf = createSpanBuffer(schema, taskContext, undefined, capacity);
+    const buf = createSpanBuffer(schema, module, 'test-span', undefined, capacity);
 
     // Core TypedArrays exist
     expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
@@ -59,17 +59,17 @@ describe('Buffer Integration', () => {
     });
 
     // Create buffer with schema
-    const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema, taskContext);
+    const module = createTestModuleContext(schema);
+    const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Verify all attribute columns created as TypedArrays with correct types (use _values suffix)
     expect(Array.isArray(buffer.requestId_values)).toBe(true); // category (raw strings)
     expect(buffer.httpStatus_values).toBeInstanceOf(Float64Array); // number
     expect(buffer.operation_values).toBeInstanceOf(Uint8Array); // enum
 
-    // Verify task context is set
-    expect(buffer.task).toBe(taskContext);
-    expect(buffer.task.module.logSchema.fields).toBe(schema.fields);
+    // Verify module is set
+    expect(buffer.module).toBe(module);
+    expect(buffer.module.logSchema.fields).toBe(schema.fields);
   });
 
   it('handles optional fields in schema', () => {
@@ -78,8 +78,8 @@ describe('Buffer Integration', () => {
       optional: S.optional(S.number()),
     });
 
-    const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema, taskContext);
+    const module = createTestModuleContext(schema);
+    const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Both should have TypedArray columns (use _values suffix)
     expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
@@ -95,8 +95,8 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // Text: unmasked plain text
     });
 
-    const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema, taskContext);
+    const module = createTestModuleContext(schema);
+    const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // All should have TypedArray columns (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
@@ -112,10 +112,8 @@ describe('Buffer Integration', () => {
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
     });
 
-    const smallAttrs = smallEnumSchema.fields;
-
-    const smallContext = createTestTaskContext(smallAttrs);
-    const smallBuffer = createSpanBuffer(smallEnumSchema, smallContext);
+    const smallModule = createTestModuleContext(smallEnumSchema);
+    const smallBuffer = createSpanBuffer(smallEnumSchema, smallModule, 'test-span');
 
     // Should use Uint8Array for enums with ≤255 values (use _values suffix)
     expect(smallBuffer.operation_values).toBeInstanceOf(Uint8Array);
@@ -127,8 +125,8 @@ describe('Buffer Integration', () => {
       plainUserId: S.category(), // No masking
     });
 
-    const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema, taskContext);
+    const module = createTestModuleContext(schema);
+    const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -167,8 +165,8 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // No masking
     });
 
-    const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema, taskContext);
+    const module = createTestModuleContext(schema);
+    const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -213,8 +211,8 @@ describe('Buffer Integration', () => {
       secretKey: S.text().mask(customMask),
     });
 
-    const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema, taskContext);
+    const module = createTestModuleContext(schema);
+    const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);

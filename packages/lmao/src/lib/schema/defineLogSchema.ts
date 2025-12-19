@@ -10,7 +10,7 @@
 
 import * as S from '@sury/sury';
 import { LogSchema } from './LogSchema.js';
-import type { InferTagAttributes, SchemaFields } from './types.js';
+import type { InferSchema, SchemaFields } from './types.js';
 
 /**
  * Brand symbol for DefinedLogSchema - used to detect this type in conditionals.
@@ -62,16 +62,16 @@ export declare const DEFINED_LOG_SCHEMA_BRAND: unique symbol;
  * - Extension methods (extend)
  * - Validation methods (validate, parse, safeParse)
  * - LogSchema methods (fieldEntries, fieldCount, fieldNames, fields)
- * - Brand marker for type detection in InferTagAttributes
+ * - Brand marker for type detection in InferSchema
  *
- * The brand marker allows InferTagAttributes to detect when it receives a
+ * The brand marker allows InferSchema to detect when it receives a
  * DefinedLogSchema and extract the original schema type T for inference.
  */
 export type DefinedLogSchema<T extends SchemaFields> = T &
   Pick<LogSchema<T>, 'fieldEntries' | 'fieldCount' | 'fieldNames' | 'fields' | 'extend'> & {
-    validate: (data: unknown) => InferTagAttributes<T>;
-    parse: (data: unknown) => InferTagAttributes<T> | null;
-    safeParse: (data: unknown) => { success: true; value: InferTagAttributes<T> } | { success: false; error: Error };
+    validate: (data: unknown) => InferSchema<T>;
+    parse: (data: unknown) => InferSchema<T> | null;
+    safeParse: (data: unknown) => { success: true; value: InferSchema<T> } | { success: false; error: Error };
     /** Brand marker - never actually set, only for type discrimination */
     readonly [DEFINED_LOG_SCHEMA_BRAND]?: T;
   };
@@ -107,7 +107,7 @@ export function defineLogSchema<T extends SchemaFields>(
     for (const [key, surySchema] of logSchema.fieldEntries()) {
       output[key] = s.field(key, surySchema);
     }
-    return output as InferTagAttributes<T>;
+    return output as InferSchema<T>;
   });
 
   // Add validation methods directly to logSchema (preserves LogSchema instance)
@@ -118,7 +118,7 @@ export function defineLogSchema<T extends SchemaFields>(
      *
      * @throws Error if validation fails
      */
-    validate: (data: unknown): InferTagAttributes<T> => {
+    validate: (data: unknown): InferSchema<T> => {
       return S.parseOrThrow(data, objectSchema);
     },
 
@@ -127,7 +127,7 @@ export function defineLogSchema<T extends SchemaFields>(
      *
      * @returns Validated data or null if invalid
      */
-    parse: (data: unknown): InferTagAttributes<T> | null => {
+    parse: (data: unknown): InferSchema<T> | null => {
       const result = S.safe(() => S.parseOrThrow(data, objectSchema));
       return result.success ? result.value : null;
     },

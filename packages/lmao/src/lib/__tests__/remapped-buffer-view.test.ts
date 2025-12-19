@@ -50,7 +50,8 @@ describe('generateRemappedBufferViewClass', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: { name: 'test' },
+        module: { name: 'test-module' },
+        spanName: 'test-span',
         getColumnIfAllocated: (name: string) => mockBuffer[`${name}_values` as keyof typeof mockBuffer],
         getNullsIfAllocated: (name: string) => mockBuffer[`${name}_nulls` as keyof typeof mockBuffer],
       } as unknown as SpanBuffer;
@@ -103,7 +104,8 @@ describe('generateRemappedBufferViewClass', () => {
         spanId: 42,
         parentSpanId: 41,
         _identity: new Uint8Array(32),
-        task: { name: 'test-task', module: { name: 'test-module' } },
+        module: { name: 'test-module' },
+        spanName: 'test-span',
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
@@ -167,13 +169,13 @@ describe('generateRemappedBufferViewClass', () => {
       expect(view._identity).toBe(buffer._identity);
     });
 
-    it('should pass through task metadata', () => {
+    it('should pass through module metadata', () => {
       const mapping = { http_status: 'status' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
       const buffer = createMockBuffer();
       const view = new ViewClass(buffer);
 
-      expect(view.task).toBe(buffer.task);
+      expect(view.module).toBe(buffer.module);
     });
   });
 
@@ -199,7 +201,8 @@ describe('generateRemappedBufferViewClass', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         status_values: statusValues, // unprefixed column
         method_values: methodValues, // unprefixed column
         getColumnIfAllocated(name: string) {
@@ -236,7 +239,8 @@ describe('generateRemappedBufferViewClass', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         status_nulls: statusNulls,
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -271,7 +275,8 @@ describe('generateRemappedBufferViewClass', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         userId_values: userIdValues,
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -304,7 +309,8 @@ describe('generateRemappedBufferViewClass', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         getColumnIfAllocated() {
           return undefined;
         },
@@ -363,7 +369,8 @@ describe('generateRemappedBufferViewClass', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         status_values: statusValues,
         method_values: methodValues,
         getColumnIfAllocated(name: string) {
@@ -630,7 +637,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         spanId: 2,
         parentSpanId: 1,
         _identity: new Uint8Array(32),
-        task: { name: 'child-task' },
+        module: { name: 'child-module' },
+        spanName: 'child-task',
         status_values: new Float64Array([404]),
         status_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -658,7 +666,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: { name: 'parent-task' },
+        module: { name: 'parent-module' },
+        spanName: 'parent-task',
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
@@ -704,7 +713,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         spanId: 3,
         parentSpanId: 2,
         _identity: new Uint8Array(32),
-        task: { name: 'db-task' },
+        module: { name: 'db-module' },
+        spanName: 'db-task',
         query_values: ['SELECT * FROM users'],
         query_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -731,7 +741,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         spanId: 2,
         parentSpanId: 1,
         _identity: new Uint8Array(32),
-        task: { name: 'http-task' },
+        module: { name: 'http-module' },
+        spanName: 'http-task',
         status_values: new Float64Array([200]),
         status_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -781,7 +792,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         status_values: new Float64Array([200]),
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -815,7 +827,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         field_with_underscores_values: ['test'],
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -852,7 +865,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         spanId: 1,
         parentSpanId: 0,
         _identity: new Uint8Array(32),
-        task: {},
+        module: {},
+        spanName: 'test-span',
         field50_values: ['value50'],
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];

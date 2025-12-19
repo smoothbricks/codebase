@@ -15,12 +15,10 @@
 import type { TypedColumnBuffer } from '@smoothbricks/arrow-builder';
 import type { ModuleContext } from './moduleContext.js';
 import type { LogSchema } from './schema/LogSchema.js';
-import type { TaskContext } from './taskContext.js';
 import type { TraceId } from './traceId.js';
 
 // Re-export context classes
 export { ModuleContext } from './moduleContext.js';
-export { TaskContext } from './taskContext.js';
 
 /**
  * SpanBuffer - lmao-specific extension of TypedColumnBuffer
@@ -180,9 +178,22 @@ export type SpanBuffer<T extends LogSchema = LogSchema> = TypedColumnBuffer<T['f
   // ============================================================================
 
   /**
-   * Reference to task context (lmao-specific).
+   * Op's module context (what code is executing).
+   * Used for rows 1+ metadata (gitSha, packageName, packagePath).
+   *
+   * Per specs/01c_context_flow_and_op_wrappers.md and 01b5_spanbuffer_memory_layout.md.
    */
-  task: TaskContext;
+  module: ModuleContext;
+
+  /**
+   * Span name for this invocation.
+   */
+  spanName: string;
+
+  /**
+   * Pre-encoded UTF-8 bytes for span name (for Arrow conversion).
+   */
+  utf8SpanName: Uint8Array;
 
   /**
    * The caller's module context (where span() was invoked from).
@@ -190,12 +201,12 @@ export type SpanBuffer<T extends LogSchema = LogSchema> = TypedColumnBuffer<T['f
    * Used for row 0 (span-start) metadata attribution - records WHERE the span
    * was invoked from, not where the code is executing.
    *
-   * For root spans: undefined (no caller, or same as task.module)
+   * For root spans: undefined (no caller, or same as module)
    * For child spans: the parent span's module context
    *
    * Access pattern (per specs/01c_context_flow_and_op_wrappers.md):
    * - Row 0: buffer.callsiteModule?.packageName (caller's module)
-   * - Rows 1+: buffer.task.module.packageName (op's module)
+   * - Rows 1+: buffer.module.packageName (op's module)
    */
   callsiteModule?: ModuleContext;
 

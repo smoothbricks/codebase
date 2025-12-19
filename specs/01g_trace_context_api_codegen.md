@@ -459,27 +459,128 @@ function generateObjectAPI(schema: Schema): Function {
 ## Feature Flag Entry Types
 
 Feature flag entry types (`ff-access` and `ff-usage`) are handled automatically by the `FeatureFlagEvaluator` using
-low-level column writers:
+internal methods on `SpanLogger`:
 
 ```typescript
 const processUser = op(async ({ ff }, userData) => {
   // Clean user API - no logging methods exposed
   if (ff.advancedValidation) {
-    // Internally creates ff-access entry
+    // Internally creates ff-access entry via log.ffAccess()
     // ...
   }
 
-  // Creates ff-usage entry
-  ff.track('advancedValidation'); // User-defined attributes can be chained
+  // Creates ff-usage entry via log.ffUsage()
+  ff.advancedValidation.track({ action: 'feature_used' });
 });
 ```
 
-**Implementation Notes** (design TBD):
+### SpanLoggerInternal Type Pattern
 
-- **Low-level access**: `FeatureFlagEvaluator` uses same column writers as codegen system
-- **Generic typing**: Column writers likely parameterized by attribute schema
-- **Clean separation**: User API stays clean, logging is internal implementation detail
-- **Unified backend**: Same zero-overhead approach as other entry types
+**Public Type** (`SpanLogger<T>`) - what users see via `ctx.log`:
+
+- Includes: `info()`, `debug()`, `warn()`, `error()`, `trace()`, `scope`, `_setScope()`
+- Does NOT include: `ffAccess()`, `ffUsage()`, `_nextRow()`
+
+**Internal Type** (`SpanLoggerInternal<T>`) - what evaluator uses:
+
+- Extends `SpanLogger<T>` with internal methods:
+  - `ffAccess(flagName: string, value: unknown): void`
+  - `ffUsage(flagName: string, context?: Record<string, unknown>): void`
+  - `_nextRow(): this` (renamed from `nextRow()` to avoid schema field conflicts)
+
+**Implementation**:
+
+```typescript
+// Public type - users see this
+export type SpanLogger<T extends LogSchema> = {
+  info(message: string): FluentLogEntry<T>;
+  debug(message: string): FluentLogEntry<T>;
+  warn(message: string): FluentLogEntry<T>;
+  error(message: string): FluentLogEntry<T>;
+  trace(message: string): FluentLogEntry<T>;
+  readonly scope: Readonly<Partial<InferSchema<T>>>;
+  _setScope(attributes: Partial<InferSchema<T>>): void;
+};
+
+// Internal type - evaluator casts to this
+export type SpanLoggerInternal<T extends LogSchema> = SpanLogger<T> & {
+  ffAccess(flagName: string, value: unknown): void;
+  ffUsage(flagName: string, context?: Record<string, unknown>): void;
+};
+```
+
+**Generated Methods** (exist at runtime, not on public type):
+
+```typescript
+// Generated in SpanLogger class
+_nextRow() {
+  if (this._writeIndex >= this._buffer._capacity - 1) {
+    this._buffer = this._getNextBuffer();
+    this._writeIndex = -1;
+    this._buffer.writeIndex = 0;
+  }
+  this._writeIndex++;
+  this._buffer.writeIndex = this._writeIndex + 1;
+  return this;
+}
+
+ffAccess(flagName, value) {
+  this._nextRow(); // Internal method - handles overflow
+  const idx = this._writeIndex;
+  this._buffer._timestamps[idx] = helpers.getTimestampNanos();
+  this._buffer._operations[idx] = ENTRY_TYPE_FF_ACCESS;
+  if (this._buffer.message_values) {
+    this._buffer.message_values[idx] = flagName;
+  }
+  if (this._buffer.ffValue_values) {
+    const strValue = value === null || value === undefined ? 'null' : String(value);
+    this._buffer.ffValue_values[idx] = strValue;
+  }
+  // Track write for capacity tuning
+  this._buffer.module.sb_totalWrites++;
+}
+
+ffUsage(flagName, context) {
+  this._nextRow(); // Internal method - handles overflow
+  const idx = this._writeIndex;
+  this._buffer._timestamps[idx] = helpers.getTimestampNanos();
+  this._buffer._operations[idx] = ENTRY_TYPE_FF_USAGE;
+  if (this._buffer.message_values) {
+    this._buffer.message_values[idx] = flagName;
+  }
+  // Context attributes can be written to user schema columns if provided
+  this._buffer.module.sb_totalWrites++;
+}
+```
+
+**Evaluator Usage**:
+
+```typescript
+// Evaluator casts to internal type to access FF methods
+#getFlag(flagName) {
+  const log = this.#spanContext.log as SpanLoggerInternal<T>;
+
+  // Check if already logged (buffer chain scan)
+  if (!this.#hasLoggedAccess(flagName)) {
+    log.ffAccess(flagName, rawValue); // Available on internal type
+  }
+
+  return value;
+}
+
+track(flagName, context?) {
+  const log = this.#spanContext.log as SpanLoggerInternal<T>;
+  log.ffUsage(flagName, context); // Always logged, not deduplicated
+}
+```
+
+**Why This Pattern?**
+
+- **Encapsulation**: Logger owns row lifecycle (`_nextRow()` + overflow handling)
+- **Type safety**: Users can't accidentally call `ctx.log.ffAccess()` - TypeScript error
+- **Zero allocation**: Methods exist at runtime, but hidden from public type
+- **No fluent return**: FF methods return `void` - not part of chaining API
+- **Reserved key protection**: `_nextRow()` uses underscore prefix to avoid conflicts with user schema fields
 
 ## Integration Points
 

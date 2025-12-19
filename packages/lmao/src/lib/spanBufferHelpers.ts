@@ -8,6 +8,8 @@
  * @smoothbricks/arrow-builder's bufferHelpers - they're Arrow concepts, not span-specific.
  */
 
+import { copyThreadIdTo } from './threadId.js';
+
 /**
  * Shared TextEncoder instance for traceId encoding.
  * TextEncoder is stateless and thread-safe, so one instance suffices.
@@ -65,6 +67,7 @@ export const spanBufferHelpers = {
   writeSpanId,
   readSpanId,
   decodeTraceId,
+  copyThreadIdTo,
 } as const;
 
 export type SpanBufferHelpers = typeof spanBufferHelpers;

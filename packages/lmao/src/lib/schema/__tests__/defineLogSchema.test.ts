@@ -89,8 +89,9 @@ describe('defineLogSchema with Sury', () => {
     });
 
     const extended = base.extend({ duration: S.number() });
-    expect(extended).toHaveProperty('requestId');
-    expect(extended).toHaveProperty('duration');
+    // extend() returns a new LogSchema instance, fields are in .fields
+    expect(extended.fields).toHaveProperty('requestId');
+    expect(extended.fields).toHaveProperty('duration');
   });
 
   test('validates enum types with Sury', () => {
@@ -159,10 +160,11 @@ describe('defineLogSchema with Sury', () => {
     expect(result.query).toBe("SELECT * FROM users WHERE id = 123 AND name = 'test'");
 
     // Verify mask metadata exists on schemas (will be used during Arrow conversion)
-    expect((schema.userId as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
-    expect((schema.email as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
-    expect((schema.apiUrl as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
-    expect((schema.query as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    // Fields are accessed via schema.fields
+    expect((schema.fields.userId as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    expect((schema.fields.email as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    expect((schema.fields.apiUrl as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
+    expect((schema.fields.query as { __mask_transform?: unknown }).__mask_transform).toBeDefined();
   });
 
   test('should reject field names starting with _', () => {

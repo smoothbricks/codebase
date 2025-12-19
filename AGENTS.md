@@ -121,7 +121,7 @@
 - `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation (tag/log methods)
 - `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer)
 - `src/lib/lmao.ts` - Main integration, context creation
-- `src/lib/types.ts` - SpanBuffer, TaskContext interfaces
+- `src/lib/types.ts` - SpanBuffer interfaces
 
 **Relationship**: lmao depends on arrow-builder. arrow-builder MUST NOT depend on lmao.
 
@@ -393,8 +393,8 @@ Unified enum for ALL trace events:
 **Note**: CATEGORY and TEXT columns store raw `string[]` on hot path. Dictionary building and UTF-8 encoding happen
 during Arrow conversion (cold path). There is NO hot-path interning.
 
-Module IDs and span names are accessed directly from `buf.task.module.packageName`, `buf.task.module.packagePath`, and
-`buf.task.spanName` during Arrow conversion.
+Module IDs and span names are accessed directly from `buf.module.packageName`, `buf.module.packagePath`, and
+`buf.spanName` during Arrow conversion.
 
 **BEFORE IMPLEMENTING**: Search these modules first! Most functionality already exists.
 

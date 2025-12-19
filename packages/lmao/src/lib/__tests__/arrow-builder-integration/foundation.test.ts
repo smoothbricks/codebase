@@ -3,29 +3,27 @@ import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { ModuleContext } from '../../moduleContext.js';
 import { S } from '../../schema/builder.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
-import { TaskContext } from '../../taskContext.js';
 import { createTraceId } from '../../traceId.js';
 import { createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Foundation', () => {
-  // Helper to create a test task context
-  function createTestTaskContext(): TaskContext {
+  // Helper to create a test module context
+  function createTestModule(): ModuleContext {
     const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       count: S.number(),
     });
 
-    // Pass LogSchema instance directly (ModuleContext accepts SchemaFields or LogSchema)
-    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', schema.fields);
-    return new TaskContext(moduleContext, 'test-span', 10);
+    // Pass LogSchema instance directly (ModuleContext accepts LogSchema)
+    return new ModuleContext('abc123', '@test/pkg', 'src/test.ts', schema);
   }
 
   it('creates SpanBuffer with TypedArrays', () => {
-    const taskContext = createTestTaskContext();
-    const schema = taskContext.module.logSchema; // LogSchema instance
+    const module = createTestModule();
+    const schema = module.logSchema; // LogSchema instance
     const traceId = createTraceId('trace-123');
 
-    const buf = createSpanBuffer(schema, taskContext, traceId); // Uses DEFAULT_BUFFER_CAPACITY
+    const buf = createSpanBuffer(schema, module, 'test-span', traceId); // Uses DEFAULT_BUFFER_CAPACITY
 
     // Span identity assertions (unified memory layout)
     expect(typeof buf.spanId).toBe('number');
@@ -50,14 +48,14 @@ describe('Buffer Foundation', () => {
     expect(buf.children).toBeInstanceOf(Array);
     expect(buf.writeIndex).toBe(0);
     expect(buf.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
-    expect(buf.task).toBe(taskContext);
+    expect(buf.module).toBe(module);
   });
 
   it('creates root SpanBuffer with createSpanBuffer', () => {
-    const taskContext = createTestTaskContext();
-    const schema = taskContext.module.logSchema; // LogSchema instance
+    const module = createTestModule();
+    const schema = module.logSchema; // LogSchema instance
 
-    const buf = createSpanBuffer(schema, taskContext, createTraceId('trace-999'));
+    const buf = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-999'));
 
     expect(buf.spanId).toBeGreaterThan(0);
     expect(buf.hasParent).toBe(false);
@@ -66,14 +64,14 @@ describe('Buffer Foundation', () => {
   });
 
   it('tracks buffer creation in capacity stats', () => {
-    const taskContext = createTestTaskContext();
-    const schema = taskContext.module.logSchema; // LogSchema instance
+    const module = createTestModule();
+    const schema = module.logSchema; // LogSchema instance
 
-    const initialCount = taskContext.module.sb_totalCreated;
+    const initialCount = module.sb_totalCreated;
 
-    createSpanBuffer(schema, taskContext, createTraceId('trace-456'), 64);
+    createSpanBuffer(schema, module, 'test-span', createTraceId('trace-456'), 64);
 
-    expect(taskContext.module.sb_totalCreated).toBe(initialCount + 1);
+    expect(module.sb_totalCreated).toBe(initialCount + 1);
   });
 
   it('handles different schema sizes', () => {
@@ -86,11 +84,10 @@ describe('Buffer Foundation', () => {
       field5: S.number(),
     });
 
-    // Create task context with larger schema (pass LogSchema, not .fields)
-    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', largeSchema);
-    const taskContext = new TaskContext(moduleContext, 'test-span', 10);
+    // Create module context with larger schema (pass LogSchema, not .fields)
+    const module = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', largeSchema);
 
-    const buf = createSpanBuffer(largeSchema, taskContext, createTraceId('trace-789'), 64);
+    const buf = createSpanBuffer(largeSchema, module, 'test-span', createTraceId('trace-789'), 64);
 
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them

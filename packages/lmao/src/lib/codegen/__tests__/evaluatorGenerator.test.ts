@@ -1,21 +1,57 @@
 import { describe, expect, test } from 'bun:test';
+import { createTestSchema, createTestSpanBuffer } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
-import { defineFeatureFlags, type EvaluationContext } from '../../schema/defineFeatureFlags.js';
-import { type BooleanFlagContext, type FlagValue, InMemoryFlagEvaluator } from '../../schema/evaluator.js';
-import { createEvaluatorClass, type GeneratedEvaluatorState, generateEvaluatorClass } from '../evaluatorGenerator.js';
+import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
+import { type BooleanFlagContext, InMemoryFlagEvaluator } from '../../schema/evaluator.js';
+import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../../schema/systemSchema.js';
+import type { LogSchema } from '../../schema/types.js';
+import type { SpanContext } from '../../spanContext.js';
+import type { SpanBuffer } from '../../types.js';
+import { createEvaluatorClass, generateEvaluatorClass } from '../evaluatorGenerator.js';
+import { createSpanLogger } from '../spanLoggerGenerator.js';
 
-// Mock dependencies for testing the generated class
-const mockValidateFlagValue = <T>(value: unknown, _schema: unknown, defaultValue: T): T => {
-  if (value === null || value === undefined) {
-    return defaultValue;
-  }
-  return value as T;
-};
+/**
+ * Create a mock SpanContext for testing FeatureFlagEvaluator
+ *
+ * The evaluator needs:
+ * - _buffer with scopeValues and writeIndex
+ * - log with ffAccess, ffUsage, and _writeIndex
+ * - buffer getter that returns _buffer
+ */
+function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): SpanContext<T, any, any> {
+  // Create a real SpanLogger for the buffer using the schema from module
+  const schema = spanBuffer.module.logSchema as T;
+  const logger = createSpanLogger(schema, spanBuffer);
 
-const mockGetTimestampNanos = (): bigint => BigInt(Date.now()) * 1_000_000n;
+  // Mock SpanContext with the essential properties
+  const mockCtx = {
+    _buffer: spanBuffer,
+    get buffer() {
+      return spanBuffer;
+    },
+    log: logger,
+    // Other properties not needed by evaluator tests
+    traceId: spanBuffer._traceId,
+    ff: null as any,
+    env: {},
+    deps: {},
+    tag: {} as any,
+    scope: spanBuffer.scopeValues || {},
+    setScope: (attrs: any) => {
+      if (!spanBuffer.scopeValues) {
+        spanBuffer.scopeValues = {};
+      }
+      Object.assign(spanBuffer.scopeValues, attrs);
+    },
+    ok: () => ({ success: true, value: undefined }),
+    err: () => ({ success: false, error: 'error' }),
+    span: () => Promise.resolve(undefined),
+    span_op: () => Promise.resolve(undefined),
+    span_fn: () => Promise.resolve(undefined),
+  } as unknown as SpanContext<T, any, any>;
 
-const MOCK_FF_ACCESS = 7;
-const MOCK_FF_USAGE = 8;
+  return mockCtx;
+}
 
 describe('EvaluatorGenerator', () => {
   describe('generateEvaluatorClass', () => {
@@ -28,7 +64,7 @@ describe('EvaluatorGenerator', () => {
       const code = generateEvaluatorClass(schema.schema);
 
       // Should be a valid IIFE wrapper
-      expect(code).toContain('(function(validateFlagValue, getTimestampNanos');
+      expect(code).toContain('(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA)');
       expect(code).toContain("'use strict'");
       expect(code).toContain('class GeneratedEvaluator');
 
@@ -36,12 +72,14 @@ describe('EvaluatorGenerator', () => {
       expect(code).toContain('get debugMode()');
       expect(code).toContain('get maxRetries()');
 
-      // Should have core methods
-      expect(code).toContain('forContext(additional)');
-      expect(code).toContain('withBuffer(buffer)');
-      expect(code).toContain('getContext()');
+      // Should have new API methods (not old ones)
+      expect(code).toContain('forContext(ctx)');
       expect(code).toContain('async get(flag)');
       expect(code).toContain('trackUsage(flag, context)');
+
+      // Should NOT have old API methods
+      expect(code).not.toContain('withBuffer(');
+      expect(code).not.toContain('getContext()');
     });
 
     test('generates unique getter for each flag', () => {
@@ -71,32 +109,23 @@ describe('EvaluatorGenerator', () => {
 
   describe('createEvaluatorClass', () => {
     test('creates a functional class constructor', () => {
-      const schema = defineFeatureFlags({
+      const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),
       });
+      const logSchema = createTestSchema({});
+      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
+        ffSchema.schema,
+        (value, schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
       );
 
       expect(typeof GeneratedClass).toBe('function');
 
-      const evaluator = new InMemoryFlagEvaluator({ debugMode: true });
-      const state: GeneratedEvaluatorState<typeof schema.schema> = {
-        schema: schema.schema,
-        evaluationContext: { userId: 'test' },
-        evaluator,
-        buffer: null,
-
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      };
-
-      const instance = new GeneratedClass(state);
+      const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: true });
+      const instance = new GeneratedClass(mockCtx, evaluator);
       expect(instance).toBeDefined();
     });
 
@@ -105,21 +134,9 @@ describe('EvaluatorGenerator', () => {
         testFlag: S.boolean().default(false).sync(),
       });
 
-      const Class1 = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
-      );
+      const Class1 = createEvaluatorClass(schema.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
-      const Class2 = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
-      );
+      const Class2 = createEvaluatorClass(schema.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
       // Same schema should return same class (cached)
       expect(Class1).toBe(Class2);
@@ -134,21 +151,9 @@ describe('EvaluatorGenerator', () => {
         flagB: S.boolean().default(false).sync(),
       });
 
-      const Class1 = createEvaluatorClass(
-        schema1.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
-      );
+      const Class1 = createEvaluatorClass(schema1.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
-      const Class2 = createEvaluatorClass(
-        schema2.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
-      );
+      const Class2 = createEvaluatorClass(schema2.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
       // Different schemas should generate different classes
       expect(Class1).not.toBe(Class2);
@@ -157,30 +162,21 @@ describe('EvaluatorGenerator', () => {
 
   describe('Generated class functionality', () => {
     test('flag getters return FlagContext for truthy values', () => {
-      const schema = defineFeatureFlags({
+      const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),
       });
+      const logSchema = createTestSchema({});
+      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
+        ffSchema.schema,
+        (value, schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
       );
 
-      const evaluator = new InMemoryFlagEvaluator({ debugMode: true });
-      const state: GeneratedEvaluatorState<typeof schema.schema> = {
-        schema: schema.schema,
-        evaluationContext: { userId: 'test' },
-        evaluator,
-        buffer: null,
-
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      };
-
-      const instance = new GeneratedClass(state);
+      const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: true });
+      const instance = new GeneratedClass(mockCtx, evaluator);
 
       // Access the flag via generated getter
       const flag = (instance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;
@@ -191,70 +187,61 @@ describe('EvaluatorGenerator', () => {
     });
 
     test('flag getters return undefined for falsy values', () => {
-      const schema = defineFeatureFlags({
+      const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),
       });
+      const logSchema = createTestSchema({});
+      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
+        ffSchema.schema,
+        (value, schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
       );
 
-      const evaluator = new InMemoryFlagEvaluator({ debugMode: false });
-      const state: GeneratedEvaluatorState<typeof schema.schema> = {
-        schema: schema.schema,
-        evaluationContext: { userId: 'test' },
-        evaluator,
-        buffer: null,
-
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      };
-
-      const instance = new GeneratedClass(state);
+      const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: false });
+      const instance = new GeneratedClass(mockCtx, evaluator);
 
       const flag = (instance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;
       expect(flag).toBeUndefined();
     });
 
-    test('forContext creates new instance with merged context', () => {
-      const schema = defineFeatureFlags({
+    test('forContext creates new instance bound to new SpanContext', () => {
+      const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),
       });
+      const logSchema = createTestSchema({});
+      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
+        ffSchema.schema,
+        (value, schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
       );
 
-      const evaluator = new InMemoryFlagEvaluator({ debugMode: true });
-      const state: GeneratedEvaluatorState<typeof schema.schema> = {
-        schema: schema.schema,
-        evaluationContext: { userId: 'user-123' },
-        evaluator,
-        buffer: null,
+      const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: true });
+      const instance = new GeneratedClass(mockCtx, evaluator);
 
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      };
+      // Create a new SpanContext for child span
+      const { spanBuffer: childBuffer } = createTestSpanBuffer(logSchema, { spanName: 'child-span' });
+      const childCtx = createMockSpanContext(childBuffer);
 
-      const instance = new GeneratedClass(state);
-      const childInstance = instance.forContext({ requestId: 'req-456' });
+      const childInstance = instance.forContext(childCtx);
 
-      expect(childInstance.getContext().userId).toBe('user-123');
-      expect(childInstance.getContext().requestId).toBe('req-456');
+      // Child should have flag accessible
+      const childFlag = (childInstance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;
+      expect(childFlag?.value).toBe(true);
     });
 
-    test('flag access is cached (deduplication)', () => {
-      const schema = defineFeatureFlags({
+    test('flag access is deduplicated via buffer scan', () => {
+      const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),
       });
+      const logSchema = createTestSchema({});
+      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const mockCtx = createMockSpanContext(spanBuffer);
 
       let evalCount = 0;
       const trackingEvaluator = {
@@ -266,108 +253,70 @@ describe('EvaluatorGenerator', () => {
       };
 
       const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
+        ffSchema.schema,
+        (value, schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
       );
 
-      const state: GeneratedEvaluatorState<typeof schema.schema> = {
-        schema: schema.schema,
-        evaluationContext: { userId: 'test' },
-        evaluator: trackingEvaluator,
-        buffer: null,
-
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      };
-
-      const instance = new GeneratedClass(state);
+      const instance = new GeneratedClass(mockCtx, trackingEvaluator as any);
 
       // Access flag multiple times
       (instance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;
       (instance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;
       (instance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;
 
-      // Should only evaluate once (cached)
-      expect(evalCount).toBe(1);
+      // Evaluator should be called each time (no local cache)
+      expect(evalCount).toBe(3);
+
+      // But ff-access should only be logged once (buffer deduplication)
+      const accessCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_ACCESS);
+      expect(accessCount).toBe(1);
     });
 
     test('async get method works correctly', async () => {
-      const schema = defineFeatureFlags({
+      const ffSchema = defineFeatureFlags({
         asyncFlag: S.number().default(100).async(),
       });
+      const logSchema = createTestSchema({});
+      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
+        ffSchema.schema,
+        (value, schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
       );
 
-      const evaluator = new InMemoryFlagEvaluator({ asyncFlag: 200 });
-      const state: GeneratedEvaluatorState<typeof schema.schema> = {
-        schema: schema.schema,
-        evaluationContext: { userId: 'test' },
-        evaluator,
-        buffer: null,
-
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      };
-
-      const instance = new GeneratedClass(state);
+      const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { asyncFlag: 200 });
+      const instance = new GeneratedClass(mockCtx, evaluator);
       const result = (await instance.get('asyncFlag')) as { value: number; track: () => void };
 
       expect(result).toBeDefined();
       expect(result.value).toBe(200);
     });
 
-    test('trackUsage logs to column writers', () => {
-      const schema = defineFeatureFlags({
+    test('trackUsage logs ff-usage entry via logger', () => {
+      const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),
       });
-
-      type LogEntry = Record<string, unknown>;
-      const logs: LogEntry[] = [];
-      const mockWriters = {
-        writeEntryType: (type: string) => logs.push({ type }),
-        writeFfName: (name: string) => logs.push({ name }),
-        writeFfValue: (value: FlagValue) => logs.push({ value }),
-        writeAction: (action?: string) => logs.push({ action }),
-        writeOutcome: (outcome?: string) => logs.push({ outcome }),
-        writeContextAttributes: (ctx: EvaluationContext) => logs.push({ context: ctx }),
-      };
+      const logSchema = createTestSchema({});
+      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
+        ffSchema.schema,
+        (value, schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
       );
 
-      const evaluator = new InMemoryFlagEvaluator({ debugMode: true });
-      const state: GeneratedEvaluatorState<typeof schema.schema> = {
-        schema: schema.schema,
-        evaluationContext: { userId: 'test' },
-        evaluator,
-        buffer: null,
+      const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: true });
+      const instance = new GeneratedClass(mockCtx, evaluator);
 
-        columnWriters: mockWriters,
-        accessedFlags: new Set(),
-        flagCache: new Map(),
-      };
-
-      const instance = new GeneratedClass(state);
       instance.trackUsage('debugMode', { action: 'test_action', outcome: 'success' });
 
-      expect(logs).toContainEqual({ type: 'ff-usage' });
-      expect(logs).toContainEqual({ name: 'debugMode' });
-      expect(logs).toContainEqual({ action: 'test_action' });
-      expect(logs).toContainEqual({ outcome: 'success' });
+      // Check buffer for ff-usage entry
+      const usageCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_USAGE);
+      expect(usageCount).toBe(1);
     });
   });
 
@@ -377,28 +326,16 @@ describe('EvaluatorGenerator', () => {
         flag1: S.boolean().default(false).sync(),
         flag2: S.number().default(0).sync(),
       });
+      const logSchema = createTestSchema({});
 
-      const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
-      );
+      const GeneratedClass = createEvaluatorClass(schema.schema, (value, s, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
-      const evaluator = new InMemoryFlagEvaluator({});
+      const mockEvaluator = new InMemoryFlagEvaluator(schema.schema, {});
 
       const createInstance = () => {
-        const state: GeneratedEvaluatorState<typeof schema.schema> = {
-          schema: schema.schema,
-          evaluationContext: { userId: 'test' },
-          evaluator,
-          buffer: null,
-
-          accessedFlags: new Set(),
-          flagCache: new Map(),
-        };
-        return new GeneratedClass(state);
+        const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+        const mockCtx = createMockSpanContext(spanBuffer);
+        return new GeneratedClass(mockCtx, mockEvaluator);
       };
 
       const instance1 = createInstance();
@@ -420,13 +357,7 @@ describe('EvaluatorGenerator', () => {
         testFlag: S.boolean().default(false).sync(),
       });
 
-      const GeneratedClass = createEvaluatorClass(
-        schema.schema,
-        mockValidateFlagValue,
-        mockGetTimestampNanos,
-        MOCK_FF_ACCESS,
-        MOCK_FF_USAGE,
-      );
+      const GeneratedClass = createEvaluatorClass(schema.schema, (value, s, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
       // Check the prototype for getter descriptors
       const descriptor = Object.getOwnPropertyDescriptor(GeneratedClass.prototype, 'testFlag');
@@ -504,3 +435,21 @@ describe('generateEvaluatorClass snapshots', () => {
     expect(code).toMatchSnapshot();
   });
 });
+
+/**
+ * Helper to count entries of a specific type in the buffer
+ */
+function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
+  let count = 0;
+  let current: SpanBuffer<any> | null = buffer;
+  while (current) {
+    const writeIndex = current.writeIndex;
+    for (let i = 0; i < writeIndex; i++) {
+      if (current._operations[i] === entryType) {
+        count++;
+      }
+    }
+    current = current.next;
+  }
+  return count;
+}

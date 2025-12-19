@@ -16,7 +16,7 @@ import type { ModuleContext } from './moduleContext.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import type { LogSchema } from './schema/types.js';
-import { createSpanBuffer } from './spanBuffer.js';
+import { createChildSpanBuffer, createSpanBuffer } from './spanBuffer.js';
 import {
   createSpanContextProto,
   createSpanLogger,
@@ -24,7 +24,6 @@ import {
   type SpanLogger,
   writeSpanStart,
 } from './spanContext.js';
-import { TaskContext } from './taskContext.js';
 import { getTimestampNanos } from './timestamp.js';
 import type { TraceContext } from './traceContext.js';
 import type { TraceId } from './traceId.js';
@@ -133,21 +132,11 @@ export class Op<Ctx, Args extends unknown[], Result> {
     // 1. Get schema from module
     const schemaOnly = this.module.logSchema;
 
-    // 2. Create TaskContext with span name
-    const taskContext = new TaskContext(this.module, spanName, lineNumber);
-
-    // 3. Create SpanBuffer with callsiteModule reference
+    // 2. Create SpanBuffer with module reference directly (no TaskContext wrapper)
     let spanBuffer: SpanBuffer<LogSchema>;
     if (parentBuffer) {
-      // Child span - parent provides traceId through parent chain
-      spanBuffer = createSpanBuffer(schemaOnly, taskContext, parentBuffer.traceId);
-      spanBuffer.parent = parentBuffer;
-      spanBuffer.callsiteModule = callsiteModule;
-
-      // Inherit scope from parent buffer per specs/01i_span_scope_attributes.md:
-      // "Child spans inherit parent scope by reference (safe because immutable - zero-cost!)"
-      // createSpanBuffer creates ROOT buffer with empty scope, but we need parent's scope
-      spanBuffer.scopeValues = parentBuffer.scopeValues;
+      // Child span - use createChildSpanBuffer which handles parent chain, callsiteModule, scope
+      spanBuffer = createChildSpanBuffer(parentBuffer, this.module, spanName);
 
       // Register with parent's children array (RemappedBufferView if prefixed)
       // Only check for RemappedBufferView when registering with parent (child spans only)
@@ -162,7 +151,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
       }
     } else {
       // Root span - uses traceId from TraceContext
-      spanBuffer = createSpanBuffer(schemaOnly, taskContext, traceCtx.traceId as TraceId);
+      spanBuffer = createSpanBuffer(schemaOnly, this.module, spanName, traceCtx.traceId as TraceId);
     }
 
     // 4. Write span-start entry (row 0) and pre-initialize span-end (row 1)
@@ -179,20 +168,17 @@ export class Op<Ctx, Args extends unknown[], Result> {
     // 6. Create tag writer for span attributes (writes to row 0)
     const tagAPI = createTagWriter(schemaOnly, spanBuffer);
 
-    // 7. Create a new feature flag evaluator bound to this span's buffer
-    const spanFf = traceCtx.ff.withBuffer(spanBuffer);
+    // 7. Create SpanContext prototype for this invocation
+    const spanContextProto = createSpanContextProto(schemaOnly, this.module);
 
-    // 8. Create SpanContext prototype for this invocation
-    const spanContextProto = createSpanContextProto(schemaOnly, taskContext);
-
-    // 9. Create span context using prototype-based inheritance
+    // 8. Create span context using prototype-based inheritance
     const spanContext = Object.create(spanContextProto) as MutableSpanContext<
       LogSchema,
       FeatureFlagSchema,
       Record<string, unknown>
     >;
 
-    // 10. Copy user properties from traceCtx to spanContext
+    // 9. Copy user properties from traceCtx to spanContext
     const traceCtxAny = traceCtx as unknown as Record<string, unknown>;
     for (const key of Object.keys(traceCtxAny)) {
       if (!RESERVED_CONTEXT_KEYS.has(key)) {
@@ -206,10 +192,8 @@ export class Op<Ctx, Args extends unknown[], Result> {
       }
     }
 
-    // 11. Assign span-specific properties directly
+    // 10. Assign span-specific properties directly
     spanContext.traceId = traceCtx.traceId as TraceId;
-    spanContext.ff = spanFf as FeatureFlagEvaluator<FeatureFlagSchema> &
-      InferFeatureFlagsWithContext<FeatureFlagSchema>;
     spanContext.env = (traceCtx as unknown as Record<string, unknown>).env as Record<string, unknown>;
     // Wire deps - plain object references (zero-allocation per spec 01l)
     // Get deps from module context or use empty object
@@ -221,6 +205,13 @@ export class Op<Ctx, Args extends unknown[], Result> {
     spanContext._spanLogger = spanLogger;
     // Store traceCtx reference for Op invocation via span_op
     spanContext._traceCtx = traceCtx;
+
+    // 11. Create feature flag evaluator bound to this span context
+    // Must be after spanContext is created since forContext receives the full SpanContext
+    // forContext() creates a span-bound evaluator with typed getters
+    const spanFf = traceCtx.ff.forContext!(spanContext);
+    spanContext.ff = spanFf as unknown as FeatureFlagEvaluator<FeatureFlagSchema> &
+      InferFeatureFlagsWithContext<FeatureFlagSchema>;
 
     // 12. Execute op function with exception handling
     try {

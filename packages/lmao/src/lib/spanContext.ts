@@ -18,12 +18,12 @@ import { FluentErrorResult, FluentSuccessResult } from './result.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
-import type { InferTagAttributes, LogSchema } from './schema/types.js';
+import type { InferSchema, LogSchema } from './schema/types.js';
 import { createChildSpanBuffer, createNextBuffer } from './spanBuffer.js';
 import { getTimestampNanos } from './timestamp.js';
 import type { TraceContext } from './traceContext.js';
 import type { TraceId } from './traceId.js';
-import type { SpanBuffer, TaskContext } from './types.js';
+import type { ModuleContext, SpanBuffer } from './types.js';
 
 // =============================================================================
 // SpanContext Symbol Marker
@@ -70,6 +70,23 @@ export interface FluentLogEntry {
  * schema-specific setter methods via ColumnWriter<T>.
  */
 export type SpanLogger<T extends LogSchema> = BaseSpanLogger<T>;
+
+/**
+ * Internal SpanLogger type with FF methods (not on public type).
+ * Methods exist at runtime but are hidden from TypeScript users.
+ */
+export type SpanLoggerInternal<T extends LogSchema> = SpanLogger<T> & {
+  /**
+   * Write feature flag access entry (internal, not on public type).
+   * Called by FeatureFlagEvaluator to log flag access.
+   */
+  ffAccess(flagName: string, value: unknown): void;
+  /**
+   * Write feature flag usage entry (internal, not on public type).
+   * Called by FeatureFlagEvaluator to log flag usage.
+   */
+  ffUsage(flagName: string, context?: Record<string, unknown>): void;
+};
 
 // =============================================================================
 // SpanFn Types
@@ -220,7 +237,7 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
    * ctx.log.info('Processing'); // Includes requestId and userId
    * ctx.setScope({ userId: null }); // Clear userId from scope
    */
-  setScope(attributes: Partial<InferTagAttributes<T> | null>): void;
+  setScope(attributes: Partial<InferSchema<T> | null>): void;
 
   /**
    * Read-only view of current scoped attributes
@@ -232,7 +249,7 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
    * ctx.setScope({ requestId: 'r1' });
    * console.log(ctx.scope.requestId); // 'r1'
    */
-  readonly scope: Readonly<Partial<InferTagAttributes<T>>>;
+  readonly scope: Readonly<Partial<InferSchema<T>>>;
 
   /**
    * Create a success result with optional attributes
@@ -320,8 +337,8 @@ export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagS
   _spanLogger: BaseSpanLogger<T>;
   _traceCtx?: TraceContext<FF, Record<string, unknown>>; // Hidden reference to root trace context for Op invocation
   buffer: SpanBuffer<T>;
-  setScope: (attributes: Partial<InferTagAttributes<T> | null>) => void;
-  scope: Readonly<Partial<InferTagAttributes<T>>>;
+  setScope: (attributes: Partial<InferSchema<T> | null>) => void;
+  scope: Readonly<Partial<InferSchema<T>>>;
   ok: <V>(value: V) => FluentSuccessResult<V, T>;
   err: <E>(code: string, error: E) => FluentErrorResult<E, T>;
   span: SpanFn<T, FF, Env>;
@@ -408,7 +425,7 @@ export function createSpanContextProto<
   T extends LogSchema,
   FF extends FeatureFlagSchema,
   Env = Record<string, unknown>,
->(schemaOnly: T, taskContext: TaskContext): Record<string | symbol, unknown> {
+>(schemaOnly: T, _module: ModuleContext): Record<string | symbol, unknown> {
   return {
     [SPAN_CONTEXT_MARKER]: true as const,
 
@@ -418,15 +435,15 @@ export function createSpanContextProto<
     },
 
     // Scope getter - returns current scope values as frozen object
-    get scope(): Readonly<Partial<InferTagAttributes<T>>> {
+    get scope(): Readonly<Partial<InferSchema<T>>> {
       const buffer = (this as unknown as MutableSpanContext<T, FF, Env>)._buffer;
-      return (buffer.scopeValues as Readonly<Partial<InferTagAttributes<T>>>) ?? Object.freeze({});
+      return (buffer.scopeValues as Readonly<Partial<InferSchema<T>>>) ?? Object.freeze({});
     },
 
     // setScope method - delegates to spanLogger._setScope
-    setScope(this: MutableSpanContext<T, FF, Env>, attributes: Partial<InferTagAttributes<T> | null>): void {
-      // Cast needed because _setScope expects Partial<InferTagAttributes<T>> but we accept null values
-      this._spanLogger._setScope(attributes as Partial<InferTagAttributes<T>>);
+    setScope(this: MutableSpanContext<T, FF, Env>, attributes: Partial<InferSchema<T> | null>): void {
+      // Cast needed because _setScope expects Partial<InferSchema<T>> but we accept null values
+      this._spanLogger._setScope(attributes as Partial<InferSchema<T>>);
     },
 
     // Ok method - creates FluentSuccessResult
@@ -456,9 +473,9 @@ export function createSpanContextProto<
       }
 
       // Call op._invoke with proper parameters
-      // callsiteModule is the current span's module (taskContext.module)
+      // callsiteModule is the current span's module (buffer.module)
       // Cast needed: SpanBuffer<T> -> SpanBuffer (TypeScript variance limitation with index signatures)
-      return op._invoke(traceCtx, this._buffer as SpanBuffer, taskContext.module, name, line, args);
+      return op._invoke(traceCtx, this._buffer as SpanBuffer, this._buffer.module, name, line, args);
     },
 
     // Monomorphic span_fn - inline closure (per spec 01o lines 51-53)
@@ -470,7 +487,8 @@ export function createSpanContextProto<
       fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>,
     ): Promise<R> {
       // Create child span buffer
-      const childBuffer = createChildSpanBuffer(this._buffer, taskContext);
+      // Uses same module as parent - span_fn creates child spans within same module context
+      const childBuffer = createChildSpanBuffer(this._buffer, this._buffer.module, name);
 
       // Explicit registration with parent's children array
       this._buffer.children.push(childBuffer);
@@ -487,21 +505,23 @@ export function createSpanContextProto<
       // Create tag writer for child span attributes (writes to row 0)
       const childTagAPI = createTagWriter(schemaOnly, childBuffer);
 
-      // Create a new feature flag evaluator bound to the CHILD buffer
-      const childFf = this.ff.withBuffer(childBuffer as unknown as SpanBuffer) as FeatureFlagEvaluator<FF> &
-        InferFeatureFlagsWithContext<FF>;
-
       // Use Object.create(ctx) for prototype inheritance (ctx may be overridden)
       const childContext = Object.create(ctx) as MutableSpanContext<T, FF, Env>;
 
       // Assign child-specific properties directly (stable hidden class)
-      childContext.ff = childFf;
       childContext.tag = childTagAPI;
       childContext.log = childLogger as SpanLogger<T>;
       childContext._buffer = childBuffer;
       childContext._spanLogger = childLogger;
       // ALWAYS copy _traceCtx directly (V8 optimization - no prototype access)
       childContext._traceCtx = (ctx as unknown as MutableSpanContext<T, FF, Env>)._traceCtx;
+
+      // Create a new feature flag evaluator bound to the CHILD span context
+      // Must be after childContext is created since forContext receives the full SpanContext
+      const childFf = this.ff.forContext!(
+        childContext as unknown as SpanContext<T, FF, Env>,
+      ) as unknown as FeatureFlagEvaluator<FF> & InferFeatureFlagsWithContext<FF>;
+      childContext.ff = childFf;
 
       // Execute child span with exception handling (direct async, no IIFE)
       try {

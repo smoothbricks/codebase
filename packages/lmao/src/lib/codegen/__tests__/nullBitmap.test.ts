@@ -15,7 +15,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createTestTaskContext } from '../../__tests__/test-helpers.js';
+import { createTestModuleContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { LogSchema } from '../../schema/types.js';
@@ -40,16 +40,16 @@ function getBitsSet(nullBitmap: Uint8Array, count: number): boolean[] {
  * Create a test buffer from a schema
  */
 function createTestBuffer(schema: LogSchema): SpanBuffer {
-  const taskContext = createTestTaskContext(schema.fields);
-  return createSpanBuffer(schema.fields, taskContext);
+  const module = createTestModuleContext(schema);
+  return createSpanBuffer(schema, module, 'test-span');
 }
 
 /**
  * Create a test buffer with a specific capacity
  */
 function createTestBufferWithCapacity(schema: LogSchema, capacity: number): SpanBuffer {
-  const taskContext = createTestTaskContext(schema.fields);
-  return createSpanBuffer(schema.fields, taskContext, undefined, capacity);
+  const module = createTestModuleContext(schema);
+  return createSpanBuffer(schema, module, 'test-span', undefined, capacity);
 }
 
 /**
@@ -160,7 +160,11 @@ describe('null bitmap correctness', () => {
   });
 
   describe('log message writes (arbitrary index)', () => {
-    it('should set correct bit for log entry at index 5', () => {
+    it('should NOT set null bitmap during info() - scope filling is deferred to Arrow conversion', () => {
+      // Per specs/01i_span_scope_attributes.md:
+      // - Scope values are stored in buffer.scopeValues as a plain object
+      // - Scope filling happens at Arrow conversion time, NOT during span execution
+      // - This is because scope values are "defaults" that fill null slots
       const schema = defineLogSchema({
         requestId: S.category(),
       });
@@ -175,20 +179,22 @@ describe('null bitmap correctness', () => {
       // Set _writeIndex to 4 so nextRow() makes it 5
       logger._writeIndex = 4;
 
-      // Log a message - this should write scoped attributes at index 5
+      // Log a message - this does NOT write scoped attributes during execution
+      // Scope values are filled at Arrow conversion time
       logger.info('test message');
 
-      // Check null bitmap - bit 5 should be set
+      // Verify that the null bitmap bit is NOT set (scope is deferred)
       const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      expect(nulls[0] & (1 << 5)).toBe(1 << 5);
-
-      // Check that bit 4 is NOT set (wasn't written)
-      expect(nulls[0] & (1 << 4)).toBe(0);
+      // Null bitmap might not even be allocated since we never directly wrote to requestId
+      if (nulls) {
+        // If allocated, the bits should be 0 (not written directly)
+        expect(nulls[0] & (1 << 5)).toBe(0);
+      }
     });
 
-    it('should set correct bit for log entry at index 9 (crosses byte boundary)', () => {
+    it('should NOT set null bitmap at index 9 during info() - scope is deferred', () => {
+      // Same as above - scope values are NOT written during span execution
+      // They are stored in buffer.scopeValues and filled at Arrow conversion
       const schema = defineLogSchema({
         requestId: S.category(),
       });
@@ -204,16 +210,20 @@ describe('null bitmap correctness', () => {
       // Set _writeIndex to 8 so nextRow() makes it 9
       logger._writeIndex = 8;
 
-      // Log a message - this should write scoped attributes at index 9
+      // Log a message - does NOT write scoped attributes immediately
       logger.info('test message');
 
-      // Check null bitmap - bit 9 should be set (byte 1, bit 1)
+      // Verify scope values are stored correctly
+      expect(buffer.scopeValues.requestId).toBe('req-456');
+
+      // Null bitmap is not set during execution (deferred to Arrow conversion)
       const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      const byteIndex = 9 >>> 3; // = 1
-      const bitOffset = 9 & 7; // = 1
-      expect(nulls[byteIndex] & (1 << bitOffset)).toBe(1 << bitOffset);
+      if (nulls) {
+        const byteIndex = 9 >>> 3; // = 1
+        const bitOffset = 9 & 7; // = 1
+        // Not set - scope filling is deferred
+        expect(nulls[byteIndex] & (1 << bitOffset)).toBe(0);
+      }
     });
   });
 });

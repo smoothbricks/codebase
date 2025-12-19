@@ -212,7 +212,9 @@ export function generateRemappedBufferViewClass(
     get _identity() { return this._buffer._identity; }
     
     // Metadata (pass-through)
-    get task() { return this._buffer.task; }
+    get module() { return this._buffer.module; }
+    get spanName() { return this._buffer.spanName; }
+    get utf8SpanName() { return this._buffer.utf8SpanName; }
     
     // Remapped column access (for Arrow conversion iteration)
     // Maps prefixed name → unprefixed name before calling underlying buffer

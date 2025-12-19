@@ -7,7 +7,6 @@ import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createNextBuffer, createSpanBuffer } from '../spanBuffer.js';
-import { TaskContext } from '../taskContext.js';
 import type { SpanBuffer } from '../types.js';
 
 /**
@@ -40,11 +39,10 @@ const testSchema = new LogSchema(
 const RESERVED_ROWS = 2;
 
 /**
- * Helper: Create a TaskContext for testing
+ * Helper: Create a ModuleContext for testing
  */
-function createTestTaskContext(spanName = 'test-span'): TaskContext {
-  const moduleContext = new ModuleContext('test-sha', '@test/overflow', 'src/overflow.ts', testSchema);
-  return new TaskContext(moduleContext, spanName, 10);
+function createTestModuleContext(): ModuleContext {
+  return new ModuleContext('test-sha', '@test/overflow', 'src/overflow.ts', testSchema);
 }
 
 /**
@@ -138,15 +136,15 @@ function expectedBufferCount(numEntries: number, capacity: number, reservedRows:
 }
 
 describe('Buffer Overflow Property Tests', () => {
-  let taskContext: TaskContext;
+  let module: ModuleContext;
 
   beforeEach(() => {
-    taskContext = createTestTaskContext();
+    module = createTestModuleContext();
     // Reset overflow counters
-    taskContext.module.sb_overflows = 0;
-    taskContext.module.sb_overflowWrites = 0;
-    taskContext.module.sb_totalWrites = 0;
-    taskContext.module.sb_totalCreated = 0;
+    module.sb_overflows = 0;
+    module.sb_overflowWrites = 0;
+    module.sb_totalWrites = 0;
+    module.sb_totalCreated = 0;
   });
 
   describe('Property: Entry Preservation', () => {
@@ -157,10 +155,10 @@ describe('Buffer Overflow Property Tests', () => {
           fc.integer({ min: 1, max: 200 }),
           (numEntries) => {
             // Reset counters for each test run
-            taskContext.module.sb_overflows = 0;
-            taskContext.module.sb_totalCreated = 0;
+            module.sb_overflows = 0;
+            module.sb_totalCreated = 0;
 
-            const buffer = createSpanBuffer(testSchema, taskContext);
+            const buffer = createSpanBuffer(testSchema, module, 'test-span');
             const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
             // Write entries
@@ -189,11 +187,11 @@ describe('Buffer Overflow Property Tests', () => {
     it('buffer count matches mathematical formula for any entry count', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
-          taskContext.module.sb_overflows = 0;
-          taskContext.module.sb_totalCreated = 0;
+          module.sb_overflows = 0;
+          module.sb_totalCreated = 0;
 
           const capacity = DEFAULT_BUFFER_CAPACITY; // 8
-          const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+          const buffer = createSpanBuffer(testSchema, module, 'test-span', undefined, capacity);
           const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           // Write entries
@@ -216,10 +214,10 @@ describe('Buffer Overflow Property Tests', () => {
     it('buffer chain is properly linked', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
-          taskContext.module.sb_overflows = 0;
-          taskContext.module.sb_totalCreated = 0;
+          module.sb_overflows = 0;
+          module.sb_totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, taskContext);
+          const buffer = createSpanBuffer(testSchema, module, 'test-span');
           const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           for (let i = 0; i < numEntries; i++) {
@@ -259,10 +257,10 @@ describe('Buffer Overflow Property Tests', () => {
     it('each entry has correct attribute values', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
-          taskContext.module.sb_overflows = 0;
-          taskContext.module.sb_totalCreated = 0;
+          module.sb_overflows = 0;
+          module.sb_totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, taskContext);
+          const buffer = createSpanBuffer(testSchema, module, 'test-span');
           const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
@@ -300,10 +298,10 @@ describe('Buffer Overflow Property Tests', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 150 }), (numEntries) => {
           // Reset counters
-          taskContext.module.sb_overflows = 0;
-          taskContext.module.sb_totalCreated = 0;
+          module.sb_overflows = 0;
+          module.sb_totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, taskContext);
+          const buffer = createSpanBuffer(testSchema, module, 'test-span');
           const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           for (let i = 0; i < numEntries; i++) {
@@ -313,7 +311,7 @@ describe('Buffer Overflow Property Tests', () => {
           const { bufferCount } = analyzeBufferChain(buffer);
 
           // Property: overflow events = bufferCount - 1 (one per chain link)
-          expect(taskContext.module.sb_overflows).toBe(bufferCount - 1);
+          expect(module.sb_overflows).toBe(bufferCount - 1);
         }),
         { numRuns: 100 },
       );
@@ -324,10 +322,10 @@ describe('Buffer Overflow Property Tests', () => {
     it('each buffer writeIndex is within capacity', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
-          taskContext.module.sb_overflows = 0;
-          taskContext.module.sb_totalCreated = 0;
+          module.sb_overflows = 0;
+          module.sb_totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, taskContext);
+          const buffer = createSpanBuffer(testSchema, module, 'test-span');
           const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           for (let i = 0; i < numEntries; i++) {
@@ -353,9 +351,9 @@ describe('Buffer Overflow Property Tests', () => {
     it('exact usable capacity: no overflow when entries fit in first buffer', () => {
       const capacity = DEFAULT_BUFFER_CAPACITY; // 8
       const usableCapacity = capacity - RESERVED_ROWS; // 6 entries fit
-      taskContext.module.sb_overflows = 0;
+      module.sb_overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+      const buffer = createSpanBuffer(testSchema, module, 'test-span', undefined, capacity);
       const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
       // Write exactly usable capacity entries (6 with capacity=8, reserved=2)
@@ -365,7 +363,7 @@ describe('Buffer Overflow Property Tests', () => {
 
       // Should be exactly 1 buffer (no overflow)
       expect(buffer.next).toBeUndefined();
-      expect(taskContext.module.sb_overflows).toBe(0);
+      expect(module.sb_overflows).toBe(0);
       // writeIndex = RESERVED_ROWS + usableCapacity = 2 + 6 = 8 = capacity
       expect(buffer.writeIndex).toBe(capacity);
     });
@@ -373,9 +371,9 @@ describe('Buffer Overflow Property Tests', () => {
     it('usable capacity + 1: triggers exactly one overflow', () => {
       const capacity = DEFAULT_BUFFER_CAPACITY; // 8
       const usableCapacity = capacity - RESERVED_ROWS; // 6
-      taskContext.module.sb_overflows = 0;
+      module.sb_overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+      const buffer = createSpanBuffer(testSchema, module, 'test-span', undefined, capacity);
       const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
       // Write usable capacity + 1 entries (7 entries)
@@ -386,7 +384,7 @@ describe('Buffer Overflow Property Tests', () => {
       // Should be exactly 2 buffers
       expect(buffer.next).toBeDefined();
       expect(buffer.next?.next).toBeUndefined();
-      expect(taskContext.module.sb_overflows).toBe(1);
+      expect(module.sb_overflows).toBe(1);
 
       // First buffer full, second has 1 entry
       expect(buffer.writeIndex).toBe(capacity);
@@ -394,16 +392,16 @@ describe('Buffer Overflow Property Tests', () => {
     });
 
     it('zero entries: single buffer with just reserved space', () => {
-      taskContext.module.sb_overflows = 0;
+      module.sb_overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, taskContext);
+      const buffer = createSpanBuffer(testSchema, module, 'test-span');
       // Create logger but don't write anything
       createSpanLogger(testSchema, buffer, createNextBuffer);
 
       expect(buffer.next).toBeUndefined();
       // Logger constructor sets writeIndex to 2 (after reserved rows)
       expect(buffer.writeIndex).toBe(RESERVED_ROWS);
-      expect(taskContext.module.sb_overflows).toBe(0);
+      expect(module.sb_overflows).toBe(0);
     });
   });
 
@@ -416,11 +414,11 @@ describe('Buffer Overflow Property Tests', () => {
             .integer({ min: 8, max: 64 })
             .map((n) => (n + 7) & ~7), // capacity aligned to 8
           (numEntries, capacity) => {
-            taskContext.module.sb_overflows = 0;
-            taskContext.module.sb_totalCreated = 0;
-            taskContext.module.sb_capacity = capacity; // Set for chained buffers
+            module.sb_overflows = 0;
+            module.sb_totalCreated = 0;
+            module.sb_capacity = capacity; // Set for chained buffers
 
-            const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+            const buffer = createSpanBuffer(testSchema, module, 'test-span', undefined, capacity);
             const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
             for (let i = 0; i < numEntries; i++) {
@@ -434,7 +432,7 @@ describe('Buffer Overflow Property Tests', () => {
             expect(bufferCount).toBe(expected);
 
             // Property: overflow count matches
-            expect(taskContext.module.sb_overflows).toBe(bufferCount - 1);
+            expect(module.sb_overflows).toBe(bufferCount - 1);
           },
         ),
         { numRuns: 100 },

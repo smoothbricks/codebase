@@ -284,7 +284,7 @@ export class FlushScheduler {
     for (const buffer of buffersToFlush) {
       let currentBuffer: SpanBuffer | undefined = buffer;
       while (currentBuffer) {
-        modulesInThisFlush.add(currentBuffer.task.module);
+        modulesInThisFlush.add(currentBuffer.module);
         currentBuffer = currentBuffer.next as SpanBuffer | undefined;
       }
     }

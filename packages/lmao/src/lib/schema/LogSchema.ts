@@ -33,6 +33,18 @@ const RESERVED_NAMES = new Set([
   'error', // ctx.log.error()
   'trace', // ctx.log.trace()
 
+  // Internal SpanLogger methods (prefixed with _ but included for completeness)
+  '_nextRow', // Internal row advancement
+  '_buffer', // Internal buffer reference
+  '_writeIndex', // Internal write position
+  '_getNextBuffer', // Internal buffer chaining
+  '_setScope', // Internal scope setter
+  '_prefillScopedAttributes', // Internal scope prefill
+
+  // Internal FF logging methods (called by evaluator, not on public type)
+  'ffAccess', // Feature flag access logging
+  'ffUsage', // Feature flag usage logging
+
   // Confusing - properties on SpanContext (not technically conflicting)
   'tag', // ctx.tag is TagWriter; ctx.tag.tag() would be confusing
   'scope', // ctx.scope is readonly; ctx.scope.scope would be confusing

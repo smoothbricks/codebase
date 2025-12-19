@@ -1,12 +1,16 @@
 /**
- * Test helpers for creating ModuleContext and TaskContext instances.
+ * Test helpers for creating ModuleContext instances.
+ * TaskContext has been removed - SpanBuffer now stores module, spanName directly.
  */
 
+import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { ModuleContext } from '../moduleContext.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
-import { TaskContext } from '../taskContext.js';
+import { createSpanBuffer as realCreateSpanBuffer } from '../spanBuffer.js';
+import { createTraceId, generateTraceId } from '../traceId.js';
+import type { SpanBuffer } from '../types.js';
 
 /**
  * Create a LogSchema with system fields merged for testing.
@@ -38,19 +42,29 @@ export function createTestModuleContext(
 }
 
 /**
- * Create a TaskContext for testing.
- * Accepts either LogSchema or plain SchemaFields.
+ * Test-only helper that creates a ModuleContext and SpanBuffer in one call.
+ * This replaces the old createTestTaskContext pattern.
+ *
+ * @returns Object with module and spanBuffer
  */
-export function createTestTaskContext(
-  schema: SchemaFields | LogSchema,
+export function createTestSpanBuffer<T extends SchemaFields | LogSchema>(
+  schema: T,
   options: {
     gitSha?: string;
     packageName?: string;
     packagePath?: string;
     spanName?: string;
-    lineNumber?: number;
+    traceId?: string;
+    capacity?: number;
   } = {},
-): TaskContext {
-  const moduleContext = createTestModuleContext(schema, options);
-  return new TaskContext(moduleContext, options.spanName ?? 'test-span', options.lineNumber ?? 0);
+): { module: ModuleContext; spanBuffer: SpanBuffer<LogSchema> } {
+  const module = createTestModuleContext(schema, options);
+  const spanName = options.spanName ?? 'test-span';
+  const traceId = options.traceId ? createTraceId(options.traceId) : generateTraceId();
+  const capacity = options.capacity ?? DEFAULT_BUFFER_CAPACITY;
+
+  const logSchema = schema instanceof LogSchema ? schema : module.logSchema;
+  const spanBuffer = realCreateSpanBuffer(logSchema, module, spanName, traceId, capacity);
+
+  return { module, spanBuffer };
 }
