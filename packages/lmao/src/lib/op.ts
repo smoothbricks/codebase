@@ -19,7 +19,7 @@ import type { LogSchema } from './schema/types.js';
 import { createSpanBuffer } from './spanBuffer.js';
 import {
   createSpanContextProto,
-  createSpanLoggerWithScope,
+  createSpanLogger,
   type MutableSpanContext,
   type SpanLogger,
   writeSpanStart,
@@ -144,6 +144,11 @@ export class Op<Ctx, Args extends unknown[], Result> {
       spanBuffer.parent = parentBuffer;
       spanBuffer.callsiteModule = callsiteModule;
 
+      // Inherit scope from parent buffer per specs/01i_span_scope_attributes.md:
+      // "Child spans inherit parent scope by reference (safe because immutable - zero-cost!)"
+      // createSpanBuffer creates ROOT buffer with empty scope, but we need parent's scope
+      spanBuffer.scopeValues = parentBuffer.scopeValues;
+
       // Register with parent's children array
       (parentBuffer.children as SpanBuffer[]).push(spanBuffer);
     } else {
@@ -159,36 +164,26 @@ export class Op<Ctx, Args extends unknown[], Result> {
       spanBuffer.lineNumber(0, lineNumber);
     }
 
-    // 5. Inherit scoped values from parent buffer by reference (safe because immutable/frozen)
-    // Per specs/01i_span_scope_attributes.md: Snapshot semantics, zero-cost inheritance
-    const inheritedScopeValues = parentBuffer?.scopeValues ?? Object.freeze({});
-    spanBuffer.scopeValues = inheritedScopeValues;
+    // 5. Create span logger with typed logging methods
+    const spanLogger = createSpanLogger(schemaOnly, spanBuffer as SpanBuffer<LogSchema>);
 
-    // 6. Create span logger with typed logging methods
-    // Pass buffer's scopeValues (which is the inherited reference)
-    const spanLogger = createSpanLoggerWithScope(
-      schemaOnly,
-      spanBuffer as SpanBuffer<LogSchema>,
-      spanBuffer.scopeValues,
-    );
-
-    // 7. Create tag writer for span attributes (writes to row 0)
+    // 6. Create tag writer for span attributes (writes to row 0)
     const tagAPI = createTagWriter(schemaOnly, spanBuffer);
 
-    // 8. Create a new feature flag evaluator bound to this span's buffer
+    // 7. Create a new feature flag evaluator bound to this span's buffer
     const spanFf = traceCtx.ff.withBuffer(spanBuffer);
 
-    // 9. Create SpanContext prototype for this invocation
+    // 8. Create SpanContext prototype for this invocation
     const spanContextProto = createSpanContextProto(schemaOnly, taskContext);
 
-    // 10. Create span context using prototype-based inheritance
+    // 9. Create span context using prototype-based inheritance
     const spanContext = Object.create(spanContextProto) as MutableSpanContext<
       LogSchema,
       FeatureFlagSchema,
       Record<string, unknown>
     >;
 
-    // 11. Copy user properties from traceCtx to spanContext
+    // 10. Copy user properties from traceCtx to spanContext
     const traceCtxAny = traceCtx as unknown as Record<string, unknown>;
     for (const key of Object.keys(traceCtxAny)) {
       if (!RESERVED_CONTEXT_KEYS.has(key)) {
@@ -202,7 +197,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
       }
     }
 
-    // 12. Assign span-specific properties directly
+    // 11. Assign span-specific properties directly
     spanContext.traceId = traceCtx.traceId as TraceId;
     spanContext.ff = spanFf as FeatureFlagEvaluator<FeatureFlagSchema> &
       InferFeatureFlagsWithContext<FeatureFlagSchema>;
@@ -218,7 +213,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
     // Store traceCtx reference for Op invocation via span_op
     spanContext._traceCtx = traceCtx;
 
-    // 13. Execute op function with exception handling
+    // 12. Execute op function with exception handling
     try {
       return await this.fn(spanContext as unknown as Ctx, ...args);
     } catch (error) {

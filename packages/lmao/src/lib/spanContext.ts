@@ -9,8 +9,10 @@
 
 import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
-import { createScope, createScopeWithInheritance, type GeneratedScope } from './codegen/scopeGenerator.js';
-import { type BaseSpanLogger, createSpanLogger } from './codegen/spanLoggerGenerator.js';
+import {
+  type BaseSpanLogger,
+  createSpanLogger as createSpanLoggerFromGenerator,
+} from './codegen/spanLoggerGenerator.js';
 import type { Op, OpBrand } from './op.js';
 import { FluentErrorResult, FluentSuccessResult } from './result.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
@@ -371,37 +373,18 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
 }
 
 /**
- * Helper function to create a SpanLogger with inherited scope values.
+ * Create a SpanLogger for the given buffer.
  *
- * Uses the imported createSpanLogger from spanLoggerGenerator.js and
- * handles scope creation and inheritance.
+ * Per specs/01i_span_scope_attributes.md: Scope values are stored directly on buffer.scopeValues.
+ * The SpanLogger reads/writes scope via buffer.scopeValues - no separate Scope class needed.
  *
  * @param schema - Tag attribute schema with field definitions
  * @param buffer - SpanBuffer to write entries to (per-span instance)
- * @param inheritedScopeValues - Scoped values inherited from parent span (from _getScopeValues())
  * @returns SpanLogger with typed methods matching schema
  */
-export function createSpanLoggerWithScope<T extends LogSchema>(
-  schema: T,
-  buffer: SpanBuffer<T>,
-  inheritedScopeValues?: Record<string, unknown>,
-): BaseSpanLogger<T> {
-  // Create Scope instance (separate from column storage)
-  const scopeInstance: GeneratedScope =
-    inheritedScopeValues && Object.keys(inheritedScopeValues).length > 0
-      ? createScopeWithInheritance(schema, inheritedScopeValues)
-      : createScope(schema);
-
-  // Create the SpanLogger using the imported function
-  const logger = createSpanLogger(schema, buffer, scopeInstance, createNextBuffer);
-
-  // If scoped values were inherited, pre-fill the buffer
-  // The _setScope() method will update both the Scope instance and pre-fill buffer
-  if (inheritedScopeValues && Object.keys(inheritedScopeValues).length > 0) {
-    logger._setScope(inheritedScopeValues as Partial<InferTagAttributes<T>>);
-  }
-
-  return logger as BaseSpanLogger<T>;
+export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): BaseSpanLogger<T> {
+  // Create the SpanLogger - it will read/write scope via buffer.scopeValues
+  return createSpanLoggerFromGenerator(schema, buffer, createNextBuffer) as BaseSpanLogger<T>;
 }
 
 /**
@@ -474,7 +457,8 @@ export function createSpanContextProto<
 
       // Call op._invoke with proper parameters
       // callsiteModule is the current span's module (taskContext.module)
-      return op._invoke(traceCtx, this._buffer, taskContext.module, name, line, args);
+      // Cast needed: SpanBuffer<T> -> SpanBuffer (TypeScript variance limitation with index signatures)
+      return op._invoke(traceCtx, this._buffer as SpanBuffer, taskContext.module, name, line, args);
     },
 
     // Monomorphic span_fn - inline closure (per spec 01o lines 51-53)
@@ -497,12 +481,8 @@ export function createSpanContextProto<
       // Write line number to row 0
       childBuffer.lineNumber(0, line);
 
-      // Child inherits parent's scopeValues by reference - safe because immutable/frozen
-      // Per specs/01i_span_scope_attributes.md: Snapshot semantics, zero-cost inheritance
-      childBuffer.scopeValues = this._buffer.scopeValues ?? Object.freeze({});
-
-      // Create child context with its own logger (with inherited scope values)
-      const childLogger = createSpanLoggerWithScope(schemaOnly, childBuffer, childBuffer.scopeValues);
+      // Create child span logger (scope inheritance handled by buffer constructor)
+      const childLogger = createSpanLogger(schemaOnly, childBuffer);
 
       // Create tag writer for child span attributes (writes to row 0)
       const childTagAPI = createTagWriter(schemaOnly, childBuffer);

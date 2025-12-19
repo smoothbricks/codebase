@@ -12,11 +12,12 @@ import {
 } from '../flushScheduler.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { SpanBuffer } from '../types.js';
-import { createTestTaskContext } from './test-helpers.js';
+import { createTestSchema, createTestTaskContext } from './test-helpers.js';
 
 function createTestBuffer(): SpanBuffer {
-  const taskContext = createTestTaskContext({});
-  const buffer = createSpanBuffer({}, taskContext);
+  const schema = createTestSchema({});
+  const taskContext = createTestTaskContext(schema.fields);
+  const buffer = createSpanBuffer(schema, taskContext);
   // Write some test data
   buffer.writeIndex = 5;
   for (let i = 0; i < buffer.writeIndex; i++) {

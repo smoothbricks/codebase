@@ -156,8 +156,10 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
     );
   }
 
+  // Spread .fields to get the actual schema field definitions
+  // (spreading systemSchema directly would spread class instance properties like _fieldNames, not schema fields)
   return {
-    ...systemSchema,
+    ...systemSchema.fields,
     ...userSchema,
   } as typeof systemSchema & T;
 }

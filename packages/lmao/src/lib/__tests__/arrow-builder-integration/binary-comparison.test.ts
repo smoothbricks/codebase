@@ -15,11 +15,12 @@
 import { describe, expect, it } from 'bun:test';
 import * as arrow from 'apache-arrow';
 import { convertToArrowTable } from '../../convertToArrow.js';
-import { ENTRY_TYPE_SPAN_START } from '../../lmao.js';
 import { S } from '../../schema/builder.js';
+import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
+
 import { createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import { createTestTaskContext } from '../test-helpers.js';
+import { createTestSchema, createTestTaskContext } from '../test-helpers.js';
 
 /**
  * Round-trip test: serialize to IPC, deserialize, verify data matches
@@ -63,7 +64,7 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('serializes and deserializes correctly', () => {
     it('number columns survive round-trip', () => {
-      const schema = { value: S.number() } as const;
+      const schema = createTestSchema({ value: S.number() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -96,7 +97,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('boolean columns survive round-trip', () => {
-      const schema = { flag: S.boolean() } as const;
+      const schema = createTestSchema({ flag: S.boolean() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       // Need capacity for 9 test values
@@ -120,7 +121,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('enum columns survive round-trip', () => {
-      const schema = { status: S.enum(['pending', 'active', 'completed'] as const) } as const;
+      const schema = createTestSchema({ status: S.enum(['pending', 'active', 'completed'] as const) });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -147,7 +148,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('category columns survive round-trip', () => {
-      const schema = { userId: S.category() } as const;
+      const schema = createTestSchema({ userId: S.category() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -276,7 +277,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('text columns survive round-trip', () => {
-      const schema = { userMessage: S.text() } as const;
+      const schema = createTestSchema({ userMessage: S.text() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -299,7 +300,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('nullable columns with nulls survive round-trip', () => {
-      const schema = { value: S.number() } as const;
+      const schema = createTestSchema({ value: S.number() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -330,13 +331,13 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('mixed column types survive round-trip', () => {
-      const schema = {
+      const schema = createTestSchema({
         count: S.number(),
         active: S.boolean(),
         status: S.enum(['pending', 'active', 'completed'] as const),
         userId: S.category(),
         userMessage: S.text(),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -396,7 +397,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('system columns survive round-trip', () => {
-      const schema = {} as const;
+      const schema = createTestSchema({});
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -441,7 +442,7 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('schema correctness', () => {
     it('system columns have correct nullability', () => {
-      const schema = { userAttr: S.number() } as const;
+      const schema = createTestSchema({ userAttr: S.number() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -479,11 +480,11 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('dictionary columns have correct type', () => {
-      const schema = {
+      const schema = createTestSchema({
         category: S.category(),
         text: S.text(),
         status: S.enum(['a', 'b'] as const),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -513,7 +514,7 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('null bitmap format', () => {
     it('uses Arrow format (1=valid, 0=null)', () => {
-      const schema = { value: S.number() } as const;
+      const schema = createTestSchema({ value: S.number() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -556,7 +557,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('handles sparse nulls correctly', () => {
-      const schema = { value: S.number() } as const;
+      const schema = createTestSchema({ value: S.number() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       // Need capacity for 10 values
@@ -597,7 +598,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('omits null bitmap when no nulls', () => {
-      const schema = { value: S.number() } as const;
+      const schema = createTestSchema({ value: S.number() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -629,7 +630,7 @@ describe('Arrow IPC Round-Trip', () => {
 
   describe('dictionary encoding', () => {
     it('preserves dictionary values through round-trip', () => {
-      const schema = { category: S.category() } as const;
+      const schema = createTestSchema({ category: S.category() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -652,7 +653,7 @@ describe('Arrow IPC Round-Trip', () => {
     });
 
     it('handles repeated values efficiently', () => {
-      const schema = { userId: S.category() } as const;
+      const schema = createTestSchema({ userId: S.category() });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       // Use capacity of 128 to hold 100 rows without overflow

@@ -10,7 +10,7 @@
 
 import * as S from '@sury/sury';
 import { LogSchema } from './LogSchema.js';
-import type { InferTagAttributes, Schema, SchemaFields } from './types.js';
+import type { InferTagAttributes, SchemaFields } from './types.js';
 
 /**
  * Brand symbol for DefinedLogSchema - used to detect this type in conditionals.

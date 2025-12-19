@@ -502,9 +502,9 @@ export function createCapacityStatsRecordBatch(
     //   Core system: timestamp(0), entry_type(6)
     //   Metadata: trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
     //             package_name(7), package_path(8), git_sha(9)
-    //   System attribute: message(10)
-    // Total: 11 columns before user attributes
-    const METADATA_AND_SYSTEM_COLUMNS_COUNT = 11;
+    //   System attribute: message(10), uint64_value(11)
+    // Total: 12 columns before user attributes
+    const METADATA_AND_SYSTEM_COLUMNS_COUNT = 12;
 
     // Iterate through arrowSchema fields (starting after metadata+system columns) to get only columns that exist
     for (let i = METADATA_AND_SYSTEM_COLUMNS_COUNT; i < arrowSchema.fields.length; i++) {

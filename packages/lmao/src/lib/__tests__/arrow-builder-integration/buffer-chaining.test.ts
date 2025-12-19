@@ -1,30 +1,24 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import type { SchemaFields } from '@smoothbricks/lmao';
-import { createNextBuffer, createSpanBuffer, defineLogSchema, S } from '@smoothbricks/lmao';
+import { createNextBuffer, createSpanBuffer, type defineLogSchema, S } from '@smoothbricks/lmao';
+import type { DefinedLogSchema } from '../../schema/defineLogSchema.js';
 import type { TaskContext } from '../../types.js';
-import { createTestTaskContext } from '../test-helpers.js';
-
-/**
- * Type helper to extract schema fields from LogSchema or DefinedLogSchema
- */
-type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
+import { createTestSchema, createTestTaskContext } from '../test-helpers.js';
 
 describe('Buffer Chaining', () => {
   let taskContext: TaskContext;
-  let schema: ReturnType<typeof defineLogSchema>;
+  let schema: DefinedLogSchema<ReturnType<typeof defineLogSchema>['fields']>;
 
   beforeEach(() => {
-    const schemaDefinition = defineLogSchema({
+    // Use LogSchema directly - createSpanBuffer requires LogSchema, not plain object
+    schema = createTestSchema({
       userId: S.category(),
       requestId: S.category(),
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
       duration: S.number(),
     });
 
-    schema = schemaDefinition.fields;
-
-    taskContext = createTestTaskContext(schema, { lineNumber: 10 });
+    taskContext = createTestTaskContext(schema.fields, { lineNumber: 10 });
   });
 
   describe('createNextBuffer', () => {
@@ -115,7 +109,7 @@ describe('Buffer Chaining', () => {
     it('should handle buffer with parent correctly', () => {
       const parentBuffer = createSpanBuffer(schema, taskContext);
 
-      const childTaskContext = createTestTaskContext(schema, { spanName: 'child-span' });
+      const childTaskContext = createTestTaskContext(schema.fields, { spanName: 'child-span' });
 
       const childBuffer = createSpanBuffer(schema, childTaskContext);
       childBuffer.parent = parentBuffer;
@@ -135,7 +129,7 @@ describe('Buffer Chaining', () => {
       const buffer = createSpanBuffer(schema, taskContext);
 
       // Add a child to original buffer
-      const childTaskContext = createTestTaskContext(schema, { spanName: 'child-span' });
+      const childTaskContext = createTestTaskContext(schema.fields, { spanName: 'child-span' });
       const childBuffer = createSpanBuffer(schema, childTaskContext);
       buffer.children.push(childBuffer);
 

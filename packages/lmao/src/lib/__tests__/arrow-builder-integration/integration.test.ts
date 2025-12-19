@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'bun:test';
 import { createAttributeColumns, createColumnWriter, maskingTransforms } from '@smoothbricks/arrow-builder';
 import { convertToArrowTable, createSpanBuffer, defineLogSchema, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
-import { createTestTaskContext } from '../test-helpers.js';
+import { createTestSchema, createTestTaskContext } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
   it('generates TypedArray columns with proper names for defined schema', () => {
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       isActive: S.boolean(),
       score: S.number(),
@@ -27,14 +27,14 @@ describe('Buffer Integration', () => {
   });
 
   it('creates a SpanBuffer with core and attribute TypedArray columns', () => {
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       score: S.number(),
     });
 
     const taskContext = createTestTaskContext(schema.fields);
     const capacity = 64;
-    const buf = createSpanBuffer(schema.fields, taskContext, undefined, capacity);
+    const buf = createSpanBuffer(schema, taskContext, undefined, capacity);
 
     // Core TypedArrays exist
     expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
@@ -52,15 +52,15 @@ describe('Buffer Integration', () => {
 
   it('integrates schema definition with buffer creation', () => {
     // Define schema with defineLogSchema
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       requestId: S.category(), // Category: request IDs repeat
       httpStatus: S.number(),
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // Enum: known HTTP methods
     });
 
-    // Create buffer with schema fields
+    // Create buffer with schema
     const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema.fields, taskContext);
+    const buffer = createSpanBuffer(schema, taskContext);
 
     // Verify all attribute columns created as TypedArrays with correct types (use _values suffix)
     expect(Array.isArray(buffer.requestId_values)).toBe(true); // category (raw strings)
@@ -73,13 +73,13 @@ describe('Buffer Integration', () => {
   });
 
   it('handles optional fields in schema', () => {
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       required: S.category(), // Category string
       optional: S.optional(S.number()),
     });
 
     const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema.fields, taskContext);
+    const buffer = createSpanBuffer(schema, taskContext);
 
     // Both should have TypedArray columns (use _values suffix)
     expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
@@ -89,14 +89,14 @@ describe('Buffer Integration', () => {
   });
 
   it('handles masked fields in schema', () => {
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       userId: S.category().mask('hash'),
       email: S.text().mask('email'),
       plainText: S.text(), // Text: unmasked plain text
     });
 
     const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema.fields, taskContext);
+    const buffer = createSpanBuffer(schema, taskContext);
 
     // All should have TypedArray columns (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
@@ -108,31 +108,31 @@ describe('Buffer Integration', () => {
 
   it('selects correct enum TypedArray size based on value count', () => {
     // Small enum (<256 values) should use Uint8Array
-    const smallEnumSchema = defineLogSchema({
+    const smallEnumSchema = createTestSchema({
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
     });
 
     const smallAttrs = smallEnumSchema.fields;
 
     const smallContext = createTestTaskContext(smallAttrs);
-    const smallBuffer = createSpanBuffer(smallAttrs, smallContext);
+    const smallBuffer = createSpanBuffer(smallEnumSchema, smallContext);
 
     // Should use Uint8Array for enums with ≤255 values (use _values suffix)
     expect(smallBuffer.operation_values).toBeInstanceOf(Uint8Array);
   });
 
   it('applies masking during Arrow conversion for category fields', () => {
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       userId: S.category().mask('hash'),
       plainUserId: S.category(), // No masking
     });
 
     const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema.fields, taskContext);
+    const buffer = createSpanBuffer(schema, taskContext);
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    writer.nextRow().userId('user-12345').plainUserId('user-12345');
+    (writer.nextRow() as any).userId('user-12345').plainUserId('user-12345');
 
     // Set required system columns
     buffer.timestamps[0] = 1000n;
@@ -161,19 +161,18 @@ describe('Buffer Integration', () => {
   });
 
   it('applies masking during Arrow conversion for text fields', () => {
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       email: S.text().mask('email'),
       sqlQuery: S.text().mask('sql'),
       plainText: S.text(), // No masking
     });
 
     const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema.fields, taskContext);
+    const buffer = createSpanBuffer(schema, taskContext);
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    writer
-      .nextRow()
+    (writer.nextRow() as any)
       .email('john@example.com')
       .sqlQuery("SELECT * FROM users WHERE id = 123 AND name = 'test'")
       .plainText('Plain unmasked text');
@@ -210,16 +209,16 @@ describe('Buffer Integration', () => {
     // Custom mask function that keeps first 4 chars and replaces rest with *
     const customMask = (value: string) => value.slice(0, 4) + '*'.repeat(Math.max(0, value.length - 4));
 
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       secretKey: S.text().mask(customMask),
     });
 
     const taskContext = createTestTaskContext(schema.fields);
-    const buffer = createSpanBuffer(schema.fields, taskContext);
+    const buffer = createSpanBuffer(schema, taskContext);
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    writer.nextRow().secretKey('sk_live_abcd1234efgh5678');
+    (writer.nextRow() as any).secretKey('sk_live_abcd1234efgh5678');
 
     // Set required system columns
     buffer.timestamps[0] = 1000n;

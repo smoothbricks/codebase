@@ -9,7 +9,7 @@
  */
 
 import { LogSchema } from './LogSchema.js';
-import type { Schema, SchemaFields } from './types.js';
+import type { SchemaFields } from './types.js';
 
 /**
  * Merge two log schemas with conflict detection

@@ -6,7 +6,7 @@ import { describe, expect, it } from 'bun:test';
 import { prefixSchema } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import type { SchemaFields } from '../schema/types.js';
+import { LogSchema, type SchemaFields } from '../schema/types.js';
 
 describe('prefixSchema', () => {
   describe('success cases', () => {
@@ -55,7 +55,7 @@ describe('prefixSchema', () => {
       const schema = defineLogSchema({});
       const prefixed = prefixSchema(schema, 'test');
 
-      expect(Object.keys(prefixed)).toHaveLength(0);
+      expect(prefixed.fieldCount).toBe(0);
     });
 
     it('should handle schema with single field', () => {
@@ -65,7 +65,7 @@ describe('prefixSchema', () => {
 
       const prefixed = prefixSchema(schema, 'prefix');
 
-      expect(Object.keys(prefixed)).toHaveLength(1);
+      expect(prefixed.fieldCount).toBe(1);
       expect(prefixed).toHaveProperty('prefix_onlyField');
     });
 
@@ -88,7 +88,7 @@ describe('prefixSchema', () => {
 
       const prefixed = prefixSchema(schema, 'many');
 
-      expect(Object.keys(prefixed)).toHaveLength(100);
+      expect(prefixed.fieldCount).toBe(100);
       expect(prefixed).toHaveProperty('many_field0');
       expect(prefixed).toHaveProperty('many_field99');
     });
@@ -96,10 +96,11 @@ describe('prefixSchema', () => {
 
   describe('failure cases', () => {
     it('should handle schema with undefined fields gracefully', () => {
-      const schema = {
+      // Create a real LogSchema with an undefined value (edge case)
+      const schema = new LogSchema({
         validField: S.text(),
-        undefinedField: undefined,
-      } as unknown as LogSchema;
+        undefinedField: undefined as unknown as ReturnType<typeof S.text>,
+      });
 
       const prefixed = prefixSchema(schema, 'test');
 
@@ -109,9 +110,10 @@ describe('prefixSchema', () => {
     });
 
     it('should handle schema with null values', () => {
-      const schema = {
-        field: null,
-      } as unknown as LogSchema;
+      // Create a real LogSchema with a null value (edge case)
+      const schema = new LogSchema({
+        field: null as unknown as ReturnType<typeof S.text>,
+      });
 
       const prefixed = prefixSchema(schema, 'test');
 
@@ -120,9 +122,9 @@ describe('prefixSchema', () => {
     });
 
     it('should handle special characters in prefix', () => {
-      const schema: SchemaFields = {
+      const schema = defineLogSchema({
         field: S.text(),
-      };
+      });
 
       const prefixed = prefixSchema(schema, 'prefix-with-dashes');
 

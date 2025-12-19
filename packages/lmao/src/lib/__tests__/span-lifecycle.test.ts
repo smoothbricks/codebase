@@ -567,9 +567,10 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should create buffer with proper structure for fixed layout', () => {
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = testSchema;
-    const taskContext = createTestTaskContext(schemaFields as SchemaFields);
-    const buffer = createSpanBuffer(schemaFields as SchemaFields, taskContext);
+    // Use the LogSchema directly (not a plain object extraction)
+    // testSchema is already a LogSchema from defineLogSchema()
+    const taskContext = createTestTaskContext(testSchema.fields);
+    const buffer = createSpanBuffer(testSchema, taskContext);
 
     // Buffer should have timestamps array for duration calculation
     expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);

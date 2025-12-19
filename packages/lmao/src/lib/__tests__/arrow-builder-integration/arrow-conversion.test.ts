@@ -10,8 +10,10 @@
  */
 
 import { beforeEach, describe, expect, test } from 'bun:test';
+import type { Table } from 'apache-arrow';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
 import { S } from '../../schema/builder.js';
+
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -28,15 +30,27 @@ import {
 } from '../../schema/systemSchema.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import { createTestTaskContext } from '../test-helpers.js';
+import { createTestSchema, createTestTaskContext } from '../test-helpers.js';
+
+/**
+ * Helper to get raw timestamp value from Arrow table.
+ * Arrow JS converts Timestamp<NANOSECOND> to milliseconds in get()/toJSON(),
+ * so we access the underlying BigInt64Array directly.
+ */
+function getRawTimestamp(table: Table, rowIndex: number): bigint {
+  const timestampCol = table.getChild('timestamp');
+  if (!timestampCol) throw new Error('timestamp column not found');
+  const values = timestampCol.data[0]?.values as BigInt64Array;
+  return values[rowIndex];
+}
 
 describe('Arrow Table Conversion', () => {
   describe('Single buffer conversion', () => {
     test('converts basic span buffer to Arrow table', () => {
-      const schema = {
+      const schema = createTestSchema({
         httpStatus: S.number(),
         userId: S.category(),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
@@ -56,7 +70,8 @@ describe('Arrow Table Conversion', () => {
 
       // Check that columns exist
       const row0 = table.get(0)?.toJSON();
-      expect(row0?.timestamp).toBe(1000n);
+      // Use helper for raw timestamp (Arrow JS converts to milliseconds in toJSON)
+      expect(getRawTimestamp(table, 0)).toBe(1000n);
       expect(row0?.entry_type).toBe('span-start');
       expect(row0?.message).toBe('test-span');
       expect(row0?.httpStatus).toBe(200);
@@ -64,9 +79,9 @@ describe('Arrow Table Conversion', () => {
     });
 
     test('handles multiple rows in buffer', () => {
-      const schema = {
+      const schema = createTestSchema({
         level: S.enum(['DEBUG', 'INFO', 'WARN', 'ERROR'] as const),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-456'));
@@ -94,26 +109,26 @@ describe('Arrow Table Conversion', () => {
       expect(table.numRows).toBe(3);
 
       const row0 = table.get(0)?.toJSON();
-      expect(row0?.timestamp).toBe(1000n);
+      expect(getRawTimestamp(table, 0)).toBe(1000n);
       expect(row0?.entry_type).toBe('span-start');
       expect(row0?.level).toBe('INFO');
 
       const row1 = table.get(1)?.toJSON();
-      expect(row1?.timestamp).toBe(2000n);
+      expect(getRawTimestamp(table, 1)).toBe(2000n);
       expect(row1?.entry_type).toBe('info');
       expect(row1?.level).toBe('DEBUG');
 
       const row2 = table.get(2)?.toJSON();
-      expect(row2?.timestamp).toBe(3000n);
+      expect(getRawTimestamp(table, 2)).toBe(3000n);
       expect(row2?.entry_type).toBe('span-ok');
       expect(row2?.level).toBe('WARN');
     });
 
     test('handles null values correctly', () => {
-      const schema = {
+      const schema = createTestSchema({
         optionalField: S.category(),
         requiredField: S.number(),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-789'));
@@ -138,9 +153,9 @@ describe('Arrow Table Conversion', () => {
 
   describe('Buffer chaining', () => {
     test('converts chained buffers to single table', () => {
-      const schema = {
+      const schema = createTestSchema({
         counter: S.number(),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer1 = createSpanBuffer(schema, taskContext, createTraceId('trace-chain'));
@@ -165,18 +180,18 @@ describe('Arrow Table Conversion', () => {
       expect(table.numRows).toBe(2);
 
       const row0 = table.get(0)?.toJSON();
-      expect(row0?.timestamp).toBe(1000n);
+      expect(getRawTimestamp(table, 0)).toBe(1000n);
       expect(row0?.counter).toBe(1);
 
       const row1 = table.get(1)?.toJSON();
-      expect(row1?.timestamp).toBe(2000n);
+      expect(getRawTimestamp(table, 1)).toBe(2000n);
       expect(row1?.counter).toBe(2);
     });
 
     test('handles multiple chained buffers', () => {
-      const schema = {
+      const schema = createTestSchema({
         value: S.number(),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer1 = createSpanBuffer(schema, taskContext, createTraceId('trace-multi-chain'));
@@ -213,9 +228,9 @@ describe('Arrow Table Conversion', () => {
 
   describe('Span tree conversion', () => {
     test('converts parent and child spans to single table', () => {
-      const schema = {
+      const schema = createTestSchema({
         spanType: S.category(),
-      } as const;
+      });
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const parentBuffer = createSpanBuffer(schema, taskContext, createTraceId('trace-tree'));
@@ -226,9 +241,10 @@ describe('Arrow Table Conversion', () => {
       parentBuffer.spanType(0, 'parent');
       parentBuffer.writeIndex = 1;
 
-      // Create child span
+      // Create child span and register with parent
       const childTaskContext = createTestTaskContext(schema, { lineNumber: 43 });
-      const childBuffer = createChildSpanBuffer(schema, childTaskContext, parentBuffer);
+      const childBuffer = createChildSpanBuffer(parentBuffer, childTaskContext);
+      parentBuffer.children.push(childBuffer); // Explicit registration per spanBuffer.ts
 
       childBuffer.timestamps[0] = 1500n;
       childBuffer.operations[0] = ENTRY_TYPE_SPAN_START;
@@ -250,7 +266,8 @@ describe('Arrow Table Conversion', () => {
 
       const table = convertSpanTreeToArrowTable(parentBuffer);
 
-      // Should have 4 rows: parent start, child start, child end, parent end
+      // Should have 4 rows: parent start, parent end, child start, child end
+      // (walkSpanTree visits buffer rows first, then children recursively)
       expect(table.numRows).toBe(4);
 
       // Verify span hierarchy is preserved
@@ -261,14 +278,15 @@ describe('Arrow Table Conversion', () => {
       expect(new Set(traceIds).size).toBe(1);
 
       // Parent and child should have different span_ids
+      // Order: parent start (0), parent end (1), child start (2), child end (3)
       const spanIds = rows.map((r) => r?.span_id);
-      expect(spanIds[0]).toBe(spanIds[3]); // Parent start and end
-      expect(spanIds[1]).toBe(spanIds[2]); // Child start and end
-      expect(spanIds[0]).not.toBe(spanIds[1]); // Parent != Child
+      expect(spanIds[0]).toBe(spanIds[1]); // Parent start and end (both from parent buffer)
+      expect(spanIds[2]).toBe(spanIds[3]); // Child start and end (both from child buffer)
+      expect(spanIds[0]).not.toBe(spanIds[2]); // Parent != Child
     });
 
     test('handles multiple sibling child spans', () => {
-      const schema = {} as const;
+      const schema = createTestSchema({});
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const parentBuffer = createSpanBuffer(schema, taskContext, createTraceId('trace-siblings'));
@@ -278,9 +296,10 @@ describe('Arrow Table Conversion', () => {
       parentBuffer.message(0, 'parent');
       parentBuffer.writeIndex = 1;
 
-      // Create first child
+      // Create first child and register with parent
       const child1TaskContext = createTestTaskContext(schema, { lineNumber: 43 });
-      const child1Buffer = createChildSpanBuffer(schema, child1TaskContext, parentBuffer);
+      const child1Buffer = createChildSpanBuffer(parentBuffer, child1TaskContext);
+      parentBuffer.children.push(child1Buffer); // Explicit registration per spanBuffer.ts
       child1Buffer.timestamps[0] = 1100n;
       child1Buffer.operations[0] = ENTRY_TYPE_SPAN_START;
       child1Buffer.message(0, 'child-1');
@@ -289,9 +308,10 @@ describe('Arrow Table Conversion', () => {
       child1Buffer.message(1, 'child-1');
       child1Buffer.writeIndex = 2;
 
-      // Create second child
+      // Create second child and register with parent
       const child2TaskContext = createTestTaskContext(schema, { lineNumber: 44 });
-      const child2Buffer = createChildSpanBuffer(schema, child2TaskContext, parentBuffer);
+      const child2Buffer = createChildSpanBuffer(parentBuffer, child2TaskContext);
+      parentBuffer.children.push(child2Buffer); // Explicit registration per spanBuffer.ts
       child2Buffer.timestamps[0] = 1300n;
       child2Buffer.operations[0] = ENTRY_TYPE_SPAN_START;
       child2Buffer.message(0, 'child-2');
@@ -315,10 +335,11 @@ describe('Arrow Table Conversion', () => {
 
   describe('Entry type handling', () => {
     test('correctly converts all entry types', () => {
-      const schema = {} as const;
+      const schema = createTestSchema({});
 
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
-      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-types'));
+      // Use capacity of 16 to hold all 11 entry types
+      const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-types'), 16);
 
       const entryTypes = [
         ENTRY_TYPE_SPAN_START,
@@ -370,7 +391,7 @@ describe('Arrow Table Conversion', () => {
 
   describe('Buffer metrics', () => {
     test('includes both span entries and buffer metric entries in same table', () => {
-      const schema = {} as const;
+      const schema = createTestSchema({});
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 
@@ -434,7 +455,7 @@ describe('Arrow Table Conversion', () => {
     });
 
     test('includes only buffer metrics when no span data', () => {
-      const schema = {} as const;
+      const schema = createTestSchema({});
       const taskContext = createTestTaskContext(schema, { lineNumber: 42 });
       const buffer = createSpanBuffer(schema, taskContext, createTraceId('trace-123'));
 

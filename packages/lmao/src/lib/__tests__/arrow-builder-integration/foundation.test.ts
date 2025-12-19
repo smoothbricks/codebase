@@ -2,22 +2,15 @@ import { describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { ModuleContext } from '../../moduleContext.js';
 import { S } from '../../schema/builder.js';
-import { defineLogSchema } from '../../schema/defineLogSchema.js';
-import type { SchemaFields } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 import { TaskContext } from '../../taskContext.js';
 import { createTraceId } from '../../traceId.js';
-
-/**
- * Type helper to extract schema fields from LogSchema or DefinedLogSchema
- * Removes the validation and extension methods, leaving only Sury schemas
- */
-type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
+import { createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Foundation', () => {
   // Helper to create a test task context
   function createTestTaskContext(): TaskContext {
-    const schema = defineLogSchema({
+    const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       count: S.number(),
     });
@@ -29,7 +22,7 @@ describe('Buffer Foundation', () => {
 
   it('creates SpanBuffer with TypedArrays', () => {
     const taskContext = createTestTaskContext();
-    const schema = taskContext.module.logSchema.fields; // Extract fields for createSpanBuffer
+    const schema = taskContext.module.logSchema; // LogSchema instance
     const traceId = createTraceId('trace-123');
 
     const buf = createSpanBuffer(schema, taskContext, traceId); // Uses DEFAULT_BUFFER_CAPACITY
@@ -62,7 +55,7 @@ describe('Buffer Foundation', () => {
 
   it('creates root SpanBuffer with createSpanBuffer', () => {
     const taskContext = createTestTaskContext();
-    const schema = taskContext.module.logSchema.fields; // Extract fields for createSpanBuffer
+    const schema = taskContext.module.logSchema; // LogSchema instance
 
     const buf = createSpanBuffer(schema, taskContext, createTraceId('trace-999'));
 
@@ -74,7 +67,7 @@ describe('Buffer Foundation', () => {
 
   it('tracks buffer creation in capacity stats', () => {
     const taskContext = createTestTaskContext();
-    const schema = taskContext.module.logSchema.fields; // Extract fields for createSpanBuffer
+    const schema = taskContext.module.logSchema; // LogSchema instance
 
     const initialCount = taskContext.module.sb_totalCreated;
 
@@ -85,7 +78,7 @@ describe('Buffer Foundation', () => {
 
   it('handles different schema sizes', () => {
     // Define a larger schema
-    const largeSchema = defineLogSchema({
+    const largeSchema = createTestSchema({
       field1: S.category(), // Category string
       field2: S.number(),
       field3: S.boolean(),
@@ -93,14 +86,11 @@ describe('Buffer Foundation', () => {
       field5: S.number(),
     });
 
-    // Extract schema fields from LogSchema instance
-    const tagAttributes = largeSchema.fields;
-
-    // Create task context with larger schema
-    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', tagAttributes);
+    // Create task context with larger schema (pass LogSchema, not .fields)
+    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', largeSchema);
     const taskContext = new TaskContext(moduleContext, 'test-span', 10);
 
-    const buf = createSpanBuffer(tagAttributes, taskContext, createTraceId('trace-789'), 64);
+    const buf = createSpanBuffer(largeSchema, taskContext, createTraceId('trace-789'), 64);
 
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them

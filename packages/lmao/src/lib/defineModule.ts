@@ -18,7 +18,7 @@ import type { EvaluationContext, FeatureFlagSchema } from './schema/defineFeatur
 import { FeatureFlagEvaluator, type FlagEvaluator, type FlagValue } from './schema/evaluator.js';
 import { LogSchema } from './schema/LogSchema.js';
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
-import type { Schema, SchemaFields } from './schema/types.js';
+import type { SchemaFields } from './schema/types.js';
 import type { SpanContext } from './spanContext.js';
 import { getThreadId } from './threadId.js';
 import {
@@ -195,7 +195,7 @@ export type TraceContextParams<FF extends FeatureFlagSchema, Extra extends Recor
  * Note: PrefixedModule does NOT extend Module to avoid method/property name conflict
  */
 export interface PrefixedModule<
-  T extends LogSchema | SchemaFields,
+  T extends SchemaFields,
   FF extends FeatureFlagSchema,
   Extra extends Record<string, unknown>,
   P extends string,
@@ -589,10 +589,10 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
             throw new Error('op() requires function when name is provided');
           }
           // Return Op instance directly (per spec and experiment)
-          return new Op<SpanContext<T, FF, Record<string, unknown>> & Extra, any[], any>(
+          return new Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, any[], any>(
             nameOrDefs, // name is FIRST parameter
             state.moduleContext,
-            fn as (ctx: SpanContext<T, FF, Record<string, unknown>> & Extra, ...args: any[]) => Promise<any>,
+            fn as (ctx: SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, ...args: any[]) => Promise<any>,
             line,
           );
         }
@@ -638,7 +638,7 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         };
 
         // Apply prefix to schema
-        const prefixedSchema = prefixSchema(state.schemaOnly, prefix) as T;
+        const prefixedSchema = prefixSchema(state.logSchema, prefix);
 
         // Create new module context with prefixed schema
         const prefixedModuleContext = new ModuleContext(
@@ -652,8 +652,8 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
 
         // Create prefixed module by calling defineModule again with prefixed schema
         // This creates a new module with the prefixed schema
-        const prefixedSchemaFields = prefixedSchema.fields;
-        const prefixedModuleDef = defineModule<typeof prefixedSchemaFields, FF>({
+        const prefixedSchemaFields = prefixedSchema.fields as SchemaFields;
+        const prefixedModuleDef = defineModule<SchemaFields, FF>({
           metadata: state.metadata,
           logSchema: prefixedSchemaFields,
           deps: state.deps,
@@ -682,7 +682,7 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         // Implementation that handles both overloads
         const spanImpl = <R, Args extends unknown[]>(
           lineNumberOrName: number | string,
-          nameOrOp: string | Op<SpanContext<LogSchema | SchemaFields, FF, Record<string, unknown>> & Extra, Args, R>,
+          nameOrOp: string | Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, Args, R>,
           ...rest: unknown[]
         ): Promise<R> => {
           // Determine if line number is provided (first arg is number)
@@ -690,8 +690,8 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
           const lineNumber = hasLine ? (lineNumberOrName as number) : 0;
           const name = hasLine ? (nameOrOp as string) : (lineNumberOrName as string);
           const op = hasLine
-            ? (rest[0] as Op<SpanContext<LogSchema | SchemaFields, FF, Record<string, unknown>> & Extra, Args, R>)
-            : (nameOrOp as Op<SpanContext<LogSchema | SchemaFields, FF, Record<string, unknown>> & Extra, Args, R>);
+            ? (rest[0] as Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, Args, R>)
+            : (nameOrOp as Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, Args, R>);
           const args = (hasLine ? rest.slice(1) : rest) as Args;
 
           // Create a minimal trace context for root span
@@ -766,9 +766,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
 
     op<Args extends unknown[], R>(
       name: string,
-      fn: OpFunction<Args, R, T, FF, Record<string, unknown>, Record<string, unknown>>,
+      fn: OpFunction<Args, R, LogSchema<T>, FF, Record<string, unknown>, Record<string, unknown>>,
       line?: number,
-    ): Op<SpanContext<T, FF, Record<string, unknown>> & Record<string, unknown>, Args, R> {
+    ): Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Record<string, unknown>, Args, R> {
       return createModule<Record<string, unknown>>(undefined, undefined).op(name, fn, line);
     },
   };
@@ -788,7 +788,7 @@ export { FluentErrorResult, FluentSuccessResult } from './result.js';
 export type { FluentLogEntry, SpanContext, SpanFn, SpanLogger } from './spanContext.js';
 export {
   createSpanContextProto,
-  createSpanLoggerWithScope,
+  createSpanLogger,
   isSpanContext,
   SPAN_CONTEXT_MARKER,
   writeSpanStart,

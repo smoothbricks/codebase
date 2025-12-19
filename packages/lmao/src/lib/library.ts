@@ -41,7 +41,10 @@ import type { SpanBuffer } from './types.js';
  * - Prefix: 'http'
  * - Output: { http_status: S.number(), http_method: S.enum(['GET', 'POST']) }
  */
-export function prefixSchema<T extends LogSchema>(schema: T, prefix: string): LogSchema {
+export function prefixSchema(
+  schema: LogSchema | { fieldEntries(): Iterable<[string, unknown]> },
+  prefix: string,
+): LogSchema & Record<string, unknown> {
   const prefixedFields: Record<string, unknown> = {};
 
   // Get schema fields from LogSchema.fieldEntries()
@@ -50,7 +53,9 @@ export function prefixSchema<T extends LogSchema>(schema: T, prefix: string): Lo
     prefixedFields[prefixedName] = fieldSchema;
   }
 
-  return new LogSchema(prefixedFields as SchemaFields);
+  // Create LogSchema and spread fields directly onto result for direct access
+  const logSchema = new LogSchema(prefixedFields as SchemaFields);
+  return Object.assign(logSchema, prefixedFields);
 }
 
 /**

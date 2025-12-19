@@ -31,8 +31,7 @@ import {
   DEFAULT_BUFFER_CAPACITY,
   getColumnBufferClass,
 } from '@smoothbricks/arrow-builder';
-import { LogSchema } from './schema/LogSchema.js';
-import type { SchemaFields } from './schema/types.js';
+import type { LogSchema } from './schema/LogSchema.js';
 import { spanBufferHelpers } from './spanBufferHelpers.js';
 import { generateTraceId, type TraceId } from './traceId.js';
 import type { ModuleContext, SpanBuffer, TaskContext } from './types.js';
@@ -66,8 +65,8 @@ export const SpanBufferTestUtils = {
    * Get a column's null bitmap (generated property)
    */
   getNullBitmap(buffer: SpanBuffer, columnName: string): Uint8Array | undefined {
-    const nullsName = `${columnName}_nulls` as keyof SpanBuffer;
-    return buffer[nullsName] as Uint8Array | undefined;
+    const nullsName = `${columnName}_nulls`;
+    return (buffer as Record<string, unknown>)[nullsName] as Uint8Array | undefined;
   },
 
   /**
@@ -126,9 +125,7 @@ const spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
  * - Span-specific properties (parent, children, task)
  * - Identity getters (spanId, traceId, hasParent, parentSpanId)
  */
-function getSpanBufferClass<T extends SchemaFields>(schema: T | LogSchema<T>): SpanBufferConstructor {
-  // Wrap plain schema objects in LogSchema if needed
-  const logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
+function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferConstructor {
   const cached = spanBufferClassCache.get(schema);
   if (cached) {
     return cached;
@@ -158,12 +155,25 @@ function getSpanBufferClass<T extends SchemaFields>(schema: T | LogSchema<T>): S
         const systemSize = requestedCapacity * 9; // timestamps (8*cap) + operations (1*cap)
         
         if (isChained && parent) {
-          // CHAINED: share identity, only allocate system columns
-          // parent here is the buffer we're chaining FROM (to share identity)
-          // but our tree parent should be the same as that buffer's parent
+          // ============================================================
+          // CHAINED BUFFER (overflow storage for same logical span)
+          // ============================================================
+          // IMPORTANT: 'parent' parameter here is the PREVIOUS BUFFER IN THE CHAIN
+          // (the one that overflowed), NOT the tree parent!
+          //
+          // We extract THREE things from the chain predecessor:
+          //   1. parent.parent    → tree parent (for traceId resolution)
+          //   2. parent._identity → shared identity (same spanId)
+          //   3. parent.scopeValues → shared scope (same logical span)
+          //
+          // Why parent.parent for tree structure?
+          //   The traceId getter walks: this.parent.traceId → ... → root._identity
+          //   Chained buffers share _identity, so they need the SAME tree parent
+          //   to resolve traceId consistently.
+          // ============================================================
           this.parent = parent.parent;
           this._system = new ArrayBuffer(systemSize);
-          this._identity = parent._identity; // Shared reference!
+          this._identity = parent._identity; // Shared with chain predecessor!
         } else if (parent) {
           // CHILD: parent is our tree parent
           this.parent = parent;
@@ -202,10 +212,13 @@ function getSpanBufferClass<T extends SchemaFields>(schema: T | LogSchema<T>): S
         // Scope values initialization per specs/01i_span_scope_attributes.md:
         // - ROOT: allocate empty frozen scope (single allocation per trace)
         // - CHILD: inherit from tree parent by reference (zero cost)
-        // - CHAINED: inherit from buffer we're chaining from (same logical span)
+        // - CHAINED: inherit from chain predecessor (same logical span, NOT tree parent!)
         if (isChained && parent) {
+          // CHAINED: 'parent' is the chain predecessor, NOT tree parent!
+          // We want scope from the buffer we're chaining from (same logical span).
           this.scopeValues = parent.scopeValues;
         } else if (parent) {
+          // CHILD: 'parent' IS the tree parent here
           this.scopeValues = parent.scopeValues;
         } else {
           this.scopeValues = Object.freeze({});
@@ -303,11 +316,11 @@ function getSpanBufferClass<T extends SchemaFields>(schema: T | LogSchema<T>): S
   };
 
   // Generate class using arrow-builder (provides lazy attribute columns)
-  const GeneratedClass = getColumnBufferClass(logSchema, extension);
+  const GeneratedClass = getColumnBufferClass(schema, extension);
   const SpanBufferClass = GeneratedClass as unknown as SpanBufferConstructor;
 
-  // Cache for future use (use logSchema as key)
-  spanBufferClassCache.set(logSchema, SpanBufferClass);
+  // Cache for future use
+  spanBufferClassCache.set(schema, SpanBufferClass);
 
   return SpanBufferClass;
 }
@@ -321,29 +334,26 @@ function getSpanBufferClass<T extends SchemaFields>(schema: T | LogSchema<T>): S
  *
  * Root buffers have identity: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
  *
- * @param schema - Tag attribute schema defining column types
+ * @param schema - Tag attribute schema defining column types (must be LogSchema)
  * @param taskContext - Task context with module metadata and capacity stats
  * @param traceId - Trace ID (auto-generated if omitted)
  * @param capacity - Buffer capacity (default: DEFAULT_BUFFER_CAPACITY)
  *
  * @returns SpanBuffer with typed setters for schema fields
  */
-export function createSpanBuffer<T extends SchemaFields>(
+export function createSpanBuffer<T extends LogSchema>(
   schema: T,
   taskContext: TaskContext,
   traceId?: TraceId,
   capacity = DEFAULT_BUFFER_CAPACITY,
-): SpanBuffer<LogSchema<T>> {
+): SpanBuffer<T> {
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const alignedCapacity = (capacity + 7) & ~7;
 
   // Use provided TraceId or generate a new one
   const resolvedTraceId: string = traceId ?? generateTraceId();
 
-  // Wrap plain schema objects in LogSchema if needed
-  const logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
-
-  const SpanBufferClass = getSpanBufferClass(logSchema);
+  const SpanBufferClass = getSpanBufferClass(schema);
   // Root spans have no callsiteModule (they're the entry point)
   return new SpanBufferClass(
     alignedCapacity,

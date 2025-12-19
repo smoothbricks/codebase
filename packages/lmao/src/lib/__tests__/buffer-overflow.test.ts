@@ -5,6 +5,7 @@ import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { ModuleContext } from '../moduleContext.js';
 import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
+import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createNextBuffer, createSpanBuffer } from '../spanBuffer.js';
 import { TaskContext } from '../taskContext.js';
 import type { SpanBuffer } from '../types.js';
@@ -20,14 +21,16 @@ import type { SpanBuffer } from '../types.js';
  * 5. Overflow Counter: module.sb_overflows === bufferCount - 1
  */
 
-// Schema for testing - includes various column types
-const testSchema = new LogSchema({
-  requestId: S.category(),
-  userId: S.category(),
-  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
-  duration: S.number(),
-  success: S.boolean(),
-});
+// Schema for testing - includes various column types and system fields
+const testSchema = new LogSchema(
+  mergeWithSystemSchema({
+    requestId: S.category(),
+    userId: S.category(),
+    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
+    duration: S.number(),
+    success: S.boolean(),
+  }),
+);
 
 /**
  * SpanLogger reserves rows 0-1 for span-start and span-end.
