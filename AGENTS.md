@@ -1,5 +1,19 @@
 # AGENTS.md - AI Coding Assistant Guidelines for LMAO
 
+## ⚠️ GREENFIELD PROJECT - NO BACKWARDS COMPATIBILITY
+
+**THIS IS A GREENFIELD PROJECT.** There is NO legacy code. There are NO existing users.
+
+- **DO NOT** add backwards compatibility layers or deprecated API support
+- **DO NOT** maintain old function signatures "just in case"
+- **DO NOT** keep dead code around
+- **ALWAYS** follow the specs exactly - specs are the source of truth (unless explicitly told otherwise)
+- If implementation diverges from spec → **FIX THE IMPLEMENTATION**
+- If tests don't match spec → **FIX THE TESTS**
+- When in doubt, ask - don't add compatibility shims
+
+---
+
 ## 📚 BEFORE WRITING CODE, READ THESE SPECS:
 
 ### Package Architecture (Read FIRST!)
@@ -10,7 +24,7 @@
 ### Core System
 
 - **System Overview**: specs/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8 Optimization
-  Patterns**
+  Patterns** (see also [V8 Optimization References](#v8-optimization-references) below)
 - **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema, feature flags [**LMAO**]
 - **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern
   [**LMAO**]
@@ -82,7 +96,7 @@
 - Schema DSL (S.enum/category/text/number/boolean) (specs/01a)
 - logSchema definitions with masking and `attr_` prefix
 - **System columns (timestamps, operations) - ALWAYS eager, never lazy**
-- **Scope class generation - SEPARATE from buffer columns**
+- **Scope storage - plain object on buffer, NO codegen needed**
 - SpanBuffer creation (extends ColumnBuffer with span metadata)
 - SpanLogger/ctx API generation (specs/01g, 01j)
 - Fluent logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/01h)
@@ -94,14 +108,13 @@
 
 - System columns NEVER lazy (written every entry, zero conditionals)
 - User attribute columns lazy by default (sparse data)
-- Scope is a SEPARATE generated class (NOT stored in lazy columns)
+- Scope is a plain object (`buffer.scopeValues`) - filled at Arrow conversion via SIMD
 - Direct properties on SpanBuffer (attr*$name_nulls + attr*$name_values)
 
 **Key Files**:
 
 - `src/lib/schema/` - Schema builders, logSchema, feature flags
-- `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation
-- `src/lib/codegen/scopeGenerator.ts` - Scope class generation (SEPARATE from buffer)
+- `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation (tag/log methods)
 - `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer)
 - `src/lib/lmao.ts` - Main integration, context creation
 - `src/lib/types.ts` - SpanBuffer, TaskContext interfaces
@@ -173,6 +186,42 @@ Three distinct string types, each with different storage strategies:
 - **Test All**: `nx test lmao` (runs all tests for a package)
 - **Note**: Tests no longer depend on typecheck-tests - linting handles that. Tests only depend on build.
 
+### Property-Based Testing with fast-check
+
+**Prefer property-based tests** for buffer, overflow, and data integrity scenarios. The `fast-check` library is
+installed.
+
+```typescript
+import fc from 'fast-check';
+
+// Example: Verify buffer overflow preserves all entries
+fc.assert(
+  fc.property(
+    fc.integer({ min: 1, max: 200 }), // Generate test inputs
+    (numEntries) => {
+      // ... write numEntries to buffer ...
+      const entries = collectEntries(buffer);
+      expect(entries.length).toBe(numEntries); // Property must hold for ALL inputs
+    }
+  ),
+  { numRuns: 100 }
+);
+```
+
+**When to use property-based tests:**
+
+- Buffer overflow and chaining (entry preservation, buffer count formulas)
+- Data integrity across serialization/deserialization
+- Mathematical invariants (e.g., `sb_overflows === bufferCount - 1`)
+- Any scenario where "it works for N" should imply "it works for all N"
+
+**Key properties to test:**
+
+- **Preservation**: All N inputs produce exactly N outputs
+- **Formulas**: Buffer count matches `1 + ceil((N - reservedRows) / capacity)`
+- **Bounds**: Values stay within expected ranges
+- **Consistency**: Related counters/metrics stay in sync
+
 ## Implementation Patterns (See specs/01h_entry_types_and_logging_primitives.md)
 
 - **Schema Definition**: ALWAYS use `defineLogSchema()` with `S` builder:
@@ -240,10 +289,14 @@ Unified enum for ALL trace events:
 
 ## Span Scope Attributes (See specs/01i_span_scope_attributes.md)
 
-- Set scoped attributes: ctx.log.scope({ requestId, userId })
-- Automatically propagates to all child entries and spans
-- Zero runtime cost after initial scope setting
-- Eliminates repetitive attribute setting
+- Set scoped attributes: `ctx.setScope({ requestId, userId })` - merge semantics, `null` to clear
+- Read scope: `ctx.scope.requestId` - readonly view
+- Scope appears on ALL rows in Arrow output (default for all rows)
+- **Direct writes win**: `tag.X()` wins on row 0, `ctx.ok().X()` wins on row 1, scope fills rows 2+
+- **Immutable objects**: `setScope` creates NEW frozen object (never mutates)
+- Child spans inherit parent scope by reference (safe because immutable - zero-cost!)
+- **Snapshot semantics**: Child's scope is frozen at creation time (async safe, no race conditions)
+- Columns filled via `TypedArray.fill()` at Arrow conversion (SIMD optimized)
 
 ## Self-Tuning Buffers (See specs/01b2_buffer_self_tuning.md)
 
@@ -298,7 +351,6 @@ Unified enum for ALL trace events:
 - ✅ `createSpanLoggerClass()` - Compile and cache SpanLogger classes
 - ✅ Compile-time enum mapping via switch-case (V8 JIT-inlined)
 - ✅ Prototype methods for zero-overhead tag writing
-- ✅ Scoped attributes with `scope()` method
 - ✅ Distinct entry types (info/debug/warn/error)
 
 ### Context & Integration (@packages/lmao/src/lib/)
@@ -309,7 +361,8 @@ Unified enum for ALL trace events:
 - ✅ `ctx.span()` - Child span creation (polymorphic dispatcher)
 - ✅ `ctx.span_op()` / `ctx.span_fn()` - Monomorphic span methods (for transformer)
 - ✅ `ctx.tag` - Chainable tag API for span attributes
-- ✅ `ctx.log.scope()` - Scoped attribute propagation
+- ✅ `ctx.setScope()` - Set scope values (merge semantics, null to clear)
+- ✅ `ctx.scope` - Read-only view of current scope
 - ✅ Feature flag evaluation with analytics tracking
 - ✅ `callsiteModule` on SpanBuffer for dual module attribution (row 0 vs rows 1+)
 
@@ -335,8 +388,23 @@ Unified enum for ALL trace events:
 - ✅ `TextStringStorage` - Text storage without interning (exported from lmao.ts)
 - ✅ `categoryInterner` - Global category interner
 - ✅ `textStringStorage` - Global text storage
-- ✅ `moduleIdInterner` - Module ID interning
-- ✅ `spanNameInterner` - Span name interning
 - ✅ `Utf8Cache` (SIEVE-based) - Bounded UTF-8 encoding cache for Arrow conversion
 
+**Note**: Module IDs and span names are accessed directly from `buf.task.module.packageName`,
+`buf.task.module.packagePath`, and `buf.task.spanName` during Arrow conversion - no separate interners needed.
+
 **BEFORE IMPLEMENTING**: Search these modules first! Most functionality already exists.
+
+## V8 Optimization References
+
+When implementing performance-critical code, refer to these V8 optimization resources:
+
+- **Primary Spec**: [V8 Optimization Patterns](specs/01_trace_logging_system.md#v8-optimization-patterns) - Complete
+  guide to V8 optimization patterns used in LMAO
+- **External References**:
+  - [V8 Fast Properties Blog](https://v8.dev/blog/fast-properties) - Hidden class internals and property access
+    optimization
+  - [Web.dev V8 Performance Tips](https://web.dev/articles/speed-v8) - Best practices for V8 optimization
+  - [V8 Hidden Classes and Inline Caching](https://richardartoul.github.io/jekyll/update/2015/04/26/hidden-classes.html) -
+    Detailed explanation of hidden classes
+- **Key Principle**: Objects with same properties in same order share hidden classes = optimized property access
