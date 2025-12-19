@@ -237,8 +237,8 @@ export type TypedColumnBuffer<Schema> = ColumnBuffer & {
   [K in keyof FilterSchemaFields<Schema> as `${K & string}_nulls`]: Uint8Array;
 } & {
   // Setter methods: columnName(position, value) => TypedColumnBuffer<Schema>
-  // Note: Can't use `this` because this is a type alias, not an interface
-  [K in keyof FilterSchemaFields<Schema> & string]: (
+  // Provides fluent API by returning self
+  [K in keyof FilterSchemaFields<Schema>]: (
     pos: number,
     val: SetterValueType<FilterSchemaFields<Schema>[K]>,
   ) => TypedColumnBuffer<Schema>;

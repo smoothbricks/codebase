@@ -48,7 +48,7 @@ const demoModule = defineModule({
 let rootBuffer: SpanBuffer | null = null;
 
 // Op that logs things - in production the transformer injects .line(N) calls
-const processItems = demoModule.task('process-items', async (ctx, userId: string, items: string[]) => {
+const processItems = demoModule.op('process-items', async (ctx, userId: string, items: string[]) => {
   // Capture the buffer (accessing internal for demo purposes)
   rootBuffer = (ctx.log as unknown as { _buffer: SpanBuffer })._buffer;
 
@@ -98,7 +98,7 @@ async function main() {
   console.log('Trace ID:', traceCtx.traceId);
 
   // Execute op
-  const result = await processItems(traceCtx, 'user-456', ['item-1', 'item-2', 'item-3']);
+  const result = await traceCtx.span('process-items', processItems, 'user-456', ['item-1', 'item-2', 'item-3']);
 
   console.log('\nOp result:', result.success ? 'SUCCESS' : 'FAILED');
   if (result.success) {

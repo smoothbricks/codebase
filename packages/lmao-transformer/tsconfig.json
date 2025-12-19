@@ -4,6 +4,9 @@
   "include": [],
   "references": [
     {
+      "path": "../arrow-builder"
+    },
+    {
       "path": "../lmao"
     },
     {

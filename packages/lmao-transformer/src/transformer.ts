@@ -103,19 +103,19 @@ function findNearestPackage(filePath: string): { packageName: string; packageDir
 }
 
 /**
- * Check if the call expression is a createModuleContext() call.
- * Handles both direct calls and property access (e.g., lmao.createModuleContext()).
+ * Check if the call expression is a defineModule() call.
+ * Handles both direct calls and property access (e.g., lmao.defineModule()).
  */
-function isCreateModuleContextCall(node: ts.CallExpression): boolean {
+function isDefineModuleCall(node: ts.CallExpression): boolean {
   const expr = node.expression;
 
-  // Direct call: createModuleContext({...})
-  if (ts.isIdentifier(expr) && expr.text === 'createModuleContext') {
+  // Direct call: defineModule({...})
+  if (ts.isIdentifier(expr) && expr.text === 'defineModule') {
     return true;
   }
 
-  // Property access: lmao.createModuleContext({...})
-  if (ts.isPropertyAccessExpression(expr) && expr.name.text === 'createModuleContext') {
+  // Property access: lmao.defineModule({...})
+  if (ts.isPropertyAccessExpression(expr) && expr.name.text === 'defineModule') {
     return true;
   }
 
@@ -123,33 +123,33 @@ function isCreateModuleContextCall(node: ts.CallExpression): boolean {
 }
 
 /**
- * Check if an object literal already has a moduleMetadata property.
+ * Check if an object literal already has a metadata property.
  */
-function hasModuleMetadataProperty(objectLiteral: ts.ObjectLiteralExpression): boolean {
+function hasMetadataProperty(objectLiteral: ts.ObjectLiteralExpression): boolean {
   return objectLiteral.properties.some(
-    (prop) => ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === 'moduleMetadata',
+    (prop) => ts.isPropertyAssignment(prop) && ts.isIdentifier(prop.name) && prop.name.text === 'metadata',
   );
 }
 
 /**
- * Try to transform createModuleContext() to inject moduleMetadata.
+ * Try to transform defineModule() to inject metadata.
  *
  * Before:
- *   createModuleContext({ tagAttributes: schema })
+ *   defineModule({ logSchema: schema })
  *
  * After:
- *   createModuleContext({
- *     moduleMetadata: { gitSha: '...', packageName: '...', packagePath: '...' },
- *     tagAttributes: schema
+ *   defineModule({
+ *     metadata: { gitSha: '...', packageName: '...', packagePath: '...' },
+ *     logSchema: schema
  *   })
  */
-function tryTransformCreateModuleContextCall(
+function tryTransformDefineModuleCall(
   node: ts.CallExpression,
   sourceFile: ts.SourceFile,
   factory: ts.NodeFactory,
   _projectRoot: string,
 ): ts.CallExpression | null {
-  if (!isCreateModuleContextCall(node)) {
+  if (!isDefineModuleCall(node)) {
     return null;
   }
 
@@ -163,8 +163,8 @@ function tryTransformCreateModuleContextCall(
     return null;
   }
 
-  // Don't transform if moduleMetadata already exists
-  if (hasModuleMetadataProperty(firstArg)) {
+  // Don't transform if metadata already exists
+  if (hasMetadataProperty(firstArg)) {
     return null;
   }
 
@@ -179,8 +179,8 @@ function tryTransformCreateModuleContextCall(
     ? path.relative(packageInfo.packageDir, absoluteFilePath)
     : path.basename(absoluteFilePath);
 
-  // Create the moduleMetadata object literal
-  const moduleMetadataObject = factory.createObjectLiteralExpression(
+  // Create the metadata object literal
+  const metadataObject = factory.createObjectLiteralExpression(
     [
       factory.createPropertyAssignment(factory.createIdentifier('gitSha'), factory.createStringLiteral(gitSha)),
       factory.createPropertyAssignment(
@@ -195,15 +195,12 @@ function tryTransformCreateModuleContextCall(
     true, // multiLine
   );
 
-  // Create the moduleMetadata property assignment
-  const moduleMetadataProperty = factory.createPropertyAssignment(
-    factory.createIdentifier('moduleMetadata'),
-    moduleMetadataObject,
-  );
+  // Create the metadata property assignment
+  const metadataProperty = factory.createPropertyAssignment(factory.createIdentifier('metadata'), metadataObject);
 
-  // Create new object literal with moduleMetadata as first property
+  // Create new object literal with metadata as first property
   const newObjectLiteral = factory.createObjectLiteralExpression(
-    [moduleMetadataProperty, ...firstArg.properties],
+    [metadataProperty, ...firstArg.properties],
     true, // multiLine
   );
 
@@ -244,6 +241,7 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
           if (!processedCalls.has(callExpr)) {
             const tagTransformed = tryTransformTagChainFromInliner(
               callExpr,
+              node, // Pass the ExpressionStatement instead of just the CallExpression
               sourceFile,
               factory,
               processedCalls,
@@ -266,8 +264,8 @@ export function createLmaoTransformer(options: LmaoTransformerOptions = {}): ts.
           return ts.visitEachChild(node, visitor, context);
         }
 
-        // Check for createModuleContext() pattern
-        const moduleContextTransformed = tryTransformCreateModuleContextCall(node, sourceFile, factory, projectRoot);
+        // Check for defineModule() pattern
+        const moduleContextTransformed = tryTransformDefineModuleCall(node, sourceFile, factory, projectRoot);
         if (moduleContextTransformed) {
           return ts.visitEachChild(moduleContextTransformed, visitor, context);
         }

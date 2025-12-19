@@ -23,9 +23,9 @@ import {
   createSpanBuffer,
   createTagWriter,
   createTraceId,
+  defineLogSchema,
   ENTRY_TYPE_SPAN_START,
   S,
-  type SchemaFields,
 } from '@smoothbricks/lmao';
 import * as arrow from 'apache-arrow';
 import { createTestTaskContext } from './test-helpers.js';
@@ -120,21 +120,21 @@ function getEnumIndex(value: string, enumValues: readonly string[]): number {
 
 describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   describe('literal values for all types', () => {
-    const testSchema = {
+    const testSchema = defineLogSchema({
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
       userId: S.category(),
-      message: S.text(),
+      description: S.text(),
       count: S.number(),
       enabled: S.boolean(),
-    } satisfies SchemaFields;
+    });
 
     it('enum literal produces identical output', () => {
       const traceId = createTraceId('trace-enum-test');
       const taskContext1 = createTestTaskContext(testSchema);
       const taskContext2 = createTestTaskContext(testSchema);
 
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
+      const buffer1 = createSpanBuffer(testSchema, taskContext1, 'test-span', traceId);
+      const buffer2 = createSpanBuffer(testSchema, taskContext2, 'test-span', traceId);
 
       // Setup: write system columns identically
       const timestamp = BigInt(Date.now()) * 1000000n;
@@ -226,10 +226,10 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
-      tagWriter1.message('hello world');
+      tagWriter1.description('hello world');
 
       // Direct write (text stores raw string)
-      buffer2.message(0, 'hello world');
+      buffer2.description(0, 'hello world');
 
       const table1 = convertToArrowTable(buffer1);
       const table2 = convertToArrowTable(buffer2);
@@ -237,8 +237,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      expect(table1.get(0)?.toJSON().message).toBe('hello world');
-      expect(table2.get(0)?.toJSON().message).toBe('hello world');
+      expect(table1.get(0)?.toJSON().description).toBe('hello world');
+      expect(table2.get(0)?.toJSON().description).toBe('hello world');
     });
 
     it('number literal produces identical output', () => {
@@ -345,11 +345,11 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   });
 
   describe('chained tag calls', () => {
-    const testSchema = {
+    const testSchema = defineLogSchema({
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
       userId: S.category(),
       count: S.number(),
-    } satisfies SchemaFields;
+    });
 
     it('multiple chained calls produce identical output', () => {
       const traceId = createTraceId('trace-chain-test');
@@ -398,11 +398,11 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   });
 
   describe('with() bulk setter', () => {
-    const testSchema = {
+    const testSchema = defineLogSchema({
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
       userId: S.category(),
       count: S.number(),
-    } satisfies SchemaFields;
+    });
 
     it('with() bulk setter produces identical output to individual calls', () => {
       const traceId = createTraceId('trace-with-test');
@@ -474,10 +474,10 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   });
 
   describe('enum index calculation', () => {
-    const testSchema = {
+    const testSchema = defineLogSchema({
       // Enum values NOT in alphabetical order
       status: S.enum(['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED'] as const),
-    } satisfies SchemaFields;
+    });
 
     it('verifies enum index uses declaration order', () => {
       // Runtime uses declaration order (NOT alphabetically sorted):
@@ -520,8 +520,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
         const enumIndex = getEnumIndex(value, enumValues);
         buffer2.status(0, enumIndex);
 
-        const table1 = convertToArrowTable(buffer1);
-        const table2 = convertToArrowTable(buffer2);
+        const table1 = convertToArrowTable(buffer1 as any);
+        const table2 = convertToArrowTable(buffer2 as any);
 
         const result = compareArrowTablesDetailed(table1, table2);
         expect(result.equal).toBe(true);
@@ -534,10 +534,10 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   });
 
   describe('eager columns', () => {
-    const testSchema = {
+    const testSchema = defineLogSchema({
       lazyField: S.category(),
       eagerField: S.category().eager(),
-    } satisfies SchemaFields;
+    });
 
     it('eager column setter produces identical output to lazy column setter', () => {
       const traceId = createTraceId('trace-eager-test');
@@ -577,10 +577,10 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   });
 
   describe('null/undefined handling', () => {
-    const testSchema = {
+    const testSchema = defineLogSchema({
       nullableNumber: S.number(),
       nullableString: S.category(),
-    } satisfies SchemaFields;
+    });
 
     it('unset columns remain null', () => {
       const traceId = createTraceId('trace-null-test');
@@ -648,10 +648,10 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   });
 
   describe('multiple rows', () => {
-    const testSchema = {
-      value: S.number(),
-      tag: S.category(),
-    } satisfies SchemaFields;
+    const testSchema = defineLogSchema({
+      nullableNumber: S.number(),
+      nullableString: S.category(),
+    });
 
     it('multiple rows produce identical output', () => {
       const traceId = createTraceId('trace-multirow-test');
@@ -729,13 +729,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
   });
 
   describe('IPC round-trip verification', () => {
-    const testSchema = {
+    const testSchema = defineLogSchema({
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
       userId: S.category(),
-      message: S.text(),
+      description: S.text(),
       count: S.number(),
       enabled: S.boolean(),
-    } satisfies SchemaFields;
+    });
 
     it('both fluent and direct writes produce valid IPC that round-trips correctly', () => {
       const traceId = createTraceId('trace-roundtrip-test');
@@ -756,12 +756,12 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
-      tagWriter1.operation('UPDATE').userId('user-roundtrip').message('test message').count(999).enabled(true);
+      tagWriter1.operation('UPDATE').userId('user-roundtrip').description('test description').count(999).enabled(true);
 
       // Direct writes
       buffer2.operation(0, getEnumIndex('UPDATE', ['CREATE', 'READ', 'UPDATE', 'DELETE']));
       buffer2.userId(0, 'user-roundtrip');
-      buffer2.message(0, 'test message');
+      buffer2.description(0, 'test description');
       buffer2.count(0, 999);
       buffer2.enabled(0, true);
 

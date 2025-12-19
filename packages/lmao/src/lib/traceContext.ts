@@ -10,6 +10,7 @@
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { FlagEvaluator } from './schema/evaluator.js';
 import type { LogSchema } from './schema/types.js';
+import type { TraceId } from './traceId.js';
 
 // =============================================================================
 // Reserved Keys
@@ -71,7 +72,7 @@ export type RootSpanFn = {
  */
 export interface TraceContextSystem<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown> {
   // System properties (always present, auto-generated)
-  readonly traceId: string;
+  readonly traceId: TraceId;
   readonly anchorEpochMicros: number; // Nanoseconds.now() / 1000n at trace root (microsecond precision)
   readonly anchorPerfNow: number; // performance.now() at trace root
   readonly threadId: bigint; // 64-bit random ID per worker/process
@@ -120,7 +121,7 @@ export interface TraceContextBase {
   /** Marker for prototype chain detection */
   readonly [TRACE_CONTEXT_MARKER]: true;
   /** Trace ID for this context */
-  traceId: string;
+  traceId: TraceId;
   /** Epoch microseconds when trace started */
   anchorEpochMicros: number;
   /** performance.now() when trace started */
@@ -143,7 +144,7 @@ export interface TraceContextBase {
  */
 export const TraceContextProto: TraceContextBase = {
   [TRACE_CONTEXT_MARKER]: true,
-  traceId: undefined as unknown as string,
+  traceId: undefined as unknown as TraceId,
   anchorEpochMicros: undefined as unknown as number,
   anchorPerfNow: undefined as unknown as number,
   threadId: undefined as unknown as bigint,

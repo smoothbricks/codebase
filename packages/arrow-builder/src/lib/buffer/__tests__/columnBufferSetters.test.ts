@@ -1,21 +1,23 @@
 import { describe, expect, test } from 'bun:test';
 import { S } from '../../schema/builder.js';
+import { ColumnSchema } from '../../schema/ColumnSchema.js';
 import { createGeneratedColumnBuffer } from '../columnBufferGenerator.js';
 
 // Create a schema with all types using the S schema builder
-const mockSchema = {
+const mockSchema = new ColumnSchema({
   status: S.enum(['pending', 'active', 'completed'] as const),
   userId: S.category(),
   errorMsg: S.text(),
   count: S.number(),
   isActive: S.boolean(),
-};
+  timestamp: S.bigUint64(),
+});
 
 // Schema with eager column (no null bitmap, allocated in constructor)
-const eagerSchema = {
+const eagerSchema = new ColumnSchema({
   message: S.category().eager(),
   userId: S.category(),
-};
+});
 
 describe('ColumnBuffer setter methods', () => {
   test('should generate setter methods for each column', () => {
@@ -194,9 +196,9 @@ describe('Eager column support (__eager: true)', () => {
 
   test('eager column should work with enum type', () => {
     // Now that S.enum() has .eager() method, we can use it directly
-    const eagerEnumSchema = {
+    const eagerEnumSchema = new ColumnSchema({
       status: S.enum(['a', 'b', 'c'] as const).eager(),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(eagerEnumSchema, 10);
 
@@ -213,9 +215,9 @@ describe('Eager column support (__eager: true)', () => {
 
   test('eager column should work with number type', () => {
     // S.number() now has .eager() method
-    const eagerNumberSchema = {
+    const eagerNumberSchema = new ColumnSchema({
       count: S.number().eager(),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(eagerNumberSchema, 10);
 
@@ -230,9 +232,9 @@ describe('Eager column support (__eager: true)', () => {
 
   test('eager column should work with boolean type', () => {
     // S.boolean() now has .eager() method
-    const eagerBoolSchema = {
+    const eagerBoolSchema = new ColumnSchema({
       active: S.boolean().eager(),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(eagerBoolSchema, 10);
 
@@ -251,9 +253,9 @@ describe('Eager column support (__eager: true)', () => {
 
 describe('Null value support in setters', () => {
   test('lazy column setter handles null by clearing null bit', () => {
-    const schema = {
+    const schema = new ColumnSchema({
       userId: S.category(),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(schema, 10);
 
@@ -272,9 +274,9 @@ describe('Null value support in setters', () => {
   });
 
   test('lazy column setter handles undefined by clearing null bit', () => {
-    const schema = {
+    const schema = new ColumnSchema({
       count: S.number(),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(schema, 10);
 
@@ -294,9 +296,9 @@ describe('Null value support in setters', () => {
   });
 
   test('eager column setter writes default value for null', () => {
-    const schema = {
+    const schema = new ColumnSchema({
       message: S.text().eager(),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(schema, 10);
 
@@ -310,9 +312,9 @@ describe('Null value support in setters', () => {
   });
 
   test('eager number column setter writes 0 for null', () => {
-    const schema = {
+    const schema = new ColumnSchema({
       count: S.number().eager(),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(schema, 10);
 
@@ -326,9 +328,9 @@ describe('Null value support in setters', () => {
   });
 
   test('lazy enum column handles null correctly', () => {
-    const schema = {
+    const schema = new ColumnSchema({
       status: S.enum(['PENDING', 'ACTIVE', 'DONE']),
-    };
+    });
 
     const buffer = createGeneratedColumnBuffer(schema, 10);
 
@@ -340,5 +342,168 @@ describe('Null value support in setters', () => {
     // Write null
     buffer.status(0, null as unknown as number);
     expect(buffer.status_nulls[0] & 1).toBe(0); // null bit cleared
+  });
+});
+
+describe('ColumnBuffer comprehensive data type coverage', () => {
+  test('should handle all supported enum sizes', () => {
+    // Small enum (<256 values) - should use Uint8Array
+    const smallEnumSchema = new ColumnSchema({
+      smallStatus: S.enum(['A', 'B', 'C'] as const),
+    });
+
+    // Medium enum (100 values) - should use Uint8Array
+    const mediumEnumSchema = new ColumnSchema({
+      mediumStatus: S.enum(Array.from({ length: 100 }, (_, i) => `VAL_${i}`) as const),
+    });
+
+    // Large enum (>256 values) - should use Uint16Array
+    const largeEnumSchema = new ColumnSchema({
+      largeStatus: S.enum(Array.from({ length: 300 }, (_, i) => `BIG_${i}`) as const),
+    });
+
+    const smallBuffer = createGeneratedColumnBuffer(smallEnumSchema, 10);
+    const mediumBuffer = createGeneratedColumnBuffer(mediumEnumSchema, 10);
+    const largeBuffer = createGeneratedColumnBuffer(largeEnumSchema, 10);
+
+    // Verify TypedArray types
+    expect(smallBuffer.smallStatus_values instanceof Uint8Array).toBe(true);
+    expect(mediumBuffer.mediumStatus_values instanceof Uint8Array).toBe(true);
+    expect(largeBuffer.largeStatus_values instanceof Uint16Array).toBe(true);
+  });
+
+  test('should handle BigInt values in bigUint64 columns', () => {
+    const bigIntSchema = new ColumnSchema({
+      timestamp: S.bigUint64(),
+      largeId: S.bigUint64(),
+    });
+
+    const buffer = createGeneratedColumnBuffer(bigIntSchema, 10);
+
+    // Test various BigInt values including edge cases
+    const testValues = [
+      0n,
+      1n,
+      1234567890n,
+      BigInt('18446744073709551615'), // Max uint64
+      BigInt('9223372036854775808'), // 2^63
+    ];
+
+    testValues.forEach((value, idx) => {
+      buffer.timestamp(idx, value);
+      buffer.largeId(idx, value * 2n);
+      expect(buffer.timestamp_values[idx]).toBe(value);
+      // BigUint64Array wraps around at 2^64, so multiply result wraps too
+      expect(buffer.largeId_values[idx]).toBe((value * 2n) & 0xffffffffffffffffn);
+    });
+
+    // Verify BigUint64Array type
+    expect(buffer.timestamp_values instanceof BigUint64Array).toBe(true);
+    expect(buffer.largeId_values instanceof BigUint64Array).toBe(true);
+  });
+
+  test('should handle null/undefined correctly across all types', () => {
+    const testSchema = new ColumnSchema({
+      enumCol: S.enum(['A', 'B'] as const),
+      categoryCol: S.category(),
+      textCol: S.text(),
+      numberCol: S.number(),
+      booleanCol: S.boolean(),
+      bigIntCol: S.bigUint64(),
+    });
+
+    const buffer = createGeneratedColumnBuffer(testSchema, 10);
+
+    // Write real values first
+    buffer.enumCol(0, 1);
+    buffer.categoryCol(0, 'test-category');
+    buffer.textCol(0, 'test-text');
+    buffer.numberCol(0, 42.5);
+    buffer.booleanCol(0, true);
+    buffer.bigIntCol(0, 12345n);
+
+    // Verify null bits are set after writing real values (1 = not null)
+    expect(buffer.enumCol_nulls[0] & 1).toBe(1);
+    expect(buffer.categoryCol_nulls[0] & 0b10).toBe(0b10);
+    expect(buffer.textCol_nulls[0] & 0b100).toBe(0b100);
+    expect(buffer.numberCol_nulls[0] & 0b1000).toBe(0b1000);
+    expect(buffer.booleanCol_nulls[0] & 0b100000).toBe(0b100000);
+    expect(buffer.bigIntCol_nulls[0] & 0b1000000).toBe(0b1000000);
+
+    // Write null/undefined to clear bits
+    buffer.enumCol(0, null as unknown as number);
+    buffer.categoryCol(0, undefined as unknown as string);
+    buffer.textCol(0, null as unknown as string);
+    buffer.numberCol(0, undefined as unknown as number);
+    buffer.booleanCol(0, null as unknown as boolean);
+    buffer.bigIntCol(0, undefined as unknown as bigint);
+
+    // Verify all null bits are cleared
+    expect(buffer.enumCol_nulls[0] & 1).toBe(0);
+    expect(buffer.categoryCol_nulls[0] & 0b10).toBe(0);
+    expect(buffer.textCol_nulls[0] & 0b100).toBe(0);
+    expect(buffer.numberCol_nulls[0] & 0b1000).toBe(0);
+    expect(buffer.booleanCol_nulls[0] & 0b100000).toBe(0);
+    expect(buffer.bigIntCol_nulls[0] & 0b1000000).toBe(0);
+  });
+
+  test('should handle boolean bit packing across multiple bytes', () => {
+    const booleanSchema = new ColumnSchema({
+      flags: S.boolean(),
+    });
+
+    const buffer = createGeneratedColumnBuffer(booleanSchema, 25);
+
+    // Set bits across multiple bytes
+    buffer.flags(0, true); // byte 0, bit 0
+    buffer.flags(7, true); // byte 0, bit 7
+    buffer.flags(8, true); // byte 1, bit 0
+    buffer.flags(15, true); // byte 1, bit 7
+    buffer.flags(16, true); // byte 2, bit 0
+    buffer.flags(23, true); // byte 2, bit 7
+
+    // Verify bit patterns
+    expect(buffer.flags_values[0]).toBe(0b10000001); // 129
+    expect(buffer.flags_values[1]).toBe(0b10000001); // 129
+    expect(buffer.flags_values[2]).toBe(0b10000001); // 129
+    expect(buffer.flags_values[3]).toBe(0b00000000); // 0 (buffer only allocated 25, but bits are set at specified positions)
+  });
+
+  test('should handle capacity boundaries correctly', () => {
+    const testSchema = new ColumnSchema({
+      value: S.number(),
+    });
+
+    // Test with exactly 16 capacity (aligned to 16)
+    const buffer = createGeneratedColumnBuffer(testSchema, 16);
+
+    // Should be able to write to all positions 0-15
+    for (let i = 0; i < 16; i++) {
+      buffer.value(i, i * 10);
+    }
+
+    // Verify all values are written
+    for (let i = 0; i < 16; i++) {
+      expect(buffer.value_values[i]).toBe(i * 10);
+      expect(buffer.value_nulls[i >>> 3] & (1 << (i & 7))).toBe(1 << (i & 7));
+    }
+  });
+
+  test('should handle method chaining correctly', () => {
+    const testSchema = new ColumnSchema({
+      text: S.text(),
+      number: S.number(),
+      flag: S.boolean(),
+    });
+
+    const buffer = createGeneratedColumnBuffer(testSchema, 10);
+
+    // Test method chaining
+    const result = buffer.text(0, 'first').number(0, 42).flag(0, true);
+
+    expect(result).toBe(buffer);
+    expect(buffer.text_values[0]).toBe('first');
+    expect(buffer.number_values[0]).toBe(42);
+    expect(buffer.flag_nulls[0] & 1).toBe(1);
   });
 });

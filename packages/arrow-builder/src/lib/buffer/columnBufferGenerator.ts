@@ -130,6 +130,7 @@ function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStora
   if (schemaType === 'enum') {
     const enumValues = schemaWithMetadata.__enum_values;
     const enumCount = enumValues?.length ?? 0;
+
     // Uint8Array can hold 0-255 indices (256 values total)
     if (enumCount === 0 || enumCount <= 256) {
       return { constructorName: 'Uint8Array', bytesPerElement: 1, isBitPacked: false, schemaType, enumValues, isEager };
@@ -144,6 +145,7 @@ function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStora
         isEager,
       };
     }
+    // >65536 values: Uint32Array (4 bytes)
     return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, enumValues, isEager };
   }
 
@@ -167,6 +169,7 @@ function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStora
     return { constructorName: 'BigUint64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
   }
 
+  // Default to Uint32Array for unknown types
   return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
 }
 
@@ -187,7 +190,7 @@ function generateInlineAllocation(columnName: string, info: ColumnStorageInfo): 
   }
 
   if (constructorName === 'Array') {
-    // String array: nulls is Uint8Array, values is JS Array (can't share ArrayBuffer)
+    // String array: nulls is bit-packed Uint8Array, values is JS Array (can't share ArrayBuffer)
     return `const cap = this._alignedCapacity;
         const nullSize = (cap + 7) >>> 3;
         v = this._${columnName}_nulls = new Uint8Array(nullSize);
@@ -255,7 +258,7 @@ export function generateColumnBufferClass(
   className = 'GeneratedColumnBuffer',
   extension?: ColumnBufferExtension,
 ): string {
-  // Schema should always be a ColumnSchema instance now (wrapped at API boundaries)
+  // Schema should always be a ColumnSchema instance (LogSchema extends ColumnSchema)
   if (!isColumnSchema(schema)) {
     throw new Error(
       `Schema must be a ColumnSchema instance. Got: ${typeof schema}. ` +

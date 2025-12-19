@@ -297,6 +297,34 @@ export function findTagChainRoot(
 let varCounter = 0;
 
 /**
+ * Clear comments and source position from generated nodes to prevent comment inheritance from source code.
+ *
+ * When creating new Statement nodes via factory.createExpressionStatement(),
+ * they inherit comments from nearby source locations and may have positional
+ * information that causes them to be associated with source comments during
+ * printing. This function recursively clears comments from the node and all its children.
+ *
+ * @param node - The node to clear comments and position from
+ */
+function clearComments(node: ts.Node): void {
+  // Clear synthetic leading comments
+  ts.setSyntheticLeadingComments(node, undefined);
+
+  // Clear synthetic trailing comments
+  ts.setSyntheticTrailingComments(node, undefined);
+
+  // Clear source map range to prevent source comment inheritance
+  ts.setSourceMapRange(node, undefined);
+
+  // Clear positional information to prevent source comment inheritance
+  (node as any).pos = -1;
+  (node as any).end = -1;
+
+  // Recursively clear comments from all child nodes
+  ts.forEachChild(node, clearComments);
+}
+
+/**
  * Reset the variable counter. Call at the start of each transformation.
  */
 function resetVarCounter(): void {
@@ -446,32 +474,32 @@ function generateBooleanWrite(
     // Set null bitmap (if not eager)
     if (!isEager) {
       // $$b.field_nulls[0] |= 1
-      statements.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-        ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
       );
+      clearComments(stmt);
+      statements.push(stmt);
     }
 
     // Set or clear value bit
     if (isTrue) {
       // $$b.field_values[0] |= 1
-      statements.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-        ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
       );
+      clearComments(stmt);
+      statements.push(stmt);
     } else {
       // $$b.field_values[0] &= ~1
-      statements.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(
-            valuesAccess,
-            ts.SyntaxKind.AmpersandEqualsToken,
-            factory.createPrefixUnaryExpression(ts.SyntaxKind.TildeToken, factory.createNumericLiteral(1)),
-          ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(
+          valuesAccess,
+          ts.SyntaxKind.AmpersandEqualsToken,
+          factory.createPrefixUnaryExpression(ts.SyntaxKind.TildeToken, factory.createNumericLiteral(1)),
         ),
       );
+      clearComments(stmt);
+      statements.push(stmt);
     }
   } else {
     // Variable - wrap in null check
@@ -479,48 +507,63 @@ function generateBooleanWrite(
     const varIdent = factory.createIdentifier(varName);
 
     // const $$v0 = getValue();
-    statements.push(
-      factory.createVariableStatement(
-        undefined,
-        factory.createVariableDeclarationList(
-          [factory.createVariableDeclaration(varIdent, undefined, undefined, argument)],
-          ts.NodeFlags.Const,
-        ),
+    const varStmt = factory.createVariableStatement(
+      undefined,
+      factory.createVariableDeclarationList(
+        [factory.createVariableDeclaration(varIdent, undefined, undefined, argument)],
+        ts.NodeFlags.Const,
       ),
     );
+    clearComments(varStmt);
+    statements.push(varStmt);
 
     // Build the if body
     const ifBody: ts.Statement[] = [];
 
     // Set null bitmap (if not eager)
     if (!isEager) {
-      ifBody.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-        ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
       );
+      clearComments(stmt);
+      ifBody.push(stmt);
     }
 
-    // if ($$v0) { values |= 1 } else { values &= ~1 }
-    ifBody.push(
-      factory.createIfStatement(
-        varIdent,
-        factory.createBlock([
-          factory.createExpressionStatement(
-            factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-          ),
-        ]),
-        factory.createBlock([
-          factory.createExpressionStatement(
-            factory.createBinaryExpression(
-              valuesAccess,
-              ts.SyntaxKind.AmpersandEqualsToken,
-              factory.createPrefixUnaryExpression(ts.SyntaxKind.TildeToken, factory.createNumericLiteral(1)),
-            ),
-          ),
-        ]),
+    // Create the true and false statements
+    const trueStmt = factory.createExpressionStatement(
+      factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
+    );
+    clearComments(trueStmt);
+
+    const falseStmt = factory.createExpressionStatement(
+      factory.createBinaryExpression(
+        valuesAccess,
+        ts.SyntaxKind.AmpersandEqualsToken,
+        factory.createPrefixUnaryExpression(ts.SyntaxKind.TildeToken, factory.createNumericLiteral(1)),
       ),
     );
+    clearComments(falseStmt);
+
+    // if ($$v0) { values |= 1 } else { values &= ~1 }
+    const trueBlock = factory.createBlock([trueStmt]);
+    clearComments(trueBlock);
+    const falseBlock = factory.createBlock([falseStmt]);
+    clearComments(falseBlock);
+    const innerIfStmt = factory.createIfStatement(varIdent, trueBlock, falseBlock);
+    clearComments(innerIfStmt);
+    ifBody.push(innerIfStmt);
+
+    // if ($$v0 != null) { ... }
+    const ifBodyBlock = factory.createBlock(ifBody, true);
+    clearComments(ifBodyBlock);
+    const outerIfStmt = factory.createIfStatement(
+      factory.createBinaryExpression(varIdent, ts.SyntaxKind.ExclamationEqualsToken, factory.createNull()),
+      ifBodyBlock,
+    );
+    clearComments(outerIfStmt);
+    statements.push(outerIfStmt);
+
+    ifBody.push(factory.createIfStatement(varIdent, factory.createBlock([trueStmt]), factory.createBlock([falseStmt])));
 
     // if ($$v0 != null) { ... }
     statements.push(
@@ -552,41 +595,37 @@ function generateEnumWrite(
 
     // Set null bitmap (if not eager)
     if (!isEager) {
-      statements.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-        ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
       );
+      clearComments(stmt);
+      statements.push(stmt);
     }
 
     // $$b.field_values[0] = indexValue
-    statements.push(
-      factory.createExpressionStatement(
-        factory.createBinaryExpression(
-          valuesAccess,
-          ts.SyntaxKind.EqualsToken,
-          factory.createNumericLiteral(indexValue),
-        ),
-      ),
+    const stmt = factory.createExpressionStatement(
+      factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.EqualsToken, factory.createNumericLiteral(indexValue)),
     );
+    clearComments(stmt);
+    statements.push(stmt);
   } else {
     // Variable - generate switch IIFE
     // Set null bitmap (if not eager)
     if (!isEager) {
-      statements.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-        ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
       );
+      clearComments(stmt);
+      statements.push(stmt);
     }
 
     // $$b.field_values[0] = (($$v) => { switch($$v) {...} })(argument)
     const switchIIFE = generateEnumSwitchIIFE(factory, argument, enumValues);
-    statements.push(
-      factory.createExpressionStatement(
-        factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.EqualsToken, switchIIFE),
-      ),
+    const stmt = factory.createExpressionStatement(
+      factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.EqualsToken, switchIIFE),
     );
+    clearComments(stmt);
+    statements.push(stmt);
   }
 }
 
@@ -606,61 +645,63 @@ function generateDirectWrite(
     // Literal value - no null check needed
     if (!isEager) {
       // Set null bitmap
-      statements.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-        ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
       );
+      clearComments(stmt);
+      statements.push(stmt);
     }
 
     // Direct assignment
-    statements.push(
-      factory.createExpressionStatement(
-        factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.EqualsToken, argument),
-      ),
+    const stmt = factory.createExpressionStatement(
+      factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.EqualsToken, argument),
     );
+    clearComments(stmt);
+    statements.push(stmt);
   } else {
     // Variable - wrap in null check
     const varName = generateVarName();
     const varIdent = factory.createIdentifier(varName);
 
     // const $$v0 = getValue();
-    statements.push(
-      factory.createVariableStatement(
-        undefined,
-        factory.createVariableDeclarationList(
-          [factory.createVariableDeclaration(varIdent, undefined, undefined, argument)],
-          ts.NodeFlags.Const,
-        ),
+    const varStmt = factory.createVariableStatement(
+      undefined,
+      factory.createVariableDeclarationList(
+        [factory.createVariableDeclaration(varIdent, undefined, undefined, argument)],
+        ts.NodeFlags.Const,
       ),
     );
+    clearComments(varStmt);
+    statements.push(varStmt);
 
     // Build if body
     const ifBody: ts.Statement[] = [];
 
     if (!isEager) {
       // Set null bitmap
-      ifBody.push(
-        factory.createExpressionStatement(
-          factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
-        ),
+      const stmt = factory.createExpressionStatement(
+        factory.createBinaryExpression(nullsAccess, ts.SyntaxKind.BarEqualsToken, factory.createNumericLiteral(1)),
       );
+      clearComments(stmt);
+      ifBody.push(stmt);
     }
 
     // Assign value
-    ifBody.push(
-      factory.createExpressionStatement(
-        factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.EqualsToken, varIdent),
-      ),
+    const stmt = factory.createExpressionStatement(
+      factory.createBinaryExpression(valuesAccess, ts.SyntaxKind.EqualsToken, varIdent),
     );
+    clearComments(stmt);
+    ifBody.push(stmt);
 
     // if ($$v0 != null) { ... }
-    statements.push(
-      factory.createIfStatement(
-        factory.createBinaryExpression(varIdent, ts.SyntaxKind.ExclamationEqualsToken, factory.createNull()),
-        factory.createBlock(ifBody, true),
-      ),
+    const ifBodyBlock = factory.createBlock(ifBody, true);
+    clearComments(ifBodyBlock);
+    const ifStmt = factory.createIfStatement(
+      factory.createBinaryExpression(varIdent, ts.SyntaxKind.ExclamationEqualsToken, factory.createNull()),
+      ifBodyBlock,
     );
+    clearComments(ifStmt);
+    statements.push(ifStmt);
   }
 }
 
@@ -707,14 +748,15 @@ function unrollWithCall(
  * @returns A block statement with inlined writes, or null if transformation not possible
  */
 export function tryTransformTagChain(
-  node: ts.CallExpression,
+  callExpr: ts.CallExpression,
+  expressionStmt: ts.ExpressionStatement,
   _sourceFile: ts.SourceFile,
   factory: ts.NodeFactory,
   processedCalls: WeakSet<ts.CallExpression>,
   typeChecker: ts.TypeChecker | undefined,
 ): ts.Statement | null {
   // Find the tag chain root
-  const chainInfo = findTagChainRoot(node, typeChecker);
+  const chainInfo = findTagChainRoot(callExpr, typeChecker);
   if (!chainInfo) return null;
 
   // Must have at least one tag call or with call to transform
@@ -750,6 +792,35 @@ export function tryTransformTagChain(
     unrollWithCall(factory, bufferExpr, withCall, chainInfo.schemaInfo, statements);
   }
 
+  // Clear comments from all statements to prevent inheritance/duplication
+  for (const stmt of statements) {
+    clearComments(stmt);
+  }
+
   // Return a block statement containing all the writes
-  return factory.createBlock(statements, true);
+  const block = factory.createBlock(statements, true);
+
+  // Extract and preserve the original leading comment from the ExpressionStatement
+  const sourceFile = expressionStmt.getSourceFile();
+  const sourceText = sourceFile.getFullText();
+
+  // Use expressionStmt.pos (not getStart()) for proper comment range detection
+  const commentRanges = ts.getLeadingCommentRanges(sourceText, expressionStmt.pos);
+
+  if (commentRanges && commentRanges.length > 0) {
+    // Get the last (closest) comment before the statement
+    const lastComment = commentRanges[commentRanges.length - 1];
+
+    // Only preserve single-line comments (// comments)
+    if (lastComment.kind === ts.SyntaxKind.SingleLineCommentTrivia) {
+      // Extract the comment text and clean it
+      const commentText = sourceText.substring(lastComment.pos, lastComment.end);
+      const commentContent = commentText.substring(2).trim(); // Remove '//' prefix
+
+      // Add the cleaned comment as a synthetic leading comment on the block
+      ts.addSyntheticLeadingComment(block, ts.SyntaxKind.SingleLineCommentTrivia, ` ${commentContent}`, true);
+    }
+  }
+
+  return block;
 }

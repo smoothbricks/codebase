@@ -311,7 +311,7 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
    * const table = convertToArrowTable(ctx.buffer);
    * ```
    */
-  readonly buffer: SpanBuffer<T>;
+  readonly buffer: SpanBuffer;
 }
 
 // =============================================================================
@@ -491,7 +491,7 @@ export function createSpanContextProto<
       const childBuffer = createChildSpanBuffer(this._buffer, this._buffer.module, name);
 
       // Explicit registration with parent's children array
-      this._buffer.children.push(childBuffer);
+      this._buffer.children.push(childBuffer as SpanBuffer);
 
       // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
       writeSpanStart(childBuffer, name);
@@ -509,9 +509,9 @@ export function createSpanContextProto<
       const childContext = Object.create(ctx) as MutableSpanContext<T, FF, Env>;
 
       // Assign child-specific properties directly (stable hidden class)
-      childContext.tag = childTagAPI;
+      childContext.tag = childTagAPI as SpanContext<T, FF, Env>['tag'];
       childContext.log = childLogger as SpanLogger<T>;
-      childContext._buffer = childBuffer;
+      childContext._buffer = childBuffer as SpanBuffer<T>;
       childContext._spanLogger = childLogger;
       // ALWAYS copy _traceCtx directly (V8 optimization - no prototype access)
       childContext._traceCtx = (ctx as unknown as MutableSpanContext<T, FF, Env>)._traceCtx;

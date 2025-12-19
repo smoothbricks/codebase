@@ -151,7 +151,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
       }
     } else {
       // Root span - uses traceId from TraceContext
-      spanBuffer = createSpanBuffer(schemaOnly, this.module, spanName, traceCtx.traceId as TraceId);
+      spanBuffer = createSpanBuffer(schemaOnly, this.module, spanName, traceCtx.traceId);
     }
 
     // 4. Write span-start entry (row 0) and pre-initialize span-end (row 1)

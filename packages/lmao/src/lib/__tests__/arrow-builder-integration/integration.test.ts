@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'bun:test';
-import { createAttributeColumns, createColumnWriter, maskingTransforms } from '@smoothbricks/arrow-builder';
+import {
+  createAttributeColumns,
+  createColumnWriter,
+  DEFAULT_BUFFER_CAPACITY,
+  maskingTransforms,
+} from '@smoothbricks/arrow-builder';
 import { convertToArrowTable, createSpanBuffer, defineLogSchema, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
@@ -233,5 +239,98 @@ describe('Buffer Integration', () => {
     // Input is 24 chars, first 4 are kept, remaining 20 are replaced with *
     const maskedValue = secretKeyCol?.get(0);
     expect(maskedValue).toBe('sk_l********************');
+  });
+
+  describe('Cross-Package Integration', () => {
+    it('validates lmao schema creates correct arrow-builder TypedArray types', () => {
+      const schema = createTestSchema({
+        enumField: S.enum(['A', 'B', 'C']), // Maps to Uint8Array
+        categoryField: S.category(), // Maps to string[]
+        textField: S.text(), // Maps to string[]
+        numberField: S.number(), // Maps to Float64Array
+        booleanField: S.boolean(), // Maps to Uint8Array
+        optionalField: S.optional(S.number()), // Maps to Uint32Array
+      });
+
+      const module = createTestModuleContext(schema);
+      const buffer = createSpanBuffer(schema, module, 'integration-test');
+
+      // Verify arrow-builder created correct TypedArray types for each schema type
+      expect(buffer.enumField_values).toBeInstanceOf(Uint8Array);
+      expect(Array.isArray(buffer.categoryField_values)).toBe(true);
+      expect(Array.isArray(buffer.textField_values)).toBe(true);
+      expect(buffer.numberField_values).toBeInstanceOf(Float64Array);
+      expect(buffer.booleanField_values).toBeInstanceOf(Uint8Array);
+      expect(buffer.optionalField_values).toBeInstanceOf(Uint32Array);
+
+      // Verify Arrow null bitmaps exist for all columns
+      expect(buffer.enumField_nulls).toBeInstanceOf(Uint8Array);
+      expect(buffer.categoryField_nulls).toBeInstanceOf(Uint8Array);
+      expect(buffer.textField_nulls).toBeInstanceOf(Uint8Array);
+      expect(buffer.numberField_nulls).toBeInstanceOf(Uint8Array);
+      expect(buffer.booleanField_nulls).toBeInstanceOf(Uint8Array);
+      expect(buffer.optionalField_nulls).toBeInstanceOf(Uint8Array);
+    });
+
+    it('ensures data flows correctly between lmao APIs and arrow-builder buffers', () => {
+      const schema = createTestSchema({
+        userId: S.category(),
+        operation: S.enum(['GET', 'POST']),
+        httpStatus: S.number(),
+        error: S.text().mask('email'),
+      });
+
+      const module = createTestModuleContext(schema);
+      const buffer = createSpanBuffer(schema, module, 'data-flow-test');
+
+      // Use ColumnWriter API to write data (more robust than direct array access)
+      const writer = createColumnWriter(schema, buffer);
+      (writer.nextRow() as any)
+        .userId('user-123')
+        .operation(1) // Use numeric value for POST (index 1 in ['GET', 'POST'])
+        .httpStatus(200)
+        .error('john@example.com');
+
+      // Set system columns
+      buffer.timestamps[0] = 1000n;
+      buffer.operations[0] = ENTRY_TYPE_INFO;
+      buffer.writeIndex = 1;
+
+      // Convert to Arrow using arrow-builder
+      const table = convertToArrowTable(buffer as any);
+
+      // Verify Arrow conversion preserves data and applies masking
+      expect(table.numRows).toBe(1);
+      expect(table.getChild('userId')?.get(0)).toBe('user-123');
+      expect(table.getChild('operation')?.get(0)).toBe('POST');
+      expect(table.getChild('httpStatus')?.get(0)).toBe(200);
+      expect(table.getChild('error')?.get(0)).toBe('j*****@example.com'); // Email masked
+    });
+
+    it('validates module context integration with buffer metadata', () => {
+      const schema = createTestSchema({
+        requestId: S.category(),
+      });
+
+      const module = createTestModuleContext(schema, {
+        gitSha: 'test-sha-123',
+        packageName: '@test/package',
+        packagePath: 'src/integration.test.ts',
+      });
+
+      const buffer = createSpanBuffer(schema, module, 'context-integration');
+
+      // Verify buffer properly references module context
+      expect(buffer.module).toBe(module);
+      expect(buffer.module.logSchema).toBe(module.logSchema);
+      expect(buffer.spanName).toBe('context-integration');
+
+      // Verify system metadata columns are accessible
+      expect(buffer.spanId).toBeGreaterThan(0);
+      expect(typeof buffer.hasParent).toBe('boolean');
+      expect(buffer.children).toBeInstanceOf(Array);
+      expect(buffer.writeIndex).toBe(0);
+      expect(buffer.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+    });
   });
 });

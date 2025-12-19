@@ -1,4 +1,6 @@
 import { describe, expect, it } from 'bun:test';
+import { S } from '../../schema/builder.js';
+import { ColumnSchema } from '../../schema/ColumnSchema.js';
 import type { SchemaFields } from '../../schema-types.js';
 import { createGeneratedColumnBuffer } from '../columnBufferGenerator.js';
 import {
@@ -11,13 +13,13 @@ import {
 // Test schemas with proper metadata markers
 // Cast to SchemaFields to work around strict type checking in tests
 // In real usage, these would be proper Sury schemas with __schema_type metadata
-const testSchema = {
-  userId: { __schema_type: 'category' },
-  status: { __schema_type: 'enum', __enum_values: ['ok', 'error'] },
-  count: { __schema_type: 'number' },
-  enabled: { __schema_type: 'boolean' },
-  message: { __schema_type: 'text' },
-} as unknown as SchemaFields;
+const testSchema = new ColumnSchema({
+  userId: S.category(),
+  status: S.enum(['ok', 'error'] as const),
+  count: S.number(),
+  enabled: S.boolean(),
+  message: S.text(),
+});
 
 describe('generateColumnWriterClass', () => {
   it('generates valid class code', () => {
@@ -72,8 +74,8 @@ describe('getColumnWriterClass', () => {
   });
 
   it('creates different classes for different schemas', () => {
-    const schema1 = { foo: { __schema_type: 'number' } } as unknown as SchemaFields;
-    const schema2 = { bar: { __schema_type: 'number' } } as unknown as SchemaFields;
+    const schema1 = new ColumnSchema({ foo: S.number() });
+    const schema2 = new ColumnSchema({ bar: S.number() });
     const WriterClass1 = getColumnWriterClass(schema1);
     const WriterClass2 = getColumnWriterClass(schema2);
     expect(WriterClass1).not.toBe(WriterClass2);

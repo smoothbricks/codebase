@@ -276,71 +276,130 @@ return ctx.ok({ done: true });`;
     });
   });
 
-  describe('createModuleContext() transformation', () => {
-    it('should inject moduleMetadata into createModuleContext()', () => {
-      const input = ['createModuleContext({', '  tagAttributes: schema,', '});'].join('\n');
+  describe('defineModule() transformation', () => {
+    it('should inject metadata into defineModule()', () => {
+      const input = ['defineModule({', '  logSchema: schema,', '});'].join('\n');
       const output = transform(input);
-      expect(output).toContain('moduleMetadata');
+      expect(output).toContain('metadata');
       expect(output).toContain('gitSha');
       expect(output).toContain('packageName');
       expect(output).toContain('packagePath');
     });
 
-    it('should not overwrite existing moduleMetadata', () => {
+    it('should not overwrite existing metadata', () => {
       const input = [
-        'createModuleContext({',
-        "  moduleMetadata: { gitSha: 'custom', packageName: 'custom', packagePath: 'custom' },",
-        '  tagAttributes: schema,',
+        'defineModule({',
+        "  metadata: { gitSha: 'custom', packageName: 'custom', packagePath: 'custom' },",
+        '  logSchema: schema,',
         '});',
       ].join('\n');
       const output = transform(input);
       expect(output).toContain("gitSha: 'custom'");
-      // Should NOT have duplicate moduleMetadata
-      expect(output.match(/moduleMetadata/g)?.length).toBe(1);
+      // Should NOT have duplicate metadata
+      expect(output.match(/metadata/g)?.length).toBe(1);
     });
 
-    it('should handle lmao.createModuleContext() property access pattern', () => {
-      const input = ['lmao.createModuleContext({', '  tagAttributes: schema,', '});'].join('\n');
+    it('should handle lmao.defineModule() property access pattern', () => {
+      const input = ['lmao.defineModule({', '  logSchema: schema,', '});'].join('\n');
       const output = transform(input);
-      expect(output).toContain('moduleMetadata');
+      expect(output).toContain('metadata');
       expect(output).toContain('gitSha');
       expect(output).toContain('packageName');
       expect(output).toContain('packagePath');
     });
 
-    it('should preserve existing properties when injecting moduleMetadata', () => {
-      const input = ['createModuleContext({', '  tagAttributes: schema,', '  featureFlags: flags,', '});'].join('\n');
+    it('should preserve existing properties when injecting metadata', () => {
+      const input = ['defineModule({', '  logSchema: schema,', '  ff: flags,', '});'].join('\n');
       const output = transform(input);
-      expect(output).toContain('moduleMetadata');
-      expect(output).toContain('tagAttributes');
-      expect(output).toContain('featureFlags');
+      expect(output).toContain('metadata');
+      expect(output).toContain('logSchema');
     });
 
-    it('should not transform createModuleContext without object argument', () => {
-      const input = 'createModuleContext();';
+    it('should not transform defineModule without object argument', () => {
+      const input = 'defineModule();';
       const output = transform(input);
-      expect(output).not.toContain('moduleMetadata');
+      expect(output).toBe('defineModule();\n');
     });
 
-    it('should not transform createModuleContext with non-object argument', () => {
-      const input = 'createModuleContext(config);';
+    it('should not transform defineModule with non-object argument', () => {
+      const input = 'defineModule(config);';
       const output = transform(input);
-      expect(output).not.toContain('moduleMetadata');
+      expect(output).toBe('defineModule(config);\n');
     });
 
-    it('should handle createModuleContext with empty object', () => {
-      const input = 'createModuleContext({});';
+    it('should not transform defineModule with non-object argument', () => {
+      const input = 'defineModule(config);';
       const output = transform(input);
-      expect(output).toContain('moduleMetadata');
+      expect(normalize(output)).toBe('defineModule(config);');
+    });
+
+    it('should handle defineModule with empty object', () => {
+      const input = 'defineModule({});';
+      const output = transform(input);
+      expect(output).toContain('metadata');
       expect(output).toContain('gitSha');
     });
 
-    it('should use unknown for gitSha when git is not available', () => {
-      // The test runs in a git repo, but the transformer handles missing git gracefully
-      // This test just verifies that some gitSha is present (either actual or 'unknown')
-      const input = 'createModuleContext({ tagAttributes: schema });';
+    it('should not transform defineModule with logSchema property', () => {
+      const input = 'defineModule({ logSchema: schema });';
       const output = transform(input);
-      expect(output).toContain('gitSha:');
+      expect(output).toContain('metadata');
+      expect(output).toContain('logSchema');
+    });
+
+    it('should not overwrite existing metadata', () => {
+      const input = [
+        'defineModule({',
+        "  metadata: { gitSha: 'custom', packageName: 'custom', packagePath: 'custom' },",
+        '  logSchema: schema,',
+        '});',
+      ].join('\n');
+      const output = transform(input);
+      expect(output).toContain("gitSha: 'custom'");
+      // Should NOT have duplicate metadata
+      expect(output.match(/metadata/g)?.length).toBe(1);
+    });
+
+    it('should handle lmao.defineModule() property access pattern', () => {
+      const input = ['lmao.defineModule({', '  logSchema: schema,', '});'].join('\n');
+      const output = transform(input);
+      expect(output).toContain('metadata');
+      expect(output).toContain('gitSha');
+      expect(output).toContain('packageName');
+      expect(output).toContain('packagePath');
+    });
+
+    it('should preserve existing properties when injecting metadata', () => {
+      const input = ['defineModule({', '  logSchema: schema,', '  ff: flags,', '});'].join('\n');
+      const output = transform(input);
+      expect(output).toContain('metadata');
+      expect(output).toContain('logSchema');
+    });
+
+    it('should not transform defineModule without object argument', () => {
+      const input = 'defineModule();';
+      const output = transform(input);
+      expect(output).toBe('defineModule();\n');
+    });
+
+    it('should not transform defineModule with non-object argument', () => {
+      const input = 'defineModule(config);';
+      const output = transform(input);
+      expect(output).toBe('defineModule(config);\n');
+    });
+
+    it('should handle defineModule with empty object', () => {
+      const input = 'defineModule({});';
+      const output = transform(input);
+      expect(output).toContain('metadata');
+      expect(output).toContain('gitSha');
+    });
+
+    it('should not transform defineModule with logSchema property', () => {
+      const input = 'defineModule({ logSchema: schema });';
+      const output = transform(input);
+      expect(output).toContain('metadata');
+      expect(output).toContain('logSchema');
     });
   });
 

@@ -1,6 +1,5 @@
 /**
  * Test helpers for creating ModuleContext instances.
- * TaskContext has been removed - SpanBuffer now stores module, spanName directly.
  */
 
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
@@ -43,12 +42,11 @@ export function createTestModuleContext(
 
 /**
  * Test-only helper that creates a ModuleContext and SpanBuffer in one call.
- * This replaces the old createTestTaskContext pattern.
  *
  * @returns Object with module and spanBuffer
  */
-export function createTestSpanBuffer<T extends SchemaFields | LogSchema>(
-  schema: T,
+export function createTestSpanBuffer(
+  schema: SchemaFields | LogSchema,
   options: {
     gitSha?: string;
     packageName?: string;

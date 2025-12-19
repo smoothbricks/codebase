@@ -136,7 +136,7 @@ export const systemSchema: DefinedLogSchema<SystemSchemaFieldTypes> = defineLogS
  *
  * Warns if user schema conflicts with system schema fields.
  */
-export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSchema: T): typeof systemSchema & T {
+export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSchema: T): SystemSchemaFieldTypes & T {
   // Check for conflicts between user schema and system schema
   // Use fieldNames to get only actual field names, not ColumnSchema properties or methods
   const systemKeys = new Set(systemSchema.fieldNames);
@@ -161,7 +161,7 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
   return {
     ...systemSchema.fields,
     ...userSchema,
-  } as typeof systemSchema & T;
+  } as SystemSchemaFieldTypes & T;
 }
 
 // =============================================================================

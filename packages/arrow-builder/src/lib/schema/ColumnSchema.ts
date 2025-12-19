@@ -87,7 +87,10 @@ export class ColumnSchema<T extends SchemaFields = SchemaFields> {
    * Used for type guards and instanceof checks
    */
   static isColumnSchema(value: unknown): value is ColumnSchema {
-    return value instanceof ColumnSchema;
+    return (
+      value instanceof ColumnSchema ||
+      (value != null && typeof value === 'object' && 'fieldNames' in value && 'fieldEntries' in value)
+    );
   }
 }
 

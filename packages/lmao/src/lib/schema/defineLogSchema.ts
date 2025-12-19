@@ -67,14 +67,10 @@ export declare const DEFINED_LOG_SCHEMA_BRAND: unique symbol;
  * The brand marker allows InferSchema to detect when it receives a
  * DefinedLogSchema and extract the original schema type T for inference.
  */
-export type DefinedLogSchema<T extends SchemaFields> = T &
-  Pick<LogSchema<T>, 'fieldEntries' | 'fieldCount' | 'fieldNames' | 'fields' | 'extend'> & {
-    validate: (data: unknown) => InferSchema<T>;
-    parse: (data: unknown) => InferSchema<T> | null;
-    safeParse: (data: unknown) => { success: true; value: InferSchema<T> } | { success: false; error: Error };
-    /** Brand marker - never actually set, only for type discrimination */
-    readonly [DEFINED_LOG_SCHEMA_BRAND]?: T;
-  };
+export type DefinedLogSchema<T extends SchemaFields> = LogSchema<T> & {
+  /** Brand marker - never actually set, only for type discrimination */
+  readonly [DEFINED_LOG_SCHEMA_BRAND]?: T;
+};
 
 /**
  * Options for defineLogSchema
@@ -88,10 +84,7 @@ export interface DefineLogSchemaOptions {
   _skipReservedNameValidation?: boolean;
 }
 
-export function defineLogSchema<T extends SchemaFields>(
-  schema: T,
-  options?: DefineLogSchemaOptions,
-): DefinedLogSchema<T> {
+export function defineLogSchema<T extends SchemaFields>(schema: T, options?: DefineLogSchemaOptions): LogSchema<T> {
   // Wrap user input into LogSchema first
   const logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
 
@@ -154,5 +147,5 @@ export function defineLogSchema<T extends SchemaFields>(
   }
 
   // Return logSchema (still a LogSchema instance with added methods)
-  return result as DefinedLogSchema<T>;
+  return result as LogSchema<T>;
 }

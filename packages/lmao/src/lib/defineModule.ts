@@ -22,7 +22,7 @@ import {
   type InferFeatureFlagsWithContext,
 } from './schema/evaluator.js';
 import { LogSchema } from './schema/LogSchema.js';
-import { mergeWithSystemSchema } from './schema/systemSchema.js';
+import { mergeWithSystemSchema, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
 import type { SpanContext } from './spanContext.js';
 import { getThreadId } from './threadId.js';
@@ -245,6 +245,10 @@ export interface PrefixedModule<
    * Wire dependencies
    */
   use(wiredDeps: Record<string, unknown>): BoundModule<T, FF, Extra>;
+  /**
+   * Original log schema for chaining prefixes
+   */
+  readonly _originalLogSchema: LogSchema<T>;
 }
 
 /**
@@ -256,7 +260,7 @@ export interface BoundModule<
   T extends SchemaFields,
   FF extends FeatureFlagSchema,
   Extra extends Record<string, unknown>,
-> {
+> extends Module<T, FF, Extra> {
   /**
    * Create a root span directly (without traceContext)
    *
@@ -359,12 +363,15 @@ interface BuilderState<T extends SchemaFields, FF extends FeatureFlagSchema> {
   ff?: FF;
   moduleContext: ModuleContext;
   schemaOnly: SchemaFields;
+  // Pre-computed property order for V8 hidden class optimization
+  extraPropertyOrder?: string[];
 }
 
 /**
  * Builder after .ctx<Extra>(defaults) is called
  */
-interface CtxBuilder<T extends SchemaFields, FF extends FeatureFlagSchema, Extra extends Record<string, unknown>> {
+interface CtxBuilder<T extends SchemaFields, FF extends FeatureFlagSchema, Extra extends Record<string, unknown>>
+  extends Module<T, FF, Extra> {
   /**
    * Finalize the module with optional ff evaluator
    */
@@ -374,7 +381,8 @@ interface CtxBuilder<T extends SchemaFields, FF extends FeatureFlagSchema, Extra
 /**
  * Initial builder returned by defineModule()
  */
-interface DefineModuleBuilder<T extends SchemaFields, FF extends FeatureFlagSchema> {
+interface DefineModuleBuilder<T extends SchemaFields, FF extends FeatureFlagSchema>
+  extends Module<T, FF, Record<string, unknown>> {
   /**
    * Define Extra context properties with defaults
    *
@@ -390,24 +398,7 @@ interface DefineModuleBuilder<T extends SchemaFields, FF extends FeatureFlagSche
    *
    * The type system enforces required/optional based on Extra type's `?` markers, not the defaults values.
    */
-  ctx<Extra extends Record<string, unknown>>(
-    defaults: ValidateExtra<Extra>,
-  ): CtxBuilder<T, FF, Extra> & Module<T, FF, Extra>;
-
-  // Also expose Module interface directly (when .ctx() is not called)
-  readonly metadata: ModuleMetadata;
-  readonly module: ModuleContext;
-  readonly sb_capacity: number;
-  readonly sb_totalWrites: number;
-  readonly sb_overflows: number;
-  readonly sb_overflowWrites: number;
-  readonly sb_totalCreated: number;
-  traceContext(params: TraceContextParams<FF, Record<string, unknown>>): TraceContext<FF, Record<string, unknown>>;
-  op<Args extends unknown[], R>(
-    name: string,
-    fn: OpFunction<Args, R, LogSchema<T>, FF, Record<string, unknown>, Record<string, unknown>>,
-    line?: number,
-  ): Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Record<string, unknown>, Args, R>;
+  ctx<Extra extends Record<string, unknown>>(defaults: ValidateExtra<Extra>): CtxBuilder<T, FF, Extra>;
 }
 
 // =============================================================================
@@ -491,6 +482,7 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
     ff: options.ff,
     moduleContext,
     schemaOnly,
+    extraPropertyOrder: undefined, // Will be set when ctx() is called
   };
 
   /**
@@ -499,6 +491,7 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
   function createModule<Extra extends Record<string, unknown>>(
     extraDefaults: Extra | undefined,
     ffEvaluator?: FlagEvaluator,
+    extraPropertyOrder?: string[],
   ): Module<T, FF, Extra> {
     // Use provided evaluator or create default
     const evaluator = ffEvaluator ?? new DefaultValueFlagEvaluator(state.ff);
@@ -578,9 +571,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         // RootSpanFn is a function type with overloads, so we cast the implementation
         ctx.span = spanImpl as unknown as RootSpanFn;
 
-        // Assign user properties
-        if (extraDefaults) {
-          for (const key of Object.keys(extraDefaults)) {
+        // Assign user properties in fixed order for V8 hidden class optimization
+        if (extraDefaults && extraPropertyOrder && extraPropertyOrder.length > 0) {
+          for (const key of extraPropertyOrder) {
             if (key in userProps) {
               (ctx as Record<string, unknown>)[key] = (userProps as Record<string, unknown>)[key];
             } else {
@@ -588,7 +581,8 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
             }
           }
         }
-        // Also copy any extra user props not in defaults
+        // Also copy any extra user props not in defaults (maintains backward compatibility)
+        // Note: This can break V8 hidden class optimization for objects with extra properties
         for (const key of Object.keys(userProps)) {
           if (!(key in ctx)) {
             (ctx as Record<string, unknown>)[key] = (userProps as Record<string, unknown>)[key];
@@ -662,13 +656,17 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         };
 
         // Get original unprefixed schema (before prefixing)
-        const originalSchema = state.logSchema;
+        // For chaining, check if this is already a PrefixedModule
+        const self = this as unknown as { _prefix?: string; _originalLogSchema?: LogSchema };
+        const isChaining = self._prefix != null;
+        const originalSchema = isChaining ? self._originalLogSchema || state.logSchema : state.logSchema;
+        const finalPrefix = isChaining ? `${self._prefix}_${prefix}` : prefix;
 
         // Apply prefix to schema
-        const prefixedSchema = prefixSchema(originalSchema, prefix);
+        const prefixedSchema = prefixSchema(originalSchema, finalPrefix);
 
         // Create prefix mapping: unprefixed → prefixed (e.g., { status: 'http_status' })
-        const prefixMapping = createPrefixMapping(originalSchema, prefix);
+        const prefixMapping = createPrefixMapping(originalSchema, finalPrefix);
 
         // Invert mapping for RemappedBufferView: prefixed → unprefixed (e.g., { 'http_status': 'status' })
         const invertedMapping: Record<string, string> = {};
@@ -709,8 +707,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
 
         return {
           ...prefixedModule,
-          _prefix: prefix,
-        } as PrefixedModule<T, FF, Extra, P>;
+          _prefix: finalPrefix as P,
+          _originalLogSchema: originalSchema, // Store original for chaining
+        } as unknown as PrefixedModule<T, FF, Extra, P>;
       },
 
       /**
@@ -720,8 +719,42 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
        * Returns BoundModule with span() method
        */
       use(wiredDeps: Record<string, unknown>): BoundModule<T, FF, Extra> {
+        // Merge schemas from wired dependencies into the main module schema
+        let mergedSchema = state.logSchema;
+        const mergedFieldNames = new Set(state.logSchema.fieldNames);
+        if (wiredDeps) {
+          for (const dep of Object.values(wiredDeps)) {
+            if (dep && typeof dep === 'object' && 'module' in dep) {
+              const depModule = (dep as { module: { logSchema: LogSchema } }).module;
+              if (depModule.logSchema) {
+                // Filter out system fields and already merged fields from dependency schema
+                const depFields: Record<string, unknown> = {};
+                for (const [fieldName, fieldSchema] of depModule.logSchema.fieldEntries()) {
+                  if (!SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName) && !mergedFieldNames.has(fieldName)) {
+                    depFields[fieldName] = fieldSchema;
+                    mergedFieldNames.add(fieldName);
+                  }
+                }
+                if (Object.keys(depFields).length > 0) {
+                  mergedSchema = mergedSchema.extend(depFields as SchemaFields);
+                }
+              }
+            }
+          }
+        }
+
+        // Create new module context with merged schema
+        const mergedModuleContext = new ModuleContext(
+          state.metadata.gitSha ?? 'unknown',
+          state.metadata.packageName,
+          state.metadata.packagePath,
+          mergedSchema,
+        );
+        // Copy deps and other properties
+        (mergedModuleContext as unknown as { deps?: Record<string, unknown> }).deps = wiredDeps;
+
         // Store wired deps in state for use in span context
-        const boundState = { ...state, deps: wiredDeps };
+        const boundState = { ...state, deps: wiredDeps, logSchema: mergedSchema, moduleContext: mergedModuleContext };
 
         // Implementation that handles both overloads
         const spanImpl = <R, Args extends unknown[]>(
@@ -753,8 +786,10 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
           );
         };
 
-        // Create bound module with span method supporting both overloads
+        // Create bound module with span method and merged module context
         const boundModule: BoundModule<T, FF, Extra> = {
+          ...this, // Include all module properties
+          module: mergedModuleContext, // Override with merged module context
           // TypeScript doesn't support overloads in object literals, so we use a function
           // that handles both cases internally
           span: spanImpl as BoundModule<T, FF, Extra>['span'],
@@ -765,18 +800,23 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
     };
   }
 
+  // Create a module with default empty Extra for when .ctx() is not called
+  const defaultModule = createModule<Record<string, unknown>>(undefined, undefined);
+
   // Return the builder
   const builder: DefineModuleBuilder<T, FF> = {
-    ctx<Extra extends Record<string, unknown>>(
-      defaults: ValidateExtra<Extra>,
-    ): CtxBuilder<T, FF, Extra> & Module<T, FF, Extra> {
-      // The returned object has both .make() and all Module methods
-      const module = createModule<Extra>(defaults as Extra, undefined);
+    ...defaultModule,
 
+    ctx<Extra extends Record<string, unknown>>(defaults: ValidateExtra<Extra>): CtxBuilder<T, FF, Extra> {
+      // Pre-compute property order for V8 hidden class optimization
+      const extraPropertyOrder = Object.keys(defaults);
+
+      // Return CtxBuilder which extends Module and adds .make()
+      const module = createModule<Extra>(defaults as Extra, undefined, extraPropertyOrder);
       return {
         ...module,
         make(opts?: { ffEvaluator?: FlagEvaluator }) {
-          return createModule<Extra>(defaults as Extra, opts?.ffEvaluator);
+          return createModule<Extra>(defaults as Extra, opts?.ffEvaluator, extraPropertyOrder);
         },
       };
     },
@@ -804,16 +844,12 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
       return state.moduleContext.sb_totalCreated;
     },
 
-    traceContext(params: TraceContextParams<FF, Record<string, unknown>>): TraceContext<FF, Record<string, unknown>> {
-      return createModule<Record<string, unknown>>(undefined, undefined).traceContext(params);
+    prefix<P extends string>(prefix: P): PrefixedModule<T, FF, Record<string, unknown>, P> {
+      return createModule<Record<string, unknown>>(undefined, undefined).prefix(prefix);
     },
 
-    op<Args extends unknown[], R>(
-      name: string,
-      fn: OpFunction<Args, R, LogSchema<T>, FF, Record<string, unknown>, Record<string, unknown>>,
-      line?: number,
-    ): Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Record<string, unknown>, Args, R> {
-      return createModule<Record<string, unknown>>(undefined, undefined).op(name, fn, line);
+    use(wiredDeps: Record<string, unknown>): BoundModule<T, FF, Record<string, unknown>> {
+      return createModule<Record<string, unknown>>(undefined, undefined).use(wiredDeps);
     },
   };
 

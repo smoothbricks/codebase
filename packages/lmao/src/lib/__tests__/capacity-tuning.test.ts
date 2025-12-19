@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
+import fc from 'fast-check';
 import { shouldTuneCapacity } from '../defineModule.js';
 import { ModuleContext } from '../moduleContext.js';
 
@@ -353,6 +354,185 @@ describe('Capacity Tuning Algorithm', () => {
       module.sb_totalCreated = 10;
       shouldTuneCapacity(module);
       expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+    });
+  });
+
+  describe('Property-Based Testing for Self-Tuning Formulas', () => {
+    it('should verify all mathematical invariants for arbitrary inputs', () => {
+      fc.assert(
+        fc.property(
+          fc.record({
+            totalWrites: fc.integer({ min: 0, max: 10000 }),
+            overflowWrites: fc.integer({ min: 0, max: 5000 }),
+            totalCreated: fc.integer({ min: 0, max: 1000 }),
+            initialCapacity: fc.constantFrom(8, 16, 32, 64, 128, 256, 512, 1024),
+          }),
+          ({ totalWrites, overflowWrites, totalCreated, initialCapacity }) => {
+            // Set up module state
+            module.sb_totalWrites = totalWrites;
+            module.sb_overflowWrites = overflowWrites;
+            module.sb_totalCreated = totalCreated;
+            module.sb_capacity = initialCapacity;
+
+            const beforeCapacity = module.sb_capacity;
+            shouldTuneCapacity(module);
+            const afterCapacity = module.sb_capacity;
+
+            // Core invariants that must always hold
+            expect(afterCapacity).toBeGreaterThanOrEqual(8);
+            expect(afterCapacity).toBeLessThanOrEqual(1024);
+            expect(afterCapacity & (afterCapacity - 1)).toBe(0); // Power of 2
+
+            // Verify exact behavior matches specification
+            const overflowRatio = totalWrites > 0 ? overflowWrites / totalWrites : 0;
+            const hasEnoughSamples = totalWrites >= 100;
+            const hasManyBuffers = totalCreated >= 10;
+
+            if (hasEnoughSamples) {
+              if (overflowRatio > 0.15 && beforeCapacity < 1024) {
+                expect(afterCapacity).toBe(Math.min(beforeCapacity * 2, 1024));
+              } else if (overflowRatio < 0.05 && hasManyBuffers && beforeCapacity > 8) {
+                expect(afterCapacity).toBe(Math.max(8, beforeCapacity / 2));
+              } else {
+                expect(afterCapacity).toBe(beforeCapacity);
+              }
+            } else {
+              expect(afterCapacity).toBe(beforeCapacity);
+            }
+
+            // Stats reset invariant
+            if (afterCapacity !== beforeCapacity) {
+              expect(module.sb_totalWrites).toBe(0);
+              expect(module.sb_overflowWrites).toBe(0);
+              expect(module.sb_totalCreated).toBe(0);
+            }
+          },
+        ),
+        { numRuns: 1000 },
+      );
+    });
+
+    it('should verify the specific failing case from property testing', () => {
+      // Reproduce the exact counterexample that exposed the analysis bug
+      module.sb_totalWrites = 104; // 13 spans * 8 entries each
+      module.sb_overflowWrites = 0; // No overflow
+      module.sb_totalCreated = 18; // 5 initial + 13 spans created
+      module.sb_capacity = 64; // Start capacity
+
+      // Verify conditions before tuning
+      const overflowRatio = module.sb_totalWrites > 0 ? module.sb_overflowWrites / module.sb_totalWrites : 0;
+      const hasEnoughSamples = module.sb_totalWrites >= 100;
+      const hasManyBuffers = module.sb_totalCreated >= 10;
+
+      const beforeCapacity = module.sb_capacity;
+      shouldTuneCapacity(module);
+      const afterCapacity = module.sb_capacity;
+
+      console.log('Failing case analysis:');
+      console.log('  totalWrites:', module.sb_totalWrites);
+      console.log('  overflowWrites:', module.sb_overflowWrites);
+      console.log('  overflowRatio:', overflowRatio);
+      console.log('  totalCreated:', module.sb_totalCreated);
+      console.log('  hasEnoughSamples:', hasEnoughSamples);
+      console.log('  hasManyBuffers:', hasManyBuffers);
+      console.log('  beforeCapacity:', beforeCapacity);
+      console.log('  afterCapacity:', afterCapacity);
+
+      // All conditions for shrinking are met:
+      expect(hasEnoughSamples).toBe(true); // 104 >= 100
+      expect(overflowRatio < 0.05).toBe(true); // 0 < 0.05
+      expect(hasManyBuffers).toBe(true); // 18 >= 10
+      expect(beforeCapacity > 8).toBe(true); // 64 > 8
+
+      // Therefore, capacity SHOULD shrink from 64 to 32
+      expect(afterCapacity).toBe(32); // Implementation IS correct
+      expect(module.sb_totalWrites).toBe(0); // Stats should reset
+      expect(module.sb_overflowWrites).toBe(0);
+      expect(module.sb_totalCreated).toBe(0);
+    });
+
+    it('should verify boundary conditions with precision', () => {
+      fc.assert(
+        fc.property(
+          fc.record({
+            totalWrites: fc.integer({ min: 95, max: 105 }), // Around sample boundary
+            overflowRatio: fc.double({ min: -0.1, max: 0.3 }).filter((n) => !isNaN(n)),
+            totalCreated: fc.integer({ min: 8, max: 12 }), // Around buffer boundary
+            initialCapacity: fc.constantFrom(8, 16, 32, 64, 128, 256, 512, 1024),
+          }),
+          ({ totalWrites, overflowRatio, totalCreated, initialCapacity }) => {
+            const overflowWrites = Math.max(0, Math.floor(totalWrites * Math.max(0, overflowRatio)));
+
+            module.sb_totalWrites = totalWrites;
+            module.sb_overflowWrites = overflowWrites;
+            module.sb_totalCreated = totalCreated;
+            module.sb_capacity = initialCapacity;
+
+            shouldTuneCapacity(module);
+
+            // Verify capacity respects boundaries
+            expect(module.sb_capacity).toBeGreaterThanOrEqual(8);
+            expect(module.sb_capacity).toBeLessThanOrEqual(1024);
+            expect(module.sb_capacity & (module.sb_capacity - 1)).toBe(0);
+          },
+        ),
+        { numRuns: 500 },
+      );
+    });
+
+    it('should handle extreme workload patterns', () => {
+      fc.assert(
+        fc.property(
+          fc.array(
+            fc.record({
+              writes: fc.integer({ min: 50, max: 1000 }),
+              overflows: fc.integer({ min: 0, max: 500 }),
+              buffers: fc.integer({ min: 1, max: 50 }),
+            }),
+            { minLength: 3, maxLength: 10 },
+          ),
+          (periods) => {
+            // Reset module
+            module.sb_capacity = DEFAULT_BUFFER_CAPACITY;
+            module.sb_totalWrites = 0;
+            module.sb_overflowWrites = 0;
+            module.sb_totalCreated = 0;
+
+            const capacityChanges: number[] = [];
+
+            for (const period of periods) {
+              module.sb_totalWrites += period.writes;
+              module.sb_overflowWrites += period.overflows;
+              module.sb_totalCreated += period.buffers;
+
+              const before = module.sb_capacity;
+              shouldTuneCapacity(module);
+              const after = module.sb_capacity;
+
+              if (before !== after) {
+                capacityChanges.push(after);
+                // Verify power-of-2 changes
+                expect([0.5, 2]).toContain(after / before);
+              }
+            }
+
+            // Final state should be reasonable
+            const totalWrites = periods.reduce((sum, p) => sum + p.writes, 0);
+            const totalOverflows = periods.reduce((sum, p) => sum + p.overflows, 0);
+            const overallRatio = totalWrites > 0 ? totalOverflows / totalWrites : 0;
+
+            if (overallRatio > 0.15) {
+              expect(module.sb_capacity).toBeGreaterThanOrEqual(DEFAULT_BUFFER_CAPACITY);
+            } else if (overallRatio < 0.05) {
+              expect(module.sb_capacity).toBeLessThanOrEqual(DEFAULT_BUFFER_CAPACITY);
+            }
+
+            // Should maintain power-of-2 invariant
+            expect(module.sb_capacity & (module.sb_capacity - 1)).toBe(0);
+          },
+        ),
+        { numRuns: 100 },
+      );
     });
   });
 });
