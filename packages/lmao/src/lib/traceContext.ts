@@ -1,0 +1,164 @@
+/**
+ * TraceContext Types and Prototype System
+ *
+ * Per specs/01c_context_flow_and_task_wrappers.md and specs/01l_module_builder_pattern.md:
+ * - TraceContext is created via module.traceContext() at request entry
+ * - Uses prototype-based inheritance for V8 hidden class optimization
+ * - Contains system properties (traceId, timestamps, threadId) + user Extra
+ */
+
+import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
+import type { FeatureFlagEvaluator } from './schema/evaluator.js';
+
+// =============================================================================
+// Reserved Keys
+// =============================================================================
+
+/**
+ * Reserved keys that Extra cannot contain (compile-time enforcement)
+ *
+ * Per spec 01l lines 379-386
+ */
+export type ReservedTraceContextKeys = 'traceId' | 'anchorEpochMicros' | 'anchorPerfNow' | 'threadId' | 'ff' | 'span';
+
+// =============================================================================
+// Op Type (imported from op.ts)
+// =============================================================================
+
+/**
+ * Op type - traced operation
+ *
+ * Imported from op.ts to break circular dependency.
+ * The actual Op class is defined in op.ts.
+ */
+import type { Op } from './op.js';
+
+export type { Op } from './op.js';
+
+// =============================================================================
+// RootSpanFn Type
+// =============================================================================
+
+/**
+ * Function type for ctx.span() at the root level
+ *
+ * Per spec 01c lines 243-244 and experiment exp7-full-ctx.ts lines 253-259:
+ * Supports both with and without line number (transformer injects line number)
+ *
+ * The first argument (lineNumber) is injected by the transformer.
+ */
+export type RootSpanFn = {
+  // Overload 1: With line number (transformer output)
+  <Ctx, R, Args extends unknown[]>(line: number, name: string, op: Op<Ctx, Args, R>, ...args: Args): Promise<R>;
+  // Overload 2: Without line number (user writes)
+  <Ctx, R, Args extends unknown[]>(name: string, op: Op<Ctx, Args, R>, ...args: Args): Promise<R>;
+};
+
+// =============================================================================
+// TraceContext Interface
+// =============================================================================
+
+/**
+ * TraceContext system properties - root context created via module.traceContext()
+ *
+ * Per spec 01c lines 206-216 and 01l lines 369-377:
+ * - System properties are auto-generated and cannot be overridden via Extra
+ *
+ * @typeParam FF - Feature flag schema type
+ */
+export interface TraceContextSystem<FF extends FeatureFlagSchema> {
+  // System properties (always present, auto-generated)
+  readonly traceId: string;
+  readonly anchorEpochMicros: number; // Nanoseconds.now() / 1000n at trace root (microsecond precision)
+  readonly anchorPerfNow: number; // performance.now() at trace root
+  readonly threadId: bigint; // 64-bit random ID per worker/process
+  readonly ff: FeatureFlagEvaluator<FF>;
+  readonly span: RootSpanFn;
+}
+
+/**
+ * TraceContext - system properties + user Extra
+ *
+ * Per spec 01c lines 215-216:
+ * ```typescript
+ * interface TraceContext<FF, Extra> { ... } & Extra;
+ * ```
+ *
+ * Extra properties are spread via intersection at usage site.
+ *
+ * @typeParam FF - Feature flag schema type
+ * @typeParam Extra - User-defined properties (e.g., requestId, userId, env)
+ */
+export type TraceContext<FF extends FeatureFlagSchema, Extra extends Record<string, unknown>> = TraceContextSystem<FF> &
+  Extra;
+
+// =============================================================================
+// Prototype System for V8 Hidden Class Optimization
+// =============================================================================
+
+/**
+ * Internal symbol to mark contexts as prototype-based
+ * Used for type guards and instanceof-like checks
+ */
+export const TRACE_CONTEXT_MARKER = Symbol.for('lmao.TraceContext');
+
+/**
+ * Base prototype interface for all trace contexts.
+ *
+ * Per specs/01c_context_flow_and_task_wrappers.md:
+ * - Methods are defined ONCE on a shared prototype
+ * - Object.create() is used for inheritance (no object spreads)
+ * - Properties are assigned directly for stable hidden classes
+ *
+ * This is used internally and should not be accessed directly.
+ */
+export interface TraceContextBase {
+  /** Marker for prototype chain detection */
+  readonly [TRACE_CONTEXT_MARKER]: true;
+  /** Trace ID for this context */
+  traceId: string;
+  /** Epoch microseconds when trace started */
+  anchorEpochMicros: number;
+  /** performance.now() when trace started */
+  anchorPerfNow: number;
+  /** 64-bit random ID per worker/process */
+  threadId: bigint;
+  /** Feature flag evaluator */
+  ff: unknown;
+  /** Root span function */
+  span: unknown;
+}
+
+/**
+ * The shared prototype object for TraceContext.
+ *
+ * Per V8 optimization guidelines:
+ * - Define methods ONCE on prototype, not per-instance
+ * - Use Object.create() for inheritance chains
+ * - Avoid object spreads which break hidden classes
+ */
+export const TraceContextProto: TraceContextBase = {
+  [TRACE_CONTEXT_MARKER]: true,
+  traceId: undefined as unknown as string,
+  anchorEpochMicros: undefined as unknown as number,
+  anchorPerfNow: undefined as unknown as number,
+  threadId: undefined as unknown as bigint,
+  ff: undefined,
+  span: undefined,
+};
+
+// =============================================================================
+// Type Guard
+// =============================================================================
+
+/**
+ * Type guard to check if a value is a TraceContext
+ */
+export function isTraceContext(value: unknown): value is TraceContext<FeatureFlagSchema, Record<string, unknown>> {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    TRACE_CONTEXT_MARKER in value &&
+    (value as Record<symbol, unknown>)[TRACE_CONTEXT_MARKER] === true
+  );
+}
