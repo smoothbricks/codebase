@@ -1008,16 +1008,9 @@ export function convertSpanTreeToArrowTable(
           }
         }
       }
-      // Also add scope values to dictionary (they need to be in dictionary to be usable)
-      const scopeValue = buffer.scopeValues?.[fieldName] as string | undefined;
-      if (scopeValue !== undefined) {
-        let maskedValue = originalToMasked.get(scopeValue);
-        if (maskedValue === undefined) {
-          maskedValue = maskTransform ? maskTransform(scopeValue) : scopeValue;
-          originalToMasked.set(scopeValue, maskedValue);
-        }
-        builder.add(maskedValue);
-      }
+      // Scope values are now pre-filled in columns at allocation time
+      // (via lazy getters and _prefillScopedAttributes on overflow),
+      // so they'll be added to dictionary via the column iteration above
     }
 
     for (const [fieldName, builder] of textBuilders) {
@@ -1040,16 +1033,9 @@ export function convertSpanTreeToArrowTable(
           }
         }
       }
-      // Also add scope values to dictionary (they need to be in dictionary to be usable)
-      const scopeValue = buffer.scopeValues?.[fieldName] as string | undefined;
-      if (scopeValue !== undefined) {
-        let maskedValue = originalToMasked.get(scopeValue);
-        if (maskedValue === undefined) {
-          maskedValue = maskTransform ? maskTransform(scopeValue) : scopeValue;
-          originalToMasked.set(scopeValue, maskedValue);
-        }
-        builder.add(maskedValue);
-      }
+      // Scope values are now pre-filled in columns at allocation time
+      // (via lazy getters and _prefillScopedAttributes on overflow),
+      // so they'll be added to dictionary via the column iteration above
     }
   });
 
@@ -1269,7 +1255,7 @@ function convertBuffersWithSharedDicts(
   categoryDicts: Map<string, FinalizedDictionary>,
   textDicts: Map<string, FinalizedDictionary>,
   _attrDictIds: Map<string, number>,
-  lmaoSchema: Record<string, unknown>,
+  _lmaoSchema: Record<string, unknown>,
   schemaFields: Array<[string, unknown]>,
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
@@ -1706,42 +1692,26 @@ function convertBuffersWithSharedDicts(
       let nullCount = 0;
       let rowOffset = 0;
 
+      // Scope values are pre-filled in columns at allocation time
+      // (via lazy getters and _prefillScopedAttributes on overflow),
+      // so we just read column values directly
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
-        // Check if this buffer has a scope value for this field
-        const scopeValue = buf.scopeValues?.[fieldName] as string | undefined;
-        let scopeEncodedValue: number | undefined;
-        if (scopeValue !== undefined) {
-          const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
-          scopeEncodedValue = dict.indexMap.get(maskedScopeValue);
-        }
 
         if (col) {
           for (let i = 0; i < buf.writeIndex; i++) {
             const v = col[i];
             const rowIdx = rowOffset + i;
             if (v != null) {
-              // Direct write wins - look up the masked value
               const maskedValue = originalToMasked.get(v) ?? v;
               indices[rowIdx] = dict.indexMap.get(maskedValue) ?? 0;
-              nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-            } else if (scopeEncodedValue !== undefined) {
-              // No direct write, but have scope value - use it
-              indices[rowIdx] = scopeEncodedValue;
               nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
             } else {
               nullCount++;
             }
           }
-        } else if (scopeEncodedValue !== undefined) {
-          // Column not allocated but we have scope - fill all rows with scope value
-          for (let i = 0; i < buf.writeIndex; i++) {
-            const rowIdx = rowOffset + i;
-            indices[rowIdx] = scopeEncodedValue;
-            nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-          }
         } else {
-          // No column and no scope - all nulls
+          // Column not allocated - all nulls
           nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;

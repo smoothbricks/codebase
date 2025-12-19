@@ -10,6 +10,7 @@ export * from './lib/buffer/createBuilders.js';
 export * from './lib/buffer/createColumnBuffer.js';
 export * from './lib/buffer/microseconds.js';
 export * from './lib/buffer/Nanoseconds.js';
+export * from './lib/buffer/scopeFill.js';
 export * from './lib/buffer/types.js';
 export * from './lib/schema/index.js';
 export * from './lib/schema-types.js';

@@ -90,8 +90,6 @@ export * from './lib/schema/types.js';
 
 export type { ResultWriter, TagWriter } from './lib/codegen/fixedPositionWriterGenerator.js';
 export { createResultWriter, createTagWriter } from './lib/codegen/fixedPositionWriterGenerator.js';
-export type { GeneratedScope, ScopeClass } from './lib/codegen/scopeGenerator.js';
-export { createScope, createScopeWithInheritance, generateScopeClass } from './lib/codegen/scopeGenerator.js';
 export type { BaseSpanLogger } from './lib/codegen/spanLoggerGenerator.js';
 export { createSpanLogger, createSpanLoggerClass } from './lib/codegen/spanLoggerGenerator.js';
 

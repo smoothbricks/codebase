@@ -30,7 +30,6 @@ import { createNextBuffer as createNextSpanBuffer } from '../spanBuffer.js';
 // Import timestamp function - will be injected as dependency
 import { getTimestampNanos } from '../timestamp.js';
 import type { SpanBuffer } from '../types.js';
-import type { GeneratedScope } from './scopeGenerator.js';
 
 /**
  * SpanLogger interface with logging methods and schema-specific attribute setters.
@@ -70,7 +69,7 @@ export type BaseSpanLogger<T extends LogSchema> = ColumnWriter<T> & {
   warn(message: string): FluentLogEntry<T>;
   error(message: string): FluentLogEntry<T>;
   trace(message: string): FluentLogEntry<T>;
-  _getScope(): GeneratedScope;
+  readonly scope: Readonly<Record<string, unknown>>;
   _setScope(attributes: Partial<InferTagAttributes<T>>): void;
 };
 
@@ -124,21 +123,11 @@ function generateEnumFluentSetters(enumFieldNames: Set<string>): string {
  * - Child spans inherit parent scope by reference (safe because immutable)
  * - Scope filling happens at Arrow conversion time, NOT during span execution
  */
-function generateSetScopeMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
-  const scopeUpdates = schemaFields.map(([fieldName]) => {
-    return `
-      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
-        this._scope.${fieldName} = attributes.${fieldName};
-      }`;
-  });
-
+function generateSetScopeMethod(): string {
   // Immutable scope: create new frozen object with merge semantics and null clearing
   // No buffer pre-filling - scope values are filled at Arrow conversion time via SIMD
   return `
     _setScope(attributes) {
-      ${scopeUpdates.join('\n')}
-      
-      // Immutable scope semantics: create new frozen object
       const current = this._buffer.scopeValues || {};
       const next = { ...current };
       
@@ -167,7 +156,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
     if (lmaoType === 'boolean') {
       return `
       {
-        const scopeValue = this._scope.${fieldName};
+        const scopeValue = this._buffer.scopeValues?.${fieldName};
         if (scopeValue !== null && scopeValue !== undefined) {
           helpers.fillBooleanBitmapRange(this._buffer.${columnName}_values, startIdx, endIdx, scopeValue);
           helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
@@ -185,7 +174,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
     if (lmaoType === 'category' || lmaoType === 'text') {
       return `
       {
-        const scopeValue = this._scope.${fieldName};
+        const scopeValue = this._buffer.scopeValues?.${fieldName};
         if (scopeValue !== null && scopeValue !== undefined) {
           const values = this._buffer.${columnName}_values;
           for (let i = startIdx; i < endIdx; i++) {
@@ -198,7 +187,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
 
     return `
       {
-        const scopeValue = this._scope.${fieldName};
+        const scopeValue = this._buffer.scopeValues?.${fieldName};
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.${columnName}_values.fill(${valueExpr}, startIdx, endIdx);
           helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
@@ -235,12 +224,12 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
   }
 
   // Generate methods
-  const setScopeMethod = generateSetScopeMethod(schemaFields, enumFieldNames);
+  const setScopeMethod = generateSetScopeMethod();
   const prefillMethod = generatePrefillScopedAttributesMethod(schemaFields, enumFieldNames);
   const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
 
   return {
-    constructorParams: 'scope, createNextBuffer',
+    constructorParams: 'createNextBuffer',
 
     // Entry type constants (inlined from lmao.ts)
     preamble: `
@@ -259,7 +248,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     constructorCode: `
       this._writeIndex = 1;
       this._buffer.writeIndex = 2;
-      this._scope = scope;
       this._createNextBuffer = createNextBuffer;
       this._inOverflow = false;
 `,
@@ -422,9 +410,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     }
 
     ` +
-      // Get the Scope instance directly.
-      `_getScope() {
-      return this._scope;
+      // Get the scope values from buffer directly.
+      `get scope() {
+      return this._buffer.scopeValues;
     }
 
     ${setScopeMethod}
@@ -547,7 +535,6 @@ const spanLoggerClassCache = new WeakMap<
   LogSchema,
   new (
     buffer: SpanBuffer,
-    scope: GeneratedScope,
     createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
   ) => BaseSpanLogger<LogSchema>
 >();
@@ -567,7 +554,6 @@ export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
 ): new (
   buffer: SpanBuffer,
-  scope: GeneratedScope,
   createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
 ) => BaseSpanLogger<T> {
   // Check cache first
@@ -581,7 +567,6 @@ export function createSpanLoggerClass<T extends LogSchema>(
 
     SpanLoggerClass = WriterClass as unknown as new (
       buffer: SpanBuffer,
-      scope: GeneratedScope,
       createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
     ) => BaseSpanLogger<LogSchema>;
 
@@ -590,23 +575,20 @@ export function createSpanLoggerClass<T extends LogSchema>(
 
   return SpanLoggerClass as new (
     buffer: SpanBuffer,
-    scope: GeneratedScope,
     createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
   ) => BaseSpanLogger<T>;
 }
 
 /**
- * Create a SpanLogger instance for the given buffer and scope.
+ * Create a SpanLogger instance for the given buffer.
  *
  * @param schema - Tag attribute schema
  * @param buffer - SpanBuffer to write to
- * @param scope - Scope instance for scoped attributes
  * @param createNextBuffer - Function to create next buffer on overflow (defaults to createNextSpanBuffer)
  */
 export function createSpanLogger<T extends LogSchema>(
   schema: T,
   buffer: SpanBuffer<T>,
-  scope: GeneratedScope,
   createNextBuffer: (buffer: SpanBuffer<T>) => SpanBuffer<T> = createNextSpanBuffer as unknown as (
     buffer: SpanBuffer<T>,
   ) => SpanBuffer<T>,
@@ -617,10 +599,6 @@ export function createSpanLogger<T extends LogSchema>(
   // SpanBuffer<T> IS a SpanBuffer - the generic is only for compile-time typing.
   return new SpanLoggerClass(
     buffer as unknown as SpanBuffer,
-    scope,
     createNextBuffer as unknown as (buffer: SpanBuffer) => SpanBuffer,
   );
 }
-
-// Re-export types that may be needed by consumers
-export type { GeneratedScope } from './scopeGenerator.js';

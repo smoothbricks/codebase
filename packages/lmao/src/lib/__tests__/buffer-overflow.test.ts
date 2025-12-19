@@ -1,7 +1,6 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
-import { generateScopeClass } from '../codegen/scopeGenerator.js';
 import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { ModuleContext } from '../moduleContext.js';
 import { S } from '../schema/builder.js';
@@ -137,7 +136,6 @@ function expectedBufferCount(numEntries: number, capacity: number, reservedRows:
 
 describe('Buffer Overflow Property Tests', () => {
   let taskContext: TaskContext;
-  let ScopeClass: ReturnType<typeof generateScopeClass>;
 
   beforeEach(() => {
     taskContext = createTestTaskContext();
@@ -146,7 +144,6 @@ describe('Buffer Overflow Property Tests', () => {
     taskContext.module.sb_overflowWrites = 0;
     taskContext.module.sb_totalWrites = 0;
     taskContext.module.sb_totalCreated = 0;
-    ScopeClass = generateScopeClass(testSchema);
   });
 
   describe('Property: Entry Preservation', () => {
@@ -161,8 +158,7 @@ describe('Buffer Overflow Property Tests', () => {
             taskContext.module.sb_totalCreated = 0;
 
             const buffer = createSpanBuffer(testSchema, taskContext);
-            const scope = new ScopeClass();
-            const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+            const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
             // Write entries
             for (let i = 0; i < numEntries; i++) {
@@ -195,8 +191,7 @@ describe('Buffer Overflow Property Tests', () => {
 
           const capacity = DEFAULT_BUFFER_CAPACITY; // 8
           const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
-          const scope = new ScopeClass();
-          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+          const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           // Write entries
           for (let i = 0; i < numEntries; i++) {
@@ -222,8 +217,7 @@ describe('Buffer Overflow Property Tests', () => {
           taskContext.module.sb_totalCreated = 0;
 
           const buffer = createSpanBuffer(testSchema, taskContext);
-          const scope = new ScopeClass();
-          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+          const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -266,8 +260,7 @@ describe('Buffer Overflow Property Tests', () => {
           taskContext.module.sb_totalCreated = 0;
 
           const buffer = createSpanBuffer(testSchema, taskContext);
-          const scope = new ScopeClass();
-          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+          const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
 
@@ -308,8 +301,7 @@ describe('Buffer Overflow Property Tests', () => {
           taskContext.module.sb_totalCreated = 0;
 
           const buffer = createSpanBuffer(testSchema, taskContext);
-          const scope = new ScopeClass();
-          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+          const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -333,8 +325,7 @@ describe('Buffer Overflow Property Tests', () => {
           taskContext.module.sb_totalCreated = 0;
 
           const buffer = createSpanBuffer(testSchema, taskContext);
-          const scope = new ScopeClass();
-          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+          const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -362,8 +353,7 @@ describe('Buffer Overflow Property Tests', () => {
       taskContext.module.sb_overflows = 0;
 
       const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
-      const scope = new ScopeClass();
-      const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+      const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
       // Write exactly usable capacity entries (6 with capacity=8, reserved=2)
       for (let i = 0; i < usableCapacity; i++) {
@@ -383,8 +373,7 @@ describe('Buffer Overflow Property Tests', () => {
       taskContext.module.sb_overflows = 0;
 
       const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
-      const scope = new ScopeClass();
-      const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+      const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
       // Write usable capacity + 1 entries (7 entries)
       for (let i = 0; i < usableCapacity + 1; i++) {
@@ -405,9 +394,8 @@ describe('Buffer Overflow Property Tests', () => {
       taskContext.module.sb_overflows = 0;
 
       const buffer = createSpanBuffer(testSchema, taskContext);
-      const scope = new ScopeClass();
       // Create logger but don't write anything
-      createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+      createSpanLogger(testSchema, buffer, createNextBuffer);
 
       expect(buffer.next).toBeUndefined();
       // Logger constructor sets writeIndex to 2 (after reserved rows)
@@ -430,8 +418,7 @@ describe('Buffer Overflow Property Tests', () => {
             taskContext.module.sb_capacity = capacity; // Set for chained buffers
 
             const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
-            const scope = new ScopeClass();
-            const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+            const logger = createSpanLogger(testSchema, buffer, createNextBuffer);
 
             for (let i = 0; i < numEntries; i++) {
               logger.info(`msg-${i}`).requestId(`req-${i}`);

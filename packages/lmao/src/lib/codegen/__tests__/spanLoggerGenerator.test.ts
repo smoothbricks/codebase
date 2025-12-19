@@ -24,7 +24,6 @@ import {
 import type { LogSchema } from '../../schema/types.js';
 import { createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import type { SpanBuffer } from '../../types.js';
-import { createScope } from '../scopeGenerator.js';
 import { type BaseSpanLogger, createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
 function createTestBuffer(schema: LogSchema): SpanBuffer {
@@ -65,28 +64,27 @@ describe('createSpanLoggerClass', () => {
   });
 
   describe('instance creation', () => {
-    it('should create instance with buffer, scope, and createNextBuffer', () => {
+    it('should create instance with buffer and createNextBuffer', () => {
       const schema = defineLogSchema({
         userId: S.category(),
       });
       const buffer = createTestBuffer(schema);
-      const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
 
-      const logger = new SpanLoggerClass(buffer, scope, createNextBuffer);
+      const logger = new SpanLoggerClass(buffer, createNextBuffer);
 
       expect(logger).toBeDefined();
       expect(logger._buffer).toBe(buffer);
-      expect(logger._getScope()).toBe(scope);
+      // Scope is now accessed via buffer.scopeValues
+      expect(buffer.scopeValues).toBeDefined();
     });
 
     it('should start with _writeIndex = 1', () => {
       const schema = defineLogSchema({});
       const buffer = createTestBuffer(schema);
-      const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
 
-      const logger = new SpanLoggerClass(buffer, scope, createNextBuffer);
+      const logger = new SpanLoggerClass(buffer, createNextBuffer);
 
       expect(logger._writeIndex).toBe(1);
     });
@@ -102,9 +100,8 @@ describe('createSpanLoggerClass', () => {
         userId: S.category(),
       });
       buffer = createTestBuffer(schema);
-      const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      logger = new SpanLoggerClass(buffer, scope, createNextBuffer);
+      logger = new SpanLoggerClass(buffer, createNextBuffer);
     });
 
     it('should increment _writeIndex on info()', () => {
@@ -168,34 +165,34 @@ describe('createSpanLoggerClass', () => {
   });
 
   describe('scope management', () => {
-    it('should update scope values via _setScope', () => {
+    it('should update scope values via _setScope to buffer.scopeValues', () => {
       const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
       });
       const buffer = createTestBuffer(schema);
-      const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scope, createNextBuffer);
+      const logger = new SpanLoggerClass(buffer, createNextBuffer);
 
       logger._setScope({ userId: 'user123' });
 
-      expect(scope.userId).toBe('user123');
-      expect(scope.requestId).toBeUndefined();
+      // Scope is now stored on buffer.scopeValues
+      expect(buffer.scopeValues?.userId).toBe('user123');
+      expect(buffer.scopeValues?.requestId).toBeUndefined();
     });
 
-    it('should return scope via _getScope()', () => {
+    it('should access scope via logger.scope getter', () => {
       const schema = defineLogSchema({
         userId: S.category(),
       });
       const buffer = createTestBuffer(schema);
-      const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scope, createNextBuffer);
+      const logger = new SpanLoggerClass(buffer, createNextBuffer);
 
-      scope.userId = 'test123';
+      logger._setScope({ userId: 'test123' });
 
-      expect(logger._getScope().userId).toBe('test123');
+      // Scope is accessed via logger.scope getter (reads from buffer.scopeValues)
+      expect(logger.scope?.userId).toBe('test123');
     });
   });
 
@@ -207,9 +204,8 @@ describe('createSpanLoggerClass', () => {
         enabled: S.boolean(),
       });
       const buffer = createTestBuffer(schema);
-      const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scope, createNextBuffer);
+      const logger = new SpanLoggerClass(buffer, createNextBuffer);
 
       // Log an entry first to advance writeIndex
       logger.info('Test');
@@ -226,9 +222,8 @@ describe('createSpanLoggerClass', () => {
         userId: S.category(),
       });
       const buffer = createTestBuffer(schema);
-      const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scope, createNextBuffer);
+      const logger = new SpanLoggerClass(buffer, createNextBuffer);
 
       // Log an entry and chain attribute
       logger.info('Test');

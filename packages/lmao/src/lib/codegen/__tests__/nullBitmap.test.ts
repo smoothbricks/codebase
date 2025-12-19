@@ -7,7 +7,7 @@
  * Architecture changes (new design):
  * - SpanLogger handles log entries (rows 2+), NOT tag writes (row 0)
  * - Tag writing is done via ctx.tag which is a separate API (not on SpanLogger)
- * - SpanLogger constructor: (buffer, scope, createNextBuffer)
+ * - SpanLogger constructor: (buffer, createNextBuffer)
  * - SpanLogger._writeIndex starts at 1 (rows 0/1 are reserved for span-start/end)
  * - _setScope() stores scope values in buffer.scopeValues (immutable, frozen)
  * - Scope filling happens at Arrow conversion time, NOT during span execution
@@ -18,10 +18,9 @@ import { describe, expect, it } from 'bun:test';
 import { createTestTaskContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
-import type { SchemaFields } from '../../schema/types.js';
+import type { LogSchema } from '../../schema/types.js';
 import { createSpanBuffer, SpanBufferTestUtils } from '../../spanBuffer.js';
 import type { SpanBuffer } from '../../types.js';
-import { createScope } from '../scopeGenerator.js';
 import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
 /**
@@ -38,6 +37,22 @@ function getBitsSet(nullBitmap: Uint8Array, count: number): boolean[] {
 }
 
 /**
+ * Create a test buffer from a schema
+ */
+function createTestBuffer(schema: LogSchema): SpanBuffer {
+  const taskContext = createTestTaskContext(schema.fields);
+  return createSpanBuffer(schema.fields, taskContext);
+}
+
+/**
+ * Create a test buffer with a specific capacity
+ */
+function createTestBufferWithCapacity(schema: LogSchema, capacity: number): SpanBuffer {
+  const taskContext = createTestTaskContext(schema.fields);
+  return createSpanBuffer(schema.fields, taskContext, undefined, capacity);
+}
+
+/**
  * Mock createNextBuffer that just returns the same buffer (for tests that don't need overflow)
  */
 const mockCreateNextBuffer = (buffer: SpanBuffer): SpanBuffer => buffer;
@@ -47,12 +62,11 @@ describe('null bitmap correctness', () => {
     it('should store scope values in buffer.scopeValues as frozen object', () => {
       const schema = defineLogSchema({
         requestId: S.category(),
-      }) as unknown as SchemaFields;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+      });
+      const buffer = createTestBuffer(schema);
 
-      const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
 
       // _setScope should store values in buffer.scopeValues (not fill buffer columns)
       logger._setScope({ requestId: 'req-123' });
@@ -69,12 +83,11 @@ describe('null bitmap correctness', () => {
       const schema = defineLogSchema({
         requestId: S.category(),
         userId: S.category(),
-      }) as unknown as SchemaFields;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+      });
+      const buffer = createTestBuffer(schema);
 
-      const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
 
       // First setScope call
       logger._setScope({ requestId: 'req-123' });
@@ -102,12 +115,11 @@ describe('null bitmap correctness', () => {
       const schema = defineLogSchema({
         requestId: S.category(),
         userId: S.category(),
-      }) as unknown as SchemaFields;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+      });
+      const buffer = createTestBuffer(schema);
 
-      const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
 
       // Set initial values
       logger._setScope({ requestId: 'req-123', userId: 'user-456' });
@@ -125,12 +137,11 @@ describe('null bitmap correctness', () => {
     it('should NOT fill buffer columns during _setScope (deferred to Arrow conversion)', () => {
       const schema = defineLogSchema({
         requestId: S.category(),
-      }) as unknown as SchemaFields;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+      });
+      const buffer = createTestBuffer(schema);
 
-      const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
 
       // _setScope should NOT fill buffer columns
       logger._setScope({ requestId: 'req-123' });
@@ -152,15 +163,14 @@ describe('null bitmap correctness', () => {
     it('should set correct bit for log entry at index 5', () => {
       const schema = defineLogSchema({
         requestId: S.category(),
-      }) as unknown as SchemaFields;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+      });
+      const buffer = createTestBuffer(schema);
 
-      const scopeInstance = createScope(schema);
-      // Set scope value directly (GeneratedScope has index signature)
-      scopeInstance.requestId = 'req-123';
+      // Set scope value via buffer.scopeValues directly for test setup
+      buffer.scopeValues = Object.freeze({ requestId: 'req-123' });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
 
       // Set _writeIndex to 4 so nextRow() makes it 5
       logger._writeIndex = 4;
@@ -181,16 +191,15 @@ describe('null bitmap correctness', () => {
     it('should set correct bit for log entry at index 9 (crosses byte boundary)', () => {
       const schema = defineLogSchema({
         requestId: S.category(),
-      }) as unknown as SchemaFields;
+      });
       // Need capacity > 9 to test writing at index 9
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 16);
+      const buffer = createTestBufferWithCapacity(schema, 16);
 
-      const scopeInstance = createScope(schema);
-      // Set scope value directly (GeneratedScope has index signature)
-      scopeInstance.requestId = 'req-456';
+      // Set scope value via buffer.scopeValues directly for test setup
+      buffer.scopeValues = Object.freeze({ requestId: 'req-456' });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
 
       // Set _writeIndex to 8 so nextRow() makes it 9
       logger._writeIndex = 8;
