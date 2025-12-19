@@ -25,13 +25,18 @@ export type {
   LazyTextSchema,
   MaskPreset,
   MaskTransform,
+  SchemaFields,
   SchemaType,
   SchemaWithMetadata,
-  TagAttributeSchema,
 } from '@smoothbricks/arrow-builder';
 
+// Re-export ColumnSchema and SchemaFields from arrow-builder for external use
+export { ColumnSchema, isColumnSchema } from '@smoothbricks/arrow-builder';
 // Re-export Sury's core types for external use
 export type { Input, Output, Schema } from '@sury/sury';
+
+// Re-export LogSchema for external use
+export { isLogSchema, LogSchema } from './LogSchema.js';
 
 // Import schema metadata types for use in InferTagAttributes and local type definitions
 import type {
@@ -45,47 +50,55 @@ import type {
   LazyEnumSchema,
   LazyNumberSchema,
   LazyTextSchema,
-  TagAttributeSchema,
+  SchemaFields,
 } from '@smoothbricks/arrow-builder';
-// Import the brand symbol from defineTagAttributes for ExtractOriginalSchema detection
-import type { DEFINED_TAG_ATTRIBUTES_BRAND } from './defineTagAttributes.js';
+import type { DEFINED_LOG_SCHEMA_BRAND } from './defineLogSchema.js';
+import type { LogSchema } from './LogSchema.js';
 
 /**
- * Extract the original schema type from DefinedTagAttributes.
+ * Extract the original schema fields type from LogSchema or DefinedLogSchema.
+ * If T is a LogSchema, extract the fields type.
  * If T has the brand marker, extract the original schema from it.
  * Otherwise, return T unchanged.
  */
-type ExtractOriginalSchema<T extends TagAttributeSchema> = T extends {
-  readonly [DEFINED_TAG_ATTRIBUTES_BRAND]?: infer Original extends TagAttributeSchema;
-}
-  ? Original
-  : T;
+type ExtractSchemaFields<T> = T extends LogSchema<infer Fields>
+  ? Fields
+  : T extends {
+        readonly [DEFINED_LOG_SCHEMA_BRAND]?: infer Original;
+      }
+    ? Original extends SchemaFields
+      ? Original
+      : T extends SchemaFields
+        ? T
+        : never
+    : T extends SchemaFields
+      ? T
+      : never;
 
 /**
  * Filter out function keys from a schema type.
- * Methods like validate, parse, safeParse, extend are added by defineTagAttributes
- * but should not be treated as schema fields.
+ * Methods like validate, parse, safeParse, extend are added by defineLogSchema
+ * but should not be treated as schema fields for iteration.
  *
- * Works on the ORIGINAL schema (without index signature pollution).
+ * Works on LogSchema fields or plain schema objects.
  */
-type SchemaFieldKeys<T extends TagAttributeSchema> = keyof ExtractOriginalSchema<T> extends infer K
-  ? K extends string
-    ? string extends K // Exclude index signature (where K is exactly `string`)
-      ? never
-      : ExtractOriginalSchema<T>[K] extends (...args: unknown[]) => unknown // Exclude functions
-        ? never
-        : K
-    : never
-  : never;
+type SchemaFieldKeys<T> = T extends LogSchema<infer Fields>
+  ? keyof Fields
+  : ExtractSchemaFields<T> extends infer Fields
+    ? keyof Fields extends infer K
+      ? K extends string
+        ? K
+        : never
+      : never
+    : never;
 
 /**
- * Extract TypeScript output types from tag attribute schema
+ * Extract TypeScript output types from log schema
  * This enables full type inference from Sury schemas
  *
  * IMPORTANT: This type must properly infer from schemas with __schema_type metadata
  *
- * For DefinedTagAttributes, uses the brand marker to extract the original schema
- * type before the index signature was added, preserving type inference.
+ * Works with LogSchema instances or plain schema objects.
  *
  * Type resolution order:
  * 1. Check if it's an enum schema -> extract enum type
@@ -97,32 +110,32 @@ type SchemaFieldKeys<T extends TagAttributeSchema> = keyof ExtractOriginalSchema
  *
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
-export type InferTagAttributes<T extends TagAttributeSchema> = {
-  [K in SchemaFieldKeys<T>]: ExtractOriginalSchema<T>[K] extends LazyEnumSchema<infer E>
+export type InferTagAttributes<T extends LogSchema | SchemaFields> = {
+  [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends LazyEnumSchema<infer E>
     ? E
-    : ExtractOriginalSchema<T>[K] extends EagerEnumSchema<infer E2>
+    : ExtractSchemaFields<T>[K] extends EagerEnumSchema<infer E2>
       ? E2
-      : ExtractOriginalSchema<T>[K] extends LazyCategorySchema | EagerCategorySchema
+      : ExtractSchemaFields<T>[K] extends LazyCategorySchema | EagerCategorySchema
         ? string
-        : ExtractOriginalSchema<T>[K] extends LazyTextSchema | EagerTextSchema
+        : ExtractSchemaFields<T>[K] extends LazyTextSchema | EagerTextSchema
           ? string
-          : ExtractOriginalSchema<T>[K] extends LazyNumberSchema | EagerNumberSchema
+          : ExtractSchemaFields<T>[K] extends LazyNumberSchema | EagerNumberSchema
             ? number
-            : ExtractOriginalSchema<T>[K] extends LazyBooleanSchema | EagerBooleanSchema
+            : ExtractSchemaFields<T>[K] extends LazyBooleanSchema | EagerBooleanSchema
               ? boolean
-              : ExtractOriginalSchema<T>[K] extends Sury.Schema<infer Out, unknown>
+              : ExtractSchemaFields<T>[K] extends Sury.Schema<infer Out, unknown>
                 ? Out
                 : never;
 };
 
 /**
- * Extract TypeScript input types from tag attribute schema
+ * Extract TypeScript input types from log schema
  * Used for validation before transformation
  *
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
-export type InferTagAttributesInput<T extends TagAttributeSchema> = {
-  [K in SchemaFieldKeys<T>]: T[K] extends Sury.Schema<unknown, infer In> ? In : never;
+export type InferTagAttributesInput<T extends LogSchema | SchemaFields> = {
+  [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends Sury.Schema<unknown, infer In> ? In : never;
 };
 
 /**
@@ -220,21 +233,4 @@ export interface SchemaBuilder {
   union<T extends readonly [Sury.Schema<unknown, unknown>, ...Sury.Schema<unknown, unknown>[]]>(
     schemas: T,
   ): Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>>;
-}
-
-/**
- * Get schema field entries, filtering out methods added by defineTagAttributes
- *
- * Methods like validate, parse, safeParse, extend are added by defineTagAttributes
- * but should not be treated as schema fields for iteration.
- *
- * @param schema - Tag attribute schema (possibly with methods)
- * @returns Array of [fieldName, fieldSchema] tuples, excluding methods
- */
-export function getSchemaFields<T extends TagAttributeSchema>(
-  schema: T,
-): Array<[string, Sury.Schema<unknown, unknown>]> {
-  return Object.entries(schema).filter(([_, value]) => typeof value !== 'function') as Array<
-    [string, Sury.Schema<unknown, unknown>]
-  >;
 }

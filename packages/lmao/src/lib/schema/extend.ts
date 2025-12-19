@@ -8,11 +8,11 @@
  * - Custom domain attributes
  */
 
-import { validateAttributeNames } from './defineTagAttributes.js';
-import type { TagAttributeSchema } from './types.js';
+import { LogSchema } from './LogSchema.js';
+import type { Schema, SchemaFields } from './types.js';
 
 /**
- * Merge two tag attribute schemas with conflict detection
+ * Merge two log schemas with conflict detection
  *
  * This performs shallow merge and validates:
  * - No conflicting field names
@@ -20,123 +20,44 @@ import type { TagAttributeSchema } from './types.js';
  *
  * Example:
  * ```typescript
- * const base = { requestId: S.string() };
- * const httpAttrs = { httpStatus: S.number(), httpMethod: S.string() };
+ * const base = { requestId: S.category() };
+ * const httpAttrs = { httpStatus: S.number(), httpMethod: S.enum(['GET', 'POST']) };
  * const combined = extendSchema(base, httpAttrs);
  * // Result: { requestId, httpStatus, httpMethod }
  * ```
  *
- * @param base - Base tag attribute schema
+ * @param base - Base log schema (LogSchema or plain object)
  * @param extension - Additional attributes to add
  * @returns Merged schema
  * @throws Error if field names conflict
  */
-export function extendSchema<T extends TagAttributeSchema, U extends TagAttributeSchema>(base: T, extension: U): T & U {
+export function extendSchema<T extends LogSchema | SchemaFields, U extends SchemaFields>(
+  base: T,
+  extension: U,
+): T extends LogSchema<infer B> ? LogSchema<B & U> : T & U {
+  // Extract base fields (from LogSchema.fields or plain object)
+  const baseFields = base instanceof LogSchema ? base.fields : base;
+  const baseKeys = new Set(Object.keys(baseFields));
+
   // Check for field name conflicts
-  const baseKeys = new Set(Object.keys(base));
   for (const key of Object.keys(extension)) {
     if (baseKeys.has(key)) {
       throw new Error(
         `Schema conflict: attribute '${key}' already exists in base schema. ` +
-          `Base schema has: ${Object.keys(base).join(', ')}`,
+          `Base schema has: ${Object.keys(baseFields).join(', ')}`,
       );
     }
   }
 
-  // Validate extension doesn't use reserved names
-  validateAttributeNames(extension);
+  // Assert extension doesn't use reserved names
+  LogSchema.assertUserFieldNames(Object.keys(extension));
 
   // Perform shallow merge
-  return { ...base, ...extension };
-}
+  const merged = { ...baseFields, ...extension };
 
-/**
- * Extended schema interface with fluent .extend() method
- *
- * This allows chaining multiple extensions:
- * ```typescript
- * const schema = createExtendableSchema(baseAttrs)
- *   .extend(httpAttrs)
- *   .extend(dbAttrs)
- *   .extend(customAttrs);
- * ```
- */
-export interface ExtendedSchema<T extends TagAttributeSchema> {
-  /**
-   * Extend this schema with additional attributes
-   *
-   * @param extension - Additional attributes to add
-   * @returns New extended schema with chaining support
-   */
-  extend<U extends TagAttributeSchema>(extension: U): ExtendedSchema<T & U>;
-}
-
-/**
- * Type helper to extract the raw schema from ExtendedSchema
- * The ExtendedSchema spreads the schema fields, so we can use it directly as TagAttributeSchema
- */
-export type UnwrapExtendedSchema<T> = T extends ExtendedSchema<infer S> ? S : T extends TagAttributeSchema ? T : never;
-
-/**
- * Options for createExtendedSchema
- */
-export interface CreateExtendedSchemaOptions {
-  /**
-   * Skip validation of reserved names.
-   * Only used internally for defining system schema columns.
-   * @internal
-   */
-  _skipReservedNameValidation?: boolean;
-}
-
-/**
- * Create an extendable schema wrapper
- *
- * This provides a fluent API for schema composition while maintaining
- * the underlying Sury schema objects.
- *
- * Example:
- * ```typescript
- * const base = createExtendableSchema({
- *   requestId: S.string(),
- *   userId: S.optional(S.masked('hash'))
- * });
- *
- * const withHttp = base.extend({
- *   httpStatus: S.number(),
- *   httpMethod: S.enum(['GET', 'POST', 'PUT', 'DELETE'])
- * });
- *
- * const withDb = withHttp.extend({
- *   dbQuery: S.masked('sql'),
- *   dbDuration: S.number()
- * });
- * ```
- *
- * @param schema - Tag attribute schema to make extendable
- * @param options - Optional configuration (e.g., skip reserved name validation for system schema)
- * @returns Schema with .extend() method for chaining
- */
-export function createExtendedSchema<T extends TagAttributeSchema>(
-  schema: T,
-  options?: CreateExtendedSchemaOptions,
-): ExtendedSchema<T> {
-  // Validate initial schema doesn't use reserved names (unless skipped for system schema)
-  if (!options?._skipReservedNameValidation) {
-    validateAttributeNames(schema);
+  // If base was LogSchema, return LogSchema; otherwise return plain object
+  if (base instanceof LogSchema) {
+    return new LogSchema(merged) as unknown as T extends LogSchema<infer B> ? LogSchema<B & U> : T & U;
   }
-
-  // Create proxy object that contains schema fields and .extend() method
-  // This is safe because we're adding a method to a schema object
-  const proxy = { ...schema } as T & ExtendedSchema<T>;
-
-  // Attach .extend() method that returns new extended schema
-  proxy.extend = <U extends TagAttributeSchema>(extension: U): ExtendedSchema<T & U> => {
-    const merged = extendSchema(schema, extension);
-    // Recursively create extended schema from merged result
-    // Extensions should always validate reserved names
-    return createExtendedSchema(merged);
-  };
-
-  return proxy;
+  return merged as unknown as T extends LogSchema<infer B> ? LogSchema<B & U> : T & U;
 }

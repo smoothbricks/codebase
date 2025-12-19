@@ -11,12 +11,13 @@
 
 import { describe, expect, test } from 'bun:test';
 import { S } from '../builder.js';
-import { defineTagAttributes, validateAttributeNames } from '../defineTagAttributes.js';
-import { createExtendedSchema, extendSchema } from '../extend.js';
+import { defineLogSchema } from '../defineLogSchema.js';
+import { extendSchema } from '../extend.js';
+import { LogSchema } from '../LogSchema.js';
 
-describe('defineTagAttributes with Sury', () => {
+describe('defineLogSchema with Sury', () => {
   test('defines base attributes with Sury schemas', () => {
-    const attrs = defineTagAttributes({
+    const attrs = defineLogSchema({
       requestId: S.category(),
       userId: S.category().mask('hash'), // Masking applied during Arrow conversion, not validation
       timestamp: S.number(),
@@ -29,7 +30,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('validates data correctly with Sury', () => {
-    const attrs = defineTagAttributes({
+    const attrs = defineLogSchema({
       requestId: S.category(),
       count: S.number(),
     });
@@ -44,7 +45,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('throws on invalid data', () => {
-    const attrs = defineTagAttributes({
+    const attrs = defineLogSchema({
       count: S.number(),
     });
 
@@ -54,7 +55,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('parse returns null on error', () => {
-    const attrs = defineTagAttributes({
+    const attrs = defineLogSchema({
       count: S.number(),
     });
 
@@ -63,7 +64,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('safeParse returns detailed result', () => {
-    const attrs = defineTagAttributes({
+    const attrs = defineLogSchema({
       count: S.number(),
     });
 
@@ -83,7 +84,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('supports schema extension', () => {
-    const base = defineTagAttributes({
+    const base = defineLogSchema({
       requestId: S.category(),
     });
 
@@ -93,7 +94,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('validates enum types with Sury', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
     });
 
@@ -102,7 +103,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('rejects invalid enum values', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       operation: S.enum(['SELECT', 'INSERT']),
     });
 
@@ -112,7 +113,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('handles optional fields correctly', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       required: S.category(),
       optional: S.optional(S.number()),
     });
@@ -136,7 +137,7 @@ describe('defineTagAttributes with Sury', () => {
   test('masking metadata is set on schema', () => {
     // Masking is now applied during Arrow conversion, not validation
     // This test verifies the mask metadata is correctly attached to schemas
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category().mask('hash'),
       email: S.text().mask('email'),
       apiUrl: S.text().mask('url'),
@@ -166,7 +167,7 @@ describe('defineTagAttributes with Sury', () => {
 
   test('should reject field names starting with _', () => {
     expect(() =>
-      defineTagAttributes({
+      defineLogSchema({
         _reserved: S.text(),
       }),
     ).toThrow("Field name '_reserved' cannot start with '_'");
@@ -174,36 +175,26 @@ describe('defineTagAttributes with Sury', () => {
 
   test('rejects reserved attribute names', () => {
     expect(() => {
-      validateAttributeNames({
-        with: S.category(), // Reserved!
-      });
+      LogSchema.assertUserFieldNames(['with']); // Reserved!
     }).toThrow(/reserved/i);
 
     expect(() => {
-      validateAttributeNames({
-        message: S.category(), // Reserved!
-      });
+      LogSchema.assertUserFieldNames(['message']); // Reserved!
     }).toThrow(/reserved/i);
 
     expect(() => {
-      validateAttributeNames({
-        tag: S.category(), // Reserved!
-      });
+      LogSchema.assertUserFieldNames(['tag']); // Reserved!
     }).toThrow(/reserved/i);
   });
 
   test('allows non-reserved names', () => {
     expect(() => {
-      validateAttributeNames({
-        requestId: S.category(),
-        userId: S.category(),
-        customField: S.number(),
-      });
+      LogSchema.assertUserFieldNames(['requestId', 'userId']);
     }).not.toThrow();
   });
 
   test('fluent extend API works', () => {
-    const base = createExtendedSchema({
+    const base = new LogSchema({
       requestId: S.category(),
     });
 
@@ -211,12 +202,12 @@ describe('defineTagAttributes with Sury', () => {
       httpStatus: S.number(),
     });
 
-    expect(extended).toHaveProperty('requestId');
-    expect(extended).toHaveProperty('httpStatus');
+    expect(extended.fields).toHaveProperty('requestId');
+    expect(extended.fields).toHaveProperty('httpStatus');
   });
 
   test('chained extensions work', () => {
-    const base = createExtendedSchema({
+    const base = new LogSchema({
       requestId: S.category(),
     });
 
@@ -228,9 +219,9 @@ describe('defineTagAttributes with Sury', () => {
       dbQuery: S.text().mask('sql'),
     });
 
-    expect(withDb).toHaveProperty('requestId');
-    expect(withDb).toHaveProperty('httpStatus');
-    expect(withDb).toHaveProperty('dbQuery');
+    expect(withDb.fields).toHaveProperty('requestId');
+    expect(withDb.fields).toHaveProperty('httpStatus');
+    expect(withDb.fields).toHaveProperty('dbQuery');
   });
 
   test('extendSchema detects conflicts', () => {
@@ -243,7 +234,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('union schemas work', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       value: S.union([S.category(), S.number()]),
     });
 
@@ -255,7 +246,7 @@ describe('defineTagAttributes with Sury', () => {
   });
 
   test('complex nested schema validation', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       requestId: S.category(),
       userId: S.optional(S.category()), // Masking would be: S.category().mask('hash')
       httpStatus: S.number(),
