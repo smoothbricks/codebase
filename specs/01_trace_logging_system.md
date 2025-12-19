@@ -379,22 +379,55 @@ logger.userId('123').requestId('req-456');
 - No copying - just prototype chain link
 - Maintains hidden class stability
 
-**Pattern**: Use prototype chain for context inheritance.
+**Why Object Spread Breaks Hidden Classes:**
+
+V8 creates hidden classes based on the **order** properties are added. Object spread `{...obj}` can create new hidden
+classes even when properties are in the same order, because:
+
+- The spread operation is seen as dynamic property addition
+- V8 may not recognize that the resulting object has the same shape as the source
+- Each spread operation can trigger a new hidden class creation
+
+**Pattern**: Use prototype chain for context inheritance, or generated classes with fixed property order.
 
 ```typescript
-// ✅ GOOD: Prototype inheritance
+// ✅ GOOD: Prototype inheritance - preserves hidden class
 const childCtx = Object.create(parentCtx);
 childCtx.spanName = 'child-op'; // Only override what changes
 
-// ❌ BAD: Object spread copies all properties
-const childCtx = { ...parentCtx, spanName: 'child-op' }; // Hidden class pollution
+// ✅ GOOD: Generated class with fixed property order - stable hidden class
+class GeneratedScope {
+  userId = undefined; // Property 1 - always same order
+  requestId = undefined; // Property 2 - always same order
+}
+const scope1 = new GeneratedScope();
+const scope2 = new GeneratedScope(); // Same hidden class as scope1
+
+// ❌ BAD: Object spread creates new hidden class each time
+const childCtx = { ...parentCtx, spanName: 'child-op' }; // New hidden class!
+const childScope = { ...parentScope }; // New hidden class!
 ```
+
+**Key Insight from V8 Documentation:**
+
+- V8 reuses hidden classes when objects have **the same properties in the same order**
+- Property order matters: `{a: 1, b: 2}` and `{b: 2, a: 1}` get different hidden classes
+- Object spread `{...obj}` can create new hidden classes even with same properties
+- Generated classes guarantee consistent property order = stable hidden classes
+
+**References:**
+
+- [V8 Fast Properties Blog](https://v8.dev/blog/fast-properties) - Hidden class internals
+- [Web.dev V8 Performance Tips](https://web.dev/articles/speed-v8) - Best practices
+- [V8 Hidden Classes and Inline Caching](https://richardartoul.github.io/jekyll/update/2015/04/26/hidden-classes.html) -
+  Detailed explanation
 
 **Application in LMAO**:
 
 - `createTraceContext()` uses `Object.create(TraceContextProto)`
 - Child spans use `Object.create(parentCtx)`
 - User `Extra` properties inherit through prototype chain
+- Scope classes are generated with fixed property order for stable hidden classes
 
 ### 5. TypedArray Performance
 
