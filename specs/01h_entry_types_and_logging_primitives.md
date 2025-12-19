@@ -220,6 +220,8 @@ const processUser = op(async ({ tag, log }) => {
   - Contains usage context and outcome data (user-defined attribute columns)
   - Tracks actual feature utilization vs just evaluation
 
+See **[Feature Flags](./01p_feature_flags.md)** for details on the evaluator implementation and tracking API.
+
 ### Metrics Entry Types
 
 Metrics are structured logs that capture operational statistics during flush cycles. All metrics rows from the same

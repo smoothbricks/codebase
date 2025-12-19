@@ -25,7 +25,8 @@
 
 - **System Overview**: specs/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8 Optimization
   Patterns** (see also [V8 Optimization References](#v8-optimization-references) below)
-- **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema, feature flags [**LMAO**]
+- **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema [**LMAO**]
+- **Feature Flags**: specs/01p_feature_flags.md - Flag schema, evaluator, analytics [**LMAO**]
 - **Context Flow**: specs/01c_context_flow_and_op_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern [**LMAO**]
 - **Buffer Architecture**: specs/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
   [**ARROW-BUILDER**]
