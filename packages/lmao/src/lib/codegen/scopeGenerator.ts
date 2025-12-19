@@ -16,8 +16,7 @@
  * - NO system columns (timestamps, operations, labels)
  */
 
-import type { TagAttributeSchema } from '../schema/types.js';
-import { getSchemaFields } from '../schema/types.js';
+import type { LogSchema } from '../schema/types.js';
 
 /**
  * Generated Scope instance interface
@@ -42,7 +41,7 @@ export type ScopeClass = new () => GeneratedScope;
  * Cache for generated Scope classes (per schema)
  * WeakMap allows garbage collection when schema is no longer referenced
  */
-const scopeClassCache = new WeakMap<TagAttributeSchema, ScopeClass>();
+const scopeClassCache = new WeakMap<LogSchema, ScopeClass>();
 
 /**
  * Generate Scope class code from schema
@@ -55,10 +54,9 @@ const scopeClassCache = new WeakMap<TagAttributeSchema, ScopeClass>();
  * @param schema - Tag attribute schema (user-defined attributes only)
  * @returns JavaScript code string for the Scope class
  */
-export function generateScopeClassCode(schema: TagAttributeSchema): string {
-  // Get schema fields (excluding methods added by defineTagAttributes)
-  const schemaFields = getSchemaFields(schema);
-  const fieldNames = schemaFields.map(([name]) => name);
+export function generateScopeClassCode(schema: LogSchema): string {
+  // Get schema field names from LogSchema.fieldNames
+  const fieldNames = schema.fieldNames;
 
   // Generate private field declarations (all initialized to undefined)
   const privateFields = fieldNames.map((name) => `  _${name} = undefined;`).join('\n');
@@ -114,7 +112,7 @@ ${getScopeValues}
  *
  * @example
  * ```typescript
- * const schema = defineTagAttributes({
+ * const schema = defineLogSchema({
  *   userId: S.category(),
  *   requestId: S.category(),
  *   count: S.number()
@@ -130,7 +128,7 @@ ${getScopeValues}
  * // { userId: 'user123', requestId: undefined, count: 42 }
  * ```
  */
-export function generateScopeClass(schema: TagAttributeSchema): ScopeClass {
+export function generateScopeClass(schema: LogSchema): ScopeClass {
   // Check cache first
   let ScopeClass = scopeClassCache.get(schema);
 
@@ -159,7 +157,7 @@ export function generateScopeClass(schema: TagAttributeSchema): ScopeClass {
  * @param schema - Tag attribute schema
  * @returns New Scope instance with all attributes = undefined
  */
-export function createScope(schema: TagAttributeSchema): GeneratedScope {
+export function createScope(schema: LogSchema): GeneratedScope {
   const ScopeClass = generateScopeClass(schema);
   return new ScopeClass();
 }
@@ -175,7 +173,7 @@ export function createScope(schema: TagAttributeSchema): GeneratedScope {
  * @returns New Scope instance with parent values
  */
 export function createScopeWithInheritance(
-  schema: TagAttributeSchema,
+  schema: LogSchema,
   parentScopeValues: Record<string, unknown>,
 ): GeneratedScope {
   const scope = createScope(schema);

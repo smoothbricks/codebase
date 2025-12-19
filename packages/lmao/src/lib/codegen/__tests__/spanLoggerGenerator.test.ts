@@ -12,36 +12,30 @@
 
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { createTestTaskContext } from '../../__tests__/test-helpers.js';
-import { ENTRY_TYPE_DEBUG, ENTRY_TYPE_ERROR, ENTRY_TYPE_INFO, ENTRY_TYPE_TRACE, ENTRY_TYPE_WARN } from '../../lmao.js';
 import { S } from '../../schema/builder.js';
-import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
-import { getSchemaFields, type TagAttributeSchema } from '../../schema/types.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import {
+  ENTRY_TYPE_DEBUG,
+  ENTRY_TYPE_ERROR,
+  ENTRY_TYPE_INFO,
+  ENTRY_TYPE_TRACE,
+  ENTRY_TYPE_WARN,
+} from '../../schema/systemSchema.js';
+import type { LogSchema } from '../../schema/types.js';
 import { createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import type { SpanBuffer } from '../../types.js';
 import { createScope } from '../scopeGenerator.js';
 import { type BaseSpanLogger, createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
-/**
- * Extract plain schema from defineTagAttributes result
- */
-function extractSchema(defined: unknown): TagAttributeSchema {
-  const fields = getSchemaFields(defined as TagAttributeSchema);
-  const schema: TagAttributeSchema = {};
-  for (const [name, field] of fields) {
-    schema[name] = field;
-  }
-  return schema;
-}
-
-function createTestBuffer(schema: TagAttributeSchema = {}): SpanBuffer {
-  const taskContext = createTestTaskContext(schema);
-  return createSpanBuffer(schema, taskContext);
+function createTestBuffer(schema: LogSchema): SpanBuffer {
+  const taskContext = createTestTaskContext(schema.fields);
+  return createSpanBuffer(schema.fields, taskContext);
 }
 
 describe('createSpanLoggerClass', () => {
   describe('class creation', () => {
     it('should create a SpanLogger class for empty schema', () => {
-      const schema: TagAttributeSchema = {};
+      const schema = defineLogSchema({});
       const SpanLoggerClass = createSpanLoggerClass(schema);
 
       expect(SpanLoggerClass).toBeDefined();
@@ -49,10 +43,9 @@ describe('createSpanLoggerClass', () => {
     });
 
     it('should cache generated classes for the same schema', () => {
-      const defined = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
       });
-      const schema = extractSchema(defined);
 
       const Class1 = createSpanLoggerClass(schema);
       const Class2 = createSpanLoggerClass(schema);
@@ -61,8 +54,8 @@ describe('createSpanLoggerClass', () => {
     });
 
     it('should create different classes for different schemas', () => {
-      const schema1 = extractSchema(defineTagAttributes({ userId: S.category() }));
-      const schema2 = extractSchema(defineTagAttributes({ requestId: S.category() }));
+      const schema1 = defineLogSchema({ userId: S.category() });
+      const schema2 = defineLogSchema({ requestId: S.category() });
 
       const Class1 = createSpanLoggerClass(schema1);
       const Class2 = createSpanLoggerClass(schema2);
@@ -73,11 +66,9 @@ describe('createSpanLoggerClass', () => {
 
   describe('instance creation', () => {
     it('should create instance with buffer, scope, and createNextBuffer', () => {
-      const schema = extractSchema(
-        defineTagAttributes({
-          userId: S.category(),
-        }),
-      );
+      const schema = defineLogSchema({
+        userId: S.category(),
+      });
       const buffer = createTestBuffer(schema);
       const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
@@ -90,7 +81,7 @@ describe('createSpanLoggerClass', () => {
     });
 
     it('should start with _writeIndex = 1', () => {
-      const schema = extractSchema(defineTagAttributes({}));
+      const schema = defineLogSchema({});
       const buffer = createTestBuffer(schema);
       const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
@@ -102,16 +93,14 @@ describe('createSpanLoggerClass', () => {
   });
 
   describe('logging methods', () => {
-    let schema: TagAttributeSchema;
+    let schema: LogSchema;
     let buffer: SpanBuffer;
-    let logger: BaseSpanLogger<TagAttributeSchema>;
+    let logger: BaseSpanLogger<LogSchema>;
 
     beforeEach(() => {
-      schema = extractSchema(
-        defineTagAttributes({
-          userId: S.category(),
-        }),
-      );
+      schema = defineLogSchema({
+        userId: S.category(),
+      });
       buffer = createTestBuffer(schema);
       const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
@@ -180,12 +169,10 @@ describe('createSpanLoggerClass', () => {
 
   describe('scope management', () => {
     it('should update scope values via _setScope', () => {
-      const schema = extractSchema(
-        defineTagAttributes({
-          userId: S.category(),
-          requestId: S.category(),
-        }),
-      );
+      const schema = defineLogSchema({
+        userId: S.category(),
+        requestId: S.category(),
+      });
       const buffer = createTestBuffer(schema);
       const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
@@ -198,11 +185,9 @@ describe('createSpanLoggerClass', () => {
     });
 
     it('should return scope via _getScope()', () => {
-      const schema = extractSchema(
-        defineTagAttributes({
-          userId: S.category(),
-        }),
-      );
+      const schema = defineLogSchema({
+        userId: S.category(),
+      });
       const buffer = createTestBuffer(schema);
       const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
@@ -216,13 +201,11 @@ describe('createSpanLoggerClass', () => {
 
   describe('fluent attribute setters', () => {
     it('should have attribute setter methods from ColumnWriter', () => {
-      const schema = extractSchema(
-        defineTagAttributes({
-          userId: S.category(),
-          count: S.number(),
-          enabled: S.boolean(),
-        }),
-      );
+      const schema = defineLogSchema({
+        userId: S.category(),
+        count: S.number(),
+        enabled: S.boolean(),
+      });
       const buffer = createTestBuffer(schema);
       const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
@@ -239,11 +222,9 @@ describe('createSpanLoggerClass', () => {
     });
 
     it('should write attribute values at current _writeIndex', () => {
-      const schema = extractSchema(
-        defineTagAttributes({
-          userId: S.category(),
-        }),
-      );
+      const schema = defineLogSchema({
+        userId: S.category(),
+      });
       const buffer = createTestBuffer(schema);
       const scope = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);

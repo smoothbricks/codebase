@@ -4,25 +4,36 @@
  * @module moduleContext
  */
 
-import {
-  type BufferCapacityStats,
-  DEFAULT_BUFFER_CAPACITY,
-  intern,
-  PreEncodedEntry,
-} from '@smoothbricks/arrow-builder';
-import type { TagAttributeSchema } from './schema/types.js';
+import { DEFAULT_BUFFER_CAPACITY, intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
+import { LogSchema } from './schema/LogSchema.js';
+import type { SchemaFields } from './schema/types.js';
 
 /**
  * Module context shared across all tasks in the same module.
  */
 export class ModuleContext {
-  /** Self-tuning buffer capacity stats (initialized with defaults) */
-  readonly spanBufferCapacityStats: BufferCapacityStats = {
-    currentCapacity: DEFAULT_BUFFER_CAPACITY,
-    totalWrites: 0,
-    overflowWrites: 0,
-    totalBuffersCreated: 0,
-  };
+  // ============================================================================
+  // Self-tuning buffer capacity stats (sb_ prefix for V8 optimization)
+  // Direct property access is faster than nested object access.
+  // ============================================================================
+
+  /** Current tuned buffer capacity */
+  sb_capacity = DEFAULT_BUFFER_CAPACITY;
+
+  /** Total writes since last tuning */
+  sb_totalWrites = 0;
+
+  /** Writes that caused buffer overflow */
+  sb_overflows = 0;
+
+  /** Entries written to overflow buffers (count of writes, not overflow events) */
+  sb_overflowWrites = 0;
+
+  /** Number of buffers created */
+  sb_totalCreated = 0;
+
+  /** The log schema for this module */
+  public readonly logSchema: LogSchema;
 
   /** Pre-encoded entry for package (for Arrow dictionary building) */
   readonly packageEntry: PreEncodedEntry;
@@ -39,8 +50,10 @@ export class ModuleContext {
     public readonly packageName: string,
     /** Path within package, relative to package.json (e.g., 'src/services/user.ts') */
     public readonly packagePath: string,
-    public readonly tagAttributes: TagAttributeSchema,
+    schema: SchemaFields | LogSchema,
   ) {
+    // Wrap plain schema objects in LogSchema if needed
+    this.logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
     // Pre-encode and store as reusable entries for Arrow dictionary building
     // Using class instances for V8 optimization (consistent hidden class shape)
     this.packageEntry = new PreEncodedEntry(packageName, intern(packageName));

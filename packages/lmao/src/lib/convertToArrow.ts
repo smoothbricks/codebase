@@ -49,10 +49,10 @@ import {
   getArrowFieldName,
   walkSpanTree,
 } from './arrow/utils.js';
-import { ENTRY_TYPE_NAMES } from './lmao.js';
 import type { ModuleContext } from './moduleContext.js';
+import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
-import { getSchemaFields } from './schema/types.js';
+import type { LogSchema } from './schema/types.js';
 import type { SpanBuffer } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
@@ -94,7 +94,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
   const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
   if (totalRows === 0) return new RecordBatch({});
 
-  const schema = buffers[0].task.module.tagAttributes;
+  const schema: LogSchema = buffers[0].task.module.logSchema;
   const fields: Field[] = [];
   let systemVectors: Vector[] = [];
 
@@ -111,19 +111,35 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
     const traceIdUniqueCount = traceIdSet.size;
     traceIdArrowIndexTypeCtor = traceIdUniqueCount <= 255 ? Uint8 : traceIdUniqueCount <= 65535 ? Uint16 : Uint32;
 
+    // Include both task.module (for rows 1+) and callsiteModule (for row 0) values
     const packageSet = new Set<string>();
-    for (const buf of buffers) packageSet.add(buf.task.module.packageName);
+    for (const buf of buffers) {
+      packageSet.add(buf.task.module.packageName);
+      if (buf.callsiteModule) {
+        packageSet.add(buf.callsiteModule.packageName);
+      }
+    }
     const packageUniqueCount = packageSet.size;
     packageNameArrowIndexTypeCtor = packageUniqueCount <= 255 ? Uint8 : packageUniqueCount <= 65535 ? Uint16 : Uint32;
 
     const modulePathSet = new Set<string>();
-    for (const buf of buffers) modulePathSet.add(buf.task.module.packagePath);
+    for (const buf of buffers) {
+      modulePathSet.add(buf.task.module.packagePath);
+      if (buf.callsiteModule) {
+        modulePathSet.add(buf.callsiteModule.packagePath);
+      }
+    }
     const packagePathUniqueCount = modulePathSet.size;
     packagePathArrowIndexTypeCtor =
       packagePathUniqueCount <= 255 ? Uint8 : packagePathUniqueCount <= 65535 ? Uint16 : Uint32;
 
     const gitShaSet = new Set<string>();
-    for (const buf of buffers) gitShaSet.add(buf.task.module.gitSha || '');
+    for (const buf of buffers) {
+      gitShaSet.add(buf.task.module.gitSha || '');
+      if (buf.callsiteModule) {
+        gitShaSet.add(buf.callsiteModule.gitSha || '');
+      }
+    }
     const gitShaUniqueCount = gitShaSet.size;
     gitShaArrowIndexTypeCtor = gitShaUniqueCount <= 255 ? Uint8 : gitShaUniqueCount <= 65535 ? Uint16 : Uint32;
   }
@@ -152,7 +168,9 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
     fields.push(Field.new({ name: 'message', type: new Dictionary(new Utf8(), new Uint32()) }));
   }
 
-  for (const [fieldName, fieldSchema] of Object.entries(schema)) {
+  // Use LogSchema.fieldEntries() directly
+  const userSchemaFields = Array.from(schema.fieldEntries());
+  for (const [fieldName, fieldSchema] of userSchemaFields) {
     const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
 
@@ -250,7 +268,9 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
   }
 
   // Build user attribute vectors and update schema field types BEFORE creating schema
-  for (const [fieldName, fieldSchema] of Object.entries(schema)) {
+  // Use LogSchema.fieldEntries() directly
+  const userSchemaFields2 = Array.from(schema.fieldEntries());
+  for (const [fieldName, fieldSchema] of userSchemaFields2) {
     const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
     const columnName = fieldName; // User columns have no prefix
@@ -688,9 +708,18 @@ function buildMetadataColumns(buffers: SpanBuffer[], vectors: Vector[]): void {
     ),
   );
 
-  // Metadata column: Package name (from task.module.packageName)
+  // Metadata column: Package name (from task.module.packageName, with callsiteModule for row 0)
+  // Per specs/01c_context_flow_and_task_wrappers.md:
+  // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
+  // - Rows 1+ (logs, span-end): uses task.module
   const packageSet = new Set<string>();
-  for (const buf of buffers) packageSet.add(buf.task.module.packageName);
+  for (const buf of buffers) {
+    packageSet.add(buf.task.module.packageName);
+    // Include callsiteModule if present (used for row 0)
+    if (buf.callsiteModule) {
+      packageSet.add(buf.callsiteModule.packageName);
+    }
+  }
   const packageArray = Array.from(packageSet);
   const packageMap = new Map(packageArray.map((name, idx) => [name, idx]));
 
@@ -703,12 +732,20 @@ function buildMetadataColumns(buffers: SpanBuffer[], vectors: Vector[]): void {
   const packageIndices = new packageIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const packageIndex = packageMap.get(buf.task.module.packageName);
-    if (packageIndex === undefined) {
-      throw new Error(`Package index not found for: ${buf.task.module.packageName}`);
+    // Row 0: use callsiteModule if available, else fall back to task.module
+    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.task.module.packageName;
+    const callsitePkgIdx = packageMap.get(callsitePkgName) ?? 0;
+
+    // Op's module (task.module) for rows 1+
+    const opPkgIdx = packageMap.get(buf.task.module.packageName) ?? 0;
+
+    // Set row 0 (span-start) to callsite module
+    packageIndices[rowOffset] = callsitePkgIdx;
+
+    // Set rows 1+ (span-end, logs) to op's module
+    if (buf.writeIndex > 1) {
+      packageIndices.fill(opPkgIdx, rowOffset + 1, rowOffset + buf.writeIndex);
     }
-    // Use fill() - constant value per buffer
-    packageIndices.fill(packageIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
 
@@ -733,9 +770,15 @@ function buildMetadataColumns(buffers: SpanBuffer[], vectors: Vector[]): void {
     ),
   );
 
-  // Metadata column: Package path (from task.module.packagePath)
+  // Metadata column: Package path (from task.module.packagePath, with callsiteModule for row 0)
   const modulePathSet = new Set<string>();
-  for (const buf of buffers) modulePathSet.add(buf.task.module.packagePath);
+  for (const buf of buffers) {
+    modulePathSet.add(buf.task.module.packagePath);
+    // Include callsiteModule if present (used for row 0)
+    if (buf.callsiteModule) {
+      modulePathSet.add(buf.callsiteModule.packagePath);
+    }
+  }
   const modulePathArray = Array.from(modulePathSet);
   const modulePathMap = new Map(modulePathArray.map((name, idx) => [name, idx]));
 
@@ -749,12 +792,20 @@ function buildMetadataColumns(buffers: SpanBuffer[], vectors: Vector[]): void {
   const packagePathIndices = new packagePathIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const modulePathIndex = modulePathMap.get(buf.task.module.packagePath);
-    if (modulePathIndex === undefined) {
-      throw new Error(`Module path index not found for: ${buf.task.module.packagePath}`);
+    // Row 0: use callsiteModule if available, else fall back to task.module
+    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.task.module.packagePath;
+    const callsitePathIdx = modulePathMap.get(callsitePathName) ?? 0;
+
+    // Op's module (task.module) for rows 1+
+    const opPathIdx = modulePathMap.get(buf.task.module.packagePath) ?? 0;
+
+    // Set row 0 (span-start) to callsite module
+    packagePathIndices[rowOffset] = callsitePathIdx;
+
+    // Set rows 1+ (span-end, logs) to op's module
+    if (buf.writeIndex > 1) {
+      packagePathIndices.fill(opPathIdx, rowOffset + 1, rowOffset + buf.writeIndex);
     }
-    // Use fill() - constant value per buffer
-    packagePathIndices.fill(modulePathIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
 
@@ -779,9 +830,15 @@ function buildMetadataColumns(buffers: SpanBuffer[], vectors: Vector[]): void {
     ),
   );
 
-  // Metadata column: Git SHA (from task.module.gitSha)
+  // Metadata column: Git SHA (from task.module.gitSha, with callsiteModule for row 0)
   const gitShaSet = new Set<string>();
-  for (const buf of buffers) gitShaSet.add(buf.task.module.gitSha);
+  for (const buf of buffers) {
+    gitShaSet.add(buf.task.module.gitSha);
+    // Include callsiteModule if present (used for row 0)
+    if (buf.callsiteModule) {
+      gitShaSet.add(buf.callsiteModule.gitSha);
+    }
+  }
   const gitShaArray = Array.from(gitShaSet);
   const gitShaMap = new Map(gitShaArray.map((sha, idx) => [sha, idx]));
 
@@ -794,12 +851,20 @@ function buildMetadataColumns(buffers: SpanBuffer[], vectors: Vector[]): void {
   const gitShaIndices = new gitShaIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const gitShaIndex = gitShaMap.get(buf.task.module.gitSha);
-    if (gitShaIndex === undefined) {
-      throw new Error(`GitSha index not found for: ${buf.task.module.gitSha}`);
+    // Row 0: use callsiteModule if available, else fall back to task.module
+    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.task.module.gitSha;
+    const callsiteGitShaIdx = gitShaMap.get(callsiteGitSha) ?? 0;
+
+    // Op's module (task.module) for rows 1+
+    const opGitShaIdx = gitShaMap.get(buf.task.module.gitSha) ?? 0;
+
+    // Set row 0 (span-start) to callsite module
+    gitShaIndices[rowOffset] = callsiteGitShaIdx;
+
+    // Set rows 1+ (span-end, logs) to op's module
+    if (buf.writeIndex > 1) {
+      gitShaIndices.fill(opGitShaIdx, rowOffset + 1, rowOffset + buf.writeIndex);
     }
-    // Use fill() - constant value per buffer
-    gitShaIndices.fill(gitShaIndex, rowOffset, rowOffset + buf.writeIndex);
     rowOffset += buf.writeIndex;
   }
 
@@ -840,6 +905,7 @@ export function convertSpanTreeToArrowTable(
   rootBuffer: SpanBuffer,
   _systemColumnBuilder?: SystemColumnBuilder,
   modulesToLogStats?: Set<ModuleContext>,
+  periodStartNs?: bigint,
 ): Table {
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 0: Collect ALL unique schema fields from ALL buffers in the tree
@@ -849,9 +915,14 @@ export function convertSpanTreeToArrowTable(
   const mergedSchemaFields = new Map<string, unknown>();
 
   walkSpanTree(rootBuffer, (buffer) => {
-    const bufferSchema = buffer.task.module.tagAttributes;
-    const fields = getSchemaFields(bufferSchema);
+    const bufferSchema = buffer.task.module.logSchema;
+    const fields = Array.from(bufferSchema.fieldEntries());
     for (const [fieldName, fieldSchema] of fields) {
+      // Skip system schema fields - they are handled separately as system columns
+      // (message, lineNumber, errorCode, exceptionStack, ffValue, uint64Value)
+      if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) {
+        continue;
+      }
       // Only add if not already present (first buffer with this field wins)
       if (!mergedSchemaFields.has(fieldName)) {
         mergedSchemaFields.set(fieldName, fieldSchema);
@@ -911,7 +982,11 @@ export function convertSpanTreeToArrowTable(
     traceIdBuilder.add(buffer.traceId);
 
     // Collect unique ModuleContexts (already have pre-encoded entries)
+    // Include both task.module (for rows 1+) and callsiteModule (for row 0) if present
     uniqueModules.add(buffer.task.module);
+    if (buffer.callsiteModule) {
+      uniqueModules.add(buffer.callsiteModule);
+    }
 
     for (const [fieldName, builder] of categoryBuilders) {
       const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
@@ -932,6 +1007,16 @@ export function convertSpanTreeToArrowTable(
             builder.add(maskedValue);
           }
         }
+      }
+      // Also add scope values to dictionary (they need to be in dictionary to be usable)
+      const scopeValue = buffer.scopeValues?.[fieldName] as string | undefined;
+      if (scopeValue !== undefined) {
+        let maskedValue = originalToMasked.get(scopeValue);
+        if (maskedValue === undefined) {
+          maskedValue = maskTransform ? maskTransform(scopeValue) : scopeValue;
+          originalToMasked.set(scopeValue, maskedValue);
+        }
+        builder.add(maskedValue);
       }
     }
 
@@ -954,6 +1039,16 @@ export function convertSpanTreeToArrowTable(
             builder.add(maskedValue);
           }
         }
+      }
+      // Also add scope values to dictionary (they need to be in dictionary to be usable)
+      const scopeValue = buffer.scopeValues?.[fieldName] as string | undefined;
+      if (scopeValue !== undefined) {
+        let maskedValue = originalToMasked.get(scopeValue);
+        if (maskedValue === undefined) {
+          maskedValue = maskTransform ? maskTransform(scopeValue) : scopeValue;
+          originalToMasked.set(scopeValue, maskedValue);
+        }
+        builder.add(maskedValue);
       }
     }
   });
@@ -1132,8 +1227,12 @@ export function convertSpanTreeToArrowTable(
   // Create capacity stats RecordBatch if needed
   if (modulesToLogStats && modulesToLogStats.size > 0) {
     const hasSpanData = batch !== undefined;
+    // periodStartNs must be provided by the caller (from FlushScheduler's tracked period start)
+    // If not provided, use 0n as a fallback (indicates period tracking not enabled)
+    const effectivePeriodStartNs = periodStartNs ?? 0n;
     const capacityStatsBatch = createCapacityStatsRecordBatch(
       modulesToLogStats,
+      effectivePeriodStartNs,
       arrowSchema,
       mergedSchema,
       hasSpanData,
@@ -1381,12 +1480,27 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Metadata column: Package name (from task.module.packageName, using shared dictionary)
+  // Metadata column: Package name (from task.module.packageName, with callsiteModule for row 0)
+  // Per specs/01c_context_flow_and_task_wrappers.md:
+  // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
+  // - Rows 1+ (logs, span-end): uses task.module
   const packageIndices = new packageDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const pkgIdx = packageDict.indexMap.get(buf.task.module.packageName) ?? 0;
-    packageIndices.fill(pkgIdx, offset, offset + buf.writeIndex);
+    // Row 0: use callsiteModule if available, else fall back to task.module
+    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.task.module.packageName;
+    const callsitePkgIdx = packageDict.indexMap.get(callsitePkgName) ?? 0;
+
+    // Op's module (task.module) for rows 1+
+    const opPkgIdx = packageDict.indexMap.get(buf.task.module.packageName) ?? 0;
+
+    // Set row 0 (span-start) to callsite module
+    packageIndices[offset] = callsitePkgIdx;
+
+    // Set rows 1+ (span-end, logs) to op's module
+    if (buf.writeIndex > 1) {
+      packageIndices.fill(opPkgIdx, offset + 1, offset + buf.writeIndex);
+    }
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1411,12 +1525,24 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Metadata column: Package path (from task.module.packagePath, using shared dictionary)
+  // Metadata column: Package path (from task.module.packagePath, with callsiteModule for row 0)
   const packagePathIndices = new packagePathDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const pathIdx = packagePathDict.indexMap.get(buf.task.module.packagePath) ?? 0;
-    packagePathIndices.fill(pathIdx, offset, offset + buf.writeIndex);
+    // Row 0: use callsiteModule if available, else fall back to task.module
+    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.task.module.packagePath;
+    const callsitePathIdx = packagePathDict.indexMap.get(callsitePathName) ?? 0;
+
+    // Op's module (task.module) for rows 1+
+    const opPathIdx = packagePathDict.indexMap.get(buf.task.module.packagePath) ?? 0;
+
+    // Set row 0 (span-start) to callsite module
+    packagePathIndices[offset] = callsitePathIdx;
+
+    // Set rows 1+ (span-end, logs) to op's module
+    if (buf.writeIndex > 1) {
+      packagePathIndices.fill(opPathIdx, offset + 1, offset + buf.writeIndex);
+    }
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1441,14 +1567,24 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Metadata column: Git SHA (from task.module.gitSha, using shared dictionary)
+  // Metadata column: Git SHA (from task.module.gitSha, with callsiteModule for row 0)
   const gitShaIndices2 = new gitShaDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const gitSha = buf.task.module.gitSha;
-    const idx = gitShaDict.indexMap.get(gitSha) ?? 0;
-    // Use fill() - constant value per buffer
-    gitShaIndices2.fill(idx, offset, offset + buf.writeIndex);
+    // Row 0: use callsiteModule if available, else fall back to task.module
+    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.task.module.gitSha;
+    const callsiteGitShaIdx = gitShaDict.indexMap.get(callsiteGitSha) ?? 0;
+
+    // Op's module (task.module) for rows 1+
+    const opGitShaIdx = gitShaDict.indexMap.get(buf.task.module.gitSha) ?? 0;
+
+    // Set row 0 (span-start) to callsite module
+    gitShaIndices2[offset] = callsiteGitShaIdx;
+
+    // Set rows 1+ (span-end, logs) to op's module
+    if (buf.writeIndex > 1) {
+      gitShaIndices2.fill(opGitShaIdx, offset + 1, offset + buf.writeIndex);
+    }
     offset += buf.writeIndex;
   }
   vectors.push(
@@ -1572,20 +1708,40 @@ function convertBuffersWithSharedDicts(
 
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
+        // Check if this buffer has a scope value for this field
+        const scopeValue = buf.scopeValues?.[fieldName] as string | undefined;
+        let scopeEncodedValue: number | undefined;
+        if (scopeValue !== undefined) {
+          const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
+          scopeEncodedValue = dict.indexMap.get(maskedScopeValue);
+        }
+
         if (col) {
           for (let i = 0; i < buf.writeIndex; i++) {
             const v = col[i];
             const rowIdx = rowOffset + i;
             if (v != null) {
-              // Look up the masked value, then find its index in the dictionary
+              // Direct write wins - look up the masked value
               const maskedValue = originalToMasked.get(v) ?? v;
               indices[rowIdx] = dict.indexMap.get(maskedValue) ?? 0;
+              nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+            } else if (scopeEncodedValue !== undefined) {
+              // No direct write, but have scope value - use it
+              indices[rowIdx] = scopeEncodedValue;
               nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
             } else {
               nullCount++;
             }
           }
+        } else if (scopeEncodedValue !== undefined) {
+          // Column not allocated but we have scope - fill all rows with scope value
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const rowIdx = rowOffset + i;
+            indices[rowIdx] = scopeEncodedValue;
+            nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+          }
         } else {
+          // No column and no scope - all nulls
           nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;
@@ -1626,20 +1782,40 @@ function convertBuffersWithSharedDicts(
 
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
+        // Check if this buffer has a scope value for this field
+        const scopeValue = buf.scopeValues?.[fieldName] as string | undefined;
+        let scopeEncodedValue: number | undefined;
+        if (scopeValue !== undefined) {
+          const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
+          scopeEncodedValue = dict.indexMap.get(maskedScopeValue);
+        }
+
         if (col) {
           for (let i = 0; i < buf.writeIndex; i++) {
             const v = col[i];
             const rowIdx = rowOffset + i;
             if (v != null) {
-              // Look up the masked value, then find its index in the dictionary
+              // Direct write wins - look up the masked value
               const maskedValue = originalToMasked.get(v) ?? v;
               indices[rowIdx] = dict.indexMap.get(maskedValue) ?? 0;
+              nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+            } else if (scopeEncodedValue !== undefined) {
+              // No direct write, but have scope value - use it
+              indices[rowIdx] = scopeEncodedValue;
               nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
             } else {
               nullCount++;
             }
           }
+        } else if (scopeEncodedValue !== undefined) {
+          // Column not allocated but we have scope - fill all rows with scope value
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const rowIdx = rowOffset + i;
+            indices[rowIdx] = scopeEncodedValue;
+            nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+          }
         } else {
+          // No column and no scope - all nulls
           nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;
@@ -1670,32 +1846,58 @@ function convertBuffersWithSharedDicts(
     } else if (lmaoType === 'number') {
       const allValues = new Float64Array(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
-      nullBitmap.fill(0xff);
+      // Start with all nulls (bits cleared) - we'll set bits as we find values
       let nullCount = 0;
       let rowOffset = 0;
 
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
+        // Check if this buffer has a scope value for this field
+        const scopeValue = buf.scopeValues?.[fieldName] as number | undefined;
 
         if (col instanceof Float64Array) {
           allValues.set(col.subarray(0, buf.writeIndex), rowOffset);
           if (srcNulls) {
-            // Copy null bits - still need per-bit loop for non-aligned copy
+            // Process each row - direct write wins, then scope, then null
             for (let i = 0; i < buf.writeIndex; i++) {
               const srcByte = i >>> 3;
               const srcBit = i & 7;
               const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
-              if (!isValid) {
-                const rowIdx = rowOffset + i;
-                nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+              const rowIdx = rowOffset + i;
+              if (isValid) {
+                // Direct write - mark as valid
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else if (scopeValue !== undefined) {
+                // No direct write, but have scope value - use it
+                allValues[rowIdx] = scopeValue;
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else {
+                // No direct write and no scope - null
+                nullCount++;
+              }
+            }
+          } else {
+            // No null bitmap means column was allocated but no writes - check scope
+            for (let i = 0; i < buf.writeIndex; i++) {
+              const rowIdx = rowOffset + i;
+              if (scopeValue !== undefined) {
+                allValues[rowIdx] = scopeValue;
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else {
                 nullCount++;
               }
             }
           }
+        } else if (scopeValue !== undefined) {
+          // Column not allocated but we have scope - fill all rows with scope value
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const rowIdx = rowOffset + i;
+            allValues[rowIdx] = scopeValue;
+            nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+          }
         } else {
-          // Column doesn't exist for this buffer - all nulls
-          clearBitRange(nullBitmap, rowOffset, buf.writeIndex);
+          // Column doesn't exist for this buffer and no scope - all nulls
           nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;
@@ -1717,35 +1919,65 @@ function convertBuffersWithSharedDicts(
       const requiredBytes = Math.ceil(totalRows / 8);
       const allValues = new Uint8Array(requiredBytes);
       const nullBitmap = new Uint8Array(requiredBytes);
-      nullBitmap.fill(0xff);
+      // Start with all nulls (bits cleared) - we'll set bits as we find values
       let nullCount = 0;
       let rowOffset = 0;
 
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
+        // Check if this buffer has a scope value for this field
+        const scopeValue = buf.scopeValues?.[fieldName] as boolean | undefined;
 
         if (col instanceof Uint8Array) {
           // Copy boolean values bit by bit - can't avoid loop for bit-level operations
           for (let i = 0; i < buf.writeIndex; i++) {
             const srcByte = i >>> 3;
             const srcBit = i & 7;
-            const value = (col[srcByte] & (1 << srcBit)) !== 0;
             const rowIdx = rowOffset + i;
-            if (value) {
-              allValues[rowIdx >>> 3] |= 1 << (rowIdx & 7);
-            }
+
             if (srcNulls) {
               const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
-              if (!isValid) {
-                nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+              if (isValid) {
+                // Direct write - copy the value
+                const value = (col[srcByte] & (1 << srcBit)) !== 0;
+                if (value) {
+                  allValues[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+                }
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else if (scopeValue !== undefined) {
+                // No direct write, but have scope value - use it
+                if (scopeValue) {
+                  allValues[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+                }
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else {
+                // No direct write and no scope - null
+                nullCount++;
+              }
+            } else {
+              // No null bitmap - check scope
+              if (scopeValue !== undefined) {
+                if (scopeValue) {
+                  allValues[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+                }
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else {
                 nullCount++;
               }
             }
           }
+        } else if (scopeValue !== undefined) {
+          // Column not allocated but we have scope - fill all rows with scope value
+          for (let i = 0; i < buf.writeIndex; i++) {
+            const rowIdx = rowOffset + i;
+            if (scopeValue) {
+              allValues[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+            }
+            nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+          }
         } else {
-          // Column doesn't exist for this buffer - all nulls
-          clearBitRange(nullBitmap, rowOffset, buf.writeIndex);
+          // Column doesn't exist for this buffer and no scope - all nulls
           nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;
@@ -1775,13 +2007,25 @@ function convertBuffersWithSharedDicts(
         (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
       const allIndices = new indexArrayCtor(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
-      nullBitmap.fill(0xff);
+      // Start with all nulls (bits cleared) - we'll set bits as we find values
       let nullCount = 0;
       let rowOffset = 0;
+
+      // Build enum value to index mapping for scope lookup
+      const enumValueToIndex = new Map<string, number>();
+      for (let i = 0; i < enumValues.length; i++) {
+        enumValueToIndex.set(enumValues[i] as string, i);
+      }
 
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
+        // Check if this buffer has a scope value for this field
+        const scopeValue = buf.scopeValues?.[fieldName] as string | undefined;
+        let scopeEncodedValue: number | undefined;
+        if (scopeValue !== undefined) {
+          scopeEncodedValue = enumValueToIndex.get(scopeValue);
+        }
 
         if (col instanceof indexArrayCtor) {
           allIndices.set(col.subarray(0, buf.writeIndex), rowOffset);
@@ -1790,19 +2034,41 @@ function convertBuffersWithSharedDicts(
               const srcByte = i >>> 3;
               const srcBit = i & 7;
               const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
-              if (!isValid) {
-                const rowIdx = rowOffset + i;
-                nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
+              const rowIdx = rowOffset + i;
+              if (isValid) {
+                // Direct write - mark as valid
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else if (scopeEncodedValue !== undefined) {
+                // No direct write, but have scope value - use it
+                allIndices[rowIdx] = scopeEncodedValue;
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else {
+                // No direct write and no scope - null
+                nullCount++;
+              }
+            }
+          } else {
+            // No null bitmap - check scope for each row
+            for (let i = 0; i < buf.writeIndex; i++) {
+              const rowIdx = rowOffset + i;
+              if (scopeEncodedValue !== undefined) {
+                allIndices[rowIdx] = scopeEncodedValue;
+                nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
+              } else {
                 nullCount++;
               }
             }
           }
-        } else {
+        } else if (scopeEncodedValue !== undefined) {
+          // Column not allocated but we have scope - fill all rows with scope value
           for (let i = 0; i < buf.writeIndex; i++) {
             const rowIdx = rowOffset + i;
-            nullBitmap[rowIdx >>> 3] &= ~(1 << (rowIdx & 7));
-            nullCount++;
+            allIndices[rowIdx] = scopeEncodedValue;
+            nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
           }
+        } else {
+          // Column doesn't exist for this buffer and no scope - all nulls
+          nullCount += buf.writeIndex;
         }
         rowOffset += buf.writeIndex;
       }

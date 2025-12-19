@@ -10,8 +10,8 @@
 
 import { describe, expect, test } from 'bun:test';
 import { S } from '../../schema/builder.js';
-import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
-import type { TagAttributeSchema } from '../../schema/types.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import type { SchemaFields } from '../../schema/types.js';
 import {
   createScope,
   createScopeWithInheritance,
@@ -22,7 +22,7 @@ import {
 describe('Scope Class Generation', () => {
   describe('Basic Scope Creation', () => {
     test('should generate a Scope class from schema', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
         count: S.number(),
@@ -34,7 +34,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should create Scope instance with all fields initialized to undefined', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
         count: S.number(),
@@ -51,7 +51,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should allow setting and getting values', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
         count: S.number(),
@@ -71,7 +71,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should have _getScopeValues() method', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
         count: S.number(),
@@ -93,7 +93,7 @@ describe('Scope Class Generation', () => {
 
   describe('Scope Inheritance', () => {
     test('should create Scope with inherited values', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
         operation: S.category(),
@@ -112,7 +112,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should allow child to override inherited values', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
         level: S.number(),
@@ -132,7 +132,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should not copy undefined values during inheritance', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
         count: S.number(),
@@ -152,7 +152,7 @@ describe('Scope Class Generation', () => {
 
   describe('Different Data Types', () => {
     test('should support enum types', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         status: S.enum(['pending', 'active', 'completed']),
         operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
       });
@@ -167,7 +167,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should support category types', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         sessionId: S.category(),
       });
@@ -182,7 +182,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should support text types', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         errorMessage: S.text(),
         requestBody: S.text(),
       });
@@ -197,7 +197,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should support number types', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         count: S.number(),
         duration: S.number(),
       });
@@ -212,7 +212,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should support boolean types', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         isValid: S.boolean(),
         isEnabled: S.boolean(),
       });
@@ -229,7 +229,7 @@ describe('Scope Class Generation', () => {
 
   describe('Scope Class Caching', () => {
     test('should reuse cached Scope class for same schema', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         count: S.number(),
       });
@@ -242,11 +242,11 @@ describe('Scope Class Generation', () => {
     });
 
     test('should create different Scope classes for different schemas', () => {
-      const schema1 = defineTagAttributes({
+      const schema1 = defineLogSchema({
         userId: S.category(),
       });
 
-      const schema2 = defineTagAttributes({
+      const schema2 = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
       });
@@ -261,7 +261,7 @@ describe('Scope Class Generation', () => {
 
   describe('Separation from Column Storage', () => {
     test('should NOT contain system columns', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         count: S.number(),
       });
@@ -276,7 +276,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should NOT allocate TypedArrays', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         count: S.number(),
       });
@@ -294,7 +294,7 @@ describe('Scope Class Generation', () => {
     });
 
     test('should store raw values (not interned)', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         description: S.text(),
       });
@@ -317,7 +317,7 @@ describe('Scope Class Generation', () => {
 
   describe('Multiple Instances', () => {
     test('should create independent Scope instances', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         userId: S.category(),
         count: S.number(),
       });
@@ -342,41 +342,41 @@ describe('Scope Class Generation', () => {
 
 describe('generateScopeClassCode snapshots', () => {
   test('snapshot: empty schema', () => {
-    const schema = defineTagAttributes({});
-    const code = generateScopeClassCode(schema as TagAttributeSchema);
+    const schema = defineLogSchema({});
+    const code = generateScopeClassCode(schema as SchemaFields);
     expect(code).toMatchSnapshot();
   });
 
   test('snapshot: all field types', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
       errorMsg: S.text(),
       count: S.number(),
       enabled: S.boolean(),
     });
-    const code = generateScopeClassCode(schema as TagAttributeSchema);
+    const code = generateScopeClassCode(schema as SchemaFields);
     expect(code).toMatchSnapshot();
   });
 
   test('snapshot: category fields only', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       sessionId: S.category(),
       requestId: S.category(),
     });
-    const code = generateScopeClassCode(schema as TagAttributeSchema);
+    const code = generateScopeClassCode(schema as SchemaFields);
     expect(code).toMatchSnapshot();
   });
 
   test('snapshot: mixed types', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       status: S.enum(['pending', 'active', 'completed']),
       duration: S.number(),
       isValid: S.boolean(),
       errorMessage: S.text(),
     });
-    const code = generateScopeClassCode(schema as TagAttributeSchema);
+    const code = generateScopeClassCode(schema as SchemaFields);
     expect(code).toMatchSnapshot();
   });
 });

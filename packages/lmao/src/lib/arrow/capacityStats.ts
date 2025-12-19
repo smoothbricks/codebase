@@ -28,15 +28,31 @@ import {
   Utf8,
   type Vector,
 } from 'apache-arrow';
-import { ENTRY_TYPE_CAPACITY_STATS, ENTRY_TYPE_NAMES } from '../lmao.js';
 import type { ModuleContext } from '../moduleContext.js';
+import {
+  ENTRY_TYPE_BUFFER_CREATED,
+  ENTRY_TYPE_BUFFER_OVERFLOW_WRITES,
+  ENTRY_TYPE_BUFFER_OVERFLOWS,
+  ENTRY_TYPE_BUFFER_WRITES,
+  ENTRY_TYPE_NAMES,
+  ENTRY_TYPE_PERIOD_START,
+} from '../schema/systemSchema.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import { globalUtf8Cache } from '../utf8Cache.js';
 import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
 
 /**
- * Create a RecordBatch with capacity stats entries for the given modules.
- * Each module gets one row with its capacity statistics serialized as JSON in the message column.
+ * Create a RecordBatch with buffer metric entries for the given modules.
+ *
+ * Per specs/01n_op_and_buffer_metrics.md, each module emits 5 rows:
+ * - period-start: uint64_value = periodStartNs (when the metrics period began)
+ * - buffer-writes: uint64_value = total entries written to buffers
+ * - buffer-overflow-writes: uint64_value = entries written to overflow buffers
+ * - buffer-created: uint64_value = number of SpanBuffer instances allocated
+ * - buffer-overflows: uint64_value = number of overflow events
+ *
+ * The `message` column is null for all buffer-* entry types (only op-* uses message).
+ * Ratios like efficiency and overflow_rate are computed at query time, not here.
  *
  * **Dictionary handling**: Each RecordBatch has its own dictionary data.
  * This function builds dictionaries containing only the modules that have capacity stats,
@@ -45,19 +61,25 @@ import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
  *
  * **Schema handling**: If `hasSpanData` is false (no span data in the tree), builds a minimal
  * schema with only the columns needed for capacity stats:
- * - timestamp, entry_type, package_name, package_path, git_sha, message (if in schema)
+ * - timestamp, entry_type, package_name, package_path, git_sha, uint64_value
  * - NO trace_id, thread_id, span_id, parent_thread_id, parent_span_id
- * - NO custom attribute columns (except message)
+ * - NO custom attribute columns
  *
  * If `hasSpanData` is true, uses the full `arrowSchema` so RecordBatches can be combined.
  */
+
+/** Number of metric rows per module (period-start + 4 buffer metrics) */
+const ROWS_PER_MODULE = 5;
+
 export function createCapacityStatsRecordBatch(
   modulesToLogStats: Set<ModuleContext>,
+  periodStartNs: bigint,
   arrowSchema: Schema,
   lmaoSchema: Record<string, unknown>,
   hasSpanData = true,
 ): RecordBatch {
-  const capacityStatsRows = modulesToLogStats.size;
+  const moduleCount = modulesToLogStats.size;
+  const capacityStatsRows = moduleCount * ROWS_PER_MODULE;
   if (capacityStatsRows === 0) {
     return new RecordBatch({});
   }
@@ -67,7 +89,6 @@ export function createCapacityStatsRecordBatch(
 
   // Build dictionaries containing only modules with capacity stats
   // This ensures the RecordBatch only includes dictionary entries it actually uses
-  const moduleCount = modulesArray.length;
   const packageEntries: PreEncodedEntry[] = new Array(moduleCount);
   const packagePathEntries: PreEncodedEntry[] = new Array(moduleCount);
   const gitShaEntries: PreEncodedEntry[] = new Array(moduleCount);
@@ -117,7 +138,8 @@ export function createCapacityStatsRecordBatch(
       }
     }
   } else {
-    // Build minimal schema: only columns needed for capacity stats
+    // Build minimal schema: only columns needed for buffer metrics
+    // Per spec, buffer-* entry types don't use message column, so we skip it in minimal schema
     const fields: Field[] = [];
     fields.push(Field.new({ name: 'timestamp', type: new TimestampNanosecond() }));
     fields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8()) }));
@@ -139,12 +161,8 @@ export function createCapacityStatsRecordBatch(
         type: new Dictionary(new Utf8(), new capacityStatsGitShaDict.arrowIndexTypeCtor()),
       }),
     );
-
-    // Message is always included as a system column (even if not in user schema)
-    // Message will be dictionary-encoded, but we'll determine the type after building the dict
-    // For now, use Uint8 as placeholder (will be updated after building messageDict)
-    fields.push(Field.new({ name: 'message', type: new Dictionary(new Utf8(), new Uint8()) }));
-    messageFieldIndex = fields.length - 1;
+    // uint64_value for metric values
+    fields.push(Field.new({ name: 'uint64_value', type: new Uint64() }));
 
     capacityStatsSchema = new Schema(fields);
     timestampType = new TimestampNanosecond();
@@ -154,36 +172,14 @@ export function createCapacityStatsRecordBatch(
     gitShaType = new Dictionary(new Utf8(), new capacityStatsGitShaDict.arrowIndexTypeCtor());
   }
 
-  // Build capacity stats JSON strings
-  // Create a separate dictionary just for capacity stats messages
-  // This doesn't pollute the main message dictionary cache
-  const capacityStatsMessages: string[] = [];
-  const nowNs = BigInt(Date.now()) * 1_000_000n;
-
-  for (const module of modulesArray) {
-    const stats = module.spanBufferCapacityStats;
-    const efficiency = stats.totalWrites / (stats.totalBuffersCreated * stats.currentCapacity);
-    const overflowRatio = stats.totalWrites > 0 ? stats.overflowWrites / stats.totalWrites : 0;
-
-    const statsJson = JSON.stringify({
-      currentCapacity: stats.currentCapacity,
-      totalWrites: stats.totalWrites,
-      overflowWrites: stats.overflowWrites,
-      totalBuffers: stats.totalBuffersCreated,
-      efficiency,
-      overflowRatio,
-    });
-
-    capacityStatsMessages.push(statsJson);
-  }
-
-  // Create a separate dictionary just for capacity stats messages
-  // This doesn't pollute the main message dictionary cache
+  // Per spec, buffer metrics don't use message column (null for all buffer-* entry types)
+  // Only period-start and op-* entry types use message.
+  // We need an empty message dict for the null values.
   const capacityStatsMessageBuilder = new DictionaryBuilder(globalUtf8Cache);
-  for (const msg of capacityStatsMessages) {
-    capacityStatsMessageBuilder.add(msg);
-  }
-  const capacityStatsMessageDict = capacityStatsMessageBuilder.finalize(false); // not sorted
+  capacityStatsMessageBuilder.add(''); // Single empty string for nulls
+  const capacityStatsMessageDict = capacityStatsMessageBuilder.finalize(false);
+
+  const nowNs = BigInt(Date.now()) * 1_000_000n;
 
   // Timestamp - all current time
   const timestamps = new BigInt64Array(capacityStatsRows);
@@ -295,9 +291,21 @@ export function createCapacityStatsRecordBatch(
     );
   }
 
-  // Entry type - all CAPACITY_STATS
+  // Entry type - 5 rows per module with different entry types:
+  // Row 0: period-start
+  // Row 1: buffer-writes
+  // Row 2: buffer-overflow-writes
+  // Row 3: buffer-created
+  // Row 4: buffer-overflows
   const entryTypeIndices = new Int8Array(capacityStatsRows);
-  entryTypeIndices.fill(ENTRY_TYPE_CAPACITY_STATS);
+  for (let m = 0; m < moduleCount; m++) {
+    const baseRow = m * ROWS_PER_MODULE;
+    entryTypeIndices[baseRow + 0] = ENTRY_TYPE_PERIOD_START;
+    entryTypeIndices[baseRow + 1] = ENTRY_TYPE_BUFFER_WRITES;
+    entryTypeIndices[baseRow + 2] = ENTRY_TYPE_BUFFER_OVERFLOW_WRITES;
+    entryTypeIndices[baseRow + 3] = ENTRY_TYPE_BUFFER_CREATED;
+    entryTypeIndices[baseRow + 4] = ENTRY_TYPE_BUFFER_OVERFLOWS;
+  }
   vectors.push(
     makeVector(
       makeData({
@@ -321,11 +329,15 @@ export function createCapacityStatsRecordBatch(
   );
 
   // Package name - from modules (using capacity stats dictionary)
+  // Each module has ROWS_PER_MODULE rows, all with the same package name
   const packageIndices = new capacityStatsPackageDict.indexArrayCtor(capacityStatsRows);
-  for (let i = 0; i < capacityStatsRows; i++) {
-    const module = modulesArray[i];
+  for (let m = 0; m < moduleCount; m++) {
+    const module = modulesArray[m];
     const pkgIdx = capacityStatsPackageDict.indexMap.get(module.packageName) ?? 0;
-    packageIndices[i] = pkgIdx;
+    const baseRow = m * ROWS_PER_MODULE;
+    for (let r = 0; r < ROWS_PER_MODULE; r++) {
+      packageIndices[baseRow + r] = pkgIdx;
+    }
   }
   vectors.push(
     makeVector(
@@ -350,11 +362,15 @@ export function createCapacityStatsRecordBatch(
   );
 
   // Package path - from modules (using capacity stats dictionary)
+  // Each module has ROWS_PER_MODULE rows, all with the same package path
   const packagePathIndices = new capacityStatsPackagePathDict.indexArrayCtor(capacityStatsRows);
-  for (let i = 0; i < capacityStatsRows; i++) {
-    const module = modulesArray[i];
+  for (let m = 0; m < moduleCount; m++) {
+    const module = modulesArray[m];
     const pathIdx = capacityStatsPackagePathDict.indexMap.get(module.packagePath) ?? 0;
-    packagePathIndices[i] = pathIdx;
+    const baseRow = m * ROWS_PER_MODULE;
+    for (let r = 0; r < ROWS_PER_MODULE; r++) {
+      packagePathIndices[baseRow + r] = pathIdx;
+    }
   }
   vectors.push(
     makeVector(
@@ -379,11 +395,15 @@ export function createCapacityStatsRecordBatch(
   );
 
   // Git SHA - from modules (using capacity stats dictionary)
+  // Each module has ROWS_PER_MODULE rows, all with the same git SHA
   const gitShaIndices = new capacityStatsGitShaDict.indexArrayCtor(capacityStatsRows);
-  for (let i = 0; i < capacityStatsRows; i++) {
-    const module = modulesArray[i];
+  for (let m = 0; m < moduleCount; m++) {
+    const module = modulesArray[m];
     const idx = capacityStatsGitShaDict.indexMap.get(module.gitSha) ?? 0;
-    gitShaIndices[i] = idx;
+    const baseRow = m * ROWS_PER_MODULE;
+    for (let r = 0; r < ROWS_PER_MODULE; r++) {
+      gitShaIndices[baseRow + r] = idx;
+    }
   }
   vectors.push(
     makeVector(
@@ -408,14 +428,15 @@ export function createCapacityStatsRecordBatch(
   );
 
   // System attribute column: message (index 10) - handle separately before user attributes
+  // Per spec, buffer-* entry types don't use message column (all null)
   if (hasSpanData && messageFieldIndex !== undefined) {
     const messageField = arrowSchema.fields[messageFieldIndex];
     if (messageField && messageField.name === 'message') {
       const messageFieldType = messageField.type as Dictionary<Utf8, Uint8 | Uint16 | Uint32>;
       const indices = new capacityStatsMessageDict.indexArrayCtor(capacityStatsRows);
-      for (let i = 0; i < capacityStatsRows; i++) {
-        indices[i] = capacityStatsMessageDict.indexMap.get(capacityStatsMessages[i]) ?? 0;
-      }
+      indices.fill(0); // All point to empty string (index 0)
+      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
+      nullBitmap.fill(0); // All null
 
       vectors.push(
         makeVector(
@@ -423,8 +444,9 @@ export function createCapacityStatsRecordBatch(
             type: messageFieldType,
             offset: 0,
             length: capacityStatsRows,
-            nullCount: 0,
+            nullCount: capacityStatsRows,
             data: indices,
+            nullBitmap,
             dictionary: makeVector(
               makeData({
                 type: new Utf8(),
@@ -439,6 +461,37 @@ export function createCapacityStatsRecordBatch(
         ),
       );
     }
+  }
+
+  // uint64_value column - stores metric values per spec
+  // Per spec 01n_op_and_buffer_metrics.md:
+  // - period-start: periodStartNs (nanosecond timestamp when period began)
+  // - buffer-writes: module.sb_totalWrites
+  // - buffer-overflow-writes: module.sb_overflowWrites
+  // - buffer-created: module.sb_totalCreated
+  // - buffer-overflows: module.sb_overflows
+  if (hasSpanData) {
+    const uint64Values = new BigUint64Array(capacityStatsRows);
+    for (let m = 0; m < moduleCount; m++) {
+      const module = modulesArray[m];
+      const baseRow = m * ROWS_PER_MODULE;
+      uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
+      uint64Values[baseRow + 1] = BigInt(module.sb_totalWrites); // buffer-writes
+      uint64Values[baseRow + 2] = BigInt(module.sb_overflowWrites); // buffer-overflow-writes
+      uint64Values[baseRow + 3] = BigInt(module.sb_totalCreated); // buffer-created
+      uint64Values[baseRow + 4] = BigInt(module.sb_overflows); // buffer-overflows
+    }
+    vectors.push(
+      makeVector(
+        makeData({
+          type: new Uint64(),
+          offset: 0,
+          length: capacityStatsRows,
+          nullCount: 0,
+          data: uint64Values,
+        }),
+      ),
+    );
   }
 
   // User attribute columns - only include if combining with span data
@@ -609,47 +662,29 @@ export function createCapacityStatsRecordBatch(
       }
     } // end for loop
   } else {
-    // Minimal schema: only add message column if it exists
-    if (messageFieldIndex !== undefined) {
-      const indices = new capacityStatsMessageDict.indexArrayCtor(capacityStatsRows);
-      for (let i = 0; i < capacityStatsRows; i++) {
-        indices[i] = capacityStatsMessageDict.indexMap.get(capacityStatsMessages[i]) ?? 0;
-      }
-
-      // Update schema field type with correct index type
-      const messageField = capacityStatsSchema.fields[messageFieldIndex];
-      const updatedMessageField = Field.new({
-        name: messageField.name,
-        type: new Dictionary(new Utf8(), new capacityStatsMessageDict.arrowIndexTypeCtor()),
-      });
-      capacityStatsSchema = new Schema([
-        ...capacityStatsSchema.fields.slice(0, messageFieldIndex),
-        updatedMessageField,
-        ...capacityStatsSchema.fields.slice(messageFieldIndex + 1),
-      ]);
-
-      vectors.push(
-        makeVector(
-          makeData({
-            type: new Dictionary(new Utf8(), new capacityStatsMessageDict.arrowIndexTypeCtor()),
-            offset: 0,
-            length: capacityStatsRows,
-            nullCount: 0,
-            data: indices,
-            dictionary: makeVector(
-              makeData({
-                type: new Utf8(),
-                offset: 0,
-                length: capacityStatsMessageDict.indexMap.size,
-                nullCount: 0,
-                valueOffsets: capacityStatsMessageDict.offsets,
-                data: capacityStatsMessageDict.data,
-              }),
-            ),
-          }),
-        ),
-      );
+    // Minimal schema: add uint64_value column with metric values
+    // Per spec, buffer-* entry types use uint64_value, not message
+    const uint64Values = new BigUint64Array(capacityStatsRows);
+    for (let m = 0; m < moduleCount; m++) {
+      const module = modulesArray[m];
+      const baseRow = m * ROWS_PER_MODULE;
+      uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
+      uint64Values[baseRow + 1] = BigInt(module.sb_totalWrites); // buffer-writes
+      uint64Values[baseRow + 2] = BigInt(module.sb_overflowWrites); // buffer-overflow-writes
+      uint64Values[baseRow + 3] = BigInt(module.sb_totalCreated); // buffer-created
+      uint64Values[baseRow + 4] = BigInt(module.sb_overflows); // buffer-overflows
     }
+    vectors.push(
+      makeVector(
+        makeData({
+          type: new Uint64(),
+          offset: 0,
+          length: capacityStatsRows,
+          nullCount: 0,
+          data: uint64Values,
+        }),
+      ),
+    );
   }
 
   // When hasSpanData is true, rebuild schema from the actual vector types

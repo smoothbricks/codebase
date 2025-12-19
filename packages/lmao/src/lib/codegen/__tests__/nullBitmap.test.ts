@@ -2,21 +2,23 @@
  * Unit tests for null bitmap correctness in SpanLogger code generation
  *
  * These tests verify that the generated code sets null bitmap bits correctly
- * for single writes, bulk fills, and edge cases like partial byte fills.
+ * for single writes and log entries with scoped attributes.
  *
  * Architecture changes (new design):
  * - SpanLogger handles log entries (rows 2+), NOT tag writes (row 0)
  * - Tag writing is done via ctx.tag which is a separate API (not on SpanLogger)
  * - SpanLogger constructor: (buffer, scope, createNextBuffer)
  * - SpanLogger._writeIndex starts at 1 (rows 0/1 are reserved for span-start/end)
- * - Scoped attributes are written via _setScope() which fills from _writeIndex+1 to capacity
+ * - _setScope() stores scope values in buffer.scopeValues (immutable, frozen)
+ * - Scope filling happens at Arrow conversion time, NOT during span execution
+ * - Direct writes (tag/log) win over scope values on their respective rows
  */
 
 import { describe, expect, it } from 'bun:test';
 import { createTestTaskContext } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
-import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
-import type { TagAttributeSchema } from '../../schema/types.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import type { SchemaFields } from '../../schema/types.js';
 import { createSpanBuffer, SpanBufferTestUtils } from '../../spanBuffer.js';
 import type { SpanBuffer } from '../../types.js';
 import { createScope } from '../scopeGenerator.js';
@@ -41,215 +43,116 @@ function getBitsSet(nullBitmap: Uint8Array, count: number): boolean[] {
 const mockCreateNextBuffer = (buffer: SpanBuffer): SpanBuffer => buffer;
 
 describe('null bitmap correctness', () => {
-  describe('scope bulk fill', () => {
-    it('should correctly fill bits within a single byte (indices 2-7)', () => {
-      const schema = defineTagAttributes({
+  describe('immutable scope semantics', () => {
+    it('should store scope values in buffer.scopeValues as frozen object', () => {
+      const schema = defineLogSchema({
         requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
+      }) as unknown as SchemaFields;
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
-      // SpanLogger starts with _writeIndex = 1, but we want to test filling from index 2
-      // So we need to simulate that writeIndex is 1 (so _writeIndex+1 = 2)
 
       const scopeInstance = createScope(schema);
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
 
-      // Logger starts with _writeIndex = 1, so _setScope will fill from index 2 to capacity
-      // Set scope - should fill from index 2 to capacity (64)
-      // _setScope is a public method on BaseSpanLogger
+      // _setScope should store values in buffer.scopeValues (not fill buffer columns)
       logger._setScope({ requestId: 'req-123' });
 
-      // Check null bitmap for first byte
+      // Verify scope values are stored in buffer.scopeValues
+      expect(buffer.scopeValues).toBeDefined();
+      expect(buffer.scopeValues?.requestId).toBe('req-123');
+
+      // Verify the object is frozen (immutable)
+      expect(Object.isFrozen(buffer.scopeValues)).toBe(true);
+    });
+
+    it('should create new frozen object on each _setScope call (merge semantics)', () => {
+      const schema = defineLogSchema({
+        requestId: S.category(),
+        userId: S.category(),
+      }) as unknown as SchemaFields;
+      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+
+      const scopeInstance = createScope(schema);
+      const SpanLoggerClass = createSpanLoggerClass(schema);
+      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+
+      // First setScope call
+      logger._setScope({ requestId: 'req-123' });
+      const firstScopeValues = buffer.scopeValues;
+      expect(firstScopeValues?.requestId).toBe('req-123');
+      expect(firstScopeValues?.userId).toBeUndefined();
+
+      // Second setScope call - should merge with existing values
+      logger._setScope({ userId: 'user-456' });
+      const secondScopeValues = buffer.scopeValues;
+
+      // Should be a NEW object (immutable semantics)
+      expect(secondScopeValues).not.toBe(firstScopeValues);
+
+      // Should have merged values
+      expect(secondScopeValues?.requestId).toBe('req-123');
+      expect(secondScopeValues?.userId).toBe('user-456');
+
+      // Both should be frozen
+      expect(Object.isFrozen(firstScopeValues)).toBe(true);
+      expect(Object.isFrozen(secondScopeValues)).toBe(true);
+    });
+
+    it('should clear keys when null is passed (null clears, undefined ignores)', () => {
+      const schema = defineLogSchema({
+        requestId: S.category(),
+        userId: S.category(),
+      }) as unknown as SchemaFields;
+      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+
+      const scopeInstance = createScope(schema);
+      const SpanLoggerClass = createSpanLoggerClass(schema);
+      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+
+      // Set initial values
+      logger._setScope({ requestId: 'req-123', userId: 'user-456' });
+      expect(buffer.scopeValues?.requestId).toBe('req-123');
+      expect(buffer.scopeValues?.userId).toBe('user-456');
+
+      // Pass null to clear requestId, undefined should be ignored
+      logger._setScope({ requestId: null as unknown as string, userId: undefined });
+
+      // requestId should be cleared (null), userId should remain (undefined ignored)
+      expect(buffer.scopeValues?.requestId).toBeUndefined();
+      expect(buffer.scopeValues?.userId).toBe('user-456');
+    });
+
+    it('should NOT fill buffer columns during _setScope (deferred to Arrow conversion)', () => {
+      const schema = defineLogSchema({
+        requestId: S.category(),
+      }) as unknown as SchemaFields;
+      const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
+
+      const scopeInstance = createScope(schema);
+      const SpanLoggerClass = createSpanLoggerClass(schema);
+      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
+
+      // _setScope should NOT fill buffer columns
+      logger._setScope({ requestId: 'req-123' });
+
+      // Check null bitmap - should NOT have any bits set (no buffer writes)
       const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
       expect(nulls).toBeDefined();
       if (!nulls) throw new Error('Null bitmap should be defined');
       const bitsSet = getBitsSet(nulls, 8);
 
-      // Bits 0,1 should NOT be set (before _writeIndex+1)
-      expect(bitsSet[0]).toBe(false);
-      expect(bitsSet[1]).toBe(false);
-      // Bits 2-7 should be set (filled by _setScope from _writeIndex+1)
-      expect(bitsSet[2]).toBe(true);
-      expect(bitsSet[3]).toBe(true);
-      expect(bitsSet[4]).toBe(true);
-      expect(bitsSet[5]).toBe(true);
-      expect(bitsSet[6]).toBe(true);
-      expect(bitsSet[7]).toBe(true);
-    });
-
-    it('should correctly fill exactly one full byte (indices 0-7)', () => {
-      const schema = defineTagAttributes({
-        requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
-      // Create buffer with capacity 8
-      const taskContext = createTestTaskContext(schema);
-      taskContext.module.spanBufferCapacityStats.currentCapacity = 8;
-      const buffer = createSpanBuffer(schema, taskContext, undefined, 8);
-
-      const scopeInstance = createScope(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
-
-      // Override _writeIndex to -1 so _writeIndex+1 = 0 (fill entire buffer from 0)
-      // _writeIndex is a public property on ColumnWriter
-      logger._writeIndex = -1;
-
-      // Set scope - should fill indices 0-7
-      logger._setScope({ requestId: 'req-123' });
-
-      // Check null bitmap - byte 0 should be 0xFF (all bits set)
-      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      expect(nulls[0]).toBe(0xff);
-    });
-
-    it('should correctly fill across byte boundary (indices 5-12)', () => {
-      const schema = defineTagAttributes({
-        requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 16);
-      SpanBufferTestUtils.setCapacity(buffer, 13); // End at index 12 (exclusive), so fill 5-12
-
-      const scopeInstance = createScope(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
-
-      // Set _writeIndex to 4 so _writeIndex+1 = 5
-      logger._writeIndex = 4;
-
-      // Set scope - should fill from index 5 to 12
-      logger._setScope({ requestId: 'req-123' });
-
-      // Check null bitmap
-      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      const bitsSet = getBitsSet(nulls, 16);
-
-      // Bits 0-4 should NOT be set
-      for (let i = 0; i < 5; i++) {
+      // No bits should be set - scope filling happens at Arrow conversion time
+      for (let i = 0; i < 8; i++) {
         expect(bitsSet[i]).toBe(false);
       }
-      // Bits 5-12 should be set
-      for (let i = 5; i < 13; i++) {
-        expect(bitsSet[i]).toBe(true);
-      }
-      // Bits 13-15 should NOT be set
-      for (let i = 13; i < 16; i++) {
-        expect(bitsSet[i]).toBe(false);
-      }
-    });
-
-    it('should correctly fill multiple full bytes (indices 0-23)', () => {
-      const schema = defineTagAttributes({
-        requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 24);
-
-      const scopeInstance = createScope(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
-
-      // Override _writeIndex to -1 so _writeIndex+1 = 0
-      logger._writeIndex = -1;
-
-      // Set scope - should fill indices 0-23 (3 full bytes)
-      logger._setScope({ requestId: 'req-123' });
-
-      // Check null bitmap - bytes 0,1,2 should all be 0xFF
-      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      expect(nulls[0]).toBe(0xff);
-      expect(nulls[1]).toBe(0xff);
-      expect(nulls[2]).toBe(0xff);
-    });
-
-    it('should handle partial start and end bytes (indices 3-21)', () => {
-      const schema = defineTagAttributes({
-        requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 24);
-      SpanBufferTestUtils.setCapacity(buffer, 22); // End at index 21 (exclusive)
-
-      const scopeInstance = createScope(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
-
-      // Set _writeIndex to 2 so _writeIndex+1 = 3
-      logger._writeIndex = 2;
-
-      // Set scope - should fill indices 3-21
-      logger._setScope({ requestId: 'req-123' });
-
-      // Check null bitmap
-      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      const bitsSet = getBitsSet(nulls, 24);
-
-      // Bits 0-2 should NOT be set
-      expect(bitsSet[0]).toBe(false);
-      expect(bitsSet[1]).toBe(false);
-      expect(bitsSet[2]).toBe(false);
-
-      // Bits 3-21 should be set
-      for (let i = 3; i < 22; i++) {
-        expect(bitsSet[i]).toBe(true);
-      }
-
-      // Bits 22-23 should NOT be set
-      expect(bitsSet[22]).toBe(false);
-      expect(bitsSet[23]).toBe(false);
-    });
-
-    it('BUG TEST: should correctly fill within single byte when start > 0 (indices 2-5)', () => {
-      // This is the edge case that might be buggy:
-      // When startIdx and endIdx are within the same byte, and startIdx > 0
-      const schema = defineTagAttributes({
-        requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
-      const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 8);
-      SpanBufferTestUtils.setCapacity(buffer, 6); // End at index 5 (exclusive), so fill 2-5
-
-      const scopeInstance = createScope(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, scopeInstance, mockCreateNextBuffer);
-
-      // Set _writeIndex to 1 so _writeIndex+1 = 2
-      logger._writeIndex = 1;
-
-      // Set scope - should fill indices 2-5 only
-      logger._setScope({ requestId: 'req-123' });
-
-      // Check null bitmap
-      const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      const bitsSet = getBitsSet(nulls, 8);
-
-      // Bits 0,1 should NOT be set
-      expect(bitsSet[0]).toBe(false);
-      expect(bitsSet[1]).toBe(false);
-
-      // Bits 2-5 should be set
-      expect(bitsSet[2]).toBe(true);
-      expect(bitsSet[3]).toBe(true);
-      expect(bitsSet[4]).toBe(true);
-      expect(bitsSet[5]).toBe(true);
-
-      // Bits 6,7 should NOT be set
-      expect(bitsSet[6]).toBe(false);
-      expect(bitsSet[7]).toBe(false);
     });
   });
 
   describe('log message writes (arbitrary index)', () => {
     it('should set correct bit for log entry at index 5', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
+      }) as unknown as SchemaFields;
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema));
 
       const scopeInstance = createScope(schema);
@@ -276,9 +179,9 @@ describe('null bitmap correctness', () => {
     });
 
     it('should set correct bit for log entry at index 9 (crosses byte boundary)', () => {
-      const schema = defineTagAttributes({
+      const schema = defineLogSchema({
         requestId: S.category(),
-      }) as unknown as TagAttributeSchema;
+      }) as unknown as SchemaFields;
       // Need capacity > 9 to test writing at index 9
       const buffer = createSpanBuffer(schema, createTestTaskContext(schema), undefined, 16);
 

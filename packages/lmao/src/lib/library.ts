@@ -1,5 +1,5 @@
 /**
- * Library Integration Pattern with Prefix Remapping
+ * Library Prefix/Remapping Utilities
  *
  * WHY: Libraries need to write clean, domain-focused code (ctx.tag.status(200))
  * while avoiding naming conflicts when composed with other libraries.
@@ -15,63 +15,22 @@
  * WHAT: This module provides:
  * - prefixSchema() - Rename schema fields with prefix
  * - createPrefixMapping() - Build clean→prefixed name mapping
+ * - generateRemappedBufferViewClass() - Generate view for Arrow conversion
  * - generateRemappedSpanLoggerClass() - Generate class with clean methods, prefixed writes
- * - createLibraryModule() - Library author API for defining modules
- * - moduleContextFactory() - Application API for composing libraries with prefixes
+ * - createRemappedSpanLoggerClass() - Compile and cache SpanLogger classes
  */
 
 import type { BaseSpanLogger } from './codegen/spanLoggerGenerator.js';
-import type { ModuleContextBuilder, RequestContext, SpanContext, TaskFunction } from './lmao.js';
 import {
-  createModuleContext,
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
   ENTRY_TYPE_INFO,
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
-} from './lmao.js';
-import { S } from './schema/builder.js';
-import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
+} from './schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from './schema/typeGuards.js';
-import type { TagAttributeSchema } from './schema/types.js';
-import { getSchemaFields } from './schema/types.js';
+import { LogSchema, type SchemaFields } from './schema/types.js';
 import type { SpanBuffer } from './types.js';
-
-/**
- * Library operation definition
- * Maps operation name to implementation function and span name
- */
-export interface LibraryOperation<
-  Args extends unknown[],
-  Result,
-  T extends TagAttributeSchema,
-  FF extends FeatureFlagSchema,
-  Env = Record<string, unknown>,
-> {
-  fn: TaskFunction<Args, Result, T, FF, Env>;
-  spanName: string;
-}
-
-/**
- * Library module with operations
- * Created by library authors, consumed by applications
- */
-export interface LibraryModule<
-  T extends TagAttributeSchema,
-  FF extends FeatureFlagSchema,
-  Env = Record<string, unknown>,
-  Ops extends Record<string, LibraryOperation<unknown[], unknown, T, FF, Env>> = Record<
-    string,
-    LibraryOperation<unknown[], unknown, T, FF, Env>
-  >,
-> {
-  schema: T;
-  operations: Ops;
-  task<Args extends unknown[], Result>(
-    name: string,
-    fn: TaskFunction<Args, Result, T, FF, Env>,
-  ): (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
-}
 
 /**
  * Prefix a tag attribute schema
@@ -82,22 +41,22 @@ export interface LibraryModule<
  * - Prefix: 'http'
  * - Output: { http_status: S.number(), http_method: S.enum(['GET', 'POST']) }
  */
-export function prefixSchema<T extends TagAttributeSchema>(schema: T, prefix: string): TagAttributeSchema {
-  const prefixedSchema: TagAttributeSchema = {};
+export function prefixSchema<T extends LogSchema>(schema: T, prefix: string): LogSchema {
+  const prefixedFields: Record<string, unknown> = {};
 
-  // Get schema fields, excluding methods added by defineTagAttributes
-  for (const [fieldName, fieldSchema] of getSchemaFields(schema)) {
+  // Get schema fields from LogSchema.fieldEntries()
+  for (const [fieldName, fieldSchema] of schema.fieldEntries()) {
     const prefixedName = `${prefix}_${fieldName}`;
-    prefixedSchema[prefixedName] = fieldSchema;
+    prefixedFields[prefixedName] = fieldSchema;
   }
 
-  return prefixedSchema;
+  return new LogSchema(prefixedFields as SchemaFields);
 }
 
 /**
  * Prefix mapping: maps clean names to prefixed column names
  *
- * WHY: Library authors write ctx.tag.status() but buffer column is attr_http_status
+ * WHY: Library authors write ctx.tag.status() but buffer column is http_status
  * HOW: At module creation time, we build this mapping once (cold path)
  *
  * @example
@@ -105,7 +64,7 @@ export function prefixSchema<T extends TagAttributeSchema>(schema: T, prefix: st
  * // Output: { status: 'http_status', method: 'http_method' }
  */
 export interface PrefixMapping {
-  [cleanName: string]: string; // cleanName -> prefixedColumnName (without attr_ prefix)
+  [cleanName: string]: string; // cleanName -> prefixedColumnName
 }
 
 /**
@@ -114,18 +73,20 @@ export interface PrefixMapping {
  * WHY: This mapping is used by generateRemappedSpanLoggerClass to create methods
  * that write to prefixed columns but expose clean API names.
  *
- * @param schema - Clean schema (without prefix)
+ * @param schema - Clean schema (LogSchema instance)
  * @param prefix - Prefix to apply (e.g., 'http')
  * @returns Mapping from clean name to prefixed name
  *
  * @example
- * const mapping = createPrefixMapping({ status: S.number() }, 'http');
+ * const schema = defineLogSchema({ status: S.number() });
+ * const mapping = createPrefixMapping(schema, 'http');
  * // Returns: { status: 'http_status' }
  */
-export function createPrefixMapping<T extends TagAttributeSchema>(schema: T, prefix: string): PrefixMapping {
+export function createPrefixMapping<T extends LogSchema>(schema: T, prefix: string): PrefixMapping {
   const mapping: PrefixMapping = {};
 
-  for (const [fieldName] of getSchemaFields(schema)) {
+  // Use LogSchema.fieldNames directly (no conditional needed)
+  for (const fieldName of schema.fieldNames) {
     mapping[fieldName] = `${prefix}_${fieldName}`;
   }
 
@@ -309,7 +270,7 @@ function generateRemappedAttributeWriter(
   schema: unknown,
   hasEnumMapping: boolean,
 ): string {
-  const columnName = `attr_${prefixedColumnName}`;
+  const columnName = prefixedColumnName;
   const lmaoType = getSchemaType(schema);
 
   // For enums, use pre-generated mapping function (uses cleanName for function)
@@ -390,7 +351,7 @@ function generateRemappedAttributeWriter(
  * Generate a remapped SpanLogger class for library prefix support
  *
  * WHY: Library authors write clean code (ctx.tag.status(200)) but buffers use prefixed
- * columns (attr_http_status). This function generates a class at module creation time
+ * columns (http_status). This function generates a class at module creation time
  * (cold path) that exposes clean method names but writes to prefixed columns.
  *
  * HOW: Uses new Function() to generate optimized JavaScript code. The generated class
@@ -398,7 +359,7 @@ function generateRemappedAttributeWriter(
  *
  * WHAT: Returns executable JavaScript code string for a SpanLogger class with:
  * - Clean method names (status, method, url)
- * - Writes to prefixed columns (attr_http_status, attr_http_method, attr_http_url)
+ * - Writes to prefixed columns (http_status, http_method, http_url)
  * - Full support for enum/category/text type handling
  * - Method chaining support
  *
@@ -413,14 +374,15 @@ function generateRemappedAttributeWriter(
  *   { status: 'http_status', method: 'http_method' },
  *   'HttpSpanLogger'
  * );
- * // Generated class has .status() method that writes to attr_http_status
+ * // Generated class has .status() method that writes to http_status
  */
-export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
+export function generateRemappedSpanLoggerClass<T extends LogSchema>(
   cleanSchema: T,
   prefixMapping: PrefixMapping,
   className = 'RemappedSpanLogger',
 ): string {
-  const schemaFields = getSchemaFields(cleanSchema);
+  // Use LogSchema.fieldEntries() to iterate schema fields
+  const schemaFields = Array.from(cleanSchema.fieldEntries());
 
   // Generate enum mapping functions (use cleanName for function names)
   const enumMappings: string[] = [];
@@ -505,7 +467,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
       const idx = 0;
       for (const [cleanKey, value] of Object.entries(attributes)) {
         const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
-        const columnName = 'attr_' + prefixedKey;
+        const columnName = prefixedKey;
         const column = this._buffer[columnName + '_values'];
         if (column && value !== null && value !== undefined) {
           column[idx] = value;
@@ -535,7 +497,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
       for (let idx = startIdx; idx < endIdx; idx++) {
         for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
           const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
-          const columnName = 'attr_' + prefixedKey;
+          const columnName = prefixedKey;
           const column = this._buffer[columnName + '_values'];
           if (column) {
             column[idx] = value;
@@ -574,7 +536,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
       }
       for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
         const prefixedKey = PREFIX_MAPPING[cleanKey] || cleanKey;
-        const columnName = 'attr_' + prefixedKey;
+        const columnName = prefixedKey;
         const column = this._buffer[columnName + '_values'];
         if (column) {
           column[idx] = value;
@@ -624,7 +586,7 @@ export function generateRemappedSpanLoggerClass<T extends TagAttributeSchema>(
  * @param prefixMapping - Mapping from clean names to prefixed names
  * @returns Constructor for the remapped SpanLogger class
  */
-export function createRemappedSpanLoggerClass<T extends TagAttributeSchema>(
+export function createRemappedSpanLoggerClass<T extends LogSchema>(
   cleanSchema: T,
   prefixMapping: PrefixMapping,
 ): new (
@@ -639,323 +601,4 @@ export function createRemappedSpanLoggerClass<T extends TagAttributeSchema>(
   const GeneratedClass = new Function(`return ${classCode}`)();
 
   return GeneratedClass;
-}
-
-/**
- * Create a library module with clean schema
- * Library authors use this to define their module
- *
- * Accepts both plain TagAttributeSchema and extended schemas from defineTagAttributes
- *
- * @param options - Library metadata, schema, and operations
- * @returns Library module with operations
- */
-export function createLibraryModule<
-  T extends TagAttributeSchema,
-  FF extends FeatureFlagSchema = FeatureFlagSchema,
-  Env = Record<string, unknown>,
-  Ops extends Record<string, LibraryOperation<unknown[], unknown, T, FF, Env>> = Record<
-    string,
-    LibraryOperation<unknown[], unknown, T, FF, Env>
-  >,
->(options: {
-  gitSha: string;
-  packageName: string;
-  packagePath: string;
-  schema: T;
-  operations?: Ops;
-}): LibraryModule<T, FF, Env, Ops> {
-  // Extract just the schema fields (without validation methods)
-  const schemaFields = getSchemaFields(options.schema);
-  const cleanSchema = {} as T;
-  for (const [fieldName, fieldSchema] of schemaFields) {
-    (cleanSchema as Record<string, unknown>)[fieldName] = fieldSchema;
-  }
-
-  // Create module context with clean schema (no prefix yet)
-  const moduleContext = createModuleContext<T, FF, Env>({
-    moduleMetadata: {
-      gitSha: options.gitSha,
-      packageName: options.packageName,
-      packagePath: options.packagePath,
-    },
-    tagAttributes: cleanSchema,
-  });
-
-  return {
-    schema: cleanSchema,
-    operations: (options.operations || {}) as Ops,
-    task: moduleContext.task,
-  };
-}
-
-/**
- * Create a remapped tag proxy for library use
- *
- * WHY: Library task functions receive ctx.tag with clean method names,
- * but the underlying buffer uses prefixed column names.
- *
- * HOW: Uses a Proxy to intercept method calls and remap them to prefixed columns.
- * This approach has minimal overhead since Proxy is well-optimized in V8.
- *
- * @param originalTag - The tag API with prefixed method names (ctx.tag)
- * @param prefixMapping - Mapping from clean names to prefixed names
- * @returns Proxy that remaps clean method calls to prefixed methods
- */
-function createRemappedTagProxy<T extends TagAttributeSchema>(
-  originalTag: SpanContext<TagAttributeSchema, FeatureFlagSchema>['tag'],
-  prefixMapping: PrefixMapping,
-): SpanContext<T, FeatureFlagSchema>['tag'] {
-  // Create proxy for the tag API
-  const tagProxy: SpanContext<T, FeatureFlagSchema>['tag'] = new Proxy(originalTag as object, {
-    get(target, prop: string) {
-      // Check if this is a clean name that needs remapping
-      const prefixedName = prefixMapping[prop];
-      if (prefixedName && typeof (target as Record<string, unknown>)[prefixedName] === 'function') {
-        // Return a function that calls the prefixed method but maintains chaining
-        return (value: unknown) => {
-          ((target as Record<string, unknown>)[prefixedName] as (v: unknown) => unknown)(value);
-          return tagProxy; // Return proxy for chaining
-        };
-      }
-
-      // Handle 'with' method specially - remap attribute keys
-      if (prop === 'with') {
-        return (attributes: Record<string, unknown>) => {
-          const remappedAttributes: Record<string, unknown> = {};
-          for (const [key, value] of Object.entries(attributes)) {
-            const prefixedKey = prefixMapping[key] || key;
-            remappedAttributes[prefixedKey] = value;
-          }
-          (target as { with: (attrs: Record<string, unknown>) => unknown }).with(remappedAttributes);
-          return tagProxy;
-        };
-      }
-
-      // For other properties/methods, pass through
-      const value = (target as Record<string, unknown>)[prop];
-      if (typeof value === 'function') {
-        return value.bind(target);
-      }
-      return value;
-    },
-  }) as SpanContext<T, FeatureFlagSchema>['tag'];
-
-  return tagProxy;
-}
-
-/**
- * Create a remapped scope function for library use
- *
- * @param originalScope - The scope function (ctx.scope)
- * @param prefixMapping - Mapping from clean names to prefixed names
- * @returns Function that remaps attribute keys before calling scope
- */
-function createRemappedScopeFunction<T extends TagAttributeSchema>(
-  originalScope: SpanContext<TagAttributeSchema, FeatureFlagSchema>['scope'],
-  prefixMapping: PrefixMapping,
-): SpanContext<T, FeatureFlagSchema>['scope'] {
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Type erasure at runtime boundary
-  return (attributes: Record<string, unknown>) => {
-    const remappedAttributes: Record<string, unknown> = {};
-    for (const [key, value] of Object.entries(attributes)) {
-      const prefixedKey = prefixMapping[key] || key;
-      remappedAttributes[prefixedKey] = value;
-    }
-    // Type assertion needed because we're remapping between different schema types at runtime
-    (originalScope as (attrs: Record<string, unknown>) => void)(remappedAttributes);
-  };
-}
-
-/**
- * Module context factory for library composition with prefix remapping
- *
- * WHY: Applications need to compose multiple libraries without naming conflicts.
- * Each library defines clean schemas, and this factory applies prefixes while
- * maintaining the clean API for library code.
- *
- * HOW: Creates a module context with prefixed schema, but wraps task functions
- * so that library code receives a remapped context where clean method names
- * (ctx.tag.status) map to prefixed buffer columns (attr_http_status).
- *
- * WHAT:
- * - Prefixes all schema field names (status → http_status)
- * - Creates task wrappers that remap ctx.log methods
- * - Library author writes: ctx.tag.status(200)
- * - Runtime writes to: buffer.attr_http_status[idx] = 200
- *
- * Per specs/01e_library_integration_pattern.md:
- * - Library writes: ctx.tag.status(200)
- * - Final column: http_status (with prefix)
- * - All mapping happens at task creation time (cold path)
- *
- * @param prefix - Prefix to apply to all schema fields (e.g., 'http', 'db')
- * @param moduleMetadata - Library metadata (gitSha, packageName, packagePath)
- * @param schema - Clean library schema (without prefix)
- * @param operations - Library operations to wrap
- * @returns Module context builder with prefixed schema and remapped task wrappers
- *
- * @example
- * const httpLib = moduleContextFactory(
- *   'http',
- *   { gitSha: 'abc', packageName: '@lib/http', packagePath: 'src/index.ts' },
- *   { status: S.number(), method: S.enum(['GET', 'POST']) }
- * );
- *
- * // Library task function uses clean names
- * const myTask = httpLib.task('request', async (ctx) => {
- *   ctx.tag.status(200);  // Writes to http_status column
- *   ctx.tag.method('GET'); // Writes to http_method column
- * });
- */
-export function moduleContextFactory<
-  T extends TagAttributeSchema,
-  FF extends FeatureFlagSchema = FeatureFlagSchema,
-  Env = Record<string, unknown>,
->(
-  prefix: string,
-  moduleMetadata: {
-    gitSha: string;
-    packageName: string;
-    packagePath: string;
-  },
-  schema: T,
-  operations?: Record<string, LibraryOperation<unknown[], unknown, T, FF, Env>>,
-): ModuleContextBuilder<TagAttributeSchema, FF, Env> & {
-  // Type erasure at runtime boundary; type safety enforced via LibraryOperation generics
-  operations: Record<string, (ctx: RequestContext<FF, Env>, ...args: unknown[]) => Promise<unknown>>;
-  /** Clean schema (without prefix) - useful for type inference */
-  cleanSchema: T;
-  /** Prefix mapping from clean names to prefixed names */
-  prefixMapping: PrefixMapping;
-} {
-  // Create prefix mapping (cold path - done once)
-  const prefixMapping = createPrefixMapping(schema, prefix);
-
-  // Apply prefix to schema for buffer column creation
-  const prefixedSchema = prefixSchema(schema, prefix);
-
-  // Create module context with prefixed schema
-  // This creates buffers with columns like attr_http_status
-  const moduleContext = createModuleContext({
-    moduleMetadata,
-    tagAttributes: prefixedSchema,
-  }) as ModuleContextBuilder<TagAttributeSchema, FF, Env>;
-
-  // Create a wrapped task function that remaps the context
-  const wrappedTask = <Args extends unknown[], Result>(
-    name: string,
-    fn: TaskFunction<Args, Result, T, FF, Env>,
-  ): ((ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>) => {
-    // Get the underlying task wrapper from the module context
-    const underlyingTask = moduleContext.task(name, async (ctx, ...args: Args) => {
-      // Create remapped context for the library function
-      // The ctx.tag here has prefixed methods (http_status), but we need clean methods (status)
-      const remappedTag = createRemappedTagProxy<T>(ctx.tag, prefixMapping);
-
-      // Remap the scope function to use clean attribute names
-      const remappedScope = createRemappedScopeFunction<T>(ctx.scope, prefixMapping);
-
-      // Create a new context with the remapped tag and scope
-      // Use Object.create to preserve prototype methods (ok, err, span, buffer getter)
-      // Per V8 hidden class optimization - Object.create preserves prototype chain
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any -- Type erasure at runtime boundary
-      const remappedCtx = Object.create(ctx) as SpanContext<T, FF, Env>;
-      // Override tag and scope with remapped versions
-      (remappedCtx as { tag: typeof remappedTag }).tag = remappedTag;
-      (remappedCtx as { scope: typeof remappedScope }).scope = remappedScope;
-
-      // Call the library function with the remapped context
-      return fn(remappedCtx, ...args);
-    });
-
-    return underlyingTask;
-  };
-
-  // Wrap operations with remapped task wrappers
-  // Type erasure intentional at runtime boundary; type safety enforced via LibraryOperation generics
-  const wrappedOperations: Record<string, (ctx: RequestContext<FF, Env>, ...args: unknown[]) => Promise<unknown>> = {};
-
-  if (operations) {
-    for (const [opName, opDef] of Object.entries(operations)) {
-      wrappedOperations[opName] = wrappedTask(opDef.spanName, opDef.fn);
-    }
-  }
-
-  return {
-    // Type assertion needed because wrappedTask uses T (library schema) but return type uses TagAttributeSchema
-    // This is intentional type erasure at the runtime boundary
-    task: wrappedTask as ModuleContextBuilder<TagAttributeSchema, FF, Env>['task'],
-    spanBufferCapacityStats: moduleContext.spanBufferCapacityStats,
-    operations: wrappedOperations,
-    cleanSchema: schema,
-    prefixMapping,
-  };
-}
-
-/**
- * Library factory result type
- */
-export interface LibraryFactory<
-  T extends TagAttributeSchema,
-  FF extends FeatureFlagSchema = FeatureFlagSchema,
-  Env = Record<string, unknown>,
-> {
-  task: <Args extends unknown[], Result>(
-    name: string,
-    fn: TaskFunction<Args, Result, T, FF, Env>,
-  ) => (ctx: RequestContext<FF, Env>, ...args: Args) => Promise<Result>;
-  operations: Record<string, (ctx: RequestContext<FF, Env>, ...args: unknown[]) => Promise<unknown>>;
-}
-
-/**
- * Example: HTTP library factory
- * Shows how a library would be structured
- */
-export function createHttpLibrary(prefix = 'http'): LibraryFactory<TagAttributeSchema> {
-  // Example HTTP schema (library defines clean names using S builder)
-  // Note: In real usage, you would call defineTagAttributes() for validation
-  const httpSchemaDefinition = {
-    status: S.number(),
-    method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
-    url: S.text(),
-    duration: S.number(),
-  };
-
-  const moduleMetadata = {
-    gitSha: 'dev',
-    packageName: '@smoothbricks/http-library',
-    packagePath: 'src/index.ts',
-  };
-
-  // Operations would be defined here
-  const operations = {};
-
-  // Pass the raw schema object (without methods)
-  return moduleContextFactory(prefix, moduleMetadata, httpSchemaDefinition, operations);
-}
-
-/**
- * Example: Database library factory
- */
-export function createDatabaseLibrary(prefix = 'db'): LibraryFactory<TagAttributeSchema> {
-  // Example DB schema (library defines clean names using S builder)
-  // Note: In real usage, you would call defineTagAttributes() for validation
-  const dbSchemaDefinition = {
-    query: S.text(),
-    duration: S.number(),
-    table: S.category(),
-    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
-  };
-
-  const moduleMetadata = {
-    gitSha: 'dev',
-    packageName: '@smoothbricks/db-library',
-    packagePath: 'src/index.ts',
-  };
-
-  const operations = {};
-
-  // Pass the raw schema object (without methods)
-  return moduleContextFactory(prefix, moduleMetadata, dbSchemaDefinition, operations);
 }

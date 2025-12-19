@@ -1,9 +1,9 @@
 import * as S from '@sury/sury';
 import { createEvaluatorClass, type GeneratedEvaluatorState } from '../codegen/evaluatorGenerator.js';
-import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../lmao.js';
 import { getTimestampNanos } from '../timestamp.js';
 import type { SpanBuffer } from '../types.js';
 import type { EvaluationContext, FeatureFlagSchema } from './defineFeatureFlags.js';
+import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from './systemSchema.js';
 
 /**
  * Type guard to validate flag value matches schema

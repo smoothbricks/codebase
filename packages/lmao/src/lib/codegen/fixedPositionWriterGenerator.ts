@@ -21,8 +21,7 @@
 
 import { bufferHelpers } from '@smoothbricks/arrow-builder';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
-import type { InferTagAttributes, TagAttributeSchema } from '../schema/types.js';
-import { getSchemaFields } from '../schema/types.js';
+import type { InferTagAttributes, LogSchema } from '../schema/types.js';
 import type { SpanBuffer } from '../types.js';
 
 /**
@@ -51,7 +50,7 @@ export interface FixedPositionWriterExtension {
 /**
  * TagWriter interface - fluent setter API for span-start attributes (row 0)
  */
-export type TagWriter<T extends TagAttributeSchema> = {
+export type TagWriter<T extends LogSchema> = {
   /**
    * Bulk set multiple attributes at once.
    */
@@ -68,7 +67,7 @@ export type TagWriter<T extends TagAttributeSchema> = {
  *
  * Includes _result and _error properties for accessing the return value or error.
  */
-export type ResultWriter<T extends TagAttributeSchema, R = unknown, E = unknown> = {
+export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
   /**
    * The successful result value (set by ctx.ok(data))
    */
@@ -168,12 +167,12 @@ function generateWithMethod(schemaFields: [string, unknown][], enumFieldNames: S
  * @returns JavaScript code string for the class
  */
 export function generateFixedPositionWriterClass(
-  schema: TagAttributeSchema,
+  schema: LogSchema,
   position: number,
   className: string,
   extension?: FixedPositionWriterExtension,
 ): string {
-  const schemaFields = getSchemaFields(schema);
+  const schemaFields = Array.from(schema.fieldEntries());
 
   // Generate enum mapping functions
   const enumMappings: string[] = [];
@@ -259,23 +258,18 @@ ${extensionMethods}
  * Cache for TagWriter classes (position 0).
  * WeakMap allows garbage collection when schema is no longer referenced.
  */
-const tagWriterClassCache = new WeakMap<
-  TagAttributeSchema,
-  new (
-    buffer: SpanBuffer,
-  ) => TagWriter<TagAttributeSchema>
->();
+const tagWriterClassCache = new WeakMap<LogSchema, new (buffer: SpanBuffer) => TagWriter<LogSchema>>();
 
 /**
  * Cache for ResultWriter classes (position 1).
  */
 const resultWriterClassCache = new WeakMap<
-  TagAttributeSchema,
+  LogSchema,
   new (
     buffer: SpanBuffer,
     result: unknown,
     isError: boolean,
-  ) => ResultWriter<TagAttributeSchema>
+  ) => ResultWriter<LogSchema>
 >();
 
 // ============================================================================
@@ -286,7 +280,7 @@ const resultWriterClassCache = new WeakMap<
  * Generate TagWriter class code for a schema.
  * TagWriter writes to position 0 (span-start row).
  */
-export function generateTagWriterClass(schema: TagAttributeSchema): string {
+export function generateTagWriterClass(schema: LogSchema): string {
   return generateFixedPositionWriterClass(schema, 0, 'GeneratedTagWriter');
 }
 
@@ -296,7 +290,7 @@ export function generateTagWriterClass(schema: TagAttributeSchema): string {
  * @param schema - Tag attribute schema
  * @returns TagWriter class constructor
  */
-export function getTagWriterClass<T extends TagAttributeSchema>(schema: T): new (buffer: SpanBuffer) => TagWriter<T> {
+export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: SpanBuffer) => TagWriter<T> {
   let WriterClass = tagWriterClassCache.get(schema);
 
   if (!WriterClass) {
@@ -308,7 +302,7 @@ export function getTagWriterClass<T extends TagAttributeSchema>(schema: T): new 
       helpers: typeof bufferHelpers,
     ) => new (
       buffer: SpanBuffer,
-    ) => TagWriter<TagAttributeSchema>;
+    ) => TagWriter<LogSchema>;
 
     WriterClass = factory(bufferHelpers);
     tagWriterClassCache.set(schema, WriterClass);
@@ -326,7 +320,7 @@ export function getTagWriterClass<T extends TagAttributeSchema>(schema: T): new 
  * @param buffer - SpanBuffer to write to
  * @returns TagWriter instance bound to position 0
  */
-export function createTagWriter<T extends TagAttributeSchema>(schema: T, buffer: SpanBuffer<T>): TagWriter<T> {
+export function createTagWriter<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): TagWriter<T> {
   const WriterClass = getTagWriterClass(schema);
   // Type assertion needed because WriterClass constructor expects SpanBuffer
   // (non-generic) but we pass SpanBuffer<T>. This is safe because at runtime
@@ -362,7 +356,7 @@ const resultWriterExtension: FixedPositionWriterExtension = {
  * Generate ResultWriter class code for a schema.
  * ResultWriter writes to position 1 (result row).
  */
-export function generateResultWriterClass(schema: TagAttributeSchema): string {
+export function generateResultWriterClass(schema: LogSchema): string {
   return generateFixedPositionWriterClass(schema, 1, 'GeneratedResultWriter', resultWriterExtension);
 }
 
@@ -372,7 +366,7 @@ export function generateResultWriterClass(schema: TagAttributeSchema): string {
  * @param schema - Tag attribute schema
  * @returns ResultWriter class constructor
  */
-export function getResultWriterClass<T extends TagAttributeSchema>(
+export function getResultWriterClass<T extends LogSchema>(
   schema: T,
 ): new (
   buffer: SpanBuffer,
@@ -392,7 +386,7 @@ export function getResultWriterClass<T extends TagAttributeSchema>(
       buffer: SpanBuffer,
       resultOrError: unknown,
       isError: boolean,
-    ) => ResultWriter<TagAttributeSchema>;
+    ) => ResultWriter<LogSchema>;
 
     WriterClass = factory(bufferHelpers);
     resultWriterClassCache.set(schema, WriterClass);
@@ -414,7 +408,7 @@ export function getResultWriterClass<T extends TagAttributeSchema>(
  * @param isError - Whether this is an error result
  * @returns ResultWriter instance bound to position 1
  */
-export function createResultWriter<T extends TagAttributeSchema, R = unknown, E = unknown>(
+export function createResultWriter<T extends LogSchema, R = unknown, E = unknown>(
   schema: T,
   buffer: SpanBuffer,
   resultOrError: R | E,
@@ -433,7 +427,7 @@ export function createResultWriter<T extends TagAttributeSchema, R = unknown, E 
  * @param extension - Optional extension for constructor code, methods, params
  * @returns Writer class constructor
  */
-export function getFixedPositionWriterClass<T extends TagAttributeSchema>(
+export function getFixedPositionWriterClass<T extends LogSchema>(
   schema: T,
   position: number,
   extension?: FixedPositionWriterExtension,

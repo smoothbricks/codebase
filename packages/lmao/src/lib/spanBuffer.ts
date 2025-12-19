@@ -31,10 +31,11 @@ import {
   DEFAULT_BUFFER_CAPACITY,
   getColumnBufferClass,
 } from '@smoothbricks/arrow-builder';
-import type { TagAttributeSchema } from './schema/types.js';
+import { LogSchema } from './schema/LogSchema.js';
+import type { SchemaFields } from './schema/types.js';
 import { spanBufferHelpers } from './spanBufferHelpers.js';
 import { generateTraceId, type TraceId } from './traceId.js';
-import type { SpanBuffer, TaskContext } from './types.js';
+import type { ModuleContext, SpanBuffer, TaskContext } from './types.js';
 
 // ============================================================================
 // Thread-local state (generated once per process/worker)
@@ -108,13 +109,14 @@ type SpanBufferConstructor = new (
   parent: SpanBuffer | undefined,
   isChained: boolean,
   traceId: string | undefined,
+  callsiteModule: ModuleContext | undefined,
 ) => SpanBuffer;
 
 /**
  * Cache for generated SpanBuffer classes per schema.
  * Key is the schema object reference (WeakMap for GC).
  */
-const spanBufferClassCache = new WeakMap<TagAttributeSchema, SpanBufferConstructor>();
+const spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
 
 /**
  * Get or create a SpanBuffer class for the given schema.
@@ -124,7 +126,9 @@ const spanBufferClassCache = new WeakMap<TagAttributeSchema, SpanBufferConstruct
  * - Span-specific properties (parent, children, task)
  * - Identity getters (spanId, traceId, hasParent, parentSpanId)
  */
-function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
+function getSpanBufferClass<T extends SchemaFields>(schema: T | LogSchema<T>): SpanBufferConstructor {
+  // Wrap plain schema objects in LogSchema if needed
+  const logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
   const cached = spanBufferClassCache.get(schema);
   if (cached) {
     return cached;
@@ -132,7 +136,7 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
-    constructorParams: 'task, parent, isChained, traceId',
+    constructorParams: 'task, parent, isChained, traceId, callsiteModule',
     preamble: `
         // Thread-local span counter (per-process/worker, see threadId.ts docs)
         // This MUST stay in preamble - it's per-class state incremented during construction
@@ -143,6 +147,12 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
         this.task = task;
         this.children = [];
         this.next = undefined;
+        
+        // Store callsiteModule for dual module attribution (row 0 vs rows 1+)
+        // Per specs/01c_context_flow_and_task_wrappers.md:
+        // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
+        // - Rows 1+ (logs, span-end): uses task.module
+        this.callsiteModule = callsiteModule;
         
         // Calculate system buffer size
         const systemSize = requestedCapacity * 9; // timestamps (8*cap) + operations (1*cap)
@@ -189,6 +199,18 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
           this._identity.set(traceBytes, 13);
         }
         
+        // Scope values initialization per specs/01i_span_scope_attributes.md:
+        // - ROOT: allocate empty frozen scope (single allocation per trace)
+        // - CHILD: inherit from tree parent by reference (zero cost)
+        // - CHAINED: inherit from buffer we're chaining from (same logical span)
+        if (isChained && parent) {
+          this.scopeValues = parent.scopeValues;
+        } else if (parent) {
+          this.scopeValues = parent.scopeValues;
+        } else {
+          this.scopeValues = Object.freeze({});
+        }
+        
         // System columns at FIXED offsets (same for ALL buffer types)
         // These override the ColumnBuffer's _timestamps/_operations with our unified layout
         this._timestamps = new BigInt64Array(this._system, 0, requestedCapacity);
@@ -207,7 +229,7 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
         this._writeIndex = 0;
         
         // Track buffer creation
-        task.module.spanBufferCapacityStats.totalBuffersCreated++;
+        task.module.sb_totalCreated++;
       `,
     methods: `
         // Aliases for buffer management properties (native getters - V8 optimized)
@@ -281,11 +303,11 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
   };
 
   // Generate class using arrow-builder (provides lazy attribute columns)
-  const GeneratedClass = getColumnBufferClass(schema, extension);
+  const GeneratedClass = getColumnBufferClass(logSchema, extension);
   const SpanBufferClass = GeneratedClass as unknown as SpanBufferConstructor;
 
-  // Cache for future use
-  spanBufferClassCache.set(schema, SpanBufferClass);
+  // Cache for future use (use logSchema as key)
+  spanBufferClassCache.set(logSchema, SpanBufferClass);
 
   return SpanBufferClass;
 }
@@ -306,20 +328,31 @@ function getSpanBufferClass(schema: TagAttributeSchema): SpanBufferConstructor {
  *
  * @returns SpanBuffer with typed setters for schema fields
  */
-export function createSpanBuffer<T extends TagAttributeSchema>(
+export function createSpanBuffer<T extends SchemaFields>(
   schema: T,
   taskContext: TaskContext,
   traceId?: TraceId,
   capacity = DEFAULT_BUFFER_CAPACITY,
-): SpanBuffer<T> {
+): SpanBuffer<LogSchema<T>> {
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const alignedCapacity = (capacity + 7) & ~7;
 
   // Use provided TraceId or generate a new one
   const resolvedTraceId: string = traceId ?? generateTraceId();
 
-  const SpanBufferClass = getSpanBufferClass(schema);
-  return new SpanBufferClass(alignedCapacity, taskContext, undefined, false, resolvedTraceId) as SpanBuffer<T>;
+  // Wrap plain schema objects in LogSchema if needed
+  const logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
+
+  const SpanBufferClass = getSpanBufferClass(logSchema);
+  // Root spans have no callsiteModule (they're the entry point)
+  return new SpanBufferClass(
+    alignedCapacity,
+    taskContext,
+    undefined,
+    false,
+    resolvedTraceId,
+    undefined,
+  ) as SpanBuffer<T>;
 }
 
 /**
@@ -328,21 +361,38 @@ export function createSpanBuffer<T extends TagAttributeSchema>(
  * Child buffers have identity: [threadId(8)][spanId(4)] (12 bytes)
  * Parent reference is via `parent` property pointer.
  *
+ * Per specs/01c_context_flow_and_task_wrappers.md:
+ * - `callsiteModule` is the caller's module (where span() was invoked)
+ * - `taskContext.module` is the op's module (where code executes)
+ * - Row 0 uses callsiteModule for gitSha/packageName/packagePath
+ * - Rows 1+ use taskContext.module for gitSha/packageName/packagePath
+ *
  * @param parentBuffer - Parent span's buffer
  * @param taskContext - Task context (may differ from parent if calling across modules)
  *
  * @returns Child SpanBuffer linked to parent, with same schema type as parent
  */
-export function createChildSpanBuffer<T extends TagAttributeSchema>(
+export function createChildSpanBuffer<T extends LogSchema>(
   parentBuffer: SpanBuffer<T>,
   taskContext: TaskContext,
 ): SpanBuffer<T> {
-  const schema = parentBuffer.task.module.tagAttributes as T;
+  const schema = parentBuffer.task.module.logSchema as T;
   const capacity = parentBuffer.capacity;
+
+  // The caller's module (parent's task.module) becomes callsiteModule
+  // This records WHERE span() was invoked from
+  const callsiteModule = parentBuffer.task.module;
 
   const SpanBufferClass = getSpanBufferClass(schema);
   // Cast parentBuffer to base SpanBuffer for constructor, result back to SpanBuffer<T>
-  return new SpanBufferClass(capacity, taskContext, parentBuffer as SpanBuffer, false, undefined) as SpanBuffer<T>;
+  return new SpanBufferClass(
+    capacity,
+    taskContext,
+    parentBuffer as SpanBuffer,
+    false,
+    undefined,
+    callsiteModule,
+  ) as SpanBuffer<T>;
 }
 
 /**
@@ -355,14 +405,22 @@ export function createChildSpanBuffer<T extends TagAttributeSchema>(
  *
  * @returns New SpanBuffer linked via `buffer.next`, with same schema type
  */
-export function createNextBuffer<T extends TagAttributeSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
-  const schema = buffer.task.module.tagAttributes as T;
+export function createNextBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
+  const schema = buffer.task.module.logSchema as T;
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
-  const capacity = (buffer.task.module.spanBufferCapacityStats.currentCapacity + 7) & ~7;
+  const capacity = (buffer.task.module.sb_capacity + 7) & ~7;
 
   const SpanBufferClass = getSpanBufferClass(schema);
   // Cast buffer to base SpanBuffer for constructor, result back to SpanBuffer<T>
-  const nextBuffer = new SpanBufferClass(capacity, buffer.task, buffer as SpanBuffer, true, undefined) as SpanBuffer<T>;
+  // Chained buffers inherit callsiteModule from the original buffer
+  const nextBuffer = new SpanBufferClass(
+    capacity,
+    buffer.task,
+    buffer as SpanBuffer,
+    true,
+    undefined,
+    buffer.callsiteModule,
+  ) as SpanBuffer<T>;
 
   // Link current buffer to next
   buffer.next = nextBuffer;

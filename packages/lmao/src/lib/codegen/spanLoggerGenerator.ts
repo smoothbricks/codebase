@@ -17,18 +17,15 @@
  */
 
 import { type ColumnWriter, type ColumnWriterExtension, getColumnWriterClass } from '@smoothbricks/arrow-builder';
-// Import entry type constants from lmao.ts (single source of truth)
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
   ENTRY_TYPE_INFO,
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
-  trackOverflowAndTune,
-} from '../lmao.js';
+} from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
-import type { InferTagAttributes, TagAttributeSchema } from '../schema/types.js';
-import { getSchemaFields } from '../schema/types.js';
+import type { InferTagAttributes, LogSchema } from '../schema/types.js';
 import { createNextBuffer as createNextSpanBuffer } from '../spanBuffer.js';
 // Import timestamp function - will be injected as dependency
 import { getTimestampNanos } from '../timestamp.js';
@@ -51,7 +48,7 @@ import type { GeneratedScope } from './scopeGenerator.js';
  * Includes system columns (line) plus all schema fields from T.
  * Also includes logging methods for continued chaining (e.g., ctx.log.info('x').info('y'))
  */
-export type FluentLogEntry<T extends TagAttributeSchema> = {
+export type FluentLogEntry<T extends LogSchema> = {
   /**
    * Set the source code line number for this log entry.
    * Injected by the LMAO transformer.
@@ -67,7 +64,7 @@ export type FluentLogEntry<T extends TagAttributeSchema> = {
   [K in keyof InferTagAttributes<T>]: (value: InferTagAttributes<T>[K]) => FluentLogEntry<T>;
 };
 
-export type BaseSpanLogger<T extends TagAttributeSchema> = ColumnWriter<T> & {
+export type BaseSpanLogger<T extends LogSchema> = ColumnWriter<T> & {
   info(message: string): FluentLogEntry<T>;
   debug(message: string): FluentLogEntry<T>;
   warn(message: string): FluentLogEntry<T>;
@@ -118,8 +115,14 @@ function generateEnumFluentSetters(enumFieldNames: Set<string>): string {
 }
 
 /**
- * Generate _setScope() method code - UNROLLED per-column with BULK null bitmap fill
- * Uses TypedArray.fill() for values and fillNullBitmapRange helper for null bitmaps
+ * Generate _setScope() method code - IMMUTABLE scope semantics
+ *
+ * Per specs/01i_span_scope_attributes.md:
+ * - Creates NEW frozen object (never mutates existing)
+ * - Merge semantics: new values merge with existing
+ * - null clears a key, undefined is ignored
+ * - Child spans inherit parent scope by reference (safe because immutable)
+ * - Scope filling happens at Arrow conversion time, NOT during span execution
  */
 function generateSetScopeMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
   const scopeUpdates = schemaFields.map(([fieldName]) => {
@@ -129,52 +132,26 @@ function generateSetScopeMethod(schemaFields: [string, unknown][], enumFieldName
       }`;
   });
 
-  const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
-    const columnName = fieldName;
-    const lmaoType = getSchemaType(fieldSchema);
-
-    // Boolean uses bit-packed storage - bulk fill using helper
-    if (lmaoType === 'boolean') {
-      return `
-      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
-        helpers.fillBooleanBitmapRange(this._buffer.${columnName}_values, startIdx, endIdx, attributes.${fieldName});
-        helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
-      }`;
-    }
-
-    // Value processing based on type
-    let valueExpr = `attributes.${fieldName}`;
-    if (lmaoType === 'enum' && enumFieldNames.has(fieldName)) {
-      valueExpr = `getEnumIndex_${fieldName}(attributes.${fieldName})`;
-    }
-
-    // For string arrays (category/text), use manual loop instead of fill()
-    if (lmaoType === 'category' || lmaoType === 'text') {
-      return `
-      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
-        const values = this._buffer.${columnName}_values;
-        for (let i = startIdx; i < endIdx; i++) {
-          values[i] = ${valueExpr};
-        }
-        helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
-      }`;
-    }
-
-    return `
-      if ('${fieldName}' in attributes && attributes.${fieldName} !== null && attributes.${fieldName} !== undefined) {
-        this._buffer.${columnName}_values.fill(${valueExpr}, startIdx, endIdx);
-        helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
-      }`;
-  });
-
-  // Update the Scope instance (stores raw values, not interned)
-  // Pre-fill remaining buffer capacity with scoped attributes
+  // Immutable scope: create new frozen object with merge semantics and null clearing
+  // No buffer pre-filling - scope values are filled at Arrow conversion time via SIMD
   return `
     _setScope(attributes) {
       ${scopeUpdates.join('\n')}
-      const startIdx = this._writeIndex + 1;
-      const endIdx = this._buffer._capacity;
-      ${columnFills.join('\n')}
+      
+      // Immutable scope semantics: create new frozen object
+      const current = this._buffer.scopeValues || {};
+      const next = { ...current };
+      
+      for (const key of Object.keys(attributes)) {
+        const value = attributes[key];
+        if (value === null) {
+          delete next[key];
+        } else if (value !== undefined) {
+          next[key] = value;
+        }
+      }
+      
+      this._buffer.scopeValues = Object.freeze(next);
     }`;
 }
 
@@ -238,57 +215,10 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
 }
 
 /**
- * Generate scope writes for logging methods - writes scoped attributes at current _writeIndex
- */
-function generateScopeWritesForLogEntry(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
-  return schemaFields
-    .map(([fieldName, fieldSchema]) => {
-      const columnName = fieldName;
-      const lmaoType = getSchemaType(fieldSchema);
-
-      // Boolean uses bit-packed storage
-      if (lmaoType === 'boolean') {
-        return `
-      {
-        const scopeValue = this._scope.${fieldName};
-        if (scopeValue !== null && scopeValue !== undefined) {
-          const idx = this._writeIndex;
-          const byteIndex = idx >>> 3;
-          const bitOffset = idx & 7;
-          if (scopeValue) {
-            this._buffer.${columnName}_values[byteIndex] |= (1 << bitOffset);
-          } else {
-            this._buffer.${columnName}_values[byteIndex] &= ~(1 << bitOffset);
-          }
-          helpers.setNullBit(this._buffer.${columnName}_nulls, idx);
-        }
-      }`;
-      }
-
-      // Value processing based on type
-      let valueExpr = 'scopeValue';
-      if (lmaoType === 'enum' && enumFieldNames.has(fieldName)) {
-        valueExpr = `getEnumIndex_${fieldName}(scopeValue)`;
-      }
-
-      return `
-      {
-        const scopeValue = this._scope.${fieldName};
-        if (scopeValue !== null && scopeValue !== undefined) {
-          const idx = this._writeIndex;
-          this._buffer.${columnName}_values[idx] = ${valueExpr};
-          helpers.setNullBit(this._buffer.${columnName}_nulls, idx);
-        }
-      }`;
-    })
-    .join('\n');
-}
-
-/**
  * Build the extension for SpanLogger that extends ColumnWriter
  */
-function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExtension {
-  const schemaFields = getSchemaFields(schema);
+function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
+  const schemaFields = Array.from(schema.fieldEntries());
 
   // Collect enum mappings
   const enumMappings: string[] = [];
@@ -307,7 +237,6 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
   // Generate methods
   const setScopeMethod = generateSetScopeMethod(schemaFields, enumFieldNames);
   const prefillMethod = generatePrefillScopedAttributesMethod(schemaFields, enumFieldNames);
-  const scopeWrites = generateScopeWritesForLogEntry(schemaFields, enumFieldNames);
   const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
 
   return {
@@ -332,6 +261,7 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       this._buffer.writeIndex = 2;
       this._scope = scope;
       this._createNextBuffer = createNextBuffer;
+      this._inOverflow = false;
 `,
 
     // Override _getNextBuffer to create new SpanBuffer on overflow.
@@ -344,7 +274,8 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       `
     _getNextBuffer() {
       const oldBuffer = this._buffer;
-      helpers.trackOverflowAndTune(oldBuffer.task.module.spanBufferCapacityStats);
+      oldBuffer.task.module.sb_overflows++;
+      this._inOverflow = true;
       const nextBuffer = this._createNextBuffer(oldBuffer);
       oldBuffer._next = nextBuffer;
       this._buffer = nextBuffer;
@@ -375,7 +306,7 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
       // Write system columns
       // Write message to unified message column (log message template)
       // For eager columns (like message), there's no null bitmap - the column is always present
-      // Apply scoped attributes
+      // NOTE: Scope values are NOT written here - they are filled at Arrow conversion time
       // Track write for capacity tuning (per specs/01b2_buffer_self_tuning.md)
       `info(message) {
       this.nextRow();
@@ -388,8 +319,10 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      ${scopeWrites}
-      this._buffer.task.module.spanBufferCapacityStats.totalWrites++;
+      this._buffer.task.module.sb_totalWrites++;
+      if (this._inOverflow) {
+        this._buffer.task.module.sb_overflowWrites++;
+      }
       return this;
     }
 
@@ -406,8 +339,10 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      ${scopeWrites}
-      this._buffer.task.module.spanBufferCapacityStats.totalWrites++;
+      this._buffer.task.module.sb_totalWrites++;
+      if (this._inOverflow) {
+        this._buffer.task.module.sb_overflowWrites++;
+      }
       return this;
     }
 
@@ -424,8 +359,10 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      ${scopeWrites}
-      this._buffer.task.module.spanBufferCapacityStats.totalWrites++;
+      this._buffer.task.module.sb_totalWrites++;
+      if (this._inOverflow) {
+        this._buffer.task.module.sb_overflowWrites++;
+      }
       return this;
     }
 
@@ -442,8 +379,10 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      ${scopeWrites}
-      this._buffer.task.module.spanBufferCapacityStats.totalWrites++;
+      this._buffer.task.module.sb_totalWrites++;
+      if (this._inOverflow) {
+        this._buffer.task.module.sb_overflowWrites++;
+      }
       return this;
     }
 
@@ -460,8 +399,10 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      ${scopeWrites}
-      this._buffer.task.module.spanBufferCapacityStats.totalWrites++;
+      this._buffer.task.module.sb_totalWrites++;
+      if (this._inOverflow) {
+        this._buffer.task.module.sb_overflowWrites++;
+      }
       return this;
     }
 
@@ -498,7 +439,6 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
     dependencies: {
       helpers: {
         getTimestampNanos,
-        trackOverflowAndTune: trackOverflowAndTune,
         setNullBit: (bitmap: Uint8Array, idx: number) => {
           bitmap[idx >>> 3] |= 1 << (idx & 7);
         },
@@ -604,12 +544,12 @@ function buildSpanLoggerExtension(schema: TagAttributeSchema): ColumnWriterExten
  * Cache for generated SpanLogger classes per schema.
  */
 const spanLoggerClassCache = new WeakMap<
-  TagAttributeSchema,
+  LogSchema,
   new (
     buffer: SpanBuffer,
     scope: GeneratedScope,
     createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
-  ) => BaseSpanLogger<TagAttributeSchema>
+  ) => BaseSpanLogger<LogSchema>
 >();
 
 /**
@@ -623,7 +563,7 @@ const spanLoggerClassCache = new WeakMap<
  *
  * Note: Fluent attribute setters are inherited from ColumnWriter and write at _writeIndex.
  */
-export function createSpanLoggerClass<T extends TagAttributeSchema>(
+export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
 ): new (
   buffer: SpanBuffer,
@@ -643,7 +583,7 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
       buffer: SpanBuffer,
       scope: GeneratedScope,
       createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
-    ) => BaseSpanLogger<TagAttributeSchema>;
+    ) => BaseSpanLogger<LogSchema>;
 
     spanLoggerClassCache.set(schema, SpanLoggerClass);
   }
@@ -663,7 +603,7 @@ export function createSpanLoggerClass<T extends TagAttributeSchema>(
  * @param scope - Scope instance for scoped attributes
  * @param createNextBuffer - Function to create next buffer on overflow (defaults to createNextSpanBuffer)
  */
-export function createSpanLogger<T extends TagAttributeSchema>(
+export function createSpanLogger<T extends LogSchema>(
   schema: T,
   buffer: SpanBuffer<T>,
   scope: GeneratedScope,
