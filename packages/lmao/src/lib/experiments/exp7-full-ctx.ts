@@ -53,7 +53,7 @@
  *    - Future options can be added here
  *
  * 10. Naming conventions:
- *    - logSchema (not tagAttributes) - schema for what gets logged
+ *    - logSchema (not logSchema) - schema for what gets logged
  *    - SpanContext - user-facing context passed to op functions
  *    - buffer.callsiteModule - caller's module (for row 0's gitSha/packageName/packagePath)
  *    - buffer.module - Op's module (for rows 1+ gitSha/packageName/packagePath)
