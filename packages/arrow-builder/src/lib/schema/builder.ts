@@ -14,12 +14,14 @@ import * as Sury from '@sury/sury';
 import { Uint8, Uint16, Uint32 } from 'apache-arrow';
 import { intern } from '../arrow/interner.js';
 import type {
+  EagerBigUint64Schema,
   EagerBooleanSchema,
   EagerCategorySchema,
   EagerEnumSchema,
   EagerNumberSchema,
   EagerTextSchema,
   EnumUtf8Precomputed,
+  LazyBigUint64Schema,
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyEnumSchema,
@@ -139,6 +141,13 @@ export interface ArrowSchemaBuilder {
   number(): LazyNumberSchema;
 
   /**
+   * Create bigUint64 schema
+   * Storage: BigUint64Array
+   * @returns Schema with chainable `.eager()` method
+   */
+  bigUint64(): LazyBigUint64Schema;
+
+  /**
    * Create boolean schema
    * Storage: Uint8Array (0/1)
    * @returns Schema with chainable `.eager()` method
@@ -207,6 +216,27 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
         Object.getPrototypeOf(schema),
         Object.getOwnPropertyDescriptors(schema),
       ) as EagerNumberSchema;
+      (eagerSchema as { __eager: true }).__eager = true;
+      return eagerSchema;
+    };
+
+    return schema;
+  },
+
+  bigUint64: (): LazyBigUint64Schema => {
+    // Clone to avoid mutating the shared Sury.bigint singleton
+    const schema = Object.create(
+      Object.getPrototypeOf(Sury.bigint),
+      Object.getOwnPropertyDescriptors(Sury.bigint),
+    ) as LazyBigUint64Schema;
+    schema.__schema_type = 'bigUint64';
+
+    // Add chainable .eager() method
+    schema.eager = (): EagerBigUint64Schema => {
+      const eagerSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as EagerBigUint64Schema;
       (eagerSchema as { __eager: true }).__eager = true;
       return eagerSchema;
     };

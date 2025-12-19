@@ -18,7 +18,7 @@ import { Uint8, Uint16, Uint32 } from 'apache-arrow';
  * - number: Float64Array
  * - boolean: Uint8Array (0/1)
  */
-export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean';
+export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean' | 'bigUint64';
 
 /**
  * Eager brand marker - columns marked as eager are allocated immediately
@@ -249,4 +249,35 @@ export type LazyBooleanSchema = Sury.Schema<boolean, unknown> &
      * Use for columns written on every entry.
      */
     eager(): EagerBooleanSchema;
+  };
+
+// =============================================================================
+// BIGUINT64 SCHEMA TYPES
+// =============================================================================
+
+/**
+ * Base metadata for bigUint64 schema (shared between lazy and eager)
+ */
+interface BigUint64MetadataBase {
+  __schema_type: 'bigUint64';
+}
+
+/**
+ * Eager bigUint64 schema - allocated immediately, no null bitmap
+ * Storage: BigUint64Array
+ */
+export type EagerBigUint64Schema = Sury.Schema<bigint, unknown> & BigUint64MetadataBase & EagerBrand;
+
+/**
+ * Lazy bigUint64 schema with chainable eager method
+ * Storage: BigUint64Array
+ */
+export type LazyBigUint64Schema = Sury.Schema<bigint, unknown> &
+  BigUint64MetadataBase &
+  LazyBrand & {
+    /**
+     * Mark this column as eager (always written, no null bitmap).
+     * Use for columns written on every entry.
+     */
+    eager(): EagerBigUint64Schema;
   };
