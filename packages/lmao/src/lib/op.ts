@@ -1,7 +1,7 @@
 /**
  * Op - Traced operation class
  *
- * Per specs/01l_module_builder_pattern.md and specs/01c_context_flow_and_task_wrappers.md:
+ * Per specs/01l_module_builder_pattern.md and specs/01c_context_flow_and_op_wrappers.md:
  * - Wraps a user function with automatic span tracking
  * - Captures module metadata for attribution
  * - Has _invoke method called by span()
@@ -149,8 +149,17 @@ export class Op<Ctx, Args extends unknown[], Result> {
       // createSpanBuffer creates ROOT buffer with empty scope, but we need parent's scope
       spanBuffer.scopeValues = parentBuffer.scopeValues;
 
-      // Register with parent's children array
-      (parentBuffer.children as SpanBuffer[]).push(spanBuffer);
+      // Register with parent's children array (RemappedBufferView if prefixed)
+      // Only check for RemappedBufferView when registering with parent (child spans only)
+      // Root spans don't need RemappedBufferView - they're not in any parent's children array
+      if (this.module.remappedViewClass) {
+        // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
+        const view = new this.module.remappedViewClass(spanBuffer);
+        parentBuffer.children.push(view);
+      } else {
+        // No prefix - push raw buffer directly
+        parentBuffer.children.push(spanBuffer);
+      }
     } else {
       // Root span - uses traceId from TraceContext
       spanBuffer = createSpanBuffer(schemaOnly, taskContext, traceCtx.traceId as TraceId);

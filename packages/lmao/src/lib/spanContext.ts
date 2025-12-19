@@ -1,7 +1,7 @@
 /**
  * SpanContext - Context provided to op functions during span execution
  *
- * Per specs/01c_context_flow_and_task_wrappers.md and specs/01l_module_builder_pattern.md:
+ * Per specs/01c_context_flow_and_op_wrappers.md and specs/01l_module_builder_pattern.md:
  * - SpanContext combines built-in properties with user-extensible Extra
  * - Uses prototype-based inheritance for V8 hidden class optimization
  * - Child spans inherit scoped attributes from parents
@@ -49,7 +49,7 @@ export interface FluentLogEntry {
   /**
    * Set the source code line number for this log entry.
    *
-   * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
+   * Per specs/01c_context_flow_and_op_wrappers.md "Line Number System":
    * - TypeScript transformer injects these calls at compile time
    * - No runtime overhead - just a method call with literal number
    *

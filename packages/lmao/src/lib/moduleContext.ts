@@ -7,6 +7,7 @@
 import { DEFAULT_BUFFER_CAPACITY, intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import { LogSchema } from './schema/LogSchema.js';
 import type { SchemaFields } from './schema/types.js';
+import type { SpanBuffer } from './types.js';
 
 /**
  * Module context shared across all tasks in the same module.
@@ -43,6 +44,20 @@ export class ModuleContext {
 
   /** Pre-encoded entry for gitSha (for Arrow dictionary building) */
   readonly gitShaEntry: PreEncodedEntry;
+
+  /**
+   * RemappedBufferView class for library prefix support.
+   *
+   * V8 OPTIMIZATION: Always present (not optional) for consistent hidden class shape.
+   * Set to undefined for unprefixed modules, set to generated class for prefixed modules.
+   *
+   * This ensures all ModuleContext instances share the same hidden class, allowing V8 to:
+   * - Inline property access after first check
+   * - Optimize the truthy check `if (this.module.remappedViewClass)` to near-zero cost
+   *
+   * Per specs/01e_library_integration_pattern.md and 01c_context_flow_and_op_wrappers.md
+   */
+  remappedViewClass: (new (buffer: SpanBuffer) => SpanBuffer) | undefined = undefined;
 
   constructor(
     public readonly gitSha: string,

@@ -609,8 +609,8 @@ const withScope = op(async (ctx) => {
 
 This span scope attributes system integrates with:
 
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides the foundational context
-  creation and inheritance mechanisms
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Provides the foundational context creation
+  and inheritance mechanisms
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Lazy column allocation for tag columns
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Demonstrates how libraries can use scoped
   attributes for clean traced operations

@@ -26,8 +26,7 @@
 - **System Overview**: specs/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8 Optimization
   Patterns** (see also [V8 Optimization References](#v8-optimization-references) below)
 - **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema, feature flags [**LMAO**]
-- **Context Flow**: specs/01c_context_flow_and_task_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern
-  [**LMAO**]
+- **Context Flow**: specs/01c_context_flow_and_op_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern [**LMAO**]
 - **Buffer Architecture**: specs/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
   [**ARROW-BUILDER**]
 - **TypeScript Transformer**: specs/01o_typescript_transformer.md - Compile-time V8 optimizations, span_op/span_fn
@@ -35,10 +34,12 @@
 
 ### Buffer System Details (All in @packages/arrow-builder)
 
-- **Buffer Overview**: specs/01b_columnar_buffer_architecture_overview.md - High-level columnar storage concepts
 - **Performance Opts**: specs/01b1_buffer_performance_optimizations.md - Cache alignment, string interning, enum
   optimization
 - **Self-Tuning**: specs/01b2_buffer_self_tuning.md - Zero-config capacity management
+- **High-Precision Timestamps**: specs/01b3_high_precision_timestamps.md - Nanosecond timestamps, BigInt64Array
+- **Span Identity**: specs/01b4_span_identity.md - Span ID design, TraceId, distributed tracing
+- **SpanBuffer Memory Layout**: specs/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization
 - **Arrow Table**: specs/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
 
 ### API & Code Generation (All in @packages/lmao)

@@ -29,6 +29,7 @@ import {
   TraceContextProto,
 } from './traceContext.js';
 import { generateTraceId, type TraceId } from './traceId.js';
+import type { SpanBuffer } from './types.js';
 
 // =============================================================================
 // Module-Level Constants
@@ -631,14 +632,31 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
        * Uses prefixSchema to rename schema fields with prefix
        */
       prefix<P extends string>(prefix: P): PrefixedModule<T, FF, Extra, P> {
-        // Import prefixSchema dynamically to avoid circular dependency
+        // Import prefixSchema and RemappedBufferView utilities dynamically to avoid circular dependency
         // eslint-disable-next-line @typescript-eslint/no-require-imports
-        const { prefixSchema } = require('./library.js') as {
+        const { prefixSchema, createPrefixMapping, generateRemappedBufferViewClass } = require('./library.js') as {
           prefixSchema: (schema: LogSchema, prefix: string) => LogSchema;
+          createPrefixMapping: (schema: LogSchema, prefix: string) => Record<string, string>;
+          generateRemappedBufferViewClass: (mapping: Record<string, string>) => new (buffer: SpanBuffer) => SpanBuffer;
         };
 
+        // Get original unprefixed schema (before prefixing)
+        const originalSchema = state.logSchema;
+
         // Apply prefix to schema
-        const prefixedSchema = prefixSchema(state.logSchema, prefix);
+        const prefixedSchema = prefixSchema(originalSchema, prefix);
+
+        // Create prefix mapping: unprefixed → prefixed (e.g., { status: 'http_status' })
+        const prefixMapping = createPrefixMapping(originalSchema, prefix);
+
+        // Invert mapping for RemappedBufferView: prefixed → unprefixed (e.g., { 'http_status': 'status' })
+        const invertedMapping: Record<string, string> = {};
+        for (const [unprefixed, prefixed] of Object.entries(prefixMapping)) {
+          invertedMapping[prefixed] = unprefixed;
+        }
+
+        // Generate RemappedBufferView class (cold path - happens once per prefix application)
+        const remappedViewClass = generateRemappedBufferViewClass(invertedMapping);
 
         // Create new module context with prefixed schema
         const prefixedModuleContext = new ModuleContext(
@@ -649,6 +667,8 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         );
         // Copy deps
         (prefixedModuleContext as unknown as { deps?: Record<string, unknown> }).deps = state.deps;
+        // Store RemappedBufferView class for Op._invoke() to use
+        prefixedModuleContext.remappedViewClass = remappedViewClass;
 
         // Create prefixed module by calling defineModule again with prefixed schema
         // This creates a new module with the prefixed schema
@@ -662,6 +682,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
 
         // Get the module instance (without .ctx() call, uses default Extra = Record<string, unknown>)
         const prefixedModule = prefixedModuleDef as unknown as Module<T, FF, Extra>;
+
+        // Set remappedViewClass on the module's ModuleContext (the one actually used by ops)
+        prefixedModule.module.remappedViewClass = remappedViewClass;
 
         return {
           ...prefixedModule,

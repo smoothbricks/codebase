@@ -1334,7 +1334,7 @@ function convertBuffersWithSharedDicts(
   );
 
   // Metadata column: Package name (from task.module.packageName, with callsiteModule for row 0)
-  // Per specs/01c_context_flow_and_task_wrappers.md:
+  // Per specs/01c_context_flow_and_op_wrappers.md:
   // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
   // - Rows 1+ (logs, span-end): uses task.module
   const packageIndices = new packageDict.indexArrayCtor(totalRows);

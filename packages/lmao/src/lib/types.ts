@@ -193,7 +193,7 @@ export type SpanBuffer<T extends LogSchema = LogSchema> = TypedColumnBuffer<T['f
    * For root spans: undefined (no caller, or same as task.module)
    * For child spans: the parent span's module context
    *
-   * Access pattern (per specs/01c_context_flow_and_task_wrappers.md):
+   * Access pattern (per specs/01c_context_flow_and_op_wrappers.md):
    * - Row 0: buffer.callsiteModule?.packageName (caller's module)
    * - Rows 1+: buffer.task.module.packageName (op's module)
    */

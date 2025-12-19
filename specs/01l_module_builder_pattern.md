@@ -1042,7 +1042,7 @@ const appRoot = appModule.use({
 ## Integration with Other Specs
 
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Schema definition (`S.number()`, `S.category()`, etc.)
-- **[Context Flow and Op Wrappers](./01c_context_flow_and_task_wrappers.md)**: How context flows through span() calls
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: How context flows through span() calls
 - **[Module Context and SpanLogger Generation](./01j_module_context_and_spanlogger_generation.md)**: TagAPI/SpanLogger
   generation
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for Arrow conversion

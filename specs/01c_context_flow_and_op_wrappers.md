@@ -325,7 +325,14 @@ class Op<Ctx, Args extends unknown[], Result> {
 
     // 2. Register with parent's children (RemappedBufferView if prefixed)
     if (parentBuffer) {
-      parentBuffer.children.push(this.module.prefix ? new RemappedBufferView(buffer, this.module.prefixMap) : buffer);
+      if (this.module.remappedViewClass) {
+        // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
+        const view = new this.module.remappedViewClass(buffer);
+        parentBuffer.children.push(view);
+      } else {
+        // No prefix - push raw buffer directly
+        parentBuffer.children.push(buffer);
+      }
     }
 
     // 3. Write span-start entry (row 0)

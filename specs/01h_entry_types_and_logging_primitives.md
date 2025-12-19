@@ -1031,7 +1031,7 @@ This entry type system integrates with:
 - **[Arrow Table Structure](./01f_arrow_table_structure.md)**: Entry types become the `entry_type` column
 - **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Generated APIs use these primitives
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Column writers populate buffer arrays
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Op lifecycle creates span entry types
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Op lifecycle creates span entry types
 
 The entry type system provides the foundational vocabulary for all trace events, ensuring consistency and performance
 across the entire logging system.

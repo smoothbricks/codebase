@@ -84,7 +84,7 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
   /**
    * Source code line number for this entry.
    *
-   * Per specs/01c_context_flow_and_task_wrappers.md "Line Number System":
+   * Per specs/01c_context_flow_and_op_wrappers.md "Line Number System":
    * - Uint16 column (max 65535 lines per file)
    * - TypeScript transformer injects line numbers at compile time
    * - No runtime overhead - just a method call with literal number

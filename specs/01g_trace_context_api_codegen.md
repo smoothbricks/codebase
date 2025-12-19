@@ -489,8 +489,7 @@ This codegen system integrates with:
   type system and column writer patterns
 - **[Arrow Table Structure](./01f_arrow_table_structure.md)**: Generated APIs populate the final Arrow table structure
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Column writers populate buffer arrays
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Op lifecycle integrates with generated
-  APIs
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Op lifecycle integrates with generated APIs
 
 ## uint64 Method Generation
 

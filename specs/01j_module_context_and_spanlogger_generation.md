@@ -275,9 +275,16 @@ class Op<Ctx, Args extends unknown[], Result> {
       ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
       : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.traceId);
 
-    // 2. Link to parent
+    // 2. Register with parent's children (RemappedBufferView if prefixed)
     if (parentBuffer) {
-      parentBuffer.children.push(buffer);
+      if (this.module.remappedViewClass) {
+        // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
+        const view = new this.module.remappedViewClass(buffer);
+        parentBuffer.children.push(view);
+      } else {
+        // No prefix - push raw buffer directly
+        parentBuffer.children.push(buffer);
+      }
       buffer.parent = parentBuffer;
     }
 
@@ -772,7 +779,7 @@ setAttribute(name, value) {
 
 This module context and op generation system integrates with:
 
-- **[Context Flow and Op Wrappers](./01c_context_flow_and_task_wrappers.md)**: Provides SpanContext and span() mechanics
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Provides SpanContext and span() mechanics
 - **[Module Builder Pattern](./01l_module_builder_pattern.md)**: High-level API for defineModule + op()
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes LogSchema definitions
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for prefixed columns

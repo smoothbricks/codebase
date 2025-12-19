@@ -1,7 +1,7 @@
 /**
  * TraceContext Types and Prototype System
  *
- * Per specs/01c_context_flow_and_task_wrappers.md and specs/01l_module_builder_pattern.md:
+ * Per specs/01c_context_flow_and_op_wrappers.md and specs/01l_module_builder_pattern.md:
  * - TraceContext is created via module.traceContext() at request entry
  * - Uses prototype-based inheritance for V8 hidden class optimization
  * - Contains system properties (traceId, timestamps, threadId) + user Extra
@@ -105,7 +105,7 @@ export const TRACE_CONTEXT_MARKER = Symbol.for('lmao.TraceContext');
 /**
  * Base prototype interface for all trace contexts.
  *
- * Per specs/01c_context_flow_and_task_wrappers.md:
+ * Per specs/01c_context_flow_and_op_wrappers.md:
  * - Methods are defined ONCE on a shared prototype
  * - Object.create() is used for inheritance (no object spreads)
  * - Properties are assigned directly for stable hidden classes

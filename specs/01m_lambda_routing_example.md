@@ -647,6 +647,6 @@ resolvers, or microservice gateways.
 
 - **[Module Builder Pattern](./01l_module_builder_pattern.md)**: Defines `defineModule()`, `.prefix()`, `.use()` API
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for Arrow conversion
-- **[Context Flow](./01c_context_flow_and_task_wrappers.md)**: How context propagates through span() calls
+- **[Context Flow](./01c_context_flow_and_op_wrappers.md)**: How context propagates through span() calls
 - **[Trace Schema System](./01a_trace_schema_system.md)**: `S.enum()`, `S.category()`, `S.text()` definitions
 - **[Arrow Table Structure](./01f_arrow_table_structure.md)**: Final queryable format

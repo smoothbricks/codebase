@@ -583,7 +583,7 @@ This pattern integrates with other components:
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Provides the schema definition and composition mechanisms
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generates prefixed TypedArray columns based
   on composed schemas
-- **[Context Flow and Task Wrappers](./01c_context_flow_and_task_wrappers.md)**: Implements the op wrapper pattern that
+- **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Implements the op wrapper pattern that
   libraries build upon
 - **[Trace Context API Codegen](./01g_trace_context_api_codegen.md)**: Details the runtime code generation that creates
   the optimized library APIs

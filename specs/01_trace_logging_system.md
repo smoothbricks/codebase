@@ -112,7 +112,7 @@ integration. It consists of these main components:
 - Zero-copy conversion from runtime buffers to Apache Arrow format.
 - **WHY**: Enables efficient querying, compression, and integration with data analysis tools.
 
-### 4. [Context Flow and Op/Span Pattern](./01c_context_flow_and_task_wrappers.md)
+### 4. [Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md)
 
 **Purpose**: Hierarchical context management with span correlation.
 
@@ -502,7 +502,7 @@ The trace logging system integrates with these platform components:
 1. **[Package Architecture](./00_package_architecture.md)** - arrow-builder vs lmao separation, op() + span() evolution
 2. **[Schema System](./01a_trace_schema_system.md)** - Attribute definitions and type safety
 3. **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)** - Memory layout and performance
-4. **[Context Flow and Op/Span Pattern](./01c_context_flow_and_task_wrappers.md)** - Execution model and span hierarchy
+4. **[Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md)** - Execution model and span hierarchy
 5. **[AI Integration](./01d_ai_agent_integration.md)** - LLM-powered analysis and insights
 6. **[Library Integration Pattern](./01e_library_integration_pattern.md)** - Library attribute conflict resolution
 7. **[Arrow Table Structure](./01f_arrow_table_structure.md)** - Final queryable format

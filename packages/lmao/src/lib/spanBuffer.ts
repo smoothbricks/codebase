@@ -146,7 +146,7 @@ function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferConstruct
         this.next = undefined;
         
         // Store callsiteModule for dual module attribution (row 0 vs rows 1+)
-        // Per specs/01c_context_flow_and_task_wrappers.md:
+        // Per specs/01c_context_flow_and_op_wrappers.md:
         // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
         // - Rows 1+ (logs, span-end): uses task.module
         this.callsiteModule = callsiteModule;
@@ -371,7 +371,7 @@ export function createSpanBuffer<T extends LogSchema>(
  * Child buffers have identity: [threadId(8)][spanId(4)] (12 bytes)
  * Parent reference is via `parent` property pointer.
  *
- * Per specs/01c_context_flow_and_task_wrappers.md:
+ * Per specs/01c_context_flow_and_op_wrappers.md:
  * - `callsiteModule` is the caller's module (where span() was invoked)
  * - `taskContext.module` is the op's module (where code executes)
  * - Row 0 uses callsiteModule for gitSha/packageName/packagePath
