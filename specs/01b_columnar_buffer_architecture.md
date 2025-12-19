@@ -478,6 +478,8 @@ The actual implementation generates a concrete SpanBuffer class with lazy getter
 
 ```typescript
 // Pseudo-code: Generated at module creation time (cold path)
+// PACKAGE: arrow-builder provides generateColumnBufferClass()
+// PACKAGE: lmao extends with span-specific properties via ColumnBufferExtension
 // Example for userId attribute (category type, Uint32Array):
 
 class GeneratedColumnBuffer {
@@ -559,10 +561,14 @@ Consider a schema with 20 attributes where a typical span only uses 3:
 
 **Purpose**: Provide a generic interface that can be extended with schema-generated columns.
 
+**PACKAGE**: This interface is defined in **lmao** (`packages/lmao/src/lib/types.ts`). It extends arrow-builder's
+`TypedColumnBuffer` with span-specific properties (tree structure, identity, context).
+
 **CRITICAL**: Column properties are **direct properties** on the SpanBuffer via lazy getters (no nested
 `columns: Record<...>`). This design provides zero indirection for hot path access.
 
 ```typescript
+// PACKAGE: lmao - SpanBuffer extends arrow-builder's TypedColumnBuffer
 interface SpanBuffer {
   // Core columns - always present (allocated immediately in constructor)
   timestamps: BigInt64Array; // Every operation appends timestamp (nanoseconds)
@@ -1470,9 +1476,15 @@ function isParentOf(this: SpanBuffer, other: SpanBuffer): boolean {
 **Purpose**: Enable arrow-builder to provide extensible buffer generation while allowing lmao to inject span-specific
 functionality without tight coupling.
 
+**PACKAGE BOUNDARY**: This mechanism is the key to maintaining clean separation:
+
+- **arrow-builder** owns the `ColumnBufferExtension` interface and `getColumnBufferClass()` function
+- **lmao** provides the extension with span-specific code (identity, tree structure, context)
+- arrow-builder has NO knowledge of what the extension code does
+
 ### Design Overview
 
-The `createColumnBufferClass()` function in arrow-builder accepts callback options that allow injecting:
+The `getColumnBufferClass()` function in arrow-builder accepts callback options that allow injecting:
 
 1. **Constructor code**: Additional initialization logic
 2. **Methods**: Instance methods added to the generated class
@@ -1517,8 +1529,10 @@ interface ColumnBufferExtensionOptions {
 ### Usage Example (lmao extending arrow-builder)
 
 ```typescript
-// In lmao: Create SpanBuffer class by extending ColumnBuffer
-const SpanBufferClass = createColumnBufferClass(schema, {
+// PACKAGE: lmao (packages/lmao/src/lib/spanBuffer.ts)
+// This code lives in lmao but calls arrow-builder's getColumnBufferClass()
+// The extension injects span-specific code that arrow-builder executes blindly
+const SpanBufferClass = getColumnBufferClass(schema, {
   preamble: `
     const { createRootSpanIdentity, createChildSpanIdentity } = require('./spanIdentity');
   `,
@@ -1629,7 +1643,7 @@ This enables V8 to:
 - **Shared ArrayBuffer**: Each column's nulls and values share ONE ArrayBuffer (cache-friendly)
 - **Per-span buffers**: Each span gets its own buffer for sorted logs and simple implementation
 - **No traceId/spanId arrays**: These are constant per buffer, stored as properties
-- **Symbol-based storage**: Per-instance storage via Symbol keys (no closure sharing bugs)
+- **Direct underscore-prefixed properties**: Per-instance storage via `_columnName_nulls` and `_columnName_values`
 - **Minimal interface**: Only essential fields, no capacity/length bloat
 - **Shared references**: Module context shared across all ops
 - **Tree structure**: Efficient parent-child span relationships
@@ -1647,10 +1661,13 @@ applied to buffer columns during writes or pre-fill operations.
 
 **Purpose**: Extend the base interface with typed columns based on tag attribute schemas.
 
+**PACKAGE**: This section describes **lmao**-level code that uses arrow-builder's extension mechanism. The factory
+functions (`createSpanBuffer`, `getSpanBufferClass`) live in `packages/lmao/src/lib/spanBuffer.ts`.
+
 **See Also**: [Trace Schema System](./01a_trace_schema_system.md) for how these schemas are defined.
 
 ```typescript
-// Generated from composed schema (HTTP + DB + user attributes)
+// PACKAGE: lmao - Generated from composed schema (HTTP + DB + user attributes)
 // Each attribute becomes DIRECT properties via lazy getters on buffer
 interface ComposedSpanBuffer extends SpanBuffer {
   // HTTP library attributes (prefix prevents conflicts with SpanBuffer internals)
@@ -2010,7 +2027,9 @@ toArrow(): ArrowColumn {
 4. **V8 optimization**: Simple array assignment optimizes better than Map.get()
 
 **See Also**: [Buffer Performance Optimizations](./01b1_buffer_performance_optimizations.md) for detailed CATEGORY vs
-TEXT string handling strategies.
+TEXT string handling strategies, and the
+[String Interning and UTF-8 Caching Architecture](./01b1_buffer_performance_optimizations.md#string-interning-and-utf-8-caching-architecture)
+section for the two-tier interner design (global interner for compile-time strings, SIEVE cache for runtime strings).
 
 ## Tag Operation Implementation
 
@@ -2431,6 +2450,12 @@ index++;
 
 **Purpose**: Convert columnar buffers to Apache Arrow RecordBatches and then to Parquet files.
 
+**PACKAGE**: This entire section describes **lmao**-level functionality. The conversion process lives in lmao and
+orchestrates arrow-builder's low-level utilities.
+
+**See Also**: [Arrow Table Structure](./01f_arrow_table_structure.md) for the complete Arrow schema definition and
+ClickHouse query patterns.
+
 ### Copy Semantics and Performance
 
 **Important Clarification**: The Arrow conversion is NOT zero-copy in all cases. Understanding the actual semantics:
@@ -2613,6 +2638,12 @@ function createRecordBatch(buffer: SpanBuffer, scope: GeneratedScope): arrow.Rec
 ## Arrow Conversion Integration
 
 **Purpose**: The columnar buffer architecture enables efficient conversion to Apache Arrow format.
+
+**PACKAGE**: Arrow conversion is orchestrated by **lmao**. It uses arrow-builder's low-level utilities (null bitmap
+helpers, dictionary builders) but owns the tree-walking, scope-filling, and RecordBatch creation logic.
+
+**See Also**: [Arrow Table Structure](./01f_arrow_table_structure.md) for the complete Arrow schema, column types, and
+ClickHouse query examples.
 
 **Key Integration Points**:
 

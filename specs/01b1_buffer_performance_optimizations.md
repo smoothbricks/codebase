@@ -239,7 +239,7 @@ The system provides three string types with different performance/memory tradeof
 
 **Use Case**: Known values at compile time (entry types, log levels, status codes)
 
-**Key Insight**: All work done ONCE at startup. Hot path is just a Map lookup + array write.
+**Key Insight**: All work done ONCE at code generation. Hot path is a V8 JIT-inlined switch statement + array write.
 
 ```typescript
 // Schema definition
@@ -248,12 +248,12 @@ const schema = {
   logLevel: S.enum(['debug', 'info', 'warn', 'error']),
 };
 
-// Implementation
-class EnumColumn {
+// Generated code (via new Function() at module init)
+// Switch statements are V8 JIT-inlined for maximum performance
+class GeneratedEnumColumn {
   // IMMUTABLE after construction
   private readonly sortedDictionary: string[];
   private readonly utf8Dictionary: Uint8Array[]; // Pre-encoded at startup
-  private readonly reverseMap: Map<string, number>;
 
   // Mutable: per-entry indices
   private values: Uint8Array;
@@ -264,15 +264,32 @@ class EnumColumn {
     // ═══════════════════════════════════════════════════════════
     this.sortedDictionary = [...possibleValues].sort();
     this.utf8Dictionary = this.sortedDictionary.map((s) => new TextEncoder().encode(s));
-    this.reverseMap = new Map(this.sortedDictionary.map((v, i) => [v, i]));
     this.values = new Uint8Array(capacity);
   }
 
-  // HOT PATH: Map lookup + array write (zero allocation)
+  // HOT PATH: Generated switch-case (V8 JIT-inlines to jump table)
+  // This method is GENERATED via new Function() at module init time
+  // Example for entryType enum:
   write(idx: number, value: string): void {
-    const dictIdx = this.reverseMap.get(value);
-    if (dictIdx === undefined) {
-      throw new Error(`Invalid enum value: ${value}`);
+    let dictIdx: number;
+    switch (value) {
+      case 'debug':
+        dictIdx = 0;
+        break;
+      case 'info':
+        dictIdx = 1;
+        break;
+      case 'span-err':
+        dictIdx = 2;
+        break;
+      case 'span-ok':
+        dictIdx = 3;
+        break;
+      case 'span-start':
+        dictIdx = 4;
+        break;
+      default:
+        throw new Error(`Invalid enum value: ${value}`);
     }
     this.values[idx] = dictIdx;
   }
@@ -288,15 +305,26 @@ class EnumColumn {
 }
 ```
 
+**Why Switch-Case over Map:**
+
+- V8 JIT compiles switch statements to jump tables (O(1) with no hash overhead)
+- No Map object allocation or hash computation
+- Compile-time known values = compile-time optimized code
+- Monomorphic call sites enable inline caching
+
 **Why Sorted Dictionary:**
 
 - Enables binary search for "does value X exist?" queries
 - Arrow/Parquet can skip unused dictionary entries
 - ClickHouse can push down predicates efficiently
 
-**Performance Characteristics:** | Operation | Cost | Allocations | |-----------|------|-------------| | Startup | O(n
-log n) sort + O(n) UTF-8 encode | Dictionary arrays | | Hot path write | O(1) Map lookup + array write | Zero | | Cold
-path flush | O(1) slice | Index array copy |
+**Performance Characteristics:**
+
+| Operation       | Cost                                | Allocations       |
+| --------------- | ----------------------------------- | ----------------- |
+| Startup         | O(n log n) sort + O(n) UTF-8 encode | Dictionary arrays |
+| Hot path write  | O(1) switch + array write           | Zero              |
+| Cold path flush | O(1) slice                          | Index array copy  |
 
 #### 2. CATEGORY: Raw String Storage + Cold-Path Dictionary (Repeated Values)
 
@@ -527,18 +555,22 @@ class TextColumn {
 - No global interner - per-column, per-flush
 - GC can collect strings after flush completes
 
-**Performance Characteristics:** | Operation | Cost | Allocations | |-----------|------|-------------| | Hot path write
-| O(1) array assignment | Zero | | Cold path flush | O(n) count + O(n log n) sort + O(n) UTF-8 | Dictionary/values
-arrays | | Post-flush | Strings array cleared | Zero (GC releases) |
+**Performance Characteristics:**
+
+| Operation       | Cost                                      | Allocations              |
+| --------------- | ----------------------------------------- | ------------------------ |
+| Hot path write  | O(1) array assignment                     | Zero                     |
+| Cold path flush | O(n) count + O(n log n) sort + O(n) UTF-8 | Dictionary/values arrays |
+| Post-flush      | Strings array cleared                     | Zero (GC releases)       |
 
 ### String Type Comparison
 
 | Aspect                 | ENUM                      | CATEGORY                    | TEXT                        |
 | ---------------------- | ------------------------- | --------------------------- | --------------------------- |
 | **Hot path storage**   | Uint8Array (index)        | string[] (raw JS strings)   | string[] (raw JS strings)   |
-| **Hot path work**      | Map lookup + array write  | Array assignment only       | Array assignment only       |
+| **Hot path work**      | Switch + array write      | Array assignment only       | Array assignment only       |
 | **Hot path cost**      | O(1)                      | O(1)                        | O(1)                        |
-| **Hot path interning** | No (compile-time map)     | **No** (deferred to cold)   | **No** (deferred to cold)   |
+| **Hot path interning** | No (compile-time switch)  | **No** (deferred to cold)   | **No** (deferred to cold)   |
 | **Cold path**          | Zero (pre-computed)       | Sort + dedupe + SIEVE UTF-8 | 2-pass + conditional dict   |
 | **Memory bound**       | Fixed (schema)            | Per-flush (strings cleared) | Per-flush (strings cleared) |
 | **Dictionary sorted**  | ✓ At startup              | ✓ At flush                  | ✓ If used                   |

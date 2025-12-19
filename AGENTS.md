@@ -260,8 +260,8 @@ Unified enum for ALL trace events:
 1. **Hot Path**: TypedArray writes ONLY. No Arrow builders, no objects, no console.log
 2. **Cache Alignment**: 64-byte aligned TypedArrays (specs/01b_columnar_buffer_architecture.md)
 3. **String Optimization**:
-   - Enums: Compile-time mapping to Uint8 (1 byte)
-   - Categories: Runtime string interning to Uint32 (4 bytes)
+   - Enums: Compile-time switch-case mapping to Uint8 (1 byte)
+   - Categories: Raw strings on hot path, dictionary built on cold path
    - Text: Raw strings without dictionary overhead
 4. **Direct References**: SpanLogger holds buffer ref, no lookups
    (specs/01j_module_context_and_spanlogger_generation.md)
@@ -383,14 +383,13 @@ Unified enum for ALL trace events:
 
 ### String Storage
 
-- ✅ `StringInterner` - Category string interning (exported from lmao.ts)
-- ✅ `TextStringStorage` - Text storage without interning (exported from lmao.ts)
-- ✅ `categoryInterner` - Global category interner
-- ✅ `textStringStorage` - Global text storage
-- ✅ `Utf8Cache` (SIEVE-based) - Bounded UTF-8 encoding cache for Arrow conversion
+- ✅ `Utf8Cache` (SIEVE-based) - Bounded UTF-8 encoding cache for Arrow conversion (cold path only)
 
-**Note**: Module IDs and span names are accessed directly from `buf.task.module.packageName`,
-`buf.task.module.packagePath`, and `buf.task.spanName` during Arrow conversion - no separate interners needed.
+**Note**: CATEGORY and TEXT columns store raw `string[]` on hot path. Dictionary building and UTF-8 encoding happen
+during Arrow conversion (cold path). There is NO hot-path interning.
+
+Module IDs and span names are accessed directly from `buf.task.module.packageName`, `buf.task.module.packagePath`, and
+`buf.task.spanName` during Arrow conversion.
 
 **BEFORE IMPLEMENTING**: Search these modules first! Most functionality already exists.
 
