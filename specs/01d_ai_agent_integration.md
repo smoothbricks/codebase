@@ -33,17 +33,19 @@ const traceServer = new MCPServer({
 });
 
 // Tool: Query traces by test run ID
+// Note: testRunId IS the trace_id for test runs - it's a custom trace_id value used for test correlation
 traceServer.addTool({
   name: 'get_traces_by_test_run',
   description: 'Get all traces for a specific test run',
   inputSchema: {
     type: 'object',
     properties: {
-      testRunId: { type: 'string' },
+      testRunId: { type: 'string', description: 'The trace_id used for this test run (testRunId === trace_id)' },
     },
   },
   handler: async ({ testRunId }) => {
-    return await queryTraceDatabase({ testRunId });
+    // testRunId is used as the trace_id value for all spans in this test run
+    return await queryTraceDatabase({ traceId: testRunId });
   },
 });
 
@@ -61,6 +63,56 @@ traceServer.addTool({
   },
   handler: async ({ spanName, testRunId, timeRange }) => {
     return await queryTraceDatabase({ spanName, testRunId, timeRange });
+  },
+});
+
+// Tool: Query by span identity (thread_id + span_id composite)
+traceServer.addTool({
+  name: 'get_span_by_identity',
+  description: 'Get a specific span by its identity (thread_id + span_id)',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      threadId: { type: 'string', description: 'Thread ID (uint64, hex format)' },
+      spanId: { type: 'number', description: 'Span ID (uint32)' },
+      traceId: { type: 'string', optional: true, description: 'Optional: filter by trace_id for validation' },
+    },
+  },
+  handler: async ({ threadId, spanId, traceId }) => {
+    // Query by composite identity
+    return await queryTraceDatabase({
+      threadId,
+      spanId,
+      traceId, // Optional validation
+    });
+  },
+});
+
+// Tool: Get parent span
+traceServer.addTool({
+  name: 'get_parent_span',
+  description: 'Get the parent span of a given span',
+  inputSchema: {
+    type: 'object',
+    properties: {
+      threadId: { type: 'string', description: 'Thread ID of the child span' },
+      spanId: { type: 'number', description: 'Span ID of the child span' },
+      traceId: { type: 'string', description: 'Trace ID (for validation)' },
+    },
+  },
+  handler: async ({ threadId, spanId, traceId }) => {
+    // First get the child span to find parent references
+    const childSpan = await queryTraceDatabase({ threadId, spanId, traceId });
+    if (!childSpan || !childSpan.parent_thread_id || !childSpan.parent_span_id) {
+      return null; // Root span has no parent
+    }
+
+    // Query parent using parent_thread_id + parent_span_id
+    return await queryTraceDatabase({
+      threadId: childSpan.parent_thread_id,
+      spanId: childSpan.parent_span_id,
+      traceId, // Same trace
+    });
   },
 });
 
@@ -106,6 +158,18 @@ traceServer.addTool({
 ## Test Framework Integration
 
 **Purpose**: Automatically correlate traces with test runs for AI-driven analysis.
+
+**Why Jest/Bun Examples**:
+
+Jest and Bun are shown as **examples** of how test framework integration works. The design is **framework-agnostic** -
+any test framework can integrate similarly by:
+
+1. Generating a single `testRunId` for the entire test suite
+2. Setting that `testRunId` as the `trace_id` for all spans during the test run
+3. Optionally tagging individual test cases with metadata
+
+The integration pattern works with Vitest, Mocha, Jest, Bun, and any other test framework that supports plugins or
+hooks.
 
 ### Jest Plugin
 
@@ -193,12 +257,44 @@ Console: ✅ 1000 tests passed (15 failed)
 AI: Let me check the trace data for that run...
 MCP Tool Call: get_traces_by_test_run({ testRunId: "test-run-abc123" })
 Result: [
-  { testCase: 'user login flow', span: 'user-validation', duration: 2.3ms, success: true },
-  { testCase: 'user login flow', span: 'database-query', duration: 45ms, success: true },
-  { testCase: 'email notification', span: 'email-send', duration: 120ms, error: 'SMTP timeout' },
-  { testCase: 'password reset', span: 'email-send', duration: 125ms, error: 'SMTP timeout' },
+  {
+    testCase: 'user login flow',
+    message: 'user-validation',
+    entry_type: 'span-ok',
+    thread_id: '0x1a2b3c4d5e6f7890',
+    span_id: 1,
+    parent_thread_id: null,
+    parent_span_id: null,
+    timestamp: '2024-01-01T10:00:00.002300Z',
+    // Duration calculated from timestamps (not a column)
+  },
+  {
+    testCase: 'user login flow',
+    message: 'database-query',
+    entry_type: 'span-ok',
+    thread_id: '0x1a2b3c4d5e6f7890',
+    span_id: 2,
+    parent_thread_id: '0x1a2b3c4d5e6f7890',
+    parent_span_id: 1,
+    timestamp: '2024-01-01T10:00:00.045000Z',
+  },
+  {
+    testCase: 'email notification',
+    message: 'email-send',
+    entry_type: 'span-err',
+    thread_id: '0x1a2b3c4d5e6f7890',
+    span_id: 3,
+    parent_thread_id: '0x1a2b3c4d5e6f7890',
+    parent_span_id: 1,
+    timestamp: '2024-01-01T10:00:00.120000Z',
+    // Error details in attribute columns
+  },
   // ... more traces
 ]
+
+Note: The actual Arrow table uses separate columns: `message` (span name), `entry_type`, `thread_id`, `span_id`,
+`parent_thread_id`, `parent_span_id`. Duration is calculated from `timestamp` differences, not stored as a column.
+Span identification uses the composite `(thread_id, span_id)` - see [Arrow Table Structure](./01f_arrow_table_structure.md).
 
 AI: I see multiple email-send spans failing with SMTP timeouts across different test cases.
     Let me check the pattern...
@@ -219,6 +315,14 @@ AI: All 15 failures are SMTP timeouts. Let me fix the retry logic and timeout co
 **Purpose**: Deploy authenticated MCP server for production trace access with privacy controls.
 
 ### Production MCP Server
+
+**Why OAuth2**:
+
+- **Standard protocol**: Industry-standard API authentication protocol with broad tooling support
+- **Scope-based access control**: Fine-grained permissions via scopes (`trace:read`, `trace:decrypt`)
+- **Audit trail**: OAuth2 tokens provide built-in audit logging for security compliance
+- **Token management**: Standard token refresh and revocation mechanisms
+- **Integration**: Works seamlessly with existing identity providers (Okta, Auth0, etc.)
 
 ```typescript
 // Production MCP server with OAuth
@@ -425,15 +529,39 @@ const AI_AGENT_PROMPTS = {
     - Use span('name', op, ...args) to execute with tracing
     - Use tag.* for structured data
     - Use ok() and err() for results
+    - Use setScope() for attributes that propagate to all rows and child spans
     
     Operation definition pattern:
     const { op } = myModule;
-    const processUser = op(async ({ span, log, tag }, userId: string) => {
+    const processUser = op(async ({ span, log, tag, setScope }, userId: string) => {
+      // Scope: Set once, appears on all rows and child spans
+      setScope({ requestId: 'req-123', userId });
+      
+      // Tag: Span attributes (row 0 only)
       tag.userId(userId);           // Automatically hashed
       tag.operation('SELECT');      // Enum validation
-      await span('fetch-data', fetchOp, userId);  // Nested operation
+      
+      // Nested operation - name provided at call site
+      await span('fetch-data', fetchOp, userId);
+      
+      // Log: Creates new rows (appends)
+      log.info('Processing complete').with({ itemCount: 42 });
+      
       return ok({ processed: true });
     });
+    
+    Note: The TypeScript transformer injects line numbers as the first argument to span():
+    - User writes: await span('fetch-data', fetchOp, userId);
+    - Transformer outputs: await span(42, 'fetch-data', fetchOp, userId);
+    This enables source code linking without runtime stack trace parsing.
+    
+    Scope attributes (setScope):
+    - Set once at span level, propagates to ALL rows and child spans
+    - Use for request context (requestId, userId, tenantId) that applies to entire trace
+    - Child spans inherit parent scope by reference (zero-cost, immutable)
+    - Direct writes (tag, ok/err, log fluent) override scope for specific rows
+    - Example: setScope({ requestId: 'req-123', userId: 'user-456' })
+    See [Span Scope Attributes](./01i_span_scope_attributes.md) for details.
     
     Schema examples:
     tag.userId(user.id);            // Automatically hashed
@@ -468,6 +596,25 @@ const AI_AGENT_PROMPTS = {
       // tag.databaseUrl(dbUrl);         // Would be masked
     });
   `,
+
+  metrics: `
+    Metrics are structured logs with specific entry types:
+    
+    - Op metrics: op-invocations, op-errors, op-exceptions, op-duration-total, 
+      op-duration-ok, op-duration-err, op-duration-min, op-duration-max
+    - Buffer metrics: buffer-writes, buffer-overflow-writes, buffer-created, buffer-overflows
+    - Period marker: period-start (marks metrics period boundaries)
+    
+    Metrics are automatically emitted during flush cycles. The entry_type column identifies
+    the metric type, and uint64_value contains the metric value (count or nanoseconds).
+    
+    Example query patterns:
+    - Find slow operations: WHERE entry_type = 'op-duration-max' AND uint64_value > 1000000000
+    - Buffer health: WHERE entry_type LIKE 'buffer-%'
+    - Error rates: Compare op-invocations vs op-errors
+    
+    See [Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md) for complete list.
+  `,
 };
 ```
 
@@ -484,17 +631,110 @@ const AI_AGENT_PROMPTS = {
 This integration enables AI agents to make informed decisions based on actual application behavior rather than just code
 analysis.
 
+## Arrow Table Conversion
+
+**Purpose**: MCP tools convert SpanBuffer data to Arrow tables for efficient querying and analysis.
+
+### Zero-Copy Conversion
+
+MCP tools use **zero-copy Arrow conversion** to transform SpanBuffer data into Arrow tables. This process:
+
+- **Uses direct TypedArray references**: No copying of data during conversion (see
+  [Arrow Table Structure](./01f_arrow_table_structure.md#zero-copy-mandate))
+- **Builds dictionaries in cold path**: String interning happens during conversion, not at write time
+- **Two-pass tree conversion**: First pass builds dictionaries, second pass creates RecordBatches (see
+  [Tree Walker and Arrow Conversion](./01k_tree_walker_and_arrow_conversion.md))
+- **Shared dictionaries**: All RecordBatches reference the same dictionary vectors for efficient storage
+
+The conversion happens in the cold path (when MCP tools are called), ensuring zero overhead on the hot path (runtime
+logging).
+
 ## Arrow Table Column Reference
 
 When querying trace data via MCP tools, the following columns are available:
 
-| Column                  | Description                                                             |
-| ----------------------- | ----------------------------------------------------------------------- |
-| `message`               | Op/span name (from `span('name', op, ...args)`) or log message template |
-| `package_name`          | npm package name of the module the op is bound to                       |
-| `package_path`          | Path within package where module was defined                            |
-| `entry_type`            | `span-start`, `span-ok`, `span-err`, `info`, `debug`, etc.              |
-| `trace_id`              | Request correlation ID                                                  |
-| `thread_id` + `span_id` | Unique span identifier                                                  |
+| Column             | Description                                                                                                                                                    |
+| ------------------ | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `message`          | Span name, log message template, exception message, OR flag name (see [Message Column](#message-column))                                                       |
+| `package_name`     | npm package name of the module the op is bound to (see [Module Identification](#module-identification))                                                        |
+| `package_path`     | Path within package where module was defined (see [Module Identification](#module-identification))                                                             |
+| `entry_type`       | `span-start`, `span-ok`, `span-err`, `info`, `debug`, `op-invocations`, `buffer-writes`, etc. (see [Entry Types](./01h_entry_types_and_logging_primitives.md)) |
+| `trace_id`         | Request correlation ID (W3C format: 32 lowercase hex characters). For test runs, `testRunId` IS the `trace_id`                                                 |
+| `thread_id`        | Thread/worker identifier (uint64, crypto-secure random)                                                                                                        |
+| `span_id`          | Unit of work within thread (uint32, incrementing counter)                                                                                                      |
+| `parent_thread_id` | Parent span's thread (uint64, nullable - null for root spans)                                                                                                  |
+| `parent_span_id`   | Parent span's ID (uint32, nullable - null for root spans)                                                                                                      |
+| `ff_value`         | Feature flag value (dictionary-encoded string, S.category). Flag name is in `message` column for `ff-access`/`ff-usage` entries                                |
+
+### Message Column
+
+The `message` column serves different purposes based on entry type:
+
+- **Span entries** (`span-start`, `span-ok`, `span-err`, `span-exception`): Contains the span name
+- **Log entries** (`info`, `debug`, `warn`, `error`): Contains the message template (format string, NOT interpolated)
+- **Feature flag entries** (`ff-access`, `ff-usage`): Contains the flag name
+- **Op metrics** (`op-invocations`, `op-errors`, etc.): Contains the op name
+- **Exception entries** (`span-exception`): Contains the exception message
+
+See [Arrow Table Structure](./01f_arrow_table_structure.md#the-message-system-column) for complete details.
+
+### Module Identification
+
+The `package_name` and `package_path` columns work together to identify the source location:
+
+- **`package_name`**: npm package name (e.g., `'@smoothbricks/lmao'`) - globally unique namespace
+- **`package_path`**: Path within package relative to package.json (e.g., `'src/services/user.ts'`)
+- **Dual module attribution**:
+  - **Row 0 (span-start)**: Uses `callsiteModule` - identifies where the span was invoked (call site)
+  - **Rows 1+ (span-end, log entries)**: Uses `module` - identifies where the code executes (op definition)
+  - This enables distinguishing "who called this span" vs "where is the code that runs"
+
+Example: If `httpModule.GET` is called from `userService.createUser`, row 0 shows `userService` (caller) and rows 1+
+show `httpModule` (execution).
+
+See [Arrow Table Structure](./01f_arrow_table_structure.md#module-identification) for complete details.
+
+### Span Identification
+
+Spans are uniquely identified by the composite `(thread_id, span_id)`:
+
+- **`thread_id`**: Crypto-secure 64-bit random, generated once per thread/worker
+- **`span_id`**: Thread-local incrementing counter (32-bit)
+- **Parent relationship**: Use `parent_thread_id` + `parent_span_id` to find parent spans
+- **Global uniqueness**: `(trace_id, thread_id, span_id)` is globally unique
+
+To query a specific span:
+
+```sql
+SELECT * FROM traces
+WHERE thread_id = @thread_id AND span_id = @span_id;
+```
+
+To find parent spans:
+
+```sql
+SELECT * FROM traces
+WHERE thread_id = @parent_thread_id AND span_id = @parent_span_id;
+```
+
+**Example MCP Query**:
+
+```typescript
+// Get a specific span by identity
+const span = await mcp.callTool('get_span_by_identity', {
+  threadId: '0x1a2b3c4d5e6f7890',
+  spanId: 42,
+  traceId: 'test-run-abc123', // Optional validation
+});
+
+// Get parent span
+const parentSpan = await mcp.callTool('get_parent_span', {
+  threadId: '0x1a2b3c4d5e6f7890',
+  spanId: 42,
+  traceId: 'test-run-abc123',
+});
+```
+
+See [Arrow Table Structure](./01f_arrow_table_structure.md#span-identification) for complete details.
 
 See [Arrow Table Structure](./01f_arrow_table_structure.md) for complete schema.
