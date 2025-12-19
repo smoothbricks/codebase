@@ -39,7 +39,10 @@
 - **Self-Tuning**: specs/01b2_buffer_self_tuning.md - Zero-config capacity management
 - **High-Precision Timestamps**: specs/01b3_high_precision_timestamps.md - Nanosecond timestamps, BigInt64Array
 - **Span Identity**: specs/01b4_span_identity.md - Span ID design, TraceId, distributed tracing
-- **SpanBuffer Memory Layout**: specs/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization
+- **SpanBuffer Memory Layout**: specs/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization,
+  SpanBuffer interface
+- **Buffer Codegen Extension**: specs/01b6_buffer_codegen_extension.md - ColumnBufferExtension, lazy getters,
+  schema-generated buffers
 - **Arrow Table**: specs/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
 
 ### API & Code Generation (All in @packages/lmao)

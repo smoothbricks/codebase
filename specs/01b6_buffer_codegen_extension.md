@@ -138,6 +138,68 @@ class GeneratedSpanBuffer {
 }
 ```
 
+### Lazy Column Getter Implementation
+
+Attribute columns use lazy getters that allocate shared ArrayBuffers on first access:
+
+```typescript
+// Generated at module creation time (cold path)
+// Example for userId attribute (category type, Uint32Array):
+
+class GeneratedColumnBuffer {
+  constructor(requestedCapacity) {
+    // Initialize system columns (always allocated)
+    this._timestamps = new BigInt64Array(alignedCapacity);
+    this._operations = new Uint8Array(alignedCapacity);
+
+    // Lazy columns initialized as undefined (not allocated yet)
+    this._userId_nulls = undefined;
+    this._userId_values = undefined;
+  }
+
+  // Lazy getter - allocates BOTH nulls and values on first access
+  get userId_nulls() {
+    if (this._userId_nulls === undefined) {
+      // Allocate shared ArrayBuffer for nulls + values
+      // Calculate aligned sizes for cache line optimization
+      // Create TypedArray views into shared buffer
+      // Set both _userId_nulls and _userId_values
+    }
+    return this._userId_nulls;
+  }
+
+  // Values getter triggers allocation via nulls getter
+  get userId_values() {
+    if (this._userId_values === undefined) this.userId_nulls; // Trigger allocation
+    return this._userId_values;
+  }
+
+  // Setter method writes to TypedArrays and updates null bitmap
+  userId(pos, val) {
+    if (val == null) {
+      // Clear null bit (mark as null)
+    } else {
+      // Set value and mark as valid in null bitmap
+    }
+    return this;
+  }
+
+  // Helpers to check allocation without triggering it
+  getColumnIfAllocated(columnName) {
+    return this[`_${columnName}_values`];
+  }
+}
+```
+
+**Key Design Points**:
+
+1. **Shared ArrayBuffer**: Each column uses ONE ArrayBuffer for both nulls and values
+2. **Cache Alignment**: Null bitmap end is aligned to value type's element size
+3. **Direct Properties**: Uses `this._userId_nulls` and `this._userId_values` (not Symbols)
+4. **Inline Allocation**: Allocation happens directly in the getter, not via separate allocator function
+5. **Zero Indirection**: Direct property access (`buffer.userId_values[i]`)
+6. **V8 Optimization**: Generated classes optimize well with hidden classes and inline caching
+
 ### V8 Hidden Class Optimization
 
 The extension mechanism ensures a **fixed hidden class shape**:

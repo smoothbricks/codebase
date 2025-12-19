@@ -67,6 +67,41 @@ Span completion entry types (all written to row 1):
   - Indicates truly exceptional circumstances
   - Duration still valid: `timestamps[1] - timestamps[0]`
 
+#### Buffer Initialization Code
+
+The fixed row layout is established at span creation and updated on completion:
+
+```typescript
+function initializeSpanBuffer(buffer: SpanBuffer, spanName: string): void {
+  const now = getTimestamp();
+
+  // Row 0: span-start (always present)
+  buffer.timestamps[0] = now;
+  buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+
+  // Row 1: pre-initialized as span-exception (exception safety)
+  buffer.timestamps[1] = now; // Updated by ok()/err()
+  buffer.operations[1] = ENTRY_TYPE_SPAN_EXCEPTION; // Overwritten on completion
+
+  // Ready for events at row 2
+  buffer.writeIndex = 2;
+}
+
+function completeSpanOk(buffer: SpanBuffer, result?: any): void {
+  buffer.timestamps[1] = getTimestamp();
+  buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+  // Result data written to row 1's attribute columns
+}
+
+function completeSpanErr(buffer: SpanBuffer, error: string): void {
+  buffer.timestamps[1] = getTimestamp();
+  buffer.operations[1] = ENTRY_TYPE_SPAN_ERR;
+  // Error details written to row 1's attribute columns
+}
+```
+
+This design ensures every span has valid duration data, even when exceptions bypass normal completion.
+
 ### Log Level Entry Types
 
 Structured logging with message templates and typed attributes - **APPENDS new rows starting at row 2**:

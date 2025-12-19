@@ -401,3 +401,100 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 
 - Root: O(1) decode from \_identity
 - Child depth N: O(N) pointer walks (typically N=3-5)
+
+## Complete SpanBuffer Interface
+
+**Purpose**: Provide the authoritative interface definition that can be extended with schema-generated columns.
+
+**PACKAGE**: This interface is defined in **lmao** (`packages/lmao/src/lib/types.ts`). It extends arrow-builder's
+`TypedColumnBuffer` with span-specific properties (tree structure, identity, context).
+
+**CRITICAL**: Column properties are **direct properties** on the SpanBuffer via lazy getters (no nested
+`columns: Record<...>`). This design provides zero indirection for hot path access.
+
+```typescript
+// PACKAGE: lmao - SpanBuffer extends arrow-builder's TypedColumnBuffer
+interface SpanBuffer {
+  // Core columns - always present (allocated immediately in constructor)
+  timestamps: BigInt64Array; // Every operation appends timestamp (nanoseconds)
+  operations: Uint8Array; // Operation type: tag, ok, err, etc.
+  lineNumber_values: Int32Array; // Line numbers for each entry
+  lineNumber_nulls: Uint8Array; // Null bitmap for line numbers
+
+  // Attribute columns - DIRECT PROPERTIES with LAZY GETTERS (no nested Record!)
+  // Each attribute has TWO properties sharing ONE ArrayBuffer:
+  // - X_nulls: Uint8Array for null bitmap (Arrow format: 1=valid, 0=null)
+  // - X_values: TypedArray for actual values
+  // Schema-generated via new Function() at module creation time
+  userId_nulls: Uint8Array; // Lazy getter
+  userId_values: Uint32Array; // Lazy getter
+  userId: Uint32Array; // Shorthand getter (alias for _values)
+
+  requestId_nulls: Uint8Array;
+  requestId_values: Uint32Array;
+  requestId: Uint32Array;
+
+  http_status_nulls: Uint8Array; // Prefixed library column
+  http_status_values: Uint16Array;
+  http_status: Uint16Array;
+  // ... same pattern for all schema attributes
+
+  // Tree structure
+  children: SpanBuffer[];
+  parent?: SpanBuffer; // Reference to parent SpanBuffer
+
+  // Dual module references for accurate source attribution
+  callsiteModule?: ModuleContext; // Caller's module (for row 0 metadata)
+  module: ModuleContext; // Op's module (for rows 1+ metadata)
+  spanName: string; // Span name for this invocation
+
+  // Buffer management
+  writeIndex: number; // Current write position (0 to capacity-1)
+  capacity: number; // Logical capacity for bounds checking
+  next?: SpanBuffer; // Chain to next buffer when overflow
+
+  // Span Identification (see Span Identity section above)
+  threadId: bigint; // 64-bit random ID per worker
+  spanId: number; // 32-bit thread-local counter
+  traceId: string; // Root trace ID (constant per span)
+
+  // Helpers (don't trigger allocation)
+  getColumnIfAllocated(columnName: string): TypedArray | undefined;
+  getNullsIfAllocated(columnName: string): Uint8Array | undefined;
+}
+
+// ModuleContext - module-level metadata with flattened stats
+interface ModuleContext {
+  packageName: string; // npm package name from package.json
+  packagePath: string; // Path within package, relative to package.json
+  gitSha: string; // Git SHA at build time
+  prefix?: string; // Optional prefix for library integration
+  logSchema: LogSchema; // Schema definition for this module
+
+  // Self-tuning buffer capacity stats (flattened, not nested)
+  sb_capacity: number; // Current buffer capacity
+  sb_totalWrites: number; // Total writes for tuning decisions
+  sb_overflows: number; // Overflow count for tuning decisions
+  sb_totalCreated: number; // Total buffers created
+}
+```
+
+### Access Patterns
+
+```typescript
+// Module metadata (row 0 uses callsiteModule, rows 1+ use module)
+buffer.callsiteModule?.packageName; // Caller's '@mycompany/http' (for row 0)
+buffer.module.packageName; // Op's module (for rows 1+)
+buffer.spanName; // Span name (direct property)
+
+// Self-tuning stats (flattened on module)
+buffer.module.sb_capacity; // 8 (default, self-tuning adapts)
+buffer.module.sb_totalWrites; // 1234
+
+// Direct property access - zero indirection:
+buffer.userId_values[idx] = value; // ✅ Direct TypedArray access
+buffer.userId_nulls[byteIdx] |= bitmask; // ✅ Direct bitmap access
+
+// Check allocation without triggering it:
+const values = buffer.getColumnIfAllocated('userId');
+```

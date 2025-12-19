@@ -859,6 +859,40 @@ This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 
 ## Integration Points
 
+### Buffer Access Patterns for Conversion
+
+When converting SpanBuffers to Arrow, use these patterns for efficient access:
+
+```typescript
+// IMPORTANT: Use subarray() for zero-copy conversion
+const view = buffer.timestamps.subarray(0, writeIndex); // Zero-copy VIEW
+
+// Check if column was allocated without triggering allocation
+const values = buffer.getColumnIfAllocated('userId');
+if (values) {
+  const arrowData = values.subarray(0, writeIndex); // Zero-copy
+}
+
+// Conversion outcomes by column state:
+// - Column allocated + written → subarray() with existing null bitmap
+// - Column not allocated + scope value → allocate + fill at conversion (cold path)
+// - Column not allocated + no scope value → Column omitted entirely (zero cost)
+```
+
+**What IS Efficient (Minimal Copy)**:
+
+- Lazy columns never accessed: Zero conversion cost
+- TypedArray `subarray()`: Creates a VIEW (no copy)
+- Arrow dictionary encoding: Strings deduplicated
+
+**What DOES Copy Data**:
+
+- `TypedArray.slice()`: Creates NEW ArrayBuffer
+- Null bitmap transformation
+- String dictionary building from `string[]` arrays
+
+### Related Specifications
+
 This specification integrates with:
 
 - **[Package Architecture](./00_package_architecture.md)**: Defines arrow-builder vs lmao responsibilities
