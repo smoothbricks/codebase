@@ -64,5 +64,8 @@
     "tags": [
       "npm:public"
     ]
+  },
+  "devDependencies": {
+    "fast-check": "^4.4.0"
   }
 }

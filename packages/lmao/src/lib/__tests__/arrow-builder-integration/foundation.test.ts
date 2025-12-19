@@ -2,14 +2,14 @@ import { describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { ModuleContext } from '../../moduleContext.js';
 import { S } from '../../schema/builder.js';
-import { defineTagAttributes } from '../../schema/defineTagAttributes.js';
-import type { TagAttributeSchema } from '../../schema/types.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import type { SchemaFields } from '../../schema/types.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 import { TaskContext } from '../../taskContext.js';
 import { createTraceId } from '../../traceId.js';
 
 /**
- * Type helper to extract schema fields from ExtendedSchema
+ * Type helper to extract schema fields from LogSchema or DefinedLogSchema
  * Removes the validation and extension methods, leaving only Sury schemas
  */
 type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
@@ -17,22 +17,19 @@ type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'exte
 describe('Buffer Foundation', () => {
   // Helper to create a test task context
   function createTestTaskContext(): TaskContext {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(), // Category: user IDs repeat
       count: S.number(),
     });
 
-    // Extract just the schema fields (exclude methods like validate, parse, etc.)
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
-
-    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', tagAttributes);
+    // Pass LogSchema instance directly (ModuleContext accepts SchemaFields or LogSchema)
+    const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', schema.fields);
     return new TaskContext(moduleContext, 'test-span', 10);
   }
 
   it('creates SpanBuffer with TypedArrays', () => {
     const taskContext = createTestTaskContext();
-    const schema = taskContext.module.tagAttributes;
+    const schema = taskContext.module.logSchema.fields; // Extract fields for createSpanBuffer
     const traceId = createTraceId('trace-123');
 
     const buf = createSpanBuffer(schema, taskContext, traceId); // Uses DEFAULT_BUFFER_CAPACITY
@@ -65,7 +62,7 @@ describe('Buffer Foundation', () => {
 
   it('creates root SpanBuffer with createSpanBuffer', () => {
     const taskContext = createTestTaskContext();
-    const schema = taskContext.module.tagAttributes;
+    const schema = taskContext.module.logSchema.fields; // Extract fields for createSpanBuffer
 
     const buf = createSpanBuffer(schema, taskContext, createTraceId('trace-999'));
 
@@ -77,18 +74,18 @@ describe('Buffer Foundation', () => {
 
   it('tracks buffer creation in capacity stats', () => {
     const taskContext = createTestTaskContext();
-    const schema = taskContext.module.tagAttributes;
+    const schema = taskContext.module.logSchema.fields; // Extract fields for createSpanBuffer
 
-    const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
+    const initialCount = taskContext.module.sb_totalCreated;
 
     createSpanBuffer(schema, taskContext, createTraceId('trace-456'), 64);
 
-    expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
+    expect(taskContext.module.sb_totalCreated).toBe(initialCount + 1);
   });
 
   it('handles different schema sizes', () => {
     // Define a larger schema
-    const largeSchema = defineTagAttributes({
+    const largeSchema = defineLogSchema({
       field1: S.category(), // Category string
       field2: S.number(),
       field3: S.boolean(),
@@ -96,9 +93,8 @@ describe('Buffer Foundation', () => {
       field5: S.number(),
     });
 
-    // Extract just the schema fields (exclude methods)
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = largeSchema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof largeSchema> & TagAttributeSchema;
+    // Extract schema fields from LogSchema instance
+    const tagAttributes = largeSchema.fields;
 
     // Create task context with larger schema
     const moduleContext = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', tagAttributes);

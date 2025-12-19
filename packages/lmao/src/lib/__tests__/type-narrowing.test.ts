@@ -4,37 +4,36 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createModuleContext, createRequestContext } from '../lmao.js';
+import { defineModule } from '../defineModule.js';
 import { S } from '../schema/builder.js';
-import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
-import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
+import { defineLogSchema } from '../schema/defineLogSchema.js';
 
-const testSchema = defineTagAttributes({
+const testSchema = defineLogSchema({
   userId: S.category(),
   customField: S.category(),
 });
 
-const testFlags = defineFeatureFlags({
-  testFlag: S.boolean().default(true).sync(),
-});
-
-const mockEvaluator = new InMemoryFlagEvaluator({
-  testFlag: true,
-});
+// Create a simple module for testing
+function createTestModule() {
+  return defineModule({
+    metadata: {
+      gitSha: 'abc123',
+      packageName: '@test/pkg',
+      packagePath: '/test/module.ts',
+    },
+    logSchema: testSchema,
+  })
+    .ctx<{ requestId?: string }>({
+      requestId: undefined,
+    })
+    .make();
+}
 
 describe('Type Narrowing with FluentResult', () => {
   it('should properly narrow success result type', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
+    const testModule = createTestModule();
 
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testOp', async (ctx) => {
       const result = ctx.ok({ id: 123, name: 'test' });
 
       // Type narrowing should work with FluentResult
@@ -49,23 +48,16 @@ describe('Type Narrowing with FluentResult', () => {
       return null;
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const output = await task(requestCtx);
+    const output = await traceCtx.span('testOp', testOp);
     expect(output).toEqual({ id: 123, name: 'test' });
   });
 
   it('should properly narrow error result type', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
+    const testModule = createTestModule();
 
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testOp', async (ctx) => {
       const result = ctx.err('TEST_ERROR', { field: 'email', reason: 'invalid' });
 
       // Type narrowing should work with FluentResult
@@ -81,23 +73,16 @@ describe('Type Narrowing with FluentResult', () => {
       return null;
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const output = await task(requestCtx);
+    const output = await traceCtx.span('testOp', testOp);
     expect(output).toBe('TEST_ERROR');
   });
 
   it('should support chaining before type check', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
+    const testModule = createTestModule();
 
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testOp', async (ctx) => {
       const result = ctx.ok({ id: 456 }).with({ userId: 'user1' }).message('Success');
 
       // Type narrowing should still work after chaining
@@ -109,23 +94,16 @@ describe('Type Narrowing with FluentResult', () => {
       return 0;
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const output = await task(requestCtx);
+    const output = await traceCtx.span('testOp', testOp);
     expect(output).toBe(456);
   });
 
   it('should handle error result with chaining', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
+    const testModule = createTestModule();
 
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testOp', async (ctx) => {
       const result = ctx
         .err('VALIDATION_ERROR', { message: 'Invalid input' })
         .with({ userId: 'user1' })
@@ -141,9 +119,9 @@ describe('Type Narrowing with FluentResult', () => {
       return 'OK';
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const output = await task(requestCtx);
+    const output = await traceCtx.span('testOp', testOp);
     expect(output).toBe('VALIDATION_ERROR');
   });
 });

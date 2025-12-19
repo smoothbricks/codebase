@@ -3,14 +3,14 @@
  */
 
 import { ModuleContext } from '../moduleContext.js';
-import type { TagAttributeSchema } from '../schema/types.js';
+import type { SchemaFields } from '../schema/types.js';
 import { TaskContext } from '../taskContext.js';
 
 /**
  * Create a ModuleContext for testing.
  */
 export function createTestModuleContext(
-  tagAttributes: TagAttributeSchema,
+  schema: SchemaFields,
   options: {
     gitSha?: string;
     packageName?: string;
@@ -21,7 +21,7 @@ export function createTestModuleContext(
     options.gitSha ?? 'test-sha',
     options.packageName ?? '@test/package',
     options.packagePath ?? 'src/test.ts',
-    tagAttributes,
+    schema,
   );
 }
 
@@ -29,7 +29,7 @@ export function createTestModuleContext(
  * Create a TaskContext for testing.
  */
 export function createTestTaskContext(
-  tagAttributes: TagAttributeSchema,
+  schema: SchemaFields,
   options: {
     gitSha?: string;
     packageName?: string;
@@ -38,6 +38,6 @@ export function createTestTaskContext(
     lineNumber?: number;
   } = {},
 ): TaskContext {
-  const moduleContext = createTestModuleContext(tagAttributes, options);
+  const moduleContext = createTestModuleContext(schema, options);
   return new TaskContext(moduleContext, options.spanName ?? 'test-span', options.lineNumber ?? 0);
 }

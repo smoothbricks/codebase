@@ -1,35 +1,28 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import type { TagAttributeSchema } from '@smoothbricks/lmao';
-import { createNextBuffer, createSpanBuffer, defineTagAttributes, S } from '@smoothbricks/lmao';
+import type { SchemaFields } from '@smoothbricks/lmao';
+import { createNextBuffer, createSpanBuffer, defineLogSchema, S } from '@smoothbricks/lmao';
 import type { TaskContext } from '../../types.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
 /**
- * Type helper to extract schema fields from ExtendedSchema
+ * Type helper to extract schema fields from LogSchema or DefinedLogSchema
  */
 type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
 
 describe('Buffer Chaining', () => {
   let taskContext: TaskContext;
-  let schema: TagAttributeSchema;
+  let schema: ReturnType<typeof defineLogSchema>;
 
   beforeEach(() => {
-    const schemaDefinition = defineTagAttributes({
+    const schemaDefinition = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
       duration: S.number(),
     });
 
-    const {
-      validate: _validate,
-      parse: _parse,
-      safeParse: _safeParse,
-      extend: _extend,
-      ...schemaFields
-    } = schemaDefinition;
-    schema = schemaFields as ExtractSchemaFields<typeof schemaDefinition> & TagAttributeSchema;
+    schema = schemaDefinition.fields;
 
     taskContext = createTestTaskContext(schema, { lineNumber: 10 });
   });
@@ -57,7 +50,7 @@ describe('Buffer Chaining', () => {
       const buffer = createSpanBuffer(schema, taskContext);
 
       // Update capacity stats
-      taskContext.module.spanBufferCapacityStats.currentCapacity = 128;
+      taskContext.module.sb_capacity = 128;
 
       const nextBuffer = createNextBuffer(buffer);
 
@@ -112,11 +105,11 @@ describe('Buffer Chaining', () => {
 
     it('should increment totalBuffersCreated stat', () => {
       const buffer = createSpanBuffer(schema, taskContext);
-      const initialCount = taskContext.module.spanBufferCapacityStats.totalBuffersCreated;
+      const initialCount = taskContext.module.sb_totalCreated;
 
       createNextBuffer(buffer);
 
-      expect(taskContext.module.spanBufferCapacityStats.totalBuffersCreated).toBe(initialCount + 1);
+      expect(taskContext.module.sb_totalCreated).toBe(initialCount + 1);
     });
 
     it('should handle buffer with parent correctly', () => {
@@ -161,7 +154,7 @@ describe('Buffer Chaining', () => {
       const nextBuffer = createNextBuffer(buffer);
 
       expect(nextBuffer.writeIndex).toBe(0);
-      expect(nextBuffer.capacity).toBe(taskContext.module.spanBufferCapacityStats.currentCapacity);
+      expect(nextBuffer.capacity).toBe(taskContext.module.sb_capacity);
     });
 
     it('should preserve null bitmaps structure in chained buffer', () => {
@@ -180,13 +173,13 @@ describe('Buffer Chaining', () => {
       expect(buffer1.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
       // Simulate capacity tuning - double it
-      taskContext.module.spanBufferCapacityStats.currentCapacity = DEFAULT_BUFFER_CAPACITY * 2;
+      taskContext.module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 2;
 
       const buffer2 = createNextBuffer(buffer1);
       expect(buffer2.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
       // Change capacity again - double again
-      taskContext.module.spanBufferCapacityStats.currentCapacity = DEFAULT_BUFFER_CAPACITY * 4;
+      taskContext.module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4;
 
       const buffer3 = createNextBuffer(buffer2);
       expect(buffer3.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);

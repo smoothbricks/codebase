@@ -1,38 +1,19 @@
 import { describe, expect, it } from 'bun:test';
 import { createAttributeColumns, createColumnWriter, maskingTransforms } from '@smoothbricks/arrow-builder';
-import type { TagAttributeSchema } from '@smoothbricks/lmao';
-import {
-  convertToArrowTable,
-  createSpanBuffer,
-  defineTagAttributes,
-  ENTRY_TYPE_SPAN_START,
-  S,
-} from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, defineLogSchema, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { createTestTaskContext } from '../test-helpers.js';
-
-// TestStringInterner no longer needed - convertToArrowTable now uses direct string access
-// via buf.task.module.packageName, buf.task.module.packagePath, and buf.task.spanName
-
-/**
- * Type helper to extract schema fields from ExtendedSchema
- * Removes the validation and extension methods, leaving only Sury schemas
- */
-type ExtractSchemaFields<T> = Omit<T, 'validate' | 'parse' | 'safeParse' | 'extend'>;
 
 describe('Buffer Integration', () => {
   it('generates TypedArray columns with proper names for defined schema', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(), // Category: user IDs repeat
       isActive: S.boolean(),
       score: S.number(),
     });
 
-    // Extract just the schema fields (exclude methods)
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
-
     const capacity = 64;
-    const columns = createAttributeColumns(tagAttributes, capacity);
+    // createAttributeColumns expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const columns = createAttributeColumns(schema, capacity);
 
     // Keys - should have  prefix
     expect(columns).toHaveProperty('userId');
@@ -46,18 +27,14 @@ describe('Buffer Integration', () => {
   });
 
   it('creates a SpanBuffer with core and attribute TypedArray columns', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(), // Category: user IDs repeat
       score: S.number(),
     });
 
-    // Extract just the schema fields (exclude methods)
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
-
-    const taskContext = createTestTaskContext(tagAttributes);
+    const taskContext = createTestTaskContext(schema.fields);
     const capacity = 64;
-    const buf = createSpanBuffer(tagAttributes, taskContext, undefined, capacity);
+    const buf = createSpanBuffer(schema.fields, taskContext, undefined, capacity);
 
     // Core TypedArrays exist
     expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
@@ -74,20 +51,16 @@ describe('Buffer Integration', () => {
   });
 
   it('integrates schema definition with buffer creation', () => {
-    // Define schema with defineTagAttributes
-    const schema = defineTagAttributes({
+    // Define schema with defineLogSchema
+    const schema = defineLogSchema({
       requestId: S.category(), // Category: request IDs repeat
       httpStatus: S.number(),
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // Enum: known HTTP methods
     });
 
-    // Extract just the schema fields (exclude methods)
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
-
-    // Create buffer with schema
-    const taskContext = createTestTaskContext(tagAttributes);
-    const buffer = createSpanBuffer(tagAttributes, taskContext);
+    // Create buffer with schema fields
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext);
 
     // Verify all attribute columns created as TypedArrays with correct types (use _values suffix)
     expect(Array.isArray(buffer.requestId_values)).toBe(true); // category (raw strings)
@@ -96,21 +69,17 @@ describe('Buffer Integration', () => {
 
     // Verify task context is set
     expect(buffer.task).toBe(taskContext);
-    expect(buffer.task.module.tagAttributes).toBe(tagAttributes);
+    expect(buffer.task.module.logSchema.fields).toBe(schema.fields);
   });
 
   it('handles optional fields in schema', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       required: S.category(), // Category string
       optional: S.optional(S.number()),
     });
 
-    // Extract just the schema fields (exclude methods)
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
-
-    const taskContext = createTestTaskContext(tagAttributes);
-    const buffer = createSpanBuffer(tagAttributes, taskContext);
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext);
 
     // Both should have TypedArray columns (use _values suffix)
     expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
@@ -120,18 +89,14 @@ describe('Buffer Integration', () => {
   });
 
   it('handles masked fields in schema', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category().mask('hash'),
       email: S.text().mask('email'),
       plainText: S.text(), // Text: unmasked plain text
     });
 
-    // Extract just the schema fields (exclude methods)
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
-
-    const taskContext = createTestTaskContext(tagAttributes);
-    const buffer = createSpanBuffer(tagAttributes, taskContext);
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext);
 
     // All should have TypedArray columns (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
@@ -143,12 +108,11 @@ describe('Buffer Integration', () => {
 
   it('selects correct enum TypedArray size based on value count', () => {
     // Small enum (<256 values) should use Uint8Array
-    const smallEnumSchema = defineTagAttributes({
+    const smallEnumSchema = defineLogSchema({
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
     });
 
-    const { validate: _v1, parse: _p1, safeParse: _s1, extend: _e1, ...smallFields } = smallEnumSchema;
-    const smallAttrs = smallFields as ExtractSchemaFields<typeof smallEnumSchema> & TagAttributeSchema;
+    const smallAttrs = smallEnumSchema.fields;
 
     const smallContext = createTestTaskContext(smallAttrs);
     const smallBuffer = createSpanBuffer(smallAttrs, smallContext);
@@ -158,25 +122,16 @@ describe('Buffer Integration', () => {
   });
 
   it('applies masking during Arrow conversion for category fields', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category().mask('hash'),
       plainUserId: S.category(), // No masking
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext);
 
-    // Create interners
-    // const moduleIdInterner = new TestStringInterner();
-    // const spanNameInterner = new TestStringInterner();
-    // moduleIdInterner.intern('test-module');
-    // spanNameInterner.intern('test-span');
-
-    const taskContext = createTestTaskContext(tagAttributes);
-    const buffer = createSpanBuffer(tagAttributes, taskContext);
-
-    // Use ColumnWriter fluent API to write values
-    const writer = createColumnWriter(tagAttributes, buffer);
+    // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
+    const writer = createColumnWriter(schema, buffer);
     writer.nextRow().userId('user-12345').plainUserId('user-12345');
 
     // Set required system columns
@@ -206,26 +161,17 @@ describe('Buffer Integration', () => {
   });
 
   it('applies masking during Arrow conversion for text fields', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       email: S.text().mask('email'),
       sqlQuery: S.text().mask('sql'),
       plainText: S.text(), // No masking
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext);
 
-    // Create interners
-    // const moduleIdInterner = new TestStringInterner();
-    // const spanNameInterner = new TestStringInterner();
-    // moduleIdInterner.intern('test-module');
-    // spanNameInterner.intern('test-span');
-
-    const taskContext = createTestTaskContext(tagAttributes);
-    const buffer = createSpanBuffer(tagAttributes, taskContext);
-
-    // Use ColumnWriter fluent API to write values
-    const writer = createColumnWriter(tagAttributes, buffer);
+    // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
+    const writer = createColumnWriter(schema, buffer);
     writer
       .nextRow()
       .email('john@example.com')
@@ -264,24 +210,15 @@ describe('Buffer Integration', () => {
     // Custom mask function that keeps first 4 chars and replaces rest with *
     const customMask = (value: string) => value.slice(0, 4) + '*'.repeat(Math.max(0, value.length - 4));
 
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       secretKey: S.text().mask(customMask),
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const tagAttributes = schemaFields as ExtractSchemaFields<typeof schema> & TagAttributeSchema;
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext);
 
-    // Create interners
-    // const moduleIdInterner = new TestStringInterner();
-    // const spanNameInterner = new TestStringInterner();
-    // moduleIdInterner.intern('test-module');
-    // spanNameInterner.intern('test-span');
-
-    const taskContext = createTestTaskContext(tagAttributes);
-    const buffer = createSpanBuffer(tagAttributes, taskContext);
-
-    // Use ColumnWriter fluent API to write value
-    const writer = createColumnWriter(tagAttributes, buffer);
+    // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
+    const writer = createColumnWriter(schema, buffer);
     writer.nextRow().secretKey('sk_live_abcd1234efgh5678');
 
     // Set required system columns

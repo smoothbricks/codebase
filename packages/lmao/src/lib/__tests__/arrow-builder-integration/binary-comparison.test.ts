@@ -21,9 +21,6 @@ import { createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
 import { createTestTaskContext } from '../test-helpers.js';
 
-// MockStringInterner no longer needed - convertToArrowTable now uses direct string access
-// via buf.task.module.packageName, buf.task.module.packagePath, and buf.task.spanName
-
 /**
  * Round-trip test: serialize to IPC, deserialize, verify data matches
  */

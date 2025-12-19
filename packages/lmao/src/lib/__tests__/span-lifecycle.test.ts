@@ -5,20 +5,17 @@
 
 import { describe, expect, it } from 'bun:test';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
+import { defineModule } from '../defineModule.js';
+import { S } from '../schema/builder.js';
+import { defineLogSchema } from '../schema/defineLogSchema.js';
 import {
-  createModuleContext,
-  createRequestContext,
   ENTRY_TYPE_INFO,
   ENTRY_TYPE_SPAN_ERR,
   ENTRY_TYPE_SPAN_EXCEPTION,
   ENTRY_TYPE_SPAN_OK,
   ENTRY_TYPE_SPAN_START,
-} from '../lmao.js';
-import { S } from '../schema/builder.js';
-import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
-import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
-import type { TagAttributeSchema } from '../schema/types.js';
+} from '../schema/systemSchema.js';
+import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { SpanBuffer } from '../types.js';
 import { createTestTaskContext } from './test-helpers.js';
@@ -26,39 +23,34 @@ import { createTestTaskContext } from './test-helpers.js';
 // Test schema
 // Note: resultMessage, exceptionMessage, errorCode, and exceptionStack are now system columns
 // (defined in systemSchema) - they don't need to be defined here
-const testSchema = defineTagAttributes({
+const testSchema = defineLogSchema({
   userId: S.category(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
   spanName: S.category(),
+  requestId: S.category(),
 });
 
-const testFlags = defineFeatureFlags({
-  testFlag: S.boolean().default(true).sync(),
-});
-
-// Mock feature flag evaluator
-const mockEvaluator = new InMemoryFlagEvaluator({
-  testFlag: true,
-});
+// Create module using new API - no feature flags needed for these tests
+const testModule = defineModule({
+  metadata: {
+    gitSha: 'abc123',
+    packageName: '@test/pkg',
+    packagePath: '/test/module.ts',
+  },
+  logSchema: testSchema,
+})
+  .ctx<{ requestId?: string; userId?: string }>({ requestId: undefined, userId: undefined })
+  .make();
 
 describe('Span Lifecycle', () => {
   it('should write span-start entry when task begins', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       return ctx.ok('success');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1', userId: 'user1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1', userId: 'user1' });
 
-    await task(requestCtx);
+    await traceCtx.span('testTask', testOp);
 
     // Buffer is internal, but we can verify behavior through side effects
     // The span-start entry should be written before any other operations
@@ -66,22 +58,13 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-ok entry with ctx.ok()', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       return ctx.ok({ id: 123, name: 'test' });
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -90,22 +73,13 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-err entry with ctx.err()', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       return ctx.err('VALIDATION_ERROR', { field: 'email', message: 'Invalid email' });
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -115,37 +89,19 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-exception entry when task throws', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (_ctx) => {
+    const testOp = testModule.op('testTask', async (_ctx) => {
       throw new Error('Unexpected error');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    await expect(task(requestCtx)).rejects.toThrow('Unexpected error');
+    await expect(traceCtx.span('testTask', testOp)).rejects.toThrow('Unexpected error');
   });
 });
 
 describe('Fluent Result API', () => {
   it('should support .with() for setting attributes on ok result', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123 }).with({
         userId: 'user1',
         operation: 'CREATE',
@@ -153,9 +109,9 @@ describe('Fluent Result API', () => {
       return result;
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -164,22 +120,13 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .message() for setting message on ok result', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       return ctx.ok({ id: 123 }).message('User created successfully');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -188,22 +135,13 @@ describe('Fluent Result API', () => {
   });
 
   it('should support chaining .with() and .message()', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       return ctx.ok({ id: 123 }).with({ userId: 'user1', operation: 'CREATE' }).message('User created successfully');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -212,22 +150,13 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .with() on err result', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       return ctx.err('VALIDATION_ERROR', { field: 'email' }).with({ userId: 'user1', operation: 'CREATE' });
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -236,22 +165,13 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .message() on err result', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       return ctx.err('VALIDATION_ERROR', { field: 'email' }).message('Invalid email format');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -262,16 +182,7 @@ describe('Fluent Result API', () => {
 
 describe('Child Span Lifecycle', () => {
   it('should write span-start for child spans', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('parentTask', async (ctx) => {
+    const testOp = testModule.op('parentTask', async (ctx) => {
       const childResult = await ctx.span('childSpan', async (childCtx) => {
         return childCtx.ok('child success');
       });
@@ -279,45 +190,27 @@ describe('Child Span Lifecycle', () => {
       return ctx.ok(childResult);
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('parentTask', testOp);
 
     expect(result.success).toBe(true);
   });
 
   it('should write span-exception for child span errors', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('parentTask', async (ctx) => {
+    const testOp = testModule.op('parentTask', async (ctx) => {
       await ctx.span('childSpan', async (_childCtx) => {
         throw new Error('Child span error');
       });
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    await expect(task(requestCtx)).rejects.toThrow('Child span error');
+    await expect(traceCtx.span('parentTask', testOp)).rejects.toThrow('Child span error');
   });
 
   it('should handle nested child spans', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('parentTask', async (ctx) => {
+    const testOp = testModule.op('parentTask', async (ctx) => {
       const result1 = await ctx.span('child1', async (child1Ctx) => {
         const result2 = await child1Ctx.span('child2', async (child2Ctx) => {
           return child2Ctx.ok('grandchild success');
@@ -328,49 +221,31 @@ describe('Child Span Lifecycle', () => {
       return ctx.ok(result1);
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('parentTask', testOp);
 
     expect(result.success).toBe(true);
   });
 
-  it('should create child span when task() is called from parent span context', async () => {
-    // This test verifies the bug fix: when moduleContext.task() is called from a parent
+  it('should create child span when op() is called from parent span context', async () => {
+    // This test verifies the bug fix: when module.op() is called from a parent
     // SpanContext (has buffer property), it should create a child span, not a root span.
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
     let parentBuffer: SpanBuffer | undefined;
     let childBuffer: SpanBuffer | undefined;
 
-    const parentTask = moduleCtx.task('parent-task', async (ctx) => {
-      parentBuffer = ctx.buffer;
-
-      // Call child task from parent span context
-      // This should create a child span, not a root span
-      const childResult = await childTask(ctx);
-
-      return ctx.ok(childResult);
-    });
-
-    const childTask = moduleCtx.task('child-task', async (ctx) => {
+    const childOp = testModule.op('child-task', async (ctx) => {
       childBuffer = ctx.buffer;
 
       // Verify child span is linked to parent
       expect(ctx.buffer.parent).toBeDefined();
-      expect(ctx.buffer.parent).toBe(parentBuffer);
+      // Use === comparison to avoid type mismatch between SpanBuffer<Schema> and untyped SpanBuffer
+      expect(ctx.buffer.parent === parentBuffer).toBe(true);
       expect(parentBuffer).toBeDefined();
       const parent = parentBuffer as NonNullable<typeof parentBuffer>;
 
       // Verify child span inherits parent's schema
-      expect(ctx.buffer.task.module.tagAttributes).toBe(parent.task.module.tagAttributes);
+      expect(ctx.buffer.task.module.logSchema).toBe(parent.task.module.logSchema);
 
       // Verify child span has different spanId but same traceId
       expect(ctx.buffer.spanId).not.toBe(parent.spanId);
@@ -379,8 +254,18 @@ describe('Child Span Lifecycle', () => {
       return ctx.ok('child-done');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
-    const result = await parentTask(requestCtx);
+    const parentOp = testModule.op('parent-task', async (ctx) => {
+      parentBuffer = ctx.buffer;
+
+      // Call child op from parent span context
+      // This should create a child span, not a root span
+      const childResult = await ctx.span('child-task', childOp);
+
+      return ctx.ok(childResult);
+    });
+
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    const result = await traceCtx.span('parent-task', parentOp);
 
     expect(result.success).toBe(true);
     expect(parentBuffer).toBeDefined();
@@ -388,37 +273,28 @@ describe('Child Span Lifecycle', () => {
     expect(childBuffer?.parent).toBe(parentBuffer);
   });
 
-  it('should create proper parent-child hierarchy in Arrow conversion when task() called from parent', async () => {
-    // This test verifies that when task() is called from a parent span, the resulting
+  it('should create proper parent-child hierarchy in Arrow conversion when op() called from parent', async () => {
+    // This test verifies that when op() is called from a parent span, the resulting
     // child span appears correctly in Arrow conversion with proper parent_span_id relationships.
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
     let rootBuffer: SpanBuffer | undefined;
 
-    const rootTask = moduleCtx.task('root-task', async (ctx) => {
-      rootBuffer = ctx.buffer;
-      ctx.tag.operation('CREATE');
-
-      // Call child task from root span context
-      await childTask(ctx);
-
-      return ctx.ok('root-done');
-    });
-
-    const childTask = moduleCtx.task('child-task', async (ctx) => {
+    const childOp = testModule.op('child-task', async (ctx) => {
       ctx.tag.operation('READ');
       return ctx.ok('child-done');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
-    await rootTask(requestCtx);
+    const rootOp = testModule.op('root-task', async (ctx) => {
+      rootBuffer = ctx.buffer;
+      ctx.tag.operation('CREATE');
+
+      // Call child op from root span context
+      await ctx.span('child-task', childOp);
+
+      return ctx.ok('root-done');
+    });
+
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    await traceCtx.span('root-task', rootOp);
 
     expect(rootBuffer).toBeDefined();
     if (!rootBuffer) {
@@ -458,58 +334,51 @@ describe('Child Span Lifecycle', () => {
     expect(rootSpanStart?.trace_id).toBe(childSpanStart?.trace_id);
   });
 
-  it('should inherit parent schema when task() called from parent span', async () => {
-    // This test verifies that child spans created via task() inherit the parent's schema.
-    // When a task from one module is called from a parent span in another module,
+  it('should inherit parent schema when op() called from parent span', async () => {
+    // This test verifies that child spans created via op() inherit the parent's schema.
+    // When an op from one module is called from a parent span in another module,
     // the child span should use the parent's schema, not its own module's schema.
-    const sharedSchema = defineTagAttributes({
+    const sharedSchema = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    const parentModuleCtx = createModuleContext({
-      moduleMetadata: {
+    const parentModule = defineModule({
+      metadata: {
         gitSha: 'abc123',
         packageName: '@test/parent',
         packagePath: '/test/parent.ts',
       },
-      tagAttributes: sharedSchema,
-    });
+      logSchema: sharedSchema,
+    })
+      .ctx<{ requestId?: string }>({ requestId: undefined })
+      .make();
 
-    const childModuleCtx = createModuleContext({
-      moduleMetadata: {
+    const childModule = defineModule({
+      metadata: {
         gitSha: 'abc123',
         packageName: '@test/child',
         packagePath: '/test/child.ts',
       },
-      tagAttributes: sharedSchema, // Same schema - but different module context
-    });
+      logSchema: sharedSchema, // Same schema - but different module context
+    })
+      .ctx<{ requestId?: string }>({ requestId: undefined })
+      .make();
 
     let parentBuffer: SpanBuffer | undefined;
     let childBuffer: SpanBuffer | undefined;
 
-    const parentTask = parentModuleCtx.task('parent-task', async (ctx) => {
-      parentBuffer = ctx.buffer;
-      ctx.tag.userId('user123').requestId('req456').operation('CREATE');
-
-      // Call child task from parent span context
-      // Child should inherit parent's schema (from parent buffer), not its own module's schema
-      await childTask(ctx);
-
-      return ctx.ok('parent-done');
-    });
-
-    const childTask = childModuleCtx.task('child-task', async (ctx) => {
+    const childOp = childModule.op('child-task', async (ctx) => {
       childBuffer = ctx.buffer;
 
       // Verify child span inherits parent's schema
-      // Even though childModuleCtx has its own schema, the child buffer should use parent's schema
-      // Note: The child buffer's schema comes from parentBuffer.task.module.tagAttributes
-      // (inherited via createChildSpanBuffer), not from childModuleCtx's schema
+      // Even though childModule has its own schema, the child buffer should use parent's schema
+      // Note: The child buffer's schema comes from parentBuffer.task.module.logSchema
+      // (inherited via createChildSpanBuffer), not from childModule's schema
       expect(parentBuffer).toBeDefined();
       const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-      expect(ctx.buffer.task.module.tagAttributes).toEqual(parent.task.module.tagAttributes);
+      expect(ctx.buffer.task.module.logSchema).toEqual(parent.task.module.logSchema);
 
       // Child should be able to access parent's schema fields
       ctx.tag.userId('user123').operation('READ');
@@ -517,8 +386,19 @@ describe('Child Span Lifecycle', () => {
       return ctx.ok('child-done');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
-    await parentTask(requestCtx);
+    const parentOp = parentModule.op('parent-task', async (ctx) => {
+      parentBuffer = ctx.buffer;
+      ctx.tag.userId('user123').requestId('req456').operation('CREATE');
+
+      // Call child op from parent span context
+      // Child should inherit parent's schema (from parent buffer), not its own module's schema
+      await ctx.span('child-task', childOp);
+
+      return ctx.ok('parent-done');
+    });
+
+    const traceCtx = parentModule.traceContext({ requestId: 'req1' });
+    await traceCtx.span('parent-task', parentOp);
 
     expect(parentBuffer).toBeDefined();
     expect(childBuffer).toBeDefined();
@@ -526,22 +406,13 @@ describe('Child Span Lifecycle', () => {
     // Child buffer's schema should be the same as parent's schema (inherited)
     // Note: We use toEqual because the schemas are equal but may be different object references
     // The important thing is that the child buffer can write to parent's schema fields
-    expect(childBuffer?.task.module.tagAttributes).toEqual(parentBuffer?.task.module.tagAttributes);
+    expect(childBuffer?.task.module.logSchema).toEqual(parentBuffer?.task.module.logSchema);
   });
 });
 
 describe('FluentResult Type Compatibility', () => {
   it('should allow direct access to success property', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123 });
 
       // Should be able to access success property directly
@@ -551,23 +422,14 @@ describe('FluentResult Type Compatibility', () => {
       return null;
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
     expect(result).toEqual({ id: 123 });
   });
 
   it('should allow direct access to error property', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('testTask', async (ctx) => {
+    const testOp = testModule.op('testTask', async (ctx) => {
       const result = ctx.err('TEST_ERROR', { message: 'test' });
 
       // Should be able to access error property directly
@@ -577,9 +439,9 @@ describe('FluentResult Type Compatibility', () => {
       return null;
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    const result = await task(requestCtx);
+    const result = await traceCtx.span('testTask', testOp);
     expect(result).toBe('TEST_ERROR');
   });
 });
@@ -593,23 +455,14 @@ describe('FluentResult Type Compatibility', () => {
  */
 describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 and span-ok at row 1 after ctx.ok()', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
     let capturedBuffer: SpanBuffer | undefined;
-    const task = moduleCtx.task('test-task', async (ctx) => {
+    const testOp = testModule.op('test-task', async (ctx) => {
       capturedBuffer = ctx.buffer;
       return ctx.ok('done');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1', userId: 'user1' }, testFlags, mockEvaluator, {});
-    const result = await task(requestCtx);
+    const traceCtx = testModule.traceContext({ requestId: 'req1', userId: 'user1' });
+    const result = await traceCtx.span('test-task', testOp);
 
     expect(result.success).toBe(true);
     expect(capturedBuffer).toBeDefined();
@@ -618,23 +471,14 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
     let capturedBuffer: SpanBuffer | undefined;
-    const task = moduleCtx.task('test', async (ctx) => {
+    const testOp = testModule.op('test', async (ctx) => {
       capturedBuffer = ctx.buffer;
       return ctx.err('ERROR_CODE', { detail: 'error detail' });
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
-    const result = await task(requestCtx);
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    const result = await traceCtx.span('test', testOp);
 
     expect(result.success).toBe(false);
     expect(capturedBuffer).toBeDefined();
@@ -643,24 +487,15 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
     let capturedBuffer: SpanBuffer | undefined;
-    const task = moduleCtx.task('test', async (ctx) => {
+    const testOp = testModule.op('test', async (ctx) => {
       capturedBuffer = ctx.buffer;
       throw new Error('Unexpected failure');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
 
-    await expect(task(requestCtx)).rejects.toThrow('Unexpected failure');
+    await expect(traceCtx.span('test', testOp)).rejects.toThrow('Unexpected failure');
     expect(capturedBuffer).toBeDefined();
     expect(capturedBuffer?.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
     expect(capturedBuffer?.operations[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
@@ -670,24 +505,15 @@ describe('Fixed Row Layout', () => {
     // This tests the writeSpanStart function behavior
     // After writeSpanStart, writeIndex should be 2 (row 0 = span-start, row 1 = pre-init, events at row 2+)
 
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('test', async (ctx) => {
+    const testOp = testModule.op('test', async (ctx) => {
       // At this point, writeSpanStart has been called
       // Events logged here should go to row 2+
       ctx.log.info('first event');
       return ctx.ok('done');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
-    await task(requestCtx);
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    await traceCtx.span('test', testOp);
 
     // The task completed successfully, meaning:
     // - Row 0 has span-start
@@ -697,23 +523,14 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should append events starting at row 2', async () => {
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('test', async (ctx) => {
+    const testOp = testModule.op('test', async (ctx) => {
       ctx.log.info('first event'); // Should be row 2
       ctx.log.info('second event'); // Should be row 3
       return ctx.ok('done');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
-    const result = await task(requestCtx);
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    const result = await traceCtx.span('test', testOp);
 
     expect(result.success).toBe(true);
     // If events were incorrectly written to row 0 or 1, the span lifecycle would be corrupted
@@ -722,23 +539,14 @@ describe('Fixed Row Layout', () => {
 
   it('should allow duration calculation as timestamps[1] - timestamps[0]', async () => {
     // This tests the fixed layout enables simple duration calculation
-    const moduleCtx = createModuleContext({
-      moduleMetadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: '/test/module.ts',
-      },
-      tagAttributes: testSchema,
-    });
-
-    const task = moduleCtx.task('test', async (ctx) => {
+    const testOp = testModule.op('test', async (ctx) => {
       // Small delay to ensure non-zero duration
       await new Promise((resolve) => setTimeout(resolve, 5));
       return ctx.ok('done');
     });
 
-    const requestCtx = createRequestContext({ requestId: 'req1' }, testFlags, mockEvaluator, {});
-    await task(requestCtx);
+    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    await traceCtx.span('test', testOp);
 
     // The fixed layout means:
     // - timestamps[0] = span-start time
@@ -760,8 +568,8 @@ describe('Fixed Row Layout', () => {
 
   it('should create buffer with proper structure for fixed layout', () => {
     const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = testSchema;
-    const taskContext = createTestTaskContext(schemaFields as TagAttributeSchema);
-    const buffer = createSpanBuffer(schemaFields as TagAttributeSchema, taskContext);
+    const taskContext = createTestTaskContext(schemaFields as SchemaFields);
+    const buffer = createSpanBuffer(schemaFields as SchemaFields, taskContext);
 
     // Buffer should have timestamps array for duration calculation
     expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);

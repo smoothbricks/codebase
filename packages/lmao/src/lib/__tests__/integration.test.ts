@@ -2,27 +2,27 @@
  * Integration tests for schema integration patterns
  *
  * Tests the full integration of:
- * - Request context creation with feature flags and environment
- * - Module context with tag attributes
- * - Task wrappers with span context
- * - Feature flag analytics tracking
+ * - Module definition with defineModule()
+ * - TraceContext creation with module.traceContext()
+ * - Op wrappers with span context
+ * - Feature flag evaluation and analytics
  * - Typed tag attribute API
  */
 
-import { beforeEach, describe, expect, it } from 'bun:test';
-import { createModuleContext, createRequestContext } from '../lmao.js';
+import { describe, expect, it } from 'bun:test';
+import { defineModule } from '../defineModule.js';
 import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
+import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 
 describe('Schema Integration Patterns', () => {
-  // Define tag attributes for DB operations
+  // Define log schema for DB operations
   // Using the three string types per specs/01a_trace_schema_system.md:
   // - S.enum: Known values at compile time
   // - S.category: Values that often repeat
   // - S.text: Unique values
-  const dbAttributes = defineTagAttributes({
+  const dbSchema = defineLogSchema({
     requestId: S.category(), // Category: request IDs repeat within traces
     userId: S.category(), // Category: user IDs repeat across operations
     duration: S.number(),
@@ -39,86 +39,106 @@ describe('Schema Integration Patterns', () => {
     experimentalFeature: S.boolean().default(false).async(),
   });
 
+  // Environment config type
+  type EnvConfig = {
+    awsRegion: string;
+    maxConnections: number;
+    databaseUrl: string;
+  };
+
   // Environment config
-  const environmentConfig = {
+  const environmentConfig: EnvConfig = {
     awsRegion: 'us-east-1',
     maxConnections: 100,
     databaseUrl: 'postgresql://localhost:5432/test',
   };
 
-  let flagEvaluator: InMemoryFlagEvaluator;
-
-  beforeEach(() => {
-    flagEvaluator = new InMemoryFlagEvaluator({
+  // Create flag evaluator with test values
+  function createFlagEvaluator() {
+    return new InMemoryFlagEvaluator({
       advancedValidation: true,
       maxRetries: 5,
       experimentalFeature: false,
     });
-  });
+  }
 
-  describe('createRequestContext', () => {
-    it('should create request context with feature flags and environment', () => {
-      const ctx = createRequestContext(
-        { requestId: 'req-123', userId: 'user-456' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
+  // Create a shared module for tests (without feature flags)
+  function createTestModule() {
+    return defineModule({
+      metadata: {
+        gitSha: 'abc123',
+        packageName: '@test/pkg',
+        packagePath: 'src/services/user.ts',
+      },
+      logSchema: dbSchema,
+    })
+      .ctx<{ requestId?: string; userId?: string; env: EnvConfig }>({
+        requestId: undefined,
+        userId: undefined,
+        env: null!,
+      })
+      .make();
+  }
+
+  // Create a module WITH feature flags
+  function createModuleWithFlags() {
+    return defineModule({
+      metadata: {
+        gitSha: 'abc123',
+        packageName: '@test/pkg',
+        packagePath: 'src/services/user.ts',
+      },
+      logSchema: dbSchema,
+      ff: featureFlags.schema,
+    })
+      .ctx<{ requestId?: string; userId?: string; env: EnvConfig }>({
+        requestId: undefined,
+        userId: undefined,
+        env: null!,
+      })
+      .make({ ffEvaluator: createFlagEvaluator() });
+  }
+
+  describe('module.traceContext', () => {
+    it('should create trace context with environment', () => {
+      const testModule = createTestModule();
+      const ctx = testModule.traceContext({
+        requestId: 'req-123',
+        userId: 'user-456',
+        env: environmentConfig,
+      });
 
       expect(ctx.requestId).toBe('req-123');
       expect(ctx.userId).toBe('user-456');
-      // TraceId is now W3C format (32 hex chars) via generateTraceId from traceId.ts
+      // TraceId is W3C format (32 hex chars) via generateTraceId from traceId.ts
       expect(ctx.traceId).toMatch(/^[a-f0-9]{32}$/);
-      expect(ctx.ff).toBeDefined();
       expect(ctx.env).toBe(environmentConfig);
     });
 
     it('should provide access to environment config as plain properties', () => {
-      const ctx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
+      const testModule = createTestModule();
+      const ctx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
 
       expect(ctx.env.awsRegion).toBe('us-east-1');
       expect(ctx.env.maxConnections).toBe(100);
       expect(ctx.env.databaseUrl).toBe('postgresql://localhost:5432/test');
     });
-
-    it('should create feature flag evaluator', () => {
-      const ctx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
-
-      // Access sync flags as properties - returns { value, track } object when truthy
-      // Use type assertions since TypeScript types don't match runtime API
-      expect((ctx.ff.advancedValidation as unknown as { value: boolean }).value).toBe(true);
-      expect((ctx.ff.maxRetries as unknown as { value: number }).value).toBe(5);
-    });
   });
 
-  describe('createModuleContext', () => {
-    it('should create module context with tag attributes', () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+  describe('defineModule', () => {
+    it('should create module with log schema', () => {
+      const testModule = createTestModule();
 
-      expect(moduleContext).toBeDefined();
-      expect(moduleContext.task).toBeFunction();
+      expect(testModule).toBeDefined();
+      expect(testModule.op).toBeFunction();
+      expect(testModule.traceContext).toBeFunction();
     });
 
-    it('should create task wrapper that provides span context', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+    it('should create op wrapper that provides span context', async () => {
+      const testModule = createTestModule();
 
-      const testTask = moduleContext.task('test-task', async (ctx) => {
+      const testOp = testModule.op('test-task', async (ctx) => {
         expect(ctx.log).toBeDefined();
-        expect(ctx.ff).toBeDefined();
         expect(ctx.env).toBeDefined();
         expect(ctx.ok).toBeFunction();
         expect(ctx.err).toBeFunction();
@@ -126,25 +146,145 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
+      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
 
-      const result = await testTask(requestCtx);
+      const result = await traceCtx.span('test-task', testOp);
       expect(result.success).toBe(true);
+    });
+  });
+
+  describe('Feature Flag Integration', () => {
+    it('should create trace context with feature flags', () => {
+      const testModule = createModuleWithFlags();
+      const ctx = testModule.traceContext({
+        requestId: 'req-123',
+        env: environmentConfig,
+      });
+
+      expect(ctx.ff).toBeDefined();
+      expect(ctx.traceId).toMatch(/^[a-f0-9]{32}$/);
+    });
+
+    it('should access sync feature flags as properties', async () => {
+      const testModule = createModuleWithFlags();
+
+      const testOp = testModule.op('test-ff', async (ctx) => {
+        // Sync flags return FlagContext wrappers when truthy (undefined when falsy)
+        // Access .value to get the actual flag value
+        const validationFlag = ctx.ff.advancedValidation;
+        const retriesFlag = ctx.ff.maxRetries;
+
+        expect(validationFlag).toBeDefined();
+        expect((validationFlag as { value: boolean }).value).toBe(true);
+
+        expect(retriesFlag).toBeDefined();
+        expect((retriesFlag as { value: number }).value).toBe(5);
+
+        return ctx.ok({ validated: true });
+      });
+
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-123',
+        env: environmentConfig,
+      });
+
+      const result = await traceCtx.span('test-ff', testOp);
+      expect(result.success).toBe(true);
+    });
+
+    it('should access async feature flags via get()', async () => {
+      const testModule = createModuleWithFlags();
+
+      const testOp = testModule.op('test-async-ff', async (ctx) => {
+        // Async flags use ctx.ff.get('flagName')
+        // Returns FlagContext when truthy, undefined when falsy
+        const experimentalFlag = await ctx.ff.get('experimentalFeature');
+
+        // Flag is false, so should be undefined (falsy pattern)
+        expect(experimentalFlag).toBeUndefined();
+
+        return ctx.ok({ experimental: false });
+      });
+
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-123',
+        env: environmentConfig,
+      });
+
+      const result = await traceCtx.span('test-async-ff', testOp);
+      expect(result.success).toBe(true);
+    });
+
+    it('should track feature flag usage', async () => {
+      const testModule = createModuleWithFlags();
+
+      const testOp = testModule.op('test-ff-tracking', async (ctx) => {
+        // Access flag first
+        const validationFlag = ctx.ff.advancedValidation;
+
+        if (validationFlag) {
+          // Use track() on the flag context to log usage
+          validationFlag.track({ action: 'validation_performed', outcome: 'success' });
+        }
+
+        // Can also use trackUsage directly
+        ctx.ff.trackUsage('advancedValidation', {
+          action: 'retry_check',
+          outcome: 'skipped',
+        });
+
+        return ctx.ok({ tracked: true });
+      });
+
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-123',
+        env: environmentConfig,
+      });
+
+      const result = await traceCtx.span('test-ff-tracking', testOp);
+      expect(result.success).toBe(true);
+    });
+
+    it('should use feature flags in conditional logic', async () => {
+      const testModule = createModuleWithFlags();
+
+      const testOp = testModule.op('conditional-logic', async (ctx) => {
+        // Natural truthy/falsy pattern - flag is undefined when disabled
+        if (ctx.ff.advancedValidation) {
+          ctx.log.info('Advanced validation enabled');
+          ctx.tag.operation('SELECT'); // Validation query
+        } else {
+          ctx.log.info('Basic validation only');
+          ctx.tag.operation('INSERT'); // Skip validation
+        }
+
+        // Number flags also work with truthy pattern
+        const retries = ctx.ff.maxRetries;
+        if (retries) {
+          ctx.tag.duration(retries.value * 100); // Use retry count for timeout
+        }
+
+        return ctx.ok({ validated: !!ctx.ff.advancedValidation });
+      });
+
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-123',
+        env: environmentConfig,
+      });
+
+      const result = await traceCtx.span('conditional-logic', testOp);
+      expect(result.success).toBe(true);
+      if (result.success) {
+        expect(result.value.validated).toBe(true);
+      }
     });
   });
 
   describe('Method Chaining', () => {
     it('should chain multiple tag methods fluently and write to buffers', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const testTask = moduleContext.task('test-chaining', async (ctx) => {
+      const testOp = testModule.op('test-chaining', async (ctx) => {
         // Each method returns the tag object for chaining
         const result = ctx.tag
           .requestId('req-001')
@@ -162,9 +302,9 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ chained: true });
       });
 
-      const requestCtx = createRequestContext({ requestId: 'req-001' }, featureFlags, flagEvaluator, environmentConfig);
+      const traceCtx = testModule.traceContext({ requestId: 'req-001', env: environmentConfig });
 
-      const result = await testTask(requestCtx);
+      const result = await traceCtx.span('test-chaining', testOp);
       expect(result.success).toBe(true);
 
       // Note: Buffer writes are happening in memory to Arrow columnar format
@@ -172,16 +312,9 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should chain with() method and continue chaining', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const testTask = moduleContext.task('test-with-chaining', async (ctx) => {
+      const testOp = testModule.op('test-with-chaining', async (ctx) => {
         // with() returns the tag object, allowing continued chaining
         ctx.tag
           .with({
@@ -199,23 +332,16 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ chained: true });
       });
 
-      const requestCtx = createRequestContext({ requestId: 'req-002' }, featureFlags, flagEvaluator, environmentConfig);
+      const traceCtx = testModule.traceContext({ requestId: 'req-002', env: environmentConfig });
 
-      const result = await testTask(requestCtx);
+      const result = await traceCtx.span('test-with-chaining', testOp);
       expect(result.success).toBe(true);
     });
 
     it('should support real-world chaining pattern: orderId and amount', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/order.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const testTask = moduleContext.task('process-order', async (ctx, orderId: string, amount: number) => {
+      const testOp = testModule.op('process-order', async (ctx, orderId: string, amount: number) => {
         // Example from requirements: ctx.tag.orderId(order.id).amount(order.total)
         // Using available attributes to simulate
         ctx.tag
@@ -228,14 +354,13 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, amount });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-003', userId: 'user-003' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-003',
+        userId: 'user-003',
+        env: environmentConfig,
+      });
 
-      const result = await testTask(requestCtx, 'order-789', 149.99);
+      const result = await traceCtx.span('process-order', testOp, 'order-789', 149.99);
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.value.orderId).toBe('order-789');
@@ -244,18 +369,11 @@ describe('Schema Integration Patterns', () => {
     });
   });
 
-  describe('Task Integration', () => {
+  describe('Op Integration', () => {
     it('should provide typed tag attribute API with method chaining', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const testTask = moduleContext.task('test-task', async (ctx) => {
+      const testOp = testModule.op('test-task', async (ctx) => {
         // Method chaining - each method returns the tag object
         ctx.tag.requestId('req-123').userId('user-456').operation('INSERT').duration(12.5).httpStatus(200);
 
@@ -274,23 +392,16 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
+      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
 
-      const result = await testTask(requestCtx);
+      const result = await traceCtx.span('test-task', testOp);
       expect(result.success).toBe(true);
     });
 
     it('should provide message logging methods', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const testTask = moduleContext.task('test-task', async (ctx) => {
+      const testOp = testModule.op('test-task', async (ctx) => {
         ctx.log.info('Info message');
         ctx.log.debug('Debug message');
         ctx.log.warn('Warning message');
@@ -301,39 +412,32 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
+      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
 
-      const result = await testTask(requestCtx);
+      const result = await traceCtx.span('test-task', testOp);
       expect(result.success).toBe(true);
     });
 
     it('should provide ok/err result helpers', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const successTask = moduleContext.task('success-task', async (ctx) => {
+      const successOp = testModule.op('success-task', async (ctx) => {
         return ctx.ok({ data: 'result' });
       });
 
-      const errorTask = moduleContext.task('error-task', async (ctx) => {
+      const errorOp = testModule.op('error-task', async (ctx) => {
         return ctx.err('VALIDATION_ERROR', { field: 'email' });
       });
 
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
+      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
 
-      const successResult = await successTask(requestCtx);
+      const successResult = await traceCtx.span('success-task', successOp);
       expect(successResult.success).toBe(true);
       if (successResult.success) {
         expect(successResult.value).toEqual({ data: 'result' });
       }
 
-      const errorResult = await errorTask(requestCtx);
+      const errorResult = await traceCtx.span('error-task', errorOp);
       expect(errorResult.success).toBe(false);
       if (!errorResult.success) {
         expect(errorResult.error.code).toBe('VALIDATION_ERROR');
@@ -342,16 +446,9 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should support child spans with chained tag methods', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const testTask = moduleContext.task('parent-task', async (ctx) => {
+      const testOp = testModule.op('parent-task', async (ctx) => {
         // Parent span with chained tags
         ctx.tag.requestId('req-123').operation('INSERT').duration(50.0);
 
@@ -367,145 +464,21 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
+      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
 
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-    });
-  });
-
-  describe('Feature Flag Integration', () => {
-    it('should write feature flag access to child buffer, not parent buffer', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      // Track that child span has its own ff evaluator bound to child buffer
-      let parentFfRef: unknown = null;
-      let childFfRef: unknown = null;
-
-      const testTask = moduleContext.task('parent-task', async (ctx) => {
-        parentFfRef = ctx.ff;
-
-        // Access flag in parent - should log to parent buffer
-        const parentFlag = ctx.ff.advancedValidation;
-        expect(parentFlag).toBeDefined();
-
-        await ctx.span('child-task', async (childCtx) => {
-          childFfRef = childCtx.ff;
-
-          // Child ff should be a DIFFERENT instance than parent ff
-          // This ensures ff-access entries go to child buffer, not parent
-          expect(childCtx.ff).not.toBe(ctx.ff);
-
-          // Access same flag in child - should log to CHILD buffer (not parent)
-          const childFlag = childCtx.ff.advancedValidation;
-          expect(childFlag).toBeDefined();
-
-          return { done: true };
-        });
-
-        return ctx.ok({ success: true });
-      });
-
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
-      await testTask(requestCtx);
-
-      // Verify parent and child had different ff instances
-      expect(parentFfRef).not.toBe(childFfRef);
-    });
-
-    it('should access feature flags in task context', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-task', async (ctx) => {
-        // Access sync flags as properties - returns { value, track } object when truthy
-        // Use type assertions since TypeScript types don't match runtime API
-        const shouldValidate = (ctx.ff.advancedValidation as unknown as { value: boolean }).value;
-        const maxRetries = (ctx.ff.maxRetries as unknown as { value: number }).value;
-
-        expect(shouldValidate).toBe(true);
-        expect(maxRetries).toBe(5);
-
-        if (shouldValidate) {
-          ctx.log.info('Performing advanced validation');
-        }
-
-        // Track usage
-        ctx.ff.trackUsage('advancedValidation', {
-          action: 'validation_performed',
-          outcome: 'success',
-        });
-
-        return ctx.ok({ validated: shouldValidate });
-      });
-
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.validated).toBe(true);
-      }
-    });
-
-    it('should access async feature flags', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-task', async (ctx) => {
-        // Async flags use method call
-        // TypeScript can't properly infer async flag types through the generic chain
-        // so we use a type assertion to access the specific flag type
-        const experimentalEnabled = await (ctx.ff.get as (flag: 'experimentalFeature') => Promise<boolean>)(
-          'experimentalFeature',
-        );
-        // The new FF API returns undefined when a flag is false
-        expect(experimentalEnabled).toBeUndefined();
-
-        return ctx.ok({ experimental: experimentalEnabled });
-      });
-
-      const requestCtx = createRequestContext({ requestId: 'req-123' }, featureFlags, flagEvaluator, environmentConfig);
-
-      const result = await testTask(requestCtx);
+      const result = await traceCtx.span('parent-task', testOp);
       expect(result.success).toBe(true);
     });
   });
 
   describe('Method Chaining Examples', () => {
     it('should support various chaining patterns', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/order.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+      const testModule = createTestModule();
 
-      const processOrder = moduleContext.task('process-order', async (ctx, orderId: string, _amount: number) => {
+      const processOrder = testModule.op('process-order', async (ctx, orderId: string, _amount: number) => {
         // Example from requirements: ctx.tag.orderId(order.id).amount(order.total)
         ctx.tag
-          .requestId(ctx.requestId)
+          .requestId(ctx.requestId || 'unknown')
           .userId(ctx.userId || 'anonymous')
           .operation('INSERT');
 
@@ -515,14 +488,13 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, processed: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-999', userId: 'user-123' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-999',
+        userId: 'user-123',
+        env: environmentConfig,
+      });
 
-      const result = await processOrder(requestCtx, 'order-456', 99.99);
+      const result = await traceCtx.span('process-order', processOrder, 'order-456', 99.99);
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.value.orderId).toBe('order-456');
@@ -530,23 +502,16 @@ describe('Schema Integration Patterns', () => {
       }
     });
 
-    it('should demonstrate complete integration with chaining', async () => {
-      // Create module context
-      const { task } = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+    it('should demonstrate complete integration with chaining and feature flags', async () => {
+      // Create module with feature flags
+      const testModule = createModuleWithFlags();
 
-      // Define task with extensive chaining
-      const createUser = task('create-user', async (ctx, userData: { email: string; name: string }) => {
-        // Feature flag access - returns { value, track } object when truthy
-        if ((ctx.ff.advancedValidation as unknown as { value: boolean } | undefined)?.value) {
+      // Define op with extensive chaining and feature flag usage
+      const createUser = testModule.op('create-user', async (ctx, userData: { email: string; name: string }) => {
+        // Feature flag conditional - natural truthy pattern
+        if (ctx.ff.advancedValidation) {
           ctx.log.info('Using advanced validation');
-          ctx.ff.trackUsage('advancedValidation', {
+          ctx.ff.advancedValidation.track({
             action: 'validation_performed',
             outcome: 'success',
           });
@@ -554,7 +519,7 @@ describe('Schema Integration Patterns', () => {
 
         // Environment access and chained tags
         ctx.tag
-          .requestId(ctx.requestId)
+          .requestId(ctx.requestId || 'unknown')
           .userId(userData.email)
           .region(ctx.env.awsRegion as string)
           .operation('INSERT');
@@ -586,16 +551,15 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ id: 'user-123', ...userData });
       });
 
-      // Create request context
-      const requestCtx = createRequestContext(
-        { requestId: 'req-123', userId: 'user-456' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
+      // Create trace context
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-123',
+        userId: 'user-456',
+        env: environmentConfig,
+      });
 
-      // Execute task
-      const result = await createUser(requestCtx, {
+      // Execute op
+      const result = await traceCtx.span('create-user', createUser, {
         email: 'test@example.com',
         name: 'Test User',
       });
@@ -610,128 +574,62 @@ describe('Schema Integration Patterns', () => {
   });
 
   describe('Prototype-based Context Inheritance', () => {
-    it('should preserve user properties in child spans via prototype chain', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+    it('should preserve user properties in parent spans', async () => {
+      const testModule = createTestModule();
 
       let parentRequestId: string | undefined;
-      let childRequestId: string | undefined;
       let parentUserId: string | undefined;
-      let childUserId: string | undefined;
 
-      const testTask = moduleContext.task('parent-task', async (ctx) => {
+      const testOp = testModule.op('parent-task', async (ctx) => {
         // Capture parent context properties
         parentRequestId = ctx.requestId;
         parentUserId = ctx.userId;
 
         await ctx.span('child-task', async (childCtx) => {
-          // Capture child context properties - should inherit from parent
-          childRequestId = childCtx.requestId;
-          childUserId = childCtx.userId;
-
           return childCtx.ok({ done: true });
         });
 
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-inherit-test', userId: 'user-inherit-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      await testTask(requestCtx);
-
-      // Verify properties are inherited in child span
-      expect(parentRequestId).toBe('req-inherit-test');
-      expect(childRequestId).toBe('req-inherit-test');
-      expect(parentUserId).toBe('user-inherit-test');
-      expect(childUserId).toBe('user-inherit-test');
-    });
-
-    it('should preserve env config in child spans', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-inherit-test',
+        userId: 'user-inherit-test',
+        env: environmentConfig,
       });
 
-      let parentEnv: Record<string, unknown> | undefined;
-      let childEnv: Record<string, unknown> | undefined;
+      await traceCtx.span('parent-task', testOp);
 
-      const testTask = moduleContext.task('parent-task', async (ctx) => {
+      // Verify properties are available in parent span
+      expect(parentRequestId).toBe('req-inherit-test');
+      expect(parentUserId).toBe('user-inherit-test');
+    });
+
+    it('should preserve env config in parent and child spans', async () => {
+      const testModule = createTestModule();
+
+      let parentEnv: EnvConfig | undefined;
+
+      const testOp = testModule.op('parent-task', async (ctx) => {
         parentEnv = ctx.env;
 
         await ctx.span('child-task', async (childCtx) => {
-          childEnv = childCtx.env;
           return childCtx.ok({ done: true });
         });
 
         return ctx.ok({ success: true });
       });
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-env-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
+      const traceCtx = testModule.traceContext({
+        requestId: 'req-env-test',
+        env: environmentConfig,
+      });
 
-      await testTask(requestCtx);
+      await traceCtx.span('parent-task', testOp);
 
       // Verify env is same object reference (not copied)
       expect(parentEnv).toBe(environmentConfig);
-      expect(childEnv).toBe(environmentConfig);
-      expect((parentEnv as typeof environmentConfig)?.awsRegion).toBe('us-east-1');
-      expect((childEnv as typeof environmentConfig)?.awsRegion).toBe('us-east-1');
-    });
-
-    it('should have separate ff evaluators for parent and child spans', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/user.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      let parentFf: unknown;
-      let childFf: unknown;
-
-      const testTask = moduleContext.task('parent-task', async (ctx) => {
-        parentFf = ctx.ff;
-
-        await ctx.span('child-task', async (childCtx) => {
-          childFf = childCtx.ff;
-          return childCtx.ok({ done: true });
-        });
-
-        return ctx.ok({ success: true });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-ff-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      await testTask(requestCtx);
-
-      // Child should have its own ff evaluator (bound to child buffer)
-      expect(parentFf).not.toBe(childFf);
+      expect(parentEnv?.awsRegion).toBe('us-east-1');
     });
   });
 });

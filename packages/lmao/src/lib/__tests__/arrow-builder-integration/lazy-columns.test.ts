@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
-import { createSpanBuffer, createTagWriter, defineTagAttributes, S } from '@smoothbricks/lmao';
+import { createSpanBuffer, createTagWriter, defineLogSchema, S } from '@smoothbricks/lmao';
 import { createTestTaskContext } from '../test-helpers.js';
 
 /**
@@ -12,14 +12,14 @@ import { createTestTaskContext } from '../test-helpers.js';
 
 describe('True Lazy Initialization', () => {
   it('should NOT have TypedArrays for unaccessed columns', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
       count: S.number(),
       active: S.boolean(),
     });
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Core columns are always allocated
     expect(buffer._timestamps).toBeInstanceOf(BigInt64Array);
@@ -42,12 +42,12 @@ describe('True Lazy Initialization', () => {
   });
 
   it('should allocate null bitmaps lazily', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
     });
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Access userId column via _values suffix (category = Array now)
     const userIdColumn = buffer.userId_values;
@@ -64,15 +64,15 @@ describe('True Lazy Initialization', () => {
   });
 
   it('should save memory with sparse column access', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       col1: S.number(),
       col2: S.number(),
       col3: S.number(),
       col4: S.number(),
       col5: S.number(),
     });
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 1024);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 1024);
 
     // Only access 2 of 5 columns (use _values suffix for the array)
     (buffer.col1_values as Float64Array)[0] = 1;
@@ -91,12 +91,12 @@ describe('True Lazy Initialization', () => {
   });
 
   it('should have getters that become values after first access', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       field1: S.category(),
       field2: S.number(),
     });
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Before access: should be getter on prototype (use _values suffix)
     const proto = Object.getPrototypeOf(buffer);
@@ -116,17 +116,15 @@ describe('True Lazy Initialization', () => {
 
 describe('Lazy Column Initialization', () => {
   it('should not allocate attribute columns until accessed', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
       duration: S.number(),
     });
 
-    // Extract schema fields
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Core columns should be allocated immediately
     expect(buffer._timestamps).toBeInstanceOf(BigInt64Array);
@@ -149,7 +147,7 @@ describe('Lazy Column Initialization', () => {
   });
 
   it('should allocate correct TypedArray type for different schema types', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       smallEnum: S.enum(['A', 'B', 'C']), // < 256 values -> Uint8Array
       category: S.category(), // -> Array<string> (no hot-path interning)
       text: S.text(), // -> Array<string> (no hot-path interning)
@@ -157,8 +155,8 @@ describe('Lazy Column Initialization', () => {
       bool: S.boolean(), // -> Uint8Array
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Access each column via _values suffix and verify type
     // Per spec 01a:
@@ -175,25 +173,25 @@ describe('Lazy Column Initialization', () => {
   it('should allocate small enum as Uint8Array', () => {
     // Create enum with < 256 values (at the limit)
     const enumValues = Array.from({ length: 256 }, (_, i) => `VALUE_${i}`);
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       maxEnum: S.enum(enumValues),
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Should use Uint8Array for <= 255 values (use _values suffix)
     expect(buffer.maxEnum_values).toBeInstanceOf(Uint8Array);
   });
 
   it('should work correctly when writing to lazily-allocated columns', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       count: S.number(),
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Write to columns via _values suffix (triggering lazy allocation)
     // Category stores strings in Array (no hot-path interning)
@@ -210,12 +208,12 @@ describe('Lazy Column Initialization', () => {
   });
 
   it('should allow multiple accesses to the same column without re-allocation', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // First access (use _values suffix)
     const column1 = buffer.userId_values;
@@ -228,13 +226,13 @@ describe('Lazy Column Initialization', () => {
   });
 
   it('should handle null bitmap lazy initialization correctly', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
     });
 
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const buffer = createColumnBuffer(schemaFields, 64);
+    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    const buffer = createColumnBuffer(schema, 64);
 
     // Access one null bitmap
     const userIdNulls = buffer.userId_nulls;
@@ -254,17 +252,15 @@ describe('Lazy Column Initialization', () => {
 
 describe('SpanBuffer Lazy Column Allocation', () => {
   it('should have eager columns allocated immediately and lazy columns undefined until accessed', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
       count: S.number(),
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    // Extract schema fields
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const taskContext = createTestTaskContext(schemaFields);
-    const buffer = createSpanBuffer(schemaFields, taskContext, undefined, 8);
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext, undefined, 8);
 
     // Eager columns (system columns) should be allocated immediately
     expect(buffer._timestamps).toBeDefined();
@@ -309,17 +305,15 @@ describe('SpanBuffer Lazy Column Allocation', () => {
   });
 
   it('should allocate lazy columns when TagWriter writes to them', () => {
-    const schema = defineTagAttributes({
+    const schema = defineLogSchema({
       userId: S.category(),
       requestId: S.category(),
       count: S.number(),
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    // Extract schema fields
-    const { validate: _validate, parse: _parse, safeParse: _safeParse, extend: _extend, ...schemaFields } = schema;
-    const taskContext = createTestTaskContext(schemaFields);
-    const buffer = createSpanBuffer(schemaFields, taskContext, undefined, 8);
+    const taskContext = createTestTaskContext(schema.fields);
+    const buffer = createSpanBuffer(schema.fields, taskContext, undefined, 8);
 
     // Lazy columns should be undefined before TagWriter access
     expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();
@@ -327,8 +321,8 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     expect(buffer.getColumnIfAllocated('count')).toBeUndefined();
     expect(buffer.getColumnIfAllocated('operation')).toBeUndefined();
 
-    // Create TagWriter and write to one column
-    const tagWriter = createTagWriter(schemaFields, buffer);
+    // Create TagWriter and write to one column (createTagWriter expects LogSchema instance)
+    const tagWriter = createTagWriter(schema, buffer);
     tagWriter.userId('user-123');
 
     // After TagWriter write, the column should be allocated

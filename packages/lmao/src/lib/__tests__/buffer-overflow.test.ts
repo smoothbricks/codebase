@@ -1,659 +1,454 @@
-import { describe, expect, it } from 'bun:test';
-import { createModuleContext, createRequestContext } from '../lmao.js';
+import { beforeEach, describe, expect, it } from 'bun:test';
+import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
+import fc from 'fast-check';
+import { generateScopeClass } from '../codegen/scopeGenerator.js';
+import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
+import { ModuleContext } from '../moduleContext.js';
 import { S } from '../schema/builder.js';
-import { defineTagAttributes } from '../schema/defineTagAttributes.js';
-import { SpanBufferTestUtils } from '../spanBuffer.js';
+import { LogSchema } from '../schema/LogSchema.js';
+import { createNextBuffer, createSpanBuffer } from '../spanBuffer.js';
+import { TaskContext } from '../taskContext.js';
+import type { SpanBuffer } from '../types.js';
 
 /**
- * Tests for buffer overflow handling and capacity tuning
+ * Property-based tests for buffer overflow handling.
+ *
+ * Core properties verified:
+ * 1. Entry Preservation: All N entries exist across the buffer chain
+ * 2. Buffer Count Formula: Exact number of buffers matches mathematical expectation
+ * 3. Chain Integrity: Linked list is properly formed
+ * 4. Data Correctness: Each entry has expected attribute values
+ * 5. Overflow Counter: module.sb_overflows === bufferCount - 1
  */
-describe('Buffer Overflow and Capacity Management', () => {
-  const dbAttributes = defineTagAttributes({
-    requestId: S.category(),
-    userId: S.category(),
-    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
-    duration: S.number(),
-    httpStatus: S.number(),
-    region: S.category(),
-    query: S.text(),
+
+// Schema for testing - includes various column types
+const testSchema = new LogSchema({
+  requestId: S.category(),
+  userId: S.category(),
+  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
+  duration: S.number(),
+  success: S.boolean(),
+});
+
+/**
+ * SpanLogger reserves rows 0-1 for span-start and span-end.
+ * User entries start at row 2. So with capacity C, we can write (C-2) entries
+ * before overflow in the first buffer.
+ */
+const RESERVED_ROWS = 2;
+
+/**
+ * Helper: Create a TaskContext for testing
+ */
+function createTestTaskContext(spanName = 'test-span'): TaskContext {
+  const moduleContext = new ModuleContext('test-sha', '@test/overflow', 'src/overflow.ts', testSchema);
+  return new TaskContext(moduleContext, spanName, 10);
+}
+
+/**
+ * Helper: Count buffers in chain and collect total entries
+ */
+function analyzeBufferChain(rootBuffer: SpanBuffer): {
+  bufferCount: number;
+  totalEntries: number;
+  writeIndices: number[];
+} {
+  const writeIndices: number[] = [];
+  let bufferCount = 0;
+  let totalEntries = 0;
+  let current: SpanBuffer | undefined = rootBuffer;
+
+  while (current) {
+    bufferCount++;
+    writeIndices.push(current.writeIndex);
+    totalEntries += current.writeIndex;
+    current = current.next as SpanBuffer | undefined;
+  }
+
+  return { bufferCount, totalEntries, writeIndices };
+}
+
+/**
+ * Helper: Collect all entries from buffer chain
+ */
+function collectEntries(
+  rootBuffer: SpanBuffer,
+  startRow = 0,
+): Array<{
+  bufferIndex: number;
+  rowIndex: number;
+  requestId: string | undefined;
+  userId: string | undefined;
+  operation: number | undefined;
+  duration: number | undefined;
+}> {
+  const entries: Array<{
+    bufferIndex: number;
+    rowIndex: number;
+    requestId: string | undefined;
+    userId: string | undefined;
+    operation: number | undefined;
+    duration: number | undefined;
+  }> = [];
+
+  let bufferIndex = 0;
+  let current: SpanBuffer | undefined = rootBuffer;
+
+  while (current) {
+    // First buffer starts at startRow, subsequent buffers start at 0
+    const start = bufferIndex === 0 ? startRow : 0;
+    const end = current.writeIndex;
+
+    for (let row = start; row < end; row++) {
+      entries.push({
+        bufferIndex,
+        rowIndex: row,
+        requestId: (current as unknown as Record<string, unknown[]>).requestId_values?.[row] as string | undefined,
+        userId: (current as unknown as Record<string, unknown[]>).userId_values?.[row] as string | undefined,
+        operation: (current as unknown as Record<string, unknown[]>).operation_values?.[row] as number | undefined,
+        duration: (current as unknown as Record<string, unknown[]>).duration_values?.[row] as number | undefined,
+      });
+    }
+
+    bufferIndex++;
+    current = current.next as SpanBuffer | undefined;
+  }
+
+  return entries;
+}
+
+/**
+ * Calculate expected buffer count for N entries.
+ *
+ * With capacity C and R reserved rows in first buffer:
+ * - First buffer holds (C - R) entries
+ * - Each subsequent buffer holds C entries
+ *
+ * Formula: 1 + ceil(max(0, N - (C - R)) / C)
+ */
+function expectedBufferCount(numEntries: number, capacity: number, reservedRows: number): number {
+  const firstBufferCapacity = capacity - reservedRows;
+  if (numEntries <= firstBufferCapacity) {
+    return 1;
+  }
+  const remaining = numEntries - firstBufferCapacity;
+  return 1 + Math.ceil(remaining / capacity);
+}
+
+describe('Buffer Overflow Property Tests', () => {
+  let taskContext: TaskContext;
+  let ScopeClass: ReturnType<typeof generateScopeClass>;
+
+  beforeEach(() => {
+    taskContext = createTestTaskContext();
+    // Reset overflow counters
+    taskContext.module.sb_overflows = 0;
+    taskContext.module.sb_overflowWrites = 0;
+    taskContext.module.sb_totalWrites = 0;
+    taskContext.module.sb_totalCreated = 0;
+    ScopeClass = generateScopeClass(testSchema);
   });
 
-  const featureFlags = {
-    schema: {
-      advancedValidation: S.boolean().default(false).sync(),
-      newUI: S.boolean().default(false).sync(),
-    },
-  };
+  describe('Property: Entry Preservation', () => {
+    it('all entries are preserved across buffer chain for any entry count', () => {
+      fc.assert(
+        fc.property(
+          // Generate entry count from 1 to 200 (enough to trigger many overflows)
+          fc.integer({ min: 1, max: 200 }),
+          (numEntries) => {
+            // Reset counters for each test run
+            taskContext.module.sb_overflows = 0;
+            taskContext.module.sb_totalCreated = 0;
 
-  const flagEvaluator = {
-    getSync: () => true,
-    getAsync: async () => true,
-  };
+            const buffer = createSpanBuffer(testSchema, taskContext);
+            const scope = new ScopeClass();
+            const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
 
-  const environmentConfig = {
-    apiEndpoint: 'https://api.example.com',
-    logLevel: 'info',
-  };
-
-  describe('Buffer Overflow in Tag Operations', () => {
-    it('should handle tag writes that exceed initial buffer capacity', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      // Set very small capacity to force overflow
-      const testTask = moduleContext.task('test-overflow', async (ctx) => {
-        // Write more entries than the initial capacity
-        // Initial capacity is 64, so write 100 entries
-        for (let i = 0; i < 100; i++) {
-          ctx.tag
-            .requestId(`req-${i}`)
-            .userId(`user-${i}`)
-            .operation('SELECT')
-            .duration(Math.random() * 100);
-        }
-
-        return ctx.ok({ written: 100 });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-overflow-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.written).toBe(100);
-      }
-    });
-
-    it('should handle chained tag writes correctly', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-chaining', async (ctx) => {
-        // Each tag write should work even after overflow
-        for (let i = 0; i < 10; i++) {
-          ctx.tag
-            .requestId(`req-${i}`)
-            .userId(`user-${i}`)
-            .with({ operation: 'SELECT', duration: 10.5 })
-            .httpStatus(200)
-            .region('us-west-2');
-        }
-
-        return ctx.ok({ written: 10 });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-chain-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-    });
-
-    it('should handle very large number of writes', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-large-writes', async (ctx) => {
-        // Write 1000 entries to test multiple buffer chains
-        for (let i = 0; i < 1000; i++) {
-          ctx.tag.requestId(`req-${i}`).userId(`user-${i}`);
-        }
-
-        return ctx.ok({ written: 1000 });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-large-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.written).toBe(1000);
-      }
-    });
-  });
-
-  describe('Buffer Overflow in Message Logging', () => {
-    it('should handle message logs that exceed buffer capacity', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-message-overflow', async (ctx) => {
-        // Write many messages
-        for (let i = 0; i < 100; i++) {
-          ctx.log.info(`Message ${i}`);
-          ctx.log.debug(`Debug ${i}`);
-          ctx.log.warn(`Warning ${i}`);
-        }
-
-        return ctx.ok({ messages: 300 });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-message-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.messages).toBe(300);
-      }
-    });
-
-    it('should handle mixed tag and message writes', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-mixed-writes', async (ctx) => {
-        // Interleave tag writes and messages
-        for (let i = 0; i < 100; i++) {
-          ctx.tag.requestId(`req-${i}`).userId(`user-${i}`);
-          ctx.log.info(`Processing request ${i}`);
-          ctx.tag.operation('SELECT').duration(10.5);
-          ctx.log.debug(`Query completed for ${i}`);
-        }
-
-        return ctx.ok({ writes: 400 });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-mixed-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.writes).toBe(400);
-      }
-    });
-  });
-
-  describe('Child Span Buffer Overflow', () => {
-    it('should handle overflow in child spans', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-child-overflow', async (ctx) => {
-        // Parent writes
-        for (let i = 0; i < 50; i++) {
-          ctx.tag.requestId(`parent-${i}`);
-        }
-
-        // Child span with many writes
-        await ctx.span('child-span', async (childCtx) => {
-          for (let i = 0; i < 100; i++) {
-            childCtx.tag.requestId(`child-${i}`).userId(`user-${i}`);
-          }
-        });
-
-        return ctx.ok({ parentWrites: 50, childWrites: 100 });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-child-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.parentWrites).toBe(50);
-        expect(result.value.childWrites).toBe(100);
-      }
-    });
-
-    it('should handle multiple child spans with overflow', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-multi-child', async (ctx) => {
-        // Create 5 child spans, each with 100 writes
-        for (let childNum = 0; childNum < 5; childNum++) {
-          await ctx.span(`child-${childNum}`, async (childCtx) => {
-            for (let i = 0; i < 100; i++) {
-              childCtx.tag.requestId(`child-${childNum}-req-${i}`).userId(`user-${i}`);
+            // Write entries
+            for (let i = 0; i < numEntries; i++) {
+              logger
+                .info(`msg-${i}`)
+                .requestId(`req-${i}`)
+                .userId(`user-${i}`)
+                .operation(['SELECT', 'INSERT', 'UPDATE', 'DELETE'][i % 4] as 'SELECT')
+                .duration(i * 10);
             }
-          });
-        }
 
-        return ctx.ok({ children: 5, writesPerChild: 100 });
-      });
+            // Collect entries starting from row RESERVED_ROWS (rows 0-1 are span lifecycle)
+            const entries = collectEntries(buffer, RESERVED_ROWS);
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-multi-child-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
+            // Property: exactly numEntries entries exist
+            expect(entries.length).toBe(numEntries);
+          },
+        ),
+        { numRuns: 100 },
       );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.children).toBe(5);
-        expect(result.value.writesPerChild).toBe(100);
-      }
     });
   });
 
-  describe('Capacity Tuning Behavior', () => {
-    it('should not crash with rapid writes', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+  describe('Property: Buffer Count Formula', () => {
+    it('buffer count matches mathematical formula for any entry count', () => {
+      fc.assert(
+        fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
+          taskContext.module.sb_overflows = 0;
+          taskContext.module.sb_totalCreated = 0;
 
-      // Execute multiple tasks to trigger capacity tuning
-      const testTask = moduleContext.task('test-rapid', async (ctx) => {
-        for (let i = 0; i < 200; i++) {
-          ctx.tag.requestId(`req-${i}`);
-        }
-        return ctx.ok({ written: 200 });
-      });
+          const capacity = DEFAULT_BUFFER_CAPACITY; // 8
+          const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+          const scope = new ScopeClass();
+          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-rapid-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
+          // Write entries
+          for (let i = 0; i < numEntries; i++) {
+            logger.info(`msg-${i}`);
+          }
+
+          const { bufferCount } = analyzeBufferChain(buffer);
+          // SpanLogger reserves 2 rows (span-start, span-end)
+          const expected = expectedBufferCount(numEntries, capacity, RESERVED_ROWS);
+
+          expect(bufferCount).toBe(expected);
+        }),
+        { numRuns: 100 },
       );
-
-      // Run task multiple times
-      for (let i = 0; i < 5; i++) {
-        const result = await testTask(requestCtx);
-        expect(result.success).toBe(true);
-      }
-    });
-
-    it('should handle writes at exact capacity boundary', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-boundary', async (ctx) => {
-        // Save root buffer BEFORE any writes (ctx.log._buffer may change on overflow)
-        const rootBuffer = ctx.log._buffer;
-
-        // With default capacity=8, we have rows 0-1 reserved (span-start, span-end)
-        // So we can write 6 log entries before hitting capacity (rows 2-7)
-        // Writing more will trigger buffer chaining (overflow)
-        for (let i = 0; i < 10; i++) {
-          ctx.log.info(`log-${i}`);
-        }
-
-        // Count buffer chain length starting from root
-        let bufferCount = 0;
-        let currentBuffer: typeof rootBuffer | undefined = rootBuffer;
-        while (currentBuffer) {
-          bufferCount++;
-          currentBuffer = currentBuffer._next;
-        }
-
-        return ctx.ok({ written: 10, bufferCount });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-boundary-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.written).toBe(10);
-        // With capacity=8 and 10 log entries (starting at row 2), we need overflow
-        // Row 0: span-start, Row 1: span-ok, Rows 2-7: first 6 logs, then chain for remaining 4
-        expect(result.value.bufferCount).toBeGreaterThanOrEqual(2); // At least root + 1 chained buffer
-      }
     });
   });
 
-  describe('Scoped Attributes on Buffer Overflow', () => {
-    it('should carry scoped attributes forward when buffer overflows', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+  describe('Property: Chain Integrity', () => {
+    it('buffer chain is properly linked', () => {
+      fc.assert(
+        fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
+          taskContext.module.sb_overflows = 0;
+          taskContext.module.sb_totalCreated = 0;
 
-      const testTask = moduleContext.task('test-scope-overflow', async (ctx) => {
-        // Set scoped attributes at the beginning (scope is now on ctx directly)
-        ctx.scope({ requestId: 'scoped-req-123', userId: 'scoped-user-456' });
+          const buffer = createSpanBuffer(testSchema, taskContext);
+          const scope = new ScopeClass();
+          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
 
-        // Write enough messages to trigger buffer overflow
-        // Initial capacity is 64, and writeIndex starts at 2 (row 0: span-start, row 1: span-end)
-        // So we need 62+ messages to overflow
-        for (let i = 0; i < 100; i++) {
-          ctx.log.info(`Message ${i}`);
-        }
+          for (let i = 0; i < numEntries; i++) {
+            logger.info(`msg-${i}`);
+          }
 
-        // The scoped attributes should be present in the new buffer
-        // We can verify by getting the scoped values from the scope instance
-        const scopedAttrs = ctx.log._getScope()._getScopeValues();
+          // Walk the chain and verify each link
+          const buffers: SpanBuffer[] = [];
+          let current: SpanBuffer | undefined = buffer;
+          while (current) {
+            buffers.push(current);
+            current = current.next as SpanBuffer | undefined;
+          }
 
-        return ctx.ok({
-          messagesWritten: 100,
-          scopedRequestId: scopedAttrs.requestId,
-          scopedUserId: scopedAttrs.userId,
-        });
-      });
+          // Property: each buffer (except last) has next pointing to following buffer
+          for (let i = 0; i < buffers.length - 1; i++) {
+            expect(buffers[i].next).toBe(buffers[i + 1]);
+          }
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-scope-overflow-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
+          // Property: last buffer has no next
+          expect(buffers[buffers.length - 1].next).toBeUndefined();
+
+          // Property: all buffers share same spanId and traceId
+          const spanId = buffer.spanId;
+          const traceId = buffer.traceId;
+          for (const buf of buffers) {
+            expect(buf.spanId).toBe(spanId);
+            expect(buf.traceId).toBe(traceId);
+          }
+        }),
+        { numRuns: 50 },
       );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.messagesWritten).toBe(100);
-        // Scoped attributes should still be accessible (they're stored in the logger, not buffer)
-        expect(result.value.scopedRequestId).toBeDefined();
-        expect(result.value.scopedUserId).toBeDefined();
-      }
-    });
-
-    it('should apply scoped attributes to messages in chained buffer after overflow', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
-
-      const testTask = moduleContext.task('test-scope-prefill', async (ctx) => {
-        // Set scoped attributes
-        ctx.scope({ region: 'us-east-1' });
-
-        // Write enough messages to trigger overflow
-        for (let i = 0; i < 80; i++) {
-          ctx.log.info(`Message ${i}`);
-        }
-
-        // Write a final message after overflow - scoped attributes should be applied
-        ctx.log.info('Final message after overflow');
-
-        return ctx.ok({ success: true });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-scope-prefill-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
     });
   });
 
-  describe('Error Handling', () => {
-    it('should not lose data on buffer overflow', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+  describe('Property: Data Correctness', () => {
+    it('each entry has correct attribute values', () => {
+      fc.assert(
+        fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
+          taskContext.module.sb_overflows = 0;
+          taskContext.module.sb_totalCreated = 0;
 
-      const testTask = moduleContext.task('test-no-data-loss', async (ctx) => {
-        const writes: string[] = [];
+          const buffer = createSpanBuffer(testSchema, taskContext);
+          const scope = new ScopeClass();
+          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
 
-        // Write many entries and track them
-        for (let i = 0; i < 150; i++) {
-          const reqId = `req-${i}`;
-          writes.push(reqId);
-          ctx.tag.requestId(reqId);
-        }
+          const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
 
-        return ctx.ok({ totalWrites: writes.length });
-      });
+          // Write entries with predictable values
+          for (let i = 0; i < numEntries; i++) {
+            logger
+              .info(`msg-${i}`)
+              .requestId(`req-${i}`)
+              .userId(`user-${i}`)
+              .operation(operations[i % 4])
+              .duration(i * 10.5);
+          }
 
-      const requestCtx = createRequestContext(
-        { requestId: 'req-no-loss-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
+          // Collect starting from RESERVED_ROWS
+          const entries = collectEntries(buffer, RESERVED_ROWS);
+
+          // Property: each entry has expected values
+          for (let i = 0; i < numEntries; i++) {
+            const entry = entries[i];
+            expect(entry.requestId).toBe(`req-${i}`);
+            expect(entry.userId).toBe(`user-${i}`);
+            // Enum stored as index
+            expect(entry.operation).toBe(i % 4);
+            expect(entry.duration).toBe(i * 10.5);
+          }
+        }),
+        { numRuns: 50 },
       );
+    });
+  });
 
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.totalWrites).toBe(150);
+  describe('Property: Overflow Counter Consistency', () => {
+    it('sb_overflows equals bufferCount - 1', () => {
+      fc.assert(
+        fc.property(fc.integer({ min: 1, max: 150 }), (numEntries) => {
+          // Reset counters
+          taskContext.module.sb_overflows = 0;
+          taskContext.module.sb_totalCreated = 0;
+
+          const buffer = createSpanBuffer(testSchema, taskContext);
+          const scope = new ScopeClass();
+          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+
+          for (let i = 0; i < numEntries; i++) {
+            logger.info(`msg-${i}`);
+          }
+
+          const { bufferCount } = analyzeBufferChain(buffer);
+
+          // Property: overflow events = bufferCount - 1 (one per chain link)
+          expect(taskContext.module.sb_overflows).toBe(bufferCount - 1);
+        }),
+        { numRuns: 100 },
+      );
+    });
+  });
+
+  describe('Property: WriteIndex Bounds', () => {
+    it('each buffer writeIndex is within capacity', () => {
+      fc.assert(
+        fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
+          taskContext.module.sb_overflows = 0;
+          taskContext.module.sb_totalCreated = 0;
+
+          const buffer = createSpanBuffer(testSchema, taskContext);
+          const scope = new ScopeClass();
+          const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+
+          for (let i = 0; i < numEntries; i++) {
+            logger.info(`msg-${i}`);
+          }
+
+          // Walk chain and check each buffer
+          let current: SpanBuffer | undefined = buffer;
+          while (current) {
+            // Property: writeIndex <= capacity
+            expect(current.writeIndex).toBeLessThanOrEqual(current.capacity);
+            // Property: writeIndex >= 0
+            expect(current.writeIndex).toBeGreaterThanOrEqual(0);
+            current = current.next as SpanBuffer | undefined;
+          }
+        }),
+        { numRuns: 100 },
+      );
+    });
+  });
+
+  describe('Edge Cases', () => {
+    it('exact usable capacity: no overflow when entries fit in first buffer', () => {
+      const capacity = DEFAULT_BUFFER_CAPACITY; // 8
+      const usableCapacity = capacity - RESERVED_ROWS; // 6 entries fit
+      taskContext.module.sb_overflows = 0;
+
+      const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+      const scope = new ScopeClass();
+      const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
+
+      // Write exactly usable capacity entries (6 with capacity=8, reserved=2)
+      for (let i = 0; i < usableCapacity; i++) {
+        logger.info(`msg-${i}`);
       }
+
+      // Should be exactly 1 buffer (no overflow)
+      expect(buffer.next).toBeUndefined();
+      expect(taskContext.module.sb_overflows).toBe(0);
+      // writeIndex = RESERVED_ROWS + usableCapacity = 2 + 6 = 8 = capacity
+      expect(buffer.writeIndex).toBe(capacity);
     });
 
-    it('should handle errors during writes without corrupting buffer', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+    it('usable capacity + 1: triggers exactly one overflow', () => {
+      const capacity = DEFAULT_BUFFER_CAPACITY; // 8
+      const usableCapacity = capacity - RESERVED_ROWS; // 6
+      taskContext.module.sb_overflows = 0;
 
-      const testTask = moduleContext.task('test-error-handling', async (ctx) => {
-        try {
-          // Write some entries
-          for (let i = 0; i < 50; i++) {
-            ctx.tag.requestId(`req-${i}`);
-          }
+      const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+      const scope = new ScopeClass();
+      const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
 
-          // Simulate an error
-          throw new Error('Simulated error');
-        } catch (_error) {
-          // Continue writing after error
-          for (let i = 50; i < 100; i++) {
-            ctx.tag.requestId(`req-${i}`);
-          }
-
-          return ctx.ok({ recovered: true, writes: 100 });
-        }
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-error-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
-      );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.recovered).toBe(true);
-        expect(result.value.writes).toBe(100);
+      // Write usable capacity + 1 entries (7 entries)
+      for (let i = 0; i < usableCapacity + 1; i++) {
+        logger.info(`msg-${i}`);
       }
+
+      // Should be exactly 2 buffers
+      expect(buffer.next).toBeDefined();
+      expect(buffer.next?.next).toBeUndefined();
+      expect(taskContext.module.sb_overflows).toBe(1);
+
+      // First buffer full, second has 1 entry
+      expect(buffer.writeIndex).toBe(capacity);
+      expect(buffer.next?.writeIndex).toBe(1);
     });
 
-    it('should correctly write fluent attributes across 128 log entries with overflow', async () => {
-      const moduleContext = createModuleContext({
-        moduleMetadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'src/services/test.ts',
-        },
-        tagAttributes: dbAttributes,
-      });
+    it('zero entries: single buffer with just reserved space', () => {
+      taskContext.module.sb_overflows = 0;
 
-      const testTask = moduleContext.task('test-fluent-overflow', async (ctx) => {
-        const NUM_ENTRIES = 128;
-        const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
+      const buffer = createSpanBuffer(testSchema, taskContext);
+      const scope = new ScopeClass();
+      // Create logger but don't write anything
+      createSpanLogger(testSchema, buffer, scope, createNextBuffer);
 
-        // Save root buffer BEFORE any writes (ctx.log._buffer will change on overflow)
-        const rootBuffer = ctx.log._buffer;
+      expect(buffer.next).toBeUndefined();
+      // Logger constructor sets writeIndex to 2 (after reserved rows)
+      expect(buffer.writeIndex).toBe(RESERVED_ROWS);
+      expect(taskContext.module.sb_overflows).toBe(0);
+    });
+  });
 
-        // Write 128 log entries, each with fluent attribute chaining
-        // With default capacity=8, this will trigger many overflows
-        for (let i = 0; i < NUM_ENTRIES; i++) {
-          ctx.log
-            .info(`Message ${i}`)
-            .requestId(`req-${i}`)
-            .userId(`user-${i}`)
-            .operation(operations[i % 4])
-            .duration(i * 10);
-        }
+  describe('Varying Capacity', () => {
+    it('property holds for different buffer capacities', () => {
+      fc.assert(
+        fc.property(
+          fc.integer({ min: 1, max: 100 }), // entries
+          fc
+            .integer({ min: 8, max: 64 })
+            .map((n) => (n + 7) & ~7), // capacity aligned to 8
+          (numEntries, capacity) => {
+            taskContext.module.sb_overflows = 0;
+            taskContext.module.sb_totalCreated = 0;
+            taskContext.module.sb_capacity = capacity; // Set for chained buffers
 
-        // Count buffer chain length to verify overflow occurred
-        let bufferCount = 0;
-        let countBuffer: typeof rootBuffer | undefined = rootBuffer;
-        while (countBuffer) {
-          bufferCount++;
-          countBuffer = countBuffer._next;
-        }
+            const buffer = createSpanBuffer(testSchema, taskContext, undefined, capacity);
+            const scope = new ScopeClass();
+            const logger = createSpanLogger(testSchema, buffer, scope, createNextBuffer);
 
-        // Collect all entries from buffer chain
-        // We know there are NUM_ENTRIES entries starting at row 2 of root buffer
-        const entries: Array<{
-          requestId: string;
-          userId: string;
-          operation: number;
-          duration: number;
-        }> = [];
+            for (let i = 0; i < numEntries; i++) {
+              logger.info(`msg-${i}`).requestId(`req-${i}`);
+            }
 
-        let currentBuffer: typeof rootBuffer | undefined = rootBuffer;
-        let entriesCollected = 0;
-        let bufferNum = 0;
+            const { bufferCount } = analyzeBufferChain(buffer);
 
-        while (currentBuffer && entriesCollected < NUM_ENTRIES) {
-          bufferNum++;
-          // Skip rows 0-1 (tag and result rows) in root buffer only
-          const startRow = bufferNum === 1 ? 2 : 0;
-          // Use writeIndex to only iterate through actual written entries
-          // Utility handles ColumnBuffer -> SpanBuffer cast internally
-          const endRow = SpanBufferTestUtils.getWriteIndex(currentBuffer);
+            // Property: buffer count matches formula (with reserved rows)
+            const expected = expectedBufferCount(numEntries, capacity, RESERVED_ROWS);
+            expect(bufferCount).toBe(expected);
 
-          for (let row = startRow; row < endRow && entriesCollected < NUM_ENTRIES; row++) {
-            entries.push({
-              requestId: currentBuffer.requestId_values?.[row] as string,
-              userId: currentBuffer.userId_values?.[row] as string,
-              operation: currentBuffer.operation_values?.[row] as number,
-              duration: currentBuffer.duration_values?.[row] as number,
-            });
-            entriesCollected++;
-          }
-
-          currentBuffer = currentBuffer._next as typeof rootBuffer | undefined;
-        }
-
-        return ctx.ok({
-          entriesWritten: entries.length,
-          entries,
-          bufferCount,
-        });
-      });
-
-      const requestCtx = createRequestContext(
-        { requestId: 'req-fluent-overflow-test' },
-        featureFlags,
-        flagEvaluator,
-        environmentConfig,
+            // Property: overflow count matches
+            expect(taskContext.module.sb_overflows).toBe(bufferCount - 1);
+          },
+        ),
+        { numRuns: 100 },
       );
-
-      const result = await testTask(requestCtx);
-      expect(result.success).toBe(true);
-      if (result.success) {
-        expect(result.value.entriesWritten).toBe(128);
-
-        // With capacity=8: 6 entries fit in root buffer (rows 2-7), then 122 more need chaining
-        // 122 / 8 = ~16 more buffers needed, so total should be ~17+ buffers
-        expect(result.value.bufferCount).toBeGreaterThanOrEqual(17);
-
-        // Verify each entry has correct attributes
-        for (let i = 0; i < 128; i++) {
-          const entry = result.value.entries[i];
-          expect(entry.requestId).toBe(`req-${i}`);
-          expect(entry.userId).toBe(`user-${i}`);
-          // Enum values are stored as indices
-          expect(entry.operation).toBe(i % 4);
-          expect(entry.duration).toBe(i * 10);
-        }
-      }
     });
   });
 });
