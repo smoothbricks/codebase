@@ -13,9 +13,9 @@
 import {
   convertToArrowTable,
   createModuleContext,
-  createRequestContext,
+  createTraceContext,
   defineFeatureFlags,
-  defineTagAttributes,
+  defineLogSchema,
   InMemoryFlagEvaluator,
   labelInterner,
   moduleIdInterner,
@@ -23,7 +23,7 @@ import {
 } from '@smoothbricks/lmao';
 
 // Define schema
-const schema = defineTagAttributes({
+const schema = defineLogSchema({
   userId: S.category(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
   duration: S.number(),
@@ -94,18 +94,18 @@ async function main() {
   console.log('EXECUTING TRANSFORMED CODE');
   console.log('='.repeat(70));
 
-  const requestCtx = createRequestContext(
+  const traceCtx = createTraceContext(
     { requestId: 'req-demo-001', userId: 'user-abc' },
     featureFlags,
     new InMemoryFlagEvaluator({ enableFeature: true }),
     { environment: 'demo' },
   );
 
-  console.log('\nRequest ID:', requestCtx.requestId);
-  console.log('Trace ID:', requestCtx.traceId);
+  console.log('\nRequest ID:', traceCtx.requestId);
+  console.log('Trace ID:', traceCtx.traceId);
   console.log('\nExecuting task...\n');
 
-  const result = await processData(requestCtx, 'user-123', ['item-1', 'item-2', 'item-3']);
+  const result = await processData(traceCtx, 'user-123', ['item-1', 'item-2', 'item-3']);
 
   console.log('Task result:', result.success ? 'SUCCESS' : 'FAILED');
   if (result.success) {

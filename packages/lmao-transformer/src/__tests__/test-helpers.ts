@@ -3,13 +3,13 @@
  * Mirrors packages/lmao/src/lib/__tests__/test-helpers.ts
  */
 
-import { ModuleContext, type TagAttributeSchema, TaskContext } from '@smoothbricks/lmao';
+import { type LogSchema, ModuleContext, TaskContext } from '@smoothbricks/lmao';
 
 /**
  * Create a ModuleContext for testing.
  */
 export function createTestModuleContext(
-  tagAttributes: TagAttributeSchema,
+  tagAttributes: LogSchema,
   options: {
     gitSha?: string;
     packageName?: string;
@@ -28,7 +28,7 @@ export function createTestModuleContext(
  * Create a TaskContext for testing.
  */
 export function createTestTaskContext(
-  tagAttributes: TagAttributeSchema,
+  tagAttributes: LogSchema,
   options: {
     gitSha?: string;
     packageName?: string;

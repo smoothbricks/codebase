@@ -25,7 +25,7 @@ import {
   createTraceId,
   ENTRY_TYPE_SPAN_START,
   S,
-  type TagAttributeSchema,
+  type SchemaFields,
 } from '@smoothbricks/lmao';
 import * as arrow from 'apache-arrow';
 import { createTestTaskContext } from './test-helpers.js';
@@ -126,7 +126,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       message: S.text(),
       count: S.number(),
       enabled: S.boolean(),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('enum literal produces identical output', () => {
       const traceId = createTraceId('trace-enum-test');
@@ -349,7 +349,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
       userId: S.category(),
       count: S.number(),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('multiple chained calls produce identical output', () => {
       const traceId = createTraceId('trace-chain-test');
@@ -402,7 +402,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE'] as const),
       userId: S.category(),
       count: S.number(),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('with() bulk setter produces identical output to individual calls', () => {
       const traceId = createTraceId('trace-with-test');
@@ -477,7 +477,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     const testSchema = {
       // Enum values NOT in alphabetical order
       status: S.enum(['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED'] as const),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('verifies enum index uses declaration order', () => {
       // Runtime uses declaration order (NOT alphabetically sorted):
@@ -537,7 +537,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     const testSchema = {
       lazyField: S.category(),
       eagerField: S.category().eager(),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('eager column setter produces identical output to lazy column setter', () => {
       const traceId = createTraceId('trace-eager-test');
@@ -580,7 +580,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     const testSchema = {
       nullableNumber: S.number(),
       nullableString: S.category(),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('unset columns remain null', () => {
       const traceId = createTraceId('trace-null-test');
@@ -651,7 +651,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     const testSchema = {
       value: S.number(),
       tag: S.category(),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('multiple rows produce identical output', () => {
       const traceId = createTraceId('trace-multirow-test');
@@ -735,7 +735,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       message: S.text(),
       count: S.number(),
       enabled: S.boolean(),
-    } satisfies TagAttributeSchema;
+    } satisfies SchemaFields;
 
     it('both fluent and direct writes produce valid IPC that round-trips correctly', () => {
       const traceId = createTraceId('trace-roundtrip-test');
