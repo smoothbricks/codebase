@@ -9,6 +9,10 @@ logging system. It handles three types of data:
 2. **Feature Flags** - Dynamic behavior configuration with analytics
 3. **Environment Variables** - Static deployment configuration
 
+> **Package Ownership**: Schema definitions live in `@smoothbricks/lmao`. Buffer storage implementation (TypedArrays,
+> lazy columns, null bitmaps) lives in `@smoothbricks/arrow-builder`. See `00_package_architecture.md` for the complete
+> separation of concerns.
+
 ## Design Philosophy
 
 **Key Insight**: Different types of configuration data have different access patterns, tracking needs, and performance
@@ -99,11 +103,19 @@ function toArrowDictionary() {
 - ✓ Pre-sorted dictionary enables binary search queries
 - ✓ UTF-8 bytes allocated ONCE, reused for every Arrow flush
 
-**Limits:**
+**Automatic Index Type Selection:**
 
-- Max 256 values (Uint8Array: 0-255)
-- Use Uint16Array for 256-65536 values
-- Use Uint32Array for >65536 values (rare)
+At schema definition time, LMAO automatically selects the optimal TypedArray based on enum value count. The schema
+stores `__index_array_ctor` and `__arrow_index_type_ctor` metadata, used by both buffer allocation
+(`columnBufferGenerator.ts`) and Arrow conversion (`convertToArrow.ts`).
+
+| Value Count | Index Type  | Bytes | Notes                                   |
+| ----------- | ----------- | ----- | --------------------------------------- |
+| 1-255       | Uint8Array  | 1     | Most common (HTTP methods, entry types) |
+| 256-65,535  | Uint16Array | 2     | Rare (large lookup tables)              |
+| 65,536+     | Uint32Array | 4     | Very rare                               |
+
+No manual configuration required - the system measures enum value count and selects optimally.
 
 #### 2. CATEGORY - Values Often Repeat (LIMITED CARDINALITY)
 
@@ -229,16 +241,18 @@ userId: S.category(); // ✓ Same users appear multiple times
 action: S.category(); // ✓ 'login', 'logout', 'purchase' repeat
 region: S.category(); // ✓ 'us-east-1', 'eu-west-1', limited set
 spanName: S.category(); // ✓ Same span names repeat
-spanName: S.category(); // ✓ Same span names repeat
 ```
 
 **Anti-patterns (use TEXT instead):**
 
 ```typescript
-requestId: S.category(); // ✗ Every request has unique ID - will thrash LRU
-timestamp: S.category(); // ✗ Every log has unique timestamp
-uuid: S.category(); // ✗ UUIDs are unique by definition
+requestId: S.category(); // ✗ Every request has unique ID - bloats cold-path dictionary
+timestamp: S.category(); // ✗ Every log has unique timestamp - unbounded dictionary growth
+uuid: S.category(); // ✗ UUIDs are unique by definition - no deduplication benefit
 ```
+
+Note: The issue is NOT hot-path LRU thrashing (CATEGORY doesn't intern on hot path). The problem is cold-path dictionary
+building: unique values create dictionaries as large as the data itself, negating compression benefits.
 
 #### 3. TEXT - Unique Values, Rarely Repeat
 
@@ -311,8 +325,12 @@ function convertTextColumn(strings: string[]): ConversionResult {
   // ═══════════════════════════════════════════════════════════
 
   // Threshold: 128 bytes minimum savings to justify dictionary overhead
-  // - Below threshold: complexity not worth it
-  // - Above threshold: meaningful space reduction
+  // WHY 128 bytes? Dictionary encoding adds complexity:
+  // - Additional indices array allocation
+  // - Extra indirection during queries
+  // - Sorting overhead for dictionary values
+  // Below 128 bytes, these costs outweigh the compression benefit.
+  // This threshold was chosen empirically based on typical log payloads.
   if (spaceSavings > 128) {
     // Dictionary encoding: sort for query optimization
     const sortedUnique = [...occurrences.keys()].sort();
@@ -569,8 +587,12 @@ const logSchema = {
 
 **System columns** (defined in systemSchema):
 
+> **Naming Convention**: These are Arrow column names (no prefix). SpanBuffer properties use `_` prefix for system
+> columns (e.g., `_timestamps`, `_operations`) per `00_package_architecture.md`. User attribute columns use no prefix in
+> both Arrow output and SpanBuffer properties.
+
 ```typescript
-// Core system columns
+// Core system columns (Arrow column names shown)
 // See 01b_columnar_buffer_architecture.md "Span Definition" for span ID design details
 const systemSchema = {
   // Trace structure
