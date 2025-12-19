@@ -5,19 +5,12 @@
  * with automatic span lifecycle tracking (span-start, span-ok, span-err, span-exception)
  */
 
-import {
-  createModuleContext,
-  createRequestContext,
-  defineFeatureFlags,
-  defineTagAttributes,
-  InMemoryFlagEvaluator,
-  S,
-} from '../src/index.js';
+import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
 
 // Define schema for user management operations
 // Note: resultMessage/exceptionMessage are not needed - use the unified .message() API
 // which writes to the system 'message' column
-const userSchema = defineTagAttributes({
+const userSchema = defineLogSchema({
   userId: S.category(),
   email: S.category(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
@@ -36,19 +29,19 @@ const mockEvaluator = new InMemoryFlagEvaluator({
   enableEmailNotifications: false,
 });
 
-// Create module context
-const userModule = createModuleContext({
+// Create module with defineModule
+const userModule = defineModule({
   moduleMetadata: {
     gitSha: 'abc123',
     packageName: '@example/user-module',
     packagePath: 'src/modules/user.ts',
   },
-  tagAttributes: userSchema,
+  logSchema: userSchema,
 });
 
 // Example 1: Success with fluent API
 const createUser = userModule.task('createUser', async (ctx, email: string, name: string) => {
-  // Span-start entry is automatically written at task start
+  // Span-start entry is automatically written at op start
 
   const startTime = Date.now();
 
@@ -146,30 +139,31 @@ const processUserRegistration = userModule.task('processUserRegistration', async
 
 // Run examples
 async function main() {
-  const requestCtx = createRequestContext({ requestId: 'req_001', userId: 'admin' }, featureFlags, mockEvaluator, {
+  // Create trace context via module
+  const traceCtx = userModule.traceContext({ requestId: 'req_001', userId: 'admin' }, featureFlags, mockEvaluator, {
     environment: 'development',
   });
 
   console.log('=== Example 1: Success with Fluent API ===');
-  const user = await createUser(requestCtx, 'john@example.com', 'John Doe');
+  const user = await createUser(traceCtx, 'john@example.com', 'John Doe');
   console.log('Result:', user);
   console.log();
 
   console.log('=== Example 2: Validation Error ===');
-  const validResult = await validateEmail(requestCtx, 'invalid-email');
+  const validResult = await validateEmail(traceCtx, 'invalid-email');
   console.log('Result:', validResult);
   console.log();
 
   console.log('=== Example 3: Exception Handling ===');
   try {
-    await updateUser(requestCtx, 'invalid', { name: 'New Name' });
+    await updateUser(traceCtx, 'invalid', { name: 'New Name' });
   } catch (error) {
     console.log('Caught exception:', (error as Error).message);
   }
   console.log();
 
   console.log('=== Example 4: Nested Spans with Lifecycle ===');
-  const registration = await processUserRegistration(requestCtx, 'jane@example.com', 'Jane Smith');
+  const registration = await processUserRegistration(traceCtx, 'jane@example.com', 'Jane Smith');
   console.log('Result:', registration);
 }
 

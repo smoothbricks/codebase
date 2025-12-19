@@ -16,10 +16,9 @@
 
 import {
   createLibraryModule,
-  createModuleContext,
-  createRequestContext,
   defineFeatureFlags,
-  defineTagAttributes,
+  defineLogSchema,
+  defineModule,
   InMemoryFlagEvaluator,
   S,
 } from '../src/index.js';
@@ -32,7 +31,7 @@ import {
  * HTTP library with clean, unprefixed schema
  * Library author writes domain-focused code
  */
-const httpSchema = defineTagAttributes({
+const httpSchema = defineLogSchema({
   status: S.number(),
   method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
   url: S.text(),
@@ -112,7 +111,7 @@ function createHttpLibrary(prefix = 'http') {
  * Database library with clean schema
  * Notice: Both HTTP and DB have 'duration' field - no conflict when prefixed
  */
-const dbSchema = defineTagAttributes({
+const dbSchema = defineLogSchema({
   query: S.text(),
   duration: S.number(), // Same name as HTTP library - will be prefixed
   table: S.category(),
@@ -177,7 +176,7 @@ function createDatabaseLibrary(prefix = 'db') {
 /**
  * Cache library schema
  */
-const cacheSchema = defineTagAttributes({
+const cacheSchema = defineLogSchema({
   operation: S.enum(['GET', 'SET', 'DELETE', 'EXISTS']),
   key: S.category(),
   hit: S.boolean(),
@@ -237,7 +236,7 @@ const dbLib = createDatabaseLibrary('db');
 const cacheLib = createCacheLibrary('redis');
 
 // Define application-specific attributes
-const appSchema = defineTagAttributes({
+const appSchema = defineLogSchema({
   userId: S.category(),
   requestId: S.category(),
   businessMetric: S.number(),
@@ -257,14 +256,14 @@ const composedSchema = {
   ...appSchema,
 };
 
-// Create application module with composed schema
-const { task } = createModuleContext({
+// Create application module with composed schema using defineModule
+const appModule = defineModule({
   moduleMetadata: {
     gitSha: 'app-v1.0.0',
     packageName: '@example/user-service',
     packagePath: 'src/services/user.ts',
   },
-  tagAttributes: composedSchema,
+  logSchema: composedSchema,
 });
 
 // ============================================================================
@@ -281,10 +280,10 @@ interface UserData {
 }
 
 /**
- * Application task that uses multiple libraries
+ * Application op that uses multiple libraries
  * Demonstrates how libraries work together seamlessly
  */
-const getUserProfile = task('get-user-profile', async (ctx, userId: string) => {
+const getUserProfile = appModule.task('get-user-profile', async (ctx, userId: string) => {
   // Set application-specific attributes
   ctx.tag.userId(userId).requestId(ctx.requestId);
 
@@ -342,13 +341,13 @@ async function runExample() {
   console.log('\n🚀 Library Integration Pattern Example\n');
   console.log('='.repeat(70));
 
-  // Create request context
+  // Create request context via module
   const flagEvaluator = new InMemoryFlagEvaluator({
     useCache: true,
     debugMode: false,
   });
 
-  const requestCtx = createRequestContext(
+  const traceCtx = appModule.traceContext(
     {
       requestId: `req-${Date.now()}`,
       userId: 'admin',
@@ -359,13 +358,13 @@ async function runExample() {
   );
 
   console.log('\n📊 Request Context:');
-  console.log(`   Request ID: ${requestCtx.requestId}`);
-  console.log(`   Trace ID: ${requestCtx.traceId}`);
-  console.log(`   Cache Enabled: ${requestCtx.ff.useCache}`);
+  console.log(`   Request ID: ${traceCtx.requestId}`);
+  console.log(`   Trace ID: ${traceCtx.traceId}`);
+  console.log(`   Cache Enabled: ${traceCtx.ff.useCache}`);
 
   // Execute business logic that uses multiple libraries
-  console.log('\n🔄 Executing getUserProfile task...\n');
-  const result = await getUserProfile(requestCtx, 'user-123');
+  console.log('\n🔄 Executing getUserProfile op...\n');
+  const result = await getUserProfile(traceCtx, 'user-123');
 
   if (result.success) {
     console.log('✅ Success! User profile retrieved:', result.value);

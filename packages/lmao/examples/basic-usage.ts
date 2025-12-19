@@ -2,10 +2,10 @@
  * Example: Basic LMAO Integration Pattern with Method Chaining
  *
  * This example demonstrates:
- * - Creating request context with feature flags and environment
- * - Using the new createTraceContext API for V8 hidden class optimization
+ * - Creating trace context via module.traceContext() (per spec 01l)
+ * - Using the defineModule().ctx<Extra>().make() builder pattern
  * - Defining tag attributes for structured logging
- * - Using task wrappers with typed span context
+ * - Using op() for typed span context
  * - Accessing feature flags and environment config
  * - METHOD CHAINING: ctx.tag.userId(id).requestId(req).operation('INSERT')
  * - Chaining with with(): ctx.tag.with({...}).operation('SELECT')
@@ -14,22 +14,14 @@
  * Key Feature: All tag methods return the tag object for fluent chaining!
  */
 
-import {
-  createModuleContext,
-  createRequestContext,
-  createTraceContext,
-  defineFeatureFlags,
-  defineTagAttributes,
-  InMemoryFlagEvaluator,
-  S,
-} from '../src/index.js';
+import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
 
 // 1. Define tag attributes for your domain
 // Using the three string types per specs/01a_trace_schema_system.md:
 // - S.enum: Known values at compile time (Uint8Array, 1 byte)
 // - S.category: Values that often repeat (Uint32Array with string interning)
 // - S.text: Unique values (no dictionary overhead)
-const dbAttributes = defineTagAttributes({
+const dbAttributes = defineLogSchema({
   requestId: S.category(), // Category: request IDs repeat within traces
   userId: S.category(), // Category: user IDs repeat across operations
   duration: S.number(),
@@ -46,52 +38,60 @@ const featureFlags = defineFeatureFlags({
   experimentalFeature: S.boolean().default(false).async(),
 });
 
-// 3. Define environment config (just a plain object)
-const environmentConfig = {
-  awsRegion: 'us-east-1',
-  maxConnections: 100,
-  databaseUrl: 'postgresql://localhost:5432/mydb',
-  debug: true,
-};
+// 3. Define environment config type
+interface EnvConfig {
+  awsRegion: string;
+  maxConnections: number;
+  databaseUrl: string;
+  debug: boolean;
+}
 
-// 4. Create feature flag evaluator (would be LaunchDarkly, database, etc. in production)
+// 4. Define Extra context properties
+interface ExtraContext {
+  env: EnvConfig;
+  requestId: string;
+  userId: string;
+}
+
+// 5. Create feature flag evaluator (would be LaunchDarkly, database, etc. in production)
 const flagEvaluator = new InMemoryFlagEvaluator({
   advancedValidation: true,
   maxRetries: 5,
   experimentalFeature: false,
 });
 
-// 5. Create module context with tag attributes
-// Note: Using the internal createModuleContext API directly
-// In production, you'd typically use createLibraryModule for better ergonomics
-const { task } = createModuleContext({
-  moduleMetadata: {
+// 6. Create module with defineModule().ctx<Extra>().make() pattern
+// Per spec 01l - this is the ONLY way to create modules
+const userModule = defineModule({
+  metadata: {
     gitSha: 'abc123def456',
     packageName: '@example/user-service',
     packagePath: 'src/services/user.ts',
   },
-  tagAttributes: dbAttributes,
-});
+  logSchema: dbAttributes,
+  ff: featureFlags,
+})
+  .ctx<ExtraContext>({
+    env: null!, // Required - will be provided at traceContext() time
+    requestId: null!, // Required
+    userId: null!, // Required
+  })
+  .make({ ffEvaluator: flagEvaluator });
 
-// 6. Define tasks with typed context
+// 7. Define ops with typed context
 interface UserData {
   email: string;
   name: string;
 }
 
-const createUser = task('create-user', async (ctx, userData: UserData) => {
+// Op function using module.op()
+const createUser = userModule.op('create-user', async (ctx, userData: UserData) => {
   // Feature flag access (sync flags are properties)
   if (ctx.ff.advancedValidation) {
     ctx.log.info('Using advanced validation');
-
-    // Track feature flag usage for analytics
-    ctx.ff.trackUsage('advancedValidation', {
-      action: 'validation_performed',
-      outcome: 'success',
-    });
   }
 
-  // Environment access (just plain property access)
+  // Environment access (from Extra context)
   const region = ctx.env.awsRegion;
   const _maxConnections = ctx.env.maxConnections;
 
@@ -106,9 +106,9 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
     })
     .query('BEGIN TRANSACTION');
 
-  // Child span for validation with chained tags
+  // Child span for validation - uses inline closure pattern
   const validation = await ctx.span('validate-user', async (childCtx) => {
-    // Chaining works in child spans too - use childCtx.tag (not .log.tag)
+    // Chaining works in child spans too
     childCtx.tag.operation('SELECT').query('SELECT COUNT(*) FROM users WHERE email = ?').duration(12.5).httpStatus(200);
 
     // Simulate validation
@@ -122,7 +122,7 @@ const createUser = task('create-user', async (ctx, userData: UserData) => {
   });
 
   if (!validation.success) {
-    return ctx.err('VALIDATION_FAILED', validation.error);
+    return ctx.err('VALIDATION_FAILED', { reason: 'child failed' });
   }
 
   // Simulate database operation with chained tags
@@ -171,54 +171,7 @@ async function handleRequest() {
   }
 }
 
-// 8. Alternative: Use createTraceContext (V8 optimized, new API)
-async function handleRequestWithTraceContext() {
-  // Method 2: Use createTraceContext for V8 hidden class optimization
-  // This avoids object spreads in child contexts, maintaining stable V8 hidden classes
-  const requestCtx = createTraceContext<
-    typeof featureFlags.schema,
-    typeof environmentConfig,
-    { requestId: string; userId: string; customProp: string }
-  >(
-    {
-      ff: { schema: featureFlags, evaluator: flagEvaluator },
-      env: environmentConfig,
-    },
-    {
-      requestId: `req-${Date.now()}`,
-      userId: 'user-456',
-      // Custom properties are directly accessible on the context
-      customProp: 'custom-value',
-    },
-  );
-
-  console.log('\n📊 Request context created (via createTraceContext):', {
-    requestId: requestCtx.requestId,
-    traceId: requestCtx.traceId,
-    // Custom properties are directly accessible
-    customProp: requestCtx.customProp,
-  });
-
-  // Execute task - same API as createRequestContext
-  // The task accepts RequestContext, createTraceContext returns a compatible type
-  const result = await createUser(requestCtx as unknown as Parameters<typeof createUser>[0], {
-    email: 'jane@example.com',
-    name: 'Jane Doe',
-  });
-
-  if (result.success) {
-    console.log('✅ User created successfully:', result.value);
-  } else {
-    console.error('❌ Failed to create user:', result.error);
-  }
-}
-
-// Run examples
-console.log('🚀 LMAO Integration Example - Columnar Buffer Storage\n');
-console.log('Running with createRequestContext (backward-compatible)...');
-handleRequest()
-  .then(() => {
-    console.log('\nRunning with createTraceContext (V8 optimized)...');
-    return handleRequestWithTraceContext();
-  })
-  .catch(console.error);
+// Run example
+console.log('LMAO Integration Example - Columnar Buffer Storage\n');
+console.log('Running with module.traceContext()...');
+handleRequest().catch(console.error);

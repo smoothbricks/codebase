@@ -3,26 +3,19 @@
  *
  * Demonstrates how to use LMAO in an Express-style middleware architecture:
  * - Middleware sets request-level scope attributes
- * - Business logic tasks inherit scoped attributes
+ * - Business logic ops inherit scoped attributes
  * - Zero repetition of context attributes
  *
  * Per specs/01i_span_scope_attributes.md - Middleware Pattern
  */
 
-import {
-  createModuleContext,
-  createRequestContext,
-  defineFeatureFlags,
-  defineTagAttributes,
-  InMemoryFlagEvaluator,
-  S,
-} from '../src/index.js';
+import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
 
 // ====================
 // Schema Definition
 // ====================
 
-const apiSchema = defineTagAttributes({
+const apiSchema = defineLogSchema({
   // Request metadata (set in middleware)
   requestId: S.category(),
   userId: S.category(),
@@ -44,25 +37,25 @@ const featureFlags = defineFeatureFlags({
 });
 
 // ====================
-// Module Context
+// Module Context with defineModule
 // ====================
 
-const apiModule = createModuleContext({
+const apiModule = defineModule({
   moduleMetadata: {
     gitSha: 'abc123',
     packageName: '@example/user-api',
     packagePath: 'src/api/user-controller.ts',
   },
-  tagAttributes: apiSchema,
+  logSchema: apiSchema,
 });
 
 // ====================
 // Simulated Express Request/Response with Proper Typing
 // ====================
 
-// Define RequestContext type we'll attach
-// ✅ Use typeof featureFlags.schema to get the FeatureFlagSchema type
-type LmaoRequestContext = ReturnType<typeof createRequestContext<typeof featureFlags.schema, Record<string, unknown>>>;
+// Define TraceContext type we'll attach
+// Use typeof featureFlags.schema to get the FeatureFlagSchema type
+type LmaoTraceContext = ReturnType<typeof apiModule.traceContext>;
 
 // Extend Request interface using declaration merging (proper TypeScript pattern)
 interface Request {
@@ -72,8 +65,8 @@ interface Request {
   user?: { id: string };
   headers: { [key: string]: string };
   ip: string;
-  // ✅ PROPER WAY: Extend the interface instead of using (as any)
-  ctx: LmaoRequestContext;
+  // PROPER WAY: Extend the interface instead of using (as any)
+  ctx: LmaoTraceContext;
 }
 
 interface Response {
@@ -100,8 +93,8 @@ function lmaoMiddleware(req: Request, _res: Response, next: () => void) {
     detailedLogging: true,
   });
 
-  // Create request context
-  const requestCtx = createRequestContext(
+  // Create request context via module
+  const traceCtx = apiModule.traceContext(
     {
       requestId: req.id,
       userId: req.user?.id,
@@ -111,8 +104,8 @@ function lmaoMiddleware(req: Request, _res: Response, next: () => void) {
     {},
   );
 
-  // ✅ Attach context to request (now type-safe!)
-  req.ctx = requestCtx;
+  // Attach context to request (now type-safe!)
+  req.ctx = traceCtx;
 
   next();
 }
@@ -137,7 +130,7 @@ const createUser = apiModule.task(
     },
   ) => {
     // Add business-specific scope (merges with middleware scope)
-    ctx.scope({
+    ctx.setScope({
       operation: 'CREATE_USER',
       resourceId: userData.email,
     });
@@ -167,7 +160,7 @@ const createUser = apiModule.task(
     // Create user
     const userId = `user-${Date.now()}`;
 
-    ctx.scope({
+    ctx.setScope({
       resourceId: userId,
       httpStatus: 201,
     });
@@ -191,7 +184,7 @@ const createUser = apiModule.task(
 const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
   // Only set business-specific scope
   // Middleware scope (requestId, endpoint, etc.) is already inherited
-  ctx.scope({
+  ctx.setScope({
     operation: 'GET_USER',
     resourceId: userId,
   });
@@ -207,15 +200,15 @@ const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
     return { id: userId, email: 'user@example.com', name: 'John Doe' };
   })();
 
-  // ✅ Error case - TypeScript knows this returns FluentErrorResult
+  // Error case - TypeScript knows this returns FluentErrorResult
   if (!user) {
-    ctx.scope({ httpStatus: 404 });
+    ctx.setScope({ httpStatus: 404 });
     ctx.log.info('User not found');
     return ctx.err('USER_NOT_FOUND', { userId });
   }
 
-  // ✅ Success case - TypeScript knows this returns FluentSuccessResult
-  ctx.scope({ httpStatus: 200 });
+  // Success case - TypeScript knows this returns FluentSuccessResult
+  ctx.setScope({ httpStatus: 200 });
   ctx.log.info('User fetched successfully');
 
   return ctx.ok(user);
@@ -234,7 +227,7 @@ const updateUser = apiModule.task(
       email?: string;
     },
   ) => {
-    ctx.scope({
+    ctx.setScope({
       operation: 'UPDATE_USER',
       resourceId: userId,
     });
@@ -260,7 +253,7 @@ const updateUser = apiModule.task(
     // Apply updates
     const updatedUser = { id: userId, ...updates };
 
-    ctx.scope({
+    ctx.setScope({
       httpStatus: 200,
     });
 
@@ -274,7 +267,7 @@ const updateUser = apiModule.task(
 // Simulated Express Routes
 // ====================
 
-// ✅ PROPER WAY: No more (as any) casts - fully type-safe!
+// PROPER WAY: No more (as any) casts - fully type-safe!
 async function handleCreateUser(req: Request, res: Response) {
   const result = await createUser(req.ctx, {
     email: 'newuser@example.com',
@@ -293,7 +286,7 @@ async function handleCreateUser(req: Request, res: Response) {
 async function handleGetUser(req: Request, res: Response) {
   const result = await getUser(req.ctx, 'user-123');
 
-  // ✅ TypeScript knows result is a union: FluentSuccessResult | FluentErrorResult
+  // TypeScript knows result is a union: FluentSuccessResult | FluentErrorResult
   // Type narrowing with 'if (result.success)' gives us type safety
   if (result.success) {
     // TypeScript knows: result.value exists, result.error doesn't
@@ -389,7 +382,7 @@ async function main() {
   console.log('\n✨ Example complete!');
   console.log('\n💡 Key Takeaway:');
   console.log('   Middleware sets requestId, userId, endpoint, httpMethod, userAgent, ipAddress ONCE');
-  console.log('   All business logic tasks inherit these attributes automatically');
+  console.log('   All business logic ops inherit these attributes automatically');
   console.log('   Business code only adds domain-specific attributes (operation, resourceId, httpStatus)');
   console.log('   This eliminates 50-80% of repetitive logging boilerplate!\n');
 }

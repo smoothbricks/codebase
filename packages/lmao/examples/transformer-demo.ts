@@ -4,7 +4,7 @@
  *
  * This example demonstrates:
  * 1. Module context with moduleMetadata (as transformer would inject)
- * 2. Task execution with logging
+ * 2. Op execution with logging
  * 3. Conversion to Arrow table
  * 4. Printing the table contents
  *
@@ -13,17 +13,16 @@
 
 import {
   convertToArrowTable,
-  createModuleContext,
-  createRequestContext,
   defineFeatureFlags,
-  defineTagAttributes,
+  defineLogSchema,
+  defineModule,
   InMemoryFlagEvaluator,
   S,
   type SpanBuffer,
 } from '../src/index.js';
 
 // Define schema
-const schema = defineTagAttributes({
+const schema = defineLogSchema({
   userId: S.category(),
   operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
   duration: S.number(),
@@ -35,21 +34,21 @@ const featureFlags = defineFeatureFlags({
   enableCaching: S.boolean().default(true).sync(),
 });
 
-// Create module context - in production the transformer injects moduleMetadata
-const { task } = createModuleContext({
+// Create module with defineModule - in production the transformer injects moduleMetadata
+const demoModule = defineModule({
   moduleMetadata: {
     gitSha: 'abc123def456',
     packageName: '@smoothbricks/lmao',
     packagePath: 'examples/transformer-demo.ts',
   },
-  tagAttributes: schema,
+  logSchema: schema,
 });
 
 // Store reference to the root buffer for Arrow conversion
 let rootBuffer: SpanBuffer | null = null;
 
-// Task that logs things - in production the transformer injects .line(N) calls
-const processItems = task('process-items', async (ctx, userId: string, items: string[]) => {
+// Op that logs things - in production the transformer injects .line(N) calls
+const processItems = demoModule.task('process-items', async (ctx, userId: string, items: string[]) => {
   // Capture the buffer (accessing internal for demo purposes)
   rootBuffer = (ctx.log as unknown as { _buffer: SpanBuffer })._buffer;
 
@@ -89,18 +88,19 @@ async function main() {
   // Setup
   const flagEvaluator = new InMemoryFlagEvaluator({ enableCaching: true });
 
-  const requestCtx = createRequestContext({ requestId: 'req-001', userId: 'user-123' }, featureFlags, flagEvaluator, {
+  // Create trace context via module
+  const traceCtx = demoModule.traceContext({ requestId: 'req-001', userId: 'user-123' }, featureFlags, flagEvaluator, {
     environment: 'demo',
   });
 
-  console.log('\n--- EXECUTING TASK ---\n');
-  console.log('Request ID:', requestCtx.requestId);
-  console.log('Trace ID:', requestCtx.traceId);
+  console.log('\n--- EXECUTING OP ---\n');
+  console.log('Request ID:', traceCtx.requestId);
+  console.log('Trace ID:', traceCtx.traceId);
 
-  // Execute task
-  const result = await processItems(requestCtx, 'user-456', ['item-1', 'item-2', 'item-3']);
+  // Execute op
+  const result = await processItems(traceCtx, 'user-456', ['item-1', 'item-2', 'item-3']);
 
-  console.log('\nTask result:', result.success ? 'SUCCESS' : 'FAILED');
+  console.log('\nOp result:', result.success ? 'SUCCESS' : 'FAILED');
   if (result.success) {
     console.log('Value:', JSON.stringify(result.value));
   }

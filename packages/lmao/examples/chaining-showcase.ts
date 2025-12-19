@@ -5,18 +5,11 @@
  * Each tag method returns the tag object, allowing natural, readable chaining.
  */
 
-import {
-  createModuleContext,
-  createRequestContext,
-  defineFeatureFlags,
-  defineTagAttributes,
-  InMemoryFlagEvaluator,
-  S,
-} from '../src/index.js';
+import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
 
 // Define comprehensive tag attributes
 // Using the three string types per specs/01a_trace_schema_system.md
-const orderAttributes = defineTagAttributes({
+const orderAttributes = defineLogSchema({
   requestId: S.category(), // Category: request IDs repeat
   userId: S.category(), // Category: user IDs repeat
   orderId: S.category(), // Category: order IDs may repeat in tracking
@@ -45,18 +38,18 @@ const flagEvaluator = new InMemoryFlagEvaluator({
   fastCheckout: true,
 });
 
-// Create module context
-const { task } = createModuleContext({
+// Create module with defineModule
+const orderModule = defineModule({
   moduleMetadata: {
     gitSha: 'abc123def456',
     packageName: '@example/order-service',
     packagePath: 'src/services/order.ts',
   },
-  tagAttributes: orderAttributes,
+  logSchema: orderAttributes,
 });
 
 // Example 1: Simple chaining
-const validateOrder = task('validate-order', async (ctx, orderId: string) => {
+const validateOrder = orderModule.task('validate-order', async (ctx, orderId: string) => {
   // Clean, readable chaining
   ctx.tag
     .requestId(ctx.requestId)
@@ -80,7 +73,7 @@ interface Order {
   paymentMethod: PaymentMethod;
 }
 
-const processPayment = task('process-payment', async (ctx, order: Order) => {
+const processPayment = orderModule.task('process-payment', async (ctx, order: Order) => {
   // Example: ctx.tag.orderId(order.id).amount(order.total)
   ctx.tag
     .orderId(order.id)
@@ -132,7 +125,7 @@ const processPayment = task('process-payment', async (ctx, order: Order) => {
 });
 
 // Example 3: Mixing with() and chaining
-const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) => {
+const createOrder = orderModule.task('create-order', async (ctx, orderData: Partial<Order>) => {
   // Validate required fields or apply safe defaults
   const id = orderData.id ?? `order-${Date.now()}`;
   const total = orderData.total ?? 0;
@@ -175,7 +168,8 @@ const createOrder = task('create-order', async (ctx, orderData: Partial<Order>) 
 
 // Run examples
 async function runExamples() {
-  const requestCtx = createRequestContext(
+  // Create trace context via module
+  const traceCtx = orderModule.traceContext(
     {
       requestId: `req-${Date.now()}`,
       userId: 'user-456',
@@ -187,12 +181,12 @@ async function runExamples() {
 
   console.log('\n=== Example 1: Simple Chaining ===');
   console.log('Writing to columnar buffers...');
-  const validation = await validateOrder(requestCtx, 'order-789');
+  const validation = await validateOrder(traceCtx, 'order-789');
   console.log('✅ Result:', validation);
 
   console.log('\n=== Example 2: Real-world Pattern (orderId/amount) ===');
   console.log('Each chained call writes to a separate row in Arrow columns...');
-  const payment = await processPayment(requestCtx, {
+  const payment = await processPayment(traceCtx, {
     id: 'order-789',
     total: 149.99,
     currency: 'USD',
@@ -202,7 +196,7 @@ async function runExamples() {
 
   console.log('\n=== Example 3: Mixing with() and Chaining ===');
   console.log('Bulk attributes written, then individual columns appended...');
-  const creation = await createOrder(requestCtx, {
+  const creation = await createOrder(traceCtx, {
     id: 'order-999',
     total: 299.99,
     currency: 'EUR',
