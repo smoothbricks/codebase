@@ -22,7 +22,7 @@
  * // Node.js (true nanosecond precision)
  * import { Nanoseconds } from '@smoothbricks/lmao/node';
  *
- * buffer.timestamps[idx] = Nanoseconds.now();
+ * buffer.timestamp[idx] = Nanoseconds.now();
  * ```
  *
  * @module nanoseconds

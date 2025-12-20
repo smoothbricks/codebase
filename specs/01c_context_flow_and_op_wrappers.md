@@ -27,14 +27,14 @@ ModuleContext (class) - ONE per module definition
 ├── sb_overflows: number (overflow write count)
 └── sb_totalCreated: number (total buffers created)
 
-SpanBuffer - ONE per span
-├── callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
-├── module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
-├── spanName: string               ← span name for this invocation
+SpanBuffer - ONE per span (internal interface)
+├── _callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
+├── _module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
+├── _spanName: string               ← span name for this invocation
 ├── lineNumber_values: Int32Array  ← line numbers per row (written directly, NOT stored as property)
-├── parent?: SpanBuffer            ← reference to parent (child spans walk this for traceId)
-├── children: SpanBuffer[]         ← child spans
-├── traceId (getter)               ← root stores it, children walk parent chain
+├── _parent?: SpanBuffer            ← reference to parent (child spans walk this for trace_id)
+├── _children: SpanBuffer[]         ← child spans
+├── trace_id (getter)               ← root stores it, children walk parent chain
 └── columns, writeIndex, etc.
 
 SpanContext (interface) - user-facing, what ops receive
@@ -82,7 +82,7 @@ buffer.module.gitSha; // Op's git SHA (for rows 1+)
 buffer.module.sb_capacity; // Self-tuning stats
 buffer.spanName; // Span name (direct property)
 buffer.lineNumber_values[0]; // Line number for row 0 (written directly, NO lineNumber property)
-buffer.traceId; // Walks parent chain to root if child span
+buffer.trace_id; // Walks parent chain to root if child span
 ```
 
 ## Design Rationale: From ctx Parameter to Destructured Context
@@ -141,15 +141,15 @@ entry writing, and context setup automatically.
 
 - `TraceContext` is created via `module.traceContext()` at request entry
 - `SpanContext` is what op functions receive
-- TraceContext has system props: `traceId`, `anchorEpochMicros`, `anchorPerfNow`, `threadId`
+- TraceContext has system props: `trace_id`, `anchorEpochMicros`, `anchorPerfNow`, `thread_id`
 - SpanContext has: `tag`, `log`, `scope`, `ok`, `err`, `span`, `buffer`, `ff`, `deps`
 
 ```
 TraceContext (created via module.traceContext())
-├── traceId: string (system prop)
+├── trace_id: string (system prop)
 ├── anchorEpochMicros: number (system prop)
 ├── anchorPerfNow: number (system prop)
-├── threadId: bigint (system prop)
+├── thread_id: bigint (system prop)
 ├── ff: FeatureFlagEvaluator (system prop)
 ├── span: RootSpanFn (system prop)
 ├── env: EnvironmentConfig (Extra - user-defined)
@@ -194,10 +194,10 @@ high-precision time anchor.
 ```typescript
 // Reserved keys that Extra cannot contain (compile-time enforcement)
 type ReservedTraceContextKeys = keyof {
-  traceId: unknown;
+  trace_id: unknown;
   anchorEpochMicros: unknown;
   anchorPerfNow: unknown;
-  threadId: unknown;
+  thread_id: unknown;
   ff: unknown;
   span: unknown;
 };
@@ -205,11 +205,11 @@ type ReservedTraceContextKeys = keyof {
 // TraceContext = System props + Extra
 interface TraceContext<FF, Extra> {
   // System properties (always present)
-  traceId: string;
+  trace_id: string;
   anchorEpochMicros: number; // Date.now() * 1000 at trace root
   anchorPerfNow: number; // performance.now() at trace root (browser)
   // OR anchorHrTime: bigint;  // process.hrtime.bigint() at trace root (Node.js)
-  threadId: bigint; // 64-bit random ID, generated once per worker/process
+  thread_id: bigint; // 64-bit random ID, generated once per worker/process
   ff: FeatureFlagEvaluator<FF>;
   span: RootSpanFn<FF, Extra>; // Root span creation - entry point for ops
 } & Extra; // User-defined properties (e.g., requestId, userId, env)
@@ -235,10 +235,10 @@ function createTraceContext<FF, Extra>(
   const perfNow = performance.now();
 
   return {
-    traceId: generateTraceId(),
+    trace_id: generateTraceId(),
     anchorEpochMicros: epochMs * 1000,
     anchorPerfNow: perfNow,
-    threadId: workerThreadId,
+    thread_id: workerThreadId,
     ff: params.ff,
     span: (name, op, ...args) => op._invoke(this, null, name, args),
     ...params, // Spread Extra properties (e.g., requestId, userId, env)
@@ -317,21 +317,21 @@ class Op<Ctx, Args extends unknown[], Result> {
     // 1. Create SpanBuffer with callsiteModule reference:
     //    - callsiteModule: where span() was called (for row 0's gitSha/packageName/packagePath)
     //    - this.module: the Op's module (for rows 1+ gitSha/packageName/packagePath)
-    // - Root: stores traceId in identity bytes
-    // - Child: walks parent chain for traceId (no duplication)
+    // - Root: stores trace_id in identity bytes
+    // - Child: walks parent chain for trace_id (no duplication)
     const buffer = parentBuffer
       ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
-      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.traceId);
+      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.trace_id);
 
-    // 2. Register with parent's children (RemappedBufferView if prefixed)
+    // 2. Register with parent's _children (RemappedBufferView if prefixed)
     if (parentBuffer) {
       if (this.module.remappedViewClass) {
         // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
         const view = new this.module.remappedViewClass(buffer);
-        parentBuffer.children.push(view);
+        parentBuffer._children.push(view);
       } else {
         // No prefix - push raw buffer directly
-        parentBuffer.children.push(buffer);
+        parentBuffer._children.push(buffer);
       }
     }
 
@@ -547,7 +547,7 @@ const result = await ctx.span('GET', GET, 'https://example.com');
 
 ## Thread ID and Distributed Span Identification
 
-The `threadId` in TraceContext enables collision-resistant span identification:
+The `thread_id` in TraceContext enables collision-resistant span identification:
 
 **Problem**: Simple incrementing span IDs (`span_id++`) collide across workers.
 
@@ -557,12 +557,12 @@ The `threadId` in TraceContext enables collision-resistant span identification:
 - `span_id`: 32-bit incrementing counter, assigned per span creation
 
 ```
-Worker A: parentBuffer = { threadId: 0xAAA..., spanId: 1 }
+Worker A: parentBuffer = { thread_id: 0xAAA..., span_id: 1 }
     │
     └─► pmap() dispatches to Thread B
         │
         ▼
-Worker B: childBuffer = { threadId: 0xBBB..., spanId: 1, parent: parentBuffer }
+Worker B: childBuffer = { thread_id: 0xBBB..., span_id: 1, parent: parentBuffer }
           Arrow output: parent_thread_id=0xAAA..., parent_span_id=1
 ```
 

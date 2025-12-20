@@ -1,16 +1,157 @@
 # AGENTS.md - AI Coding Assistant Guidelines for LMAO
 
-## ⚠️ GREENFIELD PROJECT - NO BACKWARDS COMPATIBILITY
+## 💡 DEVELOPMENT TOOLS NOTE
+
+**For efficient code search and editing in this project, use Serena's tools when available.** Serena provides semantic
+code understanding, symbol-based editing, and precise file operations that are optimized for TypeScript and complex
+codebases.
+
+### Comby for Structural Search/Replace
+
+**Docs**: https://comby.dev/docs/syntax-reference
+
+Use comby for bulk structural code edits. Key syntax:
+
+| Pattern        | Description                                                            |
+| -------------- | ---------------------------------------------------------------------- |
+| `:[var]`       | Match zero or more chars (lazy), stops at newline outside delimiters   |
+| `:[[var]]`     | Match one or more alphanumeric + `_` (like `\w+`)                      |
+| `:[var:e]`     | Match expression-like (handles balanced parens, e.g., `foo.bar(x, y)`) |
+| `:[var.]`      | Match alphanumeric + punctuation (`.`, `;`, `-`)                       |
+| `:[var\n]`     | Match up to and including newline                                      |
+| `:[ var]`      | Match only whitespace (no newlines)                                    |
+| `:[var~regex]` | Match arbitrary PCRE regex                                             |
+
+**⚠️ CRITICAL: ALWAYS dry-run first with `-diff` before using `-in-place`!**
+
+```bash
+# Step 1: ALWAYS preview changes first (dry-run)
+comby 'old_pattern' 'new_pattern' -matcher .ts -d src -diff
+
+# Step 2: Only after verifying the diff, apply changes
+comby 'old_pattern' 'new_pattern' -matcher .ts -d src -in-place
+```
+
+**Examples**:
+
+```bash
+# Rename destructured variable (preview first!)
+comby 'const { :[a], createTrace } = :[rest]' 'const { :[a], logBinding } = :[rest]' -matcher .ts -d src -diff
+# Then with -in-place after review
+
+# Match function calls with args
+comby 'createTrace(:[args])' 'tracer.trace(:[args])' -matcher .ts -d src -diff
+
+# Match multiline with expression hole
+comby 'new Tracer(:[factory:e], { sink: :[sink:e] })' 'new Tracer({ logBinding: :[factory:e].logBinding, sink: :[sink:e] })' -matcher .ts -d src -diff
+```
+
+**Tips**:
+
+- **ALWAYS use `-diff` first** - never go straight to `-in-place`
+- Use `-matcher .ts` for TypeScript (better than `-extensions ts`)
+- Use `:[var:e]` for expressions that may contain parens/brackets
+- Comby handles balanced delimiters automatically - `{:[x]}` matches balanced braces
+- Patterns can match more broadly than expected - review the diff carefully!
+
+### git-reword-commit (for rewriting commit messages)
+
+Rewrite a commit message without affecting worktree or staged changes. Uses git-filter-repo API directly.
+
+```bash
+# Replace entire message
+echo "feat: new message" | ./tooling/git-reword-commit abc123
+
+# Prepend to existing message
+cat msg.txt | ./tooling/git-reword-commit abc123 --prepend
+
+# Append to existing message
+echo "Co-authored-by: Someone" | ./tooling/git-reword-commit abc123 --append
+```
+
+**Note**: Message is read from stdin to preserve newlines and avoid shell escaping issues.
+
+### ts-morph MCP Tools (for cross-file refactoring)
+
+When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
+
+- **Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
+  ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`.
+- **Example**:
+  ```
+  tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
+  tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
+  ```
+
+## ⚠️ GREENFIELD PROJECT - CRITICAL ANALYSIS APPROACH
 
 **THIS IS A GREENFIELD PROJECT.** There is NO legacy code. There are NO existing users.
 
 - **DO NOT** add backwards compatibility layers or deprecated API support
 - **DO NOT** maintain old function signatures "just in case"
 - **DO NOT** keep dead code around
-- **ALWAYS** follow the specs exactly - specs are the source of truth (unless explicitly told otherwise)
-- If implementation diverges from spec → **FIX THE IMPLEMENTATION**
-- If tests don't match spec → **FIX THE TESTS**
-- When in doubt, ask - don't add compatibility shims
+- **CRITICALLY ANALYZE** specs vs implementation - specs evolve and may be outdated or incorrect
+- If implementation diverges from spec → **EVALUATE WHICH IS CORRECT** and update accordingly
+- **GENERATE TASKS FOR BOTH** implementation fixes AND spec updates when inconsistencies are found
+- **QUESTION ASSUMPTIONS** - implementation may have discovered better approaches than spec requirements
+- When in doubt, ask - don't blindly follow specs if implementation suggests better patterns
+
+---
+
+## 🔍 CRITICAL ANALYSIS APPROACH - SPECS ARE NOT SACRED
+
+**SPECS EVOLVE AND MAY BE WRONG** - The agent must actively critique and improve specifications:
+
+### Spec Consistency Review Agent Requirements
+
+The agent should:
+
+1. **REVIEW for INCONSISTENCIES** between spec and implementation
+2. **CRITIQUE the specs themselves** - specs will evolve
+3. **Evaluate if implementation approaches are better than spec requirements**
+4. **Generate tasks for BOTH** implementation fixes AND spec updates
+
+### When Implementation Diverges from Spec
+
+- **Don't blindly fix implementation** - specs may be wrong or outdated
+- **Evaluate trade-offs**: Performance, ergonomics, correctness, maintainability
+- **Implementation may be right**: Greenfield projects often discover better patterns during coding
+- **Update specs proactively**: If implementation proves superior, update the spec to match
+- **Document rationale**: When diverging from spec, explain WHY in commit messages and spec updates
+
+### Spec Quality Assessment
+
+- **Question assumptions**: Are spec requirements still valid? Do they make sense?
+- **Check for outdated patterns**: Specs written early may not reflect current best practices
+- **Validate constraints**: Are spec limitations still necessary or were they premature optimizations?
+- **Consider real-world usage**: Does the spec match actual developer needs and workflows?
+
+### Task Generation Strategy
+
+- **Implementation fixes**: When spec is clearly correct and implementation is wrong
+- **Spec updates**: When implementation demonstrates better approach or spec is outdated
+- **Hybrid tasks**: When both spec and implementation need refinement
+- **Documentation updates**: Always update this file when discovering new patterns or insights
+
+---
+
+## ⚠️ REPO COLLABORATION - MULTIPLE AGENTS WORKING SIMULTANEOUSLY
+
+**MULTIPLE AI AGENTS WORK IN THIS REPO** - coordinate carefully to avoid conflicts:
+
+- **NEVER use `git checkout`** - This can reset other agents' work in progress
+- **NEVER use `git reset`** - Same issue, destroys other agents' changes
+- **Check git status first** - See what others are working on before making changes
+- **Communicate changes** - If you modify shared interfaces/types, notify other agents
+- **Avoid conflicting edits** - Work on different files when possible, coordinate on shared files
+
+**If you accidentally use git checkout/reset:**
+
+- IMMEDIATELY notify other agents what you changed
+- They may need to reapply their work
+- Use this as a lesson to check git status first next time
+
+---
 
 ---
 
@@ -55,7 +196,7 @@
 
 ### Integration & Output
 
-- **Module Builder Pattern**: specs/01l_module_builder_pattern.md - `defineModule()` + `op()` API [**LMAO**]
+- **Op Context Pattern**: specs/01l_op_context_pattern.md - `defineOpContext()`, `defineOp()`, and Tracer [**LMAO**]
 - **Library Integration**: specs/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
 - **AI Agent Integration**: specs/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
 
@@ -226,6 +367,69 @@ fc.assert(
 - **Bounds**: Values stay within expected ranges
 - **Consistency**: Related counters/metrics stay in sync
 
+## SPANBUFFER PROPERTY NAMING: EXACT ARROW COLUMN MATCH
+
+**CRITICAL**: SpanBuffer public properties MUST match Arrow table column names exactly (no camelCase conversions). This
+ensures obvious data flow and enables users to define custom columns with consistent naming.
+
+### Core Arrow Columns → SpanBuffer Properties (Exact Match)
+
+- `trace_id` → `trace_id` getter
+- `thread_id` → `thread_id` getter
+- `span_id` → `span_id` getter
+- `parent_thread_id` → `parent_thread_id` getter
+- `parent_span_id` → `parent_span_id` getter
+- `timestamp` → `timestamp` (direct TypedArray)
+- `entry_type` → `entry_type` (direct TypedArray)
+- `package_name` → `package_name` (dictionary encoded)
+- `package_file` → `package_file` (dictionary encoded)
+- `git_sha` → `git_sha` (dictionary encoded)
+
+### System Schema Fields (snake_case)
+
+- `message` (eager category)
+- `line` (lazy number)
+- `error_code` (lazy category)
+- `exception_stack` (lazy text)
+- `ff_value` (lazy category)
+- `uint64_value` (lazy bigUint64)
+
+### SpanContext Changes
+
+- No `traceId` (access via `ctx.buffer.trace_id`)
+- New `module` getter for direct access to module metadata
+- `callee_package`, `callee_file`, `callee_line`, `callee_git_sha` getters (pull from `buffer.module` and
+  `buffer.line(0)`)
+- `SpanLogger` methods use `snake_case` (e.g., `error_code()`, `ff_value()`)
+
+### Internal Properties (underscore prefix)
+
+- `_system`, `_identity`, `_writeIndex`, `_capacity`, `_next`, `_hasParent`, `_children`, `_parent`, `_module`,
+  `_spanName`, `_callsiteModule`, `_scopeValues`
+
+### Implementation Details
+
+- **Arrow columns**: Use exact underscore names (correspond 1:1 with Arrow table)
+- **System fields**: `snake_case` (same as Arrow columns)
+- **Internal**: `_` prefix for encapsulation (implementation details)
+
+### Example
+
+```typescript
+// ✅ CORRECT - Arrow column names match exactly
+buffer.trace_id; // Arrow column: trace_id
+buffer.parent_span_id; // Arrow column: parent_span_id
+buffer.timestamp; // Arrow column: timestamp
+
+// ✅ CORRECT - System fields (snake_case)
+buffer.message; // System field: message
+buffer.line; // System field: line
+
+// ✅ CORRECT - Internal (underscore)
+buffer._children; // Internal tree structure
+buffer._module; // Internal context
+```
+
 ## Implementation Patterns (See specs/01h_entry_types_and_logging_primitives.md)
 
 - **Schema Definition**: ALWAYS use `defineLogSchema()` with `S` builder:
@@ -279,17 +483,80 @@ Unified enum for ALL trace events:
 - **Dual API**: Object-based (ctx.tag({ userId: "123" })) and property-based (ctx.tag.userId("123"))
 - **Zero allocation**: Fluent methods return this, no intermediate objects
 
-## Library Integration (See specs/01l_module_builder_pattern.md & 01e)
+## Library Integration (See specs/01l_op_context_pattern.md & 01e)
 
-- Libraries use `defineModule({ metadata, logSchema, deps, ff }).ctx<Extra>(defaults).make()` to define their module
+- Libraries use `defineOpContext({ logSchema, deps, flags, ctx })` to define their op context
 - Ops are defined via
-  `const { op } = myModule; export const myOp = op('name', async ({ span, log, tag }, ...args) => {})`
-- Ops destructure context: `{ span, log, tag, deps, ff, env }` - take only what you need
-- Span names at call site: `await span('contextual-name', someOp, args)` - caller names spans
-- Deps can be destructured: `const { retry, auth } = deps`
-- Prefix applied at use time: `httpLib.prefix('http').use({ retry: retryLib.prefix('http_retry').use() })`
+  `const { defineOp, defineOps } = opContext; const myOp = defineOp('name', async (ctx, ...args) => {})`
+- Ops receive full ctx and can destructure: `{ span, log, tag, deps, ff, env }` - take only what you need
+- Span names at call site: `await ctx.span('contextual-name', someOp, args)` - caller names spans
+- Deps can be destructured: `const { retry, auth } = ctx.deps`
+- Prefix applied at use time: `httpOps.prefix('http')` for column prefixing
 - RemappedBufferView maps prefixed names to unprefixed columns for Arrow conversion
-- `.ctx<Extra>(defaults)` requires all keys enumerable for `new Function()` codegen (V8 hidden class optimization)
+- `ctx` properties require all keys enumerable for V8 hidden class optimization
+
+## Tracer Usage Pattern
+
+`Tracer` is an **abstract base class** with 5 lifecycle hooks. Use concrete implementations:
+
+```typescript
+import { TestTracer, NoOpTracer, StdioTracer, ArrayQueueTracer } from '@smoothbricks/lmao';
+
+// defineOpContext returns OpContextFactory which extends OpContextBinding
+const opContext = defineOpContext({
+  logSchema: defineLogSchema({ userId: S.category() }),
+  ctx: { env: null as Env }, // Required at trace time
+});
+
+// For tests that need buffer inspection:
+const tracer = new TestTracer(opContext);
+const { trace } = tracer;
+await trace('fetch', fetchOp);
+const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
+
+// For tests that don't need output:
+const { trace } = new NoOpTracer(opContext);
+
+// For development/debugging (colored console output):
+const { trace } = new StdioTracer(opContext);
+
+// For production batching:
+const tracer = new ArrayQueueTracer(opContext);
+// ... process requests ...
+const batch = tracer.drain();
+for (const buf of batch) {
+  await sendToBackend(convertSpanTreeToArrowTable(buf));
+}
+
+// With feature flag evaluator:
+const { trace } = new TestTracer(opContext, { flagEvaluator });
+
+// trace() overloads - name is always required:
+await trace('my-op', myOp); // invoke Op
+await trace('handle', async (ctx) => ctx.ok('done')); // inline function
+
+// With context overrides (flat object, not nested { ctx: {...} }):
+await trace('my-op', { env: myEnv, requestId: 'req-123' }, myOp);
+await trace('handle', { env: myEnv }, async (ctx) => ctx.ok('done'));
+
+// With trace_id for distributed tracing:
+await trace('my-op', { trace_id: incomingTraceId, env: myEnv }, myOp);
+```
+
+**Key Points:**
+
+- **Tracer is abstract** - use `NoOpTracer`, `TestTracer`, `StdioTracer`, or `ArrayQueueTracer`
+- **Pass full opContext** - `new TestTracer(opContext)` not just logBinding
+- **Always destructure** `{ trace, flush }` from concrete tracer instance
+- `TestTracer.rootBuffers` - accumulated root buffers for inspection
+- `TestTracer.statsSnapshots` - captured capacity tuning stats
+- `ArrayQueueTracer.drain()` - consume and clear batched buffers
+- `StdioTracer` - prints spans with color-coded trace IDs and indentation
+
+**Lifecycle Hooks** (for custom Tracer implementations): | Hook | When Called | |------|-------------| |
+`onTraceStart(rootBuffer)` | Before root fn execution | | `onTraceEnd(rootBuffer)` | After root fn completes (in
+finally) | | `onSpanStart(childBuffer)` | Before child span fn execution | | `onSpanEnd(childBuffer)` | After child span
+fn completes | | `onStatsWillResetFor(buffer)` | Before capacity tuning stats reset |
 
 ## Span Scope Attributes (See specs/01i_span_scope_attributes.md)
 
@@ -345,7 +612,6 @@ Unified enum for ALL trace events:
 - ✅ `createNextBuffer()` - Buffer chaining for overflow
 - ✅ `createAttributeColumns()` - Schema-based column creation
 - ✅ Null bitmap management (Arrow format)
-- ✅ Self-tuning capacity with `sb_*` stats (sb_capacity, sb_totalWrites, sb_overflows, sb_totalCreated)
 - ✅ `convertToArrowTable()` - Zero-copy Arrow conversion
 - ✅ `convertSpanTreeToArrowTable()` - Recursive tree conversion
 
@@ -393,7 +659,7 @@ Unified enum for ALL trace events:
 **Note**: CATEGORY and TEXT columns store raw `string[]` on hot path. Dictionary building and UTF-8 encoding happen
 during Arrow conversion (cold path). There is NO hot-path interning.
 
-Module IDs and span names are accessed directly from `buf.module.packageName`, `buf.module.packagePath`, and
+Module IDs and span names are accessed directly from `buf.module.package_name`, `buf.module.package_file`, and
 `buf.spanName` during Arrow conversion.
 
 **BEFORE IMPLEMENTING**: Search these modules first! Most functionality already exists.

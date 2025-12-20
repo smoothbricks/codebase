@@ -5,7 +5,7 @@ import {
   DEFAULT_BUFFER_CAPACITY,
   maskingTransforms,
 } from '@smoothbricks/arrow-builder';
-import { convertToArrowTable, createSpanBuffer, defineLogSchema, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
 
@@ -43,17 +43,17 @@ describe('Buffer Integration', () => {
     const buf = createSpanBuffer(schema, module, 'test-span', undefined, capacity);
 
     // Core TypedArrays exist
-    expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
-    expect(buf.operations).toBeInstanceOf(Uint8Array);
+    expect(buf.timestamp).toBeInstanceOf(BigInt64Array);
+    expect(buf.entry_type).toBeInstanceOf(Uint8Array);
 
     // Attribute columns exist with correct types (use _values suffix)
     expect(Array.isArray(buf.userId_values)).toBe(true); // category (raw strings)
     expect(buf.score_values).toBeInstanceOf(Float64Array); // number
 
     // Metadata
-    expect(buf.capacity).toBe(capacity);
-    expect(buf.writeIndex).toBe(0);
-    expect(buf.children).toHaveLength(0);
+    expect(buf._capacity).toBe(capacity);
+    expect(buf._writeIndex).toBe(0);
+    expect(buf._children).toHaveLength(0);
   });
 
   it('integrates schema definition with buffer creation', () => {
@@ -74,8 +74,8 @@ describe('Buffer Integration', () => {
     expect(buffer.operation_values).toBeInstanceOf(Uint8Array); // enum
 
     // Verify module is set
-    expect(buffer.module).toBe(module);
-    expect(buffer.module.logSchema.fields).toBe(schema.fields);
+    expect(buffer._module).toBe(module);
+    expect(buffer._module.logSchema.fields).toBe(schema.fields);
   });
 
   it('handles optional fields in schema', () => {
@@ -136,12 +136,13 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    (writer.nextRow() as any).userId('user-12345').plainUserId('user-12345');
+    // Dynamic fluent API - schema methods are generated at runtime and can't be typed statically
+    (writer._nextRow() as any).userId('user-12345').plainUserId('user-12345');
 
     // Set required system columns
-    buffer.timestamps[0] = 1000n;
-    buffer.operations[0] = ENTRY_TYPE_SPAN_START;
-    buffer.writeIndex = 1;
+    buffer.timestamp[0] = 1000n;
+    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    buffer._writeIndex = 1;
 
     // Convert to Arrow table
     const table = convertToArrowTable(buffer);
@@ -176,15 +177,15 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    (writer.nextRow() as any)
+    (writer._nextRow() as any)
       .email('john@example.com')
       .sqlQuery("SELECT * FROM users WHERE id = 123 AND name = 'test'")
       .plainText('Plain unmasked text');
 
     // Set required system columns
-    buffer.timestamps[0] = 1000n;
-    buffer.operations[0] = ENTRY_TYPE_SPAN_START;
-    buffer.writeIndex = 1;
+    buffer.timestamp[0] = 1000n;
+    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    buffer._writeIndex = 1;
 
     // Convert to Arrow table
     const table = convertToArrowTable(buffer);
@@ -222,12 +223,12 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    (writer.nextRow() as any).secretKey('sk_live_abcd1234efgh5678');
+    (writer._nextRow() as any).secretKey('sk_live_abcd1234efgh5678');
 
     // Set required system columns
-    buffer.timestamps[0] = 1000n;
-    buffer.operations[0] = ENTRY_TYPE_SPAN_START;
-    buffer.writeIndex = 1;
+    buffer.timestamp[0] = 1000n;
+    buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+    buffer._writeIndex = 1;
 
     // Convert to Arrow table
     const table = convertToArrowTable(buffer);
@@ -285,16 +286,16 @@ describe('Buffer Integration', () => {
 
       // Use ColumnWriter API to write data (more robust than direct array access)
       const writer = createColumnWriter(schema, buffer);
-      (writer.nextRow() as any)
+      (writer._nextRow() as any)
         .userId('user-123')
         .operation(1) // Use numeric value for POST (index 1 in ['GET', 'POST'])
         .httpStatus(200)
         .error('john@example.com');
 
       // Set system columns
-      buffer.timestamps[0] = 1000n;
-      buffer.operations[0] = ENTRY_TYPE_INFO;
-      buffer.writeIndex = 1;
+      buffer.timestamp[0] = 1000n;
+      buffer.entry_type[0] = ENTRY_TYPE_INFO;
+      buffer._writeIndex = 1;
 
       // Convert to Arrow using arrow-builder
       const table = convertToArrowTable(buffer as any);
@@ -321,16 +322,16 @@ describe('Buffer Integration', () => {
       const buffer = createSpanBuffer(schema, module, 'context-integration');
 
       // Verify buffer properly references module context
-      expect(buffer.module).toBe(module);
-      expect(buffer.module.logSchema).toBe(module.logSchema);
-      expect(buffer.spanName).toBe('context-integration');
+      expect(buffer._module).toBe(module);
+      expect(buffer._module.logSchema).toBe(module.logSchema);
+      expect(buffer._spanName).toBe('context-integration');
 
       // Verify system metadata columns are accessible
-      expect(buffer.spanId).toBeGreaterThan(0);
-      expect(typeof buffer.hasParent).toBe('boolean');
-      expect(buffer.children).toBeInstanceOf(Array);
-      expect(buffer.writeIndex).toBe(0);
-      expect(buffer.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(buffer.span_id).toBeGreaterThan(0);
+      expect(typeof buffer._hasParent).toBe('boolean');
+      expect(buffer._children).toBeInstanceOf(Array);
+      expect(buffer._writeIndex).toBe(0);
+      expect(buffer._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });
   });
 });

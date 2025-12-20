@@ -41,17 +41,17 @@ This occurs with:
 - **Distributed services**: Same trace spanning multiple machines
 - **Serverless**: Multiple Lambda invocations for the same request
 
-### Solution: Separate Columns (threadId + spanId)
+### Solution: Separate Columns (thread_id + span_id)
 
 The span ID is split into two components with different lifecycles:
 
 ```typescript
 // Generated ONCE per worker/process at startup (cold path)
-const threadId: bigint = generateRandom64Bit();
+const thread_id: bigint = generateRandom64Bit();
 
 interface SpanBuffer {
-  threadId: bigint; // Reference to worker's 64-bit random ID
-  spanId: number; // 32-bit incrementing counter (i++ per span)
+  thread_id: bigint; // Reference to worker's 64-bit random ID
+  span_id: number; // 32-bit incrementing counter (i++ per span)
   parent?: SpanBuffer; // Tree link to derive parent IDs
 }
 ```
@@ -82,15 +82,15 @@ To find a parent span, you need:
 
 **Hot Path Performance**:
 
-- `spanId = nextSpanId++` is a simple increment (no BigInt, no crypto)
+- `span_id = nextSpanId++` is a simple increment (no BigInt, no crypto)
 - No random generation per span
 - No 64-bit arithmetic in the hot path
 
 **Cold Path Efficiency**:
 
-- `threadId` generated once at worker startup using `crypto.getRandomValues()`
+- `thread_id` generated once at worker startup using `crypto.getRandomValues()`
 - BigInt conversion happens once, not per span
-- Arrow conversion references the same `threadId` for all spans in a buffer
+- Arrow conversion references the same `thread_id` for all spans in a buffer
 
 **Collision Resistance**:
 
@@ -148,10 +148,10 @@ Worker B (thread_id: 0xCCC): span_id 1, 2...              (all traces combined)
 // NOT per-class, NOT per-trace - one counter per worker that increments across all traces
 let nextSpanId = 1;
 
-// threadId comes from threadId.ts module-level singleton (not a parameter)
+// thread_id comes from thread_id.ts module-level singleton (not a parameter)
 // Module and spanName are passed directly (flattened from TaskContext)
 
-function createSpanBuffer(schema, module, spanName, traceId, capacity): SpanBuffer {
+function createSpanBuffer(schema, module, spanName, trace_id, capacity): SpanBuffer {
   const SpanBufferClass = getSpanBufferClass(schema); // Cached per schema
   return new SpanBufferClass(
     capacity,
@@ -159,7 +159,7 @@ function createSpanBuffer(schema, module, spanName, traceId, capacity): SpanBuff
     spanName, // Span name
     undefined, // parent
     false, // isChained
-    traceId,
+    trace_id,
     undefined // callsiteModule
   );
 }
@@ -171,16 +171,16 @@ During cold path conversion to Arrow, span IDs become separate columns:
 
 ```typescript
 // Arrow columns (separate, not a Struct)
-thread_id: Uint64; // buffer.threadId (BigInt → Uint64)
-span_id: Uint32; // buffer.spanId (number → Uint32)
-parent_thread_id: Uint64; // buffer.parent?.threadId (nullable)
-parent_span_id: Uint32; // buffer.parent?.spanId (nullable)
+thread_id: Uint64; // buffer.thread_id (BigInt → Uint64)
+span_id: Uint32; // buffer.span_id (number → Uint32)
+parent_thread_id: Uint64; // buffer.parent?.thread_id (nullable)
+parent_span_id: Uint32; // buffer.parent?.span_id (nullable)
 ```
 
 **Conversion efficiency**:
 
-- `threadId` BigInt conversion happens once per buffer (not per row)
-- `spanId` uses Uint32Array directly (no conversion needed)
+- `thread_id` BigInt conversion happens once per buffer (not per row)
+- `span_id` uses Uint32Array directly (no conversion needed)
 - Parent IDs derived from tree structure (no separate storage)
 
 ### Cross-Thread Parent References
@@ -190,15 +190,15 @@ Child spans on different threads can reference parent spans on other threads:
 ```typescript
 // Parent span on Thread A
 const parentBuffer = {
-  threadId: 0x1a2b3c4d5e6f7890n, // Thread A's ID
-  spanId: 42,
+  thread_id: 0x1a2b3c4d5e6f7890n, // Thread A's ID
+  span_id: 42,
   // ...
 };
 
 // Child span on Thread B (via pmap or worker)
 const childBuffer = {
-  threadId: 0x9876543210fedcban, // Thread B's ID (different!)
-  spanId: 1,
+  thread_id: 0x9876543210fedcban, // Thread B's ID (different!)
+  span_id: 1,
   parent: parentBuffer, // References parent on Thread A
   // ...
 };
@@ -243,7 +243,7 @@ WHERE parent_thread_id IS NULL AND parent_span_id IS NULL;
 
 | Aspect           | Design Choice                        | Benefit                                  |
 | ---------------- | ------------------------------------ | ---------------------------------------- |
-| **Hot path**     | `spanId++`                           | Zero crypto/BigInt overhead per span     |
+| **Hot path**     | `span_id++`                          | Zero crypto/BigInt overhead per span     |
 | **Cold path**    | BigInt conversion once per buffer    | Minimal conversion overhead              |
 | **Collisions**   | 64-bit random thread ID              | Negligible collision probability         |
 | **Parent refs**  | Tree structure with SpanBuffer links | Cross-thread parents naturally supported |
@@ -343,19 +343,19 @@ function generateTraceId(): TraceId {
 
 ```typescript
 // At request boundary - generate or accept trace ID
-const traceId = request.headers['x-trace-id'] ? createTraceId(request.headers['x-trace-id']) : generateTraceId();
+const trace_id = request.headers['x-trace-id'] ? createTraceId(request.headers['x-trace-id']) : generateTraceId();
 
-// Pass to root span, children walk parent chain
+// Pass to root span, _children walk parent chain
 // Op's internal wrapper creates the buffer
 // lineNumber is written directly to lineNumber_values[0] inside _invoke(), NOT passed to createSpanBuffer
-const rootSpan = createSpanBuffer(schema, module, spanName, traceId);
+const rootSpan = createSpanBuffer(schema, module, spanName, trace_id);
 rootSpan.lineNumber_values[0] = lineNumber; // Direct TypedArray write
 
 const childSpan = createChildSpanBuffer(rootSpan, childModule, childSpanName);
 childSpan.lineNumber_values[0] = childLineNumber; // Direct TypedArray write
 
 // All spans in trace share the SAME string reference
-console.log(rootSpan.traceId === childSpan.traceId); // true (same reference)
+console.log(rootSpan.trace_id === childSpan.trace_id); // true (same reference)
 ```
 
 ### SpanBuffer Integration
@@ -363,12 +363,12 @@ console.log(rootSpan.traceId === childSpan.traceId); // true (same reference)
 ```typescript
 interface SpanBuffer {
   // TraceId is a shared string reference (zero-copy across spans)
-  traceId: TraceId;
+  trace_id: TraceId;
 
   // SpanIdentity is per-span (25-byte ArrayBuffer)
-  spanId: SpanIdentity;
+  span_id: SpanIdentity;
 
-  // Comparison methods check BOTH traceId AND spanId
+  // Comparison methods check BOTH trace_id AND span_id
   isParentOf(other: SpanBuffer): boolean;
   isChildOf(other: SpanBuffer): boolean;
 }
@@ -376,9 +376,9 @@ interface SpanBuffer {
 // Implementation
 function isParentOf(this: SpanBuffer, other: SpanBuffer): boolean {
   // Fast string reference comparison first
-  if (this.traceId !== other.traceId) return false;
+  if (this.trace_id !== other.trace_id) return false;
   // Then SpanIdentity comparison
-  return this.spanId.isParentOf(other.spanId);
+  return this.span_id.isParentOf(other.span_id);
 }
 ```
 

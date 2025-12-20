@@ -111,7 +111,7 @@ describe('Schema Integration Patterns', () => {
       expect(ctx.requestId).toBe('req-123');
       expect(ctx.userId).toBe('user-456');
       // TraceId is W3C format (32 hex chars) via generateTraceId from traceId.ts
-      expect(ctx.traceId).toMatch(/^[a-f0-9]{32}$/);
+      expect(ctx.trace_id).toMatch(/^[a-f0-9]{32}$/);
       expect(ctx.env).toBe(environmentConfig);
     });
 
@@ -162,7 +162,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       expect(ctx.ff).toBeDefined();
-      expect(ctx.traceId).toMatch(/^[a-f0-9]{32}$/);
+      expect(ctx.trace_id).toMatch(/^[a-f0-9]{32}$/);
     });
 
     it('should access sync feature flags as properties', async () => {

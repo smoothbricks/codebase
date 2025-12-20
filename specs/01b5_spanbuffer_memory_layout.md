@@ -13,8 +13,8 @@ minimal allocations, and zero conditional logic for system column access.
 
 ### Design Principles
 
-1. **Single `_system` ArrayBuffer** per buffer containing timestamps, operations, and identity (for non-chained)
-2. **System columns FIRST** - timestamps and operations at fixed offsets 0 and `capacity * 8`
+1. **Single `_system` ArrayBuffer** per buffer containing timestamp, entry_type, and identity (for non-chained)
+2. **System columns FIRST** - timestamp and entry_type at fixed offsets 0 and `capacity * 8`
 3. **Identity AFTER system columns** - variable size depending on buffer type (root vs child vs chained)
 4. **Parent pointer for ancestry** - no copied parent identity bytes, just walk the `parent` reference
 5. **Chained buffers share identity** - overflow buffers point to the same `_identity` view as their root
@@ -27,26 +27,26 @@ minimal allocations, and zero conditional logic for system column access.
 │                                                                                 │
 │ _system: ArrayBuffer                                                            │
 │ ┌────────────────────────┬──────────────────┬────────────────────────────────┐  │
-│ │ timestamps             │ operations       │ identity                       │  │
-│ │ BigInt64Array          │ Uint8Array       │ [threadId][spanId][len][trace] │  │
-│ │ 8 * capacity bytes     │ 1 * capacity     │ 8 + 4 + 1 + traceId.length     │  │
+│ │ timestamp              │ entry_type       │ identity                       │  │
+│ │ BigInt64Array          │ Uint8Array       │ [thread_id][span_id][len][trace] │  │
+│ │ 8 * capacity bytes     │ 1 * capacity     │ 8 + 4 + 1 + trace_id.length     │  │
 │ └────────────────────────┴──────────────────┴────────────────────────────────┘  │
 │  offset: 0                capacity * 8       capacity * 9                       │
 │                                                                                 │
 │ Views:                                                                          │
-│   timestamps ──► BigInt64Array(this._system, 0, capacity)                       │
-│   operations ──► Uint8Array(this._system, capacity * 8, capacity)               │
-│   _identity  ──► Uint8Array(this._system, capacity * 9, 13 + traceId.length)    │
+│   timestamp ──► BigInt64Array(this._system, 0, capacity)                        │
+│   entry_type ──► Uint8Array(this._system, capacity * 8, capacity)               │
+│   _identity  ──► Uint8Array(this._system, capacity * 9, 13 + trace_id.length)    │
 │                                                                                 │
-│ Identity layout (13 + traceId.length bytes):                                    │
-│   [0-7]   threadId    (8 bytes, crypto-secure random, same for all spans)       │
-│   [8-11]  spanId      (4 bytes, Uint32, incrementing counter)                   │
-│   [12]    traceIdLen  (1 byte, length of traceId string)                        │
-│   [13+]   traceId     (1-128 bytes, ASCII string)                               │
+│ Identity layout (13 + trace_id.length bytes):                                    │
+│   [0-7]   thread_id    (8 bytes, crypto-secure random, same for all spans)       │
+│   [8-11]  span_id      (4 bytes, Uint32, incrementing counter)                   │
+│   [12]    trace_idLen  (1 byte, length of trace_id string)                        │
+│   [13+]   trace_id     (1-128 bytes, ASCII string)                               │
 │                                                                                 │
 │ Properties:                                                                     │
 │   parent: undefined (root has no parent)                                        │
-│   children: SpanBuffer[]                                                        │
+│   _children: SpanBuffer[]                                                        │
 │   callsiteModule: ModuleContext (caller's module for row 0 metadata)            │
 │   module: ModuleContext (Op's module for rows 1+ metadata)                      │
 │   spanName: string (per-span data)                                              │
@@ -58,24 +58,24 @@ minimal allocations, and zero conditional logic for system column access.
 │                                                                                 │
 │ _system: ArrayBuffer                                                            │
 │ ┌────────────────────────┬──────────────────┬─────────────────┐                 │
-│ │ timestamps             │ operations       │ identity        │                 │
-│ │ BigInt64Array          │ Uint8Array       │ [threadId][span]│                 │
+│ │ timestamp              │ entry_type       │ identity        │                 │
+│ │ BigInt64Array          │ Uint8Array       │ [thread_id][span]│                 │
 │ │ 8 * capacity bytes     │ 1 * capacity     │ 8 + 4 = 12 bytes│                 │
 │ └────────────────────────┴──────────────────┴─────────────────┘                 │
 │  offset: 0                capacity * 8       capacity * 9                       │
 │                                                                                 │
 │ Views:                                                                          │
-│   timestamps ──► BigInt64Array(this._system, 0, capacity)                       │
-│   operations ──► Uint8Array(this._system, capacity * 8, capacity)               │
+│   timestamp ──► BigInt64Array(this._system, 0, capacity)                        │
+│   entry_type ──► Uint8Array(this._system, capacity * 8, capacity)               │
 │   _identity  ──► Uint8Array(this._system, capacity * 9, 12)                     │
 │                                                                                 │
 │ Identity layout (12 bytes):                                                     │
-│   [0-7]   threadId    (8 bytes, same as process threadId)                       │
-│   [8-11]  spanId      (4 bytes, Uint32, incrementing counter)                   │
+│   [0-7]   thread_id    (8 bytes, same as process thread_id)                       │
+│   [8-11]  span_id      (4 bytes, Uint32, incrementing counter)                   │
 │                                                                                 │
 │ Properties:                                                                     │
-│   parent ──────────────► (parent SpanBuffer - for traceId + parentSpanId)       │
-│   children: SpanBuffer[]                                                        │
+│   parent ──────────────► (parent SpanBuffer - for trace_id + parentSpanId)       │
+│   _children: SpanBuffer[]                                                        │
 │   callsiteModule: ModuleContext (caller's module for row 0 metadata)            │
 │   module: ModuleContext (Op's module for rows 1+ metadata)                      │
 │   spanName: string (per-span data)                                              │
@@ -87,20 +87,20 @@ minimal allocations, and zero conditional logic for system column access.
 │                                                                                 │
 │ _system: ArrayBuffer (NO identity - smallest allocation!)                       │
 │ ┌────────────────────────┬──────────────────┐                                   │
-│ │ timestamps             │ operations       │                                   │
+│ │ timestamp              │ entry_type       │                                   │
 │ │ BigInt64Array          │ Uint8Array       │                                   │
 │ │ 8 * capacity bytes     │ 1 * capacity     │                                   │
 │ └────────────────────────┴──────────────────┘                                   │
 │  offset: 0                capacity * 8                                          │
 │                                                                                 │
 │ Views:                                                                          │
-│   timestamps ──► BigInt64Array(this._system, 0, capacity)                       │
-│   operations ──► Uint8Array(this._system, capacity * 8, capacity)               │
+│   timestamp ──► BigInt64Array(this._system, 0, capacity)                        │
+│   entry_type ──► Uint8Array(this._system, capacity * 8, capacity)               │
 │   _identity  ──────────────► (first buffer's _identity - shared reference!)     │
 │                                                                                 │
 │ Properties:                                                                     │
 │   parent ──────────────► (same as first buffer's parent)                        │
-│   children: [] (only root buffer tracks children)                               │
+│   _children: [] (only root buffer tracks _children)                               │
 │   callsiteModule: ModuleContext (shared from first buffer)                      │
 │   module: ModuleContext (Op's module, shared reference)                         │
 │   spanName: string (per-span data)                                              │
@@ -110,11 +110,11 @@ minimal allocations, and zero conditional logic for system column access.
 
 ### Memory Savings
 
-| Buffer Type | Separate Allocations (alternative)                  | Unified \_system (chosen)              |
-| ----------- | --------------------------------------------------- | -------------------------------------- |
-| Root        | 25 bytes identity + timestamps AB + ops AB          | Single AB: capacity\*9 + 13 + traceLen |
-| Child       | 25 bytes identity + timestamps AB + ops AB          | Single AB: capacity\*9 + 12            |
-| Chained     | 25 bytes identity (copied) + timestamps AB + ops AB | Single AB: capacity\*9 (no identity!)  |
+| Buffer Type | Separate Allocations (alternative)                        | Unified \_system (chosen)              |
+| ----------- | --------------------------------------------------------- | -------------------------------------- |
+| Root        | 25 bytes identity + timestamp AB + entry_type AB          | Single AB: capacity\*9 + 13 + traceLen |
+| Child       | 25 bytes identity + timestamp AB + entry_type AB          | Single AB: capacity\*9 + 12            |
+| Chained     | 25 bytes identity (copied) + timestamp AB + entry_type AB | Single AB: capacity\*9 (no identity!)  |
 
 **Key savings from unified approach:**
 
@@ -124,16 +124,16 @@ minimal allocations, and zero conditional logic for system column access.
 
 ### Why System Columns BEFORE Identity
 
-Placing timestamps and operations at the START of the buffer means:
+Placing timestamp and entry_type at the START of the buffer means:
 
-1. **Fixed offsets for ALL buffer types** - timestamps always at 0, ops always at `capacity * 8`
+1. **Fixed offsets for ALL buffer types** - timestamp always at 0, entry_type always at `capacity * 8`
 2. **Zero conditional logic** - same view creation code for root, child, and chained
 3. **Chained is just truncated** - same layout prefix, just shorter (no identity suffix)
 
 ```typescript
 // SAME code for root, child, AND chained:
-this.timestamps = new BigInt64Array(this._system, 0, capacity);
-this.operations = new Uint8Array(this._system, capacity * 8, capacity);
+this.timestamp = new BigInt64Array(this._system, 0, capacity);
+this.entry_type = new Uint8Array(this._system, capacity * 8, capacity);
 
 // Only non-chained buffers have identity after system columns:
 if (!isChained) {
@@ -152,12 +152,12 @@ get hasParent(): boolean {
 }
 
 get parentSpanId(): number {
-  return this.parent?.spanId ?? 0;
+  return this.parent?.span_id ?? 0;
 }
 
-get traceId(): string {
+get trace_id(): string {
   if (this.parent) {
-    return this.parent.traceId;  // Walk up to root
+    return this.parent.trace_id;  // Walk up to root
   }
   // Root: decode from _identity
   const len = this._identity[12];
@@ -178,19 +178,19 @@ isChildOf(other: SpanBuffer): boolean {
 
 - `isParentOf` is now O(1) pointer comparison instead of 12-byte loop
 - No 12 bytes copied per child span
-- `traceId` walks to root (spans rarely deep, typically 3-5 levels)
+- `trace_id` walks to root (spans rarely deep, typically 3-5 levels)
 
-### spanId at Fixed Offset
+### span_id at Fixed Offset
 
-The `spanId` getter works identically for root and child because threadId and spanId are at the same offsets:
+The `span_id` getter works identically for root and child because thread_id and span_id are at the same offsets:
 
 ```typescript
 // Identity layout for both root and child:
-//   [0-7]   threadId (8 bytes)
-//   [8-11]  spanId (4 bytes)
-//   ... (root has traceIdLen + traceId after, child stops here)
+//   [0-7]   thread_id (8 bytes)
+//   [8-11]  span_id (4 bytes)
+//   ... (root has trace_idLen + trace_id after, child stops here)
 
-get spanId(): number {
+get span_id(): number {
   const b = this._identity;
   return b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
 }
@@ -198,23 +198,23 @@ get spanId(): number {
 
 ### Thread ID Generation
 
-Thread ID is cached as raw bytes at module level (threadId.ts) for zero-copy writes:
+Thread ID is cached as raw bytes at module level (thread_id.ts) for zero-copy writes:
 
 ````typescript
-// Module-level singleton (threadId.ts)
+// Module-level singleton (thread_id.ts)
 // Generated once per process/worker, cached as Uint8Array for zero-copy writes
-let threadIdBytes: Uint8Array | null = null;
+let thread_idBytes: Uint8Array | null = null;
 
 function ensureInitialized(): void {
-  if (threadIdBytes !== null) return;
-  threadIdBytes = new Uint8Array(8);
-  crypto.getRandomValues(threadIdBytes); // Crypto-secure, generated once
+  if (thread_idBytes !== null) return;
+  thread_idBytes = new Uint8Array(8);
+  crypto.getRandomValues(thread_idBytes); // Crypto-secure, generated once
 }
 
 // Hot-path API: copy cached bytes directly (zero-copy)
 function copyThreadIdTo(dest: Uint8Array, offset: number): void {
   ensureInitialized();
-  dest.set(threadIdBytes!, offset); // Direct copy of cached bytes
+  dest.set(thread_idBytes!, offset); // Direct copy of cached bytes
 }
 
 ### Constructor Implementation
@@ -223,12 +223,12 @@ function copyThreadIdTo(dest: Uint8Array, offset: number): void {
 class SpanBuffer {
   readonly _system: ArrayBuffer;
   readonly _identity: Uint8Array;
-  readonly timestamps: BigInt64Array;
-  readonly operations: Uint8Array;
+  readonly timestamp: BigInt64Array;
+  readonly entry_type: Uint8Array;
 
   parent?: SpanBuffer;
-  children: SpanBuffer[];
-  next?: SpanBuffer;
+  _children: SpanBuffer[];
+  _next?: SpanBuffer;
 
   // Per-span invocation data
   // NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property on SpanBuffer
@@ -236,8 +236,8 @@ class SpanBuffer {
   module: ModuleContext; // Op's module (for rows 1+ gitSha/packageName/packagePath)
   spanName: string;
 
-  writeIndex: number;
-  capacity: number;
+  _writeIndex: number;
+  _capacity: number;
 
   constructor(
     requestedCapacity: number,
@@ -245,18 +245,18 @@ class SpanBuffer {
     spanName: string, // Span name
     parent?: SpanBuffer,
     isChained = false,
-    traceId?: string, // Only for root spans
+    trace_id?: string, // Only for root spans
     callsiteModule?: ModuleContext // Caller's module for row 0 metadata
   ) {
     // Store module and spanName (flattened from TaskContext)
     this.module = module;
     this.spanName = spanName;
-    this.children = [];
-    this.next = undefined;
+    this._children = [];
+    this._next = undefined;
     this.callsiteModule = callsiteModule;
 
     // Calculate system buffer size
-    const systemSize = requestedCapacity * 9; // timestamps (8*cap) + operations (1*cap)
+    const systemSize = requestedCapacity * 9; // timestamp (8*cap) + entry_type (1*cap)
 
     if (isChained && parent) {
       // CHAINED: share identity, only allocate system columns
@@ -264,31 +264,31 @@ class SpanBuffer {
       this._system = new ArrayBuffer(systemSize);
       this._identity = parent._identity; // Shared reference!
     } else if (parent) {
-      // CHILD: own 12-byte identity (threadId + spanId)
+      // CHILD: own 12-byte identity (thread_id + span_id)
       this.parent = parent;
       const identitySize = 12;
       this._system = new ArrayBuffer(systemSize + identitySize);
       this._identity = new Uint8Array(this._system, systemSize, identitySize);
 
-      // Set threadId via threadId.ts module-level singleton (cached bytes)
+      // Set thread_id via thread_id.ts module-level singleton (cached bytes)
       copyThreadIdTo(this._identity, 0);
 
-      // Set spanId (bytes 8-11, little-endian) - accesses module-level nextSpanId via closure
+      // Set span_id (bytes 8-11, little-endian) - accesses module-level nextSpanId via closure
       sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
     } else {
-      // ROOT: identity with traceId
-      const traceBytes = traceId ? sbHelpers.textEncoder.encode(traceId) : new Uint8Array(0);
+      // ROOT: identity with trace_id
+      const traceBytes = trace_id ? sbHelpers.textEncoder.encode(trace_id) : new Uint8Array(0);
       const identitySize = 13 + traceBytes.length;
       this._system = new ArrayBuffer(systemSize + identitySize);
       this._identity = new Uint8Array(this._system, systemSize, identitySize);
 
-      // Set threadId via threadId.ts module-level singleton (cached bytes)
+      // Set thread_id via thread_id.ts module-level singleton (cached bytes)
       copyThreadIdTo(this._identity, 0);
 
-      // Set spanId
+      // Set span_id
       sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
 
-      // Set traceId length and bytes
+      // Set trace_id length and bytes
       this._identity[12] = traceBytes.length;
       this._identity.set(traceBytes, 13);
     }
@@ -298,8 +298,8 @@ class SpanBuffer {
     this._operations = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
 
     // Direct property aliases for system columns (V8 hidden class friendly)
-    this.timestamps = this._timestamps;
-    this.operations = this._operations;
+    this.timestamp = this._timestamps;
+    this.entry_type = this._operations;
 
     this._writeIndex = 0;
 
@@ -312,8 +312,8 @@ class SpanBuffer {
 ### Getters (Cold Path - Lazy DataView)
 
 ```typescript
-// spanId at fixed offset 8-11 for both root and child
-get spanId(): number {
+// span_id at fixed offset 8-11 for both root and child
+get span_id(): number {
   const b = this._identity;
   return b[8] | (b[9] << 8) | (b[10] << 16) | (b[11] << 24);
 }
@@ -323,19 +323,19 @@ get hasParent(): boolean {
 }
 
 get parentSpanId(): number {
-  return this.parent?.spanId ?? 0;
+  return this.parent?.span_id ?? 0;
 }
 
-get traceId(): string {
+get trace_id(): string {
   if (this.parent) {
-    return this.parent.traceId;  // Walk up
+    return this.parent.trace_id;  // Walk up
   }
   // Root: decode from identity
   const len = this._identity[12];
   return String.fromCharCode(...this._identity.subarray(13, 13 + len));
 }
 
-// Copy threadId bytes for Arrow conversion
+// Copy thread_id bytes for Arrow conversion
 copyThreadIdTo(dest: Uint8Array, offset: number): void {
   dest.set(this._identity.subarray(0, 8), offset);
 }
@@ -369,19 +369,19 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 
 **Construction (root span):**
 
-- 1 ArrayBuffer allocation (systemSize + 13 + traceId.length)
+- 1 ArrayBuffer allocation (systemSize + 13 + trace_id.length)
 - 3 TypedArray view creations (timestamps, operations, \_identity)
-- 1 Uint8Array.set() for threadId (8 bytes)
-- 4 byte writes for spanId
-- 1 byte write for traceId length
-- 1 Uint8Array.set() for traceId bytes
+- 1 Uint8Array.set() for thread_id (8 bytes)
+- 4 byte writes for span_id
+- 1 byte write for trace_id length
+- 1 Uint8Array.set() for trace_id bytes
 
 **Construction (child span):**
 
 - 1 ArrayBuffer allocation (systemSize + 12)
 - 3 TypedArray view creations
-- 1 Uint8Array.set() for threadId (8 bytes)
-- 4 byte writes for spanId
+- 1 Uint8Array.set() for thread_id (8 bytes)
+- 4 byte writes for span_id
 - 1 pointer assignment to parent
 
 **Construction (chained overflow):**
@@ -397,7 +397,7 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 - `isChildOf`: O(1) pointer comparison
 - No byte loops, no DataView creation
 
-**traceId access:**
+**trace_id access:**
 
 - Root: O(1) decode from \_identity
 - Child depth N: O(N) pointer walks (typically N=3-5)
@@ -416,8 +416,8 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 // PACKAGE: lmao - SpanBuffer extends arrow-builder's TypedColumnBuffer
 interface SpanBuffer {
   // Core columns - always present (allocated immediately in constructor)
-  timestamps: BigInt64Array; // Every operation appends timestamp (nanoseconds)
-  operations: Uint8Array; // Operation type: tag, ok, err, etc.
+  timestamp: BigInt64Array; // Every operation appends timestamp (nanoseconds)
+  entry_type: Uint8Array; // Operation type: tag, ok, err, etc.
   lineNumber_values: Int32Array; // Line numbers for each entry
   lineNumber_nulls: Uint8Array; // Null bitmap for line numbers
 
@@ -440,7 +440,7 @@ interface SpanBuffer {
   // ... same pattern for all schema attributes
 
   // Tree structure
-  children: SpanBuffer[];
+  _children: SpanBuffer[];
   parent?: SpanBuffer; // Reference to parent SpanBuffer
 
   // Dual module references for accurate source attribution
@@ -449,14 +449,14 @@ interface SpanBuffer {
   spanName: string; // Span name for this invocation
 
   // Buffer management
-  writeIndex: number; // Current write position (0 to capacity-1)
-  capacity: number; // Logical capacity for bounds checking
-  next?: SpanBuffer; // Chain to next buffer when overflow
+  _writeIndex: number; // Current write position (0 to capacity-1)
+  _capacity: number; // Logical capacity for bounds checking
+  _next?: SpanBuffer; // Chain to next buffer when overflow
 
   // Span Identification (see Span Identity section above)
-  threadId: bigint; // 64-bit random ID per worker
-  spanId: number; // 32-bit thread-local counter
-  traceId: string; // Root trace ID (constant per span)
+  thread_id: bigint; // 64-bit random ID per worker
+  span_id: number; // 32-bit thread-local counter
+  trace_id: string; // Root trace ID (constant per span)
 
   // Helpers (don't trigger allocation)
   getColumnIfAllocated(columnName: string): TypedArray | undefined;

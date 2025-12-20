@@ -76,26 +76,26 @@ function initializeSpanBuffer(buffer: SpanBuffer, spanName: string): void {
   const now = getTimestamp();
 
   // Row 0: span-start (always present)
-  buffer.timestamps[0] = now;
-  buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+  buffer.timestamp[0] = now;
+  buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
   // Row 1: pre-initialized as span-exception (exception safety)
-  buffer.timestamps[1] = now; // Updated by ok()/err()
-  buffer.operations[1] = ENTRY_TYPE_SPAN_EXCEPTION; // Overwritten on completion
+  buffer.timestamp[1] = now; // Updated by ok()/err()
+  buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION; // Overwritten on completion
 
   // Ready for events at row 2
-  buffer.writeIndex = 2;
+  buffer._writeIndex = 2;
 }
 
 function completeSpanOk(buffer: SpanBuffer, result?: any): void {
-  buffer.timestamps[1] = getTimestamp();
-  buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+  buffer.timestamp[1] = getTimestamp();
+  buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
   // Result data written to row 1's attribute columns
 }
 
 function completeSpanErr(buffer: SpanBuffer, error: string): void {
-  buffer.timestamps[1] = getTimestamp();
-  buffer.operations[1] = ENTRY_TYPE_SPAN_ERR;
+  buffer.timestamp[1] = getTimestamp();
+  buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
   // Error details written to row 1's attribute columns
 }
 ```
@@ -974,7 +974,7 @@ The fixed row layout guarantees that duration is always computable:
 // Duration = timestamps[1] - timestamps[0]
 // Works for ALL completion types: span-ok, span-err, AND span-exception
 function getSpanDuration(buffer: SpanBuffer): number {
-  return buffer.timestamps[1] - buffer.timestamps[0];
+  return buffer.timestamp[1] - buffer.timestamp[0];
 }
 ```
 

@@ -28,7 +28,7 @@ SpanBuffers, enabling per-op tuning.
 3. **Memory Safety** - Never causes OOM
 4. **Optimal Throughput** - Balances memory vs performance
 5. **Environment Agnostic** - Same code everywhere
-6. **Per-Span Buffers** - Each span gets its own buffer (created by op wrapper), avoiding traceId/spanId TypedArrays
+6. **Per-Span Buffers** - Each span gets its own buffer (created by op wrapper), avoiding trace_id/span_id TypedArrays
 7. **Buffer Chaining** - Graceful overflow handling while learning optimal capacity
 8. **Freelist Pooling** - Pooling buffers for V8 GC optimization (future experiment, not yet implemented)
 9. **Lazy-to-Eager Column Promotion** - Frequently-used columns automatically pre-allocate (see
@@ -161,9 +161,9 @@ class PredictiveBuffer {
     // If write rate is increasing
     if (recentRate > olderRate * 1.2) {
       const projectedWrites = recentRate * 10; // Next 10 seconds
-      const neededCapacity = this.writeIndex + projectedWrites;
+      const neededCapacity = this._writeIndex + projectedWrites;
 
-      if (neededCapacity > this.capacity * 0.8) {
+      if (neededCapacity > this._capacity * 0.8) {
         this.grow(neededCapacity);
       }
     }
@@ -189,11 +189,11 @@ class CompactingBuffer {
     // Don't compact too frequently
     if (timeSinceCompaction < 60000) return; // 1 minute minimum
 
-    const utilization = this.writeIndex / this.capacity;
+    const utilization = this._writeIndex / this._capacity;
     const shouldCompact =
       utilization < 0.25 && // Less than 25% used
-      this.capacity > this.initialCapacity * 4 && // Grown significantly
-      this.highWaterMark < this.capacity * 0.5; // Never used >50%
+      this._capacity > this.initialCapacity * 4 && // Grown significantly
+      this.highWaterMark < this._capacity * 0.5; // Never used >50%
 
     if (shouldCompact) {
       this.performCompaction();
@@ -207,25 +207,25 @@ class CompactingBuffer {
     const newCapacity = Math.max(
       this.initialCapacity,
       this.highWaterMark * 1.5, // 50% headroom
-      alignToCache(this.writeIndex * 2)
+      alignToCache(this._writeIndex * 2)
     );
 
     // Create new arrays
     const newArrays = this.createArrays(newCapacity);
 
     // Copy active data
-    for (let i = 0; i < this.writeIndex; i++) {
-      newArrays.timestamps[i] = this.timestamps[i];
-      newArrays.operations[i] = this.operations[i];
+    for (let i = 0; i < this._writeIndex; i++) {
+      newArrays.timestamp[i] = this.timestamp[i];
+      newArrays.entry_type[i] = this.entry_type[i];
       // ... copy other columns
     }
 
     // Swap arrays
     Object.assign(this, newArrays);
-    this.capacity = newCapacity;
+    this._capacity = newCapacity;
 
     // Reset high water mark
-    this.highWaterMark = this.writeIndex;
+    this.highWaterMark = this._writeIndex;
   }
 }
 ```
@@ -389,7 +389,7 @@ class FlushScheduler {
     const now = Date.now();
 
     // Size-based flush
-    if (this.writeIndex > this.capacity * this.config.capacityThreshold) {
+    if (this._writeIndex > this._capacity * this.config.capacityThreshold) {
       reasons.push('capacity');
     }
 
@@ -404,7 +404,7 @@ class FlushScheduler {
     }
 
     // Idle flush (no writes for a while)
-    if (this.writeIndex > 0 && now - this.lastWriteTime > this.config.idleTimeoutMs) {
+    if (this._writeIndex > 0 && now - this.lastWriteTime > this.config.idleTimeoutMs) {
       reasons.push('idle');
     }
 
@@ -625,7 +625,7 @@ class MonitoredBuffer extends SelfTuningBuffer {
 
   private updateEfficiencyMetrics() {
     // Memory efficiency
-    this.metrics.memoryEfficiency = this.writeIndex / this.capacity;
+    this.metrics.memoryEfficiency = this._writeIndex / this._capacity;
 
     // Growth efficiency (did we grow at the right time?)
     const recentGrowths = this.metrics.capacityHistory.filter((h) => h.reason === 'growth').slice(-10);
@@ -679,11 +679,11 @@ class SelfTuningSpanBuffer {
   }
 
   write(timestamp: number, operation: number, attrs: Record<string, number>) {
-    const idx = this.writeIndex++;
+    const idx = this._writeIndex++;
 
     // Hot path: just writes
-    this.timestamps[idx] = timestamp;
-    this.operations[idx] = operation;
+    this.timestamp[idx] = timestamp;
+    this.entry_type[idx] = operation;
 
     for (const [key, value] of Object.entries(attrs)) {
       const array = this.attributes.get(key);
@@ -694,7 +694,7 @@ class SelfTuningSpanBuffer {
     this.stats.lastWriteTime = Date.now();
 
     // Check if action needed
-    if (idx >= this.capacity - 1) {
+    if (idx >= this._capacity - 1) {
       this.grow();
     } else if (idx % 1000 === 0) {
       this.checkCompaction();
@@ -709,8 +709,8 @@ class SelfTuningSpanBuffer {
     const newOperations = new Uint8Array(newCapacity);
 
     // Copy data
-    newTimestamps.set(this.timestamps);
-    newOperations.set(this.operations);
+    newTimestamps.set(this.timestamp);
+    newOperations.set(this.entry_type);
 
     // Copy attribute arrays
     for (const [key, array] of this.attributes) {
@@ -720,9 +720,9 @@ class SelfTuningSpanBuffer {
     }
 
     // Swap
-    this.timestamps = newTimestamps;
-    this.operations = newOperations;
-    this.capacity = newCapacity;
+    this.timestamp = newTimestamps;
+    this.entry_type = newOperations;
+    this._capacity = newCapacity;
 
     this.stats.grows++;
   }
@@ -738,13 +738,15 @@ class SelfTuningSpanBuffer {
     // Growth factor based on history
     const growthFactor = this.stats.grows < 3 ? 2.0 : 1.5;
 
-    return Math.min(Math.max(this.capacity * growthFactor, this.writeIndex + predictedWrites), this.getMaxCapacity());
+    return Math.min(Math.max(this._capacity * growthFactor, this._writeIndex + predictedWrites), this.getMaxCapacity());
   }
 
   // Auto-flush when needed
   private checkAutoFlush() {
     const shouldFlush =
-      this.writeIndex > this.capacity * 0.8 || Date.now() - this.stats.lastFlushTime > 1000 || this.isMemoryPressure();
+      this._writeIndex > this._capacity * 0.8 ||
+      Date.now() - this.stats.lastFlushTime > 1000 ||
+      this.isMemoryPressure();
 
     if (shouldFlush) {
       this.flush();
@@ -755,7 +757,7 @@ class SelfTuningSpanBuffer {
     const batch = this.toArrow();
 
     // Reset for next batch
-    this.writeIndex = 0;
+    this._writeIndex = 0;
     this.stats.lastFlushTime = Date.now();
     this.stats.flushes++;
 
@@ -774,14 +776,14 @@ describe('Self-tuning buffer', () => {
   test('starts small, grows as needed', () => {
     const buffer = new SelfTuningSpanBuffer();
 
-    expect(buffer.capacity).toBeLessThan(1000);
+    expect(buffer._capacity).toBeLessThan(1000);
 
     // Write a lot
     for (let i = 0; i < 10000; i++) {
       buffer.write(Date.now(), 1, { userId: i });
     }
 
-    expect(buffer.capacity).toBeGreaterThan(10000);
+    expect(buffer._capacity).toBeGreaterThan(10000);
   });
 
   test('compacts when underutilized', async () => {
@@ -792,7 +794,7 @@ describe('Self-tuning buffer', () => {
       buffer.write(Date.now(), 1, { userId: i });
     }
 
-    const largeCapacity = buffer.capacity;
+    const largeCapacity = buffer._capacity;
 
     // Flush and write less
     buffer.flush();
@@ -804,7 +806,7 @@ describe('Self-tuning buffer', () => {
     // Wait for compaction
     await new Promise((resolve) => setTimeout(resolve, 61000));
 
-    expect(buffer.capacity).toBeLessThan(largeCapacity);
+    expect(buffer._capacity).toBeLessThan(largeCapacity);
   });
 
   test('adapts to workload pattern', () => {
@@ -1241,7 +1243,7 @@ Self-tuning buffers provide:
 
 **Important Note**: This self-tuning is specifically designed for trace logging, where we have clear metrics (spans per
 module, overflow rates, utilization patterns, column usage). The tuning mechanism is part of the trace logging system,
-not a general-purpose buffer library. Each span's own buffer eliminates the need for traceId/spanId TypedArrays since
+not a general-purpose buffer library. Each span's own buffer eliminates the need for trace_id/span_id TypedArrays since
 they're constant per buffer.
 
 The result: a logging system that "just works" whether you're on a Raspberry Pi or a 64-core server.

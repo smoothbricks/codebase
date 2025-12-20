@@ -306,7 +306,7 @@ class GeneratedEvaluator<FF extends FeatureFlagSchema, T extends LogSchema, Env>
 
     // Walk chain FORWARD via .next, scan each buffer BACKWARD from writeIndex
     while (buf) {
-      const limit = buf === log._buffer ? log._writeIndex : buf.writeIndex;
+      const limit = buf === log._buffer ? log._writeIndex : buf._writeIndex;
       // Scan BACKWARD within each buffer (finds recent accesses faster)
       for (let i = limit - 1; i >= 0; i--) {
         if (
@@ -316,7 +316,7 @@ class GeneratedEvaluator<FF extends FeatureFlagSchema, T extends LogSchema, Env>
           return true;
         }
       }
-      buf = buf.next; // Move to next buffer in chain
+      buf = buf._next; // Move to next buffer in chain
     }
     return false;
   }
@@ -450,7 +450,7 @@ const defaultFfEvaluator = new FeatureFlagEvaluator(
 function createBootstrapContext(): SpanContext {
   const buffer = createSpanBuffer(...);
   const ctx: SpanContext = {
-    traceId: generateTraceId(),
+    trace_id: generateTraceId(),
     requestId: 'bootstrap',
     // ...
     ff: defaultFfEvaluator.forContext(ctx), // Uses defaults - always works

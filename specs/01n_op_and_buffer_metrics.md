@@ -45,8 +45,8 @@ query patterns.
 **The math:**
 
 ```
-startTs = buffer.timestamps[0]  // Written by span-start
-endTs = buffer.timestamps[1]    // Written by span-ok or span-err
+startTs = buffer.timestamp[0]  // Written by span-start
+endTs = buffer.timestamp[1]    // Written by span-ok or span-err
 durationNs = endTs - startTs    // Pure subtraction, no syscall
 ```
 
@@ -209,13 +209,13 @@ async invoke(parentCtx, spanName, line, ...args) {
 
   // Buffer creation writes span-start timestamp to row 0
   const buffer = createSpanBuffer(...);
-  const startTs = buffer.timestamps[0];  // Already captured!
+  const startTs = buffer.timestamp[0];  // Already captured!
 
   try {
     const result = await this.fn(ctx, ...args);
 
     // span-ok writes end timestamp to row 1
-    const endTs = buffer.timestamps[1];  // Already captured!
+    const endTs = buffer.timestamp[1];  // Already captured!
     const durationNs = BigInt(endTs - startTs);
 
     this.totalDurationNs += durationNs;
@@ -227,7 +227,7 @@ async invoke(parentCtx, spanName, line, ...args) {
   } catch (e) {
     this.exceptionCount++;  // or errorCount for expected errors
 
-    const endTs = buffer.timestamps[1];
+    const endTs = buffer.timestamp[1];
     const durationNs = BigInt(endTs - startTs);
 
     this.totalDurationNs += durationNs;
@@ -240,8 +240,8 @@ async invoke(parentCtx, spanName, line, ...args) {
 }
 ```
 
-**Key insight:** No extra timing calls. We reuse `buffer.timestamps[0]` (written by `span-start`) and
-`buffer.timestamps[1]` (written by `span-ok/err`).
+**Key insight:** No extra timing calls. We reuse `buffer.timestamp[0]` (written by `span-start`) and
+`buffer.timestamp[1]` (written by `span-ok/err`).
 
 ## Metrics Flush
 

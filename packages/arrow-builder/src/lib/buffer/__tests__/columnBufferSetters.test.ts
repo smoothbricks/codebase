@@ -354,12 +354,12 @@ describe('ColumnBuffer comprehensive data type coverage', () => {
 
     // Medium enum (100 values) - should use Uint8Array
     const mediumEnumSchema = new ColumnSchema({
-      mediumStatus: S.enum(Array.from({ length: 100 }, (_, i) => `VAL_${i}`) as const),
+      mediumStatus: S.enum(Array.from({ length: 100 }, (_, i) => `VAL_${i}`)),
     });
 
     // Large enum (>256 values) - should use Uint16Array
     const largeEnumSchema = new ColumnSchema({
-      largeStatus: S.enum(Array.from({ length: 300 }, (_, i) => `BIG_${i}`) as const),
+      largeStatus: S.enum(Array.from({ length: 300 }, (_, i) => `BIG_${i}`)),
     });
 
     const smallBuffer = createGeneratedColumnBuffer(smallEnumSchema, 10);
@@ -424,11 +424,11 @@ describe('ColumnBuffer comprehensive data type coverage', () => {
 
     // Verify null bits are set after writing real values (1 = not null)
     expect(buffer.enumCol_nulls[0] & 1).toBe(1);
-    expect(buffer.categoryCol_nulls[0] & 0b10).toBe(0b10);
-    expect(buffer.textCol_nulls[0] & 0b100).toBe(0b100);
-    expect(buffer.numberCol_nulls[0] & 0b1000).toBe(0b1000);
-    expect(buffer.booleanCol_nulls[0] & 0b100000).toBe(0b100000);
-    expect(buffer.bigIntCol_nulls[0] & 0b1000000).toBe(0b1000000);
+    expect(buffer.categoryCol_nulls[0] & 1).toBe(1);
+    expect(buffer.textCol_nulls[0] & 1).toBe(1);
+    expect(buffer.numberCol_nulls[0] & 1).toBe(1);
+    expect(buffer.booleanCol_nulls[0] & 1).toBe(1);
+    expect(buffer.bigIntCol_nulls[0] & 1).toBe(1);
 
     // Write null/undefined to clear bits
     buffer.enumCol(0, null as unknown as number);

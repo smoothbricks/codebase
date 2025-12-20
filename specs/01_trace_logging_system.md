@@ -99,7 +99,7 @@ integration. It consists of these main components:
 - **Exception Safety**: Row 1 pre-initialized as `span-exception` ensures valid data even if exception is never caught.
 - **Buffer Overflow**: Graceful chaining via `createNextBuffer()` when capacity exceeded - see
   [Self-Tuning](./01b2_buffer_self_tuning.md) for capacity learning.
-- **Distributed Tracing**: `threadId` (64-bit random, once per worker) + `spanId` (32-bit counter) for collision-free
+- **Distributed Tracing**: `thread_id` (64-bit random, once per worker) + `span_id` (32-bit counter) for collision-free
   span identification across workers.
 - **High-Precision Timestamps**: Anchored design with sub-millisecond precision from performance.now()/hrtime.
 - **WHY**: Achieves <0.1ms runtime overhead and >90% storage compression by separating the hot path (writes) from the
@@ -285,7 +285,7 @@ instead of dictionary lookup.
 // ✅ GOOD: All properties defined upfront
 class TraceContext {
   constructor() {
-    this.traceId = undefined;
+    this.trace_id = undefined;
     this.span = undefined;
     this.ff = undefined;
     this.env = undefined; // Even if undefined, declare it!
@@ -294,7 +294,7 @@ class TraceContext {
 
 // ❌ BAD: Properties added dynamically break hidden class
 const ctx = {};
-ctx.traceId = 'abc'; // Hidden class transition #1
+ctx.trace_id = 'abc'; // Hidden class transition #1
 ctx.span = spanFn; // Hidden class transition #2
 ```
 
@@ -319,7 +319,7 @@ function writeTimestamp(buffer: SpanBuffer, idx: number, value: bigint) {
 
 // ❌ BAD: Different buffer shapes at same call site
 function writeTimestamp(buffer: any, idx: number, value: bigint) {
-  buffer.timestamps[idx] = value; // Polymorphic - could be any shape
+  buffer.timestamp[idx] = value; // Polymorphic - could be any shape
 }
 ```
 

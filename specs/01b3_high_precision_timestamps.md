@@ -64,10 +64,10 @@ subsequent timestamps.
 
 ```typescript
 // ✅ CORRECT: Trace timestamps use anchored approach
-buffer.timestamps[idx] = getTimestampMicros(ctx.anchorEpochMicros, ctx.anchorPerfNow);
+buffer.timestamp[idx] = getTimestampMicros(ctx.anchorEpochMicros, ctx.anchorPerfNow);
 
 // ❌ WRONG: Don't use Date.now() for trace timestamps
-buffer.timestamps[idx] = Date.now() * 1000; // No sub-ms precision, repeated syscalls
+buffer.timestamp[idx] = Date.now() * 1000; // No sub-ms precision, repeated syscalls
 
 // ✅ CORRECT: Scheduling uses Date.now()
 const nextFlushTime = Date.now() + flushIntervalMs;
@@ -85,14 +85,14 @@ const filename = `traces-${Date.now()}.parquet`;
 
 // TraceContext system props (Extra props defined via .ctx<Extra>())
 interface TraceContextSystem<FF> {
-  traceId: string;
+  trace_id: string;
 
   // Time anchor - flat primitives, not nested object
   anchorEpochMicros: number; // Date.now() * 1000 at trace root
   anchorPerfNow: number; // performance.now() at trace root
 
   // Thread/worker ID for distributed tracing
-  threadId: bigint;
+  thread_id: bigint;
 
   ff: FeatureFlagEvaluator<FF>;
   span: RootSpanFn;
@@ -107,10 +107,10 @@ function createTraceContext<FF, Extra>(params: { ff: FeatureFlagEvaluator<FF> } 
   const perfNow = performance.now();
 
   return {
-    traceId: generateTraceId(),
+    trace_id: generateTraceId(),
     anchorEpochMicros: epochMs * 1000,
     anchorPerfNow: perfNow,
-    threadId: workerThreadId,
+    thread_id: workerThreadId,
     ff: params.ff,
     span: createRootSpanFn(),
     ...params, // Spread Extra (e.g., env, requestId, userId)
@@ -140,14 +140,14 @@ function getTimestamp(ctx: TraceContext): bigint {
 
 // TraceContext system props (Extra props defined via .ctx<Extra>())
 interface TraceContextSystem<FF> {
-  traceId: string;
+  trace_id: string;
 
   // Time anchor - flat primitives
   anchorEpochMicros: number; // Date.now() * 1000 at trace root
   anchorHrTime: bigint; // process.hrtime.bigint() at trace root
 
   // Thread/worker ID for distributed tracing
-  threadId: bigint;
+  thread_id: bigint;
 
   ff: FeatureFlagEvaluator<FF>;
   span: RootSpanFn;
@@ -162,10 +162,10 @@ function createTraceContext<FF, Extra>(params: { ff: FeatureFlagEvaluator<FF> } 
   const hrTime = process.hrtime.bigint();
 
   return {
-    traceId: generateTraceId(),
+    trace_id: generateTraceId(),
     anchorEpochMicros: epochMs * 1000,
     anchorHrTime: hrTime,
-    threadId: workerThreadId,
+    thread_id: workerThreadId,
     ff: params.ff,
     span: createRootSpanFn(),
     ...params, // Spread Extra (e.g., env, requestId, userId)
@@ -194,10 +194,10 @@ TimestampNanosecond type during cold path conversion:
 
 ```typescript
 // Hot path: BigInt64Array storage (nanoseconds since epoch)
-buffer.timestamps[idx] = getTimestamp(ctx); // e.g., 1704067200000000000n
+buffer.timestamp[idx] = getTimestamp(ctx); // e.g., 1704067200000000000n
 
 // Cold path: Arrow conversion
-const arrowTimestamps = arrow.TimestampNanosecond.from(buffer.timestamps.subarray(0, buffer.writeIndex));
+const arrowTimestamps = arrow.TimestampNanosecond.from(buffer.timestamp.subarray(0, buffer._writeIndex));
 ```
 
 **Why Nanoseconds**:

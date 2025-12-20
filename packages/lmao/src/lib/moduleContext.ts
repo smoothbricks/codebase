@@ -53,7 +53,7 @@ export class ModuleContext {
    *
    * This ensures all ModuleContext instances share the same hidden class, allowing V8 to:
    * - Inline property access after first check
-   * - Optimize the truthy check `if (this.module.remappedViewClass)` to near-zero cost
+   * - Optimize the truthy check `if (this._module.remappedViewClass)` to near-zero cost
    *
    * Per specs/01e_library_integration_pattern.md and 01c_context_flow_and_op_wrappers.md
    */

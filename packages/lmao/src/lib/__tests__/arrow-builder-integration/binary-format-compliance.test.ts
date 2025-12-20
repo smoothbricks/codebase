@@ -19,10 +19,10 @@ describe('Arrow Binary Format Compliance', () => {
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 
       // Write some data using generated methods
-      buffer.timestamps[0] = BigInt(Date.now()) * 1000000n;
-      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.timestamp[0] = BigInt(Date.now()) * 1000000n;
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer.numberValue(0, 42);
-      buffer.writeIndex = 1;
+      buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
       const ipcBytes = arrow.tableToIPC(table, 'stream');
@@ -47,10 +47,10 @@ describe('Arrow Binary Format Compliance', () => {
 
       // Write test data using generated methods
       const testValue = 0x12345678;
-      buffer.timestamps[0] = BigInt(Date.now()) * 1000000n;
-      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.timestamp[0] = BigInt(Date.now()) * 1000000n;
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer.uint32Value(0, testValue);
-      buffer.writeIndex = 1;
+      buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
       const ipcBytes = arrow.tableToIPC(table, 'stream');
@@ -88,8 +88,8 @@ describe('Arrow Binary Format Compliance', () => {
 
       for (let i = 0; i < testData.length; i++) {
         const value = testData[i];
-        buffer.timestamps[i] = BigInt(Date.now()) * 1000000n;
-        buffer.operations[i] = ENTRY_TYPE_SPAN_START;
+        buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
+        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
 
         if (value === null) {
           // Don't call the method for null values, just leave as default (null)
@@ -97,7 +97,7 @@ describe('Arrow Binary Format Compliance', () => {
           buffer.numberValue(i, value);
         }
       }
-      buffer.writeIndex = testData.length;
+      buffer._writeIndex = testData.length;
 
       const table = convertToArrowTable(buffer);
       const ipcBytes = arrow.tableToIPC(table, 'stream');
@@ -139,11 +139,11 @@ describe('Arrow Binary Format Compliance', () => {
       const testValues = [0, 1, 2, 0]; // a=0, b=1, c=2, includes repeated value
 
       for (let i = 0; i < testValues.length; i++) {
-        buffer.timestamps[i] = BigInt(Date.now()) * 1000000n;
-        buffer.operations[i] = ENTRY_TYPE_SPAN_START;
+        buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
+        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
         buffer.enumValue(i, testValues[i]);
       }
-      buffer.writeIndex = testValues.length;
+      buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
       const ipcBytes = arrow.tableToIPC(table, 'stream');
@@ -183,11 +183,11 @@ describe('Arrow Binary Format Compliance', () => {
       const testValues = ['', 'hello', '', 'world!'];
 
       for (let i = 0; i < testValues.length; i++) {
-        buffer.timestamps[i] = BigInt(Date.now()) * 1000000n;
-        buffer.operations[i] = ENTRY_TYPE_SPAN_START;
+        buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
+        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
         buffer.textValue(i, testValues[i]);
       }
-      buffer.writeIndex = testValues.length;
+      buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
       const ipcBytes = arrow.tableToIPC(table, 'stream');
@@ -249,11 +249,11 @@ describe('Arrow Binary Format Compliance', () => {
       const testValues = [true, false, true, false, true];
 
       for (let i = 0; i < testValues.length; i++) {
-        buffer.timestamps[i] = BigInt(Date.now()) * 1000000n;
-        buffer.operations[i] = ENTRY_TYPE_SPAN_START;
+        buffer.timestamp[i] = BigInt(Date.now()) * 1000000n;
+        buffer.entry_type[i] = ENTRY_TYPE_SPAN_START;
         buffer.boolValue(i, testValues[i]);
       }
-      buffer.writeIndex = testValues.length;
+      buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
       const ipcBytes = arrow.tableToIPC(table, 'stream');

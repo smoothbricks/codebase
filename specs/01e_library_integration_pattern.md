@@ -54,16 +54,16 @@ Instead of trying to remap writes at runtime (which adds hot-path overhead), we:
 ```
 Application Root Buffer (schema: { userId, http_status, http_method, db_query })
 │
-├── children[0]: RemappedBufferView
+├── _children[0]: RemappedBufferView
 │   │   Maps: http_status → status, http_method → method
 │   │
 │   └── wraps: HTTP Library Buffer (schema: { status, method })
 │               │
-│               └── children[0]: RemappedBufferView (for nested auth library)
+│               └── _children[0]: RemappedBufferView (for nested auth library)
 │                       Maps: auth_token → token
 │                       └── wraps: Auth Library Buffer (schema: { token })
 │
-└── children[1]: App's own child span buffer (same schema as root)
+└── _children[1]: App's own child span buffer (same schema as root)
 ```
 
 ### RemappedBufferView Implementation
@@ -84,15 +84,15 @@ function generateRemappedBufferViewClass(
       }
 
       // Tree traversal (pass-through)
-      get children() { return this._buffer.children; }
-      get next() { return this._buffer.next; }
+      get _children() { return this._buffer._children; }
+      get _next() { return this._buffer._next; }
 
-      // Row count
-      get writeIndex() { return this._buffer.writeIndex; }
+    // Row count
+    get _writeIndex() { return this._buffer._writeIndex; }
 
-      // System columns (NOT remapped - same in all buffers)
-      get timestamps() { return this._buffer.timestamps; }
-      get operations() { return this._buffer.operations; }
+    // System columns (NOT remapped - same in all buffers)
+    get timestamp() { return this._buffer.timestamp; }
+    get entry_type() { return this._buffer.entry_type; }
       get message_values() { return this._buffer.message_values; }
       get message_nulls() { return this._buffer.message_nulls; }
       get lineNumber_values() { return this._buffer.lineNumber_values; }
@@ -105,9 +105,9 @@ function generateRemappedBufferViewClass(
       get ffValue_nulls() { return this._buffer.ffValue_nulls; }
 
       // Identity (pass-through)
-      get traceId() { return this._buffer.traceId; }
-      get threadId() { return this._buffer.threadId; }
-      get spanId() { return this._buffer.spanId; }
+      get trace_id() { return this._buffer.trace_id; }
+      get thread_id() { return this._buffer.thread_id; }
+      get span_id() { return this._buffer.span_id; }
       get parentSpanId() { return this._buffer.parentSpanId; }
       get _identity() { return this._buffer._identity; }
 
@@ -141,7 +141,7 @@ function generateRemappedBufferViewClass(
 
 **Cold Path (Arrow conversion)**:
 
-- Tree walker encounters RemappedBufferView in parent's `children[]`
+- Tree walker encounters RemappedBufferView in parent's `_children[]`
 - Calls `view.getColumnIfAllocated('http_status')`
 - RemappedBufferView maps to `buffer.getColumnIfAllocated('status')`
 - Returns the actual TypedArray for that column
@@ -162,14 +162,14 @@ registration. `span()` just invokes the op and passes metadata (name, line numbe
 // Inside op's wrapper (conceptual):
 async invoke(parentCtx, spanName, line, ...args) {
   // 1. Create SpanBuffer with module's UNPREFIXED schema
-  const ownBuffer = createSpanBuffer(unprefixedSchema, callsite, traceId);
+  const ownBuffer = createSpanBuffer(unprefixedSchema, callsite, trace_id);
 
   // 2. Register with parent - wrap with RemappedBufferView if prefixed
   if (prefix && parentCtx?.buffer) {
     const remappedView = new RemappedViewClass(ownBuffer);
-    parentCtx.buffer.children.push(remappedView);
+    parentCtx.buffer._children.push(remappedView);
   } else if (parentCtx?.buffer) {
-    parentCtx.buffer.children.push(ownBuffer);
+    parentCtx.buffer._children.push(ownBuffer);
   }
 
   // 3. Setup context with destructured helpers
@@ -217,7 +217,7 @@ await GET.invoke(currentCtx, 'fetch-data', __LINE__, 'https://api.example.com');
 It does **NOT**:
 
 - Create buffers
-- Register children
+- Register \_children
 - Handle exceptions
 
 ## Library Definition with defineModule

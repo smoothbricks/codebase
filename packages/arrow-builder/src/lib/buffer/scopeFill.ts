@@ -33,7 +33,7 @@ export function fillNullSlots(
     const bitIdx = i & 7;
     const isNull = (nullBitmap[byteIdx] & (1 << bitIdx)) === 0;
     if (isNull) {
-      (values as any)[i] = value;
+      (values as (number | string)[])[i] = value;
       nullBitmap[byteIdx] |= 1 << bitIdx; // Mark as valid
     }
   }

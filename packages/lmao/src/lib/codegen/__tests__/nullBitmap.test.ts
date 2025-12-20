@@ -9,7 +9,7 @@
  * - Tag writing is done via ctx.tag which is a separate API (not on SpanLogger)
  * - SpanLogger constructor: (buffer, createNextBuffer)
  * - SpanLogger._writeIndex starts at 1 (rows 0/1 are reserved for span-start/end)
- * - _setScope() stores scope values in buffer.scopeValues (immutable, frozen)
+ * - _setScope() stores scope values in buffer._scopeValues (immutable, frozen)
  * - Scope filling happens at Arrow conversion time, NOT during span execution
  * - Direct writes (tag/log) win over scope values on their respective rows
  */
@@ -59,7 +59,7 @@ const mockCreateNextBuffer = (buffer: SpanBuffer): SpanBuffer => buffer;
 
 describe('null bitmap correctness', () => {
   describe('immutable scope semantics', () => {
-    it('should store scope values in buffer.scopeValues as frozen object', () => {
+    it('should store scope values in buffer._scopeValues as frozen object', () => {
       const schema = defineLogSchema({
         requestId: S.category(),
       });
@@ -68,15 +68,15 @@ describe('null bitmap correctness', () => {
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
 
-      // _setScope should store values in buffer.scopeValues (not fill buffer columns)
+      // _setScope should store values in buffer._scopeValues (not fill buffer columns)
       logger._setScope({ requestId: 'req-123' });
 
-      // Verify scope values are stored in buffer.scopeValues
-      expect(buffer.scopeValues).toBeDefined();
-      expect(buffer.scopeValues?.requestId).toBe('req-123');
+      // Verify scope values are stored in buffer._scopeValues
+      expect(buffer._scopeValues).toBeDefined();
+      expect(buffer._scopeValues?.requestId).toBe('req-123');
 
       // Verify the object is frozen (immutable)
-      expect(Object.isFrozen(buffer.scopeValues)).toBe(true);
+      expect(Object.isFrozen(buffer._scopeValues)).toBe(true);
     });
 
     it('should create new frozen object on each _setScope call (merge semantics)', () => {
@@ -91,13 +91,13 @@ describe('null bitmap correctness', () => {
 
       // First setScope call
       logger._setScope({ requestId: 'req-123' });
-      const firstScopeValues = buffer.scopeValues;
+      const firstScopeValues = buffer._scopeValues;
       expect(firstScopeValues?.requestId).toBe('req-123');
       expect(firstScopeValues?.userId).toBeUndefined();
 
       // Second setScope call - should merge with existing values
       logger._setScope({ userId: 'user-456' });
-      const secondScopeValues = buffer.scopeValues;
+      const secondScopeValues = buffer._scopeValues;
 
       // Should be a NEW object (immutable semantics)
       expect(secondScopeValues).not.toBe(firstScopeValues);
@@ -123,15 +123,15 @@ describe('null bitmap correctness', () => {
 
       // Set initial values
       logger._setScope({ requestId: 'req-123', userId: 'user-456' });
-      expect(buffer.scopeValues?.requestId).toBe('req-123');
-      expect(buffer.scopeValues?.userId).toBe('user-456');
+      expect(buffer._scopeValues?.requestId).toBe('req-123');
+      expect(buffer._scopeValues?.userId).toBe('user-456');
 
       // Pass null to clear requestId, undefined should be ignored
       logger._setScope({ requestId: null as unknown as string, userId: undefined });
 
       // requestId should be cleared (null), userId should remain (undefined ignored)
-      expect(buffer.scopeValues?.requestId).toBeUndefined();
-      expect(buffer.scopeValues?.userId).toBe('user-456');
+      expect(buffer._scopeValues?.requestId).toBeUndefined();
+      expect(buffer._scopeValues?.userId).toBe('user-456');
     });
 
     it('should NOT fill buffer columns during _setScope (deferred to Arrow conversion)', () => {
@@ -162,7 +162,7 @@ describe('null bitmap correctness', () => {
   describe('log message writes (arbitrary index)', () => {
     it('should NOT set null bitmap during info() - scope filling is deferred to Arrow conversion', () => {
       // Per specs/01i_span_scope_attributes.md:
-      // - Scope values are stored in buffer.scopeValues as a plain object
+      // - Scope values are stored in buffer._scopeValues as a plain object
       // - Scope filling happens at Arrow conversion time, NOT during span execution
       // - This is because scope values are "defaults" that fill null slots
       const schema = defineLogSchema({
@@ -170,8 +170,8 @@ describe('null bitmap correctness', () => {
       });
       const buffer = createTestBuffer(schema);
 
-      // Set scope value via buffer.scopeValues directly for test setup
-      buffer.scopeValues = Object.freeze({ requestId: 'req-123' });
+      // Set scope value via buffer._scopeValues directly for test setup
+      buffer._scopeValues = Object.freeze({ requestId: 'req-123' });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
@@ -194,15 +194,15 @@ describe('null bitmap correctness', () => {
 
     it('should NOT set null bitmap at index 9 during info() - scope is deferred', () => {
       // Same as above - scope values are NOT written during span execution
-      // They are stored in buffer.scopeValues and filled at Arrow conversion
+      // They are stored in buffer._scopeValues and filled at Arrow conversion
       const schema = defineLogSchema({
         requestId: S.category(),
       });
       // Need capacity > 9 to test writing at index 9
       const buffer = createTestBufferWithCapacity(schema, 16);
 
-      // Set scope value via buffer.scopeValues directly for test setup
-      buffer.scopeValues = Object.freeze({ requestId: 'req-456' });
+      // Set scope value via buffer._scopeValues directly for test setup
+      buffer._scopeValues = Object.freeze({ requestId: 'req-456' });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
       const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
@@ -214,7 +214,7 @@ describe('null bitmap correctness', () => {
       logger.info('test message');
 
       // Verify scope values are stored correctly
-      expect(buffer.scopeValues.requestId).toBe('req-456');
+      expect(buffer._scopeValues.requestId).toBe('req-456');
 
       // Null bitmap is not set during execution (deferred to Arrow conversion)
       const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');

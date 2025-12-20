@@ -79,7 +79,7 @@ export function concatenateNullBitmaps(
 
   if (!hasAnyNulls) return { nullBitmap: undefined, nullCount: 0 };
 
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   const bitmapBytes = Math.ceil(totalRows / 8);
   const nullBitmap = new Uint8Array(bitmapBytes);
   nullBitmap.fill(0xff); // Default all valid
@@ -91,7 +91,7 @@ export function concatenateNullBitmaps(
 
   for (const buf of buffers) {
     const sourceBitmap = buf[nullsName];
-    const rowCount = buf.writeIndex;
+    const rowCount = buf._writeIndex;
 
     if (sourceBitmap) {
       const byteOffset = rowOffset >>> 3; // rowOffset / 8
@@ -134,9 +134,9 @@ export function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => 
   let current: SpanBuffer | undefined = root;
   while (current) {
     visitor(current);
-    current = current.next as SpanBuffer | undefined;
+    current = current._next as SpanBuffer | undefined;
   }
-  for (const child of root.children) {
+  for (const child of root._children) {
     walkSpanTree(child, visitor);
   }
 }

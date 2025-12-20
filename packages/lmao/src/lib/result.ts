@@ -97,10 +97,10 @@ export class FluentSuccessResult<V, T extends LogSchema> implements SuccessResul
     this.value = value;
 
     // Overwrite the pre-initialized span-exception with span-ok
-    buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
 
     // Write timestamp (nanoseconds since epoch)
-    buffer.timestamps[1] = getTimestampNanos();
+    buffer.timestamp[1] = getTimestampNanos();
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
     // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)
@@ -172,10 +172,10 @@ export class FluentErrorResult<E, T extends LogSchema> implements ErrorResult<E>
     this.error = { code, details };
 
     // Overwrite the pre-initialized span-exception with span-err
-    buffer.operations[1] = ENTRY_TYPE_SPAN_ERR;
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
 
     // Write timestamp (nanoseconds since epoch)
-    buffer.timestamps[1] = getTimestampNanos();
+    buffer.timestamp[1] = getTimestampNanos();
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
     // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)

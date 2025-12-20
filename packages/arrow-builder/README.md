@@ -38,8 +38,8 @@ import { createColumnBuffer } from '@smoothbricks/arrow-builder';
 const buffer = createColumnBuffer(schema, 1000);
 
 // Write data with manual bounds checking
-buffer.timestamps[buffer.writeIndex] = timestamp;
-buffer.operations[buffer.writeIndex] = opType;
+buffer.timestamp[buffer.writeIndex] = timestamp;
+buffer.entry_type[buffer.writeIndex] = opType;
 buffer.writeIndex++;
 
 // Chain to next buffer when full
@@ -71,8 +71,8 @@ All buffers are automatically aligned to 64-byte cache line boundaries for optim
 const buffer = createColumnBuffer(schema, 64);
 
 // All TypedArrays are 64-byte aligned
-buffer.timestamps; // Float64Array (aligned)
-buffer.operations; // Uint8Array (aligned)
+buffer.timestamp; // BigInt64Array (aligned)
+buffer.entry_type; // Uint8Array (aligned)
 ```
 
 ### 4. V8-Optimized Runtime Codegen
@@ -207,7 +207,7 @@ const timestamp = Microseconds.fromMillis(Date.now());
 const precise = Microseconds.fromNanos(process.hrtime.bigint());
 
 // Use in buffer
-buffer.timestamps[idx] = timestamp;
+buffer.timestamp[idx] = timestamp;
 ```
 
 **Benefits:**
@@ -224,8 +224,8 @@ Arrow-builder is optimized for the **hot path** (writing data):
 
 ```typescript
 // Hot path: Direct property access, no function calls
-buffer.timestamps[idx] = timestamp; // ~1-2 CPU cycles
-buffer.operations[idx] = opType; // ~1-2 CPU cycles
+buffer.timestamp[idx] = timestamp; // ~1-2 CPU cycles
+buffer.entry_type[idx] = opType; // ~1-2 CPU cycles
 buffer.attr_userId_values[idx] = userId; // ~1-2 CPU cycles
 buffer.writeIndex++; // ~1 CPU cycle
 ```
@@ -276,8 +276,8 @@ const buffer = createColumnBuffer(schema, 1000);
 function recordMetric(metric: number, value: number) {
   const idx = buffer.writeIndex;
 
-  buffer.timestamps[idx] = Microseconds.fromMillis(Date.now());
-  buffer.operations[idx] = 1; // METRIC_SAMPLE operation
+  buffer.timestamp[idx] = Microseconds.fromMillis(Date.now());
+  buffer.entry_type[idx] = 1; // METRIC_SAMPLE operation
   buffer.attr_metric_values[idx] = metric;
   buffer.attr_value_values[idx] = value;
 
@@ -305,8 +305,8 @@ const buffer = createColumnBuffer(schema, 500);
 function appendEvent(eventType: number, entityId: number, payload: number) {
   const idx = buffer.writeIndex;
 
-  buffer.timestamps[idx] = Microseconds.fromNanos(process.hrtime.bigint());
-  buffer.operations[idx] = eventType;
+  buffer.timestamp[idx] = Microseconds.fromNanos(process.hrtime.bigint());
+  buffer.entry_type[idx] = eventType;
   buffer.attr_entityId_values[idx] = entityId;
   buffer.attr_payload_values[idx] = payload;
 
@@ -338,8 +338,8 @@ function cacheResults(rows: Array<{ id: number; name: string; age: number; activ
   for (const row of rows) {
     const idx = buffer.writeIndex;
 
-    buffer.timestamps[idx] = Microseconds.fromMillis(Date.now());
-    buffer.operations[idx] = 0; // ROW operation
+    buffer.timestamp[idx] = Microseconds.fromMillis(Date.now());
+    buffer.entry_type[idx] = 0; // ROW operation
     buffer.attr_id_values[idx] = row.id;
     buffer.attr_name_values[idx] = internString(row.name);
     buffer.attr_age_values[idx] = row.age;

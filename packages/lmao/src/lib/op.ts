@@ -26,7 +26,7 @@ import {
 } from './spanContext.js';
 import { getTimestampNanos } from './timestamp.js';
 import type { TraceContext } from './traceContext.js';
-import type { TraceId } from './traceId.js';
+
 import type { SpanBuffer } from './types.js';
 
 // =============================================================================
@@ -88,8 +88,8 @@ const RESERVED_CONTEXT_KEYS = new Set<string>([
  * - Span names are provided at CALL SITE: `await span('contextual-name', myOp, args)`
  *
  * Op captures the module for source attribution:
- * - When span() invokes this Op, the Op's module becomes buffer.module (for rows 1+)
- * - The caller's module becomes buffer.callsiteModule (for row 0)
+ * - When span() invokes this Op, the Op's module becomes buffer._module (for rows 1+)
+ * - The caller's module becomes buffer._callsiteModule (for row 0)
  *
  * @typeParam Ctx - Required context type (contravariant position)
  * @typeParam Args - Tuple of argument types (excluding ctx)
@@ -124,7 +124,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
   async _invoke(
     traceCtx: TraceContext<FeatureFlagSchema, Record<string, unknown>>,
     parentBuffer: SpanBuffer | null,
-    callsiteModule: ModuleContext,
+    _callsiteModule: ModuleContext,
     spanName: string,
     lineNumber: number,
     args: Args,
@@ -144,10 +144,10 @@ export class Op<Ctx, Args extends unknown[], Result> {
       if (this.module.remappedViewClass) {
         // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
         const view = new this.module.remappedViewClass(spanBuffer);
-        parentBuffer.children.push(view);
+        parentBuffer._children.push(view);
       } else {
         // No prefix - push raw buffer directly
-        parentBuffer.children.push(spanBuffer);
+        parentBuffer._children.push(spanBuffer);
       }
     } else {
       // Root span - uses traceId from TraceContext
@@ -192,12 +192,6 @@ export class Op<Ctx, Args extends unknown[], Result> {
       }
     }
 
-    // 10. Assign span-specific properties directly
-    spanContext.traceId = traceCtx.traceId as TraceId;
-    spanContext.env = (traceCtx as unknown as Record<string, unknown>).env as Record<string, unknown>;
-    // Wire deps - plain object references (zero-allocation per spec 01l)
-    // Get deps from module context or use empty object
-    spanContext.deps = (this.module as unknown as { deps?: Record<string, unknown> }).deps ?? {};
     spanContext.tag = tagAPI;
     spanContext.log = spanLogger as SpanLogger<LogSchema>;
     spanContext._buffer = spanBuffer;
@@ -209,7 +203,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
     // 11. Create feature flag evaluator bound to this span context
     // Must be after spanContext is created since forContext receives the full SpanContext
     // forContext() creates a span-bound evaluator with typed getters
-    const spanFf = traceCtx.ff.forContext!(spanContext);
+    const spanFf = traceCtx.ff.forContext?.(spanContext);
     spanContext.ff = spanFf as unknown as FeatureFlagEvaluator<FeatureFlagSchema> &
       InferFeatureFlagsWithContext<FeatureFlagSchema>;
 
@@ -218,7 +212,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
       return await this.fn(spanContext as unknown as Ctx, ...args);
     } catch (error) {
       // Write span-exception to row 1 (fixed layout)
-      spanBuffer.timestamps[1] = getTimestampNanos();
+      spanBuffer.timestamp[1] = getTimestampNanos();
 
       // Write exception details to row 1
       const errorMessage = error instanceof Error ? error.message : String(error);

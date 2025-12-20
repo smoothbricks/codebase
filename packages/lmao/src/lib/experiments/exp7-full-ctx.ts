@@ -55,8 +55,8 @@
  * 10. Naming conventions:
  *    - logSchema (not logSchema) - schema for what gets logged
  *    - SpanContext - user-facing context passed to op functions
- *    - buffer.callsiteModule - caller's module (for row 0's gitSha/packageName/packagePath)
- *    - buffer.module - Op's module (for rows 1+ gitSha/packageName/packagePath)
+ *    - buffer._callsiteModule - caller's module (for row 0's gitSha/packageName/packagePath)
+ *    - buffer._module - Op's module (for rows 1+ gitSha/packageName/packagePath)
  *    - sb_* stats (not spanBufferCapacityStats.*)
  *
  * 11. Op class design:
@@ -160,8 +160,8 @@ interface ModuleContext {
  * - Span names are provided at CALL SITE: `await span('contextual-name', myOp, args)`
  *
  * Op captures the module for source attribution:
- * - When span() invokes this Op, the Op's module becomes buffer.module (for rows 1+)
- * - The caller's module becomes buffer.callsiteModule (for row 0)
+ * - When span() invokes this Op, the Op's module becomes buffer._module (for rows 1+)
+ * - The caller's module becomes buffer._callsiteModule (for row 0)
  *
  * @typeParam Ctx - Required context type (contravariant position)
  * @typeParam Args - Tuple of argument types (excluding ctx)

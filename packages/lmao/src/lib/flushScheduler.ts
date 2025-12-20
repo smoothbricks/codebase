@@ -219,7 +219,7 @@ export class FlushScheduler {
    */
   private shouldFlushByCapacity(): boolean {
     for (const buffer of this.buffers) {
-      const utilizationRatio = buffer.writeIndex / buffer.capacity;
+      const utilizationRatio = buffer._writeIndex / buffer._capacity;
       if (utilizationRatio >= this.config.capacityThreshold) {
         return true;
       }
@@ -284,8 +284,8 @@ export class FlushScheduler {
     for (const buffer of buffersToFlush) {
       let currentBuffer: SpanBuffer | undefined = buffer;
       while (currentBuffer) {
-        modulesInThisFlush.add(currentBuffer.module);
-        currentBuffer = currentBuffer.next as SpanBuffer | undefined;
+        modulesInThisFlush.add(currentBuffer._module);
+        currentBuffer = currentBuffer._next as SpanBuffer | undefined;
       }
     }
 
@@ -309,9 +309,9 @@ export class FlushScheduler {
       // Count rows in buffer chain
       let currentBuffer: SpanBuffer | undefined = buffer;
       while (currentBuffer) {
-        totalRows += currentBuffer.writeIndex;
+        totalRows += currentBuffer._writeIndex;
         totalBuffers++;
-        currentBuffer = currentBuffer.next as SpanBuffer | undefined;
+        currentBuffer = currentBuffer._next as SpanBuffer | undefined;
       }
     }
 
@@ -393,17 +393,17 @@ export class FlushScheduler {
       // Reset buffers after successful flush to avoid duplicate re-processing
       for (const buffer of buffersToFlush) {
         // Reset writeIndex to 0 for the root buffer
-        buffer.writeIndex = 0;
+        buffer._writeIndex = 0;
 
         // Clear any linked/chained buffers
-        let nextBuffer = buffer.next as SpanBuffer | undefined;
+        let nextBuffer = buffer._next as SpanBuffer | undefined;
         while (nextBuffer) {
-          nextBuffer.writeIndex = 0;
-          const temp = nextBuffer.next as SpanBuffer | undefined;
-          nextBuffer.next = undefined; // Unlink chained buffer
+          nextBuffer._writeIndex = 0;
+          const temp = nextBuffer._next as SpanBuffer | undefined;
+          nextBuffer._next = undefined; // Unlink chained buffer
           nextBuffer = temp;
         }
-        buffer.next = undefined; // Clear link from root buffer
+        buffer._next = undefined; // Clear link from root buffer
       }
     } catch (error) {
       console.error('Error in flush handler:', error);

@@ -75,8 +75,8 @@ describe('createSpanLoggerClass', () => {
 
       expect(logger).toBeDefined();
       expect(logger._buffer).toBe(buffer);
-      // Scope is now accessed via buffer.scopeValues
-      expect(buffer.scopeValues).toBeDefined();
+      // Scope is now accessed via buffer._scopeValues
+      expect(buffer._scopeValues).toBeDefined();
     });
 
     it('should start with _writeIndex = 1', () => {
@@ -165,7 +165,7 @@ describe('createSpanLoggerClass', () => {
   });
 
   describe('scope management', () => {
-    it('should update scope values via _setScope to buffer.scopeValues', () => {
+    it('should update scope values via _setScope to buffer._scopeValues', () => {
       const schema = defineLogSchema({
         userId: S.category(),
         requestId: S.category(),
@@ -176,9 +176,9 @@ describe('createSpanLoggerClass', () => {
 
       logger._setScope({ userId: 'user123' });
 
-      // Scope is now stored on buffer.scopeValues
-      expect(buffer.scopeValues?.userId).toBe('user123');
-      expect(buffer.scopeValues?.requestId).toBeUndefined();
+      // Scope is now stored on buffer._scopeValues
+      expect(buffer._scopeValues?.userId).toBe('user123');
+      expect(buffer._scopeValues?.requestId).toBeUndefined();
     });
 
     it('should access scope via logger.scope getter', () => {
@@ -191,7 +191,7 @@ describe('createSpanLoggerClass', () => {
 
       logger._setScope({ userId: 'test123' });
 
-      // Scope is accessed via logger.scope getter (reads from buffer.scopeValues)
+      // Scope is accessed via logger.scope getter (reads from buffer._scopeValues)
       expect(logger.scope?.userId).toBe('test123');
     });
   });

@@ -1,7 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { S } from '../../schema/builder.js';
 import { ColumnSchema } from '../../schema/ColumnSchema.js';
-import type { SchemaFields } from '../../schema-types.js';
 import { createGeneratedColumnBuffer } from '../columnBufferGenerator.js';
 import {
   type ColumnWriter,
@@ -96,31 +95,28 @@ describe('createColumnWriter', () => {
 
     // First row
     writer.nextRow();
-    (writer as ColumnWriter & { userId(v: string): ColumnWriter }).userId('user1');
-    (writer as ColumnWriter & { count(v: number): ColumnWriter }).count(42);
+    writer.userId('user1');
+    writer.count(42);
 
     expect(writer._writeIndex).toBe(0);
-    expect((buffer as unknown as { userId_values: string[] }).userId_values[0]).toBe('user1');
-    expect((buffer as unknown as { count_values: Float64Array }).count_values[0]).toBe(42);
+    expect(buffer.userId_values[0]).toBe('user1');
+    expect(buffer.count_values[0]).toBe(42);
 
     // Second row
     writer.nextRow();
-    (writer as ColumnWriter & { userId(v: string): ColumnWriter }).userId('user2');
-    (writer as ColumnWriter & { count(v: number): ColumnWriter }).count(100);
+    writer.userId('user2');
+    writer.count(100);
 
     expect(writer._writeIndex).toBe(1);
-    expect((buffer as unknown as { userId_values: string[] }).userId_values[1]).toBe('user2');
-    expect((buffer as unknown as { count_values: Float64Array }).count_values[1]).toBe(100);
+    expect(buffer.userId_values[1]).toBe('user2');
+    expect(buffer.count_values[1]).toBe(100);
   });
 
   it('supports fluent chaining', () => {
     const buffer = createGeneratedColumnBuffer(testSchema, 64);
     const writer = createColumnWriter(testSchema, buffer);
 
-    // Use explicit type assertions for dynamic methods
-    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-    const w = writer as any;
-    const result = w.nextRow().userId('user1').status(0).count(42).message('hello');
+    const result = writer.nextRow().userId('user1').status('ok').count(42).message('hello');
 
     expect(result).toBe(writer);
   });
@@ -188,7 +184,7 @@ describe('createColumnWriter', () => {
       'test-value',
     );
 
-    expect((writer as ColumnWriter & { _custom: string })._custom).toBe('test-value');
+    expect((writer as ColumnWriter<typeof testSchema> & { _custom: string })._custom).toBe('test-value');
   });
 
   it('supports extension dependencies', () => {

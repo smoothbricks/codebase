@@ -88,22 +88,22 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
     get evaluator() { return this.#evaluator; }
 ` +
     // Generated code: #hasLoggedAccess() - scans buffer chain backward to check if flag already logged
-    // Walks chain forward via .next, scans each buffer backward from writeIndex
+    // Walks chain forward via ._next, scans each buffer backward from writeIndex
     `
     #hasLoggedAccess(flagName) {
       let buf = this.#spanContext._buffer;
       
       while (buf) {
-        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
         // This ensures we check all written entries including the most recent
-        const limit = buf.writeIndex;
+        const limit = buf._writeIndex;
         for (let i = limit - 1; i >= 0; i--) {
           if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
               buf.message_values && buf.message_values[i] === flagName) {
             return true;
           }
         }
-        buf = buf.next;
+        buf = buf._next;
       }
       return false;
     }
@@ -117,7 +117,7 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
       const definition = this.#schema[flagName];
       
       // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
+      const evaluationContext = ctx.buffer._scopeValues || {};
       
       // Always evaluate - backend caches based on evaluationContext
       const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
@@ -189,7 +189,7 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
       const definition = this.#schema[flag];
       
       // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
+      const evaluationContext = ctx.buffer._scopeValues || {};
       
       const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);

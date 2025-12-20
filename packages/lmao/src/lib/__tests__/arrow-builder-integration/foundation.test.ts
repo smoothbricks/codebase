@@ -26,14 +26,14 @@ describe('Buffer Foundation', () => {
     const buf = createSpanBuffer(schema, module, 'test-span', traceId); // Uses DEFAULT_BUFFER_CAPACITY
 
     // Span identity assertions (unified memory layout)
-    expect(typeof buf.spanId).toBe('number');
-    expect(buf.spanId).toBeGreaterThan(0);
-    expect(buf.hasParent).toBe(false);
-    expect(buf.traceId).toBe(traceId);
+    expect(typeof buf.span_id).toBe('number');
+    expect(buf.span_id).toBeGreaterThan(0);
+    expect(buf._hasParent).toBe(false);
+    expect(buf.trace_id).toBe(traceId);
 
     // Check TypedArrays are created
-    expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
-    expect(buf.operations).toBeInstanceOf(Uint8Array);
+    expect(buf.timestamp).toBeInstanceOf(BigInt64Array);
+    expect(buf.entry_type).toBeInstanceOf(Uint8Array);
 
     // Check null bitmaps exist for each attribute (Arrow format: 1 Uint8Array per column)
     expect(buf.userId_nulls).toBeInstanceOf(Uint8Array);
@@ -45,10 +45,10 @@ describe('Buffer Foundation', () => {
     expect(buf.count_values).toBeInstanceOf(Float64Array); // number → Float64Array
 
     // Metadata
-    expect(buf.children).toBeInstanceOf(Array);
-    expect(buf.writeIndex).toBe(0);
-    expect(buf.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
-    expect(buf.module).toBe(module);
+    expect(buf._children).toBeInstanceOf(Array);
+    expect(buf._writeIndex).toBe(0);
+    expect(buf._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+    expect(buf._module).toBe(module);
   });
 
   it('creates root SpanBuffer with createSpanBuffer', () => {
@@ -57,10 +57,10 @@ describe('Buffer Foundation', () => {
 
     const buf = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-999'));
 
-    expect(buf.spanId).toBeGreaterThan(0);
-    expect(buf.hasParent).toBe(false);
-    expect(buf.parent).toBeUndefined();
-    expect(buf.children).toHaveLength(0);
+    expect(buf.span_id).toBeGreaterThan(0);
+    expect(buf._hasParent).toBe(false);
+    expect(buf._parent).toBeUndefined();
+    expect(buf._children).toHaveLength(0);
   });
 
   it('tracks buffer creation in capacity stats', () => {

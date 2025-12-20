@@ -20,7 +20,7 @@ import { createSpanLogger } from '../spanLoggerGenerator.js';
  */
 function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): SpanContext<T, any, any> {
   // Create a real SpanLogger for the buffer using the schema from module
-  const schema = spanBuffer.module.logSchema as T;
+  const schema = spanBuffer._module.logSchema as T;
   const logger = createSpanLogger(schema, spanBuffer);
 
   // Mock SpanContext with the essential properties
@@ -36,12 +36,12 @@ function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): 
     env: {},
     deps: {},
     tag: {} as any,
-    scope: spanBuffer.scopeValues || {},
+    scope: spanBuffer._scopeValues || {},
     setScope: (attrs: any) => {
-      if (!spanBuffer.scopeValues) {
-        spanBuffer.scopeValues = {};
+      if (!spanBuffer._scopeValues) {
+        spanBuffer._scopeValues = {};
       }
-      Object.assign(spanBuffer.scopeValues, attrs);
+      Object.assign(spanBuffer._scopeValues, attrs);
     },
     ok: () => ({ success: true, value: undefined }),
     err: () => ({ success: false, error: 'error' }),
@@ -118,7 +118,7 @@ describe('EvaluatorGenerator', () => {
 
       const GeneratedClass = createEvaluatorClass(
         ffSchema.schema,
-        (value, schema, def) => value ?? def,
+        (value, _schema, def) => value ?? def,
         ENTRY_TYPE_FF_ACCESS,
       );
 
@@ -134,9 +134,9 @@ describe('EvaluatorGenerator', () => {
         testFlag: S.boolean().default(false).sync(),
       });
 
-      const Class1 = createEvaluatorClass(schema.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
+      const Class1 = createEvaluatorClass(schema.schema, (value, _schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
-      const Class2 = createEvaluatorClass(schema.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
+      const Class2 = createEvaluatorClass(schema.schema, (value, _schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
       // Same schema should return same class (cached)
       expect(Class1).toBe(Class2);
@@ -151,9 +151,9 @@ describe('EvaluatorGenerator', () => {
         flagB: S.boolean().default(false).sync(),
       });
 
-      const Class1 = createEvaluatorClass(schema1.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
+      const Class1 = createEvaluatorClass(schema1.schema, (value, _schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
-      const Class2 = createEvaluatorClass(schema2.schema, (value, schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
+      const Class2 = createEvaluatorClass(schema2.schema, (value, _schema, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
 
       // Different schemas should generate different classes
       expect(Class1).not.toBe(Class2);
@@ -171,7 +171,7 @@ describe('EvaluatorGenerator', () => {
 
       const GeneratedClass = createEvaluatorClass(
         ffSchema.schema,
-        (value, schema, def) => value ?? def,
+        (value, _schema, def) => value ?? def,
         ENTRY_TYPE_FF_ACCESS,
       );
 
@@ -196,7 +196,7 @@ describe('EvaluatorGenerator', () => {
 
       const GeneratedClass = createEvaluatorClass(
         ffSchema.schema,
-        (value, schema, def) => value ?? def,
+        (value, _schema, def) => value ?? def,
         ENTRY_TYPE_FF_ACCESS,
       );
 
@@ -217,7 +217,7 @@ describe('EvaluatorGenerator', () => {
 
       const GeneratedClass = createEvaluatorClass(
         ffSchema.schema,
-        (value, schema, def) => value ?? def,
+        (value, _schema, def) => value ?? def,
         ENTRY_TYPE_FF_ACCESS,
       );
 
@@ -254,7 +254,7 @@ describe('EvaluatorGenerator', () => {
 
       const GeneratedClass = createEvaluatorClass(
         ffSchema.schema,
-        (value, schema, def) => value ?? def,
+        (value, _schema, def) => value ?? def,
         ENTRY_TYPE_FF_ACCESS,
       );
 
@@ -283,7 +283,7 @@ describe('EvaluatorGenerator', () => {
 
       const GeneratedClass = createEvaluatorClass(
         ffSchema.schema,
-        (value, schema, def) => value ?? def,
+        (value, _schema, def) => value ?? def,
         ENTRY_TYPE_FF_ACCESS,
       );
 
@@ -305,7 +305,7 @@ describe('EvaluatorGenerator', () => {
 
       const GeneratedClass = createEvaluatorClass(
         ffSchema.schema,
-        (value, schema, def) => value ?? def,
+        (value, _schema, def) => value ?? def,
         ENTRY_TYPE_FF_ACCESS,
       );
 
@@ -328,7 +328,11 @@ describe('EvaluatorGenerator', () => {
       });
       const logSchema = createTestSchema({});
 
-      const GeneratedClass = createEvaluatorClass(schema.schema, (value, s, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
+      const GeneratedClass = createEvaluatorClass(
+        schema.schema,
+        (value, _s, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
+      );
 
       const mockEvaluator = new InMemoryFlagEvaluator(schema.schema, {});
 
@@ -357,7 +361,11 @@ describe('EvaluatorGenerator', () => {
         testFlag: S.boolean().default(false).sync(),
       });
 
-      const GeneratedClass = createEvaluatorClass(schema.schema, (value, s, def) => value ?? def, ENTRY_TYPE_FF_ACCESS);
+      const GeneratedClass = createEvaluatorClass(
+        schema.schema,
+        (value, _s, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
+      );
 
       // Check the prototype for getter descriptors
       const descriptor = Object.getOwnPropertyDescriptor(GeneratedClass.prototype, 'testFlag');
@@ -443,13 +451,13 @@ function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
   let count = 0;
   let current: SpanBuffer<any> | null = buffer;
   while (current) {
-    const writeIndex = current.writeIndex;
+    const writeIndex = current._writeIndex;
     for (let i = 0; i < writeIndex; i++) {
       if (current._operations[i] === entryType) {
         count++;
       }
     }
-    current = current.next;
+    current = current._next;
   }
   return count;
 }

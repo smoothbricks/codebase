@@ -130,7 +130,7 @@ function generateSetScopeMethod(): string {
   // No buffer pre-filling - scope values are filled at Arrow conversion time via SIMD
   return `
     _setScope(attributes) {
-      const current = this._buffer.scopeValues || {};
+      const current = this._buffer._scopeValues || {};
       const next = { ...current };
       
       for (const key of Object.keys(attributes)) {
@@ -142,7 +142,7 @@ function generateSetScopeMethod(): string {
         }
       }
       
-      this._buffer.scopeValues = Object.freeze(next);
+      this._buffer._scopeValues = Object.freeze(next);
     }`;
 }
 
@@ -158,7 +158,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
     if (lmaoType === 'boolean') {
       return `
       {
-        const scopeValue = this._buffer.scopeValues?.${fieldName};
+        const scopeValue = this._buffer._scopeValues?.${fieldName};
         if (scopeValue !== null && scopeValue !== undefined) {
           helpers.fillBooleanBitmapRange(this._buffer.${columnName}_values, startIdx, endIdx, scopeValue);
           helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
@@ -176,7 +176,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
     if (lmaoType === 'category' || lmaoType === 'text') {
       return `
       {
-        const scopeValue = this._buffer.scopeValues?.${fieldName};
+        const scopeValue = this._buffer._scopeValues?.${fieldName};
         if (scopeValue !== null && scopeValue !== undefined) {
           const values = this._buffer.${columnName}_values;
           for (let i = startIdx; i < endIdx; i++) {
@@ -189,7 +189,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
 
     return `
       {
-        const scopeValue = this._buffer.scopeValues?.${fieldName};
+        const scopeValue = this._buffer._scopeValues?.${fieldName};
         if (scopeValue !== null && scopeValue !== undefined) {
           this._buffer.${columnName}_values.fill(${valueExpr}, startIdx, endIdx);
           helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
@@ -251,7 +251,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     // Sync buffer's writeIndex - needed for Arrow conversion
     constructorCode: `
       this._writeIndex = 1;
-      this._buffer.writeIndex = 2;
+      this._buffer._writeIndex = 2;
       this._createNextBuffer = createNextBuffer;
       this._inOverflow = false;
 `,
@@ -266,7 +266,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `
     _getNextBuffer() {
       const oldBuffer = this._buffer;
-      oldBuffer.module.sb_overflows++;
+      oldBuffer._module.sb_overflows++;
       this._inOverflow = true;
       const nextBuffer = this._createNextBuffer(oldBuffer);
       oldBuffer._next = nextBuffer;
@@ -285,10 +285,10 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       if (this._writeIndex >= this._buffer._capacity - 1) {
         this._buffer = this._getNextBuffer();
         this._writeIndex = -1;
-        this._buffer.writeIndex = 0;
+        this._buffer._writeIndex = 0;
       }
       this._writeIndex++;
-      this._buffer.writeIndex = this._writeIndex + 1;
+      this._buffer._writeIndex = this._writeIndex + 1;
       return this;
     }
 
@@ -311,9 +311,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.module.sb_totalWrites++;
+      this._buffer._module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.module.sb_overflowWrites++;
+        this._buffer._module.sb_overflowWrites++;
       }
       return this;
     }
@@ -331,9 +331,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.module.sb_totalWrites++;
+      this._buffer._module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.module.sb_overflowWrites++;
+        this._buffer._module.sb_overflowWrites++;
       }
       return this;
     }
@@ -351,9 +351,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.module.sb_totalWrites++;
+      this._buffer._module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.module.sb_overflowWrites++;
+        this._buffer._module.sb_overflowWrites++;
       }
       return this;
     }
@@ -371,9 +371,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.module.sb_totalWrites++;
+      this._buffer._module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.module.sb_overflowWrites++;
+        this._buffer._module.sb_overflowWrites++;
       }
       return this;
     }
@@ -391,9 +391,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer.module.sb_totalWrites++;
+      this._buffer._module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.module.sb_overflowWrites++;
+        this._buffer._module.sb_overflowWrites++;
       }
       return this;
     }
@@ -419,9 +419,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.ffValue_nulls, idx);
         }
       }
-      this._buffer.module.sb_totalWrites++;
+      this._buffer._module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.module.sb_overflowWrites++;
+        this._buffer._module.sb_overflowWrites++;
       }
     }
 
@@ -441,9 +441,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       }
       // Context attributes can be written to user schema columns if provided
       // For now, just log the flag name - context can be added later if needed
-      this._buffer.module.sb_totalWrites++;
+      this._buffer._module.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer.module.sb_overflowWrites++;
+        this._buffer._module.sb_overflowWrites++;
       }
     }
 
@@ -465,7 +465,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     ` +
       // Get the scope values from buffer directly.
       `get scope() {
-      return this._buffer.scopeValues;
+      return this._buffer._scopeValues;
     }
 
     ${setScopeMethod}

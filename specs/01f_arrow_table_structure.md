@@ -25,9 +25,9 @@ The correct zero-copy approach is demonstrated in `extern/arrow-js-ffi/src/vecto
 return arrow.makeData({
   type: dataType,
   offset: 0,
-  length: buffer.writeIndex,
+  length: buffer._writeIndex,
   nullCount,
-  data: buffer.timestamps.subarray(0, buffer.writeIndex), // Direct reference!
+  data: buffer.timestamp.subarray(0, buffer._writeIndex), // Direct reference!
   nullBitmap,
 });
 
@@ -55,11 +55,11 @@ Different column types require different zero-copy strategies:
 
 ```typescript
 // Number column (Float64Array)
-const data = buffer.httpDuration_values.subarray(0, buffer.writeIndex);
+const data = buffer.httpDuration_values.subarray(0, buffer._writeIndex);
 return arrow.makeData({
   type: new arrow.Float64(),
   offset: 0,
-  length: buffer.writeIndex,
+  length: buffer._writeIndex,
   nullCount,
   data,
   nullBitmap,
@@ -72,7 +72,7 @@ return arrow.makeData({
 
 ```typescript
 // Category column: raw strings stored in hot path, dictionary built here
-const rawStrings = buffer.httpMethod_values.slice(0, buffer.writeIndex);
+const rawStrings = buffer.httpMethod_values.slice(0, buffer._writeIndex);
 
 // Build dictionary from unique strings (COLD PATH - deferred interning)
 const uniqueStrings = [...new Set(rawStrings.filter((s) => s != null))].sort();
@@ -89,7 +89,7 @@ for (let i = 0; i < rawStrings.length; i++) {
 return arrow.makeData({
   type: new arrow.Dictionary(new arrow.Utf8(), new arrow.Uint32()),
   offset: 0,
-  length: buffer.writeIndex,
+  length: buffer._writeIndex,
   nullCount,
   data: indicesData, // Indices built from raw strings
   nullBitmap,
@@ -129,7 +129,7 @@ if (useDictionary) {
 
 ### Buffer Concatenation for Chained Buffers
 
-When SpanBuffer chains need concatenation (buffer.next), use this helper:
+When SpanBuffer chains need concatenation (buffer.\_next), use this helper:
 
 ```typescript
 /**
@@ -151,7 +151,7 @@ function concatenateTypedArrays<T extends TypedArray>(arrays: T[]): T {
 
 // Usage with buffer chain
 const buffers: SpanBuffer[] = collectBufferChain(rootBuffer);
-const timestampArrays = buffers.map((buf) => buf.timestamps.subarray(0, buf.writeIndex));
+const timestampArrays = buffers.map((buf) => buf.timestamp.subarray(0, buf._writeIndex));
 const allTimestamps = concatenateTypedArrays(timestampArrays);
 
 return arrow.makeData({
@@ -181,11 +181,11 @@ function buildNullBitmap(buffer: SpanBuffer, columnName: string): { nullBitmap: 
     return { nullBitmap: null, nullCount: 0 }; // All valid
   }
 
-  const validBits = nullBitmap.subarray(0, Math.ceil(buffer.writeIndex / 8));
+  const validBits = nullBitmap.subarray(0, Math.ceil(buffer._writeIndex / 8));
 
   // Count nulls (0 bits)
   let nullCount = 0;
-  for (let i = 0; i < buffer.writeIndex; i++) {
+  for (let i = 0; i < buffer._writeIndex; i++) {
     const byteIndex = Math.floor(i / 8);
     const bitOffset = i % 8;
     const isValid = (validBits[byteIndex] & (1 << bitOffset)) !== 0;
@@ -406,8 +406,8 @@ In memory, span identification is packed into a 25-byte `SpanIdentity` ArrayBuff
 SpanIdentity (25 bytes):
 ┌──────────────────────────────────────────────────────────────────────────┐
 │ Byte 0:      flags           (bit 0 = hasParent)                         │
-│ Bytes 1-8:   threadId        (8 bytes, crypto-secure random)             │
-│ Bytes 9-12:  spanId          (4 bytes, thread-local counter)             │
+│ Bytes 1-8:   thread_id        (8 bytes, crypto-secure random)             │
+│ Bytes 9-12:  span_id          (4 bytes, thread-local counter)             │
 │ Bytes 13-20: parentThreadId  (8 bytes, zeroed if root)                   │
 │ Bytes 21-24: parentSpanId    (4 bytes, zeroed if root)                   │
 └──────────────────────────────────────────────────────────────────────────┘
@@ -425,7 +425,7 @@ SpanIdentity (25 bytes):
 type TraceId = string & { readonly __brand: 'TraceId' };
 
 // All spans share the same reference
-rootSpan.traceId === childSpan.traceId; // true (same string reference)
+rootSpan.trace_id === childSpan.trace_id; // true (same string reference)
 ```
 
 ### Global Uniqueness
@@ -446,7 +446,7 @@ To find a parent span, you need:
 SpanBuffer provides convenience methods:
 
 ```typescript
-// These check BOTH traceId equality AND SpanIdentity relationship
+// These check BOTH trace_id equality AND SpanIdentity relationship
 spanA.isParentOf(spanB); // true if spanA is spanB's parent
 spanB.isChildOf(spanA); // true if spanB is spanA's child
 ```
@@ -588,23 +588,23 @@ ORDER BY span_id;
 During Arrow conversion, the `SpanIdentity` 25-byte ArrayBuffer is expanded to separate columns:
 
 ```typescript
-function convertSpanIdentityToArrowColumns(spanId: SpanIdentity, rowCount: number): ArrowColumns {
+function convertSpanIdentityToArrowColumns(spanIdentity: SpanIdentity, rowCount: number): ArrowColumns {
   // Thread ID: extract 8 bytes, convert to BigUint64
-  const threadIdBytes = spanId.threadId; // Uint8Array view of bytes 1-8
+  const threadIdBytes = spanIdentity.threadId; // Uint8Array view of bytes 1-8
   const threadIdView = new DataView(threadIdBytes.buffer, threadIdBytes.byteOffset, 8);
   const threadIdValue = threadIdView.getBigUint64(0, true); // little-endian
   const threadIdData = new BigUint64Array(rowCount).fill(threadIdValue);
 
   // Span ID: direct 32-bit value
-  const spanIdData = new Uint32Array(rowCount).fill(spanId.spanId);
+  const spanIdData = new Uint32Array(rowCount).fill(spanIdentity.spanId);
 
   // Parent columns (nullable based on hasParent flag)
-  if (spanId.hasParent) {
-    const parentThreadIdBytes = spanId.parentThreadId;
+  if (spanIdentity.hasParent) {
+    const parentThreadIdBytes = spanIdentity.parentThreadId;
     const parentThreadIdView = new DataView(parentThreadIdBytes.buffer, parentThreadIdBytes.byteOffset, 8);
     const parentThreadIdValue = parentThreadIdView.getBigUint64(0, true);
     const parentThreadIdData = new BigUint64Array(rowCount).fill(parentThreadIdValue);
-    const parentSpanIdData = new Uint32Array(rowCount).fill(spanId.parentSpanId);
+    const parentSpanIdData = new Uint32Array(rowCount).fill(spanIdentity.parentSpanId);
 
     return {
       thread_id: { data: threadIdData, nullBitmap: null },
@@ -660,31 +660,31 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 1, parent_thread_id: null, parent_span_i
 thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890, parent_span_id: 1
 ```
 
-| trace_id     | span_id | parent_span_id | timestamp                  | entry_type   | package_name              | package_path                   | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
-| ------------ | ------- | -------------- | -------------------------- | ------------ | ------------------------- | ------------------------------ | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `@mycompany/user-service` | `src/controllers/user.ts`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.005Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Starting registration for ${userId}`           | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.010Z` | `span-start` | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.015Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.045Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | 30.2          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 2       | 1              | `2024-01-01T10:00:00.046Z` | `span-ok`    | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.050Z` | `span-start` | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.052Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.067Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | 15.3        | 0       | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.068Z` | `debug`      | `@mycompany/user-service` | `src/repositories/user.ts`     | `User does not exist, proceeding with creation` | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 3       | 1              | `2024-01-01T10:00:00.069Z` | `span-ok`    | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.070Z` | `span-start` | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.072Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.095Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | 23.1        | 1       | `users`  | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 4       | 1              | `2024-01-01T10:00:00.096Z` | `span-ok`    | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.100Z` | `span-start` | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.105Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.245Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | 140.3         | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 5       | 1              | `2024-01-01T10:00:00.246Z` | `span-ok`    | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.250Z` | `tag`        | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | 1.0             | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for ${userId}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
-| `req-abc123` | 1       | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| trace_id     | thread_id            | span_id | parent_thread_id     | parent_span_id | timestamp                  | entry_type   | package_name              | package_path                   | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
+| ------------ | -------------------- | ------- | -------------------- | -------------- | -------------------------- | ------------ | ------------------------- | ------------------------------ | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `@mycompany/user-service` | `src/controllers/user.ts`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.005Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Starting registration for ${userId}`           | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.010Z` | `span-start` | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.015Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.045Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | 30.2          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.046Z` | `span-ok`    | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 3       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.050Z` | `span-start` | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 3       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.052Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 3       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.067Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | `SELECT id FROM users WHERE email = ?`                                  | 15.3        | 0       | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 3       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.068Z` | `debug`      | `@mycompany/user-service` | `src/repositories/user.ts`     | `User does not exist, proceeding with creation` | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 3       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.069Z` | `span-ok`    | `@mycompany/user-service` | `src/repositories/user.ts`     | `check-user-exists`                             | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 4       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.070Z` | `span-start` | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 4       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.072Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | null        | null    | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 4       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.095Z` | `tag`        | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | `INSERT INTO users (email, password_hash, created_at) VALUES (?, ?, ?)` | 23.1        | 1       | `users`  | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 4       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.096Z` | `span-ok`    | `@mycompany/user-service` | `src/repositories/user.ts`     | `create-user`                                   | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.100Z` | `span-start` | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.105Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.245Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | 140.3         | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.246Z` | `span-ok`    | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.250Z` | `tag`        | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | 1.0             | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for ${userId}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 
 ## The `message` System Column
 
@@ -1224,7 +1224,7 @@ efficiency and shared dictionaries.
 - **Shared dictionaries**: All RecordBatches reference the same dictionary vectors
 - **UTF-8 caching**: Encode once, copy on reuse for repeated strings
 - **Depth-first pre-order traversal**: Parents before children (optimal for queries and compression)
-- **Buffer overflow handling**: Multiple buffers with same spanId yielded contiguously
+- **Buffer overflow handling**: Multiple buffers with same span_id yielded contiguously
 
 ## Current Implementation Status
 
@@ -1247,7 +1247,7 @@ efficiency and shared dictionaries.
 
 ```typescript
 // Collect value arrays from each buffer
-const valueArrays = buffers.map((buf) => buf.column.subarray(0, buf.writeIndex));
+const valueArrays = buffers.map((buf) => buf.column.subarray(0, buf._writeIndex));
 // Concatenate (one copy, but still better than builder's per-value copy)
 const allValues = concatenateTypedArrays(valueArrays);
 const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
@@ -1260,7 +1260,7 @@ vectors.push(arrow.makeVector(data));
 
 ```typescript
 // Collect index arrays
-const indexArrays = buffers.map((buf) => buf.column_values.subarray(0, buf.writeIndex));
+const indexArrays = buffers.map((buf) => buf.column_values.subarray(0, buf._writeIndex));
 const allIndices = concatenateTypedArrays(indexArrays);
 const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 // Create dictionary vector from interner

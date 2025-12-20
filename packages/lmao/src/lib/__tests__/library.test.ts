@@ -24,7 +24,6 @@ import {
 } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { LogSchema, type SchemaFields } from '../schema/types.js';
 
 describe('Library Integration Pattern', () => {
   describe('Schema Prefixing', () => {
@@ -175,7 +174,7 @@ describe('Library Integration Pattern', () => {
       const mockBuffer = {
         getColumnIfAllocated: (name: string) => (name === 'status' ? mockColumn : undefined),
         getNullsIfAllocated: (name: string) => (name === 'status' ? mockColumn : undefined),
-        children: [],
+        _children: [],
         writeIndex: 0,
         timestamps: new BigInt64Array(1),
         operations: new Uint8Array(1),
@@ -196,7 +195,6 @@ describe('Library Integration Pattern', () => {
         _identity: 'test-identity',
         module: { packageName: 'test' },
         spanName: 'test-span',
-        utf8SpanName: new Uint8Array(),
       } as any;
 
       const view = new ViewClass(mockBuffer);
@@ -390,18 +388,18 @@ describe('Module Builder Pattern Integration', () => {
       });
 
       expect(appModule.metadata.packageName).toBe('@test/app');
-      expect(appModule.module.logSchema.fieldNames).toContain('userId');
-      expect(appModule.module.logSchema.fieldNames).toContain('endpoint');
+      expect(appModule._module.logSchema.fieldNames).toContain('userId');
+      expect(appModule._module.logSchema.fieldNames).toContain('endpoint');
     });
 
     it('should provide access to module schema and metadata', () => {
       const httpModule = createHttpModule();
 
       // Test direct schema access
-      expect(httpModule.module.logSchema.fieldNames).toContain('status');
-      expect(httpModule.module.logSchema.fieldNames).toContain('method');
-      expect(httpModule.module.logSchema.fieldNames).toContain('url');
-      expect(httpModule.module.logSchema.fieldNames).toContain('duration');
+      expect(httpModule._module.logSchema.fieldNames).toContain('status');
+      expect(httpModule._module.logSchema.fieldNames).toContain('method');
+      expect(httpModule._module.logSchema.fieldNames).toContain('url');
+      expect(httpModule._module.logSchema.fieldNames).toContain('duration');
 
       // Test metadata access
       expect(httpModule.metadata.packageName).toBe('@test/http');
@@ -423,7 +421,7 @@ describe('Module Builder Pattern Integration', () => {
         },
       });
 
-      const schema = complexModule.module.logSchema;
+      const schema = complexModule._module.logSchema;
       expect(schema.fieldNames).toContain('enumField');
       expect(schema.fieldNames).toContain('categoryField');
       expect(schema.fieldNames).toContain('textField');
@@ -438,10 +436,10 @@ describe('Module Builder Pattern Integration', () => {
       const prefixedHttpModule = httpModule.prefix('http');
 
       // Prefixed module should have prefixed schema
-      expect(prefixedHttpModule.module.logSchema.fieldNames).toContain('http_status');
-      expect(prefixedHttpModule.module.logSchema.fieldNames).toContain('http_method');
-      expect(prefixedHttpModule.module.logSchema.fieldNames).not.toContain('status');
-      expect(prefixedHttpModule.module.logSchema.fieldNames).not.toContain('method');
+      expect(prefixedHttpModule._module.logSchema.fieldNames).toContain('http_status');
+      expect(prefixedHttpModule._module.logSchema.fieldNames).toContain('http_method');
+      expect(prefixedHttpModule._module.logSchema.fieldNames).not.toContain('status');
+      expect(prefixedHttpModule._module.logSchema.fieldNames).not.toContain('method');
     });
 
     it('should support prefix chaining', () => {
@@ -449,8 +447,8 @@ describe('Module Builder Pattern Integration', () => {
       const doublePrefixed = httpModule.prefix('api').prefix('v1');
 
       // Should have both prefixes
-      expect(doublePrefixed.module.logSchema.fieldNames).toContain('v1_api_status');
-      expect(doublePrefixed.module.logSchema.fieldNames).toContain('v1_api_method');
+      expect(doublePrefixed._module.logSchema.fieldNames).toContain('v1_api_status');
+      expect(doublePrefixed._module.logSchema.fieldNames).toContain('v1_api_method');
     });
 
     it('should handle different field types with prefixing', () => {
@@ -469,7 +467,7 @@ describe('Module Builder Pattern Integration', () => {
       });
 
       const prefixed = complexModule.prefix('complex');
-      const schema = prefixed.module.logSchema;
+      const schema = prefixed._module.logSchema;
 
       // All field types should be preserved with prefix
       expect(schema.fieldNames).toContain('complex_enumField');
@@ -488,7 +486,7 @@ describe('Module Builder Pattern Integration', () => {
       expect(prefixedHttpModule.metadata.packagePath).toBe('src/index.ts');
 
       // Prefixed schema should preserve field metadata
-      const statusField = prefixedHttpModule.module.logSchema.fields.http_status;
+      const statusField = prefixedHttpModule._module.logSchema.fields.http_status;
       expect(statusField).toHaveProperty('__schema_type', 'number');
     });
   });
@@ -504,9 +502,9 @@ describe('Module Builder Pattern Integration', () => {
 
       expect(wiredHttp).toBeDefined();
       // The wired module should have access to prefixed retry functionality
-      expect(wiredHttp.module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredHttp.module.logSchema.fieldNames).toContain('http_retry_attempt');
-      expect(wiredHttp.module.logSchema.fieldNames).toContain('http_retry_delay');
+      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_status');
+      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_attempt');
+      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_delay');
     });
 
     it('should support shared dependencies', () => {
@@ -542,14 +540,14 @@ describe('Module Builder Pattern Integration', () => {
       expect(appRoot).toBeDefined();
 
       // Verify shared instance is used in both places
-      expect(appRoot.module.logSchema.fieldNames).toContain('shared_retry_attempt');
-      expect(appRoot.module.logSchema.fieldNames).toContain('shared_retry_delay');
+      expect(appRoot._module.logSchema.fieldNames).toContain('shared_retry_attempt');
+      expect(appRoot._module.logSchema.fieldNames).toContain('shared_retry_delay');
     });
 
     it('should handle dependency chains', () => {
       const retryModule = createRetryModule();
       const httpModule = createHttpModule();
-      const dbModule = createDbModule();
+      const _dbModule = createDbModule();
 
       // Create a chain: HTTP -> retry -> nested retry
       const nestedRetry = retryModule.prefix('http_retry_nested').use();
@@ -558,8 +556,8 @@ describe('Module Builder Pattern Integration', () => {
       });
 
       expect(wiredHttp).toBeDefined();
-      expect(wiredHttp.module.logSchema.fieldNames).toContain('http_retry_nested_attempt');
-      expect(wiredHttp.module.logSchema.fieldNames).toContain('http_retry_nested_delay');
+      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_nested_attempt');
+      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_nested_delay');
     });
 
     it('should maintain type safety in dependency composition', () => {
@@ -574,8 +572,8 @@ describe('Module Builder Pattern Integration', () => {
       expect(wired).toBeDefined();
 
       // Verify that both original and retry schemas are present
-      expect(wired.module.logSchema.fieldNames).toContain('http_status');
-      expect(wired.module.logSchema.fieldNames).toContain('http_retry_attempt');
+      expect(wired._module.logSchema.fieldNames).toContain('http_status');
+      expect(wired._module.logSchema.fieldNames).toContain('http_retry_attempt');
     });
   });
 
@@ -611,7 +609,7 @@ describe('Module Builder Pattern Integration', () => {
       expect(ctx.env.region).toBe('us-east-1');
       expect(ctx.requestId).toBe('req-123');
       expect(ctx.userId).toBe('user-456');
-      expect(ctx.traceId).toBeDefined();
+      expect(ctx.trace_id).toBeDefined();
       expect(ctx.span).toBeDefined();
     });
 
@@ -763,9 +761,9 @@ describe('Library Composition Scenarios', () => {
       });
 
       // Verify that composed schema has both app and library fields
-      expect(wiredApp.module.logSchema.fieldNames).toContain('endpoint');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_method');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('endpoint');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_status');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_method');
     });
 
     it('should maintain separate namespaces', () => {
@@ -793,15 +791,15 @@ describe('Library Composition Scenarios', () => {
       });
 
       // Each library should have its own prefix
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_method');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('db_query');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('db_duration');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('db_rows');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_status');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_method');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('db_query');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('db_duration');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('db_rows');
 
       // App fields should also be present
-      expect(wiredApp.module.logSchema.fieldNames).toContain('endpoint');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('requestType');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('endpoint');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('requestType');
     });
   });
 
@@ -815,18 +813,18 @@ describe('Library Composition Scenarios', () => {
         retry: retryModule.prefix('http_retry').use(),
       });
 
-      expect(httpWithRetry.module.logSchema.fieldNames).toContain('http_status');
-      expect(httpWithRetry.module.logSchema.fieldNames).toContain('http_method');
-      expect(httpWithRetry.module.logSchema.fieldNames).toContain('http_url');
-      expect(httpWithRetry.module.logSchema.fieldNames).toContain('http_duration');
+      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_status');
+      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_method');
+      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_url');
+      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_duration');
 
       // Retry dependency fields should be present with prefix
-      expect(httpWithRetry.module.logSchema.fieldNames).toContain('http_retry_attempt');
-      expect(httpWithRetry.module.logSchema.fieldNames).toContain('http_retry_delay');
+      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_retry_attempt');
+      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_retry_delay');
     });
 
     it('should handle deep dependency chains', () => {
-      const authModule = defineModule({
+      const _authModule = defineModule({
         metadata: {
           packageName: '@test/auth',
           packagePath: 'src/index.ts',
@@ -842,7 +840,7 @@ describe('Library Composition Scenarios', () => {
 
       // Create dependency chain: Auth -> Retry -> HTTP
       const retryForHttp = retryModule.prefix('http_retry').use();
-      const httpWithRetry = httpModule.prefix('http').use({
+      const _httpWithRetry = httpModule.prefix('http').use({
         retry: retryForHttp,
       });
       const httpWithAuth = httpModule.prefix('http').use({
@@ -869,14 +867,14 @@ describe('Library Composition Scenarios', () => {
       });
 
       // All dependency chains should be represented in the final schema
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_method');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_url');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('http_duration');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_status');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_method');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_url');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('http_duration');
 
       // Check that retry dependencies are properly namespaced
-      expect(wiredApp.module.logSchema.fieldNames).toContain('shared_auth_retry_attempt');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('shared_auth_retry_delay');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('shared_auth_retry_attempt');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('shared_auth_retry_delay');
     });
   });
 
@@ -930,8 +928,8 @@ describe('Library Composition Scenarios', () => {
       expect(wiredApp).toBeDefined();
 
       // Verify all schemas are properly composed
-      const httpSchema = wiredApp.module.logSchema;
-      const dbSchema = wiredApp.module.logSchema;
+      const httpSchema = wiredApp._module.logSchema;
+      const dbSchema = wiredApp._module.logSchema;
 
       // HTTP with its dependencies
       expect(httpSchema.fieldNames).toContain('http_status');
@@ -951,8 +949,8 @@ describe('Library Composition Scenarios', () => {
       expect(dbSchema.fieldNames).toContain('db_cache_misses');
 
       // App fields should be present
-      expect(wiredApp.module.logSchema.fieldNames).toContain('userId');
-      expect(wiredApp.module.logSchema.fieldNames).toContain('requestId');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('userId');
+      expect(wiredApp._module.logSchema.fieldNames).toContain('requestId');
     });
 
     it('should handle dependency sharing patterns', () => {
@@ -991,8 +989,8 @@ describe('Library Composition Scenarios', () => {
       expect(wiredApp).toBeDefined();
 
       // Verify that both retry configurations are present with proper prefixes
-      const httpSchema = wiredApp.module.logSchema;
-      const dbSchema = wiredApp.module.logSchema;
+      const httpSchema = wiredApp._module.logSchema;
+      const dbSchema = wiredApp._module.logSchema;
 
       expect(httpSchema.fieldNames).toContain('http_status');
       expect(httpSchema.fieldNames).toContain('fast_retry_attempt');

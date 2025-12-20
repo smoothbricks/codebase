@@ -28,14 +28,14 @@ describe('RemappedBufferView Integration', () => {
           method: S.enum(['GET', 'POST']),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const prefixedHttp = httpModule.prefix('http');
 
       // Check that remappedViewClass is stored on the module's ModuleContext
-      expect(prefixedHttp.module.remappedViewClass).toBeDefined();
-      expect(typeof prefixedHttp.module.remappedViewClass).toBe('function');
+      expect(prefixedHttp._module.remappedViewClass).toBeDefined();
+      expect(typeof prefixedHttp._module.remappedViewClass).toBe('function');
     });
 
     it('should have undefined remappedViewClass for unprefixed modules', () => {
@@ -49,11 +49,11 @@ describe('RemappedBufferView Integration', () => {
           status: S.number(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       // Unprefixed module should have undefined remappedViewClass
-      expect(httpModule.module.remappedViewClass).toBeUndefined();
+      expect(httpModule._module.remappedViewClass).toBeUndefined();
     });
   });
 
@@ -69,7 +69,7 @@ describe('RemappedBufferView Integration', () => {
           userId: S.category(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const httpModule = defineModule({
@@ -83,7 +83,7 @@ describe('RemappedBufferView Integration', () => {
           method: S.enum(['GET', 'POST']),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const prefixedHttp = httpModule.prefix('http');
@@ -110,10 +110,10 @@ describe('RemappedBufferView Integration', () => {
 
       expect(rootBuffer).toBeDefined();
       expect(childBuffer).toBeDefined();
-      expect(rootBuffer?.children).toHaveLength(1);
+      expect(rootBuffer?._children).toHaveLength(1);
 
       // Child should be wrapped in RemappedBufferView
-      const child = rootBuffer?.children[0];
+      const child = rootBuffer?._children[0];
       expect(child).toBeDefined();
 
       // RemappedBufferView should have _buffer property pointing to actual buffer
@@ -132,7 +132,7 @@ describe('RemappedBufferView Integration', () => {
           userId: S.category(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const dbModule = defineModule({
@@ -145,7 +145,7 @@ describe('RemappedBufferView Integration', () => {
           query: S.text(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       let rootBuffer: SpanBuffer | undefined;
@@ -168,10 +168,10 @@ describe('RemappedBufferView Integration', () => {
 
       expect(rootBuffer).toBeDefined();
       expect(childBuffer).toBeDefined();
-      expect(rootBuffer?.children).toHaveLength(1);
+      expect(rootBuffer?._children).toHaveLength(1);
 
       // Child should be raw buffer (not wrapped)
-      const child = rootBuffer?.children[0];
+      const child = rootBuffer?._children[0];
       expect(child).toBe(childBuffer);
       // Should not have _buffer property (that's only on RemappedBufferView)
       expect((child as unknown as { _buffer?: SpanBuffer })._buffer).toBeUndefined();
@@ -190,7 +190,7 @@ describe('RemappedBufferView Integration', () => {
           status: S.number(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const prefixedHttp = httpModule.prefix('http');
@@ -209,7 +209,7 @@ describe('RemappedBufferView Integration', () => {
 
       expect(rootBuffer).toBeDefined();
       // Root buffer should not be wrapped (no parent to register with)
-      expect(rootBuffer?.parent).toBeUndefined();
+      expect(rootBuffer?._parent).toBeUndefined();
       // Root buffer should not have _buffer property
       expect((rootBuffer as unknown as { _buffer?: SpanBuffer })._buffer).toBeUndefined();
     });
@@ -227,7 +227,7 @@ describe('RemappedBufferView Integration', () => {
           userId: S.category(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const httpModule = defineModule({
@@ -241,7 +241,7 @@ describe('RemappedBufferView Integration', () => {
           method: S.enum(['GET', 'POST']),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const prefixedHttp = httpModule.prefix('http');
@@ -291,7 +291,7 @@ describe('RemappedBufferView Integration', () => {
           userId: S.category(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const httpModule = defineModule({
@@ -304,7 +304,7 @@ describe('RemappedBufferView Integration', () => {
           status: S.number(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const dbModule = defineModule({
@@ -317,7 +317,7 @@ describe('RemappedBufferView Integration', () => {
           query: S.text(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const cacheModule = defineModule({
@@ -330,7 +330,7 @@ describe('RemappedBufferView Integration', () => {
           key: S.category(),
         }),
       })
-        .ctx<{}>({})
+        .ctx<Record<string, never>>({})
         .make();
 
       const prefixedHttp = httpModule.prefix('http');
@@ -372,11 +372,11 @@ describe('RemappedBufferView Integration', () => {
       if (!rootBuffer) throw new Error('rootBuffer is undefined');
 
       // Verify tree structure: app → http → db → cache
-      expect(rootBuffer.children).toHaveLength(1);
-      const httpChild = rootBuffer.children[0];
-      expect(httpChild.children).toHaveLength(1);
-      const dbChild = httpChild.children[0];
-      expect(dbChild.children).toHaveLength(1);
+      expect(rootBuffer._children).toHaveLength(1);
+      const httpChild = rootBuffer._children[0];
+      expect(httpChild._children).toHaveLength(1);
+      const dbChild = httpChild._children[0];
+      expect(dbChild._children).toHaveLength(1);
 
       // Convert to Arrow table
       const table = convertSpanTreeToArrowTable(rootBuffer);

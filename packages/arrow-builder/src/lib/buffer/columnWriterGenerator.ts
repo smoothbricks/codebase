@@ -108,7 +108,7 @@ export type ColumnWriter<T extends ColumnSchema = ColumnSchema> = {
   nextRow(): ColumnWriter<T>;
   _getNextBuffer(): ColumnBuffer;
 } & {
-  [K in keyof T as K extends string ? K : never]: (value: import('@sury/sury').Output<T[K]>) => ColumnWriter<T>;
+  [K in keyof T['fields']]: (value: import('@sury/sury').Output<T['fields'][K]>) => ColumnWriter<T>;
 };
 
 /**
@@ -136,9 +136,24 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
     return this;`;
   }
 
-  // All other types: call buffer's setter method (handles enum mapping, null bitmap, etc.)
+  if (schemaType === 'enum') {
+    // Convert string enum value to numeric index
+    return `
+    const idx = this._writeIndex;
+    const enumIndex = this._buffer.${columnName}_enumValues.indexOf(value);
+    if (enumIndex === -1) {
+      throw new Error(\`Invalid enum value "\${value}" for field "${columnName}". Valid values: \${this._buffer.${columnName}_enumValues.join(', ')}\`);
+    }
+    this._buffer.${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7)); // Set not-null
+    this._buffer.${columnName}_values[idx] = enumIndex;
+    return this;`;
+  }
+
+  // All other types: set value in TypedArray and update null bitmap
   return `
-    this._buffer.${columnName}(this._writeIndex, value);
+    const idx = this._writeIndex;
+    this._buffer.${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7)); // Set not-null
+    this._buffer.${columnName}_values[idx] = value;
     return this;`;
 }
 

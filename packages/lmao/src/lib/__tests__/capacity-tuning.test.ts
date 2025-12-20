@@ -456,7 +456,7 @@ describe('Capacity Tuning Algorithm', () => {
         fc.property(
           fc.record({
             totalWrites: fc.integer({ min: 95, max: 105 }), // Around sample boundary
-            overflowRatio: fc.double({ min: -0.1, max: 0.3 }).filter((n) => !isNaN(n)),
+            overflowRatio: fc.double({ min: -0.1, max: 0.3 }).filter((n) => !Number.isNaN(n)),
             totalCreated: fc.integer({ min: 8, max: 12 }), // Around buffer boundary
             initialCapacity: fc.constantFrom(8, 16, 32, 64, 128, 256, 512, 1024),
           }),

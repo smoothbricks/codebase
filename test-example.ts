@@ -1,34 +1,11 @@
-/**
- * Example: IDEAL Library Integration Pattern
- *
- * Per specs/01e_library_integration_pattern.md:
- * - Libraries define clean schemas without prefixes
- * - Libraries declare dependencies via `deps: { otherLib: otherModule }`
- * - Dependencies are automatically wired through use()
- * - Operations access dependencies through typed `ctx.deps`
- * - Zero runtime overhead through compile-time optimization
- *
- * This example demonstrates:
- * 1. Clean library definitions with dependency declarations
- * 2. Automatic dependency wiring via use()
- * 3. Type-safe dependency access through ctx.deps
- * 4. Simple composition without complex prefixing
- *
- * Key Pattern: Libraries declare deps and use() wires them automatically!
- */
+#!/usr/bin/env bun
 
-import { defineLogSchema, defineModule, S } from '../src/index.js';
+// Simple test runner for the library integration example
+import { defineLogSchema, defineModule, S } from './packages/lmao/src/index.js';
 
 // ============================================================================
-// CACHE LIBRARY - Foundation for other libraries
+// CACHE LIBRARY (defined first so HTTP can reference it)
 // ============================================================================
-
-const cacheSchema = defineLogSchema({
-  operation: S.enum(['GET', 'SET', 'DELETE', 'EXISTS']),
-  key: S.category(),
-  hit: S.boolean(),
-  ttl: S.number(),
-});
 
 const cacheModule = defineModule({
   metadata: {
@@ -36,13 +13,20 @@ const cacheModule = defineModule({
     packageName: '@acme/cache',
     packagePath: 'src/redis.ts',
   },
-  logSchema: cacheSchema,
+  logSchema: {
+    operation: S.enum(['GET', 'SET', 'DELETE', 'EXISTS']),
+    key: S.category(),
+    hit: S.boolean(),
+    ttl: S.number(),
+  },
 })
   .ctx({})
   .make();
 
-// Cache operations - these will be accessible via ctx.deps.cache
 const cacheGet = cacheModule.op('cache-get', async (ctx, key: string) => {
+  console.log('🔍 cacheGet Op - traceId from ctx._traceCtx:', (ctx as any)._traceCtx?.traceId);
+  console.log('🔍 cacheGet Op - buffer trace_id:', (ctx as any)._buffer?.trace_id);
+
   ctx.tag.operation('GET').key(key);
 
   // Mock: simulate cache lookup
@@ -58,21 +42,12 @@ const cacheSet = cacheModule.op('cache-set', async (ctx, key: string, value: unk
     .operation('SET')
     .key(key)
     .ttl(ttl as number);
-
-  // Mock: simulate cache write
   return ctx.ok({ success: true });
 });
 
 // ============================================================================
-// HTTP LIBRARY - Declares dependency on cache
+// HTTP LIBRARY (now can reference cacheModule in deps)
 // ============================================================================
-
-const httpSchema = defineLogSchema({
-  status: S.number(),
-  method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
-  url: S.text(),
-  duration: S.number(),
-});
 
 const httpModule = defineModule({
   metadata: {
@@ -80,8 +55,13 @@ const httpModule = defineModule({
     packageName: '@acme/http-client',
     packagePath: 'src/index.ts',
   },
-  logSchema: httpSchema,
-  deps: { cache: cacheModule }, // IDEAL: Declare dependency here!
+  logSchema: {
+    status: S.number(),
+    method: S.enum(['GET', 'POST', 'PUT', 'DELETE', 'PATCH']),
+    url: S.text(),
+    duration: S.number(),
+  },
+  deps: { cache: cacheModule }, // HTTP library declares dependency on cache
 })
   .ctx({})
   .make();
@@ -90,33 +70,30 @@ const httpModule = defineModule({
 const httpRequest = httpModule.op('http-request', async (ctx, opts: { method: string; url: string }) => {
   const startTime = performance.now();
 
-  // Access wired cache dependency (currently requires type assertion due to type system limitation)
-  const { cache } = ctx.deps as {
-    cache: {
-      get: (key: string) => Promise<{ hit: boolean; value?: unknown }>;
-      set: (key: string, value: unknown, ttl?: number) => Promise<{ success: boolean }>;
-    };
-  };
+  console.log('🔍 httpRequest Op - traceId from ctx._traceCtx:', (ctx as any)._traceCtx?.traceId);
+  console.log('🔍 httpRequest Op - buffer trace_id:', (ctx as any)._buffer?.trace_id);
+
+  // Access wired cache dependency
+  const { cache } = ctx.deps;
 
   // Check cache first using wired dependency
   const cacheKey = `http:${opts.method}:${opts.url}`;
-  const cached = await cache.get(cacheKey);
+  const cached = await cache.span('cache-get', cacheGet, cacheKey);
 
-  if (cached.hit) {
+  if (cached.success && cached.value.hit) {
     ctx.tag
       .method(opts.method)
       .url(opts.url)
       .status(200)
       .duration(performance.now() - startTime);
-    return ctx.ok(cached.value);
+    return ctx.ok(cached.value.value);
   }
 
   // Cache miss - make HTTP request
   ctx.tag.method(opts.method).url(opts.url);
 
-  // Simulate HTTP request
   try {
-    // Mock: simulate successful response
+    // Mock HTTP request
     const response = {
       status: opts.method === 'POST' ? 201 : 200,
       data: { success: true },
@@ -126,7 +103,7 @@ const httpRequest = httpModule.op('http-request', async (ctx, opts: { method: st
     ctx.tag.status(response.status).duration(duration);
 
     // Cache successful response
-    await cache.set(cacheKey, response, 300);
+    await cache.span('cache-set', cacheSet, cacheKey, response, 300);
 
     return ctx.ok(response);
   } catch (error) {
@@ -137,16 +114,8 @@ const httpRequest = httpModule.op('http-request', async (ctx, opts: { method: st
 });
 
 // ============================================================================
-// DATABASE LIBRARY - Independent of other libraries
+// DB LIBRARY (for completeness)
 // ============================================================================
-
-const dbSchema = defineLogSchema({
-  query: S.text(),
-  duration: S.number(), // Same name as HTTP library - will be prefixed
-  table: S.category(),
-  operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
-  rowsAffected: S.number(),
-});
 
 const dbModule = defineModule({
   metadata: {
@@ -154,7 +123,13 @@ const dbModule = defineModule({
     packageName: '@acme/database',
     packagePath: 'src/client.ts',
   },
-  logSchema: dbSchema,
+  logSchema: {
+    query: S.text(),
+    duration: S.number(),
+    table: S.category(),
+    operation: S.enum(['SELECT', 'INSERT', 'UPDATE', 'DELETE']),
+    rowsAffected: S.number(),
+  },
 })
   .ctx({})
   .make();
@@ -168,11 +143,22 @@ const dbQuery = dbModule.op('db-query', async (ctx, sql: string) => {
 // APPLICATION COMPOSITION - Automatic Dependency Wiring
 // ============================================================================
 
+// Demonstrate multiple extends: build app schema by extending multiple times
 const appSchema = defineLogSchema({
+  ...httpModule.logSchema.fields,
+  ...cacheModule.logSchema.fields,
+  ...dbModule.logSchema.fields,
   userId: S.category(),
   requestId: S.category(),
   businessMetric: S.number(),
 });
+
+// Extend with schemas from wired modules via multiple extends
+// This demonstrates reusing module schemas - each extend adds fields from one module
+const appSchemaExtended = appSchema;
+// .extend() // Reuse HTTP schema fields
+// .extend(cacheModule.logSchema.fields) // Reuse cache schema fields
+// .extend(dbModule.logSchema.fields); // Reuse DB schema fields
 
 const appModule = defineModule({
   metadata: {
@@ -180,55 +166,16 @@ const appModule = defineModule({
     packageName: '@example/user-service',
     packagePath: 'src/app.ts',
   },
-  logSchema: appSchema,
+  logSchema: appSchemaExtended, // Use extended schema with all module fields
 })
   .ctx({})
   .make();
 
 // IDEAL: Simple wiring - HTTP automatically gets its cache dependency!
 const wiredApp = appModule.use({
-  http: httpModule, // HTTP library + its cache dependency auto-wired
+  http: httpModule, // HTTP library + its cache dep auto-wired
   db: dbModule, // DB library (no deps)
   cache: cacheModule, // Direct cache access for app
-});
-
-/**
- * User data interface
- */
-interface UserData {
-  id: string;
-  email: string;
-  name: string;
-}
-
-// Application operation using wired libraries
-const getUserProfile = wiredApp.op('get-user-profile', async (ctx, userId: string) => {
-  // Set app-specific attributes
-  ctx.tag.userId(userId).requestId('req-123');
-
-  // Use DB to fetch user (current type system requires assertion - should be typed!)
-  ctx.log.info('Fetching user from database');
-  const dbResult = await (ctx.deps as any).db.span('db-query', dbQuery, `SELECT * FROM users WHERE id = '${userId}'`);
-
-  if (!dbResult.success) {
-    return ctx.err('DB_QUERY_FAILED', 'Database error');
-  }
-
-  const user = dbResult.value.rows[0] as unknown as UserData;
-
-  // HTTP library uses its internal cache automatically!
-  ctx.log.info('Enriching user data via HTTP (with automatic caching)');
-  const enrichResult = await (ctx.deps as any).http.span('http-request', httpRequest, {
-    method: 'GET',
-    url: `https://api.example.com/users/${userId}/profile`,
-  });
-
-  if (!enrichResult.success) {
-    ctx.log.warn('Failed to enrich user data, continuing with basic data');
-  }
-
-  ctx.tag.businessMetric(enrichResult.success ? 1 : 0.5);
-  return ctx.ok(user);
 });
 
 // ============================================================================
@@ -251,12 +198,46 @@ async function runExample() {
 
   // Execute operation using wired libraries
   console.log('\n🔄 Executing getUserProfile...\n');
+
+  // Application operation using wired libraries
+  const getUserProfile = wiredApp.op('get-user-profile', async (ctx, userId: string) => {
+    console.log('🔍 getUserProfile Op - traceId from ctx._traceCtx:', (ctx as any)._traceCtx?.traceId);
+    console.log('🔍 getUserProfile Op - buffer trace_id:', (ctx as any)._buffer?.trace_id);
+
+    // Set app-specific attributes
+    ctx.tag.userId(userId).requestId('req-123');
+
+    // Use DB to fetch user
+    ctx.log.info('Fetching user from database');
+    const dbResult = await ctx.span('db-query', dbQuery, `SELECT * FROM users WHERE id = '${userId}'`);
+
+    if (!dbResult.success) {
+      return ctx.err('DB_QUERY_FAILED', 'Database error');
+    }
+
+    const user = dbResult.value.rows[0];
+
+    // HTTP library uses its internal cache automatically!
+    ctx.log.info('Enriching user data via HTTP (with automatic caching)');
+    const enrichResult = await ctx.span('http-request', httpRequest, {
+      method: 'GET',
+      url: `https://api.example.com/users/${userId}/profile`,
+    });
+
+    if (!enrichResult.success) {
+      ctx.log.warn('Failed to enrich user data, continuing with basic data');
+    }
+
+    ctx.tag.businessMetric(enrichResult.success ? 1 : 0.5);
+    return ctx.ok(user);
+  });
+
   const result = await traceCtx.span('get-user-profile', getUserProfile, 'user-123');
 
   if (result.success) {
     console.log('✅ Success:', result.value);
   } else {
-    console.log('❌ Error:', result.error);
+    console.log('❌ Error: Operation failed');
   }
 
   console.log('\n💡 IDEAL Design Principles:');
@@ -267,4 +248,4 @@ async function runExample() {
   console.log('- Zero runtime overhead for dependency resolution');
 }
 
-// Uncomment to run: runExample().catch(console.error);
+runExample().catch(console.error);

@@ -30,10 +30,10 @@ import {
   type ColumnBufferExtension,
   DEFAULT_BUFFER_CAPACITY,
   getColumnBufferClass,
-  intern,
 } from '@smoothbricks/arrow-builder';
 import type { LogSchema } from './schema/LogSchema.js';
-
+import { textEncoder } from './spanBufferHelpers.js';
+import { writeThreadIdToUint64Array } from './threadId.js';
 import type { TraceId } from './traceId.js';
 import type { ModuleContext, SpanBuffer } from './types.js';
 
@@ -81,7 +81,7 @@ export const SpanBufferTestUtils = {
    * Set buffer writeIndex (for testing)
    */
   setWriteIndex(buffer: SpanBuffer, writeIndex: number): void {
-    buffer.writeIndex = writeIndex;
+    buffer._writeIndex = writeIndex;
   },
 
   /**
@@ -92,7 +92,7 @@ export const SpanBufferTestUtils = {
   getWriteIndex(buffer: ColumnBuffer): number {
     // At runtime, ColumnBuffer is actually SpanBuffer (SpanBuffer extends TypedColumnBuffer extends ColumnBuffer)
     // Cast internally so callers don't need to
-    return (buffer as unknown as SpanBuffer).writeIndex;
+    return (buffer as unknown as SpanBuffer)._writeIndex;
   },
 };
 
@@ -107,7 +107,6 @@ type SpanBufferConstructor = new (
   capacity: number,
   module: ModuleContext,
   spanName: string,
-  utf8SpanName: Uint8Array,
   parent: SpanBuffer | undefined,
   isChained: boolean,
   traceId: TraceId | undefined,
@@ -128,26 +127,32 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
-    constructorParams: 'module, spanName, utf8SpanName, parent, isChained, traceId, callsiteModule',
+    constructorParams: 'module, spanName, parent, isChained, traceId, callsiteModule',
+    dependencies: {
+      writeThreadIdToUint64Array,
+      textEncoder,
+    },
     preamble: `
       // Thread-local span counter (per-process/worker, see threadId.ts docs)
-      const spanId = ++globalSpanCounter;
+      if (typeof globalThis.globalSpanCounter === 'undefined') {
+        globalThis.globalSpanCounter = 0;
+      }
+      const spanId = ++globalThis.globalSpanCounter;
 
       // Store module context directly (no TaskContext wrapper)
-      this.module = module;
-      this.spanName = spanName;
-      this.utf8SpanName = utf8SpanName;
-      this.children = [];
-      this.next = undefined;
+      this._module = module;
+      this._spanName = spanName;
+       this._children = [];
+      this._next = undefined;
 
       // Store callsiteModule for dual module attribution (row 0 vs rows 1+)
       // Per specs/01c_context_flow_and_op_wrappers.md:
       // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
       // - Rows 1+ (logs, span-end): uses module
-      this.callsiteModule = callsiteModule;
+      this._callsiteModule = callsiteModule;
 
       // Calculate system buffer size
-      const systemSize = requestedCapacity * 9; // timestamps (8*cap) + operations (1*cap)
+      const systemSize = requestedCapacity * 9; // _timestamps (8*cap) + _operations (1*cap)
 
       if (isChained && parent) {
         // ============================================================
@@ -173,10 +178,11 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 
           // Write identity: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
           const view = new DataView(this._system, systemSize);
-          view.setBigUint64(0, getThreadId(), true); // threadId
+          const threadIdArray = new BigUint64Array(this._system, systemSize, 1);
+          writeThreadIdToUint64Array(threadIdArray, 0); // threadId
           view.setUint32(8, spanId, true); // spanId
           if (traceId) {
-            const traceIdUtf8 = utf8Encode(traceId);
+            const traceIdUtf8 = textEncoder.encode(traceId);
             this._identity[12] = traceIdUtf8.length;
             this._identity.set(traceIdUtf8, 13);
           }
@@ -184,15 +190,76 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
       }
 
       // Set up system column views
-      this.timestamps = new BigInt64Array(this._system, 0, requestedCapacity);
-      this.operations = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
+  this.timestamp = new BigInt64Array(this._system, 0, requestedCapacity);
+  this.entry_type = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
+
+      // Create internal aliases for backwards compatibility
+      this._timestamps = this.timestamp;
+      this._operations = this.entry_type;
 
       // Initialize system columns to zero
-      this.timestamps.fill(0n);
-      this.operations.fill(0);
+      this.timestamp.fill(0n);
+      this.entry_type.fill(0);
 
-      this.writeIndex = 0;
-      this.capacity = requestedCapacity;
+      this._writeIndex = 0;
+      this._capacity = requestedCapacity;
+    `,
+    methods: `
+    get span_id() {
+      return this._identity ? new DataView(this._identity.buffer, this._identity.byteOffset + 8).getUint32(0, true) : 0;
+    }
+
+    get thread_id() {
+      return this._identity ? new DataView(this._identity.buffer, this._identity.byteOffset).getBigUint64(0, true) : 0n;
+    }
+
+    get trace_id() {
+      // Walk up parent chain to find root span with trace_id
+      let current = this;
+      while (current._parent) {
+        current = current._parent;
+      }
+      if (!current._identity) {
+        return undefined;
+      }
+      const len = current._identity[12];
+      const traceIdBytes = current._identity.subarray(13, 13 + len);
+      return new TextDecoder().decode(traceIdBytes);
+    }
+
+    get _hasParent() {
+      return this._parent !== undefined;
+    }
+
+    get parent_span_id() {
+      return this._parent?.span_id ?? 0;
+    }
+
+    get parent_thread_id() {
+      return this._parent?.thread_id ?? 0n;
+    }
+
+    isParentOf(other) {
+      return this === other._parent;
+    }
+
+    isChildOf(other) {
+      return this._parent === other;
+    }
+
+    copyThreadIdTo(dest, offset) {
+      if (this._identity) {
+        const view = new DataView(this._identity.buffer, this._identity.byteOffset);
+        const threadId = view.getBigUint64(0, true);
+        new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, threadId, true);
+      } else {
+        new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, 0n, true);
+      }
+    }
+
+    copyParentThreadIdTo(dest, offset) {
+      this._parent?.copyThreadIdTo(dest, offset) ?? new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, 0n, true);
+    }
     `,
   };
 
@@ -231,14 +298,10 @@ export function createSpanBuffer<T extends LogSchema>(
 ): SpanBuffer<T> {
   // Use provided capacity parameter
 
-  // Pre-encode span name for Arrow conversion
-  const utf8SpanName = intern(spanName);
-
   const SpanBufferClass = getSpanBufferClass(schema) as new (
     capacity: number,
     module: ModuleContext,
     spanName: string,
-    utf8SpanName: Uint8Array,
     parent: SpanBuffer | undefined,
     isChained: boolean,
     traceId: TraceId | undefined,
@@ -250,7 +313,6 @@ export function createSpanBuffer<T extends LogSchema>(
     capacity,
     module,
     spanName,
-    utf8SpanName,
     undefined, // no parent
     false, // not chained
     undefined, // no callsiteModule for root
@@ -266,29 +328,28 @@ export function createSpanBuffer<T extends LogSchema>(
  *
  * @param buffer - The full buffer that needs overflow handling
  *
- * @returns New SpanBuffer linked via `buffer.next`, with same schema type
+ * @returns New SpanBuffer linked via `buffer._next`, with same schema type
  */
 export function createNextBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
-  const schema = buffer.module.logSchema as T;
+  const schema = buffer._module.logSchema as T;
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
-  const capacity = (buffer.module.sb_capacity + 7) & ~7;
+  const capacity = (buffer._module.sb_capacity + 7) & ~7;
 
   const SpanBufferClass = getSpanBufferClass(schema);
   // Cast buffer to base SpanBuffer for constructor, result back to SpanBuffer<T>
-  // Chained buffers inherit callsiteModule, spanName, and utf8SpanName from the original buffer
+  // Chained buffers inherit callsiteModule and spanName from the original buffer
   const nextBuffer = new SpanBufferClass(
     capacity,
-    buffer.module,
-    buffer.spanName,
-    buffer.utf8SpanName,
+    buffer._module,
+    buffer._spanName,
     buffer as SpanBuffer,
     true,
     undefined,
-    buffer.callsiteModule,
+    buffer._callsiteModule,
   ) as SpanBuffer<T>;
 
   // Link current buffer to next
-  buffer.next = nextBuffer;
+  buffer._next = nextBuffer;
 
   return nextBuffer;
 }
@@ -306,38 +367,33 @@ export function createNextBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): Sp
  *
  * @returns New SpanBuffer linked to parent, with same schema type
  */
-export function createChildSpanBuffer<T extends LogSchema>(
-  parentBuffer: SpanBuffer<T>,
+export function createChildSpanBuffer(
+  parentBuffer: SpanBuffer,
   module: ModuleContext,
   spanName: string,
   capacity: number = DEFAULT_BUFFER_CAPACITY,
-): SpanBuffer<T> {
-  const schema = parentBuffer.module.logSchema as T;
-
-  // Pre-encode span name for Arrow conversion
-  const utf8SpanName = intern(spanName);
+): SpanBuffer {
+  const schema = module.logSchema;
 
   const SpanBufferClass = getSpanBufferClass(schema) as new (
     capacity: number,
     module: ModuleContext,
     spanName: string,
-    utf8SpanName: Uint8Array,
     parent: SpanBuffer | undefined,
     isChained: boolean,
     traceId: TraceId | undefined,
     callsiteModule: ModuleContext | undefined,
-  ) => SpanBuffer<T>;
+  ) => SpanBuffer;
 
   // Create child buffer with parent reference
   return new SpanBufferClass(
     capacity,
     module,
     spanName,
-    utf8SpanName,
     parentBuffer as SpanBuffer, // parent
     false, // not chained
     undefined, // no explicit traceId for child
-    parentBuffer.module, // callsiteModule is parent's module
+    module, // callsiteModule
   );
 }
 

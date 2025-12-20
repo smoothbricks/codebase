@@ -377,30 +377,30 @@ export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagS
  */
 export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanName: string): void {
   // Row 0: span-start (fixed layout)
-  buffer.operations[0] = ENTRY_TYPE_SPAN_START;
-  buffer.timestamps[0] = getTimestampNanos();
+  buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+  buffer.timestamp[0] = getTimestampNanos();
   buffer.message(0, spanName); // Unified message column for span name
 
   // Row 1: pre-initialize as span-exception (will be overwritten on ok/err)
-  buffer.operations[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-  buffer.timestamps[1] = 0n; // Will be set on completion
+  buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+  buffer.timestamp[1] = 0n; // Will be set on completion
 
   // Events start at row 2
-  buffer.writeIndex = 2;
+  buffer._writeIndex = 2;
 }
 
 /**
  * Create a SpanLogger for the given buffer.
  *
- * Per specs/01i_span_scope_attributes.md: Scope values are stored directly on buffer.scopeValues.
- * The SpanLogger reads/writes scope via buffer.scopeValues - no separate Scope class needed.
+ * Per specs/01i_span_scope_attributes.md: Scope values are stored directly on buffer._scopeValues.
+ * The SpanLogger reads/writes scope via buffer._scopeValues - no separate Scope class needed.
  *
  * @param schema - Tag attribute schema with field definitions
  * @param buffer - SpanBuffer to write entries to (per-span instance)
  * @returns SpanLogger with typed methods matching schema
  */
 export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): BaseSpanLogger<T> {
-  // Create the SpanLogger - it will read/write scope via buffer.scopeValues
+  // Create the SpanLogger - it will read/write scope via buffer._scopeValues
   return createSpanLoggerFromGenerator(schema, buffer, createNextBuffer) as BaseSpanLogger<T>;
 }
 
@@ -425,7 +425,7 @@ export function createSpanContextProto<
   T extends LogSchema,
   FF extends FeatureFlagSchema,
   Env = Record<string, unknown>,
->(schemaOnly: T, _module: ModuleContext): Record<string | symbol, unknown> {
+>(schemaOnly: T, moduleContext: ModuleContext): Record<string | symbol, unknown> {
   return {
     [SPAN_CONTEXT_MARKER]: true as const,
 
@@ -437,7 +437,7 @@ export function createSpanContextProto<
     // Scope getter - returns current scope values as frozen object
     get scope(): Readonly<Partial<InferSchema<T>>> {
       const buffer = (this as unknown as MutableSpanContext<T, FF, Env>)._buffer;
-      return (buffer.scopeValues as Readonly<Partial<InferSchema<T>>>) ?? Object.freeze({});
+      return (buffer._scopeValues as Readonly<Partial<InferSchema<T>>>) ?? Object.freeze({});
     },
 
     // setScope method - delegates to spanLogger._setScope
@@ -473,9 +473,16 @@ export function createSpanContextProto<
       }
 
       // Call op._invoke with proper parameters
-      // callsiteModule is the current span's module (buffer.module)
+      // callsiteModule is the current span's module (buffer._module)
       // Cast needed: SpanBuffer<T> -> SpanBuffer (TypeScript variance limitation with index signatures)
-      return op._invoke(traceCtx, this._buffer as SpanBuffer, this._buffer.module, name, line, args);
+      return op._invoke(
+        this._traceCtx as TraceContext<FF, Record<string, unknown>>,
+        this._buffer as SpanBuffer,
+        moduleContext,
+        name,
+        line,
+        args,
+      );
     },
 
     // Monomorphic span_fn - inline closure (per spec 01o lines 51-53)
@@ -488,10 +495,10 @@ export function createSpanContextProto<
     ): Promise<R> {
       // Create child span buffer
       // Uses same module as parent - span_fn creates child spans within same module context
-      const childBuffer = createChildSpanBuffer(this._buffer, this._buffer.module, name);
+      const childBuffer = createChildSpanBuffer(this._buffer as SpanBuffer, moduleContext, name) as SpanBuffer<T>;
 
       // Explicit registration with parent's children array
-      this._buffer.children.push(childBuffer as SpanBuffer);
+      this._buffer._children.push(childBuffer as SpanBuffer);
 
       // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
       writeSpanStart(childBuffer, name);
@@ -518,7 +525,7 @@ export function createSpanContextProto<
 
       // Create a new feature flag evaluator bound to the CHILD span context
       // Must be after childContext is created since forContext receives the full SpanContext
-      const childFf = this.ff.forContext!(
+      const childFf = this.ff.forContext?.(
         childContext as unknown as SpanContext<T, FF, Env>,
       ) as unknown as FeatureFlagEvaluator<FF> & InferFeatureFlagsWithContext<FF>;
       childContext.ff = childFf;
@@ -528,7 +535,7 @@ export function createSpanContextProto<
         return await fn(childContext as unknown as SpanContext<T, FF, Env>);
       } catch (error) {
         // Write span-exception to row 1 (fixed layout)
-        childBuffer.timestamps[1] = getTimestampNanos();
+        childBuffer.timestamp[1] = getTimestampNanos();
 
         // Write exception details to row 1
         const errorMessage = error instanceof Error ? error.message : String(error);

@@ -22,7 +22,7 @@ import {
   type InferFeatureFlagsWithContext,
 } from './schema/evaluator.js';
 import { LogSchema } from './schema/LogSchema.js';
-import { mergeWithSystemSchema, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
+import { mergeWithSystemSchema } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
 import type { SpanContext } from './spanContext.js';
 import { getThreadId } from './threadId.js';
@@ -229,7 +229,7 @@ export interface PrefixedModule<
   P extends string,
 > {
   readonly metadata: ModuleMetadata;
-  readonly module: ModuleContext;
+  readonly moduleContext: ModuleContext;
   readonly _prefix: P; // Use _prefix to avoid conflict with prefix() method
   // Buffer metrics (flattened names)
   readonly sb_capacity: number;
@@ -288,7 +288,8 @@ export interface BoundModule<
  */
 export interface Module<T extends SchemaFields, FF extends FeatureFlagSchema, Extra extends Record<string, unknown>> {
   readonly metadata: ModuleMetadata;
-  readonly module: ModuleContext;
+  readonly moduleContext: ModuleContext;
+  readonly logSchema: LogSchema<T>;
 
   // Buffer metrics (flattened names)
   readonly sb_capacity: number;
@@ -444,7 +445,7 @@ interface DefineModuleBuilder<T extends SchemaFields, FF extends FeatureFlagSche
 export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchema = FeatureFlagSchema>(options: {
   metadata?: ModuleMetadata;
   moduleMetadata?: ModuleMetadata;
-  logSchema: T;
+  logSchema: T | LogSchema<T>;
   deps?: Record<string, unknown>;
   ff?: FF;
 }): DefineModuleBuilder<T, FF> {
@@ -498,7 +499,8 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
 
     return {
       metadata: state.metadata,
-      module: state.moduleContext,
+      moduleContext: state.moduleContext,
+      logSchema: state.logSchema,
 
       // Buffer metrics passthrough
       get sb_capacity() {
@@ -703,7 +705,7 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         const prefixedModule = prefixedModuleDef as unknown as Module<T, FF, Extra>;
 
         // Set remappedViewClass on the module's ModuleContext (the one actually used by ops)
-        prefixedModule.module.remappedViewClass = remappedViewClass;
+        prefixedModule.moduleContext.remappedViewClass = remappedViewClass;
 
         return {
           ...prefixedModule,
@@ -717,85 +719,112 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
        *
        * Per spec 01l lines 418-419
        * Returns BoundModule with span() method
+       *
+       * Wiring Logic:
+       * - Module declares deps: { cache: cacheModule } (declarations)
+       * - Caller provides wiredDeps: { cache: actualCacheInstance } (implementations)
+       * - Result: ctx.deps = { cache: actualCacheInstance } (typed access)
        */
       use(wiredDeps: Record<string, unknown>): BoundModule<T, FF, Extra> {
-        // Merge schemas from wired dependencies into the main module schema
-        let mergedSchema = state.logSchema;
-        const mergedFieldNames = new Set(state.logSchema.fieldNames);
-        if (wiredDeps) {
-          for (const dep of Object.values(wiredDeps)) {
-            if (dep && typeof dep === 'object' && 'module' in dep) {
-              const depModule = (dep as { module: { logSchema: LogSchema } }).module;
-              if (depModule.logSchema) {
-                // Filter out system fields and already merged fields from dependency schema
-                const depFields: Record<string, unknown> = {};
-                for (const [fieldName, fieldSchema] of depModule.logSchema.fieldEntries()) {
-                  if (!SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName) && !mergedFieldNames.has(fieldName)) {
-                    depFields[fieldName] = fieldSchema;
-                    mergedFieldNames.add(fieldName);
-                  }
-                }
-                if (Object.keys(depFields).length > 0) {
-                  mergedSchema = mergedSchema.extend(depFields as SchemaFields);
-                }
-              }
+        // Create the wired dependencies map by combining declarations with implementations
+        const finalDeps: Record<string, unknown> = {};
+
+        // First, add all declared dependencies (from module definition)
+        if (state.deps) {
+          for (const [depName, depDeclaration] of Object.entries(state.deps)) {
+            const implementation = wiredDeps[depName];
+            if (implementation !== undefined) {
+              // Use provided implementation
+              finalDeps[depName] = implementation;
+            } else {
+              // Use declaration as fallback (allows partial wiring)
+              finalDeps[depName] = depDeclaration;
             }
           }
         }
 
-        // Create new module context with merged schema
-        const mergedModuleContext = new ModuleContext(
-          state.metadata.gitSha ?? 'unknown',
-          state.metadata.packageName,
-          state.metadata.packagePath,
-          mergedSchema,
-        );
-        // Copy deps and other properties
-        (mergedModuleContext as unknown as { deps?: Record<string, unknown> }).deps = wiredDeps;
+        // Then add any additional wired deps not declared in the module
+        for (const [depName, depValue] of Object.entries(wiredDeps)) {
+          if (!(depName in finalDeps)) {
+            finalDeps[depName] = depValue;
+          }
+        }
 
-        // Store wired deps in state for use in span context
-        const boundState = { ...state, deps: wiredDeps, logSchema: mergedSchema, moduleContext: mergedModuleContext };
+        // Ensure all module dependencies have span() method by binding them if needed
+        for (const [depName, depValue] of Object.entries(finalDeps)) {
+          if (depValue && typeof depValue === 'object' && 'use' in depValue && !('span' in depValue)) {
+            // This is a module that hasn't been bound yet - bind it with empty deps
+            finalDeps[depName] = (depValue as any).use({});
+          }
+        }
 
-        // Implementation that handles both overloads
-        const spanImpl = <R, Args extends unknown[]>(
-          lineNumberOrName: number | string,
-          nameOrOp: string | Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, Args, R>,
-          ...rest: unknown[]
-        ): Promise<R> => {
-          // Determine if line number is provided (first arg is number)
-          const hasLine = typeof lineNumberOrName === 'number';
-          const lineNumber = hasLine ? (lineNumberOrName as number) : 0;
-          const name = hasLine ? (nameOrOp as string) : (lineNumberOrName as string);
-          const op = hasLine
-            ? (rest[0] as Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, Args, R>)
-            : (nameOrOp as Op<SpanContext<LogSchema<T>, FF, Record<string, unknown>> & Extra, Args, R>);
-          const args = (hasLine ? rest.slice(1) : rest) as Args;
+        // Combine schemas from all wired modules
+        const combinedSchemaFields: SchemaFields = {};
 
-          // Create a minimal trace context for root span
-          const traceCtx = this.traceContext({} as TraceContextParams<FF, Extra>);
-          // Override deps with wired deps
-          (traceCtx as unknown as { deps: Record<string, unknown> }).deps = wiredDeps;
-          // Call op._invoke directly
-          return op._invoke(
-            traceCtx as unknown as TraceContext<FeatureFlagSchema, Record<string, unknown>>,
-            null,
-            boundState.moduleContext,
-            name,
-            lineNumber,
-            args,
-          );
-        };
+        // Start with current module's schema
+        for (const [fieldName, fieldSchema] of this.logSchema.fieldEntries()) {
+          combinedSchemaFields[fieldName] = fieldSchema;
+        }
 
-        // Create bound module with span method and merged module context
-        const boundModule: BoundModule<T, FF, Extra> = {
+        // Add schemas from wired deps (they should already be prefixed)
+        for (const depValue of Object.values(finalDeps)) {
+          if (depValue && typeof depValue === 'object' && 'logSchema' in depValue) {
+            const depModule = depValue as { logSchema: LogSchema };
+            for (const [fieldName, fieldSchema] of depModule.logSchema.fieldEntries()) {
+              // Use field name as-is (assume already prefixed)
+              combinedSchemaFields[fieldName] = fieldSchema;
+            }
+          }
+        }
+
+        // Create combined LogSchema
+        const combinedLogSchema = new LogSchema(combinedSchemaFields);
+
+        // Store original traceContext method
+        const originalTraceContext = this.traceContext;
+
+        // Create bound module with combined schema and span method
+        const boundModule = {
           ...this, // Include all module properties
-          module: mergedModuleContext, // Override with merged module context
-          // TypeScript doesn't support overloads in object literals, so we use a function
-          // that handles both cases internally
-          span: spanImpl as BoundModule<T, FF, Extra>['span'],
+          logSchema: combinedLogSchema, // Override with combined schema
+
+          // Override traceContext to include wired deps
+          traceContext(params: TraceContextParams<FF, Extra>): TraceContext<FF, Extra> {
+            const traceCtx = originalTraceContext.call(this, params);
+            // Set deps on the trace context for access in span contexts
+            (traceCtx as unknown as { deps: Record<string, unknown> }).deps = finalDeps;
+            return traceCtx;
+          },
+
+          // Implementation that handles both span overloads
+          span: function (
+            lineNumberOrName: number | string,
+            nameOrOp: string | Op<any, any[], any>,
+            ...rest: unknown[]
+          ): Promise<any> {
+            // Determine if line number is provided (first arg is number)
+            const hasLine = typeof lineNumberOrName === 'number';
+            const lineNumber = hasLine ? (lineNumberOrName as number) : 0;
+            const name = hasLine ? (nameOrOp as string) : (lineNumberOrName as string);
+            const op = hasLine ? (rest[0] as Op<any, any[], any>) : (nameOrOp as Op<any, any[], any>);
+            const args = (hasLine ? rest.slice(1) : rest) as unknown[];
+
+            // Create a trace context with wired deps for root span
+            const traceCtx = this.traceContext({} as TraceContextParams<FF, Extra>);
+
+            // Call op._invoke with the trace context that includes wired deps
+            return op._invoke(
+              traceCtx as unknown as TraceContext<FeatureFlagSchema, Record<string, unknown>>,
+              null,
+              state.moduleContext,
+              name,
+              lineNumber,
+              args,
+            );
+          },
         };
 
-        return boundModule;
+        return boundModule as unknown as BoundModule<T, FF, Extra>;
       },
     };
   }

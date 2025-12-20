@@ -22,7 +22,7 @@ This monorepo contains two distinct packages with clear separation of concerns:
 │  • Scope classes (SEPARATE from buffer columns)                 │
 │  • Feature flag evaluation                                       │
 │  • Fluent logging API (tag, log destructured from ctx)          │
-│  • System columns (timestamps, operations) - ALWAYS eager       │
+│  • System columns (timestamp, entry_type) - ALWAYS eager       │
 │  • User attribute columns - lazy by default                     │
 └─────────────────────────────────────────────────────────────────┘
                               │
@@ -122,7 +122,7 @@ const GET = op(async ({ span, log, tag }) => {
 
 ### 2. Zero Overhead Hot Path (lmao)
 
-**WHY**: System columns (timestamps, operations) are written on EVERY log entry. Even a single `if (values === null)`
+**WHY**: System columns (timestamp, entry_type) are written on EVERY log entry. Even a single `if (values === null)`
 check adds overhead per entry, compounding to milliseconds on high-throughput spans.
 
 **HOW lmao implements this**:
@@ -209,7 +209,7 @@ A low-level alternative to `apache-arrow` for building Arrow tables and record-b
 - ❌ Masking functions (hash, url, sql, email)
 - ❌ Context propagation or hierarchy
 - ❌ System vs user column distinction
-- ❌ Tree structures (parent/child spans, buffer.children, buffer.next)
+- ❌ Tree structures (parent/child spans, buffer.\_children, buffer.\_next)
 - ❌ Any `@smoothbricks/lmao` dependency
 
 ### Column Naming Convention
@@ -318,7 +318,7 @@ A high-level structured logging library providing excellent developer experience
 - **Zero-allocation hot path**: Avoid string interpolation and object allocation during logging
 - **Schema-driven type safety**: Compile-time and runtime validation of logged data
 - **Context propagation**: Automatic trace correlation through traceContext→op→span hierarchy
-- **System column optimization**: timestamps/operations are NEVER lazy
+- **System column optimization**: timestamp/entry_type are NEVER lazy
 
 ### What lmao OWNS
 
@@ -333,7 +333,7 @@ A high-level structured logging library providing excellent developer experience
 9. **SpanLogger generation** - Typed methods per schema field
 10. **Fluent logging API** - `tag.userId()`, `log.info()`, destructured from context
 11. **Entry type semantics** - Span lifecycle (start/ok/err), log levels (info/debug/warn/error)
-12. **System column management** - timestamps, operations (ALWAYS eager, never lazy)
+12. **System column management** - timestamp, entry_type (ALWAYS eager, never lazy)
 13. **Library integration** - Prefix-based attribute namespacing for third-party libraries
 14. **Background flush scheduling** - Adaptive flush timing based on buffer capacity
 15. **Tree walking** - Recursive traversal of SpanBuffer trees (parent/children/overflow chains)
@@ -346,11 +346,29 @@ A high-level structured logging library providing excellent developer experience
 
 ### System Columns vs User Attributes
 
-**System columns** (timestamps, operations) are written on EVERY entry - ALWAYS eager, pre-allocated in constructor.
+**System columns** (timestamp, entry_type) are written on EVERY entry - ALWAYS eager, pre-allocated in constructor.
 
 **User attribute columns** are sparse and optional - lazy by default, allocated only when first written.
 
 See `01b_columnar_buffer_architecture.md` for implementation details.
+
+### SpanBuffer Property Naming Convention
+
+SpanBuffer public properties correspond exactly to Arrow table column names for obvious data flow:
+
+- **Core Arrow Columns** (exact underscore names):
+  - `trace_id`, `thread_id`, `span_id`, `parent_thread_id`, `parent_span_id`
+  - `timestamp`, `entry_type`
+
+- **System Schema Fields** (camelCase for API ergonomics):
+  - `message`, `lineNumber`, `errorCode`, `exceptionStack`, `ffValue`, `uint64Value`
+
+- **Internal Properties** (`_` prefix for encapsulation):
+  - `_system`, `_identity`, `_writeIndex`, `_capacity`, `_next`, `_hasParent`
+  - `_children`, `_parent`, `_module`, `_spanName`, `_callsiteModule`, `_scopeValues`
+
+This ensures SpanBuffer properties match Arrow columns 1:1, enabling users to define custom columns with consistent
+naming.
 
 ---
 

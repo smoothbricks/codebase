@@ -65,32 +65,32 @@ interface ColumnBufferExtensionOptions {
 // This code lives in lmao but calls arrow-builder's getColumnBufferClass()
 const SpanBufferClass = getColumnBufferClass(schema, {
   preamble: `
-    const { createRootSpanIdentity, createChildSpanIdentity } = require('./spanIdentity');
+    const { createRootSpanIdentity, createChildSpanIdentity } = require('./span_identity');
   `,
 
   constructorCode: `
     // Initialize span-specific fields
-    this.traceId = traceId;
-    this.spanId = parentIdentity 
+    this.trace_id = trace_id;
+    this.span_id = parentIdentity 
       ? parentIdentity.createChild(nextSpanId++)
       : createRootSpanIdentity();
-    this.children = [];
+    this._children = [];
     this.parent = parent;
   `,
 
   properties: [
-    { name: 'traceId', type: 'property', code: 'null' },
-    { name: 'spanId', type: 'property', code: 'null' },
-    { name: 'children', type: 'property', code: '[]' },
+    { name: 'trace_id', type: 'property', code: 'null' },
+    { name: 'span_id', type: 'property', code: 'null' },
+    { name: '_children', type: 'property', code: '[]' },
     { name: 'parent', type: 'property', code: 'null' },
   ],
 
   methods: {
     isParentOf: `
-      return this.traceId === other.traceId && this.spanId.isParentOf(other.spanId);
+      return this.trace_id === other.trace_id && this.span_id.isParentOf(other.span_id);
     `,
     isChildOf: `
-      return this.traceId === other.traceId && this.spanId.isChildOf(other.spanId);
+      return this.trace_id === other.trace_id && this.span_id.isChildOf(other.span_id);
     `,
   },
 });
@@ -104,36 +104,36 @@ class GeneratedSpanBuffer {
   // --- Core ColumnBuffer properties (from arrow-builder) ---
   timestamps: BigInt64Array;
   operations: Uint8Array;
-  writeIndex: number;
-  capacity: number;
+  _writeIndex: number;
+  _capacity: number;
 
   // --- Lazy attribute columns (from schema) ---
   // userId_nulls, userId_values, etc.
 
   // --- Extension properties (from lmao) ---
-  traceId: TraceId;
-  spanId: SpanIdentity;
-  children: SpanBuffer[];
+  trace_id: TraceId;
+  span_id: SpanIdentity;
+  _children: SpanBuffer[];
   parent: SpanBuffer | null;
 
-  constructor(capacity, traceId, parentIdentity, parent) {
+  constructor(capacity, trace_id, parentIdentity, parent) {
     // Core initialization (arrow-builder)
     this._alignedCapacity = getCacheAlignedCapacity(capacity);
-    this.timestamps = new BigInt64Array(this._alignedCapacity);
-    this.operations = new Uint8Array(this._alignedCapacity);
-    this.writeIndex = 0;
-    this.capacity = capacity;
+    this.timestamp = new BigInt64Array(this._alignedCapacity);
+    this.entry_type = new Uint8Array(this._alignedCapacity);
+    this._writeIndex = 0;
+    this._capacity = capacity;
 
     // Extension initialization (lmao)
-    this.traceId = traceId;
-    this.spanId = parentIdentity ? parentIdentity.createChild(nextSpanId++) : createRootSpanIdentity();
-    this.children = [];
+    this.trace_id = trace_id;
+    this.span_id = parentIdentity ? parentIdentity.createChild(nextSpanId++) : createRootSpanIdentity();
+    this._children = [];
     this.parent = parent;
   }
 
   // Extension methods (lmao)
   isParentOf(other) {
-    return this.traceId === other.traceId && this.spanId.isParentOf(other.spanId);
+    return this.trace_id === other.trace_id && this.span_id.isParentOf(other.span_id);
   }
 }
 ```
@@ -265,12 +265,12 @@ function createSpanBuffer<T extends LogSchema>(
   schema: T,
   module: ModuleContext,
   spanName: string,
-  traceId?: TraceId,
+  trace_id?: TraceId,
   capacity = DEFAULT_BUFFER_CAPACITY
 ): SpanBuffer<T> {
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const alignedCapacity = (capacity + 7) & ~7;
-  const resolvedTraceId: string = traceId ?? generateTraceId();
+  const resolvedTraceId: string = trace_id ?? generateTraceId();
 
   // Get or generate the SpanBuffer class (cached per schema)
   const SpanBufferClass = getSpanBufferClass(schema);
@@ -293,7 +293,7 @@ Key optimizations in the generated class:
 
 - `nextSpanId` is module-level (per-worker), accessed via closure
 - All span properties set in constructor code via extension
-- `threadId` comes from module-level singleton
+- `thread_id` comes from module-level singleton
 - No post-creation property assignment
 
 ```typescript
@@ -301,12 +301,12 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
   if (cached) return cached;
 
   const extension: ColumnBufferExtension = {
-    constructorParams: 'module, spanName, parent, isChained, traceId, callsiteModule',
+    constructorParams: 'module, spanName, parent, isChained, trace_id, callsiteModule',
     constructorCode: `
       this.module = module;
       this.spanName = spanName;
-      this.children = [];
-      this.next = undefined;
+      this._children = [];
+      this._next = undefined;
       this.callsiteModule = callsiteModule;
       
       // Calculate system buffer size
@@ -326,15 +326,15 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
         copyThreadIdTo(this._identity, 0);
         sbHelpers.writeSpanId(this._identity, 8, nextSpanId++);
       } else {
-        // ROOT: identity with traceId
+        // ROOT: identity with trace_id
         // ... (see full implementation in 01b5_spanbuffer_memory_layout.md)
       }
       
       // System columns at FIXED offsets
       this._timestamps = new BigInt64Array(this._system, 0, requestedCapacity);
       this._operations = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
-      this.timestamps = this._timestamps;
-      this.operations = this._operations;
+      this.timestamp = this._timestamps;
+      this.entry_type = this._operations;
       
       this._writeIndex = 0;
       module.sb_totalCreated++;
@@ -369,7 +369,7 @@ function createNextBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffe
     buffer.callsiteModule
   ) as SpanBuffer<T>;
 
-  buffer.next = nextBuffer;
+  buffer._next = nextBuffer;
   return nextBuffer;
 }
 ```
@@ -382,7 +382,7 @@ function createNextBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffe
 - **Lazy allocation**: Columns allocated on first access via lazy getters
 - **Shared ArrayBuffer**: Each column's nulls and values share ONE ArrayBuffer
 - **Per-span buffers**: Each span gets own buffer for sorted logs
-- **No traceId/spanId arrays**: Constant per buffer, stored as properties
+- **No trace_id/span_id arrays**: Constant per buffer, stored as properties
 - **Type safety**: Schema drives column generation and TypeScript types
 - **Conflict prevention**: Optional prefixes (e.g., `http_`, `db_`) prevent name conflicts
 

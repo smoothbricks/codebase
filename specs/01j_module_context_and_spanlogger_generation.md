@@ -31,13 +31,14 @@ ModuleContext (class) - ONE per module definition
 ├── sb_overflows: number (overflow write count)
 └── sb_totalCreated: number (total buffers created)
 
-SpanBuffer - ONE per span
-├── callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
-├── module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
-├── spanName: string               ← span name for this invocation
+SpanBuffer - ONE per span (internal interface)
+├── _callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
+├── _module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
+├── _spanName: string               ← span name for this invocation
 ├── lineNumber_values: Int32Array  ← line numbers per row (written directly, NOT stored as property)
-├── parent?: SpanBuffer            ← reference to parent (child spans walk this for traceId)
-├── children: SpanBuffer[]         ← child spans
+├── _parent?: SpanBuffer            ← reference to parent (child spans walk this for trace_id)
+├── _children: SpanBuffer[]         ← child spans
+├── trace_id (getter)               ← root stores it, children walk parent chain
 └── columns, writeIndex, etc.
 
 SpanContext (interface) - user-facing, what ops receive
@@ -273,17 +274,17 @@ class Op<Ctx, Args extends unknown[], Result> {
     //    - this.module: the Op's module (for rows 1+ gitSha/packageName/packagePath)
     const buffer = parentBuffer
       ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
-      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.traceId);
+      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.trace_id);
 
-    // 2. Register with parent's children (RemappedBufferView if prefixed)
+    // 2. Register with parent's _children (RemappedBufferView if prefixed)
     if (parentBuffer) {
       if (this.module.remappedViewClass) {
         // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
         const view = new this.module.remappedViewClass(buffer);
-        parentBuffer.children.push(view);
+        parentBuffer._children.push(view);
       } else {
         // No prefix - push raw buffer directly
-        parentBuffer.children.push(buffer);
+        parentBuffer._children.push(buffer);
       }
       buffer.parent = parentBuffer;
     }

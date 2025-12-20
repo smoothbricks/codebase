@@ -56,6 +56,21 @@ export const SYSTEM_SCHEMA_FIELD_NAMES = new Set([
   'uint64Value',
 ]);
 
+/**
+ * Reserved system column names - these correspond to Arrow table columns and cannot be
+ * used as user schema field names because they conflict with SpanBuffer properties.
+ */
+export const RESERVED_SYSTEM_COLUMN_NAMES = new Set([
+  // Arrow table columns (exact names)
+  'trace_id',
+  'thread_id',
+  'span_id',
+  'parent_thread_id',
+  'parent_span_id',
+  'timestamp',
+  'entry_type',
+]);
+
 const systemSchemaFields: SystemSchemaFieldTypes = {
   /**
    * Unified message column - serves different purposes based on entry type.
@@ -134,25 +149,39 @@ export const systemSchema: DefinedLogSchema<SystemSchemaFieldTypes> = defineLogS
  * Merge system schema with user schema
  * System columns are always included, user schema extends them
  *
- * Warns if user schema conflicts with system schema fields.
+ * Warns if user schema conflicts with system schema fields or reserved column names.
  */
 export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSchema: T): SystemSchemaFieldTypes & T {
   // Check for conflicts between user schema and system schema
   // Use fieldNames to get only actual field names, not ColumnSchema properties or methods
   const systemKeys = new Set(systemSchema.fieldNames);
+  const reservedKeys = RESERVED_SYSTEM_COLUMN_NAMES;
   const userKeys = userSchema instanceof LogSchema ? userSchema.fieldNames : Object.keys(userSchema);
 
-  const conflictingKeys = userKeys.filter((key) => {
+  const conflictingSystemKeys = userKeys.filter((key) => {
     // Only check if it's a schema field (not a method like validate/parse/extend)
     const value = userSchema[key];
     return systemKeys.has(key) && typeof value !== 'function';
   });
 
-  if (conflictingKeys.length > 0) {
+  const conflictingReservedKeys = userKeys.filter((key) => {
+    const value = userSchema[key];
+    return reservedKeys.has(key) && typeof value !== 'function';
+  });
+
+  if (conflictingSystemKeys.length > 0) {
     console.warn(
-      `!  User schema conflicts with system schema fields: ${conflictingKeys.join(', ')}\n` +
+      `!  User schema conflicts with system schema fields: ${conflictingSystemKeys.join(', ')}\n` +
         '   User definitions will override system schema. This may cause unexpected behavior.\n' +
         `   System fields: ${Array.from(systemKeys).join(', ')}`,
+    );
+  }
+
+  if (conflictingReservedKeys.length > 0) {
+    throw new Error(
+      `User schema cannot include reserved system column names: ${conflictingReservedKeys.join(', ')}\n` +
+        '   These names conflict with SpanBuffer properties that correspond to Arrow table columns.\n' +
+        `   Reserved names: ${Array.from(reservedKeys).join(', ')}`,
     );
   }
 
@@ -267,7 +296,7 @@ export const ENTRY_TYPE_BUFFER_OVERFLOWS = 24;
  *
  * @example
  * ```typescript
- * const entryType = buffer.operations[index];
+ * const entryType = buffer.entry_type[index];
  * const typeName = ENTRY_TYPE_NAMES[entryType]; // e.g., 'span-ok'
  * ```
  */

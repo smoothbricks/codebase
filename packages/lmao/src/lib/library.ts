@@ -184,15 +184,15 @@ export function generateRemappedBufferViewClass(
     }
     
     // Tree traversal (pass-through)
-    get children() { return this._buffer.children; }
-    get next() { return this._buffer.next; }
-    
+    get _children() { return this._buffer._children; }
+    get _next() { return this._buffer._next; }
+
     // Row count
-    get writeIndex() { return this._buffer.writeIndex; }
-    
+    get _writeIndex() { return this._buffer._writeIndex; }
+
     // System columns (NOT remapped - same in all buffers)
-    get timestamps() { return this._buffer.timestamps; }
-    get operations() { return this._buffer.operations; }
+    get timestamp() { return this._buffer.timestamp; }
+    get entry_type() { return this._buffer.entry_type; }
     get message_values() { return this._buffer.message_values; }
     get message_nulls() { return this._buffer.message_nulls; }
     get lineNumber_values() { return this._buffer.lineNumber_values; }
@@ -205,17 +205,16 @@ export function generateRemappedBufferViewClass(
     get ffValue_nulls() { return this._buffer.ffValue_nulls; }
     
     // Identity (pass-through)
-    get traceId() { return this._buffer.traceId; }
-    get threadId() { return this._buffer.threadId; }
-    get spanId() { return this._buffer.spanId; }
-    get parentSpanId() { return this._buffer.parentSpanId; }
+    get trace_id() { return this._buffer.trace_id; }
+    get thread_id() { return this._buffer.thread_id; }
+    get span_id() { return this._buffer.span_id; }
+    get parent_span_id() { return this._buffer.parent_span_id; }
+    get parent_thread_id() { return this._buffer.parent_thread_id; }
     get _identity() { return this._buffer._identity; }
     
     // Metadata (pass-through)
-    get module() { return this._buffer.module; }
-    get spanName() { return this._buffer.spanName; }
-    get utf8SpanName() { return this._buffer.utf8SpanName; }
-    
+    get module() { return this._buffer._module; }
+    get spanName() { return this._buffer._spanName; }
     // Remapped column access (for Arrow conversion iteration)
     // Maps prefixed name → unprefixed name before calling underlying buffer
     getColumnIfAllocated(name) {
@@ -499,7 +498,7 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
           this._scopedAttributes[cleanKey] = value;
         }
       }
-      const startIdx = this._buffer.writeIndex;
+      const startIdx = this._buffer._writeIndex;
       const endIdx = this._buffer._capacity;
       for (let idx = startIdx; idx < endIdx; idx++) {
         for (const [cleanKey, value] of Object.entries(this._scopedAttributes)) {
@@ -523,12 +522,12 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
     // writes entry type + timestamp + message, applies scoped attributes
     `_writeMessage(entryType, message) {
       // Check if buffer is full and create next buffer if needed
-      if (this._buffer.writeIndex >= this._buffer._capacity) {
+      if (this._buffer._writeIndex >= this._buffer._capacity) {
         const oldBuffer = this._buffer;
         this._buffer = this._createNextBuffer(oldBuffer);
-        oldBuffer.next = this._buffer;
+        oldBuffer._next = this._buffer;
       }
-      const idx = this._buffer.writeIndex;
+      const idx = this._buffer._writeIndex;
       this._buffer._operations[idx] = entryType;
       this._buffer._timestamps[idx] = getTimestampNanos();
       const messageColumn = this._buffer.message_values;
@@ -555,7 +554,7 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
           }
         }
       }
-      this._buffer.writeIndex++;
+      this._buffer._writeIndex++;
     }
     ` +
     // Generated code: message() generic logging with level string mapping to entry type constants

@@ -71,11 +71,11 @@ describe('Arrow IPC Round-Trip', () => {
 
       const testValues = [1.5, 2.5, 3.5, Number.NaN, 5.5];
       for (const value of testValues) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         buffer.value(idx, value);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -105,11 +105,11 @@ describe('Arrow IPC Round-Trip', () => {
 
       const testValues = [true, false, true, false, true, false, true, false, true];
       for (const value of testValues) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         buffer.flag(idx, value);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -132,11 +132,11 @@ describe('Arrow IPC Round-Trip', () => {
       const testIndices = [0, 2, 1, 0, 2];
       const expectedStrings = ['pending', 'completed', 'active', 'pending', 'completed'];
       for (const enumIdx of testIndices) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, enumIdx);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -155,11 +155,11 @@ describe('Arrow IPC Round-Trip', () => {
 
       const testValues = ['user-123', 'user-456', 'user-789', 'user-123', 'user-456'];
       for (const userId of testValues) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         buffer.userId(idx, userId);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -284,11 +284,11 @@ describe('Arrow IPC Round-Trip', () => {
 
       const testValues = ['First message', 'Second message', 'Third message', 'Second message', 'First message'];
       for (const value of testValues) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         buffer.userMessage(idx, value);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -307,9 +307,9 @@ describe('Arrow IPC Round-Trip', () => {
 
       const testValues = [1.0, null, 3.0, null, 5.0];
       for (const value of testValues) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         if (value !== null) {
           buffer.value(idx, value);
         } else {
@@ -319,7 +319,7 @@ describe('Arrow IPC Round-Trip', () => {
             setNull(nullBitmap, idx, true);
           }
         }
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -349,9 +349,9 @@ describe('Arrow IPC Round-Trip', () => {
       ];
 
       for (const row of testData) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
 
         if (row.count !== null) {
           buffer.count(idx, row.count);
@@ -365,7 +365,7 @@ describe('Arrow IPC Round-Trip', () => {
         (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, row.status);
         buffer.userId(idx, row.userId);
         buffer.userMessage(idx, row.userMessage);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -405,10 +405,10 @@ describe('Arrow IPC Round-Trip', () => {
       // Write a few rows with timestamps (BigInt64Array stores nanoseconds)
       const timestamps = [1000n, 1100n, 1200n];
       for (let i = 0; i < 3; i++) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = timestamps[i];
-        buffer.operations[idx] = i;
-        buffer.writeIndex++;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = timestamps[i];
+        buffer.entry_type[idx] = i;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -447,10 +447,10 @@ describe('Arrow IPC Round-Trip', () => {
       const module = createTestModuleContext(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
-      const idx = buffer.writeIndex;
-      buffer.timestamps[idx] = 1000n;
-      buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
-      buffer.writeIndex++;
+      const idx = buffer._writeIndex;
+      buffer.timestamp[idx] = 1000n;
+      buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
+      buffer._writeIndex++;
 
       const table = convertToArrowTable(buffer);
 
@@ -489,13 +489,13 @@ describe('Arrow IPC Round-Trip', () => {
       const module = createTestModuleContext(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
-      const idx = buffer.writeIndex;
-      buffer.timestamps[idx] = 1000n;
-      buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+      const idx = buffer._writeIndex;
+      buffer.timestamp[idx] = 1000n;
+      buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
       buffer.category(idx, 'cat1');
       buffer.text(idx, 'text1');
       (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, 0);
-      buffer.writeIndex++;
+      buffer._writeIndex++;
 
       const table = convertToArrowTable(buffer);
 
@@ -522,9 +522,9 @@ describe('Arrow IPC Round-Trip', () => {
       // Write pattern: valid, null, valid, null, valid, null, valid, null
       const values = [1.0, null, 2.0, null, 3.0, null, 4.0, null];
       for (const value of values) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         if (value !== null) {
           buffer.value(idx, value);
         } else {
@@ -533,7 +533,7 @@ describe('Arrow IPC Round-Trip', () => {
             setNull(nullBitmap, idx, true);
           }
         }
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -566,9 +566,9 @@ describe('Arrow IPC Round-Trip', () => {
       // Only one null in 10 values
       const values = [1, 2, 3, null, 5, 6, 7, 8, 9, 10];
       for (const value of values) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         if (value !== null) {
           buffer.value(idx, value);
         } else {
@@ -577,7 +577,7 @@ describe('Arrow IPC Round-Trip', () => {
             setNull(nullBitmap, idx, true);
           }
         }
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -606,11 +606,11 @@ describe('Arrow IPC Round-Trip', () => {
       // No nulls - write all valid values
       const values = [1, 2, 3, 4, 5];
       for (const value of values) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         buffer.value(idx, value);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -637,11 +637,11 @@ describe('Arrow IPC Round-Trip', () => {
 
       const testValues = ['alpha', 'beta', 'zebra', 'alpha', 'beta'];
       for (const category of testValues) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         buffer.category(idx, category);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
@@ -662,11 +662,11 @@ describe('Arrow IPC Round-Trip', () => {
       // Write same value many times
       const testValue = 'user-repeated';
       for (let i = 0; i < 100; i++) {
-        const idx = buffer.writeIndex;
-        buffer.timestamps[idx] = 1000n;
-        buffer.operations[idx] = ENTRY_TYPE_SPAN_START;
+        const idx = buffer._writeIndex;
+        buffer.timestamp[idx] = 1000n;
+        buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
         buffer.userId(idx, testValue);
-        buffer.writeIndex++;
+        buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);

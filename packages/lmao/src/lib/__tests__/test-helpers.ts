@@ -57,9 +57,9 @@ export function createTestSpanBuffer(
   } = {},
 ): { module: ModuleContext; spanBuffer: SpanBuffer<LogSchema> } {
   const module = createTestModuleContext(schema, options);
-  const spanName = options.spanName ?? 'test-span';
-  const traceId = options.traceId ? createTraceId(options.traceId) : generateTraceId();
-  const capacity = options.capacity ?? DEFAULT_BUFFER_CAPACITY;
+  const spanName = options._spanName ?? 'test-span';
+  const traceId = options.trace_id ? createTraceId(options.trace_id) : generateTraceId();
+  const capacity = options._capacity ?? DEFAULT_BUFFER_CAPACITY;
 
   const logSchema = schema instanceof LogSchema ? schema : module.logSchema;
   const spanBuffer = realCreateSpanBuffer(logSchema, module, spanName, traceId, capacity);

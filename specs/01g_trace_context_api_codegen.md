@@ -517,10 +517,10 @@ _nextRow() {
   if (this._writeIndex >= this._buffer._capacity - 1) {
     this._buffer = this._getNextBuffer();
     this._writeIndex = -1;
-    this._buffer.writeIndex = 0;
+    this._buffer._writeIndex = 0;
   }
   this._writeIndex++;
-  this._buffer.writeIndex = this._writeIndex + 1;
+  this._buffer._writeIndex = this._writeIndex + 1;
   return this;
 }
 
@@ -607,7 +607,7 @@ The `.uint64(value: bigint)` method is generated on:
 ```typescript
 // Generated on TagAPI, SpanLogger, and result helpers
 uint64(value) {
-  const idx = this._buffer.writeIndex - 1;  // Current entry
+  const idx = this._buffer._writeIndex - 1;  // Current entry
   this._buffer.uint64_value_nulls[Math.floor(idx / 8)] |= (1 << (idx % 8));
   this._buffer.uint64_value_values[idx] = value;
   return this;
@@ -654,20 +654,20 @@ const createArrowVectors = (spanBuffer: SpanBuffer) => {
   const writeIndex = spanBuffer.writeIndex;
   return {
     // Zero-copy: slice existing cache-aligned TypedArrays to actual write length
-    timestamp: arrow.Float64Vector.from(spanBuffer.timestamps.slice(0, writeIndex)),
+    timestamp: arrow.Float64Vector.from(spanBuffer.timestamp.slice(0, writeIndex)),
 
     // Span identification columns (separate columns, not Struct)
     // thread_id and span_id are constant per buffer, filled for each row
-    thread_id: createUint64Column(spanBuffer.threadId, writeIndex),
-    span_id: createUint32Column(spanBuffer.spanId, writeIndex),
+    thread_id: createUint64Column(spanBuffer.thread_id, writeIndex),
+    span_id: createUint32Column(spanBuffer.span_id, writeIndex),
     parent_thread_id: spanBuffer.parent
-      ? createUint64Column(spanBuffer.parent.threadId, writeIndex)
+      ? createUint64Column(spanBuffer.parent.thread_id, writeIndex)
       : createNullUint64Column(writeIndex),
     parent_span_id: spanBuffer.parent
-      ? createUint32Column(spanBuffer.parent.spanId, writeIndex)
+      ? createUint32Column(spanBuffer.parent.span_id, writeIndex)
       : createNullUint32Column(writeIndex),
 
-    entry_type: arrow.Utf8Vector.from(spanBuffer.operations.slice(0, writeIndex)),
+    entry_type: arrow.Utf8Vector.from(spanBuffer.entry_type.slice(0, writeIndex)),
 
     // Generated attribute columns - zero-copy from existing arrays
     http_status: arrow.Int32Vector.from(spanBuffer.httpStatus_values.slice(0, writeIndex)),

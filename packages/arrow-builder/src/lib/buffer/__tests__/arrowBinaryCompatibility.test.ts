@@ -20,18 +20,6 @@ import { describe, expect, it } from 'bun:test';
 import * as arrow from 'apache-arrow';
 import { S } from '../../schema/builder.js';
 import { ColumnSchema } from '../../schema/ColumnSchema.js';
-import type {
-  EagerBooleanSchema,
-  EagerCategorySchema,
-  EagerEnumSchema,
-  EagerNumberSchema,
-  EagerTextSchema,
-  LazyBooleanSchema,
-  LazyCategorySchema,
-  LazyEnumSchema,
-  LazyNumberSchema,
-  LazyTextSchema,
-} from '../../schema/types.js';
 import { createGeneratedColumnBuffer } from '../columnBufferGenerator.js';
 import { expose } from '../types.js';
 

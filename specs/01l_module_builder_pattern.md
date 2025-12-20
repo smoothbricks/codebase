@@ -209,7 +209,7 @@ const generatedCode = `
   class TraceContext {
     constructor() {
       // All properties defined upfront = stable V8 hidden class
-      this.traceId = undefined;
+      this.trace_id = undefined;
       this.span = undefined;
       this.ff = undefined;
       ${extraKeys.map((k) => `this.${k} = undefined;`).join('\n')}
@@ -368,20 +368,20 @@ These properties are auto-generated and cannot be overridden via Extra:
 ```typescript
 interface TraceContext<FF, Extra> {
   // Auto-generated system properties
-  traceId: string; // UUID for this trace
+  trace_id: string; // UUID for this trace
   anchorEpochMicros: number; // Epoch timestamp when trace started
   anchorPerfNow: number; // performance.now() when trace started
-  threadId: bigint; // 64-bit worker/process identifier
+  thread_id: bigint; // 64-bit worker/process identifier
   ff: FeatureFlagEvaluator<FF>;
   span: RootSpanFn<FF, Extra>;
 } & Extra; // User-defined properties
 
 // Reserved keys that Extra cannot contain (compile-time enforcement)
 type ReservedTraceContextKeys =
-  | 'traceId'
+  | 'trace_id'
   | 'anchorEpochMicros'
   | 'anchorPerfNow'
-  | 'threadId'
+  | 'thread_id'
   | 'ff'
   | 'span';
 ```

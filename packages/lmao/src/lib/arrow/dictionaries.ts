@@ -30,7 +30,7 @@ export function buildSortedCategoryDictionary(
   maskTransform?: (value: string) => string,
 ): DictionaryBuildResult {
   const valuesName = `${columnName}_values` as const;
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
 
   // Build mapping from original value to masked value (for dictionary lookup)
   // and collect unique masked values for the dictionary
@@ -40,7 +40,7 @@ export function buildSortedCategoryDictionary(
   for (const buf of buffers) {
     const column = buf[valuesName];
     if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
+      for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
         if (value != null && !originalToMasked.has(value)) {
           const maskedValue = maskTransform ? maskTransform(value) : value;
@@ -65,7 +65,7 @@ export function buildSortedCategoryDictionary(
   for (const buf of buffers) {
     const column = buf[valuesName];
     if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
+      for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
         if (value != null) {
           const maskedValue = originalToMasked.get(value) ?? value;
@@ -75,7 +75,7 @@ export function buildSortedCategoryDictionary(
         }
       }
     }
-    rowOffset += buf.writeIndex;
+    rowOffset += buf._writeIndex;
   }
 
   return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);
@@ -90,7 +90,7 @@ export function buildTextDictionary(
   maskTransform?: (value: string) => string,
 ): DictionaryBuildResult | null {
   const valuesName = `${columnName}_values` as const;
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
 
   // Build mapping from original value to masked value and track frequency of masked values
   const frequencyMap = new Map<string, number>();
@@ -99,7 +99,7 @@ export function buildTextDictionary(
   for (const buf of buffers) {
     const column = buf[valuesName];
     if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
+      for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
         if (value != null) {
           let maskedValue: string;
@@ -137,7 +137,7 @@ export function buildTextDictionary(
   for (const buf of buffers) {
     const column = buf[valuesName];
     if (column && Array.isArray(column)) {
-      for (let i = 0; i < buf.writeIndex; i++) {
+      for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
         if (value != null) {
           const maskedValue = originalToMasked.get(value) ?? value;
@@ -147,7 +147,7 @@ export function buildTextDictionary(
         }
       }
     }
-    rowOffset += buf.writeIndex;
+    rowOffset += buf._writeIndex;
   }
 
   return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);

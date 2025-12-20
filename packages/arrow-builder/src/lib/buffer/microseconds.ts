@@ -31,8 +31,8 @@
  * const precise = Microseconds.fromNanos(process.hrtime.bigint());
  *
  * // Store in buffer
- * buffer.timestamps[idx] = timestamp; // Type-safe!
- * buffer.timestamps[idx] = Date.now(); // ❌ Type error!
+ * buffer.timestamp[idx] = timestamp; // Type-safe!
+ * buffer.timestamp[idx] = Date.now(); // ❌ Type error!
  * ```
  */
 
@@ -42,7 +42,7 @@
  * A `number` with a compile-time brand that prevents accidental mixing of time units.
  * The brand is erased at runtime, so there is zero overhead.
  */
-export type Microseconds = number & { readonly __brand: 'Microseconds' };
+export type Microseconds = number & { readonly _brand: 'Microseconds' };
 
 /**
  * Utility functions for working with Microseconds

@@ -21,9 +21,6 @@
   ],
   "references": [
     {
-      "path": "../arrow-builder/tsconfig.lib.json"
-    },
-    {
       "path": "../lmao/tsconfig.lib.json"
     }
   ]

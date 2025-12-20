@@ -11,7 +11,7 @@
  *
  * ## Naming Conventions
  *
- * - System properties use `_` prefix: `_capacity`, `_next`, `_timestamps`, `_operations`
+ * - System properties use `_` prefix: `_capacity`, `_next`
  * - User columns have NO prefix, just suffixes: `userId_nulls`, `userId_values`, `userId` (alias)
  *
  * This prevents collisions between user-defined field names and system internals.
@@ -33,9 +33,9 @@
  * This allows multiple writers to share a buffer or write to different regions.
  */
 export interface ColumnBuffer {
-  // System columns - prefixed with _ to avoid collision with user columns
-  _timestamps: BigInt64Array; // Nanosecond-precision timestamps since Unix epoch
-  _operations: Uint8Array; // Operation type: tag, ok, err, etc.
+  // Generic columnar buffer - no assumptions about table columns
+  _capacity: number; // Buffer capacity
+  _next?: ColumnBuffer; // Chain to overflow buffer
 
   // User attribute columns are added dynamically at runtime via code generation
   // Each attribute has TWO properties:
@@ -59,10 +59,16 @@ export interface ColumnBuffer {
     | Float32Array
     | Float64Array
     | string[];
+}
 
-  // Buffer management - prefixed with _ to avoid collision with user columns
-  _capacity: number; // Logical capacity for bounds checking
-  _next?: ColumnBuffer; // Chain to next buffer when overflow
+/**
+ * Narrow buffer interface without dynamic schema access.
+ * Prevents compile-time access to schema fields while maintaining system properties.
+ */
+export interface NarrowColumnBuffer {
+  // No system columns - arrow-builder is generic
+  _capacity: number;
+  _next?: NarrowColumnBuffer;
 }
 
 /**
@@ -135,6 +141,7 @@ export type TypedArrayConstructor =
 // Type-safe buffer types for generated column buffers
 // ============================================================================
 
+import type { ColumnSchema } from '../schema/ColumnSchema.js';
 import type {
   EagerBigUint64Schema,
   EagerBooleanSchema,
@@ -204,9 +211,76 @@ export type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
  * Filter out function properties from a schema object.
  * Only keeps actual schema field definitions.
  */
-type FilterSchemaFields<T> = {
+export type FilterSchemaFields<T> = {
   [K in keyof T as T[K] extends (...args: unknown[]) => unknown ? never : K]: T[K];
 };
+
+/**
+ * Type aliases for schema-based property access keys.
+ * Enables DRY composition of schema properties across types.
+ */
+export type ValueKeys<T> = T extends { fields: infer F } ? `${keyof FilterSchemaFields<F>}_values` : never;
+export type NullKeys<T> = T extends { fields: infer F } ? `${keyof FilterSchemaFields<F>}_nulls` : never;
+
+/**
+ * Typed property access for schema-defined value arrays.
+ * Used for composing schema-based access in buffer types.
+ */
+export type SchemaValueProperties<T> = T extends { fields: infer F }
+  ? { [K in ValueKeys<T>]: ValuesArrayType<FilterSchemaFields<F>[Extract<keyof FilterSchemaFields<F>, string>]> }
+  : never;
+
+/**
+ * Extract the fields from a schema, handling ColumnSchema wrappers.
+ */
+export type ExtractFields<S> = S extends ColumnSchema<infer F> ? F : S;
+
+/**
+ * Buffer data properties (arrays and null bitmaps) without setter methods.
+ * Separated from setters to allow different return types for fluent APIs.
+ */
+export type BufferData<Schema> = ColumnBuffer & {
+  // Column value arrays (internal, use expose() to access with type safety)
+  [K in keyof FilterSchemaFields<ExtractFields<Schema>> as `${K & string}_values`]: ValuesArrayType<
+    FilterSchemaFields<ExtractFields<Schema>>[K]
+  >;
+} & {
+  // Column null bitmaps (internal, use expose() to access with type safety)
+  [K in keyof FilterSchemaFields<ExtractFields<Schema>> as `${K & string}_nulls`]: Uint8Array;
+};
+
+/**
+ * Setter methods layer, parameterized by return type.
+ * Allows different fluent API return types.
+ */
+// ReturnType defaults to unknown for type safety while allowing flexible fluent API return types
+export type BufferSetters<Schema, ReturnType = unknown> = {
+  [K in keyof FilterSchemaFields<ExtractFields<Schema>>]: (
+    pos: number,
+    val: SetterValueType<FilterSchemaFields<ExtractFields<Schema>>[K]>,
+  ) => ReturnType;
+};
+
+/**
+ * Runtime inspection methods layer.
+ */
+export type BufferMethods = {
+  getColumnIfAllocated(columnName: string): ColumnValueType | undefined;
+  getNullsIfAllocated(columnName: string): Uint8Array | undefined;
+};
+
+/**
+ * Narrow buffer methods for runtime-only access.
+ */
+export interface NarrowBufferMethods {
+  getColumnIfAllocated(columnName: string): ColumnValueType | undefined;
+  getNullsIfAllocated(columnName: string): Uint8Array | undefined;
+}
+
+/**
+ * Narrow buffer with methods.
+ */
+export type NarrowBuffer = NarrowColumnBuffer & NarrowBufferMethods;
 
 /**
  * Generate the typed column buffer type for a given schema.
@@ -225,28 +299,39 @@ type FilterSchemaFields<T> = {
  * Since we need schema-derived properties (e.g., `userId_values`, `status_nulls`),
  * we must use a type alias with mapped types.
  *
+ * ## Why Composable?
+ *
+ * Breaking into layers allows consumers (like SpanBuffer) to override return types
+ * for fluent APIs while reusing the core data and method structures:
+ * - BufferData: Arrays and null bitmaps
+ * - BufferSetters: Typed setter methods (defaults to any for flexibility)
+ * - BufferMethods: Runtime inspection methods
+ *
  * The tradeoff: `this` return type is only available in interfaces/classes,
- * so setter methods return `TypedColumnBuffer<Schema>` instead of `this`.
+ * so setter methods return the composed type instead of `this`.
  * This slightly limits polymorphism but has no runtime impact.
  */
-export type TypedColumnBuffer<Schema> = ColumnBuffer & {
-  // Column value arrays (internal, use expose() to access with type safety)
-  [K in keyof FilterSchemaFields<Schema> as `${K & string}_values`]: ValuesArrayType<FilterSchemaFields<Schema>[K]>;
-} & {
-  // Column null bitmaps (internal, use expose() to access with type safety)
-  [K in keyof FilterSchemaFields<Schema> as `${K & string}_nulls`]: Uint8Array;
-} & {
-  // Setter methods: columnName(position, value) => TypedColumnBuffer<Schema>
-  // Provides fluent API by returning self
-  [K in keyof FilterSchemaFields<Schema>]: (
-    pos: number,
-    val: SetterValueType<FilterSchemaFields<Schema>[K]>,
-  ) => TypedColumnBuffer<Schema>;
-} & {
-  // Runtime inspection methods
-  getColumnIfAllocated(columnName: string): ColumnValueType | undefined;
-  getNullsIfAllocated(columnName: string): Uint8Array | undefined;
-};
+export type TypedColumnBuffer<Schema> = BufferData<Schema> &
+  BufferMethods & {
+    // Index signatures for backward compatibility and dynamic access
+    [key: `${string}_values`]: TypedArray | string[] | undefined;
+    [key: `${string}_nulls`]: Uint8Array | undefined;
+    // Index signature for setter methods (for compatibility with generic code)
+    [key: string]:
+      | ((pos: number, val: unknown) => TypedColumnBuffer<Schema>)
+      | TypedArray
+      | string[]
+      | Uint8Array
+      | number
+      | BufferMethods[keyof BufferMethods]
+      | undefined;
+  } & {
+    // Setter methods that return this for fluent API
+    [K in keyof FilterSchemaFields<ExtractFields<Schema>>]: (
+      pos: number,
+      val: SetterValueType<FilterSchemaFields<ExtractFields<Schema>>[K]>,
+    ) => TypedColumnBuffer<Schema>;
+  };
 
 /**
  * Exposed view of a TypedColumnBuffer with typed access to internal arrays.
@@ -260,7 +345,9 @@ export type TypedColumnBuffer<Schema> = ColumnBuffer & {
 export type ExposedColumnBuffer<Schema> = TypedColumnBuffer<Schema> & {
   // Alias getters for direct array access (same as _values)
   // These shadow the setter methods for read-only access to underlying arrays
-  readonly [K in keyof FilterSchemaFields<Schema> & string]: ValuesArrayType<FilterSchemaFields<Schema>[K]>;
+  readonly [K in keyof FilterSchemaFields<ExtractFields<Schema>> & string]: ValuesArrayType<
+    FilterSchemaFields<ExtractFields<Schema>>[K]
+  >;
 };
 
 /**

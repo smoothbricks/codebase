@@ -9,7 +9,7 @@
  * - Span tree conversion
  */
 
-import { beforeEach, describe, expect, test } from 'bun:test';
+import { describe, expect, test } from 'bun:test';
 import type { Table } from 'apache-arrow';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
 import { S } from '../../schema/builder.js';
@@ -26,7 +26,6 @@ import {
   ENTRY_TYPE_SPAN_START,
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
-  mergeWithSystemSchema,
 } from '../../schema/systemSchema.js';
 import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
@@ -56,12 +55,12 @@ describe('Arrow Table Conversion', () => {
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // Write some test data
-      buffer.timestamps[0] = 1000n;
-      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.timestamp[0] = 1000n;
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer.message(0, 'test-span');
       buffer.httpStatus(0, 200);
       buffer.userId(0, 'user-123');
-      buffer.writeIndex = 1;
+      buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
 
@@ -87,22 +86,22 @@ describe('Arrow Table Conversion', () => {
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-456'));
 
       // Write multiple rows
-      buffer.timestamps[0] = 1000n;
-      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.timestamp[0] = 1000n;
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer.message(0, 'span-1');
       buffer.level(0, 1); // INFO
 
-      buffer.timestamps[1] = 2000n;
-      buffer.operations[1] = ENTRY_TYPE_INFO;
+      buffer.timestamp[1] = 2000n;
+      buffer.entry_type[1] = ENTRY_TYPE_INFO;
       buffer.message(1, 'Log message');
       buffer.level(1, 0); // DEBUG
 
-      buffer.timestamps[2] = 3000n;
-      buffer.operations[2] = ENTRY_TYPE_SPAN_OK;
+      buffer.timestamp[2] = 3000n;
+      buffer.entry_type[2] = ENTRY_TYPE_SPAN_OK;
       buffer.message(2, 'span-1');
       buffer.level(2, 2); // WARN
 
-      buffer.writeIndex = 3;
+      buffer._writeIndex = 3;
 
       const table = convertToArrowTable(buffer);
 
@@ -134,12 +133,12 @@ describe('Arrow Table Conversion', () => {
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-789'));
 
       // Write row with only requiredField set
-      buffer.timestamps[0] = 1000n;
-      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.timestamp[0] = 1000n;
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer.message(0, 'test-span');
       buffer.requiredField(0, 42);
       // optionalField not set - should be null
-      buffer.writeIndex = 1;
+      buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
 
@@ -161,19 +160,19 @@ describe('Arrow Table Conversion', () => {
       const buffer1 = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-chain'));
 
       // Fill first buffer
-      buffer1.timestamps[0] = 1000n;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.timestamp[0] = 1000n;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer1.message(0, 'test-span');
       buffer1.counter(0, 1);
-      buffer1.writeIndex = 1;
+      buffer1._writeIndex = 1;
 
       // Create chained buffer
       const buffer2 = createNextBuffer(buffer1);
-      buffer2.timestamps[0] = 2000n;
-      buffer2.operations[0] = ENTRY_TYPE_INFO;
+      buffer2.timestamp[0] = 2000n;
+      buffer2.entry_type[0] = ENTRY_TYPE_INFO;
       buffer2.message(0, 'Log in chain');
       buffer2.counter(0, 2);
-      buffer2.writeIndex = 1;
+      buffer2._writeIndex = 1;
 
       const table = convertToArrowTable(buffer1);
 
@@ -196,25 +195,25 @@ describe('Arrow Table Conversion', () => {
       const module = createTestModuleContext(schema);
       const buffer1 = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-multi-chain'));
 
-      buffer1.timestamps[0] = 1000n;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer1.timestamp[0] = 1000n;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer1.message(0, 'test');
       buffer1.value(0, 1);
-      buffer1.writeIndex = 1;
+      buffer1._writeIndex = 1;
 
       const buffer2 = createNextBuffer(buffer1);
-      buffer2.timestamps[0] = 2000n;
-      buffer2.operations[0] = ENTRY_TYPE_INFO;
+      buffer2.timestamp[0] = 2000n;
+      buffer2.entry_type[0] = ENTRY_TYPE_INFO;
       buffer2.message(0, 'log-1');
       buffer2.value(0, 2);
-      buffer2.writeIndex = 1;
+      buffer2._writeIndex = 1;
 
       const buffer3 = createNextBuffer(buffer2);
-      buffer3.timestamps[0] = 3000n;
-      buffer3.operations[0] = ENTRY_TYPE_SPAN_OK;
+      buffer3.timestamp[0] = 3000n;
+      buffer3.entry_type[0] = ENTRY_TYPE_SPAN_OK;
       buffer3.message(0, 'test');
       buffer3.value(0, 3);
-      buffer3.writeIndex = 1;
+      buffer3._writeIndex = 1;
 
       const table = convertToArrowTable(buffer1);
 
@@ -235,33 +234,33 @@ describe('Arrow Table Conversion', () => {
       const module = createTestModuleContext(schema);
       const parentBuffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-tree'));
 
-      parentBuffer.timestamps[0] = 1000n;
-      parentBuffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      parentBuffer.timestamp[0] = 1000n;
+      parentBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       parentBuffer.message(0, 'parent-span');
       parentBuffer.spanType(0, 'parent');
-      parentBuffer.writeIndex = 1;
+      parentBuffer._writeIndex = 1;
 
       // Create child span and register with parent
       const childBuffer = createChildSpanBuffer(parentBuffer, module, 'child-span');
-      parentBuffer.children.push(childBuffer); // Explicit registration per spanBuffer.ts
+      parentBuffer._children.push(childBuffer); // Explicit registration per spanBuffer.ts
 
-      childBuffer.timestamps[0] = 1500n;
-      childBuffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      childBuffer.timestamp[0] = 1500n;
+      childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       childBuffer.message(0, 'child-span');
       childBuffer.spanType(0, 'child');
-      childBuffer.writeIndex = 1;
+      childBuffer._writeIndex = 1;
 
       // Complete child span
-      childBuffer.timestamps[1] = 1800n;
-      childBuffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+      childBuffer.timestamp[1] = 1800n;
+      childBuffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
       childBuffer.message(1, 'child-span');
-      childBuffer.writeIndex = 2;
+      childBuffer._writeIndex = 2;
 
       // Complete parent span
-      parentBuffer.timestamps[1] = 2000n;
-      parentBuffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+      parentBuffer.timestamp[1] = 2000n;
+      parentBuffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
       parentBuffer.message(1, 'parent-span');
-      parentBuffer.writeIndex = 2;
+      parentBuffer._writeIndex = 2;
 
       const table = convertSpanTreeToArrowTable(parentBuffer);
 
@@ -290,38 +289,38 @@ describe('Arrow Table Conversion', () => {
       const module = createTestModuleContext(schema);
       const parentBuffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-siblings'));
 
-      parentBuffer.timestamps[0] = 1000n;
-      parentBuffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      parentBuffer.timestamp[0] = 1000n;
+      parentBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       parentBuffer.message(0, 'parent');
-      parentBuffer.writeIndex = 1;
+      parentBuffer._writeIndex = 1;
 
       // Create first child and register with parent
       const child1Buffer = createChildSpanBuffer(parentBuffer, module, 'child1-span');
-      parentBuffer.children.push(child1Buffer); // Explicit registration per spanBuffer.ts
-      child1Buffer.timestamps[0] = 1100n;
-      child1Buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      parentBuffer._children.push(child1Buffer); // Explicit registration per spanBuffer.ts
+      child1Buffer.timestamp[0] = 1100n;
+      child1Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       child1Buffer.message(0, 'child-1');
-      child1Buffer.timestamps[1] = 1200n;
-      child1Buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+      child1Buffer.timestamp[1] = 1200n;
+      child1Buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
       child1Buffer.message(1, 'child-1');
-      child1Buffer.writeIndex = 2;
+      child1Buffer._writeIndex = 2;
 
       // Create second child and register with parent
       const child2Buffer = createChildSpanBuffer(parentBuffer, module, 'child2-span');
-      parentBuffer.children.push(child2Buffer); // Explicit registration per spanBuffer.ts
-      child2Buffer.timestamps[0] = 1300n;
-      child2Buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      parentBuffer._children.push(child2Buffer); // Explicit registration per spanBuffer.ts
+      child2Buffer.timestamp[0] = 1300n;
+      child2Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       child2Buffer.message(0, 'child-2');
-      child2Buffer.timestamps[1] = 1400n;
-      child2Buffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+      child2Buffer.timestamp[1] = 1400n;
+      child2Buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
       child2Buffer.message(1, 'child-2');
-      child2Buffer.writeIndex = 2;
+      child2Buffer._writeIndex = 2;
 
       // Complete parent
-      parentBuffer.timestamps[1] = 1500n;
-      parentBuffer.operations[1] = ENTRY_TYPE_SPAN_OK;
+      parentBuffer.timestamp[1] = 1500n;
+      parentBuffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
       parentBuffer.message(1, 'parent');
-      parentBuffer.writeIndex = 2;
+      parentBuffer._writeIndex = 2;
 
       const table = convertSpanTreeToArrowTable(parentBuffer);
 
@@ -368,11 +367,11 @@ describe('Arrow Table Conversion', () => {
 
       // Write one row for each entry type
       for (let i = 0; i < entryTypes.length; i++) {
-        buffer.timestamps[i] = BigInt(1000 + i * 100);
-        buffer.operations[i] = entryTypes[i];
+        buffer.timestamp[i] = BigInt(1000 + i * 100);
+        buffer.entry_type[i] = entryTypes[i];
         buffer.message(i, `entry-${i}`);
       }
-      buffer.writeIndex = entryTypes.length;
+      buffer._writeIndex = entryTypes.length;
 
       const table = convertToArrowTable(buffer);
 
@@ -393,15 +392,15 @@ describe('Arrow Table Conversion', () => {
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // Write some span entries
-      buffer.timestamps[0] = 1000n;
-      buffer.operations[0] = ENTRY_TYPE_SPAN_START;
+      buffer.timestamp[0] = 1000n;
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer.message(0, 'test-span');
-      buffer.writeIndex = 1;
+      buffer._writeIndex = 1;
 
-      buffer.timestamps[1] = 2000n;
-      buffer.operations[1] = ENTRY_TYPE_INFO;
+      buffer.timestamp[1] = 2000n;
+      buffer.entry_type[1] = ENTRY_TYPE_INFO;
       buffer.message(1, 'Test log message');
-      buffer.writeIndex = 2;
+      buffer._writeIndex = 2;
 
       // Update capacity stats to have meaningful values
       module.sb_capacity = 128;
@@ -457,7 +456,7 @@ describe('Arrow Table Conversion', () => {
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // Buffer has no entries (writeIndex = 0)
-      buffer.writeIndex = 0;
+      buffer._writeIndex = 0;
 
       // Update capacity stats
       module.sb_capacity = 64;

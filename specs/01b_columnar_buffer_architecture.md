@@ -13,8 +13,8 @@ The columnar buffer architecture is the core performance engine of the trace log
 7. **Tree-structured spans** with efficient parent-child relationships
 8. **Background processing pipeline** for Arrow/Parquet serialization
 
-**Key Design Insight**: Every span gets its own buffer. This eliminates the need for traceId/spanId TypedArrays (they're
-constant per buffer), keeps logs sorted in Arrow output, and enables efficient Arrow conversion.
+**Key Design Insight**: Every span gets its own buffer. This eliminates the need for trace_id/span_id TypedArrays
+(they're constant per buffer), keeps logs sorted in Arrow output, and enables efficient Arrow conversion.
 
 ## Design Philosophy
 
@@ -177,9 +177,9 @@ for the full interface definition including:
 
 - Core columns (`timestamps`, `operations`)
 - Attribute columns with lazy getters (`X_nulls`, `X_values`)
-- Tree structure (`children`, `parent`)
+- Tree structure (children, parent)
 - Dual module references (`callsiteModule`, `module`)
-- Span identification (`threadId`, `spanId`, `traceId`)
+- Span identification (`thread_id`, `span_id`, `trace_id`)
 - `ModuleContext` interface with self-tuning stats
 
 **Key Architectural Point**: Column properties are **direct properties** on SpanBuffer via lazy getters (no nested
@@ -191,7 +191,7 @@ See **[Span Identity](./01b4_span_identity.md)** for:
 
 - Span definition: "unit of work within a single thread of execution"
 - Comparison to OpenTelemetry's span model
-- Distributed span ID design (`threadId` + `spanId` composite)
+- Distributed span ID design (`thread_id` + `span_id` composite)
 - Thread-local counter design (zero overhead)
 - TraceId branded string type (W3C compatible)
 
@@ -300,7 +300,7 @@ Understanding when allocations happen is critical for performance:
 
 **Per-Entry Write Rules** (zero allocations allowed):
 
-- ✅ Direct TypedArray writes: `buffer.timestamps[index] = value`
+- ✅ Direct TypedArray writes: `buffer.timestamp[index] = value`
 - ✅ Raw string storage: `buffer.userId_strings[index] = value`
 - ✅ Null bitmap updates: `buffer.userId_nulls[byteIdx] |= 1 << bitOffset`
 - ❌ Object creation: `{ timestamp, value }`

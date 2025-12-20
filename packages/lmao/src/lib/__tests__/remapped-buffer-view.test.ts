@@ -38,7 +38,7 @@ describe('generateRemappedBufferViewClass', () => {
 
       // Create a mock buffer
       const mockBuffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 5,
         timestamps: new BigInt64Array(8),
@@ -84,7 +84,7 @@ describe('generateRemappedBufferViewClass', () => {
   describe('pass-through properties', () => {
     const createMockBuffer = (): SpanBuffer => {
       const buffer = {
-        children: [{ spanId: 2 }, { spanId: 3 }],
+        _children: [{ spanId: 2 }, { spanId: 3 }],
         next: { spanId: 10 },
         writeIndex: 7,
         timestamps: new BigInt64Array([1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n]),
@@ -123,8 +123,8 @@ describe('generateRemappedBufferViewClass', () => {
       const buffer = createMockBuffer();
       const view = new ViewClass(buffer);
 
-      expect(view.children).toBe(buffer.children);
-      expect(view.next).toBe(buffer.next);
+      expect(view._children).toBe(buffer._children);
+      expect(view._next).toBe(buffer._next);
     });
 
     it('should pass through writeIndex', () => {
@@ -133,7 +133,7 @@ describe('generateRemappedBufferViewClass', () => {
       const buffer = createMockBuffer();
       const view = new ViewClass(buffer);
 
-      expect(view.writeIndex).toBe(7);
+      expect(view._writeIndex).toBe(7);
     });
 
     it('should pass through system columns', () => {
@@ -142,8 +142,8 @@ describe('generateRemappedBufferViewClass', () => {
       const buffer = createMockBuffer();
       const view = new ViewClass(buffer);
 
-      expect(view.timestamps).toBe(buffer.timestamps);
-      expect(view.operations).toBe(buffer.operations);
+      expect(view.timestamp).toBe(buffer.timestamp);
+      expect(view.entry_type).toBe(buffer.entry_type);
       expect(view.message_values).toBe(buffer.message_values);
       expect(view.message_nulls).toBe(buffer.message_nulls);
       expect(view.lineNumber_values).toBe(buffer.lineNumber_values);
@@ -162,10 +162,10 @@ describe('generateRemappedBufferViewClass', () => {
       const buffer = createMockBuffer();
       const view = new ViewClass(buffer);
 
-      expect(view.traceId).toBe(buffer.traceId);
-      expect(view.threadId).toBe(buffer.threadId);
-      expect(view.spanId).toBe(buffer.spanId);
-      expect(view.parentSpanId).toBe(buffer.parentSpanId);
+      expect(view.trace_id).toBe(buffer.trace_id);
+      expect(view.thread_id).toBe(buffer.thread_id);
+      expect(view.span_id).toBe(buffer.span_id);
+      expect(view.parent_span_id).toBe(buffer.parent_span_id);
       expect(view._identity).toBe(buffer._identity);
     });
 
@@ -175,7 +175,7 @@ describe('generateRemappedBufferViewClass', () => {
       const buffer = createMockBuffer();
       const view = new ViewClass(buffer);
 
-      expect(view.module).toBe(buffer.module);
+      expect(view._module).toBe(buffer._module);
     });
   });
 
@@ -189,7 +189,7 @@ describe('generateRemappedBufferViewClass', () => {
       const methodValues = ['GET', 'POST', 'DELETE'];
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 3,
         timestamps: new BigInt64Array(8),
@@ -227,7 +227,7 @@ describe('generateRemappedBufferViewClass', () => {
       const statusNulls = new Uint8Array([0b111]);
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 3,
         timestamps: new BigInt64Array(8),
@@ -263,7 +263,7 @@ describe('generateRemappedBufferViewClass', () => {
       const userIdValues = ['user1', 'user2'];
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 2,
         timestamps: new BigInt64Array(8),
@@ -297,7 +297,7 @@ describe('generateRemappedBufferViewClass', () => {
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 0,
         timestamps: new BigInt64Array(8),
@@ -357,7 +357,7 @@ describe('generateRemappedBufferViewClass', () => {
       const methodValues = new Uint8Array([0]); // enum index
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),
@@ -434,8 +434,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const level4Op = appModule.op('level4-task', async (ctx) => {
         buffers.push({
           level: 4,
-          spanId: ctx.buffer.spanId,
-          parentSpanId: ctx.buffer.parentSpanId,
+          spanId: ctx.buffer.span_id,
+          parentSpanId: ctx.buffer.parent_span_id,
         });
         ctx.tag.requestId('req-level4');
         return ctx.ok({ level: 4 });
@@ -444,8 +444,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const level3Op = appModule.op('level3-task', async (ctx) => {
         buffers.push({
           level: 3,
-          spanId: ctx.buffer.spanId,
-          parentSpanId: ctx.buffer.parentSpanId,
+          spanId: ctx.buffer.span_id,
+          parentSpanId: ctx.buffer.parent_span_id,
         });
         ctx.tag.requestId('req-level3');
 
@@ -456,8 +456,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const level2Op = appModule.op('level2-task', async (ctx) => {
         buffers.push({
           level: 2,
-          spanId: ctx.buffer.spanId,
-          parentSpanId: ctx.buffer.parentSpanId,
+          spanId: ctx.buffer.span_id,
+          parentSpanId: ctx.buffer.parent_span_id,
         });
         ctx.tag.userId('user-level2');
 
@@ -468,8 +468,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const level1Op = appModule.op('level1-task', async (ctx) => {
         buffers.push({
           level: 1,
-          spanId: ctx.buffer.spanId,
-          parentSpanId: ctx.buffer.parentSpanId,
+          spanId: ctx.buffer.span_id,
+          parentSpanId: ctx.buffer.parent_span_id,
         });
         ctx.tag.requestId('req-root').userId('user-root');
 
@@ -490,10 +490,10 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       expect(buffers[3].level).toBe(4);
 
       // Root has no parent (parentSpanId = 0)
-      expect(buffers[0].parentSpanId).toBe(0);
+      expect(buffers[0].parent_span_id).toBe(0);
 
       // Verify all spanIds are unique and non-zero
-      const spanIds = buffers.map((b) => b.spanId);
+      const spanIds = buffers.map((b) => b.span_id);
       expect(new Set(spanIds).size).toBe(4); // All unique
       for (const spanId of spanIds) {
         expect(spanId).toBeGreaterThan(0);
@@ -501,7 +501,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       // Verify each non-root level has a valid parent spanId
       for (let i = 1; i < buffers.length; i++) {
-        expect(buffers[i].parentSpanId).toBeGreaterThan(0);
+        expect(buffers[i].parent_span_id).toBeGreaterThan(0);
       }
     });
 
@@ -520,22 +520,22 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const traceIds: string[] = [];
 
       const level4Op = appModule.op('level4', async (ctx) => {
-        traceIds.push(ctx.buffer.traceId);
+        traceIds.push(ctx.buffer.trace_id);
         return ctx.ok({});
       });
 
       const level3Op = appModule.op('level3', async (ctx) => {
-        traceIds.push(ctx.buffer.traceId);
+        traceIds.push(ctx.buffer.trace_id);
         return ctx.span('to-level4', level4Op);
       });
 
       const level2Op = appModule.op('level2', async (ctx) => {
-        traceIds.push(ctx.buffer.traceId);
+        traceIds.push(ctx.buffer.trace_id);
         return ctx.span('to-level3', level3Op);
       });
 
       const level1Op = appModule.op('level1', async (ctx) => {
-        traceIds.push(ctx.buffer.traceId);
+        traceIds.push(ctx.buffer.trace_id);
         return ctx.span('to-level2', level2Op);
       });
 
@@ -625,7 +625,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       // Create child buffer mock
       const childBuffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),
@@ -654,7 +654,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       // Create parent buffer with child as RemappedBufferView
       const parentBuffer = {
-        children: [childView], // Parent sees RemappedBufferView, not raw buffer
+        _children: [childView], // Parent sees RemappedBufferView, not raw buffer
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),
@@ -677,17 +677,17 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       } as unknown as SpanBuffer;
 
       // Simulate tree traversal (as Arrow conversion would do)
-      expect(parentBuffer.children).toHaveLength(1);
+      expect(parentBuffer._children).toHaveLength(1);
 
-      const child = parentBuffer.children[0] as SpanBuffer;
+      const child = parentBuffer._children[0] as SpanBuffer;
 
       // Access via prefixed name through the view
       expect(child.getColumnIfAllocated('http_status')).toEqual(new Float64Array([404]));
 
       // System columns pass through unchanged
-      expect(child.spanId).toBe(2);
-      expect(child.parentSpanId).toBe(1);
-      expect(child.traceId).toBe('12345678901234567890123456789012' as TraceId);
+      expect(child.span_id).toBe(2);
+      expect(child.parent_span_id).toBe(1);
+      expect(child.trace_id).toBe('12345678901234567890123456789012' as TraceId);
     });
 
     it('should handle nested RemappedBufferView in children array', () => {
@@ -701,7 +701,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       // Grandchild: DB library buffer
       const grandchildBuffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),
@@ -729,7 +729,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       // Child: HTTP library buffer with DB grandchild
       const childBuffer = {
-        children: [grandchildView],
+        _children: [grandchildView],
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),
@@ -757,7 +757,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       // Root: App buffer with HTTP child
       const rootBuffer = {
-        children: [childView],
+        _children: [childView],
         writeIndex: 1,
         spanId: 1,
         getColumnIfAllocated(name: string) {
@@ -766,8 +766,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       } as unknown as SpanBuffer;
 
       // Traverse the tree
-      const httpChild = rootBuffer.children[0] as SpanBuffer;
-      const dbGrandchild = httpChild.children[0] as SpanBuffer;
+      const httpChild = rootBuffer._children[0] as SpanBuffer;
+      const dbGrandchild = httpChild._children[0] as SpanBuffer;
 
       // Each level returns correct prefixed columns
       expect(httpChild.getColumnIfAllocated('http_status')).toEqual(new Float64Array([200]));
@@ -780,7 +780,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const ViewClass = generateRemappedBufferViewClass({});
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),
@@ -815,7 +815,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),
@@ -853,7 +853,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
       const buffer = {
-        children: [],
+        _children: [],
         next: undefined,
         writeIndex: 1,
         timestamps: new BigInt64Array(8),

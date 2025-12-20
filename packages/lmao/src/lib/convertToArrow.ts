@@ -75,7 +75,7 @@ export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: S
 
   while (currentBuffer) {
     buffers.push(currentBuffer);
-    currentBuffer = currentBuffer.next as SpanBuffer | undefined;
+    currentBuffer = currentBuffer._next as SpanBuffer | undefined;
   }
 
   return convertBuffersToRecordBatch(buffers, systemColumnBuilder);
@@ -91,10 +91,10 @@ export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: S
 function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
   if (buffers.length === 0) return new RecordBatch({});
 
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   if (totalRows === 0) return new RecordBatch({});
 
-  const schema: LogSchema = buffers[0].module.logSchema;
+  const schema: LogSchema = buffers[0]._module.logSchema;
 
   // Build vectors first, then derive schema from them
   // This ensures Field types and vector data types are identical (Arrow IPC requirement)
@@ -186,9 +186,9 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
       for (const buf of buffers) {
         const column = buf[valuesName];
         if (column && column instanceof indexArrayCtor) {
-          valueArrays.push(column.subarray(0, buf.writeIndex));
+          valueArrays.push(column.subarray(0, buf._writeIndex));
         } else {
-          valueArrays.push(new indexArrayCtor(buf.writeIndex));
+          valueArrays.push(new indexArrayCtor(buf._writeIndex));
         }
       }
 
@@ -308,9 +308,9 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
       for (const buf of buffers) {
         const column = buf[valuesName];
         if (column && column instanceof Float64Array) {
-          valueArrays.push(column.subarray(0, buf.writeIndex));
+          valueArrays.push(column.subarray(0, buf._writeIndex));
         } else {
-          valueArrays.push(new Float64Array(buf.writeIndex));
+          valueArrays.push(new Float64Array(buf._writeIndex));
         }
       }
 
@@ -337,10 +337,10 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
       for (const buf of buffers) {
         const column = buf[valuesName];
         if (column && column instanceof Uint8Array) {
-          const requiredBytes = Math.ceil(buf.writeIndex / 8);
+          const requiredBytes = Math.ceil(buf._writeIndex / 8);
           valueArrays.push(column.subarray(0, requiredBytes));
         } else {
-          const requiredBytes = Math.ceil(buf.writeIndex / 8);
+          const requiredBytes = Math.ceil(buf._writeIndex / 8);
           valueArrays.push(new Uint8Array(requiredBytes));
         }
       }
@@ -395,11 +395,11 @@ function buildMetadataColumnsWithFields(
   const allTimestamps = new BigInt64Array(totalRows);
   let timestampOffset = 0;
   for (const buf of buffers) {
-    if (!buf.timestamps) {
-      throw new Error(`Buffer missing timestamps property (writeIndex: ${buf.writeIndex})`);
+    if (!buf.timestamp) {
+      throw new Error(`Buffer missing timestamps property (_writeIndex: ${buf._writeIndex})`);
     }
-    allTimestamps.set(buf.timestamps.subarray(0, buf.writeIndex), timestampOffset);
-    timestampOffset += buf.writeIndex;
+    allTimestamps.set(buf.timestamp.subarray(0, buf._writeIndex), timestampOffset);
+    timestampOffset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -415,7 +415,7 @@ function buildMetadataColumnsWithFields(
 
   // Trace ID
   const traceIdSet = new Set<string>();
-  for (const buf of buffers) traceIdSet.add(buf.traceId);
+  for (const buf of buffers) traceIdSet.add(buf.trace_id);
   const traceIdArray = Array.from(traceIdSet);
   const traceIdMap = new Map(traceIdArray.map((id, idx) => [id, idx]));
   const traceIdUniqueCount = traceIdArray.length;
@@ -426,12 +426,12 @@ function buildMetadataColumnsWithFields(
   const traceIdIndices = new traceIdIndexArrayCtor(totalRows);
   let rowOffset = 0;
   for (const buf of buffers) {
-    const traceIdIndex = traceIdMap.get(buf.traceId);
+    const traceIdIndex = traceIdMap.get(buf.trace_id);
     if (traceIdIndex === undefined) {
-      throw new Error(`TraceId index not found for: ${buf.traceId}`);
+      throw new Error(`TraceId index not found for: ${buf.trace_id}`);
     }
-    traceIdIndices.fill(traceIdIndex, rowOffset, rowOffset + buf.writeIndex);
-    rowOffset += buf.writeIndex;
+    traceIdIndices.fill(traceIdIndex, rowOffset, rowOffset + buf._writeIndex);
+    rowOffset += buf._writeIndex;
   }
 
   const traceIdDictType = new Dictionary(new Utf8(), new traceIdArrowIndexTypeCtor());
@@ -464,8 +464,8 @@ function buildMetadataColumnsWithFields(
   const threadIds = new BigUint64Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    threadIds.fill(buf.threadId, rowOffset, rowOffset + buf.writeIndex);
-    rowOffset += buf.writeIndex;
+    threadIds.fill(buf.thread_id, rowOffset, rowOffset + buf._writeIndex);
+    rowOffset += buf._writeIndex;
   }
   vectors.push(
     makeVector(makeData({ type: threadIdType, offset: 0, length: totalRows, nullCount: 0, data: threadIds })),
@@ -477,8 +477,8 @@ function buildMetadataColumnsWithFields(
   const spanIds = new Uint32Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    spanIds.fill(buf.spanId, rowOffset, rowOffset + buf.writeIndex);
-    rowOffset += buf.writeIndex;
+    spanIds.fill(buf.span_id, rowOffset, rowOffset + buf._writeIndex);
+    rowOffset += buf._writeIndex;
   }
   vectors.push(makeVector(makeData({ type: spanIdType, offset: 0, length: totalRows, nullCount: 0, data: spanIds })));
 
@@ -491,13 +491,13 @@ function buildMetadataColumnsWithFields(
   let parentThreadIdNullCount = 0;
   rowOffset = 0;
   for (const buf of buffers) {
-    if (buf.parent) {
-      parentThreadIds.fill(buf.parent.threadId, rowOffset, rowOffset + buf.writeIndex);
+    if (buf._parent) {
+      parentThreadIds.fill(buf.parent_thread_id, rowOffset, rowOffset + buf._writeIndex);
     } else {
-      clearBitRange(parentThreadIdNulls, rowOffset, buf.writeIndex);
-      parentThreadIdNullCount += buf.writeIndex;
+      clearBitRange(parentThreadIdNulls, rowOffset, buf._writeIndex);
+      parentThreadIdNullCount += buf._writeIndex;
     }
-    rowOffset += buf.writeIndex;
+    rowOffset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -521,13 +521,13 @@ function buildMetadataColumnsWithFields(
   let parentSpanIdNullCount = 0;
   rowOffset = 0;
   for (const buf of buffers) {
-    if (buf.hasParent) {
-      parentSpanIds.fill(buf.parentSpanId, rowOffset, rowOffset + buf.writeIndex);
+    if (buf._hasParent) {
+      parentSpanIds.fill(buf.parent_span_id, rowOffset, rowOffset + buf._writeIndex);
     } else {
-      clearBitRange(parentSpanIdNulls, rowOffset, buf.writeIndex);
-      parentSpanIdNullCount += buf.writeIndex;
+      clearBitRange(parentSpanIdNulls, rowOffset, buf._writeIndex);
+      parentSpanIdNullCount += buf._writeIndex;
     }
-    rowOffset += buf.writeIndex;
+    rowOffset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -548,11 +548,11 @@ function buildMetadataColumnsWithFields(
   const entryTypeIndices = new Int8Array(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    if (!buf.operations) {
-      throw new Error(`Buffer missing operations property (writeIndex: ${buf.writeIndex})`);
+    if (!buf.entry_type) {
+      throw new Error(`Buffer missing operations property (_writeIndex: ${buf._writeIndex})`);
     }
-    entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), rowOffset);
-    rowOffset += buf.writeIndex;
+    entryTypeIndices.set(buf.entry_type.subarray(0, buf._writeIndex), rowOffset);
+    rowOffset += buf._writeIndex;
   }
   const entryTypeDictData = makeData({
     type: new Utf8(),
@@ -578,8 +578,8 @@ function buildMetadataColumnsWithFields(
   // Package name
   const packageSet = new Set<string>();
   for (const buf of buffers) {
-    packageSet.add(buf.module.packageName);
-    if (buf.callsiteModule) packageSet.add(buf.callsiteModule.packageName);
+    packageSet.add(buf._module.packageName);
+    if (buf._callsiteModule) packageSet.add(buf._callsiteModule.packageName);
   }
   const packageArray = Array.from(packageSet);
   const packageMap = new Map(packageArray.map((name, idx) => [name, idx]));
@@ -594,14 +594,14 @@ function buildMetadataColumnsWithFields(
   const packageIndices = new packageIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.module.packageName;
+    const callsitePkgName = buf._callsiteModule?.packageName ?? buf._module.packageName;
     const callsitePkgIdx = packageMap.get(callsitePkgName) ?? 0;
-    const opPkgIdx = packageMap.get(buf.module.packageName) ?? 0;
+    const opPkgIdx = packageMap.get(buf._module.packageName) ?? 0;
     packageIndices[rowOffset] = callsitePkgIdx;
-    if (buf.writeIndex > 1) {
-      packageIndices.fill(opPkgIdx, rowOffset + 1, rowOffset + buf.writeIndex);
+    if (buf._writeIndex > 1) {
+      packageIndices.fill(opPkgIdx, rowOffset + 1, rowOffset + buf._writeIndex);
     }
-    rowOffset += buf.writeIndex;
+    rowOffset += buf._writeIndex;
   }
   const packageDictData = makeData({
     type: new Utf8(),
@@ -627,8 +627,8 @@ function buildMetadataColumnsWithFields(
   // Package path
   const modulePathSet = new Set<string>();
   for (const buf of buffers) {
-    modulePathSet.add(buf.module.packagePath);
-    if (buf.callsiteModule) modulePathSet.add(buf.callsiteModule.packagePath);
+    modulePathSet.add(buf._module.packagePath);
+    if (buf._callsiteModule) modulePathSet.add(buf._callsiteModule.packagePath);
   }
   const modulePathArray = Array.from(modulePathSet);
   const modulePathMap = new Map(modulePathArray.map((name, idx) => [name, idx]));
@@ -644,14 +644,14 @@ function buildMetadataColumnsWithFields(
   const packagePathIndices = new packagePathIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.module.packagePath;
+    const callsitePathName = buf._callsiteModule?.packagePath ?? buf._module.packagePath;
     const callsitePathIdx = modulePathMap.get(callsitePathName) ?? 0;
-    const opPathIdx = modulePathMap.get(buf.module.packagePath) ?? 0;
+    const opPathIdx = modulePathMap.get(buf._module.packagePath) ?? 0;
     packagePathIndices[rowOffset] = callsitePathIdx;
-    if (buf.writeIndex > 1) {
-      packagePathIndices.fill(opPathIdx, rowOffset + 1, rowOffset + buf.writeIndex);
+    if (buf._writeIndex > 1) {
+      packagePathIndices.fill(opPathIdx, rowOffset + 1, rowOffset + buf._writeIndex);
     }
-    rowOffset += buf.writeIndex;
+    rowOffset += buf._writeIndex;
   }
   const packagePathDictData = makeData({
     type: new Utf8(),
@@ -677,8 +677,8 @@ function buildMetadataColumnsWithFields(
   // Git SHA
   const gitShaSet = new Set<string>();
   for (const buf of buffers) {
-    gitShaSet.add(buf.module.gitSha);
-    if (buf.callsiteModule) gitShaSet.add(buf.callsiteModule.gitSha);
+    gitShaSet.add(buf._module.gitSha);
+    if (buf._callsiteModule) gitShaSet.add(buf._callsiteModule.gitSha);
   }
   const gitShaArray = Array.from(gitShaSet);
   const gitShaMap = new Map(gitShaArray.map((sha, idx) => [sha, idx]));
@@ -693,14 +693,14 @@ function buildMetadataColumnsWithFields(
   const gitShaIndices = new gitShaIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.module.gitSha;
+    const callsiteGitSha = buf._callsiteModule?.gitSha ?? buf._module.gitSha;
     const callsiteGitShaIdx = gitShaMap.get(callsiteGitSha) ?? 0;
-    const opGitShaIdx = gitShaMap.get(buf.module.gitSha) ?? 0;
+    const opGitShaIdx = gitShaMap.get(buf._module.gitSha) ?? 0;
     gitShaIndices[rowOffset] = callsiteGitShaIdx;
-    if (buf.writeIndex > 1) {
-      gitShaIndices.fill(opGitShaIdx, rowOffset + 1, rowOffset + buf.writeIndex);
+    if (buf._writeIndex > 1) {
+      gitShaIndices.fill(opGitShaIdx, rowOffset + 1, rowOffset + buf._writeIndex);
     }
-    rowOffset += buf.writeIndex;
+    rowOffset += buf._writeIndex;
   }
   const gitShaDictData = makeData({
     type: new Utf8(),
@@ -760,7 +760,7 @@ export function convertSpanTreeToArrowTable(
   const mergedSchemaFields = new Map<string, unknown>();
 
   walkSpanTree(rootBuffer, (buffer) => {
-    const bufferSchema = buffer.module.logSchema;
+    const bufferSchema = buffer._module.logSchema;
     const fields = Array.from(bufferSchema.fieldEntries());
     for (const [fieldName, fieldSchema] of fields) {
       // Skip system schema fields - they are handled separately as system columns
@@ -823,14 +823,14 @@ export function convertSpanTreeToArrowTable(
 
   let spanRows = 0;
   walkSpanTree(rootBuffer, (buffer) => {
-    spanRows += buffer.writeIndex;
-    traceIdBuilder.add(buffer.traceId);
+    spanRows += buffer._writeIndex;
+    traceIdBuilder.add(buffer.trace_id);
 
     // Collect unique ModuleContexts (already have pre-encoded entries)
-    // Include both task.module (for rows 1+) and callsiteModule (for row 0) if present
-    uniqueModules.add(buffer.module);
-    if (buffer.callsiteModule) {
-      uniqueModules.add(buffer.callsiteModule);
+    // Include both task._module (for rows 1+) and callsiteModule (for row 0) if present
+    uniqueModules.add(buffer._module);
+    if (buffer._callsiteModule) {
+      uniqueModules.add(buffer._callsiteModule);
     }
 
     for (const [fieldName, builder] of categoryBuilders) {
@@ -841,7 +841,7 @@ export function convertSpanTreeToArrowTable(
         throw new Error(`Category originalToMasked map not found for field: ${fieldName}`);
       }
       if (col) {
-        for (let i = 0; i < buffer.writeIndex; i++) {
+        for (let i = 0; i < buffer._writeIndex; i++) {
           const originalValue = col[i];
           if (originalValue != null) {
             let maskedValue = originalToMasked.get(originalValue);
@@ -855,7 +855,7 @@ export function convertSpanTreeToArrowTable(
       }
       // Also add scope values to dictionary (they may not be in columns)
       // Per specs/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
-      const scopeValue = buffer.scopeValues?.[fieldName] as string | undefined;
+      const scopeValue = buffer._scopeValues?.[fieldName] as string | undefined;
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
         if (maskedScopeValue === undefined) {
@@ -874,7 +874,7 @@ export function convertSpanTreeToArrowTable(
         throw new Error(`Text originalToMasked map not found for field: ${fieldName}`);
       }
       if (col) {
-        for (let i = 0; i < buffer.writeIndex; i++) {
+        for (let i = 0; i < buffer._writeIndex; i++) {
           const originalValue = col[i];
           if (originalValue != null) {
             let maskedValue = originalToMasked.get(originalValue);
@@ -888,7 +888,7 @@ export function convertSpanTreeToArrowTable(
       }
       // Also add scope values to dictionary (they may not be in columns)
       // Per specs/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
-      const scopeValue = buffer.scopeValues?.[fieldName] as string | undefined;
+      const scopeValue = buffer._scopeValues?.[fieldName] as string | undefined;
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
         if (maskedScopeValue === undefined) {
@@ -971,7 +971,7 @@ export function convertSpanTreeToArrowTable(
   // Core system column: entry_type (from _system ArrayBuffer)
   arrowFields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8(), 1) }));
 
-  // Metadata columns (from task.module):
+  // Metadata columns (from task._module):
   arrowFields.push(
     Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new packageDict.arrowIndexTypeCtor(), 2) }),
   );
@@ -1052,7 +1052,7 @@ export function convertSpanTreeToArrowTable(
   const allBuffers: SpanBuffer[] = [];
 
   walkSpanTree(rootBuffer, (buffer) => {
-    if (buffer.writeIndex > 0) {
+    if (buffer._writeIndex > 0) {
       allBuffers.push(buffer);
     }
   });
@@ -1127,7 +1127,7 @@ function convertBuffersWithSharedDicts(
   categoryOriginalToMasked: Map<string, Map<string, string>>,
   textOriginalToMasked: Map<string, Map<string, string>>,
 ): RecordBatch {
-  const totalRows = buffers.reduce((sum, buf) => sum + buf.writeIndex, 0);
+  const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   const vectors: Vector[] = [];
 
   // Get types from the shared schema
@@ -1151,11 +1151,11 @@ function convertBuffersWithSharedDicts(
   for (const buf of buffers) {
     // Use set() with subarray - bulk copy
     // Defensive check: timestamps should always exist, but guard against corruption
-    if (!buf.timestamps) {
-      throw new Error(`Buffer missing timestamps property (writeIndex: ${buf.writeIndex})`);
+    if (!buf.timestamp) {
+      throw new Error(`Buffer missing timestamps property (_writeIndex: ${buf._writeIndex})`);
     }
-    allTimestamps.set(buf.timestamps.subarray(0, buf.writeIndex), offset);
-    offset += buf.writeIndex;
+    allTimestamps.set(buf.timestamp.subarray(0, buf._writeIndex), offset);
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1173,10 +1173,10 @@ function convertBuffersWithSharedDicts(
   const traceIdIndices = new traceIdDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    const idx = traceIdDict.indexMap.get(buf.traceId) ?? 0;
+    const idx = traceIdDict.indexMap.get(buf.trace_id) ?? 0;
     // Use fill() - constant value per buffer
-    traceIdIndices.fill(idx, offset, offset + buf.writeIndex);
-    offset += buf.writeIndex;
+    traceIdIndices.fill(idx, offset, offset + buf._writeIndex);
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1205,8 +1205,8 @@ function convertBuffersWithSharedDicts(
   const threadIds = new BigUint64Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    threadIds.fill(buf.threadId, offset, offset + buf.writeIndex);
-    offset += buf.writeIndex;
+    threadIds.fill(buf.thread_id, offset, offset + buf._writeIndex);
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1225,8 +1225,8 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Use fill() - constant value per buffer
-    spanIds.fill(buf.spanId, offset, offset + buf.writeIndex);
-    offset += buf.writeIndex;
+    spanIds.fill(buf.span_id, offset, offset + buf._writeIndex);
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1248,13 +1248,13 @@ function convertBuffersWithSharedDicts(
   let parentThreadIdNullCount = 0;
   offset = 0;
   for (const buf of buffers) {
-    if (buf.parent) {
-      parentThreadIds.fill(buf.parent.threadId, offset, offset + buf.writeIndex);
+    if (buf._parent) {
+      parentThreadIds.fill(buf.parent_thread_id, offset, offset + buf._writeIndex);
     } else {
-      clearBitRange(parentThreadIdNulls, offset, buf.writeIndex);
-      parentThreadIdNullCount += buf.writeIndex;
+      clearBitRange(parentThreadIdNulls, offset, buf._writeIndex);
+      parentThreadIdNullCount += buf._writeIndex;
     }
-    offset += buf.writeIndex;
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1277,14 +1277,14 @@ function convertBuffersWithSharedDicts(
   let parentSpanIdNullCount = 0;
   offset = 0;
   for (const buf of buffers) {
-    if (buf.hasParent) {
+    if (buf._hasParent) {
       // Use fill() - constant value per buffer
-      parentSpanIds.fill(buf.parentSpanId, offset, offset + buf.writeIndex);
+      parentSpanIds.fill(buf.parent_span_id, offset, offset + buf._writeIndex);
     } else {
-      clearBitRange(parentSpanIdNulls, offset, buf.writeIndex);
-      parentSpanIdNullCount += buf.writeIndex;
+      clearBitRange(parentSpanIdNulls, offset, buf._writeIndex);
+      parentSpanIdNullCount += buf._writeIndex;
     }
-    offset += buf.writeIndex;
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1299,18 +1299,18 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Core system column: Entry type (from _system ArrayBuffer, buf.operations)
+  // Core system column: Entry type (from _system ArrayBuffer, buf.entry_type)
   const entryTypeIndices = new Int8Array(totalRows);
   offset = 0;
   for (const buf of buffers) {
     // Use set() with subarray - bulk copy
     // Note: operations is Uint8Array but entryTypeIndices is Int8Array, same underlying representation
     // Defensive check: operations should always exist, but guard against corruption
-    if (!buf.operations) {
-      throw new Error(`Buffer missing operations property (writeIndex: ${buf.writeIndex})`);
+    if (!buf.entry_type) {
+      throw new Error(`Buffer missing operations property (_writeIndex: ${buf._writeIndex})`);
     }
-    entryTypeIndices.set(buf.operations.subarray(0, buf.writeIndex), offset);
-    offset += buf.writeIndex;
+    entryTypeIndices.set(buf.entry_type.subarray(0, buf._writeIndex), offset);
+    offset += buf._writeIndex;
   }
   const entryTypeDictData = makeData({
     type: new Utf8(),
@@ -1333,28 +1333,28 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Metadata column: Package name (from task.module.packageName, with callsiteModule for row 0)
+  // Metadata column: Package name (from task._module.packageName, with callsiteModule for row 0)
   // Per specs/01c_context_flow_and_op_wrappers.md:
   // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
-  // - Rows 1+ (logs, span-end): uses task.module
+  // - Rows 1+ (logs, span-end): uses task._module
   const packageIndices = new packageDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    // Row 0: use callsiteModule if available, else fall back to task.module
-    const callsitePkgName = buf.callsiteModule?.packageName ?? buf.module.packageName;
+    // Row 0: use callsiteModule if available, else fall back to task._module
+    const callsitePkgName = buf._callsiteModule?.packageName ?? buf._module.packageName;
     const callsitePkgIdx = packageDict.indexMap.get(callsitePkgName) ?? 0;
 
-    // Op's module (task.module) for rows 1+
-    const opPkgIdx = packageDict.indexMap.get(buf.module.packageName) ?? 0;
+    // Op's module (task._module) for rows 1+
+    const opPkgIdx = packageDict.indexMap.get(buf._module.packageName) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packageIndices[offset] = callsitePkgIdx;
 
     // Set rows 1+ (span-end, logs) to op's module
-    if (buf.writeIndex > 1) {
-      packageIndices.fill(opPkgIdx, offset + 1, offset + buf.writeIndex);
+    if (buf._writeIndex > 1) {
+      packageIndices.fill(opPkgIdx, offset + 1, offset + buf._writeIndex);
     }
-    offset += buf.writeIndex;
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1378,25 +1378,25 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Metadata column: Package path (from task.module.packagePath, with callsiteModule for row 0)
+  // Metadata column: Package path (from task._module.packagePath, with callsiteModule for row 0)
   const packagePathIndices = new packagePathDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    // Row 0: use callsiteModule if available, else fall back to task.module
-    const callsitePathName = buf.callsiteModule?.packagePath ?? buf.module.packagePath;
+    // Row 0: use callsiteModule if available, else fall back to task._module
+    const callsitePathName = buf._callsiteModule?.packagePath ?? buf._module.packagePath;
     const callsitePathIdx = packagePathDict.indexMap.get(callsitePathName) ?? 0;
 
-    // Op's module (task.module) for rows 1+
-    const opPathIdx = packagePathDict.indexMap.get(buf.module.packagePath) ?? 0;
+    // Op's module (task._module) for rows 1+
+    const opPathIdx = packagePathDict.indexMap.get(buf._module.packagePath) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packagePathIndices[offset] = callsitePathIdx;
 
     // Set rows 1+ (span-end, logs) to op's module
-    if (buf.writeIndex > 1) {
-      packagePathIndices.fill(opPathIdx, offset + 1, offset + buf.writeIndex);
+    if (buf._writeIndex > 1) {
+      packagePathIndices.fill(opPathIdx, offset + 1, offset + buf._writeIndex);
     }
-    offset += buf.writeIndex;
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1420,25 +1420,25 @@ function convertBuffersWithSharedDicts(
     ),
   );
 
-  // Metadata column: Git SHA (from task.module.gitSha, with callsiteModule for row 0)
+  // Metadata column: Git SHA (from task._module.gitSha, with callsiteModule for row 0)
   const gitShaIndices2 = new gitShaDict.indexArrayCtor(totalRows);
   offset = 0;
   for (const buf of buffers) {
-    // Row 0: use callsiteModule if available, else fall back to task.module
-    const callsiteGitSha = buf.callsiteModule?.gitSha ?? buf.module.gitSha;
+    // Row 0: use callsiteModule if available, else fall back to task._module
+    const callsiteGitSha = buf._callsiteModule?.gitSha ?? buf._module.gitSha;
     const callsiteGitShaIdx = gitShaDict.indexMap.get(callsiteGitSha) ?? 0;
 
-    // Op's module (task.module) for rows 1+
-    const opGitShaIdx = gitShaDict.indexMap.get(buf.module.gitSha) ?? 0;
+    // Op's module (task._module) for rows 1+
+    const opGitShaIdx = gitShaDict.indexMap.get(buf._module.gitSha) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     gitShaIndices2[offset] = callsiteGitShaIdx;
 
     // Set rows 1+ (span-end, logs) to op's module
-    if (buf.writeIndex > 1) {
-      gitShaIndices2.fill(opGitShaIdx, offset + 1, offset + buf.writeIndex);
+    if (buf._writeIndex > 1) {
+      gitShaIndices2.fill(opGitShaIdx, offset + 1, offset + buf._writeIndex);
     }
-    offset += buf.writeIndex;
+    offset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1498,7 +1498,7 @@ function convertBuffersWithSharedDicts(
   for (const buf of buffers) {
     const col = buf.getColumnIfAllocated('message') as string[] | undefined;
     if (col) {
-      for (let i = 0; i < buf.writeIndex; i++) {
+      for (let i = 0; i < buf._writeIndex; i++) {
         const v = col[i];
         const rowIdx = messageRowOffset + i;
         if (v != null) {
@@ -1508,7 +1508,7 @@ function convertBuffersWithSharedDicts(
         }
       }
     }
-    messageRowOffset += buf.writeIndex;
+    messageRowOffset += buf._writeIndex;
   }
   vectors.push(
     makeVector(
@@ -1580,7 +1580,7 @@ function convertBuffersWithSharedDicts(
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf.scopeValues?.[fieldName] as string | undefined;
+        const scopeValue = buf._scopeValues?.[fieldName] as string | undefined;
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
@@ -1588,7 +1588,7 @@ function convertBuffersWithSharedDicts(
         }
 
         if (col) {
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const v = col[i];
             const rowIdx = rowOffset + i;
             if (v != null) {
@@ -1606,16 +1606,16 @@ function convertBuffersWithSharedDicts(
           }
         } else if (scopeEncodedValue !== undefined) {
           // Column not allocated but we have scope - fill all rows with scope value
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const rowIdx = rowOffset + i;
             indices[rowIdx] = scopeEncodedValue;
             nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
           }
         } else {
           // No column and no scope - all nulls
-          nullCount += buf.writeIndex;
+          nullCount += buf._writeIndex;
         }
-        rowOffset += buf.writeIndex;
+        rowOffset += buf._writeIndex;
       }
 
       vectors.push(
@@ -1654,7 +1654,7 @@ function convertBuffersWithSharedDicts(
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf.scopeValues?.[fieldName] as string | undefined;
+        const scopeValue = buf._scopeValues?.[fieldName] as string | undefined;
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
@@ -1662,7 +1662,7 @@ function convertBuffersWithSharedDicts(
         }
 
         if (col) {
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const v = col[i];
             const rowIdx = rowOffset + i;
             if (v != null) {
@@ -1680,16 +1680,16 @@ function convertBuffersWithSharedDicts(
           }
         } else if (scopeEncodedValue !== undefined) {
           // Column not allocated but we have scope - fill all rows with scope value
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const rowIdx = rowOffset + i;
             indices[rowIdx] = scopeEncodedValue;
             nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
           }
         } else {
           // No column and no scope - all nulls
-          nullCount += buf.writeIndex;
+          nullCount += buf._writeIndex;
         }
-        rowOffset += buf.writeIndex;
+        rowOffset += buf._writeIndex;
       }
 
       vectors.push(
@@ -1725,13 +1725,13 @@ function convertBuffersWithSharedDicts(
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf.scopeValues?.[fieldName] as number | undefined;
+        const scopeValue = buf._scopeValues?.[fieldName] as number | undefined;
 
         if (col instanceof Float64Array) {
-          allValues.set(col.subarray(0, buf.writeIndex), rowOffset);
+          allValues.set(col.subarray(0, buf._writeIndex), rowOffset);
           if (srcNulls) {
             // Process each row - direct write wins, then scope, then null
-            for (let i = 0; i < buf.writeIndex; i++) {
+            for (let i = 0; i < buf._writeIndex; i++) {
               const srcByte = i >>> 3;
               const srcBit = i & 7;
               const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
@@ -1750,7 +1750,7 @@ function convertBuffersWithSharedDicts(
             }
           } else {
             // No null bitmap means column was allocated but no writes - check scope
-            for (let i = 0; i < buf.writeIndex; i++) {
+            for (let i = 0; i < buf._writeIndex; i++) {
               const rowIdx = rowOffset + i;
               if (scopeValue !== undefined) {
                 allValues[rowIdx] = scopeValue;
@@ -1762,16 +1762,16 @@ function convertBuffersWithSharedDicts(
           }
         } else if (scopeValue !== undefined) {
           // Column not allocated but we have scope - fill all rows with scope value
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const rowIdx = rowOffset + i;
             allValues[rowIdx] = scopeValue;
             nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
           }
         } else {
           // Column doesn't exist for this buffer and no scope - all nulls
-          nullCount += buf.writeIndex;
+          nullCount += buf._writeIndex;
         }
-        rowOffset += buf.writeIndex;
+        rowOffset += buf._writeIndex;
       }
 
       vectors.push(
@@ -1798,11 +1798,11 @@ function convertBuffersWithSharedDicts(
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf.scopeValues?.[fieldName] as boolean | undefined;
+        const scopeValue = buf._scopeValues?.[fieldName] as boolean | undefined;
 
         if (col instanceof Uint8Array) {
           // Copy boolean values bit by bit - can't avoid loop for bit-level operations
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const srcByte = i >>> 3;
             const srcBit = i & 7;
             const rowIdx = rowOffset + i;
@@ -1840,7 +1840,7 @@ function convertBuffersWithSharedDicts(
           }
         } else if (scopeValue !== undefined) {
           // Column not allocated but we have scope - fill all rows with scope value
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const rowIdx = rowOffset + i;
             if (scopeValue) {
               allValues[rowIdx >>> 3] |= 1 << (rowIdx & 7);
@@ -1849,9 +1849,9 @@ function convertBuffersWithSharedDicts(
           }
         } else {
           // Column doesn't exist for this buffer and no scope - all nulls
-          nullCount += buf.writeIndex;
+          nullCount += buf._writeIndex;
         }
-        rowOffset += buf.writeIndex;
+        rowOffset += buf._writeIndex;
       }
 
       vectors.push(
@@ -1892,16 +1892,16 @@ function convertBuffersWithSharedDicts(
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf.scopeValues?.[fieldName] as string | undefined;
+        const scopeValue = buf._scopeValues?.[fieldName] as string | undefined;
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           scopeEncodedValue = enumValueToIndex.get(scopeValue);
         }
 
         if (col instanceof indexArrayCtor) {
-          allIndices.set(col.subarray(0, buf.writeIndex), rowOffset);
+          allIndices.set(col.subarray(0, buf._writeIndex), rowOffset);
           if (srcNulls) {
-            for (let i = 0; i < buf.writeIndex; i++) {
+            for (let i = 0; i < buf._writeIndex; i++) {
               const srcByte = i >>> 3;
               const srcBit = i & 7;
               const isValid = (srcNulls[srcByte] & (1 << srcBit)) !== 0;
@@ -1920,7 +1920,7 @@ function convertBuffersWithSharedDicts(
             }
           } else {
             // No null bitmap - check scope for each row
-            for (let i = 0; i < buf.writeIndex; i++) {
+            for (let i = 0; i < buf._writeIndex; i++) {
               const rowIdx = rowOffset + i;
               if (scopeEncodedValue !== undefined) {
                 allIndices[rowIdx] = scopeEncodedValue;
@@ -1932,16 +1932,16 @@ function convertBuffersWithSharedDicts(
           }
         } else if (scopeEncodedValue !== undefined) {
           // Column not allocated but we have scope - fill all rows with scope value
-          for (let i = 0; i < buf.writeIndex; i++) {
+          for (let i = 0; i < buf._writeIndex; i++) {
             const rowIdx = rowOffset + i;
             allIndices[rowIdx] = scopeEncodedValue;
             nullBitmap[rowIdx >>> 3] |= 1 << (rowIdx & 7);
           }
         } else {
           // Column doesn't exist for this buffer and no scope - all nulls
-          nullCount += buf.writeIndex;
+          nullCount += buf._writeIndex;
         }
-        rowOffset += buf.writeIndex;
+        rowOffset += buf._writeIndex;
       }
 
       const enumDictData = makeData({

@@ -60,9 +60,9 @@ function analyzeBufferChain(rootBuffer: SpanBuffer): {
 
   while (current) {
     bufferCount++;
-    writeIndices.push(current.writeIndex);
-    totalEntries += current.writeIndex;
-    current = current.next as SpanBuffer | undefined;
+    writeIndices.push(current._writeIndex);
+    totalEntries += current._writeIndex;
+    current = current._next as SpanBuffer | undefined;
   }
 
   return { bufferCount, totalEntries, writeIndices };
@@ -97,7 +97,7 @@ function collectEntries(
   while (current) {
     // First buffer starts at startRow, subsequent buffers start at 0
     const start = bufferIndex === 0 ? startRow : 0;
-    const end = current.writeIndex;
+    const end = current._writeIndex;
 
     for (let row = start; row < end; row++) {
       entries.push({
@@ -111,7 +111,7 @@ function collectEntries(
     }
 
     bufferIndex++;
-    current = current.next as SpanBuffer | undefined;
+    current = current._next as SpanBuffer | undefined;
   }
 
   return entries;
@@ -229,23 +229,23 @@ describe('Buffer Overflow Property Tests', () => {
           let current: SpanBuffer | undefined = buffer;
           while (current) {
             buffers.push(current);
-            current = current.next as SpanBuffer | undefined;
+            current = current._next as SpanBuffer | undefined;
           }
 
           // Property: each buffer (except last) has next pointing to following buffer
           for (let i = 0; i < buffers.length - 1; i++) {
-            expect(buffers[i].next).toBe(buffers[i + 1]);
+            expect(buffers[i]._next).toBe(buffers[i + 1]);
           }
 
           // Property: last buffer has no next
-          expect(buffers[buffers.length - 1].next).toBeUndefined();
+          expect(buffers[buffers.length - 1]._next).toBeUndefined();
 
           // Property: all buffers share same spanId and traceId
-          const spanId = buffer.spanId;
-          const traceId = buffer.traceId;
+          const spanId = buffer.span_id;
+          const traceId = buffer.trace_id;
           for (const buf of buffers) {
-            expect(buf.spanId).toBe(spanId);
-            expect(buf.traceId).toBe(traceId);
+            expect(buf.span_id).toBe(spanId);
+            expect(buf.trace_id).toBe(traceId);
           }
         }),
         { numRuns: 50 },
@@ -336,10 +336,10 @@ describe('Buffer Overflow Property Tests', () => {
           let current: SpanBuffer | undefined = buffer;
           while (current) {
             // Property: writeIndex <= capacity
-            expect(current.writeIndex).toBeLessThanOrEqual(current.capacity);
+            expect(current._writeIndex).toBeLessThanOrEqual(current._capacity);
             // Property: writeIndex >= 0
-            expect(current.writeIndex).toBeGreaterThanOrEqual(0);
-            current = current.next as SpanBuffer | undefined;
+            expect(current._writeIndex).toBeGreaterThanOrEqual(0);
+            current = current._next as SpanBuffer | undefined;
           }
         }),
         { numRuns: 100 },
@@ -362,10 +362,10 @@ describe('Buffer Overflow Property Tests', () => {
       }
 
       // Should be exactly 1 buffer (no overflow)
-      expect(buffer.next).toBeUndefined();
+      expect(buffer._next).toBeUndefined();
       expect(module.sb_overflows).toBe(0);
       // writeIndex = RESERVED_ROWS + usableCapacity = 2 + 6 = 8 = capacity
-      expect(buffer.writeIndex).toBe(capacity);
+      expect(buffer._writeIndex).toBe(capacity);
     });
 
     it('usable capacity + 1: triggers exactly one overflow', () => {
@@ -382,13 +382,13 @@ describe('Buffer Overflow Property Tests', () => {
       }
 
       // Should be exactly 2 buffers
-      expect(buffer.next).toBeDefined();
-      expect(buffer.next?.next).toBeUndefined();
+      expect(buffer._next).toBeDefined();
+      expect(buffer._next?._next).toBeUndefined();
       expect(module.sb_overflows).toBe(1);
 
       // First buffer full, second has 1 entry
-      expect(buffer.writeIndex).toBe(capacity);
-      expect(buffer.next?.writeIndex).toBe(1);
+      expect(buffer._writeIndex).toBe(capacity);
+      expect(buffer._next?._writeIndex).toBe(1);
     });
 
     it('zero entries: single buffer with just reserved space', () => {
@@ -398,9 +398,9 @@ describe('Buffer Overflow Property Tests', () => {
       // Create logger but don't write anything
       createSpanLogger(testSchema, buffer, createNextBuffer);
 
-      expect(buffer.next).toBeUndefined();
+      expect(buffer._next).toBeUndefined();
       // Logger constructor sets writeIndex to 2 (after reserved rows)
-      expect(buffer.writeIndex).toBe(RESERVED_ROWS);
+      expect(buffer._writeIndex).toBe(RESERVED_ROWS);
       expect(module.sb_overflows).toBe(0);
     });
   });

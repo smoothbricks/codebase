@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
-import { createSpanBuffer, createTagWriter, defineLogSchema, S } from '@smoothbricks/lmao';
+import { createSpanBuffer, createTagWriter, S } from '@smoothbricks/lmao';
 import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
 
 /**
@@ -268,8 +268,8 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     expect(buffer._operations).toBeDefined();
     expect(buffer._operations).toBeInstanceOf(Uint8Array);
     // Also check public aliases
-    expect(buffer.timestamps).toBe(buffer._timestamps);
-    expect(buffer.operations).toBe(buffer._operations);
+    expect(buffer.timestamp).toBe(buffer._timestamps);
+    expect(buffer.entry_type).toBe(buffer._operations);
 
     // Lazy columns (user attributes) should be undefined before access
     expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();

@@ -15,7 +15,6 @@ import {
   ENTRY_TYPE_SPAN_OK,
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
-import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { SpanBuffer } from '../types.js';
 import { createTestModuleContext } from './test-helpers.js';
@@ -238,18 +237,18 @@ describe('Child Span Lifecycle', () => {
       childBuffer = ctx.buffer;
 
       // Verify child span is linked to parent
-      expect(ctx.buffer.parent).toBeDefined();
+      expect(ctx.buffer._parent).toBeDefined();
       // Use === comparison to avoid type mismatch between SpanBuffer<Schema> and untyped SpanBuffer
-      expect(ctx.buffer.parent === parentBuffer).toBe(true);
+      expect(ctx.buffer._parent === parentBuffer).toBe(true);
       expect(parentBuffer).toBeDefined();
       const parent = parentBuffer as NonNullable<typeof parentBuffer>;
 
       // Verify child span inherits parent's schema
-      expect(ctx.buffer.module.logSchema).toBe(parent.module.logSchema);
+      expect(ctx.buffer._module.logSchema).toBe(parent._module.logSchema);
 
       // Verify child span has different spanId but same traceId
-      expect(ctx.buffer.spanId).not.toBe(parent.spanId);
-      expect(ctx.buffer.traceId).toBe(parent.traceId);
+      expect(ctx.buffer.span_id).not.toBe(parent.span_id);
+      expect(ctx.buffer.trace_id).toBe(parent.trace_id);
 
       return ctx.ok('child-done');
     });
@@ -270,7 +269,7 @@ describe('Child Span Lifecycle', () => {
     expect(result.success).toBe(true);
     expect(parentBuffer).toBeDefined();
     expect(childBuffer).toBeDefined();
-    expect(childBuffer?.parent).toBe(parentBuffer);
+    expect(childBuffer?._parent).toBe(parentBuffer);
   });
 
   it('should create proper parent-child hierarchy in Arrow conversion when op() called from parent', async () => {
@@ -325,10 +324,10 @@ describe('Child Span Lifecycle', () => {
     expect(childSpanStart).toBeDefined();
 
     // Root span should have null parent_span_id
-    expect(rootSpanStart?.parent_span_id).toBe(null);
+    expect(rootSpanStart?._parent_span_id).toBe(null);
 
     // Child span should reference root span's span_id
-    expect(childSpanStart?.parent_span_id).toBe(rootSpanStart?.span_id);
+    expect(childSpanStart?._parent_span_id).toBe(rootSpanStart?.span_id);
 
     // Both should have same trace_id
     expect(rootSpanStart?.trace_id).toBe(childSpanStart?.trace_id);
@@ -374,11 +373,11 @@ describe('Child Span Lifecycle', () => {
 
       // Verify child span inherits parent's schema
       // Even though childModule has its own schema, the child buffer should use parent's schema
-      // Note: The child buffer's schema comes from parentBuffer.module.logSchema
+      // Note: The child buffer's schema comes from parentBuffer._module.logSchema
       // (inherited via createChildSpanBuffer), not from childModule's schema
       expect(parentBuffer).toBeDefined();
       const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-      expect(ctx.buffer.module.logSchema).toEqual(parent.module.logSchema);
+      expect(ctx.buffer._module.logSchema).toEqual(parent._module.logSchema);
 
       // Child should be able to access parent's schema fields
       ctx.tag.userId('user123').operation('READ');
@@ -402,11 +401,11 @@ describe('Child Span Lifecycle', () => {
 
     expect(parentBuffer).toBeDefined();
     expect(childBuffer).toBeDefined();
-    expect(childBuffer?.parent).toBe(parentBuffer);
+    expect(childBuffer?._parent).toBe(parentBuffer);
     // Child buffer's schema should be the same as parent's schema (inherited)
     // Note: We use toEqual because the schemas are equal but may be different object references
     // The important thing is that the child buffer can write to parent's schema fields
-    expect(childBuffer?.module.logSchema).toEqual(parentBuffer?.module.logSchema);
+    expect(childBuffer?._module.logSchema).toEqual(parentBuffer?._module.logSchema);
   });
 });
 
@@ -466,8 +465,8 @@ describe('Fixed Row Layout', () => {
 
     expect(result.success).toBe(true);
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer?.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer?.operations[1]).toBe(ENTRY_TYPE_SPAN_OK);
+    expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
   });
 
   it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
@@ -482,8 +481,8 @@ describe('Fixed Row Layout', () => {
 
     expect(result.success).toBe(false);
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer?.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer?.operations[1]).toBe(ENTRY_TYPE_SPAN_ERR);
+    expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_ERR);
   });
 
   it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {
@@ -497,8 +496,8 @@ describe('Fixed Row Layout', () => {
 
     await expect(traceCtx.span('test', testOp)).rejects.toThrow('Unexpected failure');
     expect(capturedBuffer).toBeDefined();
-    expect(capturedBuffer?.operations[0]).toBe(ENTRY_TYPE_SPAN_START);
-    expect(capturedBuffer?.operations[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
+    expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
+    expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
   });
 
   it('should start writeIndex at 2 after span-start is written', async () => {
@@ -573,15 +572,15 @@ describe('Fixed Row Layout', () => {
     const buffer = createSpanBuffer(testSchema, module, 'test-span');
 
     // Buffer should have timestamps array for duration calculation
-    expect(buffer.timestamps).toBeInstanceOf(BigInt64Array);
+    expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);
 
     // Buffer should have operations array for entry types
-    expect(buffer.operations).toBeInstanceOf(Uint8Array);
+    expect(buffer.entry_type).toBeInstanceOf(Uint8Array);
 
     // Buffer should have enough capacity for at least rows 0, 1, and events
-    expect(buffer.capacity).toBeGreaterThanOrEqual(2);
+    expect(buffer._capacity).toBeGreaterThanOrEqual(2);
 
     // Fresh buffer starts at writeIndex 0
-    expect(buffer.writeIndex).toBe(0);
+    expect(buffer._writeIndex).toBe(0);
   });
 });

@@ -45,7 +45,7 @@ traceServer.addTool({
   },
   handler: async ({ testRunId }) => {
     // testRunId is used as the trace_id value for all spans in this test run
-    return await queryTraceDatabase({ traceId: testRunId });
+    return await queryTraceDatabase({ trace_id: testRunId });
   },
 });
 
@@ -73,17 +73,17 @@ traceServer.addTool({
   inputSchema: {
     type: 'object',
     properties: {
-      threadId: { type: 'string', description: 'Thread ID (uint64, hex format)' },
-      spanId: { type: 'number', description: 'Span ID (uint32)' },
-      traceId: { type: 'string', optional: true, description: 'Optional: filter by trace_id for validation' },
+      thread_id: { type: 'string', description: 'Thread ID (uint64, hex format)' },
+      span_id: { type: 'number', description: 'Span ID (uint32)' },
+      trace_id: { type: 'string', optional: true, description: 'Optional: filter by trace_id for validation' },
     },
   },
-  handler: async ({ threadId, spanId, traceId }) => {
+  handler: async ({ thread_id, span_id, trace_id }) => {
     // Query by composite identity
     return await queryTraceDatabase({
-      threadId,
-      spanId,
-      traceId, // Optional validation
+      thread_id,
+      span_id,
+      trace_id, // Optional validation
     });
   },
 });
@@ -95,23 +95,23 @@ traceServer.addTool({
   inputSchema: {
     type: 'object',
     properties: {
-      threadId: { type: 'string', description: 'Thread ID of the child span' },
-      spanId: { type: 'number', description: 'Span ID of the child span' },
-      traceId: { type: 'string', description: 'Trace ID (for validation)' },
+      thread_id: { type: 'string', description: 'Thread ID of the child span' },
+      span_id: { type: 'number', description: 'Span ID of the child span' },
+      trace_id: { type: 'string', description: 'Trace ID (for validation)' },
     },
   },
-  handler: async ({ threadId, spanId, traceId }) => {
+  handler: async ({ thread_id, span_id, trace_id }) => {
     // First get the child span to find parent references
-    const childSpan = await queryTraceDatabase({ threadId, spanId, traceId });
+    const childSpan = await queryTraceDatabase({ thread_id, span_id, trace_id });
     if (!childSpan || !childSpan.parent_thread_id || !childSpan.parent_span_id) {
       return null; // Root span has no parent
     }
 
     // Query parent using parent_thread_id + parent_span_id
     return await queryTraceDatabase({
-      threadId: childSpan.parent_thread_id,
-      spanId: childSpan.parent_span_id,
-      traceId, // Same trace
+      thread_id: childSpan.parent_thread_id,
+      span_id: childSpan.parent_span_id,
+      trace_id, // Same trace
     });
   },
 });
@@ -386,8 +386,8 @@ traceServer.addTool({
   name: 'get_production_trace_details',
   description: 'Get detailed production trace with optional decryption',
   requiresAuth: true,
-  handler: async ({ traceId, includeDecrypted }, { user, scopes }) => {
-    const trace = await getProductionTrace(traceId);
+  handler: async ({ trace_id, includeDecrypted }, { user, scopes }) => {
+    const trace = await getProductionTrace(trace_id);
 
     if (includeDecrypted && scopes.includes('trace:decrypt')) {
       // Decrypt sensitive data for authorized users
@@ -423,13 +423,13 @@ traceServer.addTool({
 // Query distributed traces across S3 files
 const distributedQuery = `
   SELECT 
-    traceId,
+    trace_id,
     service,
     span,
     duration,
     timestamp
   FROM s3('s3://traces/*/trace-*.parquet')
-  WHERE traceId = '${traceId}'
+  WHERE trace_id = '${trace_id}'
   ORDER BY timestamp
 `;
 
@@ -440,19 +440,19 @@ traceServer.addTool({
   inputSchema: {
     type: 'object',
     properties: {
-      traceId: { type: 'string' },
+      trace_id: { type: 'string' },
       services: { type: 'array', items: { type: 'string' }, optional: true },
     },
   },
-  handler: async ({ traceId, services }) => {
+  handler: async ({ trace_id, services }) => {
     // Use ClickHouse chDB or AWS Athena for cross-service queries
-    return await queryDistributedTrace({ traceId, services });
+    return await queryDistributedTrace({ trace_id, services });
   },
 });
 
 // Deploy chDB on AWS Lambda for serverless trace queries
-const lambdaTraceQuery = async (traceId: string) => {
-  return await chdb.query(distributedQuery, { traceId });
+const lambdaTraceQuery = async (trace_id: string) => {
+  return await chdb.query(distributedQuery, { trace_id });
 };
 ```
 
@@ -722,16 +722,16 @@ WHERE thread_id = @parent_thread_id AND span_id = @parent_span_id;
 ```typescript
 // Get a specific span by identity
 const span = await mcp.callTool('get_span_by_identity', {
-  threadId: '0x1a2b3c4d5e6f7890',
-  spanId: 42,
-  traceId: 'test-run-abc123', // Optional validation
+  thread_id: '0x1a2b3c4d5e6f7890',
+  span_id: 42,
+  trace_id: 'test-run-abc123', // Optional validation
 });
 
 // Get parent span
 const parentSpan = await mcp.callTool('get_parent_span', {
-  threadId: '0x1a2b3c4d5e6f7890',
-  spanId: 42,
-  traceId: 'test-run-abc123',
+  thread_id: '0x1a2b3c4d5e6f7890',
+  span_id: 42,
+  trace_id: 'test-run-abc123',
 });
 ```
 

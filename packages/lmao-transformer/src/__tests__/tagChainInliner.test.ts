@@ -138,13 +138,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
       // Setup: write system columns identically
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API (non-transformed)
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -182,13 +182,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -216,13 +216,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -250,13 +250,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -284,13 +284,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -318,13 +318,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -360,13 +360,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API - chained
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -413,13 +413,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Using with() - bulk setter
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -447,13 +447,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Mixed: fluent + with() + fluent
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -502,13 +502,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
         const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
         const timestamp = BigInt(Date.now()) * 1000000n;
-        buffer1.timestamps[0] = timestamp;
-        buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-        buffer1.writeIndex = 1;
+        buffer1.timestamp[0] = timestamp;
+        buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+        buffer1._writeIndex = 1;
 
-        buffer2.timestamps[0] = timestamp;
-        buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-        buffer2.writeIndex = 1;
+        buffer2.timestamp[0] = timestamp;
+        buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+        buffer2._writeIndex = 1;
 
         // Fluent API (user-facing, accepts string)
         const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -548,13 +548,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Using fluent API for both
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -591,13 +591,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Don't write to any user columns - they should remain null
 
@@ -621,13 +621,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Write only one column
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -667,15 +667,15 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       for (let i = 0; i < 5; i++) {
         const timestamp = baseTimestamp + BigInt(i * 1000000);
 
-        buffer1.timestamps[i] = timestamp;
-        buffer1.operations[i] = ENTRY_TYPE_SPAN_START;
+        buffer1.timestamp[i] = timestamp;
+        buffer1.entry_type[i] = ENTRY_TYPE_SPAN_START;
 
-        buffer2.timestamps[i] = timestamp;
-        buffer2.operations[i] = ENTRY_TYPE_SPAN_START;
+        buffer2.timestamp[i] = timestamp;
+        buffer2.entry_type[i] = ENTRY_TYPE_SPAN_START;
       }
 
-      buffer1.writeIndex = 5;
-      buffer2.writeIndex = 5;
+      buffer1._writeIndex = 5;
+      buffer2._writeIndex = 5;
 
       // Write tags for each row using fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -746,13 +746,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
 
       const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamps[0] = timestamp;
-      buffer1.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer1.writeIndex = 1;
+      buffer1.timestamp[0] = timestamp;
+      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer1._writeIndex = 1;
 
-      buffer2.timestamps[0] = timestamp;
-      buffer2.operations[0] = ENTRY_TYPE_SPAN_START;
-      buffer2.writeIndex = 1;
+      buffer2.timestamp[0] = timestamp;
+      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer2._writeIndex = 1;
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);

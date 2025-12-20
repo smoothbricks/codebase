@@ -33,7 +33,7 @@ TypedArrays bypass all these costs:
 
 ```javascript
 // Direct memory access, no allocations
-buffer.timestamps[idx] = Date.now(); // 8 bytes written directly
+buffer.timestamp[idx] = Date.now(); // 8 bytes written directly
 buffer.userIds[idx] = 123; // 4 bytes written directly
 ```
 
@@ -55,11 +55,11 @@ class SpanBuffer {
   operations: Uint8Array;
 
   writeTimestamp(idx: number, value: number) {
-    this.timestamps[idx] = value; // V8 knows it's Float64Array
+    this.timestamp[idx] = value; // V8 knows it's Float64Array
   }
 
   writeOperation(idx: number, value: number) {
-    this.operations[idx] = value; // V8 knows it's Uint8Array
+    this.entry_type[idx] = value; // V8 knows it's Uint8Array
   }
 }
 ```
@@ -87,7 +87,7 @@ function generateWriteMethods(schema: BufferSchema) {
 // BAD: Dynamic property addition
 class BadBuffer {
   constructor() {
-    this.timestamps = new BigInt64Array(64);
+    this.timestamp = new BigInt64Array(64);
     // Properties added later cause hidden class transitions
   }
 
@@ -99,15 +99,15 @@ class BadBuffer {
 // GOOD: Fixed shape from construction
 class GoodBuffer {
   // All properties defined upfront
-  readonly timestamps: BigInt64Array;
-  readonly operations: Uint8Array;
+  readonly timestamp: BigInt64Array;
+  readonly entry_type: Uint8Array;
   readonly userId_values: Uint32Array;
   readonly action_values: Uint32Array;
 
   constructor(capacity: number) {
     // Single hidden class, never changes
-    this.timestamps = new BigInt64Array(capacity);
-    this.operations = new Uint8Array(capacity);
+    this.timestamp = new BigInt64Array(capacity);
+    this.entry_type = new Uint8Array(capacity);
     this.userId_values = new Uint32Array(capacity);
     this.action_values = new Uint32Array(capacity);
   }
@@ -154,11 +154,11 @@ function alignedCapacity(requestedSize: number, bytesPerElement: number): number
 class AlignedBuffer {
   constructor(capacity: number) {
     // Each array starts on cache line boundary
-    this.timestamps = new BigInt64Array(alignedCapacity(capacity, 8));
-    this.operations = new Uint8Array(alignedCapacity(capacity, 1));
+    this.timestamp = new BigInt64Array(alignedCapacity(capacity, 8));
+    this.entry_type = new Uint8Array(alignedCapacity(capacity, 1));
 
     // Ensure arrays are cache-aligned in memory
-    if (this.timestamps.byteOffset % CACHE_LINE_SIZE !== 0) {
+    if (this.timestamp.byteOffset % CACHE_LINE_SIZE !== 0) {
       console.warn('Array not cache-aligned, performance may suffer');
     }
   }
@@ -174,27 +174,27 @@ class AlignedBuffer {
 class RandomBuffer {
   write(data: LogEntry[]) {
     data.forEach((entry, i) => {
-      const idx = Math.floor(Math.random() * this.capacity);
-      this.timestamps[idx] = entry.timestamp; // Cache miss likely
+      const idx = Math.floor(Math.random() * this._capacity);
+      this.timestamp[idx] = entry.timestamp; // Cache miss likely
     });
   }
 }
 
 // GOOD: Sequential access
 class SequentialBuffer {
-  private writeIndex = 0;
+  private _writeIndex = 0;
 
   write(data: LogEntry[]) {
-    let idx = this.writeIndex;
+    let idx = this._writeIndex;
 
     for (const entry of data) {
-      this.timestamps[idx] = entry.timestamp; // Sequential
-      this.operations[idx] = entry.operation; // Sequential
+      this.timestamp[idx] = entry.timestamp; // Sequential
+      this.entry_type[idx] = entry.operation; // Sequential
       this.userId_values[idx] = entry.userId; // Sequential
       idx++;
     }
 
-    this.writeIndex = idx;
+    this._writeIndex = idx;
   }
 }
 ```
@@ -298,7 +298,7 @@ class GeneratedEnumColumn {
   toArrow(): ArrowColumn {
     return {
       type: 'dictionary',
-      indices: this.values.slice(0, this.writeIndex),
+      indices: this.values.slice(0, this._writeIndex),
       dictionary: this.utf8Dictionary, // Already sorted + UTF-8 encoded!
     };
   }
@@ -657,18 +657,18 @@ class PooledBuffer {
   private pool = new BufferPool();
 
   grow() {
-    const newSize = this.capacity * 2;
+    const newSize = this._capacity * 2;
 
     // Acquire new arrays from pool
     const newTimestamps = this.pool.acquire(newSize, Float64Array);
 
     // Copy data
-    newTimestamps.set(this.timestamps);
+    newTimestamps.set(this.timestamp);
 
     // Release old array to pool
-    this.pool.release(this.timestamps);
+    this.pool.release(this.timestamp);
 
-    this.timestamps = newTimestamps;
+    this.timestamp = newTimestamps;
   }
 }
 ```
@@ -681,15 +681,15 @@ class PooledBuffer {
 class FastBuffer {
   // Hot path: Just array writes
   writeHot(timestamp: number, operation: number, userId: number) {
-    const idx = this.writeIndex++;
+    const idx = this._writeIndex++;
 
     // No function calls, no checks, just writes
-    this.timestamps[idx] = timestamp;
-    this.operations[idx] = operation;
+    this.timestamp[idx] = timestamp;
+    this.entry_type[idx] = operation;
     this.userIds[idx] = userId;
 
     // Capacity check at end (predictable branch)
-    if (idx === this.capacity - 1) {
+    if (idx === this._capacity - 1) {
       this._grow(); // Cold path
     }
   }
@@ -714,11 +714,11 @@ class BatchBuffer {
 
   // Batch write amortizes overhead
   writeBatch(entries: LogEntry[]) {
-    const startIdx = this.writeIndex;
+    const startIdx = this._writeIndex;
     const count = entries.length;
 
     // Single capacity check
-    if (startIdx + count >= this.capacity) {
+    if (startIdx + count >= this._capacity) {
       this._ensureCapacity(startIdx + count);
     }
 
@@ -727,12 +727,12 @@ class BatchBuffer {
       const idx = startIdx + i;
       const entry = entries[i];
 
-      this.timestamps[idx] = entry.timestamp;
-      this.operations[idx] = entry.operation;
+      this.timestamp[idx] = entry.timestamp;
+      this.entry_type[idx] = entry.operation;
       this.userIds[idx] = entry.userId;
     }
 
-    this.writeIndex = startIdx + count;
+    this._writeIndex = startIdx + count;
   }
 }
 ```
@@ -836,14 +836,14 @@ function profileMemory() {
 ```typescript
 // BAD
 write(entry: LogEntry) {
-  const idx = this.writeIndex++;
-  this.arrays.timestamps[idx] = entry.timestamp; // Property lookup!
+  const idx = this._writeIndex++;
+  this.arrays.timestamp[idx] = entry.timestamp; // Property lookup!
 }
 
 // GOOD
 write(entry: LogEntry) {
-  const idx = this.writeIndex++;
-  this.timestamps[idx] = entry.timestamp; // Direct access
+  const idx = this._writeIndex++;
+  this.timestamp[idx] = entry.timestamp; // Direct access
 }
 ```
 
@@ -868,7 +868,7 @@ write(timestamp: number) {
 ```typescript
 // BAD
 write(idx: number, value: number) {
-  if (idx < 0 || idx >= this.capacity) { // Every write
+  if (idx < 0 || idx >= this._capacity) { // Every write
     throw new Error('Index out of bounds');
   }
   this.data[idx] = value;
@@ -876,11 +876,11 @@ write(idx: number, value: number) {
 
 // GOOD
 write(value: number) {
-  const idx = this.writeIndex++;
+  const idx = this._writeIndex++;
   this.data[idx] = value;
 
   // Single check at end
-  if (idx === this.capacity - 1) {
+  if (idx === this._capacity - 1) {
     this._grow();
   }
 }
@@ -931,7 +931,7 @@ Memory is managed in flush cycles. Each cycle:
 | **CATEGORY flush state** | `flushDictionary`, `flushIndices` | -                     | Per-flush dictionary rebuilt each time |
 | **CATEGORY UTF-8 cache** | Nothing                           | Hot value UTF-8 bytes | Avoid re-encoding hot values           |
 | **TEXT strings**         | `strings[]` array                 | -                     | No interning needed - per-flush        |
-| **TypedArrays**          | `writeIndex` reset to 0           | Array buffers         | Reuse allocations                      |
+| **TypedArrays**          | `_writeIndex` reset to 0          | Array buffers         | Reuse allocations                      |
 
 ### Memory Bounds
 
@@ -984,7 +984,7 @@ class FlushScheduler {
 
   shouldFlush(buffer: SpanBuffer): boolean {
     return (
-      buffer.writeIndex / buffer.capacity > this.config.capacityThreshold ||
+      buffer._writeIndex / buffer._capacity > this.config.capacityThreshold ||
       Date.now() - this.lastFlushTime > this.config.maxIntervalMs ||
       Date.now() - this.lastWriteTime > this.config.idleTimeoutMs ||
       process.memoryUsage().heapUsed > this.config.memoryThresholdMb * 1024 * 1024

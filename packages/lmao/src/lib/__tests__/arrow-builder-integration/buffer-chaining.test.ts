@@ -27,14 +27,14 @@ describe('Buffer Chaining', () => {
       const nextBuffer = createNextBuffer(buffer);
 
       // Should inherit spanId and traceId
-      expect(nextBuffer.spanId).toBe(buffer.spanId);
-      expect(nextBuffer.traceId).toBe(buffer.traceId);
+      expect(nextBuffer.span_id).toBe(buffer.span_id);
+      expect(nextBuffer.trace_id).toBe(buffer.trace_id);
 
       // Should be linked via next property
-      expect(buffer.next).toBe(nextBuffer);
+      expect(buffer._next).toBe(nextBuffer);
 
       // Should have same parent
-      expect(nextBuffer.parent).toBe(buffer.parent);
+      expect(nextBuffer._parent).toBe(buffer._parent);
 
       // Should have same task context
       expect(nextBuffer.task).toBe(buffer.task);
@@ -49,21 +49,21 @@ describe('Buffer Chaining', () => {
       const nextBuffer = createNextBuffer(buffer);
 
       // Should use updated capacity
-      expect(nextBuffer.capacity).toBe(128);
+      expect(nextBuffer._capacity).toBe(128);
     });
 
     it('should create independent writeIndex for chained buffer', () => {
       const buffer = createSpanBuffer(schema, module, 'test-span');
 
       // Write some data to original buffer
-      buffer.writeIndex = 50;
+      buffer._writeIndex = 50;
 
       const nextBuffer = createNextBuffer(buffer);
 
       // Chained buffer should start at 0
-      expect(nextBuffer.writeIndex).toBe(0);
+      expect(nextBuffer._writeIndex).toBe(0);
       // Uses currentCapacity from stats (default)
-      expect(nextBuffer.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(nextBuffer._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });
 
     it('should maintain schema structure in chained buffer', () => {
@@ -77,8 +77,8 @@ describe('Buffer Chaining', () => {
       expect(nextBuffer.duration_values).toBeInstanceOf(Float64Array);
 
       // Should have core columns
-      expect(nextBuffer.timestamps).toBeInstanceOf(BigInt64Array);
-      expect(nextBuffer.operations).toBeInstanceOf(Uint8Array);
+      expect(nextBuffer.timestamp).toBeInstanceOf(BigInt64Array);
+      expect(nextBuffer.entry_type).toBeInstanceOf(Uint8Array);
     });
 
     it('should handle multiple chained buffers', () => {
@@ -87,14 +87,14 @@ describe('Buffer Chaining', () => {
       const buffer3 = createNextBuffer(buffer2);
 
       // All should have same spanId and traceId
-      expect(buffer2.spanId).toBe(buffer1.spanId);
-      expect(buffer3.spanId).toBe(buffer1.spanId);
-      expect(buffer2.traceId).toBe(buffer1.traceId);
-      expect(buffer3.traceId).toBe(buffer1.traceId);
+      expect(buffer2.span_id).toBe(buffer1.span_id);
+      expect(buffer3.span_id).toBe(buffer1.span_id);
+      expect(buffer2.trace_id).toBe(buffer1.trace_id);
+      expect(buffer3.trace_id).toBe(buffer1.trace_id);
 
       // Should be properly linked
-      expect(buffer1.next).toBe(buffer2);
-      expect(buffer2.next).toBe(buffer3);
+      expect(buffer1._next).toBe(buffer2);
+      expect(buffer2._next).toBe(buffer3);
     });
 
     it('should increment totalBuffersCreated stat', () => {
@@ -110,16 +110,16 @@ describe('Buffer Chaining', () => {
       const parentBuffer = createSpanBuffer(schema, module, 'test-span');
 
       const childBuffer = createChildSpanBuffer(parentBuffer, module, 'child-span');
-      parentBuffer.children.push(childBuffer);
+      parentBuffer._children.push(childBuffer);
 
       const nextChildBuffer = createNextBuffer(childBuffer);
 
       // Should maintain parent relationship
-      expect(nextChildBuffer.parent).toBe(parentBuffer);
+      expect(nextChildBuffer._parent).toBe(parentBuffer);
 
       // Should NOT be added to parent's children (it's a continuation, not a new span)
-      expect(parentBuffer.children).toHaveLength(1);
-      expect(parentBuffer.children[0]).toBe(childBuffer);
+      expect(parentBuffer._children).toHaveLength(1);
+      expect(parentBuffer._children[0]).toBe(childBuffer);
     });
 
     it('should create empty children array for chained buffer', () => {
@@ -127,24 +127,24 @@ describe('Buffer Chaining', () => {
 
       // Add a child to original buffer
       const childBuffer = createChildSpanBuffer(buffer, module, 'child-span');
-      buffer.children.push(childBuffer);
+      buffer._children.push(childBuffer);
 
       const nextBuffer = createNextBuffer(buffer);
 
       // Chained buffer should have empty children array
-      expect(nextBuffer.children).toHaveLength(0);
+      expect(nextBuffer._children).toHaveLength(0);
     });
   });
 
   describe('Buffer Chaining Edge Cases', () => {
     it('should handle buffer at exact capacity', () => {
       const buffer = createSpanBuffer(schema, module, 'test-span', undefined, 10);
-      buffer.writeIndex = 10; // At exact capacity
+      buffer._writeIndex = 10; // At exact capacity
 
       const nextBuffer = createNextBuffer(buffer);
 
-      expect(nextBuffer.writeIndex).toBe(0);
-      expect(nextBuffer.capacity).toBe(module.sb_capacity);
+      expect(nextBuffer._writeIndex).toBe(0);
+      expect(nextBuffer._capacity).toBe(module.sb_capacity);
     });
 
     it('should preserve null bitmaps structure in chained buffer', () => {
@@ -160,19 +160,19 @@ describe('Buffer Chaining', () => {
 
     it('should handle capacity changes between chained buffers', () => {
       const buffer1 = createSpanBuffer(schema, module, 'test-span');
-      expect(buffer1.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(buffer1._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
       // Simulate capacity tuning - double it
       module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 2;
 
       const buffer2 = createNextBuffer(buffer1);
-      expect(buffer2.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      expect(buffer2._capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
       // Change capacity again - double again
       module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4;
 
       const buffer3 = createNextBuffer(buffer2);
-      expect(buffer3.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
+      expect(buffer3._capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
     });
   });
 
@@ -185,25 +185,25 @@ describe('Buffer Chaining', () => {
       const testEntries = Array.from({ length: 10 }, (_, i) => ({
         userId: `user-${i % 3}`,
         requestId: `req-${i % 2}`,
-        operation: ['GET', 'POST', 'PUT', 'DELETE'][i % 4] as any,
+        operation: (['GET', 'POST', 'PUT', 'DELETE'] as const)[i % 4],
         duration: i * 1.5,
       }));
 
       let currentBuffer = rootBuffer;
       for (let i = 0; i < testEntries.length; i++) {
-        if (currentBuffer.writeIndex >= currentBuffer.capacity) {
+        if (currentBuffer._writeIndex >= currentBuffer._capacity) {
           currentBuffer = createNextBuffer(currentBuffer);
         }
 
-        const pos = currentBuffer.writeIndex;
+        const pos = currentBuffer._writeIndex;
         const entry = testEntries[i];
 
         currentBuffer.userId(pos, entry.userId);
         currentBuffer.requestId(pos, entry.requestId);
         currentBuffer.operation(pos, entry.operation);
         currentBuffer.duration(pos, entry.duration);
-        currentBuffer.timestamps[pos] = BigInt(Date.now() + i * 1000);
-        currentBuffer.writeIndex++;
+        currentBuffer.timestamp[pos] = BigInt(Date.now() + i * 1000);
+        currentBuffer._writeIndex++;
       }
 
       // Verify all data is preserved across the chain
@@ -211,7 +211,7 @@ describe('Buffer Chaining', () => {
       let verifiedCount = 0;
 
       while (verificationBuffer && verifiedCount < testEntries.length) {
-        for (let i = 0; i < verificationBuffer.writeIndex && verifiedCount < testEntries.length; i++) {
+        for (let i = 0; i < verificationBuffer._writeIndex && verifiedCount < testEntries.length; i++) {
           const expected = testEntries[verifiedCount];
 
           expect(verificationBuffer.userId_values[i]).toBe(expected.userId);
@@ -224,7 +224,7 @@ describe('Buffer Chaining', () => {
           verifiedCount++;
         }
 
-        verificationBuffer = verificationBuffer.next;
+        verificationBuffer = verificationBuffer._next;
       }
 
       expect(verifiedCount).toBe(testEntries.length);
@@ -238,50 +238,50 @@ describe('Buffer Chaining', () => {
       const buffer1 = createNextBuffer(rootBuffer);
       const child1 = createChildSpanBuffer(buffer1, module, 'child1');
       const child2 = createChildSpanBuffer(buffer1, module, 'child2');
-      buffer1.children.push(child1, child2);
+      buffer1._children.push(child1, child2);
 
       // Create second chained buffer with children
       const buffer2 = createNextBuffer(buffer1);
       const child3 = createChildSpanBuffer(buffer2, module, 'child3');
-      buffer2.children.push(child3);
+      buffer2._children.push(child3);
 
       // Verify topology
-      expect(rootBuffer.parent).toBeUndefined();
-      expect(rootBuffer.next).toBe(buffer1);
-      expect(rootBuffer.children).toHaveLength(0);
+      expect(rootBuffer._parent).toBeUndefined();
+      expect(rootBuffer._next).toBe(buffer1);
+      expect(rootBuffer._children).toHaveLength(0);
 
-      expect(buffer1.parent).toBe(rootBuffer);
-      expect(buffer1.next).toBe(buffer2);
-      expect(buffer1.children).toHaveLength(2);
-      expect(buffer1.children[0]).toBe(child1);
-      expect(buffer1.children[1]).toBe(child2);
+      expect(buffer1._parent).toBe(rootBuffer);
+      expect(buffer1._next).toBe(buffer2);
+      expect(buffer1._children).toHaveLength(2);
+      expect(buffer1._children[0]).toBe(child1);
+      expect(buffer1._children[1]).toBe(child2);
 
-      expect(buffer2.parent).toBe(buffer1);
-      expect(buffer2.next).toBeUndefined();
-      expect(buffer2.children).toHaveLength(1);
-      expect(buffer2.children[0]).toBe(child3);
+      expect(buffer2._parent).toBe(buffer1);
+      expect(buffer2._next).toBeUndefined();
+      expect(buffer2._children).toHaveLength(1);
+      expect(buffer2._children[0]).toBe(child3);
 
       // Verify identity sharing
-      expect(rootBuffer.traceId).toBe(traceId);
-      expect(buffer1.traceId).toBe(traceId);
-      expect(buffer2.traceId).toBe(traceId);
-      expect(child1.traceId).toBe(traceId);
-      expect(child2.traceId).toBe(traceId);
-      expect(child3.traceId).toBe(traceId);
+      expect(rootBuffer.trace_id).toBe(traceId);
+      expect(buffer1.trace_id).toBe(traceId);
+      expect(buffer2.trace_id).toBe(traceId);
+      expect(child1.trace_id).toBe(traceId);
+      expect(child2.trace_id).toBe(traceId);
+      expect(child3.trace_id).toBe(traceId);
 
-      expect(rootBuffer.spanId).toBe(buffer1.spanId);
-      expect(buffer1.spanId).toBe(buffer2.spanId);
-      expect(child1.spanId).not.toBe(buffer1.spanId);
-      expect(child2.spanId).not.toBe(buffer1.spanId);
-      expect(child3.spanId).not.toBe(buffer2.spanId);
+      expect(rootBuffer.span_id).toBe(buffer1.span_id);
+      expect(buffer1.span_id).toBe(buffer2.span_id);
+      expect(child1.span_id).not.toBe(buffer1.span_id);
+      expect(child2.span_id).not.toBe(buffer1.span_id);
+      expect(child3.span_id).not.toBe(buffer2.span_id);
 
       // Verify child relationships
-      expect(child1.parent).toBe(buffer1);
-      expect(child2.parent).toBe(buffer1);
-      expect(child3.parent).toBe(buffer2);
-      expect(child1.next).toBeUndefined();
-      expect(child2.next).toBeUndefined();
-      expect(child3.next).toBeUndefined();
+      expect(child1._parent).toBe(buffer1);
+      expect(child2._parent).toBe(buffer1);
+      expect(child3._parent).toBe(buffer2);
+      expect(child1._next).toBeUndefined();
+      expect(child2._next).toBeUndefined();
+      expect(child3._next).toBeUndefined();
     });
 
     it('should track overflow statistics accurately', () => {
@@ -293,15 +293,15 @@ describe('Buffer Chaining', () => {
       // Force multiple overflows by writing beyond capacity
       let currentBuffer = rootBuffer;
       for (let i = 0; i < 10; i++) {
-        if (currentBuffer.writeIndex >= currentBuffer.capacity) {
+        if (currentBuffer._writeIndex >= currentBuffer._capacity) {
           currentBuffer = createNextBuffer(currentBuffer);
         }
 
-        const pos = currentBuffer.writeIndex;
+        const pos = currentBuffer._writeIndex;
         currentBuffer.userId(pos, `user-${i}`);
         currentBuffer.operation(pos, 0); // GET
         currentBuffer.duration(pos, 1.0);
-        currentBuffer.writeIndex++;
+        currentBuffer._writeIndex++;
       }
 
       // Count actual buffers created
@@ -309,7 +309,7 @@ describe('Buffer Chaining', () => {
       let countBuffer: SpanBuffer | undefined = rootBuffer;
       while (countBuffer) {
         bufferCount++;
-        countBuffer = countBuffer.next;
+        countBuffer = countBuffer._next;
       }
 
       // Should have created multiple buffers for 10 entries with capacity 3
@@ -338,8 +338,8 @@ describe('Buffer Chaining', () => {
         expect(buf.operation_nulls).toBeInstanceOf(Uint8Array);
         expect(buf.duration_nulls).toBeInstanceOf(Uint8Array);
 
-        expect(buf.timestamps).toBeInstanceOf(BigInt64Array);
-        expect(buf.operations).toBeInstanceOf(Uint8Array);
+        expect(buf.timestamp).toBeInstanceOf(BigInt64Array);
+        expect(buf.entry_type).toBeInstanceOf(Uint8Array);
       }
     });
   });

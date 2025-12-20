@@ -321,7 +321,7 @@ function convertBufferToRecordBatch(
   schema: arrow.Schema,
   dictionaries: Map<string, FinalizedDictionary>
 ): arrow.RecordBatch {
-  const length = buffer.writeIndex;
+  const length = buffer._writeIndex;
   const vectors: arrow.Vector[] = [];
 
   for (const field of schema.fields) {
@@ -369,7 +369,7 @@ function convertBufferToRecordBatch(
     type: new arrow.Struct(schema.fields),
     length,
     nullCount: 0,
-    children: vectors.map((v) => v.data[0]),
+    _children: vectors.map((v) => v.data[0]),
   });
 
   return new arrow.RecordBatch(schema, structData);
@@ -383,7 +383,7 @@ The tree walking is a simple recursive function - no intermediate buffer collect
 ```typescript
 /**
  * Walk span tree depth-first, calling visitor for each buffer.
- * Handles overflow chains (buffer.next) automatically.
+ * Handles overflow chains (buffer._next) automatically.
  *
  * Note: Children may be RemappedBufferViews (for library integration).
  * RemappedBufferView implements the same interface as SpanBuffer for
@@ -393,16 +393,16 @@ function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): 
   // Visit this buffer (or RemappedBufferView)
   visitor(root);
 
-  // Visit overflow chain (same spanId, linked via .next)
-  let overflow = root.next as SpanBuffer | undefined;
+  // Visit overflow chain (same span_id, linked via ._next)
+  let overflow = root._next as SpanBuffer | undefined;
   while (overflow) {
     visitor(overflow);
-    overflow = overflow.next as SpanBuffer | undefined;
+    overflow = overflow._next as SpanBuffer | undefined;
   }
 
-  // Recursively visit children (depth-first)
+  // Recursively visit _children (depth-first)
   // Children may be SpanBuffer or RemappedBufferView
-  for (const child of root.children) {
+  for (const child of root._children) {
     walkSpanTree(child, visitor);
   }
 }
@@ -451,7 +451,7 @@ function convertSpanTreeToArrowTable(
   // Pass 1: Build dictionaries from ALL root buffers (uses shared utf8Cache)
   for (const rootBuffer of rootBuffers) {
     walkSpanTree(rootBuffer, (buffer) => {
-      totalRows += buffer.writeIndex;
+      totalRows += buffer._writeIndex;
 
       for (const field of schema.fields) {
         if (isStringColumn(buffer, field.name)) {
@@ -462,7 +462,7 @@ function convertSpanTreeToArrowTable(
           }
 
           // Add all string values from this buffer
-          for (let i = 0; i < buffer.writeIndex; i++) {
+          for (let i = 0; i < buffer._writeIndex; i++) {
             const value = getStringValue(buffer, field.name, i);
             if (value !== null) {
               dict.add(value);
@@ -483,7 +483,7 @@ function convertSpanTreeToArrowTable(
   const allBuffers: SpanBuffer[] = [];
   for (const rootBuffer of rootBuffers) {
     walkSpanTree(rootBuffer, (buffer) => {
-      if (buffer.writeIndex > 0) {
+      if (buffer._writeIndex > 0) {
         allBuffers.push(buffer);
       }
     });
@@ -603,13 +603,13 @@ Traversal order: span1 → span2 → span4 → span5 → span3
 
 ### Buffer Overflow Chain Handling
 
-Multiple buffers can share the same `spanId` due to buffer overflow:
+Multiple buffers can share the same `span_id` due to buffer overflow:
 
 ```typescript
 // When a span generates more entries than fit in one buffer:
-// - Initial buffer: spanId=5, rowCount=1000, writeIndex=1000
-// - Overflow buffer (next): spanId=5, rowCount=500, writeIndex=500
-// Both buffers have SAME spanId, different row ranges
+// - Initial buffer: span_id=5, rowCount=1000, writeIndex=1000
+// - Overflow buffer (next): span_id=5, rowCount=500, writeIndex=500
+// Both buffers have SAME span_id, different row ranges
 ```
 
 The walker yields overflow buffers immediately after the primary buffer:
@@ -618,7 +618,7 @@ The walker yields overflow buffers immediately after the primary buffer:
 Traversal with overflow:
 1. span1 primary buffer
 2. span2 primary buffer (rows 0-999)
-3. span2 overflow buffer (rows 1000-1499)  ← Same spanId!
+3. span2 overflow buffer (rows 1000-1499)  ← Same span_id!
 4. span4 primary buffer
 ...
 ```
@@ -633,7 +633,7 @@ may contain **RemappedBufferView** objects instead of raw SpanBuffers:
 ```
 Application Root Buffer (schema: { userId, http_status, http_method })
 │
-└── children[0]: RemappedBufferView  ← NOT a raw SpanBuffer
+└── _children[0]: RemappedBufferView  ← NOT a raw SpanBuffer
         │
         │   Maps prefixed → unprefixed:
         │   - http_status → status
@@ -654,14 +654,14 @@ Application Root Buffer (schema: { userId, http_status, http_method })
 ```typescript
 // Both SpanBuffer and RemappedBufferView support:
 interface TreeTraversable {
-  children: TreeTraversable[];
-  next: TreeTraversable | undefined;
-  writeIndex: number;
+  _children: TreeTraversable[];
+  _next: TreeTraversable | undefined;
+  _writeIndex: number;
   timestamps: BigInt64Array;
   operations: Uint8Array;
-  traceId: TraceId;
-  threadId: bigint;
-  spanId: number;
+  trace_id: TraceId;
+  thread_id: bigint;
+  span_id: number;
   parentSpanId: number;
   op: SpanContext;
   getColumnIfAllocated(name: string): ColumnValueType | undefined;
@@ -696,21 +696,21 @@ App Root → RemappedBufferView(HTTP) → RemappedBufferView(Auth) → Auth Buff
 
 ### Op's Responsibility: Buffer Registration
 
-SpanBuffer constructors do **not** auto-register with parent's `children[]` array. The **Op's wrapper** handles
+SpanBuffer constructors do **not** auto-register with parent's `_children[]` array. The **Op's wrapper** handles
 registration explicitly:
 
 ```typescript
 // Inside op's wrapper (conceptual):
 async invoke(parentCtx, spanName, line, ...args) {
   // Op creates its own SpanBuffer with unprefixed schema
-  const ownBuffer = createSpanBuffer(unprefixedSchema, callsite, traceId);
+  const ownBuffer = createSpanBuffer(unprefixedSchema, callsite, trace_id);
 
   // Op registers with parent - wrap with RemappedBufferView if prefixed
   if (prefix && parentCtx?.buffer) {
     const remappedView = new RemappedViewClass(ownBuffer);
-    parentCtx.buffer.children.push(remappedView); // Register the view, not raw buffer
+    parentCtx.buffer._children.push(remappedView); // Register the view, not raw buffer
   } else if (parentCtx?.buffer) {
-    parentCtx.buffer.children.push(ownBuffer);
+    parentCtx.buffer._children.push(ownBuffer);
   }
 
   // ... execute user function
@@ -791,7 +791,7 @@ function convertToRecordBatch(
     spanName: StringInterner;
   }
 ): arrow.RecordBatch {
-  const length = buffer.writeIndex;
+  const length = buffer._writeIndex;
   const vectors: arrow.Vector[] = [];
 
   // ... convert each column using makeData() ...
@@ -808,7 +808,7 @@ This is the building block used by `convertBuffersToRecordBatch` in Pass 2.
 
 | Responsibility              | Package       | Why                                                    |
 | --------------------------- | ------------- | ------------------------------------------------------ |
-| Tree walking                | lmao          | Knows about SpanBuffer.children, SpanBuffer.next       |
+| Tree walking                | lmao          | Knows about SpanBuffer.\_children, SpanBuffer.\_next   |
 | ColumnDictionary            | lmao          | Knows about category/text types from schema            |
 | Dictionary finalization     | lmao          | Builds Arrow Dictionary vectors with lmao's schema     |
 | Single buffer → RecordBatch | lmao          | Uses lmao's interners, schema, system columns          |
@@ -865,7 +865,7 @@ When converting SpanBuffers to Arrow, use these patterns for efficient access:
 
 ```typescript
 // IMPORTANT: Use subarray() for zero-copy conversion
-const view = buffer.timestamps.subarray(0, writeIndex); // Zero-copy VIEW
+const view = buffer.timestamp.subarray(0, writeIndex); // Zero-copy VIEW
 
 // Check if column was allocated without triggering allocation
 const values = buffer.getColumnIfAllocated('userId');

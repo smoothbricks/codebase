@@ -64,7 +64,7 @@ function isTagWriterType(type: ts.Type, typeChecker: ts.TypeChecker): boolean {
  * Inspects the type's properties to determine:
  * - The schema type (enum/category/text/number/boolean)
  * - Enum values for enum types (from union of string literals)
- * - Whether the field is eager (from __eager property)
+ * - Whether the field is eager (from _eager property)
  *
  * @param tagType - The TypeScript type of ctx.tag
  * @param typeChecker - TypeScript type checker instance
@@ -92,7 +92,7 @@ export function extractSchemaFromTagType(
 
     const paramType = typeChecker.getTypeOfSymbol(params[0]);
 
-    // Check for __eager property to determine eagerness
+    // Check for _eager property to determine eagerness
     const eager = checkEagerProperty(propType, typeChecker);
 
     // Check for enum type (union of string literals)
@@ -136,10 +136,10 @@ export function extractSchemaFromTagType(
 }
 
 /**
- * Check if a type has an __eager property with literal type true.
+ * Check if a type has an _eager property with literal type true.
  */
 function checkEagerProperty(type: ts.Type, typeChecker: ts.TypeChecker): boolean {
-  const eagerSymbol = type.getProperty('__eager');
+  const eagerSymbol = type.getProperty('_eager');
   if (!eagerSymbol) return false;
 
   const eagerType = typeChecker.getTypeOfSymbol(eagerSymbol);

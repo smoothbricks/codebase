@@ -87,19 +87,19 @@ interface BaseSpanBuffer extends ColumnBuffer {
   // ============================================================================
 
   /** Alias for _timestamps - nanosecond-precision timestamps */
-  readonly timestamps: BigInt64Array;
+  readonly timestamp: BigInt64Array;
 
   /** Alias for _operations - entry type codes */
-  readonly operations: Uint8Array;
+  readonly entry_type: Uint8Array;
 
-  /** Alias for _writeIndex - current write position */
-  writeIndex: number;
+  /** Current write position */
+  _writeIndex: number;
 
-  /** Alias for _capacity - buffer capacity */
-  readonly capacity: number;
+  /** Buffer capacity */
+  readonly _capacity: number;
 
-  /** Alias for _next - chain to overflow buffer */
-  next?: BaseSpanBuffer;
+  /** Chain to overflow buffer */
+  _next?: BaseSpanBuffer;
 
   // ============================================================================
   // Identity Getters (read from _identity bytes)
@@ -109,33 +109,39 @@ interface BaseSpanBuffer extends ColumnBuffer {
    * Span ID (32-bit unsigned integer).
    * Read from _identity bytes 8-11 (little-endian).
    */
-  readonly spanId: number;
+  readonly span_id: number;
 
   /**
    * Thread ID (64-bit unsigned integer as BigInt).
    * Read from _identity bytes 0-7 (little-endian).
    * Used for Arrow conversion (cold path).
    */
-  readonly threadId: bigint;
+  readonly thread_id: bigint;
 
   /**
    * Trace ID for this span.
    * For root spans: decoded from _identity bytes [12]=len, [13+]=traceId
    * For child/chained spans: walks up parent chain to root
    */
-  readonly traceId: TraceId;
+  readonly trace_id: TraceId;
 
   /**
    * Whether this span has a parent.
    * Equivalent to `parent !== undefined`.
    */
-  readonly hasParent: boolean;
+  readonly _hasParent: boolean;
 
   /**
-   * Parent's spanId (0 if no parent).
-   * Derived from parent?.spanId.
+   * Parent's span ID (0 if no parent).
+   * Derived from parent?.span_id.
    */
-  readonly parentSpanId: number;
+  readonly parent_span_id: number;
+
+  /**
+   * Parent's thread ID (0n if no parent).
+   * Derived from parent?.thread_id.
+   */
+  readonly parent_thread_id: bigint;
 
   // ============================================================================
   // Tree Structure
@@ -144,13 +150,13 @@ interface BaseSpanBuffer extends ColumnBuffer {
   /**
    * Child spans (lmao-specific for span hierarchy).
    */
-  children: BaseSpanBuffer[];
+  _children: BaseSpanBuffer[];
 
   /**
    * Parent span buffer.
    * Used to derive traceId, parentSpanId, and for isParentOf/isChildOf.
    */
-  parent?: BaseSpanBuffer;
+  _parent?: BaseSpanBuffer;
 
   // ============================================================================
   // Context
@@ -160,17 +166,12 @@ interface BaseSpanBuffer extends ColumnBuffer {
    * Op's module context (what code is executing).
    * Used for rows 1+ metadata (gitSha, packageName, packagePath).
    */
-  module: ModuleContext;
+  _module: ModuleContext;
 
   /**
    * Span name for this invocation.
    */
-  spanName: string;
-
-  /**
-   * Pre-encoded UTF-8 bytes for span name (for Arrow conversion).
-   */
-  utf8SpanName: Uint8Array;
+  _spanName: string;
 
   /**
    * The caller's module context (where span() was invoked from).
@@ -182,10 +183,10 @@ interface BaseSpanBuffer extends ColumnBuffer {
    * For child spans: the parent span's module context
    *
    * Access pattern (per specs/01c_context_flow_and_op_wrappers.md):
-   * - Row 0: buffer.callsiteModule?.packageName (caller's module)
-   * - Rows 1+: buffer.module.packageName (op's module)
+   * - Row 0: buffer._callsiteModule?.packageName (caller's module)
+   * - Rows 1+: buffer._module.packageName (op's module)
    */
-  callsiteModule?: ModuleContext;
+  _callsiteModule?: ModuleContext;
 
   /**
    * Scoped attribute values for this span.
@@ -202,7 +203,7 @@ interface BaseSpanBuffer extends ColumnBuffer {
    *
    * @internal Set by SpanLogger._setScope() or during span creation
    */
-  scopeValues?: Readonly<Record<string, unknown>>;
+  _scopeValues?: Readonly<Record<string, unknown>>;
 
   // ============================================================================
   // Methods
@@ -210,13 +211,13 @@ interface BaseSpanBuffer extends ColumnBuffer {
 
   /**
    * Check if this span is the parent of another span.
-   * O(1) pointer comparison: `this === other.parent`
+   * O(1) pointer comparison: `this === other._parent`
    */
   isParentOf(other: BaseSpanBuffer): boolean;
 
   /**
    * Check if this span is a child of another span.
-   * O(1) pointer comparison: `this.parent === other`
+   * O(1) pointer comparison: `this._parent === other`
    */
   isChildOf(other: BaseSpanBuffer): boolean;
 
@@ -303,13 +304,13 @@ export type SpanBuffer<T extends LogSchema = LogSchema> = TypedColumnBuffer<T['f
     /**
      * Child spans (lmao-specific for span hierarchy).
      */
-    children: SpanBuffer<T>[];
+    _children: SpanBuffer<T>[];
 
     /**
      * Parent span buffer.
-     * Used to derive traceId, parentSpanId, and for isParentOf/isChildOf.
+     * Used to derive trace_id, parent_span_id, and for isParentOf/isChildOf.
      */
-    parent?: SpanBuffer<T>;
+    _parent?: SpanBuffer<T>;
 
     // ============================================================================
     // Methods
@@ -317,13 +318,13 @@ export type SpanBuffer<T extends LogSchema = LogSchema> = TypedColumnBuffer<T['f
 
     /**
      * Check if this span is the parent of another span.
-     * O(1) pointer comparison: `this === other.parent`
+     * O(1) pointer comparison: `this === other._parent`
      */
     isParentOf(other: SpanBuffer<T>): boolean;
 
     /**
      * Check if this span is a child of another span.
-     * O(1) pointer comparison: `this.parent === other`
+     * O(1) pointer comparison: `this._parent === other`
      */
     isChildOf(other: SpanBuffer<T>): boolean;
   };

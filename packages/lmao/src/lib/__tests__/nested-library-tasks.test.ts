@@ -150,28 +150,28 @@ describe('Nested Library Tasks', () => {
 
       // Verify parent-child relationships
       // Root has no parent
-      expect(rootBuffer?.parent).toBeUndefined();
+      expect(rootBuffer?._parent).toBeUndefined();
 
       // Level 2's parent is root
-      expect(level2Buffer?.parent).toBe(rootBuffer);
+      expect(level2Buffer?._parent).toBe(rootBuffer);
 
       // Level 3's parent is level 2
-      expect(level3Buffer?.parent).toBe(level2Buffer);
+      expect(level3Buffer?._parent).toBe(level2Buffer);
 
       // Level 4's parent is level 3
-      expect(level4Buffer?.parent).toBe(level3Buffer);
+      expect(level4Buffer?._parent).toBe(level3Buffer);
 
       // Verify children array
-      expect(rootBuffer?.children).toContain(level2Buffer);
-      expect(level2Buffer?.children).toContain(level3Buffer);
-      expect(level3Buffer?.children).toContain(level4Buffer);
-      expect(level4Buffer?.children.length).toBe(0);
+      expect(rootBuffer?._children).toContain(level2Buffer);
+      expect(level2Buffer?._children).toContain(level3Buffer);
+      expect(level3Buffer?._children).toContain(level4Buffer);
+      expect(level4Buffer?._children.length).toBe(0);
 
       // Verify all share the same traceId
-      const traceId = rootBuffer?.traceId;
-      expect(level2Buffer?.traceId).toBe(traceId);
-      expect(level3Buffer?.traceId).toBe(traceId);
-      expect(level4Buffer?.traceId).toBe(traceId);
+      const traceId = rootBuffer?.trace_id;
+      expect(level2Buffer?.trace_id).toBe(traceId);
+      expect(level3Buffer?.trace_id).toBe(traceId);
+      expect(level4Buffer?.trace_id).toBe(traceId);
     });
 
     it('should convert 4-level nested tree to Arrow table with correct parent-child relationships', async () => {
@@ -266,16 +266,16 @@ describe('Nested Library Tasks', () => {
       expect(level4Span).toBeDefined();
 
       // Root has no parent
-      expect(rootSpan?.parent_span_id).toBeNull();
+      expect(rootSpan?._parent_span_id).toBeNull();
 
       // Level 2's parent is root
-      expect(level2Span?.parent_span_id).toBe(rootSpan?.span_id);
+      expect(level2Span?._parent_span_id).toBe(rootSpan?.span_id);
 
       // Level 3's parent is level 2
-      expect(level3Span?.parent_span_id).toBe(level2Span?.span_id);
+      expect(level3Span?._parent_span_id).toBe(level2Span?.span_id);
 
       // Level 4's parent is level 3
-      expect(level4Span?.parent_span_id).toBe(level3Span?.span_id);
+      expect(level4Span?._parent_span_id).toBe(level3Span?.span_id);
 
       // All have same trace_id
       expect(level2Span?.trace_id).toBe(rootSpan?.trace_id);
@@ -481,21 +481,21 @@ describe('Nested Library Tasks', () => {
       expect(authBuffer).toBeDefined();
 
       // Verify parent-child relationships
-      expect(httpBuffer?.parent).toBeUndefined(); // Root
-      expect(dbBuffer?.parent).toBe(httpBuffer);
-      expect(cacheBuffer?.parent).toBe(dbBuffer);
-      expect(authBuffer?.parent).toBe(cacheBuffer);
+      expect(httpBuffer?._parent).toBeUndefined(); // Root
+      expect(dbBuffer?._parent).toBe(httpBuffer);
+      expect(cacheBuffer?._parent).toBe(dbBuffer);
+      expect(authBuffer?._parent).toBe(cacheBuffer);
 
       // Verify children arrays
-      expect(httpBuffer?.children).toContain(dbBuffer);
-      expect(dbBuffer?.children).toContain(cacheBuffer);
-      expect(cacheBuffer?.children).toContain(authBuffer);
-      expect(authBuffer?.children.length).toBe(0);
+      expect(httpBuffer?._children).toContain(dbBuffer);
+      expect(dbBuffer?._children).toContain(cacheBuffer);
+      expect(cacheBuffer?._children).toContain(authBuffer);
+      expect(authBuffer?._children.length).toBe(0);
 
       // Verify all share same traceId
-      expect(dbBuffer?.traceId).toBe(httpBuffer?.traceId);
-      expect(cacheBuffer?.traceId).toBe(httpBuffer?.traceId);
-      expect(authBuffer?.traceId).toBe(httpBuffer?.traceId);
+      expect(dbBuffer?.trace_id).toBe(httpBuffer?.trace_id);
+      expect(cacheBuffer?.trace_id).toBe(httpBuffer?.trace_id);
+      expect(authBuffer?.trace_id).toBe(httpBuffer?.trace_id);
     });
   });
 
@@ -616,10 +616,10 @@ describe('Nested Library Tasks', () => {
       const process = spanStarts.find((r) => r?.message === 'process');
       const dbQuery = spanStarts.find((r) => r?.message === 'db-query');
 
-      expect(handleRequest?.parent_span_id).toBeNull();
-      expect(fetch?.parent_span_id).toBe(handleRequest?.span_id);
-      expect(process?.parent_span_id).toBe(fetch?.span_id);
-      expect(dbQuery?.parent_span_id).toBe(process?.span_id);
+      expect(handleRequest?._parent_span_id).toBeNull();
+      expect(fetch?._parent_span_id).toBe(handleRequest?.span_id);
+      expect(process?._parent_span_id).toBe(fetch?.span_id);
+      expect(dbQuery?._parent_span_id).toBe(process?.span_id);
     });
   });
 
@@ -722,7 +722,7 @@ describe('Nested Library Tasks', () => {
     /**
      * Per specs/01k_tree_walker_and_arrow_conversion.md:
      * - walkSpanTree visits all buffers including children
-     * - Visits overflow chains (buffer.next)
+     * - Visits overflow chains (buffer._next)
      * - Depth-first pre-order traversal
      */
     it('should visit all buffers in tree during Arrow conversion', async () => {

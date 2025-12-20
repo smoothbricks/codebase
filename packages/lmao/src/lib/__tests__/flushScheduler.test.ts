@@ -19,10 +19,10 @@ function createTestBuffer(): SpanBuffer {
   const module = createTestModuleContext(schema);
   const buffer = createSpanBuffer(schema, module, 'test-span');
   // Write some test data
-  buffer.writeIndex = 5;
-  for (let i = 0; i < buffer.writeIndex; i++) {
-    buffer.timestamps[i] = BigInt(Date.now()) * 1_000_000n;
-    buffer.operations[i] = 1;
+  buffer._writeIndex = 5;
+  for (let i = 0; i < buffer._writeIndex; i++) {
+    buffer.timestamp[i] = BigInt(Date.now()) * 1_000_000n;
+    buffer.entry_type[i] = 1;
   }
   return buffer;
 }
@@ -91,7 +91,7 @@ describe('FlushScheduler', () => {
 
       it('should handle buffer with zero writeIndex', () => {
         const buffer = createTestBuffer();
-        buffer.writeIndex = 0;
+        buffer._writeIndex = 0;
 
         scheduler.register(buffer);
         expect(scheduler).toBeDefined();
@@ -99,7 +99,7 @@ describe('FlushScheduler', () => {
 
       it('should handle buffer at full capacity', () => {
         const buffer = createTestBuffer();
-        buffer.writeIndex = buffer.capacity;
+        buffer._writeIndex = buffer._capacity;
 
         scheduler.register(buffer);
         expect(scheduler).toBeDefined();
@@ -109,7 +109,7 @@ describe('FlushScheduler', () => {
     describe('failure cases', () => {
       it('should handle buffer with invalid writeIndex', () => {
         const buffer = createTestBuffer();
-        buffer.writeIndex = -1;
+        buffer._writeIndex = -1;
 
         expect(() => {
           scheduler.register(buffer);
@@ -118,7 +118,7 @@ describe('FlushScheduler', () => {
 
       it('should handle buffer with writeIndex > capacity', () => {
         const buffer = createTestBuffer();
-        buffer.writeIndex = buffer.capacity + 100;
+        buffer._writeIndex = buffer._capacity + 100;
 
         expect(() => {
           scheduler.register(buffer);
@@ -231,8 +231,8 @@ describe('FlushScheduler', () => {
         // Make buffers share the same module context to ensure schema compatibility
         buffer2.task = buffer1.task;
 
-        buffer1.writeIndex = 10;
-        buffer2.writeIndex = 20;
+        buffer1._writeIndex = 10;
+        buffer2._writeIndex = 20;
 
         scheduler.register(buffer1);
         scheduler.register(buffer2);
@@ -252,7 +252,7 @@ describe('FlushScheduler', () => {
 
       it('should handle flush with empty buffers', async () => {
         const buffer = createTestBuffer();
-        buffer.writeIndex = 0;
+        buffer._writeIndex = 0;
 
         scheduler.register(buffer);
 
@@ -287,7 +287,7 @@ describe('FlushScheduler', () => {
           const errorScheduler = new FlushScheduler(errorHandler);
 
           const buffer = createTestBuffer();
-          const originalWriteIndex = buffer.writeIndex;
+          const originalWriteIndex = buffer._writeIndex;
           errorScheduler.register(buffer);
 
           // Should complete without throwing (error is caught and logged)
@@ -298,7 +298,7 @@ describe('FlushScheduler', () => {
           expect(errorMessages.some((msg) => String(msg).includes('Error in flush handler'))).toBe(true);
 
           // Verify buffers are NOT reset on failure (to avoid data loss)
-          expect(buffer.writeIndex).toBe(originalWriteIndex);
+          expect(buffer._writeIndex).toBe(originalWriteIndex);
 
           errorScheduler.stop();
         } finally {
@@ -348,7 +348,7 @@ describe('FlushScheduler', () => {
           const rejectedScheduler = new FlushScheduler(rejectedHandler);
 
           const buffer = createTestBuffer();
-          const originalWriteIndex = buffer.writeIndex;
+          const originalWriteIndex = buffer._writeIndex;
           rejectedScheduler.register(buffer);
 
           // Should complete without throwing (error is caught and logged)
@@ -359,7 +359,7 @@ describe('FlushScheduler', () => {
           expect(errorMessages.some((msg) => String(msg).includes('Error in flush handler'))).toBe(true);
 
           // Verify buffers are NOT reset on failure (to avoid data loss)
-          expect(buffer.writeIndex).toBe(originalWriteIndex);
+          expect(buffer._writeIndex).toBe(originalWriteIndex);
 
           rejectedScheduler.stop();
         } finally {

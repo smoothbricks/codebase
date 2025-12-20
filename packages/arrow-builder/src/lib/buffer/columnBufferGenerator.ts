@@ -49,9 +49,9 @@ export interface ColumnBufferExtension {
    * Has access to `this` and any constructorParams.
    * @example
    * ```
-   * this.traceId = traceId;
-   * this.spanId = spanIdentity;
-   * this.children = [];
+   * this._trace_id = traceId;
+   * this._span_id = spanIdentity;
+   * this._children = [];
    * ```
    */
   constructorCode?: string;
@@ -61,7 +61,7 @@ export interface ColumnBufferExtension {
    * @example
    * ```
    * isParentOf(other) {
-   *   return this.traceId === other.traceId;
+   *   return this._trace_id === other._trace_id;
    * }
    * ```
    */
@@ -268,12 +268,10 @@ export function generateColumnBufferClass(
 
   const schemaFields = schema.fieldNames;
 
-  // System columns + buffer management
+  // Buffer management
   const constructorCode: string[] = [
     '    const alignedCapacity = helpers.getAlignedCapacity(requestedCapacity);',
     '    this._alignedCapacity = alignedCapacity;',
-    '    this._timestamps = new BigInt64Array(alignedCapacity);',
-    '    this._operations = new Uint8Array(alignedCapacity);',
     '    this._capacity = requestedCapacity;',
     '    this._next = undefined;',
   ];
@@ -298,6 +296,13 @@ export function generateColumnBufferClass(
       }
       // Getter just returns the backing property
       getterMethods.push(`    get ${columnName}_values() { return this._${columnName}_values; }`);
+      // Alias getter for direct access (used by expose())
+      getterMethods.push(`    get ${columnName}() { return this.${columnName}_values; }`);
+
+      // For enums, store the enum values array
+      if (storageInfo.schemaType === 'enum' && storageInfo.enumValues) {
+        constructorCode.push(`    this.${columnName}_enumValues = ${JSON.stringify(storageInfo.enumValues)};`);
+      }
 
       // Eager setter: write default for null
       const valueAssignment = generateSetterValueAssignment(storageInfo, `this._${columnName}`);
@@ -315,6 +320,11 @@ export function generateColumnBufferClass(
     constructorCode.push(`    this._${columnName}_nulls = undefined;`);
     constructorCode.push(`    this._${columnName}_values = undefined;`);
 
+    // For enums, store the enum values array
+    if (storageInfo.schemaType === 'enum' && storageInfo.enumValues) {
+      constructorCode.push(`    this.${columnName}_enumValues = ${JSON.stringify(storageInfo.enumValues)};`);
+    }
+
     // _nulls getter: allocates BOTH nulls and values on first access
     const allocationCode = generateInlineAllocation(columnName, storageInfo);
     getterMethods.push(`    get ${columnName}_nulls() {
@@ -330,6 +340,9 @@ export function generateColumnBufferClass(
       if (this._${columnName}_values === undefined) this.${columnName}_nulls;
       return this._${columnName}_values;
     }`);
+
+    // Alias getter for direct access (used by expose())
+    getterMethods.push(`    get ${columnName}() { return this.${columnName}_values; }`);
 
     // Lazy setter: handle null by clearing bit, valid value by setting bit
     const valueAssignment = generateSetterValueAssignment(storageInfo, `this.${columnName}`);
@@ -371,9 +384,9 @@ export function generateColumnBufferClass(
 
   return `'use strict';
 const lazyColumnNames = ${JSON.stringify(lazyColumnNames)};
-${preambleCode}
 class ${className} {
   constructor(${constructorSignature}) {
+${preambleCode}
 ${constructorCode.join('\n')}
   }
   getColumnIfAllocated(columnName) { return this[\`_\${columnName}_values\`]; }

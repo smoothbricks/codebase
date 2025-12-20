@@ -3,8 +3,7 @@
  * Mirrors packages/lmao/src/lib/__tests__/test-helpers.ts
  */
 
-import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import { createSpanBuffer, generateTraceId, type LogSchema, ModuleContext } from '@smoothbricks/lmao';
+import { type LogSchema, ModuleContext } from '@smoothbricks/lmao';
 
 /**
  * Create a ModuleContext for testing.
