@@ -314,7 +314,7 @@ V8 optimizes function calls that always receive the same types. A call site that
 ```typescript
 // ✅ GOOD: All SpanBuffers have same shape (from generated class)
 function writeTimestamp(buffer: SpanBuffer, idx: number, value: bigint) {
-  buffer._timestamps[idx] = value; // Monomorphic - same hidden class every time
+  buffer.timestamp[idx] = value; // Monomorphic - same hidden class every time
 }
 
 // ❌ BAD: Different buffer shapes at same call site
@@ -463,7 +463,7 @@ get userId_values() {
 
 **Application in LMAO**:
 
-- System columns (`_timestamps`, `_operations`) always eager
+- System columns (timestamp, entry_type) always eager
 - User attribute columns lazy by default
 - `S.number().eager()` forces eager allocation for hot columns
 

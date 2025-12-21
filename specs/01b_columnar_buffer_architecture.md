@@ -57,7 +57,7 @@ Span completion entry types (all written to row 1):
 2. **Row 1 is pre-initialized as span-exception**: Set to `ENTRY_TYPE_SPAN_EXCEPTION` at span creation
 3. **Row 1 overwritten on completion**: `ctx.ok()` → span-ok, `ctx.err()` → span-err
 4. **Exception safety**: If exception thrown and never caught, row 1 remains span-exception (valid data)
-5. **Duration always valid**: `timestamps[1] - timestamps[0]` computes duration
+5. **Duration always valid**: `timestamp[1] - timestamp[0]` computes duration
 6. **Events append from row 2**: `ctx.log.*` creates new rows starting at index 2
 7. **writeIndex starts at 2**: After span initialization, ready for event appends
 
@@ -130,8 +130,8 @@ columns.
 
 **Immediately Allocated (Core Columns)**:
 
-- `timestamps: BigInt64Array` - Every entry has a timestamp
-- `operations: Uint8Array` - Every entry has an operation/entry type
+- `timestamp: BigInt64Array` - Every entry has a timestamp
+- `entry_type: Uint8Array` - Every entry has an operation/entry type
 
 **Lazily Allocated (via Lazy Getters)**:
 
@@ -143,7 +143,7 @@ columns.
 
 - Stored in Scope class instances (see 01i_span_scope_attributes.md)
 - NOT stored in buffer columns
-- Applied to buffer columns during writes or pre-fill operations
+- Applied to buffer columns during writes or pre-fill entry_type
 
 See **[Buffer Code Generation and Extension](./01b6_buffer_codegen_extension.md#lazy-column-getter-implementation)** for
 the lazy getter implementation code and key design points.
@@ -175,7 +175,7 @@ See
 **[SpanBuffer Memory Layout - Complete Interface](./01b5_spanbuffer_memory_layout.md#complete-spanbuffer-interface)**
 for the full interface definition including:
 
-- Core columns (`timestamps`, `operations`)
+- Core columns (`timestamp`, `entry_type`)
 - Attribute columns with lazy getters (`X_nulls`, `X_values`)
 - Tree structure (children, parent)
 - Dual module references (`callsiteModule`, `module`)
@@ -199,7 +199,7 @@ See **[Span Identity](./01b4_span_identity.md)** for:
 
 See **[SpanBuffer Memory Layout](./01b5_spanbuffer_memory_layout.md)** for:
 
-- Unified `_system` ArrayBuffer layout (timestamps + operations + identity)
+- Unified `_system` ArrayBuffer layout (timestamp + entry_type + identity)
 - Buffer type layouts (Root/Child/Chained diagrams)
 - Parent-based ancestry (pointer comparison)
 - Thread ID generation and caching
@@ -239,7 +239,7 @@ strategy.
 
 **Quick Summary**:
 
-- **System columns (EAGER)**: `timestamps`, `operations` - allocated in constructor, written every entry
+- **System columns (EAGER)**: `timestamp`, `entry_type` - allocated in constructor, written every entry
 - **User columns (LAZY)**: Schema attributes - allocated on first access via lazy getters
 - **Self-tuning promotion**: Columns used in ≥80% of spans promote to eager allocation
 
@@ -305,7 +305,7 @@ Understanding when allocations happen is critical for performance:
 - ✅ Null bitmap updates: `buffer.userId_nulls[byteIdx] |= 1 << bitOffset`
 - ❌ Object creation: `{ timestamp, value }`
 - ❌ Array methods: `fields.map(...)`
-- ❌ String operations: `value.trim()`
+- ❌ String entry_type: `value.trim()`
 
 ## Background Processing Pipeline
 
@@ -329,5 +329,5 @@ See **[Arrow Table Structure](./01f_arrow_table_structure.md)** for:
 - TypedArray `slice()`: Creates NEW ArrayBuffer (copies)
 - Scope-only columns: Allocate and fill during cold path
 
-This columnar architecture ensures that high-performance buffer operations flow into efficient analytical storage and
+This columnar architecture ensures that high-performance buffer entry_type flow into efficient analytical storage and
 querying.

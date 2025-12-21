@@ -51,8 +51,8 @@ function writeToBuffer(buffer: any, index: number, value: any) {
 
 // GOOD: Monomorphic access
 class SpanBuffer {
-  timestamps: BigInt64Array;
-  operations: Uint8Array;
+  timestamp: BigInt64Array;
+  entry_type: Uint8Array;
 
   writeTimestamp(idx: number, value: number) {
     this.timestamp[idx] = value; // V8 knows it's Float64Array
@@ -214,7 +214,7 @@ Strings are expensive:
 ### Hot Path vs Cold Path: Deferred Processing
 
 **CRITICAL DESIGN PRINCIPLE**: The hot path (logging) should be as lightweight as possible. All expensive string
-operations (dictionary building, UTF-8 encoding, sorting) are deferred to the cold path (Arrow conversion).
+entry_type (dictionary building, UTF-8 encoding, sorting) are deferred to the cold path (Arrow conversion).
 
 ```
 HOT PATH (logging)                    COLD PATH (Arrow conversion)
@@ -614,8 +614,8 @@ const logs: LogEntry[] = []; // Random memory layout
 
 // GOOD: Struct of Arrays (SoA) - Our approach
 class ColumnarBuffer {
-  timestamps: Float64Array; // All timestamps together
-  operations: Uint8Array; // All operations together
+  timestamp: Float64Array; // All timestamp together
+  entry_type: Uint8Array; // All entry_type together
   userIds: Uint32Array; // All userIds together
   actions: Uint32Array; // All actions together
 }
@@ -696,7 +696,7 @@ class FastBuffer {
 
   // Cold path: Growth, compaction, etc
   private _grow() {
-    // Expensive operations isolated here
+    // Expensive entry_type isolated here
   }
 }
 ```

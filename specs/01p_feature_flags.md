@@ -310,7 +310,7 @@ class GeneratedEvaluator<FF extends FeatureFlagSchema, T extends LogSchema, Env>
       // Scan BACKWARD within each buffer (finds recent accesses faster)
       for (let i = limit - 1; i >= 0; i--) {
         if (
-          buf._operations[i] === ENTRY_TYPE_FF_ACCESS &&
+          buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS &&
           buf._message_values[i] === flagName
         ) {
           return true;

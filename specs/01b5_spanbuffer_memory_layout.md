@@ -294,11 +294,11 @@ class SpanBuffer {
     }
 
     // System columns at FIXED offsets (same for ALL buffer types)
-    this._timestamps = new BigInt64Array(this._system, 0, requestedCapacity);
-    this._operations = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
+    this._timestamp = new BigInt64Array(this._system, 0, requestedCapacity);
+    this._entry_type = new Uint8Array(this._system, requestedCapacity * 8, requestedCapacity);
 
     // Direct property aliases for system columns (V8 hidden class friendly)
-    this.timestamp = this._timestamps;
+    this.timestamp = this._timestamp;
     this.entry_type = this._operations;
 
     this._writeIndex = 0;
@@ -370,7 +370,7 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 **Construction (root span):**
 
 - 1 ArrayBuffer allocation (systemSize + 13 + trace_id.length)
-- 3 TypedArray view creations (timestamps, operations, \_identity)
+- 3 TypedArray view creations (timestamp, entry_type, \_identity)
 - 1 Uint8Array.set() for thread_id (8 bytes)
 - 4 byte writes for span_id
 - 1 byte write for trace_id length
@@ -387,7 +387,7 @@ Object.assign(SpanBuffer.prototype, spanBufferMethods);
 **Construction (chained overflow):**
 
 - 1 ArrayBuffer allocation (systemSize only - smallest!)
-- 2 TypedArray view creations (timestamps, operations)
+- 2 TypedArray view creations (timestamp, entry_type)
 - 1 pointer assignment for \_identity (shared!)
 - 1 pointer assignment for parent
 
