@@ -195,14 +195,14 @@ export function generateRemappedBufferViewClass(
     get entry_type() { return this._buffer.entry_type; }
     get message_values() { return this._buffer.message_values; }
     get message_nulls() { return this._buffer.message_nulls; }
-    get lineNumber_values() { return this._buffer.lineNumber_values; }
-    get lineNumber_nulls() { return this._buffer.lineNumber_nulls; }
-    get errorCode_values() { return this._buffer.errorCode_values; }
-    get errorCode_nulls() { return this._buffer.errorCode_nulls; }
-    get exceptionStack_values() { return this._buffer.exceptionStack_values; }
-    get exceptionStack_nulls() { return this._buffer.exceptionStack_nulls; }
-    get ffValue_values() { return this._buffer.ffValue_values; }
-    get ffValue_nulls() { return this._buffer.ffValue_nulls; }
+    get line_values() { return this._buffer.line_values; }
+    get line_nulls() { return this._buffer.line_nulls; }
+    get error_code_values() { return this._buffer.error_code_values; }
+    get error_code_nulls() { return this._buffer.error_code_nulls; }
+    get exception_stack_values() { return this._buffer.exception_stack_values; }
+    get exception_stack_nulls() { return this._buffer.exception_stack_nulls; }
+    get ff_value_values() { return this._buffer.ff_value_values; }
+    get ff_value_nulls() { return this._buffer.ff_value_nulls; }
     
     // Identity (pass-through)
     get trace_id() { return this._buffer.trace_id; }

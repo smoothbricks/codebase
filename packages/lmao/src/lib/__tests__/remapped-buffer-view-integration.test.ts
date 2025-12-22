@@ -19,9 +19,9 @@ describe('RemappedBufferView Integration', () => {
     it('should store remappedViewClass when prefix is applied', () => {
       const httpModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/http',
-          packagePath: 'src/http.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/http',
+          package_file: 'src/http.ts',
         },
         logSchema: defineLogSchema({
           status: S.number(),
@@ -41,9 +41,9 @@ describe('RemappedBufferView Integration', () => {
     it('should have undefined remappedViewClass for unprefixed modules', () => {
       const httpModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/http',
-          packagePath: 'src/http.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/http',
+          package_file: 'src/http.ts',
         },
         logSchema: defineLogSchema({
           status: S.number(),
@@ -61,9 +61,9 @@ describe('RemappedBufferView Integration', () => {
     it('should wrap child buffer in RemappedBufferView when module has prefix', async () => {
       const appModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: defineLogSchema({
           userId: S.category(),
@@ -74,9 +74,9 @@ describe('RemappedBufferView Integration', () => {
 
       const httpModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/http',
-          packagePath: 'src/http.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/http',
+          package_file: 'src/http.ts',
         },
         logSchema: defineLogSchema({
           status: S.number(),
@@ -124,9 +124,9 @@ describe('RemappedBufferView Integration', () => {
     it('should push raw buffer when module has no prefix', async () => {
       const appModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: defineLogSchema({
           userId: S.category(),
@@ -137,9 +137,9 @@ describe('RemappedBufferView Integration', () => {
 
       const dbModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/db',
-          packagePath: 'src/db.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/db',
+          package_file: 'src/db.ts',
         },
         logSchema: defineLogSchema({
           query: S.text(),
@@ -182,9 +182,9 @@ describe('RemappedBufferView Integration', () => {
     it('should not create RemappedBufferView for root spans', async () => {
       const httpModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/http',
-          packagePath: 'src/http.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/http',
+          package_file: 'src/http.ts',
         },
         logSchema: defineLogSchema({
           status: S.number(),
@@ -219,9 +219,9 @@ describe('RemappedBufferView Integration', () => {
     it('should allow Arrow conversion to access prefixed columns', async () => {
       const appModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: defineLogSchema({
           userId: S.category(),
@@ -232,9 +232,9 @@ describe('RemappedBufferView Integration', () => {
 
       const httpModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/http',
-          packagePath: 'src/http.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/http',
+          package_file: 'src/http.ts',
         },
         logSchema: defineLogSchema({
           status: S.number(),
@@ -283,9 +283,9 @@ describe('RemappedBufferView Integration', () => {
     it('should handle nested prefixed modules (http → db → cache)', async () => {
       const appModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: defineLogSchema({
           userId: S.category(),
@@ -296,9 +296,9 @@ describe('RemappedBufferView Integration', () => {
 
       const httpModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/http',
-          packagePath: 'src/http.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/http',
+          package_file: 'src/http.ts',
         },
         logSchema: defineLogSchema({
           status: S.number(),
@@ -309,9 +309,9 @@ describe('RemappedBufferView Integration', () => {
 
       const dbModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/db',
-          packagePath: 'src/db.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/db',
+          package_file: 'src/db.ts',
         },
         logSchema: defineLogSchema({
           query: S.text(),
@@ -322,9 +322,9 @@ describe('RemappedBufferView Integration', () => {
 
       const cacheModule = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/cache',
-          packagePath: 'src/cache.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/cache',
+          package_file: 'src/cache.ts',
         },
         logSchema: defineLogSchema({
           key: S.category(),

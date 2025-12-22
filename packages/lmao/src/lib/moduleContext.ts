@@ -37,13 +37,13 @@ export class ModuleContext {
   public readonly logSchema: LogSchema;
 
   /** Pre-encoded entry for package (for Arrow dictionary building) */
-  readonly packageEntry: PreEncodedEntry;
+  readonly package_name_entry: PreEncodedEntry;
 
-  /** Pre-encoded entry for packagePath (for Arrow dictionary building) */
-  readonly packagePathEntry: PreEncodedEntry;
+  /** Pre-encoded entry for package_file (for Arrow dictionary building) */
+  readonly package_file_entry: PreEncodedEntry;
 
-  /** Pre-encoded entry for gitSha (for Arrow dictionary building) */
-  readonly gitShaEntry: PreEncodedEntry;
+  /** Pre-encoded entry for git_sha (for Arrow dictionary building) */
+  readonly git_sha_entry: PreEncodedEntry;
 
   /**
    * RemappedBufferView class for library prefix support.
@@ -60,19 +60,19 @@ export class ModuleContext {
   remappedViewClass: (new (buffer: SpanBuffer) => SpanBuffer) | undefined = undefined;
 
   constructor(
-    public readonly gitSha: string,
+    public readonly git_sha: string,
     /** npm package name (e.g., '@smoothbricks/lmao') */
-    public readonly packageName: string,
+    public readonly package_name: string,
     /** Path within package, relative to package.json (e.g., 'src/services/user.ts') */
-    public readonly packagePath: string,
+    public readonly package_file: string,
     schema: SchemaFields | LogSchema,
   ) {
     // Wrap plain schema objects in LogSchema if needed
     this.logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
     // Pre-encode and store as reusable entries for Arrow dictionary building
     // Using class instances for V8 optimization (consistent hidden class shape)
-    this.packageEntry = new PreEncodedEntry(packageName, intern(packageName));
-    this.packagePathEntry = new PreEncodedEntry(packagePath, intern(packagePath));
-    this.gitShaEntry = new PreEncodedEntry(gitSha, intern(gitSha));
+    this.package_name_entry = new PreEncodedEntry(package_name, intern(package_name));
+    this.package_file_entry = new PreEncodedEntry(package_file, intern(package_file));
+    this.git_sha_entry = new PreEncodedEntry(git_sha, intern(git_sha));
   }
 }

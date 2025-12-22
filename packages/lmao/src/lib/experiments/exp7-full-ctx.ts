@@ -104,10 +104,8 @@ interface LogAPI {
  * Uses `keyof` to extract keys from a structural type definition.
  */
 type ReservedTraceContextKeys = keyof {
-  traceId: unknown;
   anchorEpochMicros: unknown;
   anchorPerfNow: unknown;
-  threadId: unknown;
   ff: unknown;
   span: unknown;
 };
@@ -145,8 +143,8 @@ declare const OpBrand: unique symbol;
  * Real implementation has more fields (utf8PackageName, sb_* stats, etc.)
  */
 interface ModuleContext {
-  packageName: string;
-  packagePath: string;
+  package_name: string;
+  package_file: string;
   gitSha?: string;
 }
 
@@ -273,7 +271,6 @@ interface RootSpanFn {
  */
 type TraceContext<FF, Extra> = {
   // System-level only
-  traceId: string;
 
   // Time anchor - flat primitives for performance
   anchorEpochMicros: number; // Date.now() * 1000 at trace root
@@ -281,7 +278,6 @@ type TraceContext<FF, Extra> = {
   // OR anchorHrTime: bigint;  // process.hrtime.bigint() at trace root (Node.js)
 
   // Worker/Thread ID for distributed span identification
-  threadId: bigint; // 64-bit random ID, generated once per worker/process
 
   ff: FeatureFlagEvaluator<FF>;
 
@@ -339,8 +335,8 @@ type BatchResult<Ctx, T> = {
  * - gitSha: from GIT_SHA env or git rev-parse HEAD
  */
 interface ModuleMetadata {
-  packageName: string;
-  packagePath: string;
+  package_name: string;
+  package_file: string;
   gitSha?: string;
 }
 
@@ -490,10 +486,8 @@ class ModuleBuilder<Schema, Deps, FF> {
             const ctx = Object.create(TraceContextProto) as TraceContext<FF, Extra>;
 
             // Assign system props directly
-            (ctx as { traceId: string }).traceId = Math.random().toString(36).substring(2, 15);
             (ctx as { anchorEpochMicros: number }).anchorEpochMicros = Date.now() * 1000;
             (ctx as { anchorPerfNow: number }).anchorPerfNow = performance.now();
-            (ctx as { threadId: bigint }).threadId = BigInt(Math.floor(Math.random() * Number.MAX_SAFE_INTEGER));
             // Use provided ff or default
             (ctx as { ff: FeatureFlagEvaluator<FF> }).ff =
               params.ff ?? (defaultFfEvaluator as FeatureFlagEvaluator<FF>);
@@ -613,7 +607,7 @@ function defineModule<Schema, Deps extends Record<string, AnyModule>, FF>(config
 // ============================================================================
 
 const simpleModule = defineModule({
-  metadata: { packageName: '@test/simple', packagePath: 'test.ts' },
+  metadata: { package_name: '@test/simple', package_file: 'test.ts' },
   logSchema: { count: 0 as number },
   deps: {},
   ff: { enabled: true as boolean },
@@ -642,7 +636,7 @@ interface HttpEnv {
 }
 
 const httpModule = defineModule({
-  metadata: { packageName: '@test/http', packagePath: 'src/http.ts' },
+  metadata: { package_name: '@test/http', package_file: 'src/http.ts' },
   logSchema: { status: 0 as number, method: '' as 'GET' | 'POST' | 'PUT' | 'DELETE' },
   deps: {},
   ff: { premiumApi: true as boolean },
@@ -676,7 +670,7 @@ interface AnalyticsTracker {
 }
 
 const analyticsModule = defineModule({
-  metadata: { packageName: '@test/analytics', packagePath: 'src/analytics.ts' },
+  metadata: { package_name: '@test/analytics', package_file: 'src/analytics.ts' },
   logSchema: { eventName: '' as string, eventValue: 0 as number },
   deps: {},
   ff: { trackingEnabled: true as boolean },
@@ -713,7 +707,7 @@ interface MinimalEnv {
 }
 
 const minimalModule = defineModule({
-  metadata: { packageName: '@test/minimal', packagePath: 'src/minimal.ts' },
+  metadata: { package_name: '@test/minimal', package_file: 'src/minimal.ts' },
   logSchema: { regionName: '' as string },
   deps: {},
   ff: {},
@@ -731,7 +725,7 @@ interface ExtendedEnv extends MinimalEnv {
 }
 
 const extendedModule = defineModule({
-  metadata: { packageName: '@test/extended', packagePath: 'src/extended.ts' },
+  metadata: { package_name: '@test/extended', package_file: 'src/extended.ts' },
   logSchema: { data: '' as string },
   deps: {},
   ff: {},
@@ -785,7 +779,7 @@ interface RichEnv {
 }
 
 const richModule = defineModule({
-  metadata: { packageName: '@test/rich', packagePath: 'src/rich.ts' },
+  metadata: { package_name: '@test/rich', package_file: 'src/rich.ts' },
   logSchema: { secret: '' as string },
   deps: {},
   ff: {},
@@ -798,7 +792,7 @@ const richOp = richModule.op('useSecret', async (ctx) => {
 
 // Module with less env than richOp needs
 const poorModule = defineModule({
-  metadata: { packageName: '@test/poor', packagePath: 'src/poor.ts' },
+  metadata: { package_name: '@test/poor', package_file: 'src/poor.ts' },
   logSchema: { result: 0 as number },
   deps: {},
   ff: {},
@@ -820,14 +814,14 @@ void _poorOp;
 // ============================================================================
 
 const parentModule = defineModule({
-  metadata: { packageName: '@test/parent', packagePath: 'src/parent.ts' },
+  metadata: { package_name: '@test/parent', package_file: 'src/parent.ts' },
   logSchema: { value: 0 as number },
   deps: {},
   ff: {},
 }).ctx<{ env: { baseUrl: string } }>();
 
 const childModule = defineModule({
-  metadata: { packageName: '@test/child', packagePath: 'src/child.ts' },
+  metadata: { package_name: '@test/child', package_file: 'src/child.ts' },
   logSchema: { childValue: '' as string },
   deps: {},
   ff: { childFlag: true as boolean },
@@ -872,7 +866,7 @@ interface BatchEnv {
 }
 
 const batchModule = defineModule({
-  metadata: { packageName: '@test/batch', packagePath: 'src/batch.ts' },
+  metadata: { package_name: '@test/batch', package_file: 'src/batch.ts' },
   logSchema: { method: '' as 'GET' | 'POST', url: '' as string, statusCode: 0 as number },
   deps: {},
   ff: { useNewApi: true as boolean },
@@ -994,7 +988,7 @@ void _testThisBindingErrors;
 // ============================================================================
 
 const overloadModule = defineModule({
-  metadata: { packageName: '@test/overload', packagePath: 'src/overload.ts' },
+  metadata: { package_name: '@test/overload', package_file: 'src/overload.ts' },
   logSchema: { data: '' as string },
   deps: {},
   ff: {},
@@ -1046,7 +1040,7 @@ void overloadOps;
 
 // First, create a dep module
 const depModule = defineModule({
-  metadata: { packageName: '@test/dep', packagePath: 'src/dep.ts' },
+  metadata: { package_name: '@test/dep', package_file: 'src/dep.ts' },
   logSchema: { depValue: 0 as number },
   deps: {},
   ff: {},
@@ -1059,7 +1053,7 @@ const depOp = depModule.op('depAction', async (ctx, x: number) => {
 
 // Module that uses deps
 const consumerModule = defineModule({
-  metadata: { packageName: '@test/consumer', packagePath: 'src/consumer.ts' },
+  metadata: { package_name: '@test/consumer', package_file: 'src/consumer.ts' },
   logSchema: { result: 0 as number },
   deps: { myDep: depModule },
   ff: {},
@@ -1069,7 +1063,7 @@ const consumerModule = defineModule({
 // In real implementation, deps would provide access to invoke dep ops
 const consumerOp = consumerModule.op('consume', async (ctx, input: number) => {
   // ctx.deps.myDep is the dep module
-  const depModulePackage = ctx.deps.myDep.metadata.packageName;
+  const depModulePackage = ctx.deps.myDep.metadata.package_name;
   void depModulePackage;
 
   // In practice, you'd use span to call dep ops
@@ -1084,7 +1078,7 @@ type ConsumerDeps = typeof consumerOp extends Op<infer C, infer _A, infer _R>
     : never
   : never;
 // Check that myDep exists and has metadata.packageName (all Modules have metadata)
-type HasMyDep = ConsumerDeps extends { myDep: { metadata: { packageName: string } } } ? true : false;
+type HasMyDep = ConsumerDeps extends { myDep: { metadata: { package_name: string } } } ? true : false;
 const _checkHasMyDep: HasMyDep = true;
 void _checkHasMyDep;
 void depOp;
@@ -1095,7 +1089,7 @@ void consumerOp;
 // ============================================================================
 
 const inlineModule = defineModule({
-  metadata: { packageName: '@test/inline', packagePath: 'src/inline.ts' },
+  metadata: { package_name: '@test/inline', package_file: 'src/inline.ts' },
   logSchema: { count: 0 as number, label: '' as string },
   deps: {},
   ff: { premium: true as boolean },
@@ -1231,39 +1225,39 @@ void inlineReturnTypeTest;
 // instead of Module methods. Errors appear when trying to USE the module.
 
 const badModule1 = defineModule({
-  metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+  metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
-}).ctx<{ traceId: string }>();
+}).ctx<{ trace_id: string }>();
 
 const badModule2 = defineModule({
-  metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+  metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
 }).ctx<{ ff: string }>();
 
 const badModule3 = defineModule({
-  metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+  metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
 }).ctx<{ span: () => void }>();
 
 const badModule4 = defineModule({
-  metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+  metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
-}).ctx<{ anchorEpochMicros: number }>();
+}).ctx<{ anchor_epoch_micros: number }>();
 
 const badModule5 = defineModule({
-  metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+  metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
-}).ctx<{ threadId: bigint }>();
+}).ctx<{ thread_id: bigint }>();
 
 // Errors appear when trying to use the bad modules - they don't have Module methods
 
@@ -1294,7 +1288,7 @@ void _checkBadModule1Error;
 
 // Define module with Extra including env, requestId
 const appModule = defineModule({
-  metadata: { packageName: '@test/app', packagePath: 'src/index.ts' },
+  metadata: { package_name: '@test/app', package_file: 'src/index.ts' },
   logSchema: { endpoint: '' as string, status: 0 as number },
   deps: {},
   ff: { premium: true as boolean },
@@ -1315,7 +1309,6 @@ const trace = appModule.traceContext({
 });
 
 // Verify types
-trace.traceId; // string
 trace.env.region; // string
 trace.requestId; // string
 trace.ff.get('premium'); // boolean

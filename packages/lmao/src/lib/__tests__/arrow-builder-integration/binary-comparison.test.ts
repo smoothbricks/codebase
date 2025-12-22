@@ -424,7 +424,7 @@ describe('Arrow IPC Round-Trip', () => {
       expect(fieldNames).toContain('parent_span_id');
       expect(fieldNames).toContain('entry_type');
       expect(fieldNames).toContain('package_name');
-      expect(fieldNames).toContain('package_path');
+      expect(fieldNames).toContain('package_file');
 
       // Verify timestamps round-tripped correctly
       // Arrow's getter converts nanoseconds to a decimal, so access raw BigInt64Array

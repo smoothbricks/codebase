@@ -11,15 +11,15 @@ import { type LogSchema, ModuleContext } from '@smoothbricks/lmao';
 export function createTestModuleContext(
   tagAttributes: LogSchema,
   options: {
-    gitSha?: string;
-    packageName?: string;
-    packagePath?: string;
+    git_sha?: string;
+    package_name?: string;
+    package_file?: string;
   } = {},
 ): ModuleContext {
   return new ModuleContext(
-    options.gitSha ?? 'test-sha',
-    options.packageName ?? '@test/package',
-    options.packagePath ?? 'src/test.ts',
+    options.git_sha ?? 'test-sha',
+    options.package_name ?? '@test/package',
+    options.package_file ?? 'src/test.ts',
     tagAttributes,
   );
 }
@@ -30,11 +30,11 @@ export function createTestModuleContext(
 export function createTestTaskContext(
   tagAttributes: LogSchema,
   options: {
-    gitSha?: string;
-    packageName?: string;
-    packagePath?: string;
+    git_sha?: string;
+    package_name?: string;
+    package_file?: string;
     spanName?: string;
-    lineNumber?: number;
+    line?: number;
   } = {},
 ): ModuleContext {
   return createTestModuleContext(tagAttributes, options);

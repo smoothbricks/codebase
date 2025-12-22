@@ -128,7 +128,7 @@ describe('FlushScheduler', () => {
       it('should handle buffer with missing properties', () => {
         const buffer = createTestBuffer();
         // Create a partial buffer missing timestamps to test error handling
-        const { timestamps: _timestamps, ...partialBuffer } = buffer;
+        const { timestamp: _timestamps, ...partialBuffer } = buffer;
 
         expect(() => {
           scheduler.register(partialBuffer as SpanBuffer);
@@ -316,7 +316,7 @@ describe('FlushScheduler', () => {
         try {
           const buffer = createTestBuffer();
           // Create a partial buffer missing timestamps to test error handling
-          const { timestamps: _timestamps, ...partialBuffer } = buffer;
+          const { timestamp: _timestamps, ...partialBuffer } = buffer;
 
           scheduler.register(partialBuffer as SpanBuffer);
 

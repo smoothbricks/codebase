@@ -39,19 +39,19 @@ describe('generateRemappedBufferViewClass', () => {
       // Create a mock buffer
       const mockBuffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 5,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 5,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: ['test'],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 123n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 123n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: { name: 'test-module' },
-        spanName: 'test-span',
+        ___module: { name: 'test-module' },
+        _spanName: 'test-span',
         getColumnIfAllocated: (name: string) => mockBuffer[`${name}_values` as keyof typeof mockBuffer],
         getNullsIfAllocated: (name: string) => mockBuffer[`${name}_nulls` as keyof typeof mockBuffer],
       } as unknown as SpanBuffer;
@@ -84,28 +84,28 @@ describe('generateRemappedBufferViewClass', () => {
   describe('pass-through properties', () => {
     const createMockBuffer = (): SpanBuffer => {
       const buffer = {
-        _children: [{ spanId: 2 }, { spanId: 3 }],
-        next: { spanId: 10 },
-        writeIndex: 7,
-        timestamps: new BigInt64Array([1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n]),
-        operations: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
+        _children: [{ span_id: 2 }, { span_id: 3 }],
+        _next: { span_id: 10 },
+        _writeIndex: 7,
+        timestamp: new BigInt64Array([1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n]),
+        entry_type: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
         message_values: ['msg1', 'msg2'],
         message_nulls: new Uint8Array([0b11]),
-        lineNumber_values: new Float64Array([10, 20]),
-        lineNumber_nulls: new Uint8Array([0b11]),
-        errorCode_values: ['ERR001'],
-        errorCode_nulls: new Uint8Array([0b01]),
-        exceptionStack_values: ['stack trace'],
-        exceptionStack_nulls: new Uint8Array([0b01]),
-        ffValue_values: ['true'],
-        ffValue_nulls: new Uint8Array([0b01]),
-        traceId: 'abc123def456789012345678901234ab' as TraceId,
-        threadId: 99n,
-        spanId: 42,
-        parentSpanId: 41,
+        line_values: new Float64Array([10, 20]),
+        line_nulls: new Uint8Array([0b11]),
+        error_code_values: ['ERR001'],
+        error_code_nulls: new Uint8Array([0b01]),
+        exception_stack_values: ['stack trace'],
+        exception_stack_nulls: new Uint8Array([0b01]),
+        ff_value_values: ['true'],
+        ff_value_nulls: new Uint8Array([0b01]),
+        trace_id: 'abc123def456789012345678901234ab' as TraceId,
+        thread_id: 99n,
+        span_id: 42,
+        parent_span_id: 41,
         _identity: new Uint8Array(32),
-        module: { name: 'test-module' },
-        spanName: 'test-span',
+        ____module: { name: 'test-module' },
+        _spanName: 'test-span',
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
@@ -146,14 +146,14 @@ describe('generateRemappedBufferViewClass', () => {
       expect(view.entry_type).toBe(buffer.entry_type);
       expect(view.message_values).toBe(buffer.message_values);
       expect(view.message_nulls).toBe(buffer.message_nulls);
-      expect(view.lineNumber_values).toBe(buffer.lineNumber_values);
-      expect(view.lineNumber_nulls).toBe(buffer.lineNumber_nulls);
-      expect(view.errorCode_values).toBe(buffer.errorCode_values);
-      expect(view.errorCode_nulls).toBe(buffer.errorCode_nulls);
-      expect(view.exceptionStack_values).toBe(buffer.exceptionStack_values);
-      expect(view.exceptionStack_nulls).toBe(buffer.exceptionStack_nulls);
-      expect(view.ffValue_values).toBe(buffer.ffValue_values);
-      expect(view.ffValue_nulls).toBe(buffer.ffValue_nulls);
+      expect(view.line_values).toBe(buffer.line_values);
+      expect(view.line_nulls).toBe(buffer.line_nulls);
+      expect(view.error_code_values).toBe(buffer.error_code_values);
+      expect(view.error_code_nulls).toBe(buffer.error_code_nulls);
+      expect(view.exception_stack_values).toBe(buffer.exception_stack_values);
+      expect(view.exception_stack_nulls).toBe(buffer.exception_stack_nulls);
+      expect(view.ff_value_values).toBe(buffer.ff_value_values);
+      expect(view.ff_value_nulls).toBe(buffer.ff_value_nulls);
     });
 
     it('should pass through identity properties', () => {
@@ -190,19 +190,19 @@ describe('generateRemappedBufferViewClass', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 3,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 3,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         status_values: statusValues, // unprefixed column
         method_values: methodValues, // unprefixed column
         getColumnIfAllocated(name: string) {
@@ -228,19 +228,19 @@ describe('generateRemappedBufferViewClass', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 3,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 3,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         status_nulls: statusNulls,
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -264,19 +264,19 @@ describe('generateRemappedBufferViewClass', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 2,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 2,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         userId_values: userIdValues,
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -298,19 +298,19 @@ describe('generateRemappedBufferViewClass', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 0,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 0,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         getColumnIfAllocated() {
           return undefined;
         },
@@ -358,19 +358,19 @@ describe('generateRemappedBufferViewClass', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         status_values: statusValues,
         method_values: methodValues,
         getColumnIfAllocated(name: string) {
@@ -420,22 +420,22 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       // All using app schema directly (no library prefixing)
       const appModule = defineModule({
         metadata: {
-          gitSha: 'test',
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          git_sha: 'test',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: appSchema,
       })
         .ctx<Record<string, unknown>>({})
         .make();
 
-      const buffers: { level: number; spanId: number; parentSpanId: number }[] = [];
+      const buffers: { level: number; span_id: number; parent_span_id: number }[] = [];
 
       const level4Op = appModule.op('level4-task', async (ctx) => {
         buffers.push({
           level: 4,
-          spanId: ctx.buffer.span_id,
-          parentSpanId: ctx.buffer.parent_span_id,
+          span_id: ctx.buffer.span_id,
+          parent_span_id: ctx.buffer.parent_span_id,
         });
         ctx.tag.requestId('req-level4');
         return ctx.ok({ level: 4 });
@@ -444,8 +444,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const level3Op = appModule.op('level3-task', async (ctx) => {
         buffers.push({
           level: 3,
-          spanId: ctx.buffer.span_id,
-          parentSpanId: ctx.buffer.parent_span_id,
+          span_id: ctx.buffer.span_id,
+          parent_span_id: ctx.buffer.parent_span_id,
         });
         ctx.tag.requestId('req-level3');
 
@@ -456,8 +456,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const level2Op = appModule.op('level2-task', async (ctx) => {
         buffers.push({
           level: 2,
-          spanId: ctx.buffer.span_id,
-          parentSpanId: ctx.buffer.parent_span_id,
+          span_id: ctx.buffer.span_id,
+          parent_span_id: ctx.buffer.parent_span_id,
         });
         ctx.tag.userId('user-level2');
 
@@ -468,8 +468,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const level1Op = appModule.op('level1-task', async (ctx) => {
         buffers.push({
           level: 1,
-          spanId: ctx.buffer.span_id,
-          parentSpanId: ctx.buffer.parent_span_id,
+          span_id: ctx.buffer.span_id,
+          parent_span_id: ctx.buffer.parent_span_id,
         });
         ctx.tag.requestId('req-root').userId('user-root');
 
@@ -508,9 +508,9 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
     it('should propagate traceId through all nested levels', async () => {
       const appModule = defineModule({
         metadata: {
-          gitSha: 'test',
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          git_sha: 'test',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: appSchema,
       })
@@ -585,7 +585,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const prefixedHttpSchema = prefixSchema(httpSchema as LogSchema, 'http');
 
       const httpModule = defineModule({
-        metadata: { gitSha: 'test', packageName: '@test/http', packagePath: 'src/http.ts' },
+        metadata: { git_sha: 'test', package_name: '@test/http', package_file: 'src/http.ts' },
         logSchema: prefixedHttpSchema.fields, // Use .fields to get SchemaFields
       })
         .ctx<Record<string, never>>({})
@@ -626,19 +626,19 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       // Create child buffer mock
       const childBuffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: ['child-span'],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 2,
-        parentSpanId: 1,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 2,
+        parent_span_id: 1,
         _identity: new Uint8Array(32),
-        module: { name: 'child-module' },
-        spanName: 'child-task',
+        ___module: { name: 'child-module' },
+        _spanName: 'child-task',
         status_values: new Float64Array([404]),
         status_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -655,19 +655,19 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       // Create parent buffer with child as RemappedBufferView
       const parentBuffer = {
         _children: [childView], // Parent sees RemappedBufferView, not raw buffer
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: ['parent-span'],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: { name: 'parent-module' },
-        spanName: 'parent-task',
+        ___module: { name: 'parent-module' },
+        _spanName: 'parent-task',
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
@@ -702,19 +702,19 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       // Grandchild: DB library buffer
       const grandchildBuffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: ['db-query'],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 3,
-        parentSpanId: 2,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 3,
+        parent_span_id: 2,
         _identity: new Uint8Array(32),
-        module: { name: 'db-module' },
-        spanName: 'db-task',
+        ___module: { name: 'db-module' },
+        _spanName: 'db-task',
         query_values: ['SELECT * FROM users'],
         query_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -730,19 +730,19 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       // Child: HTTP library buffer with DB grandchild
       const childBuffer = {
         _children: [grandchildView],
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: ['http-request'],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 2,
-        parentSpanId: 1,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 2,
+        parent_span_id: 1,
         _identity: new Uint8Array(32),
-        module: { name: 'http-module' },
-        spanName: 'http-task',
+        ___module: { name: 'http-module' },
+        _spanName: 'http-task',
         status_values: new Float64Array([200]),
         status_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -758,8 +758,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       // Root: App buffer with HTTP child
       const rootBuffer = {
         _children: [childView],
-        writeIndex: 1,
-        spanId: 1,
+        _writeIndex: 1,
+        span_id: 1,
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
@@ -781,19 +781,19 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         status_values: new Float64Array([200]),
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -816,19 +816,19 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         field_with_underscores_values: ['test'],
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -854,19 +854,19 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       const buffer = {
         _children: [],
-        next: undefined,
-        writeIndex: 1,
-        timestamps: new BigInt64Array(8),
-        operations: new Uint8Array(8),
+        _next: undefined,
+        _writeIndex: 1,
+        timestamp: new BigInt64Array(8),
+        entry_type: new Uint8Array(8),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        traceId: '12345678901234567890123456789012' as TraceId,
-        threadId: 1n,
-        spanId: 1,
-        parentSpanId: 0,
+        trace_id: '12345678901234567890123456789012' as TraceId,
+        thread_id: 1n,
+        span_id: 1,
+        parent_span_id: 0,
         _identity: new Uint8Array(32),
-        module: {},
-        spanName: 'test-span',
+        ___module: {},
+        _spanName: 'test-span',
         field50_values: ['value50'],
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];

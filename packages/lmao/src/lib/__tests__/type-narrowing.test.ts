@@ -17,9 +17,9 @@ const testSchema = defineLogSchema({
 function createTestModule() {
   return defineModule({
     metadata: {
-      gitSha: 'abc123',
-      packageName: '@test/pkg',
-      packagePath: '/test/module.ts',
+      git_sha: 'abc123',
+      package_name: '@test/pkg',
+      package_file: '/test/module.ts',
     },
     logSchema: testSchema,
   })

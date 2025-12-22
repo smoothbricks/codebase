@@ -23,11 +23,11 @@ export const textEncoder = new TextEncoder();
  * @param offset - Byte offset to write at
  * @param spanId - 32-bit span ID
  */
-export function writeSpanId(identity: Uint8Array, offset: number, spanId: number): void {
-  identity[offset] = spanId & 0xff;
-  identity[offset + 1] = (spanId >> 8) & 0xff;
-  identity[offset + 2] = (spanId >> 16) & 0xff;
-  identity[offset + 3] = (spanId >> 24) & 0xff;
+export function writeSpanId(identity: Uint8Array, offset: number, span_id: number): void {
+  identity[offset] = span_id & 0xff;
+  identity[offset + 1] = (span_id >> 8) & 0xff;
+  identity[offset + 2] = (span_id >> 16) & 0xff;
+  identity[offset + 3] = (span_id >> 24) & 0xff;
 }
 
 /**

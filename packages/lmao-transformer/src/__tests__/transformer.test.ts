@@ -22,18 +22,16 @@ function normalize(code: string): string {
 
 describe('lmao-transformer', () => {
   describe('ctx.span() transformation', () => {
-    it('should add line number to ctx.span() calls with 2 arguments', () => {
+    it('should add line number and rewrite to span_fn for closure', () => {
       const input = `ctx.span('test', async () => {});`;
       const output = transform(input);
-      expect(normalize(output)).toContain("ctx.span('test', async () => { }, 1)");
+      expect(normalize(output)).toContain("ctx.span_fn(1, 'test', async () => { })");
     });
 
-    it('should not transform if line argument already provided', () => {
-      const input = `ctx.span('test', async () => {}, 99);`;
+    it('should prepend line number and rewrite to span_op for non-closures', () => {
+      const input = `ctx.span('test', myOp);`;
       const output = transform(input);
-      // Should keep the existing 99, not add another argument
-      expect(normalize(output)).toContain("ctx.span('test', async () => { }, 99)");
-      expect(normalize(output)).not.toContain(', 1)');
+      expect(normalize(output)).toContain("ctx.span_op(1, 'test', myOp)");
     });
 
     it('should handle multi-line spans and use correct line number', () => {
@@ -42,14 +40,14 @@ ctx.span('first', async () => {});
 const y = 2;
 ctx.span('second', async () => {});`;
       const output = transform(input);
-      expect(normalize(output)).toContain("ctx.span('first', async () => { }, 2)");
-      expect(normalize(output)).toContain("ctx.span('second', async () => { }, 4)");
+      expect(normalize(output)).toContain("ctx.span_fn(2, 'first', async () => { })");
+      expect(normalize(output)).toContain("ctx.span_fn(4, 'second', async () => { })");
     });
 
     it('should handle await ctx.span()', () => {
       const input = `await ctx.span('test', async (childCtx) => { return 42; });`;
       const output = transform(input);
-      expect(normalize(output)).toContain("await ctx.span('test', async (childCtx) => { return 42; }, 1)");
+      expect(normalize(output)).toContain("await ctx.span_fn(1, 'test', async (childCtx) => { return 42; })");
     });
 
     it('should handle nested spans', () => {
@@ -58,20 +56,14 @@ ctx.span('second', async () => {});`;
 });`;
       const output = transform(input);
       expect(normalize(output)).toContain(
-        "ctx.span('outer', async (outerCtx) => { outerCtx.span('inner', async () => { }, 2); }, 1)",
+        "ctx.span_fn(1, 'outer', async (outerCtx) => { outerCtx.span_fn(2, 'inner', async () => { }); })",
       );
     });
 
-    it('should not transform non-ctx.span patterns', () => {
-      const input = `something.span('test', fn);`;
+    it('should handle span with more than 2 arguments', () => {
+      const input = `ctx.span('name', op, 1, 2, 3);`;
       const output = transform(input);
-      expect(normalize(output)).toContain("something.span('test', fn, 1)");
-    });
-
-    it('should handle span with more than 2 arguments (already has line)', () => {
-      const input = `ctx.span('name', async () => {}, 100);`;
-      const output = transform(input);
-      expect(normalize(output)).toContain('async () => { }, 100');
+      expect(normalize(output)).toContain("ctx.span_op(1, 'name', op, 1, 2, 3)");
     });
   });
 

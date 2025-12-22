@@ -32,9 +32,9 @@ const testSchema = defineLogSchema({
 // Create module using new API - no feature flags needed for these tests
 const testModule = defineModule({
   metadata: {
-    gitSha: 'abc123',
-    packageName: '@test/pkg',
-    packagePath: '/test/module.ts',
+    git_sha: 'abc123',
+    package_name: '@test/pkg',
+    package_file: '/test/module.ts',
   },
   logSchema: testSchema,
 })
@@ -324,10 +324,10 @@ describe('Child Span Lifecycle', () => {
     expect(childSpanStart).toBeDefined();
 
     // Root span should have null parent_span_id
-    expect(rootSpanStart?._parent_span_id).toBe(null);
+    expect(rootSpanStart?.parent_span_id).toBe(null);
 
     // Child span should reference root span's span_id
-    expect(childSpanStart?._parent_span_id).toBe(rootSpanStart?.span_id);
+    expect(childSpanStart?.parent_span_id).toBe(rootSpanStart?.span_id);
 
     // Both should have same trace_id
     expect(rootSpanStart?.trace_id).toBe(childSpanStart?.trace_id);
@@ -345,9 +345,9 @@ describe('Child Span Lifecycle', () => {
 
     const parentModule = defineModule({
       metadata: {
-        gitSha: 'abc123',
-        packageName: '@test/parent',
-        packagePath: '/test/parent.ts',
+        git_sha: 'abc123',
+        package_name: '@test/parent',
+        package_file: '/test/parent.ts',
       },
       logSchema: sharedSchema,
     })
@@ -356,9 +356,9 @@ describe('Child Span Lifecycle', () => {
 
     const childModule = defineModule({
       metadata: {
-        gitSha: 'abc123',
-        packageName: '@test/child',
-        packagePath: '/test/child.ts',
+        git_sha: 'abc123',
+        package_name: '@test/child',
+        package_file: '/test/child.ts',
       },
       logSchema: sharedSchema, // Same schema - but different module context
     })

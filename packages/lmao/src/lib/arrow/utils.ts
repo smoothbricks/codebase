@@ -123,7 +123,6 @@ export function concatenateNullBitmaps(
  * Get Arrow field name from LMAO field name
  */
 export function getArrowFieldName(fieldName: string): string {
-  if (fieldName === 'logMessage') return 'message';
   return fieldName;
 }
 

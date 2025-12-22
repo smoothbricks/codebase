@@ -24,9 +24,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });
@@ -58,9 +58,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });
@@ -97,9 +97,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });
@@ -146,9 +146,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });
@@ -190,9 +190,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });
@@ -238,9 +238,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });
@@ -292,9 +292,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });
@@ -329,9 +329,9 @@ describe('Span Scope Attributes', () => {
 
       const module = defineModule({
         metadata: {
-          gitSha: 'abc123',
-          packageName: '@test/pkg',
-          packagePath: 'test.ts',
+          git_sha: 'abc123',
+          package_name: '@test/pkg',
+          package_file: 'test.ts',
         },
         logSchema: schema,
       });

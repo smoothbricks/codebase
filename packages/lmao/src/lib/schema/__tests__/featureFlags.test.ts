@@ -28,7 +28,6 @@ function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): 
       return spanBuffer;
     },
     log: logger,
-    traceId: spanBuffer._traceId,
     ff: null as any,
     env: {},
     deps: {},

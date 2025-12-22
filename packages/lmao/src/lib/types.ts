@@ -164,7 +164,7 @@ interface BaseSpanBuffer extends ColumnBuffer {
 
   /**
    * Op's module context (what code is executing).
-   * Used for rows 1+ metadata (gitSha, packageName, packagePath).
+   * Used for rows 1+ metadata (git_sha, package_name, package_file).
    */
   _module: ModuleContext;
 
@@ -285,17 +285,20 @@ export type SpanBuffer<T extends LogSchema = LogSchema> = TypedColumnBuffer<T['f
      */
     message(pos: number, val: string): SpanBuffer<T>;
 
-    /** Set line number at position (number column) */
-    lineNumber(pos: number, val: number): SpanBuffer<T>;
+    /** Set line at position (number column) */
+    line(pos: number, val: number): SpanBuffer<T>;
 
     /** Set error code at position (category/string column) */
-    errorCode(pos: number, val: string): SpanBuffer<T>;
+    error_code(pos: number, val: string): SpanBuffer<T>;
 
     /** Set exception stack at position (text/string column) */
-    exceptionStack(pos: number, val: string): SpanBuffer<T>;
+    exception_stack(pos: number, val: string): SpanBuffer<T>;
 
     /** Set feature flag value at position (category/string column) */
-    ffValue(pos: number, val: string): SpanBuffer<T>;
+    ff_value(pos: number, val: string): SpanBuffer<T>;
+
+    /** Set uint64 value at position (uint64 column) */
+    uint64_value(pos: number, val: bigint): SpanBuffer<T>;
 
     // ============================================================================
     // Tree Structure

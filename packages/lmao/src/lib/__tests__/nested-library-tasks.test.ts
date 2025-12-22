@@ -42,9 +42,9 @@ describe('Nested Library Tasks', () => {
       // Use empty ctx<{}>({}) to avoid type conflicts across modules
       const module1 = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/module1',
-          packagePath: 'src/module1.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/module1',
+          package_file: 'src/module1.ts',
         },
         logSchema: sharedSchema,
       })
@@ -53,9 +53,9 @@ describe('Nested Library Tasks', () => {
 
       const module2 = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/module2',
-          packagePath: 'src/module2.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/module2',
+          package_file: 'src/module2.ts',
         },
         logSchema: sharedSchema,
       })
@@ -64,9 +64,9 @@ describe('Nested Library Tasks', () => {
 
       const module3 = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/module3',
-          packagePath: 'src/module3.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/module3',
+          package_file: 'src/module3.ts',
         },
         logSchema: sharedSchema,
       })
@@ -75,9 +75,9 @@ describe('Nested Library Tasks', () => {
 
       const module4 = defineModule({
         metadata: {
-          gitSha: 'test-sha',
-          packageName: '@test/module4',
-          packagePath: 'src/module4.ts',
+          git_sha: 'test-sha',
+          package_name: '@test/module4',
+          package_file: 'src/module4.ts',
         },
         logSchema: sharedSchema,
       })
@@ -180,28 +180,28 @@ describe('Nested Library Tasks', () => {
       });
 
       const module1 = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@test/m1', packagePath: 'm1.ts' },
+        metadata: { git_sha: 'sha', package_name: '@test/m1', package_file: 'm1.ts' },
         logSchema: sharedSchema,
       })
         .ctx<{}>({})
         .make();
 
       const module2 = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@test/m2', packagePath: 'm2.ts' },
+        metadata: { git_sha: 'sha', package_name: '@test/m2', package_file: 'm2.ts' },
         logSchema: sharedSchema,
       })
         .ctx<{}>({})
         .make();
 
       const module3 = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@test/m3', packagePath: 'm3.ts' },
+        metadata: { git_sha: 'sha', package_name: '@test/m3', package_file: 'm3.ts' },
         logSchema: sharedSchema,
       })
         .ctx<{}>({})
         .make();
 
       const module4 = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@test/m4', packagePath: 'm4.ts' },
+        metadata: { git_sha: 'sha', package_name: '@test/m4', package_file: 'm4.ts' },
         logSchema: sharedSchema,
       })
         .ctx<{}>({})
@@ -266,16 +266,16 @@ describe('Nested Library Tasks', () => {
       expect(level4Span).toBeDefined();
 
       // Root has no parent
-      expect(rootSpan?._parent_span_id).toBeNull();
+      expect(rootSpan?.parent_span_id).toBeNull();
 
       // Level 2's parent is root
-      expect(level2Span?._parent_span_id).toBe(rootSpan?.span_id);
+      expect(level2Span?.parent_span_id).toBe(rootSpan?.span_id);
 
       // Level 3's parent is level 2
-      expect(level3Span?._parent_span_id).toBe(level2Span?.span_id);
+      expect(level3Span?.parent_span_id).toBe(level2Span?.span_id);
 
       // Level 4's parent is level 3
-      expect(level4Span?._parent_span_id).toBe(level3Span?.span_id);
+      expect(level4Span?.parent_span_id).toBe(level3Span?.span_id);
 
       // All have same trace_id
       expect(level2Span?.trace_id).toBe(rootSpan?.trace_id);
@@ -317,7 +317,7 @@ describe('Nested Library Tasks', () => {
 
       // HTTP library module
       const httpModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/http', packagePath: 'http.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
         logSchema: httpSchema,
       })
         .ctx<{}>({})
@@ -325,7 +325,7 @@ describe('Nested Library Tasks', () => {
 
       // DB library module
       const dbModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/db', packagePath: 'db.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
         logSchema: dbSchema,
       })
         .ctx<{}>({})
@@ -333,7 +333,7 @@ describe('Nested Library Tasks', () => {
 
       // Cache library module
       const cacheModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/cache', packagePath: 'cache.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/cache', package_file: 'cache.ts' },
         logSchema: cacheSchema,
       })
         .ctx<{}>({})
@@ -341,7 +341,7 @@ describe('Nested Library Tasks', () => {
 
       // Auth library module
       const authModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/auth', packagePath: 'auth.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/auth', package_file: 'auth.ts' },
         logSchema: authSchema,
       })
         .ctx<{}>({})
@@ -412,28 +412,28 @@ describe('Nested Library Tasks', () => {
 
     it('should maintain correct tree structure with 4 levels of library tasks', async () => {
       const httpModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/http', packagePath: 'http.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
         logSchema: defineLogSchema({ http_status: S.number() }),
       })
         .ctx<{}>({})
         .make();
 
       const dbModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/db', packagePath: 'db.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
         logSchema: defineLogSchema({ db_query: S.text() }),
       })
         .ctx<{}>({})
         .make();
 
       const cacheModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/cache', packagePath: 'cache.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/cache', package_file: 'cache.ts' },
         logSchema: defineLogSchema({ cache_key: S.category() }),
       })
         .ctx<{}>({})
         .make();
 
       const authModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/auth', packagePath: 'auth.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/auth', package_file: 'auth.ts' },
         logSchema: defineLogSchema({ auth_userId: S.category() }),
       })
         .ctx<{}>({})
@@ -522,28 +522,28 @@ describe('Nested Library Tasks', () => {
       });
 
       const regularModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@app/handler', packagePath: 'handler.ts' },
+        metadata: { git_sha: 'sha', package_name: '@app/handler', package_file: 'handler.ts' },
         logSchema: regularSchema,
       })
         .ctx<{}>({})
         .make();
 
       const regularModule2 = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@app/processor', packagePath: 'processor.ts' },
+        metadata: { git_sha: 'sha', package_name: '@app/processor', package_file: 'processor.ts' },
         logSchema: regularSchema,
       })
         .ctx<{}>({})
         .make();
 
       const httpModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/http', packagePath: 'http.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
         logSchema: httpSchema,
       })
         .ctx<{}>({})
         .make();
 
       const dbModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/db', packagePath: 'db.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
         logSchema: dbSchema,
       })
         .ctx<{}>({})
@@ -616,10 +616,10 @@ describe('Nested Library Tasks', () => {
       const process = spanStarts.find((r) => r?.message === 'process');
       const dbQuery = spanStarts.find((r) => r?.message === 'db-query');
 
-      expect(handleRequest?._parent_span_id).toBeNull();
-      expect(fetch?._parent_span_id).toBe(handleRequest?.span_id);
-      expect(process?._parent_span_id).toBe(fetch?.span_id);
-      expect(dbQuery?._parent_span_id).toBe(process?.span_id);
+      expect(handleRequest?.parent_span_id).toBeNull();
+      expect(fetch?.parent_span_id).toBe(handleRequest?.span_id);
+      expect(process?.parent_span_id).toBe(fetch?.span_id);
+      expect(dbQuery?.parent_span_id).toBe(process?.span_id);
     });
   });
 
@@ -633,21 +633,21 @@ describe('Nested Library Tasks', () => {
     it('should isolate columns with same name using different prefixes', async () => {
       // All libraries have a "status" column concept, but with different prefixes
       const httpModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/http', packagePath: 'http.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
         logSchema: defineLogSchema({ http_status: S.number() }),
       })
         .ctx<{}>({})
         .make();
 
       const dbModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/db', packagePath: 'db.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
         logSchema: defineLogSchema({ db_status: S.category() }),
       })
         .ctx<{}>({})
         .make();
 
       const processModule = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@lib/process', packagePath: 'process.ts' },
+        metadata: { git_sha: 'sha', package_name: '@lib/process', package_file: 'process.ts' },
         logSchema: defineLogSchema({ process_status: S.enum(['running', 'stopped', 'failed']) }),
       })
         .ctx<{}>({})
@@ -731,7 +731,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const module = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@test/tree', packagePath: 'tree.ts' },
+        metadata: { git_sha: 'sha', package_name: '@test/tree', package_file: 'tree.ts' },
         logSchema: schema,
       })
         .ctx<{}>({})
@@ -801,7 +801,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const module = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@test/order', packagePath: 'order.ts' },
+        metadata: { git_sha: 'sha', package_name: '@test/order', package_file: 'order.ts' },
         logSchema: schema,
       })
         .ctx<{}>({})
@@ -868,7 +868,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const module = defineModule({
-        metadata: { gitSha: 'sha', packageName: '@test/scope', packagePath: 'scope.ts' },
+        metadata: { git_sha: 'sha', package_name: '@test/scope', package_file: 'scope.ts' },
         logSchema: schema,
       })
         .ctx<{}>({})

@@ -22,7 +22,6 @@ import type { InferSchema, LogSchema } from './schema/types.js';
 import { createChildSpanBuffer, createNextBuffer } from './spanBuffer.js';
 import { getTimestampNanos } from './timestamp.js';
 import type { TraceContext } from './traceContext.js';
-import type { TraceId } from './traceId.js';
 import type { ModuleContext, SpanBuffer } from './types.js';
 
 // =============================================================================
@@ -59,6 +58,18 @@ export interface FluentLogEntry {
    * ctx.log.info('Processing user').line(42);
    */
   line(lineNumber: number): void;
+
+  /** Set error code for this entry */
+  error_code(code: string): void;
+
+  /** Set exception stack for this entry */
+  exception_stack(stack: string): void;
+
+  /** Set feature flag value for this entry */
+  ff_value(value: string): void;
+
+  /** Set uint64 value for this entry */
+  uint64_value(value: bigint): void;
 }
 
 // =============================================================================
@@ -174,9 +185,6 @@ export type SpanFn<T extends LogSchema, FF extends FeatureFlagSchema, Env> = {
 export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, Env = Record<string, unknown>> {
   /** Marker for prototype chain detection */
   readonly [SPAN_CONTEXT_MARKER]: true;
-
-  /** Trace ID for this span's trace */
-  readonly traceId: TraceId;
 
   /**
    * Feature flags (logs access to current span)
@@ -311,7 +319,7 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
    * const table = convertToArrowTable(ctx.buffer);
    * ```
    */
-  readonly buffer: SpanBuffer;
+  readonly buffer: SpanBuffer<T>;
 }
 
 // =============================================================================
@@ -324,9 +332,14 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
  *
  * @internal
  */
-export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagSchema, Env = Record<string, unknown>> {
+export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagSchema, Env = Record<string, unknown>>
+  extends SpanContext<T, FF, Env> {
   [SPAN_CONTEXT_MARKER]: true;
-  traceId: TraceId;
+  __module: ModuleContext;
+  callee_package: string;
+  callee_file: string;
+  callee_line: number;
+  callee_git_sha: string;
   ff: FeatureFlagEvaluator<FF> & InferFeatureFlagsWithContext<FF>;
   env: Env;
   deps: Record<string, unknown>;
@@ -429,6 +442,23 @@ export function createSpanContextProto<
   return {
     [SPAN_CONTEXT_MARKER]: true as const,
 
+    // Module getter - returns _buffer._module
+    get module(): ModuleContext {
+      return (this as any).buffer.module;
+    },
+    get callee_package(): string {
+      return (this as any).buffer.module.package_name;
+    },
+    get callee_file(): string {
+      return (this as any).buffer.module.package_file;
+    },
+    get callee_line(): number {
+      return (this as any).buffer.line(0);
+    },
+    get callee_git_sha(): string {
+      return (this as any).buffer.module.git_sha;
+    },
+
     // Buffer getter - returns _buffer
     get buffer(): SpanBuffer<T> {
       return (this as unknown as MutableSpanContext<T, FF, Env>)._buffer;
@@ -504,7 +534,7 @@ export function createSpanContextProto<
       writeSpanStart(childBuffer, name);
 
       // Write line number to row 0
-      childBuffer.lineNumber(0, line);
+      childBuffer.line(0, line);
 
       // Create child span logger (scope inheritance handled by buffer constructor)
       const childLogger = createSpanLogger(schemaOnly, childBuffer);
@@ -543,7 +573,7 @@ export function createSpanContextProto<
 
         childBuffer.message(1, errorMessage);
         if (errorStack) {
-          childBuffer.exceptionStack(1, errorStack);
+          childBuffer.exception_stack(1, errorStack);
         }
 
         // Re-throw to propagate

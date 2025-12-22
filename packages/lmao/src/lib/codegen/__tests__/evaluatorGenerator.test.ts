@@ -31,7 +31,6 @@ function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): 
     },
     log: logger,
     // Other properties not needed by evaluator tests
-    traceId: spanBuffer._traceId,
     ff: null as any,
     env: {},
     deps: {},
@@ -449,11 +448,11 @@ describe('generateEvaluatorClass snapshots', () => {
  */
 function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
   let count = 0;
-  let current: SpanBuffer<any> | null = buffer;
+  let current: SpanBuffer<any> | undefined = buffer;
   while (current) {
     const writeIndex = current._writeIndex;
     for (let i = 0; i < writeIndex; i++) {
-      if (current._operations[i] === entryType) {
+      if (current.entry_type[i] === entryType) {
         count++;
       }
     }

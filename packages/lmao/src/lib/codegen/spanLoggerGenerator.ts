@@ -55,6 +55,15 @@ export type FluentLogEntry<T extends LogSchema> = {
    * Injected by the LMAO transformer.
    */
   line(lineNumber: number): FluentLogEntry<T>;
+  /** Set error code for this entry */
+  error_code(code: string): FluentLogEntry<T>;
+  /** Set exception stack for this entry */
+  exception_stack(stack: string): FluentLogEntry<T>;
+  /** Set feature flag value for this entry */
+  ff_value(value: string): FluentLogEntry<T>;
+  /** Set uint64 value for this entry */
+  uint64_value(value: bigint): FluentLogEntry<T>;
+
   // Logging methods for continued chaining
   info(message: string): FluentLogEntry<T>;
   debug(message: string): FluentLogEntry<T>;
@@ -412,11 +421,11 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      if (this._buffer.ffValue_values) {
+      if (this._buffer.ff_value_values) {
         const strValue = value === null || value === undefined ? 'null' : String(value);
-        this._buffer.ffValue_values[idx] = strValue;
-        if (this._buffer.ffValue_nulls) {
-          helpers.setNullBit(this._buffer.ffValue_nulls, idx);
+        this._buffer.ff_value_values[idx] = strValue;
+        if (this._buffer.ff_value_nulls) {
+          helpers.setNullBit(this._buffer.ff_value_nulls, idx);
         }
       }
       this._buffer._module.sb_totalWrites++;
@@ -453,10 +462,54 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Writes to _writeIndex (the current row).
       `line(lineNumber) {
       const idx = this._writeIndex;
-      if (this._buffer.lineNumber_values) {
-        this._buffer.lineNumber_values[idx] = lineNumber;
-        if (this._buffer.lineNumber_nulls) {
-          helpers.setNullBit(this._buffer.lineNumber_nulls, idx);
+      if (this._buffer.line_values) {
+        this._buffer.line_values[idx] = lineNumber;
+        if (this._buffer.line_nulls) {
+          helpers.setNullBit(this._buffer.line_nulls, idx);
+        }
+      }
+      return this;
+    }
+
+    error_code(code) {
+      const idx = this._writeIndex;
+      if (this._buffer.error_code_values) {
+        this._buffer.error_code_values[idx] = code;
+        if (this._buffer.error_code_nulls) {
+          helpers.setNullBit(this._buffer.error_code_nulls, idx);
+        }
+      }
+      return this;
+    }
+
+    exception_stack(stack) {
+      const idx = this._writeIndex;
+      if (this._buffer.exception_stack_values) {
+        this._buffer.exception_stack_values[idx] = stack;
+        if (this._buffer.exception_stack_nulls) {
+          helpers.setNullBit(this._buffer.exception_stack_nulls, idx);
+        }
+      }
+      return this;
+    }
+
+    ff_value(value) {
+      const idx = this._writeIndex;
+      if (this._buffer.ff_value_values) {
+        this._buffer.ff_value_values[idx] = value;
+        if (this._buffer.ff_value_nulls) {
+          helpers.setNullBit(this._buffer.ff_value_nulls, idx);
+        }
+      }
+      return this;
+    }
+
+    uint64_value(value) {
+      const idx = this._writeIndex;
+      if (this._buffer.uint64_value_values) {
+        this._buffer.uint64_value_values[idx] = value;
+        if (this._buffer.uint64_value_nulls) {
+          helpers.setNullBit(this._buffer.uint64_value_nulls, idx);
         }
       }
       return this;

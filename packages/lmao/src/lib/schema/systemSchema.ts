@@ -22,17 +22,17 @@ import { LogSchema, type Schema } from './types.js';
  */
 interface SystemSchemaFieldTypes extends Record<string, Schema<unknown>> {
   message: EagerCategorySchema;
-  lineNumber: LazyNumberSchema;
-  errorCode: LazyCategorySchema;
-  exceptionStack: LazyTextSchema;
-  ffValue: LazyCategorySchema;
-  uint64Value: LazyBigUint64Schema;
+  line: LazyNumberSchema;
+  error_code: LazyCategorySchema;
+  exception_stack: LazyTextSchema;
+  ff_value: LazyCategorySchema;
+  uint64_value: LazyBigUint64Schema;
 }
 
 // Use arrow-builder's S directly (not lmao's wrapped version) to get clean types
 // that don't include the flag builder methods - this avoids type inference issues.
 const messageSchema: EagerCategorySchema = ArrowS.category().eager();
-const lineNumberSchema: LazyNumberSchema = ArrowS.number();
+const lineSchema: LazyNumberSchema = ArrowS.number();
 const errorCodeSchema: LazyCategorySchema = ArrowS.category();
 const exceptionStackSchema: LazyTextSchema = ArrowS.text();
 const ffValueSchema: LazyCategorySchema = ArrowS.category();
@@ -49,11 +49,11 @@ const uint64ValueSchema: LazyBigUint64Schema = ArrowS.bigUint64();
  */
 export const SYSTEM_SCHEMA_FIELD_NAMES = new Set([
   'message',
-  'lineNumber',
-  'errorCode',
-  'exceptionStack',
-  'ffValue',
-  'uint64Value',
+  'line',
+  'error_code',
+  'exception_stack',
+  'ff_value',
+  'uint64_value',
 ]);
 
 /**
@@ -110,14 +110,14 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
    * - Debugging and error analysis
    * - IDE integration for "jump to line"
    */
-  lineNumber: lineNumberSchema,
+  line: lineSchema,
 
   // Error handling
-  errorCode: errorCodeSchema,
-  exceptionStack: exceptionStackSchema,
+  error_code: errorCodeSchema,
+  exception_stack: exceptionStackSchema,
 
   // Feature flags (ffName is now part of unified `message` column)
-  ffValue: ffValueSchema, // Can be boolean, string, or number as string
+  ff_value: ffValueSchema, // Can be boolean, string, or number as string
 
   /**
    * uint64 value column for metrics and user .uint64() API.
@@ -132,7 +132,7 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
    * - Only metrics rows and entries where .uint64() is called
    * - Zero overhead for rows that don't use it
    */
-  uint64Value: uint64ValueSchema,
+  uint64_value: uint64ValueSchema,
 };
 
 /**

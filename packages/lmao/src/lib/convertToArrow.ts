@@ -160,7 +160,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
 
   // Build user attribute vectors
   // Skip system schema fields - they are handled separately as system columns
-  // (message is handled above, lineNumber/errorCode/exceptionStack/ffValue/uint64Value below)
+  // (message is handled above, line/error_code/exception_stack/ff_value/uint64_value below)
   const userSchemaFields = Array.from(schema.fieldEntries()).filter(
     ([fieldName]) => !SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName),
   );
@@ -578,8 +578,8 @@ function buildMetadataColumnsWithFields(
   // Package name
   const packageSet = new Set<string>();
   for (const buf of buffers) {
-    packageSet.add(buf._module.packageName);
-    if (buf._callsiteModule) packageSet.add(buf._callsiteModule.packageName);
+    packageSet.add(buf._module.package_name);
+    if (buf._callsiteModule) packageSet.add(buf._callsiteModule.package_name);
   }
   const packageArray = Array.from(packageSet);
   const packageMap = new Map(packageArray.map((name, idx) => [name, idx]));
@@ -594,9 +594,9 @@ function buildMetadataColumnsWithFields(
   const packageIndices = new packageIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePkgName = buf._callsiteModule?.packageName ?? buf._module.packageName;
+    const callsitePkgName = buf._callsiteModule?.package_name ?? buf._module.package_name;
     const callsitePkgIdx = packageMap.get(callsitePkgName) ?? 0;
-    const opPkgIdx = packageMap.get(buf._module.packageName) ?? 0;
+    const opPkgIdx = packageMap.get(buf._module.package_name) ?? 0;
     packageIndices[rowOffset] = callsitePkgIdx;
     if (buf._writeIndex > 1) {
       packageIndices.fill(opPkgIdx, rowOffset + 1, rowOffset + buf._writeIndex);
@@ -624,11 +624,11 @@ function buildMetadataColumnsWithFields(
     ),
   );
 
-  // Package path
+  // Package file
   const modulePathSet = new Set<string>();
   for (const buf of buffers) {
-    modulePathSet.add(buf._module.packagePath);
-    if (buf._callsiteModule) modulePathSet.add(buf._callsiteModule.packagePath);
+    modulePathSet.add(buf._module.package_file);
+    if (buf._callsiteModule) modulePathSet.add(buf._callsiteModule.package_file);
   }
   const modulePathArray = Array.from(modulePathSet);
   const modulePathMap = new Map(modulePathArray.map((name, idx) => [name, idx]));
@@ -639,14 +639,14 @@ function buildMetadataColumnsWithFields(
     packagePathUniqueCount <= 255 ? Uint8 : packagePathUniqueCount <= 65535 ? Uint16 : Uint32;
 
   const packagePathDictType = new Dictionary(new Utf8(), new packagePathArrowIndexTypeCtor());
-  fields.push(Field.new({ name: 'package_path', type: packagePathDictType }));
+  fields.push(Field.new({ name: 'package_file', type: packagePathDictType }));
 
   const packagePathIndices = new packagePathIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePathName = buf._callsiteModule?.packagePath ?? buf._module.packagePath;
+    const callsitePathName = buf._callsiteModule?.package_file ?? buf._module.package_file;
     const callsitePathIdx = modulePathMap.get(callsitePathName) ?? 0;
-    const opPathIdx = modulePathMap.get(buf._module.packagePath) ?? 0;
+    const opPathIdx = modulePathMap.get(buf._module.package_file) ?? 0;
     packagePathIndices[rowOffset] = callsitePathIdx;
     if (buf._writeIndex > 1) {
       packagePathIndices.fill(opPathIdx, rowOffset + 1, rowOffset + buf._writeIndex);
@@ -677,8 +677,8 @@ function buildMetadataColumnsWithFields(
   // Git SHA
   const gitShaSet = new Set<string>();
   for (const buf of buffers) {
-    gitShaSet.add(buf._module.gitSha);
-    if (buf._callsiteModule) gitShaSet.add(buf._callsiteModule.gitSha);
+    gitShaSet.add(buf._module.git_sha);
+    if (buf._callsiteModule) gitShaSet.add(buf._callsiteModule.git_sha);
   }
   const gitShaArray = Array.from(gitShaSet);
   const gitShaMap = new Map(gitShaArray.map((sha, idx) => [sha, idx]));
@@ -693,9 +693,9 @@ function buildMetadataColumnsWithFields(
   const gitShaIndices = new gitShaIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsiteGitSha = buf._callsiteModule?.gitSha ?? buf._module.gitSha;
+    const callsiteGitSha = buf._callsiteModule?.git_sha ?? buf._module.git_sha;
     const callsiteGitShaIdx = gitShaMap.get(callsiteGitSha) ?? 0;
-    const opGitShaIdx = gitShaMap.get(buf._module.gitSha) ?? 0;
+    const opGitShaIdx = gitShaMap.get(buf._module.git_sha) ?? 0;
     gitShaIndices[rowOffset] = callsiteGitShaIdx;
     if (buf._writeIndex > 1) {
       gitShaIndices.fill(opGitShaIdx, rowOffset + 1, rowOffset + buf._writeIndex);
@@ -764,7 +764,7 @@ export function convertSpanTreeToArrowTable(
     const fields = Array.from(bufferSchema.fieldEntries());
     for (const [fieldName, fieldSchema] of fields) {
       // Skip system schema fields - they are handled separately as system columns
-      // (message, lineNumber, errorCode, exceptionStack, ffValue, uint64Value)
+      // (message, line, error_code, exception_stack, ff_value, uint64_value)
       if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) {
         continue;
       }
@@ -918,9 +918,9 @@ export function convertSpanTreeToArrowTable(
   const gitShaEntries: PreEncodedEntry[] = new Array(moduleCount);
   let idx = 0;
   for (const m of uniqueModules) {
-    packageEntries[idx] = m.packageEntry;
-    packagePathEntries[idx] = m.packagePathEntry;
-    gitShaEntries[idx] = m.gitShaEntry;
+    packageEntries[idx] = m.package_name_entry;
+    packagePathEntries[idx] = m.package_file_entry;
+    gitShaEntries[idx] = m.git_sha_entry;
     idx++;
   }
 
@@ -976,7 +976,7 @@ export function convertSpanTreeToArrowTable(
     Field.new({ name: 'package_name', type: new Dictionary(new Utf8(), new packageDict.arrowIndexTypeCtor(), 2) }),
   );
   arrowFields.push(
-    Field.new({ name: 'package_path', type: new Dictionary(new Utf8(), new packagePathDict.arrowIndexTypeCtor(), 3) }),
+    Field.new({ name: 'package_file', type: new Dictionary(new Utf8(), new packagePathDict.arrowIndexTypeCtor(), 3) }),
   );
   arrowFields.push(
     Field.new({ name: 'git_sha', type: new Dictionary(new Utf8(), new gitShaDict.arrowIndexTypeCtor(), 4) }),
@@ -1132,7 +1132,7 @@ function convertBuffersWithSharedDicts(
 
   // Get types from the shared schema
   // Schema order: timestamp(0), trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
-  //               entry_type(6), package_name(7), package_path(8), git_sha(9), message(10)
+  //               entry_type(6), package_name(7), package_file(8), git_sha(9), message(10)
   const timestampType = arrowSchema.fields[0].type as TimestampNanosecond;
   const traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8>;
   // Span ID columns: thread_id (2), span_id (3), parent_thread_id (4), parent_span_id (5)
@@ -1341,11 +1341,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsitePkgName = buf._callsiteModule?.packageName ?? buf._module.packageName;
+    const callsitePkgName = buf._callsiteModule?.package_name ?? buf._module.package_name;
     const callsitePkgIdx = packageDict.indexMap.get(callsitePkgName) ?? 0;
 
     // Op's module (task._module) for rows 1+
-    const opPkgIdx = packageDict.indexMap.get(buf._module.packageName) ?? 0;
+    const opPkgIdx = packageDict.indexMap.get(buf._module.package_name) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packageIndices[offset] = callsitePkgIdx;
@@ -1383,11 +1383,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsitePathName = buf._callsiteModule?.packagePath ?? buf._module.packagePath;
+    const callsitePathName = buf._callsiteModule?.package_file ?? buf._module.package_file;
     const callsitePathIdx = packagePathDict.indexMap.get(callsitePathName) ?? 0;
 
     // Op's module (task._module) for rows 1+
-    const opPathIdx = packagePathDict.indexMap.get(buf._module.packagePath) ?? 0;
+    const opPathIdx = packagePathDict.indexMap.get(buf._module.package_file) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packagePathIndices[offset] = callsitePathIdx;
@@ -1425,11 +1425,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsiteGitSha = buf._callsiteModule?.gitSha ?? buf._module.gitSha;
+    const callsiteGitSha = buf._callsiteModule?.git_sha ?? buf._module.git_sha;
     const callsiteGitShaIdx = gitShaDict.indexMap.get(callsiteGitSha) ?? 0;
 
     // Op's module (task._module) for rows 1+
-    const opGitShaIdx = gitShaDict.indexMap.get(buf._module.gitSha) ?? 0;
+    const opGitShaIdx = gitShaDict.indexMap.get(buf._module.git_sha) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     gitShaIndices2[offset] = callsiteGitShaIdx;
@@ -1468,7 +1468,7 @@ function convertBuffersWithSharedDicts(
   // Schema order: Core system + metadata columns + system attribute columns:
   //   Core system: timestamp(0), entry_type(6)
   //   Metadata: trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
-  //             package_name(7), package_path(8), git_sha(9)
+  //             package_name(7), package_file(8), git_sha(9)
   //   System attribute: message(10), uint64_value(11)
   // Total: 12 columns before user attributes
   const METADATA_AND_SYSTEM_COLUMNS_COUNT = 12;

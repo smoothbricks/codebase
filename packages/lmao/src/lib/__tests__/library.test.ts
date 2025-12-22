@@ -175,26 +175,26 @@ describe('Library Integration Pattern', () => {
         getColumnIfAllocated: (name: string) => (name === 'status' ? mockColumn : undefined),
         getNullsIfAllocated: (name: string) => (name === 'status' ? mockColumn : undefined),
         _children: [],
-        writeIndex: 0,
-        timestamps: new BigInt64Array(1),
-        operations: new Uint8Array(1),
+        _writeIndex: 0,
+        timestamp: new BigInt64Array(1),
+        entry_type: new Uint8Array(1),
         message_values: [],
         message_nulls: new Uint8Array(1),
-        lineNumber_values: new Uint32Array(1),
-        lineNumber_nulls: new Uint8Array(1),
-        errorCode_values: new Uint16Array(1),
-        errorCode_nulls: new Uint8Array(1),
-        exceptionStack_values: [],
-        exceptionStack_nulls: new Uint8Array(1),
-        ffValue_values: [],
-        ffValue_nulls: new Uint8Array(1),
-        traceId: 'test-trace-id',
-        threadId: 123n,
-        spanId: 456,
-        parentSpanId: null,
+        line_values: new Uint32Array(1),
+        line_nulls: new Uint8Array(1),
+        error_code_values: new Uint16Array(1),
+        error_code_nulls: new Uint8Array(1),
+        exception_stack_values: [],
+        exception_stack_nulls: new Uint8Array(1),
+        ff_value_values: [],
+        ff_value_nulls: new Uint8Array(1),
+        trace_id: 'test-trace-id',
+        thread_id: 123n,
+        span_id: 456,
+        parent_span_id: null,
         _identity: 'test-identity',
-        module: { packageName: 'test' },
-        spanName: 'test-span',
+        __module: { package_name: 'test' },
+        _spanName: 'test-span',
       } as any;
 
       const view = new ViewClass(mockBuffer);
@@ -325,8 +325,8 @@ describe('Module Builder Pattern Integration', () => {
   const createHttpModule = () => {
     const module = defineModule({
       metadata: {
-        packageName: '@test/http',
-        packagePath: 'src/index.ts',
+        package_name: '@test/http',
+        package_file: 'src/index.ts',
       },
       logSchema: {
         status: S.number(),
@@ -341,8 +341,8 @@ describe('Module Builder Pattern Integration', () => {
   const createDbModule = () => {
     const module = defineModule({
       metadata: {
-        packageName: '@test/db',
-        packagePath: 'src/index.ts',
+        package_name: '@test/db',
+        package_file: 'src/index.ts',
       },
       logSchema: {
         query: S.text(),
@@ -356,8 +356,8 @@ describe('Module Builder Pattern Integration', () => {
   const createRetryModule = () => {
     const module = defineModule({
       metadata: {
-        packageName: '@test/retry',
-        packagePath: 'src/index.ts',
+        package_name: '@test/retry',
+        package_file: 'src/index.ts',
       },
       logSchema: {
         attempt: S.number(),
@@ -374,8 +374,8 @@ describe('Module Builder Pattern Integration', () => {
 
       const appModule = defineModule({
         metadata: {
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: {
           userId: S.category(),
@@ -387,9 +387,9 @@ describe('Module Builder Pattern Integration', () => {
         },
       });
 
-      expect(appModule.metadata.packageName).toBe('@test/app');
       expect(appModule._module.logSchema.fieldNames).toContain('userId');
       expect(appModule._module.logSchema.fieldNames).toContain('endpoint');
+      expect(appModule.metadata.package_name).toBe('@test/app');
     });
 
     it('should provide access to module schema and metadata', () => {
@@ -402,15 +402,15 @@ describe('Module Builder Pattern Integration', () => {
       expect(httpModule._module.logSchema.fieldNames).toContain('duration');
 
       // Test metadata access
-      expect(httpModule.metadata.packageName).toBe('@test/http');
-      expect(httpModule.metadata.packagePath).toBe('src/index.ts');
+      expect(httpModule.metadata.package_name).toBe('@test/http');
+      expect(httpModule.metadata.package_file).toBe('src/index.ts');
     });
 
     it('should handle complex schema types', () => {
       const complexModule = defineModule({
         metadata: {
-          packageName: '@test/complex',
-          packagePath: 'src/index.ts',
+          package_name: '@test/complex',
+          package_file: 'src/index.ts',
         },
         logSchema: {
           enumField: S.enum(['A', 'B']),
@@ -454,8 +454,8 @@ describe('Module Builder Pattern Integration', () => {
     it('should handle different field types with prefixing', () => {
       const complexModule = defineModule({
         metadata: {
-          packageName: '@test/complex',
-          packagePath: 'src/index.ts',
+          package_name: '@test/complex',
+          package_file: 'src/index.ts',
         },
         logSchema: {
           enumField: S.enum(['A', 'B']),
@@ -482,8 +482,8 @@ describe('Module Builder Pattern Integration', () => {
       const prefixedHttpModule = httpModule.prefix('http');
 
       // Metadata should be accessible on prefixed module
-      expect(prefixedHttpModule.metadata.packageName).toBe('@test/http');
-      expect(prefixedHttpModule.metadata.packagePath).toBe('src/index.ts');
+      expect(prefixedHttpModule.metadata.package_name).toBe('@test/http');
+      expect(prefixedHttpModule.metadata.package_file).toBe('src/index.ts');
 
       // Prefixed schema should preserve field metadata
       const statusField = prefixedHttpModule._module.logSchema.fields.http_status;
@@ -518,8 +518,8 @@ describe('Module Builder Pattern Integration', () => {
       // Both HTTP and DB use the same retry instance
       const appRoot = defineModule({
         metadata: {
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: {
           userId: S.category(),
@@ -581,8 +581,8 @@ describe('Module Builder Pattern Integration', () => {
     it('should create trace context with extra properties', () => {
       const testModule = defineModule({
         metadata: {
-          packageName: '@test/module',
-          packagePath: 'src/index.ts',
+          package_name: '@test/module',
+          package_file: 'src/index.ts',
         },
         logSchema: {
           value: S.number(),
@@ -616,8 +616,8 @@ describe('Module Builder Pattern Integration', () => {
     it('should enforce required extra properties at compile time', () => {
       const testModule = defineModule({
         metadata: {
-          packageName: '@test/module',
-          packagePath: 'src/index.ts',
+          package_name: '@test/module',
+          package_file: 'src/index.ts',
         },
         logSchema: {},
       }).ctx<{
@@ -640,8 +640,8 @@ describe('Module Builder Pattern Integration', () => {
     it('should allow optional extra properties', () => {
       const testModule = defineModule({
         metadata: {
-          packageName: '@test/module',
-          packagePath: 'src/index.ts',
+          package_name: '@test/module',
+          package_file: 'src/index.ts',
         },
         logSchema: {},
       }).ctx<{
@@ -667,8 +667,8 @@ describe('Module Builder Pattern Integration', () => {
     it('should preserve extra property defaults', () => {
       const testModule = defineModule({
         metadata: {
-          packageName: '@test/module',
-          packagePath: 'src/index.ts',
+          package_name: '@test/module',
+          package_file: 'src/index.ts',
         },
         logSchema: {},
       }).ctx<{
@@ -698,8 +698,8 @@ describe('Library Composition Scenarios', () => {
   const createHttpModule = () => {
     const module = defineModule({
       metadata: {
-        packageName: '@test/http',
-        packagePath: 'src/index.ts',
+        package_name: '@test/http',
+        package_file: 'src/index.ts',
       },
       logSchema: {
         status: S.number(),
@@ -714,8 +714,8 @@ describe('Library Composition Scenarios', () => {
   const createDbModule = () => {
     const module = defineModule({
       metadata: {
-        packageName: '@test/db',
-        packagePath: 'src/index.ts',
+        package_name: '@test/db',
+        package_file: 'src/index.ts',
       },
       logSchema: {
         query: S.text(),
@@ -729,8 +729,8 @@ describe('Library Composition Scenarios', () => {
   const createRetryModule = () => {
     const module = defineModule({
       metadata: {
-        packageName: '@test/retry',
-        packagePath: 'src/index.ts',
+        package_name: '@test/retry',
+        package_file: 'src/index.ts',
       },
       logSchema: {
         attempt: S.number(),
@@ -745,8 +745,8 @@ describe('Library Composition Scenarios', () => {
       const httpModule = createHttpModule();
       const appModule = defineModule({
         metadata: {
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: {
           endpoint: S.category(),
@@ -772,8 +772,8 @@ describe('Library Composition Scenarios', () => {
 
       const appModule = defineModule({
         metadata: {
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: {
           endpoint: S.category(),
@@ -826,8 +826,8 @@ describe('Library Composition Scenarios', () => {
     it('should handle deep dependency chains', () => {
       const _authModule = defineModule({
         metadata: {
-          packageName: '@test/auth',
-          packagePath: 'src/index.ts',
+          package_name: '@test/auth',
+          package_file: 'src/index.ts',
         },
         logSchema: {
           userId: S.category(),
@@ -849,8 +849,8 @@ describe('Library Composition Scenarios', () => {
 
       const appModule = defineModule({
         metadata: {
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: {
           requestId: S.category(),
@@ -885,8 +885,8 @@ describe('Library Composition Scenarios', () => {
       const retryModule = createRetryModule();
       const cacheModule = defineModule({
         metadata: {
-          packageName: '@test/cache',
-          packagePath: 'src/index.ts',
+          package_name: '@test/cache',
+          package_file: 'src/index.ts',
         },
         logSchema: {
           hits: S.number(),
@@ -896,8 +896,8 @@ describe('Library Composition Scenarios', () => {
 
       const appModule = defineModule({
         metadata: {
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: {
           userId: S.category(),
@@ -964,8 +964,8 @@ describe('Library Composition Scenarios', () => {
 
       const appModule = defineModule({
         metadata: {
-          packageName: '@test/app',
-          packagePath: 'src/app.ts',
+          package_name: '@test/app',
+          package_file: 'src/app.ts',
         },
         logSchema: {
           endpoint: S.category(),

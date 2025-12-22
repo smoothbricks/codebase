@@ -61,7 +61,7 @@ import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
  *
  * **Schema handling**: If `hasSpanData` is false (no span data in the tree), builds a minimal
  * schema with only the columns needed for capacity stats:
- * - timestamp, entry_type, package_name, package_path, git_sha, uint64_value
+ * - timestamp, entry_type, package_name, package_file, git_sha, uint64_value
  * - NO trace_id, thread_id, span_id, parent_thread_id, parent_span_id
  * - NO custom attribute columns
  *
@@ -94,9 +94,9 @@ export function createCapacityStatsRecordBatch(
   const gitShaEntries: PreEncodedEntry[] = new Array(moduleCount);
   for (let i = 0; i < moduleCount; i++) {
     const module = modulesArray[i];
-    packageEntries[i] = module.packageEntry;
-    packagePathEntries[i] = module.packagePathEntry;
-    gitShaEntries[i] = module.gitShaEntry;
+    packageEntries[i] = module.package_name_entry;
+    packagePathEntries[i] = module.package_file_entry;
+    gitShaEntries[i] = module.git_sha_entry;
   }
 
   const cmp = (a: PreEncodedEntry, b: PreEncodedEntry) => compareStrings(a.str, b.str);
@@ -151,7 +151,7 @@ export function createCapacityStatsRecordBatch(
     );
     fields.push(
       Field.new({
-        name: 'package_path',
+        name: 'package_file',
         type: new Dictionary(new Utf8(), new capacityStatsPackagePathDict.arrowIndexTypeCtor()),
       }),
     );
@@ -333,7 +333,7 @@ export function createCapacityStatsRecordBatch(
   const packageIndices = new capacityStatsPackageDict.indexArrayCtor(capacityStatsRows);
   for (let m = 0; m < moduleCount; m++) {
     const module = modulesArray[m];
-    const pkgIdx = capacityStatsPackageDict.indexMap.get(module.packageName) ?? 0;
+    const pkgIdx = capacityStatsPackageDict.indexMap.get(module.package_name) ?? 0;
     const baseRow = m * ROWS_PER_MODULE;
     for (let r = 0; r < ROWS_PER_MODULE; r++) {
       packageIndices[baseRow + r] = pkgIdx;
@@ -366,7 +366,7 @@ export function createCapacityStatsRecordBatch(
   const packagePathIndices = new capacityStatsPackagePathDict.indexArrayCtor(capacityStatsRows);
   for (let m = 0; m < moduleCount; m++) {
     const module = modulesArray[m];
-    const pathIdx = capacityStatsPackagePathDict.indexMap.get(module.packagePath) ?? 0;
+    const pathIdx = capacityStatsPackagePathDict.indexMap.get(module.package_file) ?? 0;
     const baseRow = m * ROWS_PER_MODULE;
     for (let r = 0; r < ROWS_PER_MODULE; r++) {
       packagePathIndices[baseRow + r] = pathIdx;
@@ -399,7 +399,7 @@ export function createCapacityStatsRecordBatch(
   const gitShaIndices = new capacityStatsGitShaDict.indexArrayCtor(capacityStatsRows);
   for (let m = 0; m < moduleCount; m++) {
     const module = modulesArray[m];
-    const idx = capacityStatsGitShaDict.indexMap.get(module.gitSha) ?? 0;
+    const idx = capacityStatsGitShaDict.indexMap.get(module.git_sha) ?? 0;
     const baseRow = m * ROWS_PER_MODULE;
     for (let r = 0; r < ROWS_PER_MODULE; r++) {
       gitShaIndices[baseRow + r] = idx;
@@ -501,7 +501,7 @@ export function createCapacityStatsRecordBatch(
     // Schema order: Core system + metadata columns + system attribute columns:
     //   Core system: timestamp(0), entry_type(6)
     //   Metadata: trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
-    //             package_name(7), package_path(8), git_sha(9)
+    //             package_name(7), package_file(8), git_sha(9)
     //   System attribute: message(10), uint64_value(11)
     // Total: 12 columns before user attributes
     const METADATA_AND_SYSTEM_COLUMNS_COUNT = 12;

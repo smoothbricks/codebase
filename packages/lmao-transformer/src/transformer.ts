@@ -182,13 +182,13 @@ function tryTransformDefineModuleCall(
   // Create the metadata object literal
   const metadataObject = factory.createObjectLiteralExpression(
     [
-      factory.createPropertyAssignment(factory.createIdentifier('gitSha'), factory.createStringLiteral(gitSha)),
+      factory.createPropertyAssignment(factory.createIdentifier('git_sha'), factory.createStringLiteral(gitSha)),
       factory.createPropertyAssignment(
-        factory.createIdentifier('packageName'),
+        factory.createIdentifier('package_name'),
         factory.createStringLiteral(packageName),
       ),
       factory.createPropertyAssignment(
-        factory.createIdentifier('packagePath'),
+        factory.createIdentifier('package_file'),
         factory.createStringLiteral(packagePath),
       ),
     ],
@@ -370,7 +370,11 @@ function isLmaoSpanLoggerType(type: ts.Type, typeChecker: ts.TypeChecker): boole
 }
 
 /**
- * Try to transform a ctx.span('name', fn) call to ctx.span('name', fn, lineNumber)
+ * Try to transform a ctx.span('name', fn) call.
+ *
+ * Rewrites to monomorphic methods for V8 optimization:
+ * - ctx.span('name', op, ...args) -> ctx.span_op(line, 'name', op, ...args)
+ * - ctx.span('name', async (ctx) => ...) -> ctx.span_fn(line, 'name', async (ctx) => ...)
  */
 function tryTransformSpanCall(
   node: ts.CallExpression,
@@ -388,8 +392,8 @@ function tryTransformSpanCall(
     return null;
   }
 
-  // Check we have exactly 2 arguments (name, fn) - not already transformed
-  if (node.arguments.length !== 2) {
+  // Must have at least 2 arguments (name, opOrFn)
+  if (node.arguments.length < 2) {
     return null;
   }
 
@@ -397,16 +401,39 @@ function tryTransformSpanCall(
   if (typeChecker) {
     const receiverType = typeChecker.getTypeAtLocation(expr.expression);
     if (!isLmaoContextType(receiverType, typeChecker)) {
-      return null;
+      // Also check if it's a BoundModule (which also has .span())
+      const typeName = typeChecker.typeToString(receiverType);
+      if (!typeName.startsWith('BoundModule<') && !typeName.includes('BoundModule')) {
+        return null;
+      }
     }
   }
 
+  const nameArg = node.arguments[0];
+  const opOrFnArg = node.arguments[1];
+  const restArgs = node.arguments.slice(2);
+
   const lineNumber = getLineNumber(node, sourceFile);
 
-  return factory.updateCallExpression(node, node.expression, node.typeArguments, [
-    ...node.arguments,
-    factory.createNumericLiteral(lineNumber),
-  ]);
+  // Determine if it's an Op or a function
+  let isOp = false;
+  if (typeChecker) {
+    const opOrFnType = typeChecker.getTypeAtLocation(opOrFnArg);
+    const typeName = typeChecker.typeToString(opOrFnType);
+    isOp = typeName.startsWith('Op<') || typeName.includes('Op');
+  } else {
+    // Heuristic: if it's not a function literal, assume it's an Op
+    isOp = !ts.isArrowFunction(opOrFnArg) && !ts.isFunctionExpression(opOrFnArg);
+  }
+
+  const methodName = isOp ? 'span_op' : 'span_fn';
+
+  return factory.updateCallExpression(
+    node,
+    factory.createPropertyAccessExpression(expr.expression, factory.createIdentifier(methodName)),
+    node.typeArguments,
+    [factory.createNumericLiteral(lineNumber), nameArg, opOrFnArg, ...restArgs],
+  );
 }
 
 /**

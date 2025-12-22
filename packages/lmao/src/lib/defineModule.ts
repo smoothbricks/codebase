@@ -162,9 +162,9 @@ export type OpFunction<
  * Module metadata injected by TypeScript transformer
  */
 export interface ModuleMetadata {
-  packageName: string;
-  packagePath: string;
-  gitSha?: string;
+  package_name: string;
+  package_file: string;
+  git_sha?: string;
 }
 
 /**
@@ -206,7 +206,7 @@ export type TraceContextParams<
   /** Optional ff evaluator override (root evaluator) */
   ff?: FlagEvaluator<T, FF, Env>;
   /** Optional trace ID (auto-generated if not provided) */
-  traceId?: TraceId;
+  trace_id?: TraceId;
 } & Extra;
 
 /**
@@ -452,9 +452,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
   // Support both 'metadata' and 'moduleMetadata' for compatibility
   const metadata = options.metadata ??
     options.moduleMetadata ?? {
-      packageName: 'unknown',
-      packagePath: 'unknown',
-      gitSha: undefined,
+      package_name: 'unknown',
+      package_file: 'unknown',
+      git_sha: undefined,
     };
 
   // Wrap user input in LogSchema if needed (handles both LogSchema instances and plain objects)
@@ -468,9 +468,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
 
   // Create ModuleContext
   const moduleContext = new ModuleContext(
-    metadata.gitSha ?? 'unknown',
-    metadata.packageName,
-    metadata.packagePath,
+    metadata.git_sha ?? 'unknown',
+    metadata.package_name,
+    metadata.package_file,
     schemaOnly,
   );
   // Store deps in moduleContext for access in Op._invoke()
@@ -523,14 +523,14 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
        * Create TraceContext for starting a new trace
        */
       traceContext(params: TraceContextParams<FF, Extra>): TraceContext<FF, Extra> {
-        const { ff: ffOverride, traceId: providedTraceId, ...userProps } = params;
+        const { ff: ffOverride, trace_id: providedTrace_id, ...userProps } = params;
 
         // Use provided evaluator override or the module's root evaluator
         // The root evaluator is a FlagEvaluator that can create span-bound evaluators via forContext()
         const rootEvaluator = ffOverride ?? evaluator;
 
         // Generate system properties
-        const traceId = providedTraceId ?? generateTraceId();
+        const traceId = providedTrace_id ?? generateTraceId();
         // Use Nanoseconds.now() for better precision, convert to microseconds
         const anchorEpochMicros = Number(Nanoseconds.now() / 1000n);
         const anchorPerfNow = performance.now();
@@ -542,10 +542,10 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         } & Extra;
 
         // Assign system properties
-        ctx.traceId = traceId;
-        ctx.anchorEpochMicros = anchorEpochMicros;
-        ctx.anchorPerfNow = anchorPerfNow;
-        ctx.threadId = threadId;
+        ctx.trace_id = traceId;
+        ctx.anchor_epoch_micros = anchorEpochMicros;
+        ctx.anchor_perf_now = anchorPerfNow;
+        ctx.thread_id = threadId;
         ctx.ff = rootEvaluator;
 
         // Create root span function supporting both overloads
@@ -582,11 +582,11 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
               (ctx as Record<string, unknown>)[key] = (extraDefaults as Record<string, unknown>)[key];
             }
           }
-        }
-        // Also copy any extra user props not in defaults (maintains backward compatibility)
-        // Note: This can break V8 hidden class optimization for objects with extra properties
-        for (const key of Object.keys(userProps)) {
-          if (!(key in ctx)) {
+        } else {
+          // Fallback - track keys if defaults not provided via .ctx()
+          const keys = Object.keys(userProps);
+          ctx._extraKeys = keys;
+          for (const key of keys) {
             (ctx as Record<string, unknown>)[key] = (userProps as Record<string, unknown>)[key];
           }
         }
@@ -681,9 +681,9 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
 
         // Create new module context with prefixed schema
         const prefixedModuleContext = new ModuleContext(
-          state.metadata.gitSha ?? 'unknown',
-          state.metadata.packageName,
-          state.metadata.packagePath,
+          state.metadata.git_sha ?? 'unknown',
+          state.metadata.package_name,
+          state.metadata.package_file,
           prefixedSchema,
         );
         // Copy deps
@@ -725,14 +725,16 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
        * - Caller provides wiredDeps: { cache: actualCacheInstance } (implementations)
        * - Result: ctx.deps = { cache: actualCacheInstance } (typed access)
        */
-      use(wiredDeps: Record<string, unknown>): BoundModule<T, FF, Extra> {
+      use(wiredDeps: Record<string, unknown> = {}): BoundModule<T, FF, Extra> {
         // Create the wired dependencies map by combining declarations with implementations
         const finalDeps: Record<string, unknown> = {};
+
+        const effectiveWiredDeps = wiredDeps ?? {};
 
         // First, add all declared dependencies (from module definition)
         if (state.deps) {
           for (const [depName, depDeclaration] of Object.entries(state.deps)) {
-            const implementation = wiredDeps[depName];
+            const implementation = effectiveWiredDeps[depName];
             if (implementation !== undefined) {
               // Use provided implementation
               finalDeps[depName] = implementation;
@@ -744,7 +746,7 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         }
 
         // Then add any additional wired deps not declared in the module
-        for (const [depName, depValue] of Object.entries(wiredDeps)) {
+        for (const [depName, depValue] of Object.entries(effectiveWiredDeps)) {
           if (!(depName in finalDeps)) {
             finalDeps[depName] = depValue;
           }
@@ -767,9 +769,12 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         }
 
         // Add schemas from wired deps (they should already be prefixed)
-        for (const depValue of Object.values(finalDeps)) {
+        for (const [depName, depValue] of Object.entries(finalDeps)) {
           if (depValue && typeof depValue === 'object' && 'logSchema' in depValue) {
             const depModule = depValue as { logSchema: LogSchema };
+            console.debug(`Combining schema from dep: ${depName}`, {
+              fields: depModule.logSchema.fieldNames,
+            });
             for (const [fieldName, fieldSchema] of depModule.logSchema.fieldEntries()) {
               // Use field name as-is (assume already prefixed)
               combinedSchemaFields[fieldName] = fieldSchema;
@@ -780,6 +785,17 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         // Create combined LogSchema
         const combinedLogSchema = new LogSchema(combinedSchemaFields);
 
+        // Create new ModuleContext with combined schema
+        // This ensures buffers created by this bound module have access to all fields
+        const combinedModuleContext = new ModuleContext(
+          this.moduleContext.git_sha,
+          this.moduleContext.package_name,
+          this.moduleContext.package_file,
+          combinedLogSchema,
+        );
+        combinedModuleContext.remappedViewClass = this.moduleContext.remappedViewClass;
+        (combinedModuleContext as unknown as { deps?: Record<string, unknown> }).deps = finalDeps;
+
         // Store original traceContext method
         const originalTraceContext = this.traceContext;
 
@@ -787,9 +803,11 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
         const boundModule = {
           ...this, // Include all module properties
           logSchema: combinedLogSchema, // Override with combined schema
+          moduleContext: combinedModuleContext, // Override with combined context
 
           // Override traceContext to include wired deps
           traceContext(params: TraceContextParams<FF, Extra>): TraceContext<FF, Extra> {
+            // Important: call original with 'this' as the NEW boundModule to use NEW moduleContext
             const traceCtx = originalTraceContext.call(this, params);
             // Set deps on the trace context for access in span contexts
             (traceCtx as unknown as { deps: Record<string, unknown> }).deps = finalDeps;
@@ -813,10 +831,11 @@ export function defineModule<T extends SchemaFields, FF extends FeatureFlagSchem
             const traceCtx = this.traceContext({} as TraceContextParams<FF, Extra>);
 
             // Call op._invoke with the trace context that includes wired deps
+            // Use the combined moduleContext
             return op._invoke(
               traceCtx as unknown as TraceContext<FeatureFlagSchema, Record<string, unknown>>,
               null,
-              state.moduleContext,
+              combinedModuleContext,
               name,
               lineNumber,
               args,

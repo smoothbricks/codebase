@@ -105,11 +105,11 @@ export const SpanBufferTestUtils = {
  */
 type SpanBufferConstructor = new (
   capacity: number,
-  module: ModuleContext,
+  __module: ModuleContext,
   spanName: string,
   parent: SpanBuffer | undefined,
   isChained: boolean,
-  traceId: TraceId | undefined,
+  trace_id: TraceId | undefined,
   callsiteModule: ModuleContext | undefined,
 ) => SpanBuffer;
 
@@ -127,7 +127,7 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
-    constructorParams: 'module, spanName, parent, isChained, traceId, callsiteModule',
+    constructorParams: 'module, spanName, parent, isChained, trace_id, callsiteModule',
     dependencies: {
       writeThreadIdToUint64Array,
       textEncoder,
@@ -142,8 +142,13 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
       // Store module context directly (no TaskContext wrapper)
       this._module = module;
       this._spanName = spanName;
-       this._children = [];
+      this._parent = parent;
+      this._children = [];
       this._next = undefined;
+
+      // Inherit scope from parent (if child or chained)
+      // Child spans inherit by reference (safe because immutable)
+      this._scopeValues = parent ? parent._scopeValues : undefined;
 
       // Store callsiteModule for dual module attribution (row 0 vs rows 1+)
       // Per specs/01c_context_flow_and_op_wrappers.md:
@@ -166,8 +171,8 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
         // ROOT/CHILD BUFFER (new logical span)
         // ============================================================
         // Calculate identity size
-        const traceIdBytes = traceId ? utf8Encode(traceId).length : 0;
-        const identitySize = isChained ? 0 : 12 + traceIdBytes; // threadId(8) + spanId(4) + len(1) + traceId(N) - or 0 for chained
+        const traceIdBytes = trace_id ? textEncoder.encode(trace_id).length : 0;
+        const identitySize = isChained ? 0 : 13 + traceIdBytes; // threadId(8) + spanId(4) + len(1) + traceId(N)
 
         // Allocate unified buffer
         this._system = new ArrayBuffer(systemSize + identitySize);
@@ -181,8 +186,8 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
           const threadIdArray = new BigUint64Array(this._system, systemSize, 1);
           writeThreadIdToUint64Array(threadIdArray, 0); // threadId
           view.setUint32(8, spanId, true); // spanId
-          if (traceId) {
-            const traceIdUtf8 = textEncoder.encode(traceId);
+          if (trace_id) {
+            const traceIdUtf8 = textEncoder.encode(trace_id);
             this._identity[12] = traceIdUtf8.length;
             this._identity.set(traceIdUtf8, 13);
           }
@@ -293,18 +298,18 @@ export function createSpanBuffer<T extends LogSchema>(
   schema: T,
   module: ModuleContext,
   spanName: string,
-  traceId?: TraceId,
+  trace_id?: TraceId,
   capacity: number = DEFAULT_BUFFER_CAPACITY,
 ): SpanBuffer<T> {
   // Use provided capacity parameter
 
   const SpanBufferClass = getSpanBufferClass(schema) as new (
     capacity: number,
-    module: ModuleContext,
+    moduleContext: ModuleContext,
     spanName: string,
     parent: SpanBuffer | undefined,
     isChained: boolean,
-    traceId: TraceId | undefined,
+    trace_id: TraceId | undefined,
     callsiteModule: ModuleContext | undefined,
   ) => SpanBuffer<T>;
 
@@ -315,7 +320,7 @@ export function createSpanBuffer<T extends LogSchema>(
     spanName,
     undefined, // no parent
     false, // not chained
-    undefined, // no callsiteModule for root
+    trace_id, // trace_id for root
     undefined, // no callsiteModule for root
   );
 }
@@ -381,7 +386,7 @@ export function createChildSpanBuffer(
     spanName: string,
     parent: SpanBuffer | undefined,
     isChained: boolean,
-    traceId: TraceId | undefined,
+    trace_id: TraceId | undefined,
     callsiteModule: ModuleContext | undefined,
   ) => SpanBuffer;
 
@@ -392,8 +397,8 @@ export function createChildSpanBuffer(
     spanName,
     parentBuffer as SpanBuffer, // parent
     false, // not chained
-    undefined, // no explicit traceId for child
     module, // callsiteModule
+    undefined, // no explicit trace_id for child
   );
 }
 

@@ -37,11 +37,13 @@
     "apache-arrow": "^21.1.0",
     "tslib": "^2.3.0"
   },
+  "scripts": {
+    "bench": "bun run benchmarks/*.bench.ts"
+  },
   "nx": {
     "sourceRoot": "packages/lmao/src",
     "projectType": "library",
     "targets": {
-      "lint": {},
       "typecheck-tests": {
         "executor": "nx:run-commands",
         "options": {

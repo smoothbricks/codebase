@@ -27,15 +27,15 @@ export function createTestSchema<T extends SchemaFields>(fields: T): LogSchema<T
 export function createTestModuleContext(
   schema: SchemaFields | LogSchema,
   options: {
-    gitSha?: string;
-    packageName?: string;
-    packagePath?: string;
+    git_sha?: string;
+    package_name?: string;
+    package_file?: string;
   } = {},
 ): ModuleContext {
   return new ModuleContext(
-    options.gitSha ?? 'test-sha',
-    options.packageName ?? '@test/package',
-    options.packagePath ?? 'src/test.ts',
+    options.git_sha ?? 'test-sha',
+    options.package_name ?? '@test/package',
+    options.package_file ?? 'src/test.ts',
     schema,
   );
 }
@@ -48,18 +48,18 @@ export function createTestModuleContext(
 export function createTestSpanBuffer(
   schema: SchemaFields | LogSchema,
   options: {
-    gitSha?: string;
-    packageName?: string;
-    packagePath?: string;
+    git_sha?: string;
+    package_name?: string;
+    package_file?: string;
     spanName?: string;
-    traceId?: string;
+    trace_id?: string;
     capacity?: number;
   } = {},
-): { module: ModuleContext; spanBuffer: SpanBuffer<LogSchema> } {
+): { __module: ModuleContext; spanBuffer: SpanBuffer<LogSchema> } {
   const module = createTestModuleContext(schema, options);
-  const spanName = options._spanName ?? 'test-span';
+  const spanName = options.spanName ?? 'test-span';
   const traceId = options.trace_id ? createTraceId(options.trace_id) : generateTraceId();
-  const capacity = options._capacity ?? DEFAULT_BUFFER_CAPACITY;
+  const capacity = options.capacity ?? DEFAULT_BUFFER_CAPACITY;
 
   const logSchema = schema instanceof LogSchema ? schema : module.logSchema;
   const spanBuffer = realCreateSpanBuffer(logSchema, module, spanName, traceId, capacity);

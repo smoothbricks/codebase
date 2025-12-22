@@ -66,9 +66,9 @@ describe('Schema Integration Patterns', () => {
   function createTestModule() {
     return defineModule({
       metadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: 'src/services/user.ts',
+        git_sha: 'abc123',
+        package_name: '@test/pkg',
+        package_file: 'src/services/user.ts',
       },
       logSchema: dbSchema,
     })
@@ -84,9 +84,9 @@ describe('Schema Integration Patterns', () => {
   function createModuleWithFlags() {
     return defineModule({
       metadata: {
-        gitSha: 'abc123',
-        packageName: '@test/pkg',
-        packagePath: 'src/services/user.ts',
+        git_sha: 'abc123',
+        package_name: '@test/pkg',
+        package_file: 'src/services/user.ts',
       },
       logSchema: dbSchema,
       ff: featureFlags.schema,

@@ -314,9 +314,9 @@ describe('Buffer Integration', () => {
       });
 
       const module = createTestModuleContext(schema, {
-        gitSha: 'test-sha-123',
-        packageName: '@test/package',
-        packagePath: 'src/integration.test.ts',
+        git_sha: 'test-sha-123',
+        package_name: '@test/package',
+        package_file: 'src/integration.test.ts',
       });
 
       const buffer = createSpanBuffer(schema, module, 'context-integration');

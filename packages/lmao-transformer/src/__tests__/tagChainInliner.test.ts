@@ -649,8 +649,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
   describe('multiple rows', () => {
     const testSchema = defineLogSchema({
-      nullableNumber: S.number(),
-      nullableString: S.category(),
+      value: S.number(),
+      tag_val: S.category(),
     });
 
     it('multiple rows produce identical output', () => {
@@ -682,36 +682,36 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
       // Row 0
       (tagWriter1 as unknown as { _pos: number })._pos = 0;
-      tagWriter1.value(10).tag('first');
+      tagWriter1.value(10).tag_val('first');
 
       // Row 1
       (tagWriter1 as unknown as { _pos: number })._pos = 1;
-      tagWriter1.value(20).tag('second');
+      tagWriter1.value(20).tag_val('second');
 
       // Row 2 - no tags (null)
 
       // Row 3
       (tagWriter1 as unknown as { _pos: number })._pos = 3;
-      tagWriter1.value(40).tag('fourth');
+      tagWriter1.value(40).tag_val('fourth');
 
       // Row 4
       (tagWriter1 as unknown as { _pos: number })._pos = 4;
-      tagWriter1.value(50).tag('fifth');
+      tagWriter1.value(50).tag_val('fifth');
 
       // Direct writes for buffer2
       buffer2.value(0, 10);
-      buffer2.tag(0, 'first');
+      buffer2.tag_val(0, 'first');
 
       buffer2.value(1, 20);
-      buffer2.tag(1, 'second');
+      buffer2.tag_val(1, 'second');
 
       // Row 2 - no writes
 
       buffer2.value(3, 40);
-      buffer2.tag(3, 'fourth');
+      buffer2.tag_val(3, 'fourth');
 
       buffer2.value(4, 50);
-      buffer2.tag(4, 'fifth');
+      buffer2.tag_val(4, 'fifth');
 
       const table1 = convertToArrowTable(buffer1);
       const table2 = convertToArrowTable(buffer2);
@@ -724,7 +724,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
       // Verify row 2 is null
       expect(table1.get(2)?.toJSON().value).toBe(null);
-      expect(table1.get(2)?.toJSON().tag).toBe(null);
+      expect(table1.get(2)?.toJSON().tag_val).toBe(null);
     });
   });
 

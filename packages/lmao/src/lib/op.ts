@@ -25,7 +25,7 @@ import {
   writeSpanStart,
 } from './spanContext.js';
 import { getTimestampNanos } from './timestamp.js';
-import type { TraceContext } from './traceContext.js';
+import type { TraceContext, TraceContextBase } from './traceContext.js';
 
 import type { SpanBuffer } from './types.js';
 
@@ -55,18 +55,13 @@ const RESERVED_CONTEXT_KEYS = new Set<string>([
   'ff',
   'tag',
   'log',
-  '_buffer',
-  '_schema',
-  '_spanLogger',
   'buffer',
   'scope',
   'ok',
   'err',
   'span',
-  'traceId',
   'anchorEpochMicros',
   'anchorPerfNow',
-  'threadId',
 ]);
 
 // =============================================================================
@@ -102,7 +97,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
   constructor(
     /** The Op's name for metrics (invocations, errors, duration) */
     readonly name: string,
-    /** The module where this Op was defined - for gitSha/packageName/packagePath attribution */
+    /** The module where this Op was defined - for git_sha/package_name/package_file attribution */
     readonly module: ModuleContext,
     /** The user function to execute */
     private fn: (ctx: Ctx, ...args: Args) => Promise<Result>,
@@ -150,8 +145,8 @@ export class Op<Ctx, Args extends unknown[], Result> {
         parentBuffer._children.push(spanBuffer);
       }
     } else {
-      // Root span - uses traceId from TraceContext
-      spanBuffer = createSpanBuffer(schemaOnly, this.module, spanName, traceCtx.traceId);
+      // Root span - uses trace_id from TraceContext
+      spanBuffer = createSpanBuffer(schemaOnly, this.module, spanName, traceCtx.trace_id);
     }
 
     // 4. Write span-start entry (row 0) and pre-initialize span-end (row 1)
@@ -159,7 +154,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
 
     // Write line number to row 0 if provided
     if (lineNumber > 0) {
-      spanBuffer.lineNumber(0, lineNumber);
+      spanBuffer.line(0, lineNumber);
     }
 
     // 5. Create span logger with typed logging methods
@@ -179,16 +174,19 @@ export class Op<Ctx, Args extends unknown[], Result> {
     >;
 
     // 9. Copy user properties from traceCtx to spanContext
-    const traceCtxAny = traceCtx as unknown as Record<string, unknown>;
-    for (const key of Object.keys(traceCtxAny)) {
-      if (!RESERVED_CONTEXT_KEYS.has(key)) {
-        (spanContext as Record<string, unknown>)[key] = traceCtxAny[key];
+    const traceCtxAny = traceCtx as unknown as TraceContextBase;
+    const extraKeys = traceCtxAny._extraKeys;
+    if (extraKeys) {
+      for (let i = 0; i < extraKeys.length; i++) {
+        const key = extraKeys[i];
+        (spanContext as Record<string, unknown>)[key] = (traceCtxAny as any)[key];
       }
-    }
-    // Also copy inherited properties
-    for (const key in traceCtxAny) {
-      if (!RESERVED_CONTEXT_KEYS.has(key) && !(key in spanContext) && !Object.hasOwn(traceCtxAny, key)) {
-        (spanContext as Record<string, unknown>)[key] = traceCtxAny[key];
+    } else {
+      // Fallback for non-prototype contexts (unlikely in production)
+      for (const key of Object.keys(traceCtxAny)) {
+        if (!RESERVED_CONTEXT_KEYS.has(key)) {
+          (spanContext as Record<string, unknown>)[key] = (traceCtxAny as any)[key];
+        }
       }
     }
 
@@ -220,7 +218,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
 
       spanBuffer.message(1, errorMessage);
       if (errorStack) {
-        spanBuffer.exceptionStack(1, errorStack);
+        spanBuffer.exception_stack(1, errorStack);
       }
 
       // Re-throw to propagate

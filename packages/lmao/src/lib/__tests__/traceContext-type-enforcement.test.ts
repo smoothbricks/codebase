@@ -20,7 +20,7 @@ import { defineModule } from '../defineModule.js';
 
 // Module with required and optional Extra properties
 const testModule = defineModule({
-  metadata: { packageName: '@test/module', packagePath: 'src/test.ts' },
+  metadata: { package_name: '@test/module', package_file: 'src/test.ts' },
   logSchema: {
     userId: S.category(),
   },
@@ -99,7 +99,7 @@ describe('TraceContext Type Enforcement', () => {
 describe('Extra Type Flow Through Builder Chain', () => {
   it('should preserve Extra type through .ctx().make() chain', () => {
     const module = defineModule({
-      metadata: { packageName: '@test/flow', packagePath: 'src/flow.ts' },
+      metadata: { package_name: '@test/flow', package_file: 'src/flow.ts' },
       logSchema: {},
     })
       .ctx<{
@@ -123,7 +123,7 @@ describe('Extra Type Flow Through Builder Chain', () => {
   it('should preserve Extra type when .make() is called without .ctx()', () => {
     // When .ctx() is not called, Extra defaults to Record<string, unknown>
     const module = defineModule({
-      metadata: { packageName: '@test/no-ctx', packagePath: 'src/no-ctx.ts' },
+      metadata: { package_name: '@test/no-ctx', package_file: 'src/no-ctx.ts' },
       logSchema: {},
     });
 
@@ -147,15 +147,15 @@ describe('Reserved Keys Enforcement', () => {
 
     // These build but produce `never` for the reserved key, causing errors when used:
     const badTraceIdModule = defineModule({
-      metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+      metadata: { package_name: '@test/bad', package_file: 'test.ts' },
       logSchema: {},
-    }).ctx<{ traceId: string }>({
+    }).ctx<{ trace_id: string }>({
       // @ts-expect-error Type 'null' is not assignable to type 'never'
-      traceId: null!,
+      trace_id: null!,
     });
 
     const badFfModule = defineModule({
-      metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+      metadata: { package_name: '@test/bad', package_file: 'test.ts' },
       logSchema: {},
     }).ctx<{ ff: string }>({
       // @ts-expect-error Type 'null' is not assignable to type 'never'
@@ -163,7 +163,7 @@ describe('Reserved Keys Enforcement', () => {
     });
 
     const badSpanModule = defineModule({
-      metadata: { packageName: '@test/bad', packagePath: 'test.ts' },
+      metadata: { package_name: '@test/bad', package_file: 'test.ts' },
       logSchema: {},
     }).ctx<{ span: () => void }>({
       // @ts-expect-error Type 'null' is not assignable to type 'never'

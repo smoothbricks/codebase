@@ -72,10 +72,8 @@ export type RootSpanFn = {
  */
 export interface TraceContextSystem<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown> {
   // System properties (always present, auto-generated)
-  readonly traceId: TraceId;
   readonly anchorEpochMicros: number; // Nanoseconds.now() / 1000n at trace root (microsecond precision)
   readonly anchorPerfNow: number; // performance.now() at trace root
-  readonly threadId: bigint; // 64-bit random ID per worker/process
   /** Root flag evaluator - use forContext(spanCtx) to get span-bound evaluator */
   readonly ff: FlagEvaluator<T, FF, Env>;
   readonly span: RootSpanFn;
@@ -121,13 +119,11 @@ export interface TraceContextBase {
   /** Marker for prototype chain detection */
   readonly [TRACE_CONTEXT_MARKER]: true;
   /** Trace ID for this context */
-  traceId: TraceId;
   /** Epoch microseconds when trace started */
   anchorEpochMicros: number;
   /** performance.now() when trace started */
   anchorPerfNow: number;
   /** 64-bit random ID per worker/process */
-  threadId: bigint;
   /** Feature flag evaluator */
   ff: unknown;
   /** Root span function */
@@ -144,10 +140,8 @@ export interface TraceContextBase {
  */
 export const TraceContextProto: TraceContextBase = {
   [TRACE_CONTEXT_MARKER]: true,
-  traceId: undefined as unknown as TraceId,
   anchorEpochMicros: undefined as unknown as number,
   anchorPerfNow: undefined as unknown as number,
-  threadId: undefined as unknown as bigint,
   ff: undefined,
   span: undefined,
 };
