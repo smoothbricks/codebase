@@ -195,11 +195,11 @@ export type ColumnBuffer<Schema> = AnyColumnBuffer & {
 } & {
   readonly [K in keyof FilterSchemaFields<ExtractFields<Schema>> as `${K & string}_nulls`]: Uint8Array;
 } & {
-  // Schema-specific setter methods (return AnyColumnBuffer for variance compatibility)
+  // Schema-specific setter methods (return this for method chaining)
   [K in keyof FilterSchemaFields<ExtractFields<Schema>>]: (
     pos: number,
     val: SetterValueType<FilterSchemaFields<ExtractFields<Schema>>[K]>,
-  ) => AnyColumnBuffer;
+  ) => ColumnBuffer<Schema>;
 };
 
 /**

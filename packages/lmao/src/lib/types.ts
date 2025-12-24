@@ -355,9 +355,9 @@ export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
 } & {
   readonly [K in keyof FilterSchemaFields<T['fields']> as `${K & string}_nulls`]: Uint8Array;
 } & {
-  // Schema-specific setter methods (return AnySpanBuffer for variance)
+  // Schema-specific setter methods (return this for method chaining)
   [K in keyof FilterSchemaFields<T['fields']>]: (
     pos: number,
     val: SetterValueType<FilterSchemaFields<T['fields']>[K]>,
-  ) => AnySpanBuffer;
+  ) => SpanBuffer<T>;
 };

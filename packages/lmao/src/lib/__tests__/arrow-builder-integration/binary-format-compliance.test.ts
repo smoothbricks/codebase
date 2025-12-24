@@ -1,11 +1,11 @@
 import { describe, expect, it } from 'bun:test';
 import * as arrow from 'apache-arrow';
-import { convertToArrowTable } from '../../convertToArrow';
-import { S } from '../../schema/builder';
-import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema';
-import { createSpanBuffer } from '../../spanBuffer';
-import { createTraceId } from '../../traceId';
-import { createTestLogBinding } from '../test-helpers';
+import { convertToArrowTable } from '../../convertToArrow.js';
+import { S } from '../../schema/builder.js';
+import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
+import { createSpanBuffer } from '../../spanBuffer.js';
+import { createTraceId } from '../../traceId.js';
+import { createTestLogBinding } from '../test-helpers.js';
 
 describe('Arrow Binary Format Compliance', () => {
   describe('IPC Message Structure', () => {
