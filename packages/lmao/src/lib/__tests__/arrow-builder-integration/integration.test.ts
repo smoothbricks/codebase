@@ -137,7 +137,7 @@ describe('Buffer Integration', () => {
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
     // Dynamic fluent API - schema methods are generated at runtime and can't be typed statically
-    (writer._nextRow() as any).userId('user-12345').plainUserId('user-12345');
+    (writer.nextRow() as any).userId('user-12345').plainUserId('user-12345');
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
@@ -177,7 +177,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    (writer._nextRow() as any)
+    (writer.nextRow() as any)
       .email('john@example.com')
       .sqlQuery("SELECT * FROM users WHERE id = 123 AND name = 'test'")
       .plainText('Plain unmasked text');
@@ -223,7 +223,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    (writer._nextRow() as any).secretKey('sk_live_abcd1234efgh5678');
+    (writer.nextRow() as any).secretKey('sk_live_abcd1234efgh5678');
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
@@ -286,7 +286,7 @@ describe('Buffer Integration', () => {
 
       // Use ColumnWriter API to write data (more robust than direct array access)
       const writer = createColumnWriter(schema, buffer);
-      (writer._nextRow() as any)
+      (writer.nextRow() as any)
         .userId('user-123')
         .operation(1) // Use numeric value for POST (index 1 in ['GET', 'POST'])
         .httpStatus(200)
@@ -313,11 +313,7 @@ describe('Buffer Integration', () => {
         requestId: S.category(),
       });
 
-      const module = createTestLogBinding(schema, {
-        git_sha: 'test-sha-123',
-        package_name: '@test/package',
-        package_file: 'src/integration.test.ts',
-      });
+      const module = createTestLogBinding(schema);
 
       const buffer = createSpanBuffer(schema, module, 'context-integration');
 

@@ -20,7 +20,7 @@
 
 import type { FluentLogEntry as FluentLogEntryFromGenerator } from '../codegen/spanLoggerGenerator.js';
 import type { FluentErr, FluentOk, Result } from '../result.js';
-import type { FeatureFlagEvaluator } from '../schema/evaluator.js';
+import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { InferSchema } from '../schema/types.js';
 import type { SpanBuffer } from '../types.js';
@@ -275,7 +275,7 @@ export type SpanContext<Ctx extends OpContext> = {
    * - Logs flag access to span automatically
    * - Type-safe evaluation with context
    */
-  ff: FeatureFlagEvaluator<Ctx['flags']>;
+  ff: FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
 
   /**
    * Dependencies - can be destructured!

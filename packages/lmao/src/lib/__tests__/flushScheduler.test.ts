@@ -11,10 +11,10 @@ import {
   FlushSchedulerTestUtils,
 } from '../flushScheduler.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 import { createTestLogBinding, createTestSchema } from './test-helpers.js';
 
-function createTestBuffer(): SpanBuffer {
+function createTestBuffer(): AnySpanBuffer {
   const schema = createTestSchema({});
   const module = createTestLogBinding(schema);
   const buffer = createSpanBuffer(schema, module, 'test-span');
@@ -131,7 +131,7 @@ describe('FlushScheduler', () => {
         const { timestamp: _timestamps, ...partialBuffer } = buffer;
 
         expect(() => {
-          scheduler.register(partialBuffer as SpanBuffer);
+          scheduler.register(partialBuffer as AnySpanBuffer);
         }).not.toThrow();
       });
     });
@@ -318,7 +318,7 @@ describe('FlushScheduler', () => {
           // Create a partial buffer missing timestamps to test error handling
           const { timestamp: _timestamps, ...partialBuffer } = buffer;
 
-          scheduler.register(partialBuffer as SpanBuffer);
+          scheduler.register(partialBuffer as AnySpanBuffer);
 
           // Should complete without throwing (error is caught and logged)
           await scheduler.flush();

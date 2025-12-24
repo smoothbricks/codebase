@@ -5,8 +5,7 @@ import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
 import { type BooleanFlagContext, InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../../schema/systemSchema.js';
 import type { LogSchema } from '../../schema/types.js';
-import type { SpanContext } from '../../spanContext.js';
-import type { SpanBuffer } from '../../types.js';
+import type { AnySpanBuffer, SpanBuffer } from '../../types.js';
 import { createEvaluatorClass, generateEvaluatorClass } from '../evaluatorGenerator.js';
 import { createSpanLogger } from '../spanLoggerGenerator.js';
 
@@ -24,7 +23,7 @@ function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): 
   const logger = createSpanLogger(schema, spanBuffer);
 
   // Mock SpanContext with the essential properties
-  const mockCtx = {
+  return {
     _buffer: spanBuffer,
     get buffer() {
       return spanBuffer;
@@ -47,9 +46,7 @@ function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): 
     span: () => Promise.resolve(undefined),
     span_op: () => Promise.resolve(undefined),
     span_fn: () => Promise.resolve(undefined),
-  } as unknown as SpanContext<T, any, any>;
-
-  return mockCtx;
+  };
 }
 
 describe('EvaluatorGenerator', () => {
@@ -447,9 +444,9 @@ describe('generateEvaluatorClass snapshots', () => {
 /**
  * Helper to count entries of a specific type in the buffer
  */
-function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
+function countEntryType(buffer: AnySpanBuffer, entryType: number): number {
   let count = 0;
-  let current: SpanBuffer<any> | undefined = buffer;
+  let current: AnySpanBuffer | undefined = buffer;
   while (current) {
     const writeIndex = current._writeIndex;
     for (let i = 0; i < writeIndex; i++) {

@@ -51,17 +51,18 @@ describe('Timestamp implementations and Nanoseconds.now assignment', () => {
 describe('Node.js Timestamp (process.hrtime.bigint)', () => {
   it('should return a bigint', async () => {
     const nodeModule = await import('../timestamp.node.js');
-    const nodeGetTimestamp = nodeModule.getTimestampNanos;
-    const ts = nodeGetTimestamp();
+    const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
+    const ts = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
     expect(typeof ts).toBe('bigint');
   });
 
   it('should return increasing timestamps', async () => {
     const nodeModule = await import('../timestamp.node.js');
-    const nodeGetTimestamp = nodeModule.getTimestampNanos;
-    const ts1 = nodeGetTimestamp();
+    const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
+
+    const ts1 = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
     await new Promise((r) => setTimeout(r, 10));
-    const ts2 = nodeGetTimestamp();
+    const ts2 = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
 
     expect(ts2).toBeGreaterThan(ts1);
     // Should be roughly 10ms apart
@@ -72,12 +73,12 @@ describe('Node.js Timestamp (process.hrtime.bigint)', () => {
 
   it('should be within 1ms of Date.now()', async () => {
     const nodeModule = await import('../timestamp.node.js');
-    const nodeGetTimestamp = nodeModule.getTimestampNanos;
     // Sample multiple times and check they're all close
     // Node.js anchor may be up to 1ms off due to Date.now() millisecond precision
     for (let i = 0; i < 10; i++) {
+      const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
       const dateNowMs = Date.now();
-      const ts = nodeGetTimestamp();
+      const ts = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
       const tsMs = Nanoseconds.toMillis(ts);
 
       const diffMs = Math.abs(tsMs - dateNowMs);
@@ -87,12 +88,12 @@ describe('Node.js Timestamp (process.hrtime.bigint)', () => {
 
   it('should have sub-millisecond precision (true nanoseconds)', async () => {
     const nodeModule = await import('../timestamp.node.js');
-    const nodeGetTimestamp = nodeModule.getTimestampNanos;
+    const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
     const timestamps: bigint[] = [];
 
     // Rapid-fire timestamps
     for (let i = 0; i < 100; i++) {
-      timestamps.push(nodeGetTimestamp());
+      timestamps.push(nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow));
     }
 
     // Should see sub-millisecond differences (< 1_000_000 nanoseconds)
@@ -111,17 +112,18 @@ describe('Node.js Timestamp (process.hrtime.bigint)', () => {
 describe('Browser Timestamp (performance.now)', () => {
   it('should return a bigint', async () => {
     const browserModule = await import('../timestamp.js');
-    const browserGetTimestamp = browserModule.getTimestampNanos;
-    const ts = browserGetTimestamp();
+    const { anchorEpochNanos, anchorPerfNow } = browserModule.createTimestampAnchor();
+    const ts = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
     expect(typeof ts).toBe('bigint');
   });
 
   it('should return increasing timestamps', async () => {
     const browserModule = await import('../timestamp.js');
-    const browserGetTimestamp = browserModule.getTimestampNanos;
-    const ts1 = browserGetTimestamp();
+    const { anchorEpochNanos, anchorPerfNow } = browserModule.createTimestampAnchor();
+
+    const ts1 = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
     await new Promise((r) => setTimeout(r, 10));
-    const ts2 = browserGetTimestamp();
+    const ts2 = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
 
     expect(ts2).toBeGreaterThan(ts1);
     // Should be roughly 10ms apart
@@ -132,11 +134,11 @@ describe('Browser Timestamp (performance.now)', () => {
 
   it('should be within 1ms of Date.now()', async () => {
     const browserModule = await import('../timestamp.js');
-    const browserGetTimestamp = browserModule.getTimestampNanos;
     // Sample multiple times and check they're all close
     for (let i = 0; i < 10; i++) {
+      const { anchorEpochNanos, anchorPerfNow } = browserModule.createTimestampAnchor();
       const dateNowMs = Date.now();
-      const ts = browserGetTimestamp();
+      const ts = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
       const tsMs = Nanoseconds.toMillis(ts);
 
       const diffMs = Math.abs(tsMs - dateNowMs);

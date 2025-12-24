@@ -45,8 +45,7 @@ describe('Tracer', () => {
         return { success: true, data: 'hello' };
       });
 
-      expect(result.success).toBe(true);
-      expect(result.value).toEqual({ success: true, data: 'hello' });
+      expect(result).toEqual({ success: true, data: 'hello' });
       expect(tracer.pendingCount).toBe(1);
     });
 

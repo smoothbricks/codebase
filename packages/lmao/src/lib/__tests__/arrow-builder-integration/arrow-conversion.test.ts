@@ -281,8 +281,13 @@ describe('Arrow Table Conversion', () => {
       parentBuffer._writeIndex = 1;
 
       // Create child span and register with parent
-      const childBuffer = createChildSpanBuffer(parentBuffer, module, 'child-span', DEFAULT_METADATA);
-      parentBuffer._children.push(childBuffer); // Explicit registration per spanBuffer.ts
+      const childBuffer = createChildSpanBuffer(
+        parentBuffer,
+        module as any,
+        'child-span',
+        DEFAULT_METADATA,
+      ) as SpanBuffer<typeof schema>;
+      parentBuffer._children.push(childBuffer as any); // Explicit registration per spanBuffer.ts
 
       childBuffer.timestamp[0] = 1500n;
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;

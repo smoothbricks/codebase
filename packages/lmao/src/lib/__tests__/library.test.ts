@@ -169,11 +169,12 @@ describe('Library Integration Pattern', () => {
 
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      // Create a mock column to test mapping
-      const mockColumn = { values: new Float64Array(1), nulls: new Uint8Array(1) };
+      // Create mock column arrays to test mapping
+      const mockValues = new Float64Array(1);
+      const mockNulls = new Uint8Array(1);
       const mockBuffer = {
-        getColumnIfAllocated: (name: string) => (name === 'status' ? mockColumn : undefined),
-        getNullsIfAllocated: (name: string) => (name === 'status' ? mockColumn : undefined),
+        getColumnIfAllocated: (name: string) => (name === 'status' ? mockValues : undefined),
+        getNullsIfAllocated: (name: string) => (name === 'status' ? mockNulls : undefined),
         _children: [],
         _writeIndex: 0,
         timestamp: new BigInt64Array(1),
@@ -200,8 +201,8 @@ describe('Library Integration Pattern', () => {
       const view = new ViewClass(mockBuffer);
 
       // Should map prefixed to unprefixed
-      expect(view.getColumnIfAllocated('http_status')).toBe(mockColumn);
-      expect(view.getNullsIfAllocated('http_status')).toBe(mockColumn);
+      expect(view.getColumnIfAllocated('http_status')).toBe(mockValues);
+      expect(view.getNullsIfAllocated('http_status')).toBe(mockNulls);
 
       // Should pass through unknown names
       expect(view.getColumnIfAllocated('unknown')).toBeUndefined();
@@ -411,8 +412,8 @@ describe('Module Builder Pattern Integration', () => {
       expect(httpOpGroup.logSchema.fieldNames).toContain('method');
 
       // Verify that prefix was applied (check mapping)
-      expect(prefixedHttpOpGroup._columnMapping['status']).toBe('http_status');
-      expect(prefixedHttpOpGroup._columnMapping['method']).toBe('http_method');
+      expect(prefixedHttpOpGroup.columnMapping['status']).toBe('http_status');
+      expect(prefixedHttpOpGroup.columnMapping['method']).toBe('http_method');
     });
 
     it('should support prefix chaining', () => {
@@ -420,8 +421,8 @@ describe('Module Builder Pattern Integration', () => {
       const doublePrefixed = httpOpGroup.prefix('api').prefix('v1');
 
       // Verify both prefixes are in the mapping
-      expect(doublePrefixed._columnMapping['status']).toBe('v1_api_status');
-      expect(doublePrefixed._columnMapping['method']).toBe('v1_api_method');
+      expect(doublePrefixed.columnMapping['status']).toBe('v1_api_status');
+      expect(doublePrefixed.columnMapping['method']).toBe('v1_api_method');
     });
 
     it('should handle different field types with prefixing', () => {
@@ -439,11 +440,11 @@ describe('Module Builder Pattern Integration', () => {
       const prefixed = complexOpGroup.prefix('complex');
 
       // Verify all field types are mapped with prefix
-      expect(prefixed._columnMapping['enumField']).toBe('complex_enumField');
-      expect(prefixed._columnMapping['categoryField']).toBe('complex_categoryField');
-      expect(prefixed._columnMapping['textField']).toBe('complex_textField');
-      expect(prefixed._columnMapping['numberField']).toBe('complex_numberField');
-      expect(prefixed._columnMapping['booleanField']).toBe('complex_booleanField');
+      expect(prefixed.columnMapping['enumField']).toBe('complex_enumField');
+      expect(prefixed.columnMapping['categoryField']).toBe('complex_categoryField');
+      expect(prefixed.columnMapping['textField']).toBe('complex_textField');
+      expect(prefixed.columnMapping['numberField']).toBe('complex_numberField');
+      expect(prefixed.columnMapping['booleanField']).toBe('complex_booleanField');
     });
 
     it('should preserve schema metadata in prefixed OpGroups', () => {
@@ -466,9 +467,9 @@ describe('Module Builder Pattern Integration', () => {
 
       expect(mappedHttp).toBeDefined();
       // Verify the mappings are set
-      expect(mappedHttp._columnMapping['status']).toBe('http_status');
-      expect(mappedRetry._columnMapping['attempt']).toBe('http_retry_attempt');
-      expect(mappedRetry._columnMapping['delay']).toBe('http_retry_delay');
+      expect(mappedHttp.columnMapping['status']).toBe('http_status');
+      expect(mappedRetry.columnMapping['attempt']).toBe('http_retry_attempt');
+      expect(mappedRetry.columnMapping['delay']).toBe('http_retry_delay');
     });
 
     it('should support multiple OpGroups with different prefixes', () => {
@@ -486,9 +487,9 @@ describe('Module Builder Pattern Integration', () => {
       expect(mappedRetry).toBeDefined();
 
       // Verify each has correct mappings
-      expect(mappedHttp._columnMapping['status']).toBe('http_status');
-      expect(mappedDb._columnMapping['query']).toBe('db_query');
-      expect(mappedRetry._columnMapping['attempt']).toBe('shared_retry_attempt');
+      expect(mappedHttp.columnMapping['status']).toBe('http_status');
+      expect(mappedDb.columnMapping['query']).toBe('db_query');
+      expect(mappedRetry.columnMapping['attempt']).toBe('shared_retry_attempt');
     });
 
     it('should handle dependency chains', () => {
@@ -501,8 +502,8 @@ describe('Module Builder Pattern Integration', () => {
 
       expect(wiredHttp).toBeDefined();
       expect(nestedRetry).toBeDefined();
-      expect(nestedRetry._columnMapping['attempt']).toBe('http_retry_nested_attempt');
-      expect(nestedRetry._columnMapping['delay']).toBe('http_retry_nested_delay');
+      expect(nestedRetry.columnMapping['attempt']).toBe('http_retry_nested_attempt');
+      expect(nestedRetry.columnMapping['delay']).toBe('http_retry_nested_delay');
     });
 
     it('should maintain type safety in OpGroup composition', () => {
@@ -618,10 +619,10 @@ describe('Library Composition Scenarios', () => {
       const prefixedHttp = httpOpGroup.prefix('http');
 
       // Verify that the mapping has all http fields
-      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
-      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
-      expect(prefixedHttp._columnMapping['url']).toBe('http_url');
-      expect(prefixedHttp._columnMapping['duration']).toBe('http_duration');
+      expect(prefixedHttp.columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp.columnMapping['method']).toBe('http_method');
+      expect(prefixedHttp.columnMapping['url']).toBe('http_url');
+      expect(prefixedHttp.columnMapping['duration']).toBe('http_duration');
     });
 
     it('should maintain separate namespaces with multiple OpGroups', () => {
@@ -638,11 +639,11 @@ describe('Library Composition Scenarios', () => {
       const prefixedDb = dbOpGroup.prefix('db');
 
       // Each library should have its own prefix
-      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
-      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
-      expect(prefixedDb._columnMapping['query']).toBe('db_query');
-      expect(prefixedDb._columnMapping['duration']).toBe('db_duration');
-      expect(prefixedDb._columnMapping['rows']).toBe('db_rows');
+      expect(prefixedHttp.columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp.columnMapping['method']).toBe('http_method');
+      expect(prefixedDb.columnMapping['query']).toBe('db_query');
+      expect(prefixedDb.columnMapping['duration']).toBe('db_duration');
+      expect(prefixedDb.columnMapping['rows']).toBe('db_rows');
     });
   });
 
@@ -662,14 +663,14 @@ describe('Library Composition Scenarios', () => {
       // Retry prefixed with 'http_retry'
       const prefixedRetry = retryOpGroup.prefix('http_retry');
 
-      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
-      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
-      expect(prefixedHttp._columnMapping['url']).toBe('http_url');
-      expect(prefixedHttp._columnMapping['duration']).toBe('http_duration');
+      expect(prefixedHttp.columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp.columnMapping['method']).toBe('http_method');
+      expect(prefixedHttp.columnMapping['url']).toBe('http_url');
+      expect(prefixedHttp.columnMapping['duration']).toBe('http_duration');
 
       // Retry dependency fields should be present with prefix
-      expect(prefixedRetry._columnMapping['attempt']).toBe('http_retry_attempt');
-      expect(prefixedRetry._columnMapping['delay']).toBe('http_retry_delay');
+      expect(prefixedRetry.columnMapping['attempt']).toBe('http_retry_attempt');
+      expect(prefixedRetry.columnMapping['delay']).toBe('http_retry_delay');
     });
 
     it('should handle multiple prefix chains', () => {
@@ -688,13 +689,13 @@ describe('Library Composition Scenarios', () => {
       const sharedRetry = retryOpGroup.prefix('shared_auth_retry');
 
       // Verify each mapping is correct
-      expect(retryForHttp._columnMapping['attempt']).toBe('http_retry_attempt');
-      expect(retryForAuth._columnMapping['attempt']).toBe('http_auth_retry_attempt');
-      expect(sharedRetry._columnMapping['attempt']).toBe('shared_auth_retry_attempt');
+      expect(retryForHttp.columnMapping['attempt']).toBe('http_retry_attempt');
+      expect(retryForAuth.columnMapping['attempt']).toBe('http_auth_retry_attempt');
+      expect(sharedRetry.columnMapping['attempt']).toBe('shared_auth_retry_attempt');
 
       // HTTP stays prefixed with 'http'
       const prefixedHttp = httpOpGroup.prefix('http');
-      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp.columnMapping['status']).toBe('http_status');
     });
   });
 
@@ -735,17 +736,17 @@ describe('Library Composition Scenarios', () => {
       expect(sharedCache).toBeDefined();
 
       // Verify all mappings are correct
-      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
-      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
-      expect(prefixedDb._columnMapping['query']).toBe('db_query');
-      expect(prefixedDb._columnMapping['duration']).toBe('db_duration');
-      expect(prefixedDb._columnMapping['rows']).toBe('db_rows');
-      expect(sharedRetry._columnMapping['attempt']).toBe('shared_retry_attempt');
-      expect(sharedRetry._columnMapping['delay']).toBe('shared_retry_delay');
-      expect(sharedCache._columnMapping['hits']).toBe('shared_cache_hits');
-      expect(sharedCache._columnMapping['misses']).toBe('shared_cache_misses');
-      expect(dbCache._columnMapping['hits']).toBe('db_cache_hits');
-      expect(dbCache._columnMapping['misses']).toBe('db_cache_misses');
+      expect(prefixedHttp.columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp.columnMapping['method']).toBe('http_method');
+      expect(prefixedDb.columnMapping['query']).toBe('db_query');
+      expect(prefixedDb.columnMapping['duration']).toBe('db_duration');
+      expect(prefixedDb.columnMapping['rows']).toBe('db_rows');
+      expect(sharedRetry.columnMapping['attempt']).toBe('shared_retry_attempt');
+      expect(sharedRetry.columnMapping['delay']).toBe('shared_retry_delay');
+      expect(sharedCache.columnMapping['hits']).toBe('shared_cache_hits');
+      expect(sharedCache.columnMapping['misses']).toBe('shared_cache_misses');
+      expect(dbCache.columnMapping['hits']).toBe('db_cache_hits');
+      expect(dbCache.columnMapping['misses']).toBe('db_cache_misses');
     });
 
     it('should handle different prefix patterns', () => {
@@ -772,12 +773,12 @@ describe('Library Composition Scenarios', () => {
       expect(prefixedDb).toBeDefined();
 
       // Verify that both retry prefixes are available
-      expect(fastRetry._columnMapping['attempt']).toBe('fast_retry_attempt');
-      expect(slowRetry._columnMapping['attempt']).toBe('slow_retry_attempt');
+      expect(fastRetry.columnMapping['attempt']).toBe('fast_retry_attempt');
+      expect(slowRetry.columnMapping['attempt']).toBe('slow_retry_attempt');
 
       // HTTP and DB have their own prefixes
-      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
-      expect(prefixedDb._columnMapping['query']).toBe('db_query');
+      expect(prefixedHttp.columnMapping['status']).toBe('http_status');
+      expect(prefixedDb.columnMapping['query']).toBe('db_query');
     });
   });
 });

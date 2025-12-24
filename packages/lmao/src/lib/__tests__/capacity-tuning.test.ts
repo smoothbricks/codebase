@@ -1,24 +1,31 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
-import { shouldTuneCapacity } from '../defineModule.js';
-import { ModuleContext } from '../moduleContext.js';
+import { shouldTuneCapacity } from '../capacityTuning.js';
+import type { LogBinding } from '../logBinding.js';
+import { LogSchema } from '../schema/LogSchema.js';
 
 /**
- * Mock ModuleContext for testing capacity tuning
- * Uses sb_* properties as per ModuleContext design
+ * Create a mock LogBinding for testing capacity tuning.
+ * Uses sb_* properties as per LogBinding interface.
  */
-class MockModuleContext extends ModuleContext {
-  constructor() {
-    super('test-sha', 'test-package', 'test-path', {});
-  }
+function createMockLogBinding(): LogBinding {
+  return {
+    logSchema: new LogSchema({}),
+    remappedViewClass: undefined,
+    sb_capacity: DEFAULT_BUFFER_CAPACITY,
+    sb_totalWrites: 0,
+    sb_overflowWrites: 0,
+    sb_totalCreated: 0,
+    sb_overflows: 0,
+  };
 }
 
 describe('Capacity Tuning Algorithm', () => {
-  let module: MockModuleContext;
+  let module: LogBinding;
 
   beforeEach(() => {
-    module = new MockModuleContext();
+    module = createMockLogBinding();
   });
 
   describe('shouldTuneCapacity - Success Cases', () => {

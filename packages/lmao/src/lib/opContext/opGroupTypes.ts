@@ -161,12 +161,25 @@ export interface MappedOpGroup<Ctx extends OpContext, ContributedSchema extends 
 // =============================================================================
 
 /**
- * Any OpGroup (mapped or not) that can be used as a dependency
+ * Minimal structural interface for any OpGroup.
+ *
+ * This captures only the properties we need to read from an OpGroup
+ * in dependency wiring. By using a minimal interface with covariant
+ * properties (readonly), TypeScript allows specific OpGroup<Ctx>
+ * variants to be assigned to this type.
  */
-export type AnyOpGroup = OpGroup<OpContext> | MappedOpGroup<OpContext, SchemaFields>;
+export interface AnyOpGroup {
+  /** The log schema - read-only access for wiring */
+  readonly logSchema: LogSchema;
+  /** The ops - read-only access for wiring */
+  readonly ops: Record<string, unknown>;
+}
 
 /**
  * Type for deps config - maps names to OpGroups (optionally mapped)
+ *
+ * This is used as a constraint (`Deps extends DepsConfig`) so it needs
+ * to be wide enough to accept any specific deps configuration.
  */
 export type DepsConfig = Record<string, AnyOpGroup>;
 

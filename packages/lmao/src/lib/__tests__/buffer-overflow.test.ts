@@ -6,7 +6,7 @@ import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createOverflowBuffer, createSpanBuffer } from '../spanBuffer.js';
-import type { LogBinding, SpanBuffer } from '../types.js';
+import type { AnySpanBuffer, LogBinding } from '../types.js';
 import { createTestLogBinding } from './test-helpers.js';
 
 /**
@@ -54,7 +54,7 @@ function createTestLogBindingWithDefaults(capacity?: number): LogBinding {
 /**
  * Helper: Count buffers in chain and collect total entries
  */
-function analyzeBufferChain(rootBuffer: SpanBuffer): {
+function analyzeBufferChain(rootBuffer: AnySpanBuffer): {
   bufferCount: number;
   totalEntries: number;
   writeIndices: number[];
@@ -62,13 +62,13 @@ function analyzeBufferChain(rootBuffer: SpanBuffer): {
   const writeIndices: number[] = [];
   let bufferCount = 0;
   let totalEntries = 0;
-  let current: SpanBuffer | undefined = rootBuffer;
+  let current: AnySpanBuffer | undefined = rootBuffer;
 
   while (current) {
     bufferCount++;
     writeIndices.push(current._writeIndex);
     totalEntries += current._writeIndex;
-    current = current._overflow as SpanBuffer | undefined;
+    current = current._overflow as AnySpanBuffer | undefined;
   }
 
   return { bufferCount, totalEntries, writeIndices };
@@ -78,7 +78,7 @@ function analyzeBufferChain(rootBuffer: SpanBuffer): {
  * Helper: Collect all entries from buffer chain
  */
 function collectEntries(
-  rootBuffer: SpanBuffer,
+  rootBuffer: AnySpanBuffer,
   startRow = 0,
 ): Array<{
   bufferIndex: number;
@@ -98,7 +98,7 @@ function collectEntries(
   }> = [];
 
   let bufferIndex = 0;
-  let current: SpanBuffer | undefined = rootBuffer;
+  let current: AnySpanBuffer | undefined = rootBuffer;
 
   while (current) {
     // First buffer starts at startRow, subsequent buffers start at 0
@@ -117,7 +117,7 @@ function collectEntries(
     }
 
     bufferIndex++;
-    current = current._overflow as SpanBuffer | undefined;
+    current = current._overflow as AnySpanBuffer | undefined;
   }
 
   return entries;
@@ -226,11 +226,11 @@ describe('Buffer Overflow Property Tests', () => {
           }
 
           // Walk the chain and verify each link
-          const buffers: SpanBuffer[] = [];
-          let current: SpanBuffer | undefined = buffer;
+          const buffers: AnySpanBuffer[] = [];
+          let current: AnySpanBuffer | undefined = buffer;
           while (current) {
             buffers.push(current);
-            current = current._overflow as SpanBuffer | undefined;
+            current = current._overflow as AnySpanBuffer | undefined;
           }
 
           // Property: each buffer (except last) has next pointing to following buffer
@@ -334,13 +334,13 @@ describe('Buffer Overflow Property Tests', () => {
           }
 
           // Walk chain and check each buffer
-          let current: SpanBuffer | undefined = buffer;
+          let current: AnySpanBuffer | undefined = buffer;
           while (current) {
             // Property: writeIndex <= capacity
             expect(current._writeIndex).toBeLessThanOrEqual(current._capacity);
             // Property: writeIndex >= 0
             expect(current._writeIndex).toBeGreaterThanOrEqual(0);
-            current = current._overflow as SpanBuffer | undefined;
+            current = current._overflow as AnySpanBuffer | undefined;
           }
         }),
         { numRuns: 100 },

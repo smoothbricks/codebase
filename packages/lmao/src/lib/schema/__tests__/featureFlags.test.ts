@@ -1,60 +1,18 @@
 import { describe, expect, test } from 'bun:test';
-import { createTestSchema, createTestSpanBuffer } from '../../__tests__/test-helpers.js';
-import { createSpanLogger } from '../../codegen/spanLoggerGenerator.js';
-import type { SpanContext } from '../../spanContext.js';
-import type { SpanBuffer } from '../../types.js';
+import { defineOpContext } from '../../defineOpContext.js';
+import type { AnySpanBuffer } from '../../types.js';
 import { S } from '../builder.js';
 import { defineFeatureFlags } from '../defineFeatureFlags.js';
-import {
-  type BooleanFlagContext,
-  FeatureFlagEvaluator,
-  InMemoryFlagEvaluator,
-  type VariantFlagContext,
-} from '../evaluator.js';
+import { defineLogSchema } from '../defineLogSchema.js';
+import { type BooleanFlagContext, InMemoryFlagEvaluator, type VariantFlagContext } from '../evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../systemSchema.js';
-import type { LogSchema } from '../types.js';
-
-/**
- * Create a mock SpanContext for testing FeatureFlagEvaluator
- */
-function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): SpanContext<T, any, any> {
-  // Create a real SpanLogger for the buffer using the schema from module
-  const schema = spanBuffer._logBinding.logSchema as T;
-  const logger = createSpanLogger(schema, spanBuffer);
-
-  const mockCtx = {
-    _buffer: spanBuffer,
-    get buffer() {
-      return spanBuffer;
-    },
-    log: logger,
-    ff: null as any,
-    env: {},
-    deps: {},
-    tag: {} as any,
-    scope: spanBuffer._scopeValues || {},
-    setScope: (attrs: any) => {
-      if (!spanBuffer._scopeValues) {
-        spanBuffer._scopeValues = {};
-      }
-      Object.assign(spanBuffer._scopeValues, attrs);
-    },
-    ok: () => ({ success: true, value: undefined }),
-    err: () => ({ success: false, error: 'error' }),
-    span: () => Promise.resolve(undefined),
-    span_op: () => Promise.resolve(undefined),
-    span_fn: () => Promise.resolve(undefined),
-  } as unknown as SpanContext<T, any, any>;
-
-  return mockCtx;
-}
 
 /**
  * Helper to count entries of a specific type in the buffer
  */
-function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
+function countEntryType(buffer: AnySpanBuffer, entryType: number): number {
   let count = 0;
-  let current: SpanBuffer<any> | null = buffer;
+  let current: AnySpanBuffer | undefined = buffer;
   while (current) {
     const writeIndex = current._writeIndex;
     for (let i = 0; i < writeIndex; i++) {
@@ -68,6 +26,9 @@ function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
 }
 
 describe('Feature Flags', () => {
+  // Define a minimal log schema for tests
+  const testLogSchema = defineLogSchema({});
+
   test('defines feature flags with sync/async markers', () => {
     const flags = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
@@ -81,180 +42,205 @@ describe('Feature Flags', () => {
     expect(flags.asyncFlags).toContain('userSpecificLimit');
   });
 
-  test('evaluator returns FlagContext for truthy flags', () => {
-    const schema = defineFeatureFlags({
+  test('evaluator returns FlagContext for truthy flags', async () => {
+    const flags = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
       maxRetries: S.number().default(3).sync(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, {
-      debugMode: true,
-      maxRetries: 5,
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
+        debugMode: true,
+        maxRetries: 5,
+      }),
     });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    const result = await trace.span('test-span', async (ctx) => {
+      // Cast ff to access typed properties (type inference limitation)
+      const ff = ctx.ff as unknown as {
+        debugMode: BooleanFlagContext | undefined;
+        maxRetries: { value: number; track: () => void } | undefined;
+      };
 
-    // New API: truthy flags return FlagContext wrappers
-    type FfWithFlags = typeof ff & {
-      debugMode: BooleanFlagContext | undefined;
-      maxRetries: { value: number; track: () => void } | undefined;
-    };
+      expect(ff.debugMode).toBeDefined();
+      expect(ff.debugMode?.value).toBe(true);
+      expect(typeof ff.debugMode?.track).toBe('function');
 
-    const debugMode = (ff as FfWithFlags).debugMode;
-    expect(debugMode).toBeDefined();
-    expect(debugMode?.value).toBe(true);
-    expect(typeof debugMode?.track).toBe('function');
+      expect(ff.maxRetries).toBeDefined();
+      expect(ff.maxRetries?.value).toBe(5);
+      expect(typeof ff.maxRetries?.track).toBe('function');
 
-    const maxRetries = (ff as FfWithFlags).maxRetries;
-    expect(maxRetries).toBeDefined();
-    expect(maxRetries?.value).toBe(5);
-    expect(typeof maxRetries?.track).toBe('function');
+      return ctx.ok(null);
+    });
+
+    expect(result.success).toBe(true);
   });
 
-  test('evaluator returns undefined for falsy flags', () => {
-    const schema = defineFeatureFlags({
+  test('evaluator returns undefined for falsy flags', async () => {
+    const flags = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
       userLimit: S.number().default(100).async(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, {}); // No flags set → null values
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {}), // No flags set → null values
+    });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
-
-    // New API: falsy flags (including false defaults) return undefined
-    type FfWithFlags = typeof ff & { debugMode: BooleanFlagContext | undefined };
-    expect((ff as FfWithFlags).debugMode).toBeUndefined();
+    const trace = createTrace({});
+    await trace.span('test-span', async (ctx) => {
+      const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
+      expect(ff.debugMode).toBeUndefined();
+      return ctx.ok(null);
+    });
   });
 
   test('async flags return FlagContext via get method', async () => {
-    const schema = defineFeatureFlags({
+    const flags = defineFeatureFlags({
       userSpecificLimit: S.number().default(100).async(),
       dynamicProvider: S.enum(['stripe', 'paypal']).default('stripe').async(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, {
-      userSpecificLimit: 200,
-      dynamicProvider: 'paypal',
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
+        userSpecificLimit: 200,
+        dynamicProvider: 'paypal',
+      }),
     });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    await trace.span('test-span', async (ctx) => {
+      // Async flags accessed via get() return FlagContext
+      const limit = (await ctx.ff.get('userSpecificLimit')) as { value: number; track: () => void };
+      expect(limit).toBeDefined();
+      expect(limit.value).toBe(200);
 
-    // Async flags accessed via get() return FlagContext
-    const limit = (await ff.get('userSpecificLimit')) as { value: number; track: () => void };
-    expect(limit).toBeDefined();
-    expect(limit.value).toBe(200);
+      const provider = (await ctx.ff.get('dynamicProvider')) as VariantFlagContext<string>;
+      expect(provider).toBeDefined();
+      expect(provider.value).toBe('paypal');
 
-    const provider = (await ff.get('dynamicProvider')) as VariantFlagContext<string>;
-    expect(provider).toBeDefined();
-    expect(provider.value).toBe('paypal');
+      return ctx.ok(null);
+    });
   });
 
-  test('trackUsage logs usage events to buffer', () => {
-    const schema = defineFeatureFlags({
+  test('trackUsage logs usage events to buffer', async () => {
+    const flags = defineFeatureFlags({
       advancedValidation: S.boolean().default(false).sync(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, {
-      advancedValidation: true,
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
+        advancedValidation: true,
+      }),
     });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    await trace.span('test-span', async (ctx) => {
+      (ctx.ff as { trackUsage: (flag: string, context: object) => void }).trackUsage('advancedValidation', {
+        action: 'validation_performed',
+        outcome: 'success',
+      });
 
-    ff.trackUsage('advancedValidation', {
-      action: 'validation_performed',
-      outcome: 'success',
+      // Check buffer for ff-usage entry
+      const usageCount = countEntryType(ctx.buffer, ENTRY_TYPE_FF_USAGE);
+      expect(usageCount).toBe(1);
+
+      return ctx.ok(null);
     });
-
-    // Check buffer for ff-usage entry
-    const usageCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_USAGE);
-    expect(usageCount).toBe(1);
   });
 
-  test('track() on FlagContext logs usage events', () => {
-    const schema = defineFeatureFlags({
+  test('track() on FlagContext logs usage events', async () => {
+    const flags = defineFeatureFlags({
       advancedValidation: S.boolean().default(false).sync(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, {
-      advancedValidation: true,
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
+        advancedValidation: true,
+      }),
     });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    await trace.span('test-span', async (ctx) => {
+      const ff = ctx.ff as unknown as { advancedValidation: BooleanFlagContext | undefined };
+      const flag = ff.advancedValidation;
 
-    // Access flag to get FlagContext
-    type FfWithFlags = typeof ff & { advancedValidation: BooleanFlagContext | undefined };
-    const flag = (ff as FfWithFlags).advancedValidation;
+      // Use track() on the flag context
+      flag?.track({ action: 'validation_performed', outcome: 'success' });
 
-    // Use track() on the flag context
-    flag?.track({ action: 'validation_performed', outcome: 'success' });
+      // Check buffer for ff-usage entry
+      const usageCount = countEntryType(ctx.buffer, ENTRY_TYPE_FF_USAGE);
+      expect(usageCount).toBe(1);
 
-    // Check buffer for ff-usage entry (access is logged automatically, usage is separate)
-    const usageCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_USAGE);
-    expect(usageCount).toBe(1);
+      return ctx.ok(null);
+    });
   });
 
-  test('sync flag access is logged only once per span', () => {
-    const schema = defineFeatureFlags({
+  test('sync flag access is logged only once per span', async () => {
+    const flags = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, { debugMode: true });
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { debugMode: true }),
+    });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    await trace.span('test-span', async (ctx) => {
+      const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
 
-    // Access the flag multiple times
-    type FfWithFlags = typeof ff & { debugMode: BooleanFlagContext | undefined };
-    const value1 = (ff as FfWithFlags).debugMode;
-    const value2 = (ff as FfWithFlags).debugMode;
-    const value3 = (ff as FfWithFlags).debugMode;
+      // Access the flag multiple times
+      const value1 = ff.debugMode;
+      const value2 = ff.debugMode;
+      const value3 = ff.debugMode;
 
-    // All accesses should return same value (flag is truthy)
-    expect(value1?.value).toBe(true);
-    expect(value2?.value).toBe(true);
-    expect(value3?.value).toBe(true);
+      // All accesses should return same value (flag is truthy)
+      expect(value1?.value).toBe(true);
+      expect(value2?.value).toBe(true);
+      expect(value3?.value).toBe(true);
 
-    // Only ONE ff-access log should be written (deduplication via buffer scan)
-    const accessCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_ACCESS);
-    expect(accessCount).toBe(1);
+      // Only ONE ff-access log should be written (deduplication via buffer scan)
+      const accessCount = countEntryType(ctx.buffer, ENTRY_TYPE_FF_ACCESS);
+      expect(accessCount).toBe(1);
+
+      return ctx.ok(null);
+    });
   });
 
   test('async flag access is logged', async () => {
-    const schema = defineFeatureFlags({
+    const flags = defineFeatureFlags({
       userLimit: S.number().default(100).async(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, { userLimit: 200 });
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { userLimit: 200 }),
+    });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    await trace.span('test-span', async (ctx) => {
+      const value = (await ctx.ff.get('userLimit')) as { value: number };
+      expect(value.value).toBe(200);
 
-    const value = (await ff.get('userLimit')) as { value: number };
+      // Check buffer for ff-access entry
+      const accessCount = countEntryType(ctx.buffer, ENTRY_TYPE_FF_ACCESS);
+      expect(accessCount).toBe(1);
 
-    expect(value.value).toBe(200);
-
-    // Check buffer for ff-access entry
-    const accessCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_ACCESS);
-    expect(accessCount).toBe(1);
+      return ctx.ok(null);
+    });
   });
 
   test('S.enum validates enum values', () => {
@@ -276,7 +262,7 @@ describe('Feature Flags', () => {
   });
 
   test('multiple sync and async flags work together', async () => {
-    const schema = defineFeatureFlags({
+    const flags = defineFeatureFlags({
       // Sync flags
       enableFeatureX: S.boolean().default(false).sync(),
       maxConnectionPool: S.number().default(10).sync(),
@@ -288,42 +274,42 @@ describe('Feature Flags', () => {
       userTier: S.category().default('free').async(),
       customLimit: S.number().default(100).async(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, {
-      enableFeatureX: true,
-      maxConnectionPool: 20,
-      logLevel: 'debug',
-      userTier: 'premium',
-      customLimit: 500,
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
+        enableFeatureX: true,
+        maxConnectionPool: 20,
+        logLevel: 'debug',
+        userTier: 'premium',
+        customLimit: 500,
+      }),
     });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    await trace.span('test-span', async (ctx) => {
+      const ff = ctx.ff as unknown as {
+        enableFeatureX: BooleanFlagContext | undefined;
+        maxConnectionPool: { value: number; track: () => void } | undefined;
+        logLevel: VariantFlagContext<string> | undefined;
+        get(flag: string): Promise<unknown>;
+      };
 
-    // Test sync flags - now return FlagContext wrappers
-    type FfWithFlags = typeof ff & {
-      enableFeatureX: BooleanFlagContext | undefined;
-      maxConnectionPool: { value: number; track: () => void } | undefined;
-      logLevel: VariantFlagContext<string> | undefined;
-    };
+      // Test sync flags
+      expect(ff.enableFeatureX?.value).toBe(true);
+      expect(ff.maxConnectionPool?.value).toBe(20);
+      expect(ff.logLevel?.value).toBe('debug');
 
-    const enableFeatureX = (ff as FfWithFlags).enableFeatureX;
-    expect(enableFeatureX?.value).toBe(true);
+      // Test async flags
+      const userTier = (await ff.get('userTier')) as VariantFlagContext<string>;
+      expect(userTier.value).toBe('premium');
 
-    const maxConnectionPool = (ff as FfWithFlags).maxConnectionPool;
-    expect(maxConnectionPool?.value).toBe(20);
+      const customLimit = (await ff.get('customLimit')) as { value: number };
+      expect(customLimit.value).toBe(500);
 
-    const logLevel = (ff as FfWithFlags).logLevel;
-    expect(logLevel?.value).toBe('debug');
-
-    // Test async flags
-    const userTier = (await ff.get('userTier')) as VariantFlagContext<string>;
-    expect(userTier.value).toBe('premium');
-
-    const customLimit = (await ff.get('customLimit')) as { value: number };
-    expect(customLimit.value).toBe(500);
+      return ctx.ok(null);
+    });
   });
 
   test('InMemoryFlagEvaluator setFlag updates values', () => {
@@ -334,11 +320,12 @@ describe('Feature Flags', () => {
       testFlag: 'initial',
     });
 
-    expect(evaluator.getSync('testFlag', {})).toBe('initial');
+    // getSync receives ctx as first param (can be empty object for simple evaluator)
+    expect(evaluator.getSync({} as Parameters<typeof evaluator.getSync>[0], 'testFlag')).toBe('initial');
 
     evaluator.setFlag('testFlag', 'updated');
 
-    expect(evaluator.getSync('testFlag', {})).toBe('updated');
+    expect(evaluator.getSync({} as Parameters<typeof evaluator.getSync>[0], 'testFlag')).toBe('updated');
   });
 
   test('InMemoryFlagEvaluator works with async', async () => {
@@ -349,83 +336,92 @@ describe('Feature Flags', () => {
       asyncFlag: 42,
     });
 
-    expect(await evaluator.getAsync('asyncFlag', {})).toBe(42);
+    expect(await evaluator.getAsync({} as Parameters<typeof evaluator.getAsync>[0], 'asyncFlag')).toBe(42);
   });
 
-  test('forContext creates child evaluator bound to child SpanContext', () => {
-    const schema = defineFeatureFlags({
+  test('forContext creates child evaluator bound to child SpanContext', async () => {
+    const flags = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),
     });
-    const logSchema = createTestSchema({});
-    const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
-    const mockCtx = createMockSpanContext(spanBuffer);
 
-    const evaluator = new InMemoryFlagEvaluator(schema.schema, { debugMode: true });
+    const { createTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { debugMode: true }),
+    });
 
-    const ff = new FeatureFlagEvaluator(schema.schema, mockCtx, evaluator);
+    const trace = createTrace({});
+    await trace.span('parent-span', async (parentCtx) => {
+      const parentFf = parentCtx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
 
-    // Create child SpanContext
-    const { spanBuffer: childBuffer } = createTestSpanBuffer(logSchema, { spanName: 'child-span' });
-    const childCtx = createMockSpanContext(childBuffer);
+      // Access flag in parent
+      expect(parentFf.debugMode?.value).toBe(true);
 
-    // Create child evaluator bound to child context
-    const childFf = ff.forContext(childCtx);
+      const parentAccessCount = countEntryType(parentCtx.buffer, ENTRY_TYPE_FF_ACCESS);
+      expect(parentAccessCount).toBe(1);
 
-    // Both should have the flag accessible
-    type FfWithFlags = typeof ff & { debugMode: BooleanFlagContext | undefined };
-    expect((ff as FfWithFlags).debugMode?.value).toBe(true);
-    expect((childFf as unknown as FfWithFlags).debugMode?.value).toBe(true);
+      // Create child span - child gets its own ff evaluator via forContext
+      await parentCtx.span('child-span', async (childCtx) => {
+        const childFf = childCtx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
+        expect(childFf.debugMode?.value).toBe(true);
 
-    // Access in child should log to child buffer
-    const childAccessCount = countEntryType(childBuffer, ENTRY_TYPE_FF_ACCESS);
-    expect(childAccessCount).toBe(1);
+        // Access in child should log to child buffer
+        const childAccessCount = countEntryType(childCtx.buffer, ENTRY_TYPE_FF_ACCESS);
+        expect(childAccessCount).toBe(1);
 
-    // Parent buffer should have its own access log from earlier access
-    const parentAccessCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_ACCESS);
-    expect(parentAccessCount).toBe(1);
+        return childCtx.ok(null);
+      });
+
+      return parentCtx.ok(null);
+    });
   });
 
-  test('usage example from spec: undefined/truthy pattern', () => {
-    const schema = defineFeatureFlags({
+  test('usage example from spec: undefined/truthy pattern', async () => {
+    const flags = defineFeatureFlags({
       darkMode: S.boolean().default(false).sync(),
       advancedSearch: S.boolean().default(false).sync(),
     });
-    const logSchema = createTestSchema({});
 
     // Scenario 1: darkMode is enabled
-    const { spanBuffer: enabledBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-enabled' });
-    const enabledCtx = createMockSpanContext(enabledBuffer);
-    const enabledEvaluator = new InMemoryFlagEvaluator(schema.schema, { darkMode: true });
-    const ffEnabled = new FeatureFlagEvaluator(schema.schema, enabledCtx, enabledEvaluator);
+    const { createTrace: createEnabledTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { darkMode: true }),
+    });
 
-    type FfWithFlags = typeof ffEnabled & {
-      darkMode: BooleanFlagContext | undefined;
-      advancedSearch: BooleanFlagContext | undefined;
-    };
+    const enabledTrace = createEnabledTrace({});
+    await enabledTrace.span('test-enabled', async (ctx) => {
+      const ff = ctx.ff as unknown as { darkMode: BooleanFlagContext | undefined };
+      const darkMode = ff.darkMode;
 
-    const darkMode = (ffEnabled as FfWithFlags).darkMode;
+      // Truthy check works naturally with undefined/truthy semantics
+      if (darkMode) {
+        expect(darkMode.value).toBe(true);
+        darkMode.track({ action: 'applied' });
+      }
 
-    // Truthy check works naturally with undefined/truthy semantics
-    if (darkMode) {
-      // darkMode is BooleanFlagContext here
-      expect(darkMode.value).toBe(true);
-      // Can track usage
-      darkMode.track({ action: 'applied' });
-    }
+      return ctx.ok(null);
+    });
 
     // Scenario 2: darkMode is disabled
-    const { spanBuffer: disabledBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-disabled' });
-    const disabledCtx = createMockSpanContext(disabledBuffer);
-    const disabledEvaluator = new InMemoryFlagEvaluator(schema.schema, { darkMode: false });
-    const ffDisabled = new FeatureFlagEvaluator(schema.schema, disabledCtx, disabledEvaluator);
+    const { createTrace: createDisabledTrace } = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { darkMode: false }),
+    });
 
-    const darkModeDisabled = (ffDisabled as FfWithFlags).darkMode;
+    const disabledTrace = createDisabledTrace({});
+    await disabledTrace.span('test-disabled', async (ctx) => {
+      const ff = ctx.ff as unknown as { darkMode: BooleanFlagContext | undefined };
+      const darkModeDisabled = ff.darkMode;
 
-    // Falsy check works - undefined is falsy
-    expect(darkModeDisabled).toBeUndefined();
-    if (!darkModeDisabled) {
-      // This branch executes for disabled flags
-      expect(true).toBe(true);
-    }
+      // Falsy check works - undefined is falsy
+      expect(darkModeDisabled).toBeUndefined();
+      if (!darkModeDisabled) {
+        expect(true).toBe(true);
+      }
+
+      return ctx.ok(null);
+    });
   });
 });

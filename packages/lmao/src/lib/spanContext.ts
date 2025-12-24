@@ -81,7 +81,7 @@ export interface MutableSpanContext<Ctx extends OpContext> {
   callee_file: string;
   callee_line: number;
   callee_git_sha: string;
-  ff: FeatureFlagEvaluator<Ctx['flags']> & InferFeatureFlagsWithContext<Ctx['flags']>;
+  ff: FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
   env: Ctx['userCtx'];
   deps: Record<string, unknown>;
   tag: TagWriter<Ctx['logSchema']>;
@@ -289,9 +289,9 @@ export function createSpanContextProto<Ctx extends OpContext>(
       // Create a new feature flag evaluator bound to the CHILD span context
       // Must be after childContext is created since forContext receives the full SpanContext
       const childFf = this.ff.forContext?.(childContext as any) as unknown as
-        | FeatureFlagEvaluator<Ctx['flags']>
-        | InferFeatureFlagsWithContext<Ctx['flags']>;
-      childContext.ff = childFf as FeatureFlagEvaluator<Ctx['flags']> & InferFeatureFlagsWithContext<Ctx['flags']>;
+        | FeatureFlagEvaluator<Ctx>
+        | InferFeatureFlagsWithContext<Ctx>;
+      childContext.ff = childFf as FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
 
       // Execute child span with exception handling (direct async, no IIFE)
       try {

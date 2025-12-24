@@ -11,7 +11,7 @@
  */
 
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { createTestModuleContext } from '../../__tests__/test-helpers.js';
+import { createTestLogBinding } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -22,8 +22,8 @@ import {
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
 import type { LogSchema } from '../../schema/types.js';
-import { createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
-import type { SpanBuffer } from '../../types.js';
+import { createOverflowBuffer, createSpanBuffer } from '../../spanBuffer.js';
+import type { AnySpanBuffer } from '../../types.js';
 import { createSpanLoggerClass, type SpanLoggerImpl } from '../spanLoggerGenerator.js';
 
 function createTestBuffer(schema: LogSchema): SpanBuffer {
@@ -92,7 +92,7 @@ describe('createSpanLoggerClass', () => {
 
   describe('logging methods', () => {
     let schema: LogSchema;
-    let buffer: SpanBuffer;
+    let buffer: AnySpanBuffer;
     let logger: SpanLoggerImpl<LogSchema>;
 
     beforeEach(() => {
@@ -115,35 +115,35 @@ describe('createSpanLoggerClass', () => {
 
     it('should write entry type for info()', () => {
       logger.info('Test message');
-      expect(buffer._operations[2]).toBe(ENTRY_TYPE_INFO);
+      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_INFO);
     });
 
     it('should write entry type for debug()', () => {
       logger.debug('Debug message');
-      expect(buffer._operations[2]).toBe(ENTRY_TYPE_DEBUG);
+      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_DEBUG);
     });
 
     it('should write entry type for warn()', () => {
       logger.warn('Warning message');
-      expect(buffer._operations[2]).toBe(ENTRY_TYPE_WARN);
+      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_WARN);
     });
 
     it('should write entry type for error()', () => {
       logger.error('Error message');
-      expect(buffer._operations[2]).toBe(ENTRY_TYPE_ERROR);
+      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_ERROR);
     });
 
     it('should write entry type for trace()', () => {
       logger.trace('Trace message');
-      expect(buffer._operations[2]).toBe(ENTRY_TYPE_TRACE);
+      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_TRACE);
     });
 
     it('should write timestamp for log entries', () => {
       logger.info('Test message');
 
       // Timestamp should be non-zero BigInt
-      expect(buffer._timestamps[2]).not.toBe(0n);
-      expect(typeof buffer._timestamps[2]).toBe('bigint');
+      expect(buffer.timestamp[2]).not.toBe(0n);
+      expect(typeof buffer.timestamp[2]).toBe('bigint');
     });
 
     it('should return this for fluent chaining', () => {
@@ -158,9 +158,9 @@ describe('createSpanLoggerClass', () => {
       (logger.info('First') as unknown as typeof logger).info('Second').warn('Third');
 
       expect(logger._writeIndex).toBe(4);
-      expect(buffer._operations[2]).toBe(ENTRY_TYPE_INFO);
-      expect(buffer._operations[3]).toBe(ENTRY_TYPE_INFO);
-      expect(buffer._operations[4]).toBe(ENTRY_TYPE_WARN);
+      expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_INFO);
+      expect(buffer.entry_type[3]).toBe(ENTRY_TYPE_INFO);
+      expect(buffer.entry_type[4]).toBe(ENTRY_TYPE_WARN);
     });
   });
 

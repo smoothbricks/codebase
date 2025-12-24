@@ -113,7 +113,9 @@ describe('Span Scope Attributes', () => {
         });
 
         expect(childResult.success).toBe(true);
-        expect(childResult.value.success).toBe(true);
+        if (childResult.success) {
+          expect(childResult.value.validated).toBe(true);
+        }
         return ctx.ok('done');
       });
 

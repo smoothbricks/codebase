@@ -18,12 +18,12 @@ describe('True Lazy Initialization', () => {
       count: S.number(),
       active: S.boolean(),
     });
-    // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
+    // createColumnBuffer is generic and returns ColumnBuffer<T>
     const buffer = createColumnBuffer(schema, 64);
 
-    // Core columns are always allocated
-    expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);
-    expect(buffer.entry_type).toBeInstanceOf(Uint8Array);
+    // Core columns are always allocated (system columns from systemSchema)
+    expect(buffer.timestamp_values).toBeInstanceOf(BigInt64Array);
+    expect(buffer.entry_type_values).toBeInstanceOf(Uint8Array);
 
     // Access ONE column via _values suffix (category = Array now, not Uint32Array)
     // Note: buffer.userId is a setter method, buffer.userId_values is the getter
@@ -75,8 +75,8 @@ describe('True Lazy Initialization', () => {
     const buffer = createColumnBuffer(schema, 1024);
 
     // Only access 2 of 5 columns (use _values suffix for the array)
-    (buffer.col1_values as Float64Array)[0] = 1;
-    (buffer.col3_values as Float64Array)[0] = 3;
+    buffer.col1_values[0] = 1;
+    buffer.col3_values[0] = 3;
 
     // col2, col4, col5 should still be getters on prototype (not accessed yet)
     // Note: use _values suffix to check the getter (not the setter method)
@@ -127,11 +127,11 @@ describe('Lazy Column Initialization', () => {
     const buffer = createColumnBuffer(schema, 64);
 
     // Core columns should be allocated immediately
-    expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);
-    expect(buffer.entry_type).toBeInstanceOf(Uint8Array);
+    expect(buffer.timestamp_values).toBeInstanceOf(BigInt64Array);
+    expect(buffer.entry_type_values).toBeInstanceOf(Uint8Array);
 
     // Access one attribute column via _values suffix - should allocate it lazily on first access
-    const userIdColumn = buffer.userId_values as string[];
+    const userIdColumn = buffer.userId_values;
     // Category stores raw strings in Array
     expect(Array.isArray(userIdColumn)).toBe(true);
     expect(userIdColumn.length).toBeGreaterThan(0);
@@ -195,8 +195,8 @@ describe('Lazy Column Initialization', () => {
 
     // Write to columns via _values suffix (triggering lazy allocation)
     // Category stores strings in Array (no hot-path interning)
-    const userIdColumn = buffer.userId_values as string[];
-    const countColumn = buffer.count_values as Float64Array;
+    const userIdColumn = buffer.userId_values;
+    const countColumn = buffer.count_values;
 
     // Write a string value for category (raw strings stored directly)
     userIdColumn[0] = 'user-123';

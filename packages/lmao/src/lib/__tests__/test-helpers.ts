@@ -12,6 +12,7 @@ import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
+import type { TraceId } from '../traceId.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
 
 /**
@@ -83,7 +84,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   schema: SchemaFields | LogSchema<T>,
   options: {
     spanName?: string;
-    trace_id?: string;
+    trace_id?: TraceId;
     capacity?: number;
   } = {},
 ): { logBinding: LogBinding; spanBuffer: SpanBuffer<LogSchema<T>> } {
@@ -102,7 +103,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
     options.spanName ?? 'test-span',
     options.trace_id,
     options.capacity ?? DEFAULT_BUFFER_CAPACITY,
-  );
+  ) as SpanBuffer<LogSchema<T>>;
 
   // Set _opMetadata for Arrow conversion (tests bypass tracer which normally sets this)
   // This is necessary because createSpanBuffer doesn't set _opMetadata - that's done by tracer.ts

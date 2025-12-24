@@ -49,10 +49,9 @@ export type SpanContextWithoutFf<Ctx extends OpContext> = Omit<SpanContext<Ctx>,
  *
  * The wrapper (FeatureFlagEvaluator) holds a ctx reference to enable fluent getters.
  *
- * @template Ctx - OpContext bundle (logSchema, flags, deps, userCtx)
- * @template FF - FeatureFlagSchema defining available flags
+ * @template Ctx - OpContext bundle (contains flags via Ctx['flags'])
  */
-export interface FlagEvaluator<Ctx extends OpContext = OpContext, FF extends FeatureFlagSchema = FeatureFlagSchema> {
+export interface FlagEvaluator<Ctx extends OpContext = OpContext> {
   /**
    * Get a flag value synchronously (for cached/static flags)
    *
@@ -107,7 +106,7 @@ export interface FlagEvaluator<Ctx extends OpContext = OpContext, FF extends Fea
    *
    * Receives `Omit<SpanContext, 'ff'>` to prevent infinite recursion.
    */
-  forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<FF, Ctx> & InferFeatureFlagsWithContext<FF>;
+  forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<Ctx>;
 }
 
 /**
@@ -176,14 +175,16 @@ type InferFlagContextType<T> = T extends boolean
       : { value: T; track(context?: FlagTrackContext): void };
 
 /**
- * Infer feature flag types - returns FlagContext | undefined for each flag
+ * Infer feature flag types from OpContext - returns FlagContext | undefined for each flag
  *
  * - Returns undefined when flag is false/disabled
  * - Returns FlagContext wrapper when flag is truthy/enabled
  */
-export type InferFeatureFlagsWithContext<T extends FeatureFlagSchema> = {
-  readonly [K in keyof T]: InferFlagContextType<S.Output<T[K]['schema']>> | undefined;
-};
+export type InferFeatureFlagsWithContext<Ctx extends OpContext> = Ctx['flags'] extends FeatureFlagSchema
+  ? {
+      readonly [K in keyof Ctx['flags']]: InferFlagContextType<S.Output<Ctx['flags'][K]['schema']>> | undefined;
+    }
+  : {};
 
 // ============================================================================
 // Feature Flag Evaluator Class
@@ -198,27 +199,27 @@ const evaluatorClassCache = new WeakMap<
   new (
     spanContext: SpanContext<OpContext>,
     evaluator: FlagEvaluator,
-  ) => FeatureFlagEvaluator<FeatureFlagSchema>
+  ) => FeatureFlagEvaluator<OpContext>
 >();
 
 /**
  * Get or create a generated evaluator class for a schema
  */
-function getOrCreateEvaluatorClass<Ctx extends OpContext, FF extends FeatureFlagSchema>(
-  schema: FF,
+function getOrCreateEvaluatorClass<Ctx extends OpContext>(
+  schema: Ctx['flags'],
 ): new (
   spanContext: SpanContext<Ctx>,
-  evaluator: FlagEvaluator<Ctx, FF>,
-) => FeatureFlagEvaluator<FF, Ctx> & InferFeatureFlagsWithContext<FF> {
+  evaluator: FlagEvaluator<Ctx>,
+) => FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx> {
   // Check cache first
   let GeneratedClass = evaluatorClassCache.get(schema);
 
   if (!GeneratedClass) {
     // Generate the class using new Function()
-    GeneratedClass = createEvaluatorClass<Ctx, FF>(schema, validateFlagValue, ENTRY_TYPE_FF_ACCESS) as unknown as new (
+    GeneratedClass = createEvaluatorClass(schema, validateFlagValue, ENTRY_TYPE_FF_ACCESS) as unknown as new (
       spanContext: SpanContext<OpContext>,
       evaluator: FlagEvaluator,
-    ) => FeatureFlagEvaluator<FeatureFlagSchema>;
+    ) => FeatureFlagEvaluator<OpContext>;
 
     // Cache the generated class
     evaluatorClassCache.set(schema, GeneratedClass);
@@ -226,8 +227,8 @@ function getOrCreateEvaluatorClass<Ctx extends OpContext, FF extends FeatureFlag
 
   return GeneratedClass as unknown as new (
     spanContext: SpanContext<Ctx>,
-    evaluator: FlagEvaluator<Ctx, FF>,
-  ) => FeatureFlagEvaluator<FF, Ctx> & InferFeatureFlagsWithContext<FF>;
+    evaluator: FlagEvaluator<Ctx>,
+  ) => FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
 }
 
 /**
@@ -290,38 +291,17 @@ function getOrCreateEvaluatorClass<Ctx extends OpContext, FF extends FeatureFlag
  * The class constructor returns a generated class instance rather than this instance.
  * This is a valid JavaScript pattern for creating optimized instances with schema-specific properties.
  *
- * @template FF - Feature flag schema
- * @template Ctx - OpContext bundle (logSchema, flags, deps, userCtx)
+ * @template Ctx - OpContext bundle (contains flags via Ctx['flags'])
  */
-export class FeatureFlagEvaluator<FF extends FeatureFlagSchema, Ctx extends OpContext = OpContext> {
-  // These properties exist for type compatibility but actual implementation uses generated class
-  protected evaluator!: FlagEvaluator<Ctx, FF>;
-
-  constructor(schema: FF, spanContext: SpanContext<Ctx>, evaluator: FlagEvaluator<Ctx, FF>) {
-    // Get or create the generated class for this schema
-    const GeneratedClass = getOrCreateEvaluatorClass<Ctx, FF>(schema);
-
-    // Return generated class instance instead of this instance
-    // This is a valid JavaScript pattern - constructors can return objects
-    // biome-ignore lint/correctness/noConstructorReturn: Valid pattern for generated class instances
-    return new GeneratedClass(spanContext, evaluator) as unknown as FeatureFlagEvaluator<FF, Ctx>;
-  }
-
-  // These methods exist for TypeScript type information only
-  // The generated class handles all actual method calls
-
+export abstract class FeatureFlagEvaluator<Ctx extends OpContext = OpContext> {
   /**
    * Get async flag value
    * Returns undefined when false, FlagContext when truthy
    */
-  get(_flag: string): Promise<unknown> {
-    throw new Error('Should not be called - handled by generated class');
-  }
+  abstract get(flag: string): Promise<unknown>;
 
   /** Track flag usage. Prefer using flag.track() for the fluent API. */
-  trackUsage<K extends keyof FF>(_flag: K, _context?: FlagTrackContext): void {
-    throw new Error('Should not be called - handled by generated class');
-  }
+  abstract trackUsage<K extends keyof Ctx['flags']>(flag: K, context?: FlagTrackContext): void;
 
   /**
    * Create a new wrapper for a child span context.
@@ -330,9 +310,19 @@ export class FeatureFlagEvaluator<FF extends FeatureFlagSchema, Ctx extends OpCo
    * create a new evaluator, or return `this` if the evaluator itself
    * implements the wrapper interface.
    */
-  forContext(_ctx: SpanContext<Ctx>): FeatureFlagEvaluator<FF, Ctx> {
-    throw new Error('Should not be called - handled by generated class');
-  }
+  abstract forContext(ctx: SpanContext<Ctx>): FeatureFlagEvaluator<Ctx>;
+}
+
+/**
+ * Create a FeatureFlagEvaluator instance using the generated class
+ */
+export function createFeatureFlagEvaluator<Ctx extends OpContext>(
+  schema: Ctx['flags'],
+  spanContext: SpanContext<Ctx>,
+  evaluator: FlagEvaluator<Ctx>,
+): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx> {
+  const GeneratedClass = getOrCreateEvaluatorClass<Ctx>(schema);
+  return new GeneratedClass(spanContext, evaluator);
 }
 
 /**
@@ -343,13 +333,11 @@ export class FeatureFlagEvaluator<FF extends FeatureFlagSchema, Ctx extends OpCo
  * - forContext bootstraps the generated FeatureFlagEvaluator class (creates per-span wrapper)
  * - Generated class has typed getters (ff.darkMode) and calls this.getSync(ctx, flag)
  */
-export class InMemoryFlagEvaluator<Ctx extends OpContext = OpContext, FF extends FeatureFlagSchema = FeatureFlagSchema>
-  implements FlagEvaluator<Ctx, FF>
-{
+export class InMemoryFlagEvaluator<Ctx extends OpContext = OpContext> implements FlagEvaluator<Ctx> {
   private flags: Record<string, FlagValue> = {};
-  private ffSchema: FF;
+  private ffSchema: Ctx['flags'];
 
-  constructor(ffSchema: FF, initialFlags: Record<string, FlagValue> = {}) {
+  constructor(ffSchema: Ctx['flags'], initialFlags: Record<string, FlagValue> = {}) {
     this.ffSchema = ffSchema;
     this.flags = initialFlags;
   }
@@ -382,9 +370,7 @@ export class InMemoryFlagEvaluator<Ctx extends OpContext = OpContext, FF extends
    * Returns a per-span wrapper that holds ctx reference and reuses this evaluator.
    * The generated class has typed getters (ff.darkMode) and calls this.getSync(ctx, flag).
    */
-  forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<FF, Ctx> & InferFeatureFlagsWithContext<FF> {
-    // Pass ctx as SpanContext (ff will be set by caller after this returns)
-    return new FeatureFlagEvaluator(this.ffSchema, ctx as SpanContext<Ctx>, this) as FeatureFlagEvaluator<FF, Ctx> &
-      InferFeatureFlagsWithContext<FF>;
+  forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx> {
+    return createFeatureFlagEvaluator(this.ffSchema, ctx as SpanContext<Ctx>, this);
   }
 }

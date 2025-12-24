@@ -15,12 +15,12 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createTestModuleContext } from '../../__tests__/test-helpers.js';
+import { createTestLogBinding } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { LogSchema } from '../../schema/types.js';
 import { createSpanBuffer, SpanBufferTestUtils } from '../../spanBuffer.js';
-import type { SpanBuffer } from '../../types.js';
+import type { AnySpanBuffer } from '../../types.js';
 import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
 /**
@@ -39,23 +39,23 @@ function getBitsSet(nullBitmap: Uint8Array, count: number): boolean[] {
 /**
  * Create a test buffer from a schema
  */
-function createTestBuffer(schema: LogSchema): SpanBuffer {
-  const module = createTestModuleContext(schema);
+function createTestBuffer(schema: LogSchema): AnySpanBuffer {
+  const module = createTestLogBinding(schema);
   return createSpanBuffer(schema, module, 'test-span');
 }
 
 /**
  * Create a test buffer with a specific capacity
  */
-function createTestBufferWithCapacity(schema: LogSchema, capacity: number): SpanBuffer {
-  const module = createTestModuleContext(schema);
+function createTestBufferWithCapacity(schema: LogSchema, capacity: number): AnySpanBuffer {
+  const module = createTestLogBinding(schema);
   return createSpanBuffer(schema, module, 'test-span', undefined, capacity);
 }
 
 /**
  * Mock createNextBuffer that just returns the same buffer (for tests that don't need overflow)
  */
-const mockCreateNextBuffer = (buffer: SpanBuffer): SpanBuffer => buffer;
+const mockCreateNextBuffer = (buffer: AnySpanBuffer): AnySpanBuffer => buffer;
 
 describe('null bitmap correctness', () => {
   describe('immutable scope semantics', () => {

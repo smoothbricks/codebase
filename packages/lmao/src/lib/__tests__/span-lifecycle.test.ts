@@ -16,7 +16,7 @@ import {
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { createTestLogBinding } from './test-helpers.js';
 
 // Test schema
@@ -411,7 +411,9 @@ describe('FluentResult Type Compatibility', () => {
 
     const result = await traceCtx.span('testTask', testOp);
     expect(result.success).toBe(true);
-    expect(result.value).toEqual({ id: 123 });
+    if (result.success) {
+      expect(result.value).toEqual({ id: 123 });
+    }
   });
 
   it('should allow direct access to error property', async () => {
@@ -428,7 +430,10 @@ describe('FluentResult Type Compatibility', () => {
     const traceCtx = createTrace({ requestId: 'req1' });
 
     const result = await traceCtx.span('testTask', testOp);
-    expect(result).toBe('TEST_ERROR');
+    expect(result.success).toBe(true);
+    if (result.success) {
+      expect(result.value).toBe('TEST_ERROR');
+    }
   });
 });
 
@@ -441,9 +446,9 @@ describe('FluentResult Type Compatibility', () => {
  */
 describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 and span-ok at row 1 after ctx.ok()', async () => {
-    let capturedBuffer: SpanBuffer | undefined;
+    let capturedBuffer: AnySpanBuffer | undefined;
     const testOp = defineOp('test-task', async (ctx) => {
-      capturedBuffer = ctx.buffer as any;
+      capturedBuffer = ctx.buffer;
       return ctx.ok('done');
     });
 
@@ -457,9 +462,9 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
-    let capturedBuffer: SpanBuffer | undefined;
+    let capturedBuffer: AnySpanBuffer | undefined;
     const testOp = defineOp('test', async (ctx) => {
-      capturedBuffer = ctx.buffer as any;
+      capturedBuffer = ctx.buffer;
       return ctx.err('ERROR_CODE', { detail: 'error detail' });
     });
 
@@ -473,9 +478,9 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {
-    let capturedBuffer: SpanBuffer | undefined;
+    let capturedBuffer: AnySpanBuffer | undefined;
     const testOp = defineOp('test', async (ctx) => {
-      capturedBuffer = ctx.buffer as any;
+      capturedBuffer = ctx.buffer;
       throw new Error('Unexpected failure');
     });
 

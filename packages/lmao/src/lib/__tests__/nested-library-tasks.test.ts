@@ -16,7 +16,7 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 
 describe('Nested Library Tasks', () => {
   describe('4-level nesting WITHOUT library prefixes (regular module contexts)', () => {
@@ -51,10 +51,10 @@ describe('Nested Library Tasks', () => {
       });
 
       // Capture buffers for verification
-      let rootBuffer: SpanBuffer | undefined;
-      let level2Buffer: SpanBuffer | undefined;
-      let level3Buffer: SpanBuffer | undefined;
-      let level4Buffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
+      let level2Buffer: AnySpanBuffer | undefined;
+      let level3Buffer: AnySpanBuffer | undefined;
+      let level4Buffer: AnySpanBuffer | undefined;
 
       // Level 4 op (deepest)
       const level4Op = defineOp4('level4-op', async (ctx) => {
@@ -161,7 +161,7 @@ describe('Nested Library Tasks', () => {
         logSchema: sharedSchema,
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
 
       const level4Op = defineOp4('level4', async (ctx) => {
         ctx.tag.level(4);
@@ -292,7 +292,7 @@ describe('Nested Library Tasks', () => {
         logSchema: authSchema,
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
 
       // Auth op (deepest - level 4)
       const authOp = defineAuthOp('auth-check', async (ctx) => {
@@ -372,10 +372,10 @@ describe('Nested Library Tasks', () => {
         logSchema: defineLogSchema({ auth_userId: S.category() }),
       });
 
-      let httpBuffer: SpanBuffer | undefined;
-      let dbBuffer: SpanBuffer | undefined;
-      let cacheBuffer: SpanBuffer | undefined;
-      let authBuffer: SpanBuffer | undefined;
+      let httpBuffer: AnySpanBuffer | undefined;
+      let dbBuffer: AnySpanBuffer | undefined;
+      let cacheBuffer: AnySpanBuffer | undefined;
+      let authBuffer: AnySpanBuffer | undefined;
 
       const authOp = defineAuthOp('auth', async (ctx) => {
         authBuffer = ctx.buffer;
@@ -470,7 +470,7 @@ describe('Nested Library Tasks', () => {
         logSchema: dbSchema,
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
 
       // DB op (deepest - level 4, prefixed)
       const dbOp = defineDbOp('db-query', async (ctx) => {
@@ -565,7 +565,7 @@ describe('Nested Library Tasks', () => {
         logSchema: defineLogSchema({ process_status: S.enum(['running', 'stopped', 'failed']) }),
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
 
       const processOp = defineProcessOp('run-process', async (ctx) => {
         ctx.tag.process_status('running');
@@ -646,7 +646,7 @@ describe('Nested Library Tasks', () => {
         logSchema: schema,
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
 
       // Create a tree with multiple children at each level
       const leafOp = defineOp('leaf', async (ctx) => {
@@ -713,7 +713,7 @@ describe('Nested Library Tasks', () => {
         logSchema: schema,
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
       let order = 0;
 
       const deepOp = defineOp('deep', async (ctx) => {
@@ -777,7 +777,7 @@ describe('Nested Library Tasks', () => {
         logSchema: schema,
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
 
       const level4Op = defineOp('level4', async (ctx) => {
         ctx.tag.level(4);

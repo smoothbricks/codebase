@@ -10,11 +10,10 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 
 describe('RemappedBufferView Integration', () => {
   describe('basic span execution', () => {
@@ -62,7 +61,7 @@ describe('RemappedBufferView Integration', () => {
         logSchema: appSchema,
       });
 
-      let rootBuffer: SpanBuffer | undefined;
+      let rootBuffer: AnySpanBuffer | undefined;
 
       const parentOp = defineOp('parent-op', async (ctx) => {
         rootBuffer = ctx.buffer;

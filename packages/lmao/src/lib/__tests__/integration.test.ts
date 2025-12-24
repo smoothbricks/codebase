@@ -53,15 +53,6 @@ describe('Schema Integration Patterns', () => {
     databaseUrl: 'postgresql://localhost:5432/test',
   };
 
-  // Create flag evaluator with test values
-  function createFlagEvaluator() {
-    return new InMemoryFlagEvaluator(featureFlags.schema, {
-      advancedValidation: true,
-      maxRetries: 5,
-      experimentalFeature: false,
-    });
-  }
-
   // Create a shared op context for tests (without feature flags)
   const { defineOp, createTrace } = defineOpContext({
     logSchema: dbSchema,
@@ -76,7 +67,11 @@ describe('Schema Integration Patterns', () => {
   const { defineOp: defineOpWithFlags, createTrace: createTraceWithFlags } = defineOpContext({
     logSchema: dbSchema,
     flags: featureFlags.schema,
-    flagEvaluator: createFlagEvaluator(),
+    flagEvaluator: new InMemoryFlagEvaluator(featureFlags.schema, {
+      advancedValidation: true,
+      maxRetries: 5,
+      experimentalFeature: false,
+    }),
     ctx: {
       requestId: undefined as string | undefined,
       userId: undefined as string | undefined,

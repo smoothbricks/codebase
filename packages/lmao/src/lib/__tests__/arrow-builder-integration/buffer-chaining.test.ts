@@ -210,7 +210,7 @@ describe('Buffer Chaining', () => {
       }
 
       // Verify all data is preserved across the chain
-      let verificationBuffer: SpanBuffer | undefined = rootBuffer;
+      let verificationBuffer: SpanBuffer<typeof schema> | undefined = rootBuffer;
       let verifiedCount = 0;
 
       while (verificationBuffer && verifiedCount < testEntries.length) {
@@ -227,7 +227,7 @@ describe('Buffer Chaining', () => {
           verifiedCount++;
         }
 
-        verificationBuffer = verificationBuffer._overflow;
+        verificationBuffer = verificationBuffer._overflow as SpanBuffer<typeof schema> | undefined;
       }
 
       expect(verifiedCount).toBe(testEntries.length);
@@ -311,10 +311,10 @@ describe('Buffer Chaining', () => {
 
       // Count actual buffers created
       let bufferCount = 0;
-      let countBuffer: SpanBuffer | undefined = rootBuffer;
+      let countBuffer: SpanBuffer<typeof schema> | undefined = rootBuffer;
       while (countBuffer) {
         bufferCount++;
-        countBuffer = countBuffer._overflow;
+        countBuffer = countBuffer._overflow as SpanBuffer<typeof schema> | undefined;
       }
 
       // Should have created multiple buffers for 10 entries with capacity 3
