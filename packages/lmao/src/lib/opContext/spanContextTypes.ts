@@ -65,8 +65,11 @@ export type TagWriter<T extends LogSchema> = {
 };
 
 /**
- * Span logger for structured logging (rows 2+)
- * Generated at runtime with typed methods per schema field.
+ * SpanLogger - public API surface for structured logging.
+ *
+ * Includes core methods (info/debug/warn/error) from BaseSpanLogger
+ * and schema-specific methods from ColumnWriter.
+ * Internal methods (_setScope, _buffer, etc.) are hidden from this type.
  *
  * Per specs/01h_entry_types_and_logging_primitives.md:
  * - Each level (info/debug/warn/error) creates a log entry
@@ -91,14 +94,44 @@ export interface SpanLogger<T extends LogSchema> {
  * ctx.log.info('message').userId('u1').requestId('r1')
  *
  * All attributes are optional, chainable, and return FluentLogEntry for continuation.
+ *
+ * Includes system schema fields for direct access (no information hiding):
+ * - line(n) - Source line number (0-65535)
+ * - error_code(code) - Error code string
+ * - exception_stack(stack) - Exception stack trace
+ * - ff_value(value) - Feature flag value
+ * - uint64_value(value) - BigInt value
+ *
+ * Per specs/01c_context_flow_and_op_wrappers.md "Line Number System":
+ * - TypeScript transformer injects line() calls at compile time
+ * - No runtime overhead - just a method call with literal number
  */
 export type FluentLogEntry<T extends LogSchema> = {
   [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => FluentLogEntry<T>;
 } & {
-  /** Set source line number */
-  line(n: number): FluentLogEntry<T>;
+  /**
+   * Set the source code line number for this log entry.
+   *
+   * @param lineNumber - Source line number (0-65535)
+   * @example
+   * ctx.log.info('Processing user').line(42);
+   */
+  line(lineNumber: number): FluentLogEntry<T>;
+
   /** Set multiple attributes at once */
   with(attributes: Partial<InferSchema<T>>): FluentLogEntry<T>;
+
+  /** Set error code for this entry (system column - direct access) */
+  error_code(code: string): FluentLogEntry<T>;
+
+  /** Set exception stack for this entry (system column - direct access) */
+  exception_stack(stack: string): FluentLogEntry<T>;
+
+  /** Set feature flag value for this entry (system column - direct access) */
+  ff_value(value: string): FluentLogEntry<T>;
+
+  /** Set uint64 value for this entry (system column - direct access) */
+  uint64_value(value: bigint): FluentLogEntry<T>;
 };
 
 // =============================================================================
@@ -108,20 +141,17 @@ export type FluentLogEntry<T extends LogSchema> = {
 /**
  * SpanFn - overloaded span creation function.
  *
- * Per specs/01l_module_builder_pattern.md lines 474-511:
- * Creates child spans with type-safe Op invocation or inline closures.
+ * Per specs/01l_module_builder_pattern.md lines 474-511 and 01o lines 34-72:
+ * Creates child spans with type-safe Op invocation or inline closures, with/without line numbers.
  *
- * The transformer injects line numbers at compile time (spec 01o lines 34-72),
- * but runtime supports both patterns for fallback.
- *
- * Uses Op<Ctx, Args, S, E> for type-safe op invocation (no structural typing).
+ * The transformer injects line numbers at compile time, but runtime supports both patterns for fallback.
+ * Uses Op<Ctx, Args, S, E> and returns Result<S, E> (no generic R).
  */
 export type SpanFn<Ctx extends OpContext> = {
   /**
    * Create child span with line number and Op invocation.
    *
    * Per spec 01o lines 46-49: Monomorphic span_op for transformer-injected line numbers.
-   * Enables type-safe op invocation with automatic line tracking.
    *
    * @param line - Source code line number (injected by transformer at compile time)
    * @param name - Child span name (overrides Op's default name)
@@ -143,7 +173,6 @@ export type SpanFn<Ctx extends OpContext> = {
    * Create child span with line number and inline closure.
    *
    * Per spec 01o lines 51-53: Monomorphic span_fn for transformer-injected line numbers.
-   * Enables inline span creation with automatic line tracking.
    *
    * @param line - Source code line number (injected by transformer at compile time)
    * @param name - Child span name
@@ -165,8 +194,7 @@ export type SpanFn<Ctx extends OpContext> = {
   /**
    * Create child span with Op invocation (most common - no line number).
    *
-   * Per spec 01o lines 55-71: Polymorphic span dispatcher for fallback when
-   * transformer didn't inject line number. Automatically detects Op vs function.
+   * Per spec 01o lines 55-71: Polymorphic span dispatcher for fallback when transformer didn't inject line number.
    *
    * @param name - Child span name (overrides Op's default name)
    * @param op - Op to invoke (type-safe with Args, Success, Error types)
@@ -181,8 +209,7 @@ export type SpanFn<Ctx extends OpContext> = {
   /**
    * Create child span with inline closure (most common - no line number).
    *
-   * Per spec 01o lines 55-71: Polymorphic span dispatcher for fallback when
-   * transformer didn't inject line number. Automatically detects function pattern.
+   * Per spec 01o lines 55-71: Polymorphic span dispatcher for fallback when transformer didn't inject line number.
    *
    * @param name - Child span name
    * @param fn - Async function to execute in child span (receives SpanContext<Ctx>)

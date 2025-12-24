@@ -34,16 +34,20 @@ import { getTimestampNanos } from '../timestamp.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
 /**
- * SpanLogger interface with logging methods and schema-specific attribute setters.
- *
- * Extends ColumnWriter<T> which provides:
- * - _buffer, _writeIndex, _nextRow(), _getNextBuffer()
- * - Fluent setter methods for each schema field
- *
- * SpanLogger adds:
- * - info/debug/warn/error logging methods
- * - Scope management (_getScope, _setScope)
+ * Base SpanLogger interface - core logging methods.
+ * Extended by generated implementations with schema-specific methods.
  */
+export interface BaseSpanLogger<T extends LogSchema> {
+  /** Log info-level message */
+  info(message: string): FluentLogEntry<T>;
+  /** Log debug-level message */
+  debug(message: string): FluentLogEntry<T>;
+  /** Log warning message */
+  warn(message: string): FluentLogEntry<T>;
+  /** Log error message */
+  error(message: string): FluentLogEntry<T>;
+}
+
 /**
  * Fluent interface returned by log methods (info, debug, warn, error, trace).
  * Includes system columns (line) plus all schema fields from T.
@@ -74,7 +78,18 @@ export type FluentLogEntry<T extends LogSchema> = {
   [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => FluentLogEntry<T>;
 };
 
-export type BaseSpanLogger<T extends LogSchema> = ColumnWriter<T> & {
+/**
+ * Complete SpanLogger implementation type (runtime-generated class).
+ *
+ * Includes:
+ * - Core methods (info/debug/warn/error) from BaseSpanLogger
+ * - Schema-specific methods from ColumnWriter<T>
+ * - Internal methods (_setScope, _writeEntry, etc.)
+ *
+ * This is the FULL type returned by createSpanLogger().
+ * Users see SpanLogger<T> which hides internal methods.
+ */
+export type SpanLoggerImpl<T extends LogSchema> = ColumnWriter<T> & {
   info(message: string): FluentLogEntry<T>;
   debug(message: string): FluentLogEntry<T>;
   warn(message: string): FluentLogEntry<T>;
@@ -642,7 +657,7 @@ const spanLoggerClassCache = new WeakMap<
   new (
     buffer: AnySpanBuffer,
     createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-  ) => BaseSpanLogger<LogSchema>
+  ) => SpanLoggerImpl<LogSchema>
 >();
 
 /**
@@ -661,7 +676,7 @@ export function createSpanLoggerClass<T extends LogSchema>(
 ): new (
   buffer: AnySpanBuffer,
   createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-) => BaseSpanLogger<T> {
+) => SpanLoggerImpl<T> {
   // Check cache first
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
 
@@ -674,7 +689,7 @@ export function createSpanLoggerClass<T extends LogSchema>(
     SpanLoggerClass = WriterClass as unknown as new (
       buffer: AnySpanBuffer,
       createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-    ) => BaseSpanLogger<LogSchema>;
+    ) => SpanLoggerImpl<LogSchema>;
 
     spanLoggerClassCache.set(schema, SpanLoggerClass);
   }
@@ -682,7 +697,7 @@ export function createSpanLoggerClass<T extends LogSchema>(
   return SpanLoggerClass as new (
     buffer: AnySpanBuffer,
     createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-  ) => BaseSpanLogger<T>;
+  ) => SpanLoggerImpl<T>;
 }
 
 /**
@@ -698,7 +713,7 @@ export function createSpanLogger<T extends LogSchema>(
   createOverflowBuffer: (buffer: SpanBuffer<T>) => SpanBuffer<T> = createOverflowSpanBuffer as unknown as (
     buffer: SpanBuffer<T>,
   ) => SpanBuffer<T>,
-): BaseSpanLogger<T> {
+): SpanLoggerImpl<T> {
   const SpanLoggerClass = createSpanLoggerClass(schema);
   return new SpanLoggerClass(buffer, createOverflowBuffer as unknown as (buffer: AnySpanBuffer) => AnySpanBuffer);
 }

@@ -43,7 +43,6 @@ export type {
   ContributedSchemaOf,
   DepsConfig,
   EffectiveSchema,
-  EmptyDeps,
   MappedOpGroup,
   MappedSchema,
   OpGroup,
@@ -102,7 +101,7 @@ export { opContextType };
 export type OpContext<
   T extends LogSchema = LogSchema,
   FF extends FeatureFlagSchema = {},
-  Deps extends DepsConfig = EmptyDeps,
+  Deps extends DepsConfig = {},
   UserCtx extends Record<string, unknown> = {},
 > = {
   readonly logSchema: T;
@@ -120,7 +119,7 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { TraceContextParams, ValidateUserContext } from './contextTypes.js';
 import type { FeatureFlagSchema } from './featureFlagTypes.js';
-import type { DepsConfig, EffectiveSchema, EmptyDeps, OpGroup, SchemaFieldsOf } from './opGroupTypes.js';
+import type { DepsConfig, EffectiveSchema, OpGroup, SchemaFieldsOf } from './opGroupTypes.js';
 import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { SpanContext } from './spanContextTypes.js';
 

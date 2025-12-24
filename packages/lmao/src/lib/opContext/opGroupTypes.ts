@@ -10,6 +10,7 @@
  * @module opContext/opGroupTypes
  */
 
+import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { Op } from './opTypes.js';
 import type { OpContext } from './types.js';
@@ -168,11 +169,6 @@ export type AnyOpGroup = OpGroup<OpContext> | MappedOpGroup<OpContext, SchemaFie
  * Type for deps config - maps names to OpGroups (optionally mapped)
  */
 export type DepsConfig = Record<string, AnyOpGroup>;
-
-/**
- * Empty deps config (no dependencies)
- */
-export type EmptyDeps = Record<string, never>;
 
 // =============================================================================
 // SCHEMA COMBINATION TYPES

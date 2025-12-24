@@ -20,7 +20,7 @@
  * - createRemappedSpanLoggerClass() - Compile and cache SpanLogger classes
  */
 
-import type { BaseSpanLogger } from './codegen/spanLoggerGenerator.js';
+import type { SpanLoggerImpl } from './codegen/spanLoggerGenerator.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -599,7 +599,7 @@ export function createRemappedSpanLoggerClass<T extends LogSchema>(
   buffer: AnySpanBuffer,
   createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
   initialScopedAttributes?: Record<string, unknown>,
-) => BaseSpanLogger<T> {
+) => SpanLoggerImpl<T> {
   const classCode = generateRemappedSpanLoggerClass(cleanSchema, prefixMapping).trim();
 
   // Use Function constructor to create the class (cold path - happens once per schema/prefix combo)

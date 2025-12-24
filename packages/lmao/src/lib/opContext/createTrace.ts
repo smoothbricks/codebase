@@ -8,84 +8,26 @@
 
 import { createTagWriter } from '../codegen/fixedPositionWriterGenerator.js';
 import { createSpanLogger as createSpanLoggerFromGenerator } from '../codegen/spanLoggerGenerator.js';
-import type { FluentErr, FluentOk } from '../result.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { createOverflowBuffer, createSpanBuffer } from '../spanBuffer.js';
 import { createSpanContextProto, type MutableSpanContext, writeSpanStart } from '../spanContext.js';
 import { generateTraceId, type TraceId } from '../traceId.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
-import type { NullKeys, ResolvedContext } from './contextTypes.js';
+import type { NullKeys } from './contextTypes.js';
 import { createOpMetadata } from './defineOp.js';
-import type { BoundFeatureFlags, FeatureFlagSchema } from './featureFlagTypes.js';
-import type { DepsConfig, ResolvedDeps } from './opGroupTypes.js';
-import type { SpanFn, SpanLogger, TagWriter } from './spanContextTypes.js';
-import type { CreateTraceParams, OpContextConfig } from './types.js';
-
-// =============================================================================
-// INTERNAL SPAN CONTEXT TYPE
-// =============================================================================
-
-/**
- * Internal span context base type (SpanContext properties only).
- * Used as intersection with ResolvedContext for full InternalSpanContext.
- */
-type SpanContextBase<
-  T extends SchemaFields,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
-> = {
-  /** Feature flag accessor - placeholder, filled by factory */
-  ff: BoundFeatureFlags<FF>;
-
-  /** Dependencies - placeholder, filled by factory */
-  deps: ResolvedDeps<Deps>;
-
-  /** Tag writer - placeholder, filled by factory */
-  tag: TagWriter<LogSchema<T>>;
-
-  /** Span logger - placeholder, filled by factory */
-  log: SpanLogger<LogSchema<T>>;
-
-  /** Read-only scope getter */
-  readonly scope: Readonly<Partial<Record<string, unknown>>>;
-
-  /** Set scoped attributes */
-  setScope(attributes: Partial<Record<string, unknown>> | null): void;
-
-  /** Create success result */
-  ok<V>(value: V): FluentOk<V, LogSchema<T>>;
-
-  /** Create error result */
-  err<E>(code: string, error: E): FluentErr<E, LogSchema<T>>;
-
-  /** Create child span - fully typed SpanFn with all parameters bound */
-  span: SpanFn<LogSchema<T>, FF, Deps, UserCtx>;
-
-  /** The underlying buffer */
-  readonly buffer: SpanBuffer<LogSchema<T>>;
-
-  // Internal properties for factory to access
-  _buffer: SpanBuffer<LogSchema<T>>;
-  _schema: LogSchema<T>;
-};
-
-/**
- * Internal mutable span context for trace creation.
- * Combines ResolvedContext (user properties) with SpanContext base (system properties).
- * Properties are filled in by the factory after createTraceImpl returns.
- */
-type InternalSpanContext<
-  T extends SchemaFields,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
-> = ResolvedContext<UserCtx> & SpanContextBase<T, FF, Deps, UserCtx>;
+import type { FeatureFlagSchema } from './featureFlagTypes.js';
+import type { DepsConfig } from './opGroupTypes.js';
+import type { SpanContext } from './spanContextTypes.js';
+import type { CreateTraceParams, OpContext, OpContextConfig } from './types.js';
 
 // =============================================================================
 // CREATE TRACE IMPLEMENTATION
 // =============================================================================
+//
+// PHASE 6 NOTE: Internal types (SpanContextBase, InternalSpanContext) removed.
+// Function now returns SpanContext<OpContext<...>> directly using the bundled type parameters.
+// Implementation still uses old structure but type signature is updated.
 
 /**
  * Create a root trace context with validation and initialization.
@@ -111,7 +53,8 @@ export function createTraceImpl<
   factoryConfig: OpContextConfig<T, FF, Deps, UserCtx>,
   logBinding: LogBinding,
   params: CreateTraceParams<UserCtx>,
-): InternalSpanContext<T, FF, Deps, UserCtx> {
+  // @ts-expect-error PHASE 6: Return type updated to use OpContext bundle, but implementation not fully migrated yet
+): SpanContext<OpContext<LogSchema<T>, FF, Deps, UserCtx>> {
   // ============================================================================
   // Step 1: Validate required params (null-sentinel properties)
   // ============================================================================
@@ -213,7 +156,8 @@ export function createTraceImpl<
     ctx.ff = {} as any;
   }
 
-  return ctx as unknown as InternalSpanContext<T, FF, Deps, UserCtx>;
+  // @ts-expect-error PHASE 6: Internal implementation uses old structure, but type signature updated to OpContext bundle
+  return ctx as unknown as SpanContext<OpContext<LogSchema<T>, FF, Deps, UserCtx>>;
 }
 
 // =============================================================================

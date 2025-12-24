@@ -28,10 +28,11 @@ import {
   createTraceImpl,
   type DepsConfig,
   type EffectiveSchema,
-  type EmptyDeps,
   type FeatureFlagSchema,
+  type OpContext,
   type OpContextConfig,
   type OpContextFactory,
+  opContextType,
   RESERVED_CONTEXT_PROPS,
   type SpanContext,
 } from './opContext/index.js';
@@ -99,7 +100,7 @@ import type { LogBinding } from './types.js';
 export function defineOpContext<
   T extends SchemaFields,
   FF extends FeatureFlagSchema = Record<string, never>,
-  Deps extends DepsConfig = EmptyDeps,
+  Deps extends DepsConfig = {},
   UserCtx extends Record<string, unknown> = Record<string, never>,
 >(config: OpContextConfig<T, FF, Deps, UserCtx>): OpContextFactory<LogSchema<T>, FF, Deps, UserCtx> {
   // Runtime validation: check for reserved property names in user context
@@ -137,23 +138,24 @@ export function defineOpContext<
   };
 
   // Create the defineOp and defineOps functions bound to this config
-  const defineOp = createDefineOp<LogSchema<T>, FF, Deps, UserCtx>({
+  const defineOp = createDefineOp<OpContext<LogSchema<T>, FF, Deps, UserCtx>>({
     logSchema: config.logSchema,
     flags: config.flags as FF,
     logBinding,
   });
 
-  const defineOps = createDefineOps<LogSchema<T>, FF, Deps, UserCtx>(
+  const defineOps = createDefineOps<OpContext<LogSchema<T>, FF, Deps, UserCtx>>(
     { logSchema: config.logSchema, flags: config.flags as FF, logBinding },
     createOpGroup,
   );
 
-  // Return the factory
+  // Return the factory with phantom type property
   // Note: logSchema needs a cast because the effective schema
   // (which includes deps schemas) requires runtime computation.
   // OpContextFactory expects LogSchema<EffectiveSchema<T, Deps>>,
   // but at this point we only have T. The type is correct at the call site.
   return {
+    [opContextType]: undefined as any as OpContext<LogSchema<T>, FF, Deps, UserCtx>,
     logSchema: config.logSchema as unknown as LogSchema<any>,
     flags: config.flags as FF,
     logBinding,
@@ -163,10 +165,7 @@ export function defineOpContext<
     defineOps,
     createTrace: (params) => {
       return createTraceImpl(config, logBinding, params) as unknown as SpanContext<
-        LogSchema<EffectiveSchema<T, Deps>>,
-        FF,
-        Deps,
-        UserCtx
+        OpContext<LogSchema<EffectiveSchema<T, Deps>>, FF, Deps, UserCtx>
       >;
     },
   };

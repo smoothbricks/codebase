@@ -10,11 +10,12 @@
 import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import {
-  type BaseSpanLogger,
   createSpanLogger as createSpanLoggerFromGenerator,
+  type SpanLoggerImpl,
 } from './codegen/spanLoggerGenerator.js';
 import { Op } from './op.js';
-import { FluentErr, FluentOk } from './result.js';
+import type { SpanContext, SpanFn } from './opContext/types.js';
+import { FluentErr, FluentOk, type Result } from './result.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
@@ -34,58 +35,18 @@ import type { LogBinding, ModuleContext, SpanBuffer } from './types.js';
 export const SPAN_CONTEXT_MARKER = Symbol.for('lmao.SpanContext');
 
 // =============================================================================
-// FluentLogEntry Type
+// Type Exports
 // =============================================================================
 
-/**
- * Fluent builder for log entries - supports .line() chaining
- *
- * Returned by ctx.log.info(), ctx.log.warn(), etc. to enable:
- * ctx.log.info('message').line(42)
- */
-export interface FluentLogEntry {
-  /**
-   * Set the source code line number for this log entry.
-   *
-   * Per specs/01c_context_flow_and_op_wrappers.md "Line Number System":
-   * - TypeScript transformer injects these calls at compile time
-   * - No runtime overhead - just a method call with literal number
-   *
-   * @param lineNumber - Source line number (0-65535)
-   *
-   * @example
-   * ctx.log.info('Processing user').line(42);
-   */
-  line(lineNumber: number): void;
-
-  /** Set error code for this entry */
-  error_code(code: string): void;
-
-  /** Set exception stack for this entry */
-  exception_stack(stack: string): void;
-
-  /** Set feature flag value for this entry */
-  ff_value(value: string): void;
-
-  /** Set uint64 value for this entry */
-  uint64_value(value: bigint): void;
-}
-
-// =============================================================================
-// SpanLogger Type Alias
-// =============================================================================
+// Public SpanLogger type is defined in opContext/spanContextTypes.ts
+// It extends BaseSpanLogger (core logging methods) with ColumnWriter (schema methods)
+// This file defines SpanLoggerInternal which extends SpanLoggerImpl (includes internal methods)
 
 /**
- * SpanLogger type - alias for BaseSpanLogger which includes
- * schema-specific setter methods via ColumnWriter<T>.
+ * Internal SpanLogger type with FF methods and internal methods exposed.
+ * Used by FeatureFlagEvaluator and internal span management code.
  */
-export type SpanLogger<T extends LogSchema> = BaseSpanLogger<T>;
-
-/**
- * Internal SpanLogger type with FF methods (not on public type).
- * Methods exist at runtime but are hidden from TypeScript users.
- */
-export type SpanLoggerInternal<T extends LogSchema> = SpanLogger<T> & {
+export type SpanLoggerInternal<T extends LogSchema> = SpanLoggerImpl<T> & {
   /**
    * Write feature flag access entry (internal, not on public type).
    * Called by FeatureFlagEvaluator to log flag access.
@@ -98,224 +59,8 @@ export type SpanLoggerInternal<T extends LogSchema> = SpanLogger<T> & {
   ffUsage(flagName: string, context?: Record<string, unknown>): void;
 };
 
-// =============================================================================
-// SpanFn Types
-// =============================================================================
-
-/**
- * SpanFn type for ctx.span() - creates a child span
- *
- * Per spec 01l lines 474-511 and 01o lines 34-72:
- * Supports 6 overloads for Op invocation and inline closures, with/without line numbers.
- *
- * The transformer injects line numbers as the first argument, but runtime supports both.
- */
-export type SpanFn<T extends LogSchema, FF extends FeatureFlagSchema, Env> = {
-  // Overload 1: With line number, with ctx override
-  <R, Args extends unknown[], Ctx extends SpanContext<T, FF, Env>>(
-    line: number,
-    name: string,
-    ctx: Ctx,
-    op: Op<Ctx, Args, R>,
-    ...args: Args
-  ): Promise<R>;
-
-  // Overload 2: With line number, without ctx override
-  <R, Args extends unknown[]>(
-    line: number,
-    name: string,
-    op: Op<SpanContext<T, FF, Env>, Args, R>,
-    ...args: Args
-  ): Promise<R>;
-
-  // Overload 3: With line number, inline closure
-  <R>(line: number, name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R>;
-
-  // Overload 4: Without line number, with ctx override
-  <R, Args extends unknown[], Ctx extends SpanContext<T, FF, Env>>(
-    name: string,
-    ctx: Ctx,
-    op: Op<Ctx, Args, R>,
-    ...args: Args
-  ): Promise<R>;
-
-  // Overload 5: Without line number, without ctx override (most common)
-  <R, Args extends unknown[]>(name: string, op: Op<SpanContext<T, FF, Env>, Args, R>, ...args: Args): Promise<R>;
-
-  // Overload 6: Without line number, inline closure
-  <R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R>;
-};
-
-// =============================================================================
-// SpanContext Interface
-// =============================================================================
-
-/**
- * SpanContext - what ops receive when invoked
- *
- * Per spec 01l lines 747-762:
- * Combines built-in properties with user-extensible Extra via intersection at usage site.
- *
- * @typeParam T - Tag attribute schema for this module
- * @typeParam FF - Feature flag schema
- * @typeParam Env - Environment configuration type
- *
- * @example
- * ```typescript
- * const createUser = task('create-user', async (ctx, userData) => {
- *   // Scoped attributes (propagate to all log entries)
- *   ctx.setScope({ userId: userData.id });
- *
- *   // Span attributes (writes to span-start row)
- *   ctx.tag.operation('INSERT');
- *
- *   // Logging (includes scoped attributes)
- *   ctx.log.info('Creating user').line(42);
- *
- *   // Results
- *   return ctx.ok(user);
- * });
- * ```
- */
-export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, Env = Record<string, unknown>> {
-  /** Marker for prototype chain detection */
-  readonly [SPAN_CONTEXT_MARKER]: true;
-
-  /**
-   * Feature flags (logs access to current span)
-   */
-  readonly ff: FeatureFlagEvaluator<FF> & InferFeatureFlagsWithContext<FF>;
-
-  /**
-   * Environment configuration
-   */
-  readonly env: Env;
-
-  /**
-   * Dependencies - can be destructured!
-   *
-   * Per spec 01l lines 757-758:
-   * - Plain object references to dependency modules/ops
-   * - Zero-allocation deps (not closures)
-   *
-   * @example
-   * const { retry, auth } = deps;
-   * await span('retry', retry, 1);
-   */
-  readonly deps: Record<string, unknown>;
-
-  /**
-   * Chainable span attribute API
-   *
-   * Writes attributes to row 0 (span-start) with overwrite semantics.
-   * All methods return the tag API for chaining.
-   *
-   * @example
-   * ctx.tag.userId('u1').requestId('r1').operation('INSERT');
-   * ctx.tag.with({ userId: 'u1', requestId: 'r1' });
-   */
-  readonly tag: TagWriter<T>;
-
-  /**
-   * Logging API for structured log messages
-   *
-   * Use for logging events during span execution.
-   * Logs are appended to the buffer (row 2+).
-   *
-   * @example
-   * ctx.log.info('Processing request').line(42);
-   */
-  readonly log: SpanLogger<T>;
-
-  /**
-   * Set scoped attributes that auto-propagate to all subsequent log entries
-   *
-   * Scoped attributes are automatically included in all log entries
-   * and inherited by child spans. Uses merge semantics - pass null to clear a value.
-   *
-   * @param attributes - Attributes to scope to this span (null clears a value)
-   *
-   * @example
-   * ctx.setScope({ requestId: req.id, userId: req.user?.id });
-   * ctx.log.info('Processing'); // Includes requestId and userId
-   * ctx.setScope({ userId: null }); // Clear userId from scope
-   */
-  setScope(attributes: Partial<InferSchema<T> | null>): void;
-
-  /**
-   * Read-only view of current scoped attributes
-   *
-   * Returns the frozen scope object containing all currently scoped values.
-   * Use setScope() to modify scope values.
-   *
-   * @example
-   * ctx.setScope({ requestId: 'r1' });
-   * console.log(ctx.scope.requestId); // 'r1'
-   */
-  readonly scope: Readonly<Partial<InferSchema<T>>>;
-
-  /**
-   * Create a success result with optional attributes
-   *
-   * Writes span-ok entry to row 1 (span-end).
-   * Supports fluent chaining with .with() and .message().
-   *
-   * @param value - The success value
-   * @returns Fluent result builder
-   *
-   * @example
-   * return ctx.ok(user).with({ userId: user.id });
-   */
-  ok<V>(value: V): FluentOk<V, T>;
-
-  /**
-   * Create an error result with optional attributes
-   *
-   * Writes span-err entry to row 1 (span-end).
-   * Supports fluent chaining with .with() and .message().
-   *
-   * @param code - Error code string
-   * @param error - Error details
-   * @returns Fluent result builder
-   *
-   * @example
-   * return ctx.err('NOT_FOUND', { userId }).message('User not found');
-   */
-  err<E>(code: string, error: E): FluentErr<E, T>;
-
-  /**
-   * Create a child span with its own buffer
-   *
-   * Child spans inherit scoped attributes from the parent.
-   * The child function receives a new SpanContext.
-   *
-   * @param name - Child span name
-   * @param fn - Async function to execute in child span
-   * @param line - Optional source line number (injected by transformer)
-   * @returns Promise resolving to the child function's return value
-   *
-   * @example
-   * const result = await ctx.span('validate', async (childCtx) => {
-   *   childCtx.tag.step('validation');
-   *   return childCtx.ok({ valid: true });
-   * });
-   */
-  span: SpanFn<T, FF, Env>;
-
-  /**
-   * The underlying SpanBuffer for this context.
-   *
-   * Useful for Arrow table conversion after task completion.
-   * The buffer contains all trace data written during this span's execution.
-   *
-   * @example
-   * ```typescript
-   * const result = await myTask(requestCtx, args);
-   * const table = convertToArrowTable(ctx.buffer);
-   * ```
-   */
-  readonly buffer: SpanBuffer<T>;
-}
+// SpanFn and SpanContext are defined in opContext/spanContextTypes.ts
+// Import them for use in this implementation file
 
 // =============================================================================
 // MutableSpanContext (internal)
@@ -342,7 +87,7 @@ export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagS
   log: SpanLogger<T>;
   _buffer: SpanBuffer<T>;
   _schema: T;
-  _spanLogger: BaseSpanLogger<T>;
+  _spanLogger: SpanLoggerImpl<T>;
   buffer: SpanBuffer<T>;
   setScope: (attributes: Partial<InferSchema<T> | null>) => void;
   scope: Readonly<Partial<InferSchema<T>>>;
@@ -406,9 +151,9 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
  * @param buffer - SpanBuffer to write entries to (per-span instance)
  * @returns SpanLogger with typed methods matching schema
  */
-export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): BaseSpanLogger<T> {
+export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
   // Create the SpanLogger - it will read/write scope via buffer._scopeValues
-  return createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer) as BaseSpanLogger<T>;
+  return createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer) as SpanLoggerImpl<T>;
 }
 
 /**
@@ -647,3 +392,9 @@ export function isSpanContext<T extends LogSchema, FF extends FeatureFlagSchema,
     (value as Record<symbol, unknown>)[SPAN_CONTEXT_MARKER] === true
   );
 }
+
+// =============================================================================
+// Re-export public types from opContext/types
+// =============================================================================
+
+export type { FluentLogEntry, SpanContext, SpanFn, SpanLogger } from './opContext/types.js';

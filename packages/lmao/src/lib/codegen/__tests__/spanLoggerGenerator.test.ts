@@ -24,7 +24,7 @@ import {
 import type { LogSchema } from '../../schema/types.js';
 import { createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
 import type { SpanBuffer } from '../../types.js';
-import { type BaseSpanLogger, createSpanLoggerClass } from '../spanLoggerGenerator.js';
+import { createSpanLoggerClass, type SpanLoggerImpl } from '../spanLoggerGenerator.js';
 
 function createTestBuffer(schema: LogSchema): SpanBuffer {
   const module = createTestModuleContext(schema);
@@ -93,7 +93,7 @@ describe('createSpanLoggerClass', () => {
   describe('logging methods', () => {
     let schema: LogSchema;
     let buffer: SpanBuffer;
-    let logger: BaseSpanLogger<LogSchema>;
+    let logger: SpanLoggerImpl<LogSchema>;
 
     beforeEach(() => {
       schema = defineLogSchema({

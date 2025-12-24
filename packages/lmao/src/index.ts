@@ -88,7 +88,7 @@ export * from './lib/schema/typeGuards.js';
 
 export type { ResultWriter, TagWriter } from './lib/codegen/fixedPositionWriterGenerator.js';
 export { createResultWriter, createTagWriter } from './lib/codegen/fixedPositionWriterGenerator.js';
-export type { BaseSpanLogger } from './lib/codegen/spanLoggerGenerator.js';
+export type { BaseSpanLogger, SpanLoggerImpl } from './lib/codegen/spanLoggerGenerator.js';
 export { createSpanLogger, createSpanLoggerClass } from './lib/codegen/spanLoggerGenerator.js';
 
 // =============================================================================

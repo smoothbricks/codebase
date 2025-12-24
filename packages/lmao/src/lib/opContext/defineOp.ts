@@ -9,12 +9,10 @@
 
 import { intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import { Op as OpClass } from '../op.js';
-import type { LogSchema } from '../schema/LogSchema.js';
 import type { LogBinding } from '../types.js';
-import type { FeatureFlagSchema } from './featureFlagTypes.js';
-import type { DepsConfig, OpGroup } from './opGroupTypes.js';
+import type { OpGroup } from './opGroupTypes.js';
 import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
-import type { SpanContext } from './spanContextTypes.js';
+import type { OpContext } from './types.js';
 
 // =============================================================================
 // METADATA HELPERS
@@ -136,11 +134,12 @@ export function extractMetadataFromStack(skipFrames = 2): OpMetadata {
 // =============================================================================
 
 /**
- * Configuration passed to createDefineOp and createDefineOps factories.
+ * Configuration using OpContext bundle.
+ * Simplifies factory config by carrying all context types in one parameter.
  */
-interface DefineOpFactoryConfig<T extends LogSchema, FF extends FeatureFlagSchema> {
-  readonly logSchema: T;
-  readonly flags: FF;
+interface DefineOpFactoryConfig<Ctx extends OpContext> {
+  readonly logSchema: Ctx['logSchema'];
+  readonly flags: Ctx['flags'];
   readonly logBinding: LogBinding;
 }
 
@@ -148,12 +147,11 @@ interface DefineOpFactoryConfig<T extends LogSchema, FF extends FeatureFlagSchem
  * Factory function type for creating OpGroups.
  * Used by createDefineOps to delegate OpGroup creation.
  */
-type CreateOpGroupFn<T extends LogSchema, FF extends FeatureFlagSchema, UserCtx extends Record<string, unknown>> = (
-  logSchema: T,
-  flags: FF,
-  // biome-ignore lint/suspicious/noExplicitAny: Ops stored with any deps for flexibility
-  ops: Record<string, Op<T, FF, any, UserCtx, unknown[], unknown>>,
-) => OpGroup<T, FF, UserCtx>;
+type CreateOpGroupFn<Ctx extends OpContext> = (
+  logSchema: Ctx['logSchema'],
+  flags: Ctx['flags'],
+  ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
+) => OpGroup<Ctx>;
 
 // =============================================================================
 // CREATE DEFINE OP
@@ -168,30 +166,22 @@ type CreateOpGroupFn<T extends LogSchema, FF extends FeatureFlagSchema, UserCtx 
  * - logBinding: from factoryConfig (contains logSchema, capacity stats, optional prefix view)
  * - fn(ctx, ...args): the user function to execute
  *
- * @template T - LogSchema type
- * @template FF - Feature flag schema
- * @template Deps - Dependencies config
- * @template UserCtx - User context properties
+ * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @param factoryConfig - Configuration containing logSchema and flags
  * @returns A defineOp function for creating Op instances
  */
-export function createDefineOp<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
->(
-  factoryConfig: DefineOpFactoryConfig<T, FF>,
-): <Args extends unknown[], R>(
+export function createDefineOp<Ctx extends OpContext>(
+  factoryConfig: DefineOpFactoryConfig<Ctx>,
+): <Args extends unknown[], S, E>(
   name: string,
-  fn: OpFn<T, FF, Deps, UserCtx, Args, R>,
+  fn: OpFn<Ctx, Args, S, E>,
   metadata?: Partial<OpMetadata>,
-) => Op<T, FF, Deps, UserCtx, Args, R> {
-  return function defineOpImpl<Args extends unknown[], R>(
+) => Op<Ctx, Args, S, E> {
+  return function defineOpImpl<Args extends unknown[], S, E>(
     name: string,
-    fn: OpFn<T, FF, Deps, UserCtx, Args, R>,
+    fn: OpFn<Ctx, Args, S, E>,
     metadata?: Partial<OpMetadata>,
-  ): Op<T, FF, Deps, UserCtx, Args, R> {
+  ): Op<Ctx, Args, S, E> {
     // When transformer is not installed, extract metadata from stack trace
     // This provides useful file/line info for debugging even without build-time injection
     // skipFrames=3: Error -> extractMetadataFromStack -> defineOpImpl -> caller
@@ -204,12 +194,7 @@ export function createDefineOp<
     // - Sets _opMetadata and _callsiteMetadata
     // - Writes span-start/span-ok/span-err entries
     // - Handles exceptions with span-exception
-    return new OpClass(
-      name,
-      finalMetadata,
-      factoryConfig.logBinding,
-      fn as (ctx: SpanContext<T, FF, Deps, UserCtx>, ...args: Args) => Promise<R>,
-    ) as unknown as Op<T, FF, Deps, UserCtx, Args, R>;
+    return new OpClass(name, finalMetadata, factoryConfig.logBinding, fn) as unknown as Op<Ctx, Args, S, E>;
   };
 }
 
@@ -220,12 +205,7 @@ export function createDefineOp<
 /**
  * Type guard to check if a definition is an existing Op instance.
  */
-function isOp<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
->(def: unknown): def is Op<T, FF, Deps, UserCtx, unknown[], unknown> {
+function isOp<Ctx extends OpContext>(def: unknown): def is Op<Ctx, unknown[], unknown, unknown> {
   return def instanceof OpClass;
 }
 
@@ -241,52 +221,34 @@ function isOp<
  * - Creates OpGroup using createOpGroup(logSchema, flags, ops)
  * - Returns Object.assign(opGroup, ops) to get both OpGroup methods and individual ops
  *
- * @template T - LogSchema type
- * @template FF - Feature flag schema
- * @template Deps - Dependencies config
- * @template UserCtx - User context properties
+ * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @param factoryConfig - Configuration containing logSchema and flags
  * @param createOpGroup - Factory function for creating OpGroups
  * @returns A defineOps function for creating OpGroups
  */
-export function createDefineOps<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
->(
-  factoryConfig: DefineOpFactoryConfig<T, FF>,
-  createOpGroup: CreateOpGroupFn<T, FF, UserCtx>,
-): <
-  Defs extends Record<
-    string,
-    Op<T, FF, Deps, UserCtx, unknown[], unknown> | OpFn<T, FF, Deps, UserCtx, unknown[], unknown>
-  >,
->(
-  definitions: Defs & ThisType<OpsFromRecord<T, FF, Deps, UserCtx, Defs>>,
-) => OpGroup<T, FF, UserCtx> & OpsFromRecord<T, FF, Deps, UserCtx, Defs> {
+export function createDefineOps<Ctx extends OpContext>(
+  factoryConfig: DefineOpFactoryConfig<Ctx>,
+  createOpGroup: CreateOpGroupFn<Ctx>,
+): <Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>>(
+  definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>,
+) => OpGroup<Ctx> & OpsFromRecord<Ctx, Defs> {
   // Get the defineOp function for wrapping raw functions
-  const defineOp = createDefineOp<T, FF, Deps, UserCtx>(factoryConfig);
+  const defineOp = createDefineOp<Ctx>(factoryConfig);
 
   return function defineOpsImpl<
-    Defs extends Record<
-      string,
-      Op<T, FF, Deps, UserCtx, unknown[], unknown> | OpFn<T, FF, Deps, UserCtx, unknown[], unknown>
-    >,
-  >(
-    definitions: Defs & ThisType<OpsFromRecord<T, FF, Deps, UserCtx, Defs>>,
-  ): OpGroup<T, FF, UserCtx> & OpsFromRecord<T, FF, Deps, UserCtx, Defs> {
+    Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
+  >(definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>): OpGroup<Ctx> & OpsFromRecord<Ctx, Defs> {
     // Build the ops record by processing each definition
-    // biome-ignore lint/suspicious/noExplicitAny: Ops stored with any deps for flexibility
-    const ops: Record<string, Op<T, FF, any, UserCtx, unknown[], unknown>> = {};
+    // Ops stored with unknown context for flexibility - type checked at call site
+    const ops: Record<string, Op<Ctx, unknown[], unknown, unknown>> = {};
 
     for (const [name, def] of Object.entries(definitions)) {
-      if (isOp<T, FF, Deps, UserCtx>(def)) {
+      if (isOp<Ctx>(def)) {
         // Already an Op instance, use as-is
         ops[name] = def;
       } else {
         // Raw function, wrap with defineOp
-        ops[name] = defineOp(name, def as OpFn<T, FF, Deps, UserCtx, unknown[], unknown>);
+        ops[name] = defineOp(name, def);
       }
     }
 
@@ -294,6 +256,6 @@ export function createDefineOps<
     const opGroup = createOpGroup(factoryConfig.logSchema, factoryConfig.flags, ops);
 
     // Return OpGroup merged with individual ops for direct access
-    return Object.assign(opGroup, ops) as OpGroup<T, FF, UserCtx> & OpsFromRecord<T, FF, Deps, UserCtx, Defs>;
+    return Object.assign(opGroup, ops) as OpGroup<Ctx> & OpsFromRecord<Ctx, Defs>;
   };
 }

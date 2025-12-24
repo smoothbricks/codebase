@@ -9,13 +9,10 @@
 
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { generateRemappedBufferViewClass } from '../library.js';
-import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { LogBinding } from '../types.js';
-import type { FeatureFlagSchema } from './featureFlagTypes.js';
 import type {
   ColumnMapping,
-  EmptyDeps,
   MappedOpGroup,
   MappedSchema,
   OpGroup,
@@ -23,6 +20,7 @@ import type {
   SchemaFieldsOf,
 } from './opGroupTypes.js';
 import type { Op } from './opTypes.js';
+import type { OpContext } from './types.js';
 
 // =============================================================================
 // INTERNAL HELPERS
@@ -128,19 +126,14 @@ function buildContributedSchema<T extends SchemaFields, M extends ColumnMapping<
 /**
  * Create a MappedOpGroup from an existing group and mapping
  */
-function createMappedOpGroup<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  UserCtx extends Record<string, unknown>,
-  ContributedSchema extends SchemaFields,
->(
-  logSchema: T,
-  flags: FF,
-  ops: Record<string, Op<T, FF, EmptyDeps, UserCtx, unknown[], unknown>>,
-  columnMapping: ColumnMapping<SchemaFieldsOf<T>>,
+function createMappedOpGroup<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
+  logSchema: Ctx['logSchema'],
+  flags: Ctx['flags'],
+  ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
+  columnMapping: ColumnMapping<SchemaFields>,
   contributedSchema: ContributedSchema,
   parentLogBinding: LogBinding,
-): MappedOpGroup<T, FF, UserCtx, ContributedSchema> {
+): MappedOpGroup<Ctx, ContributedSchema> {
   // Generate RemappedBufferView class for this mapping.
   // The mapping is clean→prefixed (e.g., { status: 'http_status' })
   // RemappedBufferView needs the REVERSE: prefixed→clean (e.g., { http_status: 'status' })
@@ -165,10 +158,10 @@ function createMappedOpGroup<
     logSchema,
     flags,
     ops,
-    _columnMapping: columnMapping,
-    _contributedSchema: contributedSchema,
+    columnMapping,
+    contributedSchema,
 
-    prefix<P extends string>(p: P): MappedOpGroup<T, FF, UserCtx, PrefixedSchema<ContributedSchema, P>> {
+    prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>> {
       // Apply prefix to the current mapping's target names
       const newMapping = prefixMapping(columnMapping, p);
       // Build new contributed schema by prefixing the current contributed schema
@@ -186,14 +179,24 @@ function createMappedOpGroup<
       );
     },
 
-    mapColumns<M extends ColumnMapping<SchemaFieldsOf<T>>>(
+    mapColumns<M extends ColumnMapping<ContributedSchema>>(
       mapping: M,
-    ): MappedOpGroup<T, FF, UserCtx, MappedSchema<SchemaFieldsOf<T>, M>> {
+    ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>> {
       // Override/extend the existing mapping with new mapping
       const newMapping = { ...columnMapping, ...mapping };
       // Build contributed schema from original fields with new mapping
-      const newContributed = buildContributedSchema(logSchema.fields as SchemaFieldsOf<T>, newMapping as M);
-      return createMappedOpGroup(logSchema, flags, ops, newMapping, newContributed, logBinding);
+      const newContributed = buildContributedSchema(
+        logSchema.fields as SchemaFields,
+        newMapping as ColumnMapping<SchemaFields>,
+      );
+      return createMappedOpGroup(
+        logSchema,
+        flags,
+        ops,
+        newMapping,
+        newContributed as MappedSchema<ContributedSchema, M>,
+        logBinding,
+      );
     },
   };
 }
@@ -235,15 +238,11 @@ function createMappedOpGroup<
  * deps: { http: httpOps.mapColumns({ status: 'http_status', _debug: null }) }
  * ```
  */
-export function createOpGroup<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  UserCtx extends Record<string, unknown>,
->(
-  logSchema: T,
-  flags: FF,
-  ops: Record<string, Op<T, FF, EmptyDeps, UserCtx, unknown[], unknown>>,
-): OpGroup<T, FF, UserCtx> {
+export function createOpGroup<Ctx extends OpContext>(
+  logSchema: Ctx['logSchema'],
+  flags: Ctx['flags'],
+  ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
+): OpGroup<Ctx> {
   // Extract the logBinding from the first op (all ops in the group share the same binding)
   const firstOp = Object.values(ops)[0];
   const logBinding: LogBinding = firstOp?.logBinding ?? {
@@ -261,24 +260,19 @@ export function createOpGroup<
     flags,
     ops,
 
-    prefix<P extends string>(p: P): MappedOpGroup<T, FF, UserCtx, PrefixedSchema<SchemaFieldsOf<T>, P>> {
+    prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>> {
       const fieldNames = logSchema.fieldNames;
-      const mapping = buildPrefixMapping<SchemaFieldsOf<T>, P>(fieldNames, p);
-      const contributedSchema = buildContributedSchema(logSchema.fields as SchemaFieldsOf<T>, mapping);
-      return createMappedOpGroup(
-        logSchema,
-        flags,
-        ops,
-        mapping,
-        contributedSchema as unknown as PrefixedSchema<SchemaFieldsOf<T>, P>,
-        logBinding,
-      );
+      const mapping = buildPrefixMapping(fieldNames, p);
+      const contributedSchema = buildContributedSchema(logSchema.fields as SchemaFields, mapping);
+      // @ts-expect-error - SchemaFieldsOf<Ctx['logSchema']> extends SchemaFields at runtime
+      return createMappedOpGroup(logSchema, flags, ops, mapping, contributedSchema, logBinding);
     },
 
-    mapColumns<M extends ColumnMapping<SchemaFieldsOf<T>>>(
+    mapColumns<M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
       mapping: M,
-    ): MappedOpGroup<T, FF, UserCtx, MappedSchema<SchemaFieldsOf<T>, M>> {
-      const contributedSchema = buildContributedSchema(logSchema.fields as SchemaFieldsOf<T>, mapping);
+    ): MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>> {
+      const contributedSchema = buildContributedSchema(logSchema.fields as SchemaFields, mapping);
+      // @ts-expect-error - SchemaFieldsOf<Ctx['logSchema']> extends SchemaFields at runtime
       return createMappedOpGroup(logSchema, flags, ops, mapping, contributedSchema, logBinding);
     },
   };

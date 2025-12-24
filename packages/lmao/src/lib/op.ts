@@ -11,6 +11,9 @@
  */
 
 import type { OpMetadata } from './opContext/opTypes.js';
+import type { SpanContext } from './opContext/spanContextTypes.js';
+import type { OpContext } from './opContext/types.js';
+import type { Result } from './result.js';
 import type { LogBinding } from './types.js';
 
 // =============================================================================
@@ -25,7 +28,7 @@ import type { LogBinding } from './types.js';
  * - Captures module metadata for attribution
  * - fn is public and called by span_op() after buffer/context creation
  *
- * Type parameter order matches function signature: (ctx: Ctx, ...args: Args) => Result
+ * Type parameter order matches function signature: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E>
  *
  * Op has TWO names:
  * - `name`: The Op's name for metrics (invocations, errors, duration tracking)
@@ -35,11 +38,12 @@ import type { LogBinding } from './types.js';
  * - When span() invokes this Op, the Op's metadata becomes buffer._opMetadata (for rows 1+)
  * - The caller's metadata becomes buffer._callsiteMetadata (for row 0)
  *
- * @typeParam Ctx - Required context type (contravariant position)
+ * @typeParam Ctx - OpContext with deps, ff, env (contravariant position)
  * @typeParam Args - Tuple of argument types (excluding ctx)
- * @typeParam Result - Return type (can be sync T or async Promise<T>)
+ * @typeParam S - Success type of the Result
+ * @typeParam E - Error type of the Result
  */
-export class Op<Ctx, Args extends unknown[], Result> {
+export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
   constructor(
     /** The Op's name for metrics (invocations, errors, duration) */
     readonly name: string,
@@ -48,6 +52,6 @@ export class Op<Ctx, Args extends unknown[], Result> {
     /** LogBinding with logging infrastructure (schema, capacity stats, optional prefix view) */
     readonly logBinding: LogBinding,
     /** The user function to execute - called by span_op after context creation (can be sync or async) */
-    readonly fn: (ctx: Ctx, ...args: Args) => Result,
+    readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
   ) {}
 }
