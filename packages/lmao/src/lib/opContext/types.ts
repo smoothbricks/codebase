@@ -55,7 +55,7 @@ export type {
 // Op types (metadata, function signature, instance)
 export type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 // SpanContext types (tag writer, logger, span function, full context)
-export type { FluentLogEntry, InvocableOp, SpanContext, SpanFn, SpanLogger, TagWriter } from './spanContextTypes.js';
+export type { FluentLogEntry, SpanContext, SpanFn, SpanLogger, TagWriter } from './spanContextTypes.js';
 
 // =============================================================================
 // CONVENIENCE RE-EXPORTS
@@ -63,6 +63,53 @@ export type { FluentLogEntry, InvocableOp, SpanContext, SpanFn, SpanLogger, TagW
 
 export { LogSchema } from '../schema/LogSchema.js';
 export type { FeatureFlagDefinition, InferSchema, SchemaFields } from '../schema/types.js';
+
+// =============================================================================
+// OP CONTEXT TYPE SYMBOL
+// =============================================================================
+
+/**
+ * Unique symbol to carry OpContext type on OpContextFactory.
+ * Allows extracting the bundled type without passing 4 separate params.
+ */
+declare const opContextType: unique symbol;
+
+/**
+ * Helper to extract OpContext from a factory.
+ * @example
+ * const { defineOp } = defineOpContext({ ... });
+ * type MyCtx = OpContextOf<typeof factory>; // OpContext<T, FF, Deps, UserCtx>
+ */
+export type OpContextOf<F> = F extends { readonly [opContextType]: infer Ctx } ? Ctx : never;
+
+export { opContextType };
+
+// =============================================================================
+// OP CONTEXT BUNDLE TYPE
+// =============================================================================
+
+/**
+ * Bundled type parameters for Op context.
+ *
+ * Created by defineOpContext() and shared by all Ops from that factory.
+ * Reduces type parameter count: Op<Ctx, Args, S, E> instead of Op<T, FF, Deps, UserCtx, Args, R>
+ *
+ * @template T - LogSchema type
+ * @template FF - Feature flag schema
+ * @template Deps - Dependencies config
+ * @template UserCtx - User context properties
+ */
+export type OpContext<
+  T extends LogSchema = LogSchema,
+  FF extends FeatureFlagSchema = {},
+  Deps extends DepsConfig = EmptyDeps,
+  UserCtx extends Record<string, unknown> = {},
+> = {
+  readonly logSchema: T;
+  readonly flags: FF;
+  readonly deps: Deps;
+  readonly userCtx: UserCtx;
+};
 
 // =============================================================================
 // OP CONTEXT CONFIGURATION
@@ -73,8 +120,8 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { TraceContextParams, ValidateUserContext } from './contextTypes.js';
 import type { FeatureFlagSchema } from './featureFlagTypes.js';
-import type { DepsConfig, EffectiveSchema, OpGroup, SchemaFieldsOf } from './opGroupTypes.js';
-import type { Op, OpFn, OpsFromRecord } from './opTypes.js';
+import type { DepsConfig, EffectiveSchema, EmptyDeps, OpGroup, SchemaFieldsOf } from './opGroupTypes.js';
+import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { SpanContext } from './spanContextTypes.js';
 
 /**
@@ -188,6 +235,9 @@ export interface OpContextConfig<
  * - `logSchema`: The combined effective schema
  * - `flags`: The feature flag schema
  *
+ * Uses unique symbol [opContextType] to carry the bundled OpContext type
+ * for extraction via OpContextOf<typeof factory>.
+ *
  * @template T - The app's LogSchema
  * @template FF - Feature flag schema
  * @template Deps - Wired dependencies
@@ -202,6 +252,16 @@ export interface OpContextFactory<
   Deps extends DepsConfig,
   UserCtx extends Record<string, unknown>,
 > {
+  /**
+   * Phantom type - extract via OpContextOf<typeof factory>
+   *
+   * Carries the bundled OpContext type for all Ops and Spans from this factory.
+   * This allows ops to use Op<Ctx, Args, S, E> instead of Op<T, FF, Deps, UserCtx, Args, S, E>.
+   *
+   * @internal
+   */
+  readonly [opContextType]: OpContext<T, FF, Deps, UserCtx>;
+
   /**
    * The combined log schema (app schema + dep contributions).
    *
@@ -237,79 +297,129 @@ export interface OpContextFactory<
   readonly flagEvaluator?: FlagEvaluator<T, FF, UserCtx>;
 
   /**
-   * Define a single Op with explicit name
+   * Define a single Op with explicit name.
    *
-   * @param name - Op name for metrics and default span naming
-   * @param fn - Op function
-   * @returns Op instance
+   * Creates an Op instance that wraps your function with metadata for tracing.
+   * The Op can be invoked via ctx.span() or exported for use by other modules.
+   *
+   * @param name - Op name (used for default span naming and metrics)
+   * @param fn - Op function receiving SpanContext and returning Result<S, E>
+   * @param metadata - Optional metadata override (package_name, package_file, etc.)
+   * @returns Op instance with type Op<OpContext<T, FF, Deps, UserCtx>, Args, S, E>
    *
    * @example
+   * ```typescript
    * const fetchUser = defineOp('fetchUser', async (ctx, userId: string) => {
    *   ctx.tag.userId(userId);
-   *   return ctx.ok(await db.getUser(userId));
+   *   const user = await db.getUser(userId);
+   *   if (!user) return ctx.err('NOT_FOUND', { userId });
+   *   return ctx.ok(user);
    * });
+   *
+   * // Invoke via span:
+   * const result = await ctx.span('get-user', fetchUser, 'user-123');
+   * ```
    */
-  defineOp<Args extends unknown[], R>(
+  defineOp<Args extends unknown[], S, E>(
     name: string,
-    fn: OpFn<T, FF, Deps, UserCtx, Args, R>,
-  ): Op<T, FF, Deps, UserCtx, Args, R>;
+    fn: OpFn<OpContext<T, FF, Deps, UserCtx>, Args, S, E>,
+    metadata?: Partial<OpMetadata>,
+  ): Op<OpContext<T, FF, Deps, UserCtx>, Args, S, E>;
 
   /**
-   * Define multiple Ops at once and create an OpGroup
+   * Define multiple Ops at once and create an OpGroup.
    *
-   * Property key becomes the Op name.
-   * Supports `this` binding for calling other ops in the batch.
-   * Returns an OpGroup that can be prefixed and wired as a dependency.
+   * Property keys become Op names. Supports `this` binding for calling
+   * sibling ops within the same batch. Returns an OpGroup that can be:
+   * - Prefixed with `.prefix('http')` for column namespacing
+   * - Column-mapped with `.mapColumns({ query: 'query' })` for sharing
+   * - Wired as a dependency in another module's `deps` config
    *
-   * @param definitions - Record of Op functions or existing Ops
-   * @returns OpGroup containing all defined Ops
+   * @param definitions - Record of Op functions or existing Op instances
+   * @returns OpGroup with all defined Ops accessible as properties
    *
    * @example
+   * ```typescript
    * export const userOps = defineOps({
-   *   fetchUser,  // Existing Op
-   *   updateUser: async (ctx, userId: string, data: UserData) => {
-   *     await ctx.span('validate', this.fetchUser, userId);
-   *     // ...
+   *   // Reuse existing Op
+   *   fetchUser,
+   *
+   *   // Define new op with method syntax
+   *   async createUser(ctx, data: UserData) {
+   *     ctx.tag.operation('INSERT');
+   *     const user = await db.createUser(data);
+   *     return ctx.ok(user);
+   *   },
+   *
+   *   // Call sibling op via this.opName
+   *   async createAndFetch(ctx, data: UserData) {
+   *     const created = await ctx.span('create', this.createUser, data);
+   *     if (!created.success) return created;
+   *     return ctx.span('fetch', this.fetchUser, created.value.id);
    *   },
    * });
    *
-   * // Later, wire with prefix:
+   * // Wire as dependency with prefix:
    * deps: { users: userOps.prefix('user') }
+   *
+   * // Invoke from parent context:
+   * await ctx.span('create-user', userOps.createUser, userData);
+   * ```
    */
   defineOps<
     Defs extends Record<
       string,
-      Op<T, FF, Deps, UserCtx, unknown[], unknown> | OpFn<T, FF, Deps, UserCtx, unknown[], unknown>
+      | OpFn<OpContext<T, FF, Deps, UserCtx>, unknown[], unknown, unknown>
+      | Op<OpContext<T, FF, Deps, UserCtx>, unknown[], unknown, unknown>
     >,
-  >(
-    definitions: Defs & ThisType<OpsFromRecord<T, FF, Deps, UserCtx, Defs>>,
-  ): OpGroup<T, FF, UserCtx> & OpsFromRecord<T, FF, Deps, UserCtx, Defs>;
+  >(definitions: Defs): OpGroup<OpContext<T, FF, Deps, UserCtx>> & OpsFromRecord<OpContext<T, FF, Deps, UserCtx>, Defs>;
 
   /**
-   * Create a trace context for a new request/invocation
+   * Create a root trace context for a new request/invocation.
    *
-   * Used by application code or adapters (Lambda, CF Worker, Browser, etc.)
-   * to create the root context for a trace.
+   * This is the entry point for tracing - call this at the start of each
+   * request, Lambda invocation, Cloudflare Worker fetch, etc.
    *
    * Properties that were `null` in ctx config MUST be provided here.
    * Properties with defaults can optionally be overridden.
    *
-   * @param params - Context params (required nulls + optional overrides)
-   * @returns Root SpanContext
+   * @param params - Context parameters (required nulls + optional overrides + traceId)
+   * @returns Root SpanContext ready for op invocation
    *
    * @example
-   * // Given ctx: {
-   * //   env: null as Env,                        // required
-   * //   userId: undefined as string | undefined, // optional
-   * //   config: { retry: 3 },                    // has default
+   * ```typescript
+   * // Given ctx config:
+   * // ctx: {
+   * //   env: null as Env,           // Required - must provide
+   * //   userId: undefined as string | undefined,  // Optional
+   * //   config: { retryCount: 3 },  // Has default
    * // }
-   * const ctx = createTrace({
-   *   env: workerEnv,         // Required - must provide
-   *   userId: user?.id,       // Optional - can omit or provide
-   *   // config not provided - uses default
-   * });
+   *
+   * // In Lambda handler:
+   * export async function handler(event: APIGatewayEvent, context: Context) {
+   *   const ctx = createTrace({
+   *     env: process.env,           // Required
+   *     userId: event.requestContext?.authorizer?.userId,  // Optional
+   *     // config uses default
+   *   });
+   *
+   *   const result = await ctx.span('handle-request', handleRequest, event);
+   *   return toAPIGatewayResponse(result);
+   * }
+   *
+   * // In Cloudflare Worker:
+   * export default {
+   *   async fetch(request: Request, env: Env) {
+   *     const ctx = createTrace({ env });
+   *     const result = await ctx.span('fetch', handleFetch, request);
+   *     return toResponse(result);
+   *   }
+   * };
+   * ```
    */
-  createTrace(params: CreateTraceParams<UserCtx>): SpanContext<T, FF, Deps, UserCtx>;
+  createTrace(
+    params: CreateTraceParams<UserCtx>,
+  ): SpanContext<OpContext<LogSchema<EffectiveSchema<SchemaFieldsOf<T>, Deps>>, FF, Deps, UserCtx>>;
 }
 
 // =============================================================================

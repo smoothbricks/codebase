@@ -13,8 +13,8 @@ import {
   type BaseSpanLogger,
   createSpanLogger as createSpanLoggerFromGenerator,
 } from './codegen/spanLoggerGenerator.js';
-import type { Op, OpBrand } from './op.js';
-import { FluentErrorResult, FluentSuccessResult } from './result.js';
+import { Op } from './op.js';
+import { FluentErr, FluentOk } from './result.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
@@ -115,7 +115,7 @@ export type SpanFn<T extends LogSchema, FF extends FeatureFlagSchema, Env> = {
   <R, Args extends unknown[], Ctx extends SpanContext<T, FF, Env>>(
     line: number,
     name: string,
-    ctx: Ctx & { [OpBrand]?: never },
+    ctx: Ctx,
     op: Op<Ctx, Args, R>,
     ...args: Args
   ): Promise<R>;
@@ -129,16 +129,12 @@ export type SpanFn<T extends LogSchema, FF extends FeatureFlagSchema, Env> = {
   ): Promise<R>;
 
   // Overload 3: With line number, inline closure
-  <R>(
-    line: number,
-    name: string,
-    fn: ((ctx: SpanContext<T, FF, Env>) => Promise<R>) & { [OpBrand]?: never },
-  ): Promise<R>;
+  <R>(line: number, name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R>;
 
   // Overload 4: Without line number, with ctx override
   <R, Args extends unknown[], Ctx extends SpanContext<T, FF, Env>>(
     name: string,
-    ctx: Ctx & { [OpBrand]?: never },
+    ctx: Ctx,
     op: Op<Ctx, Args, R>,
     ...args: Args
   ): Promise<R>;
@@ -147,7 +143,7 @@ export type SpanFn<T extends LogSchema, FF extends FeatureFlagSchema, Env> = {
   <R, Args extends unknown[]>(name: string, op: Op<SpanContext<T, FF, Env>, Args, R>, ...args: Args): Promise<R>;
 
   // Overload 6: Without line number, inline closure
-  <R>(name: string, fn: ((ctx: SpanContext<T, FF, Env>) => Promise<R>) & { [OpBrand]?: never }): Promise<R>;
+  <R>(name: string, fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>): Promise<R>;
 };
 
 // =============================================================================
@@ -270,7 +266,7 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
    * @example
    * return ctx.ok(user).with({ userId: user.id });
    */
-  ok<V>(value: V): FluentSuccessResult<V, T>;
+  ok<V>(value: V): FluentOk<V, T>;
 
   /**
    * Create an error result with optional attributes
@@ -285,7 +281,7 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
    * @example
    * return ctx.err('NOT_FOUND', { userId }).message('User not found');
    */
-  err<E>(code: string, error: E): FluentErrorResult<E, T>;
+  err<E>(code: string, error: E): FluentErr<E, T>;
 
   /**
    * Create a child span with its own buffer
@@ -350,8 +346,8 @@ export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagS
   buffer: SpanBuffer<T>;
   setScope: (attributes: Partial<InferSchema<T> | null>) => void;
   scope: Readonly<Partial<InferSchema<T>>>;
-  ok: <V>(value: V) => FluentSuccessResult<V, T>;
-  err: <E>(code: string, error: E) => FluentErrorResult<E, T>;
+  ok: <V>(value: V) => FluentOk<V, T>;
+  err: <E>(code: string, error: E) => FluentErr<E, T>;
   span: SpanFn<T, FF, Env>;
   span_op: <R, Args extends unknown[]>(
     line: number,
@@ -475,14 +471,14 @@ export function createSpanContextProto<
       this._spanLogger._setScope(attributes as Partial<InferSchema<T>>);
     },
 
-    // Ok method - creates FluentSuccessResult
-    ok<V>(this: MutableSpanContext<T, FF, Env>, value: V): FluentSuccessResult<V, T> {
-      return new FluentSuccessResult<V, T>(this._buffer, value, this._schema);
+    // Ok method - creates FluentOk
+    ok<V>(this: MutableSpanContext<T, FF, Env>, value: V): FluentOk<V, T> {
+      return new FluentOk<V, T>(this._buffer, value, this._schema);
     },
 
-    // Err method - creates FluentErrorResult
-    err<E>(this: MutableSpanContext<T, FF, Env>, code: string, error: E): FluentErrorResult<E, T> {
-      return new FluentErrorResult<E, T>(this._buffer, code, error, this._schema);
+    // Err method - creates FluentErr
+    err<E>(this: MutableSpanContext<T, FF, Env>, code: string, error: E): FluentErr<E, T> {
+      return new FluentErr<E, T>(this._buffer, code, error, this._schema);
     },
 
     // Monomorphic span_op - Op invocation (per spec 01o lines 46-49)
@@ -599,7 +595,7 @@ export function createSpanContextProto<
         restAfterName.length > 0 &&
         typeof restAfterName[0] === 'object' &&
         restAfterName[0] !== null &&
-        !('_invoke' in restAfterName[0])
+        !(restAfterName[0] instanceof Op)
       ) {
         // Context override detected - create child context inheriting from this via prototype
         // Override properties are spread onto the new object as own properties
@@ -620,7 +616,7 @@ export function createSpanContextProto<
       // Determine if op or fn
       const ctxToUse = ctxOverride ?? (this as unknown as SpanContext<T, FF, Env>);
 
-      if (opOrFn && '_invoke' in opOrFn) {
+      if (opOrFn instanceof Op) {
         // It's an Op
         return this.span_op(line, name, ctxToUse, opOrFn as Op<SpanContext<T, FF, Env>, unknown[], unknown>, ...args);
       }

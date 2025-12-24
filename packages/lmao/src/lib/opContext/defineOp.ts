@@ -166,7 +166,7 @@ type CreateOpGroupFn<T extends LogSchema, FF extends FeatureFlagSchema, UserCtx 
  * - name: the provided name
  * - metadata: merged with defaults
  * - logBinding: from factoryConfig (contains logSchema, capacity stats, optional prefix view)
- * - _invoke(ctx, ...args): calls fn(ctx, ...args)
+ * - fn(ctx, ...args): the user function to execute
  *
  * @template T - LogSchema type
  * @template FF - Feature flag schema
@@ -226,12 +226,7 @@ function isOp<
   Deps extends DepsConfig,
   UserCtx extends Record<string, unknown>,
 >(def: unknown): def is Op<T, FF, Deps, UserCtx, unknown[], unknown> {
-  return (
-    typeof def === 'object' &&
-    def !== null &&
-    '_invoke' in def &&
-    typeof (def as Op<T, FF, Deps, UserCtx, unknown[], unknown>)._invoke === 'function'
-  );
+  return def instanceof OpClass;
 }
 
 /**
@@ -240,7 +235,7 @@ function isOp<
  * The returned function:
  * - Iterates over Object.entries(definitions)
  * - For each [name, def]:
- *   - If def has _invoke method (is already an Op), use it as-is
+ *   - If def is an Op instance, use it as-is
  *   - Else wrap with defineOpImpl(name, def)
  * - Stores all ops in a record
  * - Creates OpGroup using createOpGroup(logSchema, flags, ops)

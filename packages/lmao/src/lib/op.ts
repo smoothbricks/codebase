@@ -14,18 +14,6 @@ import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogBinding } from './types.js';
 
 // =============================================================================
-// Op Brand Symbol
-// =============================================================================
-
-/**
- * Brand symbol to uniquely identify Op instances for overload discrimination
- *
- * Per spec 01o_typescript_transformer.md and experiment exp7-full-ctx.ts:
- * Used in SpanFn overloads to distinguish Op instances from context objects and closures
- */
-export const OpBrand: unique symbol = Symbol('OpBrand');
-
-// =============================================================================
 // Op Class
 // =============================================================================
 
@@ -49,12 +37,9 @@ export const OpBrand: unique symbol = Symbol('OpBrand');
  *
  * @typeParam Ctx - Required context type (contravariant position)
  * @typeParam Args - Tuple of argument types (excluding ctx)
- * @typeParam Result - Return type (can be sync or async)
+ * @typeParam Result - Return type (can be sync T or async Promise<T>)
  */
 export class Op<Ctx, Args extends unknown[], Result> {
-  /** Brand to distinguish Op from other objects in overload resolution */
-  declare readonly [OpBrand]: true;
-
   constructor(
     /** The Op's name for metrics (invocations, errors, duration) */
     readonly name: string,
@@ -62,7 +47,7 @@ export class Op<Ctx, Args extends unknown[], Result> {
     readonly metadata: OpMetadata,
     /** LogBinding with logging infrastructure (schema, capacity stats, optional prefix view) */
     readonly logBinding: LogBinding,
-    /** The user function to execute - called by span_op after context creation */
+    /** The user function to execute - called by span_op after context creation (can be sync or async) */
     readonly fn: (ctx: Ctx, ...args: Args) => Result,
   ) {}
 }

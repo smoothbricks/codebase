@@ -8,7 +8,7 @@
 
 import { createTagWriter } from '../codegen/fixedPositionWriterGenerator.js';
 import { createSpanLogger as createSpanLoggerFromGenerator } from '../codegen/spanLoggerGenerator.js';
-import type { FluentErrorResult, FluentSuccessResult } from '../result.js';
+import type { FluentErr, FluentOk } from '../result.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { createOverflowBuffer, createSpanBuffer } from '../spanBuffer.js';
@@ -55,10 +55,10 @@ type SpanContextBase<
   setScope(attributes: Partial<Record<string, unknown>> | null): void;
 
   /** Create success result */
-  ok<V>(value: V): FluentSuccessResult<V, LogSchema<T>>;
+  ok<V>(value: V): FluentOk<V, LogSchema<T>>;
 
   /** Create error result */
-  err<E>(code: string, error: E): FluentErrorResult<E, LogSchema<T>>;
+  err<E>(code: string, error: E): FluentErr<E, LogSchema<T>>;
 
   /** Create child span - fully typed SpanFn with all parameters bound */
   span: SpanFn<LogSchema<T>, FF, Deps, UserCtx>;

@@ -13,7 +13,7 @@ import type { SpanBuffer } from './types.js';
 /**
  * Discriminated union representing a successful operation result.
  *
- * Use with {@link ErrorResult} and {@link Result} for type-safe error handling
+ * Use with {@link Err} and {@link Result} for type-safe error handling
  * without exceptions. The `success: true` literal enables TypeScript narrowing.
  *
  * @typeParam V - The type of the success value
@@ -31,19 +31,19 @@ import type { SpanBuffer } from './types.js';
  *
  * @see {@link SpanContext.ok} - Create success result with trace logging
  */
-export type SuccessResult<V> = { success: true; value: V };
+export type Ok<V> = { success: true; value: V };
 
 /**
  * Discriminated union representing a failed operation result.
  *
- * Use with {@link SuccessResult} and {@link Result} for type-safe error handling
+ * Use with {@link Ok} and {@link Result} for type-safe error handling
  * without exceptions. The `success: false` literal enables TypeScript narrowing.
  *
  * @typeParam E - The type of the error details
  *
  * @see {@link SpanContext.err} - Create error result with trace logging
  */
-export type ErrorResult<E> = { success: false; error: { code: string; details: E } };
+export type Err<E> = { success: false; error: { code: string; details: E } };
 
 /**
  * Union type for operation results - either success or error.
@@ -73,7 +73,7 @@ export type ErrorResult<E> = { success: false; error: { code: string; details: E
  * }
  * ```
  */
-export type Result<V, E = unknown> = SuccessResult<V> | ErrorResult<E>;
+export type Result<V, E = unknown> = Ok<V> | Err<E>;
 
 /**
  * Fluent result builder for ctx.ok()/ctx.err()
@@ -85,9 +85,9 @@ export type Result<V, E = unknown> = SuccessResult<V> | ErrorResult<E>;
  * - Returns final result after writing to buffer
  *
  * This class uses ResultWriter internally for attribute writing while
- * maintaining proper TypeScript type narrowing via SuccessResult interface.
+ * maintaining proper TypeScript type narrowing via Ok interface.
  */
-export class FluentSuccessResult<V, T extends LogSchema> implements SuccessResult<V> {
+export class FluentOk<V, T extends LogSchema> implements Ok<V> {
   readonly success = true as const;
   readonly value: V;
   /** @internal - hidden from console.log via custom inspect */
@@ -159,9 +159,9 @@ export class FluentSuccessResult<V, T extends LogSchema> implements SuccessResul
  * Fluent error result with chaining support
  *
  * Uses ResultWriter internally for attribute writing while
- * maintaining proper TypeScript type narrowing via ErrorResult interface.
+ * maintaining proper TypeScript type narrowing via Err interface.
  */
-export class FluentErrorResult<E, T extends LogSchema> implements ErrorResult<E> {
+export class FluentErr<E, T extends LogSchema> implements Err<E> {
   readonly success = false as const;
   readonly error: { code: string; details: E };
   /** @internal - hidden from console.log via custom inspect */
@@ -234,3 +234,12 @@ export class FluentErrorResult<E, T extends LogSchema> implements ErrorResult<E>
     return this;
   }
 }
+
+/**
+ * Union type for fluent result builders - either success or error with chaining support.
+ *
+ * @typeParam S - The type of the success value
+ * @typeParam E - The type of the error details
+ * @typeParam T - The log schema for the span buffer
+ */
+export type FluentResult<S, E, T extends LogSchema> = FluentOk<S, T> | FluentErr<E, T>;

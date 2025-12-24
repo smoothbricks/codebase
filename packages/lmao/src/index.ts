@@ -8,14 +8,14 @@
 export * from './lib/defineOpContext.js';
 
 // Op class - used internally by defineOp()
-export { Op, OpBrand } from './lib/op.js';
+export { Op } from './lib/op.js';
 
 // =============================================================================
 // Result Types
 // =============================================================================
 
-export type { ErrorResult, Result, SuccessResult } from './lib/result.js';
-export { FluentErrorResult, FluentSuccessResult } from './lib/result.js';
+export type { Err, FluentResult, Ok, Result } from './lib/result.js';
+export { FluentErr, FluentOk } from './lib/result.js';
 
 // =============================================================================
 // TraceContext Types

@@ -23,8 +23,8 @@ import type { SchemaFields } from './types.js';
  */
 const RESERVED_NAMES = new Set([
   // Technically conflicting - methods on TagWriter/FluentLogEntry/result objects
-  'with', // Used on TagWriter, FluentLogEntry, FluentSuccessResult, FluentErrorResult
-  'message', // Used on FluentSuccessResult, FluentErrorResult
+  'with', // Used on TagWriter, FluentLogEntry, FluentOk, FluentErr
+  'message', // Used on FluentOk, FluentErr
 
   // Technically conflicting - log level methods on SpanLogger
   'info', // ctx.log.info()

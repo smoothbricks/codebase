@@ -10,10 +10,9 @@
  * @module opContext/opGroupTypes
  */
 
-import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
-import type { FeatureFlagSchema } from './featureFlagTypes.js';
 import type { Op } from './opTypes.js';
+import type { OpContext } from './types.js';
 
 // =============================================================================
 // COLUMN MAPPING TYPES
@@ -70,20 +69,15 @@ export type MappedSchema<T extends SchemaFields, M extends ColumnMapping<T>> = {
  * Created by defineOps() - represents a library's exported operations.
  * Libraries declare their schema but don't know how the app will wire them.
  */
-export interface OpGroup<
-  T extends LogSchema = LogSchema,
-  FF extends FeatureFlagSchema = FeatureFlagSchema,
-  UserCtx extends Record<string, unknown> = Record<string, unknown>,
-> {
+export interface OpGroup<Ctx extends OpContext> {
   /** The log schema for this group's ops */
-  readonly logSchema: T;
+  readonly logSchema: Ctx['logSchema'];
 
   /** The feature flag schema */
-  readonly flags: FF;
+  readonly flags: Ctx['flags'];
 
   /** The ops in this group (loosely typed - actual types preserved in intersection) */
-  // biome-ignore lint/suspicious/noExplicitAny: Ops stored with any deps - actual Op types come from defineOps intersection
-  readonly ops: Record<string, Op<T, FF, any, UserCtx, unknown[], unknown>>;
+  readonly ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>;
 
   /**
    * Apply a prefix to all schema columns.
@@ -97,7 +91,7 @@ export interface OpGroup<
    * @param prefix - Prefix to apply to all schema columns
    * @returns MappedOpGroup with prefixed schema contribution
    */
-  prefix<P extends string>(prefix: P): MappedOpGroup<T, FF, UserCtx, PrefixedSchema<SchemaFieldsOf<T>, P>>;
+  prefix<P extends string>(prefix: P): MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>>;
 
   /**
    * Map schema columns to different names in the app's schema.
@@ -122,9 +116,9 @@ export interface OpGroup<
    * }
    * ```
    */
-  mapColumns<M extends ColumnMapping<SchemaFieldsOf<T>>>(
+  mapColumns<M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
     mapping: M,
-  ): MappedOpGroup<T, FF, UserCtx, MappedSchema<SchemaFieldsOf<T>, M>>;
+  ): MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>>;
 }
 
 /**
@@ -133,40 +127,32 @@ export interface OpGroup<
  * The mapping is used during wiring to create RemappedBufferView
  * that translates the library's column writes to the app's column names.
  *
- * @template T - Original library LogSchema
- * @template FF - Feature flag schema
- * @template UserCtx - User context type
+ * @template Ctx - OpContext (bundled type with logSchema, flags, deps, userCtx)
  * @template ContributedSchema - Schema fields this group contributes to app (after mapping)
  */
-export interface MappedOpGroup<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  UserCtx extends Record<string, unknown>,
-  ContributedSchema extends SchemaFields = SchemaFields,
-> {
-  /** The original log schema (library's column names) */
-  readonly logSchema: T;
+export interface MappedOpGroup<Ctx extends OpContext, ContributedSchema extends SchemaFields> {
+  /** The log schema for this group's ops */
+  readonly logSchema: Ctx['logSchema'];
 
   /** The feature flag schema */
-  readonly flags: FF;
-
-  /** The ops in this group */
-  // biome-ignore lint/suspicious/noExplicitAny: Ops stored with any deps - actual Op types come from defineOps intersection
-  readonly ops: Record<string, Op<T, FF, any, UserCtx, unknown[], unknown>>;
-
-  /** The column mapping (library column -> app column, or null to drop) */
-  readonly _columnMapping: ColumnMapping<SchemaFieldsOf<T>>;
+  readonly flags: Ctx['flags'];
 
   /** The schema fields this group contributes to the app's combined schema */
-  readonly _contributedSchema: ContributedSchema;
+  readonly contributedSchema: ContributedSchema;
+
+  /** The column mapping (library column -> app column, or null to drop) */
+  readonly columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
+
+  /** The ops in this group */
+  readonly ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>;
 
   /** Chain with prefix (applies prefix to current mapping) */
-  prefix<P extends string>(prefix: P): MappedOpGroup<T, FF, UserCtx, PrefixedSchema<ContributedSchema, P>>;
+  prefix<P extends string>(prefix: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>>;
 
   /** Override/extend the mapping */
-  mapColumns<M extends ColumnMapping<SchemaFieldsOf<T>>>(
+  mapColumns<M extends ColumnMapping<ContributedSchema>>(
     mapping: M,
-  ): MappedOpGroup<T, FF, UserCtx, MappedSchema<SchemaFieldsOf<T>, M>>;
+  ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>>;
 }
 
 // =============================================================================
@@ -176,8 +162,7 @@ export interface MappedOpGroup<
 /**
  * Any OpGroup (mapped or not) that can be used as a dependency
  */
-// biome-ignore lint/suspicious/noExplicitAny: Generic dep type needs any for flexibility
-export type AnyOpGroup = OpGroup<any, any, any> | MappedOpGroup<any, any, any, any>;
+export type AnyOpGroup = OpGroup<OpContext> | MappedOpGroup<OpContext, SchemaFields>;
 
 /**
  * Type for deps config - maps names to OpGroups (optionally mapped)
@@ -196,10 +181,10 @@ export type EmptyDeps = Record<string, never>;
 /**
  * Extract the contributed schema from a dep (for combining into app schema)
  */
-export type ContributedSchemaOf<D> = D extends MappedOpGroup<infer _T, infer _FF, infer _UC, infer CS>
+export type ContributedSchemaOf<D> = D extends MappedOpGroup<infer _Ctx, infer CS>
   ? CS
-  : D extends OpGroup<infer T, infer _FF, infer _UC>
-    ? SchemaFieldsOf<T>
+  : D extends OpGroup<infer Ctx>
+    ? SchemaFieldsOf<Ctx['logSchema']>
     : never;
 
 /**
@@ -231,9 +216,9 @@ export type EffectiveSchema<T extends SchemaFields, D extends DepsConfig> = T & 
  * Each dep becomes accessible via ctx.deps.name
  */
 export type ResolvedDeps<D extends DepsConfig> = {
-  readonly [K in keyof D]: D[K] extends OpGroup<infer T, infer FF, infer UC>
-    ? OpGroup<T, FF, UC>
-    : D[K] extends MappedOpGroup<infer T, infer FF, infer UC, infer _CS>
-      ? OpGroup<T, FF, UC>
+  readonly [K in keyof D]: D[K] extends OpGroup<infer Ctx>
+    ? OpGroup<Ctx>
+    : D[K] extends MappedOpGroup<infer Ctx, infer _CS>
+      ? OpGroup<Ctx>
       : never;
 };

@@ -11,10 +11,10 @@
  */
 
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
-import type { LogSchema } from '../schema/LogSchema.js';
+import type { Result } from '../result.js';
 import type { LogBinding } from '../types.js';
-import type { FeatureFlagSchema } from './featureFlagTypes.js';
-import type { DepsConfig, SpanContext } from './spanContextTypes.js';
+import type { SpanContext } from './spanContextTypes.js';
+import type { OpContext } from './types.js';
 
 // =============================================================================
 // OP METADATA
@@ -50,60 +50,33 @@ export interface OpMetadata {
 // =============================================================================
 
 /**
- * Op function signature - what the user provides to defineOp
+ * Op function signature - what the user provides to defineOp.
+ * MUST return Result<S, E> or Promise<Result<S, E>>.
  *
- * @template T - LogSchema type
- * @template FF - Feature flag schema
- * @template Deps - Dependencies config
- * @template UserCtx - User context properties
+ * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @template Args - Function arguments (after ctx)
- * @template R - Return type
+ * @template S - Success type
+ * @template E - Error type
  */
-export type OpFn<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
-  Args extends unknown[],
-  R,
-> = (ctx: SpanContext<T, FF, Deps, UserCtx>, ...args: Args) => Promise<R>;
+export type OpFn<Ctx extends OpContext, Args extends unknown[], S, E> = (
+  ctx: SpanContext<Ctx>,
+  ...args: Args
+) => Result<S, E> | Promise<Result<S, E>>;
 
 /**
- * Op instance - wraps a function with metadata
+ * Op instance - wraps a function with metadata.
+ * MUST return Result<S, E> or Promise<Result<S, E>>.
  *
- * Ops are the first-class citizens of the Op-centric API. Each Op:
- * - Has a name for metrics and span naming
- * - Carries metadata injected by the transformer (package, file, git sha, line)
- * - References the LogSchema it writes to
- * - Holds a LogBinding with logging infrastructure (schema, capacity stats)
- * - Can be invoked via span() or directly via _invoke()
- *
- * @template T - LogSchema type
- * @template FF - Feature flag schema
- * @template Deps - Dependencies config
- * @template UserCtx - User context properties
+ * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @template Args - Function arguments (after ctx)
- * @template R - Return type
+ * @template S - Success type
+ * @template E - Error type
  */
-export interface Op<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
-  Args extends unknown[],
-  R,
-> {
-  /** Op name (for metrics, span naming) */
+export interface Op<Ctx extends OpContext, Args extends unknown[], S, E> {
   readonly name: string;
-
-  /** Metadata injected by transformer */
   readonly metadata: OpMetadata;
-
-  /** LogBinding with logging infrastructure (schema, capacity stats, optional prefix view) */
   readonly logBinding: LogBinding;
-
-  /** Internal: invoke the op (called by span()) */
-  _invoke(ctx: SpanContext<T, FF, Deps, UserCtx>, ...args: Args): Promise<R>;
+  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
 }
 
 // =============================================================================
@@ -117,25 +90,18 @@ export interface Op<
  * - Existing Op instances (passed through)
  * - Op function signatures (wrapped into Ops)
  *
- * @template T - LogSchema type
- * @template FF - Feature flag schema
- * @template Deps - Dependencies config
- * @template UserCtx - User context properties
+ * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @template Defs - Record of Op definitions (functions or existing Ops)
  */
 export type OpsFromRecord<
-  T extends LogSchema,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
-  Defs extends Record<
-    string,
-    Op<T, FF, Deps, UserCtx, unknown[], unknown> | OpFn<T, FF, Deps, UserCtx, unknown[], unknown>
-  >,
+  Ctx extends OpContext,
+  Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
 > = {
-  [K in keyof Defs]: Defs[K] extends Op<T, FF, Deps, UserCtx, infer Args, infer R>
-    ? Op<T, FF, Deps, UserCtx, Args, R>
-    : Defs[K] extends (ctx: SpanContext<T, FF, Deps, UserCtx>, ...args: infer Args) => Promise<infer R>
-      ? Op<T, FF, Deps, UserCtx, Args, R>
+  [K in keyof Defs]: Defs[K] extends Op<Ctx, infer Args, infer S, infer E>
+    ? Op<Ctx, Args, S, E>
+    : Defs[K] extends (ctx: SpanContext<Ctx>, ...args: infer Args) => infer R
+      ? R extends Result<infer S, infer E> | Promise<Result<infer S, infer E>>
+        ? Op<Ctx, Args, S, E>
+        : never
       : never;
 };
