@@ -309,6 +309,63 @@ class SpanBuffer {
 }
 ````
 
+### V8 In-Object Property Optimization
+
+**CRITICAL: Property Assignment Order Matters for Performance!**
+
+V8 distinguishes between **in-object properties** (stored directly on the object, ~8-12 properties) and **out-of-object
+properties** (stored in a backing store with extra indirection). The first properties assigned in the constructor get
+fast in-object slots.
+
+**SpanBuffer Property Ordering (Hottest → Coldest):**
+
+```typescript
+// SLOT 1-3: HOTTEST - Read/written on EVERY log entry
+this._writeIndex = 0;          // Incremented every write
+this._capacity = requestedCapacity;  // Compared every write (overflow check)
+this._next = undefined;        // Checked on overflow
+
+// SLOT 4-5: HOT - TypedArray refs accessed every entry
+this.timestamp = timestampView;      // Written every entry
+this.entry_type = entryTypeView;     // Written every entry
+
+// SLOT 6-7: WARM - Tree structure (span creation/navigation)
+this._children = [];           // Pushed to when creating child spans
+this._parent = parent;         // Walked for trace_id lookup
+
+// SLOT 8-9: WARM - Identity and binding (accessed during span ops)
+this._identity = identityView; // Accessed for span_id/thread_id
+this._logBinding = module;     // Accessed for schema/capacity stats
+
+// SLOT 10+: COLD - Only accessed during Arrow conversion or rarely
+this._system = systemBuffer;   // Underlying ArrayBuffer (accessed via views)
+this._spanName = spanName;     // Metadata for Arrow conversion
+this._scopeValues = ...;       // Scope inheritance
+this._callsiteMetadata = ...;  // Row 0 metadata
+```
+
+**Access Frequency Analysis:**
+
+| Property                                           | Access Pattern           | Frequency                |
+| -------------------------------------------------- | ------------------------ | ------------------------ |
+| `_writeIndex`                                      | Read + increment         | Every log entry          |
+| `_capacity`                                        | Read (overflow check)    | Every log entry          |
+| `_next`                                            | Read (buffer chain)      | On overflow              |
+| `timestamp` / `entry_type`                         | Array indexing           | Every log entry          |
+| `_children` / `_parent`                            | Tree navigation          | Span creation/completion |
+| `_identity` / `_logBinding`                        | Metadata access          | Span operations          |
+| `_system`                                          | Never after construction | Constructor only         |
+| `_spanName` / `_scopeValues` / `_callsiteMetadata` | Arrow conversion         | Cold path only           |
+
+**Why This Matters:**
+
+- In-object property access: **1-2 CPU cycles** (inline cached)
+- Out-of-object property access: **5-10 CPU cycles** (extra indirection through backing store)
+- On hot path (millions of log entries), this 3-8 cycle difference per property access compounds significantly
+
+**See Also:** [Buffer Performance Optimizations](./01b1_buffer_performance_optimizations.md) for detailed V8
+optimization patterns.
+
 ### Getters (Cold Path - Lazy DataView)
 
 ```typescript

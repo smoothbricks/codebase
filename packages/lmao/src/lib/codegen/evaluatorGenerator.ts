@@ -6,6 +6,20 @@
  * - Getter properties for each flag enable V8 hidden class optimization
  * - No Proxy overhead - direct property access with inline caching
  *
+ * ## Why Each Span Gets Its Own Evaluator Instance
+ *
+ * The generated class stores `#spanContext` because JS getters (`get darkMode()`)
+ * cannot receive parameters. This means `forContext()` MUST create a new instance
+ * per span - we can't reuse instances across spans.
+ *
+ * This is intentional and acceptable because:
+ * 1. Span creation is already a cold-path allocation
+ * 2. The object is small (just references to ctx, evaluator, schema)
+ * 3. V8 is very efficient at allocating small objects with stable hidden classes
+ *
+ * The `FlagEvaluator.getSync(ctx, flag)` receives ctx so advanced evaluators
+ * (e.g., LaunchDarkly) can use ctx.log, ctx.scope for tracing/targeting.
+ *
  * V8 Optimization benefits:
  * - Stable hidden class (all instances have same shape)
  * - Monomorphic property access (getters are real properties)
@@ -88,7 +102,7 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
     get evaluator() { return this.#evaluator; }
 ` +
     // Generated code: #hasLoggedAccess() - scans buffer chain backward to check if flag already logged
-    // Walks chain forward via ._next, scans each buffer backward from writeIndex
+    // Walks chain forward via ._overflow, scans each buffer backward from writeIndex
     `
     #hasLoggedAccess(flagName) {
       let buf = this.#spanContext._buffer;
@@ -98,29 +112,27 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
         // This ensures we check all written entries including the most recent
         const limit = buf._writeIndex;
         for (let i = limit - 1; i >= 0; i--) {
-          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
               buf.message_values && buf.message_values[i] === flagName) {
             return true;
           }
         }
-        buf = buf._next;
+        buf = buf._overflow;
       }
       return false;
     }
 ` +
     // Generated code: #getFlag() - synchronous flag evaluation with logging
-    // Reads evaluation context from scopeValues, evaluates flag, logs access on first access,
+    // Passes full SpanContext (minus ff) to evaluator for logging/tracing capability,
     // returns undefined for falsy values, wraps truthy values with track() method
     `
     #getFlag(flagName) {
       const ctx = this.#spanContext;
       const definition = this.#schema[flagName];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer._scopeValues || {};
-      
-      // Always evaluate - backend caches based on evaluationContext
-      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = this.#evaluator.getSync(ctx, flagName);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -188,10 +200,9 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
       const ctx = this.#spanContext;
       const definition = this.#schema[flag];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer._scopeValues || {};
-      
-      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = await this.#evaluator.getAsync(ctx, flag);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span

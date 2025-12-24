@@ -5,22 +5,33 @@
     "emitDeclarationOnly": true,
     "importHelpers": true,
     "isolatedModules": true,
-    "lib": ["es2022"],
+    "lib": [
+      "es2022"
+    ],
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "noEmitOnError": true,
     "noFallthroughCasesInSwitch": true,
+    "noImplicitThis": true,
     "noImplicitOverride": true,
     "noImplicitReturns": true,
     "noUnusedLocals": true,
     "skipLibCheck": true,
     "strict": true,
     "target": "es2022",
-    "customConditions": ["development"],
+    "customConditions": [
+      "development"
+    ],
     "paths": {
-      "@smoothbricks/arrow-builder": ["./packages/arrow-builder/src/index.ts"],
-      "@smoothbricks/lmao": ["./packages/lmao/src/index.ts"],
-      "@smoothbricks/lmao-transformer": ["./packages/lmao-transformer/src/index.ts"]
+      "@smoothbricks/arrow-builder": [
+        "./packages/arrow-builder/src/index.ts"
+      ],
+      "@smoothbricks/lmao": [
+        "./packages/lmao/src/index.ts"
+      ],
+      "@smoothbricks/lmao-transformer": [
+        "./packages/lmao-transformer/src/index.ts"
+      ]
     }
   }
 }

@@ -20,7 +20,7 @@ import { createSpanLogger } from '../spanLoggerGenerator.js';
  */
 function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): SpanContext<T, any, any> {
   // Create a real SpanLogger for the buffer using the schema from module
-  const schema = spanBuffer._module.logSchema as T;
+  const schema = spanBuffer._logBinding.logSchema as T;
   const logger = createSpanLogger(schema, spanBuffer);
 
   // Mock SpanContext with the essential properties
@@ -244,11 +244,12 @@ describe('EvaluatorGenerator', () => {
 
       let evalCount = 0;
       const trackingEvaluator = {
-        getSync: () => {
+        getSync: (_ctx: unknown, _flag: string) => {
           evalCount++;
           return true;
         },
-        getAsync: async () => true,
+        getAsync: async (_ctx: unknown, _flag: string) => true,
+        forContext: () => trackingEvaluator,
       };
 
       const GeneratedClass = createEvaluatorClass(
@@ -456,7 +457,7 @@ function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
         count++;
       }
     }
-    current = current._next;
+    current = current._overflow;
   }
   return count;
 }

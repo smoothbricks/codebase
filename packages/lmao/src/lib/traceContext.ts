@@ -119,15 +119,17 @@ export interface TraceContextBase {
   /** Marker for prototype chain detection */
   readonly [TRACE_CONTEXT_MARKER]: true;
   /** Trace ID for this context */
+  trace_id: TraceId;
   /** Epoch microseconds when trace started */
   anchorEpochMicros: number;
   /** performance.now() when trace started */
   anchorPerfNow: number;
-  /** 64-bit random ID per worker/process */
   /** Feature flag evaluator */
   ff: unknown;
   /** Root span function */
   span: unknown;
+  /** Pre-computed Extra keys for V8 optimization (avoid Object.keys in hot path) */
+  _extraKeys?: string[];
 }
 
 /**
@@ -140,10 +142,12 @@ export interface TraceContextBase {
  */
 export const TraceContextProto: TraceContextBase = {
   [TRACE_CONTEXT_MARKER]: true,
+  trace_id: undefined as unknown as TraceId,
   anchorEpochMicros: undefined as unknown as number,
   anchorPerfNow: undefined as unknown as number,
   ff: undefined,
   span: undefined,
+  _extraKeys: undefined,
 };
 
 // =============================================================================

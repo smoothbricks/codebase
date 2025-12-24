@@ -1,336 +1,160 @@
 /**
  * LMAO-specific types for trace logging
  *
- * These types extend the generic ColumnBuffer from arrow-builder
- * with span-specific fields and tracing concepts.
+ * ## Type System
  *
- * **Unified SpanBuffer Memory Layout**
+ * - `AnySpanBuffer`: NO index signatures, accepts any schema (for generic processing)
+ * - `SpanBuffer<T>`: WITH index signatures, typed for specific schema T (T is REQUIRED)
  *
- * SpanBuffer uses a unified memory layout per specs/01b_columnar_buffer_architecture.md:
- * - Single `_system` ArrayBuffer contains timestamps + operations + identity
- * - Identity stored inline (root/child) or shared reference (chained)
- * - Parent ancestry via pointer (not copied bytes)
- * - O(1) isParentOf/isChildOf via pointer comparison
+ * This mirrors arrow-builder's AnyColumnBuffer/ColumnBuffer<T> pattern.
  */
-import type { ColumnBuffer, TypedColumnBuffer } from '@smoothbricks/arrow-builder';
-import type { ModuleContext } from './moduleContext.js';
+
+import type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray } from '@smoothbricks/arrow-builder';
+import type { LogBinding } from './logBinding.js';
+import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
-import type { TraceId } from './traceId.js';
+import type { TraceId, TraceRoot } from './traceId.js';
 
-// Re-export context classes
-export { ModuleContext } from './moduleContext.js';
+// Re-export infrastructure types
+export type { LogBinding, RemappedViewConstructor } from './logBinding.js';
+export type { OpMetadata } from './opContext/opTypes.js';
 
-/**
- * SpanBuffer - lmao-specific extension of TypedColumnBuffer
- *
- * Adds span tree structure and task context to the base TypedColumnBuffer.
- *
- * **Type Parameter**
- *
- * `T` is a LogSchema. The buffer gets typed setters for `T['fields']`.
- *
- * **Naming Convention**
- *
- * System properties use `_` prefix to avoid collision with user column names:
- * - `_system`, `_identity`, `_timestamps`, `_operations`, `_writeIndex`, `_capacity`, `_next`
- *
- * User columns use NO prefix - just the field name:
- * - `userId`, `userId_values`, `userId_nulls`
- *
- * **Unified Memory Layout (per specs/01b_columnar_buffer_architecture.md)**
- *
- * Single `_system` ArrayBuffer contains:
- * - timestamps (BigInt64Array) at offset 0
- * - operations (Uint8Array) at offset capacity * 8
- * - identity (Uint8Array) at offset capacity * 9 (for root/child, not chained)
- *
- * Identity layout:
- * - ROOT: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
- * - CHILD: [threadId(8)][spanId(4)] (12 bytes, parent via pointer)
- * - CHAINED: shares identity reference from first buffer
- *
- * Parent ancestry is via `parent` pointer, not copied bytes.
- * This makes isParentOf/isChildOf O(1) pointer comparisons.
- */
+// Legacy alias - ModuleContext was renamed to LogBinding
+export type ModuleContext = LogBinding;
+
+// Re-export arrow-builder types for convenience
+export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
+
+// ============================================================================
+// AnySpanBuffer - Base type WITHOUT index signatures
+// ============================================================================
 
 /**
- * Base SpanBuffer interface for covariance.
- * Contains properties common to all SpanBuffer instances.
- * Extends the core ColumnBuffer for basic buffer functionality.
+ * AnySpanBuffer - Core buffer API for Arrow conversion and generic processing.
  *
- * **Memory Layout:** Single _system ArrayBuffer contains timestamps + operations + identity
- * **Identity Storage:** Inline (root/child) or shared reference (chained)
- * **Parent Ancestry:** Via pointer (not copied bytes) - O(1) isParentOf/isChildOf
+ * This interface has NO index signatures, making it compatible with
+ * any SpanBuffer<T> regardless of schema. Use this type when you need
+ * to accept any buffer (e.g., Arrow conversion, tree walking).
  */
-interface BaseSpanBuffer extends ColumnBuffer {
-  // ============================================================================
-  // Unified System ArrayBuffer
-  // ============================================================================
-
-  /**
-   * The unified ArrayBuffer containing timestamps, operations, and identity.
-   * Layout: [timestamps (8*capacity)] [operations (1*capacity)] [identity (variable)]
-   */
+export interface AnySpanBuffer extends AnyColumnBuffer {
+  // System ArrayBuffer
   readonly _system: ArrayBuffer;
-
-  /**
-   * Identity bytes (Uint8Array view into _system or shared reference for chained).
-   * - Root: 13 + traceId.length bytes at offset capacity * 9
-   * - Child: 12 bytes at offset capacity * 9
-   * - Chained: shared reference to first buffer's identity
-   */
   readonly _identity: Uint8Array;
 
-  // ============================================================================
-  // Convenient aliases for system columns (same as ColumnBuffer._timestamps etc.)
-  // These are generated as direct references in spanBuffer.ts
-  // ============================================================================
-
-  /** Alias for _timestamps - nanosecond-precision timestamps */
+  // System Columns
   readonly timestamp: BigInt64Array;
-
-  /** Alias for _operations - entry type codes */
   readonly entry_type: Uint8Array;
 
-  /** Current write position */
+  // Buffer state
   _writeIndex: number;
-
-  /** Buffer capacity */
   readonly _capacity: number;
+  _overflow?: AnySpanBuffer;
 
-  /** Chain to overflow buffer */
-  _next?: BaseSpanBuffer;
-
-  // ============================================================================
-  // Identity Getters (read from _identity bytes)
-  // ============================================================================
-
-  /**
-   * Span ID (32-bit unsigned integer).
-   * Read from _identity bytes 8-11 (little-endian).
-   */
+  // Identity Getters
   readonly span_id: number;
-
-  /**
-   * Thread ID (64-bit unsigned integer as BigInt).
-   * Read from _identity bytes 0-7 (little-endian).
-   * Used for Arrow conversion (cold path).
-   */
   readonly thread_id: bigint;
-
-  /**
-   * Trace ID for this span.
-   * For root spans: decoded from _identity bytes [12]=len, [13+]=traceId
-   * For child/chained spans: walks up parent chain to root
-   */
   readonly trace_id: TraceId;
-
-  /**
-   * Whether this span has a parent.
-   * Equivalent to `parent !== undefined`.
-   */
   readonly _hasParent: boolean;
-
-  /**
-   * Parent's span ID (0 if no parent).
-   * Derived from parent?.span_id.
-   */
   readonly parent_span_id: number;
-
-  /**
-   * Parent's thread ID (0n if no parent).
-   * Derived from parent?.thread_id.
-   */
   readonly parent_thread_id: bigint;
 
-  // ============================================================================
   // Tree Structure
-  // ============================================================================
+  _children: AnySpanBuffer[];
+  _parent?: AnySpanBuffer;
 
-  /**
-   * Child spans (lmao-specific for span hierarchy).
-   */
-  _children: BaseSpanBuffer[];
-
-  /**
-   * Parent span buffer.
-   * Used to derive traceId, parentSpanId, and for isParentOf/isChildOf.
-   */
-  _parent?: BaseSpanBuffer;
-
-  // ============================================================================
   // Context
-  // ============================================================================
-
-  /**
-   * Op's module context (what code is executing).
-   * Used for rows 1+ metadata (git_sha, package_name, package_file).
-   */
-  _module: ModuleContext;
-
-  /**
-   * Span name for this invocation.
-   */
+  _traceRoot: TraceRoot;
+  _logBinding: LogBinding;
+  _opMetadata: OpMetadata;
   _spanName: string;
+  _callsiteMetadata?: OpMetadata;
+  _scopeValues: Readonly<Record<string, unknown>>;
 
-  /**
-   * The caller's module context (where span() was invoked from).
-   *
-   * Used for row 0 (span-start) metadata attribution - records WHERE the span
-   * was invoked from, not where the code is executing.
-   *
-   * For root spans: undefined (no caller, or same as module)
-   * For child spans: the parent span's module context
-   *
-   * Access pattern (per specs/01c_context_flow_and_op_wrappers.md):
-   * - Row 0: buffer._callsiteModule?.packageName (caller's module)
-   * - Rows 1+: buffer._module.packageName (op's module)
-   */
-  _callsiteModule?: ModuleContext;
+  // System Column Setters (return AnySpanBuffer for variance)
+  message(pos: number, val: string): AnySpanBuffer;
+  line(pos: number, val: number): AnySpanBuffer;
+  error_code(pos: number, val: string): AnySpanBuffer;
+  exception_stack(pos: number, val: string): AnySpanBuffer;
+  ff_value(pos: number, val: string): AnySpanBuffer;
+  uint64_value(pos: number, val: bigint): AnySpanBuffer;
 
-  /**
-   * Scoped attribute values for this span.
-   *
-   * Updated when ctx.setScope() is called, and inherited by child spans.
-   * Stored here so child spans can access parent's scope during Op._invoke.
-   *
-   * Child spans inherit parent's scopeValues BY REFERENCE (safe because immutable/frozen).
-   * This enables zero-cost scope inheritance and async-safe snapshot semantics.
-   *
-   * NOT initialized in constructor to avoid allocating empty objects that get replaced.
-   * - Root context: set to Object.freeze({}) in op.ts
-   * - Child spans: set to parent's scopeValues reference in op.ts/spanContext.ts
-   *
-   * @internal Set by SpanLogger._setScope() or during span creation
-   */
-  _scopeValues?: Readonly<Record<string, unknown>>;
-
-  // ============================================================================
   // Methods
-  // ============================================================================
-
-  /**
-   * Check if this span is the parent of another span.
-   * O(1) pointer comparison: `this === other._parent`
-   */
-  isParentOf(other: BaseSpanBuffer): boolean;
-
-  /**
-   * Check if this span is a child of another span.
-   * O(1) pointer comparison: `this._parent === other`
-   */
-  isChildOf(other: BaseSpanBuffer): boolean;
-
-  /**
-   * Copy threadId bytes (8 bytes) to destination at offset.
-   * Used for Arrow conversion (cold path).
-   */
+  isParentOf(other: AnySpanBuffer): boolean;
+  isChildOf(other: AnySpanBuffer): boolean;
   copyThreadIdTo(dest: Uint8Array, offset: number): void;
-
-  /**
-   * Copy parent's threadId bytes (8 bytes) to destination.
-   * If no parent, fills with zeros.
-   */
   copyParentThreadIdTo(dest: Uint8Array, offset: number): void;
 }
 
+// ============================================================================
+// Schema Type Helpers
+// ============================================================================
+
+type SetterValueType<S> = S extends { __schema_type: 'enum' }
+  ? number
+  : S extends { __schema_type: 'category' | 'text' }
+    ? string
+    : S extends { __schema_type: 'number' }
+      ? number
+      : S extends { __schema_type: 'bigUint64' }
+        ? bigint
+        : S extends { __schema_type: 'boolean' }
+          ? boolean
+          : unknown;
+
+type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
+  ? Uint8Array
+  : S extends { __schema_type: 'category' | 'text' }
+    ? string[]
+    : S extends { __schema_type: 'number' }
+      ? Float64Array
+      : S extends { __schema_type: 'bigUint64' }
+        ? BigUint64Array
+        : S extends { __schema_type: 'boolean' }
+          ? Uint8Array
+          : TypedArray | string[];
+
+type FilterSchemaFields<T> = {
+  [K in keyof T as T[K] extends (...args: unknown[]) => unknown ? never : K]: T[K];
+};
+
+// ============================================================================
+// SpanBuffer<T> - Typed buffer WITH index signatures
+// ============================================================================
+
 /**
- * SpanBuffer - Unified memory layout for trace logging.
+ * SpanBuffer<T> - Fully typed buffer for a specific schema.
  *
- * Generic type with default parameter for covariance.
- * SpanBuffer (no type parameter) = SpanBuffer<LogSchema> (base type).
- * SpanBuffer<T> accepts any T extending LogSchema.
+ * Extends AnySpanBuffer with:
+ * - Schema-specific _values/_nulls properties
+ * - Schema-specific setter methods
+ * - Index signatures for dynamic access
  *
- * **Type Parameter**
- *
- * `T` is a LogSchema. The buffer gets typed setters for `T['fields']`.
- *
- * **Naming Convention**
- *
- * System properties use `_` prefix to avoid collision with user column names:
- * - `_system`, `_identity`, `_timestamps`, `_operations`, `_writeIndex`, `_capacity`, `_next`
- *
- * User columns use NO prefix - just the field name:
- * - `userId`, `userId_values`, `userId_nulls`
- *
- * **Unified Memory Layout (per specs/01b_columnar_buffer_architecture.md)**
- *
- * Single `_system` ArrayBuffer contains:
- * - timestamps (BigInt64Array) at offset 0
- * - operations (Uint8Array) at offset capacity * 8
- * - identity (Uint8Array) at offset capacity * 9 (for root/child, not chained)
- *
- * Identity layout:
- * - ROOT: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
- * - CHILD: [threadId(8)][spanId(4)] (12 bytes, parent via pointer)
- * - CHAINED: shares identity reference from first buffer
- *
- * Parent ancestry is via `parent` pointer, not copied bytes.
- * This makes isParentOf/isChildOf O(1) pointer comparisons.
+ * T is REQUIRED - there is no default. Use AnySpanBuffer for generic processing.
  */
-export type SpanBuffer<T extends LogSchema = LogSchema> = TypedColumnBuffer<T['fields']> &
-  BaseSpanBuffer & {
-    // ============================================================================
-    // System Column Setters (generated by arrow-builder)
-    // Pattern: buffer.columnName(position, value) => SpanBuffer<T>
-    //
-    // Note: Returns SpanBuffer<T> instead of `this` because SpanBuffer must be
-    // a type alias to extend TypedColumnBuffer (which uses mapped types with
-    // computed property names - not supported by interfaces).
-    // ============================================================================
+export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
+  // Override tree structure with typed versions
+  _children: SpanBuffer<T>[];
+  _parent?: SpanBuffer<T>;
+  _overflow?: SpanBuffer<T>;
 
-    /**
-     * Set unified message at position (category/string column).
-     * Used for span names, log messages, exception messages, result messages, and FF names.
-     */
-    message(pos: number, val: string): SpanBuffer<T>;
+  // Override methods with typed versions
+  isParentOf(other: SpanBuffer<T>): boolean;
+  isChildOf(other: SpanBuffer<T>): boolean;
 
-    /** Set line at position (number column) */
-    line(pos: number, val: number): SpanBuffer<T>;
-
-    /** Set error code at position (category/string column) */
-    error_code(pos: number, val: string): SpanBuffer<T>;
-
-    /** Set exception stack at position (text/string column) */
-    exception_stack(pos: number, val: string): SpanBuffer<T>;
-
-    /** Set feature flag value at position (category/string column) */
-    ff_value(pos: number, val: string): SpanBuffer<T>;
-
-    /** Set uint64 value at position (uint64 column) */
-    uint64_value(pos: number, val: bigint): SpanBuffer<T>;
-
-    // ============================================================================
-    // Tree Structure
-    // ============================================================================
-
-    /**
-     * Child spans (lmao-specific for span hierarchy).
-     */
-    _children: SpanBuffer<T>[];
-
-    /**
-     * Parent span buffer.
-     * Used to derive trace_id, parent_span_id, and for isParentOf/isChildOf.
-     */
-    _parent?: SpanBuffer<T>;
-
-    // ============================================================================
-    // Methods
-    // ============================================================================
-
-    /**
-     * Check if this span is the parent of another span.
-     * O(1) pointer comparison: `this === other._parent`
-     */
-    isParentOf(other: SpanBuffer<T>): boolean;
-
-    /**
-     * Check if this span is a child of another span.
-     * O(1) pointer comparison: `this._parent === other`
-     */
-    isChildOf(other: SpanBuffer<T>): boolean;
-  };
-
-// Re-export useful arrow-builder types for convenience
-export type { ColumnBuffer } from '@smoothbricks/arrow-builder';
+  // Index signatures for dynamic access
+  [key: `${string}_values`]: TypedArray | string[] | undefined;
+  [key: `${string}_nulls`]: Uint8Array | undefined;
+} & {
+  // Schema-specific column data
+  readonly [K in keyof FilterSchemaFields<T['fields']> as `${K & string}_values`]: ValuesArrayType<
+    FilterSchemaFields<T['fields']>[K]
+  >;
+} & {
+  readonly [K in keyof FilterSchemaFields<T['fields']> as `${K & string}_nulls`]: Uint8Array;
+} & {
+  // Schema-specific setter methods (return AnySpanBuffer for variance)
+  [K in keyof FilterSchemaFields<T['fields']>]: (
+    pos: number,
+    val: SetterValueType<FilterSchemaFields<T['fields']>[K]>,
+  ) => AnySpanBuffer;
+};

@@ -28,10 +28,10 @@ import {
 } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
-import { createNextBuffer as createNextSpanBuffer } from '../spanBuffer.js';
+import { createOverflowBuffer as createOverflowSpanBuffer } from '../spanBuffer.js';
 // Import timestamp function - will be injected as dependency
 import { getTimestampNanos } from '../timestamp.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
 /**
  * SpanLogger interface with logging methods and schema-specific attribute setters.
@@ -240,7 +240,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
   const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
 
   return {
-    constructorParams: 'createNextBuffer',
+    constructorParams: 'createOverflowBuffer',
 
     // Entry type constants (inlined from lmao.ts)
     preamble: `
@@ -261,7 +261,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     constructorCode: `
       this._writeIndex = 1;
       this._buffer._writeIndex = 2;
-      this._createNextBuffer = createNextBuffer;
+      this._createOverflowBuffer = createOverflowBuffer;
       this._inOverflow = false;
 `,
 
@@ -275,14 +275,14 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `
     _getNextBuffer() {
       const oldBuffer = this._buffer;
-      oldBuffer._module.sb_overflows++;
+      oldBuffer._logBinding.sb_overflows++;
       this._inOverflow = true;
-      const nextBuffer = this._createNextBuffer(oldBuffer);
-      oldBuffer._next = nextBuffer;
-      this._buffer = nextBuffer;
+      const overflowBuffer = this._createOverflowBuffer(oldBuffer);
+      oldBuffer._overflow = overflowBuffer;
+      this._buffer = overflowBuffer;
       this._prefillScopedAttributes();
       this._buffer = oldBuffer;
-      return nextBuffer;
+      return overflowBuffer;
     }
 
     ` +
@@ -312,17 +312,17 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `info(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
-      this._buffer._operations[idx] = ENTRY_TYPE_INFO;
+      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
+      this._buffer.entry_type[idx] = ENTRY_TYPE_INFO;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._module.sb_totalWrites++;
+      this._buffer._logBinding.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer._module.sb_overflowWrites++;
+        this._buffer._logBinding.sb_overflowWrites++;
       }
       return this;
     }
@@ -332,17 +332,17 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `debug(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
-      this._buffer._operations[idx] = ENTRY_TYPE_DEBUG;
+      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
+      this._buffer.entry_type[idx] = ENTRY_TYPE_DEBUG;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._module.sb_totalWrites++;
+      this._buffer._logBinding.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer._module.sb_overflowWrites++;
+        this._buffer._logBinding.sb_overflowWrites++;
       }
       return this;
     }
@@ -352,17 +352,17 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `warn(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
-      this._buffer._operations[idx] = ENTRY_TYPE_WARN;
+      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
+      this._buffer.entry_type[idx] = ENTRY_TYPE_WARN;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._module.sb_totalWrites++;
+      this._buffer._logBinding.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer._module.sb_overflowWrites++;
+        this._buffer._logBinding.sb_overflowWrites++;
       }
       return this;
     }
@@ -372,17 +372,17 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `error(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
-      this._buffer._operations[idx] = ENTRY_TYPE_ERROR;
+      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
+      this._buffer.entry_type[idx] = ENTRY_TYPE_ERROR;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._module.sb_totalWrites++;
+      this._buffer._logBinding.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer._module.sb_overflowWrites++;
+        this._buffer._logBinding.sb_overflowWrites++;
       }
       return this;
     }
@@ -392,17 +392,17 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `trace(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
-      this._buffer._operations[idx] = ENTRY_TYPE_TRACE;
+      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
+      this._buffer.entry_type[idx] = ENTRY_TYPE_TRACE;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._module.sb_totalWrites++;
+      this._buffer._logBinding.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer._module.sb_overflowWrites++;
+        this._buffer._logBinding.sb_overflowWrites++;
       }
       return this;
     }
@@ -413,8 +413,8 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `ffAccess(flagName, value) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
-      this._buffer._operations[idx] = ENTRY_TYPE_FF_ACCESS;
+      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
+      this._buffer.entry_type[idx] = ENTRY_TYPE_FF_ACCESS;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
         if (this._buffer.message_nulls) {
@@ -428,9 +428,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.ff_value_nulls, idx);
         }
       }
-      this._buffer._module.sb_totalWrites++;
+      this._buffer._logBinding.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer._module.sb_overflowWrites++;
+        this._buffer._logBinding.sb_overflowWrites++;
       }
     }
 
@@ -440,8 +440,8 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `ffUsage(flagName, context) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer._timestamps[idx] = helpers.getTimestampNanos();
-      this._buffer._operations[idx] = ENTRY_TYPE_FF_USAGE;
+      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
+      this._buffer.entry_type[idx] = ENTRY_TYPE_FF_USAGE;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
         if (this._buffer.message_nulls) {
@@ -450,9 +450,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       }
       // Context attributes can be written to user schema columns if provided
       // For now, just log the flag name - context can be added later if needed
-      this._buffer._module.sb_totalWrites++;
+      this._buffer._logBinding.sb_totalWrites++;
       if (this._inOverflow) {
-        this._buffer._module.sb_overflowWrites++;
+        this._buffer._logBinding.sb_overflowWrites++;
       }
     }
 
@@ -640,8 +640,8 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 const spanLoggerClassCache = new WeakMap<
   LogSchema,
   new (
-    buffer: SpanBuffer,
-    createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
+    buffer: AnySpanBuffer,
+    createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
   ) => BaseSpanLogger<LogSchema>
 >();
 
@@ -659,8 +659,8 @@ const spanLoggerClassCache = new WeakMap<
 export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
 ): new (
-  buffer: SpanBuffer,
-  createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
+  buffer: AnySpanBuffer,
+  createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
 ) => BaseSpanLogger<T> {
   // Check cache first
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
@@ -672,16 +672,16 @@ export function createSpanLoggerClass<T extends LogSchema>(
     const WriterClass = getColumnWriterClass(schema, extension);
 
     SpanLoggerClass = WriterClass as unknown as new (
-      buffer: SpanBuffer,
-      createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
+      buffer: AnySpanBuffer,
+      createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
     ) => BaseSpanLogger<LogSchema>;
 
     spanLoggerClassCache.set(schema, SpanLoggerClass);
   }
 
   return SpanLoggerClass as new (
-    buffer: SpanBuffer,
-    createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
+    buffer: AnySpanBuffer,
+    createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
   ) => BaseSpanLogger<T>;
 }
 
@@ -690,21 +690,15 @@ export function createSpanLoggerClass<T extends LogSchema>(
  *
  * @param schema - Tag attribute schema
  * @param buffer - SpanBuffer to write to
- * @param createNextBuffer - Function to create next buffer on overflow (defaults to createNextSpanBuffer)
+ * @param createOverflowBuffer - Function to create overflow buffer on overflow (defaults to createOverflowSpanBuffer)
  */
 export function createSpanLogger<T extends LogSchema>(
   schema: T,
   buffer: SpanBuffer<T>,
-  createNextBuffer: (buffer: SpanBuffer<T>) => SpanBuffer<T> = createNextSpanBuffer as unknown as (
+  createOverflowBuffer: (buffer: SpanBuffer<T>) => SpanBuffer<T> = createOverflowSpanBuffer as unknown as (
     buffer: SpanBuffer<T>,
   ) => SpanBuffer<T>,
 ): BaseSpanLogger<T> {
   const SpanLoggerClass = createSpanLoggerClass(schema);
-  // Type assertion needed because SpanLoggerClass constructor expects SpanBuffer
-  // (non-generic) but we pass SpanBuffer<T>. This is safe because at runtime
-  // SpanBuffer<T> IS a SpanBuffer - the generic is only for compile-time typing.
-  return new SpanLoggerClass(
-    buffer as unknown as SpanBuffer,
-    createNextBuffer as unknown as (buffer: SpanBuffer) => SpanBuffer,
-  );
+  return new SpanLoggerClass(buffer, createOverflowBuffer as unknown as (buffer: AnySpanBuffer) => AnySpanBuffer);
 }

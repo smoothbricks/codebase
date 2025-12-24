@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { defineModule } from '../defineModule.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 
@@ -13,27 +13,21 @@ const testSchema = defineLogSchema({
   customField: S.category(),
 });
 
-// Create a simple module for testing
-function createTestModule() {
-  return defineModule({
-    metadata: {
-      git_sha: 'abc123',
-      package_name: '@test/pkg',
-      package_file: '/test/module.ts',
-    },
+// Create a factory for testing using the new Op-centric API
+function createTestFactory() {
+  return defineOpContext({
     logSchema: testSchema,
-  })
-    .ctx<{ requestId?: string }>({
-      requestId: undefined,
-    })
-    .make();
+    ctx: {
+      requestId: undefined as string | undefined,
+    },
+  });
 }
 
 describe('Type Narrowing with FluentResult', () => {
   it('should properly narrow success result type', async () => {
-    const testModule = createTestModule();
+    const { defineOp, createTrace } = createTestFactory();
 
-    const testOp = testModule.op('testOp', async (ctx) => {
+    const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx.ok({ id: 123, name: 'test' });
 
       // Type narrowing should work with FluentResult
@@ -48,16 +42,16 @@ describe('Type Narrowing with FluentResult', () => {
       return null;
     });
 
-    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
     expect(output).toEqual({ id: 123, name: 'test' });
   });
 
   it('should properly narrow error result type', async () => {
-    const testModule = createTestModule();
+    const { defineOp, createTrace } = createTestFactory();
 
-    const testOp = testModule.op('testOp', async (ctx) => {
+    const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx.err('TEST_ERROR', { field: 'email', reason: 'invalid' });
 
       // Type narrowing should work with FluentResult
@@ -73,16 +67,16 @@ describe('Type Narrowing with FluentResult', () => {
       return null;
     });
 
-    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
     expect(output).toBe('TEST_ERROR');
   });
 
   it('should support chaining before type check', async () => {
-    const testModule = createTestModule();
+    const { defineOp, createTrace } = createTestFactory();
 
-    const testOp = testModule.op('testOp', async (ctx) => {
+    const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx.ok({ id: 456 }).with({ userId: 'user1' }).message('Success');
 
       // Type narrowing should still work after chaining
@@ -94,16 +88,16 @@ describe('Type Narrowing with FluentResult', () => {
       return 0;
     });
 
-    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
     expect(output).toBe(456);
   });
 
   it('should handle error result with chaining', async () => {
-    const testModule = createTestModule();
+    const { defineOp, createTrace } = createTestFactory();
 
-    const testOp = testModule.op('testOp', async (ctx) => {
+    const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx
         .err('VALIDATION_ERROR', { message: 'Invalid input' })
         .with({ userId: 'user1' })
@@ -119,7 +113,7 @@ describe('Type Narrowing with FluentResult', () => {
       return 'OK';
     });
 
-    const traceCtx = testModule.traceContext({ requestId: 'req1' });
+    const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
     expect(output).toBe('VALIDATION_ERROR');

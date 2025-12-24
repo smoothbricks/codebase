@@ -100,11 +100,10 @@ export class FluentSuccessResult<V, T extends LogSchema> implements SuccessResul
     buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
 
     // Write timestamp (nanoseconds since epoch)
-    buffer.timestamp[1] = getTimestampNanos();
+    buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
-    // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)
-    this.#writer = createResultWriter(schema, buffer as unknown as SpanBuffer, value, false);
+    this.#writer = createResultWriter(schema, buffer, value, false);
 
     // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
   }
@@ -175,11 +174,10 @@ export class FluentErrorResult<E, T extends LogSchema> implements ErrorResult<E>
     buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
 
     // Write timestamp (nanoseconds since epoch)
-    buffer.timestamp[1] = getTimestampNanos();
+    buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
     // Create ResultWriter for fluent attribute setting (writes to position 1)
-    // Type assertion needed because createResultWriter expects SpanBuffer (non-generic)
-    this.#writer = createResultWriter(schema, buffer as unknown as SpanBuffer, details, true);
+    this.#writer = createResultWriter(schema, buffer, details, true);
 
     // Write error code using the writer if available
     const writer = this.#writer as ResultWriter<T, never, E> & { errorCode?: (v: string) => unknown };

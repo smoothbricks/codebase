@@ -9,27 +9,30 @@ application. It provides:
 2. **Op wrapper pattern** that creates span-aware contexts
 3. **Performance optimization** through single allocation and direct references
 4. **Type-safe context destructuring** with automatic span correlation
-5. **User-extensible context** via `.ctx<Extra>()` for custom properties like env bindings
+5. **User-extensible context** via `ctx` property in `defineOpContext()` for custom properties like env bindings
 
 ## Context Hierarchy
 
 ```
-ModuleContext (class) - ONE per module definition
-├── packageName: string
-├── packagePath: string
-├── gitSha: string
-├── packageEntry: PreEncodedEntry (UTF-8 cached)
-├── packagePathEntry: PreEncodedEntry (UTF-8 cached)
-├── gitShaEntry: PreEncodedEntry (UTF-8 cached)
-├── logSchema (tag attribute definitions)
-├── sb_capacity: number (buffer capacity)
-├── sb_totalWrites: number (total writes across all buffers)
-├── sb_overflows: number (overflow write count)
-└── sb_totalCreated: number (total buffers created)
+OpMetadata (object) - ONE per Op, injected by transformer
+├── package_name: string
+├── package_file: string
+├── git_sha: string
+└── line: number (line where defineOp was called)
+
+LogBinding (object) - ONE per defineOpContext() call
+├── logSchema: LogSchema (tag attribute definitions)
+├── remappedViewClass?: RemappedViewConstructor (for prefixed libraries)
+├── sb_capacity: number (current buffer capacity for new buffers)
+├── sb_totalWrites: number (total entries written across all buffers)
+├── sb_overflowWrites: number (writes that triggered overflow)
+├── sb_totalCreated: number (total buffers created)
+└── sb_overflows: number (number of overflow events)
 
 SpanBuffer - ONE per span (internal interface)
-├── _callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
-├── _module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
+├── _callsiteMetadata?: OpMetadata  ← CALLER's metadata (where span() was invoked) - for row 0 metadata
+├── _opMetadata: OpMetadata         ← THIS OP's metadata (what code is executing) - for rows 1+ metadata
+├── _logBinding: LogBinding         ← LogBinding with schema and capacity stats
 ├── _spanName: string               ← span name for this invocation
 ├── lineNumber_values: Int32Array  ← line numbers per row (written directly, NOT stored as property)
 ├── _parent?: SpanBuffer            ← reference to parent (child spans walk this for trace_id)
@@ -40,7 +43,7 @@ SpanBuffer - ONE per span (internal interface)
 SpanContext (interface) - user-facing, what ops receive
 ├── tag: TagWriter<T>
 ├── log: SpanLogger<T>
-├── scope()
+├── scope / setScope()
 ├── ok() / err()
 ├── span()
 ├── buffer (getter)
@@ -48,10 +51,10 @@ SpanContext (interface) - user-facing, what ops receive
 └── deps: Deps
 ```
 
-**Dual Module References - Row 0 vs Rows 1+:**
+**Dual Metadata References - Row 0 vs Rows 1+:**
 
-- **Row 0 (span-start)**: Uses `callsiteModule` for `gitSha`, `packageName`, `packagePath`
-- **Rows 1+ (span-ok/err/exception, logs)**: Uses `module` for `gitSha`, `packageName`, `packagePath`
+- **Row 0 (span-start)**: Uses `callsiteMetadata` for `git_sha`, `package_name`, `package_file`
+- **Rows 1+ (span-ok/err/exception, logs)**: Uses `metadata` for `git_sha`, `package_name`, `package_file`
 
 This design enables accurate source attribution - the span-start entry records WHERE the span was invoked from, while
 subsequent entries record WHERE the code is actually executing.
@@ -62,25 +65,26 @@ Line numbers flow directly from transformer injection to TypedArray writes:
 
 ```typescript
 // Transformer output:
-await span(42, 'fetch-user', userLib.fetchUser, userId);
-//         ^^ lineNumber argument
+await ctx.span(42, 'fetch-user', userLib.fetchUser, userId);
+//             ^^ lineNumber argument
 
 // Inside span():
 buffer.lineNumber_values[0] = 42; // Direct TypedArray write for row 0
 
 // For logs (rows 1+):
-log.info('Processing').line(55); // .line(N) writes to lineNumber_values[writeIndex]
+ctx.log.info('Processing').line(55); // .line(N) writes to lineNumber_values[writeIndex]
 ```
 
 **Access chain:**
 
 ```typescript
-buffer.callsiteModule.packageName; // Caller's module metadata (for row 0)
-buffer.callsiteModule.gitSha; // Caller's git SHA (for row 0)
-buffer.module.packageName; // Op's module metadata (for rows 1+)
-buffer.module.gitSha; // Op's git SHA (for rows 1+)
-buffer.module.sb_capacity; // Self-tuning stats
-buffer.spanName; // Span name (direct property)
+buffer._callsiteMetadata.package_name; // Caller's metadata (for row 0)
+buffer._callsiteMetadata.git_sha; // Caller's git SHA (for row 0)
+buffer._opMetadata.package_name; // This op's metadata (for rows 1+)
+buffer._opMetadata.git_sha; // This op's git SHA (for rows 1+)
+buffer._logBinding.sb_capacity; // Self-tuning stats
+buffer._logBinding.logSchema; // Schema definitions
+buffer._spanName; // Span name (direct property)
 buffer.lineNumber_values[0]; // Line number for row 0 (written directly, NO lineNumber property)
 buffer.trace_id; // Walks parent chain to root if child span
 ```
@@ -93,7 +97,7 @@ An alternative approach would pass a `ctx` object through every function:
 
 ```typescript
 // Alternative approach (rejected): ctx drilling problem
-const createUser = op(async (ctx, userData) => {
+const createUser = defineOp('createUser', async (ctx, userData) => {
   ctx.tag.userId(userData.id);
   await validateUser(ctx, userData); // Pass ctx everywhere
   await saveUser(ctx, userData); // Every function needs ctx
@@ -112,8 +116,9 @@ const createUser = op(async (ctx, userData) => {
 The chosen design uses **ops** with context destructuring at the call site:
 
 ```typescript
-// Destructure what you need
-const request = op(async ({ span, log, tag }, url: string, opts: RequestOpts) => {
+// Destructure what you need from ctx
+const request = defineOp('request', async (ctx, url: string, opts: RequestOpts) => {
+  const { tag, log, deps } = ctx;
   tag.method(opts.method);
   log.info('Making request');
   const res = await fetch(url, opts);
@@ -122,7 +127,7 @@ const request = op(async ({ span, log, tag }, url: string, opts: RequestOpts) =>
 });
 
 // Caller controls span name via span()
-await span('fetch-user', request, '/users/123', { method: 'GET' });
+await ctx.span('fetch-user', request, '/users/123', { method: 'GET' });
 ```
 
 **Benefits**:
@@ -139,22 +144,22 @@ entry writing, and context setup automatically.
 
 **TraceContext vs SpanContext**:
 
-- `TraceContext` is created via `module.traceContext()` at request entry
+- `TraceContext` is created via `createTrace()` at request entry
 - `SpanContext` is what op functions receive
-- TraceContext has system props: `trace_id`, `anchorEpochMicros`, `anchorPerfNow`, `thread_id`
-- SpanContext has: `tag`, `log`, `scope`, `ok`, `err`, `span`, `buffer`, `ff`, `deps`
+- TraceContext has system props: `trace_id`, `thread_id`
+- SpanContext has: `tag`, `log`, `scope`, `setScope`, `ok`, `err`, `span`, `buffer`, `ff`, `deps`
+- Time anchors (`anchorEpochMicros`, `anchorPerfNow`) are **module-scoped** (see
+  [High-Precision Timestamps](./01b3_high_precision_timestamps.md))
 
 ```
-TraceContext (created via module.traceContext())
+TraceContext (created via createTrace())
 ├── trace_id: string (system prop)
-├── anchorEpochMicros: number (system prop)
-├── anchorPerfNow: number (system prop)
 ├── thread_id: bigint (system prop)
 ├── ff: FeatureFlagEvaluator (system prop)
 ├── span: RootSpanFn (system prop)
-├── env: EnvironmentConfig (Extra - user-defined)
-├── requestId: string (Extra - user-defined)
-├── userId?: string (Extra - user-defined)
+├── env: EnvironmentConfig (ctx - user-defined)
+├── requestId: string (ctx - user-defined)
+├── userId?: string (ctx - user-defined)
 └── ctx.span('create-user', createUserOp, userData) creates:
     ├── SpanContext (create-user span buffer)
     ├── tag: TagAPI (writes to create-user buffer)
@@ -162,9 +167,9 @@ TraceContext (created via module.traceContext())
     ├── span: ChildSpanCreator (creates child spans)
     ├── deps: BoundDeps (references to dep Op instances)
     ├── ff: traceCtx.ff.withBuffer(buffer) → NEW evaluator bound to buffer
-    ├── env: SAME from TraceContext (Extra props passed through)
-    ├── requestId: SAME from TraceContext (Extra props passed through)
-    ├── userId: SAME from TraceContext (Extra props passed through)
+    ├── env: SAME from TraceContext (ctx props passed through)
+    ├── requestId: SAME from TraceContext (ctx props passed through)
+    ├── userId: SAME from TraceContext (ctx props passed through)
     └── span('validate-user', validateOp) creates:
         ├── Child SpanContext (validate-user span buffer)
         ├── tag: TagAPI (writes to validate-user buffer)
@@ -172,7 +177,7 @@ TraceContext (created via module.traceContext())
         ├── span: ChildSpanCreator (for nested ops)
         ├── deps: SAME deps references
         ├── ff: parentCtx.ff.withBuffer(childBuffer)
-        └── Extra props: SAME (env, requestId, userId)
+        └── ctx props: SAME (env, requestId, userId)
 ```
 
 **SpanContext Properties**:
@@ -182,7 +187,7 @@ TraceContext (created via module.traceContext())
 - `tag`: TagAPI for span attributes
 - `deps`: Bound dependency ops (can be destructured: `const { retry } = deps`)
 - `ff`: Feature flag evaluator bound to current span's buffer
-- Extra props from TraceContext (e.g., `env`, `requestId`, `userId` - user-defined via `.ctx<Extra>()`)
+- ctx props from TraceContext (e.g., `env`, `requestId`, `userId` - user-defined via `ctx` in `defineOpContext()`)
 
 ## Trace-Level Context Creation
 
@@ -192,94 +197,118 @@ high-precision time anchor.
 ### TraceContext Interface
 
 ```typescript
-// Reserved keys that Extra cannot contain (compile-time enforcement)
+// Reserved keys that ctx cannot contain (compile-time enforcement)
 type ReservedTraceContextKeys = keyof {
-  trace_id: unknown;
-  anchorEpochMicros: unknown;
-  anchorPerfNow: unknown;
-  thread_id: unknown;
   ff: unknown;
   span: unknown;
+  tag: unknown;
+  log: unknown;
+  scope: unknown;
+  setScope: unknown;
+  ok: unknown;
+  err: unknown;
+  buffer: unknown;
+  deps: unknown;
+  anchorEpochMicros: unknown;
+  anchorPerfNow: unknown;
 };
 
-// TraceContext = System props + Extra
-interface TraceContext<FF, Extra> {
+// TraceContext = System props + Ctx
+interface TraceContext<FF, Ctx> {
   // System properties (always present)
-  trace_id: string;
+  // NOTE: Time anchors are MODULE-SCOPED (not per-trace).
+  // See timestamp.ts and timestamp.node.ts for implementation details.
+  // Browser: performance.timeOrigin (set once at page load)
+  // Node.js: anchorHrtime + anchorEpochNanos (captured once at module load)
   anchorEpochMicros: number; // Date.now() * 1000 at trace root
   anchorPerfNow: number; // performance.now() at trace root (browser)
-  // OR anchorHrTime: bigint;  // process.hrtime.bigint() at trace root (Node.js)
-  thread_id: bigint; // 64-bit random ID, generated once per worker/process
+  // OR anchorHrTime: bigint; // process.hrtime.bigint() at trace root (Node.js)
+
   ff: FeatureFlagEvaluator<FF>;
-  span: RootSpanFn<FF, Extra>; // Root span creation - entry point for ops
-} & Extra; // User-defined properties (e.g., requestId, userId, env)
+  span: RootSpanFn<FF, Ctx>; // Root span creation - entry point for ops
+} & Ctx; // User-defined properties (e.g., requestId, userId, env)
 ```
 
-**Key Design**: `requestId` and `userId` are NOT system properties - they are user-defined in `Extra` via
-`.ctx<Extra>()`. The `Extra` type comes from the module's `.ctx<Extra>()` declaration and is spread into SpanContext
-when ops execute.
+**IMPORTANT**: `trace_id` and `thread_id` are NOT on TraceContext - they are SpanBuffer properties:
 
-### Context Creation via Module.traceContext()
+- `buffer.trace_id` - Generated at root span creation, stored in `_identity` bytes, child spans walk parent chain
+- `buffer.thread_id` - Worker-level 64-bit random ID (generated once at startup), stored in `_identity` bytes
+
+**Key Design**: `requestId` and `userId` are NOT system properties - they are user-defined in `ctx` via
+`defineOpContext()`. The `Ctx` type comes from the `ctx` property and is spread into SpanContext when ops execute.
+
+### Context Creation via createTrace()
+
+**IMPORTANT**: `createTrace()` actually returns a `SpanContext` (root span), not a separate TraceContext object. The
+implementation creates a SpanBuffer immediately.
 
 ```typescript
-// Worker-level thread ID (generated ONCE at worker/process startup)
-const workerThreadId: bigint = generateRandom64Bit();
+// Internal implementation (simplified):
+function createTraceImpl<T, FF, Deps, UserCtx>(
+  factoryConfig: OpContextConfig<T, FF, Deps, UserCtx>,
+  logBinding: LogBinding,
+  params: CreateTraceParams<UserCtx>
+): SpanContext<T, FF, Deps, UserCtx> {
+  // 1. Generate trace ID
+  const traceId: TraceId = params.traceId ?? generateTraceId();
 
-// Module creates TraceContext with proper typing
-// Internal implementation:
-function createTraceContext<FF, Extra>(
-  module: Module<any, any, FF, Extra>,
-  params: { ff: FeatureFlagEvaluator<FF> } & Extra
-): TraceContext<FF, Extra> {
-  const epochMs = Date.now();
-  const perfNow = performance.now();
+  // 2. Create root SpanBuffer with trace_id
+  const buffer = createSpanBuffer(schema, logBinding, 'root', traceId);
 
-  return {
-    trace_id: generateTraceId(),
-    anchorEpochMicros: epochMs * 1000,
-    anchorPerfNow: perfNow,
-    thread_id: workerThreadId,
-    ff: params.ff,
-    span: (name, op, ...args) => op._invoke(this, null, name, args),
-    ...params, // Spread Extra properties (e.g., requestId, userId, env)
-  } as TraceContext<FF, Extra>;
+  // 3. Build SpanContext with user properties + system properties
+  const ctx = {
+    ...resolvedUserCtx, // User properties (env, requestId, etc.)
+    ff: /* feature flag evaluator */,
+    tag: /* tag writer */,
+    log: /* span logger */,
+    span: /* span function */,
+    // ... other system properties
+  };
+
+  return ctx as SpanContext<T, FF, Deps, UserCtx>;
 }
 
 // Usage at request entry point:
-const ctx = appModule.traceContext({
-  ff: ffEvaluator,
+const ctx = createTrace({
   env: workerEnv,
   requestId: req.headers.get('x-request-id')!,
   userId: session?.userId,
 });
 
+// ctx is already a SpanContext - can use span() directly
 await ctx.span('handle-request', handleRequestOp, req);
 ```
 
-## Op Definition and the op() Factory
+**Note**: `trace_id` and `thread_id` are stored in `ctx.buffer._identity`, not as top-level context properties.
+
+## Op Definition and the defineOp() Factory
 
 ### What is an Op?
 
-An **Op** is a traced operation. It's created via the `op()` factory from a module:
+An **Op** is a traced operation. It's created via `defineOp()` from an op context:
 
 ```typescript
-const httpModule = defineModule({
-  metadata: { packageName: '@my-company/http', packagePath: 'src/index.ts' },
-  logSchema: { status: S.number(), method: S.enum(['GET', 'POST']) },
-  deps: { retry: retryModule },
-  ff: { premiumApi: ff.boolean() },
-}).ctx<{ env: { apiTimeout: number } }>();
+const { defineOp, defineOps, createTrace } = defineOpContext({
+  logSchema: defineLogSchema({
+    status: S.number(),
+    method: S.enum(['GET', 'POST']),
+    url: S.category(),
+  }),
+  deps: { retry: retryOps },
+  flags: defineFeatureFlags({ premiumApi: S.boolean() }),
+  ctx: {
+    env: null as { apiTimeout: number }, // Required at createTrace
+  },
+});
 
-const { op } = httpModule;
+// Define ops - context is first parameter
+const request = defineOp('request', async (ctx, url: string, opts: RequestOpts) => {
+  ctx.tag.method(opts.method);
+  ctx.tag.url(url);
+  ctx.log.info('Making HTTP request');
 
-// Define ops - context destructured in signature
-const request = op(async ({ span, log, tag, env }, url: string, opts: RequestOpts) => {
-  tag.method(opts.method);
-  tag.url(url);
-  log.info('Making HTTP request');
-
-  const res = await fetch(url, { ...opts, timeout: env.apiTimeout });
-  tag.status(res.status);
+  const res = await fetch(url, { ...opts, timeout: ctx.env.apiTimeout });
+  ctx.tag.status(res.status);
   return res;
 });
 ```
@@ -292,42 +321,42 @@ The `Op<Ctx, Args, Result>` type parameters match the function signature order:
 class Op<Ctx, Args extends unknown[], Result> {
   constructor(
     readonly name: string, // For Op metrics (invocations, errors, duration)
-    private module: ModuleContext, // For gitSha/packageName/packagePath attribution
-    // fn MUST use the type parameters, not hardcoded types
+    readonly metadata: OpMetadata, // For git_sha/package_name/package_file attribution (THIS op)
+    readonly logBinding: LogBinding, // LogBinding with schema and capacity stats
     private fn: (ctx: Ctx, ...args: Args) => Promise<Result>
   ) {}
 
   /**
    * Internal invocation - called by span()
-   * @param traceCtx - The root trace context
+   * @param traceCtx - The root trace context (actually a SpanContext for root)
    * @param parentBuffer - Parent span's buffer (null for root)
-   * @param callsiteModule - The CALLER's module (where span() was invoked)
+   * @param callsiteMetadata - The CALLER's metadata (where span() was invoked) - for row 0 attribution
    * @param spanName - Name decided by caller
-   * @param lineNumber - Line number where span() was called (injected by transformer, passed directly)
+   * @param lineNumber - Line number where span() was called (injected by transformer)
    * @param args - User arguments to the op
    */
   async _invoke(
-    traceCtx: TraceContext,
+    traceCtx: TraceContext<FeatureFlagSchema, Record<string, unknown>>,
     parentBuffer: SpanBuffer | null,
-    callsiteModule: ModuleContext,
+    callsiteMetadata: OpMetadata,
     spanName: string,
     lineNumber: number,
     args: Args
   ): Promise<Result> {
-    // 1. Create SpanBuffer with callsiteModule reference:
-    //    - callsiteModule: where span() was called (for row 0's gitSha/packageName/packagePath)
-    //    - this.module: the Op's module (for rows 1+ gitSha/packageName/packagePath)
-    // - Root: stores trace_id in identity bytes
+    // 1. Create SpanBuffer with dual metadata:
+    //    - callsiteMetadata: CALLER's metadata (for row 0's git_sha/package_name/package_file)
+    //    - this.metadata: THIS OP's metadata (for rows 1+ git_sha/package_name/package_file)
+    // - Root: auto-generates trace_id
     // - Child: walks parent chain for trace_id (no duplication)
     const buffer = parentBuffer
-      ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
-      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.trace_id);
+      ? createChildSpanBuffer(parentBuffer, this.logBinding, spanName, callsiteMetadata)
+      : createSpanBuffer(schema, this.logBinding, spanName); // Auto-generates trace_id
 
     // 2. Register with parent's _children (RemappedBufferView if prefixed)
     if (parentBuffer) {
-      if (this.module.remappedViewClass) {
-        // Module has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
-        const view = new this.module.remappedViewClass(buffer);
+      if (this.logBinding.remappedViewClass) {
+        // Op has prefix - wrap buffer in RemappedBufferView for parent's tree traversal
+        const view = new this.logBinding.remappedViewClass(buffer);
         parentBuffer._children.push(view);
       } else {
         // No prefix - push raw buffer directly
@@ -336,33 +365,37 @@ class Op<Ctx, Args extends unknown[], Result> {
     }
 
     // 3. Write span-start entry (row 0)
-    //    - Uses callsiteModule for gitSha/packageName/packagePath
+    //    - Uses callsiteMetadata for git_sha/package_name/package_file
     //    - lineNumber written DIRECTLY to lineNumber_values[0] (NO intermediate object)
     buffer.lineNumber_values[0] = lineNumber; // Direct TypedArray write
-    buffer.writeSpanStart(); // Writes timestamp, operation, uses callsiteModule for metadata
+    buffer.writeSpanStart(); // Writes timestamp, operation, uses callsiteMetadata for metadata
 
-    // 4. Set up SpanContext with destructurable properties
-    // Built-in properties + Extra from .ctx<Extra>()
-    // span() captures the CURRENT module (this.module) as callsiteModule for child spans
-    const opCtx = {
-      span: (childLineNumber, name, childOp, ...childArgs) =>
-        childOp._invoke(traceCtx, buffer, this.module, name, childLineNumber, childArgs),
-      log: new this.module.SpanLogger(buffer),
-      tag: new this.module.TagAPI(buffer),
-      deps: this.module.boundDeps, // Plain object of Op references
-      ff: traceCtx.ff.withBuffer(buffer),
-      // Spread Extra properties from TraceContext (e.g., env, requestId, userId)
-      ...extractExtraFromTraceContext(traceCtx),
-    } as Ctx;
+    // 4. Set up SpanContext using prototype-based inheritance from parentSpanContext
+    // CRITICAL DESIGN: Object.create(parentSpanContext) provides:
+    // - User properties (env, requestId, userId, deps) inherited via prototype chain
+    // - Context overrides work automatically (override props become own properties on child)
+    // - V8 inline caches make prototype access fast after warmup (monomorphic)
+    // - Zero per-call allocation for user properties - just prototype link
+    // - No _extraKeys iteration needed - prototype chain handles inheritance
+    //
+    // span() captures THIS OP's metadata (this.metadata) as callsiteMetadata for child spans
+    const spanCtx = Object.create(parentSpanContext);
+
+    // Set instance properties (own properties shadow prototype values)
+    spanCtx.tag = createTagWriter(schema, buffer);
+    spanCtx.log = createSpanLogger(schema, buffer);
+    spanCtx._buffer = buffer;
+    spanCtx._spanLogger = spanCtx.log;
+    spanCtx.ff = parentSpanContext.ff.forContext(spanCtx);
 
     // 5. Execute user function with try/catch for span-exception
-    //    Rows 1+ use this.module for gitSha/packageName/packagePath
+    //    Rows 1+ use this.metadata for git_sha/package_name/package_file
     try {
-      const result = await this.fn(opCtx, ...args);
-      buffer.writeSpanOk(); // Row 1 - uses module metadata
+      const result = await this.fn(spanCtx, ...args);
+      buffer.writeSpanOk(); // Row 1 - uses metadata
       return result;
     } catch (error) {
-      buffer.writeSpanException(error); // Row 1 - uses module metadata
+      buffer.writeSpanException(error); // Row 1 - uses metadata
       throw error;
     }
   }
@@ -372,21 +405,27 @@ class Op<Ctx, Args extends unknown[], Result> {
 ### Why This Design
 
 1. **Span name at call site**: `span('retry-attempt', retry, 1)` - caller provides contextually meaningful name
-2. **Dual module references**: `callsiteModule` for row 0's gitSha/packageName/packagePath, `module` for rows 1+
+2. **Dual metadata references**: `callsiteMetadata` for row 0's git_sha/package_name/package_file, `metadata` for rows
+   1+
 3. **Zero allocation deps**: `deps` is a plain object, not closures created per call
 4. **V8 hidden class friendly**: Op is a simple class with fixed structure
 5. **Single Ctx type param**: Op carries full Ctx requirement, contravariance at span() ensures compatibility
 6. **Direct lineNumber writes**: lineNumber passed as argument to span(), written directly to `lineNumber_values[0]` (NO
    lineNumber property on any context object)
+7. **Prototype-based user property inheritance**: `Object.create(parentSpanContext)` instead of copying properties
+   - V8 inline caches make prototype access fast after warmup
+   - Context overrides work naturally (override becomes own property on child, shadows prototype)
+   - Memory efficient - no copying of user properties at each span creation
+   - No `_extraKeys` tracking needed - prototype chain handles inheritance automatically
 
 ## SpanContext Interface
 
-The context passed to op functions combines built-in properties with user-extensible `Extra`:
+The context passed to op functions combines built-in properties with user-extensible `Ctx`:
 
 ```typescript
-type SpanContext<Schema, Deps, FF, Extra> = {
+type SpanContext<Schema, Deps, FF, Ctx> = {
   // Invoke another op as a child span - supports multiple overloads
-  span: SpanFn<SpanContext<Schema, Deps, FF, Extra>>;
+  span: SpanFn<SpanContext<Schema, Deps, FF, Ctx>>;
 
   // Log messages (info/debug/warn/error)
   log: LogAPI;
@@ -402,44 +441,48 @@ type SpanContext<Schema, Deps, FF, Extra> = {
 
   // Result helpers
   ok<T>(value: T): OkResult<T>;
-  err<E>(error: E): ErrResult<E>;
+  err<E>(code: string, data?: E): ErrResult<E>;
 
-  // Scoped attributes
-  scope(attributes: Partial<Schema>): void;
+  // Scoped attributes (read-only view)
+  scope: Readonly<Partial<Schema>>;
+
+  // Set scoped attributes (merge semantics, null to clear)
+  setScope(values: Partial<Schema>): void;
 
   // Access to underlying buffer (advanced use)
   buffer: SpanBuffer;
-} & Extra; // User-extensible properties via .ctx<Extra>()
+} & Ctx; // User-extensible properties via ctx in defineOpContext()
 ```
 
-**Key Design**: The `Extra` type is spread directly into the context, so properties like `env` become top-level and can
-be destructured: `({ env, log, tag }) => ...`.
+**Key Design**: The `Ctx` type is spread directly into the context, so properties like `env` become top-level and can be
+accessed directly: `ctx.env.apiTimeout`.
 
 ### Destructuring Pattern
 
-Ops destructure the context in their signature, taking only what they need:
+Ops can destructure the context, taking only what they need:
 
 ```typescript
 // Full destructuring
-const processUser = op(async ({ span, log, tag, deps, ff, env }, user: User) => {
+const processUser = defineOp('processUser', async (ctx, user: User) => {
+  const { span, log, tag, deps, ff, env } = ctx;
   // ...
 });
 
-// Partial - only what's needed
-const validateEmail = op(async ({ log, tag }, email: string) => {
-  log.debug('Validating email');
-  tag.email(email);
+// Direct access - simpler for most cases
+const validateEmail = defineOp('validateEmail', async (ctx, email: string) => {
+  ctx.log.debug('Validating email');
+  ctx.tag.email(email);
   // ...
 });
 
 // With deps destructuring
-const fetchWithRetry = op(async ({ span, deps }, url: string) => {
-  const { retry, auth } = deps; // Destructure deps too!
+const fetchWithRetry = defineOp('fetchWithRetry', async (ctx, url: string) => {
+  const { retry, auth } = ctx.deps; // Destructure deps too!
 
   try {
-    return await span('fetch', request, url, { method: 'GET' });
+    return await ctx.span('fetch', request, url, { method: 'GET' });
   } catch (e) {
-    await span('retry', retry, 1);
+    await ctx.span('retry', retry.attempt, 1);
     throw e;
   }
 });
@@ -447,23 +490,23 @@ const fetchWithRetry = op(async ({ span, deps }, url: string) => {
 
 ## Child Span Creation via span()
 
-The `span()` function is how ops call other ops:
+The `span()` method is how ops call other ops:
 
 ```typescript
-const createUser = op(async ({ span, log, tag }, userData: UserData) => {
-  tag.userId(userData.id);
+const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
+  ctx.tag.userId(userData.id);
 
   // Validate via child span
-  const valid = await span('validate', validateUser, userData);
+  const valid = await ctx.span('validate', validateUser, userData);
   if (!valid.success) {
-    return { success: false, error: 'validation_failed' };
+    return ctx.err('VALIDATION_FAILED');
   }
 
   // Save via child span
-  const saved = await span('save', saveUser, userData);
+  const saved = await ctx.span('save', saveUser, userData);
 
-  log.info('User created');
-  return { success: true, user: saved };
+  ctx.log.info('User created');
+  return ctx.ok(saved);
 });
 ```
 
@@ -474,46 +517,52 @@ const createUser = op(async ({ span, log, tag }, userData: UserData) => {
 3. **Op provided by caller**: The Op instance to invoke
 4. **Args passed through**: Remaining arguments go to the op function
 5. **lineNumber written directly**: Written to `lineNumber_values[0]` inside \_invoke() (NO intermediate object storage)
-6. **SpanBuffer created with callsiteModule**: `callsiteModule` for row 0's metadata, `module` for rows 1+
+6. **SpanBuffer created with callsiteMetadata**: `callsiteMetadata` for row 0's metadata, `metadata` for rows 1+
 7. **Buffer linking**: Child buffer registered with parent's children array
 8. **RemappedBufferView**: If op has prefix, view maps prefixed columns for Arrow
 
 ### Example: Multiple Child Spans
 
 ```typescript
-const processOrder = op(async ({ span, log, tag, deps }, order: Order) => {
-  tag.orderId(order.id);
+const processOrder = defineOp('processOrder', async (ctx, order: Order) => {
+  ctx.tag.orderId(order.id);
 
   // Multiple child spans with contextual names
-  const validated = await span('validate-order', deps.validation, order);
-  const inventory = await span('check-inventory', deps.inventory, order.items);
-  const payment = await span('process-payment', deps.payments, order.total);
+  const validated = await ctx.span('validate-order', ctx.deps.validation.check, order);
+  const inventory = await ctx.span('check-inventory', ctx.deps.inventory.check, order.items);
+  const payment = await ctx.span('process-payment', ctx.deps.payments.charge, order.total);
 
   // Even same op can have different names based on context
-  await span('notify-customer', deps.notify, order.customerId, 'order_confirmed');
-  await span('notify-warehouse', deps.notify, order.warehouseId, 'prepare_shipment');
+  await ctx.span('notify-customer', ctx.deps.notify.send, order.customerId, 'order_confirmed');
+  await ctx.span('notify-warehouse', ctx.deps.notify.send, order.warehouseId, 'prepare_shipment');
 
-  return { validated, inventory, payment };
+  return ctx.ok({ validated, inventory, payment });
 });
 ```
 
 ## Root Invocation
 
-At the application entry point, use `module.traceContext()` then `.span()`:
+At the application entry point, use `createTrace()` then `.span()`:
 
 ```typescript
-// Wire dependencies at composition time
-const appRoot = appModule.use({
-  http: httpModule.prefix('http').use({
-    retry: retryModule.prefix('http_retry').use(),
-  }),
+// Wire dependencies at composition time via defineOpContext
+const { defineOp, createTrace } = defineOpContext({
+  logSchema: appSchema,
+  deps: {
+    http: httpOps.prefix('http'),
+    retry: retryOps.prefix('http_retry'),
+  },
+  ctx: {
+    env: null as Env, // Required
+    requestId: null as string, // Required
+    userId: undefined as string | undefined, // Optional
+  },
 });
 
 // Request handler
 app.post('/users', async (req, res) => {
-  // Create trace context via module - type-safe Extra properties
-  const ctx = appModule.traceContext({
-    ff: ffEvaluator,
+  // Create trace context - type-safe ctx properties
+  const ctx = createTrace({
     env: workerEnv,
     requestId: req.id,
     userId: req.user?.id,
@@ -523,26 +572,11 @@ app.post('/users', async (req, res) => {
   const result = await ctx.span('create-user', createUser, req.body);
 
   if (result.success) {
-    res.json(result.data);
+    res.json(result.value);
   } else {
     res.status(400).json({ error: result.error });
   }
 });
-```
-
-### Alternative: Pre-Wired Module Root
-
-For pre-wired modules, use the bound module's span method:
-
-```typescript
-// Pre-wire at app startup
-const httpRoot = httpModule.prefix('http').use({
-  retry: retryModule.prefix('http_retry').use(),
-});
-
-// Create trace context and invoke
-const ctx = httpModule.traceContext({ ff: ffEvaluator, env: workerEnv });
-const result = await ctx.span('GET', GET, 'https://example.com');
 ```
 
 ## Thread ID and Distributed Span Identification
@@ -588,21 +622,19 @@ function getTimestamp(ctx: TraceContext): bigint {
 Feature flags are accessed via `ff` in the op context:
 
 ```typescript
-const createUser = op(async ({ span, log, tag, ff }, userData: UserData) => {
-  // Destructure flags - first access logs ff-access
-  const { advancedValidation, betaFeatures } = ff;
-
-  if (advancedValidation) {
-    await span('advanced-validate', advancedValidate, userData);
-    advancedValidation.track(); // Log ff-usage
+const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
+  // Access flags via ctx.ff
+  if (await ctx.ff.advancedValidation.get()) {
+    await ctx.span('advanced-validate', advancedValidate, userData);
+    ctx.ff.advancedValidation.track(); // Log ff-usage
   }
 
-  if (betaFeatures) {
-    log.info('Beta features enabled');
-    betaFeatures.track({ feature: 'new_ui' });
+  if (await ctx.ff.betaFeatures.get()) {
+    ctx.log.info('Beta features enabled');
+    ctx.ff.betaFeatures.track({ feature: 'new_ui' });
   }
 
-  return { success: true };
+  return ctx.ok({ success: true });
 });
 ```
 
@@ -611,53 +643,64 @@ const createUser = op(async ({ span, log, tag, ff }, userData: UserData) => {
 ### Basic Op Usage
 
 ```typescript
-const { op } = userModule;
+const { defineOp, createTrace } = defineOpContext({
+  logSchema: defineLogSchema({
+    userId: S.category(),
+    operation: S.enum(['INSERT', 'UPDATE', 'DELETE']),
+  }),
+});
 
-const createUser = op(async ({ span, log, tag }, userData: UserData) => {
+const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
   // Tag span attributes
-  tag.userId(userData.id).operation('INSERT');
+  ctx.tag.userId(userData.id).operation('INSERT');
 
   // Log messages
-  log.info('Creating new user');
+  ctx.log.info('Creating new user');
 
   // Call child ops via span()
-  const validated = await span('validate', validateUser, userData);
+  const validated = await ctx.span('validate', validateUser, userData);
   if (!validated.success) {
-    log.warn('Validation failed');
-    return { success: false, error: validated.error };
+    ctx.log.warn('Validation failed');
+    return ctx.err('VALIDATION_FAILED', validated.error);
   }
 
-  const user = await span('save', saveUser, userData);
-  log.info('User created successfully');
+  const user = await ctx.span('save', saveUser, userData);
+  ctx.log.info('User created successfully');
 
-  return { success: true, user };
+  return ctx.ok(user);
 });
 ```
 
 ### Using Dependencies
 
 ```typescript
-const { op } = httpModule;
+const { defineOp } = defineOpContext({
+  logSchema: httpSchema,
+  deps: {
+    retry: retryOps,
+    auth: authOps,
+  },
+});
 
-const GET = op(async ({ span, log, tag, deps }, url: string) => {
-  // Destructure dependencies
-  const { retry, auth } = deps;
+const GET = defineOp('GET', async (ctx, url: string) => {
+  // Access deps via ctx.deps
+  const { retry, auth } = ctx.deps;
 
-  tag.method('GET').url(url);
-  log.info('Starting GET request');
+  ctx.tag.method('GET').url(url);
+  ctx.log.info('Starting GET request');
 
   // Get auth token via child span
-  const token = await span('get-token', auth.getToken);
+  const token = await ctx.span('get-token', auth.getToken);
 
   const headers = { Authorization: `Bearer ${token}` };
 
   try {
     const res = await fetch(url, { headers });
-    tag.status(res.status);
-    return res;
+    ctx.tag.status(res.status);
+    return ctx.ok(res);
   } catch (e) {
-    log.error('Request failed, retrying');
-    await span('retry', retry, 1);
+    ctx.log.error('Request failed, retrying');
+    await ctx.span('retry', retry.attempt, 1);
     throw e;
   }
 });
@@ -666,26 +709,40 @@ const GET = op(async ({ span, log, tag, deps }, url: string) => {
 ### Feature Flags and Environment
 
 ```typescript
-const processOrder = op(async ({ span, log, tag, deps, ff, env }, order: Order) => {
-  const { premiumProcessing, newPaymentFlow } = ff;
+const { defineOp, createTrace } = defineOpContext({
+  logSchema: orderSchema,
+  deps: {
+    premiumValidation: premiumValidationOps,
+    newPayment: newPaymentOps,
+    legacyPayment: legacyPaymentOps,
+  },
+  flags: defineFeatureFlags({
+    premiumProcessing: S.boolean(),
+    newPaymentFlow: S.boolean(),
+  }),
+  ctx: {
+    env: null as { paymentProvider: string },
+  },
+});
 
-  tag.orderId(order.id).total(order.total);
+const processOrder = defineOp('processOrder', async (ctx, order: Order) => {
+  ctx.tag.orderId(order.id).total(order.total);
 
-  if (premiumProcessing) {
-    await span('premium-validate', deps.premiumValidation, order);
-    premiumProcessing.track();
+  if (await ctx.ff.premiumProcessing.get()) {
+    await ctx.span('premium-validate', ctx.deps.premiumValidation.validate, order);
+    ctx.ff.premiumProcessing.track();
   }
 
-  const paymentProvider = env.paymentProvider;
+  const paymentProvider = ctx.env.paymentProvider;
 
-  if (newPaymentFlow) {
-    await span('new-payment', deps.newPayment, order, paymentProvider);
-    newPaymentFlow.track({ provider: paymentProvider });
+  if (await ctx.ff.newPaymentFlow.get()) {
+    await ctx.span('new-payment', ctx.deps.newPayment.charge, order, paymentProvider);
+    ctx.ff.newPaymentFlow.track({ provider: paymentProvider });
   } else {
-    await span('legacy-payment', deps.legacyPayment, order);
+    await ctx.span('legacy-payment', ctx.deps.legacyPayment.charge, order);
   }
 
-  return { success: true };
+  return ctx.ok({ success: true });
 });
 ```
 
@@ -693,13 +750,13 @@ const processOrder = op(async ({ span, log, tag, deps, ff, env }, order: Order) 
 
 ### Op Creation
 
-- **Module setup**: One allocation for Op instance at module load
-- **Schema compilation**: Done once at module definition time
+- **OpContext setup**: One allocation for metadata at defineOpContext() call
+- **Schema compilation**: Done once at op context definition time
 - **Deps binding**: Plain object reference, zero per-call allocation
 
 ### Op Invocation
 
-- **Buffer creation**: One SpanBuffer per span with `callsiteModule` reference
+- **Buffer creation**: One SpanBuffer per span with `callsiteMetadata` reference
 - **lineNumber**: Passed as argument to span(), written directly to `lineNumber_values[0]` (NO lineNumber property on
   any object)
 - **SpanContext creation**: One SpanContext object per invocation
@@ -707,17 +764,18 @@ const processOrder = op(async ({ span, log, tag, deps, ff, env }, order: Order) 
 
 ### Memory Usage
 
-- **Shared references**: ModuleContext and deps shared across all ops
+- **Shared references**: OpMetadata and deps shared across all ops
 - **Direct buffer access**: TagAPI/SpanLogger hold buffer reference directly
-- **Buffer management**: Self-tuning capacity per module
+- **Buffer management**: Self-tuning capacity per op context
 
 ## Integration Points
 
 This context flow system integrates with:
 
-- **[Module Context and SpanLogger Generation](./01j_module_context_and_spanlogger_generation.md)**: Provides the module
-  setup and SpanLogger/TagAPI class generation
-- **[Module Builder Pattern](./01l_module_builder_pattern.md)**: Defines `defineModule()` and `op()` API
+- **[Module Context and SpanLogger Generation](./01j_module_context_and_spanlogger_generation.md)**: Provides the
+  SpanLogger/TagAPI class generation
+- **[Op Context Pattern](./01l_op_context_pattern.md)**: Defines `defineOpContext()`, `defineOp()`, and `createTrace()`
+  API
 - **[Span Scope Attributes](./01i_span_scope_attributes.md)**: Provides span-level attribute scoping
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: Shows how libraries define ops
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Defines the SpanBuffer structure
@@ -735,12 +793,12 @@ writes:
 
 ```typescript
 // Source code:
-log.info('Processing user');
-await span('validate', validateUser, userData);
+ctx.log.info('Processing user');
+await ctx.span('validate', validateUser, userData);
 
 // Transformed (line number injected):
-log.info('Processing user').line(42); // .line(N) appended to log calls
-await span(43, 'validate', validateUser, userData); // line number FIRST for span()
+ctx.log.info('Processing user').line(42); // .line(N) appended to log calls
+await ctx.span(43, 'validate', validateUser, userData); // line number FIRST for span()
 ```
 
 **Row-based lineNumber storage:**
@@ -750,7 +808,7 @@ await span(43, 'validate', validateUser, userData); // line number FIRST for spa
 
 **SpanBuffer stores:**
 
-- `callsiteModule`: The caller's ModuleContext (for row 0's gitSha/packageName/packagePath)
-- `module`: The Op's ModuleContext (for rows 1+ gitSha/packageName/packagePath)
+- `callsiteMetadata`: The caller's OpMetadata (for row 0's git_sha/package_name/package_file)
+- `metadata`: The Op's OpMetadata (for rows 1+ git_sha/package_name/package_file)
 - `spanName`: The contextual name provided by caller
 - `lineNumber_values`: Int32Array for line numbers per row (NOT a lineNumber property)

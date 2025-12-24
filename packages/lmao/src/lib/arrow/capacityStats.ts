@@ -28,7 +28,6 @@ import {
   Utf8,
   type Vector,
 } from 'apache-arrow';
-import type { ModuleContext } from '../moduleContext.js';
 import {
   ENTRY_TYPE_BUFFER_CREATED,
   ENTRY_TYPE_BUFFER_OVERFLOW_WRITES,
@@ -38,6 +37,7 @@ import {
   ENTRY_TYPE_PERIOD_START,
 } from '../schema/systemSchema.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from '../schema/typeGuards.js';
+import type { LogBinding, OpMetadata } from '../types.js';
 import { globalUtf8Cache } from '../utf8Cache.js';
 import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
 
@@ -68,35 +68,46 @@ import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
  * If `hasSpanData` is true, uses the full `arrowSchema` so RecordBatches can be combined.
  */
 
+/**
+ * Entry for capacity stats: pairs LogBinding (with stats) with OpMetadata (with package info).
+ *
+ * When collecting modules for capacity stats, we need both:
+ * - LogBinding: has sb_totalWrites, sb_overflowWrites, sb_totalCreated, sb_overflows
+ * - OpMetadata: has package_name, package_file, git_sha
+ */
+export interface CapacityStatsEntry {
+  readonly logBinding: LogBinding;
+  readonly metadata: OpMetadata;
+}
+
 /** Number of metric rows per module (period-start + 4 buffer metrics) */
 const ROWS_PER_MODULE = 5;
 
 export function createCapacityStatsRecordBatch(
-  modulesToLogStats: Set<ModuleContext>,
+  modulesToLogStats: CapacityStatsEntry[],
   periodStartNs: bigint,
   arrowSchema: Schema,
   lmaoSchema: Record<string, unknown>,
   hasSpanData = true,
 ): RecordBatch {
-  const moduleCount = modulesToLogStats.size;
+  const moduleCount = modulesToLogStats.length;
   const capacityStatsRows = moduleCount * ROWS_PER_MODULE;
   if (capacityStatsRows === 0) {
     return new RecordBatch({});
   }
 
-  const modulesArray = Array.from(modulesToLogStats);
   const vectors: Vector[] = [];
 
   // Build dictionaries containing only modules with capacity stats
-  // This ensures the RecordBatch only includes dictionary entries it actually uses
+  // Uses pre-encoded entries from OpMetadata (interned at Op definition time)
   const packageEntries: PreEncodedEntry[] = new Array(moduleCount);
   const packagePathEntries: PreEncodedEntry[] = new Array(moduleCount);
   const gitShaEntries: PreEncodedEntry[] = new Array(moduleCount);
   for (let i = 0; i < moduleCount; i++) {
-    const module = modulesArray[i];
-    packageEntries[i] = module.package_name_entry;
-    packagePathEntries[i] = module.package_file_entry;
-    gitShaEntries[i] = module.git_sha_entry;
+    const { metadata } = modulesToLogStats[i];
+    packageEntries[i] = metadata.package_name_entry;
+    packagePathEntries[i] = metadata.package_file_entry;
+    gitShaEntries[i] = metadata.git_sha_entry;
   }
 
   const cmp = (a: PreEncodedEntry, b: PreEncodedEntry) => compareStrings(a.str, b.str);
@@ -332,8 +343,8 @@ export function createCapacityStatsRecordBatch(
   // Each module has ROWS_PER_MODULE rows, all with the same package name
   const packageIndices = new capacityStatsPackageDict.indexArrayCtor(capacityStatsRows);
   for (let m = 0; m < moduleCount; m++) {
-    const module = modulesArray[m];
-    const pkgIdx = capacityStatsPackageDict.indexMap.get(module.package_name) ?? 0;
+    const { metadata } = modulesToLogStats[m];
+    const pkgIdx = capacityStatsPackageDict.indexMap.get(metadata.package_name) ?? 0;
     const baseRow = m * ROWS_PER_MODULE;
     for (let r = 0; r < ROWS_PER_MODULE; r++) {
       packageIndices[baseRow + r] = pkgIdx;
@@ -365,8 +376,8 @@ export function createCapacityStatsRecordBatch(
   // Each module has ROWS_PER_MODULE rows, all with the same package path
   const packagePathIndices = new capacityStatsPackagePathDict.indexArrayCtor(capacityStatsRows);
   for (let m = 0; m < moduleCount; m++) {
-    const module = modulesArray[m];
-    const pathIdx = capacityStatsPackagePathDict.indexMap.get(module.package_file) ?? 0;
+    const { metadata } = modulesToLogStats[m];
+    const pathIdx = capacityStatsPackagePathDict.indexMap.get(metadata.package_file) ?? 0;
     const baseRow = m * ROWS_PER_MODULE;
     for (let r = 0; r < ROWS_PER_MODULE; r++) {
       packagePathIndices[baseRow + r] = pathIdx;
@@ -398,8 +409,8 @@ export function createCapacityStatsRecordBatch(
   // Each module has ROWS_PER_MODULE rows, all with the same git SHA
   const gitShaIndices = new capacityStatsGitShaDict.indexArrayCtor(capacityStatsRows);
   for (let m = 0; m < moduleCount; m++) {
-    const module = modulesArray[m];
-    const idx = capacityStatsGitShaDict.indexMap.get(module.git_sha) ?? 0;
+    const { metadata } = modulesToLogStats[m];
+    const idx = capacityStatsGitShaDict.indexMap.get(metadata.git_sha) ?? 0;
     const baseRow = m * ROWS_PER_MODULE;
     for (let r = 0; r < ROWS_PER_MODULE; r++) {
       gitShaIndices[baseRow + r] = idx;
@@ -469,17 +480,17 @@ export function createCapacityStatsRecordBatch(
   // - buffer-writes: module.sb_totalWrites
   // - buffer-overflow-writes: module.sb_overflowWrites
   // - buffer-created: module.sb_totalCreated
-  // - buffer-overflows: module.sb_overflows
+  // - buffer-overflows: logBinding.sb_overflows
   if (hasSpanData) {
     const uint64Values = new BigUint64Array(capacityStatsRows);
     for (let m = 0; m < moduleCount; m++) {
-      const module = modulesArray[m];
+      const { logBinding } = modulesToLogStats[m];
       const baseRow = m * ROWS_PER_MODULE;
       uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
-      uint64Values[baseRow + 1] = BigInt(module.sb_totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(module.sb_overflowWrites); // buffer-overflow-writes
-      uint64Values[baseRow + 3] = BigInt(module.sb_totalCreated); // buffer-created
-      uint64Values[baseRow + 4] = BigInt(module.sb_overflows); // buffer-overflows
+      uint64Values[baseRow + 1] = BigInt(logBinding.sb_totalWrites); // buffer-writes
+      uint64Values[baseRow + 2] = BigInt(logBinding.sb_overflowWrites); // buffer-overflow-writes
+      uint64Values[baseRow + 3] = BigInt(logBinding.sb_totalCreated); // buffer-created
+      uint64Values[baseRow + 4] = BigInt(logBinding.sb_overflows); // buffer-overflows
     }
     vectors.push(
       makeVector(
@@ -666,13 +677,13 @@ export function createCapacityStatsRecordBatch(
     // Per spec, buffer-* entry types use uint64_value, not message
     const uint64Values = new BigUint64Array(capacityStatsRows);
     for (let m = 0; m < moduleCount; m++) {
-      const module = modulesArray[m];
+      const { logBinding } = modulesToLogStats[m];
       const baseRow = m * ROWS_PER_MODULE;
       uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
-      uint64Values[baseRow + 1] = BigInt(module.sb_totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(module.sb_overflowWrites); // buffer-overflow-writes
-      uint64Values[baseRow + 3] = BigInt(module.sb_totalCreated); // buffer-created
-      uint64Values[baseRow + 4] = BigInt(module.sb_overflows); // buffer-overflows
+      uint64Values[baseRow + 1] = BigInt(logBinding.sb_totalWrites); // buffer-writes
+      uint64Values[baseRow + 2] = BigInt(logBinding.sb_overflowWrites); // buffer-overflow-writes
+      uint64Values[baseRow + 3] = BigInt(logBinding.sb_totalCreated); // buffer-created
+      uint64Values[baseRow + 4] = BigInt(logBinding.sb_overflows); // buffer-overflows
     }
     vectors.push(
       makeVector(

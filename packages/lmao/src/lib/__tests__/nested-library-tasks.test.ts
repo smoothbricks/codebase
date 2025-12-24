@@ -1,8 +1,3 @@
-// @ts-nocheck - TODO: Fix type issues when core schema type system is finalized
-// The type errors stem from:
-// 1. DefinedLogSchema vs SchemaFields type mismatch in defineModule.ts
-// 2. Cross-module op calls have schema type mismatches with Record<string, never>
-// 3. LogSchema type not fully integrated with SchemaFields
 /**
  * Tests for nested library tasks with prefix remapping
  *
@@ -18,7 +13,7 @@
 
 import { describe, expect, it } from 'bun:test';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
-import { defineModule } from '../defineModule.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { SpanBuffer } from '../types.js';
@@ -38,51 +33,22 @@ describe('Nested Library Tasks', () => {
         depth: S.number(),
       });
 
-      // Create 4 module contexts with the same schema
-      // Use empty ctx<{}>({}) to avoid type conflicts across modules
-      const module1 = defineModule({
-        metadata: {
-          git_sha: 'test-sha',
-          package_name: '@test/module1',
-          package_file: 'src/module1.ts',
-        },
+      // Create 4 op context factories with the same schema
+      const { defineOp: defineOp1, createTrace: createTrace1 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const module2 = defineModule({
-        metadata: {
-          git_sha: 'test-sha',
-          package_name: '@test/module2',
-          package_file: 'src/module2.ts',
-        },
+      const { defineOp: defineOp2 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const module3 = defineModule({
-        metadata: {
-          git_sha: 'test-sha',
-          package_name: '@test/module3',
-          package_file: 'src/module3.ts',
-        },
+      const { defineOp: defineOp3 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const module4 = defineModule({
-        metadata: {
-          git_sha: 'test-sha',
-          package_name: '@test/module4',
-          package_file: 'src/module4.ts',
-        },
+      const { defineOp: defineOp4 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       // Capture buffers for verification
       let rootBuffer: SpanBuffer | undefined;
@@ -91,7 +57,7 @@ describe('Nested Library Tasks', () => {
       let level4Buffer: SpanBuffer | undefined;
 
       // Level 4 op (deepest)
-      const level4Op = module4.op('level4-op', async (ctx) => {
+      const level4Op = defineOp4('level4-op', async (ctx) => {
         level4Buffer = ctx.buffer;
         ctx.tag.depth(4);
         ctx.tag.operation('DELETE');
@@ -99,7 +65,7 @@ describe('Nested Library Tasks', () => {
       });
 
       // Level 3 op
-      const level3Op = module3.op('level3-op', async (ctx) => {
+      const level3Op = defineOp3('level3-op', async (ctx) => {
         level3Buffer = ctx.buffer;
         ctx.tag.depth(3);
         ctx.tag.operation('UPDATE');
@@ -111,7 +77,7 @@ describe('Nested Library Tasks', () => {
       });
 
       // Level 2 op
-      const level2Op = module2.op('level2-op', async (ctx) => {
+      const level2Op = defineOp2('level2-op', async (ctx) => {
         level2Buffer = ctx.buffer;
         ctx.tag.depth(2);
         ctx.tag.operation('READ');
@@ -123,7 +89,7 @@ describe('Nested Library Tasks', () => {
       });
 
       // Root op (level 1)
-      const rootOp = module1.op('root-op', async (ctx) => {
+      const rootOp = defineOp1('root-op', async (ctx) => {
         rootBuffer = ctx.buffer;
         ctx.tag.userId('user-123');
         ctx.tag.depth(1);
@@ -136,7 +102,7 @@ describe('Nested Library Tasks', () => {
       });
 
       // Execute the nested op chain
-      const traceCtx = module1.traceContext({});
+      const traceCtx = createTrace1({});
       const result = await traceCtx.span('root-op', rootOp);
 
       // Verify result
@@ -179,61 +145,49 @@ describe('Nested Library Tasks', () => {
         level: S.number(),
       });
 
-      const module1 = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@test/m1', package_file: 'm1.ts' },
+      const { defineOp: defineOp1, createTrace: createTrace1 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const module2 = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@test/m2', package_file: 'm2.ts' },
+      const { defineOp: defineOp2 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const module3 = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@test/m3', package_file: 'm3.ts' },
+      const { defineOp: defineOp3 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const module4 = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@test/m4', package_file: 'm4.ts' },
+      const { defineOp: defineOp4 } = defineOpContext({
         logSchema: sharedSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let rootBuffer: SpanBuffer | undefined;
 
-      const level4Op = module4.op('level4', async (ctx) => {
+      const level4Op = defineOp4('level4', async (ctx) => {
         ctx.tag.level(4);
         return ctx.ok('done');
       });
 
-      const level3Op = module3.op('level3', async (ctx) => {
+      const level3Op = defineOp3('level3', async (ctx) => {
         ctx.tag.level(3);
         await ctx.span('level4', level4Op);
         return ctx.ok('done');
       });
 
-      const level2Op = module2.op('level2', async (ctx) => {
+      const level2Op = defineOp2('level2', async (ctx) => {
         ctx.tag.level(2);
         await ctx.span('level3', level3Op);
         return ctx.ok('done');
       });
 
-      const rootOp = module1.op('root', async (ctx) => {
+      const rootOp = defineOp1('root', async (ctx) => {
         rootBuffer = ctx.buffer;
         ctx.tag.level(1);
         await ctx.span('level2', level2Op);
         return ctx.ok('done');
       });
 
-      const traceCtx = module1.traceContext({});
+      const traceCtx = createTrace1({});
       await traceCtx.span('root', rootOp);
 
       expect(rootBuffer).toBeDefined();
@@ -266,7 +220,10 @@ describe('Nested Library Tasks', () => {
       expect(level4Span).toBeDefined();
 
       // Root has no parent
-      expect(rootSpan?.parent_span_id).toBeNull();
+      // Root op's span is a child of the trace root (via trace.span())
+      // So it HAS a parent_span_id (the trace root's span_id)
+      expect(rootSpan?.parent_span_id).toBeDefined();
+      expect(typeof rootSpan?.parent_span_id).toBe('number');
 
       // Level 2's parent is root
       expect(level2Span?.parent_span_id).toBe(rootSpan?.span_id);
@@ -284,7 +241,7 @@ describe('Nested Library Tasks', () => {
     });
   });
 
-  describe('4-level nesting WITH library prefixes (defineModule with prefixed columns)', () => {
+  describe('4-level nesting WITH library prefixes (defineOpContext with prefixed columns)', () => {
     /**
      * Test scenario: App -> httpModule.op (prefix: 'http') -> dbModule.op (prefix: 'db') ->
      *                cacheModule.op (prefix: 'cache') -> authModule.op (prefix: 'auth')
@@ -294,7 +251,7 @@ describe('Nested Library Tasks', () => {
      * - Library code writes to prefixed columns (ctx.tag.http_status())
      * - Columns stored with prefix (http_status, db_status, etc.)
      *
-     * Uses defineModule() pattern with prefixed column names in schema.
+     * Uses defineOpContext() pattern with prefixed column names in schema.
      */
     it('should allow libraries to write using prefixed column names', async () => {
       // Define schemas with prefixed column names for each library
@@ -315,69 +272,57 @@ describe('Nested Library Tasks', () => {
         auth_role: S.category(),
       });
 
-      // HTTP library module
-      const httpModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
+      // HTTP library context
+      const { defineOp: defineHttpOp, createTrace: createHttpTrace } = defineOpContext({
         logSchema: httpSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      // DB library module
-      const dbModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
+      // DB library context
+      const { defineOp: defineDbOp } = defineOpContext({
         logSchema: dbSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      // Cache library module
-      const cacheModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/cache', package_file: 'cache.ts' },
+      // Cache library context
+      const { defineOp: defineCacheOp } = defineOpContext({
         logSchema: cacheSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      // Auth library module
-      const authModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/auth', package_file: 'auth.ts' },
+      // Auth library context
+      const { defineOp: defineAuthOp } = defineOpContext({
         logSchema: authSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let rootBuffer: SpanBuffer | undefined;
 
       // Auth op (deepest - level 4)
-      const authOp = authModule.op('auth-check', async (ctx) => {
+      const authOp = defineAuthOp('auth-check', async (ctx) => {
         ctx.tag.auth_userId('user-456').auth_role('admin');
         return ctx.ok({ authorized: true });
       });
 
       // Cache op (level 3)
-      const cacheOp = cacheModule.op('cache-lookup', async (ctx) => {
+      const cacheOp = defineCacheOp('cache-lookup', async (ctx) => {
         ctx.tag.cache_key('session:user-456').cache_hit(true);
         await ctx.span('auth-check', authOp);
         return ctx.ok({ cached: true });
       });
 
       // DB op (level 2)
-      const dbOp = dbModule.op('db-query', async (ctx) => {
+      const dbOp = defineDbOp('db-query', async (ctx) => {
         ctx.tag.db_query('SELECT * FROM users').db_rowCount(1);
         await ctx.span('cache-lookup', cacheOp);
         return ctx.ok({ rows: [] });
       });
 
       // HTTP op (level 1 - root)
-      const httpOp = httpModule.op('http-request', async (ctx) => {
+      const httpOp = defineHttpOp('http-request', async (ctx) => {
         rootBuffer = ctx.buffer;
         ctx.tag.http_status(200).http_method('GET');
         await ctx.span('db-query', dbOp);
         return ctx.ok({ response: 'ok' });
       });
 
-      const traceCtx = httpModule.traceContext({});
+      const traceCtx = createHttpTrace({});
       const result = await traceCtx.span('http-request', httpOp);
 
       expect(result.success).toBe(true);
@@ -411,67 +356,55 @@ describe('Nested Library Tasks', () => {
     });
 
     it('should maintain correct tree structure with 4 levels of library tasks', async () => {
-      const httpModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
+      const { defineOp: defineHttpOp, createTrace: createHttpTrace } = defineOpContext({
         logSchema: defineLogSchema({ http_status: S.number() }),
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const dbModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
+      const { defineOp: defineDbOp } = defineOpContext({
         logSchema: defineLogSchema({ db_query: S.text() }),
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const cacheModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/cache', package_file: 'cache.ts' },
+      const { defineOp: defineCacheOp } = defineOpContext({
         logSchema: defineLogSchema({ cache_key: S.category() }),
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const authModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/auth', package_file: 'auth.ts' },
+      const { defineOp: defineAuthOp } = defineOpContext({
         logSchema: defineLogSchema({ auth_userId: S.category() }),
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let httpBuffer: SpanBuffer | undefined;
       let dbBuffer: SpanBuffer | undefined;
       let cacheBuffer: SpanBuffer | undefined;
       let authBuffer: SpanBuffer | undefined;
 
-      const authOp = authModule.op('auth', async (ctx) => {
+      const authOp = defineAuthOp('auth', async (ctx) => {
         authBuffer = ctx.buffer;
         ctx.tag.auth_userId('user-1');
         return ctx.ok('done');
       });
 
-      const cacheOp = cacheModule.op('cache', async (ctx) => {
+      const cacheOp = defineCacheOp('cache', async (ctx) => {
         cacheBuffer = ctx.buffer;
         ctx.tag.cache_key('key-1');
         await ctx.span('auth', authOp);
         return ctx.ok('done');
       });
 
-      const dbOp = dbModule.op('db', async (ctx) => {
+      const dbOp = defineDbOp('db', async (ctx) => {
         dbBuffer = ctx.buffer;
         ctx.tag.db_query('SELECT 1');
         await ctx.span('cache', cacheOp);
         return ctx.ok('done');
       });
 
-      const httpOp = httpModule.op('http', async (ctx) => {
+      const httpOp = defineHttpOp('http', async (ctx) => {
         httpBuffer = ctx.buffer;
         ctx.tag.http_status(200);
         await ctx.span('db', dbOp);
         return ctx.ok('done');
       });
 
-      const traceCtx = httpModule.traceContext({});
+      const traceCtx = createHttpTrace({});
       await traceCtx.span('http', httpOp);
 
       // Verify buffers captured
@@ -521,58 +454,46 @@ describe('Nested Library Tasks', () => {
         db_table: S.category(),
       });
 
-      const regularModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@app/handler', package_file: 'handler.ts' },
+      const { defineOp: defineRegularOp, createTrace: createRegularTrace } = defineOpContext({
         logSchema: regularSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const regularModule2 = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@app/processor', package_file: 'processor.ts' },
+      const { defineOp: defineRegularOp2 } = defineOpContext({
         logSchema: regularSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const httpModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
+      const { defineOp: defineHttpOp } = defineOpContext({
         logSchema: httpSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const dbModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
+      const { defineOp: defineDbOp } = defineOpContext({
         logSchema: dbSchema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let rootBuffer: SpanBuffer | undefined;
 
       // DB op (deepest - level 4, prefixed)
-      const dbOp = dbModule.op('db-query', async (ctx) => {
+      const dbOp = defineDbOp('db-query', async (ctx) => {
         ctx.tag.db_query('INSERT INTO logs').db_table('logs');
         return ctx.ok('inserted');
       });
 
       // Regular module 2 op (level 3, no prefix)
-      const processorOp = regularModule2.op('process', async (ctx) => {
+      const processorOp = defineRegularOp2('process', async (ctx) => {
         ctx.tag.step('validation');
         await ctx.span('db-query', dbOp);
         return ctx.ok('processed');
       });
 
       // HTTP library op (level 2, prefixed)
-      const httpOp = httpModule.op('fetch', async (ctx) => {
+      const httpOp = defineHttpOp('fetch', async (ctx) => {
         ctx.tag.http_status(200).http_url('/api/process');
         await ctx.span('process', processorOp);
         return ctx.ok('fetched');
       });
 
       // Root op (level 1, no prefix)
-      const rootOp = regularModule.op('handle-request', async (ctx) => {
+      const rootOp = defineRegularOp('handle-request', async (ctx) => {
         rootBuffer = ctx.buffer;
         ctx.tag.requestId('req-123');
         ctx.tag.step('start');
@@ -580,7 +501,7 @@ describe('Nested Library Tasks', () => {
         return ctx.ok('handled');
       });
 
-      const traceCtx = regularModule.traceContext({});
+      const traceCtx = createRegularTrace({});
       const result = await traceCtx.span('handle-request', rootOp);
 
       expect(result.success).toBe(true);
@@ -632,48 +553,39 @@ describe('Nested Library Tasks', () => {
      */
     it('should isolate columns with same name using different prefixes', async () => {
       // All libraries have a "status" column concept, but with different prefixes
-      const httpModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/http', package_file: 'http.ts' },
+      const { defineOp: defineHttpOp, createTrace: createHttpTrace } = defineOpContext({
         logSchema: defineLogSchema({ http_status: S.number() }),
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const dbModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/db', package_file: 'db.ts' },
+      const { defineOp: defineDbOp } = defineOpContext({
         logSchema: defineLogSchema({ db_status: S.category() }),
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
-      const processModule = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@lib/process', package_file: 'process.ts' },
+      const { defineOp: defineProcessOp } = defineOpContext({
         logSchema: defineLogSchema({ process_status: S.enum(['running', 'stopped', 'failed']) }),
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let rootBuffer: SpanBuffer | undefined;
 
-      const processOp = processModule.op('run-process', async (ctx) => {
+      const processOp = defineProcessOp('run-process', async (ctx) => {
         ctx.tag.process_status('running');
         return ctx.ok('done');
       });
 
-      const dbOp = dbModule.op('db-connect', async (ctx) => {
+      const dbOp = defineDbOp('db-connect', async (ctx) => {
         ctx.tag.db_status('connected');
         await ctx.span('run-process', processOp);
         return ctx.ok('done');
       });
 
-      const httpOp = httpModule.op('http-request', async (ctx) => {
+      const httpOp = defineHttpOp('http-request', async (ctx) => {
         rootBuffer = ctx.buffer;
         ctx.tag.http_status(200);
         await ctx.span('db-connect', dbOp);
         return ctx.ok('done');
       });
 
-      const traceCtx = httpModule.traceContext({});
+      const traceCtx = createHttpTrace({});
       await traceCtx.span('http-request', httpOp);
 
       expect(rootBuffer).toBeDefined();
@@ -722,7 +634,7 @@ describe('Nested Library Tasks', () => {
     /**
      * Per specs/01k_tree_walker_and_arrow_conversion.md:
      * - walkSpanTree visits all buffers including children
-     * - Visits overflow chains (buffer._next)
+     * - Visits overflow chains (buffer._overflow)
      * - Depth-first pre-order traversal
      */
     it('should visit all buffers in tree during Arrow conversion', async () => {
@@ -730,34 +642,31 @@ describe('Nested Library Tasks', () => {
         nodeId: S.category(),
       });
 
-      const module = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@test/tree', package_file: 'tree.ts' },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let rootBuffer: SpanBuffer | undefined;
 
       // Create a tree with multiple children at each level
-      const leafOp = module.op('leaf', async (ctx) => {
+      const leafOp = defineOp('leaf', async (ctx) => {
         ctx.tag.nodeId('leaf');
         return ctx.ok('done');
       });
 
-      const child2Op = module.op('child2', async (ctx) => {
+      const child2Op = defineOp('child2', async (ctx) => {
         ctx.tag.nodeId('child2');
         await ctx.span('leaf', leafOp); // child2 -> leaf
         return ctx.ok('done');
       });
 
-      const child1Op = module.op('child1', async (ctx) => {
+      const child1Op = defineOp('child1', async (ctx) => {
         ctx.tag.nodeId('child1');
         await ctx.span('leaf', leafOp); // child1 -> leaf (another leaf)
         return ctx.ok('done');
       });
 
-      const rootOp = module.op('root', async (ctx) => {
+      const rootOp = defineOp('root', async (ctx) => {
         rootBuffer = ctx.buffer;
         ctx.tag.nodeId('root');
         await ctx.span('child1', child1Op);
@@ -765,7 +674,7 @@ describe('Nested Library Tasks', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       await traceCtx.span('root', rootOp);
 
       expect(rootBuffer).toBeDefined();
@@ -800,35 +709,32 @@ describe('Nested Library Tasks', () => {
         order: S.number(),
       });
 
-      const module = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@test/order', package_file: 'order.ts' },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let rootBuffer: SpanBuffer | undefined;
       let order = 0;
 
-      const deepOp = module.op('deep', async (ctx) => {
+      const deepOp = defineOp('deep', async (ctx) => {
         ctx.tag.order(++order);
         return ctx.ok('done');
       });
 
-      const middleOp = module.op('middle', async (ctx) => {
+      const middleOp = defineOp('middle', async (ctx) => {
         ctx.tag.order(++order);
         await ctx.span('deep', deepOp);
         return ctx.ok('done');
       });
 
-      const rootOp = module.op('root', async (ctx) => {
+      const rootOp = defineOp('root', async (ctx) => {
         rootBuffer = ctx.buffer;
         ctx.tag.order(++order);
         await ctx.span('middle', middleOp);
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       await traceCtx.span('root', rootOp);
 
       expect(rootBuffer).toBeDefined();
@@ -867,30 +773,27 @@ describe('Nested Library Tasks', () => {
         level: S.number(),
       });
 
-      const module = defineModule({
-        metadata: { git_sha: 'sha', package_name: '@test/scope', package_file: 'scope.ts' },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
-      })
-        .ctx<{}>({})
-        .make();
+      });
 
       let rootBuffer: SpanBuffer | undefined;
 
-      const level4Op = module.op('level4', async (ctx) => {
+      const level4Op = defineOp('level4', async (ctx) => {
         ctx.tag.level(4);
         // Log a message - should include inherited scoped attributes
         ctx.log.info('at level 4');
         return ctx.ok('done');
       });
 
-      const level3Op = module.op('level3', async (ctx) => {
+      const level3Op = defineOp('level3', async (ctx) => {
         ctx.tag.level(3);
         ctx.log.info('at level 3');
         await ctx.span('level4', level4Op);
         return ctx.ok('done');
       });
 
-      const level2Op = module.op('level2', async (ctx) => {
+      const level2Op = defineOp('level2', async (ctx) => {
         // Add more scoped attributes
         ctx.setScope({ userId: 'user-456' });
         ctx.tag.level(2);
@@ -899,7 +802,7 @@ describe('Nested Library Tasks', () => {
         return ctx.ok('done');
       });
 
-      const rootOp = module.op('root', async (ctx) => {
+      const rootOp = defineOp('root', async (ctx) => {
         rootBuffer = ctx.buffer;
         // Set scoped attributes at root
         ctx.setScope({ requestId: 'req-abc' });
@@ -909,7 +812,7 @@ describe('Nested Library Tasks', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       await traceCtx.span('root', rootOp);
 
       expect(rootBuffer).toBeDefined();

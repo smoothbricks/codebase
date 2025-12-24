@@ -3,7 +3,7 @@
  */
 
 import { Uint8, Uint16, Uint32 } from 'apache-arrow';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 import { concatenateNullBitmaps } from './utils.js';
 
 /**
@@ -25,11 +25,10 @@ export class DictionaryBuildResult {
  * Build a sorted category dictionary from buffers
  */
 export function buildSortedCategoryDictionary(
-  buffers: SpanBuffer[],
+  buffers: AnySpanBuffer[],
   columnName: string,
   maskTransform?: (value: string) => string,
 ): DictionaryBuildResult {
-  const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
 
   // Build mapping from original value to masked value (for dictionary lookup)
@@ -38,7 +37,7 @@ export function buildSortedCategoryDictionary(
   const originalToMasked = new Map<string, string>();
 
   for (const buf of buffers) {
-    const column = buf[valuesName];
+    const column = buf.getColumnIfAllocated(columnName);
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
@@ -63,7 +62,7 @@ export function buildSortedCategoryDictionary(
 
   let rowOffset = 0;
   for (const buf of buffers) {
-    const column = buf[valuesName];
+    const column = buf.getColumnIfAllocated(columnName);
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
@@ -85,11 +84,10 @@ export function buildSortedCategoryDictionary(
  * Build a text dictionary from buffers (not sorted, uses frequency-based optimization)
  */
 export function buildTextDictionary(
-  buffers: SpanBuffer[],
+  buffers: AnySpanBuffer[],
   columnName: string,
   maskTransform?: (value: string) => string,
 ): DictionaryBuildResult | null {
-  const valuesName = `${columnName}_values` as const;
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
 
   // Build mapping from original value to masked value and track frequency of masked values
@@ -97,7 +95,7 @@ export function buildTextDictionary(
   const originalToMasked = new Map<string, string>();
 
   for (const buf of buffers) {
-    const column = buf[valuesName];
+    const column = buf.getColumnIfAllocated(columnName);
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
@@ -135,7 +133,7 @@ export function buildTextDictionary(
 
   let rowOffset = 0;
   for (const buf of buffers) {
-    const column = buf[valuesName];
+    const column = buf.getColumnIfAllocated(columnName);
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];

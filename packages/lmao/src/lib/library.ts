@@ -30,7 +30,7 @@ import {
 } from './schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import { LogSchema, type SchemaFields } from './schema/types.js';
-import type { SpanBuffer } from './types.js';
+import type { AnySpanBuffer } from './types.js';
 
 /**
  * Prefix a tag attribute schema
@@ -107,7 +107,7 @@ export function createPrefixMapping<T extends LogSchema>(schema: T, prefix: stri
  * Key is a stable string representation of the mapping.
  * This avoids regenerating classes for the same mapping.
  */
-const remappedBufferViewClassCache = new Map<string, new (buffer: SpanBuffer) => SpanBuffer>();
+const remappedBufferViewClassCache = new Map<string, new (buffer: AnySpanBuffer) => AnySpanBuffer>();
 
 /**
  * Create a stable cache key from a prefix mapping.
@@ -161,8 +161,8 @@ function createMappingCacheKey(mapping: Record<string, string>): string {
 export function generateRemappedBufferViewClass(
   prefixToUnprefixedMapping: Record<string, string>,
 ): new (
-  buffer: SpanBuffer,
-) => SpanBuffer {
+  buffer: AnySpanBuffer,
+) => AnySpanBuffer {
   // Check cache first
   const cacheKey = createMappingCacheKey(prefixToUnprefixedMapping);
   const cached = remappedBufferViewClassCache.get(cacheKey);
@@ -185,7 +185,7 @@ export function generateRemappedBufferViewClass(
     
     // Tree traversal (pass-through)
     get _children() { return this._buffer._children; }
-    get _next() { return this._buffer._next; }
+    get _overflow() { return this._buffer._overflow; }
 
     // Row count
     get _writeIndex() { return this._buffer._writeIndex; }
@@ -233,7 +233,7 @@ export function generateRemappedBufferViewClass(
 
   // Compile the class using Function constructor (cold path - happens once per mapping)
   // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-  const GeneratedClass = new Function(`return ${code}`)() as new (buffer: SpanBuffer) => SpanBuffer;
+  const GeneratedClass = new Function(`return ${code}`)() as new (buffer: AnySpanBuffer) => AnySpanBuffer;
 
   // Cache for future use
   remappedBufferViewClassCache.set(cacheKey, GeneratedClass);
@@ -455,10 +455,10 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
   
   class ${className} {
     ` +
-    // Generated code: constructor stores buffer, createNextBuffer function, and scoped attributes
-    `constructor(buffer, createNextBuffer, initialScopedAttributes = {}) {
+    // Generated code: constructor stores buffer, createOverflowBuffer function, and scoped attributes
+    `constructor(buffer, createOverflowBuffer, initialScopedAttributes = {}) {
       this._buffer = buffer;
-      this._createNextBuffer = createNextBuffer;
+      this._createOverflowBuffer = createOverflowBuffer;
       this._scopedAttributes = initialScopedAttributes;
     }
     ` +
@@ -521,15 +521,15 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
     // Generated code: _writeMessage() writes a log entry - ensures buffer has space,
     // writes entry type + timestamp + message, applies scoped attributes
     `_writeMessage(entryType, message) {
-      // Check if buffer is full and create next buffer if needed
+      // Check if buffer is full and create overflow buffer if needed
       if (this._buffer._writeIndex >= this._buffer._capacity) {
         const oldBuffer = this._buffer;
-        this._buffer = this._createNextBuffer(oldBuffer);
-        oldBuffer._next = this._buffer;
+        this._buffer = this._createOverflowBuffer(oldBuffer);
+        oldBuffer._overflow = this._buffer;
       }
       const idx = this._buffer._writeIndex;
-      this._buffer._operations[idx] = entryType;
-      this._buffer._timestamps[idx] = getTimestampNanos();
+      this._buffer.entry_type[idx] = entryType;
+      this._buffer.timestamp[idx] = getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
       const messageColumn = this._buffer.message_values;
       if (messageColumn) {
         messageColumn[idx] = message;
@@ -596,8 +596,8 @@ export function createRemappedSpanLoggerClass<T extends LogSchema>(
   cleanSchema: T,
   prefixMapping: PrefixMapping,
 ): new (
-  buffer: SpanBuffer,
-  createNextBuffer: (buffer: SpanBuffer) => SpanBuffer,
+  buffer: AnySpanBuffer,
+  createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
   initialScopedAttributes?: Record<string, unknown>,
 ) => BaseSpanLogger<T> {
   const classCode = generateRemappedSpanLoggerClass(cleanSchema, prefixMapping).trim();

@@ -11,9 +11,12 @@
 
 import { describe, expect, test } from 'bun:test';
 import type { Table } from 'apache-arrow';
+import type { CapacityStatsEntry } from '../../arrow/capacityStats.js';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
+import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
+import type { OpMetadata } from '../../opContext/opTypes.js';
 import { S } from '../../schema/builder.js';
-
+import type { LogSchema } from '../../schema/LogSchema.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -27,9 +30,46 @@ import {
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
-import { createChildSpanBuffer, createNextBuffer, createSpanBuffer } from '../../spanBuffer.js';
+import {
+  createChildSpanBuffer as _createChildSpanBuffer,
+  createSpanBuffer as _createSpanBuffer,
+  createOverflowBuffer,
+} from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
+import type { AnySpanBuffer, LogBinding, SpanBuffer } from '../../types.js';
+import { createTestLogBinding, createTestOpMetadata, createTestSchema } from '../test-helpers.js';
+
+/**
+ * Test-only wrapper for createSpanBuffer that sets _opMetadata.
+ * Required because Arrow conversion reads buffer._opMetadata for metadata columns,
+ * and tests bypass the tracer which normally sets this.
+ */
+function createSpanBuffer<T extends LogSchema>(
+  schema: T,
+  logBinding: LogBinding,
+  spanName: string,
+  trace_id?: ReturnType<typeof createTraceId>,
+  capacity?: number,
+): SpanBuffer<T> {
+  const buffer = _createSpanBuffer(schema, logBinding, spanName, trace_id, capacity);
+  buffer._opMetadata = DEFAULT_METADATA;
+  return buffer;
+}
+
+/**
+ * Test-only wrapper for createChildSpanBuffer that sets _opMetadata.
+ */
+function createChildSpanBuffer(
+  parentBuffer: AnySpanBuffer,
+  logBinding: LogBinding,
+  spanName: string,
+  callsiteMetadata: OpMetadata,
+  capacity?: number,
+): AnySpanBuffer {
+  const buffer = _createChildSpanBuffer(parentBuffer, logBinding, spanName, callsiteMetadata, capacity);
+  buffer._opMetadata = DEFAULT_METADATA;
+  return buffer;
+}
 
 /**
  * Helper to get raw timestamp value from Arrow table.
@@ -51,7 +91,7 @@ describe('Arrow Table Conversion', () => {
         userId: S.category(),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // Write some test data
@@ -82,7 +122,7 @@ describe('Arrow Table Conversion', () => {
         level: S.enum(['DEBUG', 'INFO', 'WARN', 'ERROR'] as const),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-456'));
 
       // Write multiple rows
@@ -129,7 +169,7 @@ describe('Arrow Table Conversion', () => {
         requiredField: S.number(),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-789'));
 
       // Write row with only requiredField set
@@ -156,7 +196,7 @@ describe('Arrow Table Conversion', () => {
         counter: S.number(),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer1 = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-chain'));
 
       // Fill first buffer
@@ -167,7 +207,7 @@ describe('Arrow Table Conversion', () => {
       buffer1._writeIndex = 1;
 
       // Create chained buffer
-      const buffer2 = createNextBuffer(buffer1);
+      const buffer2 = createOverflowBuffer(buffer1);
       buffer2.timestamp[0] = 2000n;
       buffer2.entry_type[0] = ENTRY_TYPE_INFO;
       buffer2.message(0, 'Log in chain');
@@ -192,7 +232,7 @@ describe('Arrow Table Conversion', () => {
         value: S.number(),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer1 = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-multi-chain'));
 
       buffer1.timestamp[0] = 1000n;
@@ -201,14 +241,14 @@ describe('Arrow Table Conversion', () => {
       buffer1.value(0, 1);
       buffer1._writeIndex = 1;
 
-      const buffer2 = createNextBuffer(buffer1);
+      const buffer2 = createOverflowBuffer(buffer1);
       buffer2.timestamp[0] = 2000n;
       buffer2.entry_type[0] = ENTRY_TYPE_INFO;
       buffer2.message(0, 'log-1');
       buffer2.value(0, 2);
       buffer2._writeIndex = 1;
 
-      const buffer3 = createNextBuffer(buffer2);
+      const buffer3 = createOverflowBuffer(buffer2);
       buffer3.timestamp[0] = 3000n;
       buffer3.entry_type[0] = ENTRY_TYPE_SPAN_OK;
       buffer3.message(0, 'test');
@@ -231,7 +271,7 @@ describe('Arrow Table Conversion', () => {
         spanType: S.category(),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const parentBuffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-tree'));
 
       parentBuffer.timestamp[0] = 1000n;
@@ -241,7 +281,7 @@ describe('Arrow Table Conversion', () => {
       parentBuffer._writeIndex = 1;
 
       // Create child span and register with parent
-      const childBuffer = createChildSpanBuffer(parentBuffer, module, 'child-span');
+      const childBuffer = createChildSpanBuffer(parentBuffer, module, 'child-span', DEFAULT_METADATA);
       parentBuffer._children.push(childBuffer); // Explicit registration per spanBuffer.ts
 
       childBuffer.timestamp[0] = 1500n;
@@ -286,7 +326,7 @@ describe('Arrow Table Conversion', () => {
     test('handles multiple sibling child spans', () => {
       const schema = createTestSchema({});
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const parentBuffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-siblings'));
 
       parentBuffer.timestamp[0] = 1000n;
@@ -295,7 +335,7 @@ describe('Arrow Table Conversion', () => {
       parentBuffer._writeIndex = 1;
 
       // Create first child and register with parent
-      const child1Buffer = createChildSpanBuffer(parentBuffer, module, 'child1-span');
+      const child1Buffer = createChildSpanBuffer(parentBuffer, module, 'child1-span', DEFAULT_METADATA);
       parentBuffer._children.push(child1Buffer); // Explicit registration per spanBuffer.ts
       child1Buffer.timestamp[0] = 1100n;
       child1Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -306,7 +346,7 @@ describe('Arrow Table Conversion', () => {
       child1Buffer._writeIndex = 2;
 
       // Create second child and register with parent
-      const child2Buffer = createChildSpanBuffer(parentBuffer, module, 'child2-span');
+      const child2Buffer = createChildSpanBuffer(parentBuffer, module, 'child2-span', DEFAULT_METADATA);
       parentBuffer._children.push(child2Buffer); // Explicit registration per spanBuffer.ts
       child2Buffer.timestamp[0] = 1300n;
       child2Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -333,7 +373,7 @@ describe('Arrow Table Conversion', () => {
     test('correctly converts all entry types', () => {
       const schema = createTestSchema({});
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       // Use capacity of 16 to hold all 11 entry types
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-types'), 16);
 
@@ -388,8 +428,11 @@ describe('Arrow Table Conversion', () => {
   describe('Buffer metrics', () => {
     test('includes both span entries and buffer metric entries in same table', () => {
       const schema = createTestSchema({});
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
+
+      // Set _opMetadata for Arrow conversion (tests bypass tracer which normally sets this)
+      buffer._opMetadata = createTestOpMetadata({ package_name: '@test/package' });
 
       // Write some span entries
       buffer.timestamp[0] = 1000n;
@@ -409,8 +452,9 @@ describe('Arrow Table Conversion', () => {
       module.sb_totalCreated = 2;
       module.sb_overflows = 1;
 
-      // Convert with modulesToLogStats
-      const modulesToLogStats = new Set([module]);
+      // Convert with modulesToLogStats - now requires CapacityStatsEntry[] with both logBinding and metadata
+      const metadata = createTestOpMetadata({ package_name: '@test/package' });
+      const modulesToLogStats: CapacityStatsEntry[] = [{ logBinding: module, metadata }];
       const table = convertSpanTreeToArrowTable(buffer, undefined, modulesToLogStats);
 
       // Should have span entries (2) + buffer metric entries (5) = 7 rows total
@@ -452,8 +496,11 @@ describe('Arrow Table Conversion', () => {
 
     test('includes only buffer metrics when no span data', () => {
       const schema = createTestSchema({});
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
+
+      // Set _opMetadata for Arrow conversion (tests bypass tracer which normally sets this)
+      buffer._opMetadata = createTestOpMetadata();
 
       // Buffer has no entries (writeIndex = 0)
       buffer._writeIndex = 0;
@@ -465,8 +512,9 @@ describe('Arrow Table Conversion', () => {
       module.sb_totalCreated = 1;
       module.sb_overflows = 0;
 
-      // Convert with modulesToLogStats
-      const modulesToLogStats = new Set([module]);
+      // Convert with modulesToLogStats - now requires CapacityStatsEntry[] with both logBinding and metadata
+      const metadata = createTestOpMetadata();
+      const modulesToLogStats: CapacityStatsEntry[] = [{ logBinding: module, metadata }];
       const table = convertSpanTreeToArrowTable(buffer, undefined, modulesToLogStats);
 
       // Should have only buffer metric entries (5 rows)

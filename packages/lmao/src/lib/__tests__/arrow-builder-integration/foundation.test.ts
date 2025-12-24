@@ -1,21 +1,21 @@
 import { describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import { ModuleContext } from '../../moduleContext.js';
 import { S } from '../../schema/builder.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import { createTestSchema } from '../test-helpers.js';
+import type { LogBinding } from '../../types.js';
+import { createTestLogBinding, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Foundation', () => {
   // Helper to create a test module context
-  function createTestModule(): ModuleContext {
+  function createTestModule(): LogBinding {
     const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       count: S.number(),
     });
 
-    // Pass LogSchema instance directly (ModuleContext accepts LogSchema)
-    return new ModuleContext('abc123', '@test/pkg', 'src/test.ts', schema);
+    // Use createTestModuleContext helper which returns LogBinding
+    return createTestLogBinding(schema);
   }
 
   it('creates SpanBuffer with TypedArrays', () => {
@@ -48,7 +48,7 @@ describe('Buffer Foundation', () => {
     expect(buf._children).toBeInstanceOf(Array);
     expect(buf._writeIndex).toBe(0);
     expect(buf._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
-    expect(buf._module).toBe(module);
+    expect(buf._logBinding).toBe(module);
   });
 
   it('creates root SpanBuffer with createSpanBuffer', () => {
@@ -84,8 +84,8 @@ describe('Buffer Foundation', () => {
       field5: S.number(),
     });
 
-    // Create module context with larger schema (pass LogSchema, not .fields)
-    const module = new ModuleContext('abc123', '@test/pkg', 'src/test.ts', largeSchema);
+    // Create module context with larger schema using test helper
+    const module = createTestLogBinding(largeSchema);
 
     const buf = createSpanBuffer(largeSchema, module, 'test-span', createTraceId('trace-789'), 64);
 

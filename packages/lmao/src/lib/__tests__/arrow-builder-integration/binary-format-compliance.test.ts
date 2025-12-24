@@ -5,7 +5,7 @@ import { S } from '../../schema/builder';
 import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema';
 import { createSpanBuffer } from '../../spanBuffer';
 import { createTraceId } from '../../traceId';
-import { createTestModuleContext } from '../test-helpers';
+import { createTestLogBinding } from '../test-helpers';
 
 describe('Arrow Binary Format Compliance', () => {
   describe('IPC Message Structure', () => {
@@ -14,7 +14,7 @@ describe('Arrow Binary Format Compliance', () => {
         numberValue: S.number(),
       };
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 
@@ -41,7 +41,7 @@ describe('Arrow Binary Format Compliance', () => {
         uint32Value: S.number(),
       };
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 
@@ -79,7 +79,7 @@ describe('Arrow Binary Format Compliance', () => {
         numberValue: S.number(),
       };
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 
@@ -130,7 +130,7 @@ describe('Arrow Binary Format Compliance', () => {
         enumValue: S.enum(['a', 'b', 'c']),
       };
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 
@@ -175,7 +175,7 @@ describe('Arrow Binary Format Compliance', () => {
         textValue: S.text(),
       };
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 
@@ -219,7 +219,7 @@ describe('Arrow Binary Format Compliance', () => {
         numberValue: S.number(),
       };
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 
@@ -241,7 +241,7 @@ describe('Arrow Binary Format Compliance', () => {
         boolValue: S.boolean(),
       };
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
       const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
 

@@ -2,15 +2,15 @@
  * Integration tests for schema integration patterns
  *
  * Tests the full integration of:
- * - Module definition with defineModule()
- * - TraceContext creation with module.traceContext()
+ * - Op context definition with defineOpContext()
+ * - TraceContext creation with createTrace()
  * - Op wrappers with span context
  * - Feature flag evaluation and analytics
  * - Typed tag attribute API
  */
 
 import { describe, expect, it } from 'bun:test';
-import { defineModule } from '../defineModule.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
@@ -62,47 +62,31 @@ describe('Schema Integration Patterns', () => {
     });
   }
 
-  // Create a shared module for tests (without feature flags)
-  function createTestModule() {
-    return defineModule({
-      metadata: {
-        git_sha: 'abc123',
-        package_name: '@test/pkg',
-        package_file: 'src/services/user.ts',
-      },
-      logSchema: dbSchema,
-    })
-      .ctx<{ requestId?: string; userId?: string; env: EnvConfig }>({
-        requestId: undefined,
-        userId: undefined,
-        env: null!,
-      })
-      .make();
-  }
+  // Create a shared op context for tests (without feature flags)
+  const { defineOp, createTrace } = defineOpContext({
+    logSchema: dbSchema,
+    ctx: {
+      requestId: undefined as string | undefined,
+      userId: undefined as string | undefined,
+      env: undefined as EnvConfig | undefined,
+    },
+  });
 
-  // Create a module WITH feature flags
-  function createModuleWithFlags() {
-    return defineModule({
-      metadata: {
-        git_sha: 'abc123',
-        package_name: '@test/pkg',
-        package_file: 'src/services/user.ts',
-      },
-      logSchema: dbSchema,
-      ff: featureFlags.schema,
-    })
-      .ctx<{ requestId?: string; userId?: string; env: EnvConfig }>({
-        requestId: undefined,
-        userId: undefined,
-        env: null!,
-      })
-      .make({ ffEvaluator: createFlagEvaluator() });
-  }
+  // Create an op context WITH feature flags
+  const { defineOp: defineOpWithFlags, createTrace: createTraceWithFlags } = defineOpContext({
+    logSchema: dbSchema,
+    flags: featureFlags.schema,
+    flagEvaluator: createFlagEvaluator(),
+    ctx: {
+      requestId: undefined as string | undefined,
+      userId: undefined as string | undefined,
+      env: undefined as EnvConfig | undefined,
+    },
+  });
 
-  describe('module.traceContext', () => {
+  describe('createTrace', () => {
     it('should create trace context with environment', () => {
-      const testModule = createTestModule();
-      const ctx = testModule.traceContext({
+      const ctx = createTrace({
         requestId: 'req-123',
         userId: 'user-456',
         env: environmentConfig,
@@ -111,33 +95,22 @@ describe('Schema Integration Patterns', () => {
       expect(ctx.requestId).toBe('req-123');
       expect(ctx.userId).toBe('user-456');
       // TraceId is W3C format (32 hex chars) via generateTraceId from traceId.ts
-      expect(ctx.trace_id).toMatch(/^[a-f0-9]{32}$/);
+      expect(ctx.buffer.trace_id).toMatch(/^[a-f0-9]{32}$/);
       expect(ctx.env).toBe(environmentConfig);
     });
 
     it('should provide access to environment config as plain properties', () => {
-      const testModule = createTestModule();
-      const ctx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
+      const ctx = createTrace({ requestId: 'req-123', env: environmentConfig });
 
-      expect(ctx.env.awsRegion).toBe('us-east-1');
-      expect(ctx.env.maxConnections).toBe(100);
-      expect(ctx.env.databaseUrl).toBe('postgresql://localhost:5432/test');
+      expect(ctx.env?.awsRegion).toBe('us-east-1');
+      expect(ctx.env?.maxConnections).toBe(100);
+      expect(ctx.env?.databaseUrl).toBe('postgresql://localhost:5432/test');
     });
   });
 
-  describe('defineModule', () => {
-    it('should create module with log schema', () => {
-      const testModule = createTestModule();
-
-      expect(testModule).toBeDefined();
-      expect(testModule.op).toBeFunction();
-      expect(testModule.traceContext).toBeFunction();
-    });
-
-    it('should create op wrapper that provides span context', async () => {
-      const testModule = createTestModule();
-
-      const testOp = testModule.op('test-task', async (ctx) => {
+  describe('defineOp', () => {
+    it('should create op that provides span context', () => {
+      const testOp = defineOp('test-task', async (ctx) => {
         expect(ctx.log).toBeDefined();
         expect(ctx.env).toBeDefined();
         expect(ctx.ok).toBeFunction();
@@ -146,7 +119,24 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
+      expect(testOp).toBeDefined();
+      // Op is an object with _invoke method and name property
+      expect(testOp.name).toBe('test-task');
+      // biome-ignore lint/suspicious/noExplicitAny: Testing internal Op structure
+      expect(typeof (testOp as any)._invoke).toBe('function');
+    });
+
+    it('should execute op with span context', async () => {
+      const testOp = defineOp('test-task', async (ctx) => {
+        expect(ctx.log).toBeDefined();
+        expect(ctx.env).toBeDefined();
+        expect(ctx.ok).toBeFunction();
+        expect(ctx.err).toBeFunction();
+        expect(ctx.span).toBeFunction();
+        return ctx.ok({ success: true });
+      });
+
+      const traceCtx = createTrace({ requestId: 'req-123', env: environmentConfig });
 
       const result = await traceCtx.span('test-task', testOp);
       expect(result.success).toBe(true);
@@ -155,20 +145,17 @@ describe('Schema Integration Patterns', () => {
 
   describe('Feature Flag Integration', () => {
     it('should create trace context with feature flags', () => {
-      const testModule = createModuleWithFlags();
-      const ctx = testModule.traceContext({
+      const ctx = createTraceWithFlags({
         requestId: 'req-123',
         env: environmentConfig,
       });
 
       expect(ctx.ff).toBeDefined();
-      expect(ctx.trace_id).toMatch(/^[a-f0-9]{32}$/);
+      expect(ctx.buffer.trace_id).toMatch(/^[a-f0-9]{32}$/);
     });
 
     it('should access sync feature flags as properties', async () => {
-      const testModule = createModuleWithFlags();
-
-      const testOp = testModule.op('test-ff', async (ctx) => {
+      const testOp = defineOpWithFlags('test-ff', async (ctx) => {
         // Sync flags return FlagContext wrappers when truthy (undefined when falsy)
         // Access .value to get the actual flag value
         const validationFlag = ctx.ff.advancedValidation;
@@ -183,7 +170,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: true });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTraceWithFlags({
         requestId: 'req-123',
         env: environmentConfig,
       });
@@ -193,9 +180,7 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should access async feature flags via get()', async () => {
-      const testModule = createModuleWithFlags();
-
-      const testOp = testModule.op('test-async-ff', async (ctx) => {
+      const testOp = defineOpWithFlags('test-async-ff', async (ctx) => {
         // Async flags use ctx.ff.get('flagName')
         // Returns FlagContext when truthy, undefined when falsy
         const experimentalFlag = await ctx.ff.get('experimentalFeature');
@@ -206,7 +191,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ experimental: false });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTraceWithFlags({
         requestId: 'req-123',
         env: environmentConfig,
       });
@@ -216,15 +201,13 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should track feature flag usage', async () => {
-      const testModule = createModuleWithFlags();
-
-      const testOp = testModule.op('test-ff-tracking', async (ctx) => {
+      const testOp = defineOpWithFlags('test-ff-tracking', async (ctx) => {
         // Access flag first
         const validationFlag = ctx.ff.advancedValidation;
 
         if (validationFlag) {
           // Use track() on the flag context to log usage
-          validationFlag.track({ action: 'validation_performed', outcome: 'success' });
+          validationFlag.track();
         }
 
         // Can also use trackUsage directly
@@ -236,7 +219,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ tracked: true });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTraceWithFlags({
         requestId: 'req-123',
         env: environmentConfig,
       });
@@ -246,9 +229,7 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should use feature flags in conditional logic', async () => {
-      const testModule = createModuleWithFlags();
-
-      const testOp = testModule.op('conditional-logic', async (ctx) => {
+      const testOp = defineOpWithFlags('conditional-logic', async (ctx) => {
         // Natural truthy/falsy pattern - flag is undefined when disabled
         if (ctx.ff.advancedValidation) {
           ctx.log.info('Advanced validation enabled');
@@ -267,7 +248,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: !!ctx.ff.advancedValidation });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTraceWithFlags({
         requestId: 'req-123',
         env: environmentConfig,
       });
@@ -282,9 +263,7 @@ describe('Schema Integration Patterns', () => {
 
   describe('Method Chaining', () => {
     it('should chain multiple tag methods fluently and write to buffers', async () => {
-      const testModule = createTestModule();
-
-      const testOp = testModule.op('test-chaining', async (ctx) => {
+      const testOp = defineOp('test-chaining', async (ctx) => {
         // Each method returns the tag object for chaining
         const result = ctx.tag
           .requestId('req-001')
@@ -302,7 +281,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ chained: true });
       });
 
-      const traceCtx = testModule.traceContext({ requestId: 'req-001', env: environmentConfig });
+      const traceCtx = createTrace({ requestId: 'req-001', env: environmentConfig });
 
       const result = await traceCtx.span('test-chaining', testOp);
       expect(result.success).toBe(true);
@@ -312,9 +291,7 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should chain with() method and continue chaining', async () => {
-      const testModule = createTestModule();
-
-      const testOp = testModule.op('test-with-chaining', async (ctx) => {
+      const testOp = defineOp('test-with-chaining', async (ctx) => {
         // with() returns the tag object, allowing continued chaining
         ctx.tag
           .with({
@@ -332,16 +309,14 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ chained: true });
       });
 
-      const traceCtx = testModule.traceContext({ requestId: 'req-002', env: environmentConfig });
+      const traceCtx = createTrace({ requestId: 'req-002', env: environmentConfig });
 
       const result = await traceCtx.span('test-with-chaining', testOp);
       expect(result.success).toBe(true);
     });
 
     it('should support real-world chaining pattern: orderId and amount', async () => {
-      const testModule = createTestModule();
-
-      const testOp = testModule.op('process-order', async (ctx, orderId: string, amount: number) => {
+      const testOp = defineOp('process-order', async (ctx, orderId: string, amount: number) => {
         // Example from requirements: ctx.tag.orderId(order.id).amount(order.total)
         // Using available attributes to simulate
         ctx.tag
@@ -354,7 +329,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, amount });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTrace({
         requestId: 'req-003',
         userId: 'user-003',
         env: environmentConfig,
@@ -371,9 +346,7 @@ describe('Schema Integration Patterns', () => {
 
   describe('Op Integration', () => {
     it('should provide typed tag attribute API with method chaining', async () => {
-      const testModule = createTestModule();
-
-      const testOp = testModule.op('test-task', async (ctx) => {
+      const testOp = defineOp('test-task', async (ctx) => {
         // Method chaining - each method returns the tag object
         ctx.tag.requestId('req-123').userId('user-456').operation('INSERT').duration(12.5).httpStatus(200);
 
@@ -392,16 +365,14 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
+      const traceCtx = createTrace({ requestId: 'req-123', env: environmentConfig });
 
       const result = await traceCtx.span('test-task', testOp);
       expect(result.success).toBe(true);
     });
 
     it('should provide message logging methods', async () => {
-      const testModule = createTestModule();
-
-      const testOp = testModule.op('test-task', async (ctx) => {
+      const testOp = defineOp('test-task', async (ctx) => {
         ctx.log.info('Info message');
         ctx.log.debug('Debug message');
         ctx.log.warn('Warning message');
@@ -412,24 +383,22 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
+      const traceCtx = createTrace({ requestId: 'req-123', env: environmentConfig });
 
       const result = await traceCtx.span('test-task', testOp);
       expect(result.success).toBe(true);
     });
 
     it('should provide ok/err result helpers', async () => {
-      const testModule = createTestModule();
-
-      const successOp = testModule.op('success-task', async (ctx) => {
+      const successOp = defineOp('success-task', async (ctx) => {
         return ctx.ok({ data: 'result' });
       });
 
-      const errorOp = testModule.op('error-task', async (ctx) => {
+      const errorOp = defineOp('error-task', async (ctx) => {
         return ctx.err('VALIDATION_ERROR', { field: 'email' });
       });
 
-      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
+      const traceCtx = createTrace({ requestId: 'req-123', env: environmentConfig });
 
       const successResult = await traceCtx.span('success-task', successOp);
       expect(successResult.success).toBe(true);
@@ -446,9 +415,7 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should support child spans with chained tag methods', async () => {
-      const testModule = createTestModule();
-
-      const testOp = testModule.op('parent-task', async (ctx) => {
+      const testOp = defineOp('parent-task', async (ctx) => {
         // Parent span with chained tags
         ctx.tag.requestId('req-123').operation('INSERT').duration(50.0);
 
@@ -464,7 +431,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const traceCtx = testModule.traceContext({ requestId: 'req-123', env: environmentConfig });
+      const traceCtx = createTrace({ requestId: 'req-123', env: environmentConfig });
 
       const result = await traceCtx.span('parent-task', testOp);
       expect(result.success).toBe(true);
@@ -473,9 +440,7 @@ describe('Schema Integration Patterns', () => {
 
   describe('Method Chaining Examples', () => {
     it('should support various chaining patterns', async () => {
-      const testModule = createTestModule();
-
-      const processOrder = testModule.op('process-order', async (ctx, orderId: string, _amount: number) => {
+      const processOrder = defineOp('process-order', async (ctx, orderId: string, _amount: number) => {
         // Example from requirements: ctx.tag.orderId(order.id).amount(order.total)
         ctx.tag
           .requestId(ctx.requestId || 'unknown')
@@ -488,7 +453,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, processed: true });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTrace({
         requestId: 'req-999',
         userId: 'user-123',
         env: environmentConfig,
@@ -503,25 +468,19 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should demonstrate complete integration with chaining and feature flags', async () => {
-      // Create module with feature flags
-      const testModule = createModuleWithFlags();
-
       // Define op with extensive chaining and feature flag usage
-      const createUser = testModule.op('create-user', async (ctx, userData: { email: string; name: string }) => {
+      const createUser = defineOpWithFlags('create-user', async (ctx, userData: { email: string; name: string }) => {
         // Feature flag conditional - natural truthy pattern
         if (ctx.ff.advancedValidation) {
           ctx.log.info('Using advanced validation');
-          ctx.ff.advancedValidation.track({
-            action: 'validation_performed',
-            outcome: 'success',
-          });
+          ctx.ff.advancedValidation.track();
         }
 
         // Environment access and chained tags
         ctx.tag
           .requestId(ctx.requestId || 'unknown')
           .userId(userData.email)
-          .region(ctx.env.awsRegion as string)
+          .region((ctx.env?.awsRegion ?? 'unknown') as string)
           .operation('INSERT');
 
         // Child span with chaining - tag is on childCtx directly, not on childCtx.log
@@ -552,7 +511,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // Create trace context
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTraceWithFlags({
         requestId: 'req-123',
         userId: 'user-456',
         env: environmentConfig,
@@ -575,12 +534,10 @@ describe('Schema Integration Patterns', () => {
 
   describe('Prototype-based Context Inheritance', () => {
     it('should preserve user properties in parent spans', async () => {
-      const testModule = createTestModule();
-
       let parentRequestId: string | undefined;
       let parentUserId: string | undefined;
 
-      const testOp = testModule.op('parent-task', async (ctx) => {
+      const testOp = defineOp('parent-task', async (ctx) => {
         // Capture parent context properties
         parentRequestId = ctx.requestId;
         parentUserId = ctx.userId;
@@ -592,7 +549,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTrace({
         requestId: 'req-inherit-test',
         userId: 'user-inherit-test',
         env: environmentConfig,
@@ -606,11 +563,9 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should preserve env config in parent and child spans', async () => {
-      const testModule = createTestModule();
-
       let parentEnv: EnvConfig | undefined;
 
-      const testOp = testModule.op('parent-task', async (ctx) => {
+      const testOp = defineOp('parent-task', async (ctx) => {
         parentEnv = ctx.env;
 
         await ctx.span('child-task', async (childCtx) => {
@@ -620,7 +575,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const traceCtx = testModule.traceContext({
+      const traceCtx = createTrace({
         requestId: 'req-env-test',
         env: environmentConfig,
       });

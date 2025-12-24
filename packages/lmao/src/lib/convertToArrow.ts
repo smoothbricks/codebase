@@ -38,7 +38,7 @@ import {
   Utf8,
   type Vector,
 } from 'apache-arrow';
-import { createCapacityStatsRecordBatch } from './arrow/capacityStats.js';
+import { type CapacityStatsEntry, createCapacityStatsRecordBatch } from './arrow/capacityStats.js';
 import { buildSortedCategoryDictionary, buildTextDictionary } from './arrow/dictionaries.js';
 import {
   calculateUtf8Offsets,
@@ -49,16 +49,15 @@ import {
   getArrowFieldName,
   walkSpanTree,
 } from './arrow/utils.js';
-import type { ModuleContext } from './moduleContext.js';
 import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
-import type { SpanBuffer } from './types.js';
+import type { AnySpanBuffer, OpMetadata } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
 export type SystemColumnBuilder = (
-  buffer: SpanBuffer,
-  buffers: SpanBuffer[],
+  buffer: AnySpanBuffer,
+  buffers: AnySpanBuffer[],
   totalRows: number,
 ) => { fields: Field[]; vectors: Vector[] };
 
@@ -69,13 +68,13 @@ export type SystemColumnBuilder = (
  * Dictionaries are built from the data in this RecordBatch only and are not shared
  * with other RecordBatches, even when combined into a Table.
  */
-export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
-  const buffers: SpanBuffer[] = [];
-  let currentBuffer: SpanBuffer | undefined = buffer;
+export function convertToRecordBatch(buffer: AnySpanBuffer, systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
+  const buffers: AnySpanBuffer[] = [];
+  let currentBuffer: AnySpanBuffer | undefined = buffer;
 
   while (currentBuffer) {
     buffers.push(currentBuffer);
-    currentBuffer = currentBuffer._next as SpanBuffer | undefined;
+    currentBuffer = currentBuffer._overflow;
   }
 
   return convertBuffersToRecordBatch(buffers, systemColumnBuilder);
@@ -88,13 +87,13 @@ export function convertToRecordBatch(buffer: SpanBuffer, systemColumnBuilder?: S
  * Dictionaries are built from the data in this RecordBatch only and are not shared
  * with other RecordBatches, even when combined into a Table.
  */
-function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
+function convertBuffersToRecordBatch(buffers: AnySpanBuffer[], systemColumnBuilder?: SystemColumnBuilder): RecordBatch {
   if (buffers.length === 0) return new RecordBatch({});
 
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   if (totalRows === 0) return new RecordBatch({});
 
-  const schema: LogSchema = buffers[0]._module.logSchema;
+  const schema: LogSchema = buffers[0]._logBinding.logSchema;
 
   // Build vectors first, then derive schema from them
   // This ensures Field types and vector data types are identical (Arrow IPC requirement)
@@ -179,12 +178,10 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
         Uint8Array;
       const arrowIndexTypeCtor =
         (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
-      const valuesName = `${columnName}_values` as const;
-
       // Collect value arrays - need to handle different TypedArray types
       const valueArrays: (Uint8Array | Uint16Array | Uint32Array)[] = [];
       for (const buf of buffers) {
-        const column = buf[valuesName];
+        const column = buf.getColumnIfAllocated(columnName);
         if (column && column instanceof indexArrayCtor) {
           valueArrays.push(column.subarray(0, buf._writeIndex));
         } else {
@@ -302,11 +299,10 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
         vectors.push(makeVector(textData));
       }
     } else if (lmaoType === 'number') {
-      const valuesName = `${columnName}_values` as const;
       const valueArrays: Float64Array[] = [];
 
       for (const buf of buffers) {
-        const column = buf[valuesName];
+        const column = buf.getColumnIfAllocated(columnName);
         if (column && column instanceof Float64Array) {
           valueArrays.push(column.subarray(0, buf._writeIndex));
         } else {
@@ -331,11 +327,10 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
 
       vectors.push(makeVector(numberData));
     } else if (lmaoType === 'boolean') {
-      const valuesName = `${columnName}_values` as const;
       const valueArrays: Uint8Array[] = [];
 
       for (const buf of buffers) {
-        const column = buf[valuesName];
+        const column = buf.getColumnIfAllocated(columnName);
         if (column && column instanceof Uint8Array) {
           const requiredBytes = Math.ceil(buf._writeIndex / 8);
           valueArrays.push(column.subarray(0, requiredBytes));
@@ -382,7 +377,7 @@ function convertBuffersToRecordBatch(buffers: SpanBuffer[], systemColumnBuilder?
  * fields with same dictionary ID have identical type object references.
  */
 function buildMetadataColumnsWithFields(
-  buffers: SpanBuffer[],
+  buffers: AnySpanBuffer[],
   totalRows: number,
 ): { fields: Field[]; vectors: Vector[] } {
   const fields: Field[] = [];
@@ -578,8 +573,8 @@ function buildMetadataColumnsWithFields(
   // Package name
   const packageSet = new Set<string>();
   for (const buf of buffers) {
-    packageSet.add(buf._module.package_name);
-    if (buf._callsiteModule) packageSet.add(buf._callsiteModule.package_name);
+    packageSet.add(buf._opMetadata.package_name);
+    if (buf._callsiteMetadata) packageSet.add(buf._callsiteMetadata.package_name);
   }
   const packageArray = Array.from(packageSet);
   const packageMap = new Map(packageArray.map((name, idx) => [name, idx]));
@@ -594,9 +589,9 @@ function buildMetadataColumnsWithFields(
   const packageIndices = new packageIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePkgName = buf._callsiteModule?.package_name ?? buf._module.package_name;
+    const callsitePkgName = buf._callsiteMetadata?.package_name ?? buf._opMetadata.package_name;
     const callsitePkgIdx = packageMap.get(callsitePkgName) ?? 0;
-    const opPkgIdx = packageMap.get(buf._module.package_name) ?? 0;
+    const opPkgIdx = packageMap.get(buf._opMetadata.package_name) ?? 0;
     packageIndices[rowOffset] = callsitePkgIdx;
     if (buf._writeIndex > 1) {
       packageIndices.fill(opPkgIdx, rowOffset + 1, rowOffset + buf._writeIndex);
@@ -627,8 +622,8 @@ function buildMetadataColumnsWithFields(
   // Package file
   const modulePathSet = new Set<string>();
   for (const buf of buffers) {
-    modulePathSet.add(buf._module.package_file);
-    if (buf._callsiteModule) modulePathSet.add(buf._callsiteModule.package_file);
+    modulePathSet.add(buf._opMetadata.package_file);
+    if (buf._callsiteMetadata) modulePathSet.add(buf._callsiteMetadata.package_file);
   }
   const modulePathArray = Array.from(modulePathSet);
   const modulePathMap = new Map(modulePathArray.map((name, idx) => [name, idx]));
@@ -644,9 +639,9 @@ function buildMetadataColumnsWithFields(
   const packagePathIndices = new packagePathIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsitePathName = buf._callsiteModule?.package_file ?? buf._module.package_file;
+    const callsitePathName = buf._callsiteMetadata?.package_file ?? buf._opMetadata.package_file;
     const callsitePathIdx = modulePathMap.get(callsitePathName) ?? 0;
-    const opPathIdx = modulePathMap.get(buf._module.package_file) ?? 0;
+    const opPathIdx = modulePathMap.get(buf._opMetadata.package_file) ?? 0;
     packagePathIndices[rowOffset] = callsitePathIdx;
     if (buf._writeIndex > 1) {
       packagePathIndices.fill(opPathIdx, rowOffset + 1, rowOffset + buf._writeIndex);
@@ -677,8 +672,8 @@ function buildMetadataColumnsWithFields(
   // Git SHA
   const gitShaSet = new Set<string>();
   for (const buf of buffers) {
-    gitShaSet.add(buf._module.git_sha);
-    if (buf._callsiteModule) gitShaSet.add(buf._callsiteModule.git_sha);
+    gitShaSet.add(buf._opMetadata.git_sha);
+    if (buf._callsiteMetadata) gitShaSet.add(buf._callsiteMetadata.git_sha);
   }
   const gitShaArray = Array.from(gitShaSet);
   const gitShaMap = new Map(gitShaArray.map((sha, idx) => [sha, idx]));
@@ -693,9 +688,9 @@ function buildMetadataColumnsWithFields(
   const gitShaIndices = new gitShaIndexArrayCtor(totalRows);
   rowOffset = 0;
   for (const buf of buffers) {
-    const callsiteGitSha = buf._callsiteModule?.git_sha ?? buf._module.git_sha;
+    const callsiteGitSha = buf._callsiteMetadata?.git_sha ?? buf._opMetadata.git_sha;
     const callsiteGitShaIdx = gitShaMap.get(callsiteGitSha) ?? 0;
-    const opGitShaIdx = gitShaMap.get(buf._module.git_sha) ?? 0;
+    const opGitShaIdx = gitShaMap.get(buf._opMetadata.git_sha) ?? 0;
     gitShaIndices[rowOffset] = callsiteGitShaIdx;
     if (buf._writeIndex > 1) {
       gitShaIndices.fill(opGitShaIdx, rowOffset + 1, rowOffset + buf._writeIndex);
@@ -729,7 +724,10 @@ function buildMetadataColumnsWithFields(
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow Table
  */
-export function convertToArrowTable(buffer: SpanBuffer, systemColumnBuilder?: SystemColumnBuilder): Table {
+export function convertToArrowTable<T extends LogSchema = LogSchema>(
+  buffer: AnySpanBuffer,
+  systemColumnBuilder?: SystemColumnBuilder,
+): Table {
   const batch = convertToRecordBatch(buffer, systemColumnBuilder);
   if (batch.numRows === 0) return new Table();
   return new Table([batch]);
@@ -747,9 +745,9 @@ export function convertToArrowTable(buffer: SpanBuffer, systemColumnBuilder?: Sy
  * - Pass 2: Walk tree, convert each buffer to RecordBatch using shared dictionaries
  */
 export function convertSpanTreeToArrowTable(
-  rootBuffer: SpanBuffer,
+  rootBuffer: AnySpanBuffer,
   _systemColumnBuilder?: SystemColumnBuilder,
-  modulesToLogStats?: Set<ModuleContext>,
+  modulesToLogStats?: CapacityStatsEntry[],
   periodStartNs?: bigint,
 ): Table {
   // ═══════════════════════════════════════════════════════════════════════════
@@ -760,7 +758,7 @@ export function convertSpanTreeToArrowTable(
   const mergedSchemaFields = new Map<string, unknown>();
 
   walkSpanTree(rootBuffer, (buffer) => {
-    const bufferSchema = buffer._module.logSchema;
+    const bufferSchema = buffer._logBinding.logSchema;
     const fields = Array.from(bufferSchema.fieldEntries());
     for (const [fieldName, fieldSchema] of fields) {
       // Skip system schema fields - they are handled separately as system columns
@@ -819,18 +817,18 @@ export function convertSpanTreeToArrowTable(
 
   // For package, modulePath, gitSha - collect pre-encoded entries for direct dictionary creation
   // Use a Set to deduplicate by ModuleContext identity (same module = same entries)
-  const uniqueModules = new Set<ModuleContext>();
+  const uniqueModules = new Set<OpMetadata>();
 
   let spanRows = 0;
   walkSpanTree(rootBuffer, (buffer) => {
     spanRows += buffer._writeIndex;
     traceIdBuilder.add(buffer.trace_id);
 
-    // Collect unique ModuleContexts (already have pre-encoded entries)
-    // Include both task._module (for rows 1+) and callsiteModule (for row 0) if present
-    uniqueModules.add(buffer._module);
-    if (buffer._callsiteModule) {
-      uniqueModules.add(buffer._callsiteModule);
+    // Collect unique OpMetadata (for package_name, package_file, git_sha)
+    // Include both buffer._opMetadata (for rows 1+) and callsiteMetadata (for row 0) if present
+    uniqueModules.add(buffer._opMetadata);
+    if (buffer._callsiteMetadata) {
+      uniqueModules.add(buffer._callsiteMetadata);
     }
 
     for (const [fieldName, builder] of categoryBuilders) {
@@ -903,15 +901,15 @@ export function convertSpanTreeToArrowTable(
     }
   });
 
-  if (spanRows === 0 && (!modulesToLogStats || modulesToLogStats.size === 0)) {
+  if (spanRows === 0 && (!modulesToLogStats || modulesToLogStats.length === 0)) {
     return new Table();
   }
 
   // Finalize dictionaries
   const traceIdDict = traceIdBuilder.finalize(false);
 
-  // Build dictionaries from pre-encoded ModuleContext entries
-  // Preallocate arrays, single iteration of set
+  // Build dictionaries from OpMetadata entries
+  // Use pre-encoded entries from OpMetadata (interned at Op definition time)
   const moduleCount = uniqueModules.size;
   const packageEntries: PreEncodedEntry[] = new Array(moduleCount);
   const packagePathEntries: PreEncodedEntry[] = new Array(moduleCount);
@@ -1049,7 +1047,7 @@ export function convertSpanTreeToArrowTable(
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 2: Collect all buffers with non-zero rows
   // ═══════════════════════════════════════════════════════════════════════════
-  const allBuffers: SpanBuffer[] = [];
+  const allBuffers: AnySpanBuffer[] = [];
 
   walkSpanTree(rootBuffer, (buffer) => {
     if (buffer._writeIndex > 0) {
@@ -1078,7 +1076,7 @@ export function convertSpanTreeToArrowTable(
       : undefined;
 
   // Create capacity stats RecordBatch if needed
-  if (modulesToLogStats && modulesToLogStats.size > 0) {
+  if (modulesToLogStats && modulesToLogStats.length > 0) {
     const hasSpanData = batch !== undefined;
     // periodStartNs must be provided by the caller (from FlushScheduler's tracked period start)
     // If not provided, use 0n as a fallback (indicates period tracking not enabled)
@@ -1113,7 +1111,7 @@ export function convertSpanTreeToArrowTable(
  * is not shared with other RecordBatches, even when combined into a Table.
  */
 function convertBuffersWithSharedDicts(
-  buffers: SpanBuffer[],
+  buffers: AnySpanBuffer[],
   arrowSchema: Schema,
   traceIdDict: FinalizedDictionary,
   packageDict: FinalizedDictionary,
@@ -1341,11 +1339,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsitePkgName = buf._callsiteModule?.package_name ?? buf._module.package_name;
+    const callsitePkgName = buf._callsiteMetadata?.package_name ?? buf._opMetadata.package_name;
     const callsitePkgIdx = packageDict.indexMap.get(callsitePkgName) ?? 0;
 
     // Op's module (task._module) for rows 1+
-    const opPkgIdx = packageDict.indexMap.get(buf._module.package_name) ?? 0;
+    const opPkgIdx = packageDict.indexMap.get(buf._opMetadata.package_name) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packageIndices[offset] = callsitePkgIdx;
@@ -1383,11 +1381,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsitePathName = buf._callsiteModule?.package_file ?? buf._module.package_file;
+    const callsitePathName = buf._callsiteMetadata?.package_file ?? buf._opMetadata.package_file;
     const callsitePathIdx = packagePathDict.indexMap.get(callsitePathName) ?? 0;
 
     // Op's module (task._module) for rows 1+
-    const opPathIdx = packagePathDict.indexMap.get(buf._module.package_file) ?? 0;
+    const opPathIdx = packagePathDict.indexMap.get(buf._opMetadata.package_file) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     packagePathIndices[offset] = callsitePathIdx;
@@ -1425,11 +1423,11 @@ function convertBuffersWithSharedDicts(
   offset = 0;
   for (const buf of buffers) {
     // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsiteGitSha = buf._callsiteModule?.git_sha ?? buf._module.git_sha;
+    const callsiteGitSha = buf._callsiteMetadata?.git_sha ?? buf._opMetadata.git_sha;
     const callsiteGitShaIdx = gitShaDict.indexMap.get(callsiteGitSha) ?? 0;
 
     // Op's module (task._module) for rows 1+
-    const opGitShaIdx = gitShaDict.indexMap.get(buf._module.git_sha) ?? 0;
+    const opGitShaIdx = gitShaDict.indexMap.get(buf._opMetadata.git_sha) ?? 0;
 
     // Set row 0 (span-start) to callsite module
     gitShaIndices2[offset] = callsiteGitShaIdx;

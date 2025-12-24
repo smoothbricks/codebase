@@ -12,11 +12,11 @@ import {
 } from '../flushScheduler.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { SpanBuffer } from '../types.js';
-import { createTestModuleContext, createTestSchema } from './test-helpers.js';
+import { createTestLogBinding, createTestSchema } from './test-helpers.js';
 
 function createTestBuffer(): SpanBuffer {
   const schema = createTestSchema({});
-  const module = createTestModuleContext(schema);
+  const module = createTestLogBinding(schema);
   const buffer = createSpanBuffer(schema, module, 'test-span');
   // Write some test data
   buffer._writeIndex = 5;

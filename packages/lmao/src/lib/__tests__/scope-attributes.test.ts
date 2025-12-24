@@ -9,7 +9,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { defineModule } from '../defineModule.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 
@@ -22,16 +22,11 @@ describe('Span Scope Attributes', () => {
         orderId: S.category(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const testOp = module.op('test-op', async (ctx) => {
+      const testOp = defineOp('test-op', async (ctx) => {
         // Set scope attributes
         ctx.setScope({
           userId: 'user123',
@@ -44,7 +39,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       const result = await traceCtx.span('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -56,16 +51,11 @@ describe('Span Scope Attributes', () => {
         step: S.category(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const testOp = module.op('test-op', async (ctx) => {
+      const testOp = defineOp('test-op', async (ctx) => {
         // Set scope once
         ctx.setScope({
           userId: 'user123',
@@ -80,7 +70,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       await traceCtx.span('test-span', testOp);
       // If this completes without error, scope inheritance is working
     });
@@ -95,16 +85,11 @@ describe('Span Scope Attributes', () => {
         step: S.category(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const testOp = module.op('test-op', async (ctx) => {
+      const testOp = defineOp('test-op', async (ctx) => {
         // Set scope at parent level
         ctx.setScope({
           userId: 'user123',
@@ -131,7 +116,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       const result = await traceCtx.span('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -144,16 +129,11 @@ describe('Span Scope Attributes', () => {
         level3: S.category(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const testOp = module.op('test-op', async (ctx) => {
+      const testOp = defineOp('test-op', async (ctx) => {
         ctx.setScope({ userId: 'user123', level1: 'L1' });
 
         await ctx.span('level-2', async (ctx2) => {
@@ -174,7 +154,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       const result = await traceCtx.span('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -188,16 +168,11 @@ describe('Span Scope Attributes', () => {
         taskName: S.category(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const parentOp = module.op('parent-op', async (ctx) => {
+      const parentOp = defineOp('parent-op', async (ctx) => {
         ctx.setScope({
           userId: 'user123',
           requestId: 'req456',
@@ -219,7 +194,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok(childResult);
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       const result = await traceCtx.span('parent-span', parentOp);
       expect(result.success).toBe(true);
     });
@@ -236,16 +211,11 @@ describe('Span Scope Attributes', () => {
         ip: S.category(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const middlewareOp = module.op('middleware', async (ctx) => {
+      const middlewareOp = defineOp('middleware', async (ctx) => {
         // Middleware sets up request-level scope
         ctx.setScope({
           requestId: 'req123',
@@ -274,7 +244,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok(businessResult);
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       const result = await traceCtx.span('middleware-span', middlewareOp);
       expect(result.success).toBe(true);
     });
@@ -290,16 +260,11 @@ describe('Span Scope Attributes', () => {
         isValid: S.boolean(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const testOp = module.op('test-op', async (ctx) => {
+      const testOp = defineOp('test-op', async (ctx) => {
         ctx.setScope({
           status: 'active',
           userId: 'user123',
@@ -313,7 +278,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       const result = await traceCtx.span('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -327,16 +292,11 @@ describe('Span Scope Attributes', () => {
         progress: S.number(),
       });
 
-      const module = defineModule({
-        metadata: {
-          git_sha: 'abc123',
-          package_name: '@test/pkg',
-          package_file: 'test.ts',
-        },
+      const { defineOp, createTrace } = defineOpContext({
         logSchema: schema,
       });
 
-      const testOp = module.op('test-op', async (ctx) => {
+      const testOp = defineOp('test-op', async (ctx) => {
         // Initial scope
         ctx.setScope({
           phase: 'initialization',
@@ -367,7 +327,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = module.traceContext({});
+      const traceCtx = createTrace({});
       const result = await traceCtx.span('test-span', testOp);
       expect(result.success).toBe(true);
     });

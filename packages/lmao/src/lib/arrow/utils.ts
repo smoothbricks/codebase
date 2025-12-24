@@ -3,7 +3,7 @@
  */
 
 import { countNulls } from '@smoothbricks/arrow-builder';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 
 /**
  * Encode an array of strings into a single UTF-8 Uint8Array
@@ -71,11 +71,10 @@ export function concatenateFloat64Arrays(arrays: Float64Array[]): Float64Array {
  * Concatenate null bitmaps from multiple buffers
  */
 export function concatenateNullBitmaps(
-  buffers: SpanBuffer[],
+  buffers: AnySpanBuffer[],
   columnName: string,
 ): { nullBitmap: Uint8Array | undefined; nullCount: number } {
-  const nullsName = `${columnName}_nulls` as const;
-  const hasAnyNulls = buffers.some((buf) => buf[nullsName] !== undefined);
+  const hasAnyNulls = buffers.some((buf) => buf.getNullsIfAllocated(columnName) !== undefined);
 
   if (!hasAnyNulls) return { nullBitmap: undefined, nullCount: 0 };
 
@@ -90,7 +89,7 @@ export function concatenateNullBitmaps(
   let nullCount = 0;
 
   for (const buf of buffers) {
-    const sourceBitmap = buf[nullsName];
+    const sourceBitmap = buf.getNullsIfAllocated(columnName);
     const rowCount = buf._writeIndex;
 
     if (sourceBitmap) {
@@ -129,11 +128,11 @@ export function getArrowFieldName(fieldName: string): string {
 /**
  * Walk a SpanBuffer tree (including overflow chains and children)
  */
-export function walkSpanTree(root: SpanBuffer, visitor: (buffer: SpanBuffer) => void): void {
-  let current: SpanBuffer | undefined = root;
+export function walkSpanTree(root: AnySpanBuffer, visitor: (buffer: AnySpanBuffer) => void): void {
+  let current: AnySpanBuffer | undefined = root;
   while (current) {
     visitor(current);
-    current = current._next as SpanBuffer | undefined;
+    current = current._overflow;
   }
   for (const child of root._children) {
     walkSpanTree(child, visitor);

@@ -81,3 +81,51 @@ export function generateTraceId(): TraceId {
 
   return hex as TraceId;
 }
+
+// ============================================================================
+// TraceRoot - Per-trace anchor data
+// ============================================================================
+
+/**
+ * TraceRoot - Per-trace anchoring data for high-precision timestamps
+ *
+ * Created once at trace creation (createTrace()) and shared by all spans in the trace.
+ * Stored on root SpanBuffer and copied by reference to all child spans for O(1) access.
+ *
+ * **Why per-trace anchoring:**
+ * - Each trace has fresh anchor - no long-running drift issues
+ * - NTP corrections between traces are isolated
+ * - Trace is self-contained unit with consistent time reference
+ *
+ * **Memory layout:**
+ * - Created ONCE per trace (root span creation)
+ * - Shared by ALL spans in trace (copied by reference, 8 bytes per span)
+ * - Total overhead: ~32 bytes per trace (object header + 2 properties)
+ *
+ * See specs/01b3_high_precision_timestamps.md for timestamp design.
+ */
+export interface TraceRoot {
+  /**
+   * Trace ID for this trace.
+   * Stored here for quick access without walking buffer parent chain.
+   */
+  readonly trace_id: TraceId;
+
+  /**
+   * Thread ID for this process/worker (64-bit random).
+   * Cached here to avoid repeated thread ID lookups.
+   */
+  readonly thread_id: bigint;
+
+  /**
+   * Epoch time in nanoseconds when trace was created.
+   * Captured via Date.now() * 1_000_000n at trace root.
+   */
+  readonly anchorEpochNanos: bigint;
+
+  /**
+   * High-resolution timer value when trace was created.
+   * Captured via performance.now() (browser) or process.hrtime.bigint() (Node.js).
+   */
+  readonly anchorPerfNow: number;
+}

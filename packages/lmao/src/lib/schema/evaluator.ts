@@ -3,7 +3,7 @@ import { createEvaluatorClass } from '../codegen/evaluatorGenerator.js';
 import type { SpanContext } from '../spanContext.js';
 import type { FeatureFlagSchema } from './defineFeatureFlags.js';
 import { ENTRY_TYPE_FF_ACCESS } from './systemSchema.js';
-import type { InferSchema, LogSchema } from './types.js';
+import type { LogSchema } from './types.js';
 
 /**
  * Type guard to validate flag value matches schema
@@ -22,10 +22,22 @@ function validateFlagValue<T>(value: unknown, schema: S.Schema<T, unknown>, defa
 export type FlagValue = string | number | boolean | null;
 
 /**
+ * SpanContext without 'ff' field - prevents infinite recursion in evaluators
+ */
+export type SpanContextWithoutFf<T extends LogSchema, FF extends FeatureFlagSchema, Env> = Omit<
+  SpanContext<T, FF, Env>,
+  'ff'
+>;
+
+/**
  * Feature flag evaluator interface
  *
  * This is implemented by the backend (database, LaunchDarkly, etc.)
  * and provides the actual flag values.
+ *
+ * The evaluator receives `Omit<SpanContext, 'ff'>` which provides:
+ * - Full context access (ctx.log, ctx.span, ctx.scope, ctx.env, ctx.deps)
+ * - Prevents infinite recursion (can't access ctx.ff which would call evaluator again)
  *
  * @template T - LogSchema defining the evaluation context (scope values)
  * @template FF - FeatureFlagSchema defining available flags
@@ -38,20 +50,32 @@ export interface FlagEvaluator<
 > {
   /**
    * Get a flag value synchronously (for cached/static flags)
+   *
+   * @param ctx - SpanContext without 'ff' (can log, create spans, access scope)
+   * @param flag - Flag name to evaluate
    */
-  getSync<K extends string>(flag: K, context: Partial<InferSchema<T>>): FlagValue;
+  getSync<K extends string>(ctx: SpanContextWithoutFf<T, FF, Env>, flag: K): FlagValue;
 
   /**
    * Get a flag value asynchronously (for dynamic flags)
+   *
+   * @param ctx - SpanContext without 'ff' (can log, create spans, access scope)
+   * @param flag - Flag name to evaluate
    */
-  getAsync<K extends string>(flag: K, context: Partial<InferSchema<T>>): Promise<FlagValue>;
+  getAsync<K extends string>(ctx: SpanContextWithoutFf<T, FF, Env>, flag: K): Promise<FlagValue>;
 
   /**
    * Create span-bound accessor from span context.
    * Returns a FeatureFlagEvaluator with typed getters for each flag.
-   * Receives fully typed SpanContext from the module.
+   *
+   * MUST create a new instance per span because JS getters (`get darkMode()`)
+   * cannot receive parameters - the span context must be stored at construction.
+   *
+   * Receives `Omit<SpanContext, 'ff'>` to prevent infinite recursion.
    */
-  forContext?(ctx: SpanContext<T, FF, Env>): FeatureFlagEvaluator<FF, T, Env> & InferFeatureFlagsWithContext<FF>;
+  forContext(
+    ctx: SpanContextWithoutFf<T, FF, Env>,
+  ): FeatureFlagEvaluator<FF, T, Env> & InferFeatureFlagsWithContext<FF>;
 }
 
 /**
@@ -229,6 +253,11 @@ export class FeatureFlagEvaluator<FF extends FeatureFlagSchema, T extends LogSch
 
 /**
  * Simple in-memory flag evaluator for testing
+ *
+ * Demonstrates the simplest evaluator pattern:
+ * - getSync/getAsync receive ctx first, enabling evaluators to use ctx.log, ctx.scope
+ * - forContext bootstraps the generated FeatureFlagEvaluator class (once per trace)
+ * - Generated class has typed getters (ff.darkMode) and its own forContext() for child spans
  */
 export class InMemoryFlagEvaluator<
   T extends LogSchema = LogSchema,
@@ -244,11 +273,21 @@ export class InMemoryFlagEvaluator<
     this.flags = initialFlags;
   }
 
-  getSync<K extends string>(flag: K, _context: Partial<InferSchema<T>>): FlagValue {
+  /**
+   * Get flag value synchronously.
+   * Simple evaluator ignores ctx - just returns stored value.
+   * Advanced evaluators can use ctx.log, ctx.span, ctx.scope, etc.
+   */
+  getSync<K extends string>(_ctx: SpanContextWithoutFf<T, FF, Env>, flag: K): FlagValue {
     return this.flags[flag] ?? null;
   }
 
-  async getAsync<K extends string>(flag: K, _context: Partial<InferSchema<T>>): Promise<FlagValue> {
+  /**
+   * Get flag value asynchronously.
+   * Simple evaluator ignores ctx - just returns stored value.
+   * Advanced evaluators can use ctx.log, ctx.span for tracing external calls.
+   */
+  async getAsync<K extends string>(_ctx: SpanContextWithoutFf<T, FF, Env>, flag: K): Promise<FlagValue> {
     return this.flags[flag] ?? null;
   }
 
@@ -257,10 +296,24 @@ export class InMemoryFlagEvaluator<
   }
 
   /**
-   * Create span-bound FeatureFlagEvaluator with typed getters
+   * Create span-bound FeatureFlagEvaluator with typed getters.
+   *
+   * Called once at trace creation to bootstrap the generated evaluator class.
+   * After that, child spans use the generated class's forContext() method
+   * which efficiently creates new instances reusing the same evaluator.
+   *
+   * The generated class has typed getters (ff.darkMode) and calls
+   * this.getSync(ctx, flag) for actual flag lookup.
    */
-  forContext(ctx: SpanContext<T, FF, Env>): FeatureFlagEvaluator<FF, T, Env> & InferFeatureFlagsWithContext<FF> {
-    return new FeatureFlagEvaluator(this.ffSchema, ctx, this) as FeatureFlagEvaluator<FF, T, Env> &
+  forContext(
+    ctx: SpanContextWithoutFf<T, FF, Env>,
+  ): FeatureFlagEvaluator<FF, T, Env> & InferFeatureFlagsWithContext<FF> {
+    // Pass ctx as SpanContext (ff will be set by caller after this returns)
+    return new FeatureFlagEvaluator(this.ffSchema, ctx as SpanContext<T, FF, Env>, this) as FeatureFlagEvaluator<
+      FF,
+      T,
+      Env
+    > &
       InferFeatureFlagsWithContext<FF>;
   }
 }

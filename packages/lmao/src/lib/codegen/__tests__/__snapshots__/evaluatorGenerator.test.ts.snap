@@ -22,16 +22,16 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
       let buf = this.#spanContext._buffer;
       
       while (buf) {
-        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
         // This ensures we check all written entries including the most recent
-        const limit = buf.writeIndex;
+        const limit = buf._writeIndex;
         for (let i = limit - 1; i >= 0; i--) {
-          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
               buf.message_values && buf.message_values[i] === flagName) {
             return true;
           }
         }
-        buf = buf.next;
+        buf = buf._next;
       }
       return false;
     }
@@ -40,11 +40,9 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flagName];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      // Always evaluate - backend caches based on evaluationContext
-      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = this.#evaluator.getSync(ctx, flagName);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -101,10 +99,9 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flag];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = await this.#evaluator.getAsync(ctx, flag);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -161,16 +158,16 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
       let buf = this.#spanContext._buffer;
       
       while (buf) {
-        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
         // This ensures we check all written entries including the most recent
-        const limit = buf.writeIndex;
+        const limit = buf._writeIndex;
         for (let i = limit - 1; i >= 0; i--) {
-          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
               buf.message_values && buf.message_values[i] === flagName) {
             return true;
           }
         }
-        buf = buf.next;
+        buf = buf._next;
       }
       return false;
     }
@@ -179,11 +176,9 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
       const ctx = this.#spanContext;
       const definition = this.#schema[flagName];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      // Always evaluate - backend caches based on evaluationContext
-      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = this.#evaluator.getSync(ctx, flagName);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -240,10 +235,9 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
       const ctx = this.#spanContext;
       const definition = this.#schema[flag];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = await this.#evaluator.getAsync(ctx, flag);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -308,16 +302,16 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
       let buf = this.#spanContext._buffer;
       
       while (buf) {
-        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
         // This ensures we check all written entries including the most recent
-        const limit = buf.writeIndex;
+        const limit = buf._writeIndex;
         for (let i = limit - 1; i >= 0; i--) {
-          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
               buf.message_values && buf.message_values[i] === flagName) {
             return true;
           }
         }
-        buf = buf.next;
+        buf = buf._next;
       }
       return false;
     }
@@ -326,11 +320,9 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flagName];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      // Always evaluate - backend caches based on evaluationContext
-      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = this.#evaluator.getSync(ctx, flagName);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -387,10 +379,9 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flag];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = await this.#evaluator.getAsync(ctx, flag);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -451,16 +442,16 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
       let buf = this.#spanContext._buffer;
       
       while (buf) {
-        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
         // This ensures we check all written entries including the most recent
-        const limit = buf.writeIndex;
+        const limit = buf._writeIndex;
         for (let i = limit - 1; i >= 0; i--) {
-          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
               buf.message_values && buf.message_values[i] === flagName) {
             return true;
           }
         }
-        buf = buf.next;
+        buf = buf._next;
       }
       return false;
     }
@@ -469,11 +460,9 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flagName];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      // Always evaluate - backend caches based on evaluationContext
-      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = this.#evaluator.getSync(ctx, flagName);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -530,10 +519,9 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flag];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = await this.#evaluator.getAsync(ctx, flag);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -590,16 +578,16 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
       let buf = this.#spanContext._buffer;
       
       while (buf) {
-        // Use buffer.writeIndex which is _writeIndex + 1 (points past last written index)
+        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
         // This ensures we check all written entries including the most recent
-        const limit = buf.writeIndex;
+        const limit = buf._writeIndex;
         for (let i = limit - 1; i >= 0; i--) {
-          if (buf._operations[i] === ENTRY_TYPE_FF_ACCESS && 
+          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
               buf.message_values && buf.message_values[i] === flagName) {
             return true;
           }
         }
-        buf = buf.next;
+        buf = buf._next;
       }
       return false;
     }
@@ -608,11 +596,9 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flagName];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      // Always evaluate - backend caches based on evaluationContext
-      const rawValue = this.#evaluator.getSync(flagName, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = this.#evaluator.getSync(ctx, flagName);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span
@@ -669,10 +655,9 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
       const ctx = this.#spanContext;
       const definition = this.#schema[flag];
       
-      // Read evaluation context from scopeValues
-      const evaluationContext = ctx.buffer.scopeValues || {};
-      
-      const rawValue = await this.#evaluator.getAsync(flag, evaluationContext);
+      // Pass ctx first (consistency), then flag name
+      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
+      const rawValue = await this.#evaluator.getAsync(ctx, flag);
       const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
       
       // Deduplicate: only log first access per span

@@ -146,7 +146,7 @@ describe('createColumnWriter', () => {
   it('handles overflow with _getNextBuffer', () => {
     const buffer1 = createGeneratedColumnBuffer(testSchema, 2);
     const buffer2 = createGeneratedColumnBuffer(testSchema, 2);
-    buffer1._next = buffer2;
+    buffer1._overflow = buffer2;
 
     const writer = createColumnWriter(testSchema, buffer1);
 

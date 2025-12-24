@@ -20,7 +20,7 @@ import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 
 import { createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
+import { createTestLogBinding, createTestSchema } from '../test-helpers.js';
 
 /**
  * Round-trip test: serialize to IPC, deserialize, verify data matches
@@ -66,7 +66,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('number columns survive round-trip', () => {
       const schema = createTestSchema({ value: S.number() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const testValues = [1.5, 2.5, 3.5, Number.NaN, 5.5];
@@ -99,7 +99,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('boolean columns survive round-trip', () => {
       const schema = createTestSchema({ flag: S.boolean() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       // Need capacity for 9 test values
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'), 16);
 
@@ -123,7 +123,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('enum columns survive round-trip', () => {
       const schema = createTestSchema({ status: S.enum(['pending', 'active', 'completed'] as const) });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // Write enum indices (0=pending, 1=active, 2=completed)
@@ -150,7 +150,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('category columns survive round-trip', () => {
       const schema = createTestSchema({ userId: S.category() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const testValues = ['user-123', 'user-456', 'user-789', 'user-123', 'user-456'];
@@ -279,7 +279,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('text columns survive round-trip', () => {
       const schema = createTestSchema({ userMessage: S.text() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const testValues = ['First message', 'Second message', 'Third message', 'Second message', 'First message'];
@@ -302,7 +302,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('nullable columns with nulls survive round-trip', () => {
       const schema = createTestSchema({ value: S.number() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const testValues = [1.0, null, 3.0, null, 5.0];
@@ -339,7 +339,7 @@ describe('Arrow IPC Round-Trip', () => {
         userMessage: S.text(),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const testData = [
@@ -399,7 +399,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('system columns survive round-trip', () => {
       const schema = createTestSchema({});
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // Write a few rows with timestamps (BigInt64Array stores nanoseconds)
@@ -444,7 +444,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('system columns have correct nullability', () => {
       const schema = createTestSchema({ userAttr: S.number() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const idx = buffer._writeIndex;
@@ -486,7 +486,7 @@ describe('Arrow IPC Round-Trip', () => {
         status: S.enum(['a', 'b'] as const),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const idx = buffer._writeIndex;
@@ -516,7 +516,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('uses Arrow format (1=valid, 0=null)', () => {
       const schema = createTestSchema({ value: S.number() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // Write pattern: valid, null, valid, null, valid, null, valid, null
@@ -559,7 +559,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('handles sparse nulls correctly', () => {
       const schema = createTestSchema({ value: S.number() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       // Need capacity for 10 values
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'), 16);
 
@@ -600,7 +600,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('omits null bitmap when no nulls', () => {
       const schema = createTestSchema({ value: S.number() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       // No nulls - write all valid values
@@ -632,7 +632,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('preserves dictionary values through round-trip', () => {
       const schema = createTestSchema({ category: S.category() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'));
 
       const testValues = ['alpha', 'beta', 'zebra', 'alpha', 'beta'];
@@ -655,7 +655,7 @@ describe('Arrow IPC Round-Trip', () => {
     it('handles repeated values efficiently', () => {
       const schema = createTestSchema({ userId: S.category() });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       // Use capacity of 128 to hold 100 rows without overflow
       const buffer = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-123'), 128);
 

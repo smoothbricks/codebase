@@ -6,6 +6,18 @@
 code understanding, symbol-based editing, and precise file operations that are optimized for TypeScript and complex
 codebases.
 
+### ts-morph MCP Tools (for cross-file refactoring)
+
+When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
+
+- **Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
+  ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`.
+- **Example**:
+  ```
+  tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
+  tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
+  ```
+
 ### Comby for Structural Search/Replace
 
 **Docs**: https://comby.dev/docs/syntax-reference

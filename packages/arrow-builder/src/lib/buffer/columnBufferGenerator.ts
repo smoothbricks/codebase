@@ -30,7 +30,10 @@
 
 import { type ColumnSchema, isColumnSchema, type SchemaType, type SchemaWithMetadata } from '../schema-types.js';
 import { bufferHelpers } from './bufferHelpers.js';
-import { type ColumnBuffer, DEFAULT_BUFFER_CAPACITY, type TypedColumnBuffer } from './types.js';
+import { type AnyColumnBuffer, type ColumnBuffer, DEFAULT_BUFFER_CAPACITY } from './types.js';
+
+// Re-export types for consumers
+export type { AnyColumnBuffer, ColumnBuffer };
 
 // Re-export for consumers
 export { getAlignedCapacity } from './bufferHelpers.js';
@@ -273,7 +276,7 @@ export function generateColumnBufferClass(
     '    const alignedCapacity = helpers.getAlignedCapacity(requestedCapacity);',
     '    this._alignedCapacity = alignedCapacity;',
     '    this._capacity = requestedCapacity;',
-    '    this._next = undefined;',
+    '    this._overflow = undefined;',
   ];
 
   const getterMethods: string[] = [];
@@ -402,7 +405,7 @@ return ${className};
 /**
  * Cache for generated ColumnBuffer classes.
  */
-const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => ColumnBuffer>();
+const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => AnyColumnBuffer>();
 
 function createCacheKey(schema: ColumnSchema, extension?: ColumnBufferExtension): string {
   if (!extension) return JSON.stringify(schema.fields);
@@ -418,7 +421,7 @@ export function getColumnBufferClass<S extends ColumnSchema>(
 ): new (
   capacity: number,
   ...args: unknown[]
-) => TypedColumnBuffer<S> {
+) => ColumnBuffer<S> {
   const cacheKey = createCacheKey(schema, extension);
   let BufferClass = classCache.get(cacheKey);
 
@@ -441,7 +444,7 @@ export function getColumnBufferClass<S extends ColumnSchema>(
     ) => new (
       capacity: number,
       ...args: unknown[]
-    ) => ColumnBuffer;
+    ) => AnyColumnBuffer;
     BufferClass = factory(...depValues);
     classCache.set(cacheKey, BufferClass);
   }
@@ -449,7 +452,7 @@ export function getColumnBufferClass<S extends ColumnSchema>(
   return BufferClass as unknown as new (
     capacity: number,
     ...args: unknown[]
-  ) => TypedColumnBuffer<S>;
+  ) => ColumnBuffer<S>;
 }
 
 /**
@@ -460,7 +463,7 @@ export function createGeneratedColumnBuffer<S extends ColumnSchema>(
   requestedCapacity = DEFAULT_BUFFER_CAPACITY,
   extension?: ColumnBufferExtension,
   ...constructorArgs: unknown[]
-): TypedColumnBuffer<S> {
+): ColumnBuffer<S> {
   const BufferClass = getColumnBufferClass(schema, extension);
   return new BufferClass(requestedCapacity, ...constructorArgs);
 }

@@ -7,7 +7,7 @@ import {
 } from '@smoothbricks/arrow-builder';
 import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
-import { createTestModuleContext, createTestSchema } from '../test-helpers.js';
+import { createTestLogBinding, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
   it('generates TypedArray columns with proper names for defined schema', () => {
@@ -38,7 +38,7 @@ describe('Buffer Integration', () => {
       score: S.number(),
     });
 
-    const module = createTestModuleContext(schema);
+    const module = createTestLogBinding(schema);
     const capacity = 64;
     const buf = createSpanBuffer(schema, module, 'test-span', undefined, capacity);
 
@@ -65,7 +65,7 @@ describe('Buffer Integration', () => {
     });
 
     // Create buffer with schema
-    const module = createTestModuleContext(schema);
+    const module = createTestLogBinding(schema);
     const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Verify all attribute columns created as TypedArrays with correct types (use _values suffix)
@@ -74,8 +74,8 @@ describe('Buffer Integration', () => {
     expect(buffer.operation_values).toBeInstanceOf(Uint8Array); // enum
 
     // Verify module is set
-    expect(buffer._module).toBe(module);
-    expect(buffer._module.logSchema.fields).toBe(schema.fields);
+    expect(buffer._logBinding).toBe(module);
+    expect(buffer._logBinding.logSchema.fields).toBe(schema.fields);
   });
 
   it('handles optional fields in schema', () => {
@@ -84,7 +84,7 @@ describe('Buffer Integration', () => {
       optional: S.optional(S.number()),
     });
 
-    const module = createTestModuleContext(schema);
+    const module = createTestLogBinding(schema);
     const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Both should have TypedArray columns (use _values suffix)
@@ -101,7 +101,7 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // Text: unmasked plain text
     });
 
-    const module = createTestModuleContext(schema);
+    const module = createTestLogBinding(schema);
     const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // All should have TypedArray columns (use _values suffix)
@@ -118,7 +118,7 @@ describe('Buffer Integration', () => {
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
     });
 
-    const smallModule = createTestModuleContext(smallEnumSchema);
+    const smallModule = createTestLogBinding(smallEnumSchema);
     const smallBuffer = createSpanBuffer(smallEnumSchema, smallModule, 'test-span');
 
     // Should use Uint8Array for enums with ≤255 values (use _values suffix)
@@ -131,7 +131,7 @@ describe('Buffer Integration', () => {
       plainUserId: S.category(), // No masking
     });
 
-    const module = createTestModuleContext(schema);
+    const module = createTestLogBinding(schema);
     const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
@@ -172,7 +172,7 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // No masking
     });
 
-    const module = createTestModuleContext(schema);
+    const module = createTestLogBinding(schema);
     const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
@@ -218,7 +218,7 @@ describe('Buffer Integration', () => {
       secretKey: S.text().mask(customMask),
     });
 
-    const module = createTestModuleContext(schema);
+    const module = createTestLogBinding(schema);
     const buffer = createSpanBuffer(schema, module, 'test-span');
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
@@ -253,7 +253,7 @@ describe('Buffer Integration', () => {
         optionalField: S.optional(S.number()), // Maps to Uint32Array
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'integration-test');
 
       // Verify arrow-builder created correct TypedArray types for each schema type
@@ -281,7 +281,7 @@ describe('Buffer Integration', () => {
         error: S.text().mask('email'),
       });
 
-      const module = createTestModuleContext(schema);
+      const module = createTestLogBinding(schema);
       const buffer = createSpanBuffer(schema, module, 'data-flow-test');
 
       // Use ColumnWriter API to write data (more robust than direct array access)
@@ -313,7 +313,7 @@ describe('Buffer Integration', () => {
         requestId: S.category(),
       });
 
-      const module = createTestModuleContext(schema, {
+      const module = createTestLogBinding(schema, {
         git_sha: 'test-sha-123',
         package_name: '@test/package',
         package_file: 'src/integration.test.ts',
@@ -322,8 +322,8 @@ describe('Buffer Integration', () => {
       const buffer = createSpanBuffer(schema, module, 'context-integration');
 
       // Verify buffer properly references module context
-      expect(buffer._module).toBe(module);
-      expect(buffer._module.logSchema).toBe(module.logSchema);
+      expect(buffer._logBinding).toBe(module);
+      expect(buffer._logBinding.logSchema).toBe(module.logSchema);
       expect(buffer._spanName).toBe('context-integration');
 
       // Verify system metadata columns are accessible

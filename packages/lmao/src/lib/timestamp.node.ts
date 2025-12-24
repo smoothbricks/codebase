@@ -3,33 +3,46 @@ import { Nanoseconds } from '@smoothbricks/arrow-builder';
 /**
  * Node.js timestamp implementation.
  *
- * Uses `process.hrtime.bigint()` anchored to epoch for true nanosecond precision.
+ * Uses per-trace anchored timestamps for consistent trace-wide time reference.
+ * Combines epoch anchor with process.hrtime.bigint() delta for true nanosecond precision.
  *
  * **How it works:**
- * - On module load: capture `Date.now()` and `process.hrtime.bigint()` together
- * - For each call: add hrtime delta to the epoch anchor
+ * - At trace creation: capture `Date.now()` and `process.hrtime.bigint()` together
+ * - For each timestamp: add hrtime delta to the epoch anchor
  * - Result: absolute epoch time with nanosecond precision
  *
- * **Why anchor once?**
- * - `Date.now()` has millisecond precision and can drift with NTP
- * - `process.hrtime.bigint()` has nanosecond precision but is monotonic (not epoch)
- * - Anchoring once gives both absolute epoch time AND nanosecond precision
+ * **Why per-trace anchoring:**
+ * - Each trace has fresh anchor - no long-running drift issues
+ * - NTP corrections between traces are isolated
+ * - Trace is self-contained unit with consistent time reference
  */
-
-// Anchor point: captured once at module load
-// Capture hrtime first, then Date.now() - this way Date.now() is the most recent reading
-const anchorHrtime = process.hrtime.bigint();
-const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
 
 /**
  * Get current timestamp in nanoseconds since Unix epoch.
  * True nanosecond precision via `process.hrtime.bigint()`.
+ *
+ * @param anchorEpochNanos - Epoch time in nanoseconds when trace was created
+ * @param anchorPerfNow - Anchor value from TraceRoot (process.hrtime.bigint() converted to number)
  */
-export function getTimestampNanos(): Nanoseconds {
-  return Nanoseconds.unsafe(anchorEpochNanos + (process.hrtime.bigint() - anchorHrtime));
+export function getTimestampNanos(anchorEpochNanos: bigint, anchorPerfNow: number): Nanoseconds {
+  // anchorPerfNow is Number(process.hrtime.bigint()) from trace creation
+  // Convert back to bigint (safe - no precision loss for the conversion itself)
+  const anchorHrtime = BigInt(Math.round(anchorPerfNow));
+  const currentHrtime = process.hrtime.bigint();
+  const elapsedNanos = currentHrtime - anchorHrtime;
+  return Nanoseconds.unsafe(anchorEpochNanos + elapsedNanos);
 }
 
-// Set Nanoseconds.now to our implementation
-Nanoseconds.now = getTimestampNanos;
+// Legacy compatibility - module-level anchor
+// DEPRECATED: Use per-trace anchors via buffer._traceRoot instead
+const legacyAnchorHrtime = process.hrtime.bigint();
+const legacyAnchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+
+export function getTimestampNanosLegacy(): Nanoseconds {
+  return Nanoseconds.unsafe(legacyAnchorEpochNanos + (process.hrtime.bigint() - legacyAnchorHrtime));
+}
+
+// Set Nanoseconds.now to legacy implementation for backwards compatibility
+Nanoseconds.now = getTimestampNanosLegacy;
 
 export { Nanoseconds };

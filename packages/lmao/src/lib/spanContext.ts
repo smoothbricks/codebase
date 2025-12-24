@@ -19,10 +19,9 @@ import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
-import { createChildSpanBuffer, createNextBuffer } from './spanBuffer.js';
+import { createChildSpanBuffer, createOverflowBuffer } from './spanBuffer.js';
 import { getTimestampNanos } from './timestamp.js';
-import type { TraceContext } from './traceContext.js';
-import type { ModuleContext, SpanBuffer } from './types.js';
+import type { LogBinding, ModuleContext, SpanBuffer } from './types.js';
 
 // =============================================================================
 // SpanContext Symbol Marker
@@ -335,7 +334,7 @@ export interface SpanContext<T extends LogSchema, FF extends FeatureFlagSchema, 
 export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagSchema, Env = Record<string, unknown>>
   extends SpanContext<T, FF, Env> {
   [SPAN_CONTEXT_MARKER]: true;
-  __module: ModuleContext;
+  _logBinding: ModuleContext;
   callee_package: string;
   callee_file: string;
   callee_line: number;
@@ -348,7 +347,6 @@ export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagS
   _buffer: SpanBuffer<T>;
   _schema: T;
   _spanLogger: BaseSpanLogger<T>;
-  _traceCtx?: TraceContext<FF, Record<string, unknown>>; // Hidden reference to root trace context for Op invocation
   buffer: SpanBuffer<T>;
   setScope: (attributes: Partial<InferSchema<T> | null>) => void;
   scope: Readonly<Partial<InferSchema<T>>>;
@@ -391,7 +389,7 @@ export interface MutableSpanContext<T extends LogSchema, FF extends FeatureFlagS
 export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanName: string): void {
   // Row 0: span-start (fixed layout)
   buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
-  buffer.timestamp[0] = getTimestampNanos();
+  buffer.timestamp[0] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
   buffer.message(0, spanName); // Unified message column for span name
 
   // Row 1: pre-initialize as span-exception (will be overwritten on ok/err)
@@ -414,7 +412,7 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
  */
 export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): BaseSpanLogger<T> {
   // Create the SpanLogger - it will read/write scope via buffer._scopeValues
-  return createSpanLoggerFromGenerator(schema, buffer, createNextBuffer) as BaseSpanLogger<T>;
+  return createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer) as BaseSpanLogger<T>;
 }
 
 /**
@@ -429,7 +427,7 @@ export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuf
  * - Avoid object spreads which break hidden classes
  *
  * @param schemaOnly - Tag attribute schema
- * @param taskContext - Task context with module metadata
+ * @param logBinding - LogBinding with schema and stats (ModuleContext alias)
  * @returns Prototype object for SpanContext instances
  *
  * @internal
@@ -438,25 +436,25 @@ export function createSpanContextProto<
   T extends LogSchema,
   FF extends FeatureFlagSchema,
   Env = Record<string, unknown>,
->(schemaOnly: T, moduleContext: ModuleContext): Record<string | symbol, unknown> {
+>(schemaOnly: T, logBinding: LogBinding): Record<string | symbol, unknown> {
   return {
     [SPAN_CONTEXT_MARKER]: true as const,
 
-    // Module getter - returns _buffer._module
+    // OpMetadata getter - returns _buffer._opMetadata
     get module(): ModuleContext {
-      return (this as any).buffer.module;
+      return (this as any).buffer._opMetadata;
     },
     get callee_package(): string {
-      return (this as any).buffer.module.package_name;
+      return (this as any).buffer._opMetadata.package_name;
     },
     get callee_file(): string {
-      return (this as any).buffer.module.package_file;
+      return (this as any).buffer._opMetadata.package_file;
     },
     get callee_line(): number {
       return (this as any).buffer.line(0);
     },
     get callee_git_sha(): string {
-      return (this as any).buffer.module.git_sha;
+      return (this as any).buffer._opMetadata.git_sha;
     },
 
     // Buffer getter - returns _buffer
@@ -464,10 +462,11 @@ export function createSpanContextProto<
       return (this as unknown as MutableSpanContext<T, FF, Env>)._buffer;
     },
 
-    // Scope getter - returns current scope values as frozen object
+    // Scope getter - returns current scope values (always a frozen object, never undefined)
+    // Buffer._scopeValues is initialized to EMPTY_SCOPE and only replaced with frozen objects
     get scope(): Readonly<Partial<InferSchema<T>>> {
       const buffer = (this as unknown as MutableSpanContext<T, FF, Env>)._buffer;
-      return (buffer._scopeValues as Readonly<Partial<InferSchema<T>>>) ?? Object.freeze({});
+      return buffer._scopeValues as Readonly<Partial<InferSchema<T>>>;
     },
 
     // setScope method - delegates to spanLogger._setScope
@@ -495,23 +494,14 @@ export function createSpanContextProto<
       op: Op<SpanContext<T, FF, Env>, Args, R>,
       ...args: Args
     ): Promise<R> {
-      // Direct property access - V8 optimized (no prototype walk!)
-      // ctx parameter always has _traceCtx set directly when created
-      const traceCtx = (ctx as unknown as MutableSpanContext<T, FF, Env>)._traceCtx;
-      if (!traceCtx) {
-        throw new Error('TraceContext not found - cannot invoke Op');
-      }
-
-      // Call op._invoke with proper parameters
-      // callsiteModule is the current span's module (buffer._module)
-      // Cast needed: SpanBuffer<T> -> SpanBuffer (TypeScript variance limitation with index signatures)
-      return op._invoke(
-        this._traceCtx as TraceContext<FF, Record<string, unknown>>,
-        this._buffer as SpanBuffer,
-        moduleContext,
-        name,
-        line,
-        args,
+      // Call op.fn with parent context (ctx parameter) after creating child span
+      // The Op will use Object.create(ctx) to inherit user properties via prototype chain
+      // callsiteMetadata is the CURRENT span's OpMetadata - where span() was invoked from
+      // TODO: span_op should create child span buffer and call op.fn() directly
+      // For now, cast to any to call fn (the class has fn, not _invoke)
+      return (op as unknown as { fn: (ctx: any, ...args: Args) => Promise<R> }).fn(
+        ctx as SpanContext<LogSchema, FF, Record<string, unknown>>,
+        ...args,
       );
     },
 
@@ -524,11 +514,17 @@ export function createSpanContextProto<
       fn: (ctx: SpanContext<T, FF, Env>) => Promise<R>,
     ): Promise<R> {
       // Create child span buffer
-      // Uses same module as parent - span_fn creates child spans within same module context
-      const childBuffer = createChildSpanBuffer(this._buffer as SpanBuffer, moduleContext, name) as SpanBuffer<T>;
+      // Uses same logBinding as parent - span_fn creates child spans within same logging context
+      // callsiteMetadata is the CURRENT op's metadata (for row 0 attribution)
+      const childBuffer = createChildSpanBuffer(
+        this._buffer,
+        logBinding,
+        name,
+        this._buffer._opMetadata, // callsiteMetadata - current op's metadata for row 0
+      ) as SpanBuffer<T>;
 
       // Explicit registration with parent's children array
-      this._buffer._children.push(childBuffer as SpanBuffer);
+      this._buffer._children.push(childBuffer);
 
       // Write span-start for child span (row 0) and pre-initialize span-end (row 1)
       writeSpanStart(childBuffer, name);
@@ -546,12 +542,11 @@ export function createSpanContextProto<
       const childContext = Object.create(ctx) as MutableSpanContext<T, FF, Env>;
 
       // Assign child-specific properties directly (stable hidden class)
+      // User properties (env, deps, etc.) are inherited via prototype chain from ctx
       childContext.tag = childTagAPI as SpanContext<T, FF, Env>['tag'];
       childContext.log = childLogger as SpanLogger<T>;
       childContext._buffer = childBuffer as SpanBuffer<T>;
       childContext._spanLogger = childLogger;
-      // ALWAYS copy _traceCtx directly (V8 optimization - no prototype access)
-      childContext._traceCtx = (ctx as unknown as MutableSpanContext<T, FF, Env>)._traceCtx;
 
       // Create a new feature flag evaluator bound to the CHILD span context
       // Must be after childContext is created since forContext receives the full SpanContext
@@ -565,7 +560,10 @@ export function createSpanContextProto<
         return await fn(childContext as unknown as SpanContext<T, FF, Env>);
       } catch (error) {
         // Write span-exception to row 1 (fixed layout)
-        childBuffer.timestamp[1] = getTimestampNanos();
+        childBuffer.timestamp[1] = getTimestampNanos(
+          childBuffer._traceRoot.anchorEpochNanos,
+          childBuffer._traceRoot.anchorPerfNow,
+        );
 
         // Write exception details to row 1
         const errorMessage = error instanceof Error ? error.message : String(error);
@@ -603,12 +601,10 @@ export function createSpanContextProto<
         restAfterName[0] !== null &&
         !('_invoke' in restAfterName[0])
       ) {
-        // Context override detected
+        // Context override detected - create child context inheriting from this via prototype
+        // Override properties are spread onto the new object as own properties
+        // User properties (env, deps, etc.) still inherited via prototype chain
         ctxOverride = Object.assign(Object.create(this), restAfterName[0]) as SpanContext<T, FF, Env>;
-        // CRITICAL: Copy _traceCtx directly onto the new object for V8 optimization
-        (ctxOverride as unknown as MutableSpanContext<T, FF, Env>)._traceCtx = (
-          this as MutableSpanContext<T, FF, Env>
-        )._traceCtx;
         opOrFn = restAfterName[1] as
           | Op<SpanContext<T, FF, Env>, unknown[], unknown>
           | ((ctx: SpanContext<T, FF, Env>) => Promise<unknown>);

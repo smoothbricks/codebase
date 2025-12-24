@@ -1224,57 +1224,50 @@ void inlineReturnTypeTest;
 // When Extra contains reserved keys, the returned type has __reservedKeyError
 // instead of Module methods. Errors appear when trying to USE the module.
 
+// Test reserved TraceContext property names in ctx - these should trigger errors
+// Reserved keys in this experiment: anchorEpochMicros, anchorPerfNow, ff, span
+
 const badModule1 = defineModule({
   metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
-}).ctx<{ trace_id: string }>();
+}).ctx<{ anchorEpochMicros: number }>(); // 'anchorEpochMicros' is reserved
 
 const badModule2 = defineModule({
   metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
-}).ctx<{ ff: string }>();
+}).ctx<{ ff: string }>(); // 'ff' is reserved
 
 const badModule3 = defineModule({
   metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
-}).ctx<{ span: () => void }>();
+}).ctx<{ span: () => void }>(); // 'span' is reserved
 
 const badModule4 = defineModule({
   metadata: { package_name: '@test/bad', package_file: 'test.ts' },
   logSchema: {},
   deps: {},
   ff: {},
-}).ctx<{ anchor_epoch_micros: number }>();
-
-const badModule5 = defineModule({
-  metadata: { package_name: '@test/bad', package_file: 'test.ts' },
-  logSchema: {},
-  deps: {},
-  ff: {},
-}).ctx<{ thread_id: bigint }>();
+}).ctx<{ anchorPerfNow: number }>(); // 'anchorPerfNow' is reserved
 
 // Errors appear when trying to use the bad modules - they don't have Module methods
 
-// @ts-expect-error Property 'op' does not exist - module returned error type due to reserved 'traceId' key
-badModule1.op;
+// @ts-expect-error Property 'make' does not exist - module returned error type due to reserved 'anchorEpochMicros' key
+badModule1.make;
 
-// @ts-expect-error Property 'op' does not exist - module returned error type due to reserved 'ff' key
-badModule2.op;
+// @ts-expect-error Property 'make' does not exist - module returned error type due to reserved 'ff' key
+badModule2.make;
 
-// @ts-expect-error Property 'op' does not exist - module returned error type due to reserved 'span' key
-badModule3.op;
+// @ts-expect-error Property 'make' does not exist - module returned error type due to reserved 'span' key
+badModule3.make;
 
-// @ts-expect-error Property 'traceContext' does not exist - module returned error type due to reserved 'anchorEpochMicros' key
-badModule4.traceContext;
-
-// @ts-expect-error Property 'traceContext' does not exist - module returned error type due to reserved 'threadId' key
-badModule5.traceContext;
+// @ts-expect-error Property 'make' does not exist - module returned error type due to reserved 'anchorPerfNow' key
+badModule4.make;
 
 // Verify the error types contain the expected message
 type BadModule1Type = typeof badModule1;

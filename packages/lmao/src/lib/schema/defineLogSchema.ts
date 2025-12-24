@@ -84,7 +84,23 @@ export interface DefineLogSchemaOptions {
   _skipReservedNameValidation?: boolean;
 }
 
-export function defineLogSchema<T extends SchemaFields>(schema: T, options?: DefineLogSchemaOptions): LogSchema<T> {
+/**
+ * LogSchema with validation methods added by defineLogSchema.
+ * These methods are added via Object.assign at runtime.
+ */
+export type ValidatedLogSchema<T extends SchemaFields> = LogSchema<T> & {
+  /** Validate data and throw on error */
+  validate(data: unknown): InferSchema<T>;
+  /** Validate data and return null on error */
+  parse(data: unknown): InferSchema<T> | null;
+  /** Safe parse with detailed error information */
+  safeParse(data: unknown): { success: true; value: InferSchema<T> } | { success: false; error: Error };
+};
+
+export function defineLogSchema<T extends SchemaFields>(
+  schema: T,
+  options?: DefineLogSchemaOptions,
+): ValidatedLogSchema<T> {
   // Wrap user input into LogSchema first
   const logSchema = schema instanceof LogSchema ? schema : new LogSchema(schema);
 
@@ -147,5 +163,5 @@ export function defineLogSchema<T extends SchemaFields>(schema: T, options?: Def
   }
 
   // Return logSchema (still a LogSchema instance with added methods)
-  return result as LogSchema<T>;
+  return result as ValidatedLogSchema<T>;
 }

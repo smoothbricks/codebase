@@ -22,7 +22,7 @@
 import { bufferHelpers } from '@smoothbricks/arrow-builder';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 
 /**
  * Extension options for injecting custom code into generated writer classes.
@@ -258,7 +258,7 @@ ${extensionMethods}
  * Cache for TagWriter classes (position 0).
  * WeakMap allows garbage collection when schema is no longer referenced.
  */
-const tagWriterClassCache = new WeakMap<LogSchema, new (buffer: SpanBuffer) => TagWriter<LogSchema>>();
+const tagWriterClassCache = new WeakMap<LogSchema, new (buffer: AnySpanBuffer) => TagWriter<LogSchema>>();
 
 /**
  * Cache for ResultWriter classes (position 1).
@@ -266,7 +266,7 @@ const tagWriterClassCache = new WeakMap<LogSchema, new (buffer: SpanBuffer) => T
 const resultWriterClassCache = new WeakMap<
   LogSchema,
   new (
-    buffer: SpanBuffer,
+    buffer: AnySpanBuffer,
     result: unknown,
     isError: boolean,
   ) => ResultWriter<LogSchema>
@@ -290,7 +290,7 @@ export function generateTagWriterClass(schema: LogSchema): string {
  * @param schema - Tag attribute schema
  * @returns TagWriter class constructor
  */
-export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: SpanBuffer) => TagWriter<T> {
+export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: AnySpanBuffer) => TagWriter<T> {
   let WriterClass = tagWriterClassCache.get(schema);
 
   if (!WriterClass) {
@@ -301,7 +301,7 @@ export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: 
     const factory = new Function('helpers', classCode) as (
       helpers: typeof bufferHelpers,
     ) => new (
-      buffer: SpanBuffer,
+      buffer: AnySpanBuffer,
     ) => TagWriter<LogSchema>;
 
     WriterClass = factory(bufferHelpers);
@@ -309,7 +309,7 @@ export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: 
   }
 
   return WriterClass as new (
-    buffer: SpanBuffer,
+    buffer: AnySpanBuffer,
   ) => TagWriter<T>;
 }
 
@@ -320,12 +320,9 @@ export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: 
  * @param buffer - SpanBuffer to write to
  * @returns TagWriter instance bound to position 0
  */
-export function createTagWriter<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): TagWriter<T> {
+export function createTagWriter<T extends LogSchema>(schema: T, buffer: AnySpanBuffer): TagWriter<T> {
   const WriterClass = getTagWriterClass(schema);
-  // Type assertion needed because WriterClass constructor expects SpanBuffer
-  // (non-generic) but we pass SpanBuffer<T>. This is safe because at runtime
-  // SpanBuffer<T> IS a SpanBuffer - the generic is only for compile-time typing.
-  return new WriterClass(buffer as unknown as SpanBuffer);
+  return new WriterClass(buffer);
 }
 
 // ============================================================================
@@ -369,7 +366,7 @@ export function generateResultWriterClass(schema: LogSchema): string {
 export function getResultWriterClass<T extends LogSchema>(
   schema: T,
 ): new (
-  buffer: SpanBuffer,
+  buffer: AnySpanBuffer,
   resultOrError: unknown,
   isError: boolean,
 ) => ResultWriter<T> {
@@ -383,7 +380,7 @@ export function getResultWriterClass<T extends LogSchema>(
     const factory = new Function('helpers', classCode) as (
       helpers: typeof bufferHelpers,
     ) => new (
-      buffer: SpanBuffer,
+      buffer: AnySpanBuffer,
       resultOrError: unknown,
       isError: boolean,
     ) => ResultWriter<LogSchema>;
@@ -393,7 +390,7 @@ export function getResultWriterClass<T extends LogSchema>(
   }
 
   return WriterClass as new (
-    buffer: SpanBuffer,
+    buffer: AnySpanBuffer,
     resultOrError: unknown,
     isError: boolean,
   ) => ResultWriter<T>;
@@ -410,7 +407,7 @@ export function getResultWriterClass<T extends LogSchema>(
  */
 export function createResultWriter<T extends LogSchema, R = unknown, E = unknown>(
   schema: T,
-  buffer: SpanBuffer,
+  buffer: AnySpanBuffer,
   resultOrError: R | E,
   isError: boolean,
 ): ResultWriter<T, R, E> {
@@ -432,9 +429,9 @@ export function getFixedPositionWriterClass<T extends LogSchema>(
   position: number,
   extension?: FixedPositionWriterExtension,
 ): new (
-  buffer: SpanBuffer,
+  buffer: AnySpanBuffer,
   ...args: unknown[]
-) => { _buffer: SpanBuffer; _pos: number } & Record<string, unknown> {
+) => { _buffer: AnySpanBuffer; _pos: number } & Record<string, unknown> {
   // For custom positions/extensions, generate without caching
   // (TagWriter at 0 and ResultWriter at 1 use their own caches)
   const className = `FixedPositionWriter_${position}`;
@@ -444,9 +441,9 @@ export function getFixedPositionWriterClass<T extends LogSchema>(
   const factory = new Function('helpers', classCode) as (
     helpers: typeof bufferHelpers,
   ) => new (
-    buffer: SpanBuffer,
+    buffer: AnySpanBuffer,
     ...args: unknown[]
-  ) => { _buffer: SpanBuffer; _pos: number };
+  ) => { _buffer: AnySpanBuffer; _pos: number };
 
   return factory(bufferHelpers);
 }

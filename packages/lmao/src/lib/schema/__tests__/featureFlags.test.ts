@@ -19,7 +19,7 @@ import type { LogSchema } from '../types.js';
  */
 function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): SpanContext<T, any, any> {
   // Create a real SpanLogger for the buffer using the schema from module
-  const schema = spanBuffer._module.logSchema as T;
+  const schema = spanBuffer._logBinding.logSchema as T;
   const logger = createSpanLogger(schema, spanBuffer);
 
   const mockCtx = {
@@ -58,11 +58,11 @@ function countEntryType(buffer: SpanBuffer<any>, entryType: number): number {
   while (current) {
     const writeIndex = current._writeIndex;
     for (let i = 0; i < writeIndex; i++) {
-      if (current._operations[i] === entryType) {
+      if (current.entry_type[i] === entryType) {
         count++;
       }
     }
-    current = current._next;
+    current = current._overflow;
   }
   return count;
 }

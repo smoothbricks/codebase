@@ -1,12 +1,13 @@
 // Main integration API - GREENFIELD - NO BACKWARDS COMPAT
 
 // =============================================================================
-// Primary API: defineModule
+// Primary API: defineOpContext (Op-Centric API)
 // =============================================================================
 
-// Re-export the interface separately (Module is both a type and a value concept)
-export type { Module, Module as ModuleBuilder, ModuleMetadata, OpFunction as OpFn } from './lib/defineModule.js';
-export { DefaultValueFlagEvaluator, defineModule, trackOverflowAndTune } from './lib/defineModule.js';
+// Op-Centric API - the module system (includes schema utilities and types)
+export * from './lib/defineOpContext.js';
+
+// Op class - used internally by defineOp()
 export { Op, OpBrand } from './lib/op.js';
 
 // =============================================================================
@@ -73,16 +74,13 @@ export {
 } from './lib/schema/systemSchema.js';
 
 // =============================================================================
-// Schema System
+// Schema System (additional exports not in defineOpContext)
+// Note: defineOpContext already re-exports S, defineFeatureFlags, defineLogSchema, LogSchema
 // =============================================================================
 
-export * from './lib/schema/builder.js';
-export * from './lib/schema/defineFeatureFlags.js';
-export * from './lib/schema/defineLogSchema.js';
 export * from './lib/schema/evaluator.js';
 export * from './lib/schema/extend.js';
 export * from './lib/schema/typeGuards.js';
-export * from './lib/schema/types.js';
 
 // =============================================================================
 // Code Generation (for advanced use)
@@ -106,6 +104,12 @@ export * from './lib/types.js';
 // =============================================================================
 
 export * from './lib/flushScheduler.js';
+
+// =============================================================================
+// Tracer
+// =============================================================================
+
+export { type TraceOverrides, Tracer, type TracerConfig, type TraceSink } from './lib/tracer.js';
 
 // =============================================================================
 // Library Integration

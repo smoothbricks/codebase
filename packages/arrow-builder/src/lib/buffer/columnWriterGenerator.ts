@@ -1,12 +1,12 @@
 /**
- * Runtime code generation for ColumnWriter classes that write to ColumnBuffer.
+ * Runtime code generation for ColumnWriter classes that write to AnyColumnBuffer.
  *
- * ColumnWriter provides a fluent API for writing rows to a ColumnBuffer:
+ * ColumnWriter provides a fluent API for writing rows to a AnyColumnBuffer:
  * - `nextRow()` advances to the next row (handles overflow automatically)
  * - Fluent setter methods for each schema column (e.g., `.userId("123").status("ok")`)
  *
- * WHY separate ColumnWriter from ColumnBuffer:
- * - ColumnBuffer owns storage (TypedArrays, null bitmaps)
+ * WHY separate ColumnWriter from AnyColumnBuffer:
+ * - AnyColumnBuffer owns storage (TypedArrays, null bitmaps)
  * - ColumnWriter owns write position and fluent API
  * - Writers can be extended (via _getNextBuffer) for custom overflow handling
  * - Same buffer can have multiple writers (different write positions)
@@ -18,7 +18,7 @@
  */
 
 import type { ColumnSchema, SchemaWithMetadata } from '../schema-types.js';
-import type { ColumnBuffer } from './types.js';
+import type { AnyColumnBuffer } from './types.js';
 
 /**
  * Extension options for injecting custom code into generated ColumnWriter classes.
@@ -103,10 +103,10 @@ export interface ColumnWriterExtension {
  * ```
  */
 export type ColumnWriter<T extends ColumnSchema = ColumnSchema> = {
-  _buffer: ColumnBuffer;
+  _buffer: AnyColumnBuffer;
   _writeIndex: number;
   nextRow(): ColumnWriter<T>;
-  _getNextBuffer(): ColumnBuffer;
+  _getNextBuffer(): AnyColumnBuffer;
 } & {
   [K in keyof T['fields']]: (value: import('@sury/sury').Output<T['fields'][K]>) => ColumnWriter<T>;
 };
@@ -161,7 +161,7 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
  * Generate ColumnWriter class code as a string
  *
  * Creates a class with:
- * 1. `_buffer` - reference to current ColumnBuffer
+ * 1. `_buffer` - reference to current AnyColumnBuffer
  * 2. `_writeIndex` - current write position
  * 3. `nextRow()` - advance to next row with overflow handling
  * 4. `_getNextBuffer()` - get/create next buffer (override for custom behavior)
@@ -245,10 +245,10 @@ ${constructorBody.join('\n')}
     }
 
     _getNextBuffer() {
-      if (!this._buffer._next) {
+      if (!this._buffer._overflow) {
         throw new Error('Buffer overflow: no next buffer available. Override _getNextBuffer() to handle this.');
       }
-      return this._buffer._next;
+      return this._buffer._overflow;
     }
 
 ${setterMethods.join('\n\n')}
@@ -266,7 +266,7 @@ ${extensionMethods}
  * Key: JSON-serialized schema + extension (stable across identical configurations)
  * Value: Generated class constructor
  */
-const writerClassCache = new Map<string, new (buffer: ColumnBuffer, ...args: unknown[]) => ColumnWriter>();
+const writerClassCache = new Map<string, new (buffer: AnyColumnBuffer, ...args: unknown[]) => ColumnWriter>();
 
 /**
  * Create a stable cache key from schema and extension options.
@@ -294,7 +294,7 @@ export function getColumnWriterClass<T extends ColumnSchema>(
   schema: T,
   extension?: ColumnWriterExtension,
 ): new (
-  buffer: ColumnBuffer,
+  buffer: AnyColumnBuffer,
   ...args: unknown[]
 ) => ColumnWriter<T> {
   const cacheKey = createCacheKey(schema, extension);
@@ -320,7 +320,7 @@ export function getColumnWriterClass<T extends ColumnSchema>(
     const factory = new Function(...depNames, classCode) as (
       ...args: unknown[]
     ) => new (
-      buffer: ColumnBuffer,
+      buffer: AnyColumnBuffer,
       ...args: unknown[]
     ) => ColumnWriter;
     WriterClass = factory(...depValues);
@@ -330,7 +330,7 @@ export function getColumnWriterClass<T extends ColumnSchema>(
 
   // Cast is safe because the generated class has typed setters matching the schema T
   return WriterClass as unknown as new (
-    buffer: ColumnBuffer,
+    buffer: AnyColumnBuffer,
     ...args: unknown[]
   ) => ColumnWriter<T>;
 }
@@ -339,14 +339,14 @@ export function getColumnWriterClass<T extends ColumnSchema>(
  * Create a ColumnWriter instance for the given schema and buffer
  *
  * @param schema - The tag attribute schema defining columns
- * @param buffer - The ColumnBuffer to write to
+ * @param buffer - The AnyColumnBuffer to write to
  * @param extension - Optional extension for injecting constructor code, methods, etc.
  * @param constructorArgs - Additional constructor arguments (passed to extension constructor code)
  * @returns A new ColumnWriter instance with typed setter methods
  */
 export function createColumnWriter<T extends ColumnSchema>(
   schema: T,
-  buffer: ColumnBuffer,
+  buffer: AnyColumnBuffer,
   extension?: ColumnWriterExtension,
   ...constructorArgs: unknown[]
 ): ColumnWriter<T> {

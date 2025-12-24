@@ -79,40 +79,107 @@ function generateWriteMethods(schema: BufferSchema) {
 }
 ```
 
-### 2. Hidden Class Stability
+### 2. Hidden Class Stability and In-Object Properties
 
 **WHY**: V8 creates hidden classes for object shapes. Stable shapes = fast property access.
 
-```typescript
-// BAD: Dynamic property addition
-class BadBuffer {
-  constructor() {
-    this.timestamp = new BigInt64Array(64);
-    // Properties added later cause hidden class transitions
-  }
+V8 distinguishes between **in-object properties** (stored directly on the object, fastest) and **out-of-object
+properties** (stored in a separate properties backing store, extra indirection). The number of in-object slots is
+determined at class creation time based on the initial object shape.
 
-  addColumn(name: string) {
-    this[name] = new Uint32Array(64); // New hidden class!
+**CRITICAL: Property Assignment Order Matters!**
+
+The first ~10-12 properties assigned in the constructor become in-object properties. Remaining properties go to the
+slower backing store. **Therefore, assign the HOTTEST properties FIRST** in the constructor.
+
+```typescript
+// ❌ BAD: Hot properties assigned last (likely overflow to backing store)
+class BadBuffer {
+  constructor(capacity: number) {
+    this._system = new ArrayBuffer(capacity * 9);  // Cold - never accessed after construction
+    this._spanName = 'span';       // Cold - Arrow conversion only
+    this._parent = undefined;      // Warm - occasionally accessed
+    this._children = [];           // Warm - occasionally accessed
+    this._scopeValues = undefined; // Cold - Arrow conversion only
+    this._callsiteMetadata = undefined; // Cold - Arrow conversion only
+    this._identity = new Uint8Array(12); // Warm - span operations
+    this._logBinding = module;     // Warm - span operations
+
+    // HOT properties last - likely overflow to out-of-object backing store!
+    this._writeIndex = 0;          // HOTTEST - read + increment every write!
+    this._capacity = capacity;     // HOTTEST - compared every write (overflow check)!
+    this._next = undefined;        // HOT - checked on overflow!
+    this.timestamp = new BigInt64Array(capacity);  // HOT - written EVERY entry
+    this.entry_type = new Uint8Array(capacity);    // HOT - written EVERY entry
   }
 }
 
-// GOOD: Fixed shape from construction
+// ✅ GOOD: Hot properties first (guaranteed in-object slots)
 class GoodBuffer {
-  // All properties defined upfront
-  readonly timestamp: BigInt64Array;
-  readonly entry_type: Uint8Array;
-  readonly userId_values: Uint32Array;
-  readonly action_values: Uint32Array;
-
   constructor(capacity: number) {
-    // Single hidden class, never changes
-    this.timestamp = new BigInt64Array(capacity);
-    this.entry_type = new Uint8Array(capacity);
-    this.userId_values = new Uint32Array(capacity);
-    this.action_values = new Uint32Array(capacity);
+    // SLOT 1-3: HOTTEST properties FIRST - guaranteed in-object slots
+    this._writeIndex = 0;          // Read + increment on EVERY write
+    this._capacity = capacity;     // Compared on EVERY write (overflow check)
+    this._next = undefined;        // Checked when overflow occurs
+
+    // SLOT 4-5: HOT - TypedArray refs accessed every entry
+    this.timestamp = new BigInt64Array(capacity);  // Array indexing EVERY entry
+    this.entry_type = new Uint8Array(capacity);    // Array indexing EVERY entry
+
+    // SLOT 6-7: WARM - Tree structure (span creation/navigation)
+    this._children = [];           // Modified during child span creation
+    this._parent = undefined;      // Accessed for trace_id walk
+
+    // SLOT 8-9: WARM - Identity and binding (accessed during span ops)
+    this._identity = new Uint8Array(12); // Accessed for span_id/thread_id
+    this._logBinding = module;     // Accessed for schema/capacity stats
+
+    // SLOT 10+: COLD properties last (only accessed during Arrow conversion)
+    this._system = new ArrayBuffer(capacity * 9); // NEVER accessed after construction
+    this._spanName = 'span';       // Arrow conversion only
+    this._scopeValues = undefined; // Arrow conversion only
+    this._callsiteMetadata = undefined; // Arrow conversion only
+  }
+}
+}
+
+// ✅ GOOD: Hot properties first (guaranteed in-object slots)
+class GoodBuffer {
+  constructor(capacity: number) {
+    // HOTTEST properties FIRST - guaranteed in-object slots
+    this._writeIndex = 0; // Accessed on EVERY write
+    this._capacity = capacity; // Checked on EVERY write
+    this.timestamp = new BigInt64Array(capacity); // Written EVERY entry
+    this.entry_type = new Uint8Array(capacity); // Written EVERY entry
+    this._next = undefined; // Checked on overflow (hot)
+
+    // Warm properties (tree structure, accessed during span creation)
+    this._parent = undefined;
+    this._children = [];
+    this._identity = new Uint8Array(12);
+    this._system = new ArrayBuffer(capacity * 9);
+    this._logBinding = module;
+
+    // Cold properties last (metadata, rarely accessed)
+    this._spanName = 'span';
+    this._scopeValues = undefined;
+    this._callsiteMetadata = undefined;
   }
 }
 ```
+
+**Rule of Thumb for Property Ordering:**
+
+1. **Positions 1-4**: Properties accessed on EVERY write (`_writeIndex`, `_capacity`, `timestamp`, `entry_type`)
+2. **Positions 5-10**: Properties accessed frequently during span lifecycle (`_next`, `_parent`, `_children`,
+   `_identity`, `_system`, `_logBinding`)
+3. **Positions 11+**: Cold properties (metadata, rarely-accessed fields)
+
+**Also important:**
+
+- **No dynamic property addition** - all properties must be assigned in constructor
+- **Consistent assignment order** - same order across all instances of the class
+- **Fixed shape** - never delete properties or change types
 
 ### 3. Inline Caching
 

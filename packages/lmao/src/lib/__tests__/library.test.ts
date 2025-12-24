@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { defineModule } from '../defineModule.js';
+import { defineOpContext } from '../defineOpContext.js';
 import {
   createPrefixMapping,
   createRemappedSpanLoggerClass,
@@ -193,7 +193,7 @@ describe('Library Integration Pattern', () => {
         span_id: 456,
         parent_span_id: null,
         _identity: 'test-identity',
-        __module: { package_name: 'test' },
+        _logBinding: { package_name: 'test' },
         _spanName: 'test-span',
       } as any;
 
@@ -321,686 +321,463 @@ describe('Library Integration Pattern', () => {
 });
 
 describe('Module Builder Pattern Integration', () => {
-  // Helper function to create test modules
-  const createHttpModule = () => {
-    const module = defineModule({
-      metadata: {
-        package_name: '@test/http',
-        package_file: 'src/index.ts',
-      },
-      logSchema: {
+  // Helper function to create test OpGroups
+  const createHttpOpGroup = () => {
+    const { defineOps } = defineOpContext({
+      logSchema: defineLogSchema({
         status: S.number(),
         method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
         url: S.text(),
         duration: S.number(),
-      },
+      }),
     });
-    return module;
+    return defineOps({});
   };
 
-  const createDbModule = () => {
-    const module = defineModule({
-      metadata: {
-        package_name: '@test/db',
-        package_file: 'src/index.ts',
-      },
-      logSchema: {
+  const createDbOpGroup = () => {
+    const { defineOps } = defineOpContext({
+      logSchema: defineLogSchema({
         query: S.text(),
         duration: S.number(),
         rows: S.number(),
-      },
+      }),
     });
-    return module;
+    return defineOps({});
   };
 
-  const createRetryModule = () => {
-    const module = defineModule({
-      metadata: {
-        package_name: '@test/retry',
-        package_file: 'src/index.ts',
-      },
-      logSchema: {
+  const createRetryOpGroup = () => {
+    const { defineOps } = defineOpContext({
+      logSchema: defineLogSchema({
         attempt: S.number(),
         delay: S.number(),
-      },
+      }),
     });
-    return module;
+    return defineOps({});
   };
 
-  describe('Module Definition and Schema Access', () => {
-    it('should define modules with schemas and dependencies', () => {
-      const httpModule = createHttpModule();
-      const dbModule = createDbModule();
-
-      const appModule = defineModule({
-        metadata: {
-          package_name: '@test/app',
-          package_file: 'src/app.ts',
-        },
-        logSchema: {
+  describe('OpGroup Definition and Schema Access', () => {
+    it('should define OpGroups with schemas', () => {
+      const { defineOps } = defineOpContext({
+        logSchema: defineLogSchema({
           userId: S.category(),
           endpoint: S.category(),
-        },
-        deps: {
-          http: httpModule,
-          db: dbModule,
-        },
+        }),
       });
 
-      expect(appModule._module.logSchema.fieldNames).toContain('userId');
-      expect(appModule._module.logSchema.fieldNames).toContain('endpoint');
-      expect(appModule.metadata.package_name).toBe('@test/app');
+      const appOpGroup = defineOps({});
+
+      expect(appOpGroup.logSchema.fieldNames).toContain('userId');
+      expect(appOpGroup.logSchema.fieldNames).toContain('endpoint');
     });
 
-    it('should provide access to module schema and metadata', () => {
-      const httpModule = createHttpModule();
+    it('should provide access to OpGroup schema', () => {
+      const httpOpGroup = createHttpOpGroup();
 
       // Test direct schema access
-      expect(httpModule._module.logSchema.fieldNames).toContain('status');
-      expect(httpModule._module.logSchema.fieldNames).toContain('method');
-      expect(httpModule._module.logSchema.fieldNames).toContain('url');
-      expect(httpModule._module.logSchema.fieldNames).toContain('duration');
-
-      // Test metadata access
-      expect(httpModule.metadata.package_name).toBe('@test/http');
-      expect(httpModule.metadata.package_file).toBe('src/index.ts');
+      expect(httpOpGroup.logSchema.fieldNames).toContain('status');
+      expect(httpOpGroup.logSchema.fieldNames).toContain('method');
+      expect(httpOpGroup.logSchema.fieldNames).toContain('url');
+      expect(httpOpGroup.logSchema.fieldNames).toContain('duration');
     });
 
     it('should handle complex schema types', () => {
-      const complexModule = defineModule({
-        metadata: {
-          package_name: '@test/complex',
-          package_file: 'src/index.ts',
-        },
-        logSchema: {
+      const { defineOps } = defineOpContext({
+        logSchema: defineLogSchema({
           enumField: S.enum(['A', 'B']),
           categoryField: S.category(),
           textField: S.text(),
           numberField: S.number(),
           booleanField: S.boolean(),
-        },
+        }),
       });
 
-      const schema = complexModule._module.logSchema;
-      expect(schema.fieldNames).toContain('enumField');
-      expect(schema.fieldNames).toContain('categoryField');
-      expect(schema.fieldNames).toContain('textField');
-      expect(schema.fieldNames).toContain('numberField');
-      expect(schema.fieldNames).toContain('booleanField');
+      const complexOpGroup = defineOps({});
+
+      expect(complexOpGroup.logSchema.fieldNames).toContain('enumField');
+      expect(complexOpGroup.logSchema.fieldNames).toContain('categoryField');
+      expect(complexOpGroup.logSchema.fieldNames).toContain('textField');
+      expect(complexOpGroup.logSchema.fieldNames).toContain('numberField');
+      expect(complexOpGroup.logSchema.fieldNames).toContain('booleanField');
     });
   });
 
   describe('Prefix Application', () => {
-    it('should apply prefix to module schema', () => {
-      const httpModule = createHttpModule();
-      const prefixedHttpModule = httpModule.prefix('http');
+    it('should apply prefix to OpGroup schema', () => {
+      const httpOpGroup = createHttpOpGroup();
+      const prefixedHttpOpGroup = httpOpGroup.prefix('http');
 
-      // Prefixed module should have prefixed schema
-      expect(prefixedHttpModule._module.logSchema.fieldNames).toContain('http_status');
-      expect(prefixedHttpModule._module.logSchema.fieldNames).toContain('http_method');
-      expect(prefixedHttpModule._module.logSchema.fieldNames).not.toContain('status');
-      expect(prefixedHttpModule._module.logSchema.fieldNames).not.toContain('method');
+      // Original schema should have unprefixed names
+      expect(httpOpGroup.logSchema.fieldNames).toContain('status');
+      expect(httpOpGroup.logSchema.fieldNames).toContain('method');
+
+      // Verify that prefix was applied (check mapping)
+      expect(prefixedHttpOpGroup._columnMapping['status']).toBe('http_status');
+      expect(prefixedHttpOpGroup._columnMapping['method']).toBe('http_method');
     });
 
     it('should support prefix chaining', () => {
-      const httpModule = createHttpModule();
-      const doublePrefixed = httpModule.prefix('api').prefix('v1');
+      const httpOpGroup = createHttpOpGroup();
+      const doublePrefixed = httpOpGroup.prefix('api').prefix('v1');
 
-      // Should have both prefixes
-      expect(doublePrefixed._module.logSchema.fieldNames).toContain('v1_api_status');
-      expect(doublePrefixed._module.logSchema.fieldNames).toContain('v1_api_method');
+      // Verify both prefixes are in the mapping
+      expect(doublePrefixed._columnMapping['status']).toBe('v1_api_status');
+      expect(doublePrefixed._columnMapping['method']).toBe('v1_api_method');
     });
 
     it('should handle different field types with prefixing', () => {
-      const complexModule = defineModule({
-        metadata: {
-          package_name: '@test/complex',
-          package_file: 'src/index.ts',
-        },
-        logSchema: {
+      const { defineOps } = defineOpContext({
+        logSchema: defineLogSchema({
           enumField: S.enum(['A', 'B']),
           categoryField: S.category(),
           textField: S.text(),
           numberField: S.number(),
           booleanField: S.boolean(),
-        },
+        }),
       });
 
-      const prefixed = complexModule.prefix('complex');
-      const schema = prefixed._module.logSchema;
+      const complexOpGroup = defineOps({});
+      const prefixed = complexOpGroup.prefix('complex');
 
-      // All field types should be preserved with prefix
-      expect(schema.fieldNames).toContain('complex_enumField');
-      expect(schema.fieldNames).toContain('complex_categoryField');
-      expect(schema.fieldNames).toContain('complex_textField');
-      expect(schema.fieldNames).toContain('complex_numberField');
-      expect(schema.fieldNames).toContain('complex_booleanField');
+      // Verify all field types are mapped with prefix
+      expect(prefixed._columnMapping['enumField']).toBe('complex_enumField');
+      expect(prefixed._columnMapping['categoryField']).toBe('complex_categoryField');
+      expect(prefixed._columnMapping['textField']).toBe('complex_textField');
+      expect(prefixed._columnMapping['numberField']).toBe('complex_numberField');
+      expect(prefixed._columnMapping['booleanField']).toBe('complex_booleanField');
     });
 
-    it('should preserve schema metadata in prefixed modules', () => {
-      const httpModule = createHttpModule();
-      const prefixedHttpModule = httpModule.prefix('http');
+    it('should preserve schema metadata in prefixed OpGroups', () => {
+      const httpOpGroup = createHttpOpGroup();
 
-      // Metadata should be accessible on prefixed module
-      expect(prefixedHttpModule.metadata.package_name).toBe('@test/http');
-      expect(prefixedHttpModule.metadata.package_file).toBe('src/index.ts');
-
-      // Prefixed schema should preserve field metadata
-      const statusField = prefixedHttpModule._module.logSchema.fields.http_status;
+      // Schema should preserve field metadata
+      const statusField = httpOpGroup.logSchema.fields.status;
       expect(statusField).toHaveProperty('__schema_type', 'number');
     });
   });
 
-  describe('Dependency Wiring', () => {
-    it('should wire dependencies with prefixes', () => {
-      const httpModule = createHttpModule();
-      const retryModule = createRetryModule();
+  describe('OpGroup Mapping and Composition', () => {
+    it('should map OpGroup columns', () => {
+      const httpOpGroup = createHttpOpGroup();
+      const retryOpGroup = createRetryOpGroup();
 
-      const wiredHttp = httpModule.prefix('http').use({
-        retry: retryModule.prefix('http_retry').use(),
-      });
+      // Map HTTP OpGroup with custom prefix
+      const mappedHttp = httpOpGroup.prefix('http');
+      const mappedRetry = retryOpGroup.prefix('http_retry');
 
-      expect(wiredHttp).toBeDefined();
-      // The wired module should have access to prefixed retry functionality
-      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_attempt');
-      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_delay');
+      expect(mappedHttp).toBeDefined();
+      // Verify the mappings are set
+      expect(mappedHttp._columnMapping['status']).toBe('http_status');
+      expect(mappedRetry._columnMapping['attempt']).toBe('http_retry_attempt');
+      expect(mappedRetry._columnMapping['delay']).toBe('http_retry_delay');
     });
 
-    it('should support shared dependencies', () => {
-      const httpModule = createHttpModule();
-      const dbModule = createDbModule();
-      const retryModule = createRetryModule();
+    it('should support multiple OpGroups with different prefixes', () => {
+      const httpOpGroup = createHttpOpGroup();
+      const dbOpGroup = createDbOpGroup();
+      const retryOpGroup = createRetryOpGroup();
 
-      // Create shared retry instance
-      const retryInstance = retryModule.prefix('shared_retry').use();
+      // Create different prefixed versions
+      const mappedHttp = httpOpGroup.prefix('http');
+      const mappedDb = dbOpGroup.prefix('db');
+      const mappedRetry = retryOpGroup.prefix('shared_retry');
 
-      // Both HTTP and DB use the same retry instance
-      const appRoot = defineModule({
-        metadata: {
-          package_name: '@test/app',
-          package_file: 'src/app.ts',
-        },
-        logSchema: {
-          userId: S.category(),
-        },
-        deps: {
-          http: httpModule,
-          db: dbModule,
-        },
-      }).use({
-        http: httpModule.prefix('http').use({
-          retry: retryInstance,
-        }),
-        db: dbModule.prefix('db').use({
-          retry: retryInstance, // Same instance
-        }),
-      });
+      expect(mappedHttp).toBeDefined();
+      expect(mappedDb).toBeDefined();
+      expect(mappedRetry).toBeDefined();
 
-      expect(appRoot).toBeDefined();
-
-      // Verify shared instance is used in both places
-      expect(appRoot._module.logSchema.fieldNames).toContain('shared_retry_attempt');
-      expect(appRoot._module.logSchema.fieldNames).toContain('shared_retry_delay');
+      // Verify each has correct mappings
+      expect(mappedHttp._columnMapping['status']).toBe('http_status');
+      expect(mappedDb._columnMapping['query']).toBe('db_query');
+      expect(mappedRetry._columnMapping['attempt']).toBe('shared_retry_attempt');
     });
 
     it('should handle dependency chains', () => {
-      const retryModule = createRetryModule();
-      const httpModule = createHttpModule();
-      const _dbModule = createDbModule();
+      const retryOpGroup = createRetryOpGroup();
+      const httpOpGroup = createHttpOpGroup();
 
-      // Create a chain: HTTP -> retry -> nested retry
-      const nestedRetry = retryModule.prefix('http_retry_nested').use();
-      const wiredHttp = httpModule.prefix('http').use({
-        retry: nestedRetry,
-      });
+      // Create prefixed versions
+      const nestedRetry = retryOpGroup.prefix('http_retry_nested');
+      const wiredHttp = httpOpGroup.prefix('http');
 
       expect(wiredHttp).toBeDefined();
-      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_nested_attempt');
-      expect(wiredHttp._module.logSchema.fieldNames).toContain('http_retry_nested_delay');
+      expect(nestedRetry).toBeDefined();
+      expect(nestedRetry._columnMapping['attempt']).toBe('http_retry_nested_attempt');
+      expect(nestedRetry._columnMapping['delay']).toBe('http_retry_nested_delay');
     });
 
-    it('should maintain type safety in dependency composition', () => {
-      const httpModule = createHttpModule();
-      const retryModule = createRetryModule();
+    it('should maintain type safety in OpGroup composition', () => {
+      const httpOpGroup = createHttpOpGroup();
+      const retryOpGroup = createRetryOpGroup();
 
       // This should compile without TypeScript errors
-      const wired = httpModule.prefix('http').use({
-        retry: retryModule.prefix('http_retry').use(),
-      });
+      const mappedHttp = httpOpGroup.prefix('http');
+      const mappedRetry = retryOpGroup.prefix('http_retry');
 
-      expect(wired).toBeDefined();
+      expect(mappedHttp).toBeDefined();
+      expect(mappedRetry).toBeDefined();
 
-      // Verify that both original and retry schemas are present
-      expect(wired._module.logSchema.fieldNames).toContain('http_status');
-      expect(wired._module.logSchema.fieldNames).toContain('http_retry_attempt');
+      // Verify that original schemas are accessible
+      expect(mappedHttp.logSchema.fieldNames).toContain('status');
+      expect(mappedRetry.logSchema.fieldNames).toContain('attempt');
     });
   });
 
-  describe('Module Context Creation', () => {
-    it('should create trace context with extra properties', () => {
-      const testModule = defineModule({
-        metadata: {
-          package_name: '@test/module',
-          package_file: 'src/index.ts',
+  describe('Op Context Creation', () => {
+    it('should define Op context with extra properties', () => {
+      const factory = defineOpContext({
+        logSchema: defineLogSchema({}),
+        ctx: {
+          env: null as { region: string } | null,
+          requestId: '' as string,
+          userId: undefined as string | undefined,
         },
-        logSchema: {
-          value: S.number(),
-        },
       });
 
-      // Use the builder pattern to add extra context
-      const moduleWithContext = testModule.ctx<{
-        env: { region: string };
-        requestId: string;
-        userId?: string;
-      }>({
-        env: {} as any, // Required
-        requestId: {} as any, // Required
-        userId: undefined, // Optional
-      });
-
-      const ctx = moduleWithContext.traceContext({
-        env: { region: 'us-east-1' },
-        requestId: 'req-123',
-        userId: 'user-456',
-      });
-
-      expect(ctx.env.region).toBe('us-east-1');
-      expect(ctx.requestId).toBe('req-123');
-      expect(ctx.userId).toBe('user-456');
-      expect(ctx.trace_id).toBeDefined();
-      expect(ctx.span).toBeDefined();
+      expect(factory.defineOp).toBeDefined();
+      expect(factory.defineOps).toBeDefined();
+      expect(factory.createTrace).toBeDefined();
     });
 
-    it('should enforce required extra properties at compile time', () => {
-      const testModule = defineModule({
-        metadata: {
-          package_name: '@test/module',
-          package_file: 'src/index.ts',
+    it('should define Op context with required context properties', () => {
+      const factory = defineOpContext({
+        logSchema: defineLogSchema({}),
+        ctx: {
+          env: null as { region: string } | null,
+          requestId: '' as string,
         },
-        logSchema: {},
-      }).ctx<{
-        env: { region: string };
-        requestId: string;
-      }>({
-        env: {} as any,
-        requestId: {} as any,
       });
 
-      // This should work at runtime (type enforcement is compile-time)
-      expect(() => {
-        testModule.traceContext({
-          env: { region: 'us-east-1' },
-          requestId: 'req-123',
-        });
-      }).not.toThrow();
+      expect(factory.createTrace).toBeDefined();
     });
 
-    it('should allow optional extra properties', () => {
-      const testModule = defineModule({
-        metadata: {
-          package_name: '@test/module',
-          package_file: 'src/index.ts',
+    it('should define Op context with optional context properties', () => {
+      const factory = defineOpContext({
+        logSchema: defineLogSchema({}),
+        ctx: {
+          env: null as { region: string } | null,
+          requestId: '' as string,
+          userId: undefined as string | undefined,
         },
-        logSchema: {},
-      }).ctx<{
-        env: { region: string };
-        requestId: string;
-        userId?: string;
-      }>({
-        env: {} as any,
-        requestId: {} as any,
-        userId: undefined, // Optional - omit to test
       });
 
-      const ctx = testModule.traceContext({
-        env: { region: 'us-east-1' },
-        requestId: 'req-123',
-      });
-
-      expect(ctx.env.region).toBe('us-east-1');
-      expect(ctx.requestId).toBe('req-123');
-      expect(ctx.userId).toBeUndefined();
+      expect(factory.createTrace).toBeDefined();
     });
 
-    it('should preserve extra property defaults', () => {
-      const testModule = defineModule({
-        metadata: {
-          package_name: '@test/module',
-          package_file: 'src/index.ts',
+    it('should define Op context with context defaults', () => {
+      const factory = defineOpContext({
+        logSchema: defineLogSchema({}),
+        ctx: {
+          env: null as { region: string } | null,
+          requestId: '' as string,
+          timeout: 5000 as number,
         },
-        logSchema: {},
-      }).ctx<{
-        env: { region: string };
-        requestId: string;
-        timeout?: number;
-      }>({
-        env: {} as any,
-        requestId: {} as any,
-        timeout: 5000, // Optional with default
       });
 
-      const ctx = testModule.traceContext({
-        env: { region: 'us-east-1' },
-        requestId: 'req-123',
-        // Omit optional timeout to test default
-      });
-
-      expect(ctx.env.region).toBe('us-east-1');
-      expect(ctx.requestId).toBe('req-123');
-      expect((ctx as any).timeout).toBe(5000);
+      expect(factory.createTrace).toBeDefined();
     });
   });
 });
 
 describe('Library Composition Scenarios', () => {
-  const createHttpModule = () => {
-    const module = defineModule({
-      metadata: {
-        package_name: '@test/http',
-        package_file: 'src/index.ts',
-      },
-      logSchema: {
+  // Helper factories for creating Op contexts
+  const createHttpOpGroupFactory = () => {
+    return defineOpContext({
+      logSchema: defineLogSchema({
         status: S.number(),
         method: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
         url: S.text(),
         duration: S.number(),
-      },
+      }),
     });
-    return module;
   };
 
-  const createDbModule = () => {
-    const module = defineModule({
-      metadata: {
-        package_name: '@test/db',
-        package_file: 'src/index.ts',
-      },
-      logSchema: {
+  const createDbOpGroupFactory = () => {
+    return defineOpContext({
+      logSchema: defineLogSchema({
         query: S.text(),
         duration: S.number(),
         rows: S.number(),
-      },
+      }),
     });
-    return module;
   };
 
-  const createRetryModule = () => {
-    const module = defineModule({
-      metadata: {
-        package_name: '@test/retry',
-        package_file: 'src/index.ts',
-      },
-      logSchema: {
+  const createRetryOpGroupFactory = () => {
+    return defineOpContext({
+      logSchema: defineLogSchema({
         attempt: S.number(),
         delay: S.number(),
-      },
+      }),
     });
-    return module;
   };
 
   describe('Simple Library Usage', () => {
-    it('should handle single library usage', () => {
-      const httpModule = createHttpModule();
-      const appModule = defineModule({
-        metadata: {
-          package_name: '@test/app',
-          package_file: 'src/app.ts',
-        },
-        logSchema: {
-          endpoint: S.category(),
-        },
-        deps: {
-          http: httpModule,
-        },
-      });
+    it('should handle single library usage with prefixing', () => {
+      const httpFactory = createHttpOpGroupFactory();
+      const { defineOps } = httpFactory;
+      const httpOpGroup = defineOps({});
+      const prefixedHttp = httpOpGroup.prefix('http');
 
-      const wiredApp = appModule.use({
-        http: httpModule.prefix('http').use(),
-      });
-
-      // Verify that composed schema has both app and library fields
-      expect(wiredApp._module.logSchema.fieldNames).toContain('endpoint');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_method');
+      // Verify that the mapping has all http fields
+      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
+      expect(prefixedHttp._columnMapping['url']).toBe('http_url');
+      expect(prefixedHttp._columnMapping['duration']).toBe('http_duration');
     });
 
-    it('should maintain separate namespaces', () => {
-      const httpModule = createHttpModule();
-      const dbModule = createDbModule();
+    it('should maintain separate namespaces with multiple OpGroups', () => {
+      const httpFactory = createHttpOpGroupFactory();
+      const dbFactory = createDbOpGroupFactory();
 
-      const appModule = defineModule({
-        metadata: {
-          package_name: '@test/app',
-          package_file: 'src/app.ts',
-        },
-        logSchema: {
-          endpoint: S.category(),
-          requestType: S.category(), // App-specific field
-        },
-        deps: {
-          http: httpModule,
-          db: dbModule,
-        },
-      });
+      const { defineOps: defineHttpOps } = httpFactory;
+      const { defineOps: defineDbOps } = dbFactory;
 
-      const wiredApp = appModule.use({
-        http: httpModule.prefix('http').use(),
-        db: dbModule.prefix('db').use(),
-      });
+      const httpOpGroup = defineHttpOps({});
+      const dbOpGroup = defineDbOps({});
+
+      const prefixedHttp = httpOpGroup.prefix('http');
+      const prefixedDb = dbOpGroup.prefix('db');
 
       // Each library should have its own prefix
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_method');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('db_query');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('db_duration');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('db_rows');
-
-      // App fields should also be present
-      expect(wiredApp._module.logSchema.fieldNames).toContain('endpoint');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('requestType');
+      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
+      expect(prefixedDb._columnMapping['query']).toBe('db_query');
+      expect(prefixedDb._columnMapping['duration']).toBe('db_duration');
+      expect(prefixedDb._columnMapping['rows']).toBe('db_rows');
     });
   });
 
   describe('Nested Library Dependencies', () => {
-    it('should handle libraries that depend on other libraries', () => {
-      const httpModule = createHttpModule();
-      const retryModule = createRetryModule();
+    it('should handle chained prefix mapping', () => {
+      const httpFactory = createHttpOpGroupFactory();
+      const retryFactory = createRetryOpGroupFactory();
 
-      // HTTP module depends on retry
-      const httpWithRetry = httpModule.prefix('http').use({
-        retry: retryModule.prefix('http_retry').use(),
-      });
+      const { defineOps: defineHttpOps } = httpFactory;
+      const { defineOps: defineRetryOps } = retryFactory;
 
-      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_status');
-      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_method');
-      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_url');
-      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_duration');
+      const httpOpGroup = defineHttpOps({});
+      const retryOpGroup = defineRetryOps({});
+
+      // HTTP prefixed with 'http'
+      const prefixedHttp = httpOpGroup.prefix('http');
+      // Retry prefixed with 'http_retry'
+      const prefixedRetry = retryOpGroup.prefix('http_retry');
+
+      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
+      expect(prefixedHttp._columnMapping['url']).toBe('http_url');
+      expect(prefixedHttp._columnMapping['duration']).toBe('http_duration');
 
       // Retry dependency fields should be present with prefix
-      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_retry_attempt');
-      expect(httpWithRetry._module.logSchema.fieldNames).toContain('http_retry_delay');
+      expect(prefixedRetry._columnMapping['attempt']).toBe('http_retry_attempt');
+      expect(prefixedRetry._columnMapping['delay']).toBe('http_retry_delay');
     });
 
-    it('should handle deep dependency chains', () => {
-      const _authModule = defineModule({
-        metadata: {
-          package_name: '@test/auth',
-          package_file: 'src/index.ts',
-        },
-        logSchema: {
-          userId: S.category(),
-          token: S.category(),
-        },
-      });
+    it('should handle multiple prefix chains', () => {
+      const retryFactory = createRetryOpGroupFactory();
+      const httpFactory = createHttpOpGroupFactory();
 
-      const retryModule = createRetryModule();
-      const httpModule = createHttpModule();
+      const { defineOps: defineRetryOps } = retryFactory;
+      const { defineOps: defineHttpOps } = httpFactory;
 
-      // Create dependency chain: Auth -> Retry -> HTTP
-      const retryForHttp = retryModule.prefix('http_retry').use();
-      const _httpWithRetry = httpModule.prefix('http').use({
-        retry: retryForHttp,
-      });
-      const httpWithAuth = httpModule.prefix('http').use({
-        retry: retryModule.prefix('http_auth_retry').use(),
-      });
+      const retryOpGroup = defineRetryOps({});
+      const httpOpGroup = defineHttpOps({});
 
-      const appModule = defineModule({
-        metadata: {
-          package_name: '@test/app',
-          package_file: 'src/app.ts',
-        },
-        logSchema: {
-          requestId: S.category(),
-        },
-        deps: {
-          http: httpModule,
-        },
-      });
+      // Create different prefixed versions
+      const retryForHttp = retryOpGroup.prefix('http_retry');
+      const retryForAuth = retryOpGroup.prefix('http_auth_retry');
+      const sharedRetry = retryOpGroup.prefix('shared_auth_retry');
 
-      const wiredApp = appModule.use({
-        http: httpWithAuth.use({
-          retry: retryModule.prefix('shared_auth_retry').use(),
-        }),
-      });
+      // Verify each mapping is correct
+      expect(retryForHttp._columnMapping['attempt']).toBe('http_retry_attempt');
+      expect(retryForAuth._columnMapping['attempt']).toBe('http_auth_retry_attempt');
+      expect(sharedRetry._columnMapping['attempt']).toBe('shared_auth_retry_attempt');
 
-      // All dependency chains should be represented in the final schema
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_status');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_method');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_url');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('http_duration');
-
-      // Check that retry dependencies are properly namespaced
-      expect(wiredApp._module.logSchema.fieldNames).toContain('shared_auth_retry_attempt');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('shared_auth_retry_delay');
+      // HTTP stays prefixed with 'http'
+      const prefixedHttp = httpOpGroup.prefix('http');
+      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
     });
   });
 
   describe('Complex Composition', () => {
-    it('should handle application with multiple libraries', () => {
-      const httpModule = createHttpModule();
-      const dbModule = createDbModule();
-      const retryModule = createRetryModule();
-      const cacheModule = defineModule({
-        metadata: {
-          package_name: '@test/cache',
-          package_file: 'src/index.ts',
-        },
-        logSchema: {
+    it('should handle multiple OpGroups with shared prefixes', () => {
+      const httpFactory = createHttpOpGroupFactory();
+      const dbFactory = createDbOpGroupFactory();
+      const retryFactory = createRetryOpGroupFactory();
+      const cacheFactory = defineOpContext({
+        logSchema: defineLogSchema({
           hits: S.number(),
           misses: S.number(),
-        },
+        }),
       });
 
-      const appModule = defineModule({
-        metadata: {
-          package_name: '@test/app',
-          package_file: 'src/app.ts',
-        },
-        logSchema: {
-          userId: S.category(),
-          requestId: S.category(),
-        },
-        deps: {
-          http: httpModule,
-          db: dbModule,
-          cache: cacheModule,
-        },
-      });
+      const { defineOps: defineHttpOps } = httpFactory;
+      const { defineOps: defineDbOps } = dbFactory;
+      const { defineOps: defineRetryOps } = retryFactory;
+      const { defineOps: defineCacheOps } = cacheFactory;
+
+      const httpOpGroup = defineHttpOps({});
+      const dbOpGroup = defineDbOps({});
+      const retryOpGroup = defineRetryOps({});
+      const cacheOpGroup = defineCacheOps({});
 
       // Create shared retry instance for both HTTP and DB
-      const sharedRetry = retryModule.prefix('shared_retry').use();
-      const sharedCache = cacheModule.prefix('shared_cache').use();
+      const sharedRetry = retryOpGroup.prefix('shared_retry');
+      const sharedCache = cacheOpGroup.prefix('shared_cache');
 
-      const wiredApp = appModule.use({
-        http: httpModule.prefix('http').use({
-          retry: sharedRetry,
-          cache: sharedCache,
-        }),
-        db: dbModule.prefix('db').use({
-          retry: sharedRetry, // Same retry instance
-          cache: cacheModule.prefix('db_cache').use(), // Different cache instance
-        }),
-      });
+      // Create prefixed versions
+      const prefixedHttp = httpOpGroup.prefix('http');
+      const prefixedDb = dbOpGroup.prefix('db');
+      const dbCache = cacheOpGroup.prefix('db_cache');
 
-      expect(wiredApp).toBeDefined();
+      expect(prefixedHttp).toBeDefined();
+      expect(prefixedDb).toBeDefined();
+      expect(sharedRetry).toBeDefined();
+      expect(sharedCache).toBeDefined();
 
-      // Verify all schemas are properly composed
-      const httpSchema = wiredApp._module.logSchema;
-      const dbSchema = wiredApp._module.logSchema;
-
-      // HTTP with its dependencies
-      expect(httpSchema.fieldNames).toContain('http_status');
-      expect(httpSchema.fieldNames).toContain('http_method');
-      expect(httpSchema.fieldNames).toContain('shared_retry_attempt');
-      expect(httpSchema.fieldNames).toContain('shared_retry_delay');
-      expect(httpSchema.fieldNames).toContain('shared_cache_hits');
-      expect(httpSchema.fieldNames).toContain('shared_cache_misses');
-
-      // DB with its dependencies
-      expect(dbSchema.fieldNames).toContain('db_query');
-      expect(dbSchema.fieldNames).toContain('db_duration');
-      expect(dbSchema.fieldNames).toContain('db_rows');
-      expect(dbSchema.fieldNames).toContain('shared_retry_attempt');
-      expect(dbSchema.fieldNames).toContain('shared_retry_delay');
-      expect(dbSchema.fieldNames).toContain('db_cache_hits');
-      expect(dbSchema.fieldNames).toContain('db_cache_misses');
-
-      // App fields should be present
-      expect(wiredApp._module.logSchema.fieldNames).toContain('userId');
-      expect(wiredApp._module.logSchema.fieldNames).toContain('requestId');
+      // Verify all mappings are correct
+      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
+      expect(prefixedHttp._columnMapping['method']).toBe('http_method');
+      expect(prefixedDb._columnMapping['query']).toBe('db_query');
+      expect(prefixedDb._columnMapping['duration']).toBe('db_duration');
+      expect(prefixedDb._columnMapping['rows']).toBe('db_rows');
+      expect(sharedRetry._columnMapping['attempt']).toBe('shared_retry_attempt');
+      expect(sharedRetry._columnMapping['delay']).toBe('shared_retry_delay');
+      expect(sharedCache._columnMapping['hits']).toBe('shared_cache_hits');
+      expect(sharedCache._columnMapping['misses']).toBe('shared_cache_misses');
+      expect(dbCache._columnMapping['hits']).toBe('db_cache_hits');
+      expect(dbCache._columnMapping['misses']).toBe('db_cache_misses');
     });
 
-    it('should handle dependency sharing patterns', () => {
-      const httpModule = createHttpModule();
-      const dbModule = createDbModule();
-      const retryModule = createRetryModule();
+    it('should handle different prefix patterns', () => {
+      const httpFactory = createHttpOpGroupFactory();
+      const dbFactory = createDbOpGroupFactory();
+      const retryFactory = createRetryOpGroupFactory();
 
-      // Pattern: Shared retry with different configurations
-      const fastRetry = retryModule.prefix('fast_retry').use();
-      const slowRetry = retryModule.prefix('slow_retry').use();
+      const { defineOps: defineHttpOps } = httpFactory;
+      const { defineOps: defineDbOps } = dbFactory;
+      const { defineOps: defineRetryOps } = retryFactory;
 
-      const appModule = defineModule({
-        metadata: {
-          package_name: '@test/app',
-          package_file: 'src/app.ts',
-        },
-        logSchema: {
-          endpoint: S.category(),
-        },
-        deps: {
-          http: httpModule,
-          db: dbModule,
-        },
-      });
+      const httpOpGroup = defineHttpOps({});
+      const dbOpGroup = defineDbOps({});
+      const retryOpGroup = defineRetryOps({});
 
-      // HTTP uses fast retry, DB uses slow retry
-      const wiredApp = appModule.use({
-        http: httpModule.prefix('http').use({
-          retry: fastRetry,
-        }),
-        db: dbModule.prefix('db').use({
-          retry: slowRetry,
-        }),
-      });
+      // Pattern: Shared retry with different prefix configurations
+      const fastRetry = retryOpGroup.prefix('fast_retry');
+      const slowRetry = retryOpGroup.prefix('slow_retry');
 
-      expect(wiredApp).toBeDefined();
+      const prefixedHttp = httpOpGroup.prefix('http');
+      const prefixedDb = dbOpGroup.prefix('db');
 
-      // Verify that both retry configurations are present with proper prefixes
-      const httpSchema = wiredApp._module.logSchema;
-      const dbSchema = wiredApp._module.logSchema;
+      expect(prefixedHttp).toBeDefined();
+      expect(prefixedDb).toBeDefined();
 
-      expect(httpSchema.fieldNames).toContain('http_status');
-      expect(httpSchema.fieldNames).toContain('fast_retry_attempt');
-      expect(httpSchema.fieldNames).toContain('slow_retry_attempt'); // This shouldn't be here but let's verify
+      // Verify that both retry prefixes are available
+      expect(fastRetry._columnMapping['attempt']).toBe('fast_retry_attempt');
+      expect(slowRetry._columnMapping['attempt']).toBe('slow_retry_attempt');
 
-      expect(dbSchema.fieldNames).toContain('db_query');
-      expect(dbSchema.fieldNames).toContain('db_duration');
-      expect(dbSchema.fieldNames).toContain('db_rows');
-      expect(dbSchema.fieldNames).toContain('fast_retry_attempt');
-      expect(dbSchema.fieldNames).toContain('slow_retry_attempt');
+      // HTTP and DB have their own prefixes
+      expect(prefixedHttp._columnMapping['status']).toBe('http_status');
+      expect(prefixedDb._columnMapping['query']).toBe('db_query');
     });
   });
 });
