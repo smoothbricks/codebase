@@ -10,6 +10,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
@@ -79,9 +80,48 @@ describe('RemappedBufferView Integration', () => {
       // Verify buffer has rows written
       expect(rootBuffer._writeIndex).toBeGreaterThan(0);
 
-      // Note: Arrow conversion may require additional module metadata setup
-      // which is handled differently in the Op-centric API.
-      // Testing buffer state rather than full Arrow conversion here.
+      // Convert to Arrow table and verify schema
+      const table = convertSpanTreeToArrowTable(rootBuffer);
+
+      // Should have rows
+      expect(table.numRows).toBeGreaterThan(0);
+
+      // Verify user attribute columns exist in schema
+      const fieldNames = table.schema.fields.map((f) => f.name);
+      expect(fieldNames).toContain('userId');
+      expect(fieldNames).toContain('action');
+
+      // Verify system columns exist
+      expect(fieldNames).toContain('timestamp');
+      expect(fieldNames).toContain('trace_id');
+      expect(fieldNames).toContain('span_id');
+      expect(fieldNames).toContain('entry_type');
+      expect(fieldNames).toContain('package_name');
+      expect(fieldNames).toContain('message');
+
+      // Verify actual data values in rows
+      // Collect all rows for easier debugging
+      const rows: Record<string, unknown>[] = [];
+      for (let i = 0; i < table.numRows; i++) {
+        rows.push(table.get(i)?.toJSON() as Record<string, unknown>);
+      }
+
+      // Find the row with our userId (should be the tag row or span-start row)
+      const userIdRow = rows.find((r) => r.userId === 'test-user');
+      expect(userIdRow).toBeDefined();
+      expect(userIdRow?.userId).toBe('test-user');
+      expect(userIdRow?.action).toBe('create');
+
+      // Find the log message row
+      const logRow = rows.find((r) => r.message === 'Test log message');
+      expect(logRow).toBeDefined();
+      expect(logRow?.message).toBe('Test log message');
+
+      // Verify entry types are present (span-start, info log, span-ok)
+      const entryTypes = rows.map((r) => r.entry_type);
+      expect(entryTypes).toContain('span-start');
+      expect(entryTypes).toContain('info');
+      expect(entryTypes).toContain('span-ok');
     });
   });
 

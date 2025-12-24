@@ -70,8 +70,9 @@ export type { FeatureFlagDefinition, InferSchema, SchemaFields } from '../schema
 /**
  * Unique symbol to carry OpContext type on OpContextFactory.
  * Allows extracting the bundled type without passing 4 separate params.
+ * Must be a runtime value (not just `declare const`) so it can be used as property key.
  */
-declare const opContextType: unique symbol;
+const opContextType: unique symbol = Symbol('opContextType');
 
 /**
  * Helper to extract OpContext from a factory.
