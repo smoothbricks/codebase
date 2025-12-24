@@ -113,6 +113,7 @@ describe('Span Scope Attributes', () => {
         });
 
         expect(childResult.success).toBe(true);
+        expect(childResult.value.success).toBe(true);
         return ctx.ok('done');
       });
 
@@ -191,7 +192,7 @@ describe('Span Scope Attributes', () => {
           return childCtx.ok('child-done');
         });
 
-        return ctx.ok(childResult);
+        return childResult;
       });
 
       const traceCtx = createTrace({});

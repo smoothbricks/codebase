@@ -183,7 +183,7 @@ describe('Child Span Lifecycle', () => {
         return childCtx.ok('child success');
       });
 
-      return ctx.ok(childResult);
+      return childResult;
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
@@ -198,6 +198,7 @@ describe('Child Span Lifecycle', () => {
       await ctx.span('childSpan', async (_childCtx) => {
         throw new Error('Child span error');
       });
+      return ctx.ok(undefined);
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
@@ -258,7 +259,7 @@ describe('Child Span Lifecycle', () => {
       // This should create a child span, not a root span
       const childResult = await ctx.span('child-task', childOp);
 
-      return ctx.ok(childResult);
+      return childResult;
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
@@ -401,15 +402,16 @@ describe('FluentResult Type Compatibility', () => {
 
       // Should be able to access success property directly
       if (result.success) {
-        return result.value;
+        return ctx.ok(result.value);
       }
-      return null;
+      return ctx.ok(null);
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
 
     const result = await traceCtx.span('testTask', testOp);
-    expect(result).toEqual({ id: 123 });
+    expect(result.success).toBe(true);
+    expect(result.value).toEqual({ id: 123 });
   });
 
   it('should allow direct access to error property', async () => {
@@ -418,9 +420,9 @@ describe('FluentResult Type Compatibility', () => {
 
       // Should be able to access error property directly
       if (!result.success) {
-        return result.error.code;
+        return ctx.ok(result.error.code);
       }
-      return null;
+      return ctx.ok(null);
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });

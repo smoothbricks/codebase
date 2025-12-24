@@ -423,10 +423,11 @@ describe('Schema Integration Patterns', () => {
           // Child span with chained tags - tag is on childCtx directly, not on childCtx.log
           childCtx.tag.operation('SELECT').query('SELECT * FROM users').duration(5.2).httpStatus(200);
 
-          return { found: true };
+          return childCtx.ok({ found: true });
         });
 
-        expect(childResult.found).toBe(true);
+        expect(childResult.success).toBe(true);
+        expect(childResult.value.found).toBe(true);
 
         return ctx.ok({ success: true });
       });

@@ -36,16 +36,19 @@ describe('Type Narrowing with FluentResult', () => {
         const value = result.value;
         expect(value.id).toBe(123);
         expect(value.name).toBe('test');
-        return value;
+        return result;
       }
 
-      return null;
+      return ctx.ok(null);
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
-    expect(output).toEqual({ id: 123, name: 'test' });
+    expect(output.success).toBe(true);
+    if (output.success) {
+      expect(output.value).toEqual({ id: 123, name: 'test' });
+    }
   });
 
   it('should properly narrow error result type', async () => {
@@ -61,16 +64,19 @@ describe('Type Narrowing with FluentResult', () => {
         expect(error.code).toBe('TEST_ERROR');
         expect(error.details.field).toBe('email');
         expect(error.details.reason).toBe('invalid');
-        return error.code;
+        return ctx.ok(error.code);
       }
 
-      return null;
+      return ctx.ok(null);
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
-    expect(output).toBe('TEST_ERROR');
+    expect(output.success).toBe(true);
+    if (output.success) {
+      expect(output.value).toBe('TEST_ERROR');
+    }
   });
 
   it('should support chaining before type check', async () => {
@@ -82,16 +88,19 @@ describe('Type Narrowing with FluentResult', () => {
       // Type narrowing should still work after chaining
       if (result.success) {
         expect(result.value.id).toBe(456);
-        return result.value.id;
+        return ctx.ok(result.value.id);
       }
 
-      return 0;
+      return ctx.ok(0);
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
-    expect(output).toBe(456);
+    expect(output.success).toBe(true);
+    if (output.success) {
+      expect(output.value).toBe(456);
+    }
   });
 
   it('should handle error result with chaining', async () => {
@@ -107,15 +116,18 @@ describe('Type Narrowing with FluentResult', () => {
       if (!result.success) {
         expect(result.error.code).toBe('VALIDATION_ERROR');
         expect(result.error.details.message).toBe('Invalid input');
-        return result.error.code;
+        return ctx.ok(result.error.code);
       }
 
-      return 'OK';
+      return ctx.ok('OK');
     });
 
     const traceCtx = createTrace({ requestId: 'req1' });
 
     const output = await traceCtx.span('testOp', testOp);
-    expect(output).toBe('VALIDATION_ERROR');
+    expect(output.success).toBe(true);
+    if (output.success) {
+      expect(output.value).toBe('VALIDATION_ERROR');
+    }
   });
 });
