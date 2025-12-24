@@ -385,6 +385,12 @@ export function generateColumnBufferClass(
 
   const preambleCode = extension?.preamble ? `\n${extension.preamble}\n` : '';
 
+  // Custom inspect to avoid dumping huge TypedArrays in test output
+  const inspectMethod = `
+    [Symbol.for('nodejs.util.inspect.custom')](depth, opts) {
+      return \`${className} { _writeIndex: \${this._writeIndex}, _capacity: \${this._capacity}, trace_id: \${this.trace_id ?? 'N/A'} }\`;
+    }`;
+
   return `'use strict';
 const lazyColumnNames = ${JSON.stringify(lazyColumnNames)};
 class ${className} {
@@ -396,6 +402,7 @@ ${constructorCode.join('\n')}
   getNullsIfAllocated(columnName) { return this[\`_\${columnName}_nulls\`]; }
 ${getterMethods.join('\n')}
 ${setterMethods.join('\n')}
+${inspectMethod}
 ${extensionMethods}
 }
 return ${className};

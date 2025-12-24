@@ -13,10 +13,14 @@
 
 import { describe, expect, it } from 'bun:test';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
-import { defineOpContext } from '../defineOpContext.js';
+import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { Tracer, type TraceSink } from '../tracer.js';
 import type { AnySpanBuffer } from '../types.js';
+
+// Shared no-op sink for tests that don't need table output
+const noopSink: TraceSink = () => {};
 
 describe('Nested Library Tasks', () => {
   describe('4-level nesting WITHOUT library prefixes (regular module contexts)', () => {
@@ -102,8 +106,7 @@ describe('Nested Library Tasks', () => {
       });
 
       // Execute the nested op chain
-      const traceCtx = createTrace1({});
-      const result = await traceCtx.span('root-op', rootOp);
+      const result = await trace('root-op', rootOp);
 
       // Verify result
       expect(result.success).toBe(true);
@@ -642,7 +645,7 @@ describe('Nested Library Tasks', () => {
         nodeId: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const { defineOp, logBinding } = defineOpContext({
         logSchema: schema,
       });
 
@@ -709,7 +712,7 @@ describe('Nested Library Tasks', () => {
         order: S.number(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const { defineOp, logBinding } = defineOpContext({
         logSchema: schema,
       });
 
@@ -773,7 +776,7 @@ describe('Nested Library Tasks', () => {
         level: S.number(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const { defineOp, logBinding } = defineOpContext({
         logSchema: schema,
       });
 

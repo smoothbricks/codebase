@@ -20,9 +20,10 @@
 import { describe, expect, it } from 'bun:test';
 import fc from 'fast-check';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
-import { defineOpContext } from '../defineOpContext.js';
+import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { Tracer } from '../tracer.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: SpanBuffer generic types are complex, using any for test buffer capture
 type CapturedBuffer = any;
@@ -43,7 +44,17 @@ const opContext = defineOpContext({
   ctx: {} as Record<string, never>,
 });
 
-const { defineOp, createTrace } = opContext;
+// Extract the OpContext type for use with Tracer
+type TestOpContext = OpContextOf<typeof opContext>;
+
+const { defineOp, logBinding, ctxDefaults } = opContext;
+
+/**
+ * Helper to create a properly typed tracer for tests
+ */
+function createTestTracer() {
+  return new Tracer<TestOpContext>({ logBinding, sink: () => {}, ctxDefaults });
+}
 
 /**
  * Count rows in Arrow table by entry_type
@@ -90,8 +101,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
               return ctx.ok({ logged: numEntries });
             });
 
-            const trace = createTrace({});
-            const result = await trace.span('test', testOp);
+            const { trace } = createTestTracer();
+            const result = await trace('test', testOp);
 
             expect(result.success).toBe(true);
             expect(capturedBuffer).toBeDefined();
@@ -131,8 +142,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok({ count: numEntries });
       });
 
-      const trace = createTrace({});
-      const result = await trace.span('large-test', testOp);
+      const { trace } = createTestTracer();
+      const result = await trace('large-test', testOp);
 
       expect(result.success).toBe(true);
       expect(capturedBuffer).toBeDefined();
@@ -170,8 +181,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok('done');
       });
 
-      const trace = createTrace({});
-      await trace.span('order', testOp);
+      const { trace } = createTestTracer();
+      await trace('order', testOp);
 
       const table = convertSpanTreeToArrowTable(capturedBuffer!);
       const rows = extractRows(table);
@@ -207,8 +218,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
             return ctx.ok('done');
           });
 
-          const trace = createTrace({});
-          await trace.span('integrity', testOp);
+          const { trace } = createTestTracer();
+          await trace('integrity', testOp);
 
           const table = convertSpanTreeToArrowTable(capturedBuffer!);
           const rows = extractRows(table);
@@ -251,8 +262,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok('done');
       });
 
-      const trace = createTrace({});
-      await trace.span('types', testOp);
+      const { trace } = createTestTracer();
+      await trace('types', testOp);
 
       const table = convertSpanTreeToArrowTable(capturedBuffer!);
       const rows = extractRows(table);
@@ -308,8 +319,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok('parent-done');
       });
 
-      const trace = createTrace({});
-      const result = await trace.span('parent', parentOp);
+      const { trace } = createTestTracer();
+      const result = await trace('parent', parentOp);
 
       expect(result.success).toBe(true);
       expect(rootBuffer).toBeDefined();
@@ -388,8 +399,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok('l1');
       });
 
-      const trace = createTrace({});
-      await trace.span('level1', level1Op);
+      const { trace } = createTestTracer();
+      await trace('level1', level1Op);
 
       const table = convertSpanTreeToArrowTable(level1Buffer!);
       const counts = countRowsByEntryType(table);
@@ -412,8 +423,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok('empty');
       });
 
-      const trace = createTrace({});
-      await trace.span('empty', testOp);
+      const { trace } = createTestTracer();
+      await trace('empty', testOp);
 
       const table = convertSpanTreeToArrowTable(capturedBuffer!);
 
@@ -434,8 +445,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok('done');
       });
 
-      const trace = createTrace({});
-      await trace.span('single', testOp);
+      const { trace } = createTestTracer();
+      await trace('single', testOp);
 
       const table = convertSpanTreeToArrowTable(capturedBuffer!);
       expect(table.numRows).toBe(3); // span-start + info + span-ok
@@ -455,8 +466,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.err('VALIDATION_ERROR', { field: 'email' });
       });
 
-      const trace = createTrace({});
-      await trace.span('error', testOp);
+      const { trace } = createTestTracer();
+      await trace('error', testOp);
 
       const table = convertSpanTreeToArrowTable(capturedBuffer!);
       const counts = countRowsByEntryType(table);
@@ -476,9 +487,9 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         throw new Error('test exception');
       });
 
-      const trace = createTrace({});
+      const { trace } = createTestTracer();
 
-      await expect(trace.span('exception', testOp)).rejects.toThrow('test exception');
+      await expect(trace('exception', testOp)).rejects.toThrow('test exception');
 
       // Buffer should still have entries
       expect(capturedBuffer).toBeDefined();
@@ -521,8 +532,8 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
         return ctx.ok('done');
       });
 
-      const trace = createTrace({});
-      await trace.span('mixed', testOp);
+      const { trace } = createTestTracer();
+      await trace('mixed', testOp);
 
       const table = convertSpanTreeToArrowTable(capturedBuffer!);
       const counts = countRowsByEntryType(table);

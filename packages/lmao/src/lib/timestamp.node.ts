@@ -33,16 +33,18 @@ export function getTimestampNanos(anchorEpochNanos: bigint, anchorPerfNow: numbe
   return Nanoseconds.unsafe(anchorEpochNanos + elapsedNanos);
 }
 
-// Legacy compatibility - module-level anchor
-// DEPRECATED: Use per-trace anchors via buffer._traceRoot instead
-const legacyAnchorHrtime = process.hrtime.bigint();
-const legacyAnchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
-
-export function getTimestampNanosLegacy(): Nanoseconds {
-  return Nanoseconds.unsafe(legacyAnchorEpochNanos + (process.hrtime.bigint() - legacyAnchorHrtime));
+/**
+ * Create anchor values for a new trace.
+ * Call this once at trace creation, then pass the anchors to getTimestampNanos.
+ *
+ * Uses process.hrtime.bigint() for true nanosecond precision.
+ */
+export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfNow: number } {
+  return {
+    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
+    // Store as number for consistency with browser API (performance.now() returns number)
+    anchorPerfNow: Number(process.hrtime.bigint()),
+  };
 }
-
-// Set Nanoseconds.now to legacy implementation for backwards compatibility
-Nanoseconds.now = getTimestampNanosLegacy;
 
 export { Nanoseconds };

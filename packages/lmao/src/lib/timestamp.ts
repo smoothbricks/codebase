@@ -18,4 +18,15 @@ export function getTimestampNanos(anchorEpochNanos: bigint, anchorPerfNow: numbe
   return (anchorEpochNanos + elapsedNanos) as Nanoseconds;
 }
 
+/**
+ * Create anchor values for a new trace.
+ * Call this once at trace creation, then pass the anchors to getTimestampNanos.
+ */
+export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfNow: number } {
+  return {
+    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
+    anchorPerfNow: performance.now(),
+  };
+}
+
 export { Nanoseconds };

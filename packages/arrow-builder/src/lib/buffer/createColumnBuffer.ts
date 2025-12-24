@@ -14,7 +14,7 @@
 
 import type { ColumnSchema } from '../schema-types.js';
 import { createGeneratedColumnBuffer } from './columnBufferGenerator.js';
-import type { AnyColumnBuffer } from './types.js';
+import type { ColumnBuffer } from './types.js';
 import { DEFAULT_BUFFER_CAPACITY } from './types.js';
 
 /**
@@ -50,8 +50,11 @@ import { DEFAULT_BUFFER_CAPACITY } from './types.js';
  * @param requestedCapacity - Requested buffer capacity
  * @returns Generic ColumnBuffer with timestamps, operations, and direct attribute columns
  */
-export function createColumnBuffer(schema: ColumnSchema, requestedCapacity = DEFAULT_BUFFER_CAPACITY): AnyColumnBuffer {
-  return createGeneratedColumnBuffer(schema, requestedCapacity);
+export function createColumnBuffer<T extends ColumnSchema>(
+  schema: T,
+  requestedCapacity = DEFAULT_BUFFER_CAPACITY,
+): ColumnBuffer<T> {
+  return createGeneratedColumnBuffer(schema, requestedCapacity) as ColumnBuffer<T>;
 }
 
 // NOTE: Application-specific buffer types can extend ColumnBuffer in consumer packages

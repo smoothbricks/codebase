@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test';
 import { defineOpContext } from '../../defineOpContext.js';
+import { Tracer } from '../../tracer.js';
 import type { AnySpanBuffer } from '../../types.js';
 import { S } from '../builder.js';
 import { defineFeatureFlags } from '../defineFeatureFlags.js';
@@ -48,17 +49,18 @@ describe('Feature Flags', () => {
       maxRetries: S.number().default(3).sync(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
-        debugMode: true,
-        maxRetries: 5,
-      }),
     });
 
-    const trace = createTrace({});
-    const result = await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
+      debugMode: true,
+      maxRetries: 5,
+    });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const result = await trace('test-span', async (ctx) => {
       // Cast ff to access typed properties (type inference limitation)
       const ff = ctx.ff as unknown as {
         debugMode: BooleanFlagContext | undefined;
@@ -85,14 +87,15 @@ describe('Feature Flags', () => {
       userLimit: S.number().default(100).async(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {}), // No flags set → null values
     });
 
-    const trace = createTrace({});
-    await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {}); // No flags set → null values
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
       expect(ff.debugMode).toBeUndefined();
       return ctx.ok(null);
@@ -105,17 +108,18 @@ describe('Feature Flags', () => {
       dynamicProvider: S.enum(['stripe', 'paypal']).default('stripe').async(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
-        userSpecificLimit: 200,
-        dynamicProvider: 'paypal',
-      }),
     });
 
-    const trace = createTrace({});
-    await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
+      userSpecificLimit: 200,
+      dynamicProvider: 'paypal',
+    });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('test-span', async (ctx) => {
       // Async flags accessed via get() return FlagContext
       const limit = (await ctx.ff.get('userSpecificLimit')) as { value: number; track: () => void };
       expect(limit).toBeDefined();
@@ -134,16 +138,17 @@ describe('Feature Flags', () => {
       advancedValidation: S.boolean().default(false).sync(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
-        advancedValidation: true,
-      }),
     });
 
-    const trace = createTrace({});
-    await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
+      advancedValidation: true,
+    });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('test-span', async (ctx) => {
       (ctx.ff as { trackUsage: (flag: string, context: object) => void }).trackUsage('advancedValidation', {
         action: 'validation_performed',
         outcome: 'success',
@@ -162,16 +167,17 @@ describe('Feature Flags', () => {
       advancedValidation: S.boolean().default(false).sync(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
-        advancedValidation: true,
-      }),
     });
 
-    const trace = createTrace({});
-    await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
+      advancedValidation: true,
+    });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as { advancedValidation: BooleanFlagContext | undefined };
       const flag = ff.advancedValidation;
 
@@ -191,14 +197,15 @@ describe('Feature Flags', () => {
       debugMode: S.boolean().default(false).sync(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { debugMode: true }),
     });
 
-    const trace = createTrace({});
-    await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
 
       // Access the flag multiple times
@@ -224,14 +231,15 @@ describe('Feature Flags', () => {
       userLimit: S.number().default(100).async(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { userLimit: 200 }),
     });
 
-    const trace = createTrace({});
-    await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { userLimit: 200 });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('test-span', async (ctx) => {
       const value = (await ctx.ff.get('userLimit')) as { value: number };
       expect(value.value).toBe(200);
 
@@ -275,20 +283,21 @@ describe('Feature Flags', () => {
       customLimit: S.number().default(100).async(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, {
-        enableFeatureX: true,
-        maxConnectionPool: 20,
-        logLevel: 'debug',
-        userTier: 'premium',
-        customLimit: 500,
-      }),
     });
 
-    const trace = createTrace({});
-    await trace.span('test-span', async (ctx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
+      enableFeatureX: true,
+      maxConnectionPool: 20,
+      logLevel: 'debug',
+      userTier: 'premium',
+      customLimit: 500,
+    });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as {
         enableFeatureX: BooleanFlagContext | undefined;
         maxConnectionPool: { value: number; track: () => void } | undefined;
@@ -344,14 +353,15 @@ describe('Feature Flags', () => {
       debugMode: S.boolean().default(false).sync(),
     });
 
-    const { createTrace } = defineOpContext({
+    const { logBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { debugMode: true }),
     });
 
-    const trace = createTrace({});
-    await trace.span('parent-span', async (parentCtx) => {
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true });
+
+    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    await trace('parent-span', async (parentCtx) => {
       const parentFf = parentCtx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
 
       // Access flag in parent
@@ -383,14 +393,19 @@ describe('Feature Flags', () => {
     });
 
     // Scenario 1: darkMode is enabled
-    const { createTrace: createEnabledTrace } = defineOpContext({
+    const { logBinding: enabledLogBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { darkMode: true }),
     });
 
-    const enabledTrace = createEnabledTrace({});
-    await enabledTrace.span('test-enabled', async (ctx) => {
+    const enabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: true });
+    const { trace: enabledTrace } = new Tracer({
+      logBinding: enabledLogBinding,
+      sink: () => {},
+      flagEvaluator: enabledFlagEvaluator,
+    });
+
+    await enabledTrace('test-enabled', async (ctx) => {
       const ff = ctx.ff as unknown as { darkMode: BooleanFlagContext | undefined };
       const darkMode = ff.darkMode;
 
@@ -404,14 +419,19 @@ describe('Feature Flags', () => {
     });
 
     // Scenario 2: darkMode is disabled
-    const { createTrace: createDisabledTrace } = defineOpContext({
+    const { logBinding: disabledLogBinding } = defineOpContext({
       logSchema: testLogSchema,
       flags: flags.schema,
-      flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { darkMode: false }),
     });
 
-    const disabledTrace = createDisabledTrace({});
-    await disabledTrace.span('test-disabled', async (ctx) => {
+    const disabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: false });
+    const { trace: disabledTrace } = new Tracer({
+      logBinding: disabledLogBinding,
+      sink: () => {},
+      flagEvaluator: disabledFlagEvaluator,
+    });
+
+    await disabledTrace('test-disabled', async (ctx) => {
       const ff = ctx.ff as unknown as { darkMode: BooleanFlagContext | undefined };
       const darkModeDisabled = ff.darkMode;
 

@@ -4,28 +4,37 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { defineOpContext } from '../defineOpContext.js';
+import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { Tracer } from '../tracer.js';
 
 const testSchema = defineLogSchema({
   userId: S.category(),
   customField: S.category(),
 });
 
-// Create a factory for testing using the new Op-centric API
-function createTestFactory() {
-  return defineOpContext({
-    logSchema: testSchema,
-    ctx: {
-      requestId: undefined as string | undefined,
-    },
-  });
+// Create op context factory
+const opContext = defineOpContext({
+  logSchema: testSchema,
+  ctx: {
+    requestId: undefined as string | undefined,
+  },
+});
+
+// Extract the OpContext type for use with Tracer
+type TestOpContext = OpContextOf<typeof opContext>;
+
+const { defineOp, logBinding } = opContext;
+
+// Create a properly typed tracer
+function createTestTracer() {
+  return new Tracer<TestOpContext>({ logBinding, sink: () => {} });
 }
 
 describe('Type Narrowing with FluentResult', () => {
   it('should properly narrow success result type', async () => {
-    const { defineOp, createTrace } = createTestFactory();
+    const { trace } = createTestTracer();
 
     const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx.ok({ id: 123, name: 'test' });
@@ -42,9 +51,7 @@ describe('Type Narrowing with FluentResult', () => {
       return ctx.ok(null);
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const output = await traceCtx.span('testOp', testOp);
+    const output = await trace('testOp', testOp);
     expect(output.success).toBe(true);
     if (output.success) {
       expect(output.value).toEqual({ id: 123, name: 'test' });
@@ -52,7 +59,7 @@ describe('Type Narrowing with FluentResult', () => {
   });
 
   it('should properly narrow error result type', async () => {
-    const { defineOp, createTrace } = createTestFactory();
+    const { trace } = createTestTracer();
 
     const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx.err('TEST_ERROR', { field: 'email', reason: 'invalid' });
@@ -70,9 +77,7 @@ describe('Type Narrowing with FluentResult', () => {
       return ctx.ok(null);
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const output = await traceCtx.span('testOp', testOp);
+    const output = await trace('testOp', testOp);
     expect(output.success).toBe(true);
     if (output.success) {
       expect(output.value).toBe('TEST_ERROR');
@@ -80,7 +85,7 @@ describe('Type Narrowing with FluentResult', () => {
   });
 
   it('should support chaining before type check', async () => {
-    const { defineOp, createTrace } = createTestFactory();
+    const { trace } = createTestTracer();
 
     const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx.ok({ id: 456 }).with({ userId: 'user1' }).message('Success');
@@ -94,9 +99,7 @@ describe('Type Narrowing with FluentResult', () => {
       return ctx.ok(0);
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const output = await traceCtx.span('testOp', testOp);
+    const output = await trace('testOp', testOp);
     expect(output.success).toBe(true);
     if (output.success) {
       expect(output.value).toBe(456);
@@ -104,7 +107,7 @@ describe('Type Narrowing with FluentResult', () => {
   });
 
   it('should handle error result with chaining', async () => {
-    const { defineOp, createTrace } = createTestFactory();
+    const { trace } = createTestTracer();
 
     const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx
@@ -122,9 +125,7 @@ describe('Type Narrowing with FluentResult', () => {
       return ctx.ok('OK');
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const output = await traceCtx.span('testOp', testOp);
+    const output = await trace('testOp', testOp);
     expect(output.success).toBe(true);
     if (output.success) {
       expect(output.value).toBe('VALIDATION_ERROR');

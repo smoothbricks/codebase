@@ -4,49 +4,30 @@
  * Core type definitions for Ops - the first-class citizens of the Op-centric API.
  * Ops wrap functions with metadata and enable composition.
  *
+ * The Op class and OpMetadata interface are defined in ../op.ts (single source of truth)
+ * and re-exported here for convenience.
+ *
  * ## Dependency Layer
  * This module is at Layer 3 in the type hierarchy:
  * - Depends on: spanContextTypes (Layer 2), featureFlagTypes (Layer 1)
  * - Depended on by: opGroupTypes (Layer 4)
  */
 
-import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
-import type { Result } from '../result.js';
-import type { LogBinding } from '../types.js';
+import type { ExtractError, ExtractSuccess, Result } from '../result.js';
 import type { SpanContext } from './spanContextTypes.js';
 import type { OpContext } from './types.js';
 
 // =============================================================================
-// OP METADATA
+// OP CLASS & METADATA RE-EXPORTS
 // =============================================================================
 
-/**
- * Metadata injected by the transformer into each Op.
- * These values are determined at compile time from the source location.
- *
- * Includes pre-encoded UTF-8 entries for Arrow dictionary building -
- * encode once at Op definition time, reuse for every span conversion.
- */
-export interface OpMetadata {
-  /** Package name from package.json */
-  readonly package_name: string;
-  /** File path relative to package root */
-  readonly package_file: string;
-  /** Git SHA at build time */
-  readonly git_sha: string;
-  /** Line number where defineOp was called */
-  readonly line: number;
-
-  /** Pre-encoded package_name for Arrow dictionary building */
-  readonly package_name_entry: PreEncodedEntry;
-  /** Pre-encoded package_file for Arrow dictionary building */
-  readonly package_file_entry: PreEncodedEntry;
-  /** Pre-encoded git_sha for Arrow dictionary building */
-  readonly git_sha_entry: PreEncodedEntry;
-}
+// Re-export the Op class and OpMetadata from op.ts - single source of truth
+// The class is defined in op.ts to be the canonical type used by both
+// defineOp (creates instances) and Tracer (checks instanceof)
+export { Op, type OpMetadata } from '../op.js';
 
 // =============================================================================
-// OP FUNCTION & INTERFACE
+// OP FUNCTION TYPE
 // =============================================================================
 
 /**
@@ -63,25 +44,22 @@ export type OpFn<Ctx extends OpContext, Args extends unknown[], S, E> = (
   ...args: Args
 ) => Result<S, E> | Promise<Result<S, E>>;
 
-/**
- * Op instance - wraps a function with metadata.
- * MUST return Result<S, E> or Promise<Result<S, E>>.
- *
- * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
- * @template Args - Function arguments (after ctx)
- * @template S - Success type
- * @template E - Error type
- */
-export interface Op<Ctx extends OpContext, Args extends unknown[], S, E> {
-  readonly name: string;
-  readonly metadata: OpMetadata;
-  readonly logBinding: LogBinding;
-  readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>;
-}
-
 // =============================================================================
 // OP RECORD TRANSFORMATION
 // =============================================================================
+
+// Import Op class for use in OpsFromRecord type
+import type { Op } from '../op.js';
+
+/**
+ * Convert a single definition (Op or OpFn) to an Op type.
+ * Uses ExtractSuccess/ExtractError from result.ts to infer types from return value.
+ */
+type DefToOp<Ctx extends OpContext, Def> = Def extends Op<Ctx, infer Args, infer S, infer E>
+  ? Op<Ctx, Args, S, E>
+  : Def extends (ctx: SpanContext<Ctx>, ...args: infer Args) => infer R
+    ? Op<Ctx, Args, ExtractSuccess<R>, ExtractError<R>>
+    : never;
 
 /**
  * Transform a record of Op functions into Ops
@@ -97,11 +75,5 @@ export type OpsFromRecord<
   Ctx extends OpContext,
   Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
 > = {
-  [K in keyof Defs]: Defs[K] extends Op<Ctx, infer Args, infer S, infer E>
-    ? Op<Ctx, Args, S, E>
-    : Defs[K] extends (ctx: SpanContext<Ctx>, ...args: infer Args) => infer R
-      ? R extends Result<infer S, infer E> | Promise<Result<infer S, infer E>>
-        ? Op<Ctx, Args, S, E>
-        : never
-      : never;
+  [K in keyof Defs]: DefToOp<Ctx, Defs[K]>;
 };

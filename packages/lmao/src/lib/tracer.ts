@@ -1,55 +1,67 @@
 /**
- * Tracer - Entry point for creating traces with automatic buffer collection
+ * Tracer - Abstract base class for trace collection
  *
  * Per specs/01c_context_flow_and_op_wrappers.md:
  * - Tracer owns trace() function for creating root spans
- * - Collects SpanBuffers for flushing to external sinks
- * - Bound to application-level OpContext
+ * - Collects SpanBuffers in pendingBuffers array
+ * - Subclasses implement flush() to define persistence strategy
  *
- * ## Design Rationale
+ * ## Design Philosophy
  *
- * Each ESM module has its own `defineOpContext` with its own `LogBinding`.
- * We can't wire a single collector into all those at build time. Instead,
- * the Tracer is created at the application root and `trace()` is the entry
- * point that captures the root SpanBuffer.
+ * Tracer is ABSTRACT - no sink, no persistence assumptions:
+ * - `trace()` executes ops and collects buffers
+ * - `flush()` is abstract - subclasses decide what "flush" means
+ * - Flushing is always a hint (batching, rate limiting, async queues)
  *
- * The Tracer separates concerns:
- * 1. `defineOpContext` - Creates Op factory, schema binding, LogBinding (per-module)
- * 2. `Tracer` - Owns trace(), collects buffers, handles flushing (application-level)
+ * Concrete implementations might:
+ * - Send to queue (Cloudflare Queue, SQS, Kafka)
+ * - Write to disk/database
+ * - Send to observability backend (DataDog, Honeycomb)
+ * - Accumulate in memory for testing
+ * - Drop buffers (dev/testing no-op)
  *
  * @example
  * ```typescript
- * const appContext = defineOpContext({
- *   logSchema: appSchema,
- *   ctx: { env: null as Env },
- * });
+ * // Concrete implementation - Cloudflare Queue
+ * class QueueTracer extends Tracer {
+ *   constructor(config, private queue: Queue) {
+ *     super(config);
+ *   }
  *
- * const tracer = new Tracer(appContext, {
- *   sink: async (table) => { await queue.send(table); },
- * });
+ *   async flush() {
+ *     const buffers = this.takePendingBuffers();
+ *     for (const buffer of buffers) {
+ *       const table = convertSpanTreeToArrowTable(buffer);
+ *       await this.queue.send(table);
+ *     }
+ *   }
+ * }
  *
- * // In fetch handler
- * const response = await tracer.trace('fetch', { env }, async (ctx) => {
- *   ctx.tag.method('GET');
+ * // Usage
+ * const { trace, flush } = new QueueTracer({ logBinding }, env.TRACES);
+ * await trace('fetch', async (ctx) => {
+ *   ctx.tag.userId('user-123');
  *   return new Response('ok');
  * });
- *
- * executionContext.waitUntil(tracer.flush());
+ * executionContext.waitUntil(flush());
  * ```
  *
  * @module tracer
  */
 
-import type { Table } from 'apache-arrow';
 import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createSpanLogger as createSpanLoggerFromGenerator } from './codegen/spanLoggerGenerator.js';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
+import type { LogBinding } from './logBinding.js';
+import { Op } from './op.js';
+import type { TraceContextParams } from './opContext/contextTypes.js';
 import { createOpMetadata } from './opContext/defineOp.js';
-import type { DepsConfig, FeatureFlagSchema, OpContext, OpContextFactory, SpanContext } from './opContext/types.js';
-import type { LogSchema } from './schema/LogSchema.js';
+import type { OpContext, SpanContext } from './opContext/types.js';
+import type { Result } from './result.js';
+import type { FlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
-import type { SchemaFields } from './schema/types.js';
+
 import { createOverflowBuffer, createSpanBuffer } from './spanBuffer.js';
 import { createSpanContextProto, type MutableSpanContext, writeSpanStart } from './spanContext.js';
 import { getTimestampNanos } from './timestamp.js';
@@ -63,123 +75,196 @@ import type { AnySpanBuffer, SpanBuffer } from './types.js';
 /**
  * Sink function type - receives Arrow table for export
  */
-export type TraceSink = (table: Table) => Promise<void> | void;
+export type TraceSink = (table: import('apache-arrow').Table) => Promise<void> | void;
 
 /**
- * Tracer configuration
+ * Tracer configuration - runtime concerns only
+ *
+ * @typeParam Ctx - Bundled OpContext type (logSchema, flags, deps, userCtx)
  */
-export interface TracerConfig {
+export interface TracerConfig<Ctx extends OpContext> {
+  /**
+   * LogBinding from defineOpContext - contains schema and capacity stats
+   * Type matches OpContextFactory.logBinding for Op type safety
+   */
+  logBinding: LogBinding<Ctx['logSchema']>;
+
   /**
    * Sink function to export Arrow tables
    * Called during flush() with converted trace data
    */
   sink: TraceSink;
+
+  /**
+   * Optional feature flag evaluator
+   *
+   * Provides getSync/getAsync/forContext methods to resolve flag values at runtime.
+   * If not provided, ctx.ff will be an empty object.
+   *
+   * @example
+   * ```typescript
+   * flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { darkMode: true })
+   * ```
+   */
+  flagEvaluator?: FlagEvaluator<Ctx>;
+
+  /**
+   * User context defaults from defineOpContext ctx config.
+   *
+   * Properties with null values are required at trace creation.
+   * Properties with other values are defaults that can be overridden.
+   *
+   * @example
+   * ```typescript
+   * ctxDefaults: { env: null, config: { retryCount: 3 } }
+   * ```
+   */
+  ctxDefaults?: Ctx['userCtx'];
 }
 
 /**
- * Override parameters for trace()
+ * Trace overrides - passed per-trace
  *
- * Combines optional trace ID with user context properties.
- * Required properties (null-sentinel) from ctx config must be provided here.
+ * @typeParam UserCtx - User context type from OpContext
  */
-export type TraceOverrides<UserCtx extends Record<string, unknown>> = Partial<UserCtx> & {
+export interface TraceOptions<UserCtx = Record<string, unknown>> {
   /** Use existing trace ID (e.g., from x-trace-id header) */
   traceId?: string | TraceId;
-  /** Parent span ID for distributed tracing (our root becomes their child) */
+  /** Parent span ID for distributed tracing */
   parentSpanId?: string;
-};
+  /** User context params - required props from null sentinels, optional overrides for defaults */
+  ctx?: TraceContextParams<UserCtx>;
+}
 
 // =============================================================================
 // Tracer Class
 // =============================================================================
 
 /**
- * Tracer - Entry point for creating traces
+ * Tracer - Concrete class for trace collection
  *
- * Per spec 01c_context_flow_and_op_wrappers.md:
- * - Owns trace() function for creating root spans
- * - Collects SpanBuffers for flushing
- * - Bound to application-level OpContext
+ * Provides trace execution, buffer collection, and flushing to sink.
  *
- * @typeParam T - Schema fields type
- * @typeParam FF - Feature flag schema
- * @typeParam Deps - Dependencies config
- * @typeParam UserCtx - User context properties (env, requestId, etc.)
+ * @typeParam Ctx - Bundled OpContext type (logSchema, flags, deps, userCtx)
  */
-export class Tracer<
-  T extends SchemaFields,
-  FF extends FeatureFlagSchema,
-  Deps extends DepsConfig,
-  UserCtx extends Record<string, unknown>,
-> {
-  private pendingBuffers: AnySpanBuffer[] = [];
+export class Tracer<Ctx extends OpContext> {
+  protected pendingBuffers: AnySpanBuffer[] = [];
+  private readonly logBinding: LogBinding<Ctx['logSchema']>;
   private readonly sink: TraceSink;
-  private readonly factory: OpContextFactory<LogSchema<T>, FF, Deps, UserCtx>;
   private readonly spanContextProto: Record<string | symbol, unknown>;
+  private readonly flagEvaluator?: FlagEvaluator<Ctx>;
+  private readonly ctxDefaults: Ctx['userCtx'];
 
-  constructor(factory: OpContextFactory<LogSchema<T>, FF, Deps, UserCtx>, config: TracerConfig) {
-    this.factory = factory;
+  constructor(config: TracerConfig<Ctx>) {
+    this.logBinding = config.logBinding;
     this.sink = config.sink;
+    this.flagEvaluator = config.flagEvaluator;
+    this.ctxDefaults = config.ctxDefaults ?? ({} as Ctx['userCtx']);
 
     // Create shared prototype for all SpanContexts created by this tracer
-    // This avoids recreating prototype methods per-trace
-    this.spanContextProto = createSpanContextProto<OpContext<LogSchema<T>, FF, {}, UserCtx>>(
-      factory.logSchema,
-      factory.logBinding,
-    );
+    this.spanContextProto = createSpanContextProto<Ctx>(config.logBinding.logSchema, config.logBinding);
+
+    // Bind methods for destructuring (per AGENTS.md - "Always destructure")
+    this.trace = this.trace.bind(this);
+    this.trace_op = this.trace_op.bind(this);
+    this.trace_fn = this.trace_fn.bind(this);
+    this.flush = this.flush.bind(this);
+    this.pendingCount = this.pendingCount.bind(this);
   }
 
-  /**
-   * Create a new trace with root span
-   *
-   * Consistent API with defineOp/span: name first, overrides second, body last.
-   * Returns exactly what the body returns (no Result wrapper).
-   *
-   * @param name - Root span name
-   * @param fn - Async function to execute in trace context
-   * @returns Promise resolving to fn's return value
-   */
-  trace<R>(name: string, fn: (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>): Promise<R>;
+  // ===========================================================================
+  // trace() - Polymorphic dispatcher (like span())
+  // ===========================================================================
 
-  /**
-   * Create a new trace with root span and overrides
-   *
-   * @param name - Root span name
-   * @param overrides - Trace ID and/or user context overrides
-   * @param fn - Async function to execute in trace context
-   * @returns Promise resolving to fn's return value
-   */
-  trace<R>(
+  // Overload 1: trace(name, op) - execute Op directly
+  trace<S, E>(name: string, op: Op<Ctx, [], S, E>): Promise<Result<S, E>>;
+
+  // Overload 2: trace(name, fn) - execute function (returns any value R, sync or async)
+  trace<R>(name: string, fn: (ctx: SpanContext<Ctx>) => R): R;
+
+  // Overload 3: trace(name, options, op)
+  trace<S, E>(name: string, options: TraceOptions<Ctx['userCtx']>, op: Op<Ctx, [], S, E>): Promise<Result<S, E>>;
+
+  // Overload 4: trace(name, options, fn) - execute function (returns any value R, sync or async)
+  trace<R>(name: string, options: TraceOptions<Ctx['userCtx']>, fn: (ctx: SpanContext<Ctx>) => R): R;
+
+  // Implementation
+  trace(
     name: string,
-    overrides: TraceOverrides<UserCtx>,
-    fn: (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>,
-  ): Promise<R>;
+    optionsOrOpOrFn: TraceOptions<Ctx['userCtx']> | Op<Ctx, [], any, any> | ((ctx: SpanContext<Ctx>) => any),
+    maybeOpOrFn?: Op<Ctx, [], any, any> | ((ctx: SpanContext<Ctx>) => any),
+  ): any {
+    // Parse overloaded arguments - dispatch to trace_op or trace_fn
+    // Pattern matches span() dispatcher in spanContext.ts
+    let options: TraceOptions<Ctx['userCtx']>;
+    let opOrFn: Op<Ctx, [], any, any> | ((ctx: SpanContext<Ctx>) => any);
 
-  async trace<R>(
+    if (optionsOrOpOrFn instanceof Op) {
+      options = {};
+      opOrFn = optionsOrOpOrFn;
+    } else if (typeof optionsOrOpOrFn === 'function') {
+      options = {};
+      opOrFn = optionsOrOpOrFn;
+    } else {
+      options = optionsOrOpOrFn;
+      opOrFn = maybeOpOrFn!;
+    } // biome-ignore lint/style/noUselessElse: clarity for overload parsing
+
+    // Dispatch to monomorphic methods
+    // TODO: lmao-transformer should rewrite trace(name, op) → trace_op(name, {}, op)
+    if (opOrFn instanceof Op) {
+      return this.trace_op(name, options, opOrFn as any);
+    }
+    return this.trace_fn(name, options, opOrFn as any);
+  }
+
+  // ===========================================================================
+  // trace_op - Monomorphic method for Op execution (Promise-agnostic)
+  // ===========================================================================
+
+  /**
+   * Execute an Op as a root trace (monomorphic - for transformer optimization)
+   * Returns Result<S, E> (sync) or Promise<Result<S, E>> (async) - preserves sync/async
+   */
+  trace_op<S, E>(
     name: string,
-    overridesOrFn:
-      | TraceOverrides<UserCtx>
-      | ((ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>),
-    maybeFn?: (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>,
-  ): Promise<R> {
-    // Parse overloaded arguments
-    const hasOverrides = typeof overridesOrFn !== 'function';
-    const overrides = hasOverrides ? (overridesOrFn as TraceOverrides<UserCtx>) : ({} as TraceOverrides<UserCtx>);
-    const fn = hasOverrides
-      ? maybeFn!
-      : (overridesOrFn as (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>);
+    options: TraceOptions<Ctx['userCtx']>,
+    op: Op<Ctx, [], S, E>,
+  ): Result<S, E> | Promise<Result<S, E>> {
+    const ctx = this._createRootContext(name, options, op.metadata);
+    return this._executeWithContext(ctx, (c) => op.fn(c));
+  }
 
-    // Generate or use provided trace ID
-    const traceId: TraceId = overrides.traceId ? (overrides.traceId as TraceId) : generateTraceId();
+  // ===========================================================================
+  // trace_fn - Monomorphic method for function execution (Promise-agnostic)
+  // ===========================================================================
 
-    // Get logBinding from factory - contains the MERGED schema (user + system columns)
-    const logBinding = this.factory.logBinding;
-    // IMPORTANT: Use logBinding.logSchema (merged schema) not factory.logSchema (user schema)
-    // The merged schema includes system columns like message(), line(), etc.
-    const schema = logBinding.logSchema as LogSchema<T>;
+  /**
+   * Execute a function as a root trace (monomorphic - for transformer optimization)
+   * Returns R (sync) or Promise<R> (async) - preserves sync/async
+   */
+  trace_fn<R>(name: string, options: TraceOptions<Ctx['userCtx']>, fn: (ctx: SpanContext<Ctx>) => R): R {
+    const ctx = this._createRootContext(name, options, createOpMetadata('root', 'tracer', 'runtime', 0));
+    return this._executeWithContext(ctx, fn);
+  }
+
+  // ===========================================================================
+  // Internal helpers
+  // ===========================================================================
+
+  private _createRootContext(
+    name: string,
+    options: TraceOptions<Ctx['userCtx']>,
+    metadata: ReturnType<typeof createOpMetadata>,
+  ): MutableSpanContext<Ctx> {
+    const traceId: TraceId = options.traceId ? (options.traceId as TraceId) : generateTraceId();
+    const schema = this.logBinding.logSchema as Ctx['logSchema'];
+
+    // Validate null-sentinel required fields and merge user context
+    const resolvedUserCtx = this._resolveUserContext(options.ctx);
 
     // Create root SpanBuffer
-    const buffer = createSpanBuffer(schema, logBinding, name, traceId) as SpanBuffer<LogSchema<T>>;
+    const buffer = createSpanBuffer(schema, this.logBinding, name, traceId) as SpanBuffer<Ctx['logSchema']>;
 
     // Register with pendingBuffers for collection
     this.pendingBuffers.push(buffer);
@@ -187,74 +272,135 @@ export class Tracer<
     // Initialize scope values to empty frozen object
     buffer._scopeValues = Object.freeze({});
 
-    // Set _opMetadata for Arrow conversion (root spans use a default/runtime metadata)
-    // For root spans created via Tracer, we don't have transformer-injected metadata,
-    // so we create a runtime placeholder
-    buffer._opMetadata = createOpMetadata('root', 'tracer', 'runtime', 0);
+    // Set _opMetadata for Arrow conversion
+    buffer._opMetadata = metadata;
 
-    // Write span-start entry (row 0) and pre-initialize span-end (row 1)
+    // Write span-start entry (row 0)
     writeSpanStart(buffer, name);
 
-    // Merge user context: factory defaults + overrides
-    const ctxDefaults = this.factory.ctxDefaults ?? ({} as UserCtx);
-    const resolvedUserCtx: Record<string, unknown> = { ...ctxDefaults };
-
-    // Override with provided params (excluding traceId/parentSpanId which are trace-level)
-    for (const key of Object.keys(overrides) as (keyof typeof overrides)[]) {
-      if (key !== 'traceId' && key !== 'parentSpanId') {
-        const value = overrides[key];
-        if (value !== undefined) {
-          resolvedUserCtx[key as string] = value;
-        }
-      }
-    }
-
     // Create SpanContext using prototype inheritance
-    const ctx = Object.create(this.spanContextProto) as MutableSpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>;
+    const ctx = Object.create(this.spanContextProto) as MutableSpanContext<Ctx>;
 
     // Set instance properties
     ctx._buffer = buffer;
     ctx._schema = schema;
-    ctx._logBinding = logBinding;
+    ctx._logBinding = this.logBinding;
 
     // Create tag writer and span logger
-    ctx.tag = createTagWriter(schema, buffer) as TagWriter<LogSchema<T>>;
+    ctx.tag = createTagWriter(schema, buffer) as TagWriter<Ctx['logSchema']>;
     const spanLogger = createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer);
     ctx.log = spanLogger as any;
     ctx._spanLogger = spanLogger as any;
 
-    // Spread user context properties onto context
+    // Set up deps (empty for root)
+    ctx.deps = {};
+
+    // Set up feature flags if evaluator provided
+    if (this.flagEvaluator) {
+      ctx.ff = (this.flagEvaluator as any).forContext(ctx);
+    } else {
+      ctx.ff = {} as any;
+    }
+
+    // Spread resolved user context onto SpanContext
     for (const [key, value] of Object.entries(resolvedUserCtx)) {
       (ctx as Record<string, unknown>)[key] = value;
     }
 
-    // Set up deps (empty for root, ops provide their own)
-    ctx.deps = {};
+    return ctx;
+  }
 
-    // Set up feature flags if evaluator provided
-    const flagEvaluator = this.factory.flagEvaluator;
-    if (flagEvaluator) {
-      // forContext expects SpanContext without ff (to prevent recursion)
-      // It returns a bound evaluator that becomes ctx.ff
-      // biome-ignore lint/suspicious/noExplicitAny: Type erasure needed for FlagEvaluator generics
-      ctx.ff = (flagEvaluator as any).forContext(ctx);
-    } else {
-      // No-op ff if no evaluator - empty object that won't error on access
-      // biome-ignore lint/suspicious/noExplicitAny: Type erasure for empty ff
-      ctx.ff = {} as any;
+  /**
+   * Validate null-sentinel required fields and merge with provided params.
+   *
+   * Per the ctx config pattern:
+   * - Properties with null values must be provided at trace creation
+   * - Properties with default values can optionally be overridden
+   * - undefined is allowed for optional fields
+   */
+  private _resolveUserContext(params?: TraceContextParams<Ctx['userCtx']>): Record<string, unknown> {
+    const ctxDefaults = this.ctxDefaults as Record<string, unknown>;
+
+    // Check that all null-sentinel keys are provided in params
+    for (const key of Object.keys(ctxDefaults)) {
+      const defaultValue = ctxDefaults[key];
+      if (defaultValue === null) {
+        const providedValue = (params as Record<string, unknown> | undefined)?.[key];
+        if (providedValue === null || providedValue === undefined) {
+          throw new Error(
+            `Required context parameter '${key}' must be provided. ` +
+              'Properties with null values in ctx config are required.',
+          );
+        }
+      }
     }
 
-    // Execute fn with try/catch
-    try {
-      const result = await fn(ctx as unknown as SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>);
+    // Merge defaults with provided params (provided values win)
+    const resolvedUserCtx: Record<string, unknown> = { ...ctxDefaults };
+    if (params) {
+      for (const key of Object.keys(params)) {
+        const value = (params as Record<string, unknown>)[key];
+        if (value !== undefined) {
+          resolvedUserCtx[key] = value;
+        }
+      }
+    }
 
-      // Write span-ok to row 1 (fixed layout)
+    return resolvedUserCtx;
+  }
+
+  /**
+   * Execute function with context and handle span-ok/span-err/span-exception writes
+   * Promise-agnostic: returns sync for sync fn, Promise for async fn
+   */
+  private _executeWithContext<R>(ctx: MutableSpanContext<Ctx>, fn: (ctx: SpanContext<Ctx>) => R): R {
+    const buffer = ctx._buffer;
+
+    try {
+      const result = fn(ctx as unknown as SpanContext<Ctx>);
+
+      // Check if result is a Promise
+      if (result && typeof (result as any).then === 'function') {
+        // Async path - use .then to write span-ok/err after Promise resolves
+        return (result as any).then(
+          (resolved: any) => {
+            // Write span-ok to row 1
+            buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+            buffer.timestamp[1] = getTimestampNanos(
+              buffer._traceRoot.anchorEpochNanos,
+              buffer._traceRoot.anchorPerfNow,
+            );
+            return resolved;
+          },
+          (error: any) => {
+            // Write span-exception to row 1
+            buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
+            buffer.timestamp[1] = getTimestampNanos(
+              buffer._traceRoot.anchorEpochNanos,
+              buffer._traceRoot.anchorPerfNow,
+            );
+
+            // Write exception details
+            const errorMessage = error instanceof Error ? error.message : String(error);
+            const errorStack = error instanceof Error ? error.stack : undefined;
+
+            buffer.message(1, errorMessage);
+            if (errorStack) {
+              buffer.exception_stack(1, errorStack);
+            }
+
+            throw error;
+          },
+        ) as R;
+      }
+
+      // Sync path - write span-ok immediately
       buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
       buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
       return result;
     } catch (error) {
-      // Write span-exception to row 1 (fixed layout)
+      // Sync exception path
       buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
       buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
@@ -267,19 +413,18 @@ export class Tracer<
         buffer.exception_stack(1, errorStack);
       }
 
-      // Re-throw - user handles errors
       throw error;
     }
   }
 
   /**
-   * Flush all pending buffers to sink
-   *
-   * Call this at the end of request handling to ensure all traces are exported.
-   * Integrates with CF Worker's waitUntil for background processing.
+   * Flush pending buffers to sink
    *
    * @example
-   * executionContext.waitUntil(tracer.flush());
+   * ```typescript
+   * const { trace, flush } = new Tracer({ logBinding, sink });
+   * executionContext.waitUntil(flush());
+   * ```
    */
   async flush(): Promise<void> {
     const buffers = this.pendingBuffers;
@@ -296,25 +441,12 @@ export class Tracer<
   }
 
   /**
-   * Hint that flush should happen soon (non-blocking)
-   *
-   * Can be called to indicate the tracer should flush when convenient.
-   * Implementation may batch or delay actual flushing.
-   */
-  hintFlush(): void {
-    // For now, just schedule a microtask to flush
-    // Future: could implement batching, debouncing, etc.
-    queueMicrotask(() => {
-      this.flush().catch((error) => {
-        console.error('Error in hinted flush:', error);
-      });
-    });
-  }
-
-  /**
    * Get count of pending buffers (for testing/monitoring)
+   *
+   * Note: This is a method (not a getter) so it can be safely destructured
+   * along with trace() and flush().
    */
-  get pendingCount(): number {
+  pendingCount(): number {
     return this.pendingBuffers.length;
   }
 }

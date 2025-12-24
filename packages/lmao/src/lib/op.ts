@@ -1,5 +1,8 @@
 /**
- * Op - Traced operation class
+ * Op - Traced operation class and OpMetadata
+ *
+ * This is the single source of truth for the Op class and OpMetadata interface.
+ * Other modules re-export these types for convenience.
  *
  * Wraps a user function with automatic span tracking.
  * Created by defineOp() from the Op-centric API (defineOpContext).
@@ -10,11 +13,40 @@
  * - Op name is used for metrics tracking (separate from span names)
  */
 
-import type { OpMetadata } from './opContext/opTypes.js';
+import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext } from './opContext/types.js';
 import type { Result } from './result.js';
 import type { LogBinding } from './types.js';
+
+// =============================================================================
+// OP METADATA
+// =============================================================================
+
+/**
+ * Metadata injected by the transformer into each Op.
+ * These values are determined at compile time from the source location.
+ *
+ * Includes pre-encoded UTF-8 entries for Arrow dictionary building -
+ * encode once at Op definition time, reuse for every span conversion.
+ */
+export interface OpMetadata {
+  /** Package name from package.json */
+  readonly package_name: string;
+  /** File path relative to package root */
+  readonly package_file: string;
+  /** Git SHA at build time */
+  readonly git_sha: string;
+  /** Line number where defineOp was called */
+  readonly line: number;
+
+  /** Pre-encoded package_name for Arrow dictionary building */
+  readonly package_name_entry: PreEncodedEntry;
+  /** Pre-encoded package_file for Arrow dictionary building */
+  readonly package_file_entry: PreEncodedEntry;
+  /** Pre-encoded git_sha for Arrow dictionary building */
+  readonly git_sha_entry: PreEncodedEntry;
+}
 
 // =============================================================================
 // Op Class

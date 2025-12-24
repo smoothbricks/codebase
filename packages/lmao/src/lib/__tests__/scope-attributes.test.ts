@@ -9,9 +9,10 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import { defineOpContext } from '../defineOpContext.js';
+import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { Tracer } from '../tracer.js';
 
 describe('Span Scope Attributes', () => {
   describe('Basic Scope Setting', () => {
@@ -22,9 +23,11 @@ describe('Span Scope Attributes', () => {
         orderId: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const testOp = defineOp('test-op', async (ctx) => {
         // Set scope attributes
@@ -39,8 +42,8 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('test-span', testOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
 
@@ -51,9 +54,11 @@ describe('Span Scope Attributes', () => {
         step: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const testOp = defineOp('test-op', async (ctx) => {
         // Set scope once
@@ -70,8 +75,8 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = createTrace({});
-      await traceCtx.span('test-span', testOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      await trace('test-span', testOp);
       // If this completes without error, scope inheritance is working
     });
   });
@@ -85,9 +90,11 @@ describe('Span Scope Attributes', () => {
         step: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const testOp = defineOp('test-op', async (ctx) => {
         // Set scope at parent level
@@ -119,8 +126,8 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('test-span', testOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
 
@@ -132,9 +139,11 @@ describe('Span Scope Attributes', () => {
         level3: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const testOp = defineOp('test-op', async (ctx) => {
         ctx.setScope({ userId: 'user123', level1: 'L1' });
@@ -157,8 +166,8 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('test-span', testOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
   });
@@ -171,9 +180,11 @@ describe('Span Scope Attributes', () => {
         taskName: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const parentOp = defineOp('parent-op', async (ctx) => {
         ctx.setScope({
@@ -197,8 +208,8 @@ describe('Span Scope Attributes', () => {
         return childResult;
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('parent-span', parentOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('parent-span', parentOp);
       expect(result.success).toBe(true);
     });
   });
@@ -214,9 +225,11 @@ describe('Span Scope Attributes', () => {
         ip: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const middlewareOp = defineOp('middleware', async (ctx) => {
         // Middleware sets up request-level scope
@@ -247,8 +260,8 @@ describe('Span Scope Attributes', () => {
         return ctx.ok(businessResult);
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('middleware-span', middlewareOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('middleware-span', middlewareOp);
       expect(result.success).toBe(true);
     });
   });
@@ -263,9 +276,11 @@ describe('Span Scope Attributes', () => {
         isValid: S.boolean(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const testOp = defineOp('test-op', async (ctx) => {
         ctx.setScope({
@@ -281,8 +296,8 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('test-span', testOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
   });
@@ -295,9 +310,11 @@ describe('Span Scope Attributes', () => {
         progress: S.number(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const testOp = defineOp('test-op', async (ctx) => {
         // Initial scope
@@ -330,8 +347,8 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('test-span', testOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
   });

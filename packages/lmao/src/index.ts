@@ -109,7 +109,7 @@ export * from './lib/flushScheduler.js';
 // Tracer
 // =============================================================================
 
-export { type TraceOverrides, Tracer, type TracerConfig, type TraceSink } from './lib/tracer.js';
+export { type TraceOptions, Tracer, type TracerConfig, type TraceSink } from './lib/tracer.js';
 
 // =============================================================================
 // Library Integration

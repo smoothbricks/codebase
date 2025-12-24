@@ -16,8 +16,13 @@ import { createSpanLogger } from '../spanLoggerGenerator.js';
  * - _buffer with scopeValues and writeIndex
  * - log with ffAccess, ffUsage, and _writeIndex
  * - buffer getter that returns _buffer
+ *
+ * Note: Uses explicit 'any' cast since this is a test utility and the actual
+ * SpanContext type requires OpContext (not just LogSchema). The runtime
+ * structure is what matters for these tests.
  */
-function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): SpanContext<T, any, any> {
+// biome-ignore lint/suspicious/noExplicitAny: Test utility - mock context for evaluator testing
+function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): any {
   // Create a real SpanLogger for the buffer using the schema from module
   const schema = spanBuffer._logBinding.logSchema as T;
   const logger = createSpanLogger(schema, spanBuffer);
@@ -30,12 +35,12 @@ function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): 
     },
     log: logger,
     // Other properties not needed by evaluator tests
-    ff: null as any,
+    ff: null,
     env: {},
     deps: {},
-    tag: {} as any,
+    tag: {},
     scope: spanBuffer._scopeValues || {},
-    setScope: (attrs: any) => {
+    setScope: (attrs: Record<string, unknown>) => {
       if (!spanBuffer._scopeValues) {
         spanBuffer._scopeValues = {};
       }
@@ -309,7 +314,10 @@ describe('EvaluatorGenerator', () => {
       const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: true });
       const instance = new GeneratedClass(mockCtx, evaluator);
 
-      instance.trackUsage('debugMode', { action: 'test_action', outcome: 'success' });
+      // Cast needed because createEvaluatorClass returns generic OpContext-typed class
+      // The actual runtime instance is correctly typed, but TypeScript can't infer it
+      // biome-ignore lint/suspicious/noExplicitAny: Test-specific type workaround
+      (instance as any).trackUsage('debugMode', { action: 'test_action', outcome: 'success' });
 
       // Check buffer for ff-usage entry
       const usageCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_USAGE);

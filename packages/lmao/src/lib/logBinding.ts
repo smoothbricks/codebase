@@ -72,9 +72,9 @@ export type RemappedViewConstructor = new (buffer: SpanBuffer) => SpanBuffer;
  * @property sb_overflows - Number of overflow events.
  *   Derived: buffer count = 1 + sb_overflows (always at least 1 buffer).
  */
-export interface LogBinding {
+export interface LogBinding<T extends LogSchema = LogSchema> {
   /** The unprefixed schema defining what columns exist */
-  readonly logSchema: LogSchema;
+  readonly logSchema: T;
 
   /** Optional RemappedBufferView class for prefixed/remapped buffers */
   readonly remappedViewClass?: RemappedViewConstructor;

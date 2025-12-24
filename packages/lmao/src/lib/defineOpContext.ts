@@ -8,7 +8,7 @@
  * ```typescript
  * import { defineOpContext, S, defineLogSchema } from '@smoothbricks/lmao';
  *
- * const { defineOp, defineOps, createTrace } = defineOpContext({
+ * const { defineOp, defineOps } = defineOpContext({
  *   logSchema: defineLogSchema({ userId: S.category() }),
  *   ctx: { env: null as Env },
  * });
@@ -25,16 +25,13 @@ import {
   createDefineOp,
   createDefineOps,
   createOpGroup,
-  createTraceImpl,
   type DepsConfig,
-  type EffectiveSchema,
   type FeatureFlagSchema,
   type OpContext,
   type OpContextConfig,
   type OpContextFactory,
   opContextType,
   RESERVED_CONTEXT_PROPS,
-  type SpanContext,
 } from './opContext/index.js';
 import { LogSchema } from './schema/LogSchema.js';
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
@@ -56,20 +53,19 @@ import type { LogBinding } from './types.js';
  * This is the main entry point for the Op-centric API.
  *
  * @param config - Context configuration
- * @returns OpContextFactory with defineOp, defineOps, createTrace
+ * @returns OpContextFactory with defineOp, defineOps
  *
  * @example
  * ```typescript
  * import { defineOpContext } from '@smoothbricks/lmao';
  *
- * const { defineOp, defineOps, createTrace } = defineOpContext({
+ * const { defineOp, defineOps } = defineOpContext({
  *   logSchema: myLogSchema,
  *   deps: {
  *     http: httpOps.prefix('http'),
  *     auth: authOps.prefix('auth'),
  *   },
  *   flags: myFeatureFlags,
- *   flagEvaluator: launchDarklyAdapter,
  *   ctx: {
  *     env: null as CFWorkerEnv,     // Must provide at createTrace()
  *     config: { retryCount: 3 },     // Has default
@@ -87,19 +83,11 @@ import type { LogBinding } from './types.js';
  *   myHandler,
  *   healthCheck: async (ctx) => ctx.ok({ healthy: true }),
  * });
- *
- * // Create trace (in request handler)
- * export default {
- *   fetch(req: Request, env: Env) {
- *     const ctx = createTrace({ env });
- *     return ctx.span('request', myHandler, req);
- *   }
- * };
  * ```
  */
 export function defineOpContext<
   T extends SchemaFields,
-  FF extends FeatureFlagSchema = Record<string, never>,
+  const FF extends FeatureFlagSchema = Record<string, never>,
   Deps extends DepsConfig = {},
   UserCtx extends Record<string, unknown> = Record<string, never>,
 >(config: OpContextConfig<T, FF, Deps, UserCtx>): OpContextFactory<LogSchema<T>, FF, Deps, UserCtx> {
@@ -127,8 +115,9 @@ export function defineOpContext<
 
   // Create a LogBinding with initial capacity stats
   // The logBinding serves as the infrastructure for ops to write logs
-  const logBinding: LogBinding = {
-    logSchema: mergedSchema,
+  // Type is LogBinding<LogSchema<T>> to preserve schema type for Op type safety
+  const logBinding: LogBinding<LogSchema<T>> = {
+    logSchema: mergedSchema as LogSchema<T>,
     remappedViewClass: undefined, // Will be set if prefixing is applied
     sb_capacity: DEFAULT_BUFFER_CAPACITY, // Initial capacity (self-tuning will grow this)
     sb_totalWrites: 0,
@@ -160,14 +149,8 @@ export function defineOpContext<
     flags: config.flags as FF,
     logBinding,
     ctxDefaults: (config.ctx ?? {}) as UserCtx,
-    flagEvaluator: config.flagEvaluator,
     defineOp,
     defineOps,
-    createTrace: (params) => {
-      return createTraceImpl(config, logBinding, params) as unknown as SpanContext<
-        OpContext<LogSchema<EffectiveSchema<T, Deps>>, FF, Deps, UserCtx>
-      >;
-    },
   };
 }
 

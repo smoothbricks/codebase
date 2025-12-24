@@ -229,7 +229,7 @@ describe('FlushScheduler', () => {
         const buffer2 = createTestBuffer();
 
         // Make buffers share the same module context to ensure schema compatibility
-        buffer2.task = buffer1.task;
+        buffer2._logBinding = buffer1._logBinding;
 
         buffer1._writeIndex = 10;
         buffer2._writeIndex = 20;

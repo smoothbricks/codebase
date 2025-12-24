@@ -37,16 +37,20 @@ describe('Tracer', () => {
         tables.push(table);
       };
 
-      const tracer = new Tracer(factory, { sink });
+      const { trace, pendingCount } = new Tracer({
+        logBinding: factory.logBinding,
+        sink,
+        ctxDefaults: factory.ctxDefaults,
+      });
 
-      const result = await tracer.trace('test-trace', { env: { API_KEY: 'test' } }, async (ctx) => {
+      const result = await trace('test-trace', { ctx: { env: { API_KEY: 'test' } } }, async (ctx) => {
         ctx.tag.userId('user-123');
         ctx.tag.method('GET');
         return { success: true, data: 'hello' };
       });
 
       expect(result).toEqual({ success: true, data: 'hello' });
-      expect(tracer.pendingCount).toBe(1);
+      expect(pendingCount()).toBe(1);
     });
 
     it('should flush pending buffers to sink', async () => {
@@ -59,23 +63,23 @@ describe('Tracer', () => {
         tables.push(table);
       };
 
-      const tracer = new Tracer(factory, { sink });
+      const { trace, flush, pendingCount } = new Tracer({ logBinding: factory.logBinding, sink });
 
-      await tracer.trace('trace-1', async (ctx) => {
+      await trace('trace-1', async (ctx) => {
         ctx.tag.userId('user-1');
         return 'result-1';
       });
 
-      await tracer.trace('trace-2', async (ctx) => {
+      await trace('trace-2', async (ctx) => {
         ctx.tag.userId('user-2');
         return 'result-2';
       });
 
-      expect(tracer.pendingCount).toBe(2);
+      expect(pendingCount()).toBe(2);
 
-      await tracer.flush();
+      await flush();
 
-      expect(tracer.pendingCount).toBe(0);
+      expect(pendingCount()).toBe(0);
       expect(tables.length).toBe(2);
     });
 
@@ -85,7 +89,8 @@ describe('Tracer', () => {
       });
 
       const tables: Table[] = [];
-      const tracer = new Tracer(factory, {
+      const { trace, pendingCount } = new Tracer({
+        logBinding: factory.logBinding,
         sink: (t) => {
           tables.push(t);
         },
@@ -94,13 +99,13 @@ describe('Tracer', () => {
       const error = new Error('test error');
 
       await expect(
-        tracer.trace('error-trace', async () => {
+        trace('error-trace', async () => {
           throw error;
         }),
       ).rejects.toThrow('test error');
 
       // Buffer should still be registered for flushing
-      expect(tracer.pendingCount).toBe(1);
+      expect(pendingCount()).toBe(1);
     });
 
     it('should accept optional trace ID', async () => {
@@ -108,11 +113,11 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const tracer = new Tracer(factory, { sink: () => {} });
+      const { trace } = new Tracer({ logBinding: factory.logBinding, sink: () => {} });
 
       const customTraceId = createTraceId('custom-trace-id-12345');
 
-      await tracer.trace('trace-with-id', { traceId: customTraceId }, async (ctx) => {
+      await trace('trace-with-id', { traceId: customTraceId }, async (ctx) => {
         // Access the trace ID from buffer
         expect(ctx.buffer.trace_id).toBe(customTraceId);
         return 'done';
@@ -123,14 +128,18 @@ describe('Tracer', () => {
       const factory = defineOpContext({
         logSchema: testSchema,
         ctx: {
-          env: null as unknown as TestEnv, // Required
+          env: null as unknown as TestEnv, // Required (null sentinel)
           config: { timeout: 5000 }, // Has default
         },
       });
 
-      const tracer = new Tracer(factory, { sink: () => {} });
+      const { trace } = new Tracer({
+        logBinding: factory.logBinding,
+        sink: () => {},
+        ctxDefaults: factory.ctxDefaults,
+      });
 
-      await tracer.trace('ctx-test', { env: { API_KEY: 'secret' } }, async (ctx) => {
+      await trace('ctx-test', { ctx: { env: { API_KEY: 'secret' } } }, async (ctx) => {
         // env should be from overrides
         // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
         expect((ctx as any).env.API_KEY).toBe('secret');
@@ -141,12 +150,16 @@ describe('Tracer', () => {
       });
 
       // Can override config too
-      // biome-ignore lint/suspicious/noExplicitAny: Test access with extra override
-      await tracer.trace('ctx-test-2', { env: { API_KEY: 'key2' }, config: { timeout: 10000 } } as any, async (ctx) => {
-        // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
-        expect((ctx as any).config.timeout).toBe(10000);
-        return 'done';
-      });
+      await trace(
+        'ctx-test-2',
+        // biome-ignore lint/suspicious/noExplicitAny: Test access with extra override
+        { ctx: { env: { API_KEY: 'key2' }, config: { timeout: 10000 } } as any },
+        async (ctx) => {
+          // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
+          expect((ctx as any).config.timeout).toBe(10000);
+          return 'done';
+        },
+      );
     });
   });
 
@@ -156,9 +169,9 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const tracer = new Tracer(factory, { sink: () => {} });
+      const { trace } = new Tracer({ logBinding: factory.logBinding, sink: () => {} });
 
-      const result = await tracer.trace('simple', async () => {
+      const result = await trace('simple', async () => {
         return 42;
       });
 
@@ -171,42 +184,18 @@ describe('Tracer', () => {
         ctx: { value: 0 },
       });
 
-      const tracer = new Tracer(factory, { sink: () => {} });
+      const { trace } = new Tracer({
+        logBinding: factory.logBinding,
+        sink: () => {},
+        ctxDefaults: factory.ctxDefaults,
+      });
 
-      const result = await tracer.trace('with-overrides', { value: 100 }, async (ctx) => {
+      const result = await trace('with-overrides', { ctx: { value: 100 } }, async (ctx) => {
         // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
         return (ctx as any).value;
       });
 
       expect(result).toBe(100);
-    });
-  });
-
-  describe('hintFlush', () => {
-    it('should schedule flush on microtask', async () => {
-      const factory = defineOpContext({
-        logSchema: testSchema,
-      });
-
-      let flushed = false;
-      const tracer = new Tracer(factory, {
-        sink: () => {
-          flushed = true;
-        },
-      });
-
-      await tracer.trace('hint-test', async () => 'done');
-
-      tracer.hintFlush();
-
-      // Not flushed yet (still on microtask queue)
-      expect(flushed).toBe(false);
-
-      // Wait for microtask
-      await new Promise((resolve) => queueMicrotask(resolve));
-      await new Promise((resolve) => setTimeout(resolve, 0));
-
-      expect(flushed).toBe(true);
     });
   });
 });

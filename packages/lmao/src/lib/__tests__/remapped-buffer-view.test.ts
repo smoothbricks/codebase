@@ -12,12 +12,13 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { defineOpContext } from '../defineOpContext.js';
+import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { createPrefixMapping, generateRemappedBufferViewClass, prefixSchema } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { TraceId } from '../traceId.js';
+import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
 
 describe('generateRemappedBufferViewClass', () => {
@@ -422,9 +423,11 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
     it('should handle 4-level nested tasks with correct buffer hierarchy', async () => {
       // All using app schema directly (no library prefixing)
       // Each op at each level gets its own factory to ensure separate logBindings
-      const { defineOp: defineOp1, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: appSchema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp: defineOp1, logBinding, ctxDefaults } = opContext;
 
       const buffers: { level: number; span_id: number; parent_span_id: number }[] = [];
 
@@ -474,9 +477,9 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         return ctx.ok({ level: 1, child: result });
       });
 
-      const traceCtx = createTrace({});
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
 
-      const result = await traceCtx.span('root', level1Op);
+      const result = await trace('root', level1Op);
       expect(result.success).toBe(true);
 
       // Verify buffer hierarchy - all 4 levels executed
@@ -500,9 +503,11 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
     });
 
     it('should propagate traceId through all nested levels', async () => {
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: appSchema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const traceIds: string[] = [];
 
@@ -526,9 +531,9 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         return ctx.span('to-level2', level2Op);
       });
 
-      const traceCtx = createTrace({});
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
 
-      await traceCtx.span('root', level1Op);
+      await trace('root', level1Op);
 
       // All levels should have the same traceId
       expect(traceIds).toHaveLength(4);
@@ -575,9 +580,11 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       // We need to create a LogSchema from the prefixed fields
       const prefixedLogSchema = defineLogSchema(prefixedHttpSchema.fields);
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: prefixedLogSchema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       let opExecuted = false;
 
@@ -593,9 +600,9 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       expect(typeof httpOp).toBe('object');
       expect(httpOp).toBeDefined();
 
-      // Create a trace context and run the op via span()
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('http-request', httpOp as any);
+      // Create a trace context and run the op via Tracer
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('http-request', httpOp as any);
 
       expect(opExecuted).toBe(true);
       expect(result.success).toBe(true);

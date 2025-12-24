@@ -9,7 +9,6 @@
 
 // Re-export implementation functions
 export { createOpGroup } from './createOpGroup.js';
-export { createTraceImpl, isRequiredContextKey } from './createTrace.js';
 export { createDefineOp, createDefineOps, createOpMetadata, DEFAULT_METADATA } from './defineOp.js';
 // Re-export all types from the hub
 export * from './types.js';

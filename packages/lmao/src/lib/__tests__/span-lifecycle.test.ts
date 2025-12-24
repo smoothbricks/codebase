@@ -16,7 +16,8 @@ import {
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import type { AnySpanBuffer, SpanBuffer } from '../types.js';
+import { Tracer } from '../tracer.js';
+import type { AnySpanBuffer } from '../types.js';
 import { createTestLogBinding } from './test-helpers.js';
 
 // Test schema
@@ -30,7 +31,7 @@ const testSchema = defineLogSchema({
 });
 
 // Create op context factory - no feature flags needed for these tests
-const { defineOp, createTrace } = defineOpContext({
+const { logBinding } = defineOpContext({
   logSchema: testSchema,
   ctx: {
     requestId: undefined as string | undefined,
@@ -40,13 +41,11 @@ const { defineOp, createTrace } = defineOpContext({
 
 describe('Span Lifecycle', () => {
   it('should write span-start entry when task begins', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    await trace('testTask', async (ctx) => {
       return ctx.ok('success');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1', userId: 'user1' });
-
-    await traceCtx.span('testTask', testOp);
 
     // Buffer is internal, but we can verify behavior through side effects
     // The span-start entry should be written before any other operations
@@ -54,13 +53,11 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-ok entry with ctx.ok()', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       return ctx.ok({ id: 123, name: 'test' });
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -69,13 +66,11 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-err entry with ctx.err()', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       return ctx.err('VALIDATION_ERROR', { field: 'email', message: 'Invalid email' });
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -85,29 +80,27 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-exception entry when task throws', async () => {
-    const testOp = defineOp('testTask', async (_ctx) => {
-      throw new Error('Unexpected error');
-    });
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    await expect(traceCtx.span('testTask', testOp)).rejects.toThrow('Unexpected error');
+    await expect(
+      trace('testTask', async (_ctx) => {
+        throw new Error('Unexpected error');
+      }),
+    ).rejects.toThrow('Unexpected error');
   });
 });
 
 describe('Fluent Result API', () => {
   it('should support .with() for setting attributes on ok result', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123 }).with({
         userId: 'user1',
         operation: 'CREATE',
       });
       return result;
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -116,13 +109,11 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .message() for setting message on ok result', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       return ctx.ok({ id: 123 }).message('User created successfully');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -131,13 +122,11 @@ describe('Fluent Result API', () => {
   });
 
   it('should support chaining .with() and .message()', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       return ctx.ok({ id: 123 }).with({ userId: 'user1', operation: 'CREATE' }).message('User created successfully');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(true);
     if (result.success) {
@@ -146,13 +135,11 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .with() on err result', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       return ctx.err('VALIDATION_ERROR', { field: 'email' }).with({ userId: 'user1', operation: 'CREATE' });
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -161,13 +148,11 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .message() on err result', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       return ctx.err('VALIDATION_ERROR', { field: 'email' }).message('Invalid email format');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
 
     expect(result.success).toBe(false);
     if (!result.success) {
@@ -178,7 +163,9 @@ describe('Fluent Result API', () => {
 
 describe('Child Span Lifecycle', () => {
   it('should write span-start for child spans', async () => {
-    const testOp = defineOp('parentTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('parentTask', async (ctx) => {
       const childResult = await ctx.span('childSpan', async (childCtx) => {
         return childCtx.ok('child success');
       });
@@ -186,28 +173,26 @@ describe('Child Span Lifecycle', () => {
       return childResult;
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('parentTask', testOp);
-
     expect(result.success).toBe(true);
   });
 
   it('should write span-exception for child span errors', async () => {
-    const testOp = defineOp('parentTask', async (ctx) => {
-      await ctx.span('childSpan', async (_childCtx) => {
-        throw new Error('Child span error');
-      });
-      return ctx.ok(undefined);
-    });
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    await expect(traceCtx.span('parentTask', testOp)).rejects.toThrow('Child span error');
+    await expect(
+      trace('parentTask', async (ctx) => {
+        await ctx.span('childSpan', async (_childCtx) => {
+          throw new Error('Child span error');
+        });
+        return ctx.ok(undefined);
+      }),
+    ).rejects.toThrow('Child span error');
   });
 
   it('should handle nested child spans', async () => {
-    const testOp = defineOp('parentTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('parentTask', async (ctx) => {
       const result1 = await ctx.span('child1', async (child1Ctx) => {
         const result2 = await child1Ctx.span('child2', async (child2Ctx) => {
           return child2Ctx.ok('grandchild success');
@@ -218,52 +203,43 @@ describe('Child Span Lifecycle', () => {
       return ctx.ok(result1);
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('parentTask', testOp);
-
     expect(result.success).toBe(true);
   });
 
   it('should create child span when op() is called from parent span context', async () => {
     // This test verifies the bug fix: when defineOp() ops are called from a parent
     // SpanContext (has buffer property), it should create a child span, not a root span.
-    type TestBuffer = SpanBuffer<typeof testSchema>;
-    let parentBuffer: TestBuffer | undefined;
-    let childBuffer: TestBuffer | undefined;
+    let parentBuffer: AnySpanBuffer | undefined;
+    let childBuffer: AnySpanBuffer | undefined;
 
-    const childOp = defineOp('child-task', async (ctx) => {
-      childBuffer = ctx.buffer;
-
-      // Verify child span is linked to parent
-      expect(ctx.buffer._parent).toBeDefined();
-      // Use === comparison to avoid type mismatch between SpanBuffer<Schema> and untyped SpanBuffer
-      expect(ctx.buffer._parent === parentBuffer).toBe(true);
-      expect(parentBuffer).toBeDefined();
-      const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-
-      // Verify child span inherits parent's schema
-      expect(ctx.buffer._logBinding.logSchema).toBe(parent._logBinding.logSchema);
-
-      // Verify child span has different spanId but same traceId
-      expect(ctx.buffer.span_id).not.toBe(parent.span_id);
-      expect(ctx.buffer.trace_id).toBe(parent.trace_id);
-
-      return ctx.ok('child-done');
-    });
-
-    const parentOp = defineOp('parent-task', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+    const result = await trace('parent-task', async (ctx) => {
       parentBuffer = ctx.buffer;
 
       // Call child op from parent span context
       // This should create a child span, not a root span
-      const childResult = await ctx.span('child-task', childOp);
+      const childResult = await ctx.span('child-task', async (childCtx) => {
+        childBuffer = childCtx.buffer;
+
+        // Verify child span is linked to parent
+        expect(childCtx.buffer._parent).toBeDefined();
+        // Use === comparison to avoid type mismatch between SpanBuffer<Schema> and untyped SpanBuffer
+        expect(childCtx.buffer._parent === parentBuffer).toBe(true);
+        expect(parentBuffer).toBeDefined();
+        const parent = parentBuffer as NonNullable<typeof parentBuffer>;
+
+        // Verify child span inherits parent's schema
+        expect(childCtx.buffer._logBinding.logSchema).toBe(parent._logBinding.logSchema);
+
+        // Verify child span has different spanId but same traceId
+        expect(childCtx.buffer.span_id).not.toBe(parent.span_id);
+        expect(childCtx.buffer.trace_id).toBe(parent.trace_id);
+
+        return childCtx.ok('child-done');
+      });
 
       return childResult;
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-    const result = await traceCtx.span('parent-task', parentOp);
 
     expect(result.success).toBe(true);
     expect(parentBuffer).toBeDefined();
@@ -274,26 +250,22 @@ describe('Child Span Lifecycle', () => {
   it('should create proper parent-child hierarchy in Arrow conversion when op() called from parent', async () => {
     // This test verifies that when op() is called from a parent span, the resulting
     // child span appears correctly in Arrow conversion with proper parent_span_id relationships.
-    type TestBuffer = SpanBuffer<typeof testSchema>;
-    let rootBuffer: TestBuffer | undefined;
+    let rootBuffer: AnySpanBuffer | undefined;
 
-    const childOp = defineOp('child-task', async (ctx) => {
-      ctx.tag.operation('READ');
-      return ctx.ok('child-done');
-    });
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
 
-    const rootOp = defineOp('root-task', async (ctx) => {
+    await trace('root-task', async (ctx) => {
       rootBuffer = ctx.buffer;
       ctx.tag.operation('CREATE');
 
-      // Call child op from root span context
-      await ctx.span('child-task', childOp);
+      // Create child span from root span context
+      await ctx.span('child-task', async (childCtx) => {
+        childCtx.tag.operation('READ');
+        return childCtx.ok('child-done');
+      });
 
       return ctx.ok('root-done');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-    await traceCtx.span('root-task', rootOp);
 
     expect(rootBuffer).toBeDefined();
     if (!rootBuffer) {
@@ -345,45 +317,41 @@ describe('Child Span Lifecycle', () => {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    const { defineOp: sharedDefineOp, createTrace: sharedCreateTrace } = defineOpContext({
+    const { logBinding: sharedLogBinding } = defineOpContext({
       logSchema: sharedSchema,
       ctx: {
         requestId: undefined as string | undefined,
       },
     });
 
-    type SharedBuffer = SpanBuffer<typeof sharedSchema>;
-    let parentBuffer: SharedBuffer | undefined;
-    let childBuffer: SharedBuffer | undefined;
+    let parentBuffer: AnySpanBuffer | undefined;
+    let childBuffer: AnySpanBuffer | undefined;
 
-    const childOp = sharedDefineOp('child-task', async (ctx) => {
-      childBuffer = ctx.buffer;
+    const { trace } = new Tracer({ logBinding: sharedLogBinding, sink: () => {} });
 
-      // Verify child span inherits parent's schema
-      // All ops in the factory share the same schema
-      expect(parentBuffer).toBeDefined();
-      const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-      expect(ctx.buffer._logBinding.logSchema).toEqual(parent._logBinding.logSchema);
-
-      // Child should be able to access parent's schema fields
-      ctx.tag.userId('user123').operation('READ');
-
-      return ctx.ok('child-done');
-    });
-
-    const parentOp = sharedDefineOp('parent-task', async (ctx) => {
+    await trace('parent-task', async (ctx) => {
       parentBuffer = ctx.buffer;
       ctx.tag.userId('user123').requestId('req456').operation('CREATE');
 
       // Call child op from parent span context
       // Child will inherit parent's schema (same factory)
-      await ctx.span('child-task', childOp);
+      await ctx.span('child-task', async (childCtx) => {
+        childBuffer = childCtx.buffer;
+
+        // Verify child span inherits parent's schema
+        // All ops in the factory share the same schema
+        expect(parentBuffer).toBeDefined();
+        const parent = parentBuffer as NonNullable<typeof parentBuffer>;
+        expect(childCtx.buffer._logBinding.logSchema).toEqual(parent._logBinding.logSchema);
+
+        // Child should be able to access parent's schema fields
+        childCtx.tag.userId('user123').operation('READ');
+
+        return childCtx.ok('child-done');
+      });
 
       return ctx.ok('parent-done');
     });
-
-    const traceCtx = sharedCreateTrace({ requestId: 'req1' });
-    await traceCtx.span('parent-task', parentOp);
 
     expect(parentBuffer).toBeDefined();
     expect(childBuffer).toBeDefined();
@@ -397,7 +365,9 @@ describe('Child Span Lifecycle', () => {
 
 describe('FluentResult Type Compatibility', () => {
   it('should allow direct access to success property', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123 });
 
       // Should be able to access success property directly
@@ -407,9 +377,6 @@ describe('FluentResult Type Compatibility', () => {
       return ctx.ok(null);
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.value).toEqual({ id: 123 });
@@ -417,7 +384,9 @@ describe('FluentResult Type Compatibility', () => {
   });
 
   it('should allow direct access to error property', async () => {
-    const testOp = defineOp('testTask', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+    const result = await trace('testTask', async (ctx) => {
       const result = ctx.err('TEST_ERROR', { message: 'test' });
 
       // Should be able to access error property directly
@@ -427,9 +396,6 @@ describe('FluentResult Type Compatibility', () => {
       return ctx.ok(null);
     });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
-
-    const result = await traceCtx.span('testTask', testOp);
     expect(result.success).toBe(true);
     if (result.success) {
       expect(result.value).toBe('TEST_ERROR');
@@ -447,13 +413,12 @@ describe('FluentResult Type Compatibility', () => {
 describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 and span-ok at row 1 after ctx.ok()', async () => {
     let capturedBuffer: AnySpanBuffer | undefined;
-    const testOp = defineOp('test-task', async (ctx) => {
+
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+    const result = await trace('test-task', async (ctx) => {
       capturedBuffer = ctx.buffer;
       return ctx.ok('done');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1', userId: 'user1' });
-    const result = await traceCtx.span('test-task', testOp);
 
     expect(result.success).toBe(true);
     expect(capturedBuffer).toBeDefined();
@@ -463,13 +428,12 @@ describe('Fixed Row Layout', () => {
 
   it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
     let capturedBuffer: AnySpanBuffer | undefined;
-    const testOp = defineOp('test', async (ctx) => {
+
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+    const result = await trace('test', async (ctx) => {
       capturedBuffer = ctx.buffer;
       return ctx.err('ERROR_CODE', { detail: 'error detail' });
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-    const result = await traceCtx.span('test', testOp);
 
     expect(result.success).toBe(false);
     expect(capturedBuffer).toBeDefined();
@@ -479,14 +443,15 @@ describe('Fixed Row Layout', () => {
 
   it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {
     let capturedBuffer: AnySpanBuffer | undefined;
-    const testOp = defineOp('test', async (ctx) => {
-      capturedBuffer = ctx.buffer;
-      throw new Error('Unexpected failure');
-    });
 
-    const traceCtx = createTrace({ requestId: 'req1' });
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
 
-    await expect(traceCtx.span('test', testOp)).rejects.toThrow('Unexpected failure');
+    await expect(
+      trace('test', async (ctx) => {
+        capturedBuffer = ctx.buffer;
+        throw new Error('Unexpected failure');
+      }),
+    ).rejects.toThrow('Unexpected failure');
     expect(capturedBuffer).toBeDefined();
     expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
     expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
@@ -496,15 +461,13 @@ describe('Fixed Row Layout', () => {
     // This tests the writeSpanStart function behavior
     // After writeSpanStart, writeIndex should be 2 (row 0 = span-start, row 1 = pre-init, events at row 2+)
 
-    const testOp = defineOp('test', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+    await trace('test', async (ctx) => {
       // At this point, writeSpanStart has been called
       // Events logged here should go to row 2+
       ctx.log.info('first event');
       return ctx.ok('done');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-    await traceCtx.span('test', testOp);
 
     // The task completed successfully, meaning:
     // - Row 0 has span-start
@@ -514,14 +477,12 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should append events starting at row 2', async () => {
-    const testOp = defineOp('test', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+    const result = await trace('test', async (ctx) => {
       ctx.log.info('first event'); // Should be row 2
       ctx.log.info('second event'); // Should be row 3
       return ctx.ok('done');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-    const result = await traceCtx.span('test', testOp);
 
     expect(result.success).toBe(true);
     // If events were incorrectly written to row 0 or 1, the span lifecycle would be corrupted
@@ -530,14 +491,12 @@ describe('Fixed Row Layout', () => {
 
   it('should allow duration calculation as timestamps[1] - timestamps[0]', async () => {
     // This tests the fixed layout enables simple duration calculation
-    const testOp = defineOp('test', async (ctx) => {
+    const { trace } = new Tracer({ logBinding, sink: () => {} });
+    await trace('test', async (ctx) => {
       // Small delay to ensure non-zero duration
       await new Promise((resolve) => setTimeout(resolve, 5));
       return ctx.ok('done');
     });
-
-    const traceCtx = createTrace({ requestId: 'req1' });
-    await traceCtx.span('test', testOp);
 
     // The fixed layout means:
     // - timestamps[0] = span-start time

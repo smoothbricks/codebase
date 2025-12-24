@@ -1,26 +1,27 @@
 /**
- * Type-level tests for createTrace required/optional property enforcement
+ * Type-level tests for Tracer.trace() required/optional property enforcement
  *
  * These tests verify that TypeScript properly enforces required vs optional
- * properties in createTrace() based on the ctx type definition.
+ * properties in Tracer.trace() based on the ctx type definition.
  *
  * Per spec 01l_module_builder_pattern.md (updated for Op-centric API):
- * - Properties with `null as Type` in ctx are REQUIRED in createTrace()
- * - Properties with `undefined as Type | undefined` are OPTIONAL in createTrace()
+ * - Properties with `null as Type` in ctx are REQUIRED in trace() options
+ * - Properties with `undefined as Type | undefined` are OPTIONAL in trace() options
  * - Properties with values are optional with defaults
  */
 
 import { describe, expect, it } from 'bun:test';
 import { S } from '@smoothbricks/arrow-builder';
-import { defineOpContext } from '../defineOpContext.js';
+import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { Tracer } from '../tracer.js';
 
 // =============================================================================
 // Test Factory Definitions
 // =============================================================================
 
 // Factory with required and optional ctx properties
-const { createTrace: testCreateTrace } = defineOpContext({
+const testFactory = defineOpContext({
   logSchema: defineLogSchema({
     userId: S.category(),
   }),
@@ -31,50 +32,87 @@ const { createTrace: testCreateTrace } = defineOpContext({
   },
 });
 
+// Extract OpContext type for proper Tracer typing
+type TestOpContext = OpContextOf<typeof testFactory>;
+
+// Create a tracer for testing with proper type
+const { trace: testTrace } = new Tracer<TestOpContext>({
+  logBinding: testFactory.logBinding,
+  ctxDefaults: testFactory.ctxDefaults,
+  sink: async () => {},
+});
+
 // =============================================================================
 // Type Enforcement Tests
 // =============================================================================
 
-describe('CreateTrace Type Enforcement', () => {
-  it('should accept all required properties', () => {
+describe('Tracer.trace Type Enforcement', () => {
+  it('should accept all required properties', async () => {
     // This should compile without errors
-    const ctx = testCreateTrace({
-      env: { apiTimeout: 5000, region: 'us-east-1' },
-      requestId: 'req-123',
-      // userId is optional, can be omitted
-    });
+    const result = await testTrace(
+      'test-span',
+      {
+        ctx: {
+          env: { apiTimeout: 5000, region: 'us-east-1' },
+          requestId: 'req-123',
+          // userId is optional, can be omitted
+        },
+      },
+      (ctx) => {
+        expect(ctx).toBeDefined();
+        expect(ctx.env.region).toBe('us-east-1');
+        expect(ctx.requestId).toBe('req-123');
+        return 'done';
+      },
+    );
 
-    expect(ctx).toBeDefined();
-    expect(ctx.env.region).toBe('us-east-1');
-    expect(ctx.requestId).toBe('req-123');
+    expect(result).toBe('done');
   });
 
-  it('should accept optional properties', () => {
+  it('should accept optional properties', async () => {
     // This should compile without errors
-    const ctx = testCreateTrace({
-      env: { apiTimeout: 5000, region: 'us-east-1' },
-      requestId: 'req-123',
-      userId: 'user-456', // Optional property provided
-    });
+    const result = await testTrace(
+      'test-span',
+      {
+        ctx: {
+          env: { apiTimeout: 5000, region: 'us-east-1' },
+          requestId: 'req-123',
+          userId: 'user-456', // Optional property provided
+        },
+      },
+      (ctx) => {
+        expect(ctx).toBeDefined();
+        expect(ctx.userId).toBe('user-456');
+        return 'done';
+      },
+    );
 
-    expect(ctx).toBeDefined();
-    expect(ctx.userId).toBe('user-456');
+    expect(result).toBe('done');
   });
 
   // Note: Type-level tests for missing properties would require @ts-expect-error
   // but the exact error message depends on TypeScript version.
   // The important thing is that the API enforces required properties at the type level.
-  it('should require env and requestId (compile-time check)', () => {
+  it('should require env and requestId (compile-time check)', async () => {
     // This test documents that missing required properties cause compile errors
     // We test by providing all required properties and verifying runtime behavior
-    const ctx = testCreateTrace({
-      env: { apiTimeout: 5000, region: 'us-east-1' },
-      requestId: 'req-123',
-    });
+    const result = await testTrace(
+      'test-span',
+      {
+        ctx: {
+          env: { apiTimeout: 5000, region: 'us-east-1' },
+          requestId: 'req-123',
+        },
+      },
+      (ctx) => {
+        expect(ctx.env).toEqual({ apiTimeout: 5000, region: 'us-east-1' });
+        expect(ctx.requestId).toBe('req-123');
+        expect(ctx.userId).toBeUndefined();
+        return 'done';
+      },
+    );
 
-    expect(ctx.env).toEqual({ apiTimeout: 5000, region: 'us-east-1' });
-    expect(ctx.requestId).toBe('req-123');
-    expect(ctx.userId).toBeUndefined();
+    expect(result).toBe('done');
   });
 });
 
@@ -83,8 +121,8 @@ describe('CreateTrace Type Enforcement', () => {
 // =============================================================================
 
 describe('Context Type Flow Through Factory', () => {
-  it('should preserve ctx type through defineOpContext', () => {
-    const { createTrace } = defineOpContext({
+  it('should preserve ctx type through defineOpContext', async () => {
+    const factory = defineOpContext({
       logSchema: defineLogSchema({}),
       ctx: {
         required: null as unknown as string,
@@ -92,25 +130,50 @@ describe('Context Type Flow Through Factory', () => {
       },
     });
 
-    // Type should be preserved - required is required, optional is optional
-    const ctx = createTrace({
-      required: 'value',
-      // optional can be omitted
+    type CtxType = OpContextOf<typeof factory>;
+    const { trace } = new Tracer<CtxType>({
+      logBinding: factory.logBinding,
+      ctxDefaults: factory.ctxDefaults,
+      sink: async () => {},
     });
 
-    expect(ctx.required).toBe('value');
+    // Type should be preserved - required is required, optional is optional
+    const result = await trace(
+      'test-span',
+      {
+        ctx: {
+          required: 'value',
+          // optional can be omitted
+        },
+      },
+      (ctx) => {
+        expect(ctx.required).toBe('value');
+        return 'done';
+      },
+    );
+
+    expect(result).toBe('done');
   });
 
-  it('should work without ctx property', () => {
+  it('should work without ctx property', async () => {
     // When ctx is not provided, no user context is available
-    const { createTrace } = defineOpContext({
+    const factory = defineOpContext({
       logSchema: defineLogSchema({}),
     });
 
-    // Should accept empty object
-    const ctx = createTrace({});
+    type CtxType = OpContextOf<typeof factory>;
+    const { trace } = new Tracer<CtxType>({
+      logBinding: factory.logBinding,
+      sink: async () => {},
+    });
 
-    expect(ctx).toBeDefined();
+    // Should accept empty options or no options
+    const result = await trace('test-span', (ctx) => {
+      expect(ctx).toBeDefined();
+      return 'done';
+    });
+
+    expect(result).toBe('done');
   });
 });
 

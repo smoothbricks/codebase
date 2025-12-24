@@ -115,14 +115,12 @@ export type OpContext<
 // OP CONTEXT CONFIGURATION
 // =============================================================================
 
-import type { FlagEvaluator } from '../schema/evaluator.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
-import type { TraceContextParams, ValidateUserContext } from './contextTypes.js';
+import type { ValidateUserContext } from './contextTypes.js';
 import type { FeatureFlagSchema } from './featureFlagTypes.js';
 import type { DepsConfig, EffectiveSchema, OpGroup, SchemaFieldsOf } from './opGroupTypes.js';
 import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
-import type { SpanContext } from './spanContextTypes.js';
 
 /**
  * Configuration for defineOpContext
@@ -131,7 +129,7 @@ import type { SpanContext } from './spanContextTypes.js';
  * It defines:
  * - The app's own schema (logSchema)
  * - Dependencies from other OpGroups (deps)
- * - Feature flags and their evaluator (flags, flagEvaluator)
+ * - Feature flag schema (flags)
  * - User-defined context properties (ctx)
  *
  * @template T - LogSchema fields (app's own schema)
@@ -188,23 +186,6 @@ export interface OpContextConfig<
   readonly flags?: FF;
 
   /**
-   * Feature flag evaluator
-   * Provides getSync/getAsync/forContext methods to resolve flag values.
-   * Receives SpanContext (minus `ff`) for logging, child spans, and user context.
-   *
-   * @example
-   * flagEvaluator: new InMemoryFlagEvaluator(flags.schema, { darkMode: true }),
-   *
-   * // Or implement FlagEvaluator interface for LaunchDarkly:
-   * flagEvaluator: {
-   *   getSync: (ctx, flag) => { ctx.log.debug(`Eval ${flag}`); return ldClient.variationSync(...); },
-   *   getAsync: (ctx, flag) => ldClient.variation(flag, { user: ctx.scope.userId }),
-   *   forContext: (ctx) => new FeatureFlagEvaluator(schema, ctx, this),
-   * }
-   */
-  readonly flagEvaluator?: FlagEvaluator<OpContext<LogSchema<T>, FF, Deps, UserCtx>>;
-
-  /**
    * User-defined context properties
    *
    * ALL properties must be declared here for V8 hidden class optimization.
@@ -231,7 +212,6 @@ export interface OpContextConfig<
  * This is the factory returned by defineOpContext that provides:
  * - `defineOp`: Define a single Op with explicit name
  * - `defineOps`: Define multiple Ops and create an OpGroup
- * - `createTrace`: Create a root trace context for a request/invocation
  * - `logSchema`: The combined effective schema
  * - `flags`: The feature flag schema
  *
@@ -281,20 +261,15 @@ export interface OpContextFactory<
   /**
    * LogBinding for this context (schema, capacity stats, optional prefix view).
    * Used by Tracer to create SpanBuffers and SpanContexts.
+   * Typed with schema T for Op type safety.
    */
-  readonly logBinding: import('../logBinding.js').LogBinding;
+  readonly logBinding: import('../logBinding.js').LogBinding<T>;
 
   /**
    * User context defaults from ctx config.
    * Used by Tracer to merge with trace-level overrides.
    */
   readonly ctxDefaults: UserCtx;
-
-  /**
-   * Feature flag evaluator (optional).
-   * Used by Tracer to bind feature flags to SpanContexts.
-   */
-  readonly flagEvaluator?: FlagEvaluator<OpContext<T, FF, Deps, UserCtx>>;
 
   /**
    * Define a single Op with explicit name.
@@ -373,68 +348,4 @@ export interface OpContextFactory<
       | Op<OpContext<T, FF, Deps, UserCtx>, unknown[], unknown, unknown>
     >,
   >(definitions: Defs): OpGroup<OpContext<T, FF, Deps, UserCtx>> & OpsFromRecord<OpContext<T, FF, Deps, UserCtx>, Defs>;
-
-  /**
-   * Create a root trace context for a new request/invocation.
-   *
-   * This is the entry point for tracing - call this at the start of each
-   * request, Lambda invocation, Cloudflare Worker fetch, etc.
-   *
-   * Properties that were `null` in ctx config MUST be provided here.
-   * Properties with defaults can optionally be overridden.
-   *
-   * @param params - Context parameters (required nulls + optional overrides + traceId)
-   * @returns Root SpanContext ready for op invocation
-   *
-   * @example
-   * ```typescript
-   * // Given ctx config:
-   * // ctx: {
-   * //   env: null as Env,           // Required - must provide
-   * //   userId: undefined as string | undefined,  // Optional
-   * //   config: { retryCount: 3 },  // Has default
-   * // }
-   *
-   * // In Lambda handler:
-   * export async function handler(event: APIGatewayEvent, context: Context) {
-   *   const ctx = createTrace({
-   *     env: process.env,           // Required
-   *     userId: event.requestContext?.authorizer?.userId,  // Optional
-   *     // config uses default
-   *   });
-   *
-   *   const result = await ctx.span('handle-request', handleRequest, event);
-   *   return toAPIGatewayResponse(result);
-   * }
-   *
-   * // In Cloudflare Worker:
-   * export default {
-   *   async fetch(request: Request, env: Env) {
-   *     const ctx = createTrace({ env });
-   *     const result = await ctx.span('fetch', handleFetch, request);
-   *     return toResponse(result);
-   *   }
-   * };
-   * ```
-   */
-  createTrace(
-    params: CreateTraceParams<UserCtx>,
-  ): SpanContext<OpContext<LogSchema<EffectiveSchema<SchemaFieldsOf<T>, Deps>>, FF, Deps, UserCtx>>;
 }
-
-// =============================================================================
-// CREATE TRACE PARAMS
-// =============================================================================
-
-/**
- * Parameters for creating a new trace
- *
- * Combines:
- * - Required params (null-sentinel properties from ctx config)
- * - Optional params (undefined-sentinel and default properties from ctx config)
- * - Optional traceId override
- */
-export type CreateTraceParams<UserCtx> = TraceContextParams<UserCtx> & {
-  /** Trace ID (generated if not provided) */
-  traceId?: string;
-};

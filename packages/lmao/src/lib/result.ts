@@ -243,3 +243,43 @@ export class FluentErr<E, T extends LogSchema> implements Err<E> {
  * @typeParam T - The log schema for the span buffer
  */
 export type FluentResult<S, E, T extends LogSchema> = FluentOk<S, T> | FluentErr<E, T>;
+
+// =============================================================================
+// RESULT TYPE EXTRACTION UTILITIES
+// =============================================================================
+
+/**
+ * Extract success type from a Result type.
+ * Returns `never` if R is not a Result.
+ */
+export type ResultSuccess<R> = R extends Result<infer S, unknown> ? S : never;
+
+/**
+ * Extract success type from a Promise<Result> type.
+ * Returns `never` if R is not a Promise<Result>.
+ */
+export type PromiseResultSuccess<R> = R extends Promise<Result<infer S, unknown>> ? S : never;
+
+/**
+ * Extract success type from either Result or Promise<Result>.
+ * Useful for inferring the success type from Op return values.
+ */
+export type ExtractSuccess<R> = ResultSuccess<R> | PromiseResultSuccess<R>;
+
+/**
+ * Extract error type from a Result type.
+ * Returns `never` if R is not a Result.
+ */
+export type ResultError<R> = R extends Result<unknown, infer E> ? E : never;
+
+/**
+ * Extract error type from a Promise<Result> type.
+ * Returns `never` if R is not a Promise<Result>.
+ */
+export type PromiseResultError<R> = R extends Promise<Result<unknown, infer E>> ? E : never;
+
+/**
+ * Extract error type from either Result or Promise<Result>.
+ * Useful for inferring the error type from Op return values.
+ */
+export type ExtractError<R> = ResultError<R> | PromiseResultError<R>;

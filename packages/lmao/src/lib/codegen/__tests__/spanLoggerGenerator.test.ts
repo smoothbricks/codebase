@@ -10,8 +10,8 @@
  * SpanLogger only handles log entries (rows 2+).
  */
 
-import { beforeEach, describe, expect, it } from 'bun:test';
-import { createTestLogBinding } from '../../__tests__/test-helpers.js';
+import { describe, expect, it } from 'bun:test';
+import { createTestLogger } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
@@ -21,15 +21,7 @@ import {
   ENTRY_TYPE_TRACE,
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
-import type { LogSchema } from '../../schema/types.js';
-import { createOverflowBuffer, createSpanBuffer } from '../../spanBuffer.js';
-import type { AnySpanBuffer } from '../../types.js';
-import { createSpanLoggerClass, type SpanLoggerImpl } from '../spanLoggerGenerator.js';
-
-function createTestBuffer(schema: LogSchema): SpanBuffer {
-  const module = createTestModuleContext(schema);
-  return createSpanBuffer(schema, module, 'test-span');
-}
+import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
 describe('createSpanLoggerClass', () => {
   describe('class creation', () => {
@@ -65,97 +57,98 @@ describe('createSpanLoggerClass', () => {
 
   describe('instance creation', () => {
     it('should create instance with buffer and createNextBuffer', () => {
-      const schema = defineLogSchema({
-        userId: S.category(),
-      });
-      const buffer = createTestBuffer(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-
-      const logger = new SpanLoggerClass(buffer, createNextBuffer);
+      const schema = defineLogSchema({ userId: S.category() });
+      const { buffer, logger } = createTestLogger(schema);
 
       expect(logger).toBeDefined();
       expect(logger._buffer).toBe(buffer);
-      // Scope is now accessed via buffer._scopeValues
       expect(buffer._scopeValues).toBeDefined();
     });
 
     it('should start with _writeIndex = 1', () => {
       const schema = defineLogSchema({});
-      const buffer = createTestBuffer(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-
-      const logger = new SpanLoggerClass(buffer, createNextBuffer);
+      const { logger } = createTestLogger(schema);
 
       expect(logger._writeIndex).toBe(1);
     });
   });
 
   describe('logging methods', () => {
-    let schema: LogSchema;
-    let buffer: AnySpanBuffer;
-    let logger: SpanLoggerImpl<LogSchema>;
-
-    beforeEach(() => {
-      schema = defineLogSchema({
-        userId: S.category(),
-      });
-      buffer = createTestBuffer(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      logger = new SpanLoggerClass(buffer, createNextBuffer);
-    });
-
     it('should increment _writeIndex on info()', () => {
+      const schema = defineLogSchema({ userId: S.category() });
+      const { logger } = createTestLogger(schema);
+
       expect(logger._writeIndex).toBe(1);
-
       logger.info('Test message');
-
-      // After nextRow(), _writeIndex should be 2
       expect(logger._writeIndex).toBe(2);
     });
 
     it('should write entry type for info()', () => {
+      const schema = defineLogSchema({});
+      const { buffer, logger } = createTestLogger(schema);
+
       logger.info('Test message');
       expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_INFO);
     });
 
     it('should write entry type for debug()', () => {
+      const schema = defineLogSchema({});
+      const { buffer, logger } = createTestLogger(schema);
+
       logger.debug('Debug message');
       expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_DEBUG);
     });
 
     it('should write entry type for warn()', () => {
+      const schema = defineLogSchema({});
+      const { buffer, logger } = createTestLogger(schema);
+
       logger.warn('Warning message');
       expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_WARN);
     });
 
     it('should write entry type for error()', () => {
+      const schema = defineLogSchema({});
+      const { buffer, logger } = createTestLogger(schema);
+
       logger.error('Error message');
       expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_ERROR);
     });
 
     it('should write entry type for trace()', () => {
+      const schema = defineLogSchema({});
+      const { buffer, logger } = createTestLogger(schema);
+
       logger.trace('Trace message');
       expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_TRACE);
     });
 
     it('should write timestamp for log entries', () => {
+      const schema = defineLogSchema({});
+      const { buffer, logger } = createTestLogger(schema);
+
       logger.info('Test message');
 
-      // Timestamp should be non-zero BigInt
       expect(buffer.timestamp[2]).not.toBe(0n);
       expect(typeof buffer.timestamp[2]).toBe('bigint');
     });
 
     it('should return this for fluent chaining', () => {
+      const schema = defineLogSchema({});
+      const { logger } = createTestLogger(schema);
+
       const result = logger.info('Test message');
 
-      // Result is typed as FluentLogEntry but at runtime it's the same object
-      expect(result as unknown).toBe(logger);
+      // FluentLogEntry is same object at runtime (types differ but object identity is same)
+      expect(result === (logger as unknown)).toBe(true);
     });
 
     it('should support chaining logging methods', () => {
-      // FluentLogEntry allows chaining back to logging methods
-      (logger.info('First') as unknown as typeof logger).info('Second').warn('Third');
+      const schema = defineLogSchema({});
+      const { buffer, logger } = createTestLogger(schema);
+
+      // FluentLogEntry includes logging methods for continued chaining
+      logger.info('First').info('Second').warn('Third');
 
       expect(logger._writeIndex).toBe(4);
       expect(buffer.entry_type[2]).toBe(ENTRY_TYPE_INFO);
@@ -170,28 +163,20 @@ describe('createSpanLoggerClass', () => {
         userId: S.category(),
         requestId: S.category(),
       });
-      const buffer = createTestBuffer(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, createNextBuffer);
+      const { buffer, logger } = createTestLogger(schema);
 
       logger._setScope({ userId: 'user123' });
 
-      // Scope is now stored on buffer._scopeValues
       expect(buffer._scopeValues?.userId).toBe('user123');
       expect(buffer._scopeValues?.requestId).toBeUndefined();
     });
 
     it('should access scope via logger.scope getter', () => {
-      const schema = defineLogSchema({
-        userId: S.category(),
-      });
-      const buffer = createTestBuffer(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, createNextBuffer);
+      const schema = defineLogSchema({ userId: S.category() });
+      const { logger } = createTestLogger(schema);
 
       logger._setScope({ userId: 'test123' });
 
-      // Scope is accessed via logger.scope getter (reads from buffer._scopeValues)
       expect(logger.scope?.userId).toBe('test123');
     });
   });
@@ -203,34 +188,50 @@ describe('createSpanLoggerClass', () => {
         count: S.number(),
         enabled: S.boolean(),
       });
-      const buffer = createTestBuffer(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, createNextBuffer);
+      const { logger } = createTestLogger(schema);
 
       // Log an entry first to advance writeIndex
       logger.info('Test');
 
-      // The generated class should have setter methods
-      // These come from ColumnWriter extension
-      expect(typeof (logger as unknown as Record<string, unknown>).userId).toBe('function');
-      expect(typeof (logger as unknown as Record<string, unknown>).count).toBe('function');
-      expect(typeof (logger as unknown as Record<string, unknown>).enabled).toBe('function');
+      // Verify methods exist and are callable - types come from ColumnWriter<T>
+      expect(typeof logger.userId).toBe('function');
+      expect(typeof logger.count).toBe('function');
+      expect(typeof logger.enabled).toBe('function');
     });
 
     it('should write attribute values at current _writeIndex', () => {
-      const schema = defineLogSchema({
-        userId: S.category(),
-      });
-      const buffer = createTestBuffer(schema);
-      const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, createNextBuffer);
+      const schema = defineLogSchema({ userId: S.category() });
+      const { buffer, logger } = createTestLogger(schema);
 
       // Log an entry and chain attribute
-      logger.info('Test');
-      (logger as unknown as Record<string, (v: string) => void>).userId('user123');
+      logger.info('Test').userId('user123');
 
       // Value should be at index 2 (after info() incremented from 1 to 2)
-      expect((buffer as unknown as Record<string, string[]>).userId_values[2]).toBe('user123');
+      expect(buffer.userId_values[2]).toBe('user123');
+    });
+
+    it('should support fluent chaining with attributes', () => {
+      const schema = defineLogSchema({
+        userId: S.category(),
+        count: S.number(),
+      });
+      const { buffer, logger } = createTestLogger(schema);
+
+      logger.info('Test').userId('user123').count(42);
+
+      expect(buffer.userId_values[2]).toBe('user123');
+      expect(buffer.count_values[2]).toBe(42);
+    });
+
+    it('should write multiple log entries with different attributes', () => {
+      const schema = defineLogSchema({ userId: S.category() });
+      const { buffer, logger } = createTestLogger(schema);
+
+      logger.info('First').userId('user1');
+      logger.info('Second').userId('user2');
+
+      expect(buffer.userId_values[2]).toBe('user1');
+      expect(buffer.userId_values[3]).toBe('user2');
     });
   });
 });

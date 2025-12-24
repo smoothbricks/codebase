@@ -536,7 +536,8 @@ describe('Module Builder Pattern Integration', () => {
 
       expect(factory.defineOp).toBeDefined();
       expect(factory.defineOps).toBeDefined();
-      expect(factory.createTrace).toBeDefined();
+      // logBinding is used with new Tracer({ logBinding, sink }) pattern
+      expect(factory.logBinding).toBeDefined();
     });
 
     it('should define Op context with required context properties', () => {
@@ -548,7 +549,8 @@ describe('Module Builder Pattern Integration', () => {
         },
       });
 
-      expect(factory.createTrace).toBeDefined();
+      // logBinding is used with new Tracer({ logBinding, sink }) pattern
+      expect(factory.logBinding).toBeDefined();
     });
 
     it('should define Op context with optional context properties', () => {
@@ -561,7 +563,8 @@ describe('Module Builder Pattern Integration', () => {
         },
       });
 
-      expect(factory.createTrace).toBeDefined();
+      // logBinding is used with new Tracer({ logBinding, sink }) pattern
+      expect(factory.logBinding).toBeDefined();
     });
 
     it('should define Op context with context defaults', () => {
@@ -574,7 +577,8 @@ describe('Module Builder Pattern Integration', () => {
         },
       });
 
-      expect(factory.createTrace).toBeDefined();
+      // logBinding is used with new Tracer({ logBinding, sink }) pattern
+      expect(factory.logBinding).toBeDefined();
     });
   });
 });

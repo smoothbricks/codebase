@@ -6,6 +6,7 @@
  */
 
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
+import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { createOpMetadata, DEFAULT_METADATA } from '../opContext/defineOp.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import { LogSchema } from '../schema/LogSchema.js';
@@ -110,4 +111,26 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   spanBuffer._opMetadata = DEFAULT_METADATA;
 
   return { logBinding, spanBuffer };
+}
+
+/**
+ * Create a properly typed SpanLogger for testing.
+ *
+ * Returns buffer and logger so tests can verify buffer contents directly.
+ * Uses the real createSpanLogger API - no mocks.
+ *
+ * @param schema - LogSchema to use
+ * @returns Object with buffer and logger, both properly typed
+ */
+export function createTestLogger<T extends LogSchema>(
+  schema: T,
+): {
+  buffer: SpanBuffer<T>;
+  logger: SpanLoggerImpl<T>;
+  logBinding: LogBinding;
+} {
+  const logBinding = createTestLogBinding(schema);
+  const buffer = createSpanBuffer(schema, logBinding, 'test-span');
+  const logger = createSpanLogger(schema, buffer);
+  return { buffer, logger, logBinding };
 }

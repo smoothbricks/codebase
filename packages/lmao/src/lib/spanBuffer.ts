@@ -403,15 +403,15 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
  * @param spanName - Name of the child span
  * @param capacity - Optional capacity override
  *
- * @returns New SpanBuffer linked to parent, with same schema type
+ * @returns New SpanBuffer linked to parent
  */
-export function createChildSpanBuffer(
+export function createChildSpanBuffer<T extends LogSchema>(
   parentBuffer: AnySpanBuffer,
-  logBinding: LogBinding,
+  logBinding: LogBinding & { logSchema: T },
   spanName: string,
   callsiteMetadata: OpMetadata,
   capacity: number = DEFAULT_BUFFER_CAPACITY,
-): AnySpanBuffer {
+): SpanBuffer<T> {
   const schema = logBinding.logSchema;
 
   const SpanBufferClass = getSpanBufferClass(schema) as new (
@@ -422,7 +422,7 @@ export function createChildSpanBuffer(
     isChained: boolean,
     trace_id: TraceId | undefined,
     callsiteMetadata: OpMetadata | undefined,
-  ) => AnySpanBuffer;
+  ) => SpanBuffer<T>;
 
   // Create child buffer with parent reference
   return new SpanBufferClass(

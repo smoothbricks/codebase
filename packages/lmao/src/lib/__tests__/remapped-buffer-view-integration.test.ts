@@ -11,9 +11,10 @@
 
 import { describe, expect, it } from 'bun:test';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
-import { defineOpContext } from '../defineOpContext.js';
+import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { Tracer } from '../tracer.js';
 import type { AnySpanBuffer } from '../types.js';
 
 describe('RemappedBufferView Integration', () => {
@@ -23,9 +24,11 @@ describe('RemappedBufferView Integration', () => {
         userId: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: appSchema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       let parentExecuted = false;
       let childExecuted = false;
@@ -42,8 +45,8 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ parent: true, childResult });
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('parent-span', parentOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('parent-span', parentOp);
 
       expect(parentExecuted).toBe(true);
       expect(childExecuted).toBe(true);
@@ -58,9 +61,11 @@ describe('RemappedBufferView Integration', () => {
         action: S.enum(['create', 'read', 'update', 'delete']),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: appSchema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -71,8 +76,8 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ success: true });
       });
 
-      const traceCtx = createTrace({});
-      await traceCtx.span('parent-span', parentOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      await trace('parent-span', parentOp);
 
       expect(rootBuffer).toBeDefined();
       if (!rootBuffer) throw new Error('rootBuffer is undefined');
@@ -132,9 +137,11 @@ describe('RemappedBufferView Integration', () => {
         data: S.text(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const executionOrder: number[] = [];
 
@@ -158,8 +165,8 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ level: 1 });
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('level1-span', level1Op);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('level1-span', level1Op);
 
       expect(result.success).toBe(true);
       expect(executionOrder).toEqual([1, 2, 3]);
@@ -173,9 +180,11 @@ describe('RemappedBufferView Integration', () => {
         taskStatus: S.enum(['pending', 'done']),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const taskResults: number[] = [];
 
@@ -209,8 +218,8 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ done: true });
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('parent-span', parentOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('parent-span', parentOp);
 
       expect(result.success).toBe(true);
       expect(taskResults).toEqual([1, 2, 3]);
@@ -226,9 +235,11 @@ describe('RemappedBufferView Integration', () => {
         method: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       let appExecuted = false;
       let httpExecuted = false;
@@ -246,8 +257,8 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ app: true });
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('app-span', appOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('app-span', appOp);
 
       expect(result.success).toBe(true);
       expect(appExecuted).toBe(true);
@@ -261,9 +272,11 @@ describe('RemappedBufferView Integration', () => {
         step: S.category(),
       });
 
-      const { defineOp, createTrace } = defineOpContext({
+      const opContext = defineOpContext({
         logSchema: schema,
       });
+      type Ctx = OpContextOf<typeof opContext>;
+      const { defineOp, logBinding, ctxDefaults } = opContext;
 
       const executedSteps: string[] = [];
 
@@ -280,8 +293,8 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ done: true });
       });
 
-      const traceCtx = createTrace({});
-      const result = await traceCtx.span('parent-span', parentOp);
+      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const result = await trace('parent-span', parentOp);
 
       expect(result.success).toBe(true);
       expect(executedSteps).toEqual(['parent-start', 'child', 'parent-end']);
