@@ -46,7 +46,7 @@ import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createSpanLogger as createSpanLoggerFromGenerator } from './codegen/spanLoggerGenerator.js';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import { createOpMetadata } from './opContext/defineOp.js';
-import type { DepsConfig, FeatureFlagSchema, OpContextFactory, SpanContext } from './opContext/types.js';
+import type { DepsConfig, FeatureFlagSchema, OpContext, OpContextFactory, SpanContext } from './opContext/types.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
@@ -123,7 +123,10 @@ export class Tracer<
 
     // Create shared prototype for all SpanContexts created by this tracer
     // This avoids recreating prototype methods per-trace
-    this.spanContextProto = createSpanContextProto<LogSchema<T>, FF, UserCtx>(factory.logSchema, factory.logBinding);
+    this.spanContextProto = createSpanContextProto<OpContext<LogSchema<T>, FF, {}, UserCtx>>(
+      factory.logSchema,
+      factory.logBinding,
+    );
   }
 
   /**
@@ -136,7 +139,7 @@ export class Tracer<
    * @param fn - Async function to execute in trace context
    * @returns Promise resolving to fn's return value
    */
-  trace<R>(name: string, fn: (ctx: SpanContext<LogSchema<T>, FF, Deps, UserCtx>) => Promise<R>): Promise<R>;
+  trace<R>(name: string, fn: (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>): Promise<R>;
 
   /**
    * Create a new trace with root span and overrides
@@ -149,20 +152,22 @@ export class Tracer<
   trace<R>(
     name: string,
     overrides: TraceOverrides<UserCtx>,
-    fn: (ctx: SpanContext<LogSchema<T>, FF, Deps, UserCtx>) => Promise<R>,
+    fn: (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>,
   ): Promise<R>;
 
   async trace<R>(
     name: string,
-    overridesOrFn: TraceOverrides<UserCtx> | ((ctx: SpanContext<LogSchema<T>, FF, Deps, UserCtx>) => Promise<R>),
-    maybeFn?: (ctx: SpanContext<LogSchema<T>, FF, Deps, UserCtx>) => Promise<R>,
+    overridesOrFn:
+      | TraceOverrides<UserCtx>
+      | ((ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>),
+    maybeFn?: (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>,
   ): Promise<R> {
     // Parse overloaded arguments
     const hasOverrides = typeof overridesOrFn !== 'function';
     const overrides = hasOverrides ? (overridesOrFn as TraceOverrides<UserCtx>) : ({} as TraceOverrides<UserCtx>);
     const fn = hasOverrides
       ? maybeFn!
-      : (overridesOrFn as (ctx: SpanContext<LogSchema<T>, FF, Deps, UserCtx>) => Promise<R>);
+      : (overridesOrFn as (ctx: SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>) => Promise<R>);
 
     // Generate or use provided trace ID
     const traceId: TraceId = overrides.traceId ? (overrides.traceId as TraceId) : generateTraceId();
@@ -205,7 +210,7 @@ export class Tracer<
     }
 
     // Create SpanContext using prototype inheritance
-    const ctx = Object.create(this.spanContextProto) as MutableSpanContext<LogSchema<T>, FF, UserCtx>;
+    const ctx = Object.create(this.spanContextProto) as MutableSpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>;
 
     // Set instance properties
     ctx._buffer = buffer;
@@ -214,8 +219,9 @@ export class Tracer<
 
     // Create tag writer and span logger
     ctx.tag = createTagWriter(schema, buffer) as TagWriter<LogSchema<T>>;
-    ctx.log = createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer);
-    ctx._spanLogger = ctx.log;
+    const spanLogger = createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer);
+    ctx.log = spanLogger as any;
+    ctx._spanLogger = spanLogger as any;
 
     // Spread user context properties onto context
     for (const [key, value] of Object.entries(resolvedUserCtx)) {
@@ -240,7 +246,7 @@ export class Tracer<
 
     // Execute fn with try/catch
     try {
-      const result = await fn(ctx as unknown as SpanContext<LogSchema<T>, FF, Deps, UserCtx>);
+      const result = await fn(ctx as unknown as SpanContext<OpContext<LogSchema<T>, FF, {}, UserCtx>>);
 
       // Write span-ok to row 1 (fixed layout)
       buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;

@@ -18,6 +18,7 @@
  * SpanFn now uses Op<Ctx, Args, S, E> directly (no structural typing).
  */
 
+import type { FluentLogEntry as FluentLogEntryFromGenerator } from '../codegen/spanLoggerGenerator.js';
 import type { FluentErr, FluentOk, Result } from '../result.js';
 import type { FeatureFlagEvaluator } from '../schema/evaluator.js';
 import type { LogSchema } from '../schema/LogSchema.js';
@@ -90,6 +91,9 @@ export interface SpanLogger<T extends LogSchema> {
 /**
  * Fluent log entry - chainable attribute setters after log level.
  *
+ * Re-exported from spanLoggerGenerator.ts to avoid circular dependencies.
+ * The implementation in spanLoggerGenerator.ts is the source of truth.
+ *
  * Allows setting attributes after choosing a log level:
  * ctx.log.info('message').userId('u1').requestId('r1')
  *
@@ -106,33 +110,7 @@ export interface SpanLogger<T extends LogSchema> {
  * - TypeScript transformer injects line() calls at compile time
  * - No runtime overhead - just a method call with literal number
  */
-export type FluentLogEntry<T extends LogSchema> = {
-  [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => FluentLogEntry<T>;
-} & {
-  /**
-   * Set the source code line number for this log entry.
-   *
-   * @param lineNumber - Source line number (0-65535)
-   * @example
-   * ctx.log.info('Processing user').line(42);
-   */
-  line(lineNumber: number): FluentLogEntry<T>;
-
-  /** Set multiple attributes at once */
-  with(attributes: Partial<InferSchema<T>>): FluentLogEntry<T>;
-
-  /** Set error code for this entry (system column - direct access) */
-  error_code(code: string): FluentLogEntry<T>;
-
-  /** Set exception stack for this entry (system column - direct access) */
-  exception_stack(stack: string): FluentLogEntry<T>;
-
-  /** Set feature flag value for this entry (system column - direct access) */
-  ff_value(value: string): FluentLogEntry<T>;
-
-  /** Set uint64 value for this entry (system column - direct access) */
-  uint64_value(value: bigint): FluentLogEntry<T>;
-};
+export type FluentLogEntry<T extends LogSchema> = FluentLogEntryFromGenerator<T>;
 
 // =============================================================================
 // SPAN FUNCTION TYPES

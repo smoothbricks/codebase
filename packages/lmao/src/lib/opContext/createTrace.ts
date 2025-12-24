@@ -53,7 +53,6 @@ export function createTraceImpl<
   factoryConfig: OpContextConfig<T, FF, Deps, UserCtx>,
   logBinding: LogBinding,
   params: CreateTraceParams<UserCtx>,
-  // @ts-expect-error PHASE 6: Return type updated to use OpContext bundle, but implementation not fully migrated yet
 ): SpanContext<OpContext<LogSchema<T>, FF, Deps, UserCtx>> {
   // ============================================================================
   // Step 1: Validate required params (null-sentinel properties)
@@ -121,9 +120,12 @@ export function createTraceImpl<
   // ============================================================================
   // Step 5: Create SpanContext using prototype inheritance
   // ============================================================================
-  const spanContextProto = createSpanContextProto<LogSchema<T>, FF, UserCtx>(mergedSchema as LogSchema<T>, logBinding);
+  const spanContextProto = createSpanContextProto<OpContext<LogSchema<T>, FF, Deps, UserCtx>>(
+    mergedSchema as LogSchema<T>,
+    logBinding,
+  );
 
-  const ctx = Object.create(spanContextProto) as MutableSpanContext<LogSchema<T>, FF, UserCtx>;
+  const ctx = Object.create(spanContextProto) as MutableSpanContext<OpContext<LogSchema<T>, FF, Deps, UserCtx>>;
 
   // Set instance properties
   ctx._buffer = buffer as SpanBuffer<LogSchema<T>>;
@@ -134,8 +136,9 @@ export function createTraceImpl<
   // biome-ignore lint/suspicious/noExplicitAny: Schema type erasure for runtime codegen
   ctx.tag = createTagWriter(mergedSchema, buffer) as any;
   // biome-ignore lint/suspicious/noExplicitAny: Schema type erasure for runtime codegen
-  ctx.log = createSpanLoggerFromGenerator(mergedSchema, buffer, createOverflowBuffer) as any;
-  ctx._spanLogger = ctx.log;
+  const spanLogger = createSpanLoggerFromGenerator(mergedSchema, buffer, createOverflowBuffer);
+  ctx.log = spanLogger as any;
+  ctx._spanLogger = spanLogger as any;
 
   // Spread user context properties onto context
   for (const [key, value] of Object.entries(resolvedUserCtx)) {
@@ -156,7 +159,6 @@ export function createTraceImpl<
     ctx.ff = {} as any;
   }
 
-  // @ts-expect-error PHASE 6: Internal implementation uses old structure, but type signature updated to OpContext bundle
   return ctx as unknown as SpanContext<OpContext<LogSchema<T>, FF, Deps, UserCtx>>;
 }
 

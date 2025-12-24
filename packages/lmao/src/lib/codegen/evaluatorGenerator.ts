@@ -27,19 +27,22 @@
  * - Inline caching works properly
  */
 
+import type { OpContext } from '../opContext/types.js';
 import type { FeatureFlagSchema } from '../schema/defineFeatureFlags.js';
 import type { FlagEvaluator, FlagTrackContext, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
-import type { LogSchema, Schema } from '../schema/types.js';
+import type { Schema } from '../schema/types.js';
 import type { SpanContext } from '../spanContext.js';
 
 /**
  * Base interface for generated evaluator classes
+ *
+ * Takes OpContext as primary type parameter (matches SpanContext, Op, etc.)
  */
-export interface GeneratedEvaluatorBase<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown> {
+export interface GeneratedEvaluatorBase<Ctx extends OpContext, FF extends FeatureFlagSchema = FeatureFlagSchema> {
   get(flag: string): Promise<unknown>;
   trackUsage<K extends keyof FF>(flag: K, context?: FlagTrackContext): void;
-  forContext(ctx: SpanContext<T, FF, Env>): GeneratedEvaluatorBase<FF, T, Env> & InferFeatureFlagsWithContext<FF>;
-  readonly evaluator: FlagEvaluator<T, FF, Env>;
+  forContext(ctx: SpanContext<Ctx>): GeneratedEvaluatorBase<Ctx, FF> & InferFeatureFlagsWithContext<FF>;
+  readonly evaluator: FlagEvaluator<Ctx, FF>;
 }
 
 /**
@@ -48,9 +51,9 @@ export interface GeneratedEvaluatorBase<FF extends FeatureFlagSchema, T extends 
 const evaluatorClassCache = new WeakMap<
   FeatureFlagSchema,
   new (
-    spanContext: SpanContext<LogSchema, FeatureFlagSchema, unknown>,
-    evaluator: FlagEvaluator<LogSchema, FeatureFlagSchema, unknown>,
-  ) => GeneratedEvaluatorBase<FeatureFlagSchema, LogSchema, unknown>
+    spanContext: SpanContext<OpContext>,
+    evaluator: FlagEvaluator,
+  ) => GeneratedEvaluatorBase<OpContext, FeatureFlagSchema>
 >();
 
 /**
@@ -252,21 +255,21 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
  * @param ENTRY_TYPE_FF_ACCESS - Entry type constant for access
  * @returns Constructor for generated evaluator class
  */
-export function createEvaluatorClass<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown>(
+export function createEvaluatorClass<Ctx extends OpContext, FF extends FeatureFlagSchema>(
   schema: FF,
   validateFlagValue: (value: unknown, schema: Schema<unknown, unknown>, defaultValue: unknown) => unknown,
   ENTRY_TYPE_FF_ACCESS: number,
 ): new (
-  spanContext: SpanContext<T, FF, Env>,
-  evaluator: FlagEvaluator<T, FF, Env>,
-) => GeneratedEvaluatorBase<FF, T, Env> & InferFeatureFlagsWithContext<FF> {
+  spanContext: SpanContext<Ctx>,
+  evaluator: FlagEvaluator<Ctx, FF>,
+) => GeneratedEvaluatorBase<Ctx, FF> & InferFeatureFlagsWithContext<FF> {
   // Check cache first
   const cached = evaluatorClassCache.get(schema);
   if (cached) {
     return cached as unknown as new (
-      spanContext: SpanContext<T, FF, Env>,
-      evaluator: FlagEvaluator<T, FF, Env>,
-    ) => GeneratedEvaluatorBase<FF, T, Env> & InferFeatureFlagsWithContext<FF>;
+      spanContext: SpanContext<Ctx>,
+      evaluator: FlagEvaluator<Ctx, FF>,
+    ) => GeneratedEvaluatorBase<Ctx, FF> & InferFeatureFlagsWithContext<FF>;
   }
 
   const classCode = generateEvaluatorClass(schema).trim();
@@ -284,7 +287,7 @@ export function createEvaluatorClass<FF extends FeatureFlagSchema, T extends Log
   evaluatorClassCache.set(schema, GeneratedClass);
 
   return GeneratedClass as unknown as new (
-    spanContext: SpanContext<T, FF, Env>,
-    evaluator: FlagEvaluator<T, FF, Env>,
-  ) => GeneratedEvaluatorBase<FF, T, Env> & InferFeatureFlagsWithContext<FF>;
+    spanContext: SpanContext<Ctx>,
+    evaluator: FlagEvaluator<Ctx, FF>,
+  ) => GeneratedEvaluatorBase<Ctx, FF> & InferFeatureFlagsWithContext<FF>;
 }

@@ -7,6 +7,8 @@
  * - Contains system properties (traceId, timestamps, threadId) + user Extra
  */
 
+import type { OpContext } from './opContext/types.js';
+import type { Result } from './result.js';
 import type { FeatureFlagSchema } from './schema/defineFeatureFlags.js';
 import type { FlagEvaluator } from './schema/evaluator.js';
 import type { LogSchema } from './schema/types.js';
@@ -51,9 +53,18 @@ export type { Op } from './op.js';
  */
 export type RootSpanFn = {
   // Overload 1: With line number (transformer output)
-  <Ctx, R, Args extends unknown[]>(line: number, name: string, op: Op<Ctx, Args, R>, ...args: Args): Promise<R>;
+  <Ctx extends OpContext, Args extends unknown[], S, E>(
+    line: number,
+    name: string,
+    op: Op<Ctx, Args, S, E>,
+    ...args: Args
+  ): Promise<Result<S, E>>;
   // Overload 2: Without line number (user writes)
-  <Ctx, R, Args extends unknown[]>(name: string, op: Op<Ctx, Args, R>, ...args: Args): Promise<R>;
+  <Ctx extends OpContext, Args extends unknown[], S, E>(
+    name: string,
+    op: Op<Ctx, Args, S, E>,
+    ...args: Args
+  ): Promise<Result<S, E>>;
 };
 
 // =============================================================================
@@ -70,12 +81,16 @@ export type RootSpanFn = {
  * @typeParam T - LogSchema type (for typed evaluation context)
  * @typeParam Env - Environment type
  */
-export interface TraceContextSystem<FF extends FeatureFlagSchema, T extends LogSchema = LogSchema, Env = unknown> {
+export interface TraceContextSystem<
+  FF extends FeatureFlagSchema,
+  T extends LogSchema = LogSchema,
+  Env extends Record<string, unknown> = Record<string, unknown>,
+> {
   // System properties (always present, auto-generated)
   readonly anchorEpochMicros: number; // Nanoseconds.now() / 1000n at trace root (microsecond precision)
   readonly anchorPerfNow: number; // performance.now() at trace root
   /** Root flag evaluator - use forContext(spanCtx) to get span-bound evaluator */
-  readonly ff: FlagEvaluator<T, FF, Env>;
+  readonly ff: FlagEvaluator<OpContext<T, FF, {}, Env>, FF>;
   readonly span: RootSpanFn;
 }
 

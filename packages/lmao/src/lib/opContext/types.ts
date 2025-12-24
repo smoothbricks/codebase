@@ -201,7 +201,7 @@ export interface OpContextConfig<
    *   forContext: (ctx) => new FeatureFlagEvaluator(schema, ctx, this),
    * }
    */
-  readonly flagEvaluator?: FlagEvaluator<LogSchema<T>, FF, unknown>;
+  readonly flagEvaluator?: FlagEvaluator<OpContext<LogSchema<T>, FF, {}, UserCtx>, FF>;
 
   /**
    * User-defined context properties
@@ -293,7 +293,7 @@ export interface OpContextFactory<
    * Feature flag evaluator (optional).
    * Used by Tracer to bind feature flags to SpanContexts.
    */
-  readonly flagEvaluator?: FlagEvaluator<T, FF, UserCtx>;
+  readonly flagEvaluator?: FlagEvaluator<OpContext<T, FF, Deps, UserCtx>, FF>;
 
   /**
    * Define a single Op with explicit name.
