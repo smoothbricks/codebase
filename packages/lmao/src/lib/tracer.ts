@@ -66,6 +66,7 @@ import {
   createSpanContextClass,
   type SpanContextClass,
   type SpanContextInstance,
+  writeSpanEnd,
   writeSpanStart,
 } from './spanContext.js';
 import { getTimestampNanos } from './timestamp.js';
@@ -597,9 +598,8 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
    * Execute function with context and handle span-ok/span-err/span-exception writes
    * Promise-agnostic: returns sync for sync fn, Promise for async fn
    *
-   * NOTE: If the function returns a FluentOk/FluentErr (from ctx.ok()/ctx.err()),
-   * the entry type was already written by the constructor. We detect this via
-   * instanceof and skip overwriting.
+   * Writes span-end entry (entry_type, timestamp, error_code) and applies deferred tags
+   * when the function returns a FluentOk/FluentErr result.
    */
   private _executeWithContext<R>(
     ctx: SpanContextInstance<OpContextOf<B>>,
@@ -621,17 +621,17 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
         return (result as unknown as Promise<unknown>)
           .then(
             (resolved) => {
-              // If result is FluentOk/FluentErr (from ctx.ok()/ctx.err()), entry type was already
-              // written by the constructor. Skip overwriting.
+              // Write span-end: entry_type, timestamp, error_code (if err), deferred tags
               if (resolved instanceof FluentOk || resolved instanceof FluentErr) {
-                return resolved;
+                writeSpanEnd(buffer, resolved);
+              } else {
+                // Fallback for non-FluentResult returns
+                buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+                buffer.timestamp[1] = getTimestampNanos(
+                  buffer._traceRoot.anchorEpochNanos,
+                  buffer._traceRoot.anchorPerfNow,
+                );
               }
-              // Write span-ok to row 1 (fallback for non-FluentResult returns)
-              buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-              buffer.timestamp[1] = getTimestampNanos(
-                buffer._traceRoot.anchorEpochNanos,
-                buffer._traceRoot.anchorPerfNow,
-              );
               return resolved;
             },
             (error: unknown) => {
@@ -657,15 +657,14 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
           .finally(() => this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>)) as R;
       }
 
-      // Sync path
-      // If result is FluentOk/FluentErr (from ctx.ok()/ctx.err()), entry type was already
-      // written by the constructor. Skip overwriting.
+      // Sync path - write span-end
       if (result instanceof FluentOk || result instanceof FluentErr) {
-        return result;
+        writeSpanEnd(buffer, result);
+      } else {
+        // Fallback for non-FluentResult returns
+        buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+        buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
       }
-      // Write span-ok immediately (fallback for non-FluentResult returns)
-      buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-      buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
       return result;
     } catch (error) {

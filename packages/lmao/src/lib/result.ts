@@ -2,12 +2,18 @@
  * Result types and fluent result builders for ctx.ok()/ctx.err()
  *
  * Provides type-safe error handling without exceptions using discriminated unions.
+ *
+ * ## Deferred Tag Application
+ *
+ * FluentOk and FluentErr are buffer-agnostic - they capture tag operations as closures
+ * via the `applyTags` property. When span()/trace() completes, it calls `result.applyTags(buffer)`
+ * to apply all captured tags to the correct buffer.
+ *
+ * This ensures type safety - tags are always applied to the span that created the result,
+ * preventing accidental writes to wrong buffers if a result is captured and used later.
  */
 
-import { createResultWriter, type ResultWriter } from './codegen/fixedPositionWriterGenerator.js';
-import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
-import { getTimestampNanos } from './timestamp.js';
 import type { SpanBuffer } from './types.js';
 
 /**
@@ -76,161 +82,196 @@ export type Err<E> = { success: false; error: { code: string; details: E } };
 export type Result<V, E = unknown> = Ok<V> | Err<E>;
 
 /**
- * Fluent result builder for ctx.ok()/ctx.err()
- * Allows chaining attributes and message before returning result
- *
- * Per specs/01h_entry_types_and_logging_primitives.md:
- * - Writes span-ok or span-err entry to buffer
- * - Supports .with() for attributes and individual setters
- * - Returns final result after writing to buffer
- *
- * This class uses ResultWriter internally for attribute writing while
- * maintaining proper TypeScript type narrowing via Ok interface.
+ * Type for the deferred tag application closure.
+ * Called by span()/trace() at span-end to apply captured tags to the buffer.
  */
-export class FluentOk<V, T extends LogSchema> implements Ok<V> {
-  readonly success = true as const;
+export type ApplyTagsFn<T extends LogSchema> = (buffer: SpanBuffer<T>) => void;
+
+/**
+ * Fluent success result - buffer-agnostic with deferred tag application.
+ *
+ * Created by ctx.ok(value). Tags are captured as closures and applied when
+ * span()/trace() completes, ensuring writes go to the correct buffer.
+ *
+ * @example
+ * ```typescript
+ * // Basic usage
+ * return ctx.ok(user);
+ *
+ * // With chained tags (applied at span-end)
+ * return ctx.ok(user).message('User created').with({ userId: user.id });
+ * ```
+ */
+export class FluentOk<V, T extends LogSchema = LogSchema> implements Ok<V> {
   readonly value: V;
-  /** @internal - hidden from console.log via custom inspect */
-  #writer: ResultWriter<T>;
 
-  constructor(buffer: SpanBuffer<T>, value: V, schema: T) {
+  /**
+   * Closure chain for deferred tag application.
+   * Applied by span()/trace() at span-end to write tags to buffer row 1.
+   * undefined if no chained methods were called.
+   */
+  applyTags?: ApplyTagsFn<T>;
+
+  constructor(value: V) {
     this.value = value;
+  }
 
-    // Overwrite the pre-initialized span-exception with span-ok
-    buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-
-    // Write timestamp (nanoseconds since epoch)
-    buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
-
-    // Create ResultWriter for fluent attribute setting (writes to position 1)
-    this.#writer = createResultWriter(schema, buffer, value, false);
-
-    // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
+  /** Getter for Ok interface - derived from class identity */
+  get success(): true {
+    return true;
   }
 
   /** Clean output for console.log in Node.js */
   [Symbol.for('nodejs.util.inspect.custom')](): { success: true; value: V } {
-    return { success: this.success, value: this.value };
+    return { success: true, value: this.value };
   }
 
   /** Clean output for JSON.stringify */
   toJSON(): { success: true; value: V } {
-    return { success: this.success, value: this.value };
+    return { success: true, value: this.value };
   }
 
   /**
-   * Set multiple attributes on the result entry
-   * Example: ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
+   * Set multiple attributes on the span-end entry (row 1).
+   * Deferred - applied when span()/trace() completes.
+   *
+   * @example ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
    */
   with(attributes: Partial<InferSchema<T>>): this {
-    this.#writer.with(attributes);
+    const prev = this.applyTags;
+    this.applyTags = (buffer) => {
+      if (prev) prev(buffer);
+      for (const [key, value] of Object.entries(attributes)) {
+        if (value != null && typeof (buffer as Record<string, unknown>)[key] === 'function') {
+          (buffer as Record<string, (pos: number, val: unknown) => void>)[key](1, value);
+        }
+      }
+    };
     return this;
   }
 
   /**
-   * Set a message on the result entry
-   * Example: ctx.ok(result).message('User created successfully')
+   * Set result message on span-end entry (row 1).
+   * Overwrites the default span name in the message column.
+   *
+   * @example ctx.ok(result).message('User created successfully')
    */
   message(text: string): this {
-    // Use the unified message column via the writer's message setter
-    // ResultWriter generates a message() method from the systemSchema
-    const writer = this.#writer as ResultWriter<T, V, never> & { message?: (v: string) => unknown };
-    if (typeof writer.message === 'function') {
-      writer.message(text);
-    }
+    const prev = this.applyTags;
+    this.applyTags = (buffer) => {
+      if (prev) prev(buffer);
+      buffer.message(1, text);
+    };
     return this;
   }
 
   /**
-   * Set the source code line number for this result entry
-   * Example: ctx.ok(result).line(42)
+   * Set source code line number on span-end entry (row 1).
+   * Typically injected by transformer.
+   *
+   * @example ctx.ok(result).line(42)
    */
   line(lineNumber: number): this {
-    // Use the writer's setter if available, otherwise fallback
-    const writer = this.#writer as ResultWriter<T, V, never> & { lineNumber?: (v: number) => unknown };
-    if (typeof writer.lineNumber === 'function') {
-      writer.lineNumber(lineNumber);
-    }
+    const prev = this.applyTags;
+    this.applyTags = (buffer) => {
+      if (prev) prev(buffer);
+      buffer.line(1, lineNumber);
+    };
     return this;
   }
 }
 
 /**
- * Fluent error result with chaining support
+ * Fluent error result - buffer-agnostic with deferred tag application.
  *
- * Uses ResultWriter internally for attribute writing while
- * maintaining proper TypeScript type narrowing via Err interface.
+ * Created by ctx.err(code, details). The error code is stored in the result
+ * and written to buffer by span()/trace() at span-end (not via closure).
+ *
+ * @example
+ * ```typescript
+ * // Basic usage
+ * return ctx.err('VALIDATION_FAILED', { field: 'email' });
+ *
+ * // With chained tags (applied at span-end)
+ * return ctx.err('NOT_FOUND', null).message('User not found');
+ * ```
  */
-export class FluentErr<E, T extends LogSchema> implements Err<E> {
-  readonly success = false as const;
+export class FluentErr<E, T extends LogSchema = LogSchema> implements Err<E> {
   readonly error: { code: string; details: E };
-  /** @internal - hidden from console.log via custom inspect */
-  #writer: ResultWriter<T>;
 
-  constructor(buffer: SpanBuffer<T>, code: string, details: E, schema: T) {
+  /**
+   * Closure chain for deferred tag application.
+   * Applied by span()/trace() at span-end to write tags to buffer row 1.
+   * Note: error_code is written directly by span()/trace() from this.error.code,
+   * not via this closure.
+   */
+  applyTags?: ApplyTagsFn<T>;
+
+  constructor(code: string, details: E) {
     this.error = { code, details };
+  }
 
-    // Overwrite the pre-initialized span-exception with span-err
-    buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
-
-    // Write timestamp (nanoseconds since epoch)
-    buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
-
-    // Create ResultWriter for fluent attribute setting (writes to position 1)
-    this.#writer = createResultWriter(schema, buffer, details, true);
-
-    // Write error code using the writer if available
-    const writer = this.#writer as ResultWriter<T, never, E> & { errorCode?: (v: string) => unknown };
-    if (typeof writer.errorCode === 'function') {
-      writer.errorCode(code);
-    }
-
-    // Note: writeIndex is NOT incremented - row 1 is reserved, events start at row 2
+  /** Getter for Err interface - derived from class identity */
+  get success(): false {
+    return false;
   }
 
   /** Clean output for console.log in Node.js */
   [Symbol.for('nodejs.util.inspect.custom')](): { success: false; error: { code: string; details: E } } {
-    return { success: this.success, error: this.error };
+    return { success: false, error: this.error };
   }
 
   /** Clean output for JSON.stringify */
   toJSON(): { success: false; error: { code: string; details: E } } {
-    return { success: this.success, error: this.error };
+    return { success: false, error: this.error };
   }
 
   /**
-   * Set multiple attributes on the result entry
-   * Example: ctx.err('ERROR', details).with({ userId: 'u1' })
+   * Set multiple attributes on the span-end entry (row 1).
+   * Deferred - applied when span()/trace() completes.
+   *
+   * @example ctx.err('ERROR', details).with({ userId: 'u1' })
    */
   with(attributes: Partial<InferSchema<T>>): this {
-    this.#writer.with(attributes);
+    const prev = this.applyTags;
+    this.applyTags = (buffer) => {
+      if (prev) prev(buffer);
+      for (const [key, value] of Object.entries(attributes)) {
+        if (value != null && typeof (buffer as Record<string, unknown>)[key] === 'function') {
+          (buffer as Record<string, (pos: number, val: unknown) => void>)[key](1, value);
+        }
+      }
+    };
     return this;
   }
 
   /**
-   * Set a message on the result entry
-   * Example: ctx.err('ERROR', details).message('Operation failed')
+   * Set result message on span-end entry (row 1).
+   * Overwrites the default span name in the message column.
+   *
+   * @example ctx.err('ERROR', details).message('Operation failed')
    */
   message(text: string): this {
-    // Use the unified message column via the writer's message setter
-    // ResultWriter generates a message() method from the systemSchema
-    const writer = this.#writer as ResultWriter<T, never, E> & { message?: (v: string) => unknown };
-    if (typeof writer.message === 'function') {
-      writer.message(text);
-    }
+    const prev = this.applyTags;
+    this.applyTags = (buffer) => {
+      if (prev) prev(buffer);
+      buffer.message(1, text);
+    };
     return this;
   }
 
   /**
-   * Set the source code line number for this result entry
-   * Example: ctx.err('ERROR', details).line(42)
+   * Set source code line number on span-end entry (row 1).
+   * Typically injected by transformer.
+   *
+   * @example ctx.err('ERROR', details).line(42)
    */
   line(lineNumber: number): this {
-    // Use the writer's setter if available
-    const writer = this.#writer as ResultWriter<T, never, E> & { lineNumber?: (v: number) => unknown };
-    if (typeof writer.lineNumber === 'function') {
-      writer.lineNumber(lineNumber);
-    }
+    const prev = this.applyTags;
+    this.applyTags = (buffer) => {
+      if (prev) prev(buffer);
+      buffer.line(1, lineNumber);
+    };
     return this;
   }
 }
@@ -242,7 +283,7 @@ export class FluentErr<E, T extends LogSchema> implements Err<E> {
  * @typeParam E - The type of the error details
  * @typeParam T - The log schema for the span buffer
  */
-export type FluentResult<S, E, T extends LogSchema> = FluentOk<S, T> | FluentErr<E, T>;
+export type FluentResult<S, E, T extends LogSchema = LogSchema> = FluentOk<S, T> | FluentErr<E, T>;
 
 // =============================================================================
 // RESULT TYPE EXTRACTION UTILITIES

@@ -32,9 +32,14 @@ import {
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger } from './opContext/types.js';
-import { FluentErr, FluentOk, type Result } from './result.js';
+import { type Err, FluentErr, FluentOk, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
-import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
+import {
+  ENTRY_TYPE_SPAN_ERR,
+  ENTRY_TYPE_SPAN_EXCEPTION,
+  ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_SPAN_START,
+} from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import { createChildSpanBuffer, createOverflowBuffer, type SpanBufferConstructor } from './spanBuffer.js';
 import { getTimestampNanos } from './timestamp.js';
@@ -114,6 +119,46 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
  */
 export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
   return createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer) as SpanLoggerImpl<T>;
+}
+
+/**
+ * Write span-end entry to buffer at row 1.
+ *
+ * Called by span methods after fn() returns to write:
+ * - entry_type (SPAN_OK or SPAN_ERR based on result instanceof)
+ * - timestamp
+ * - error_code (for FluentErr only)
+ * - deferred tags via result.applyTags()
+ *
+ * @param buffer - SpanBuffer to write to
+ * @param result - The result returned by the span function
+ */
+export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, result: Result<S, E>): void {
+  // Write entry_type based on result type
+  if (result instanceof FluentOk) {
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+  } else if (result instanceof FluentErr) {
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
+    // Write error_code from the result
+    buffer.error_code(1, result.error.code);
+  } else {
+    // Fallback for plain Result objects (not FluentOk/FluentErr)
+    buffer.entry_type[1] = (result as Result<S, E>).success ? ENTRY_TYPE_SPAN_OK : ENTRY_TYPE_SPAN_ERR;
+    if (!(result as Result<S, E>).success) {
+      buffer.error_code(1, ((result as Err<E>).error as { code: string }).code);
+    }
+  }
+
+  // Write timestamp
+  buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
+
+  // Apply deferred tags if present
+  if (result instanceof FluentOk || result instanceof FluentErr) {
+    const applyTags = (result as FluentOk<S, T> | FluentErr<E, T>).applyTags;
+    if (applyTags) {
+      applyTags(buffer);
+    }
+  }
 }
 
 // =============================================================================
@@ -363,11 +408,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
         spanLogger._setScope(attributes as Partial<InferSchema<Ctx['logSchema']>>);
       };
 
-      this.ok = <V>(value: V): FluentOk<V, Ctx['logSchema']> =>
-        new FluentOk<V, Ctx['logSchema']>(buffer, value, schema);
+      this.ok = <V>(value: V): FluentOk<V, Ctx['logSchema']> => new FluentOk<V, Ctx['logSchema']>(value);
 
       this.err = <E>(code: string, error: E): FluentErr<E, Ctx['logSchema']> =>
-        new FluentErr<E, Ctx['logSchema']>(buffer, code, error, schema);
+        new FluentErr<E, Ctx['logSchema']>(code, error);
 
       // span uses regular function to access `arguments` (no ...rest spread allocation)
       // Closes over `self` for calling prototype methods
@@ -845,10 +889,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       } as SpanFn<Ctx>;
 
       ctx.ok = function ok<V>(value: V): FluentOk<V, Ctx['logSchema']> {
-        return new FluentOk<V, Ctx['logSchema']>(childBuffer, value, childSchema);
+        return new FluentOk<V, Ctx['logSchema']>(value);
       };
       ctx.err = function err<E>(code: string, error: E): FluentErr<E, Ctx['logSchema']> {
-        return new FluentErr<E, Ctx['logSchema']>(childBuffer, code, error, childSchema);
+        return new FluentErr<E, Ctx['logSchema']>(code, error);
       };
       ctx.setScope = function setScope(attributes: Partial<InferSchema<Ctx['logSchema']>> | null): void {
         childLogger._setScope(attributes as Partial<InferSchema<Ctx['logSchema']>>);
@@ -902,14 +946,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
-      ctx._buffer._traceRoot.tracer.onSpanStart(ctx._buffer);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -931,14 +978,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
-      ctx._buffer._traceRoot.tracer.onSpanStart(ctx._buffer);
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -961,13 +1011,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1, a2);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -991,13 +1045,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -1022,13 +1080,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -1054,13 +1116,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -1095,13 +1161,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -1138,13 +1208,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
 
@@ -1183,13 +1257,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        return await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7, a8);
+        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7, a8);
+        writeSpanEnd(buffer, result);
+        return result;
       } catch (error) {
-        this._spanException(ctx._buffer, error);
+        this._spanException(buffer, error);
         throw error;
       } finally {
-        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
       }
     }
   }
