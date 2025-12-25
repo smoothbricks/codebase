@@ -227,11 +227,6 @@ function defineModule<Schema, Deps, FF>(config: { metadata: ModuleMetadata; logS
         use(wiredDeps: WiredDeps) {
           return createRootContext(this, wiredDeps);
         },
-
-        // Create trace context at request entry
-        traceContext(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra> {
-          return createTraceContext(moduleContext, params);
-        },
       };
     },
   };
@@ -252,17 +247,19 @@ class Op<Ctx, Args extends unknown[], Result> {
   ) {}
 
   /**
-   * Internal invocation - called by span()
+   * Internal invocation - called by span() or Tracer.trace()
    *
-   * @param traceCtx - The root trace context
-   * @param parentBuffer - Parent span's buffer (null for root)
+   * NOTE: This is pseudo-code for illustration. The actual implementation is in:
+   * - Root spans: Tracer._createRootContext() and _executeWithContext() (tracer.ts)
+   * - Child spans: SpanContext._spanPre() and span0-span8 methods (spanContext.ts)
+   *
+   * @param parentBuffer - Parent span's buffer (null for root - Tracer handles root)
    * @param callsiteModule - The CALLER's module (where span() was invoked)
    * @param spanName - Name decided by caller
    * @param lineNumber - Line number where span() was called (injected by transformer, passed directly)
    * @param args - User arguments to the op
    */
   async _invoke(
-    traceCtx: TraceContext,
     parentBuffer: SpanBuffer | null,
     callsiteModule: ModuleContext,
     spanName: string,
@@ -272,9 +269,10 @@ class Op<Ctx, Args extends unknown[], Result> {
     // 1. Create SpanBuffer with callsiteModule reference
     //    - callsiteModule: where span() was called (for row 0's gitSha/packageName/packagePath)
     //    - this.module: the Op's module (for rows 1+ gitSha/packageName/packagePath)
+    //    - For root spans, Tracer creates TraceRoot FIRST with trace_id, anchors, tracer reference
     const buffer = parentBuffer
       ? createChildSpanBuffer(parentBuffer, callsiteModule, this.module, spanName)
-      : createSpanBuffer(callsiteModule, this.module, spanName, traceCtx.trace_id);
+      : createSpanBuffer(callsiteModule, this.module, spanName, traceRoot); // traceRoot created by Tracer
 
     // 2. Register with parent's _children (RemappedBufferView if prefixed)
     if (parentBuffer) {
@@ -297,21 +295,23 @@ class Op<Ctx, Args extends unknown[], Result> {
 
     // 4. Create SpanContext (satisfies Ctx constraint)
     //    span() captures the CURRENT module (this.module) as callsiteModule for child spans
+    //    User context properties (env, requestId, etc.) come from Tracer's ctxDefaults + overrides
     const opCtx = {
       span: (childLineNumber, name, childOp, ...childArgs) =>
-        childOp._invoke(traceCtx, buffer, this.module, name, childLineNumber, childArgs),
+        childOp._invoke(buffer, this.module, name, childLineNumber, childArgs),
       log: new this.module.SpanLogger(buffer),
       tag: new this.module.TagAPI(buffer),
       deps: this.module.boundDeps,
-      ff: traceCtx.ff.withBuffer(buffer),
+      ff: flagEvaluator?.forContext(opCtx) ?? {},
       ok: (value) => ({ success: true, value }),
       err: (error) => ({ success: false, error }),
       scope: (attrs) => buffer.setScope(attrs),
       get buffer() {
         return buffer;
       },
-      // Spread Extra properties from TraceContext (e.g., env, requestId, userId)
-      ...extractExtraFromTraceContext(traceCtx),
+      // User context properties spread in (e.g., env, requestId, userId)
+      // These come from Tracer.ctxDefaults merged with trace() overrides
+      ...userCtxProperties,
     } as Ctx;
 
     // 5. Execute with try/catch
@@ -781,7 +781,7 @@ setAttribute(name, value) {
 This module context and op generation system integrates with:
 
 - **[Context Flow and Op Wrappers](./01c_context_flow_and_op_wrappers.md)**: Provides SpanContext and span() mechanics
-- **[Module Builder Pattern](./01l_module_builder_pattern.md)**: High-level API for defineModule + op()
+- **[Op Context Pattern](./01l_op_context_pattern.md)**: High-level API for defineOpContext, defineOp, and Tracer
 - **[Trace Schema System](./01a_trace_schema_system.md)**: Consumes LogSchema definitions
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for prefixed columns
 - **[Columnar Buffer Architecture](./01b_columnar_buffer_architecture.md)**: Generated classes write to SpanBuffer

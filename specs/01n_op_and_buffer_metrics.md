@@ -446,7 +446,7 @@ ORDER BY minute, package_name, op_name
 | -------------------------------------------------------------------------------------- | -------------------------------------------------- |
 | [01h_entry_types_and_logging_primitives.md](01h_entry_types_and_logging_primitives.md) | Defines the 13 new entry types in the unified enum |
 | [01f_arrow_table_structure.md](01f_arrow_table_structure.md)                           | Documents `uint64_value` as a lazy system column   |
-| [01l_module_builder_pattern.md](01l_module_builder_pattern.md)                         | Op class gains metrics properties and flush method |
+| [01l_op_context_pattern.md](01l_op_context_pattern.md)                                 | Op class gains metrics properties and flush method |
 | [01b2_buffer_self_tuning.md](01b2_buffer_self_tuning.md)                               | Buffer stats feed into `buffer-*` entry types      |
 | [01g_trace_context_api_codegen.md](01g_trace_context_api_codegen.md)                   | Generates `.uint64()` method on SpanLogger         |
 | [01a_trace_schema_system.md](01a_trace_schema_system.md)                               | Entry type enum extended with metric types         |

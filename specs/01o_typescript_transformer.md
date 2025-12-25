@@ -279,5 +279,5 @@ This enables:
 ## Related Specs
 
 - [Entry Types and Logging Primitives](./01h_entry_types_and_logging_primitives.md) - `with()` bulk setter
-- [Module Builder Pattern](./01l_module_builder_pattern.md) - Metadata injection, `span()` overloads
+- [Op Context Pattern](./01l_op_context_pattern.md) - Metadata injection, `span()` overloads
 - [Context Flow](./01c_context_flow_and_op_wrappers.md) - Line number flow to TypedArrays

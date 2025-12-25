@@ -23,7 +23,7 @@ const flags = defineFeatureFlags({
 });
 
 // 3. Create op context
-const { defineOp, defineOps, createTrace, logSchema } = defineOpContext({
+const opContext = defineOpContext({
   logSchema: appSchema,
   deps: {
     http: httpOps.prefix('http'),
@@ -34,12 +34,14 @@ const { defineOp, defineOps, createTrace, logSchema } = defineOpContext({
     return launchDarkly.variation(flag, defaultValue, { user: ctx.userId });
   },
   ctx: {
-    env: null as Env, // REQUIRED at createTrace
-    requestId: null as string, // REQUIRED at createTrace
+    env: null as Env, // REQUIRED at trace()
+    requestId: null as string, // REQUIRED at trace()
     userId: undefined as string | undefined, // OPTIONAL - may not be known yet
     config: { retryCount: 3 }, // has default, can override
   },
 });
+
+const { defineOp, defineOps } = opContext;
 
 // 4. Define ops
 const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
@@ -51,21 +53,68 @@ const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
 // 5. Export as group (for other packages to use)
 export const userOps = defineOps({ fetchUser, updateUser, deleteUser });
 
-// 6. Create trace at request boundary
+// 6. Create tracer and trace at request boundary
+import { TestTracer } from '@smoothbricks/lmao';
+
+const { trace } = new TestTracer(opContext);
+
 export default {
   async fetch(req: Request, env: Env) {
-    const ctx = createTrace({
-      env, // required
-      requestId: crypto.randomUUID(), // required
-      userId: req.headers.get('x-user-id') ?? undefined, // optional
-      // config not provided - uses default { retryCount: 3 }
-    });
-    return ctx.span('request', fetchUser, req.params.id);
+    return trace(
+      'request',
+      {
+        env, // required
+        requestId: crypto.randomUUID(), // required
+        userId: req.headers.get('x-user-id') ?? undefined, // optional
+        // config not provided - uses default { retryCount: 3 }
+      },
+      fetchUser,
+      req.params.id
+    );
   },
 };
 ```
 
 ## Core Concepts
+
+### What defineOpContext Returns
+
+`defineOpContext()` returns an `OpContextFactory` which extends `OpContextBinding`:
+
+```typescript
+interface OpContextBinding<T, FF, Deps, UserCtx> {
+  readonly [opContextType]: OpContext<T, FF, Deps, UserCtx>; // Phantom type for inference
+  readonly logBinding: LogBinding<T>; // Schema + capacity stats
+  readonly ctxDefaults: UserCtx; // User context defaults (with null sentinels)
+  readonly deps: Deps; // Wired dependencies
+}
+
+interface OpContextFactory<T, FF, Deps, UserCtx> extends OpContextBinding<T, FF, Deps, UserCtx> {
+  readonly logSchema: LogSchema<EffectiveSchema<T, Deps>>; // Computed effective schema
+  readonly flags: FF; // Feature flag schema
+  defineOp: DefineOpFn; // Create single Op
+  defineOps: DefineOpsFn; // Create multiple Ops + OpGroup
+}
+```
+
+**Usage:**
+
+```typescript
+// Store the full factory
+const opContext = defineOpContext({
+  logSchema: mySchema,
+  ctx: { env: null as Env },
+});
+
+// Destructure what you need
+const { defineOp, defineOps, logSchema } = opContext;
+
+// Pass to Tracer (accepts OpContextBinding)
+const { trace } = new TestTracer(opContext);
+```
+
+The phantom type `[opContextType]` enables TypeScript to infer the full context type from the factory, so
+`new TestTracer(opContext)` has fully typed `trace()` methods.
 
 ### Context Properties (`ctx`) - Runtime Context
 
@@ -76,7 +125,7 @@ Declare ALL properties upfront for V8 hidden class optimization. Three patterns 
 
 ```typescript
 ctx: {
-  // 1. REQUIRED - must provide at createTrace()
+  // 1. REQUIRED - must provide at trace()
   env: null as Env,                         // null sentinel → Env in SpanContext
   requestId: null as string,                // null sentinel → string in SpanContext
 
@@ -84,17 +133,17 @@ ctx: {
   userId: undefined as string | undefined,  // undefined → string | undefined in SpanContext
   sessionId: undefined as string | undefined,
 
-  // 3. HAS DEFAULT - can override at createTrace()
+  // 3. HAS DEFAULT - can override at trace()
   config: { retryCount: 3, timeout: 30000 },
   debug: false,
 }
 ```
 
-| Pattern  | Declaration                   | At createTrace() | In SpanContext   |
-| -------- | ----------------------------- | ---------------- | ---------------- |
-| Required | `null as T`                   | Must provide     | `T`              |
-| Optional | `undefined as T \| undefined` | Can omit         | `T \| undefined` |
-| Default  | `value`                       | Can override     | `typeof value`   |
+| Pattern  | Declaration                   | At trace()   | In SpanContext   |
+| -------- | ----------------------------- | ------------ | ---------------- |
+| Required | `null as T`                   | Must provide | `T`              |
+| Optional | `undefined as T \| undefined` | Can omit     | `T \| undefined` |
+| Default  | `value`                       | Can override | `typeof value`   |
 
 **Why all three?**
 
@@ -226,6 +275,49 @@ async (ctx, ...args) => {
 };
 ```
 
+## Result Types
+
+Ops return `Result<S, E>` which is a discriminated union:
+
+### Type Definitions
+
+```typescript
+type Ok<V> = { success: true; value: V };
+type Err<E> = { success: false; error: { code: string; details: E } };
+type Result<V, E = unknown> = Ok<V> | Err<E>;
+```
+
+### Fluent Builders
+
+`ctx.ok()` and `ctx.err()` return fluent builders that write to buffer row 1:
+
+```typescript
+// Success with attributes
+return ctx.ok(user).with({ cached: true }).message('User fetched from cache');
+
+// Error with attributes
+return ctx
+  .err('NOT_FOUND', { id })
+  .message('User not found')
+  .with({ searched_tables: ['users', 'archived_users'] });
+```
+
+### Chaining Methods
+
+| Method           | Purpose                               |
+| ---------------- | ------------------------------------- |
+| `.with(attrs)`   | Set schema attributes on result entry |
+| `.message(text)` | Set message column                    |
+| `.line(n)`       | Set source line number                |
+
+### Entry Type Detection
+
+The Tracer detects if a function returns `FluentOk` or `FluentErr`:
+
+- If yes: Entry type already written, Tracer doesn't overwrite
+- If no (plain Result): Tracer writes `span-ok` to row 1
+- If throws: Tracer writes `span-exception` to row 1
+
 ### Defining Ops
 
 **Single op:**
@@ -256,28 +348,244 @@ export const myOps = defineOps({ ... });
 // Consumer: myOps.prefix('my') or myOps.mapColumns({ ... })
 ```
 
-### Creating Traces
+## Tracer Architecture
 
-At request/invocation boundary:
+The Tracer is an abstract base class that manages trace execution and lifecycle. Concrete implementations define how
+trace data is collected, batched, and processed.
+
+### Abstract Tracer Class
+
+The `Tracer` class provides the foundation for all trace collection:
+
+**Constructor Signature:**
 
 ```typescript
-const ctx = createTrace({
-  // Required (null sentinel) - MUST provide
-  env: workerEnv,
-  requestId: crypto.randomUUID(),
+constructor(binding: OpContextBinding, options?: TracerOptions)
+```
 
-  // Optional (undefined sentinel) - CAN provide
-  userId: user?.id, // undefined if not authenticated yet
+- `binding` - The OpContextBinding returned from `defineOpContext()`
+- `options.flagEvaluator` - Optional feature flag evaluator for runtime flag resolution
 
-  // Default - CAN override
-  config: { retryCount: 5, timeout: 60000 },
+**Lifecycle Hooks (Abstract Methods):**
 
-  // Trace ID - auto-generated if not provided
-  traceId: 'custom-trace-id',
+All subclasses must implement these five lifecycle hooks:
+
+| Hook                    | When Called                                      | Purpose                               |
+| ----------------------- | ------------------------------------------------ | ------------------------------------- |
+| `onTraceStart()`        | Before root span function executes               | Initialize trace (e.g., start timer)  |
+| `onTraceEnd()`          | After root span completes (in finally block)     | Collect completed trace (e.g., queue) |
+| `onSpanStart()`         | Before child span function executes              | Track child span lifecycle            |
+| `onSpanEnd()`           | After child span completes (in finally block)    | Process completed child span          |
+| `onStatsWillResetFor()` | Before buffer stats reset during capacity tuning | Capture stats before they're lost     |
+
+All hooks receive the `SpanBuffer` as their argument, providing access to:
+
+- `buffer._stats` - Current stats (writes, overflows, capacity)
+- `buffer._opMetadata` - Which Op/module this buffer belongs to
+- `buffer.trace_id` - The trace identifier
+- `buffer._children` - Child span tree (for root buffers)
+
+**Public Methods:**
+
+- `trace()` - Polymorphic trace creation function (see overloads below)
+- `trace_op()` - Monomorphic Op execution (transformer optimization)
+- `trace_fn()` - Monomorphic function execution (transformer optimization)
+- `flush()` - Optional flush method (default no-op, override for batching)
+
+### Concrete Implementations
+
+| Tracer             | Purpose                                   | Key Features                                           |
+| ------------------ | ----------------------------------------- | ------------------------------------------------------ |
+| `TestTracer`       | Test inspection and Arrow conversion      | `rootBuffers[]`, `statsSnapshots[]`, `clear()`         |
+| `NoOpTracer`       | Disable tracing / performance baseline    | All hooks are no-ops, zero overhead                    |
+| `StdioTracer`      | Development debugging with console output | Color-coded trace IDs, indented tree output, durations |
+| `ArrayQueueTracer` | Production batching before backend send   | `queue[]`, `drain()` method for batch processing       |
+
+**TestTracer:**
+
+Accumulates root buffers for inspection and Arrow table conversion. Child spans accessible via `buffer._children` tree.
+
+```typescript
+const tracer = new TestTracer(opContext);
+const { trace } = tracer;
+await trace('fetch', fetchOp);
+
+expect(tracer.rootBuffers).toHaveLength(1);
+const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
+```
+
+**NoOpTracer:**
+
+Executes ops normally but discards all trace data. Useful for tests that don't need output or for disabling tracing.
+
+```typescript
+const { trace } = new NoOpTracer(opContext);
+await trace('fetch', fetchOp); // Executes, no side effects
+```
+
+**StdioTracer:**
+
+Prints spans to stdout/stderr with colors, indentation, and timestamps. Ideal for development.
+
+```typescript
+const { trace } = new StdioTracer(opContext);
+await trace('request', handleRequest);
+// [2025-12-25T10:30:45.123Z] [123456] request
+// [2025-12-25T10:30:45.125Z] [123456]   ├─ db-query
+// [2025-12-25T10:30:45.225Z] [123456]   └─ db-query [OK] (100.00ms)
+```
+
+**ArrayQueueTracer:**
+
+Batches completed traces in memory. Use `drain()` to consume and process batches.
+
+```typescript
+const tracer = new ArrayQueueTracer(opContext);
+const { trace } = tracer;
+
+await trace('req-1', handleRequest);
+await trace('req-2', handleRequest);
+
+const batch = tracer.drain(); // Returns and clears queue
+for (const buf of batch) {
+  const table = convertSpanTreeToArrowTable(buf);
+  await sendToBackend(table);
+}
+```
+
+### trace() Method Signatures
+
+The `trace()` method has 8 overloads supporting various combinations:
+
+**With Op (4 overloads):**
+
+```typescript
+// Without line number (manual calls)
+trace<S, E>(name: string, op: Op<Ctx, [], S, E>): Promise<Result<S, E>>
+trace<S, E>(name: string, overrides: TraceOverrides<UserCtx>, op: Op<Ctx, [], S, E>): Promise<Result<S, E>>
+
+// With line number (transformer-injected)
+trace<S, E>(line: number, name: string, op: Op<Ctx, [], S, E>): Promise<Result<S, E>>
+trace<S, E>(line: number, name: string, overrides: TraceOverrides<UserCtx>, op: Op<Ctx, [], S, E>): Promise<Result<S, E>>
+```
+
+**With inline function (4 overloads):**
+
+```typescript
+// Without line number (manual calls)
+trace<R>(name: string, fn: (ctx: SpanContext<Ctx>) => R): R
+trace<R>(name: string, overrides: TraceOverrides<UserCtx>, fn: (ctx: SpanContext<Ctx>) => R): R
+
+// With line number (transformer-injected)
+trace<R>(line: number, name: string, fn: (ctx: SpanContext<Ctx>) => R): R
+trace<R>(line: number, name: string, overrides: TraceOverrides<UserCtx>, fn: (ctx: SpanContext<Ctx>) => R): R
+```
+
+**TraceOverrides:**
+
+Allows providing required context and optional distributed trace ID:
+
+```typescript
+type TraceOverrides<UserCtx> = Partial<UserCtx> & { trace_id?: TraceId };
+```
+
+- All `ctx` properties with `null` sentinel must be provided
+- Optional properties (`undefined` sentinel) can be omitted
+- Default properties can be overridden
+- `trace_id` is optional (auto-generated if not provided)
+
+### Usage Examples
+
+**Basic usage with TestTracer:**
+
+```typescript
+import { defineOpContext, defineLogSchema, S, TestTracer } from '@smoothbricks/lmao';
+
+const opContext = defineOpContext({
+  logSchema: defineLogSchema({
+    user_id: S.category(),
+    operation: S.enum(['create', 'read', 'update', 'delete']),
+  }),
+  ctx: { env: null as Env }, // Required at trace time
 });
 
-// Then invoke ops
-await ctx.span('main', myOp, arg1, arg2);
+const tracer = new TestTracer(opContext);
+const { trace } = tracer;
+
+await trace('fetch-user', fetchUserOp, userId);
+
+// Inspect results
+const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
+```
+
+**With context overrides:**
+
+```typescript
+// Required ctx properties must be provided in overrides
+await trace('handle-request', { env: myEnv, requestId: 'req-123' }, handleRequestOp);
+
+// With distributed tracing
+await trace('downstream', { env: myEnv, trace_id: incomingTraceId }, processOp);
+```
+
+**Inline functions:**
+
+```typescript
+await trace('custom-logic', async (ctx) => {
+  ctx.tag.user_id('u123');
+  ctx.log.info('Processing');
+  return ctx.ok({ processed: true });
+});
+
+// With overrides
+await trace('custom-logic', { env: myEnv }, async (ctx) => {
+  return ctx.ok('done');
+});
+```
+
+**Production batching with ArrayQueueTracer:**
+
+```typescript
+// Cloudflare Worker example
+export default {
+  async fetch(req: Request, env: Env, execCtx: ExecutionContext) {
+    const tracer = new ArrayQueueTracer(opContext);
+    const { trace } = tracer;
+
+    const response = await trace('request', { env }, handleRequest, req);
+
+    // Batch send in background
+    execCtx.waitUntil(
+      (async () => {
+        const batch = tracer.drain();
+        for (const buf of batch) {
+          const table = convertSpanTreeToArrowTable(buf);
+          await env.TRACES_QUEUE.send(table);
+        }
+      })()
+    );
+
+    return response;
+  },
+};
+```
+
+**Development debugging with StdioTracer:**
+
+```typescript
+const { trace } = new StdioTracer(opContext);
+await trace('server-start', initializeServer);
+// See colored, indented output in terminal
+```
+
+**Feature flags:**
+
+```typescript
+const tracer = new TestTracer(opContext, {
+  flagEvaluator: async (ctx, flag, defaultValue) => {
+    return launchDarkly.variation(flag, defaultValue, { user: ctx.userId });
+  },
+});
 ```
 
 ## Common Patterns
@@ -374,7 +682,7 @@ All `ctx` properties must be declared upfront because:
 The `null as T` / `undefined as T | undefined` patterns ensure:
 
 - All keys exist in the config object (enumerable)
-- TypeScript correctly infers required vs optional at `createTrace()`
+- TypeScript correctly infers required vs optional at `trace()`
 - Generated SpanContext class has stable hidden class
 
 ## Metadata Injection (Transformer)

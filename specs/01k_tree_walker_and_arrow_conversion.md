@@ -745,7 +745,7 @@ dictionary vectors.
 1. **Application Composition**: The application declares dependencies on libraries and wires them with prefixes:
 
    ```typescript
-   // Define module with dependencies (see 01l_module_builder_pattern.md)
+   // Define module with dependencies (see 01l_op_context_pattern.md)
    const appModule = defineModule({
      metadata: { ... },
      schema: appSchema,

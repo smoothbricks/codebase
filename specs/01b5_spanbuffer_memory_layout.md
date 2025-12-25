@@ -555,3 +555,175 @@ buffer.userId_nulls[byteIdx] |= bitmask; // ✅ Direct bitmap access
 // Check allocation without triggering it:
 const values = buffer.getColumnIfAllocated('userId');
 ```
+
+## Buffer Creation Functions
+
+**Purpose**: Factory functions for creating SpanBuffer instances with correct identity and hierarchy.
+
+**PACKAGE**: All buffer creation functions are in **lmao** (`packages/lmao/src/lib/spanBuffer.ts`).
+
+### createSpanBuffer - Root Buffer Creation
+
+Creates a root SpanBuffer for a new trace with full identity including trace_id.
+
+```typescript
+function createSpanBuffer<T extends LogSchema>(
+  schema: T,
+  spanName: string,
+  traceRoot: TraceRoot,
+  opMetadata: OpMetadata,
+  capacity?: number
+): SpanBuffer<T>;
+```
+
+**Parameters:**
+
+- `schema` - Tag attribute schema defining column types (must be LogSchema)
+- `spanName` - Name of the span
+- `traceRoot` - Pre-built TraceRoot with trace_id, timestamp anchors, and tracer reference
+- `opMetadata` - Op metadata for attribution (package_name, package_file, git_sha, line)
+- `capacity` - Optional buffer capacity (uses class.stats.capacity if omitted)
+
+**Returns:** SpanBuffer with typed setters for schema fields
+
+**Identity Layout:** `[threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]`
+
+**Memory:** Single ArrayBuffer containing timestamps, entry_type, and identity (13 + traceId.length bytes)
+
+### createChildSpanBuffer - Child Buffer Creation
+
+Creates a child span buffer with parent linkage and simplified identity (no trace_id bytes).
+
+```typescript
+function createChildSpanBuffer<T extends LogSchema>(
+  parentBuffer: AnySpanBuffer,
+  SpanBufferClass: SpanBufferConstructor,
+  spanName: string,
+  callsiteMetadata: OpMetadata,
+  opMetadata: OpMetadata,
+  capacity?: number
+): SpanBuffer<T>;
+```
+
+**Parameters:**
+
+- `parentBuffer` - The parent span buffer (for tree hierarchy and traceRoot)
+- `SpanBufferClass` - The SpanBuffer class to instantiate (has static schema + stats)
+- `spanName` - Name of the child span
+- `callsiteMetadata` - Caller's op metadata (for row 0 attribution - who called span())
+- `opMetadata` - Op metadata for this span (for rows 1+ attribution - what's executing)
+- `capacity` - Optional capacity override (uses class.stats.capacity if omitted)
+
+**Returns:** New SpanBuffer linked to parent
+
+**Identity Layout:** `[threadId(8)][spanId(4)]` (12 bytes total)
+
+**Memory:** Single ArrayBuffer containing timestamps, entry_type, and simplified identity (12 bytes)
+
+**Note:** Child buffers access trace_id by walking parent chain to root (typically 3-5 levels).
+
+### createOverflowBuffer - Buffer Chaining
+
+Creates a continuation buffer when the current buffer overflows. Chained buffers SHARE the identity reference from the
+first buffer (they represent the SAME logical span, just additional storage).
+
+```typescript
+function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T>;
+```
+
+**Parameters:**
+
+- `buffer` - The full buffer that needs overflow handling
+
+**Returns:** New SpanBuffer linked via `buffer._overflow`, with same schema type
+
+**Identity Layout:** Shares `_identity` reference from original buffer (zero bytes allocated)
+
+**Memory:** Single ArrayBuffer containing ONLY timestamps and entry_type (smallest allocation!)
+
+**Note:** Capacity is rounded up to multiple of 8 for byte-aligned null bitmaps.
+
+### TraceRoot Interface
+
+TraceRoot is created once per trace and shared by reference across all spans. It provides timestamp anchoring and tracer
+lifecycle hooks.
+
+```typescript
+interface TraceRoot {
+  /**
+   * Trace ID for this trace.
+   * Stored here for quick access without walking buffer parent chain.
+   */
+  readonly trace_id: TraceId;
+
+  /**
+   * Epoch time in nanoseconds when trace was created.
+   * Captured via Date.now() * 1_000_000n at trace root.
+   */
+  readonly anchorEpochNanos: bigint;
+
+  /**
+   * High-resolution timer value when trace was created.
+   * Captured via performance.now() (browser) or process.hrtime.bigint() (Node.js).
+   */
+  readonly anchorPerfNow: number;
+
+  /**
+   * Tracer reference for lifecycle hooks and event callbacks.
+   * Provides onTraceStart, onTraceEnd, onSpanStart, onSpanEnd, onStatsWillResetFor.
+   */
+  readonly tracer: TracerLifecycleHooks;
+}
+```
+
+**Memory Layout:**
+
+- Created ONCE per trace (root span creation)
+- Shared by ALL spans in trace (copied by reference, 8 bytes per child span)
+- Total overhead: ~40 bytes per trace (object header + 4 properties)
+
+**Why per-trace anchoring:**
+
+- Each trace has fresh anchor - no long-running drift issues
+- NTP corrections between traces are isolated
+- Trace is self-contained unit with consistent time reference
+
+See [High-Precision Timestamps](./01b3_high_precision_timestamps.md) for timestamp design details.
+
+## Capacity Statistics
+
+Each `SpanBufferClass` (generated per schema) has a static `stats` property for capacity tuning:
+
+```typescript
+interface SpanBufferStats {
+  capacity: number; // Current capacity for new buffers
+  totalWrites: number; // Total entries written across all buffers
+  overflowWrites: number; // Writes that triggered overflow
+  totalCreated: number; // Total buffers created (root + children + chains)
+  overflows: number; // Number of overflow events
+}
+
+// Access via class
+const SpanBufferClass = getSpanBufferClass(schema);
+console.log(SpanBufferClass.stats.capacity); // Current capacity
+
+// Access via instance
+buffer._stats; // Getter returns this.constructor.stats
+```
+
+### Why Static?
+
+Stats are per-schema, not per-buffer:
+
+- All buffers from same schema share capacity learning
+- Overflow ratio computed across all buffers of same type
+- Enables cross-request capacity optimization
+
+### Stats Updates
+
+| Event              | Stats Updated                                       |
+| ------------------ | --------------------------------------------------- |
+| Buffer created     | `totalCreated++`                                    |
+| Entry written      | `totalWrites++`                                     |
+| Overflow triggered | `overflows++`, `overflowWrites += remainingEntries` |
+| Capacity adjusted  | `capacity` updated, stats reset                     |

@@ -1,11 +1,11 @@
 /**
  * Create TypedArray columns for attribute columns based on schema
  *
- * This maps Sury schema types to appropriate TypedArrays per
+ * This maps Sury schema types to appropriate storage per
  * specs/01b_columnar_buffer_architecture.md:
  * - enum → Uint8/Uint16/Uint32Array (size based on enum value count)
- * - category → Uint32Array (string interning indices)
- * - text → Uint32Array (raw string indices)
+ * - category → string[] (raw strings, dictionary built at Arrow conversion)
+ * - text → string[] (raw strings, no dictionary)
  * - number → Float64Array
  * - boolean → Uint8Array
  */

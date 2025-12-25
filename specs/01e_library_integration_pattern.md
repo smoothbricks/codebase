@@ -386,11 +386,12 @@ const handleRequest = defineOp('handleRequest', async (ctx, req: Request) => {
   return ctx.ok({ users, external });
 });
 
-// Entry point
+// Entry point with Tracer
+const { trace } = new TestTracer(opContext);
+
 export default {
   async fetch(req: Request, env: Env) {
-    const ctx = createTrace({ env });
-    return ctx.span('handle-request', handleRequest, req);
+    return trace('handle-request', { env }, handleRequest, req);
   },
 };
 ```

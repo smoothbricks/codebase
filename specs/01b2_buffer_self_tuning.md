@@ -1226,6 +1226,62 @@ ORDER BY overflow_rate DESC
 - **Consistent pattern**: Same structure as op metrics (`op-invocations`, `op-errors`, etc.)
 - **Dictionary compression**: Entry type strings compress well (only 4 unique values)
 
+## Observability Hook
+
+Before stats are reset during capacity adjustment, the Tracer's `onStatsWillResetFor` hook is called:
+
+```typescript
+// In Tracer (abstract)
+protected abstract onStatsWillResetFor(buffer: SpanBuffer<T>): void;
+
+// TestTracer captures stats for test assertions
+class TestTracer<T> extends Tracer<T> {
+  readonly statsSnapshots: StatsSnapshot[] = [];
+
+  protected onStatsWillResetFor(buffer: SpanBuffer<T>): void {
+    this.statsSnapshots.push({
+      buffer,
+      capacity: buffer._stats.capacity,
+      totalWrites: buffer._stats.totalWrites,
+      overflowWrites: buffer._stats.overflowWrites,
+      overflows: buffer._stats.overflows,
+      totalCreated: buffer._stats.totalCreated,
+    });
+  }
+}
+```
+
+### Use Cases
+
+1. **Test assertions**: `TestTracer.statsSnapshots` captures stats for verifying capacity tuning behavior
+2. **Production metrics**: `ArrayQueueTracer` can emit stats as structured entries (see "Buffer Statistics Logging"
+   above) using the `uint64_value` column pattern
+3. **Development debugging**: `StdioTracer` can log capacity changes to console
+
+### When Called
+
+The hook is called:
+
+- After capacity tuning decision is made
+- Before stats counters are reset to zero
+- Once per capacity adjustment event
+
+The hook is invoked in `_getNextBuffer()` when a buffer overflows, immediately before `trackOverflowAndTune()` is
+called:
+
+```typescript
+_getNextBuffer() {
+  const oldBuffer = this._buffer;
+  const stats = oldBuffer.constructor.stats;
+  // Notify tracer before stats reset (tracer captures for observability)
+  oldBuffer._traceRoot.tracer.onStatsWillResetFor(oldBuffer);
+  helpers.trackOverflowAndTune(stats);  // This may reset stats
+  // ... continue with overflow buffer creation
+}
+```
+
+This ensures tracers can capture the complete stats picture before they're lost to the reset.
+
 ## Summary
 
 Self-tuning buffers provide:

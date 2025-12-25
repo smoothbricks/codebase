@@ -356,7 +356,7 @@ interface FluentLog<T> {
 
 Libraries define their schema using `defineModule` and get fully typed APIs:
 
-> **See**: [Module Builder Pattern](./01l_module_builder_pattern.md) for the complete API design.
+> **See**: [Op Context Pattern](./01l_op_context_pattern.md) for the complete API design.
 
 ```typescript
 // Library defines module with logSchema (unprefixed)

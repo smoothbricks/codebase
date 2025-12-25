@@ -102,6 +102,113 @@ function completeSpanErr(buffer: SpanBuffer, error: string): void {
 
 This design ensures every span has valid duration data, even when exceptions bypass normal completion.
 
+### Fluent Result Integration
+
+`ctx.ok()` and `ctx.err()` return **buffer-agnostic** fluent builders. Tags are captured as closures and applied by
+`span()`/`trace()` when the function returns:
+
+```typescript
+// FluentOk - tags captured, applied at span-end
+return ctx.ok(value).with({ cached: true }).message('Success');
+
+// FluentErr - tags captured, applied at span-end
+return ctx.err('NOT_FOUND', { id }).with({ searched: true }).message('Not found');
+```
+
+#### Deferred Tag Application
+
+**Key Design**: `FluentOk` and `FluentErr` do NOT hold buffer references. This ensures type safety - tags are always
+applied to the correct buffer, preventing accidental writes to wrong buffers if a result is captured.
+
+Each chained method (`.with()`, `.message()`, `.line()`) captures the write operation as a closure:
+
+```typescript
+class FluentOk<V, T extends LogSchema> implements Ok<V> {
+  readonly value: V;
+  applyTags?: (buffer: SpanBuffer<T>) => void; // Closure chain
+
+  constructor(value: V) {
+    this.value = value;
+    // No buffer reference - buffer-agnostic!
+  }
+
+  get success(): true {
+    return true;
+  } // Derived from class identity
+
+  message(text: string): this {
+    const prev = this.applyTags;
+    this.applyTags = (buffer) => {
+      if (prev) prev(buffer);
+      buffer.message(1, text);
+    };
+    return this;
+  }
+
+  // Similar pattern for .with() and .line()
+}
+```
+
+#### Span-End Write Sequence
+
+When `span()` or `trace()` receives the result, it writes to row 1:
+
+```typescript
+function writeSpanEnd(buffer: SpanBuffer, result: Result): void {
+  // 1. Write entry_type based on result type
+  if (result instanceof FluentOk) {
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+  } else if (result instanceof FluentErr) {
+    buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
+    buffer.error_code(1, result.error.code);  // Write error code
+  }
+
+  // 2. Write timestamp
+  buffer.timestamp[1] = getTimestampNanos(...);
+
+  // 3. Apply deferred tags
+  if (result.applyTags) {
+    result.applyTags(buffer);
+  }
+}
+```
+
+This enables:
+
+1. **Type safety**: Result objects have no buffer reference - can't write to wrong buffer
+2. **Attribute chaining**: `.with()` captures attributes to apply at span-end
+3. **Custom messages**: `.message()` overwrites the default span name in row 1
+4. **Source tracking**: `.line()` sets source line number
+
+#### Message Column Semantics
+
+The `message` column has different semantics for row 0 vs row 1:
+
+| Row | Default Value | Can Be Overwritten? | How to Overwrite |
+| --- | ------------- | ------------------- | ---------------- |
+| 0   | Span name     | No (immutable)      | N/A              |
+| 1   | Span name     | Yes                 | `.message()`     |
+
+```typescript
+// Row 1 message = "create-user" (span name, default)
+return ctx.ok(user);
+
+// Row 1 message = "User created successfully" (custom)
+return ctx.ok(user).message('User created successfully');
+```
+
+#### Row 1 Entry Types
+
+| Return Type                  | Entry Type Written   | Written By     |
+| ---------------------------- | -------------------- | -------------- |
+| `FluentOk` (from ctx.ok())   | `span-ok` (2)        | span()/trace() |
+| `FluentErr` (from ctx.err()) | `span-err` (3)       | span()/trace() |
+| Plain `Ok<T>`                | `span-ok` (2)        | span()/trace() |
+| Plain `Err<E>`               | `span-err` (3)       | span()/trace() |
+| Exception thrown             | `span-exception` (4) | span()/trace() |
+
+**Note**: Entry types are always written by `span()`/`trace()` at span-end, never by the result constructor.
+
 ### Log Level Entry Types
 
 Structured logging with message templates and typed attributes - **APPENDS new rows starting at row 2**:
@@ -678,51 +785,94 @@ keeping logs neatly sorted in Arrow output.
 
 ## Fluent Result API
 
-The `ok()` and `err()` functions return fluent result objects that support method chaining while maintaining TypeScript
-type narrowing for Result pattern consumption.
+The `ok()` and `err()` functions return **buffer-agnostic** fluent result objects that support method chaining while
+maintaining TypeScript type narrowing for Result pattern consumption.
 
-### FluentSuccessResult
+### Deferred Tag Application Design
 
-Returned by `ok(value)`. Implements the `SuccessResult<V>` interface with additional chaining methods:
+**Key Insight**: FluentOk and FluentErr do NOT hold buffer references. This ensures:
+
+1. **Type safety**: Can't accidentally write to wrong buffer if result is captured
+2. **Clean semantics**: `return ctx.ok(value)` is clearly a terminal expression
+3. **Correct buffer targeting**: `span()`/`trace()` applies tags to the correct buffer
+
+Each chained method captures the write operation as a closure in `applyTags`:
 
 ```typescript
-class FluentSuccessResult<V, T extends LogSchema> implements SuccessResult<V> {
-  readonly success = true;
+// What happens when you write:
+return ctx.ok(user).with({ cached: true }).message('Created');
+
+// 1. ctx.ok(user) creates FluentOk with value, no buffer reference
+// 2. .with({ cached: true }) captures attribute writes in closure
+// 3. .message('Created') chains another closure
+// 4. span() receives result, calls writeSpanEnd(buffer, result)
+// 5. writeSpanEnd writes entry_type, timestamp, then calls result.applyTags(buffer)
+```
+
+### FluentOk
+
+Returned by `ctx.ok(value)`. Implements the `Ok<V>` interface with deferred chaining methods:
+
+```typescript
+class FluentOk<V, T extends LogSchema> implements Ok<V> {
   readonly value: V;
+  applyTags?: (buffer: SpanBuffer<T>) => void; // Closure chain
 
-  // Chain additional attributes onto the span-ok entry
-  with(attributes: Partial<InferTagAttributes<T>>): this;
+  constructor(value: V) {
+    this.value = value;
+    // No buffer reference!
+  }
 
-  // Add a result message
+  get success(): true {
+    return true;
+  } // Derived from class identity
+
+  // Capture attribute writes as closure
+  with(attributes: Partial<InferSchema<T>>): this;
+
+  // Capture message write as closure (overwrites span name in row 1)
   message(text: string): this;
+
+  // Capture line number write as closure
+  line(lineNumber: number): this;
 }
 ```
 
-### FluentErrorResult
+### FluentErr
 
-Returned by `err(code, details)`. Implements the `ErrorResult<E>` interface with additional chaining methods:
+Returned by `ctx.err(code, details)`. Implements the `Err<E>` interface with deferred chaining methods:
 
 ```typescript
-class FluentErrorResult<E, T extends LogSchema> implements ErrorResult<E> {
-  readonly success = false;
+class FluentErr<E, T extends LogSchema> implements Err<E> {
   readonly error: { code: string; details: E };
+  applyTags?: (buffer: SpanBuffer<T>) => void; // Closure chain
 
-  // Chain additional attributes onto the span-err entry
-  with(attributes: Partial<InferTagAttributes<T>>): this;
+  constructor(code: string, details: E) {
+    this.error = { code, details };
+    // No buffer reference! error_code written by span()/trace()
+  }
 
-  // Add an error message
+  get success(): false {
+    return false;
+  } // Derived from class identity
+
+  // Same chaining methods as FluentOk
+  with(attributes: Partial<InferSchema<T>>): this;
   message(text: string): this;
+  line(lineNumber: number): this;
 }
 ```
 
-### Buffer Layout
+### Buffer Write Timing
 
-Both fluent result types write to **row 1** (the pre-allocated span-end row):
+All writes to row 1 happen when `span()`/`trace()` completes:
 
-- Row 1 is pre-initialized as `span-exception` at span creation
-- `ok()` overwrites row 1 with `span-ok` entry type
-- `err()` overwrites row 1 with `span-err` entry type
-- Chained `.with()` and `.message()` calls write attributes to the same row 1
+1. **Entry type**: Written based on `instanceof FluentOk` vs `FluentErr`
+2. **Timestamp**: Written at span-end time
+3. **Error code**: Written from `result.error.code` for FluentErr
+4. **Deferred tags**: Applied via `result.applyTags(buffer)` if present
+
+This ensures row 1 is never partially written - it's atomic at span completion.
 
 ### Usage Examples
 

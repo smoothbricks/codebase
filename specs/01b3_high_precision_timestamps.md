@@ -79,49 +79,38 @@ const filename = `traces-${Date.now()}.parquet`;
 ### Browser Implementation
 
 ```typescript
-// ONE Date.now() captured at trace root (TraceContext creation)
+// ONE Date.now() captured at trace root (when Tracer.trace() creates TraceRoot)
 // ONE performance.now() captured at trace root
 // All subsequent timestamps use delta calculation
 
-// TraceContext system props (Extra props defined via .ctx<Extra>())
-interface TraceContextSystem<FF> {
-  trace_id: string;
+// TraceRoot - stored on root SpanBuffer, shared by all spans via reference
+interface TraceRoot {
+  readonly trace_id: TraceId;
 
   // Time anchor - flat primitives, not nested object
-  anchorEpochMicros: number; // Date.now() * 1000 at trace root
-  anchorPerfNow: number; // performance.now() at trace root
+  readonly anchorEpochNanos: bigint; // BigInt(Date.now()) * 1_000_000n at trace root
+  readonly anchorPerfNow: number; // performance.now() at trace root
 
-  // Thread/worker ID for distributed tracing
-  thread_id: bigint;
-
-  ff: FeatureFlagEvaluator<FF>;
-  span: RootSpanFn;
+  // Reference to tracer for lifecycle hooks
+  readonly tracer: TracerLifecycleHooks;
 }
 
-// Full TraceContext = System + Extra (user-defined)
-type TraceContext<FF, Extra> = TraceContextSystem<FF> & Extra;
-
-// Internal implementation of module.traceContext()
-function createTraceContext<FF, Extra>(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra> {
-  const epochMs = Date.now();
-  const perfNow = performance.now();
-
+// Created by Tracer.trace() before root span execution
+function createTraceRoot(tracer: Tracer, traceId?: TraceId): TraceRoot {
   return {
-    trace_id: generateTraceId(),
-    anchorEpochMicros: epochMs * 1000,
-    anchorPerfNow: perfNow,
-    thread_id: workerThreadId,
-    ff: params.ff,
-    span: createRootSpanFn(),
-    ...params, // Spread Extra (e.g., env, requestId, userId)
-  } as TraceContext<FF, Extra>;
+    trace_id: traceId ?? generateTraceId(),
+    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
+    anchorPerfNow: performance.now(),
+    tracer,
+  };
 }
 
-// All subsequent timestamps derived from anchor
-function getTimestamp(ctx: TraceContext): bigint {
+// All subsequent timestamps derived from anchor (accessed via buffer._traceRoot)
+function getTimestamp(buffer: SpanBuffer): bigint {
   // Returns nanoseconds since epoch
   // performance.now() - anchorPerfNow gives elapsed ms with sub-ms precision
-  return ctx.anchorEpochNanos + BigInt(Math.round((performance.now() - ctx.anchorPerfNow) * 1_000_000));
+  const { anchorEpochNanos, anchorPerfNow } = buffer._traceRoot;
+  return anchorEpochNanos + BigInt(Math.round((performance.now() - anchorPerfNow) * 1_000_000));
 }
 ```
 
@@ -134,50 +123,41 @@ function getTimestamp(ctx: TraceContext): bigint {
 ### Node.js Implementation
 
 ```typescript
-// ONE Date.now() captured at trace root
+// ONE Date.now() captured at trace root (when Tracer.trace() creates TraceRoot)
 // ONE process.hrtime.bigint() captured at trace root
 // All subsequent timestamps use hrtime delta
 
-// TraceContext system props (Extra props defined via .ctx<Extra>())
-interface TraceContextSystem<FF> {
-  trace_id: string;
+// TraceRoot - stored on root SpanBuffer, shared by all spans via reference
+// (Same interface, but anchorPerfNow stores hrtime.bigint() result)
+interface TraceRoot {
+  readonly trace_id: TraceId;
 
   // Time anchor - flat primitives
-  anchorEpochMicros: number; // Date.now() * 1000 at trace root
-  anchorHrTime: bigint; // process.hrtime.bigint() at trace root
+  readonly anchorEpochNanos: bigint; // BigInt(Date.now()) * 1_000_000n at trace root
+  readonly anchorPerfNow: number; // Number(process.hrtime.bigint()) at trace root
 
-  // Thread/worker ID for distributed tracing
-  thread_id: bigint;
-
-  ff: FeatureFlagEvaluator<FF>;
-  span: RootSpanFn;
+  // Reference to tracer for lifecycle hooks
+  readonly tracer: TracerLifecycleHooks;
 }
 
-// Full TraceContext = System + Extra (user-defined)
-type TraceContext<FF, Extra> = TraceContextSystem<FF> & Extra;
-
-// Internal implementation of module.traceContext()
-function createTraceContext<FF, Extra>(params: { ff: FeatureFlagEvaluator<FF> } & Extra): TraceContext<FF, Extra> {
-  const epochMs = Date.now();
-  const hrTime = process.hrtime.bigint();
-
+// Created by Tracer.trace() before root span execution
+function createTraceRoot(tracer: Tracer, traceId?: TraceId): TraceRoot {
   return {
-    trace_id: generateTraceId(),
-    anchorEpochMicros: epochMs * 1000,
-    anchorHrTime: hrTime,
-    thread_id: workerThreadId,
-    ff: params.ff,
-    span: createRootSpanFn(),
-    ...params, // Spread Extra (e.g., env, requestId, userId)
-  } as TraceContext<FF, Extra>;
+    trace_id: traceId ?? generateTraceId(),
+    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
+    anchorPerfNow: Number(process.hrtime.bigint()),
+    tracer,
+  };
 }
 
-// All subsequent timestamps derived from anchor
-function getTimestamp(ctx: TraceContext): bigint {
+// All subsequent timestamps derived from anchor (accessed via buffer._traceRoot)
+function getTimestamp(buffer: SpanBuffer): bigint {
   // Returns nanoseconds since epoch
   // hrtime.bigint() gives nanoseconds directly
-  const elapsedNanos = process.hrtime.bigint() - ctx.anchorHrTime;
-  return ctx.anchorEpochNanos + elapsedNanos;
+  const { anchorEpochNanos, anchorPerfNow } = buffer._traceRoot;
+  const anchorHrtime = BigInt(Math.round(anchorPerfNow));
+  const elapsedNanos = process.hrtime.bigint() - anchorHrtime;
+  return anchorEpochNanos + elapsedNanos;
 }
 ```
 
@@ -207,22 +187,22 @@ const arrowTimestamps = arrow.TimestampNanosecond.from(buffer.timestamp.subarray
 - Compatible with ClickHouse's `DateTime64(9)` type
 - Matches Arrow's native timestamp precision
 
-### Why Flattened TraceContext
+### Why Flattened TraceRoot
 
-The `TraceContext` uses flat primitives instead of nested objects:
+The `TraceRoot` uses flat primitives instead of nested objects:
 
 ```typescript
 // ✅ CORRECT: Flat primitives
-interface TraceContext {
-  anchorEpochMicros: number;
+interface TraceRoot {
+  anchorEpochNanos: bigint;
   anchorPerfNow: number;
   // ...
 }
 
 // ❌ WRONG: Nested object
-interface TraceContext {
+interface TraceRoot {
   timeAnchor: {
-    epochMicros: number;
+    epochNanos: bigint;
     perfNow: number;
   };
   // ...
@@ -235,3 +215,76 @@ interface TraceContext {
 - One less pointer chase per timestamp read
 - Simpler serialization if context needs to cross boundaries
 - Matches the "flat deferred structure" design principle
+
+## Platform-Specific Entry Points
+
+The package provides separate entry points for optimal tree-shaking and platform-specific timestamp implementations:
+
+### Node.js Entry Point
+
+```typescript
+// Import from /node for Node.js-specific optimizations
+import { TestTracer, defineOpContext } from '@smoothbricks/lmao/node';
+```
+
+Uses `process.hrtime.bigint()` for true nanosecond precision timestamps.
+
+### Browser/ES Entry Point
+
+```typescript
+// Default import for browsers/generic ES environments
+import { TestTracer, defineOpContext } from '@smoothbricks/lmao';
+```
+
+Uses `performance.now()` with microsecond precision (~5-20μs resolution), converted to nanoseconds for storage.
+
+### Why Separate Entry Points?
+
+1. **Tree-shaking**: Node.js-specific code (e.g., `process.hrtime.bigint()`) doesn't bundle into browser builds
+2. **Precision**: Node.js gets true nanosecond precision via hrtime, browsers get microsecond precision via
+   performance.now()
+3. **Compatibility**: Browser entry works in any ES environment (Deno, Cloudflare Workers, etc.)
+4. **Zero overhead**: Implementation is set once at module load via `setTimestampNanosImpl()`, no runtime branching
+
+### Implementation
+
+Both entry points provide the same API but with different underlying implementations:
+
+```typescript
+// timestamp.node.ts (Node.js - TRUE nanosecond precision)
+export function getTimestampNanos(anchorEpochNanos: bigint, anchorPerfNow: number): Nanoseconds {
+  const anchorHrtime = BigInt(Math.round(anchorPerfNow));
+  const currentHrtime = process.hrtime.bigint();
+  const elapsedNanos = currentHrtime - anchorHrtime;
+  return Nanoseconds.unsafe(anchorEpochNanos + elapsedNanos);
+}
+
+export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfNow: number } {
+  return {
+    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
+    anchorPerfNow: Number(process.hrtime.bigint()),
+  };
+}
+
+// timestamp.ts (Browser - microsecond precision, last 3 digits always 000)
+export function getTimestampNanos(anchorEpochNanos: bigint, anchorPerfNow: number): Nanoseconds {
+  const elapsedMs = performance.now() - anchorPerfNow;
+  const elapsedNanos = BigInt(Math.floor(elapsedMs * 1000)) * 1000n;
+  return (anchorEpochNanos + elapsedNanos) as Nanoseconds;
+}
+
+export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfNow: number } {
+  return {
+    anchorEpochNanos: BigInt(Date.now()) * 1_000_000n,
+    anchorPerfNow: performance.now(),
+  };
+}
+```
+
+**Key Details**:
+
+- **Anchor captured once** at trace creation via `createTimestampAnchor()`
+- All subsequent timestamps use delta from anchor for consistency
+- Both implementations use the same anchor structure (`anchorEpochNanos`, `anchorPerfNow`)
+- Entry points (`node.ts`, `es.ts`) call `setTimestampNanosImpl()` before re-exporting main functionality
+- No runtime platform detection - implementation chosen at import time for zero overhead

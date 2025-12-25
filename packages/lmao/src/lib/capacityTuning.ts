@@ -37,8 +37,8 @@ export function trackOverflowAndTune(stats: SpanBufferStats): void {
  * Called after a tuning decision to start fresh measurement window.
  * This ensures the tuning algorithm responds to recent behavior, not cumulative history.
  *
- * Note: In the future, Tracer.onStatsWillResetFor() will be called BEFORE this reset
- * to capture stats for observability. See agent-todo/tracer-architecture-refactor.plan.md.
+ * Note: Tracer.onStatsWillResetFor() is called BEFORE this reset (in spanLoggerGenerator's
+ * _getNextBuffer method) to capture stats for observability before they're lost.
  */
 function resetStats(stats: SpanBufferStats): void {
   stats.totalWrites = 0;

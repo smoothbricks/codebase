@@ -90,12 +90,6 @@ const logSchema = {
   requested: S.number(),
   returned: S.number(),
 };
-
-// track() returns chainable API with SAME methods as ctx.tag
-// Equivalent to:
-// 1. Write entry_type = FF_USAGE
-// 2. Write message = 'darkMode'  (unified message column - flag name)
-// 3. Write user-defined attributes (from log schema)
 ```
 
 ## Context Flow & Integration
@@ -128,15 +122,15 @@ flagEvaluator: async (ctx, flag, defaultValue) => {
 Request Boundary                    Middleware                         Flag Evaluation
 ─────────────────────────────────────────────────────────────────────────────────────────
 
-createTrace({                       ctx.setScope({ region })          ctx.ff.premiumFeatures
+trace('request', {                  ctx.setScope({ region })          ctx.ff.premiumFeatures
   userId,                                     │                                  │
   userPlan,                                   ▼                                  ▼
-})                               ┌─────────────────────────┐         ┌─────────────────────┐
+}, handleRequest)                ┌─────────────────────────┐         ┌─────────────────────┐
         │                        │ SpanContext             │         │ flagEvaluator(ctx)  │
         ▼                        │                         │         │                     │
 ┌─────────────────┐              │ ctx.userId (prop)       │────────▶│ ctx.userId          │
-│ TraceContext    │              │ ctx.scope.region (col)  │         │ ctx.scope.region    │
-│                 │              │                         │         │ ctx.log.debug(...)  │
+│ trace() creates │              │ ctx.scope.region (col)  │         │ ctx.scope.region    │
+│ root SpanContext│              │                         │         │ ctx.log.debug(...)  │
 │ userId: 'u123'  │──────────────│ ff: uses flagEvaluator  │         │ ctx.span(...)       │
 │ userPlan: 'pro' │              │     (Omit<ctx, 'ff'>)   │         │                     │
 └─────────────────┘              └─────────────────────────┘         └─────────────────────┘
@@ -288,8 +282,8 @@ class LaunchDarklyEvaluator implements FlagEvaluator<AppSchema, AppFlags, Env> {
   }
 }
 
-// Usage in defineOpContext
-const { defineOp, createTrace } = defineOpContext({
+// Usage with defineOpContext and Tracer
+const opContext = defineOpContext({
   logSchema: appSchema,
   flags: defineFeatureFlags({
     premiumFeatures: S.boolean().default(false).async(),
@@ -301,9 +295,11 @@ const { defineOp, createTrace } = defineOpContext({
     userId: undefined as string | undefined,
     userPlan: undefined as 'free' | 'pro' | 'enterprise' | undefined,
   },
+});
 
-  // Pass the evaluator instance
-  flagEvaluator: new LaunchDarklyEvaluator(ldClient, flags.schema),
+// Pass the evaluator to Tracer via TracerOptions
+const { trace } = new TestTracer(opContext, {
+  flagEvaluator: new LaunchDarklyEvaluator(ldClient, opContext.flags.schema),
 });
 ```
 
@@ -431,12 +427,14 @@ const evaluator = new InMemoryFlagEvaluator(flags.schema, {
   maxItems: 50, // Override default
 });
 
-const { defineOp, createTrace } = defineOpContext({
+const opContext = defineOpContext({
   logSchema: appSchema,
   flags,
   ctx: { env: null as Env },
-  flagEvaluator: evaluator,
 });
+
+// Pass the evaluator to Tracer via TracerOptions
+const { trace } = new TestTracer(opContext, { flagEvaluator: evaluator });
 
 // In tests, you can update flag values dynamically
 evaluator.setFlag('darkMode', false);
@@ -503,24 +501,29 @@ const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
 ### Request Handler Example
 
 ```typescript
+// With Tracer from defineOpContext
+const { trace } = new TestTracer(opContext);
+
 export default {
   async fetch(req: Request, env: Env) {
-    const ctx = createTrace({
-      env,
-      userId: req.headers.get('x-user-id') ?? undefined,
-      userPlan: await getUserPlan(req), // Available to flagEvaluator
-    });
+    return trace(
+      'request',
+      {
+        env,
+        userId: req.headers.get('x-user-id') ?? undefined,
+        userPlan: await getUserPlan(req), // Available to flagEvaluator
+      },
+      async (ctx) => {
+        ctx.setScope({ request_id: crypto.randomUUID() });
 
-    return ctx.span('request', async (span) => {
-      span.setScope({ request_id: crypto.randomUUID() });
+        // Flag evaluation has access to ctx.userId, ctx.userPlan, ctx.scope.request_id
+        if (await ctx.ff.maintenanceMode.get()) {
+          return new Response('Service under maintenance', { status: 503 });
+        }
 
-      // Flag evaluation has access to ctx.userId, ctx.userPlan, ctx.scope.request_id
-      if (await span.ff.maintenanceMode.get()) {
-        return new Response('Service under maintenance', { status: 503 });
+        return handleRequest(ctx, req);
       }
-
-      return handleRequest(span, req);
-    });
+    );
   },
 };
 ```
@@ -610,8 +613,8 @@ class AppFlagEvaluator implements FlagEvaluator<AppSchema, AppFlags, Env> {
   }
 }
 
-// Create op context with evaluator
-const { defineOp, createTrace } = defineOpContext({
+// Create op context - flags are defined here, evaluator is passed to Tracer
+const opContext = defineOpContext({
   logSchema: appSchema,
   flags,
   ctx: {
@@ -619,8 +622,9 @@ const { defineOp, createTrace } = defineOpContext({
     userId: undefined as string | undefined,
     userPlan: undefined as 'free' | 'pro' | 'enterprise' | undefined,
   },
-  flagEvaluator: new AppFlagEvaluator(ldClient),
 });
+
+const { defineOp } = opContext;
 
 // Define ops that use feature flags
 const processUpload = defineOp('processUpload', async (ctx, file: File) => {
@@ -644,18 +648,19 @@ const processUpload = defineOp('processUpload', async (ctx, file: File) => {
   return ctx.ok({ uploaded: true });
 });
 
-// Usage at request boundary
+// Usage at request boundary - pass evaluator to Tracer via TracerOptions
+const tracer = new TestTracer(opContext, {
+  flagEvaluator: new AppFlagEvaluator(ldClient),
+});
+
 export default {
   async fetch(req: Request, env: Env) {
-    const ctx = createTrace({
-      env,
-      userId: req.headers.get('x-user-id') ?? undefined,
-      userPlan: await getUserPlan(req),
-    });
-
-    ctx.setScope({ region: req.cf?.country ?? 'unknown' });
-
-    return ctx.span('upload', processUpload, await req.blob());
+    return tracer.trace(
+      'upload',
+      { env, userId: req.headers.get('x-user-id') ?? undefined, userPlan: await getUserPlan(req) },
+      processUpload,
+      await req.blob()
+    );
   },
 };
 ```

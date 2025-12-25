@@ -223,7 +223,7 @@ system becomes a row in the final table, enabling rich analytical queries while 
 | `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                             |
 | `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                       |
 | `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                            |
-| `package_path`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                             |
+| `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                             |
 | `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`, `'TypeError: x is not a function'` |
 
 ### Lazy System Columns (Sparse/Nullable)
@@ -254,7 +254,7 @@ rather than every row.
 
 ## Module Identification
 
-The `package_name` and `package_path` columns work together to identify the source location of each trace entry. This
+The `package_name` and `package_file` columns work together to identify the source location of each trace entry. This
 two-column design provides significant benefits over a single combined path:
 
 ### Why `packageName` + `packagePath` (Not a Combined Path)
@@ -281,7 +281,7 @@ two-column design provides significant benefits over a single combined path:
 4. **Source lookup path**: To find actual source code from a trace entry:
    - `package_name` → npm registry → git repo URL (via `repository` field in package.json)
    - Git repo → find package location within monorepo (search for package.json with matching name)
-   - `package_path` → actual source file relative to that package.json
+   - `package_file` → actual source file relative to that package.json
 
 5. **TypeScript transformer compatibility**: The TypeScript transformer computes both pieces via `findNearestPackage()`,
    which returns both `packageName` and `packageDir`. Storing them separately avoids redundant string concatenation.
@@ -300,7 +300,7 @@ const GET = op(async ({ span, log, tag }, url: string) => {
 ```
 
 - **`package_name`**: From the module the op is bound to (`httpModule`)
-- **`package_path`**: From where the module was defined (TypeScript transformer)
+- **`package_file`**: From where the module was defined (TypeScript transformer)
 - **Span names**: Come from `span('name', op, ...args)` call sites, stored in `message` column
 
 ### Why NOT Git-Based Identity
@@ -660,7 +660,7 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 1, parent_thread_id: null, parent_span_i
 thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890, parent_span_id: 1
 ```
 
-| trace_id     | thread_id            | span_id | parent_thread_id     | parent_span_id | timestamp                  | entry_type   | package_name              | package_path                   | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
+| trace_id     | thread_id            | span_id | parent_thread_id     | parent_span_id | timestamp                  | entry_type   | package_name              | package_file                   | message                                         | http_status | http_method | http_url                               | http_duration | db_query                                                                | db_duration | db_rows | db_table | user_id         | business_metric | ff_value |
 | ------------ | -------------------- | ------- | -------------------- | -------------- | -------------------------- | ------------ | ------------------------- | ------------------------------ | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `@mycompany/user-service` | `src/controllers/user.ts`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
@@ -920,7 +920,7 @@ SELECT
   count(CASE WHEN entry_type = 'span-start' THEN 1 END) as span_count
 FROM traces
 WHERE package_name = '@mycompany/user-service'
-  AND package_path = 'src/controllers/user.ts'
+  AND package_file = 'src/controllers/user.ts'
   AND message = 'register-user'
 GROUP BY trace_id
 ORDER BY total_duration_ms DESC
@@ -950,14 +950,14 @@ ORDER BY avg_duration DESC;
 -- HTTP error rates by service
 SELECT
   package_name,
-  package_path,
+  package_file,
   message as span_name,
   count(*) as total_requests,
   count(CASE WHEN http_status >= 400 THEN 1 END) as error_count,
   (error_count / total_requests) * 100 as error_rate_percent
 FROM traces
 WHERE http_status IS NOT NULL
-GROUP BY package_name, package_path, message
+GROUP BY package_name, package_file, message
 HAVING total_requests > 100  -- Only services with significant traffic
 ORDER BY error_rate_percent DESC;
 ```
@@ -970,7 +970,7 @@ SELECT
   span_id,
   parent_span_id,
   package_name,
-  package_path,
+  package_file,
   message,
   entry_type,
   timestamp,
@@ -992,7 +992,7 @@ ORDER BY timestamp;
 -- Note: message contains MESSAGE TEMPLATES, not interpolated strings
 SELECT
   package_name,
-  package_path,
+  package_file,
   entry_type as log_level,
   count(*) as message_count,
   count(DISTINCT trace_id) as trace_count,
@@ -1000,7 +1000,7 @@ SELECT
   count(CASE WHEN http_status IS NOT NULL OR user_id IS NOT NULL THEN 1 END) as structured_entries
 FROM traces
 WHERE entry_type IN ('info', 'debug', 'warn', 'error')
-GROUP BY package_name, package_path, entry_type
+GROUP BY package_name, package_file, entry_type
 ORDER BY message_count DESC;
 
 -- Find most common log message templates
@@ -1138,7 +1138,7 @@ then uses high-resolution timers for all subsequent timestamps. See
 
 **Core Design**:
 
-- ONE `Date.now()` captured at trace root (TraceContext creation via `module.traceContext()`)
+- ONE `Date.now()` captured at trace root (TraceRoot creation via `Tracer.trace()`)
 - ONE high-resolution timer captured at trace root (`performance.now()` or `process.hrtime.bigint()`)
 - All subsequent timestamps: `anchorEpochMicros + (highResNow - anchorHighRes) * scale`
 
@@ -1237,7 +1237,7 @@ efficiency and shared dictionaries.
 2. ✅ `concatenateTypedArrays()` helper - efficient buffer chain concatenation
 3. ✅ `concatenateNullBitmaps()` helper - null bitmap merging across buffers
 4. ✅ Primitive columns (number, boolean, timestamp) - direct subarray() + concatenation
-5. ✅ Dictionary columns (enum, category, text, trace_id, package_name, package_path, span_name, entry_type) - index
+5. ✅ Dictionary columns (enum, category, text, trace_id, package_name, package_file, span_name, entry_type) - index
    arrays + dictionary vectors
 6. ✅ System columns - all use zero-copy with direct TypedArray construction
 
