@@ -52,6 +52,7 @@ import {
 import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
+import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
 
@@ -93,7 +94,7 @@ function convertBuffersToRecordBatch(buffers: AnySpanBuffer[], systemColumnBuild
   const totalRows = buffers.reduce((sum, buf) => sum + buf._writeIndex, 0);
   if (totalRows === 0) return new RecordBatch({});
 
-  const schema: LogSchema = buffers[0]._logBinding.logSchema;
+  const schema: LogSchema = (buffers[0].constructor as SpanBufferConstructor).schema;
 
   // Build vectors first, then derive schema from them
   // This ensures Field types and vector data types are identical (Arrow IPC requirement)
@@ -758,7 +759,7 @@ export function convertSpanTreeToArrowTable(
   const mergedSchemaFields = new Map<string, unknown>();
 
   walkSpanTree(rootBuffer, (buffer) => {
-    const bufferSchema = buffer._logBinding.logSchema;
+    const bufferSchema = (buffer.constructor as SpanBufferConstructor).schema;
     const fields = Array.from(bufferSchema.fieldEntries());
     for (const [fieldName, fieldSchema] of fields) {
       // Skip system schema fields - they are handled separately as system columns
@@ -816,7 +817,7 @@ export function convertSpanTreeToArrowTable(
   const traceIdBuilder = new DictionaryBuilder(globalUtf8Cache);
 
   // For package, modulePath, gitSha - collect pre-encoded entries for direct dictionary creation
-  // Use a Set to deduplicate by ModuleContext identity (same module = same entries)
+  // Use a Set to deduplicate by OpMetadata identity (same module = same entries)
   const uniqueModules = new Set<OpMetadata>();
 
   let spanRows = 0;

@@ -37,7 +37,8 @@ import {
   ENTRY_TYPE_PERIOD_START,
 } from '../schema/systemSchema.js';
 import { getEnumUtf8, getEnumValues, getSchemaType } from '../schema/typeGuards.js';
-import type { LogBinding, OpMetadata } from '../types.js';
+import type { SpanBufferConstructor } from '../spanBuffer.js';
+import type { OpMetadata } from '../types.js';
 import { globalUtf8Cache } from '../utf8Cache.js';
 import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
 
@@ -69,14 +70,14 @@ import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
  */
 
 /**
- * Entry for capacity stats: pairs LogBinding (with stats) with OpMetadata (with package info).
+ * Entry for capacity stats: pairs SpanBufferConstructor (with stats) with OpMetadata (with package info).
  *
  * When collecting modules for capacity stats, we need both:
- * - LogBinding: has sb_totalWrites, sb_overflowWrites, sb_totalCreated, sb_overflows
+ * - SpanBufferConstructor: has static stats property with capacity, totalWrites, overflowWrites, totalCreated, overflows
  * - OpMetadata: has package_name, package_file, git_sha
  */
 export interface CapacityStatsEntry {
-  readonly logBinding: LogBinding;
+  readonly bufferClass: SpanBufferConstructor;
   readonly metadata: OpMetadata;
 }
 
@@ -477,20 +478,20 @@ export function createCapacityStatsRecordBatch(
   // uint64_value column - stores metric values per spec
   // Per spec 01n_op_and_buffer_metrics.md:
   // - period-start: periodStartNs (nanosecond timestamp when period began)
-  // - buffer-writes: module.sb_totalWrites
-  // - buffer-overflow-writes: module.sb_overflowWrites
-  // - buffer-created: module.sb_totalCreated
-  // - buffer-overflows: logBinding.sb_overflows
+  // - buffer-writes: bufferClass.stats.totalWrites
+  // - buffer-overflow-writes: bufferClass.stats.overflowWrites
+  // - buffer-created: bufferClass.stats.totalCreated
+  // - buffer-overflows: bufferClass.stats.overflows
   if (hasSpanData) {
     const uint64Values = new BigUint64Array(capacityStatsRows);
     for (let m = 0; m < moduleCount; m++) {
-      const { logBinding } = modulesToLogStats[m];
+      const { bufferClass } = modulesToLogStats[m];
       const baseRow = m * ROWS_PER_MODULE;
       uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
-      uint64Values[baseRow + 1] = BigInt(logBinding.sb_totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(logBinding.sb_overflowWrites); // buffer-overflow-writes
-      uint64Values[baseRow + 3] = BigInt(logBinding.sb_totalCreated); // buffer-created
-      uint64Values[baseRow + 4] = BigInt(logBinding.sb_overflows); // buffer-overflows
+      uint64Values[baseRow + 1] = BigInt(bufferClass.stats.totalWrites); // buffer-writes
+      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.overflowWrites); // buffer-overflow-writes
+      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.totalCreated); // buffer-created
+      uint64Values[baseRow + 4] = BigInt(bufferClass.stats.overflows); // buffer-overflows
     }
     vectors.push(
       makeVector(
@@ -677,13 +678,13 @@ export function createCapacityStatsRecordBatch(
     // Per spec, buffer-* entry types use uint64_value, not message
     const uint64Values = new BigUint64Array(capacityStatsRows);
     for (let m = 0; m < moduleCount; m++) {
-      const { logBinding } = modulesToLogStats[m];
+      const { bufferClass } = modulesToLogStats[m];
       const baseRow = m * ROWS_PER_MODULE;
       uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
-      uint64Values[baseRow + 1] = BigInt(logBinding.sb_totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(logBinding.sb_overflowWrites); // buffer-overflow-writes
-      uint64Values[baseRow + 3] = BigInt(logBinding.sb_totalCreated); // buffer-created
-      uint64Values[baseRow + 4] = BigInt(logBinding.sb_overflows); // buffer-overflows
+      uint64Values[baseRow + 1] = BigInt(bufferClass.stats.totalWrites); // buffer-writes
+      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.overflowWrites); // buffer-overflow-writes
+      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.totalCreated); // buffer-created
+      uint64Values[baseRow + 4] = BigInt(bufferClass.stats.overflows); // buffer-overflows
     }
     vectors.push(
       makeVector(

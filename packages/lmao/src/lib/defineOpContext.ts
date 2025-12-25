@@ -36,6 +36,7 @@ import {
 import { LogSchema } from './schema/LogSchema.js';
 import { mergeWithSystemSchema } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
+import { EMPTY_SCOPE } from './spanBuffer.js';
 import type { LogBinding } from './types.js';
 
 // =============================================================================
@@ -130,11 +131,10 @@ export function defineOpContext<
   const defineOp = createDefineOp<OpContext<LogSchema<T>, FF, Deps, UserCtx>>({
     logSchema: config.logSchema,
     flags: config.flags as FF,
-    logBinding,
   });
 
   const defineOps = createDefineOps<OpContext<LogSchema<T>, FF, Deps, UserCtx>>(
-    { logSchema: config.logSchema, flags: config.flags as FF, logBinding },
+    { logSchema: config.logSchema, flags: config.flags as FF },
     createOpGroup,
   );
 
@@ -148,7 +148,8 @@ export function defineOpContext<
     logSchema: config.logSchema as unknown as LogSchema<any>,
     flags: config.flags as FF,
     logBinding,
-    ctxDefaults: (config.ctx ?? {}) as UserCtx,
+    ctxDefaults: (config.ctx ?? EMPTY_SCOPE) as UserCtx,
+    deps: (config.deps ?? EMPTY_SCOPE) as Deps,
     defineOp,
     defineOps,
   };

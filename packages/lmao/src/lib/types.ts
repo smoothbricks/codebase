@@ -10,7 +10,6 @@
  */
 
 import type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray } from '@smoothbricks/arrow-builder';
-import type { LogBinding } from './logBinding.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { TraceId, TraceRoot } from './traceId.js';
@@ -18,9 +17,6 @@ import type { TraceId, TraceRoot } from './traceId.js';
 // Re-export infrastructure types
 export type { LogBinding, RemappedViewConstructor } from './logBinding.js';
 export type { OpMetadata } from './opContext/opTypes.js';
-
-// Legacy alias - ModuleContext was renamed to LogBinding
-export type ModuleContext = LogBinding;
 
 // Re-export arrow-builder types for convenience
 export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
@@ -191,13 +187,12 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   _traceRoot: TraceRoot;
 
   /**
-   * LogBinding for this span's module (schema, capacity stats, prefix view).
-   */
-  _logBinding: LogBinding;
-
-  /**
-   * Op metadata - package_name, package_file, git_sha, line.
-   * Per specs/01j: Identifies which op created this span.
+   * Op metadata for this span - identifies WHICH OP IS EXECUTING.
+   * Per specs/01j and opgroup-refactor.md:
+   * - Used for rows 1+ (log entries, tags, span-ok/err) attribution
+   * - For Op calls: set to op.metadata
+   * - For plain functions: inherited from parent's _opMetadata
+   * - Different from _callsiteMetadata which identifies WHO CALLED span()
    */
   _opMetadata: OpMetadata;
 
@@ -222,6 +217,51 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * - Applied to all rows at Arrow conversion via TypedArray.fill()
    */
   _scopeValues: Readonly<Record<string, unknown>>;
+
+  // ===========================================================================
+  // System Column Arrays (per specs/01h - known system schema fields)
+  // These are explicitly typed here since they're always present from systemSchema.
+  // ===========================================================================
+
+  /**
+   * Message column values - category strings (eager, always allocated).
+   * Contains span names, log messages, exception messages, etc.
+   * String arrays don't use null bitmaps - undefined/null in the array itself.
+   */
+  readonly message_values: string[];
+
+  /**
+   * Line number column values - Float64Array (lazy but always present).
+   * Contains source code line numbers injected by transformer.
+   * TypedArrays use null bitmaps for sparse data.
+   */
+  readonly line_values: Float64Array;
+  readonly line_nulls: Uint8Array;
+
+  /**
+   * Error code column values - category strings (lazy but always present).
+   * String arrays don't use null bitmaps.
+   */
+  readonly error_code_values: string[];
+
+  /**
+   * Exception stack trace column values - text strings (lazy but always present).
+   * String arrays don't use null bitmaps.
+   */
+  readonly exception_stack_values: string[];
+
+  /**
+   * Feature flag value column - category strings (lazy but always present).
+   * String arrays don't use null bitmaps.
+   */
+  readonly ff_value_values: string[];
+
+  /**
+   * Uint64 value column - BigUint64Array (lazy but always present).
+   * TypedArrays use null bitmaps for sparse data.
+   */
+  readonly uint64_value_values: BigUint64Array;
+  readonly uint64_value_nulls: Uint8Array;
 
   // ===========================================================================
   // System Column Setters (per specs/01h - always eager)

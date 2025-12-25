@@ -128,9 +128,6 @@ export type InferSchema<T extends LogSchema | SchemaFields> = {
                 : never;
 };
 
-/** @deprecated Use InferSchema instead */
-export type InferTagAttributes<T extends LogSchema | SchemaFields> = InferSchema<T>;
-
 /**
  * Extract TypeScript input types from log schema
  * Used for validation before transformation
@@ -140,9 +137,6 @@ export type InferTagAttributes<T extends LogSchema | SchemaFields> = InferSchema
 export type InferSchemaInput<T extends LogSchema | SchemaFields> = {
   [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends Sury.Schema<unknown, infer In> ? In : never;
 };
-
-/** @deprecated Use InferSchemaInput instead */
-export type InferTagAttributesInput<T extends LogSchema | SchemaFields> = InferSchemaInput<T>;
 
 /**
  * Feature flag builder with default value support

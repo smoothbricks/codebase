@@ -34,9 +34,10 @@ import {
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import { textEncoder } from './spanBufferHelpers.js';
+import type { SpanBufferStats } from './spanBufferStats.js';
 import { writeThreadIdToUint64Array } from './threadId.js';
 import type { TraceId, TraceRoot } from './traceId.js';
-import type { AnySpanBuffer, LogBinding, SpanBuffer } from './types.js';
+import type { AnySpanBuffer, SpanBuffer } from './types.js';
 
 // Re-export TraceRoot for external consumers (and to satisfy linter - it's used in generated code)
 export type { TraceRoot };
@@ -111,17 +112,29 @@ export const SpanBufferTestUtils = {
 // ============================================================================
 
 /**
- * SpanBuffer class constructor type
+ * SpanBuffer constructor type - accepts all parameters for buffer creation.
+ * Exported for use in Op class and span context creation.
+ *
+ * The generated class has static properties:
+ * - schema: LogSchema - The schema used to generate this class
+ * - stats: SpanBufferStats - Shared mutable stats for all instances
  */
-type SpanBufferConstructor = new (
-  capacity: number,
-  logBinding: LogBinding,
-  spanName: string,
-  parent: AnySpanBuffer | undefined,
-  isChained: boolean,
-  trace_id: TraceId | undefined,
-  callsiteMetadata: OpMetadata | undefined,
-) => AnySpanBuffer;
+export interface SpanBufferConstructor {
+  new (
+    capacity: number,
+    stats: SpanBufferStats,
+    spanName: string,
+    parent: AnySpanBuffer | undefined,
+    isChained: boolean,
+    trace_id: TraceId | undefined,
+    callsiteMetadata: OpMetadata | undefined,
+    opMetadata: OpMetadata | undefined,
+  ): AnySpanBuffer;
+
+  // Static properties added after class generation
+  readonly schema: LogSchema;
+  readonly stats: SpanBufferStats;
+}
 
 /**
  * Cache for generated SpanBuffer classes per schema.
@@ -129,7 +142,19 @@ type SpanBufferConstructor = new (
  */
 const spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
 
-function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
+/**
+ * Get or create a SpanBuffer class for the given schema.
+ *
+ * The generated class has static `schema` and `stats` properties:
+ * - `schema`: The LogSchema used to generate this class
+ * - `stats`: Shared SpanBufferStats for all instances from same defineOpContext
+ *
+ * Classes are cached per schema (WeakMap keyed by schema object).
+ *
+ * @param schema - LogSchema defining the buffer structure
+ * @returns SpanBufferConstructor with static schema and stats properties
+ */
+export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
   const cached = spanBufferClassCache.get(schema);
   if (cached) {
     return cached;
@@ -163,7 +188,7 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
-    constructorParams: 'logBinding, spanName, parent, isChained, trace_id, callsiteModule',
+    constructorParams: 'stats, spanName, parent, isChained, trace_id, callsiteMetadata, opMetadata',
     dependencies: {
       writeThreadIdToUint64Array,
       textEncoder,
@@ -248,11 +273,11 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
       this._parent = isChained ? parent._parent : parent;
       this._traceRoot = traceRoot;
       this._identity = identityView;
-      this._logBinding = logBinding;
       this._system = systemBuffer;
       this._spanName = spanName;
       this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
-      this._callsiteMetadata = callsiteModule;
+      this._callsiteMetadata = callsiteMetadata;
+      this._opMetadata = opMetadata;
     `,
     // Generated methods for SpanBuffer - no comments in output
     // span_id: extract from identity bytes [8:12]
@@ -298,6 +323,17 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
   // Generate class with arrow-builder
   const SpanBufferClass = getColumnBufferClass(schema, extension) as unknown as SpanBufferConstructor;
 
+  // Add static properties to the generated class
+  // These are shared across all instances from the same defineOpContext
+  (SpanBufferClass as any).schema = schema;
+  (SpanBufferClass as any).stats = {
+    capacity: DEFAULT_BUFFER_CAPACITY,
+    totalWrites: 0,
+    overflowWrites: 0,
+    totalCreated: 0,
+    overflows: 0,
+  } satisfies SpanBufferStats;
+
   // Cache for future use
   spanBufferClassCache.set(schema, SpanBufferClass);
 
@@ -314,42 +350,37 @@ function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
  * Root buffers have identity: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
  *
  * @param schema - Tag attribute schema defining column types (must be LogSchema)
- * @param logBinding - LogBinding with schema and capacity stats
  * @param spanName - Name of the span
- * @param traceId - Trace ID (auto-generated if omitted)
- * @param capacity - Buffer capacity (default: DEFAULT_BUFFER_CAPACITY)
+ * @param trace_id - Trace ID (auto-generated if omitted)
+ * @param capacity - Buffer capacity (uses class.stats.capacity if omitted)
+ * @param opMetadata - Op metadata for attribution (required for root spans)
  *
  * @returns SpanBuffer with typed setters for schema fields
  */
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
-  logBinding: LogBinding,
   spanName: string,
   trace_id?: TraceId,
-  capacity: number = DEFAULT_BUFFER_CAPACITY,
+  capacity?: number,
+  opMetadata?: OpMetadata,
 ): SpanBuffer<T> {
-  // Use provided capacity parameter
+  const SpanBufferClass = getSpanBufferClass(schema);
 
-  const SpanBufferClass = getSpanBufferClass(schema) as new (
-    capacity: number,
-    logBinding: LogBinding,
-    spanName: string,
-    parent: AnySpanBuffer | undefined,
-    isChained: boolean,
-    trace_id: TraceId | undefined,
-    callsiteMetadata: any,
-  ) => SpanBuffer<T>;
+  // Use provided capacity or default from class stats
+  const actualCapacity = capacity ?? SpanBufferClass.stats.capacity;
 
   // Create root buffer (no parent)
+  // Root spans use same metadata for both callsite and op (no distinction at root)
   return new SpanBufferClass(
-    capacity,
-    logBinding,
+    actualCapacity,
+    SpanBufferClass.stats,
     spanName,
     undefined, // no parent
     false, // not chained
     trace_id, // trace_id for root
-    undefined, // no callsiteModule for root
-  );
+    opMetadata, // callsiteMetadata for row 0
+    opMetadata, // opMetadata for rows 1+ (same as callsite for root)
+  ) as SpanBuffer<T>;
 }
 
 /**
@@ -363,31 +394,30 @@ export function createSpanBuffer<T extends LogSchema>(
  * @returns New SpanBuffer linked via `buffer._overflow`, with same schema type
  */
 export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
-  const schema = buffer._logBinding.logSchema as T;
-  // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
-  const capacity = (buffer._logBinding.sb_capacity + 7) & ~7;
+  const SpanBufferClass = buffer.constructor as SpanBufferConstructor;
+  const stats = SpanBufferClass.stats;
 
-  const SpanBufferClass = getSpanBufferClass(schema);
-  // Chained buffers inherit callsiteMetadata and spanName from the original buffer
+  // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
+  const capacity = (stats.capacity + 7) & ~7;
+
+  // Chained buffers inherit callsiteMetadata, opMetadata, and spanName from the original buffer
   // Pass buffer as parent - used for identity sharing; _parent set to buffer._parent in constructor
   const nextBuffer = new SpanBufferClass(
     capacity,
-    buffer._logBinding,
+    stats,
     buffer._spanName,
     buffer, // Used for identity sharing, _parent set to buffer._parent in constructor
-    true,
-    undefined,
+    true, // isChained
+    undefined, // trace_id (inherited via parent)
     buffer._callsiteMetadata,
+    buffer._opMetadata,
   ) as SpanBuffer<T>;
-
-  // Inherit _opMetadata from original buffer (chained buffers are same logical span)
-  nextBuffer._opMetadata = buffer._opMetadata;
 
   // Link current buffer to next
   buffer._overflow = nextBuffer;
 
   // Track buffer creation for capacity tuning
-  buffer._logBinding.sb_totalCreated++;
+  stats.totalCreated++;
 
   return nextBuffer;
 }
@@ -399,41 +429,38 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
  * for trace hierarchy and scope inheritance.
  *
  * @param parentBuffer - The parent span buffer
- * @param logBinding - The LogBinding for the child span
+ * @param SpanBufferClass - The SpanBuffer class to instantiate (has static schema + stats)
  * @param spanName - Name of the child span
- * @param capacity - Optional capacity override
+ * @param callsiteMetadata - Caller's op metadata (for row 0 attribution)
+ * @param opMetadata - Op metadata for this span (for rows 1+ attribution)
+ * @param capacity - Optional capacity override (uses class.stats.capacity if omitted)
  *
  * @returns New SpanBuffer linked to parent
  */
 export function createChildSpanBuffer<T extends LogSchema>(
   parentBuffer: AnySpanBuffer,
-  logBinding: LogBinding & { logSchema: T },
+  SpanBufferClass: SpanBufferConstructor,
   spanName: string,
   callsiteMetadata: OpMetadata,
-  capacity: number = DEFAULT_BUFFER_CAPACITY,
+  opMetadata: OpMetadata,
+  capacity?: number,
 ): SpanBuffer<T> {
-  const schema = logBinding.logSchema;
-
-  const SpanBufferClass = getSpanBufferClass(schema) as new (
-    capacity: number,
-    logBinding: LogBinding,
-    spanName: string,
-    parent: AnySpanBuffer | undefined,
-    isChained: boolean,
-    trace_id: TraceId | undefined,
-    callsiteMetadata: OpMetadata | undefined,
-  ) => SpanBuffer<T>;
+  const stats = (SpanBufferClass as any).stats as SpanBufferStats;
+  const actualCapacity = capacity ?? stats.capacity;
 
   // Create child buffer with parent reference
-  return new SpanBufferClass(
-    capacity,
-    logBinding,
+  const childBuffer = new SpanBufferClass(
+    actualCapacity,
+    stats,
     spanName,
     parentBuffer, // parent
     false, // not chained
     undefined, // no trace_id for child (walk up parent chain instead)
     callsiteMetadata, // callsiteMetadata - CALLER's op metadata (for row 0)
-  );
+    opMetadata, // opMetadata - EXECUTING op metadata (for rows 1+)
+  ) as SpanBuffer<T>;
+
+  return childBuffer;
 }
 
 // ============================================================================

@@ -290,7 +290,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `
     _getNextBuffer() {
       const oldBuffer = this._buffer;
-      oldBuffer._logBinding.sb_overflows++;
+      oldBuffer.constructor.stats.overflows++;
       this._inOverflow = true;
       const overflowBuffer = this._createOverflowBuffer(oldBuffer);
       oldBuffer._overflow = overflowBuffer;
@@ -335,9 +335,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._logBinding.sb_totalWrites++;
+      this._buffer.constructor.stats.totalWrites++;
       if (this._inOverflow) {
-        this._buffer._logBinding.sb_overflowWrites++;
+        this._buffer.constructor.stats.overflowWrites++;
       }
       return this;
     }
@@ -355,9 +355,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._logBinding.sb_totalWrites++;
+      this._buffer.constructor.stats.totalWrites++;
       if (this._inOverflow) {
-        this._buffer._logBinding.sb_overflowWrites++;
+        this._buffer.constructor.stats.overflowWrites++;
       }
       return this;
     }
@@ -375,9 +375,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._logBinding.sb_totalWrites++;
+      this._buffer.constructor.stats.totalWrites++;
       if (this._inOverflow) {
-        this._buffer._logBinding.sb_overflowWrites++;
+        this._buffer.constructor.stats.overflowWrites++;
       }
       return this;
     }
@@ -395,9 +395,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._logBinding.sb_totalWrites++;
+      this._buffer.constructor.stats.totalWrites++;
       if (this._inOverflow) {
-        this._buffer._logBinding.sb_overflowWrites++;
+        this._buffer.constructor.stats.overflowWrites++;
       }
       return this;
     }
@@ -415,9 +415,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      this._buffer._logBinding.sb_totalWrites++;
+      this._buffer.constructor.stats.totalWrites++;
       if (this._inOverflow) {
-        this._buffer._logBinding.sb_overflowWrites++;
+        this._buffer.constructor.stats.overflowWrites++;
       }
       return this;
     }
@@ -443,9 +443,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.ff_value_nulls, idx);
         }
       }
-      this._buffer._logBinding.sb_totalWrites++;
+      this._buffer.constructor.stats.totalWrites++;
       if (this._inOverflow) {
-        this._buffer._logBinding.sb_overflowWrites++;
+        this._buffer.constructor.stats.overflowWrites++;
       }
     }
 
@@ -465,9 +465,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       }
       // Context attributes can be written to user schema columns if provided
       // For now, just log the flag name - context can be added later if needed
-      this._buffer._logBinding.sb_totalWrites++;
+      this._buffer.constructor.stats.totalWrites++;
       if (this._inOverflow) {
-        this._buffer._logBinding.sb_overflowWrites++;
+        this._buffer.constructor.stats.overflowWrites++;
       }
     }
 

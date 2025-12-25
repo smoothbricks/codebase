@@ -10,7 +10,8 @@
 import { type RecordBatch, Table } from 'apache-arrow';
 import type { CapacityStatsEntry } from './arrow/capacityStats.js';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
-import type { AnySpanBuffer, LogBinding, OpMetadata } from './types.js';
+import type { SpanBufferConstructor } from './spanBuffer.js';
+import type { AnySpanBuffer, OpMetadata } from './types.js';
 
 /**
  * Number of flushes before logging capacity stats.
@@ -103,10 +104,11 @@ export class FlushScheduler {
   private _flushCount = 0;
 
   /**
-   * Track unique (LogBinding, OpMetadata) pairs that have been flushed since last capacity stats log.
-   * We use LogBinding as the key (for dedup) and store the OpMetadata for building PreEncodedEntry at conversion time.
+   * Track unique (SpanBufferConstructor, OpMetadata) pairs that have been flushed since last capacity stats log.
+   * We use SpanBufferConstructor as the key (for dedup) and store the OpMetadata for building PreEncodedEntry at conversion time.
+   * The constructor has static stats property with the capacity stats we need.
    */
-  private _logBindingsSinceLastStatsLog = new Map<LogBinding, OpMetadata>();
+  private _bufferClassesSinceLastStatsLog = new Map<SpanBufferConstructor, OpMetadata>();
 
   constructor(handler: FlushHandler, config: FlushSchedulerConfig = {}) {
     this.handler = handler;
@@ -282,26 +284,27 @@ export class FlushScheduler {
     // Collect all buffers to flush
     const buffersToFlush = Array.from(this.buffers);
 
-    // Collect unique (LogBinding, OpMetadata) pairs from buffers being flushed
-    // Use LogBinding as the key to dedup - multiple buffers may share the same logBinding
-    // We pick the first OpMetadata we see for each LogBinding (they should be consistent)
-    const logBindingsInThisFlush = new Map<LogBinding, OpMetadata>();
+    // Collect unique (SpanBufferConstructor, OpMetadata) pairs from buffers being flushed
+    // Use SpanBufferConstructor as the key to dedup - multiple buffers may share the same class
+    // We pick the first OpMetadata we see for each class (they should be consistent)
+    const bufferClassesInThisFlush = new Map<SpanBufferConstructor, OpMetadata>();
     for (const buffer of buffersToFlush) {
       let currentBuffer: AnySpanBuffer | undefined = buffer;
       while (currentBuffer) {
-        // Only add if we haven't seen this logBinding before
-        if (!logBindingsInThisFlush.has(currentBuffer._logBinding)) {
-          logBindingsInThisFlush.set(currentBuffer._logBinding, currentBuffer._opMetadata);
+        const bufferClass = currentBuffer.constructor as SpanBufferConstructor;
+        // Only add if we haven't seen this buffer class before
+        if (!bufferClassesInThisFlush.has(bufferClass)) {
+          bufferClassesInThisFlush.set(bufferClass, currentBuffer._opMetadata);
         }
         currentBuffer = currentBuffer._overflow;
       }
     }
 
     // Add to tracking map (for periodic capacity stats logging)
-    for (const [logBinding, metadata] of logBindingsInThisFlush) {
+    for (const [bufferClass, metadata] of bufferClassesInThisFlush) {
       // Only set if not already present (preserve first metadata seen)
-      if (!this._logBindingsSinceLastStatsLog.has(logBinding)) {
-        this._logBindingsSinceLastStatsLog.set(logBinding, metadata);
+      if (!this._bufferClassesSinceLastStatsLog.has(bufferClass)) {
+        this._bufferClassesSinceLastStatsLog.set(bufferClass, metadata);
       }
     }
 
@@ -312,8 +315,8 @@ export class FlushScheduler {
     const shouldLogCapacityStats = this._flushCount >= CAPACITY_STATS_FLUSH_INTERVAL;
     // Convert Map to CapacityStatsEntry[] for the conversion function
     const modulesToLogStatsForConversion: CapacityStatsEntry[] | undefined = shouldLogCapacityStats
-      ? Array.from(this._logBindingsSinceLastStatsLog.entries()).map(([logBinding, metadata]) => ({
-          logBinding,
+      ? Array.from(this._bufferClassesSinceLastStatsLog.entries()).map(([bufferClass, metadata]) => ({
+          bufferClass,
           metadata,
         }))
       : undefined;
@@ -404,7 +407,7 @@ export class FlushScheduler {
       // Reset flush counter and module tracking if we logged capacity stats
       if (shouldLogCapacityStats) {
         this._flushCount = 0;
-        this._logBindingsSinceLastStatsLog.clear();
+        this._bufferClassesSinceLastStatsLog.clear();
       }
 
       // Reset buffers after successful flush to avoid duplicate re-processing

@@ -1,16 +1,21 @@
 /**
- * OpGroup Creation
+ * OpGroup Creation - Class-based architecture for Phase 2
  *
- * Creates OpGroups from a schema, flags, and ops. Provides prefix() and mapColumns()
- * methods for column mapping when wiring as dependencies.
+ * Creates OpGroups as class instances with ops as own properties.
+ * Enables V8 hidden class optimization and cleaner API (`.opName` not `.ops.opName`).
+ *
+ * Why class-based:
+ * - Private fields (#columnMapping) don't affect hidden class (truly hidden, no enumeration)
+ * - Ops as own properties enable direct access and predictable object shape
+ * - prefix()/mapColumns() create new instances with same SpanBufferClass (shared stats)
+ * - Only remappedViewClass differs between original and prefixed op instances
  *
  * @module opContext/createOpGroup
  */
 
-import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { generateRemappedBufferViewClass } from '../library.js';
+import { Op } from '../op.js';
 import type { SchemaFields } from '../schema/types.js';
-import type { LogBinding } from '../types.js';
 import type {
   ColumnMapping,
   MappedOpGroup,
@@ -19,7 +24,6 @@ import type {
   PrefixedSchema,
   SchemaFieldsOf,
 } from './opGroupTypes.js';
-import type { Op } from './opTypes.js';
 import type { OpContext } from './types.js';
 
 // =============================================================================
@@ -31,8 +35,8 @@ import type { OpContext } from './types.js';
  * Input: clean -> prefixed mapping (e.g., { status: 'http_status' })
  * Output: prefixed -> clean mapping (e.g., { http_status: 'status' })
  *
- * RemappedBufferView needs the reverse direction: when Arrow conversion
- * asks for 'http_status', we need to find 'status' in the library's buffer.
+ * Why reverse: RemappedBufferView wraps child buffer at registration time.
+ * Arrow conversion asks for 'http_status', view needs to find 'status' in raw buffer.
  */
 function createReverseMapping(mapping: Record<string, string | null>): Record<string, string> {
   const reverse: Record<string, string> = {};
@@ -46,6 +50,9 @@ function createReverseMapping(mapping: Record<string, string | null>): Record<st
 
 /**
  * Build a prefix mapping for all schema fields
+ *
+ * Why prefix all fields: Ensures no column name collisions when wiring multiple libraries.
+ * Each library's columns become `${prefix}_${field}` in app schema.
  *
  * @param fieldNames - The field names from the schema
  * @param prefix - The prefix to apply
@@ -68,6 +75,8 @@ function buildPrefixMapping<T extends SchemaFields, P extends string>(
  * For each entry in the mapping:
  * - If mapped to a string, prefix that string: 'status' -> 'http_status'
  * - If mapped to null (dropped), keep as null
+ *
+ * Why: Enables chaining `.prefix('http').prefix('api')` to build composite prefixes.
  *
  * @param mapping - Existing column mapping
  * @param prefix - Prefix to apply
@@ -94,6 +103,9 @@ function prefixMapping<T extends SchemaFields, P extends string>(
  * The contributed schema reflects what columns this group adds to the app's schema
  * after mapping is applied.
  *
+ * Why track contributed schema: Type system needs to know what columns are available
+ * after prefix/mapping transformations for compile-time safety.
+ *
  * @param fields - Original schema fields
  * @param mapping - Column mapping
  * @returns The contributed schema with renamed keys
@@ -111,8 +123,7 @@ function buildContributedSchema<T extends SchemaFields, M extends ColumnMapping<
       // Explicitly mapped - use the mapped name
       result[mappedName] = value;
     } else {
-      // Not in mapping - keep original name (only applies when mapColumns is called
-      // with a partial mapping, but our types ensure full coverage via prefix)
+      // Not in mapping - keep original name
       result[key] = value;
     }
   }
@@ -120,85 +131,238 @@ function buildContributedSchema<T extends SchemaFields, M extends ColumnMapping<
 }
 
 // =============================================================================
-// MAPPED OP GROUP IMPLEMENTATION
+// OP GROUP CLASS - Phase 2 Architecture
 // =============================================================================
 
 /**
- * Create a MappedOpGroup from an existing group and mapping
+ * OpGroup class - Holds ops as own properties with private field for mapping state.
+ *
+ * Why class-based:
+ * 1. Private fields don't pollute object shape (no hidden class impact)
+ * 2. Ops spread as own properties for direct access (`.request` not `.ops.request`)
+ * 3. Prototype methods (prefix/mapColumns) shared across instances
+ * 4. Same SpanBufferClass preserved across prefix() calls (shared schema + stats)
+ * 5. Only remappedViewClass differs between original and prefixed ops
+ *
+ * Structure enables V8 optimization:
+ * - All OpGroup instances with same ops have same hidden class
+ * - Private fields invisible to property enumeration
+ * - Method dispatch via prototype (no per-instance copies)
  */
-function createMappedOpGroup<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
-  logSchema: Ctx['logSchema'],
-  flags: Ctx['flags'],
-  ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
-  columnMapping: ColumnMapping<SchemaFields>,
-  contributedSchema: ContributedSchema,
-  parentLogBinding: LogBinding,
-): MappedOpGroup<Ctx, ContributedSchema> {
-  // Generate RemappedBufferView class for this mapping.
-  // The mapping is clean→prefixed (e.g., { status: 'http_status' })
-  // RemappedBufferView needs the REVERSE: prefixed→clean (e.g., { http_status: 'status' })
-  // so that Arrow conversion can ask for 'http_status' and find 'status' in the buffer.
-  const reverseMapping = createReverseMapping(columnMapping as Record<string, string | null>);
-  const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
+class OpGroupImpl<Ctx extends OpContext> implements OpGroup<Ctx> {
+  // Allow dynamic op properties (ops spread as own properties in constructor)
+  [key: string]: unknown;
 
-  // Create new LogBinding with the remappedViewClass set.
-  // Share stats with parent (object spread creates shared reference for primitives,
-  // but stats are updated in-place on the binding object, so they stay synchronized)
-  const logBinding: LogBinding = {
-    logSchema: parentLogBinding.logSchema,
-    remappedViewClass,
-    sb_capacity: parentLogBinding.sb_capacity,
-    sb_totalWrites: parentLogBinding.sb_totalWrites,
-    sb_overflowWrites: parentLogBinding.sb_overflowWrites,
-    sb_totalCreated: parentLogBinding.sb_totalCreated,
-    sb_overflows: parentLogBinding.sb_overflows,
-  };
+  // Private field - truly hidden, doesn't affect hidden class or enumeration
+  readonly #columnMapping: ColumnMapping<SchemaFields>;
 
-  return {
-    logSchema,
-    flags,
-    ops,
-    columnMapping,
-    contributedSchema,
+  constructor(
+    readonly logSchema: Ctx['logSchema'],
+    readonly flags: Ctx['flags'],
+    ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
+    columnMapping?: ColumnMapping<SchemaFields>,
+  ) {
+    this.#columnMapping = columnMapping ?? {};
 
-    prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>> {
-      // Apply prefix to the current mapping's target names
-      const newMapping = prefixMapping(columnMapping, p);
-      // Build new contributed schema by prefixing the current contributed schema
-      const newContributed = buildContributedSchema(
-        contributedSchema as SchemaFields,
-        buildPrefixMapping(Object.keys(contributedSchema), p),
-      );
-      return createMappedOpGroup(
-        logSchema,
-        flags,
-        ops,
-        newMapping,
-        newContributed as PrefixedSchema<ContributedSchema, P>,
-        logBinding, // Pass our logBinding (which has remappedViewClass)
-      );
-    },
+    // Spread ops onto this instance as own properties
+    // Why spread: Enables direct access (ctx.deps.http.request)
+    for (const [name, op] of Object.entries(ops)) {
+      (this as Record<string, unknown>)[name] = op;
+    }
+  }
 
-    mapColumns<M extends ColumnMapping<ContributedSchema>>(
-      mapping: M,
-    ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>> {
-      // Override/extend the existing mapping with new mapping
-      const newMapping = { ...columnMapping, ...mapping };
-      // Build contributed schema from original fields with new mapping
-      const newContributed = buildContributedSchema(
-        logSchema.fields as SchemaFields,
-        newMapping as ColumnMapping<SchemaFields>,
-      );
-      return createMappedOpGroup(
-        logSchema,
-        flags,
-        ops,
-        newMapping,
-        newContributed as MappedSchema<ContributedSchema, M>,
-        logBinding,
-      );
-    },
-  };
+  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>> {
+    // Apply prefix to the current mapping
+    const newMapping = this.#columnMapping
+      ? prefixMapping(this.#columnMapping, p)
+      : buildPrefixMapping(this.logSchema.fieldNames, p);
+
+    // Generate RemappedBufferView for this prefix
+    // Why reverse mapping: Arrow conversion asks for 'http_status', needs to find 'status'
+    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
+
+    // Create new OpGroup with prefixed ops
+    const newGroup = new MappedOpGroupImpl(
+      this.logSchema,
+      this.flags,
+      {},
+      newMapping,
+      buildContributedSchema(this.logSchema.fields as SchemaFields, buildPrefixMapping(this.logSchema.fieldNames, p)),
+    );
+
+    // Copy ops, creating new Op instances with remappedViewClass
+    // Why same SpanBufferClass: All ops from same defineOpContext share schema + stats
+    for (const key of Object.keys(this)) {
+      const value = (this as Record<string, unknown>)[key];
+      if (value instanceof Op) {
+        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
+        (newGroup as Record<string, unknown>)[key] = new Op(
+          oldOp.metadata,
+          oldOp.SpanBufferClass, // SAME class - shared schema + stats
+          oldOp.fn,
+          remappedViewClass, // NEW - for child buffer wrapping
+        );
+      }
+    }
+
+    return newGroup as unknown as MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>>;
+  }
+
+  mapColumns<M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
+    mapping: M,
+  ): MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>> {
+    // Override/extend the existing mapping with new mapping
+    const newMapping = { ...this.#columnMapping, ...mapping };
+
+    // Generate RemappedBufferView for this mapping
+    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
+
+    // Build contributed schema from original fields with new mapping
+    const newContributed = buildContributedSchema(this.logSchema.fields as SchemaFields, newMapping);
+
+    // Create new OpGroup with mapped ops
+    const newGroup = new MappedOpGroupImpl(
+      this.logSchema,
+      this.flags,
+      {},
+      newMapping,
+      newContributed as MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>,
+    );
+
+    // Copy ops with remappedViewClass
+    for (const key of Object.keys(this)) {
+      const value = (this as Record<string, unknown>)[key];
+      if (value instanceof Op) {
+        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
+        (newGroup as Record<string, unknown>)[key] = new Op(
+          oldOp.metadata,
+          oldOp.SpanBufferClass,
+          oldOp.fn,
+          remappedViewClass,
+        );
+      }
+    }
+
+    return newGroup as MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>>;
+  }
+}
+
+// =============================================================================
+// MAPPED OP GROUP CLASS
+// =============================================================================
+
+/**
+ * MappedOpGroup class - OpGroup with column mapping applied.
+ *
+ * Why separate class: TypeScript needs distinct type for mapped groups
+ * to track contributedSchema type parameter.
+ */
+class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaFields>
+  implements MappedOpGroup<Ctx, ContributedSchema>
+{
+  // Allow dynamic op properties (ops spread as own properties in constructor)
+  [key: string]: unknown;
+
+  readonly #columnMapping: ColumnMapping<SchemaFields>;
+
+  constructor(
+    readonly logSchema: Ctx['logSchema'],
+    readonly flags: Ctx['flags'],
+    ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
+    readonly columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>,
+    readonly contributedSchema: ContributedSchema,
+  ) {
+    this.#columnMapping = columnMapping as ColumnMapping<SchemaFields>;
+
+    // Spread ops onto this instance
+    for (const [name, op] of Object.entries(ops)) {
+      (this as Record<string, unknown>)[name] = op;
+    }
+  }
+
+  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>> {
+    // Apply prefix to the current mapping's target names
+    const newMapping = prefixMapping(this.#columnMapping, p);
+
+    // Generate RemappedBufferView
+    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
+
+    // Build new contributed schema by prefixing current contributed schema
+    const newContributed = buildContributedSchema(
+      this.contributedSchema,
+      buildPrefixMapping(Object.keys(this.contributedSchema), p),
+    );
+
+    // Create new MappedOpGroup
+    const newGroup = new MappedOpGroupImpl(
+      this.logSchema,
+      this.flags,
+      {},
+      newMapping,
+      newContributed as unknown as PrefixedSchema<ContributedSchema, P>,
+    );
+
+    // Copy ops with new remappedViewClass
+    for (const key of Object.keys(this)) {
+      const value = (this as Record<string, unknown>)[key];
+      if (value instanceof Op) {
+        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
+        (newGroup as Record<string, unknown>)[key] = new Op(
+          oldOp.metadata,
+          oldOp.SpanBufferClass,
+          oldOp.fn,
+          remappedViewClass,
+        );
+      }
+    }
+
+    return newGroup as MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>>;
+  }
+
+  mapColumns<M extends ColumnMapping<ContributedSchema>>(
+    mapping: M,
+  ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>> {
+    // Override/extend the existing mapping
+    const newMapping = { ...this.#columnMapping, ...mapping };
+
+    // Generate RemappedBufferView
+    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
+
+    // Build contributed schema from original fields with new mapping
+    const newContributed = buildContributedSchema(
+      this.logSchema.fields as SchemaFields,
+      newMapping as ColumnMapping<SchemaFields>,
+    );
+
+    // Create new MappedOpGroup
+    const newGroup = new MappedOpGroupImpl(
+      this.logSchema,
+      this.flags,
+      {},
+      newMapping,
+      newContributed as MappedSchema<ContributedSchema, M>,
+    );
+
+    // Copy ops with new remappedViewClass
+    for (const key of Object.keys(this)) {
+      const value = (this as Record<string, unknown>)[key];
+      if (value instanceof Op) {
+        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
+        (newGroup as Record<string, unknown>)[key] = new Op(
+          oldOp.metadata,
+          oldOp.SpanBufferClass,
+          oldOp.fn,
+          remappedViewClass,
+        );
+      }
+    }
+
+    return newGroup as MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>>;
+  }
 }
 
 // =============================================================================
@@ -208,20 +372,23 @@ function createMappedOpGroup<Ctx extends OpContext, ContributedSchema extends Sc
 /**
  * Create an OpGroup from a schema, flags, and ops
  *
- * The ops passed to this function already have a LogBinding attached from the factory.
- * All ops in the same context share the SAME LogBinding instance, which enables self-tuning:
- * - Stats (sb_capacity, sb_totalWrites, sb_overflows) aggregate across the group
- * - This allows buffer capacity to be tuned based on the entire group's workload
+ * Why class-based: V8 hidden class optimization - all OpGroups with same ops
+ * have same object shape (private fields don't affect hidden class).
+ *
+ * The ops passed to this function already have a SpanBufferClass attached.
+ * All ops in the same context share the SAME SpanBufferClass instance, which carries:
+ * - Static schema property (shared by all instances)
+ * - Static stats property (shared mutable stats for self-tuning)
  *
  * The returned OpGroup can be:
- * - Used directly as a dependency (ops accessible via ctx.deps.name)
+ * - Used directly as a dependency (ops accessible via ctx.deps.name.opName)
  * - Prefixed with `.prefix('http')` to namespace all columns
  * - Mapped with `.mapColumns({ query: 'query', _internal: null })` for fine control
  *
  * @param logSchema - The LogSchema defining columns for this group's ops
  * @param flags - Feature flag schema
- * @param ops - Record of Op instances belonging to this group (all share same LogBinding)
- * @returns OpGroup with prefix() and mapColumns() methods
+ * @param ops - Record of Op instances belonging to this group
+ * @returns OpGroup with prefix() and mapColumns() methods, ops as own properties
  *
  * @example
  * ```typescript
@@ -230,12 +397,12 @@ function createMappedOpGroup<Ctx extends OpContext, ContributedSchema extends Sc
  *   post: postOp,
  * });
  *
- * // Later, wire with prefix:
+ * // Direct access (Phase 2):
+ * await ctx.deps.http.fetch(url);
+ *
+ * // Wire with prefix:
  * deps: { http: httpOps.prefix('http') }
  * // Columns become: http_status, http_url, http_duration, etc.
- *
- * // Or with explicit mapping:
- * deps: { http: httpOps.mapColumns({ status: 'http_status', _debug: null }) }
  * ```
  */
 export function createOpGroup<Ctx extends OpContext>(
@@ -243,37 +410,5 @@ export function createOpGroup<Ctx extends OpContext>(
   flags: Ctx['flags'],
   ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
 ): OpGroup<Ctx> {
-  // Extract the logBinding from the first op (all ops in the group share the same binding)
-  const firstOp = Object.values(ops)[0];
-  const logBinding: LogBinding = firstOp?.logBinding ?? {
-    logSchema,
-    sb_capacity: DEFAULT_BUFFER_CAPACITY, // Start small, self-tuning grows as needed
-    sb_totalWrites: 0,
-    sb_overflowWrites: 0,
-    sb_totalCreated: 0,
-    sb_overflows: 0,
-    remappedViewClass: undefined,
-  };
-
-  return {
-    logSchema,
-    flags,
-    ops,
-
-    prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>> {
-      const fieldNames = logSchema.fieldNames;
-      const mapping = buildPrefixMapping(fieldNames, p);
-      const contributedSchema = buildContributedSchema(logSchema.fields as SchemaFields, mapping);
-      // @ts-expect-error - SchemaFieldsOf<Ctx['logSchema']> extends SchemaFields at runtime
-      return createMappedOpGroup(logSchema, flags, ops, mapping, contributedSchema, logBinding);
-    },
-
-    mapColumns<M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
-      mapping: M,
-    ): MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>> {
-      const contributedSchema = buildContributedSchema(logSchema.fields as SchemaFields, mapping);
-      // @ts-expect-error - SchemaFieldsOf<Ctx['logSchema']> extends SchemaFields at runtime
-      return createMappedOpGroup(logSchema, flags, ops, mapping, contributedSchema, logBinding);
-    },
-  };
+  return new OpGroupImpl(logSchema, flags, ops);
 }

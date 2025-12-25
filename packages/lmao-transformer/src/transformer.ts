@@ -372,9 +372,19 @@ function isLmaoSpanLoggerType(type: ts.Type, typeChecker: ts.TypeChecker): boole
 /**
  * Try to transform a ctx.span('name', fn) call.
  *
- * Rewrites to monomorphic methods for V8 optimization:
- * - ctx.span('name', op, ...args) -> ctx.span_op(line, 'name', op, ...args)
- * - ctx.span('name', async (ctx) => ...) -> ctx.span_fn(line, 'name', async (ctx) => ...)
+ * Rewrites to monomorphic methods with 6 parameters before fn (OpGroup refactor):
+ * 1. line: number
+ * 2. name: string
+ * 3. childCtx: SpanContext (ctx._newCtx0())
+ * 4. SpanBufferClass: SpanBufferConstructor
+ * 5. remappedViewClass: RemappedViewConstructor | undefined
+ * 6. opMetadata: OpMetadata
+ *
+ * For Ops:
+ *   await ctx.span1(__line, 'fetch', ctx._newCtx0(), fetchOp.SpanBufferClass, fetchOp.remappedViewClass, fetchOp.metadata, fetchOp.fn, userId);
+ *
+ * For plain functions:
+ *   await ctx.span0(__line, 'process', ctx._newCtx0(), ctx._buffer.constructor, undefined, ctx._buffer._opMetadata, async (ctx) => {});
  */
 function tryTransformSpanCall(
   node: ts.CallExpression,
@@ -414,6 +424,7 @@ function tryTransformSpanCall(
   const restArgs = node.arguments.slice(2);
 
   const lineNumber = getLineNumber(node, sourceFile);
+  const ctxExpr = expr.expression; // ctx
 
   // Determine if it's an Op or a function
   let isOp = false;
@@ -426,13 +437,59 @@ function tryTransformSpanCall(
     isOp = !ts.isArrowFunction(opOrFnArg) && !ts.isFunctionExpression(opOrFnArg);
   }
 
-  const methodName = isOp ? 'span_op' : 'span_fn';
+  // Determine monomorphic method name based on argument count
+  const argCount = restArgs.length;
+  const methodName = `span${argCount}`;
+
+  // Build the 6 required parameters before fn
+  let spanBufferClassExpr: ts.Expression;
+  let remappedViewClassExpr: ts.Expression;
+  let opMetadataExpr: ts.Expression;
+  let fnExpr: ts.Expression;
+
+  if (isOp) {
+    // For Op: extract op.SpanBufferClass, op.remappedViewClass, op.metadata, op.fn
+    spanBufferClassExpr = factory.createPropertyAccessExpression(opOrFnArg, 'SpanBufferClass');
+    remappedViewClassExpr = factory.createPropertyAccessExpression(opOrFnArg, 'remappedViewClass');
+    opMetadataExpr = factory.createPropertyAccessExpression(opOrFnArg, 'metadata');
+    fnExpr = factory.createPropertyAccessExpression(opOrFnArg, 'fn');
+  } else {
+    // For plain function: use ctx._buffer.constructor, undefined, ctx._buffer._opMetadata, the function
+    spanBufferClassExpr = factory.createPropertyAccessExpression(
+      factory.createPropertyAccessExpression(ctxExpr, '_buffer'),
+      'constructor',
+    );
+    remappedViewClassExpr = factory.createIdentifier('undefined');
+    opMetadataExpr = factory.createPropertyAccessExpression(
+      factory.createPropertyAccessExpression(ctxExpr, '_buffer'),
+      '_opMetadata',
+    );
+    fnExpr = opOrFnArg;
+  }
+
+  // Build argument list:
+  // [line, name, childCtx, SpanBufferClass, remappedViewClass, opMetadata, fn, ...restArgs]
+  const newArgs: ts.Expression[] = [
+    factory.createNumericLiteral(lineNumber), // line
+    nameArg, // name
+    factory.createCallExpression(
+      // ctx._newCtx0()
+      factory.createPropertyAccessExpression(ctxExpr, '_newCtx0'),
+      undefined,
+      [],
+    ),
+    spanBufferClassExpr, // SpanBufferClass
+    remappedViewClassExpr, // remappedViewClass
+    opMetadataExpr, // opMetadata
+    fnExpr, // fn
+    ...restArgs, // ...args
+  ];
 
   return factory.updateCallExpression(
     node,
-    factory.createPropertyAccessExpression(expr.expression, factory.createIdentifier(methodName)),
+    factory.createPropertyAccessExpression(ctxExpr, factory.createIdentifier(methodName)),
     node.typeArguments,
-    [factory.createNumericLiteral(lineNumber), nameArg, opOrFnArg, ...restArgs],
+    newArgs,
   );
 }
 

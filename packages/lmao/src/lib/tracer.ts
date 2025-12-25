@@ -62,8 +62,13 @@ import type { Result } from './result.js';
 import type { FlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 
-import { createOverflowBuffer, createSpanBuffer } from './spanBuffer.js';
-import { createSpanContextProto, type MutableSpanContext, writeSpanStart } from './spanContext.js';
+import { createOverflowBuffer, createSpanBuffer, EMPTY_SCOPE } from './spanBuffer.js';
+import {
+  createSpanContextClass,
+  type SpanContextClass,
+  type SpanContextInstance,
+  writeSpanStart,
+} from './spanContext.js';
 import { getTimestampNanos } from './timestamp.js';
 import { generateTraceId, type TraceId } from './traceId.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
@@ -120,6 +125,19 @@ export interface TracerConfig<Ctx extends OpContext> {
    * ```
    */
   ctxDefaults?: Ctx['userCtx'];
+
+  /**
+   * Dependencies wired at defineOpContext time.
+   *
+   * These are passed to ctx.deps on root spans, allowing ops to
+   * access library operations via ctx.span('name', ctx.deps.http.request).
+   *
+   * @example
+   * ```typescript
+   * deps: { http: httpOps.prefix('http'), auth: authOps.prefix('auth') }
+   * ```
+   */
+  deps?: Ctx['deps'];
 }
 
 /**
@@ -151,18 +169,21 @@ export class Tracer<Ctx extends OpContext> {
   protected pendingBuffers: AnySpanBuffer[] = [];
   private readonly logBinding: LogBinding<Ctx['logSchema']>;
   private readonly sink: TraceSink;
-  private readonly spanContextProto: Record<string | symbol, unknown>;
+  private readonly SpanContextClass: SpanContextClass<Ctx>;
   private readonly flagEvaluator?: FlagEvaluator<Ctx>;
   private readonly ctxDefaults: Ctx['userCtx'];
+  private readonly deps: Ctx['deps'];
 
   constructor(config: TracerConfig<Ctx>) {
     this.logBinding = config.logBinding;
     this.sink = config.sink;
     this.flagEvaluator = config.flagEvaluator;
-    this.ctxDefaults = config.ctxDefaults ?? ({} as Ctx['userCtx']);
+    this.ctxDefaults = config.ctxDefaults ?? (EMPTY_SCOPE as Ctx['userCtx']);
+    this.deps = config.deps ?? (EMPTY_SCOPE as Ctx['deps']);
 
-    // Create shared prototype for all SpanContexts created by this tracer
-    this.spanContextProto = createSpanContextProto<Ctx>(config.logBinding.logSchema, config.logBinding);
+    // Create SpanContext class for all contexts created by this tracer
+    // The class closes over schema/logBinding and provides typed methods
+    this.SpanContextClass = createSpanContextClass<Ctx>(config.logBinding.logSchema, config.logBinding);
 
     // Bind methods for destructuring (per AGENTS.md - "Always destructure")
     this.trace = this.trace.bind(this);
@@ -191,13 +212,16 @@ export class Tracer<Ctx extends OpContext> {
   // Implementation
   trace(
     name: string,
-    optionsOrOpOrFn: TraceOptions<Ctx['userCtx']> | Op<Ctx, [], any, any> | ((ctx: SpanContext<Ctx>) => any),
-    maybeOpOrFn?: Op<Ctx, [], any, any> | ((ctx: SpanContext<Ctx>) => any),
-  ): any {
+    optionsOrOpOrFn:
+      | TraceOptions<Ctx['userCtx']>
+      | Op<Ctx, [], unknown, unknown>
+      | ((ctx: SpanContext<Ctx>) => unknown),
+    maybeOpOrFn?: Op<Ctx, [], unknown, unknown> | ((ctx: SpanContext<Ctx>) => unknown),
+  ): unknown {
     // Parse overloaded arguments - dispatch to trace_op or trace_fn
     // Pattern matches span() dispatcher in spanContext.ts
     let options: TraceOptions<Ctx['userCtx']>;
-    let opOrFn: Op<Ctx, [], any, any> | ((ctx: SpanContext<Ctx>) => any);
+    let opOrFn: Op<Ctx, [], unknown, unknown> | ((ctx: SpanContext<Ctx>) => unknown);
 
     if (optionsOrOpOrFn instanceof Op) {
       options = {};
@@ -208,14 +232,14 @@ export class Tracer<Ctx extends OpContext> {
     } else {
       options = optionsOrOpOrFn;
       opOrFn = maybeOpOrFn!;
-    } // biome-ignore lint/style/noUselessElse: clarity for overload parsing
+    }
 
     // Dispatch to monomorphic methods
     // TODO: lmao-transformer should rewrite trace(name, op) → trace_op(name, {}, op)
     if (opOrFn instanceof Op) {
-      return this.trace_op(name, options, opOrFn as any);
+      return this.trace_op(name, options, opOrFn);
     }
-    return this.trace_fn(name, options, opOrFn as any);
+    return this.trace_fn(name, options, opOrFn);
   }
 
   // ===========================================================================
@@ -244,7 +268,7 @@ export class Tracer<Ctx extends OpContext> {
    * Returns R (sync) or Promise<R> (async) - preserves sync/async
    */
   trace_fn<R>(name: string, options: TraceOptions<Ctx['userCtx']>, fn: (ctx: SpanContext<Ctx>) => R): R {
-    const ctx = this._createRootContext(name, options, createOpMetadata('root', 'tracer', 'runtime', 0));
+    const ctx = this._createRootContext(name, options, createOpMetadata('root', 'tracer', 'runtime', 'unknown', 0));
     return this._executeWithContext(ctx, fn);
   }
 
@@ -256,7 +280,7 @@ export class Tracer<Ctx extends OpContext> {
     name: string,
     options: TraceOptions<Ctx['userCtx']>,
     metadata: ReturnType<typeof createOpMetadata>,
-  ): MutableSpanContext<Ctx> {
+  ): SpanContextInstance<Ctx> {
     const traceId: TraceId = options.traceId ? (options.traceId as TraceId) : generateTraceId();
     const schema = this.logBinding.logSchema as Ctx['logSchema'];
 
@@ -264,13 +288,19 @@ export class Tracer<Ctx extends OpContext> {
     const resolvedUserCtx = this._resolveUserContext(options.ctx);
 
     // Create root SpanBuffer
-    const buffer = createSpanBuffer(schema, this.logBinding, name, traceId) as SpanBuffer<Ctx['logSchema']>;
+    const buffer = createSpanBuffer(
+      schema,
+      name, // spanName (was second param, logBinding removed)
+      traceId, // trace_id (now third param)
+      undefined, // capacity (optional, uses default from class stats)
+      metadata, // opMetadata (for both callsite and op at root level)
+    ) as SpanBuffer<Ctx['logSchema']>;
 
     // Register with pendingBuffers for collection
     this.pendingBuffers.push(buffer);
 
-    // Initialize scope values to empty frozen object
-    buffer._scopeValues = Object.freeze({});
+    // Initialize scope values to shared frozen empty object (avoid allocation)
+    buffer._scopeValues = EMPTY_SCOPE;
 
     // Set _opMetadata for Arrow conversion
     buffer._opMetadata = metadata;
@@ -278,28 +308,23 @@ export class Tracer<Ctx extends OpContext> {
     // Write span-start entry (row 0)
     writeSpanStart(buffer, name);
 
-    // Create SpanContext using prototype inheritance
-    const ctx = Object.create(this.spanContextProto) as MutableSpanContext<Ctx>;
-
-    // Set instance properties
-    ctx._buffer = buffer;
-    ctx._schema = schema;
-    ctx._logBinding = this.logBinding;
-
-    // Create tag writer and span logger
-    ctx.tag = createTagWriter(schema, buffer) as TagWriter<Ctx['logSchema']>;
+    // Create tag writer and span logger (needed for constructor)
+    const tagWriter = createTagWriter(schema, buffer) as TagWriter<Ctx['logSchema']>;
     const spanLogger = createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer);
-    ctx.log = spanLogger as any;
-    ctx._spanLogger = spanLogger as any;
 
-    // Set up deps (empty for root)
-    ctx.deps = {};
+    // Instantiate SpanContext class with direct arguments (no temp object allocation)
+    const ctx = new this.SpanContextClass(buffer, schema, spanLogger, tagWriter) as SpanContextInstance<Ctx>;
+
+    // Set up deps from config (may be EMPTY_SCOPE if none provided)
+    ctx.deps = this.deps;
 
     // Set up feature flags if evaluator provided
     if (this.flagEvaluator) {
+      // biome-ignore lint/suspicious/noExplicitAny: FF types are complex, forContext handles it
       ctx.ff = (this.flagEvaluator as any).forContext(ctx);
     } else {
-      ctx.ff = {} as any;
+      // biome-ignore lint/suspicious/noExplicitAny: Empty object as fallback when no evaluator
+      ctx.ff = EMPTY_SCOPE as any;
     }
 
     // Spread resolved user context onto SpanContext
@@ -353,17 +378,17 @@ export class Tracer<Ctx extends OpContext> {
    * Execute function with context and handle span-ok/span-err/span-exception writes
    * Promise-agnostic: returns sync for sync fn, Promise for async fn
    */
-  private _executeWithContext<R>(ctx: MutableSpanContext<Ctx>, fn: (ctx: SpanContext<Ctx>) => R): R {
+  private _executeWithContext<R>(ctx: SpanContextInstance<Ctx>, fn: (ctx: SpanContext<Ctx>) => R): R {
     const buffer = ctx._buffer;
 
     try {
-      const result = fn(ctx as unknown as SpanContext<Ctx>);
+      const result = fn(ctx as SpanContext<Ctx>);
 
       // Check if result is a Promise
-      if (result && typeof (result as any).then === 'function') {
+      if (result && typeof (result as { then?: unknown }).then === 'function') {
         // Async path - use .then to write span-ok/err after Promise resolves
-        return (result as any).then(
-          (resolved: any) => {
+        return (result as unknown as Promise<unknown>).then(
+          (resolved) => {
             // Write span-ok to row 1
             buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
             buffer.timestamp[1] = getTimestampNanos(
@@ -372,7 +397,7 @@ export class Tracer<Ctx extends OpContext> {
             );
             return resolved;
           },
-          (error: any) => {
+          (error: unknown) => {
             // Write span-exception to row 1
             buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
             buffer.timestamp[1] = getTimestampNanos(

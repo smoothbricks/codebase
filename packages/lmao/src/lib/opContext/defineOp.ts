@@ -9,7 +9,7 @@
 
 import { intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import { Op as OpClass } from '../op.js';
-import type { LogBinding } from '../types.js';
+import { getSpanBufferClass } from '../spanBuffer.js';
 import type { OpGroup } from './opGroupTypes.js';
 import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { OpContext } from './types.js';
@@ -23,12 +23,14 @@ import type { OpContext } from './types.js';
  * Uses global interner to deduplicate UTF-8 bytes across all Ops with same strings.
  */
 export function createOpMetadata(
+  name: string,
   package_name: string,
   package_file: string,
   git_sha: string,
   line: number,
 ): OpMetadata {
   return {
+    name,
     package_name,
     package_file,
     git_sha,
@@ -48,7 +50,7 @@ export function createOpMetadata(
  * Default metadata values for Ops when not injected by transformer.
  * These are placeholder values that will be replaced at compile time.
  */
-export const DEFAULT_METADATA: OpMetadata = createOpMetadata('unknown', 'unknown', 'unknown', 0);
+export const DEFAULT_METADATA: OpMetadata = createOpMetadata('unknown', 'unknown', 'unknown', 'unknown', 0);
 
 // =============================================================================
 // STACK TRACE METADATA EXTRACTION
@@ -126,7 +128,7 @@ export function extractMetadataFromStack(skipFrames = 2): OpMetadata {
     packageName = dotIndex > 0 ? fileName.slice(0, dotIndex) : fileName;
   }
 
-  return createOpMetadata(packageName, filePath, 'runtime', lineNumber);
+  return createOpMetadata('unknown', packageName, filePath, 'runtime', lineNumber);
 }
 
 // =============================================================================
@@ -140,7 +142,6 @@ export function extractMetadataFromStack(skipFrames = 2): OpMetadata {
 interface DefineOpFactoryConfig<Ctx extends OpContext> {
   readonly logSchema: Ctx['logSchema'];
   readonly flags: Ctx['flags'];
-  readonly logBinding: LogBinding;
 }
 
 /**
@@ -161,10 +162,10 @@ type CreateOpGroupFn<Ctx extends OpContext> = (
  * Creates a defineOp function bound to a specific factory config.
  *
  * The returned function creates Op objects with:
- * - name: the provided name
- * - metadata: merged with defaults
- * - logBinding: from factoryConfig (contains logSchema, capacity stats, optional prefix view)
+ * - metadata: includes name + merged with defaults
+ * - SpanBufferClass: from getSpanBufferClass(logSchema) - has static schema + stats
  * - fn(ctx, ...args): the user function to execute
+ * - remappedViewClass: undefined for original ops (set by .prefix() method)
  *
  * @template Ctx - Bundled OpContext (logSchema, flags, deps, userCtx)
  * @param factoryConfig - Configuration containing logSchema and flags
@@ -177,6 +178,9 @@ export function createDefineOp<Ctx extends OpContext>(
   fn: OpFn<Ctx, Args, S, E>,
   metadata?: Partial<OpMetadata>,
 ) => Op<Ctx, Args, S, E> {
+  // Why get class from schema: Class has static schema + stats shared by all instances
+  const SpanBufferClass = getSpanBufferClass(factoryConfig.logSchema);
+
   return function defineOpImpl<Args extends unknown[], S, E>(
     name: string,
     fn: OpFn<Ctx, Args, S, E>,
@@ -194,7 +198,9 @@ export function createDefineOp<Ctx extends OpContext>(
     // - Sets _opMetadata and _callsiteMetadata
     // - Writes span-start/span-ok/span-err entries
     // - Handles exceptions with span-exception
-    return new OpClass(name, finalMetadata, factoryConfig.logBinding, fn) as unknown as Op<Ctx, Args, S, E>;
+    // Why SpanBufferClass: All ops from same defineOpContext share this class for stats coordination
+    // Why undefined for remappedViewClass: Only prefixed ops need remapping - set by .prefix() method
+    return new OpClass(finalMetadata, SpanBufferClass, fn, undefined) as unknown as Op<Ctx, Args, S, E>;
   };
 }
 

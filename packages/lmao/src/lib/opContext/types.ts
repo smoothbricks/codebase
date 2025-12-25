@@ -272,6 +272,12 @@ export interface OpContextFactory<
   readonly ctxDefaults: UserCtx;
 
   /**
+   * Dependencies wired at defineOpContext time.
+   * Used by Tracer to populate ctx.deps on root spans.
+   */
+  readonly deps: Deps;
+
+  /**
    * Define a single Op with explicit name.
    *
    * Creates an Op instance that wraps your function with metadata for tracing.

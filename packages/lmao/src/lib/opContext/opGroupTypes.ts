@@ -12,7 +12,6 @@
 
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
-import type { Op } from './opTypes.js';
 import type { OpContext } from './types.js';
 
 // =============================================================================
@@ -69,6 +68,9 @@ export type MappedSchema<T extends SchemaFields, M extends ColumnMapping<T>> = {
  *
  * Created by defineOps() - represents a library's exported operations.
  * Libraries declare their schema but don't know how the app will wire them.
+ *
+ * Note: Ops are accessed directly as properties (`.opName` not `.ops.opName`)
+ * for V8 hidden class optimization and cleaner API ergonomics.
  */
 export interface OpGroup<Ctx extends OpContext> {
   /** The log schema for this group's ops */
@@ -76,9 +78,6 @@ export interface OpGroup<Ctx extends OpContext> {
 
   /** The feature flag schema */
   readonly flags: Ctx['flags'];
-
-  /** The ops in this group (loosely typed - actual types preserved in intersection) */
-  readonly ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>;
 
   /**
    * Apply a prefix to all schema columns.
@@ -128,6 +127,9 @@ export interface OpGroup<Ctx extends OpContext> {
  * The mapping is used during wiring to create RemappedBufferView
  * that translates the library's column writes to the app's column names.
  *
+ * Note: Ops are accessed directly as properties (`.opName` not `.ops.opName`)
+ * for V8 hidden class optimization and cleaner API ergonomics.
+ *
  * @template Ctx - OpContext (bundled type with logSchema, flags, deps, userCtx)
  * @template ContributedSchema - Schema fields this group contributes to app (after mapping)
  */
@@ -143,9 +145,6 @@ export interface MappedOpGroup<Ctx extends OpContext, ContributedSchema extends 
 
   /** The column mapping (library column -> app column, or null to drop) */
   readonly columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
-
-  /** The ops in this group */
-  readonly ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>;
 
   /** Chain with prefix (applies prefix to current mapping) */
   prefix<P extends string>(prefix: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>>;
@@ -167,12 +166,12 @@ export interface MappedOpGroup<Ctx extends OpContext, ContributedSchema extends 
  * in dependency wiring. By using a minimal interface with covariant
  * properties (readonly), TypeScript allows specific OpGroup<Ctx>
  * variants to be assigned to this type.
+ *
+ * Note: No `.ops` property - ops are accessed directly as own properties.
  */
 export interface AnyOpGroup {
   /** The log schema - read-only access for wiring */
   readonly logSchema: LogSchema;
-  /** The ops - read-only access for wiring */
-  readonly ops: Record<string, unknown>;
 }
 
 /**

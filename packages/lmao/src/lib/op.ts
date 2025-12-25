@@ -14,10 +14,11 @@
  */
 
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
+import type { RemappedViewConstructor } from './logBinding.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
 import type { OpContext } from './opContext/types.js';
 import type { Result } from './result.js';
-import type { LogBinding } from './types.js';
+import type { SpanBufferConstructor } from './spanBuffer.js';
 
 // =============================================================================
 // OP METADATA
@@ -31,6 +32,8 @@ import type { LogBinding } from './types.js';
  * encode once at Op definition time, reuse for every span conversion.
  */
 export interface OpMetadata {
+  /** Op name for metrics tracking (distinct from span names which are provided at call sites) */
+  readonly name: string;
   /** Package name from package.json */
   readonly package_name: string;
   /** File path relative to package root */
@@ -53,7 +56,7 @@ export interface OpMetadata {
 // =============================================================================
 
 /**
- * Op - Traced operation
+ * Op - Traced operation (Phase 2 architecture)
  *
  * Per spec 01l lines 436-453 and 01c lines 292-362:
  * - Wraps a user function with automatic span tracking
@@ -70,6 +73,11 @@ export interface OpMetadata {
  * - When span() invokes this Op, the Op's metadata becomes buffer._opMetadata (for rows 1+)
  * - The caller's metadata becomes buffer._callsiteMetadata (for row 0)
  *
+ * Phase 2 architecture:
+ * - SpanBufferClass carries static schema + stats (shared by all ops from same defineOpContext)
+ * - remappedViewClass only set for prefixed ops (wraps child buffers before adding to _children)
+ * - No LogBinding - stats accessed via SpanBufferClass.stats
+ *
  * @typeParam Ctx - OpContext with deps, ff, env (contravariant position)
  * @typeParam Args - Tuple of argument types (excluding ctx)
  * @typeParam S - Success type of the Result
@@ -77,13 +85,13 @@ export interface OpMetadata {
  */
 export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
   constructor(
-    /** The Op's name for metrics (invocations, errors, duration) */
-    readonly name: string,
-    /** Metadata injected by transformer: package_name, package_file, git_sha, line */
+    /** Op name for metrics, telemetry, and debugging */
     readonly metadata: OpMetadata,
-    /** LogBinding with logging infrastructure (schema, capacity stats, optional prefix view) */
-    readonly logBinding: LogBinding,
+    /** Op owns buffer creation - class has static schema + stats shared by all instances */
+    readonly SpanBufferClass: SpanBufferConstructor,
     /** The user function to execute - called by span_op after context creation (can be sync or async) */
     readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
+    /** Only set for prefixed ops - wraps child buffers during registration */
+    readonly remappedViewClass?: RemappedViewConstructor,
   ) {}
 }
