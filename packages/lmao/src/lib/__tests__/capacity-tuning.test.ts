@@ -2,365 +2,369 @@ import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
 import { shouldTuneCapacity } from '../capacityTuning.js';
-import type { LogBinding } from '../logBinding.js';
+import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
+import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
+import { mergeWithSystemSchema } from '../schema/systemSchema.js';
+import { createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
+import type { SpanBufferStats } from '../spanBufferStats.js';
 
 /**
- * Create a mock LogBinding for testing capacity tuning.
- * Uses sb_* properties as per LogBinding interface.
+ * Create mock SpanBufferStats for testing capacity tuning.
+ *
+ * Per agent-todo/opgroup-refactor.md lines 58-70, 525-547:
+ * Stats are on SpanBufferClass.stats (static property), NOT on LogBinding.
  */
-function createMockLogBinding(): LogBinding {
+function createMockStats(overrides: Partial<SpanBufferStats> = {}): SpanBufferStats {
   return {
-    logSchema: new LogSchema({}),
-    remappedViewClass: undefined,
-    sb_capacity: DEFAULT_BUFFER_CAPACITY,
-    sb_totalWrites: 0,
-    sb_overflowWrites: 0,
-    sb_totalCreated: 0,
-    sb_overflows: 0,
+    capacity: overrides.capacity ?? DEFAULT_BUFFER_CAPACITY,
+    totalWrites: overrides.totalWrites ?? 0,
+    overflowWrites: overrides.overflowWrites ?? 0,
+    totalCreated: overrides.totalCreated ?? 0,
+    overflows: overrides.overflows ?? 0,
   };
 }
 
 describe('Capacity Tuning Algorithm', () => {
-  let module: LogBinding;
+  let stats: SpanBufferStats;
 
   beforeEach(() => {
-    module = createMockLogBinding();
+    stats = createMockStats();
   });
 
   describe('shouldTuneCapacity - Success Cases', () => {
     it('should increase capacity when overflow ratio > 15%', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20; // 20% overflow
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20; // 20% overflow
       // Start with default capacity
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
-      const initialCapacity = module.sb_capacity;
-      shouldTuneCapacity(module);
+      const initialCapacity = stats.capacity;
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(initialCapacity * 2); // Doubled
-      expect(module.sb_totalWrites).toBe(0); // Reset
-      expect(module.sb_overflowWrites).toBe(0); // Reset
+      expect(stats.capacity).toBe(initialCapacity * 2); // Doubled
+      expect(stats.totalWrites).toBe(0); // Reset
+      expect(stats.overflowWrites).toBe(0); // Reset
     });
 
     it('should decrease capacity when overflow ratio < 5% with many buffers', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 3; // 3% overflow
-      module.sb_totalCreated = 15; // Many buffers
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4; // Start at 4x default so we can halve
+      stats.totalWrites = 100;
+      stats.overflowWrites = 3; // 3% overflow
+      stats.totalCreated = 15; // Many buffers
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 4; // Start at 4x default so we can halve
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2); // Halved
-      expect(module.sb_totalWrites).toBe(0); // Reset
-      expect(module.sb_overflowWrites).toBe(0); // Reset
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2); // Halved
+      expect(stats.totalWrites).toBe(0); // Reset
+      expect(stats.overflowWrites).toBe(0); // Reset
     });
 
     it('should double capacity from default to 2x', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 16; // 16% overflow
+      stats.totalWrites = 100;
+      stats.overflowWrites = 16; // 16% overflow
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
     });
 
     it('should double capacity from 128 to 256', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 16;
-      module.sb_capacity = 128;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 16;
+      stats.capacity = 128;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(256);
+      expect(stats.capacity).toBe(256);
     });
 
     it('should halve capacity from 4x to 2x default', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4; // 4% overflow
-      module.sb_totalCreated = 10;
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4; // 4% overflow
+      stats.totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 4;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
     });
 
     it('should halve capacity from 32 to 16', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4;
-      module.sb_totalCreated = 10;
-      module.sb_capacity = 32;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4;
+      stats.totalCreated = 10;
+      stats.capacity = 32;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(16);
+      expect(stats.capacity).toBe(16);
     });
   });
 
   describe('shouldTuneCapacity - Edge Cases', () => {
     it('should not tune with insufficient samples (< 100)', () => {
-      module.sb_totalWrites = 99;
-      module.sb_overflowWrites = 50; // 50% overflow, but not enough samples
-      const initialCapacity = module.sb_capacity;
+      stats.totalWrites = 99;
+      stats.overflowWrites = 50; // 50% overflow, but not enough samples
+      const initialCapacity = stats.capacity;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(initialCapacity); // Unchanged
+      expect(stats.capacity).toBe(initialCapacity); // Unchanged
     });
 
     it('should not tune at exactly 100 writes with low overflow', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 10; // 10% overflow (between 5% and 15%)
-      const initialCapacity = module.sb_capacity;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 10; // 10% overflow (between 5% and 15%)
+      const initialCapacity = stats.capacity;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(initialCapacity);
+      expect(stats.capacity).toBe(initialCapacity);
     });
 
     it('should cap capacity at 1024', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20; // 20% overflow
-      module.sb_capacity = 1024;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20; // 20% overflow
+      stats.capacity = 1024;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(1024); // Cannot increase beyond 1024
+      expect(stats.capacity).toBe(1024); // Cannot increase beyond 1024
     });
 
     it('should cap capacity at minimum when decreasing', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4; // 4% overflow
-      module.sb_totalCreated = 10;
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4; // 4% overflow
+      stats.totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY); // Cannot decrease below default
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY); // Cannot decrease below default
     });
 
     it('should not decrease without enough buffers (< 10)', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4; // 4% overflow
-      module.sb_totalCreated = 9; // Not enough buffers
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4; // 4% overflow
+      stats.totalCreated = 9; // Not enough buffers
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 4;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
     });
 
     it('should handle exactly 15% overflow (boundary)', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 15; // Exactly 15%
-      const initialCapacity = module.sb_capacity;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 15; // Exactly 15%
+      const initialCapacity = stats.capacity;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(initialCapacity); // > 15%, not >= 15%
+      expect(stats.capacity).toBe(initialCapacity); // > 15%, not >= 15%
     });
 
     it('should handle exactly 5% overflow (boundary)', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 5; // Exactly 5%
-      module.sb_totalCreated = 10;
-      const initialCapacity = module.sb_capacity;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 5; // Exactly 5%
+      stats.totalCreated = 10;
+      const initialCapacity = stats.capacity;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(initialCapacity); // < 5%, not <= 5%
+      expect(stats.capacity).toBe(initialCapacity); // < 5%, not <= 5%
     });
 
     it('should tune at 15.1% overflow', () => {
-      module.sb_totalWrites = 1000;
-      module.sb_overflowWrites = 151; // 15.1% overflow
+      stats.totalWrites = 1000;
+      stats.overflowWrites = 151; // 15.1% overflow
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
     });
 
     it('should tune at 4.9% overflow with sufficient buffers', () => {
-      module.sb_totalWrites = 1000;
-      module.sb_overflowWrites = 49; // 4.9% overflow
-      module.sb_totalCreated = 10;
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4; // Need room to decrease
+      stats.totalWrites = 1000;
+      stats.overflowWrites = 49; // 4.9% overflow
+      stats.totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 4; // Need room to decrease
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
     });
 
     it('should handle zero overflow writes', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 0; // 0% overflow
-      module.sb_totalCreated = 10;
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4; // Need room to decrease
+      stats.totalWrites = 100;
+      stats.overflowWrites = 0; // 0% overflow
+      stats.totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 4; // Need room to decrease
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2); // Should decrease
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2); // Should decrease
     });
 
     it('should handle all writes overflowing (100%)', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 100; // 100% overflow
+      stats.totalWrites = 100;
+      stats.overflowWrites = 100; // 100% overflow
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2); // Should increase
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2); // Should increase
     });
   });
 
   describe('shouldTuneCapacity - Capacity Bounds', () => {
     it('should not increase beyond 1024 even with high overflow', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 99; // 99% overflow
-      module.sb_capacity = 1024;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 99; // 99% overflow
+      stats.capacity = 1024;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(1024);
+      expect(stats.capacity).toBe(1024);
     });
 
     it('should cap at 1024 when doubling from 512', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20;
-      module.sb_capacity = 512;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20;
+      stats.capacity = 512;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(1024); // Capped at 1024 (max capacity)
+      expect(stats.capacity).toBe(1024); // Capped at 1024 (max capacity)
     });
 
     it('should not decrease below minimum', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 0;
-      module.sb_totalCreated = 10;
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 0;
+      stats.totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });
 
     it('should cap at minimum when halving from 2x', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4;
-      module.sb_totalCreated = 10;
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 2;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4;
+      stats.totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 2;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });
   });
 
   describe('Stats Reset After Tuning', () => {
     it('should reset stats after increasing capacity', () => {
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20;
-      module.sb_totalCreated = 5;
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20;
+      stats.totalCreated = 5;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_totalWrites).toBe(0);
-      expect(module.sb_overflowWrites).toBe(0);
-      expect(module.sb_totalCreated).toBe(0);
+      expect(stats.totalWrites).toBe(0);
+      expect(stats.overflowWrites).toBe(0);
+      expect(stats.totalCreated).toBe(0);
     });
 
     it('should reset stats after decreasing capacity', () => {
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 2; // Need room to decrease
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4;
-      module.sb_totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 2; // Need room to decrease
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4;
+      stats.totalCreated = 10;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_totalWrites).toBe(0);
-      expect(module.sb_overflowWrites).toBe(0);
-      expect(module.sb_totalCreated).toBe(0);
+      expect(stats.totalWrites).toBe(0);
+      expect(stats.overflowWrites).toBe(0);
+      expect(stats.totalCreated).toBe(0);
     });
 
     it('should not reset stats when no tuning occurs', () => {
-      module.sb_totalWrites = 50; // Not enough samples
-      module.sb_overflowWrites = 10;
-      module.sb_totalCreated = 5;
+      stats.totalWrites = 50; // Not enough samples
+      stats.overflowWrites = 10;
+      stats.totalCreated = 5;
 
-      shouldTuneCapacity(module);
+      shouldTuneCapacity(stats);
 
-      expect(module.sb_totalWrites).toBe(50); // Unchanged
-      expect(module.sb_overflowWrites).toBe(10); // Unchanged
-      expect(module.sb_totalCreated).toBe(5); // Unchanged
+      expect(stats.totalWrites).toBe(50); // Unchanged
+      expect(stats.overflowWrites).toBe(10); // Unchanged
+      expect(stats.totalCreated).toBe(5); // Unchanged
     });
   });
 
   describe('Multiple Tuning Cycles', () => {
     it('should handle multiple increases correctly', () => {
       // Start at default
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
       // First increase
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20;
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
-      // Second increase
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20;
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
+      // Second increase (stats were reset after first tuning)
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
 
       // Third increase
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20;
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 8);
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 8);
     });
 
     it('should handle multiple decreases correctly', () => {
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 8; // Start high
-      module.sb_totalCreated = 10;
+      stats.capacity = DEFAULT_BUFFER_CAPACITY * 8; // Start high
+      stats.totalCreated = 10;
 
       // First decrease
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4;
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
 
-      // Second decrease
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4;
-      module.sb_totalCreated = 10; // Need to set again after reset
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      // Second decrease (stats were reset, need to set totalCreated again)
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4;
+      stats.totalCreated = 10;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
       // Third decrease
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4;
-      module.sb_totalCreated = 10;
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4;
+      stats.totalCreated = 10;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });
 
     it('should handle increase then decrease', () => {
       // Start at default
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
       // Increase due to high overflow
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 20;
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
+      stats.totalWrites = 100;
+      stats.overflowWrites = 20;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
-      // Decrease due to low overflow
-      module.sb_totalWrites = 100;
-      module.sb_overflowWrites = 4;
-      module.sb_totalCreated = 10;
-      shouldTuneCapacity(module);
-      expect(module.sb_capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+      // Decrease due to low overflow (stats were reset after tuning)
+      stats.totalWrites = 100;
+      stats.overflowWrites = 4;
+      stats.totalCreated = 10;
+      shouldTuneCapacity(stats);
+      expect(stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
     });
   });
 
@@ -375,15 +379,15 @@ describe('Capacity Tuning Algorithm', () => {
             initialCapacity: fc.constantFrom(8, 16, 32, 64, 128, 256, 512, 1024),
           }),
           ({ totalWrites, overflowWrites, totalCreated, initialCapacity }) => {
-            // Set up module state
-            module.sb_totalWrites = totalWrites;
-            module.sb_overflowWrites = overflowWrites;
-            module.sb_totalCreated = totalCreated;
-            module.sb_capacity = initialCapacity;
+            // Set up stats state
+            stats.totalWrites = totalWrites;
+            stats.overflowWrites = overflowWrites;
+            stats.totalCreated = totalCreated;
+            stats.capacity = initialCapacity;
 
-            const beforeCapacity = module.sb_capacity;
-            shouldTuneCapacity(module);
-            const afterCapacity = module.sb_capacity;
+            const beforeCapacity = stats.capacity;
+            shouldTuneCapacity(stats);
+            const afterCapacity = stats.capacity;
 
             // Core invariants that must always hold
             expect(afterCapacity).toBeGreaterThanOrEqual(8);
@@ -407,11 +411,11 @@ describe('Capacity Tuning Algorithm', () => {
               expect(afterCapacity).toBe(beforeCapacity);
             }
 
-            // Stats reset invariant
+            // Stats reset invariant: if capacity changed, stats are reset
             if (afterCapacity !== beforeCapacity) {
-              expect(module.sb_totalWrites).toBe(0);
-              expect(module.sb_overflowWrites).toBe(0);
-              expect(module.sb_totalCreated).toBe(0);
+              expect(stats.totalWrites).toBe(0);
+              expect(stats.overflowWrites).toBe(0);
+              expect(stats.totalCreated).toBe(0);
             }
           },
         ),
@@ -421,25 +425,25 @@ describe('Capacity Tuning Algorithm', () => {
 
     it('should verify the specific failing case from property testing', () => {
       // Reproduce the exact counterexample that exposed the analysis bug
-      module.sb_totalWrites = 104; // 13 spans * 8 entries each
-      module.sb_overflowWrites = 0; // No overflow
-      module.sb_totalCreated = 18; // 5 initial + 13 spans created
-      module.sb_capacity = 64; // Start capacity
+      stats.totalWrites = 104; // 13 spans * 8 entries each
+      stats.overflowWrites = 0; // No overflow
+      stats.totalCreated = 18; // 5 initial + 13 spans created
+      stats.capacity = 64; // Start capacity
 
       // Verify conditions before tuning
-      const overflowRatio = module.sb_totalWrites > 0 ? module.sb_overflowWrites / module.sb_totalWrites : 0;
-      const hasEnoughSamples = module.sb_totalWrites >= 100;
-      const hasManyBuffers = module.sb_totalCreated >= 10;
+      const overflowRatio = stats.totalWrites > 0 ? stats.overflowWrites / stats.totalWrites : 0;
+      const hasEnoughSamples = stats.totalWrites >= 100;
+      const hasManyBuffers = stats.totalCreated >= 10;
 
-      const beforeCapacity = module.sb_capacity;
-      shouldTuneCapacity(module);
-      const afterCapacity = module.sb_capacity;
+      const beforeCapacity = stats.capacity;
+      shouldTuneCapacity(stats);
+      const afterCapacity = stats.capacity;
 
       console.log('Failing case analysis:');
-      console.log('  totalWrites:', module.sb_totalWrites);
-      console.log('  overflowWrites:', module.sb_overflowWrites);
+      console.log('  totalWrites:', stats.totalWrites);
+      console.log('  overflowWrites:', stats.overflowWrites);
       console.log('  overflowRatio:', overflowRatio);
-      console.log('  totalCreated:', module.sb_totalCreated);
+      console.log('  totalCreated:', stats.totalCreated);
       console.log('  hasEnoughSamples:', hasEnoughSamples);
       console.log('  hasManyBuffers:', hasManyBuffers);
       console.log('  beforeCapacity:', beforeCapacity);
@@ -453,9 +457,10 @@ describe('Capacity Tuning Algorithm', () => {
 
       // Therefore, capacity SHOULD shrink from 64 to 32
       expect(afterCapacity).toBe(32); // Implementation IS correct
-      expect(module.sb_totalWrites).toBe(0); // Stats should reset
-      expect(module.sb_overflowWrites).toBe(0);
-      expect(module.sb_totalCreated).toBe(0);
+      // Stats should be reset after tuning
+      expect(stats.totalWrites).toBe(0);
+      expect(stats.overflowWrites).toBe(0);
+      expect(stats.totalCreated).toBe(0);
     });
 
     it('should verify boundary conditions with precision', () => {
@@ -470,17 +475,17 @@ describe('Capacity Tuning Algorithm', () => {
           ({ totalWrites, overflowRatio, totalCreated, initialCapacity }) => {
             const overflowWrites = Math.max(0, Math.floor(totalWrites * Math.max(0, overflowRatio)));
 
-            module.sb_totalWrites = totalWrites;
-            module.sb_overflowWrites = overflowWrites;
-            module.sb_totalCreated = totalCreated;
-            module.sb_capacity = initialCapacity;
+            stats.totalWrites = totalWrites;
+            stats.overflowWrites = overflowWrites;
+            stats.totalCreated = totalCreated;
+            stats.capacity = initialCapacity;
 
-            shouldTuneCapacity(module);
+            shouldTuneCapacity(stats);
 
             // Verify capacity respects boundaries
-            expect(module.sb_capacity).toBeGreaterThanOrEqual(8);
-            expect(module.sb_capacity).toBeLessThanOrEqual(1024);
-            expect(module.sb_capacity & (module.sb_capacity - 1)).toBe(0);
+            expect(stats.capacity).toBeGreaterThanOrEqual(8);
+            expect(stats.capacity).toBeLessThanOrEqual(1024);
+            expect(stats.capacity & (stats.capacity - 1)).toBe(0);
           },
         ),
         { numRuns: 500 },
@@ -499,22 +504,22 @@ describe('Capacity Tuning Algorithm', () => {
             { minLength: 3, maxLength: 10 },
           ),
           (periods) => {
-            // Reset module
-            module.sb_capacity = DEFAULT_BUFFER_CAPACITY;
-            module.sb_totalWrites = 0;
-            module.sb_overflowWrites = 0;
-            module.sb_totalCreated = 0;
+            // Reset stats
+            stats.capacity = DEFAULT_BUFFER_CAPACITY;
+            stats.totalWrites = 0;
+            stats.overflowWrites = 0;
+            stats.totalCreated = 0;
 
             const capacityChanges: number[] = [];
 
             for (const period of periods) {
-              module.sb_totalWrites += period.writes;
-              module.sb_overflowWrites += period.overflows;
-              module.sb_totalCreated += period.buffers;
+              stats.totalWrites += period.writes;
+              stats.overflowWrites += period.overflows;
+              stats.totalCreated += period.buffers;
 
-              const before = module.sb_capacity;
-              shouldTuneCapacity(module);
-              const after = module.sb_capacity;
+              const before = stats.capacity;
+              shouldTuneCapacity(stats);
+              const after = stats.capacity;
 
               if (before !== after) {
                 capacityChanges.push(after);
@@ -529,17 +534,101 @@ describe('Capacity Tuning Algorithm', () => {
             const overallRatio = totalWrites > 0 ? totalOverflows / totalWrites : 0;
 
             if (overallRatio > 0.15) {
-              expect(module.sb_capacity).toBeGreaterThanOrEqual(DEFAULT_BUFFER_CAPACITY);
+              expect(stats.capacity).toBeGreaterThanOrEqual(DEFAULT_BUFFER_CAPACITY);
             } else if (overallRatio < 0.05) {
-              expect(module.sb_capacity).toBeLessThanOrEqual(DEFAULT_BUFFER_CAPACITY);
+              expect(stats.capacity).toBeLessThanOrEqual(DEFAULT_BUFFER_CAPACITY);
             }
 
             // Should maintain power-of-2 invariant
-            expect(module.sb_capacity & (module.sb_capacity - 1)).toBe(0);
+            expect(stats.capacity & (stats.capacity - 1)).toBe(0);
           },
         ),
         { numRuns: 100 },
       );
+    });
+  });
+
+  describe('Integration with SpanLogger overflow', () => {
+    /**
+     * These tests verify that trackOverflowAndTune is actually called
+     * when SpanLogger triggers buffer overflow via _getNextBuffer().
+     *
+     * The SpanLogger's generated code calls:
+     *   helpers.trackOverflowAndTune(oldBuffer.constructor.stats)
+     *
+     * We verify this by checking that stats.overflows and stats.overflowWrites
+     * are incremented when we trigger overflow.
+     */
+
+    const integrationSchema = new LogSchema(
+      mergeWithSystemSchema({
+        testField: S.category(),
+      }),
+    );
+
+    it('should call trackOverflowAndTune when buffer overflows', () => {
+      // Get SpanBufferClass and reset stats
+      const SpanBufferClass = getSpanBufferClass(integrationSchema);
+      const stats = SpanBufferClass.stats;
+
+      // Set small capacity to trigger overflow quickly
+      stats.capacity = 8;
+      stats.overflows = 0;
+      stats.overflowWrites = 0;
+      stats.totalWrites = 0;
+      stats.totalCreated = 0;
+
+      // Create buffer and logger
+      const buffer = createSpanBuffer(integrationSchema, 'test-span', undefined, undefined, undefined);
+      const logger = createSpanLogger(integrationSchema, buffer);
+
+      // SpanLogger reserves rows 0-1, so capacity 8 means 6 entries before overflow
+      // Write enough entries to trigger overflow
+      const entriesToWrite = 10; // More than capacity - 2
+
+      for (let i = 0; i < entriesToWrite; i++) {
+        logger.info(`message ${i}`);
+      }
+
+      // Verify overflow was triggered and stats updated
+      expect(stats.overflows).toBeGreaterThan(0);
+      expect(stats.overflowWrites).toBeGreaterThan(0);
+      expect(stats.totalWrites).toBe(entriesToWrite);
+    });
+
+    it('should tune capacity after enough overflow samples', () => {
+      // Get SpanBufferClass and reset stats
+      const SpanBufferClass = getSpanBufferClass(integrationSchema);
+      const stats = SpanBufferClass.stats;
+
+      // Set small capacity to trigger frequent overflows
+      const initialCapacity = 8;
+      stats.capacity = initialCapacity;
+      stats.overflows = 0;
+      stats.overflowWrites = 0;
+      stats.totalWrites = 0;
+      stats.totalCreated = 0;
+
+      // Write many entries to accumulate stats and trigger tuning
+      // Need 100+ totalWrites and >15% overflow ratio to trigger capacity increase
+      const buffer = createSpanBuffer(integrationSchema, 'test-span', undefined, undefined, undefined);
+      const logger = createSpanLogger(integrationSchema, buffer);
+
+      // With capacity 8 and 2 reserved rows, each buffer holds 6 entries
+      // Write 120 entries to accumulate enough samples to trigger tuning
+      for (let i = 0; i < 120; i++) {
+        logger.info(`message ${i}`);
+      }
+
+      // Capacity tuning should have happened:
+      // - With capacity 8, we overflow every 6 entries (high overflow ratio ~16%)
+      // - After 100 samples with >15% overflow, capacity doubles to 16
+      // - Stats are reset after tuning, so totalWrites will be low
+      // The key assertion is that capacity increased from the initial value
+      expect(stats.capacity).toBeGreaterThan(initialCapacity);
+
+      // Verify it's still a power of 2
+      expect(stats.capacity & (stats.capacity - 1)).toBe(0);
     });
   });
 });
