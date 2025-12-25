@@ -5,12 +5,14 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import type { Table } from 'apache-arrow';
+// Must import test-helpers first to initialize timestamp implementation
+import './test-helpers.js';
+import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { createTraceId } from '../traceId.js';
-import { Tracer, type TraceSink } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 // Test schema
 const testSchema = defineLogSchema({
@@ -32,16 +34,11 @@ describe('Tracer', () => {
         ctx: { env: null as unknown as TestEnv },
       });
 
-      const tables: Table[] = [];
-      const sink: TraceSink = (table) => {
-        tables.push(table);
-      };
-
-      const { trace, pendingCount } = new Tracer({
+      const tracer = new TestTracer({
         logBinding: factory.logBinding,
-        sink,
         ctxDefaults: factory.ctxDefaults,
       });
+      const { trace } = tracer;
 
       const result = await trace('test-trace', { ctx: { env: { API_KEY: 'test' } } }, async (ctx) => {
         ctx.tag.userId('user-123');
@@ -50,20 +47,16 @@ describe('Tracer', () => {
       });
 
       expect(result).toEqual({ success: true, data: 'hello' });
-      expect(pendingCount()).toBe(1);
+      expect(tracer.rootBuffers.length).toBe(1);
     });
 
-    it('should flush pending buffers to sink', async () => {
+    it('should collect multiple traces in rootBuffers', async () => {
       const factory = defineOpContext({
         logSchema: testSchema,
       });
 
-      const tables: Table[] = [];
-      const sink: TraceSink = async (table) => {
-        tables.push(table);
-      };
-
-      const { trace, flush, pendingCount } = new Tracer({ logBinding: factory.logBinding, sink });
+      const tracer = new TestTracer({ logBinding: factory.logBinding });
+      const { trace } = tracer;
 
       await trace('trace-1', async (ctx) => {
         ctx.tag.userId('user-1');
@@ -75,12 +68,14 @@ describe('Tracer', () => {
         return 'result-2';
       });
 
-      expect(pendingCount()).toBe(2);
+      expect(tracer.rootBuffers.length).toBe(2);
 
-      await flush();
+      // Convert each buffer to Arrow table to verify data
+      const table1 = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
+      const table2 = convertSpanTreeToArrowTable(tracer.rootBuffers[1]);
 
-      expect(pendingCount()).toBe(0);
-      expect(tables.length).toBe(2);
+      expect(table1.numRows).toBeGreaterThan(0);
+      expect(table2.numRows).toBeGreaterThan(0);
     });
 
     it('should handle errors and re-throw', async () => {
@@ -88,13 +83,10 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const tables: Table[] = [];
-      const { trace, pendingCount } = new Tracer({
+      const tracer = new TestTracer({
         logBinding: factory.logBinding,
-        sink: (t) => {
-          tables.push(t);
-        },
       });
+      const { trace } = tracer;
 
       const error = new Error('test error');
 
@@ -105,7 +97,7 @@ describe('Tracer', () => {
       ).rejects.toThrow('test error');
 
       // Buffer should still be registered for flushing
-      expect(pendingCount()).toBe(1);
+      expect(tracer.rootBuffers.length).toBe(1);
     });
 
     it('should accept optional trace ID', async () => {
@@ -113,7 +105,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const { trace } = new Tracer({ logBinding: factory.logBinding, sink: () => {} });
+      const { trace } = new TestTracer({ logBinding: factory.logBinding });
 
       const customTraceId = createTraceId('custom-trace-id-12345');
 
@@ -133,9 +125,8 @@ describe('Tracer', () => {
         },
       });
 
-      const { trace } = new Tracer({
+      const { trace } = new TestTracer({
         logBinding: factory.logBinding,
-        sink: () => {},
         ctxDefaults: factory.ctxDefaults,
       });
 
@@ -169,7 +160,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const { trace } = new Tracer({ logBinding: factory.logBinding, sink: () => {} });
+      const { trace } = new TestTracer({ logBinding: factory.logBinding });
 
       const result = await trace('simple', async () => {
         return 42;
@@ -184,9 +175,8 @@ describe('Tracer', () => {
         ctx: { value: 0 },
       });
 
-      const { trace } = new Tracer({
+      const { trace } = new TestTracer({
         logBinding: factory.logBinding,
-        sink: () => {},
         ctxDefaults: factory.ctxDefaults,
       });
 

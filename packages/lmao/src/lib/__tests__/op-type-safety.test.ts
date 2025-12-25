@@ -6,7 +6,7 @@ import { describe, expect, it } from 'bun:test';
 import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { Tracer } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 // Two different schemas
 const schemaA = defineLogSchema({
@@ -48,14 +48,14 @@ const opB = defineOpB('op-b', (ctx) => {
 
 describe('Op type safety', () => {
   it('should allow Op with matching schema', async () => {
-    const { trace } = new Tracer<CtxA>({ logBinding: logBindingA, sink: () => {} });
+    const { trace } = new TestTracer<CtxA>({ logBinding: logBindingA });
 
     // This SHOULD work - opA was created with logBindingA's schema
     await trace('test-a', opA);
   });
 
   it('should ERROR when passing Op with incompatible schema', async () => {
-    const { trace } = new Tracer<CtxA>({ logBinding: logBindingA, sink: () => {} });
+    const { trace } = new TestTracer<CtxA>({ logBinding: logBindingA });
 
     // This SHOULD cause a type error - opB has different schema than tracer
     // The @ts-expect-error verifies the type system catches this at compile time

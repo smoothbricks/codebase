@@ -17,15 +17,14 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+// Must import test-helpers first to initialize timestamp implementation
+import './test-helpers.js';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { Tracer, type TraceSink } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
-
-// Shared no-op sink for tests that don't need table output
-const noopSink: TraceSink = () => {};
 
 describe('Nested Library Tasks', () => {
   describe('4-level nesting WITHOUT library prefixes (regular module contexts)', () => {
@@ -49,7 +48,7 @@ describe('Nested Library Tasks', () => {
       type Ctx = OpContextOf<typeof opContext>;
       const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: noopSink, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
 
       // Capture buffers for verification
       let rootBuffer: AnySpanBuffer | undefined;
@@ -151,7 +150,7 @@ describe('Nested Library Tasks', () => {
       type Ctx = OpContextOf<typeof opContext>;
       const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: noopSink, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -337,7 +336,7 @@ describe('Nested Library Tasks', () => {
     it('should compose 4 separate library contexts with prefixed columns', async () => {
       const { defineOp, logBinding, ctxDefaults, deps } = appContext;
 
-      const { trace } = new Tracer<AppCtx>({ logBinding, sink: noopSink, ctxDefaults, deps });
+      const { trace } = new TestTracer<AppCtx>({ logBinding, ctxDefaults, deps });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -389,7 +388,7 @@ describe('Nested Library Tasks', () => {
     it('should maintain correct tree structure with 4 levels of library tasks', async () => {
       const { defineOp, logBinding, ctxDefaults, deps } = appContext;
 
-      const { trace } = new Tracer<AppCtx>({ logBinding, sink: noopSink, ctxDefaults, deps });
+      const { trace } = new TestTracer<AppCtx>({ logBinding, ctxDefaults, deps });
 
       let appBuffer: AnySpanBuffer | undefined;
 
@@ -456,7 +455,7 @@ describe('Nested Library Tasks', () => {
       type Ctx = OpContextOf<typeof opContext>;
       const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: noopSink, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -552,7 +551,7 @@ describe('Nested Library Tasks', () => {
       type Ctx = OpContextOf<typeof opContext>;
       const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: noopSink, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -636,7 +635,7 @@ describe('Nested Library Tasks', () => {
       type Ctx = OpContextOf<typeof opContext>;
       const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: noopSink, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -706,7 +705,7 @@ describe('Nested Library Tasks', () => {
       type Ctx = OpContextOf<typeof opContext>;
       const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: noopSink, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
 
       let rootBuffer: AnySpanBuffer | undefined;
       let order = 0;
@@ -773,7 +772,7 @@ describe('Nested Library Tasks', () => {
       type Ctx = OpContextOf<typeof opContext>;
       const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: noopSink, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
 
       let rootBuffer: AnySpanBuffer | undefined;
 

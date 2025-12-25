@@ -23,7 +23,7 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { Tracer } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 // biome-ignore lint/suspicious/noExplicitAny: SpanBuffer generic types are complex, using any for test buffer capture
 type CapturedBuffer = any;
@@ -53,7 +53,7 @@ const { defineOp, logBinding, ctxDefaults } = opContext;
  * Helper to create a properly typed tracer for tests
  */
 function createTestTracer() {
-  return new Tracer<TestOpContext>({ logBinding, sink: () => {}, ctxDefaults });
+  return new TestTracer<TestOpContext>({ logBinding, ctxDefaults });
 }
 
 /**

@@ -6,15 +6,9 @@ import {
   maskingTransforms,
 } from '@smoothbricks/arrow-builder';
 import type { SpanBuffer } from '@smoothbricks/lmao';
-import {
-  convertToArrowTable,
-  createSpanBuffer,
-  createTraceId,
-  ENTRY_TYPE_SPAN_START,
-  S,
-  Tracer,
-} from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, createTraceId, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
+import { TestTracer } from '../../tracers/TestTracer.js';
 import { createTestOpMetadata, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
@@ -349,7 +343,7 @@ describe('Buffer Integration', () => {
       const schema = createTestSchema({ userId: S.category() });
       const logBinding = { logSchema: schema };
 
-      const { trace } = new Tracer({ logBinding, sink: () => {} });
+      const { trace } = new TestTracer({ logBinding });
 
       let capturedBuffer: SpanBuffer<typeof schema> | undefined;
       await trace('test', async (ctx) => {

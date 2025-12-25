@@ -11,10 +11,12 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+// Must import test-helpers first to initialize timestamp implementation
+import './test-helpers.js';
 import { S } from '@smoothbricks/arrow-builder';
 import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { Tracer } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 // =============================================================================
 // Test Factory Definitions
@@ -36,10 +38,9 @@ const testFactory = defineOpContext({
 type TestOpContext = OpContextOf<typeof testFactory>;
 
 // Create a tracer for testing with proper type
-const { trace: testTrace } = new Tracer<TestOpContext>({
+const { trace: testTrace } = new TestTracer<TestOpContext>({
   logBinding: testFactory.logBinding,
   ctxDefaults: testFactory.ctxDefaults,
-  sink: async () => {},
 });
 
 // =============================================================================
@@ -131,10 +132,9 @@ describe('Context Type Flow Through Factory', () => {
     });
 
     type CtxType = OpContextOf<typeof factory>;
-    const { trace } = new Tracer<CtxType>({
+    const { trace } = new TestTracer<CtxType>({
       logBinding: factory.logBinding,
       ctxDefaults: factory.ctxDefaults,
-      sink: async () => {},
     });
 
     // Type should be preserved - required is required, optional is optional
@@ -162,9 +162,8 @@ describe('Context Type Flow Through Factory', () => {
     });
 
     type CtxType = OpContextOf<typeof factory>;
-    const { trace } = new Tracer<CtxType>({
+    const { trace } = new TestTracer<CtxType>({
       logBinding: factory.logBinding,
-      sink: async () => {},
     });
 
     // Should accept empty options or no options

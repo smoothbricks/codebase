@@ -11,11 +11,13 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+// Must import test-helpers first to initialize timestamp implementation
+import './test-helpers.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
-import { Tracer } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
 
 // Test schema
@@ -33,9 +35,8 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       // Execute sync function - trace() returns sync result
@@ -68,9 +69,8 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       const testError = new Error('Sync error');
@@ -110,9 +110,8 @@ describe('Sync/Async Trace Execution', () => {
       let capturedBuffer: AnySpanBuffer | undefined;
       let promiseResolved = false;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       // Execute async function - trace() returns Promise
@@ -163,9 +162,8 @@ describe('Sync/Async Trace Execution', () => {
       let capturedBuffer: AnySpanBuffer | undefined;
       let promiseRejected = false;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       const testError = new Error('Async error');
@@ -215,9 +213,8 @@ describe('Sync/Async Trace Execution', () => {
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       // Execute multiple sync traces
@@ -242,8 +239,8 @@ describe('Sync/Async Trace Execution', () => {
       expect(buffers[0].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
       expect(buffers[1].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
 
-      // Both traces should be pending (registered for flush)
-      expect(tracer.pendingCount()).toBe(2);
+      // Both traces should be collected
+      expect(tracer.rootBuffers.length).toBe(2);
     });
 
     it('should handle multiple async traces correctly', async () => {
@@ -253,9 +250,8 @@ describe('Sync/Async Trace Execution', () => {
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       // Execute multiple async traces in parallel
@@ -288,8 +284,8 @@ describe('Sync/Async Trace Execution', () => {
       expect(buffers[0].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
       expect(buffers[1].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
 
-      // Both traces should be pending
-      expect(tracer.pendingCount()).toBe(2);
+      // Both traces should be collected
+      expect(tracer.rootBuffers.length).toBe(2);
     });
 
     it('should handle interleaved sync and async traces', async () => {
@@ -299,9 +295,8 @@ describe('Sync/Async Trace Execution', () => {
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       // Sync trace
@@ -337,8 +332,8 @@ describe('Sync/Async Trace Execution', () => {
       expect(buffers[1].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
       expect(buffers[2].entry_type[1]).toBe(ENTRY_TYPE_SPAN_OK);
 
-      // All three traces should be pending
-      expect(tracer.pendingCount()).toBe(3);
+      // All three traces should be collected
+      expect(tracer.rootBuffers.length).toBe(3);
     });
   });
 
@@ -350,9 +345,8 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       const result = tracer.trace('sync-with-tags', (ctx) => {
@@ -378,9 +372,8 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       const result = await tracer.trace('async-with-tags', async (ctx) => {
@@ -408,9 +401,8 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       const result = tracer.trace('sync-with-logging', (ctx) => {
@@ -438,9 +430,8 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new Tracer({
+      const tracer = new TestTracer({
         logBinding,
-        sink: () => {},
       });
 
       const result = await tracer.trace('async-with-logging', async (ctx) => {

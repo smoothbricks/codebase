@@ -7,7 +7,7 @@ import { describe, expect, it } from 'bun:test';
 import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { Tracer } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 const testSchema = defineLogSchema({
   userId: S.category(),
@@ -29,7 +29,7 @@ const { defineOp, logBinding } = opContext;
 
 // Create a properly typed tracer
 function createTestTracer() {
-  return new Tracer<TestOpContext>({ logBinding, sink: () => {} });
+  return new TestTracer<TestOpContext>({ logBinding });
 }
 
 describe('Type Narrowing with FluentResult', () => {

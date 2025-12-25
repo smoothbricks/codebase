@@ -12,7 +12,7 @@ import { describe, expect, test } from 'bun:test';
 import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { Tracer } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 describe('Span Scope Attributes', () => {
   describe('Basic Scope Setting', () => {
@@ -42,7 +42,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -75,7 +75,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       await trace('test-span', testOp);
       // If this completes without error, scope inheritance is working
     });
@@ -126,7 +126,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -166,7 +166,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -208,7 +208,7 @@ describe('Span Scope Attributes', () => {
         return childResult;
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       const result = await trace('parent-span', parentOp);
       expect(result.success).toBe(true);
     });
@@ -260,7 +260,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok(businessResult);
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       const result = await trace('middleware-span', middlewareOp);
       expect(result.success).toBe(true);
     });
@@ -296,7 +296,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -347,7 +347,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: () => {}, ctxDefaults });
+      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });

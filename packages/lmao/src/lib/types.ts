@@ -19,6 +19,15 @@ import type { TraceId, TraceRoot } from './traceId.js';
 export type { LogBinding, RemappedViewConstructor } from './logBinding.js';
 export type { OpMetadata } from './opContext/opTypes.js';
 
+// Tracer interface for lifecycle hook calls from span lifecycle events
+// The Tracer provides these methods that are called during span execution
+export interface TracerLifecycleHooks {
+  onTraceStart(buffer: AnySpanBuffer): void;
+  onTraceEnd(buffer: AnySpanBuffer): void;
+  onSpanStart(buffer: AnySpanBuffer): void;
+  onSpanEnd(buffer: AnySpanBuffer): void;
+}
+
 // Re-export arrow-builder types for convenience
 export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
 
@@ -214,6 +223,14 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Contains anchorEpochNanos/anchorPerfNow for timestamp calculation.
    */
   _traceRoot: TraceRoot;
+
+  /**
+   * Reference to the Tracer that created this trace.
+   * Set on root buffer by Tracer, propagated to children by SpanContext.
+   * Used by child spans to call lifecycle hooks.
+   * @internal
+   */
+  _tracer: TracerLifecycleHooks;
 
   /**
    * Op metadata for this span - identifies WHICH OP IS EXECUTING.

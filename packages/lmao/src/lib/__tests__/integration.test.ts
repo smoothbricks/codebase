@@ -10,12 +10,14 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+// Must import test-helpers first to initialize timestamp implementation
+import './test-helpers.js';
 import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
-import { Tracer } from '../tracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 describe('Schema Integration Patterns', () => {
   // Define log schema for DB operations
@@ -92,9 +94,8 @@ describe('Schema Integration Patterns', () => {
 
   describe('Tracer API', () => {
     it('should create trace context with environment via Tracer', async () => {
-      const { trace } = new Tracer<Ctx>({
+      const { trace } = new TestTracer<Ctx>({
         logBinding,
-        sink: async () => {},
         ctxDefaults,
       });
 
@@ -116,9 +117,8 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should provide access to environment config as plain properties', async () => {
-      const { trace } = new Tracer<Ctx>({
+      const { trace } = new TestTracer<Ctx>({
         logBinding,
-        sink: async () => {},
         ctxDefaults,
       });
 
@@ -163,7 +163,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: async () => {} });
+      const { trace } = new TestTracer<Ctx>({ logBinding });
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -178,9 +178,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ checked: true });
       });
 
-      const { trace } = new Tracer<CtxWithFlags>({
+      const { trace } = new TestTracer<CtxWithFlags>({
         logBinding: logBindingWithFlags,
-        sink: async () => {},
         flagEvaluator,
         ctxDefaults: ctxDefaultsWithFlags,
       });
@@ -205,9 +204,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: true });
       });
 
-      const { trace } = new Tracer<CtxWithFlags>({
+      const { trace } = new TestTracer<CtxWithFlags>({
         logBinding: logBindingWithFlags,
-        sink: async () => {},
         flagEvaluator,
         ctxDefaults: ctxDefaultsWithFlags,
       });
@@ -228,9 +226,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ experimental: false });
       });
 
-      const { trace } = new Tracer<CtxWithFlags>({
+      const { trace } = new TestTracer<CtxWithFlags>({
         logBinding: logBindingWithFlags,
-        sink: async () => {},
         flagEvaluator,
         ctxDefaults: ctxDefaultsWithFlags,
       });
@@ -258,9 +255,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ tracked: true });
       });
 
-      const { trace } = new Tracer<CtxWithFlags>({
+      const { trace } = new TestTracer<CtxWithFlags>({
         logBinding: logBindingWithFlags,
-        sink: async () => {},
         flagEvaluator,
         ctxDefaults: ctxDefaultsWithFlags,
       });
@@ -289,9 +285,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: !!ctx.ff.advancedValidation });
       });
 
-      const { trace } = new Tracer<CtxWithFlags>({
+      const { trace } = new TestTracer<CtxWithFlags>({
         logBinding: logBindingWithFlags,
-        sink: async () => {},
         flagEvaluator,
         ctxDefaults: ctxDefaultsWithFlags,
       });
@@ -329,7 +324,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: async () => {} });
+      const { trace } = new TestTracer<Ctx>({ logBinding });
 
       const result = await trace('test-chaining', testOp);
       expect(result.success).toBe(true);
@@ -358,7 +353,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: async () => {} });
+      const { trace } = new TestTracer<Ctx>({ logBinding });
 
       const result = await trace('test-with-chaining', testOp);
       expect(result.success).toBe(true);
@@ -378,9 +373,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, amount });
       });
 
-      const { trace } = new Tracer<Ctx>({
+      const { trace } = new TestTracer<Ctx>({
         logBinding,
-        sink: async () => {},
         ctxDefaults,
       });
 
@@ -421,7 +415,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: async () => {} });
+      const { trace } = new TestTracer<Ctx>({ logBinding });
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -440,7 +434,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: async () => {} });
+      const { trace } = new TestTracer<Ctx>({ logBinding });
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -456,7 +450,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: async () => {} });
+      const { trace } = new TestTracer<Ctx>({ logBinding });
 
       const successResult = await trace('success-task', successOp);
       expect(successResult.success).toBe(true);
@@ -493,7 +487,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new Tracer<Ctx>({ logBinding, sink: async () => {} });
+      const { trace } = new TestTracer<Ctx>({ logBinding });
 
       const result = await trace('parent-task', testOp);
       expect(result.success).toBe(true);
@@ -515,9 +509,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, processed: true });
       });
 
-      const { trace } = new Tracer<Ctx>({
+      const { trace } = new TestTracer<Ctx>({
         logBinding,
-        sink: async () => {},
         ctxDefaults,
       });
 
@@ -577,9 +570,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ id: 'user-123', ...userData });
       });
 
-      const { trace } = new Tracer<CtxWithFlags>({
+      const { trace } = new TestTracer<CtxWithFlags>({
         logBinding: logBindingWithFlags,
-        sink: async () => {},
         flagEvaluator,
         ctxDefaults: ctxDefaultsWithFlags,
       });
@@ -621,9 +613,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new Tracer<Ctx>({
+      const { trace } = new TestTracer<Ctx>({
         logBinding,
-        sink: async () => {},
         ctxDefaults,
       });
 
@@ -651,9 +642,8 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new Tracer<Ctx>({
+      const { trace } = new TestTracer<Ctx>({
         logBinding,
-        sink: async () => {},
         ctxDefaults,
       });
 

@@ -1,6 +1,8 @@
 import { describe, expect, test } from 'bun:test';
+// Must import test-helpers first to initialize timestamp implementation
+import '../../__tests__/test-helpers.js';
 import { defineOpContext } from '../../defineOpContext.js';
-import { Tracer } from '../../tracer.js';
+import { TestTracer } from '../../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../../types.js';
 import { S } from '../builder.js';
 import { defineFeatureFlags } from '../defineFeatureFlags.js';
@@ -59,7 +61,7 @@ describe('Feature Flags', () => {
       maxRetries: 5,
     });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     const result = await trace('test-span', async (ctx) => {
       // Cast ff to access typed properties (type inference limitation)
       const ff = ctx.ff as unknown as {
@@ -94,7 +96,7 @@ describe('Feature Flags', () => {
 
     const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {}); // No flags set → null values
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
       expect(ff.debugMode).toBeUndefined();
@@ -118,7 +120,7 @@ describe('Feature Flags', () => {
       dynamicProvider: 'paypal',
     });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('test-span', async (ctx) => {
       // Async flags accessed via get() return FlagContext
       const limit = (await ctx.ff.get('userSpecificLimit')) as { value: number; track: () => void };
@@ -147,7 +149,7 @@ describe('Feature Flags', () => {
       advancedValidation: true,
     });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('test-span', async (ctx) => {
       (ctx.ff as { trackUsage: (flag: string, context: object) => void }).trackUsage('advancedValidation', {
         action: 'validation_performed',
@@ -176,7 +178,7 @@ describe('Feature Flags', () => {
       advancedValidation: true,
     });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as { advancedValidation: BooleanFlagContext | undefined };
       const flag = ff.advancedValidation;
@@ -204,7 +206,7 @@ describe('Feature Flags', () => {
 
     const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
 
@@ -238,7 +240,7 @@ describe('Feature Flags', () => {
 
     const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { userLimit: 200 });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('test-span', async (ctx) => {
       const value = (await ctx.ff.get('userLimit')) as { value: number };
       expect(value.value).toBe(200);
@@ -296,7 +298,7 @@ describe('Feature Flags', () => {
       customLimit: 500,
     });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as {
         enableFeatureX: BooleanFlagContext | undefined;
@@ -360,7 +362,7 @@ describe('Feature Flags', () => {
 
     const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true });
 
-    const { trace } = new Tracer({ logBinding, sink: () => {}, flagEvaluator });
+    const { trace } = new TestTracer({ logBinding, flagEvaluator });
     await trace('parent-span', async (parentCtx) => {
       const parentFf = parentCtx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
 
@@ -399,9 +401,8 @@ describe('Feature Flags', () => {
     });
 
     const enabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: true });
-    const { trace: enabledTrace } = new Tracer({
+    const { trace: enabledTrace } = new TestTracer({
       logBinding: enabledLogBinding,
-      sink: () => {},
       flagEvaluator: enabledFlagEvaluator,
     });
 
@@ -425,9 +426,8 @@ describe('Feature Flags', () => {
     });
 
     const disabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: false });
-    const { trace: disabledTrace } = new Tracer({
+    const { trace: disabledTrace } = new TestTracer({
       logBinding: disabledLogBinding,
-      sink: () => {},
       flagEvaluator: disabledFlagEvaluator,
     });
 
