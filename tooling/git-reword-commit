@@ -1,0 +1,119 @@
+#!/usr/bin/env bash
+#
+# git-reword-commit - Rewrite a commit message without affecting worktree
+#
+# Usage:
+#   echo "new message" | git-reword-commit <commit-hash>
+#   echo "prepend this" | git-reword-commit <commit-hash> --prepend
+#   echo "append this" | git-reword-commit <commit-hash> --append
+#
+# Examples:
+#   # Replace the entire commit message
+#   echo "feat: new message here" | git-reword-commit abc123
+#
+#   # Prepend to existing message (adds newline between)
+#   cat msg.txt | git-reword-commit abc123 --prepend
+#
+#   # Append to existing message (adds newline between)
+#   echo "Co-authored-by: Someone" | git-reword-commit abc123 --append
+#
+# This uses git filter-branch --msg-filter which rewrites commit messages
+# WITHOUT touching the worktree or staged changes.
+#
+
+set -euo pipefail
+
+# Suppress the filter-branch warning - we know what we're doing
+export FILTER_BRANCH_SQUELCH_WARNING=1
+
+usage() {
+  echo "Usage: <message> | git-reword-commit <commit-hash> [--prepend|--append]"
+  echo ""
+  echo "Reads new commit message from stdin."
+  echo ""
+  echo "Modes:"
+  echo "  (default)   Replace the entire commit message"
+  echo "  --prepend   Prepend to existing message (adds newline between)"
+  echo "  --append    Append to existing message (adds newline between)"
+  exit 1
+}
+
+if [ $# -lt 1 ]; then
+  usage
+fi
+
+COMMIT_SHORT="$1"
+shift
+
+# Get the full commit hash
+COMMIT_FULL=$(git rev-parse "$COMMIT_SHORT" 2>/dev/null) || {
+  echo "Error: Invalid commit reference: $COMMIT_SHORT" >&2
+  exit 1
+}
+
+MODE="replace"
+
+case "${1:-}" in
+  --prepend)
+    MODE="prepend"
+    ;;
+  --append)
+    MODE="append"
+    ;;
+  "")
+    MODE="replace"
+    ;;
+  *)
+    echo "Error: Unknown option: $1" >&2
+    usage
+    ;;
+esac
+
+# Read message from stdin and save to temp file (preserves newlines)
+MSG_FILE=$(mktemp)
+trap "rm -f '$MSG_FILE'" EXIT
+cat > "$MSG_FILE"
+
+if [ ! -s "$MSG_FILE" ]; then
+  echo "Error: Message cannot be empty (nothing on stdin)" >&2
+  usage
+fi
+
+echo "Rewriting commit $COMMIT_SHORT ($MODE mode)..."
+echo "---"
+
+# Use filter-branch with msg-filter
+# This does NOT touch the worktree - only rewrites commit objects
+git filter-branch -f --msg-filter "
+if [ \"\$GIT_COMMIT\" = \"$COMMIT_FULL\" ]; then
+  case \"$MODE\" in
+    prepend)
+      cat '$MSG_FILE'
+      echo ''
+      echo ''
+      cat
+      ;;
+    append)
+      cat
+      echo ''
+      echo ''
+      cat '$MSG_FILE'
+      ;;
+    replace)
+      cat '$MSG_FILE'
+      ;;
+  esac
+else
+  cat
+fi
+" "${COMMIT_FULL}^..HEAD"
+
+# Clean up the backup refs that filter-branch creates
+BRANCH=$(git branch --show-current)
+git update-ref -d "refs/original/refs/heads/$BRANCH" 2>/dev/null || true
+
+echo "---"
+echo "Done. Commit message rewritten."
+echo ""
+echo "New commit: $(git rev-parse HEAD)"
+echo "Note: If you've pushed this branch, you'll need to force push."
