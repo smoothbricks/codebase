@@ -15,10 +15,13 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { createBuffer } from '../../__tests__/test-helpers.js';
+import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { LogSchema } from '../../schema/types.js';
 import { createSpanBuffer, SpanBufferTestUtils } from '../../spanBuffer.js';
+import { createTraceId } from '../../traceId.js';
 import type { AnySpanBuffer } from '../../types.js';
 import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
@@ -26,14 +29,14 @@ import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
  * Create a test buffer from a schema
  */
 function createTestBuffer(schema: LogSchema): AnySpanBuffer {
-  return createSpanBuffer(schema, 'test-span');
+  return createBuffer(schema);
 }
 
 /**
  * Create a test buffer with a specific capacity
  */
 function createTestBufferWithCapacity(schema: LogSchema, capacity: number): AnySpanBuffer {
-  return createSpanBuffer(schema, 'test-span', undefined, capacity);
+  return createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA, capacity);
 }
 
 /**

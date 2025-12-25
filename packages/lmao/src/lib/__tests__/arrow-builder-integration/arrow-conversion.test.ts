@@ -53,7 +53,7 @@ describe('Arrow Table Conversion', () => {
         userId: S.category(),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'), undefined, DEFAULT_METADATA);
+      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'), DEFAULT_METADATA);
 
       // Write some test data
       buffer.timestamp[0] = 1000n;
@@ -83,7 +83,7 @@ describe('Arrow Table Conversion', () => {
         level: S.enum(['DEBUG', 'INFO', 'WARN', 'ERROR'] as const),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-456'), undefined, DEFAULT_METADATA);
+      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-456'), DEFAULT_METADATA);
 
       // Write multiple rows
       buffer.timestamp[0] = 1000n;
@@ -129,7 +129,7 @@ describe('Arrow Table Conversion', () => {
         requiredField: S.number(),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-789'), undefined, DEFAULT_METADATA);
+      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-789'), DEFAULT_METADATA);
 
       // Write row with only requiredField set
       buffer.timestamp[0] = 1000n;
@@ -155,7 +155,7 @@ describe('Arrow Table Conversion', () => {
         counter: S.number(),
       });
 
-      const buffer1 = createSpanBuffer(schema, 'test-span', createTraceId('trace-chain'), undefined, DEFAULT_METADATA);
+      const buffer1 = createSpanBuffer(schema, 'test-span', createTraceId('trace-chain'), DEFAULT_METADATA);
 
       // Fill first buffer
       buffer1.timestamp[0] = 1000n;
@@ -190,13 +190,7 @@ describe('Arrow Table Conversion', () => {
         value: S.number(),
       });
 
-      const buffer1 = createSpanBuffer(
-        schema,
-        'test-span',
-        createTraceId('trace-multi-chain'),
-        undefined,
-        DEFAULT_METADATA,
-      );
+      const buffer1 = createSpanBuffer(schema, 'test-span', createTraceId('trace-multi-chain'), DEFAULT_METADATA);
 
       buffer1.timestamp[0] = 1000n;
       buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -235,13 +229,7 @@ describe('Arrow Table Conversion', () => {
       });
 
       const SpanBufferClass = getSpanBufferClass(schema);
-      const parentBuffer = createSpanBuffer(
-        schema,
-        'test-span',
-        createTraceId('trace-tree'),
-        undefined,
-        DEFAULT_METADATA,
-      );
+      const parentBuffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-tree'), DEFAULT_METADATA);
 
       parentBuffer.timestamp[0] = 1000n;
       parentBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -302,13 +290,7 @@ describe('Arrow Table Conversion', () => {
       const schema = createTestSchema({});
 
       const SpanBufferClass = getSpanBufferClass(schema);
-      const parentBuffer = createSpanBuffer(
-        schema,
-        'test-span',
-        createTraceId('trace-siblings'),
-        undefined,
-        DEFAULT_METADATA,
-      );
+      const parentBuffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-siblings'), DEFAULT_METADATA);
 
       parentBuffer.timestamp[0] = 1000n;
       parentBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -367,7 +349,7 @@ describe('Arrow Table Conversion', () => {
       const schema = createTestSchema({});
 
       // Use capacity of 16 to hold all 11 entry types
-      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-types'), 16, DEFAULT_METADATA);
+      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-types'), DEFAULT_METADATA, 16);
 
       const entryTypes = [
         ENTRY_TYPE_SPAN_START,
@@ -422,7 +404,7 @@ describe('Arrow Table Conversion', () => {
       const schema = createTestSchema({});
       const SpanBufferClass = getSpanBufferClass(schema);
       const metadata = createTestOpMetadata({ package_name: '@test/package' });
-      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'), undefined, metadata);
+      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'), metadata);
 
       // Write some span entries
       buffer.timestamp[0] = 1000n;
@@ -487,7 +469,7 @@ describe('Arrow Table Conversion', () => {
       const schema = createTestSchema({});
       const SpanBufferClass = getSpanBufferClass(schema);
       const metadata = createTestOpMetadata();
-      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'), undefined, metadata);
+      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'), metadata);
 
       // Buffer has no entries (writeIndex = 0)
       buffer._writeIndex = 0;

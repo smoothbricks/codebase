@@ -22,16 +22,23 @@ function normalize(code: string): string {
 
 describe('lmao-transformer', () => {
   describe('ctx.span() transformation', () => {
-    it('should add line number and rewrite to span_fn for closure', () => {
+    it('should add line number and rewrite to span0 for closure', () => {
       const input = `ctx.span('test', async () => {});`;
       const output = transform(input);
-      expect(normalize(output)).toContain("ctx.span_fn(1, 'test', async () => { })");
+      // New format: ctx.span0(line, name, ctx._newCtx0(), SpanBufferClass, remappedViewClass, opMetadata, fn)
+      expect(normalize(output)).toContain("ctx.span0(1, 'test'");
+      expect(normalize(output)).toContain('ctx._newCtx0()');
+      expect(normalize(output)).toContain('ctx._buffer.constructor');
+      expect(normalize(output)).toContain('async () => { }');
     });
 
-    it('should prepend line number and rewrite to span_op for non-closures', () => {
+    it('should prepend line number and rewrite to span0 for non-closures (assumed Op)', () => {
       const input = `ctx.span('test', myOp);`;
       const output = transform(input);
-      expect(normalize(output)).toContain("ctx.span_op(1, 'test', myOp)");
+      // Without type checker, non-closure is assumed to be an Op
+      expect(normalize(output)).toContain("ctx.span0(1, 'test'");
+      expect(normalize(output)).toContain('myOp.SpanBufferClass');
+      expect(normalize(output)).toContain('myOp.fn');
     });
 
     it('should handle multi-line spans and use correct line number', () => {
@@ -40,14 +47,15 @@ ctx.span('first', async () => {});
 const y = 2;
 ctx.span('second', async () => {});`;
       const output = transform(input);
-      expect(normalize(output)).toContain("ctx.span_fn(2, 'first', async () => { })");
-      expect(normalize(output)).toContain("ctx.span_fn(4, 'second', async () => { })");
+      expect(normalize(output)).toContain("ctx.span0(2, 'first'");
+      expect(normalize(output)).toContain("ctx.span0(4, 'second'");
     });
 
     it('should handle await ctx.span()', () => {
       const input = `await ctx.span('test', async (childCtx) => { return 42; });`;
       const output = transform(input);
-      expect(normalize(output)).toContain("await ctx.span_fn(1, 'test', async (childCtx) => { return 42; })");
+      expect(normalize(output)).toContain("await ctx.span0(1, 'test'");
+      expect(normalize(output)).toContain('async (childCtx) => { return 42; }');
     });
 
     it('should handle nested spans', () => {
@@ -55,15 +63,16 @@ ctx.span('second', async () => {});`;
   outerCtx.span('inner', async () => {});
 });`;
       const output = transform(input);
-      expect(normalize(output)).toContain(
-        "ctx.span_fn(1, 'outer', async (outerCtx) => { outerCtx.span_fn(2, 'inner', async () => { }); })",
-      );
+      expect(normalize(output)).toContain("ctx.span0(1, 'outer'");
+      expect(normalize(output)).toContain("outerCtx.span0(2, 'inner'");
     });
 
     it('should handle span with more than 2 arguments', () => {
       const input = `ctx.span('name', op, 1, 2, 3);`;
       const output = transform(input);
-      expect(normalize(output)).toContain("ctx.span_op(1, 'name', op, 1, 2, 3)");
+      // With 3 extra args, method becomes span3
+      expect(normalize(output)).toContain("ctx.span3(1, 'name'");
+      expect(normalize(output)).toContain('op.fn, 1, 2, 3');
     });
   });
 
@@ -148,9 +157,9 @@ ctx.log.warn('second');`;
   ctx.log.info('Starting');
 });`;
       const output = transform(input);
-      expect(normalize(output)).toContain(
-        "ctx.span('process', async (ctx) => { ctx.log.info('Starting').line(2); }, 1)",
-      );
+      // New span format includes many more params
+      expect(normalize(output)).toContain("ctx.span0(1, 'process'");
+      expect(normalize(output)).toContain("ctx.log.info('Starting').line(2)");
     });
 
     it('should handle deeply nested structures', () => {
@@ -163,8 +172,8 @@ ctx.log.warn('second');`;
       const output = transform(input);
       expect(normalize(output)).toContain('.line(2)');
       expect(normalize(output)).toContain('.line(4)');
-      expect(normalize(output)).toContain(', 1)'); // outer span line
-      expect(normalize(output)).toContain(', 3)'); // inner span line
+      expect(normalize(output)).toContain("ctx.span0(1, 'outer'");
+      expect(normalize(output)).toContain("outerCtx.span0(3, 'inner'");
     });
   });
 
@@ -226,7 +235,7 @@ return ctx.ok({ done: true });`;
 });`;
       const output = transform(input);
       expect(normalize(output)).toContain('ctx.ok({ success: true }).line(2)');
-      expect(normalize(output)).toContain(', 1)'); // span line number
+      expect(normalize(output)).toContain('ctx.span0(1,'); // span line number is first arg
     });
   });
 
@@ -273,9 +282,9 @@ return ctx.ok({ done: true });`;
       const input = ['defineModule({', '  logSchema: schema,', '});'].join('\n');
       const output = transform(input);
       expect(output).toContain('metadata');
-      expect(output).toContain('gitSha');
-      expect(output).toContain('packageName');
-      expect(output).toContain('packagePath');
+      expect(output).toContain('git_sha');
+      expect(output).toContain('package_name');
+      expect(output).toContain('package_file');
     });
 
     it('should not overwrite existing metadata', () => {
@@ -295,9 +304,9 @@ return ctx.ok({ done: true });`;
       const input = ['lmao.defineModule({', '  logSchema: schema,', '});'].join('\n');
       const output = transform(input);
       expect(output).toContain('metadata');
-      expect(output).toContain('gitSha');
-      expect(output).toContain('packageName');
-      expect(output).toContain('packagePath');
+      expect(output).toContain('git_sha');
+      expect(output).toContain('package_name');
+      expect(output).toContain('package_file');
     });
 
     it('should preserve existing properties when injecting metadata', () => {
@@ -329,7 +338,7 @@ return ctx.ok({ done: true });`;
       const input = 'defineModule({});';
       const output = transform(input);
       expect(output).toContain('metadata');
-      expect(output).toContain('gitSha');
+      expect(output).toContain('git_sha');
     });
 
     it('should not transform defineModule with logSchema property', () => {
@@ -356,9 +365,9 @@ return ctx.ok({ done: true });`;
       const input = ['lmao.defineModule({', '  logSchema: schema,', '});'].join('\n');
       const output = transform(input);
       expect(output).toContain('metadata');
-      expect(output).toContain('gitSha');
-      expect(output).toContain('packageName');
-      expect(output).toContain('packagePath');
+      expect(output).toContain('git_sha');
+      expect(output).toContain('package_name');
+      expect(output).toContain('package_file');
     });
 
     it('should preserve existing properties when injecting metadata', () => {
@@ -384,7 +393,7 @@ return ctx.ok({ done: true });`;
       const input = 'defineModule({});';
       const output = transform(input);
       expect(output).toContain('metadata');
-      expect(output).toContain('gitSha');
+      expect(output).toContain('git_sha');
     });
 
     it('should not transform defineModule with logSchema property', () => {

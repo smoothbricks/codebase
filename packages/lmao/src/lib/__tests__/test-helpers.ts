@@ -29,7 +29,7 @@ import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import type { TraceId } from '../traceId.js';
+import { createTraceId, type TraceId } from '../traceId.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
 
 /**
@@ -104,9 +104,9 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   const spanBuffer = createSpanBuffer(
     logSchema,
     options.spanName ?? 'test-span',
-    options.trace_id,
-    options.capacity ?? DEFAULT_BUFFER_CAPACITY,
+    options.trace_id ?? createTraceId('test-trace'),
     DEFAULT_METADATA,
+    options.capacity ?? DEFAULT_BUFFER_CAPACITY,
   ) as SpanBuffer<LogSchema<T>>;
 
   return { logBinding, spanBuffer };
@@ -129,7 +129,7 @@ export function createTestLogger<T extends LogSchema>(
   logBinding: LogBinding;
 } {
   const logBinding = createTestLogBinding(schema);
-  const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, DEFAULT_METADATA);
+  const buffer = createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA);
   const logger = createSpanLogger(schema, buffer);
   return { buffer, logger, logBinding };
 }
@@ -172,3 +172,21 @@ export function getMappedOpGroupInternals<Ctx extends OpContext, ContributedSche
  * Convenience type alias for accessing column mapping from a MappedOpGroup.
  */
 export type { ColumnMapping, SchemaFieldsOf };
+
+// Re-export createTraceId for tests that need it
+export { createTraceId };
+
+/**
+ * Simple buffer creation helper for tests.
+ *
+ * This provides a simpler API than createSpanBuffer by using defaults for
+ * trace_id and opMetadata. Tests that need specific values should use
+ * createSpanBuffer directly.
+ *
+ * @param schema - LogSchema to use
+ * @param spanName - Span name (default: 'test-span')
+ * @param capacity - Buffer capacity (optional, uses default from class stats)
+ */
+export function createBuffer<T extends LogSchema>(schema: T, spanName = 'test-span', capacity?: number): SpanBuffer<T> {
+  return createSpanBuffer(schema, spanName, createTraceId('test-trace'), DEFAULT_METADATA, capacity);
+}

@@ -3,11 +3,13 @@ import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import fc from 'fast-check';
 import { shouldTuneCapacity } from '../capacityTuning.js';
 import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
+import { DEFAULT_METADATA } from '../opContext/defineOp.js';
 import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
+import { createTraceId } from '../traceId.js';
 
 /**
  * Create mock SpanBufferStats for testing capacity tuning.
@@ -579,7 +581,7 @@ describe('Capacity Tuning Algorithm', () => {
       stats.totalCreated = 0;
 
       // Create buffer and logger
-      const buffer = createSpanBuffer(integrationSchema, 'test-span', undefined, undefined, undefined);
+      const buffer = createSpanBuffer(integrationSchema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA);
       const logger = createSpanLogger(integrationSchema, buffer);
 
       // SpanLogger reserves rows 0-1, so capacity 8 means 6 entries before overflow
@@ -611,7 +613,7 @@ describe('Capacity Tuning Algorithm', () => {
 
       // Write many entries to accumulate stats and trigger tuning
       // Need 100+ totalWrites and >15% overflow ratio to trigger capacity increase
-      const buffer = createSpanBuffer(integrationSchema, 'test-span', undefined, undefined, undefined);
+      const buffer = createSpanBuffer(integrationSchema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA);
       const logger = createSpanLogger(integrationSchema, buffer);
 
       // With capacity 8 and 2 reserved rows, each buffer holds 6 entries

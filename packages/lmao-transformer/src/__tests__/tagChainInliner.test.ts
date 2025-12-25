@@ -23,12 +23,13 @@ import {
   createSpanBuffer,
   createTagWriter,
   createTraceId,
+  DEFAULT_METADATA,
   defineLogSchema,
   ENTRY_TYPE_SPAN_START,
   S,
+  type SpanBuffer,
 } from '@smoothbricks/lmao';
 import * as arrow from 'apache-arrow';
-import { createTestTaskContext } from './test-helpers.js';
 
 // ============================================================================
 // Test Helpers
@@ -114,6 +115,32 @@ function getEnumIndex(value: string, enumValues: readonly string[]): number {
   return enumValues.indexOf(value);
 }
 
+/**
+ * Create a pair of test buffers with identical setup for comparison tests.
+ * Uses DEFAULT_METADATA so convertToArrowTable has _opMetadata available.
+ */
+function createTestBufferPair<T extends ReturnType<typeof defineLogSchema>>(
+  schema: T,
+  traceIdSuffix: string,
+  capacity?: number,
+): { buffer1: SpanBuffer<T>; buffer2: SpanBuffer<T>; timestamp: bigint } {
+  const traceId = createTraceId(`trace-${traceIdSuffix}`);
+  const buffer1 = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA, capacity);
+  const buffer2 = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA, capacity);
+
+  // Setup: write system columns identically
+  const timestamp = BigInt(Date.now()) * 1000000n;
+  buffer1.timestamp[0] = timestamp;
+  buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
+  buffer1._writeIndex = 1;
+
+  buffer2.timestamp[0] = timestamp;
+  buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
+  buffer2._writeIndex = 1;
+
+  return { buffer1, buffer2, timestamp };
+}
+
 // ============================================================================
 // Test Suite
 // ============================================================================
@@ -129,29 +156,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('enum literal produces identical output', () => {
-      const traceId = createTraceId('trace-enum-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, 'test-span', traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, 'test-span', traceId);
-
-      // Setup: write system columns identically
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'enum-test');
 
       // Fluent API (non-transformed)
       const tagWriter1 = createTagWriter(testSchema, buffer1);
       tagWriter1.operation('CREATE');
 
       // Direct write (simulating transformed)
-      // Enum values are sorted alphabetically: CREATE=0, DELETE=1, READ=2, UPDATE=3
       const enumIndex = getEnumIndex('CREATE', ['CREATE', 'READ', 'UPDATE', 'DELETE']);
       buffer2.operation(0, enumIndex);
 
@@ -174,21 +185,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('category (string) literal produces identical output', () => {
-      const traceId = createTraceId('trace-category-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'category-test');
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -208,21 +205,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('text literal produces identical output', () => {
-      const traceId = createTraceId('trace-text-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'text-test');
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -242,21 +225,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('number literal produces identical output', () => {
-      const traceId = createTraceId('trace-number-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'number-test');
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -276,21 +245,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('boolean true produces identical output', () => {
-      const traceId = createTraceId('trace-bool-true-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'bool-true-test');
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -310,21 +265,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('boolean false produces identical output', () => {
-      const traceId = createTraceId('trace-bool-false-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'bool-false-test');
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -352,28 +293,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('multiple chained calls produce identical output', () => {
-      const traceId = createTraceId('trace-chain-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'chain-test');
 
       // Fluent API - chained
       const tagWriter1 = createTagWriter(testSchema, buffer1);
       tagWriter1.operation('READ').userId('user-456').count(100);
 
       // Direct writes - what transformer generates
-      // (ctx._buffer.operation(0, enumIndex), ctx._buffer.userId(0, 'user-456'), ctx._buffer.count(0, 100), ctx.tag)
       const enumIndex = getEnumIndex('READ', ['CREATE', 'READ', 'UPDATE', 'DELETE']);
       buffer2.operation(0, enumIndex);
       buffer2.userId(0, 'user-456');
@@ -405,21 +331,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('with() bulk setter produces identical output to individual calls', () => {
-      const traceId = createTraceId('trace-with-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'with-test');
 
       // Using with() - bulk setter
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -439,21 +351,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('mixed chain with fluent + with() produces correct output', () => {
-      const traceId = createTraceId('trace-mixed-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'mixed-test');
 
       // Mixed: fluent + with() + fluent
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -494,34 +392,18 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const enumValues = ['PENDING', 'ACTIVE', 'COMPLETED', 'CANCELLED'] as const;
 
       for (const value of enumValues) {
-        const traceId = createTraceId(`trace-enum-${value}`);
-        const taskContext1 = createTestTaskContext(testSchema);
-        const taskContext2 = createTestTaskContext(testSchema);
-
-        const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-        const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-        const timestamp = BigInt(Date.now()) * 1000000n;
-        buffer1.timestamp[0] = timestamp;
-        buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-        buffer1._writeIndex = 1;
-
-        buffer2.timestamp[0] = timestamp;
-        buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-        buffer2._writeIndex = 1;
+        const { buffer1, buffer2 } = createTestBufferPair(testSchema, `enum-${value}`);
 
         // Fluent API (user-facing, accepts string)
         const tagWriter1 = createTagWriter(testSchema, buffer1);
         tagWriter1.status(value);
 
         // Direct write with computed enum index (transformer-optimized, accepts index)
-        // This simulates what the transformer does - it computes the index at compile time
-        // and writes directly to the buffer, bypassing the string→index conversion.
         const enumIndex = getEnumIndex(value, enumValues);
         buffer2.status(0, enumIndex);
 
-        const table1 = convertToArrowTable(buffer1 as any);
-        const table2 = convertToArrowTable(buffer2 as any);
+        const table1 = convertToArrowTable(buffer1);
+        const table2 = convertToArrowTable(buffer2);
 
         const result = compareArrowTablesDetailed(table1, table2);
         expect(result.equal).toBe(true);
@@ -540,21 +422,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('eager column setter produces identical output to lazy column setter', () => {
-      const traceId = createTraceId('trace-eager-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'eager-test');
 
       // Using fluent API for both
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -582,24 +450,12 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       nullableString: S.category(),
     });
 
-    it('unset columns remain null', () => {
-      const traceId = createTraceId('trace-null-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
+    it('unset columns have default values', () => {
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'null-test');
 
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
-
-      // Don't write to any user columns - they should remain null
+      // Don't write to any user columns
+      // Unwritten columns get their type's default value (0 for number, null for category)
+      // because the null bitmap is only allocated when values are written
 
       const table1 = convertToArrowTable(buffer1);
       const table2 = convertToArrowTable(buffer2);
@@ -607,27 +463,13 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      // Verify columns are null
-      expect(table1.get(0)?.toJSON().nullableNumber).toBe(null);
+      // Number defaults to 0 (Float64Array default), category defaults to null (no dictionary entry)
+      expect(table1.get(0)?.toJSON().nullableNumber).toBe(0);
       expect(table1.get(0)?.toJSON().nullableString).toBe(null);
     });
 
     it('partial column writes preserve nulls in unwritten columns', () => {
-      const traceId = createTraceId('trace-partial-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'partial-test');
 
       // Write only one column
       const tagWriter1 = createTagWriter(testSchema, buffer1);
@@ -655,11 +497,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
     it('multiple rows produce identical output', () => {
       const traceId = createTraceId('trace-multirow-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId, 16);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId, 16);
+      const buffer1 = createSpanBuffer(testSchema, 'test-span', traceId, DEFAULT_METADATA, 16);
+      const buffer2 = createSpanBuffer(testSchema, 'test-span', traceId, DEFAULT_METADATA, 16);
 
       const baseTimestamp = BigInt(Date.now()) * 1000000n;
 
@@ -738,21 +577,7 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
     });
 
     it('both fluent and direct writes produce valid IPC that round-trips correctly', () => {
-      const traceId = createTraceId('trace-roundtrip-test');
-      const taskContext1 = createTestTaskContext(testSchema);
-      const taskContext2 = createTestTaskContext(testSchema);
-
-      const buffer1 = createSpanBuffer(testSchema, taskContext1, traceId);
-      const buffer2 = createSpanBuffer(testSchema, taskContext2, traceId);
-
-      const timestamp = BigInt(Date.now()) * 1000000n;
-      buffer1.timestamp[0] = timestamp;
-      buffer1.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer1._writeIndex = 1;
-
-      buffer2.timestamp[0] = timestamp;
-      buffer2.entry_type[0] = ENTRY_TYPE_SPAN_START;
-      buffer2._writeIndex = 1;
+      const { buffer1, buffer2 } = createTestBufferPair(testSchema, 'roundtrip-test');
 
       // Fluent API
       const tagWriter1 = createTagWriter(testSchema, buffer1);

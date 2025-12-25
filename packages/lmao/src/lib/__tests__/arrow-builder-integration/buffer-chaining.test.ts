@@ -12,7 +12,7 @@ import {
 } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
 import type { SpanBuffer } from '../../types.js';
-import { createTestSchema } from '../test-helpers.js';
+import { createBuffer, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Chaining', () => {
   let schema: LogSchema<any>;
@@ -32,7 +32,7 @@ describe('Buffer Chaining', () => {
 
   describe('createOverflowBuffer', () => {
     it('should create a chained buffer with same spanId and traceId', () => {
-      const buffer = createSpanBuffer(schema, 'test-span');
+      const buffer = createBuffer(schema);
       const nextBuffer = createOverflowBuffer(buffer);
 
       // Should inherit spanId and traceId
@@ -47,7 +47,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should create buffer with current capacity from stats', () => {
-      const buffer = createSpanBuffer(schema, 'test-span');
+      const buffer = createBuffer(schema);
 
       // Update capacity stats
       SpanBufferClass.stats.capacity = 128;
@@ -59,7 +59,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should create independent writeIndex for chained buffer', () => {
-      const buffer = createSpanBuffer(schema, 'test-span');
+      const buffer = createBuffer(schema);
 
       // Write some data to original buffer
       buffer._writeIndex = 50;
@@ -73,7 +73,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should maintain schema structure in chained buffer', () => {
-      const buffer = createSpanBuffer(schema, 'test-span');
+      const buffer = createBuffer(schema);
       const nextBuffer = createOverflowBuffer(buffer);
 
       // Should have same attribute columns (use _values suffix to access storage)
@@ -88,7 +88,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should handle multiple chained buffers', () => {
-      const buffer1 = createSpanBuffer(schema, 'test-span');
+      const buffer1 = createBuffer(schema);
       const buffer2 = createOverflowBuffer(buffer1);
       const buffer3 = createOverflowBuffer(buffer2);
 
@@ -104,7 +104,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should increment totalBuffersCreated stat', () => {
-      const buffer = createSpanBuffer(schema, 'test-span');
+      const buffer = createBuffer(schema);
       const initialCount = SpanBufferClass.stats.totalCreated;
 
       createOverflowBuffer(buffer);
@@ -113,7 +113,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should handle buffer with parent correctly', () => {
-      const parentBuffer = createSpanBuffer(schema, 'test-span');
+      const parentBuffer = createBuffer(schema);
 
       const childBuffer = createChildSpanBuffer(
         parentBuffer,
@@ -135,7 +135,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should create empty children array for chained buffer', () => {
-      const buffer = createSpanBuffer(schema, 'test-span');
+      const buffer = createBuffer(schema);
 
       // Add a child to original buffer
       const childBuffer = createChildSpanBuffer(
@@ -156,7 +156,7 @@ describe('Buffer Chaining', () => {
 
   describe('Buffer Chaining Edge Cases', () => {
     it('should handle buffer at exact capacity', () => {
-      const buffer = createSpanBuffer(schema, 'test-span', undefined, 10);
+      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA, 10);
       buffer._writeIndex = 10; // At exact capacity
 
       const nextBuffer = createOverflowBuffer(buffer);
@@ -166,7 +166,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should preserve null bitmaps structure in chained buffer', () => {
-      const buffer = createSpanBuffer(schema, 'test-span');
+      const buffer = createBuffer(schema);
       const nextBuffer = createOverflowBuffer(buffer);
 
       // Should have null bitmaps for each attribute (direct properties)
@@ -177,7 +177,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should handle capacity changes between chained buffers', () => {
-      const buffer1 = createSpanBuffer(schema, 'test-span');
+      const buffer1 = createBuffer(schema);
       expect(buffer1._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
       // Simulate capacity tuning - double it
@@ -197,7 +197,7 @@ describe('Buffer Chaining', () => {
   describe('Enhanced Buffer Chaining Tests', () => {
     it('should preserve data integrity across multiple buffer overflows', () => {
       const traceId = createTraceId('complex-trace');
-      const rootBuffer = createSpanBuffer(schema, 'root-span', traceId, 4); // Small capacity
+      const rootBuffer = createSpanBuffer(schema, 'root-span', traceId, DEFAULT_METADATA, 4); // Small capacity
 
       // Write entries that will cause multiple overflows
       const testEntries = Array.from({ length: 10 }, (_, i) => ({
@@ -252,7 +252,7 @@ describe('Buffer Chaining', () => {
 
     it('should maintain buffer topology with mixed relationships', () => {
       const traceId = createTraceId('topology-test');
-      const rootBuffer = createSpanBuffer(schema, 'root', traceId);
+      const rootBuffer = createSpanBuffer(schema, 'root', traceId, DEFAULT_METADATA);
 
       // Create first chained buffer with children
       const buffer1 = createOverflowBuffer(rootBuffer);
@@ -310,7 +310,7 @@ describe('Buffer Chaining', () => {
     it('should track overflow statistics accurately', () => {
       const initialCreated = SpanBufferClass.stats.totalCreated;
 
-      const rootBuffer = createSpanBuffer(schema, 'stats-test', undefined, 3); // Very small capacity
+      const rootBuffer = createSpanBuffer(schema, 'stats-test', createTraceId('test-trace'), DEFAULT_METADATA, 3); // Very small capacity
 
       // Manually create overflow buffers
       let currentBuffer = rootBuffer;
@@ -341,7 +341,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should preserve schema consistency across chain boundaries', () => {
-      const rootBuffer = createSpanBuffer(schema, 'schema-test');
+      const rootBuffer = createBuffer(schema, 'schema-test');
       const buffer1 = createOverflowBuffer(rootBuffer);
       const buffer2 = createOverflowBuffer(buffer1);
       const buffer3 = createOverflowBuffer(buffer2);

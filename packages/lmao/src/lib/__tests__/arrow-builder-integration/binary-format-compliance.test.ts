@@ -16,7 +16,7 @@ describe('Arrow Binary Format Compliance', () => {
       });
 
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA);
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Donbuffer._opMetadata = DEFAULT_METADATA;
@@ -44,7 +44,7 @@ describe('Arrow Binary Format Compliance', () => {
       });
 
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA);
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data using generated methods
@@ -82,7 +82,7 @@ describe('Arrow Binary Format Compliance', () => {
       });
 
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA);
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Write data with some nulls
@@ -133,7 +133,7 @@ describe('Arrow Binary Format Compliance', () => {
       });
 
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA);
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data using generated methods
@@ -178,7 +178,7 @@ describe('Arrow Binary Format Compliance', () => {
       });
 
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA);
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data with various string lengths
@@ -222,7 +222,7 @@ describe('Arrow Binary Format Compliance', () => {
       });
 
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA);
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Don't write any data
@@ -244,7 +244,7 @@ describe('Arrow Binary Format Compliance', () => {
       });
 
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA);
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data using generated methods

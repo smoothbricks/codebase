@@ -24,7 +24,7 @@ import {
 } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { createTestSpanBuffer, getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
+import { getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
 
 describe('Library Integration Pattern', () => {
   describe('Schema Prefixing', () => {

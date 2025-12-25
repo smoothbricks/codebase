@@ -354,18 +354,18 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
  *
  * @param schema - Tag attribute schema defining column types (must be LogSchema)
  * @param spanName - Name of the span
- * @param trace_id - Trace ID (auto-generated if omitted)
- * @param capacity - Buffer capacity (uses class.stats.capacity if omitted)
- * @param opMetadata - Op metadata for attribution (required for root spans)
+ * @param trace_id - Trace ID for distributed tracing
+ * @param opMetadata - Op metadata for attribution (package_name, package_file, git_sha, line)
+ * @param capacity - Buffer capacity (optional, uses class.stats.capacity if omitted)
  *
  * @returns SpanBuffer with typed setters for schema fields
  */
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
   spanName: string,
-  trace_id?: TraceId,
+  trace_id: TraceId,
+  opMetadata: OpMetadata,
   capacity?: number,
-  opMetadata?: OpMetadata,
 ): SpanBuffer<T> {
   const SpanBufferClass = getSpanBufferClass(schema);
 

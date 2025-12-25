@@ -84,7 +84,7 @@ describe('Schema Integration Patterns', () => {
   } = opContextWithFlags;
 
   // Create a flag evaluator with test values
-  const flagEvaluator = new InMemoryFlagEvaluator(featureFlags.schema, {
+  const flagEvaluator = new InMemoryFlagEvaluator<CtxWithFlags>(featureFlags.schema, {
     advancedValidation: true,
     maxRetries: 5,
     experimentalFeature: false,

@@ -16,6 +16,7 @@ import {
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
+import { createTraceId } from '../traceId.js';
 import { Tracer } from '../tracer.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestOpMetadata } from './test-helpers.js';
@@ -512,7 +513,7 @@ describe('Fixed Row Layout', () => {
   it('should create buffer with proper structure for fixed layout', () => {
     // Create buffer using the new Phase 2 API
     const opMetadata = createTestOpMetadata();
-    const buffer = createSpanBuffer(testSchema, 'test-span', undefined, undefined, opMetadata);
+    const buffer = createSpanBuffer(testSchema, 'test-span', createTraceId('test-trace'), opMetadata);
 
     // Buffer should have timestamps array for duration calculation
     expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);

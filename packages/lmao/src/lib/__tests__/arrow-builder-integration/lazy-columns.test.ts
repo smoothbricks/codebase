@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'bun:test';
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
-import { createSpanBuffer, createTagWriter, S } from '@smoothbricks/lmao';
+import { createTagWriter, S } from '@smoothbricks/lmao';
+import { createSpanBuffer } from '../../spanBuffer.js';
+import { createTraceId } from '../../traceId.js';
 import { createTestOpMetadata, createTestSchema } from '../test-helpers.js';
 
 /**
@@ -273,7 +275,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', undefined, 8, createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), createTestOpMetadata(), 8);
 
     // Eager columns (system columns) should be allocated immediately
     expect(buffer.timestamp).toBeDefined();
@@ -328,7 +330,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', undefined, 8, createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), createTestOpMetadata(), 8);
 
     // Lazy columns should be undefined before TagWriter access
     expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();

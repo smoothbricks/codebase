@@ -290,10 +290,10 @@ export class Tracer<Ctx extends OpContext> {
     // Create root SpanBuffer
     const buffer = createSpanBuffer(
       schema,
-      name, // spanName (was second param, logBinding removed)
-      traceId, // trace_id (now third param)
-      undefined, // capacity (optional, uses default from class stats)
+      name, // spanName
+      traceId, // trace_id
       metadata, // opMetadata (for both callsite and op at root level)
+      // capacity omitted - uses default from class stats
     ) as SpanBuffer<Ctx['logSchema']>;
 
     // Register with pendingBuffers for collection

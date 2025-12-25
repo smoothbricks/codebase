@@ -1,9 +1,10 @@
 import { describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
+import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
 import { createSpanBuffer, getSpanBufferClass, type SpanBufferConstructor } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import { createTestSchema } from '../test-helpers.js';
+import { createBuffer, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Foundation', () => {
   it('creates SpanBuffer with TypedArrays', () => {
@@ -13,7 +14,7 @@ describe('Buffer Foundation', () => {
     });
     const traceId = createTraceId('trace-123');
 
-    const buf = createSpanBuffer(schema, 'test-span', traceId); // Uses DEFAULT_BUFFER_CAPACITY
+    const buf = createSpanBuffer(schema, 'test-span', traceId, DEFAULT_METADATA); // Uses DEFAULT_BUFFER_CAPACITY
 
     // Span identity assertions (unified memory layout)
     expect(typeof buf.span_id).toBe('number');
@@ -46,7 +47,7 @@ describe('Buffer Foundation', () => {
       count: S.number(),
     });
 
-    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-999'));
+    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-999'), DEFAULT_METADATA);
 
     expect(buf.span_id).toBeGreaterThan(0);
     expect(buf._hasParent).toBe(false);
@@ -62,7 +63,7 @@ describe('Buffer Foundation', () => {
 
     // Get SpanBufferClass to access stats
     const SpanBufferClass = getSpanBufferClass(schema);
-    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-456'), 64);
+    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-456'), DEFAULT_METADATA, 64);
 
     // Stats are accessible from constructor
     const bufferClass = buf.constructor as SpanBufferConstructor;
@@ -80,7 +81,7 @@ describe('Buffer Foundation', () => {
       field5: S.number(),
     });
 
-    const buf = createSpanBuffer(largeSchema, 'test-span', createTraceId('trace-789'), 64);
+    const buf = createSpanBuffer(largeSchema, 'test-span', createTraceId('trace-789'), DEFAULT_METADATA, 64);
 
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them
@@ -103,7 +104,7 @@ describe('Buffer Foundation', () => {
       count: S.number(),
     });
 
-    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'));
+    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'), DEFAULT_METADATA);
     const SpanBufferClass = buf.constructor as SpanBufferConstructor;
 
     // Schema is accessible via static property
@@ -118,7 +119,7 @@ describe('Buffer Foundation', () => {
       count: S.number(),
     });
 
-    const buf = createSpanBuffer(schema, 'test-span');
+    const buf = createBuffer(schema);
     const SpanBufferClass = buf.constructor as SpanBufferConstructor;
 
     // Stats are accessible via static property (clean names, no sb_ prefix)
