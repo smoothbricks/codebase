@@ -276,39 +276,37 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   /**
    * Message column values - category strings (eager, always allocated).
    * Contains span names, log messages, exception messages, etc.
-   * String arrays don't use null bitmaps - undefined/null in the array itself.
    */
   readonly message_values: string[];
+  readonly message_nulls: Uint8Array;
 
   /**
    * Line number column values - Float64Array (lazy but always present).
    * Contains source code line numbers injected by transformer.
-   * TypedArrays use null bitmaps for sparse data.
    */
   readonly line_values: Float64Array;
   readonly line_nulls: Uint8Array;
 
   /**
    * Error code column values - category strings (lazy but always present).
-   * String arrays don't use null bitmaps.
    */
   readonly error_code_values: string[];
+  readonly error_code_nulls: Uint8Array;
 
   /**
    * Exception stack trace column values - text strings (lazy but always present).
-   * String arrays don't use null bitmaps.
    */
   readonly exception_stack_values: string[];
+  readonly exception_stack_nulls: Uint8Array;
 
   /**
    * Feature flag value column - category strings (lazy but always present).
-   * String arrays don't use null bitmaps.
    */
   readonly ff_value_values: string[];
+  readonly ff_value_nulls: Uint8Array;
 
   /**
    * Uint64 value column - BigUint64Array (lazy but always present).
-   * TypedArrays use null bitmaps for sparse data.
    */
   readonly uint64_value_values: BigUint64Array;
   readonly uint64_value_nulls: Uint8Array;

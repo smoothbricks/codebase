@@ -319,6 +319,44 @@ describe('Library Integration Pattern', () => {
       expect(code).toContain('numberField(value)'); // Number storage
       expect(code).toContain('booleanField(value)'); // Boolean storage
     });
+
+    it('should cache generated classes for the same schema and mapping', () => {
+      const schema = defineLogSchema({
+        status: S.number(),
+      });
+      const mapping: PrefixMapping = {
+        status: 'http_status',
+      };
+
+      const Class1 = createRemappedSpanLoggerClass(schema, mapping);
+      const Class2 = createRemappedSpanLoggerClass(schema, mapping);
+
+      // Same schema + mapping should return cached class
+      expect(Class1).toBe(Class2);
+    });
+
+    it('should create different classes for different schemas', () => {
+      const schema1 = defineLogSchema({ status: S.number() });
+      const schema2 = defineLogSchema({ code: S.number() });
+      const mapping1: PrefixMapping = { status: 'http_status' };
+      const mapping2: PrefixMapping = { code: 'http_code' };
+
+      const Class1 = createRemappedSpanLoggerClass(schema1, mapping1);
+      const Class2 = createRemappedSpanLoggerClass(schema2, mapping2);
+
+      expect(Class1).not.toBe(Class2);
+    });
+
+    it('should create different classes for same schema with different mappings', () => {
+      const schema = defineLogSchema({ status: S.number() });
+      const mapping1: PrefixMapping = { status: 'http_status' };
+      const mapping2: PrefixMapping = { status: 'api_status' };
+
+      const Class1 = createRemappedSpanLoggerClass(schema, mapping1);
+      const Class2 = createRemappedSpanLoggerClass(schema, mapping2);
+
+      expect(Class1).not.toBe(Class2);
+    });
   });
 });
 

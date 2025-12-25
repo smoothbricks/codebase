@@ -106,12 +106,35 @@ export function createPrefixMapping<T extends LogSchema>(schema: T, prefix: stri
 const remappedBufferViewClassCache = new Map<string, new (buffer: AnySpanBuffer) => AnySpanBuffer>();
 
 /**
+ * Cache for generated RemappedSpanLogger classes.
+ * Key is a stable string representation of schema fields + prefix mapping.
+ */
+const remappedSpanLoggerClassCache = new Map<
+  string,
+  new (
+    buffer: AnySpanBuffer,
+    createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
+    initialScopedAttributes?: Record<string, unknown>,
+  ) => SpanLoggerImpl<LogSchema>
+>();
+
+/**
  * Create a stable cache key from a prefix mapping.
  * Sorts keys to ensure consistent ordering.
  */
 function createMappingCacheKey(mapping: Record<string, string>): string {
   const sortedEntries = Object.entries(mapping).sort(([a], [b]) => a.localeCompare(b));
   return JSON.stringify(sortedEntries);
+}
+
+/**
+ * Create a stable cache key from schema and prefix mapping.
+ * Combines schema fields with sorted prefix mapping for consistent keys.
+ */
+function createSchemaAndMappingCacheKey(schema: LogSchema, mapping: Record<string, string>): string {
+  const schemaKey = JSON.stringify(schema.fields);
+  const mappingKey = createMappingCacheKey(mapping);
+  return `${schemaKey}:${mappingKey}`;
 }
 
 /**
@@ -609,11 +632,24 @@ export function createRemappedSpanLoggerClass<T extends LogSchema>(
   createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
   initialScopedAttributes?: Record<string, unknown>,
 ) => SpanLoggerImpl<T> {
+  // Check cache first
+  const cacheKey = createSchemaAndMappingCacheKey(cleanSchema, prefixMapping);
+  const cached = remappedSpanLoggerClassCache.get(cacheKey);
+  if (cached) {
+    return cached as new (
+      buffer: AnySpanBuffer,
+      createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
+      initialScopedAttributes?: Record<string, unknown>,
+    ) => SpanLoggerImpl<T>;
+  }
+
   const classCode = generateRemappedSpanLoggerClass(cleanSchema, prefixMapping).trim();
 
   // Use Function constructor to create the class (cold path - happens once per schema/prefix combo)
   // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
   const GeneratedClass = new Function(`return ${classCode}`)();
+
+  remappedSpanLoggerClassCache.set(cacheKey, GeneratedClass);
 
   return GeneratedClass;
 }

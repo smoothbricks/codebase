@@ -1,6 +1,3 @@
-// @ts-nocheck - Type system has DefinedLogSchema/LogSchema/SchemaFields compatibility issues
-// that require codebase-level fixes in library.ts and schema/types.ts.
-// The tests work correctly at runtime - these are only type-level issues.
 /**
  * Tests for RemappedBufferView - the view that maps prefixed column names
  * to unprefixed column names for tree traversal during Arrow conversion.
@@ -12,14 +9,15 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
+import '../../node.js'; // Configure timestamp implementation for Node.js
+import { defineOpContext } from '../defineOpContext.js';
 import { createPrefixMapping, generateRemappedBufferViewClass, prefixSchema } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { TraceId } from '../traceId.js';
 import { TestTracer } from '../tracers/TestTracer.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer } from '../types.js';
 
 describe('generateRemappedBufferViewClass', () => {
   describe('class generation', () => {
@@ -55,7 +53,7 @@ describe('generateRemappedBufferViewClass', () => {
         _spanName: 'test-span',
         getColumnIfAllocated: (name: string) => mockBuffer[`${name}_values` as keyof typeof mockBuffer],
         getNullsIfAllocated: (name: string) => mockBuffer[`${name}_nulls` as keyof typeof mockBuffer],
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(mockBuffer);
       expect(view).toBeDefined();
@@ -83,7 +81,7 @@ describe('generateRemappedBufferViewClass', () => {
   });
 
   describe('pass-through properties', () => {
-    const createMockBuffer = (): SpanBuffer => {
+    const createMockBuffer = (): AnySpanBuffer => {
       const buffer = {
         _children: [{ span_id: 2 }, { span_id: 3 }],
         _overflow: { span_id: 10 },
@@ -113,7 +111,7 @@ describe('generateRemappedBufferViewClass', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
       return buffer;
     };
 
@@ -171,15 +169,14 @@ describe('generateRemappedBufferViewClass', () => {
     });
 
     it('should pass through identity properties via _buffer', () => {
-      // Note: _logBinding is NOT passed through in the view
-      // Instead, access it via view._buffer._logBinding if needed
+      // The underlying buffer is accessible via _buffer
       const mapping = { http_status: 'status' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
       const buffer = createMockBuffer();
       const view = new ViewClass(buffer);
 
       // The underlying buffer is accessible via _buffer
-      expect((view as unknown as { _buffer: SpanBuffer })._buffer._logBinding).toBe(buffer._logBinding);
+      expect((view as unknown as { _buffer: AnySpanBuffer })._buffer._spanName).toBe(buffer._spanName);
     });
   });
 
@@ -215,7 +212,7 @@ describe('generateRemappedBufferViewClass', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
@@ -252,7 +249,7 @@ describe('generateRemappedBufferViewClass', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
@@ -288,7 +285,7 @@ describe('generateRemappedBufferViewClass', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
@@ -321,7 +318,7 @@ describe('generateRemappedBufferViewClass', () => {
         getNullsIfAllocated() {
           return undefined;
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
@@ -383,7 +380,7 @@ describe('generateRemappedBufferViewClass', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
@@ -426,8 +423,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const opContext = defineOpContext({
         logSchema: appSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp: defineOp1, logBinding, ctxDefaults } = opContext;
+      const { defineOp: defineOp1 } = opContext;
 
       const buffers: { level: number; span_id: number; parent_span_id: number }[] = [];
 
@@ -477,7 +473,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         return ctx.ok({ level: 1, child: result });
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace('root', level1Op);
       expect(result.success).toBe(true);
@@ -506,8 +502,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const opContext = defineOpContext({
         logSchema: appSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+      const { defineOp } = opContext;
 
       const traceIds: string[] = [];
 
@@ -531,7 +526,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         return ctx.span('to-level2', level2Op);
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
 
       await trace('root', level1Op);
 
@@ -583,8 +578,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const opContext = defineOpContext({
         logSchema: prefixedLogSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+      const { defineOp } = opContext;
 
       let opExecuted = false;
 
@@ -601,7 +595,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       expect(httpOp).toBeDefined();
 
       // Create a trace context and run the op via Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
       const result = await trace('http-request', httpOp as any);
 
       expect(opExecuted).toBe(true);
@@ -640,7 +634,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       // Wrap child in RemappedBufferView
       const childView = new ViewClass(childBuffer);
@@ -667,12 +661,12 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       // Simulate tree traversal (as Arrow conversion would do)
       expect(parentBuffer._children).toHaveLength(1);
 
-      const child = parentBuffer._children[0] as SpanBuffer;
+      const child = parentBuffer._children[0] as AnySpanBuffer;
 
       // Access via prefixed name through the view
       expect(child.getColumnIfAllocated('http_status')).toEqual(new Float64Array([404]));
@@ -716,7 +710,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const grandchildView = new DbViewClass(grandchildBuffer);
 
@@ -744,7 +738,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const childView = new HttpViewClass(childBuffer);
 
@@ -756,11 +750,11 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       // Traverse the tree
-      const httpChild = rootBuffer._children[0] as SpanBuffer;
-      const dbGrandchild = httpChild._children[0] as SpanBuffer;
+      const httpChild = rootBuffer._children[0] as AnySpanBuffer;
+      const dbGrandchild = httpChild._children[0] as AnySpanBuffer;
 
       // Each level returns correct prefixed columns
       expect(httpChild.getColumnIfAllocated('http_status')).toEqual(new Float64Array([200]));
@@ -794,7 +788,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
@@ -829,7 +823,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
@@ -867,7 +861,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         getNullsIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_nulls`];
         },
-      } as unknown as SpanBuffer;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(buffer);
 
