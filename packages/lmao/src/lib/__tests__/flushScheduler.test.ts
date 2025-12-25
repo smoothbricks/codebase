@@ -11,14 +11,14 @@ import {
   FlushSchedulerTestUtils,
 } from '../flushScheduler.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import { createTraceId } from '../traceId.js';
+
 import type { AnySpanBuffer } from '../types.js';
-import { createTestOpMetadata, createTestSchema } from './test-helpers.js';
+import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from './test-helpers.js';
 
 function createTestBuffer(): AnySpanBuffer {
   const schema = createTestSchema({});
   const opMetadata = createTestOpMetadata();
-  const buffer = createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), opMetadata);
+  const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), opMetadata);
   // Write some test data
   buffer._writeIndex = 5;
   for (let i = 0; i < buffer._writeIndex; i++) {

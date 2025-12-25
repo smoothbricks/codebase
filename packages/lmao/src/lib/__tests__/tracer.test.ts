@@ -12,6 +12,7 @@ import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { createTraceId } from '../traceId.js';
+
 import { TestTracer } from '../tracers/TestTracer.js';
 
 // Test schema

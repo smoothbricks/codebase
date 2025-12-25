@@ -9,7 +9,8 @@ import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
-import { createTraceId } from '../traceId.js';
+
+import { createTestTraceRoot } from './test-helpers.js';
 
 /**
  * Create mock SpanBufferStats for testing capacity tuning.
@@ -581,7 +582,13 @@ describe('Capacity Tuning Algorithm', () => {
       stats.totalCreated = 0;
 
       // Create buffer and logger
-      const buffer = createSpanBuffer(integrationSchema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA);
+      const buffer = createSpanBuffer(
+        integrationSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        undefined,
+      );
       const logger = createSpanLogger(integrationSchema, buffer);
 
       // SpanLogger reserves rows 0-1, so capacity 8 means 6 entries before overflow
@@ -613,7 +620,13 @@ describe('Capacity Tuning Algorithm', () => {
 
       // Write many entries to accumulate stats and trigger tuning
       // Need 100+ totalWrites and >15% overflow ratio to trigger capacity increase
-      const buffer = createSpanBuffer(integrationSchema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA);
+      const buffer = createSpanBuffer(
+        integrationSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        undefined,
+      );
       const logger = createSpanLogger(integrationSchema, buffer);
 
       // With capacity 8 and 2 reserved rows, each buffer holds 6 entries
@@ -631,6 +644,50 @@ describe('Capacity Tuning Algorithm', () => {
 
       // Verify it's still a power of 2
       expect(stats.capacity & (stats.capacity - 1)).toBe(0);
+    });
+
+    it('should call onStatsWillResetFor before stats reset during overflow', async () => {
+      // Import TestTracer and defineOpContext for proper integration test
+      const { defineOpContext } = await import('../defineOpContext.js');
+      const { TestTracer } = await import('../tracers/TestTracer.js');
+
+      // Create op context with small capacity
+      const ctx = defineOpContext({
+        logSchema: integrationSchema,
+      });
+
+      // Create TestTracer to capture stats snapshots
+      const tracer = new TestTracer({ logBinding: ctx.logBinding });
+      const { trace } = tracer;
+
+      // Set small capacity to trigger overflow quickly
+      const SpanBufferClass = getSpanBufferClass(integrationSchema);
+      const stats = SpanBufferClass.stats;
+      stats.capacity = 8;
+      stats.overflows = 0;
+      stats.overflowWrites = 0;
+      stats.totalWrites = 0;
+      stats.totalCreated = 0;
+
+      // Execute trace with enough log entries to trigger overflow and capacity tuning
+      // With capacity 8 and 2 reserved rows, we need 100+ writes with >15% overflow
+      trace('test-trace', (ctx) => {
+        for (let i = 0; i < 120; i++) {
+          ctx.log.info(`entry ${i}`);
+        }
+      });
+
+      // Verify the tracer captured stats snapshots before reset
+      expect(tracer.statsSnapshots.length).toBeGreaterThan(0);
+
+      // Verify captured stats show non-zero writes before reset
+      const firstSnapshot = tracer.statsSnapshots[0];
+      expect(firstSnapshot.totalWrites).toBeGreaterThan(0);
+      expect(firstSnapshot.capacity).toBeGreaterThanOrEqual(8);
+
+      // Verify buffer reference is present
+      expect(firstSnapshot.buffer).toBeDefined();
+      expect(firstSnapshot.buffer._spanName).toBeDefined();
     });
   });
 });

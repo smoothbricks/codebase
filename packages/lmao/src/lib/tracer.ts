@@ -69,7 +69,7 @@ import {
   writeSpanStart,
 } from './spanContext.js';
 import { getTimestampNanos } from './timestamp.js';
-import { generateTraceId, type TraceId } from './traceId.js';
+import { generateTraceId, type TraceId, type TraceRoot } from './traceId.js';
 import type { SpanBuffer } from './types.js';
 
 // =============================================================================
@@ -188,7 +188,7 @@ export abstract class Tracer<Ctx extends OpContext> {
    * Only called for root spans created via trace(), not child spans.
    * Subclasses implement to handle trace lifecycle events (e.g., collect for batching).
    */
-  protected abstract onTraceStart(rootBuffer: SpanBuffer<Ctx['logSchema']>): void;
+  abstract onTraceStart(rootBuffer: SpanBuffer<Ctx['logSchema']>): void;
 
   /**
    * Called when a root trace ends (after fn completes, in finally).
@@ -196,14 +196,14 @@ export abstract class Tracer<Ctx extends OpContext> {
    * Only called for root spans created via trace(), not child spans.
    * Subclasses implement to handle trace completion (e.g., queue for sending).
    */
-  protected abstract onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void;
+  abstract onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void;
 
   /**
    * Called when a child span starts (before fn execution).
    * Only called for child spans created via ctx.span(), not root traces.
    * Subclasses implement if child span lifecycle needs special handling.
    */
-  protected abstract onSpanStart(childBuffer: SpanBuffer<Ctx['logSchema']>): void;
+  abstract onSpanStart(childBuffer: SpanBuffer<Ctx['logSchema']>): void;
 
   /**
    * Called when a child span ends (after fn completes, in finally).
@@ -211,7 +211,7 @@ export abstract class Tracer<Ctx extends OpContext> {
    * Only called for child spans created via ctx.span(), not root traces.
    * Subclasses implement if child span lifecycle needs special handling.
    */
-  protected abstract onSpanEnd(childBuffer: SpanBuffer<Ctx['logSchema']>): void;
+  abstract onSpanEnd(childBuffer: SpanBuffer<Ctx['logSchema']>): void;
 
   /**
    * Flush any pending data. Default is no-op.
@@ -220,6 +220,19 @@ export abstract class Tracer<Ctx extends OpContext> {
   async flush(): Promise<void> {
     // Default no-op - subclasses override if needed
   }
+
+  /**
+   * Called before stats are reset during capacity tuning.
+   * Allows tracer to capture stats for observability before they're lost.
+   *
+   * The buffer provides all necessary context:
+   * - buffer._stats → SpanBufferStats about to be reset
+   * - buffer._opMetadata → which Op/module these stats belong to
+   * - buffer.constructor → SpanBufferClass (schema info)
+   *
+   * @param buffer - The buffer that triggered overflow
+   */
+  abstract onStatsWillResetFor(buffer: SpanBuffer<Ctx['logSchema']>): void;
 
   // ===========================================================================
   // trace() - Polymorphic dispatcher (like span())
@@ -315,20 +328,26 @@ export abstract class Tracer<Ctx extends OpContext> {
     // Validate null-sentinel required fields and merge user context
     const resolvedUserCtx = this._resolveUserContext(options.ctx);
 
-    // Create root SpanBuffer
+    // Build TraceRoot with timestamp anchors and tracer reference
+    // Platform-specific: Node.js uses process.hrtime.bigint(), Browser uses performance.now()
+    const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+    const anchorPerfNow =
+      typeof process !== 'undefined' && process.hrtime ? Number(process.hrtime.bigint()) : performance.now();
+
+    const traceRoot: TraceRoot = {
+      trace_id: traceId,
+      anchorEpochNanos,
+      anchorPerfNow,
+      tracer: this,
+    };
+
+    // Create root SpanBuffer with pre-built TraceRoot
     const buffer = createSpanBuffer(
       schema,
       name, // spanName
-      traceId, // trace_id
+      traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
       metadata, // opMetadata (for both callsite and op at root level)
-      // capacity omitted - uses default from class stats
     ) as SpanBuffer<Ctx['logSchema']>;
-
-    // Initialize scope values to shared frozen empty object (avoid allocation)
-    buffer._scopeValues = EMPTY_SCOPE;
-
-    // Set _opMetadata for Arrow conversion
-    buffer._opMetadata = metadata;
 
     // Write span-start entry (row 0)
     writeSpanStart(buffer, name);
@@ -409,10 +428,6 @@ export abstract class Tracer<Ctx extends OpContext> {
    */
   private _executeWithContext<R>(ctx: SpanContextInstance<Ctx>, fn: (ctx: SpanContext<Ctx>) => R): R {
     const buffer = ctx._buffer;
-
-    // Store tracer reference for child span hooks
-    // Cast to interface to satisfy type system (implementations provide these methods)
-    buffer._tracer = this as unknown as import('./types.js').TracerLifecycleHooks;
 
     // Call trace start hook
     this.onTraceStart(buffer);

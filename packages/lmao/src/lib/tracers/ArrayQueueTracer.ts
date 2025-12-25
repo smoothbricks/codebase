@@ -33,20 +33,24 @@ export class ArrayQueueTracer<Ctx extends OpContext = OpContext> extends Tracer<
    */
   readonly queue: AnySpanBuffer[] = [];
 
-  protected onTraceStart(_rootBuffer: AnySpanBuffer): void {
+  onTraceStart(_rootBuffer: AnySpanBuffer): void {
     // No-op
   }
 
-  protected onTraceEnd(rootBuffer: AnySpanBuffer): void {
+  onTraceEnd(rootBuffer: AnySpanBuffer): void {
     this.queue.push(rootBuffer);
   }
 
-  protected onSpanStart(_childBuffer: AnySpanBuffer): void {
+  onSpanStart(_childBuffer: AnySpanBuffer): void {
     // No-op
   }
 
-  protected onSpanEnd(_childBuffer: AnySpanBuffer): void {
+  onSpanEnd(_childBuffer: AnySpanBuffer): void {
     // No-op
+  }
+
+  onStatsWillResetFor(_buffer: AnySpanBuffer): void {
+    // No-op - override in subclass to capture stats
   }
 
   /**

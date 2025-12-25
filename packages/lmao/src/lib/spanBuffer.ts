@@ -36,7 +36,7 @@ import type { LogSchema } from './schema/LogSchema.js';
 import { textEncoder } from './spanBufferHelpers.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import { writeThreadIdToUint64Array } from './threadId.js';
-import type { TraceId, TraceRoot } from './traceId.js';
+import type { TraceRoot } from './traceId.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 
 // Re-export TraceRoot for external consumers (and to satisfy linter - it's used in generated code)
@@ -118,6 +118,13 @@ export const SpanBufferTestUtils = {
  * The generated class has static properties:
  * - schema: LogSchema - The schema used to generate this class
  * - stats: SpanBufferStats - Shared mutable stats for all instances
+ *
+ * **Constructor cases:**
+ * - ROOT: traceRoot provided (freshly created), parent undefined
+ * - CHILD: traceRoot provided (from parent._traceRoot), parent provided, isChained=false
+ * - CHAINED: traceRoot provided (from parent._traceRoot), parent provided, isChained=true
+ *
+ * traceRoot is ALWAYS provided - factories extract it from parent when needed.
  */
 export interface SpanBufferConstructor {
   new (
@@ -126,9 +133,9 @@ export interface SpanBufferConstructor {
     spanName: string,
     parent: AnySpanBuffer | undefined,
     isChained: boolean,
-    trace_id: TraceId | undefined,
     callsiteMetadata: OpMetadata | undefined,
     opMetadata: OpMetadata | undefined,
+    traceRoot: TraceRoot,
   ): AnySpanBuffer;
 
   // Static properties added after class generation
@@ -188,14 +195,46 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
-    constructorParams: 'stats, spanName, parent, isChained, trace_id, callsiteMetadata, opMetadata',
+    constructorParams: 'stats, spanName, parent, isChained, callsiteMetadata, opMetadata, traceRoot',
     dependencies: {
       writeThreadIdToUint64Array,
       textEncoder,
       EMPTY_SCOPE,
     },
-    // Thread-local span counter (per-process/worker, see threadId.ts docs)
+    // ==========================================================================
+    // GENERATED CONSTRUCTOR PREAMBLE
+    // ==========================================================================
+    // The preamble below is passed to new Function() by arrow-builder's
+    // columnBufferGenerator. It MUST be pure JavaScript:
+    // - NO TypeScript type annotations (: Type)
+    // - NO non-null assertions (!)
+    // - NO comments (waste of runtime parsing)
+    //
+    // BUFFER TYPES (determined by constructor arguments):
+    // - ROOT: traceRoot provided, parent undefined
+    //   → Creates identity with traceId: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
+    // - CHILD: traceRoot undefined (uses parent._traceRoot), parent provided, isChained=false
+    //   → Creates identity without traceId: [threadId(8)][spanId(4)]
+    // - CHAINED: traceRoot undefined (uses parent._traceRoot), parent provided, isChained=true
+    //   → Shares parent._identity (no new identity allocation)
+    //
+    // MEMORY LAYOUT:
+    // - systemBuffer: timestamps (8 bytes * cap) + entry_type (1 byte * cap) + identity
+    // - System size aligned to 8 bytes so identity's BigUint64Array offset is aligned
+    // - Identity layout: [threadId(8)][spanId(4)][traceIdLen(1)?][traceId(N)?]
+    //
+    // V8 IN-OBJECT PROPERTY OPTIMIZATION:
+    // Property assignment order determines which properties get fast in-object slots.
+    // First ~10-12 properties are stored directly on the object (fastest access).
+    // Slots 1-3: HOTTEST (every log entry) - _writeIndex, _capacity, _overflow
+    // Slots 4-5: HOT (TypedArray refs) - timestamp, entry_type
+    // Slots 6-7: WARM (tree structure) - _children, _parent
+    // Slots 8-10: WARM (context) - _traceRoot, _scopeValues, _identity
+    // Slots 11-12: WARM (system) - _system, _spanName
+    // Slots 13+: COLD (Arrow conversion only) - _callsiteMetadata, _opMetadata
+    // ==========================================================================
     preamble:
+      // Thread-local span counter (per-process/worker, see threadId.ts docs)
       `if (typeof globalThis.globalSpanCounter === 'undefined') {
          globalThis.globalSpanCounter = 0;
        }
@@ -204,80 +243,60 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
       // Calculate system buffer size: timestamps (8 bytes * cap) + entry_type (1 byte * cap)
       // Align to 8 bytes so identity's BigUint64Array offset is aligned
       `const rawSystemSize = requestedCapacity * 9;
-      const systemSize = (rawSystemSize + 7) & ~7;
-      let systemBuffer;
-      let identityView;
+       const systemSize = (rawSystemSize + 7) & ~7;
+       let systemBuffer;
+       let identityView;
 ` +
       // CHAINED BUFFER: overflow storage for same logical span - shares parent identity
-      // ROOT/CHILD BUFFER: new logical span - gets own identity section
-      // Identity layout: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
-      `if (isChained && parent) {
-        systemBuffer = new ArrayBuffer(systemSize);
-        identityView = parent._identity;
-      } else {
-        const traceIdBytes = trace_id ? textEncoder.encode(trace_id).length : 0;
-        const identitySize = 13 + traceIdBytes;
-        systemBuffer = new ArrayBuffer(systemSize + identitySize);
-        identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
-        const view = new DataView(systemBuffer, systemSize);
-        const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
-        writeThreadIdToUint64Array(threadIdArray, 0);
-        view.setUint32(8, spanId, true);
-        if (trace_id) {
-          const traceIdUtf8 = textEncoder.encode(trace_id);
-          identityView[12] = traceIdUtf8.length;
-          identityView.set(traceIdUtf8, 13);
-        }
-      }
+      `if (isChained) {
+         systemBuffer = new ArrayBuffer(systemSize);
+         identityView = parent._identity;
+       }` +
+      // ROOT BUFFER: new trace - gets identity with traceId from TraceRoot
+      ` else if (traceRoot) {
+         const traceIdUtf8 = textEncoder.encode(traceRoot.trace_id);
+         const identitySize = 13 + traceIdUtf8.length;
+         systemBuffer = new ArrayBuffer(systemSize + identitySize);
+         identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
+         const view = new DataView(systemBuffer, systemSize);
+         const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
+         writeThreadIdToUint64Array(threadIdArray, 0);
+         view.setUint32(8, spanId, true);
+         identityView[12] = traceIdUtf8.length;
+         identityView.set(traceIdUtf8, 13);
+       }` +
+      // CHILD BUFFER: new span in existing trace - gets identity without traceId
+      // (traceId accessed via parent chain walk in trace_id getter)
+      ` else {
+         const identitySize = 12;
+         systemBuffer = new ArrayBuffer(systemSize + identitySize);
+         identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
+         const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
+         writeThreadIdToUint64Array(threadIdArray, 0);
+         new DataView(systemBuffer, systemSize).setUint32(8, spanId, true);
+       }
 ` +
       // Create TypedArray views for timestamps and entry_type
       `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
-      const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
-      timestampView.fill(0n);
-      entryTypeView.fill(0);
+       const entryTypeView = new Uint8Array(systemBuffer, requestedCapacity * 8, requestedCapacity);
+       timestampView.fill(0n);
+       entryTypeView.fill(0);
 ` +
-      // Create or copy TraceRoot (per-trace anchoring data)
-      // Child/chained spans share parent's traceRoot (O(1) reference copy)
-      // Root spans create new TraceRoot with fresh timestamp anchors
-      // Platform-specific: Node.js uses process.hrtime.bigint(), Browser uses performance.now()
-      `let traceRoot;
-      if (parent) {
-        traceRoot = parent._traceRoot;
-      } else {
-        const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
-        let anchorPerfNow;
-        if (typeof process !== 'undefined' && process.hrtime) {
-          anchorPerfNow = Number(process.hrtime.bigint());
-        } else {
-          anchorPerfNow = performance.now();
-        }
-        const threadId = new DataView(identityView.buffer, identityView.byteOffset).getBigUint64(0, true);
-        traceRoot = {
-          trace_id: trace_id,
-          thread_id: threadId,
-          anchorEpochNanos,
-          anchorPerfNow,
-        };
-      }
-` +
-      // Assign properties in optimal order for V8 in-object slots
-      // Slots 1-3: HOTTEST (every log entry), Slots 4-5: HOT (TypedArray refs)
-      // Slots 6-7: WARM (tree structure), Slots 8-10: WARM (context)
-      // Slots 10+: COLD (Arrow conversion only)
+      // Assign properties in optimal order for V8 in-object slots (see comment above)
       `this._writeIndex = 0;
-      this._capacity = requestedCapacity;
-      this._overflow = undefined;
-      this.timestamp = timestampView;
-      this.entry_type = entryTypeView;
-      this._children = [];
-      this._parent = isChained ? parent._parent : parent;
-      this._traceRoot = traceRoot;
-      this._identity = identityView;
-      this._system = systemBuffer;
-      this._spanName = spanName;
-      this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
-      this._callsiteMetadata = callsiteMetadata;
-      this._opMetadata = opMetadata;
+       this._capacity = requestedCapacity;
+       this._overflow = undefined;
+       this.timestamp = timestampView;
+       this.entry_type = entryTypeView;
+       this._children = [];
+       this._parent = isChained ? parent._parent : parent;
+       this._traceRoot = traceRoot;
+       this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
+       this._identity = identityView;
+       this._system = systemBuffer;
+       this._spanName = spanName;
+       this._callsiteMetadata = callsiteMetadata;
+       this._opMetadata = opMetadata;
     `,
     // Generated methods for SpanBuffer - no comments in output
     // span_id: extract from identity bytes [8:12]
@@ -354,7 +373,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
  *
  * @param schema - Tag attribute schema defining column types (must be LogSchema)
  * @param spanName - Name of the span
- * @param trace_id - Trace ID for distributed tracing
+ * @param traceRoot - Pre-built TraceRoot with trace_id, anchors, and tracer
  * @param opMetadata - Op metadata for attribution (package_name, package_file, git_sha, line)
  * @param capacity - Buffer capacity (optional, uses class.stats.capacity if omitted)
  *
@@ -363,7 +382,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
   spanName: string,
-  trace_id: TraceId,
+  traceRoot: TraceRoot,
   opMetadata: OpMetadata,
   capacity?: number,
 ): SpanBuffer<T> {
@@ -380,9 +399,9 @@ export function createSpanBuffer<T extends LogSchema>(
     spanName,
     undefined, // no parent
     false, // not chained
-    trace_id, // trace_id for root
     opMetadata, // callsiteMetadata for row 0
     opMetadata, // opMetadata for rows 1+ (same as callsite for root)
+    traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
   ) as SpanBuffer<T>;
 }
 
@@ -411,9 +430,9 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
     buffer._spanName,
     buffer, // Used for identity sharing, _parent set to buffer._parent in constructor
     true, // isChained
-    undefined, // trace_id (inherited via parent)
     buffer._callsiteMetadata,
     buffer._opMetadata,
+    buffer._traceRoot, // traceRoot from parent
   ) as SpanBuffer<T>;
 
   // Link current buffer to next
@@ -458,9 +477,9 @@ export function createChildSpanBuffer<T extends LogSchema>(
     spanName,
     parentBuffer, // parent
     false, // not chained
-    undefined, // no trace_id for child (walk up parent chain instead)
     callsiteMetadata, // callsiteMetadata - CALLER's op metadata (for row 0)
     opMetadata, // opMetadata - EXECUTING op metadata (for rows 1+)
+    parentBuffer._traceRoot, // traceRoot from parent
   ) as SpanBuffer<T>;
 
   return childBuffer;

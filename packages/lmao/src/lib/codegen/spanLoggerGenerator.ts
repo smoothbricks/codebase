@@ -447,6 +447,8 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     _getNextBuffer() {
       const oldBuffer = this._buffer;
       const stats = oldBuffer.constructor.stats;
+      // Notify tracer before stats reset (tracer captures for observability)
+      oldBuffer._traceRoot.tracer.onStatsWillResetFor(oldBuffer);
       helpers.trackOverflowAndTune(stats);
       this._inOverflow = true;
       const overflowBuffer = this._createOverflowBuffer(oldBuffer);

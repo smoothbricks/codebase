@@ -114,7 +114,7 @@ export { ArrayQueueTracer } from './lib/tracers/ArrayQueueTracer.js';
 // Concrete tracer implementations
 export { NoOpTracer } from './lib/tracers/NoOpTracer.js';
 export { StdioTracer } from './lib/tracers/StdioTracer.js';
-export { TestTracer, type TestTracerConfig } from './lib/tracers/TestTracer.js';
+export { type StatsSnapshot, TestTracer, type TestTracerConfig } from './lib/tracers/TestTracer.js';
 
 // =============================================================================
 // Library Integration
@@ -138,7 +138,14 @@ export {
 // Trace ID
 // =============================================================================
 
-export { createTraceId, generateTraceId, isValidTraceId, MAX_TRACE_ID_LENGTH, type TraceId } from './lib/traceId.js';
+export {
+  createTraceId,
+  generateTraceId,
+  isValidTraceId,
+  MAX_TRACE_ID_LENGTH,
+  type TraceId,
+  type TraceRoot,
+} from './lib/traceId.js';
 
 // =============================================================================
 // UTF-8 Cache (for Arrow conversion)

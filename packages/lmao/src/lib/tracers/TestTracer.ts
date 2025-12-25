@@ -22,11 +22,25 @@ import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 export type TestTracerConfig<Ctx extends import('../opContext/types.js').OpContext> = Omit<TracerConfig<Ctx>, 'sink'>;
 
 /**
+ * Snapshot of buffer stats captured before reset during capacity tuning.
+ */
+export interface StatsSnapshot {
+  buffer: AnySpanBuffer;
+  totalWrites: number;
+  overflowWrites: number;
+  totalCreated: number;
+  capacity: number;
+}
+
+/**
  * Test tracer that accumulates root buffers for inspection.
  *
  * Collects all completed root trace buffers in `rootBuffers` array.
  * Child spans are accessible via the buffer's `_children` tree -
  * no need to track them separately.
+ *
+ * Also tracks capacity tuning events via `statsSnapshots` to verify
+ * that `onStatsWillResetFor` is called before stats are reset.
  *
  * @example
  * ```typescript
@@ -42,6 +56,9 @@ export type TestTracerConfig<Ctx extends import('../opContext/types.js').OpConte
  * // Convert to Arrow for detailed inspection
  * const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
  * expect(table.numRows).toBe(2); // span-start + span-ok
+ *
+ * // Verify capacity tuning was captured
+ * expect(tracer.statsSnapshots.length).toBeGreaterThan(0);
  * ```
  */
 export class TestTracer<Ctx extends import('../opContext/types.js').OpContext> extends Tracer<Ctx> {
@@ -51,6 +68,12 @@ export class TestTracer<Ctx extends import('../opContext/types.js').OpContext> e
    */
   readonly rootBuffers: AnySpanBuffer[] = [];
 
+  /**
+   * Stats snapshots captured before reset during capacity tuning.
+   * Used to verify onStatsWillResetFor hook is called correctly.
+   */
+  readonly statsSnapshots: StatsSnapshot[] = [];
+
   constructor(config: TestTracerConfig<Ctx>) {
     super(config);
   }
@@ -59,21 +82,33 @@ export class TestTracer<Ctx extends import('../opContext/types.js').OpContext> e
   // Lifecycle hook implementations
   // ===========================================================================
 
-  protected onTraceStart(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceStart(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
     // No-op - we collect on end, not start
   }
 
-  protected onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
     // Collect the root buffer when trace completes
     this.rootBuffers.push(rootBuffer);
   }
 
-  protected onSpanStart(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanStart(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
     // No-op - children are in tree, accessed via rootBuffer._children
   }
 
-  protected onSpanEnd(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanEnd(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
     // No-op - children are in tree, accessed via rootBuffer._children
+  }
+
+  onStatsWillResetFor(buffer: SpanBuffer<Ctx['logSchema']>): void {
+    // Capture stats snapshot before they're reset
+    const stats = buffer._stats;
+    this.statsSnapshots.push({
+      buffer,
+      totalWrites: stats.totalWrites,
+      overflowWrites: stats.overflowWrites,
+      totalCreated: stats.totalCreated,
+      capacity: stats.capacity,
+    });
   }
 
   // ===========================================================================
@@ -81,10 +116,11 @@ export class TestTracer<Ctx extends import('../opContext/types.js').OpContext> e
   // ===========================================================================
 
   /**
-   * Clear all collected buffers.
+   * Clear all collected buffers and stats snapshots.
    * Useful for cleanup between tests.
    */
   clear(): void {
     this.rootBuffers.length = 0;
+    this.statsSnapshots.length = 0;
   }
 }

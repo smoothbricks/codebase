@@ -32,28 +32,35 @@ export class NoOpTracer<Ctx extends OpContext> extends Tracer<Ctx> {
   /**
    * No-op hook for trace start.
    */
-  protected onTraceStart(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceStart(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
     // No-op
   }
 
   /**
    * No-op hook for trace end.
    */
-  protected onTraceEnd(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceEnd(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
     // No-op
   }
 
   /**
    * No-op hook for span start.
    */
-  protected onSpanStart(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanStart(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
     // No-op
   }
 
   /**
    * No-op hook for span end.
    */
-  protected onSpanEnd(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanEnd(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+    // No-op
+  }
+
+  /**
+   * No-op hook for stats reset.
+   */
+  onStatsWillResetFor(_buffer: SpanBuffer<Ctx['logSchema']>): void {
     // No-op
   }
 }

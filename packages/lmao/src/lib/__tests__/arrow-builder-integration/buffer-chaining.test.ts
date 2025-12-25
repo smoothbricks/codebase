@@ -10,9 +10,9 @@ import {
   getSpanBufferClass,
   type SpanBufferConstructor,
 } from '../../spanBuffer.js';
-import { createTraceId } from '../../traceId.js';
+
 import type { SpanBuffer } from '../../types.js';
-import { createBuffer, createTestSchema } from '../test-helpers.js';
+import { createBuffer, createTestSchema, createTestTraceRoot, createTraceId } from '../test-helpers.js';
 
 describe('Buffer Chaining', () => {
   let schema: LogSchema<any>;
@@ -156,7 +156,7 @@ describe('Buffer Chaining', () => {
 
   describe('Buffer Chaining Edge Cases', () => {
     it('should handle buffer at exact capacity', () => {
-      const buffer = createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA, 10);
+      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), DEFAULT_METADATA, 10);
       buffer._writeIndex = 10; // At exact capacity
 
       const nextBuffer = createOverflowBuffer(buffer);
@@ -197,7 +197,7 @@ describe('Buffer Chaining', () => {
   describe('Enhanced Buffer Chaining Tests', () => {
     it('should preserve data integrity across multiple buffer overflows', () => {
       const traceId = createTraceId('complex-trace');
-      const rootBuffer = createSpanBuffer(schema, 'root-span', traceId, DEFAULT_METADATA, 4); // Small capacity
+      const rootBuffer = createSpanBuffer(schema, 'root-span', createTestTraceRoot(traceId), DEFAULT_METADATA, 4); // Small capacity
 
       // Write entries that will cause multiple overflows
       const testEntries = Array.from({ length: 10 }, (_, i) => ({
@@ -252,7 +252,7 @@ describe('Buffer Chaining', () => {
 
     it('should maintain buffer topology with mixed relationships', () => {
       const traceId = createTraceId('topology-test');
-      const rootBuffer = createSpanBuffer(schema, 'root', traceId, DEFAULT_METADATA);
+      const rootBuffer = createSpanBuffer(schema, 'root', createTestTraceRoot(traceId), DEFAULT_METADATA, undefined);
 
       // Create first chained buffer with children
       const buffer1 = createOverflowBuffer(rootBuffer);
@@ -310,7 +310,7 @@ describe('Buffer Chaining', () => {
     it('should track overflow statistics accurately', () => {
       const initialCreated = SpanBufferClass.stats.totalCreated;
 
-      const rootBuffer = createSpanBuffer(schema, 'stats-test', createTraceId('test-trace'), DEFAULT_METADATA, 3); // Very small capacity
+      const rootBuffer = createSpanBuffer(schema, 'stats-test', createTestTraceRoot('test-trace'), DEFAULT_METADATA, 3); // Very small capacity
 
       // Manually create overflow buffers
       let currentBuffer = rootBuffer;

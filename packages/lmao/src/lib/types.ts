@@ -26,6 +26,18 @@ export interface TracerLifecycleHooks {
   onTraceEnd(buffer: AnySpanBuffer): void;
   onSpanStart(buffer: AnySpanBuffer): void;
   onSpanEnd(buffer: AnySpanBuffer): void;
+  /**
+   * Called before stats are reset during capacity tuning.
+   * Allows tracer to capture stats for observability before they're lost.
+   *
+   * The buffer provides all necessary context:
+   * - buffer._stats → SpanBufferStats about to be reset
+   * - buffer._opMetadata → which Op/module these stats belong to
+   * - buffer.constructor → SpanBufferClass (schema info)
+   *
+   * @param buffer - The buffer that triggered overflow
+   */
+  onStatsWillResetFor(buffer: AnySpanBuffer): void;
 }
 
 // Re-export arrow-builder types for convenience
@@ -223,14 +235,6 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Contains anchorEpochNanos/anchorPerfNow for timestamp calculation.
    */
   _traceRoot: TraceRoot;
-
-  /**
-   * Reference to the Tracer that created this trace.
-   * Set on root buffer by Tracer, propagated to children by SpanContext.
-   * Used by child spans to call lifecycle hooks.
-   * @internal
-   */
-  _tracer: TracerLifecycleHooks;
 
   /**
    * Op metadata for this span - identifies WHICH OP IS EXECUTING.

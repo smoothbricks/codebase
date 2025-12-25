@@ -642,9 +642,6 @@ export function createSpanContextClass<Ctx extends OpContext>(
         opMetadata, // opMetadata - WHICH op is executing (for rows 1+)
       );
 
-      // Propagate tracer reference from parent to child
-      childBuffer._tracer = this._buffer._tracer;
-
       // Why wrap buffer: RemappedBufferView translates prefixed column names during Arrow conversion
       // Parent sees remapped names, child sees unprefixed names (transparent to child)
       const bufferOrView = remappedViewClass ? new remappedViewClass(childBuffer) : childBuffer;
@@ -905,14 +902,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
-      ctx._buffer._tracer.onSpanStart(ctx._buffer);
+      ctx._buffer._traceRoot.tracer.onSpanStart(ctx._buffer);
       try {
         return await fn(ctx as unknown as SpanContext<Ctx>);
       } catch (error) {
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -934,14 +931,14 @@ export function createSpanContextClass<Ctx extends OpContext>(
         remappedViewClass,
         opMetadata,
       );
-      ctx._buffer._tracer.onSpanStart(ctx._buffer);
+      ctx._buffer._traceRoot.tracer.onSpanStart(ctx._buffer);
       try {
         return await fn(ctx as unknown as SpanContext<Ctx>, a1);
       } catch (error) {
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -970,7 +967,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -1000,7 +997,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -1031,7 +1028,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -1063,7 +1060,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -1104,7 +1101,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -1147,7 +1144,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
 
@@ -1192,7 +1189,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         this._spanException(ctx._buffer, error);
         throw error;
       } finally {
-        ctx._buffer._tracer.onSpanEnd(ctx._buffer);
+        ctx._buffer._traceRoot.tracer.onSpanEnd(ctx._buffer);
       }
     }
   }

@@ -5,8 +5,13 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-// Import from node entry point to set up timestamp implementation
-import { convertSpanTreeToArrowTable, defineLogSchema, defineOpContext, S, TestTracer } from '@smoothbricks/lmao/node';
+// Must import test-helpers first to initialize timestamp implementation
+import '../../__tests__/test-helpers.js';
+import { convertSpanTreeToArrowTable } from '../../convertToArrow.js';
+import { defineOpContext } from '../../defineOpContext.js';
+import { S } from '../../schema/builder.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import { TestTracer } from '../TestTracer.js';
 
 describe('TestTracer', () => {
   const testSchema = defineLogSchema({

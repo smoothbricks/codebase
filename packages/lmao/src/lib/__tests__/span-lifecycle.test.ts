@@ -16,10 +16,10 @@ import {
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import { createTraceId } from '../traceId.js';
+
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
-import { createTestOpMetadata } from './test-helpers.js';
+import { createTestOpMetadata, createTestTraceRoot } from './test-helpers.js';
 
 // Test schema
 // Note: resultMessage, exceptionMessage, errorCode, and exceptionStack are now system columns
@@ -513,7 +513,7 @@ describe('Fixed Row Layout', () => {
   it('should create buffer with proper structure for fixed layout', () => {
     // Create buffer using the new Phase 2 API
     const opMetadata = createTestOpMetadata();
-    const buffer = createSpanBuffer(testSchema, 'test-span', createTraceId('test-trace'), opMetadata);
+    const buffer = createSpanBuffer(testSchema, 'test-span', createTestTraceRoot('test-trace'), opMetadata);
 
     // Buffer should have timestamps array for duration calculation
     expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);

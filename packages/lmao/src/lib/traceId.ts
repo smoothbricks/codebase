@@ -112,12 +112,6 @@ export interface TraceRoot {
   readonly trace_id: TraceId;
 
   /**
-   * Thread ID for this process/worker (64-bit random).
-   * Cached here to avoid repeated thread ID lookups.
-   */
-  readonly thread_id: bigint;
-
-  /**
    * Epoch time in nanoseconds when trace was created.
    * Captured via Date.now() * 1_000_000n at trace root.
    */
@@ -128,4 +122,19 @@ export interface TraceRoot {
    * Captured via performance.now() (browser) or process.hrtime.bigint() (Node.js).
    */
   readonly anchorPerfNow: number;
+
+  /**
+   * Tracer reference for lifecycle hooks and event callbacks.
+   *
+   * Provides all Tracer lifecycle methods needed by SpanContext and SpanLogger.
+   * Uses `unknown` for buffer parameter to avoid circular dependency with types.ts.
+   * The Tracer implementation receives AnySpanBuffer at runtime.
+   */
+  readonly tracer: {
+    onTraceStart(buffer: unknown): void;
+    onTraceEnd(buffer: unknown): void;
+    onSpanStart(buffer: unknown): void;
+    onSpanEnd(buffer: unknown): void;
+    onStatsWillResetFor(buffer: unknown): void;
+  };
 }

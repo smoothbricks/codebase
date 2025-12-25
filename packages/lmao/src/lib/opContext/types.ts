@@ -203,6 +203,75 @@ export interface OpContextConfig<
 }
 
 // =============================================================================
+// OP CONTEXT BINDING (For Tracer)
+// =============================================================================
+
+/**
+ * Runtime binding from defineOpContext for use with Tracer.
+ *
+ * Contains everything a Tracer needs to create traces:
+ * - logBinding: Schema and capacity stats for buffer creation
+ * - ctxDefaults: User context defaults (with null sentinels for required fields)
+ * - deps: Wired dependencies for ctx.deps
+ *
+ * Carries phantom type via [opContextType] for full OpContext inference.
+ * This allows `new TestTracer(ctx)` to infer T from ctx.logBinding without
+ * explicit type parameters.
+ *
+ * @template T - LogSchema type
+ * @template FF - Feature flag schema
+ * @template Deps - Dependencies config
+ * @template UserCtx - User context properties
+ *
+ * @example
+ * ```typescript
+ * const ctx = defineOpContext({
+ *   logSchema: defineLogSchema({ userId: S.category() }),
+ *   ctx: { env: null as Env },
+ * });
+ *
+ * // Tracer infers types from binding - no explicit type params needed
+ * const { trace } = new TestTracer(ctx);
+ * ```
+ */
+export interface OpContextBinding<
+  T extends LogSchema = LogSchema,
+  FF extends FeatureFlagSchema = {},
+  Deps extends DepsConfig = {},
+  UserCtx extends Record<string, unknown> = {},
+> {
+  /**
+   * Phantom type - extract via OpContextOf<typeof binding>
+   *
+   * Carries the bundled OpContext type for type inference.
+   * Tracers use this to infer the full context type without explicit parameters.
+   *
+   * @internal
+   */
+  readonly [opContextType]: OpContext<T, FF, Deps, UserCtx>;
+
+  /**
+   * LogBinding for this context (schema, capacity stats, optional prefix view).
+   * Used by Tracer to create SpanBuffers and SpanContexts.
+   * Typed with schema T for Op type safety.
+   */
+  readonly logBinding: import('../logBinding.js').LogBinding<T>;
+
+  /**
+   * User context defaults from ctx config.
+   * Used by Tracer to merge with trace-level overrides.
+   * Properties with null values are required at trace creation.
+   */
+  readonly ctxDefaults: UserCtx;
+
+  /**
+   * Dependencies wired at defineOpContext time.
+   * Used by Tracer to populate ctx.deps on root spans.
+   */
+  readonly deps: Deps;
+}
+
+// =============================================================================
 // OP CONTEXT FACTORY
 // =============================================================================
 
@@ -215,6 +284,7 @@ export interface OpContextConfig<
  * - `logSchema`: The combined effective schema
  * - `flags`: The feature flag schema
  *
+ * Extends OpContextBinding to provide everything Tracer needs.
  * Uses unique symbol [opContextType] to carry the bundled OpContext type
  * for extraction via OpContextOf<typeof factory>.
  *
@@ -231,17 +301,7 @@ export interface OpContextFactory<
   FF extends FeatureFlagSchema,
   Deps extends DepsConfig,
   UserCtx extends Record<string, unknown>,
-> {
-  /**
-   * Phantom type - extract via OpContextOf<typeof factory>
-   *
-   * Carries the bundled OpContext type for all Ops and Spans from this factory.
-   * This allows ops to use Op<Ctx, Args, S, E> instead of Op<T, FF, Deps, UserCtx, Args, S, E>.
-   *
-   * @internal
-   */
-  readonly [opContextType]: OpContext<T, FF, Deps, UserCtx>;
-
+> extends OpContextBinding<T, FF, Deps, UserCtx> {
   /**
    * The combined log schema (app schema + dep contributions).
    *
@@ -257,25 +317,6 @@ export interface OpContextFactory<
    * The feature flag schema (for external consumers)
    */
   readonly flags: FF;
-
-  /**
-   * LogBinding for this context (schema, capacity stats, optional prefix view).
-   * Used by Tracer to create SpanBuffers and SpanContexts.
-   * Typed with schema T for Op type safety.
-   */
-  readonly logBinding: import('../logBinding.js').LogBinding<T>;
-
-  /**
-   * User context defaults from ctx config.
-   * Used by Tracer to merge with trace-level overrides.
-   */
-  readonly ctxDefaults: UserCtx;
-
-  /**
-   * Dependencies wired at defineOpContext time.
-   * Used by Tracer to populate ctx.deps on root spans.
-   */
-  readonly deps: Deps;
 
   /**
    * Define a single Op with explicit name.

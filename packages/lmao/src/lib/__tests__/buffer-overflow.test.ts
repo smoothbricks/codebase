@@ -7,9 +7,9 @@ import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createSpanBuffer, getSpanBufferClass, type SpanBufferConstructor } from '../spanBuffer.js';
-import { createTraceId } from '../traceId.js';
+
 import type { AnySpanBuffer } from '../types.js';
-import { createBuffer } from './test-helpers.js';
+import { createBuffer, createTestTraceRoot } from './test-helpers.js';
 
 /**
  * Property-based tests for buffer overflow handling.
@@ -204,7 +204,7 @@ describe('Buffer Overflow Property Tests', () => {
           const buffer = createSpanBuffer(
             testSchema,
             'test-span',
-            createTraceId('test-trace'),
+            createTestTraceRoot('test-trace'),
             DEFAULT_METADATA,
             capacity,
           );
@@ -369,7 +369,13 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS; // 6 entries fit
       SpanBufferClass.stats.overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA, capacity);
+      const buffer = createSpanBuffer(
+        testSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        capacity,
+      );
       const logger = createSpanLogger(testSchema, buffer);
 
       // Write exactly usable capacity entries (6 with capacity=8, reserved=2)
@@ -389,7 +395,13 @@ describe('Buffer Overflow Property Tests', () => {
       const usableCapacity = capacity - RESERVED_ROWS; // 6
       SpanBufferClass.stats.overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA, capacity);
+      const buffer = createSpanBuffer(
+        testSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        capacity,
+      );
       const logger = createSpanLogger(testSchema, buffer);
 
       // Write usable capacity + 1 entries (7 entries)
@@ -440,7 +452,7 @@ describe('Buffer Overflow Property Tests', () => {
             const buffer = createSpanBuffer(
               testSchema,
               'test-span',
-              createTraceId('test-trace'),
+              createTestTraceRoot('test-trace'),
               DEFAULT_METADATA,
               capacity,
             );

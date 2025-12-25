@@ -29,8 +29,49 @@ import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import { createTraceId, type TraceId } from '../traceId.js';
+import { createTraceId, type TraceId, type TraceRoot } from '../traceId.js';
+import { NoOpTracer } from '../tracers/NoOpTracer.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
+
+// Create a minimal LogSchema for the NoOpTracer (it doesn't actually use it)
+const minimalSchema = new LogSchema(mergeWithSystemSchema({}));
+
+/**
+ * Shared NoOpTracer instance for tests that create buffers directly.
+ * Cast to TraceRoot['tracer'] since that's what createSpanBuffer expects.
+ */
+export const TEST_TRACER = new NoOpTracer({
+  logBinding: { logSchema: minimalSchema },
+}) as unknown as TraceRoot['tracer'];
+
+/**
+ * Create a TraceRoot for testing.
+ *
+ * TraceRoot contains trace_id, timestamp anchors, and tracer reference.
+ * This helper creates one with sensible defaults for tests.
+ *
+ * @param traceId - Optional trace ID (defaults to 'test-trace')
+ * @param tracer - Optional tracer (defaults to TEST_TRACER)
+ */
+export function createTestTraceRoot(traceId?: TraceId | string, tracer?: TraceRoot['tracer']): TraceRoot {
+  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+  const anchorPerfNow =
+    typeof process !== 'undefined' && process.hrtime ? Number(process.hrtime.bigint()) : performance.now();
+
+  // Accept string or TraceId - convert string to TraceId
+  const resolvedTraceId = traceId
+    ? typeof traceId === 'string'
+      ? createTraceId(traceId)
+      : traceId
+    : createTraceId('test-trace');
+
+  return {
+    trace_id: resolvedTraceId,
+    anchorEpochNanos,
+    anchorPerfNow,
+    tracer: tracer ?? TEST_TRACER,
+  };
+}
 
 /**
  * Create a test OpMetadata with pre-encoded entries.
@@ -100,11 +141,14 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   // Create LogBinding (stats are on SpanBufferClass.stats, not LogBinding)
   const logBinding = createTestLogBinding(logSchema);
 
+  // Create TraceRoot with provided or default trace_id
+  const traceRoot = createTestTraceRoot(options.trace_id);
+
   // Create SpanBuffer using the Phase 2 API (no LogBinding parameter)
   const spanBuffer = createSpanBuffer(
     logSchema,
     options.spanName ?? 'test-span',
-    options.trace_id ?? createTraceId('test-trace'),
+    traceRoot,
     DEFAULT_METADATA,
     options.capacity ?? DEFAULT_BUFFER_CAPACITY,
   ) as SpanBuffer<LogSchema<T>>;
@@ -129,7 +173,8 @@ export function createTestLogger<T extends LogSchema>(
   logBinding: LogBinding;
 } {
   const logBinding = createTestLogBinding(schema);
-  const buffer = createSpanBuffer(schema, 'test-span', createTraceId('test-trace'), DEFAULT_METADATA);
+  const traceRoot = createTestTraceRoot();
+  const buffer = createSpanBuffer(schema, 'test-span', traceRoot, DEFAULT_METADATA);
   const logger = createSpanLogger(schema, buffer);
   return { buffer, logger, logBinding };
 }
@@ -188,5 +233,5 @@ export { createTraceId };
  * @param capacity - Buffer capacity (optional, uses default from class stats)
  */
 export function createBuffer<T extends LogSchema>(schema: T, spanName = 'test-span', capacity?: number): SpanBuffer<T> {
-  return createSpanBuffer(schema, spanName, createTraceId('test-trace'), DEFAULT_METADATA, capacity);
+  return createSpanBuffer(schema, spanName, createTestTraceRoot(), DEFAULT_METADATA, capacity);
 }

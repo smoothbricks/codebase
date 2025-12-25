@@ -188,7 +188,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
   // Lifecycle Hooks
   // --------------------------------------------------------------------------
 
-  protected onTraceStart(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceStart(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
     const traceId = rootBuffer.trace_id;
     const name = rootBuffer.message_values[0];
     const ts = formatTimestamp(rootBuffer.timestamp[0]);
@@ -197,7 +197,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     this.incrementIndent(traceId);
   }
 
-  protected onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
     const traceId = rootBuffer.trace_id;
     this.decrementIndent(traceId);
 
@@ -219,7 +219,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     }
   }
 
-  protected onSpanStart(childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanStart(childBuffer: SpanBuffer<Ctx['logSchema']>): void {
     const traceId = childBuffer.trace_id;
     const indent = this.getIndent(traceId);
     const name = childBuffer.message_values[0];
@@ -229,7 +229,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     this.incrementIndent(traceId);
   }
 
-  protected onSpanEnd(childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanEnd(childBuffer: SpanBuffer<Ctx['logSchema']>): void {
     const traceId = childBuffer.trace_id;
     this.decrementIndent(traceId);
     const indent = this.getIndent(traceId);
@@ -250,5 +250,18 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     } else {
       this.out.write(line);
     }
+  }
+
+  onStatsWillResetFor(buffer: SpanBuffer<Ctx['logSchema']>): void {
+    const stats = buffer._stats;
+    const overflowRatio = stats.totalWrites > 0 ? ((stats.overflowWrites / stats.totalWrites) * 100).toFixed(1) : '0.0';
+    const traceId = buffer.trace_id;
+    const ts = formatTimestamp(buffer.timestamp[0]);
+
+    this.out.write(
+      `[${ts}] ${this.color(traceId)}[${traceId}]${this.reset()} ` +
+        `[CAPACITY] writes=${stats.totalWrites} overflow=${stats.overflowWrites} (${overflowRatio}%) ` +
+        `buffers=${stats.totalCreated} capacity=${stats.capacity}\n`,
+    );
   }
 }
