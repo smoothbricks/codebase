@@ -58,7 +58,7 @@ import { Op } from './op.js';
 import type { TraceContextParams } from './opContext/contextTypes.js';
 import { createOpMetadata } from './opContext/defineOp.js';
 import type { OpContext, SpanContext } from './opContext/types.js';
-import type { Result } from './result.js';
+import { FluentErr, FluentOk, type Result } from './result.js';
 import type { FlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 
@@ -377,6 +377,10 @@ export class Tracer<Ctx extends OpContext> {
   /**
    * Execute function with context and handle span-ok/span-err/span-exception writes
    * Promise-agnostic: returns sync for sync fn, Promise for async fn
+   *
+   * NOTE: If the function returns a FluentOk/FluentErr (from ctx.ok()/ctx.err()),
+   * the entry type was already written by the constructor. We detect this via
+   * instanceof and skip overwriting.
    */
   private _executeWithContext<R>(ctx: SpanContextInstance<Ctx>, fn: (ctx: SpanContext<Ctx>) => R): R {
     const buffer = ctx._buffer;
@@ -389,7 +393,12 @@ export class Tracer<Ctx extends OpContext> {
         // Async path - use .then to write span-ok/err after Promise resolves
         return (result as unknown as Promise<unknown>).then(
           (resolved) => {
-            // Write span-ok to row 1
+            // If result is FluentOk/FluentErr (from ctx.ok()/ctx.err()), entry type was already
+            // written by the constructor. Skip overwriting.
+            if (resolved instanceof FluentOk || resolved instanceof FluentErr) {
+              return resolved;
+            }
+            // Write span-ok to row 1 (fallback for non-FluentResult returns)
             buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
             buffer.timestamp[1] = getTimestampNanos(
               buffer._traceRoot.anchorEpochNanos,
@@ -419,7 +428,13 @@ export class Tracer<Ctx extends OpContext> {
         ) as R;
       }
 
-      // Sync path - write span-ok immediately
+      // Sync path
+      // If result is FluentOk/FluentErr (from ctx.ok()/ctx.err()), entry type was already
+      // written by the constructor. Skip overwriting.
+      if (result instanceof FluentOk || result instanceof FluentErr) {
+        return result;
+      }
+      // Write span-ok immediately (fallback for non-FluentResult returns)
       buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
       buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
