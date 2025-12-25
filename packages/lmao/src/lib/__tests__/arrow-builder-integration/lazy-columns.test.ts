@@ -140,6 +140,10 @@ describe('Lazy Column Initialization', () => {
     // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
     const buffer = createColumnBuffer(schema, 64);
 
+    // System schema's message column is EAGER - always allocated (via mergeWithSystemSchema)
+    // Note: timestamp/entry_type are SpanBuffer-specific, NOT in ColumnBuffer
+    expect(Array.isArray(buffer.message_values)).toBe(true);
+
     // Access one attribute column via _values suffix - should allocate it lazily on first access
     const userIdColumn = buffer.userId_values;
     // Category stores raw strings in Array
