@@ -1,6 +1,6 @@
-import type { OpContext } from '../opContext/types.js';
+import type { OpContextBinding } from '../opContext/types.js';
 import { Tracer } from '../tracer.js';
-import type { AnySpanBuffer } from '../types.js';
+import type { SpanBuffer } from '../types.js';
 
 /**
  * Tracer that batches completed root traces in an in-memory queue.
@@ -11,7 +11,8 @@ import type { AnySpanBuffer } from '../types.js';
  *
  * @example
  * ```typescript
- * const tracer = new ArrayQueueTracer({ logBinding });
+ * const ctx = defineOpContext({ logSchema });
+ * const tracer = new ArrayQueueTracer(ctx);
  * const { trace } = tracer;
  *
  * // Process requests, traces accumulate
@@ -26,30 +27,31 @@ import type { AnySpanBuffer } from '../types.js';
  * }
  * ```
  */
-export class ArrayQueueTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> {
+export class ArrayQueueTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
    * Queue of completed root trace buffers.
    * Use `drain()` to consume and clear.
+   * Public for test inspection.
    */
-  readonly queue: AnySpanBuffer[] = [];
+  readonly queue: SpanBuffer<B['logBinding']['logSchema']>[] = [];
 
-  onTraceStart(_rootBuffer: AnySpanBuffer): void {
+  onTraceStart(_rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 
-  onTraceEnd(rootBuffer: AnySpanBuffer): void {
+  onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     this.queue.push(rootBuffer);
   }
 
-  onSpanStart(_childBuffer: AnySpanBuffer): void {
+  onSpanStart(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 
-  onSpanEnd(_childBuffer: AnySpanBuffer): void {
+  onSpanEnd(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 
-  onStatsWillResetFor(_buffer: AnySpanBuffer): void {
+  onStatsWillResetFor(_buffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op - override in subclass to capture stats
   }
 
@@ -59,7 +61,7 @@ export class ArrayQueueTracer<Ctx extends OpContext = OpContext> extends Tracer<
    *
    * @returns Array of root buffers (with child spans in _children tree)
    */
-  drain(): AnySpanBuffer[] {
+  drain(): SpanBuffer<B['logBinding']['logSchema']>[] {
     const buffers = [...this.queue];
     this.queue.length = 0;
     return buffers;

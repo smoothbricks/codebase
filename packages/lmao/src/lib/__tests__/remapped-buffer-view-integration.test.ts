@@ -10,8 +10,10 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+// Must import test-helpers first to initialize timestamp implementation
+import './test-helpers.js';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
-import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
@@ -27,8 +29,8 @@ describe('RemappedBufferView Integration', () => {
       const opContext = defineOpContext({
         logSchema: appSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+
+      const { defineOp } = opContext;
 
       let parentExecuted = false;
       let childExecuted = false;
@@ -45,7 +47,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ parent: true, childResult });
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
       const result = await trace('parent-span', parentOp);
 
       expect(parentExecuted).toBe(true);
@@ -64,8 +66,8 @@ describe('RemappedBufferView Integration', () => {
       const opContext = defineOpContext({
         logSchema: appSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+
+      const { defineOp } = opContext;
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -76,7 +78,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
       await trace('parent-span', parentOp);
 
       expect(rootBuffer).toBeDefined();
@@ -140,8 +142,8 @@ describe('RemappedBufferView Integration', () => {
       const opContext = defineOpContext({
         logSchema: schema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+
+      const { defineOp } = opContext;
 
       const executionOrder: number[] = [];
 
@@ -165,7 +167,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ level: 1 });
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
       const result = await trace('level1-span', level1Op);
 
       expect(result.success).toBe(true);
@@ -183,8 +185,8 @@ describe('RemappedBufferView Integration', () => {
       const opContext = defineOpContext({
         logSchema: schema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+
+      const { defineOp } = opContext;
 
       const taskResults: number[] = [];
 
@@ -218,7 +220,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ done: true });
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
       const result = await trace('parent-span', parentOp);
 
       expect(result.success).toBe(true);
@@ -238,8 +240,8 @@ describe('RemappedBufferView Integration', () => {
       const opContext = defineOpContext({
         logSchema: schema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+
+      const { defineOp } = opContext;
 
       let appExecuted = false;
       let httpExecuted = false;
@@ -257,7 +259,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ app: true });
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
       const result = await trace('app-span', appOp);
 
       expect(result.success).toBe(true);
@@ -275,8 +277,8 @@ describe('RemappedBufferView Integration', () => {
       const opContext = defineOpContext({
         logSchema: schema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
+
+      const { defineOp } = opContext;
 
       const executedSteps: string[] = [];
 
@@ -293,7 +295,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ done: true });
       });
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { trace } = new TestTracer(opContext);
       const result = await trace('parent-span', parentOp);
 
       expect(result.success).toBe(true);

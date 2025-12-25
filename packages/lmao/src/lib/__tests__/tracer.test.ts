@@ -35,13 +35,10 @@ describe('Tracer', () => {
         ctx: { env: null as unknown as TestEnv },
       });
 
-      const tracer = new TestTracer({
-        logBinding: factory.logBinding,
-        ctxDefaults: factory.ctxDefaults,
-      });
+      const tracer = new TestTracer(factory);
       const { trace } = tracer;
 
-      const result = await trace('test-trace', { ctx: { env: { API_KEY: 'test' } } }, async (ctx) => {
+      const result = await trace('test-trace', { env: { API_KEY: 'test' } }, async (ctx) => {
         ctx.tag.userId('user-123');
         ctx.tag.method('GET');
         return { success: true, data: 'hello' };
@@ -56,7 +53,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const tracer = new TestTracer({ logBinding: factory.logBinding });
+      const tracer = new TestTracer(factory);
       const { trace } = tracer;
 
       await trace('trace-1', async (ctx) => {
@@ -84,9 +81,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const tracer = new TestTracer({
-        logBinding: factory.logBinding,
-      });
+      const tracer = new TestTracer(factory);
       const { trace } = tracer;
 
       const error = new Error('test error');
@@ -106,15 +101,42 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const { trace } = new TestTracer({ logBinding: factory.logBinding });
+      const { trace } = new TestTracer(factory);
 
       const customTraceId = createTraceId('custom-trace-id-12345');
 
-      await trace('trace-with-id', { traceId: customTraceId }, async (ctx) => {
+      // biome-ignore lint/suspicious/noExplicitAny: Testing trace_id override
+      await trace('trace-with-id', { trace_id: customTraceId }, async (ctx: any) => {
         // Access the trace ID from buffer
         expect(ctx.buffer.trace_id).toBe(customTraceId);
         return 'done';
       });
+    });
+
+    it('should accept trace_id combined with userCtx overrides', async () => {
+      const factory = defineOpContext({
+        logSchema: testSchema,
+        ctx: {
+          requestId: null as unknown as string, // Required
+          env: null as unknown as TestEnv, // Required
+        },
+      });
+
+      const { trace } = new TestTracer(factory);
+      const customTraceId = createTraceId('combined-override-test');
+
+      // biome-ignore lint/suspicious/noExplicitAny: Testing combined overrides
+      await trace(
+        'combined-overrides',
+        { trace_id: customTraceId, requestId: 'req-123', env: { API_KEY: 'test' } },
+        async (ctx: any) => {
+          // Both trace_id and userCtx properties should be available
+          expect(ctx.buffer.trace_id).toBe(customTraceId);
+          expect(ctx.requestId).toBe('req-123');
+          expect(ctx.env.API_KEY).toBe('test');
+          return 'done';
+        },
+      );
     });
 
     it('should merge ctx defaults with overrides', async () => {
@@ -126,12 +148,9 @@ describe('Tracer', () => {
         },
       });
 
-      const { trace } = new TestTracer({
-        logBinding: factory.logBinding,
-        ctxDefaults: factory.ctxDefaults,
-      });
+      const { trace } = new TestTracer(factory);
 
-      await trace('ctx-test', { ctx: { env: { API_KEY: 'secret' } } }, async (ctx) => {
+      await trace('ctx-test', { env: { API_KEY: 'secret' } }, async (ctx) => {
         // env should be from overrides
         // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
         expect((ctx as any).env.API_KEY).toBe('secret');
@@ -145,10 +164,10 @@ describe('Tracer', () => {
       await trace(
         'ctx-test-2',
         // biome-ignore lint/suspicious/noExplicitAny: Test access with extra override
-        { ctx: { env: { API_KEY: 'key2' }, config: { timeout: 10000 } } as any },
-        async (ctx) => {
-          // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
-          expect((ctx as any).config.timeout).toBe(10000);
+        { env: { API_KEY: 'key2' }, config: { timeout: 10000 } } as any,
+        // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
+        async (ctx: any) => {
+          expect(ctx.config.timeout).toBe(10000);
           return 'done';
         },
       );
@@ -161,7 +180,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const { trace } = new TestTracer({ logBinding: factory.logBinding });
+      const { trace } = new TestTracer(factory);
 
       const result = await trace('simple', async () => {
         return 42;
@@ -176,12 +195,9 @@ describe('Tracer', () => {
         ctx: { value: 0 },
       });
 
-      const { trace } = new TestTracer({
-        logBinding: factory.logBinding,
-        ctxDefaults: factory.ctxDefaults,
-      });
+      const { trace } = new TestTracer(factory);
 
-      const result = await trace('with-overrides', { ctx: { value: 100 } }, async (ctx) => {
+      const result = await trace('with-overrides', { value: 100 }, async (ctx) => {
         // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
         return (ctx as any).value;
       });

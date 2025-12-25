@@ -14,6 +14,7 @@ setTimestampNanosImpl(getTimestampNanos);
 
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { createOpMetadata, DEFAULT_METADATA } from '../opContext/defineOp.js';
 import type {
   ColumnMapping,
@@ -33,16 +34,15 @@ import { createTraceId, type TraceId, type TraceRoot } from '../traceId.js';
 import { NoOpTracer } from '../tracers/NoOpTracer.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
 
-// Create a minimal LogSchema for the NoOpTracer (it doesn't actually use it)
+// Create a minimal OpContextBinding for the NoOpTracer (it doesn't actually use it)
 const minimalSchema = new LogSchema(mergeWithSystemSchema({}));
+const minimalOpContext = defineOpContext({ logSchema: minimalSchema });
 
 /**
  * Shared NoOpTracer instance for tests that create buffers directly.
  * Cast to TraceRoot['tracer'] since that's what createSpanBuffer expects.
  */
-export const TEST_TRACER = new NoOpTracer({
-  logBinding: { logSchema: minimalSchema },
-}) as unknown as TraceRoot['tracer'];
+export const TEST_TRACER = new NoOpTracer(minimalOpContext) as unknown as TraceRoot['tracer'];
 
 /**
  * Create a TraceRoot for testing.

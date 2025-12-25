@@ -23,20 +23,20 @@ const testSchema = defineLogSchema({
 describe('NoOpTracer', () => {
   describe('instantiation', () => {
     it('should create a NoOpTracer instance', () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const tracer = new NoOpTracer({ logBinding });
+      const tracer = new NoOpTracer(ctx);
       expect(tracer).toBeDefined();
       expect(tracer.trace).toBeDefined();
       expect(tracer.flush).toBeDefined();
     });
 
     it('should allow destructuring trace and flush', () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace, flush } = new NoOpTracer({ logBinding });
+      const { trace, flush } = new NoOpTracer(ctx);
       expect(typeof trace).toBe('function');
       expect(typeof flush).toBe('function');
     });
@@ -44,10 +44,10 @@ describe('NoOpTracer', () => {
 
   describe('trace execution', () => {
     it('should execute functions and return result', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { trace } = new NoOpTracer(ctx);
 
       const result = await trace('test-trace', async (ctx) => {
         ctx.tag.userId('user-123');
@@ -58,10 +58,10 @@ describe('NoOpTracer', () => {
     });
 
     it('should execute async functions and return result', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { trace } = new NoOpTracer(ctx);
 
       const result = await trace('test-trace', async (ctx) => {
         await Promise.resolve();
@@ -73,10 +73,10 @@ describe('NoOpTracer', () => {
     });
 
     it('should propagate exceptions from traced functions', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { trace } = new NoOpTracer(ctx);
 
       await expect(
         trace('test-trace', async () => {
@@ -86,10 +86,11 @@ describe('NoOpTracer', () => {
     });
 
     it('should support nested spans', async () => {
-      const { logBinding, defineOp } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { defineOp } = ctx;
+      const { trace } = new NoOpTracer(ctx);
 
       const childOp = defineOp('child', (ctx) => {
         return ctx.ok('child-done');
@@ -108,20 +109,20 @@ describe('NoOpTracer', () => {
 
   describe('flush', () => {
     it('should be a no-op that returns resolved promise', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { flush } = new NoOpTracer({ logBinding });
+      const { flush } = new NoOpTracer(ctx);
 
       // Should not throw, should resolve immediately
       await expect(flush()).resolves.toBeUndefined();
     });
 
     it('should clear pending buffers without processing', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace, flush } = new NoOpTracer({ logBinding });
+      const { trace, flush } = new NoOpTracer(ctx);
 
       // Create a trace
       await trace('test-trace', async () => {
@@ -135,10 +136,11 @@ describe('NoOpTracer', () => {
 
   describe('lifecycle hooks', () => {
     it('should not throw when hooks are called (they are no-ops)', async () => {
-      const { logBinding, defineOp } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { defineOp } = ctx;
+      const { trace } = new NoOpTracer(ctx);
 
       const childOp1 = defineOp('c1', (c) => c.ok(1));
       const childOp2 = defineOp('c2', (c) => c.ok(2));
@@ -161,10 +163,10 @@ describe('NoOpTracer', () => {
     it('should work for tests that do not need trace inspection', async () => {
       // This demonstrates using NoOpTracer for testing business logic
       // without caring about trace output
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { trace } = new NoOpTracer(ctx);
 
       const result = await trace('math-test', async () => {
         return 2 + 2;
@@ -174,10 +176,11 @@ describe('NoOpTracer', () => {
     });
 
     it('should support ctx.ok() for successful results', async () => {
-      const { logBinding, defineOp } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { defineOp } = ctx;
+      const { trace } = new NoOpTracer(ctx);
 
       const successOp = defineOp('success', (ctx) => {
         return ctx.ok({ status: 'success' });
@@ -189,10 +192,11 @@ describe('NoOpTracer', () => {
     });
 
     it('should support ctx.err() for error results', async () => {
-      const { logBinding, defineOp } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer({ logBinding });
+      const { defineOp } = ctx;
+      const { trace } = new NoOpTracer(ctx);
 
       const failingOp = defineOp('failing', (ctx) => {
         return ctx.err('VALIDATION_ERROR', { field: 'email' });

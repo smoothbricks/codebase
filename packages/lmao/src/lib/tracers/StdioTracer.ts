@@ -12,8 +12,8 @@
  *
  * @example
  * ```typescript
- * const { logBinding } = defineOpContext({ logSchema: mySchema });
- * const { trace } = new StdioTracer({ logBinding });
+ * const ctx = defineOpContext({ logSchema: mySchema });
+ * const { trace } = new StdioTracer(ctx);
  *
  * await trace('fetch-user', fetchOp);
  *
@@ -25,10 +25,10 @@
  * ```
  */
 
-import type { OpContext } from '../opContext/types.js';
+import type { OpContextBinding } from '../opContext/types.js';
 import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from '../schema/systemSchema.js';
 import type { TraceId } from '../traceId.js';
-import type { TracerConfig } from '../tracer.js';
+import type { TracerOptions } from '../tracer.js';
 import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
 
@@ -119,6 +119,22 @@ function getStatus(entryType: number): string {
 }
 
 // ============================================================================
+// StdioTracer Options
+// ============================================================================
+
+/**
+ * Options for StdioTracer
+ */
+export interface StdioTracerOptions extends TracerOptions {
+  /** Output stream (defaults to process.stdout) */
+  out?: NodeJS.WriteStream;
+  /** Error stream (defaults to process.stderr) */
+  err?: NodeJS.WriteStream;
+  /** Enable ANSI colors (defaults to true) */
+  colorEnabled?: boolean;
+}
+
+// ============================================================================
 // StdioTracer
 // ============================================================================
 
@@ -132,20 +148,22 @@ function getStatus(entryType: number): string {
  * - Human-readable timestamps and durations
  * - Exceptions go to stderr
  */
-export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> {
+export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
    * Per-trace indent levels for concurrent-safe nesting.
    * Key is trace_id string representation, value is current indent level.
    */
   private readonly indents = new Map<string, number>();
 
-  constructor(
-    config: TracerConfig<Ctx>,
-    private readonly out: NodeJS.WriteStream = process.stdout,
-    private readonly err: NodeJS.WriteStream = process.stderr,
-    private readonly colorEnabled: boolean = true,
-  ) {
-    super(config);
+  private readonly out: NodeJS.WriteStream;
+  private readonly err: NodeJS.WriteStream;
+  private readonly colorEnabled: boolean;
+
+  constructor(binding: B, options?: StdioTracerOptions) {
+    super(binding, options);
+    this.out = options?.out ?? process.stdout;
+    this.err = options?.err ?? process.stderr;
+    this.colorEnabled = options?.colorEnabled ?? true;
   }
 
   // --------------------------------------------------------------------------
@@ -188,7 +206,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
   // Lifecycle Hooks
   // --------------------------------------------------------------------------
 
-  onTraceStart(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceStart(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     const traceId = rootBuffer.trace_id;
     const name = rootBuffer.message_values[0];
     const ts = formatTimestamp(rootBuffer.timestamp[0]);
@@ -197,7 +215,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     this.incrementIndent(traceId);
   }
 
-  onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     const traceId = rootBuffer.trace_id;
     this.decrementIndent(traceId);
 
@@ -219,7 +237,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     }
   }
 
-  onSpanStart(childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanStart(childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     const traceId = childBuffer.trace_id;
     const indent = this.getIndent(traceId);
     const name = childBuffer.message_values[0];
@@ -229,7 +247,7 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     this.incrementIndent(traceId);
   }
 
-  onSpanEnd(childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanEnd(childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     const traceId = childBuffer.trace_id;
     this.decrementIndent(traceId);
     const indent = this.getIndent(traceId);
@@ -252,11 +270,11 @@ export class StdioTracer<Ctx extends OpContext = OpContext> extends Tracer<Ctx> 
     }
   }
 
-  onStatsWillResetFor(buffer: SpanBuffer<Ctx['logSchema']>): void {
-    const stats = buffer._stats;
+  onStatsWillResetFor(_buffer: SpanBuffer<B['logBinding']['logSchema']>): void {
+    const stats = _buffer._stats;
     const overflowRatio = stats.totalWrites > 0 ? ((stats.overflowWrites / stats.totalWrites) * 100).toFixed(1) : '0.0';
-    const traceId = buffer.trace_id;
-    const ts = formatTimestamp(buffer.timestamp[0]);
+    const traceId = _buffer.trace_id;
+    const ts = formatTimestamp(_buffer.timestamp[0]);
 
     this.out.write(
       `[${ts}] ${this.color(traceId)}[${traceId}]${this.reset()} ` +

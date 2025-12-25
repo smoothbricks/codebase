@@ -14,7 +14,7 @@ import { describe, expect, it } from 'bun:test';
 // Must import test-helpers first to initialize timestamp implementation
 import './test-helpers.js';
 import { S } from '@smoothbricks/arrow-builder';
-import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 
@@ -32,16 +32,8 @@ const testFactory = defineOpContext({
     requestId: null as unknown as string, // Required - no default
     userId: undefined as string | undefined, // Optional - has default
   },
-});
-
-// Extract OpContext type for proper Tracer typing
-type TestOpContext = OpContextOf<typeof testFactory>;
-
-// Create a tracer for testing with proper type
-const { trace: testTrace } = new TestTracer<TestOpContext>({
-  logBinding: testFactory.logBinding,
-  ctxDefaults: testFactory.ctxDefaults,
-});
+}); // Create a tracer for testing with proper type
+const { trace: testTrace } = new TestTracer(testFactory);
 
 // =============================================================================
 // Type Enforcement Tests
@@ -53,13 +45,12 @@ describe('Tracer.trace Type Enforcement', () => {
     const result = await testTrace(
       'test-span',
       {
-        ctx: {
-          env: { apiTimeout: 5000, region: 'us-east-1' },
-          requestId: 'req-123',
-          // userId is optional, can be omitted
-        },
+        env: { apiTimeout: 5000, region: 'us-east-1' },
+        requestId: 'req-123',
+        // userId is optional, can be omitted
       },
-      (ctx) => {
+      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
+      (ctx: any) => {
         expect(ctx).toBeDefined();
         expect(ctx.env.region).toBe('us-east-1');
         expect(ctx.requestId).toBe('req-123');
@@ -75,13 +66,12 @@ describe('Tracer.trace Type Enforcement', () => {
     const result = await testTrace(
       'test-span',
       {
-        ctx: {
-          env: { apiTimeout: 5000, region: 'us-east-1' },
-          requestId: 'req-123',
-          userId: 'user-456', // Optional property provided
-        },
+        env: { apiTimeout: 5000, region: 'us-east-1' },
+        requestId: 'req-123',
+        userId: 'user-456', // Optional property provided
       },
-      (ctx) => {
+      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
+      (ctx: any) => {
         expect(ctx).toBeDefined();
         expect(ctx.userId).toBe('user-456');
         return 'done';
@@ -100,12 +90,11 @@ describe('Tracer.trace Type Enforcement', () => {
     const result = await testTrace(
       'test-span',
       {
-        ctx: {
-          env: { apiTimeout: 5000, region: 'us-east-1' },
-          requestId: 'req-123',
-        },
+        env: { apiTimeout: 5000, region: 'us-east-1' },
+        requestId: 'req-123',
       },
-      (ctx) => {
+      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
+      (ctx: any) => {
         expect(ctx.env).toEqual({ apiTimeout: 5000, region: 'us-east-1' });
         expect(ctx.requestId).toBe('req-123');
         expect(ctx.userId).toBeUndefined();
@@ -131,22 +120,17 @@ describe('Context Type Flow Through Factory', () => {
       },
     });
 
-    type CtxType = OpContextOf<typeof factory>;
-    const { trace } = new TestTracer<CtxType>({
-      logBinding: factory.logBinding,
-      ctxDefaults: factory.ctxDefaults,
-    });
+    const { trace } = new TestTracer(factory);
 
     // Type should be preserved - required is required, optional is optional
     const result = await trace(
       'test-span',
       {
-        ctx: {
-          required: 'value',
-          // optional can be omitted
-        },
+        required: 'value',
+        // optional can be omitted
       },
-      (ctx) => {
+      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
+      (ctx: any) => {
         expect(ctx.required).toBe('value');
         return 'done';
       },
@@ -161,10 +145,7 @@ describe('Context Type Flow Through Factory', () => {
       logSchema: defineLogSchema({}),
     });
 
-    type CtxType = OpContextOf<typeof factory>;
-    const { trace } = new TestTracer<CtxType>({
-      logBinding: factory.logBinding,
-    });
+    const { trace } = new TestTracer(factory);
 
     // Should accept empty options or no options
     const result = await trace('test-span', (ctx) => {

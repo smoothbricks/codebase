@@ -9,14 +9,15 @@
  *
  * @example
  * ```typescript
- * const { trace } = new NoOpTracer({ logBinding });
+ * const ctx = defineOpContext({ logSchema });
+ * const { trace } = new NoOpTracer(ctx);
  *
  * // Trace executes, result returned, no side effects
  * const result = await trace('fetch', fetchOp);
  * ```
  */
 
-import type { OpContext } from '../opContext/types.js';
+import type { OpContextBinding } from '../opContext/types.js';
 import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
 
@@ -26,41 +27,41 @@ import type { SpanBuffer } from '../types.js';
  * All lifecycle hooks are empty - no processing, no output.
  * Useful for testing and measuring op execution cost without trace overhead.
  *
- * @typeParam Ctx - OpContext type (logSchema, flags, deps, userCtx)
+ * @typeParam B - OpContextBinding type
  */
-export class NoOpTracer<Ctx extends OpContext> extends Tracer<Ctx> {
+export class NoOpTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
    * No-op hook for trace start.
    */
-  onTraceStart(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceStart(_rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 
   /**
    * No-op hook for trace end.
    */
-  onTraceEnd(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceEnd(_rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 
   /**
    * No-op hook for span start.
    */
-  onSpanStart(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanStart(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 
   /**
    * No-op hook for span end.
    */
-  onSpanEnd(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanEnd(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 
   /**
    * No-op hook for stats reset.
    */
-  onStatsWillResetFor(_buffer: SpanBuffer<Ctx['logSchema']>): void {
+  onStatsWillResetFor(_buffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op
   }
 }

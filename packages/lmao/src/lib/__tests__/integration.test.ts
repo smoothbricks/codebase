@@ -12,7 +12,7 @@
 import { describe, expect, it } from 'bun:test';
 // Must import test-helpers first to initialize timestamp implementation
 import './test-helpers.js';
-import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
@@ -65,8 +65,8 @@ describe('Schema Integration Patterns', () => {
       env: undefined as EnvConfig | undefined,
     },
   });
-  type Ctx = OpContextOf<typeof opContext>;
-  const { defineOp, logBinding, ctxDefaults } = opContext;
+
+  const { defineOp } = opContext;
 
   // Create an op context WITH feature flags
   const opContextWithFlags = defineOpContext({
@@ -78,15 +78,11 @@ describe('Schema Integration Patterns', () => {
       env: undefined as EnvConfig | undefined,
     },
   });
-  type CtxWithFlags = OpContextOf<typeof opContextWithFlags>;
-  const {
-    defineOp: defineOpWithFlags,
-    logBinding: logBindingWithFlags,
-    ctxDefaults: ctxDefaultsWithFlags,
-  } = opContextWithFlags;
+
+  const { defineOp: defineOpWithFlags } = opContextWithFlags;
 
   // Create a flag evaluator with test values
-  const flagEvaluator = new InMemoryFlagEvaluator<CtxWithFlags>(featureFlags.schema, {
+  const flagEvaluator = new InMemoryFlagEvaluator(featureFlags.schema, {
     advancedValidation: true,
     maxRetries: 5,
     experimentalFeature: false,
@@ -94,15 +90,12 @@ describe('Schema Integration Patterns', () => {
 
   describe('Tracer API', () => {
     it('should create trace context with environment via Tracer', async () => {
-      const { trace } = new TestTracer<Ctx>({
-        logBinding,
-        ctxDefaults,
-      });
+      const { trace } = new TestTracer(opContext);
 
       // Use function overload to test user context properties
       const result = await trace(
         'check-ctx',
-        { ctx: { requestId: 'req-123', userId: 'user-456', env: environmentConfig } },
+        { requestId: 'req-123', userId: 'user-456', env: environmentConfig },
         // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties on ctx
         async (ctx: any) => {
           expect(ctx.requestId).toBe('req-123');
@@ -117,14 +110,11 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should provide access to environment config as plain properties', async () => {
-      const { trace } = new TestTracer<Ctx>({
-        logBinding,
-        ctxDefaults,
-      });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace(
         'check-env',
-        { ctx: { requestId: 'req-123', env: environmentConfig } },
+        { requestId: 'req-123', env: environmentConfig },
         // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties on ctx
         async (ctx: any) => {
           expect(ctx.env?.awsRegion).toBe('us-east-1');
@@ -163,7 +153,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -178,13 +168,9 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ checked: true });
       });
 
-      const { trace } = new TestTracer<CtxWithFlags>({
-        logBinding: logBindingWithFlags,
-        flagEvaluator,
-        ctxDefaults: ctxDefaultsWithFlags,
-      });
+      const { trace } = new TestTracer(opContextWithFlags, { flagEvaluator });
 
-      const result = await trace('check-ff', { ctx: { requestId: 'req-123', env: environmentConfig } }, testOp);
+      const result = await trace('check-ff', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
     });
 
@@ -204,13 +190,9 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: true });
       });
 
-      const { trace } = new TestTracer<CtxWithFlags>({
-        logBinding: logBindingWithFlags,
-        flagEvaluator,
-        ctxDefaults: ctxDefaultsWithFlags,
-      });
+      const { trace } = new TestTracer(opContextWithFlags, { flagEvaluator });
 
-      const result = await trace('test-ff', { ctx: { requestId: 'req-123', env: environmentConfig } }, testOp);
+      const result = await trace('test-ff', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
     });
 
@@ -226,13 +208,9 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ experimental: false });
       });
 
-      const { trace } = new TestTracer<CtxWithFlags>({
-        logBinding: logBindingWithFlags,
-        flagEvaluator,
-        ctxDefaults: ctxDefaultsWithFlags,
-      });
+      const { trace } = new TestTracer(opContextWithFlags, { flagEvaluator });
 
-      const result = await trace('test-async-ff', { ctx: { requestId: 'req-123', env: environmentConfig } }, testOp);
+      const result = await trace('test-async-ff', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
     });
 
@@ -255,13 +233,9 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ tracked: true });
       });
 
-      const { trace } = new TestTracer<CtxWithFlags>({
-        logBinding: logBindingWithFlags,
-        flagEvaluator,
-        ctxDefaults: ctxDefaultsWithFlags,
-      });
+      const { trace } = new TestTracer(opContextWithFlags, { flagEvaluator });
 
-      const result = await trace('test-ff-tracking', { ctx: { requestId: 'req-123', env: environmentConfig } }, testOp);
+      const result = await trace('test-ff-tracking', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
     });
 
@@ -285,17 +259,9 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: !!ctx.ff.advancedValidation });
       });
 
-      const { trace } = new TestTracer<CtxWithFlags>({
-        logBinding: logBindingWithFlags,
-        flagEvaluator,
-        ctxDefaults: ctxDefaultsWithFlags,
-      });
+      const { trace } = new TestTracer(opContextWithFlags, { flagEvaluator });
 
-      const result = await trace(
-        'conditional-logic',
-        { ctx: { requestId: 'req-123', env: environmentConfig } },
-        testOp,
-      );
+      const result = await trace('conditional-logic', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
       if (result.success) {
         expect(result.value.validated).toBe(true);
@@ -324,7 +290,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace('test-chaining', testOp);
       expect(result.success).toBe(true);
@@ -353,7 +319,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace('test-with-chaining', testOp);
       expect(result.success).toBe(true);
@@ -373,15 +339,12 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, amount });
       });
 
-      const { trace } = new TestTracer<Ctx>({
-        logBinding,
-        ctxDefaults,
-      });
+      const { trace } = new TestTracer(opContext);
 
       // Use trace_fn to wrap the op invocation with args
       const result = await trace(
         'process-order',
-        { ctx: { requestId: 'req-003', userId: 'user-003', env: environmentConfig } },
+        { requestId: 'req-003', userId: 'user-003', env: environmentConfig },
         // biome-ignore lint/suspicious/noExplicitAny: Testing op with additional args
         async (ctx) => (testOp as any).fn(ctx, 'order-789', 149.99),
       );
@@ -415,7 +378,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -434,7 +397,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -450,7 +413,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding });
+      const { trace } = new TestTracer(opContext);
 
       const successResult = await trace('success-task', successOp);
       expect(successResult.success).toBe(true);
@@ -487,7 +450,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer<Ctx>({ logBinding });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace('parent-task', testOp);
       expect(result.success).toBe(true);
@@ -509,14 +472,11 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, processed: true });
       });
 
-      const { trace } = new TestTracer<Ctx>({
-        logBinding,
-        ctxDefaults,
-      });
+      const { trace } = new TestTracer(opContext);
 
       const result = await trace(
         'process-order',
-        { ctx: { requestId: 'req-999', userId: 'user-123', env: environmentConfig } },
+        { requestId: 'req-999', userId: 'user-123', env: environmentConfig },
         // biome-ignore lint/suspicious/noExplicitAny: Testing op with additional args
         async (ctx) => (processOrder as any).fn(ctx, 'order-456', 99.99),
       );
@@ -570,17 +530,13 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ id: 'user-123', ...userData });
       });
 
-      const { trace } = new TestTracer<CtxWithFlags>({
-        logBinding: logBindingWithFlags,
-        flagEvaluator,
-        ctxDefaults: ctxDefaultsWithFlags,
-      });
+      const { trace } = new TestTracer(opContextWithFlags, { flagEvaluator });
 
       const result = await trace(
         'create-user',
-        { ctx: { requestId: 'req-123', userId: 'user-456', env: environmentConfig } },
-        // biome-ignore lint/suspicious/noExplicitAny: Testing op with additional args
+        { requestId: 'req-123', userId: 'user-456', env: environmentConfig },
         async (ctx) =>
+          // biome-ignore lint/suspicious/noExplicitAny: Testing op with additional args
           (createUser as any).fn(ctx, {
             email: 'test@example.com',
             name: 'Test User',
@@ -613,14 +569,11 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new TestTracer<Ctx>({
-        logBinding,
-        ctxDefaults,
-      });
+      const { trace } = new TestTracer(opContext);
 
       await trace(
         'parent-task',
-        { ctx: { requestId: 'req-inherit-test', userId: 'user-inherit-test', env: environmentConfig } },
+        { requestId: 'req-inherit-test', userId: 'user-inherit-test', env: environmentConfig },
         testOp,
       );
 
@@ -642,12 +595,9 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new TestTracer<Ctx>({
-        logBinding,
-        ctxDefaults,
-      });
+      const { trace } = new TestTracer(opContext);
 
-      await trace('parent-task', { ctx: { requestId: 'req-env-test', env: environmentConfig } }, testOp);
+      await trace('parent-task', { requestId: 'req-env-test', env: environmentConfig }, testOp);
 
       // Verify env is same object reference (not copied)
       expect(parentEnv).toBe(environmentConfig);

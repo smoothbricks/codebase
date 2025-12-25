@@ -3,7 +3,7 @@ import '../../__tests__/test-helpers.js';
 
 import { describe, expect, it } from 'bun:test';
 import { convertSpanTreeToArrowTable } from '../../convertToArrow.js';
-import { defineLogSchema, defineOpContext, type OpContextOf, S } from '../../defineOpContext.js';
+import { defineLogSchema, defineOpContext, S } from '../../defineOpContext.js';
 import { ArrayQueueTracer } from '../ArrayQueueTracer.js';
 
 describe('ArrayQueueTracer', () => {
@@ -11,20 +11,19 @@ describe('ArrayQueueTracer', () => {
     userId: S.category(),
   });
 
-  const opContext = defineOpContext({
+  const ctx = defineOpContext({
     logSchema: testSchema,
   });
-  type Ctx = OpContextOf<typeof opContext>;
-  const { logBinding, defineOp } = opContext;
+  const { defineOp } = ctx;
 
   describe('queue accumulation', () => {
     it('should start with empty queue', () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       expect(tracer.queue).toHaveLength(0);
     });
 
     it('should queue root buffer after trace completes', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -35,7 +34,7 @@ describe('ArrayQueueTracer', () => {
     });
 
     it('should queue multiple traces in order', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -51,7 +50,7 @@ describe('ArrayQueueTracer', () => {
     });
 
     it('should queue buffer even if trace throws', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const failOp = defineOp('fail', async () => {
@@ -67,7 +66,7 @@ describe('ArrayQueueTracer', () => {
 
   describe('drain()', () => {
     it('should return all queued buffers', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -83,7 +82,7 @@ describe('ArrayQueueTracer', () => {
     });
 
     it('should clear queue after drain', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -97,7 +96,7 @@ describe('ArrayQueueTracer', () => {
     });
 
     it('should return empty array when queue is empty', () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
 
       const drained = tracer.drain();
 
@@ -106,7 +105,7 @@ describe('ArrayQueueTracer', () => {
     });
 
     it('should allow new traces after drain', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -120,7 +119,7 @@ describe('ArrayQueueTracer', () => {
     });
 
     it('should return independent array (not reference to internal queue)', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -139,7 +138,7 @@ describe('ArrayQueueTracer', () => {
 
   describe('production pattern: batch processing', () => {
     it('should support batch-then-process pattern', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -165,7 +164,7 @@ describe('ArrayQueueTracer', () => {
 
   describe('child spans', () => {
     it('should include child spans in queued buffer tree', async () => {
-      const tracer = new ArrayQueueTracer<Ctx>({ logBinding });
+      const tracer = new ArrayQueueTracer(ctx);
       const { trace } = tracer;
 
       const childOp = defineOp('child', (ctx) => ctx.ok('c'));

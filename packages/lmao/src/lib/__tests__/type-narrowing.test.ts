@@ -4,7 +4,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
@@ -22,14 +22,11 @@ const opContext = defineOpContext({
   },
 });
 
-// Extract the OpContext type for use with Tracer
-type TestOpContext = OpContextOf<typeof opContext>;
+const { defineOp } = opContext;
 
-const { defineOp, logBinding } = opContext;
-
-// Create a properly typed tracer
+// Create a properly typed tracer - new API passes opContext directly
 function createTestTracer() {
-  return new TestTracer<TestOpContext>({ logBinding });
+  return new TestTracer(opContext);
 }
 
 describe('Type Narrowing with FluentResult', () => {

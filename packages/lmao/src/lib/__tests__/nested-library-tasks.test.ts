@@ -12,7 +12,7 @@
  *
  * ## Migration Note
  * The old `createTrace()` function has been removed from `defineOpContext()`.
- * Tests now use the Tracer class with `logBinding` from `defineOpContext()`.
+ * Tests now use the Tracer class directly with the context from `defineOpContext()`.
  * For nested ops with different schemas, use a combined schema or inline functions.
  */
 
@@ -20,7 +20,7 @@ import { describe, expect, it } from 'bun:test';
 // Must import test-helpers first to initialize timestamp implementation
 import './test-helpers.js';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
-import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
@@ -45,10 +45,9 @@ describe('Nested Library Tasks', () => {
       const opContext = defineOpContext({
         logSchema: sharedSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { defineOp } = opContext;
+      const { trace } = new TestTracer(opContext);
 
       // Capture buffers for verification
       let rootBuffer: AnySpanBuffer | undefined;
@@ -147,10 +146,9 @@ describe('Nested Library Tasks', () => {
       const opContext = defineOpContext({
         logSchema: sharedSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { defineOp } = opContext;
+      const { trace } = new TestTracer(opContext);
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -331,12 +329,11 @@ describe('Nested Library Tasks', () => {
         auth: authOps.prefix('auth'),
       },
     });
-    type AppCtx = OpContextOf<typeof appContext>;
 
     it('should compose 4 separate library contexts with prefixed columns', async () => {
-      const { defineOp, logBinding, ctxDefaults, deps } = appContext;
+      const { defineOp } = appContext;
 
-      const { trace } = new TestTracer<AppCtx>({ logBinding, ctxDefaults, deps });
+      const { trace } = new TestTracer(appContext);
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -386,9 +383,9 @@ describe('Nested Library Tasks', () => {
     });
 
     it('should maintain correct tree structure with 4 levels of library tasks', async () => {
-      const { defineOp, logBinding, ctxDefaults, deps } = appContext;
+      const { defineOp } = appContext;
 
-      const { trace } = new TestTracer<AppCtx>({ logBinding, ctxDefaults, deps });
+      const { trace } = new TestTracer(appContext);
 
       let appBuffer: AnySpanBuffer | undefined;
 
@@ -452,10 +449,9 @@ describe('Nested Library Tasks', () => {
       const opContext = defineOpContext({
         logSchema: combinedSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { defineOp } = opContext;
+      const { trace } = new TestTracer(opContext);
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -548,10 +544,9 @@ describe('Nested Library Tasks', () => {
       const opContext = defineOpContext({
         logSchema: combinedSchema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { defineOp } = opContext;
+      const { trace } = new TestTracer(opContext);
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -632,10 +627,9 @@ describe('Nested Library Tasks', () => {
       const opContext = defineOpContext({
         logSchema: schema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { defineOp } = opContext;
+      const { trace } = new TestTracer(opContext);
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -702,10 +696,9 @@ describe('Nested Library Tasks', () => {
       const opContext = defineOpContext({
         logSchema: schema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { defineOp } = opContext;
+      const { trace } = new TestTracer(opContext);
 
       let rootBuffer: AnySpanBuffer | undefined;
       let order = 0;
@@ -769,10 +762,9 @@ describe('Nested Library Tasks', () => {
       const opContext = defineOpContext({
         logSchema: schema,
       });
-      type Ctx = OpContextOf<typeof opContext>;
-      const { defineOp, logBinding, ctxDefaults } = opContext;
 
-      const { trace } = new TestTracer<Ctx>({ logBinding, ctxDefaults });
+      const { defineOp } = opContext;
+      const { trace } = new TestTracer(opContext);
 
       let rootBuffer: AnySpanBuffer | undefined;
 

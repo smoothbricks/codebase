@@ -6,7 +6,7 @@ import {
   maskingTransforms,
 } from '@smoothbricks/arrow-builder';
 import type { SpanBuffer } from '@smoothbricks/lmao';
-import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, defineOpContext, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';
@@ -357,9 +357,8 @@ describe('Buffer Integration', () => {
       // SpanBuffer is just storage - SpanLogger writes timestamps.
       // Use the full system (Tracer + SpanLogger) to verify entries have increasing timestamps.
       const schema = createTestSchema({ userId: S.category() });
-      const logBinding = { logSchema: schema };
-
-      const { trace } = new TestTracer({ logBinding });
+      const ctx = defineOpContext({ logSchema: schema });
+      const { trace } = new TestTracer(ctx);
 
       let capturedBuffer: SpanBuffer<typeof schema> | undefined;
       await trace('test', async (ctx) => {

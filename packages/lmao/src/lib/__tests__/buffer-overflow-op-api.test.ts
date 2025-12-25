@@ -18,9 +18,11 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+// Must import test-helpers first to initialize timestamp implementation
+import './test-helpers.js';
 import fc from 'fast-check';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
-import { defineOpContext, type OpContextOf } from '../defineOpContext.js';
+import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
@@ -39,21 +41,18 @@ const testSchema = defineLogSchema({
 });
 
 // Create op context factory
-const opContext = defineOpContext({
+const ctx = defineOpContext({
   logSchema: testSchema,
   ctx: {} as Record<string, never>,
 });
 
-// Extract the OpContext type for use with Tracer
-type TestOpContext = OpContextOf<typeof opContext>;
-
-const { defineOp, logBinding, ctxDefaults } = opContext;
+const { defineOp } = ctx;
 
 /**
  * Helper to create a properly typed tracer for tests
  */
 function createTestTracer() {
-  return new TestTracer<TestOpContext>({ logBinding, ctxDefaults });
+  return new TestTracer(ctx);
 }
 
 /**

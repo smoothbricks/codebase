@@ -29,15 +29,13 @@ const testSchema = defineLogSchema({
 describe('Sync/Async Trace Execution', () => {
   describe('Sync trace execution', () => {
     it('should write span-ok immediately for sync function', () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       // Execute sync function - trace() returns sync result
       const result = tracer.trace('sync-trace', (ctx) => {
@@ -63,15 +61,13 @@ describe('Sync/Async Trace Execution', () => {
     });
 
     it('should write span-exception immediately for sync function that throws', () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       const testError = new Error('Sync error');
 
@@ -103,16 +99,14 @@ describe('Sync/Async Trace Execution', () => {
 
   describe('Async trace execution', () => {
     it('should write span-ok after Promise resolves', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
       let promiseResolved = false;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       // Execute async function - trace() returns Promise
       const resultPromise = tracer.trace('async-trace', async (ctx) => {
@@ -155,16 +149,14 @@ describe('Sync/Async Trace Execution', () => {
     });
 
     it('should write span-exception after Promise rejects', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
       let promiseRejected = false;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       const testError = new Error('Async error');
 
@@ -207,15 +199,13 @@ describe('Sync/Async Trace Execution', () => {
 
   describe('Mixed sync/async traces', () => {
     it('should handle multiple sync traces correctly', () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       // Execute multiple sync traces
       const result1 = tracer.trace('sync-1', (ctx) => {
@@ -244,15 +234,13 @@ describe('Sync/Async Trace Execution', () => {
     });
 
     it('should handle multiple async traces correctly', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       // Execute multiple async traces in parallel
       const promise1 = tracer.trace('async-1', async (ctx) => {
@@ -289,15 +277,13 @@ describe('Sync/Async Trace Execution', () => {
     });
 
     it('should handle interleaved sync and async traces', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       // Sync trace
       const syncResult = tracer.trace('sync', (ctx) => {
@@ -339,15 +325,13 @@ describe('Sync/Async Trace Execution', () => {
 
   describe('Trace with tags and logging', () => {
     it('should support tags in sync trace', () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       const result = tracer.trace('sync-with-tags', (ctx) => {
         capturedBuffer = ctx.buffer;
@@ -366,15 +350,13 @@ describe('Sync/Async Trace Execution', () => {
     });
 
     it('should support tags in async trace', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       const result = await tracer.trace('async-with-tags', async (ctx) => {
         capturedBuffer = ctx.buffer;
@@ -395,15 +377,13 @@ describe('Sync/Async Trace Execution', () => {
     });
 
     it('should support logging in sync trace', () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       const result = tracer.trace('sync-with-logging', (ctx) => {
         capturedBuffer = ctx.buffer;
@@ -424,15 +404,13 @@ describe('Sync/Async Trace Execution', () => {
     });
 
     it('should support logging in async trace', async () => {
-      const { logBinding } = defineOpContext({
+      const ctx = defineOpContext({
         logSchema: testSchema,
       });
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer({
-        logBinding,
-      });
+      const tracer = new TestTracer(ctx);
 
       const result = await tracer.trace('async-with-logging', async (ctx) => {
         capturedBuffer = ctx.buffer;

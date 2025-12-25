@@ -10,7 +10,7 @@ import '../../__tests__/test-helpers.js';
 
 import { describe, expect, it } from 'bun:test';
 import { Writable } from 'node:stream';
-import { defineOpContext, type OpContextOf } from '../../defineOpContext.js';
+import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { StdioTracer } from '../StdioTracer.js';
@@ -34,18 +34,17 @@ describe('StdioTracer', () => {
     userId: S.category(),
   });
 
-  const opContext = defineOpContext({
+  const ctx = defineOpContext({
     logSchema: testSchema,
   });
-  type Ctx = OpContextOf<typeof opContext>;
-  const { logBinding, defineOp } = opContext;
+  const { defineOp } = ctx;
 
   describe('basic output', () => {
     it('should write trace start and end to stdout', async () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -60,7 +59,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -74,7 +73,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -90,7 +89,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const childOp = defineOp('child', (ctx) => ctx.ok('c'));
@@ -114,7 +113,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const childOp = defineOp('child', (ctx) => ctx.ok('c'));
@@ -139,7 +138,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -152,7 +151,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.err('CODE', 'error'));
@@ -165,7 +164,7 @@ describe('StdioTracer', () => {
       const { stream: out, output: stdout } = createMockStream();
       const { stream: err, output: stderr } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const failOp = defineOp('fail', async () => {
@@ -186,7 +185,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', async (ctx) => {
@@ -206,7 +205,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const childOp = defineOp('child', async (ctx) => {
@@ -235,7 +234,7 @@ describe('StdioTracer', () => {
       const { stream: err } = createMockStream();
 
       // Enable colors
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, true);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: true });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -254,7 +253,7 @@ describe('StdioTracer', () => {
       const { stream: err } = createMockStream();
 
       // Disable colors
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -274,7 +273,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer<Ctx>({ logBinding }, out, err, false);
+      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));

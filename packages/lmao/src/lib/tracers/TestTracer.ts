@@ -8,24 +8,16 @@
  * @module tracers/TestTracer
  */
 
-import { Tracer, type TracerConfig } from '../tracer.js';
-import type { AnySpanBuffer, SpanBuffer } from '../types.js';
-
-/**
- * TestTracer configuration - same as base TracerConfig but without sink
- *
- * @typeParam T - LogSchema type
- * @typeParam FF - Feature flag schema (defaults to empty)
- * @typeParam Deps - Dependencies config (defaults to empty)
- * @typeParam UserCtx - User context properties (defaults to empty)
- */
-export type TestTracerConfig<Ctx extends import('../opContext/types.js').OpContext> = Omit<TracerConfig<Ctx>, 'sink'>;
+import type { OpContextBinding } from '../opContext/types.js';
+import type { LogSchema } from '../schema/LogSchema.js';
+import { Tracer } from '../tracer.js';
+import type { SpanBuffer } from '../types.js';
 
 /**
  * Snapshot of buffer stats captured before reset during capacity tuning.
  */
-export interface StatsSnapshot {
-  buffer: AnySpanBuffer;
+export interface StatsSnapshot<T extends LogSchema = LogSchema> {
+  buffer: SpanBuffer<T>;
   totalWrites: number;
   overflowWrites: number;
   totalCreated: number;
@@ -44,7 +36,8 @@ export interface StatsSnapshot {
  *
  * @example
  * ```typescript
- * const tracer = new TestTracer({ logBinding });
+ * const ctx = defineOpContext({ logSchema });
+ * const tracer = new TestTracer(ctx);
  * const { trace } = tracer;
  *
  * await trace('my-op', myOp);
@@ -61,45 +54,41 @@ export interface StatsSnapshot {
  * expect(tracer.statsSnapshots.length).toBeGreaterThan(0);
  * ```
  */
-export class TestTracer<Ctx extends import('../opContext/types.js').OpContext> extends Tracer<Ctx> {
+export class TestTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   /**
    * All completed root trace buffers.
    * Child spans are accessible via each buffer's `_children` tree.
    */
-  readonly rootBuffers: AnySpanBuffer[] = [];
+  readonly rootBuffers: SpanBuffer<B['logBinding']['logSchema']>[] = [];
 
   /**
    * Stats snapshots captured before reset during capacity tuning.
    * Used to verify onStatsWillResetFor hook is called correctly.
    */
-  readonly statsSnapshots: StatsSnapshot[] = [];
-
-  constructor(config: TestTracerConfig<Ctx>) {
-    super(config);
-  }
+  readonly statsSnapshots: StatsSnapshot<B['logBinding']['logSchema']>[] = [];
 
   // ===========================================================================
   // Lifecycle hook implementations
   // ===========================================================================
 
-  onTraceStart(_rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceStart(_rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op - we collect on end, not start
   }
 
-  onTraceEnd(rootBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // Collect the root buffer when trace completes
     this.rootBuffers.push(rootBuffer);
   }
 
-  onSpanStart(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanStart(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op - children are in tree, accessed via rootBuffer._children
   }
 
-  onSpanEnd(_childBuffer: SpanBuffer<Ctx['logSchema']>): void {
+  onSpanEnd(_childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // No-op - children are in tree, accessed via rootBuffer._children
   }
 
-  onStatsWillResetFor(buffer: SpanBuffer<Ctx['logSchema']>): void {
+  onStatsWillResetFor(buffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     // Capture stats snapshot before they're reset
     const stats = buffer._stats;
     this.statsSnapshots.push({

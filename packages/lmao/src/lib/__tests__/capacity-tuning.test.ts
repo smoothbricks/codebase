@@ -657,7 +657,7 @@ describe('Capacity Tuning Algorithm', () => {
       });
 
       // Create TestTracer to capture stats snapshots
-      const tracer = new TestTracer({ logBinding: ctx.logBinding });
+      const tracer = new TestTracer(ctx);
       const { trace } = tracer;
 
       // Set small capacity to trigger overflow quickly
