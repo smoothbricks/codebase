@@ -1,6 +1,7 @@
-import { describe, expect, it } from 'bun:test';
+import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
+import { SPAN_LOGGER_HELPERS, setTimestampNanosImpl } from '../codegen/spanLoggerGenerator.js';
 
 describe('Node.js Timestamp (process.hrtime.bigint)', () => {
   it('should return a bigint', async () => {
@@ -122,5 +123,69 @@ describe('Nanoseconds utilities', () => {
     const raw = 123456789n;
     const ns = Nanoseconds.unsafe(raw);
     expect(ns).toBe(Nanoseconds.unsafe(raw));
+  });
+});
+
+describe('Platform entry point timestamp configuration', () => {
+  // Save original value to restore after each test
+  let originalGetTimestampNanos: typeof SPAN_LOGGER_HELPERS.getTimestampNanos;
+
+  beforeEach(() => {
+    originalGetTimestampNanos = SPAN_LOGGER_HELPERS.getTimestampNanos;
+  });
+
+  // Restore after each test to avoid polluting other tests
+  afterEach(() => {
+    SPAN_LOGGER_HELPERS.getTimestampNanos = originalGetTimestampNanos;
+  });
+
+  it('should set Node.js timestamp implementation when importing /node', async () => {
+    // Clear the implementation first
+    SPAN_LOGGER_HELPERS.getTimestampNanos = undefined;
+    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeUndefined();
+
+    // Import the node entry point (use cache-busting to force re-evaluation)
+    await import(`../../node.js?t=${Date.now()}`);
+
+    // Should have set the implementation
+    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeDefined();
+    expect(typeof SPAN_LOGGER_HELPERS.getTimestampNanos).toBe('function');
+
+    // The function should be the Node.js implementation
+    const nodeTimestamp = await import('../timestamp.node.js');
+    expect(SPAN_LOGGER_HELPERS.getTimestampNanos === nodeTimestamp.getTimestampNanos).toBe(true);
+  });
+
+  it('should set browser timestamp implementation when importing /es', async () => {
+    // Clear the implementation first
+    SPAN_LOGGER_HELPERS.getTimestampNanos = undefined;
+    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeUndefined();
+
+    // Import the es entry point (use cache-busting to force re-evaluation)
+    await import(`../../es.js?t=${Date.now()}`);
+
+    // Should have set the implementation
+    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeDefined();
+    expect(typeof SPAN_LOGGER_HELPERS.getTimestampNanos).toBe('function');
+
+    // The function should be the browser implementation
+    const browserTimestamp = await import('../timestamp.js');
+    expect(SPAN_LOGGER_HELPERS.getTimestampNanos === browserTimestamp.getTimestampNanos).toBe(true);
+  });
+
+  it('should allow setting timestamp implementation via setTimestampNanosImpl', () => {
+    // Clear first
+    SPAN_LOGGER_HELPERS.getTimestampNanos = undefined;
+
+    // Create a mock implementation
+    const mockImpl = (anchorEpochNanos: bigint, anchorPerfNow: number) => {
+      return Nanoseconds.unsafe(anchorEpochNanos + BigInt(anchorPerfNow));
+    };
+
+    // Set it
+    setTimestampNanosImpl(mockImpl);
+
+    // Verify
+    expect(SPAN_LOGGER_HELPERS.getTimestampNanos === mockImpl).toBe(true);
   });
 });

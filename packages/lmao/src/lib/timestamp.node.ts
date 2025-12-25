@@ -46,5 +46,3 @@ export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfN
     anchorPerfNow: Number(process.hrtime.bigint()),
   };
 }
-
-export { Nanoseconds };

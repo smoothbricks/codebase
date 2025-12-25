@@ -11,19 +11,15 @@
  * | Node.js  | 1 nanosecond | `process.hrtime.bigint()` anchored to epoch |
  *
  * Browser timestamps have last 3 digits as 000 (microsecond granularity).
- * For Node.js nanosecond precision, import from the `/node` entry point.
  *
  * ## Usage
  *
- * ```typescript
- * // Browser (default)
- * import { Nanoseconds } from '@smoothbricks/arrow-builder';
+ * For timestamp functionality, import from platform-specific entry points:
+ * - Node.js: `import { ... } from '@smoothbricks/lmao/node'`
+ * - Browser: `import { ... } from '@smoothbricks/lmao/es'`
  *
- * // Node.js (true nanosecond precision)
- * import { Nanoseconds } from '@smoothbricks/lmao/node';
- *
- * buffer.timestamp[idx] = Nanoseconds.now();
- * ```
+ * The base `@smoothbricks/lmao` export does NOT include timestamp implementation
+ * to enable tree-shaking.
  *
  * @module nanoseconds
  */
@@ -37,27 +33,9 @@
 export type Nanoseconds = bigint & { readonly __brand: 'Nanoseconds' };
 
 /**
- * Nanoseconds utilities.
- *
- * The `now` method is mutable - importing from `/node` entry point replaces it
- * with the Node.js implementation using `process.hrtime.bigint()`.
+ * Nanoseconds utilities for conversion between time units.
  */
 export const Nanoseconds = {
-  /**
-   * Get current timestamp in nanoseconds since Unix epoch.
-   *
-   * **Must be set by importing a timestamp module.**
-   * - Browser: `import '@smoothbricks/lmao'` sets this to use `performance` API
-   * - Node.js: `import '@smoothbricks/lmao/node'` sets this to use `process.hrtime.bigint()`
-   *
-   * Throws if called before a timestamp module is imported.
-   *
-   * @returns Current time as nanoseconds since Unix epoch
-   */
-  now(): Nanoseconds {
-    throw new Error('Nanoseconds.now not initialized. Import @smoothbricks/lmao or @smoothbricks/lmao/node first.');
-  },
-
   /**
    * Convert milliseconds to nanoseconds.
    *

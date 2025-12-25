@@ -1,7 +1,7 @@
-import { Nanoseconds } from '@smoothbricks/arrow-builder';
+import type { Nanoseconds } from '@smoothbricks/arrow-builder';
 
 /**
- * Browser timestamp implementation.
+ * Browser/ES timestamp implementation.
  *
  * Uses per-trace anchored timestamps for consistent trace-wide time reference.
  * Combines epoch anchor with performance.now() delta for microsecond precision (~5-20μs).
@@ -28,5 +28,3 @@ export function createTimestampAnchor(): { anchorEpochNanos: bigint; anchorPerfN
     anchorPerfNow: performance.now(),
   };
 }
-
-export { Nanoseconds };

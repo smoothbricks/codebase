@@ -352,10 +352,9 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       expect(parentSpan).toBeDefined();
       expect(childSpan).toBeDefined();
 
-      // Parent span is a child of the trace root (via trace.span('parent', parentOp))
-      // So it DOES have a parent_span_id (the trace root's span_id)
-      expect(parentSpan?.parent_span_id).toBeDefined();
-      expect(typeof parentSpan?.parent_span_id).toBe('number');
+      // Parent span IS the root span (created by trace('parent', parentOp))
+      // Root spans have no parent, so parent_span_id is null
+      expect(parentSpan?.parent_span_id).toBeNull();
 
       // Child's parent is the parent span
       expect(childSpan?.parent_span_id).toBe(parentSpan?.span_id);

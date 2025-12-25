@@ -187,11 +187,17 @@ describe('Buffer Overflow Property Tests', () => {
   describe('Property: Buffer Count Formula', () => {
     it('buffer count matches mathematical formula for any entry count', () => {
       fc.assert(
-        fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
+        // Limit to 90 entries to stay below capacity tuning threshold (100 writes)
+        // This ensures capacity stays constant throughout the test run
+        fc.property(fc.integer({ min: 1, max: 90 }), (numEntries) => {
+          // Reset all stats including capacity before each run
+          const capacity = DEFAULT_BUFFER_CAPACITY; // 8
+          SpanBufferClass.stats.capacity = capacity;
           SpanBufferClass.stats.overflows = 0;
+          SpanBufferClass.stats.overflowWrites = 0;
+          SpanBufferClass.stats.totalWrites = 0;
           SpanBufferClass.stats.totalCreated = 0;
 
-          const capacity = DEFAULT_BUFFER_CAPACITY; // 8
           const buffer = createSpanBuffer(testSchema, 'test-span', undefined, capacity);
           const logger = createSpanLogger(testSchema, buffer);
 
@@ -415,9 +421,12 @@ describe('Buffer Overflow Property Tests', () => {
             .integer({ min: 8, max: 64 })
             .map((n) => (n + 7) & ~7), // capacity aligned to 8
           (numEntries, capacity) => {
-            SpanBufferClass.stats.overflows = 0;
-            SpanBufferClass.stats.totalCreated = 0;
+            // Reset all stats to prevent capacity tuning from modifying them mid-test
             SpanBufferClass.stats.capacity = capacity; // Set for chained buffers
+            SpanBufferClass.stats.overflows = 0;
+            SpanBufferClass.stats.overflowWrites = 0;
+            SpanBufferClass.stats.totalWrites = 0;
+            SpanBufferClass.stats.totalCreated = 0;
 
             const buffer = createSpanBuffer(testSchema, 'test-span', undefined, capacity);
             const logger = createSpanLogger(testSchema, buffer);

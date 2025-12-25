@@ -21,7 +21,9 @@ import {
   type ColumnWriter,
   type ColumnWriterExtension,
   getColumnWriterClass,
+  type Nanoseconds,
 } from '@smoothbricks/arrow-builder';
+import { trackOverflowAndTune } from '../capacityTuning.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -34,9 +36,155 @@ import {
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 import { createOverflowBuffer as createOverflowSpanBuffer } from '../spanBuffer.js';
-// Import timestamp function - will be injected as dependency
-import { getTimestampNanos } from '../timestamp.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
+
+// =============================================================================
+// PLATFORM TIMESTAMP CONFIGURATION
+// =============================================================================
+// The timestamp implementation is set by platform entry points (/node or /es).
+// Default is undefined to enable tree-shaking when only importing types/schemas.
+
+/**
+ * Type for platform-specific timestamp function.
+ * Takes anchor values from trace creation, returns current time as Nanoseconds.
+ */
+export type GetTimestampNanos = (anchorEpochNanos: bigint, anchorPerfNow: number) => Nanoseconds;
+
+/**
+ * Set the platform-specific timestamp implementation.
+ *
+ * Called by platform entry points before any SpanLogger is created:
+ * - `@smoothbricks/lmao/node` sets Node.js impl (process.hrtime.bigint)
+ * - `@smoothbricks/lmao/es` sets browser impl (performance.now)
+ *
+ * @param impl - Platform-specific timestamp function
+ */
+export function setTimestampNanosImpl(impl: GetTimestampNanos): void {
+  SPAN_LOGGER_HELPERS.getTimestampNanos = impl;
+}
+
+// =============================================================================
+// SINGLETON HELPERS OBJECT
+// =============================================================================
+// Created once at module load, closed over by all generated SpanLogger classes.
+// This avoids recreating the helpers object for each schema.
+//
+// getTimestampNanos is undefined by default to enable tree-shaking.
+// Platform entry points (/node, /es) set it before any SpanLogger is created.
+
+/**
+ * Helper functions injected into generated SpanLogger code.
+ * Singleton - same object shared by all generated SpanLogger classes.
+ *
+ * NOTE: Not frozen because getTimestampNanos must be set by platform entry points.
+ */
+export const SPAN_LOGGER_HELPERS: {
+  getTimestampNanos: GetTimestampNanos | undefined;
+  trackOverflowAndTune: typeof trackOverflowAndTune;
+  setNullBit: (bitmap: Uint8Array, idx: number) => void;
+  fillNullBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number) => void;
+  fillBooleanBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number, value: boolean) => void;
+} = {
+  // undefined by default - set by platform entry points for tree-shaking
+  getTimestampNanos: undefined,
+  trackOverflowAndTune,
+  setNullBit: (bitmap: Uint8Array, idx: number) => {
+    bitmap[idx >>> 3] |= 1 << (idx & 7);
+  },
+  fillNullBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number) => {
+    // Fill null bitmap for range [startIdx, endIdx)
+    const startByte = startIdx >>> 3;
+    const endByte = (endIdx - 1) >>> 3;
+
+    if (startByte === endByte) {
+      // All bits in same byte
+      for (let i = startIdx; i < endIdx; i++) {
+        bitmap[i >>> 3] |= 1 << (i & 7);
+      }
+    } else {
+      // Handle first partial byte
+      const startBit = startIdx & 7;
+      if (startBit !== 0) {
+        bitmap[startByte] |= 0xff << startBit;
+      } else {
+        bitmap[startByte] = 0xff;
+      }
+
+      // Fill middle bytes
+      for (let b = startByte + 1; b < endByte; b++) {
+        bitmap[b] = 0xff;
+      }
+
+      // Handle last partial byte
+      const endBit = endIdx & 7;
+      if (endBit !== 0) {
+        bitmap[endByte] |= (1 << endBit) - 1;
+      } else {
+        bitmap[endByte] = 0xff;
+      }
+    }
+  },
+  fillBooleanBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number, value: boolean) => {
+    // Fill boolean bitmap for range with value
+    if (value) {
+      // Same as fillNullBitmapRange - set bits to 1
+      const startByte = startIdx >>> 3;
+      const endByte = (endIdx - 1) >>> 3;
+
+      if (startByte === endByte) {
+        for (let i = startIdx; i < endIdx; i++) {
+          bitmap[i >>> 3] |= 1 << (i & 7);
+        }
+      } else {
+        const startBit = startIdx & 7;
+        if (startBit !== 0) {
+          bitmap[startByte] |= 0xff << startBit;
+        } else {
+          bitmap[startByte] = 0xff;
+        }
+
+        for (let b = startByte + 1; b < endByte; b++) {
+          bitmap[b] = 0xff;
+        }
+
+        const endBit = endIdx & 7;
+        if (endBit !== 0) {
+          bitmap[endByte] |= (1 << endBit) - 1;
+        } else {
+          bitmap[endByte] = 0xff;
+        }
+      }
+    } else {
+      // Clear bits to 0
+      const startByte = startIdx >>> 3;
+      const endByte = (endIdx - 1) >>> 3;
+
+      if (startByte === endByte) {
+        for (let i = startIdx; i < endIdx; i++) {
+          bitmap[i >>> 3] &= ~(1 << (i & 7));
+        }
+      } else {
+        const startBit = startIdx & 7;
+        if (startBit !== 0) {
+          bitmap[startByte] &= ~(0xff << startBit);
+        } else {
+          bitmap[startByte] = 0;
+        }
+
+        for (let b = startByte + 1; b < endByte; b++) {
+          bitmap[b] = 0;
+        }
+
+        const endBit = endIdx & 7;
+        if (endBit !== 0) {
+          bitmap[endByte] &= ~((1 << endBit) - 1);
+        } else {
+          bitmap[endByte] = 0;
+        }
+      }
+    }
+  },
+};
 
 /**
  * Base SpanLogger interface - core logging methods.
@@ -298,7 +446,8 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `
     _getNextBuffer() {
       const oldBuffer = this._buffer;
-      oldBuffer.constructor.stats.overflows++;
+      const stats = oldBuffer.constructor.stats;
+      helpers.trackOverflowAndTune(stats);
       this._inOverflow = true;
       const overflowBuffer = this._createOverflowBuffer(oldBuffer);
       oldBuffer._overflow = overflowBuffer;
@@ -553,106 +702,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `${enumFluentSetters}
 `,
 
+    // Use singleton helpers object (created once at module load)
     dependencies: {
-      helpers: {
-        getTimestampNanos,
-        setNullBit: (bitmap: Uint8Array, idx: number) => {
-          bitmap[idx >>> 3] |= 1 << (idx & 7);
-        },
-        fillNullBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number) => {
-          // Fill null bitmap for range [startIdx, endIdx)
-          const startByte = startIdx >>> 3;
-          const endByte = (endIdx - 1) >>> 3;
-
-          if (startByte === endByte) {
-            // All bits in same byte
-            for (let i = startIdx; i < endIdx; i++) {
-              bitmap[i >>> 3] |= 1 << (i & 7);
-            }
-          } else {
-            // Handle first partial byte
-            const startBit = startIdx & 7;
-            if (startBit !== 0) {
-              bitmap[startByte] |= 0xff << startBit;
-            } else {
-              bitmap[startByte] = 0xff;
-            }
-
-            // Fill middle bytes
-            for (let b = startByte + 1; b < endByte; b++) {
-              bitmap[b] = 0xff;
-            }
-
-            // Handle last partial byte
-            const endBit = endIdx & 7;
-            if (endBit !== 0) {
-              bitmap[endByte] |= (1 << endBit) - 1;
-            } else {
-              bitmap[endByte] = 0xff;
-            }
-          }
-        },
-        fillBooleanBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number, value: boolean) => {
-          // Fill boolean bitmap for range with value
-          if (value) {
-            // Same as fillNullBitmapRange - set bits to 1
-            const startByte = startIdx >>> 3;
-            const endByte = (endIdx - 1) >>> 3;
-
-            if (startByte === endByte) {
-              for (let i = startIdx; i < endIdx; i++) {
-                bitmap[i >>> 3] |= 1 << (i & 7);
-              }
-            } else {
-              const startBit = startIdx & 7;
-              if (startBit !== 0) {
-                bitmap[startByte] |= 0xff << startBit;
-              } else {
-                bitmap[startByte] = 0xff;
-              }
-
-              for (let b = startByte + 1; b < endByte; b++) {
-                bitmap[b] = 0xff;
-              }
-
-              const endBit = endIdx & 7;
-              if (endBit !== 0) {
-                bitmap[endByte] |= (1 << endBit) - 1;
-              } else {
-                bitmap[endByte] = 0xff;
-              }
-            }
-          } else {
-            // Clear bits to 0
-            const startByte = startIdx >>> 3;
-            const endByte = (endIdx - 1) >>> 3;
-
-            if (startByte === endByte) {
-              for (let i = startIdx; i < endIdx; i++) {
-                bitmap[i >>> 3] &= ~(1 << (i & 7));
-              }
-            } else {
-              const startBit = startIdx & 7;
-              if (startBit !== 0) {
-                bitmap[startByte] &= ~(0xff << startBit);
-              } else {
-                bitmap[startByte] = 0;
-              }
-
-              for (let b = startByte + 1; b < endByte; b++) {
-                bitmap[b] = 0;
-              }
-
-              const endBit = endIdx & 7;
-              if (endBit !== 0) {
-                bitmap[endByte] &= ~((1 << endBit) - 1);
-              } else {
-                bitmap[endByte] = 0;
-              }
-            }
-          }
-        },
-      },
+      helpers: SPAN_LOGGER_HELPERS,
     },
   };
 }
@@ -685,6 +737,15 @@ export function createSpanLoggerClass<T extends LogSchema>(
   buffer: AnySpanBuffer,
   createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
 ) => SpanLoggerImpl<T> {
+  // Cold-path check: ensure platform timestamp implementation is configured
+  if (!SPAN_LOGGER_HELPERS.getTimestampNanos) {
+    throw new Error(
+      'LMAO: Timestamp implementation not configured. ' +
+        "Import from '@smoothbricks/lmao/node' (Node.js) or '@smoothbricks/lmao/es' (browser) " +
+        "instead of '@smoothbricks/lmao'.",
+    );
+  }
+
   // Check cache first
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
 

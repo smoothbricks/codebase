@@ -179,7 +179,8 @@ export function generateRemappedBufferViewClass(
       this._buffer = buffer;
       // Build _columns with prefixed names from mapping
       // mapping is { prefixedName: unprefixedName }
-      const baseFields = buffer._logSchema.fields;
+      // _logSchema may be undefined in tests using mock buffers
+      const baseFields = buffer._logSchema?.fields ?? {};
       this._columns = [];
       for (const prefixedName in mapping) {
         const unprefixedName = mapping[prefixedName];

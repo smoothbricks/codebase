@@ -5,6 +5,13 @@
  * without requiring full Op/trace context setup.
  */
 
+// Initialize Node.js timestamp implementation for tests
+// This MUST be imported before any SpanLogger is created
+import { setTimestampNanosImpl } from '../codegen/spanLoggerGenerator.js';
+import { getTimestampNanos } from '../timestamp.node.js';
+
+setTimestampNanosImpl(getTimestampNanos);
+
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { createOpMetadata, DEFAULT_METADATA } from '../opContext/defineOp.js';
