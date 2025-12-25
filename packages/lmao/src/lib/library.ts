@@ -41,14 +41,10 @@ import type { AnySpanBuffer } from './types.js';
  * - Prefix: 'http'
  * - Output: { http_status: S.number(), http_method: S.enum(['GET', 'POST']) }
  */
-export function prefixSchema(
-  schema: LogSchema | { fieldEntries(): Iterable<[string, unknown]> },
-  prefix: string,
-): LogSchema & Record<string, unknown> {
+export function prefixSchema(schema: LogSchema, prefix: string): LogSchema & Record<string, unknown> {
   const prefixedFields: Record<string, unknown> = {};
 
-  // Get schema fields from LogSchema.fieldEntries()
-  for (const [fieldName, fieldSchema] of schema.fieldEntries()) {
+  for (const [fieldName, fieldSchema] of schema._columns) {
     const prefixedName = `${prefix}_${fieldName}`;
     prefixedFields[prefixedName] = fieldSchema;
   }
@@ -91,7 +87,7 @@ export function createPrefixMapping<T extends LogSchema>(schema: T, prefix: stri
   const mapping: PrefixMapping = {};
 
   // Use LogSchema.fieldNames directly (no conditional needed)
-  for (const fieldName of schema.fieldNames) {
+  for (const fieldName of schema._columnNames) {
     mapping[fieldName] = `${prefix}_${fieldName}`;
   }
 
@@ -181,10 +177,20 @@ export function generateRemappedBufferViewClass(
   class RemappedBufferView {
     constructor(buffer) {
       this._buffer = buffer;
+      // Build _columns with prefixed names from mapping
+      // mapping is { prefixedName: unprefixedName }
+      const baseFields = buffer._logSchema.fields;
+      this._columns = [];
+      for (const prefixedName in mapping) {
+        const unprefixedName = mapping[prefixedName];
+        const schema = baseFields[unprefixedName];
+        if (schema) this._columns.push([prefixedName, schema]);
+      }
     }
     
     // Tree traversal (pass-through)
     get _children() { return this._buffer._children; }
+    get _parent() { return this._buffer._parent; }
     get _overflow() { return this._buffer._overflow; }
 
     // Row count
@@ -215,6 +221,8 @@ export function generateRemappedBufferViewClass(
     // Metadata (pass-through)
     get module() { return this._buffer._module; }
     get spanName() { return this._buffer._spanName; }
+    get _opMetadata() { return this._buffer._opMetadata; }
+    get _callsiteMetadata() { return this._buffer._callsiteMetadata; }
     // Remapped column access (for Arrow conversion iteration)
     // Maps prefixed name → unprefixed name before calling underlying buffer
     getColumnIfAllocated(name) {
@@ -388,7 +396,7 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
   className = 'RemappedSpanLogger',
 ): string {
   // Use LogSchema.fieldEntries() to iterate schema fields
-  const schemaFields = Array.from(cleanSchema.fieldEntries());
+  const schemaFields = cleanSchema._columns;
 
   // Generate enum mapping functions (use cleanName for function names)
   const enumMappings: string[] = [];

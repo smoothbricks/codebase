@@ -154,9 +154,9 @@ export const systemSchema: DefinedLogSchema<SystemSchemaFieldTypes> = defineLogS
 export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSchema: T): SystemSchemaFieldTypes & T {
   // Check for conflicts between user schema and system schema
   // Use fieldNames to get only actual field names, not ColumnSchema properties or methods
-  const systemKeys = new Set(systemSchema.fieldNames);
+  const systemKeys = new Set(systemSchema._columnNames);
   const reservedKeys = RESERVED_SYSTEM_COLUMN_NAMES;
-  const userKeys = userSchema instanceof LogSchema ? userSchema.fieldNames : Object.keys(userSchema);
+  const userKeys = userSchema instanceof LogSchema ? userSchema._columnNames : Object.keys(userSchema);
 
   const conflictingSystemKeys = userKeys.filter((key) => {
     // Only check if it's a schema field (not a method like validate/parse/extend)

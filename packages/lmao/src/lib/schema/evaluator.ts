@@ -106,7 +106,7 @@ export interface FlagEvaluator<Ctx extends OpContext = OpContext> {
    *
    * Receives `Omit<SpanContext, 'ff'>` to prevent infinite recursion.
    */
-  forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<Ctx>;
+  forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
 }
 
 /**
@@ -310,7 +310,7 @@ export abstract class FeatureFlagEvaluator<Ctx extends OpContext = OpContext> {
    * create a new evaluator, or return `this` if the evaluator itself
    * implements the wrapper interface.
    */
-  abstract forContext(ctx: SpanContext<Ctx>): FeatureFlagEvaluator<Ctx>;
+  abstract forContext(ctx: SpanContext<Ctx>): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
 }
 
 /**

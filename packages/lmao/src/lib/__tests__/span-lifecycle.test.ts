@@ -15,7 +15,7 @@ import {
   ENTRY_TYPE_SPAN_OK,
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
-import { createSpanBuffer, type SpanBufferConstructor } from '../spanBuffer.js';
+import { createSpanBuffer } from '../spanBuffer.js';
 import { Tracer } from '../tracer.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestOpMetadata } from './test-helpers.js';
@@ -229,7 +229,7 @@ describe('Child Span Lifecycle', () => {
         const parent = parentBuffer as NonNullable<typeof parentBuffer>;
 
         // Verify child span inherits parent's schema
-        expect(childCtx.buffer.logSchema).toBe(parent.logSchema);
+        expect(childCtx.buffer._logSchema).toBe(parent._logSchema);
 
         // Verify child span has different spanId but same traceId
         expect(childCtx.buffer.span_id).not.toBe(parent.span_id);
@@ -336,7 +336,7 @@ describe('Child Span Lifecycle', () => {
         // All ops in the factory share the same schema
         expect(parentBuffer).toBeDefined();
         const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-        expect(childCtx.buffer.logSchema).toEqual(parent.logSchema);
+        expect(childCtx.buffer._logSchema).toEqual(parent._logSchema);
 
         // Child should be able to access parent's schema fields
         childCtx.tag.userId('user123').operation('READ');
@@ -352,7 +352,7 @@ describe('Child Span Lifecycle', () => {
     expect(childBuffer?._parent).toBe(parentBuffer);
     // Child buffer's schema is the same as parent's schema (inherited)
     // Both buffers are instances of the same SpanBuffer class, so they share the same static schema
-    expect(childBuffer?.logSchema).toEqual(parentBuffer?.logSchema);
+    expect(childBuffer?._logSchema).toEqual(parentBuffer?._logSchema);
   });
 });
 

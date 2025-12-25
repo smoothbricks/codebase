@@ -16,7 +16,12 @@
  * SpanLogger starts with _writeIndex = 1, so first _nextRow() makes it 2.
  */
 
-import { type ColumnWriter, type ColumnWriterExtension, getColumnWriterClass } from '@smoothbricks/arrow-builder';
+import {
+  type ColumnEntry,
+  type ColumnWriter,
+  type ColumnWriterExtension,
+  getColumnWriterClass,
+} from '@smoothbricks/arrow-builder';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -173,7 +178,10 @@ function generateSetScopeMethod(): string {
 /**
  * Generate _prefillScopedAttributes() method - UNROLLED per-column with BULK null bitmap fill
  */
-function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
+function generatePrefillScopedAttributesMethod(
+  schemaFields: readonly ColumnEntry[],
+  enumFieldNames: Set<string>,
+): string {
   const columnFills = schemaFields.map(([fieldName, fieldSchema]) => {
     const columnName = fieldName;
     const lmaoType = getSchemaType(fieldSchema);
@@ -233,7 +241,7 @@ function generatePrefillScopedAttributesMethod(schemaFields: [string, unknown][]
  * Build the extension for SpanLogger that extends ColumnWriter
  */
 function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
-  const schemaFields = Array.from(schema.fieldEntries());
+  const schemaFields = schema._columns;
 
   // Collect enum mappings
   const enumMappings: string[] = [];

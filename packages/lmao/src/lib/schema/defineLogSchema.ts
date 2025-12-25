@@ -106,14 +106,14 @@ export function defineLogSchema<T extends SchemaFields>(
 
   // Assert attribute names don't use reserved names
   if (!options?._skipReservedNameValidation) {
-    LogSchema.assertUserFieldNames(logSchema.fieldNames);
+    LogSchema.assertUserFieldNames(logSchema._columnNames);
   }
 
   // Convert to Sury object schema for validation using builder pattern
   // Use LogSchema.fieldEntries() directly
   const objectSchema = S.object((s) => {
     const output: Record<string, unknown> = {};
-    for (const [key, surySchema] of logSchema.fieldEntries()) {
+    for (const [key, surySchema] of logSchema._columns) {
       output[key] = s.field(key, surySchema);
     }
     return output as InferSchema<T>;

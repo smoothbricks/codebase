@@ -19,7 +19,7 @@
  * - Zero allocation: returns same object reference
  */
 
-import { bufferHelpers } from '@smoothbricks/arrow-builder';
+import { bufferHelpers, type ColumnEntry } from '@smoothbricks/arrow-builder';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
 import type { AnySpanBuffer } from '../types.js';
@@ -139,7 +139,7 @@ function generateSetterMethod(fieldName: string, schema: unknown, hasEnumMapping
  * Generate with() method code - bulk attribute setting.
  * UNROLLED per-column code for zero Object.entries overhead.
  */
-function generateWithMethod(schemaFields: [string, unknown][], enumFieldNames: Set<string>): string {
+function generateWithMethod(schemaFields: readonly ColumnEntry[], enumFieldNames: Set<string>): string {
   const columnWrites = schemaFields.map(([fieldName]) => {
     const hasEnumMapping = enumFieldNames.has(fieldName);
     const valueExpr = hasEnumMapping ? `getEnumIndex_${fieldName}(attributes.${fieldName})` : `attributes.${fieldName}`;
@@ -172,7 +172,7 @@ export function generateFixedPositionWriterClass(
   className: string,
   extension?: FixedPositionWriterExtension,
 ): string {
-  const schemaFields = Array.from(schema.fieldEntries());
+  const schemaFields = schema._columns;
 
   // Generate enum mapping functions
   const enumMappings: string[] = [];

@@ -173,6 +173,16 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   readonly _logSchema: LogSchema;
 
   /**
+   * Column entries for Arrow conversion iteration.
+   * For SpanBuffer: delegates to _logSchema._columns (unprefixed names)
+   * For RemappedBufferView: built in constructor with prefixed names from mapping
+   *
+   * This enables Arrow conversion to iterate column names correctly regardless of
+   * whether the buffer is wrapped in a RemappedBufferView.
+   */
+  readonly _columns: ReadonlyArray<[string, unknown]>;
+
+  /**
    * Shared stats for all buffers from same defineOpContext (accessed via constructor.stats).
    * Enables self-tuning capacity learning across all ops in the same context.
    * Underscore prefix since this is an internal property.

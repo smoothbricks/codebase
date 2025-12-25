@@ -655,10 +655,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // Write line number to row 0 (line() takes pos and value)
       childBuffer.line(0, line);
 
-      // Create child span logger and tag writer
-      const childLogger = createSpanLogger(schemaOnly, childBuffer);
-      const childTagAPI = createTagWriter(schemaOnly, childBuffer);
-      const childSchema = this._schema;
+      // Create child span logger and tag writer using Op's schema (from SpanBufferClass.schema)
+      // Why Op's schema: Cross-module spans need the Op's tag methods (e.g., http lib needs .status())
+      const childSchema = (SpanBufferClass as any).schema as Ctx['logSchema'];
+      const childLogger = createSpanLogger(childSchema, childBuffer);
+      const childTagAPI = createTagWriter(childSchema, childBuffer);
 
       // Cast to impl for property assignment
       const ctx = childCtx as unknown as SpanContextImpl;
@@ -676,7 +677,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
       // SLOT 5-7: HOT - reserved keys copied from parent for O(1) access
       ctx.deps = this.deps;
-      ctx.ff = this.ff;
+      // Create child-bound FF evaluator so flag access logs to child buffer
+      // If no evaluator (ff is EMPTY_SCOPE), just copy the reference
+      ctx.ff = this.ff.forContext ? this.ff.forContext(ctx) : this.ff;
       // Note: user-defined extras (env, requestId, etc.) inherited via prototype chain
 
       // SLOT 8-11: WARM - function properties (created per-context for destructuring)

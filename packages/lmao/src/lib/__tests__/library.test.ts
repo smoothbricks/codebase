@@ -123,7 +123,7 @@ describe('Library Integration Pattern', () => {
 
       const prefixed = prefixSchema(schema, 'many');
 
-      expect(prefixed.fieldNames.length).toBe(100);
+      expect(prefixed._columnNames.length).toBe(100);
       expect(prefixed).toHaveProperty('many_field0');
       expect(prefixed).toHaveProperty('many_field99');
     });
@@ -368,18 +368,18 @@ describe('Module Builder Pattern Integration', () => {
 
       const appOpGroup = defineOps({});
 
-      expect(getOpGroupInternals(appOpGroup)._logSchema.fieldNames).toContain('userId');
-      expect(getOpGroupInternals(appOpGroup)._logSchema.fieldNames).toContain('endpoint');
+      expect(getOpGroupInternals(appOpGroup)._logSchema._columnNames).toContain('userId');
+      expect(getOpGroupInternals(appOpGroup)._logSchema._columnNames).toContain('endpoint');
     });
 
     it('should provide access to OpGroup schema', () => {
       const httpOpGroup = createHttpOpGroup();
 
       // Test direct schema access
-      expect(getOpGroupInternals(httpOpGroup)._logSchema.fieldNames).toContain('status');
-      expect(getOpGroupInternals(httpOpGroup)._logSchema.fieldNames).toContain('method');
-      expect(getOpGroupInternals(httpOpGroup)._logSchema.fieldNames).toContain('url');
-      expect(getOpGroupInternals(httpOpGroup)._logSchema.fieldNames).toContain('duration');
+      expect(getOpGroupInternals(httpOpGroup)._logSchema._columnNames).toContain('status');
+      expect(getOpGroupInternals(httpOpGroup)._logSchema._columnNames).toContain('method');
+      expect(getOpGroupInternals(httpOpGroup)._logSchema._columnNames).toContain('url');
+      expect(getOpGroupInternals(httpOpGroup)._logSchema._columnNames).toContain('duration');
     });
 
     it('should handle complex schema types', () => {
@@ -395,11 +395,11 @@ describe('Module Builder Pattern Integration', () => {
 
       const complexOpGroup = defineOps({});
 
-      expect(getOpGroupInternals(complexOpGroup)._logSchema.fieldNames).toContain('enumField');
-      expect(getOpGroupInternals(complexOpGroup)._logSchema.fieldNames).toContain('categoryField');
-      expect(getOpGroupInternals(complexOpGroup)._logSchema.fieldNames).toContain('textField');
-      expect(getOpGroupInternals(complexOpGroup)._logSchema.fieldNames).toContain('numberField');
-      expect(getOpGroupInternals(complexOpGroup)._logSchema.fieldNames).toContain('booleanField');
+      expect(getOpGroupInternals(complexOpGroup)._logSchema._columnNames).toContain('enumField');
+      expect(getOpGroupInternals(complexOpGroup)._logSchema._columnNames).toContain('categoryField');
+      expect(getOpGroupInternals(complexOpGroup)._logSchema._columnNames).toContain('textField');
+      expect(getOpGroupInternals(complexOpGroup)._logSchema._columnNames).toContain('numberField');
+      expect(getOpGroupInternals(complexOpGroup)._logSchema._columnNames).toContain('booleanField');
     });
 
     it('should reject op names starting with underscore', () => {
@@ -453,8 +453,8 @@ describe('Module Builder Pattern Integration', () => {
       const prefixedHttpOpGroup = httpOpGroup.prefix('http');
 
       // Original schema should have unprefixed names
-      expect(getOpGroupInternals(httpOpGroup)._logSchema.fieldNames).toContain('status');
-      expect(getOpGroupInternals(httpOpGroup)._logSchema.fieldNames).toContain('method');
+      expect(getOpGroupInternals(httpOpGroup)._logSchema._columnNames).toContain('status');
+      expect(getOpGroupInternals(httpOpGroup)._logSchema._columnNames).toContain('method');
 
       // Verify that prefix was applied (check mapping)
       expect(getMappedOpGroupInternals(prefixedHttpOpGroup)._columnMapping['status']).toBe('http_status');
@@ -563,8 +563,8 @@ describe('Module Builder Pattern Integration', () => {
       expect(mappedRetry).toBeDefined();
 
       // Verify that original schemas are accessible
-      expect(getMappedOpGroupInternals(mappedHttp)._logSchema.fieldNames).toContain('status');
-      expect(getMappedOpGroupInternals(mappedRetry)._logSchema.fieldNames).toContain('attempt');
+      expect(getMappedOpGroupInternals(mappedHttp)._logSchema._columnNames).toContain('status');
+      expect(getMappedOpGroupInternals(mappedRetry)._logSchema._columnNames).toContain('attempt');
     });
   });
 
@@ -879,7 +879,7 @@ describe('Edge Cases and Error Handling', () => {
 
       const prefixed = prefixSchema(schema, 'many');
 
-      expect(prefixed.fieldNames.length).toBe(100);
+      expect(prefixed._columnNames.length).toBe(100);
       expect(prefixed).toHaveProperty('many_field0');
       expect(prefixed).toHaveProperty('many_field99');
     });

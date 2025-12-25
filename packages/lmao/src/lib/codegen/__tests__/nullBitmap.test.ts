@@ -23,19 +23,6 @@ import type { AnySpanBuffer } from '../../types.js';
 import { createSpanLoggerClass } from '../spanLoggerGenerator.js';
 
 /**
- * Helper to check which bits are set in a null bitmap
- */
-function getBitsSet(nullBitmap: Uint8Array, count: number): boolean[] {
-  const result: boolean[] = [];
-  for (let i = 0; i < count; i++) {
-    const byteIndex = i >>> 3;
-    const bitOffset = i & 7;
-    result.push((nullBitmap[byteIndex] & (1 << bitOffset)) !== 0);
-  }
-  return result;
-}
-
-/**
  * Create a test buffer from a schema
  */
 function createTestBuffer(schema: LogSchema): AnySpanBuffer {

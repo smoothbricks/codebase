@@ -160,9 +160,7 @@ function convertBuffersToRecordBatch(buffers: AnySpanBuffer[], systemColumnBuild
   // Build user attribute vectors
   // Skip system schema fields - they are handled separately as system columns
   // (message is handled above, line/error_code/exception_stack/ff_value/uint64_value below)
-  const userSchemaFields = Array.from(schema.fieldEntries()).filter(
-    ([fieldName]) => !SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName),
-  );
+  const userSchemaFields = schema._columns.filter(([fieldName]) => !SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName));
   for (const [fieldName, fieldSchema] of userSchemaFields) {
     const lmaoType = getSchemaType(fieldSchema);
     const arrowFieldName = getArrowFieldName(fieldName);
@@ -758,8 +756,8 @@ export function convertSpanTreeToArrowTable(
   const mergedSchemaFields = new Map<string, unknown>();
 
   walkSpanTree(rootBuffer, (buffer) => {
-    const bufferSchema = buffer._logSchema;
-    const fields = Array.from(bufferSchema.fieldEntries());
+    // Use buffer._columns directly - works for both SpanBuffer and RemappedBufferView
+    const fields = buffer._columns;
     for (const [fieldName, fieldSchema] of fields) {
       // Skip system schema fields - they are handled separately as system columns
       // (message, line, error_code, exception_stack, ff_value, uint64_value)

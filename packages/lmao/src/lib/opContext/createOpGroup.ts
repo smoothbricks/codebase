@@ -18,6 +18,7 @@
 
 import { generateRemappedBufferViewClass } from '../library.js';
 import { Op } from '../op.js';
+import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type {
   ColumnMapping,
@@ -70,6 +71,8 @@ function buildPrefixMapping<T extends SchemaFields, P extends string>(
 ): ColumnMapping<T> {
   const mapping: Record<string, string> = {};
   for (const name of fieldNames) {
+    // Skip system columns - they should NOT be prefixed
+    if (SYSTEM_SCHEMA_FIELD_NAMES.has(name)) continue;
     mapping[name] = `${prefix}_${name}`;
   }
   return mapping as ColumnMapping<T>;
@@ -199,7 +202,7 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
     const hasMapping = this.#columnMapping && Object.keys(this.#columnMapping).length > 0;
     const newMapping = hasMapping
       ? prefixMapping(this.#columnMapping, p)
-      : buildPrefixMapping(this._logSchema.fieldNames, p);
+      : buildPrefixMapping(this._logSchema._columnNames, p);
 
     // Generate RemappedBufferView for this prefix
     // Why reverse mapping: Arrow conversion asks for 'http_status', needs to find 'status'
@@ -212,7 +215,10 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
       this._flags,
       {},
       newMapping,
-      buildContributedSchema(this._logSchema.fields as SchemaFields, buildPrefixMapping(this._logSchema.fieldNames, p)),
+      buildContributedSchema(
+        this._logSchema.fields as SchemaFields,
+        buildPrefixMapping(this._logSchema._columnNames, p),
+      ),
     );
 
     // Copy ops, creating new Op instances with remappedViewClass

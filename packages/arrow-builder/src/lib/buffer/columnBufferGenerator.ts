@@ -269,7 +269,7 @@ export function generateColumnBufferClass(
     );
   }
 
-  const schemaFields = schema.fieldNames;
+  const schemaFields = schema._columnNames;
 
   // Buffer management
   const constructorCode: string[] = [

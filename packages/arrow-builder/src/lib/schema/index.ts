@@ -5,5 +5,6 @@
  */
 
 export * from './builder.js';
+export * from './ColumnSchema.js';
 export * from './typeGuards.js';
 export * from './types.js';

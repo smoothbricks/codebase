@@ -5,7 +5,7 @@ import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
 import { type BooleanFlagContext, InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../../schema/systemSchema.js';
 import type { LogSchema } from '../../schema/types.js';
-import { createSpanBuffer, type SpanBufferConstructor } from '../../spanBuffer.js';
+import { createSpanBuffer } from '../../spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from '../../types.js';
 import { createEvaluatorClass, generateEvaluatorClass } from '../evaluatorGenerator.js';
 import { createSpanLogger } from '../spanLoggerGenerator.js';

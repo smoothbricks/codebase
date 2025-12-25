@@ -564,11 +564,11 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       });
 
       // Verify original schemas still have their fields
-      expect(httpSchema.fieldNames.includes('status')).toBe(true);
-      expect(httpSchema.fieldNames.includes('method')).toBe(true);
+      expect(httpSchema._columnNames.includes('status')).toBe(true);
+      expect(httpSchema._columnNames.includes('method')).toBe(true);
 
-      expect(dbSchema.fieldNames.includes('query')).toBe(true);
-      expect(dbSchema.fieldNames.includes('table')).toBe(true);
+      expect(dbSchema._columnNames.includes('query')).toBe(true);
+      expect(dbSchema._columnNames.includes('table')).toBe(true);
     });
 
     it('should create library module with proper op wrapper', async () => {

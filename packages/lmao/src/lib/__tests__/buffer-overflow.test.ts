@@ -5,12 +5,7 @@ import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
-import {
-  createOverflowBuffer,
-  createSpanBuffer,
-  getSpanBufferClass,
-  type SpanBufferConstructor,
-} from '../spanBuffer.js';
+import { createSpanBuffer, getSpanBufferClass, type SpanBufferConstructor } from '../spanBuffer.js';
 import type { AnySpanBuffer } from '../types.js';
 
 /**

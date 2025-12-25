@@ -27,7 +27,7 @@ export function createAttributeColumns(
   const columns: Record<string, TypedArray> = {};
 
   // Use ColumnSchema.fieldEntries() directly
-  for (const [fieldName, surySchema] of schema.fieldEntries()) {
+  for (const [fieldName, surySchema] of schema._columns) {
     // User columns have no prefix
     columns[fieldName] = createTypedArrayForSchema(surySchema, capacity);
   }

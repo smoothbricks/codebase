@@ -106,10 +106,10 @@ export class LogSchema<T extends SchemaFields = SchemaFields> extends ColumnSche
     // Check for field name conflicts
     const extensionKeys = Object.keys(extension);
     for (const key of extensionKeys) {
-      if (this.fieldNames.includes(key)) {
+      if (this._columnNames.includes(key)) {
         throw new Error(
           `Schema conflict: attribute '${key}' already exists in base schema. ` +
-            `Base schema has: ${this.fieldNames.join(', ')}`,
+            `Base schema has: ${this._columnNames.join(', ')}`,
         );
       }
     }
@@ -120,7 +120,7 @@ export class LogSchema<T extends SchemaFields = SchemaFields> extends ColumnSche
     // Perform shallow merge
     // Create merged via explicit property assignment to preserve property order for V8 hidden class stability
     const merged = Object.create(null);
-    for (const key of this.fieldNames) {
+    for (const key of this._columnNames) {
       // Use prototypeless object for stable prototype, prevents hidden class deopt
       merged[key] = this.fields[key];
     }

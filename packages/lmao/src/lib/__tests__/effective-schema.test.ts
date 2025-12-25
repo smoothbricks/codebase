@@ -27,7 +27,7 @@ describe('Effective Schema Computation', () => {
         logSchema: appSchema,
       });
 
-      expect(context.logSchema.fieldNames).toEqual(['userId', 'endpoint']);
+      expect(context.logSchema._columnNames).toEqual(['userId', 'endpoint']);
     });
   });
 
@@ -60,10 +60,10 @@ describe('Effective Schema Computation', () => {
       });
 
       // Should have all fields from both schemas
-      expect(appContext.logSchema.fieldNames).toContain('userId');
-      expect(appContext.logSchema.fieldNames).toContain('status');
-      expect(appContext.logSchema.fieldNames).toContain('method');
-      expect(appContext.logSchema.fieldNames.length).toBe(3);
+      expect(appContext.logSchema._columnNames).toContain('userId');
+      expect(appContext.logSchema._columnNames).toContain('status');
+      expect(appContext.logSchema._columnNames).toContain('method');
+      expect(appContext.logSchema._columnNames.length).toBe(3);
     });
 
     it('should combine app schema + prefixed dep schema', () => {
@@ -96,17 +96,17 @@ describe('Effective Schema Computation', () => {
       });
 
       // Should have app fields + prefixed library fields
-      expect(appContext.logSchema.fieldNames).toContain('userId');
-      expect(appContext.logSchema.fieldNames).toContain('endpoint');
-      expect(appContext.logSchema.fieldNames).toContain('http_status');
-      expect(appContext.logSchema.fieldNames).toContain('http_method');
-      expect(appContext.logSchema.fieldNames).toContain('http_url');
-      expect(appContext.logSchema.fieldNames.length).toBe(5);
+      expect(appContext.logSchema._columnNames).toContain('userId');
+      expect(appContext.logSchema._columnNames).toContain('endpoint');
+      expect(appContext.logSchema._columnNames).toContain('http_status');
+      expect(appContext.logSchema._columnNames).toContain('http_method');
+      expect(appContext.logSchema._columnNames).toContain('http_url');
+      expect(appContext.logSchema._columnNames.length).toBe(5);
 
       // Should NOT have unprefixed library fields
-      expect(appContext.logSchema.fieldNames).not.toContain('status');
-      expect(appContext.logSchema.fieldNames).not.toContain('method');
-      expect(appContext.logSchema.fieldNames).not.toContain('url');
+      expect(appContext.logSchema._columnNames).not.toContain('status');
+      expect(appContext.logSchema._columnNames).not.toContain('method');
+      expect(appContext.logSchema._columnNames).not.toContain('url');
     });
   });
 
@@ -156,19 +156,19 @@ describe('Effective Schema Computation', () => {
       });
 
       // Should have app fields
-      expect(appContext.logSchema.fieldNames).toContain('userId');
-      expect(appContext.logSchema.fieldNames).toContain('endpoint');
+      expect(appContext.logSchema._columnNames).toContain('userId');
+      expect(appContext.logSchema._columnNames).toContain('endpoint');
 
       // Should have HTTP fields with prefix
-      expect(appContext.logSchema.fieldNames).toContain('http_status');
-      expect(appContext.logSchema.fieldNames).toContain('http_method');
+      expect(appContext.logSchema._columnNames).toContain('http_status');
+      expect(appContext.logSchema._columnNames).toContain('http_method');
 
       // Should have DB fields with prefix
-      expect(appContext.logSchema.fieldNames).toContain('db_query');
-      expect(appContext.logSchema.fieldNames).toContain('db_duration');
-      expect(appContext.logSchema.fieldNames).toContain('db_rows');
+      expect(appContext.logSchema._columnNames).toContain('db_query');
+      expect(appContext.logSchema._columnNames).toContain('db_duration');
+      expect(appContext.logSchema._columnNames).toContain('db_rows');
 
-      expect(appContext.logSchema.fieldNames.length).toBe(7);
+      expect(appContext.logSchema._columnNames.length).toBe(7);
     });
 
     it('should handle mixed prefixed and unprefixed deps', () => {
@@ -213,11 +213,11 @@ describe('Effective Schema Computation', () => {
       });
 
       // Should have all fields
-      expect(appContext.logSchema.fieldNames).toContain('userId');
-      expect(appContext.logSchema.fieldNames).toContain('attempt'); // unprefixed
-      expect(appContext.logSchema.fieldNames).toContain('delay'); // unprefixed
-      expect(appContext.logSchema.fieldNames).toContain('http_status'); // prefixed
-      expect(appContext.logSchema.fieldNames.length).toBe(4);
+      expect(appContext.logSchema._columnNames).toContain('userId');
+      expect(appContext.logSchema._columnNames).toContain('attempt'); // unprefixed
+      expect(appContext.logSchema._columnNames).toContain('delay'); // unprefixed
+      expect(appContext.logSchema._columnNames).toContain('http_status'); // prefixed
+      expect(appContext.logSchema._columnNames.length).toBe(4);
     });
   });
 
@@ -250,11 +250,11 @@ describe('Effective Schema Computation', () => {
       });
 
       // Should have userId + lib_data, but NOT debugFlag
-      expect(appContext.logSchema.fieldNames).toContain('userId');
-      expect(appContext.logSchema.fieldNames).toContain('lib_data');
-      expect(appContext.logSchema.fieldNames).not.toContain('debugFlag');
-      expect(appContext.logSchema.fieldNames).not.toContain('publicData'); // renamed to lib_data
-      expect(appContext.logSchema.fieldNames.length).toBe(2);
+      expect(appContext.logSchema._columnNames).toContain('userId');
+      expect(appContext.logSchema._columnNames).toContain('lib_data');
+      expect(appContext.logSchema._columnNames).not.toContain('debugFlag');
+      expect(appContext.logSchema._columnNames).not.toContain('publicData'); // renamed to lib_data
+      expect(appContext.logSchema._columnNames.length).toBe(2);
     });
   });
 
@@ -341,10 +341,10 @@ describe('Effective Schema Computation', () => {
       });
 
       // Should have both with different names
-      expect(appContext.logSchema.fieldNames).toContain('userId');
-      expect(appContext.logSchema.fieldNames).toContain('lib1_status');
-      expect(appContext.logSchema.fieldNames).toContain('lib2_status');
-      expect(appContext.logSchema.fieldNames.length).toBe(3);
+      expect(appContext.logSchema._columnNames).toContain('userId');
+      expect(appContext.logSchema._columnNames).toContain('lib1_status');
+      expect(appContext.logSchema._columnNames).toContain('lib2_status');
+      expect(appContext.logSchema._columnNames.length).toBe(3);
     });
   });
 
@@ -376,9 +376,9 @@ describe('Effective Schema Computation', () => {
       });
 
       // Factory's logSchema should be the effective schema
-      expect(appContext.logSchema.fieldNames).toContain('userId');
-      expect(appContext.logSchema.fieldNames).toContain('http_status');
-      expect(appContext.logSchema.fieldNames.length).toBe(2);
+      expect(appContext.logSchema._columnNames).toContain('userId');
+      expect(appContext.logSchema._columnNames).toContain('http_status');
+      expect(appContext.logSchema._columnNames.length).toBe(2);
     });
   });
 

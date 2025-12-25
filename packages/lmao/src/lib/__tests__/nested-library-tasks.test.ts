@@ -229,12 +229,7 @@ describe('Nested Library Tasks', () => {
     });
   });
 
-  // TODO(opgroup-refactor): These tests are blocked until the OpGroup refactor is complete.
-  // Current issues:
-  // 1. Must use `ctx.deps.lib.ops.opName` instead of `ctx.deps.lib.opName`
-  // 2. Child spans use parent's schema for tag methods, not the Op's schema
-  // See agent-todo/opgroup-refactor.md for the fix plan.
-  describe.skip('4-level nesting WITH library prefixes (separate defineOpContext per library)', () => {
+  describe('4-level nesting WITH library prefixes (separate defineOpContext per library)', () => {
     /**
      * Test scenario: App -> HTTP lib op -> DB lib op -> Cache lib op -> Auth lib op
      *
@@ -279,7 +274,7 @@ describe('Nested Library Tasks', () => {
         ctx.tag.key('session:user-456').hit(true);
         // Call auth library via deps
 
-        await ctx.span('auth-check', ctx.deps.auth.ops.checkAuth);
+        await ctx.span('auth-check', ctx.deps.auth.checkAuth);
         return ctx.ok({ cached: true });
       },
     });
@@ -298,7 +293,7 @@ describe('Nested Library Tasks', () => {
         ctx.tag.query('SELECT * FROM users').rowCount(1);
         // Call cache library via deps
 
-        await ctx.span('cache-lookup', ctx.deps.cache.ops.lookup);
+        await ctx.span('cache-lookup', ctx.deps.cache.lookup);
         return ctx.ok({ rows: [] });
       },
     });
@@ -317,7 +312,7 @@ describe('Nested Library Tasks', () => {
         ctx.tag.status(200).method('GET');
         // Call DB library via deps
 
-        await ctx.span('db-query', ctx.deps.db.ops.execute);
+        await ctx.span('db-query', ctx.deps.db.execute);
         return ctx.ok({ response: 'ok' });
       },
     });
@@ -351,7 +346,7 @@ describe('Nested Library Tasks', () => {
         ctx.tag.requestId('req-123');
         // Call HTTP library via deps
 
-        await ctx.span('http-request', ctx.deps.http.ops.request);
+        await ctx.span('http-request', ctx.deps.http.request);
         return ctx.ok({ handled: true });
       });
 
@@ -401,7 +396,7 @@ describe('Nested Library Tasks', () => {
       const appOp = defineOp('handle-request', async (ctx) => {
         appBuffer = ctx.buffer;
         ctx.tag.requestId('req-123');
-        await ctx.span('http-request', ctx.deps.http.ops.request);
+        await ctx.span('http-request', ctx.deps.http.request);
         return ctx.ok({ handled: true });
       });
 

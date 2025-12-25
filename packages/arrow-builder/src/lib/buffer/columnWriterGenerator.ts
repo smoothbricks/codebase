@@ -173,7 +173,7 @@ export function generateColumnWriterClass(
   extension?: ColumnWriterExtension,
 ): string {
   // Get field names from ColumnSchema.fieldNames
-  const schemaFields = schema.fieldNames;
+  const schemaFields = schema._columnNames;
 
   // Generate setter methods for each schema field
   const setterMethods: string[] = [];
