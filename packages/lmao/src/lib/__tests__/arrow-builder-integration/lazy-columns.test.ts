@@ -1,17 +1,32 @@
 import { describe, expect, it } from 'bun:test';
 import { createColumnBuffer } from '@smoothbricks/arrow-builder';
 import { createSpanBuffer, createTagWriter, S } from '@smoothbricks/lmao';
-import { createTestSchema } from '../test-helpers.js';
+import { createTestOpMetadata, createTestSchema } from '../test-helpers.js';
 
 /**
  * Tests for lazy column initialization
  *
  * Per GitHub review feedback: Columns should only be allocated when accessed,
  * not eagerly during buffer creation. This saves memory for sparse columns.
+ *
+ * COLUMN TYPES:
+ *
+ * 1. SpanBuffer-specific columns (NOT in schema, created in preamble):
+ *    - timestamp, entry_type
+ *    → ONLY exist on SpanBuffer, NOT on ColumnBuffer from createColumnBuffer()
+ *    → Already tested in integration.test.ts lines 45-46
+ *
+ * 2. System SCHEMA columns (merged via createTestSchema → mergeWithSystemSchema):
+ *    - message: S.category().eager() ← EAGER (allocated immediately)
+ *    - line, error_code, etc. ← LAZY (default)
+ *
+ * 3. User SCHEMA columns:
+ *    - Default: LAZY (allocated on first access)
+ *    - Can be .eager() to allocate immediately
  */
 
-describe('True Lazy Initialization', () => {
-  it('should NOT have TypedArrays for unaccessed columns', () => {
+describe('Eager vs Lazy Column Allocation', () => {
+  it('eager schema columns allocated immediately, lazy user columns deferred', () => {
     const schema = createTestSchema({
       userId: S.category(),
       requestId: S.category(),
@@ -21,16 +36,15 @@ describe('True Lazy Initialization', () => {
     // createColumnBuffer is generic and returns ColumnBuffer<T>
     const buffer = createColumnBuffer(schema, 64);
 
-    // Core columns are always allocated (system columns from systemSchema)
-    expect(buffer.timestamp_values).toBeInstanceOf(BigInt64Array);
-    expect(buffer.entry_type_values).toBeInstanceOf(Uint8Array);
+    // System schema's message column is EAGER - always allocated (via mergeWithSystemSchema)
+    expect(Array.isArray(buffer.message_values)).toBe(true);
 
-    // Access ONE column via _values suffix (category = Array now, not Uint32Array)
+    // Access ONE user column via _values suffix (category = Array now, not Uint32Array)
     // Note: buffer.userId is a setter method, buffer.userId_values is the getter
     const userIdColumn = buffer.userId_values;
     expect(Array.isArray(userIdColumn)).toBe(true);
 
-    // Now check that OTHER columns were NOT allocated
+    // Now check that OTHER user columns were NOT allocated
     // Getters are on the prototype, not the instance
     const proto = Object.getPrototypeOf(buffer);
     const descriptor = Object.getOwnPropertyDescriptor(proto, 'requestId_values');
@@ -125,10 +139,6 @@ describe('Lazy Column Initialization', () => {
 
     // createColumnBuffer expects ColumnSchema instance (schema extends LogSchema extends ColumnSchema)
     const buffer = createColumnBuffer(schema, 64);
-
-    // Core columns should be allocated immediately
-    expect(buffer.timestamp_values).toBeInstanceOf(BigInt64Array);
-    expect(buffer.entry_type_values).toBeInstanceOf(Uint8Array);
 
     // Access one attribute column via _values suffix - should allocate it lazily on first access
     const userIdColumn = buffer.userId_values;
@@ -259,7 +269,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', undefined, 8);
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, 8, createTestOpMetadata());
 
     // Eager columns (system columns) should be allocated immediately
     expect(buffer.timestamp).toBeDefined();
@@ -269,6 +279,9 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     // Also check public aliases
     expect(buffer.timestamp).toBe(buffer.timestamp);
     expect(buffer.entry_type).toBe(buffer.entry_type);
+
+    // System schema's message column is EAGER - always allocated
+    expect(Array.isArray(buffer.message_values)).toBe(true);
 
     // Lazy columns (user attributes) should be undefined before access
     expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();
@@ -311,7 +324,7 @@ describe('SpanBuffer Lazy Column Allocation', () => {
       operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', undefined, 8);
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, 8, createTestOpMetadata());
 
     // Lazy columns should be undefined before TagWriter access
     expect(buffer.getColumnIfAllocated('userId')).toBeUndefined();

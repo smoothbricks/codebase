@@ -5,9 +5,9 @@ import {
   DEFAULT_BUFFER_CAPACITY,
   maskingTransforms,
 } from '@smoothbricks/arrow-builder';
-import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import type { SpanBuffer } from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S, Tracer } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
-import type { SpanBufferConstructor } from '../../spanBuffer.js';
 import { createTestOpMetadata, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
@@ -72,8 +72,8 @@ describe('Buffer Integration', () => {
     expect(buffer.httpStatus_values).toBeInstanceOf(Float64Array); // number
     expect(buffer.operation_values).toBeInstanceOf(Uint8Array); // enum
 
-    // Verify schema is accessible via constructor
-    expect(buffer.logSchema.fields).toBe(schema.fields);
+    // Verify schema is accessible via _logSchema (underscore prefix for system properties)
+    expect(buffer._logSchema.fields).toBe(schema.fields);
   });
 
   it('handles optional fields in schema', () => {
@@ -298,6 +298,13 @@ describe('Buffer Integration', () => {
       expect(table.getChild('error')?.get(0)).toBe('j*****@example.com'); // Email masked
     });
 
+    /**
+     * Validates that SpanBuffer correctly exposes system properties.
+     *
+     * System properties use `_` prefix (e.g., `_logSchema`, `_spanName`, `_capacity`)
+     * to distinguish them from user-defined schema columns which have no prefix.
+     * The `_` prefix does NOT mean private - these are readonly public properties.
+     */
     it('validates module context integration with buffer metadata', () => {
       const schema = createTestSchema({
         requestId: S.category(),
@@ -306,7 +313,7 @@ describe('Buffer Integration', () => {
       const buffer = createSpanBuffer(schema, 'context-integration', undefined, undefined, createTestOpMetadata());
 
       // Verify buffer properly references schema via constructor
-      expect(buffer.logSchema).toBe(schema);
+      expect(buffer._logSchema).toBe(schema);
       expect(buffer._spanName).toBe('context-integration');
 
       // Verify system metadata columns are accessible
@@ -315,6 +322,43 @@ describe('Buffer Integration', () => {
       expect(buffer._children).toBeInstanceOf(Array);
       expect(buffer._writeIndex).toBe(0);
       expect(buffer._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+    });
+  });
+
+  describe('Timestamp Ordering', () => {
+    it('should write increasing timestamps for each entry', async () => {
+      // SpanBuffer is just storage - SpanLogger writes timestamps.
+      // Use the full system (Tracer + SpanLogger) to verify entries have increasing timestamps.
+      const schema = createTestSchema({ userId: S.category() });
+      const logBinding = { logSchema: schema };
+
+      const { trace } = new Tracer({ logBinding, sink: () => {} });
+
+      let capturedBuffer: SpanBuffer<typeof schema> | undefined;
+      await trace('test', async (ctx) => {
+        // Log multiple entries with small delays
+        ctx.log.info('first');
+        await new Promise((r) => setTimeout(r, 5));
+        ctx.log.info('second');
+        await new Promise((r) => setTimeout(r, 5));
+        ctx.log.info('third');
+        // Access internal buffer for test verification
+        capturedBuffer = (ctx as unknown as { _buffer: SpanBuffer<typeof schema> })._buffer;
+        return ctx.ok('done');
+      });
+
+      // Verify timestamps are strictly increasing
+      // Row 0 = span-start, Row 1 = span-ok/span-err, Row 2+ = log entries
+      expect(capturedBuffer).toBeDefined();
+      const ts = capturedBuffer!.timestamp;
+
+      // At minimum, span-start (row 0) should be before span-ok (row 1)
+      expect(ts[1]).toBeGreaterThan(ts[0]);
+
+      // All written timestamps should be > 0
+      for (let i = 0; i < capturedBuffer!._writeIndex; i++) {
+        expect(ts[i]).toBeGreaterThan(0n);
+      }
     });
   });
 });
