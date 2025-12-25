@@ -31,7 +31,7 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
             return true;
           }
         }
-        buf = buf._next;
+        buf = buf._overflow;
       }
       return false;
     }
@@ -167,7 +167,7 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
             return true;
           }
         }
-        buf = buf._next;
+        buf = buf._overflow;
       }
       return false;
     }
@@ -311,7 +311,7 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
             return true;
           }
         }
-        buf = buf._next;
+        buf = buf._overflow;
       }
       return false;
     }
@@ -451,7 +451,7 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
             return true;
           }
         }
-        buf = buf._next;
+        buf = buf._overflow;
       }
       return false;
     }
@@ -587,7 +587,7 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
             return true;
           }
         }
-        buf = buf._next;
+        buf = buf._overflow;
       }
       return false;
     }

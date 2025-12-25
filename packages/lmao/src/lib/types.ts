@@ -12,6 +12,7 @@
 import type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray } from '@smoothbricks/arrow-builder';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
+import type { SpanBufferStats } from './spanBufferStats.js';
 import type { TraceId, TraceRoot } from './traceId.js';
 
 // Re-export infrastructure types
@@ -159,6 +160,24 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Parent's thread ID (0n if root span).
    */
   readonly parent_thread_id: bigint;
+
+  // ===========================================================================
+  // Schema & Stats Access (convenience getters for static properties)
+  // ===========================================================================
+
+  /**
+   * Schema for this buffer (accessed via constructor.schema).
+   * All buffers from same defineOpContext share the same schema.
+   * Underscore prefix since this is an internal property.
+   */
+  readonly _logSchema: LogSchema;
+
+  /**
+   * Shared stats for all buffers from same defineOpContext (accessed via constructor.stats).
+   * Enables self-tuning capacity learning across all ops in the same context.
+   * Underscore prefix since this is an internal property.
+   */
+  readonly _stats: SpanBufferStats;
 
   // ===========================================================================
   // Tree Structure (for span hierarchy)

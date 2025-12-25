@@ -21,11 +21,12 @@ import type { LogBinding, SpanBuffer } from '../types.js';
  * Uses createOpMetadata to ensure pre-encoded entries match the string values.
  */
 export function createTestOpMetadata(overrides: Partial<OpMetadata> = {}): OpMetadata {
+  const name = overrides.name ?? DEFAULT_METADATA.name;
   const package_name = overrides.package_name ?? DEFAULT_METADATA.package_name;
   const package_file = overrides.package_file ?? DEFAULT_METADATA.package_file;
   const git_sha = overrides.git_sha ?? DEFAULT_METADATA.git_sha;
   const line = overrides.line ?? DEFAULT_METADATA.line;
-  return createOpMetadata(package_name, package_file, git_sha, line);
+  return createOpMetadata(name, package_name, package_file, git_sha, line);
 }
 
 /**
@@ -97,18 +98,14 @@ export function createTestSpanBuffer<T extends SchemaFields>(
     capacity: options.capacity,
   });
 
-  // Create SpanBuffer using the new API
+  // Create SpanBuffer using the Phase 2 API (no LogBinding parameter)
   const spanBuffer = createSpanBuffer(
     logSchema,
-    logBinding,
     options.spanName ?? 'test-span',
     options.trace_id,
     options.capacity ?? DEFAULT_BUFFER_CAPACITY,
+    DEFAULT_METADATA,
   ) as SpanBuffer<LogSchema<T>>;
-
-  // Set _opMetadata for Arrow conversion (tests bypass tracer which normally sets this)
-  // This is necessary because createSpanBuffer doesn't set _opMetadata - that's done by tracer.ts
-  spanBuffer._opMetadata = DEFAULT_METADATA;
 
   return { logBinding, spanBuffer };
 }
@@ -130,7 +127,7 @@ export function createTestLogger<T extends LogSchema>(
   logBinding: LogBinding;
 } {
   const logBinding = createTestLogBinding(schema);
-  const buffer = createSpanBuffer(schema, logBinding, 'test-span');
+  const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, DEFAULT_METADATA);
   const logger = createSpanLogger(schema, buffer);
   return { buffer, logger, logBinding };
 }

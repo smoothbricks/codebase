@@ -12,12 +12,12 @@ import {
 } from '../flushScheduler.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import type { AnySpanBuffer } from '../types.js';
-import { createTestLogBinding, createTestSchema } from './test-helpers.js';
+import { createTestOpMetadata, createTestSchema } from './test-helpers.js';
 
 function createTestBuffer(): AnySpanBuffer {
   const schema = createTestSchema({});
-  const module = createTestLogBinding(schema);
-  const buffer = createSpanBuffer(schema, module, 'test-span');
+  const opMetadata = createTestOpMetadata();
+  const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, opMetadata);
   // Write some test data
   buffer._writeIndex = 5;
   for (let i = 0; i < buffer._writeIndex; i++) {
@@ -228,8 +228,8 @@ describe('FlushScheduler', () => {
         const buffer1 = createTestBuffer();
         const buffer2 = createTestBuffer();
 
-        // Make buffers share the same module context to ensure schema compatibility
-        buffer2._logBinding = buffer1._logBinding;
+        // Buffers created from the same schema share the same SpanBufferClass
+        // and can be flushed together (schema compatibility is automatic)
 
         buffer1._writeIndex = 10;
         buffer2._writeIndex = 20;

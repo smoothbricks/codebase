@@ -15,7 +15,6 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createTestLogBinding } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import type { LogSchema } from '../../schema/types.js';
@@ -40,16 +39,14 @@ function getBitsSet(nullBitmap: Uint8Array, count: number): boolean[] {
  * Create a test buffer from a schema
  */
 function createTestBuffer(schema: LogSchema): AnySpanBuffer {
-  const module = createTestLogBinding(schema);
-  return createSpanBuffer(schema, module, 'test-span');
+  return createSpanBuffer(schema, 'test-span');
 }
 
 /**
  * Create a test buffer with a specific capacity
  */
 function createTestBufferWithCapacity(schema: LogSchema, capacity: number): AnySpanBuffer {
-  const module = createTestLogBinding(schema);
-  return createSpanBuffer(schema, module, 'test-span', undefined, capacity);
+  return createSpanBuffer(schema, 'test-span', undefined, capacity);
 }
 
 /**
@@ -146,16 +143,12 @@ describe('null bitmap correctness', () => {
       // _setScope should NOT fill buffer columns
       logger._setScope({ requestId: 'req-123' });
 
-      // Check null bitmap - should NOT have any bits set (no buffer writes)
+      // Check null bitmap - should NOT be allocated (lazy allocation on first write)
       const nulls = SpanBufferTestUtils.getNullBitmap(buffer, 'requestId');
-      expect(nulls).toBeDefined();
-      if (!nulls) throw new Error('Null bitmap should be defined');
-      const bitsSet = getBitsSet(nulls, 8);
 
-      // No bits should be set - scope filling happens at Arrow conversion time
-      for (let i = 0; i < 8; i++) {
-        expect(bitsSet[i]).toBe(false);
-      }
+      // Null bitmap should NOT be allocated since we never directly wrote to requestId
+      // Scope filling happens at Arrow conversion time, not during span execution
+      expect(nulls).toBeUndefined();
     });
   });
 

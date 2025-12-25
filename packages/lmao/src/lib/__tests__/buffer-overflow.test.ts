@@ -5,9 +5,13 @@ import { createSpanLogger } from '../codegen/spanLoggerGenerator.js';
 import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
-import { createOverflowBuffer, createSpanBuffer } from '../spanBuffer.js';
-import type { AnySpanBuffer, LogBinding } from '../types.js';
-import { createTestLogBinding } from './test-helpers.js';
+import {
+  createOverflowBuffer,
+  createSpanBuffer,
+  getSpanBufferClass,
+  type SpanBufferConstructor,
+} from '../spanBuffer.js';
+import type { AnySpanBuffer } from '../types.js';
 
 /**
  * Property-based tests for buffer overflow handling.
@@ -39,16 +43,17 @@ const testSchema = new LogSchema(
 const RESERVED_ROWS = 2;
 
 /**
- * Helper: Create a LogBinding for testing with reset counters
+ * Helper: Get SpanBufferClass and reset stats for testing
  */
-function createTestLogBindingWithDefaults(capacity?: number): LogBinding {
-  return createTestLogBinding(testSchema, {
-    capacity: capacity ?? DEFAULT_BUFFER_CAPACITY,
-    sb_overflows: 0,
-    sb_overflowWrites: 0,
-    sb_totalWrites: 0,
-    sb_totalCreated: 0,
-  });
+function getTestSpanBufferClass(capacity?: number): SpanBufferConstructor {
+  const SpanBufferClass = getSpanBufferClass(testSchema);
+  // Reset stats for clean test state
+  SpanBufferClass.stats.capacity = capacity ?? DEFAULT_BUFFER_CAPACITY;
+  SpanBufferClass.stats.overflows = 0;
+  SpanBufferClass.stats.overflowWrites = 0;
+  SpanBufferClass.stats.totalWrites = 0;
+  SpanBufferClass.stats.totalCreated = 0;
+  return SpanBufferClass;
 }
 
 /**
@@ -142,10 +147,10 @@ function expectedBufferCount(numEntries: number, capacity: number, reservedRows:
 }
 
 describe('Buffer Overflow Property Tests', () => {
-  let logBinding: LogBinding;
+  let SpanBufferClass: SpanBufferConstructor;
 
   beforeEach(() => {
-    logBinding = createTestLogBindingWithDefaults();
+    SpanBufferClass = getTestSpanBufferClass();
   });
 
   describe('Property: Entry Preservation', () => {
@@ -156,11 +161,11 @@ describe('Buffer Overflow Property Tests', () => {
           fc.integer({ min: 1, max: 200 }),
           (numEntries) => {
             // Reset counters for each test run
-            logBinding.sb_overflows = 0;
-            logBinding.sb_totalCreated = 0;
+            SpanBufferClass.stats.overflows = 0;
+            SpanBufferClass.stats.totalCreated = 0;
 
-            const buffer = createSpanBuffer(testSchema, logBinding, 'test-span');
-            const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+            const buffer = createSpanBuffer(testSchema, 'test-span');
+            const logger = createSpanLogger(testSchema, buffer);
 
             // Write entries
             for (let i = 0; i < numEntries; i++) {
@@ -188,12 +193,12 @@ describe('Buffer Overflow Property Tests', () => {
     it('buffer count matches mathematical formula for any entry count', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
-          logBinding.sb_overflows = 0;
-          logBinding.sb_totalCreated = 0;
+          SpanBufferClass.stats.overflows = 0;
+          SpanBufferClass.stats.totalCreated = 0;
 
           const capacity = DEFAULT_BUFFER_CAPACITY; // 8
-          const buffer = createSpanBuffer(testSchema, logBinding, 'test-span', undefined, capacity);
-          const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+          const buffer = createSpanBuffer(testSchema, 'test-span', undefined, capacity);
+          const logger = createSpanLogger(testSchema, buffer);
 
           // Write entries
           for (let i = 0; i < numEntries; i++) {
@@ -215,11 +220,11 @@ describe('Buffer Overflow Property Tests', () => {
     it('buffer chain is properly linked', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
-          logBinding.sb_overflows = 0;
-          logBinding.sb_totalCreated = 0;
+          SpanBufferClass.stats.overflows = 0;
+          SpanBufferClass.stats.totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, logBinding, 'test-span');
-          const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+          const buffer = createSpanBuffer(testSchema, 'test-span');
+          const logger = createSpanLogger(testSchema, buffer);
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -258,11 +263,11 @@ describe('Buffer Overflow Property Tests', () => {
     it('each entry has correct attribute values', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
-          logBinding.sb_overflows = 0;
-          logBinding.sb_totalCreated = 0;
+          SpanBufferClass.stats.overflows = 0;
+          SpanBufferClass.stats.totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, logBinding, 'test-span');
-          const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+          const buffer = createSpanBuffer(testSchema, 'test-span');
+          const logger = createSpanLogger(testSchema, buffer);
 
           const operations = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
 
@@ -299,11 +304,11 @@ describe('Buffer Overflow Property Tests', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 150 }), (numEntries) => {
           // Reset counters
-          logBinding.sb_overflows = 0;
-          logBinding.sb_totalCreated = 0;
+          SpanBufferClass.stats.overflows = 0;
+          SpanBufferClass.stats.totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, logBinding, 'test-span');
-          const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+          const buffer = createSpanBuffer(testSchema, 'test-span');
+          const logger = createSpanLogger(testSchema, buffer);
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -312,7 +317,7 @@ describe('Buffer Overflow Property Tests', () => {
           const { bufferCount } = analyzeBufferChain(buffer);
 
           // Property: overflow events = bufferCount - 1 (one per chain link)
-          expect(logBinding.sb_overflows).toBe(bufferCount - 1);
+          expect(SpanBufferClass.stats.overflows).toBe(bufferCount - 1);
         }),
         { numRuns: 100 },
       );
@@ -323,11 +328,11 @@ describe('Buffer Overflow Property Tests', () => {
     it('each buffer writeIndex is within capacity', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
-          logBinding.sb_overflows = 0;
-          logBinding.sb_totalCreated = 0;
+          SpanBufferClass.stats.overflows = 0;
+          SpanBufferClass.stats.totalCreated = 0;
 
-          const buffer = createSpanBuffer(testSchema, logBinding, 'test-span');
-          const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+          const buffer = createSpanBuffer(testSchema, 'test-span');
+          const logger = createSpanLogger(testSchema, buffer);
 
           for (let i = 0; i < numEntries; i++) {
             logger.info(`msg-${i}`);
@@ -352,10 +357,10 @@ describe('Buffer Overflow Property Tests', () => {
     it('exact usable capacity: no overflow when entries fit in first buffer', () => {
       const capacity = DEFAULT_BUFFER_CAPACITY; // 8
       const usableCapacity = capacity - RESERVED_ROWS; // 6 entries fit
-      logBinding.sb_overflows = 0;
+      SpanBufferClass.stats.overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, logBinding, 'test-span', undefined, capacity);
-      const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+      const buffer = createSpanBuffer(testSchema, 'test-span', undefined, capacity);
+      const logger = createSpanLogger(testSchema, buffer);
 
       // Write exactly usable capacity entries (6 with capacity=8, reserved=2)
       for (let i = 0; i < usableCapacity; i++) {
@@ -364,7 +369,7 @@ describe('Buffer Overflow Property Tests', () => {
 
       // Should be exactly 1 buffer (no overflow)
       expect(buffer._overflow).toBeUndefined();
-      expect(logBinding.sb_overflows).toBe(0);
+      expect(SpanBufferClass.stats.overflows).toBe(0);
       // writeIndex = RESERVED_ROWS + usableCapacity = 2 + 6 = 8 = capacity
       expect(buffer._writeIndex).toBe(capacity);
     });
@@ -372,10 +377,10 @@ describe('Buffer Overflow Property Tests', () => {
     it('usable capacity + 1: triggers exactly one overflow', () => {
       const capacity = DEFAULT_BUFFER_CAPACITY; // 8
       const usableCapacity = capacity - RESERVED_ROWS; // 6
-      logBinding.sb_overflows = 0;
+      SpanBufferClass.stats.overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, logBinding, 'test-span', undefined, capacity);
-      const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+      const buffer = createSpanBuffer(testSchema, 'test-span', undefined, capacity);
+      const logger = createSpanLogger(testSchema, buffer);
 
       // Write usable capacity + 1 entries (7 entries)
       for (let i = 0; i < usableCapacity + 1; i++) {
@@ -385,7 +390,7 @@ describe('Buffer Overflow Property Tests', () => {
       // Should be exactly 2 buffers
       expect(buffer._overflow).toBeDefined();
       expect(buffer._overflow?._overflow).toBeUndefined();
-      expect(logBinding.sb_overflows).toBe(1);
+      expect(SpanBufferClass.stats.overflows).toBe(1);
 
       // First buffer full, second has 1 entry
       expect(buffer._writeIndex).toBe(capacity);
@@ -393,16 +398,16 @@ describe('Buffer Overflow Property Tests', () => {
     });
 
     it('zero entries: single buffer with just reserved space', () => {
-      logBinding.sb_overflows = 0;
+      SpanBufferClass.stats.overflows = 0;
 
-      const buffer = createSpanBuffer(testSchema, logBinding, 'test-span');
+      const buffer = createSpanBuffer(testSchema, 'test-span');
       // Create logger but don't write anything
-      createSpanLogger(testSchema, buffer, createOverflowBuffer);
+      createSpanLogger(testSchema, buffer);
 
       expect(buffer._overflow).toBeUndefined();
       // Logger constructor sets writeIndex to 2 (after reserved rows)
       expect(buffer._writeIndex).toBe(RESERVED_ROWS);
-      expect(logBinding.sb_overflows).toBe(0);
+      expect(SpanBufferClass.stats.overflows).toBe(0);
     });
   });
 
@@ -415,12 +420,12 @@ describe('Buffer Overflow Property Tests', () => {
             .integer({ min: 8, max: 64 })
             .map((n) => (n + 7) & ~7), // capacity aligned to 8
           (numEntries, capacity) => {
-            logBinding.sb_overflows = 0;
-            logBinding.sb_totalCreated = 0;
-            logBinding.sb_capacity = capacity; // Set for chained buffers
+            SpanBufferClass.stats.overflows = 0;
+            SpanBufferClass.stats.totalCreated = 0;
+            SpanBufferClass.stats.capacity = capacity; // Set for chained buffers
 
-            const buffer = createSpanBuffer(testSchema, logBinding, 'test-span', undefined, capacity);
-            const logger = createSpanLogger(testSchema, buffer, createOverflowBuffer);
+            const buffer = createSpanBuffer(testSchema, 'test-span', undefined, capacity);
+            const logger = createSpanLogger(testSchema, buffer);
 
             for (let i = 0; i < numEntries; i++) {
               logger.info(`msg-${i}`).requestId(`req-${i}`);
@@ -433,7 +438,7 @@ describe('Buffer Overflow Property Tests', () => {
             expect(bufferCount).toBe(expected);
 
             // Property: overflow count matches
-            expect(logBinding.sb_overflows).toBe(bufferCount - 1);
+            expect(SpanBufferClass.stats.overflows).toBe(bufferCount - 1);
           },
         ),
         { numRuns: 100 },

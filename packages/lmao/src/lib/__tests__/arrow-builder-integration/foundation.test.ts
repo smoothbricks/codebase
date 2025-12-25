@@ -1,29 +1,19 @@
 import { describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { S } from '../../schema/builder.js';
-import { createSpanBuffer } from '../../spanBuffer.js';
+import { createSpanBuffer, getSpanBufferClass, type SpanBufferConstructor } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import type { LogBinding } from '../../types.js';
-import { createTestLogBinding, createTestSchema } from '../test-helpers.js';
+import { createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Foundation', () => {
-  // Helper to create a test module context
-  function createTestModule(): LogBinding {
+  it('creates SpanBuffer with TypedArrays', () => {
     const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       count: S.number(),
     });
-
-    // Use createTestModuleContext helper which returns LogBinding
-    return createTestLogBinding(schema);
-  }
-
-  it('creates SpanBuffer with TypedArrays', () => {
-    const module = createTestModule();
-    const schema = module.logSchema; // LogSchema instance
     const traceId = createTraceId('trace-123');
 
-    const buf = createSpanBuffer(schema, module, 'test-span', traceId); // Uses DEFAULT_BUFFER_CAPACITY
+    const buf = createSpanBuffer(schema, 'test-span', traceId); // Uses DEFAULT_BUFFER_CAPACITY
 
     // Span identity assertions (unified memory layout)
     expect(typeof buf.span_id).toBe('number');
@@ -48,14 +38,15 @@ describe('Buffer Foundation', () => {
     expect(buf._children).toBeInstanceOf(Array);
     expect(buf._writeIndex).toBe(0);
     expect(buf._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
-    expect(buf._logBinding).toBe(module);
   });
 
   it('creates root SpanBuffer with createSpanBuffer', () => {
-    const module = createTestModule();
-    const schema = module.logSchema; // LogSchema instance
+    const schema = createTestSchema({
+      userId: S.category(),
+      count: S.number(),
+    });
 
-    const buf = createSpanBuffer(schema, module, 'test-span', createTraceId('trace-999'));
+    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-999'));
 
     expect(buf.span_id).toBeGreaterThan(0);
     expect(buf._hasParent).toBe(false);
@@ -63,15 +54,20 @@ describe('Buffer Foundation', () => {
     expect(buf._children).toHaveLength(0);
   });
 
-  it('tracks buffer creation in capacity stats', () => {
-    const module = createTestModule();
-    const schema = module.logSchema; // LogSchema instance
+  it('provides access to buffer stats via constructor', () => {
+    const schema = createTestSchema({
+      userId: S.category(),
+      count: S.number(),
+    });
 
-    const initialCount = module.sb_totalCreated;
+    // Get SpanBufferClass to access stats
+    const SpanBufferClass = getSpanBufferClass(schema);
+    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-456'), 64);
 
-    createSpanBuffer(schema, module, 'test-span', createTraceId('trace-456'), 64);
-
-    expect(module.sb_totalCreated).toBe(initialCount + 1);
+    // Stats are accessible from constructor
+    const bufferClass = buf.constructor as SpanBufferConstructor;
+    expect(bufferClass.stats).toBe(SpanBufferClass.stats);
+    expect(bufferClass.stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
   });
 
   it('handles different schema sizes', () => {
@@ -84,10 +80,7 @@ describe('Buffer Foundation', () => {
       field5: S.number(),
     });
 
-    // Create module context with larger schema using test helper
-    const module = createTestLogBinding(largeSchema);
-
-    const buf = createSpanBuffer(largeSchema, module, 'test-span', createTraceId('trace-789'), 64);
+    const buf = createSpanBuffer(largeSchema, 'test-span', createTraceId('trace-789'), 64);
 
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them
@@ -102,5 +95,37 @@ describe('Buffer Foundation', () => {
     expect(buf.field4_nulls).toBeInstanceOf(Uint8Array);
     expect(buf.field5_values).toBeInstanceOf(Float64Array); // number
     expect(buf.field5_nulls).toBeInstanceOf(Uint8Array);
+  });
+
+  it('accesses schema from SpanBufferConstructor', () => {
+    const schema = createTestSchema({
+      userId: S.category(),
+      count: S.number(),
+    });
+
+    const buf = createSpanBuffer(schema, 'test-span', createTraceId('trace-123'));
+    const SpanBufferClass = buf.constructor as SpanBufferConstructor;
+
+    // Schema is accessible via static property
+    expect(SpanBufferClass.schema).toBe(schema);
+    expect(SpanBufferClass.schema.fields.userId).toBeDefined();
+    expect(SpanBufferClass.schema.fields.count).toBeDefined();
+  });
+
+  it('accesses stats from SpanBufferConstructor', () => {
+    const schema = createTestSchema({
+      userId: S.category(),
+      count: S.number(),
+    });
+
+    const buf = createSpanBuffer(schema, 'test-span');
+    const SpanBufferClass = buf.constructor as SpanBufferConstructor;
+
+    // Stats are accessible via static property (clean names, no sb_ prefix)
+    expect(typeof SpanBufferClass.stats.capacity).toBe('number');
+    expect(typeof SpanBufferClass.stats.totalWrites).toBe('number');
+    expect(typeof SpanBufferClass.stats.overflowWrites).toBe('number');
+    expect(typeof SpanBufferClass.stats.totalCreated).toBe('number');
+    expect(typeof SpanBufferClass.stats.overflows).toBe('number');
   });
 });

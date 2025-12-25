@@ -148,10 +148,9 @@ describe('Schema Integration Patterns', () => {
       });
 
       expect(testOp).toBeDefined();
-      // Op is an object with fn method and name property
-      expect(testOp.name).toBe('test-task');
-      // biome-ignore lint/suspicious/noExplicitAny: Testing internal Op structure
-      expect(typeof (testOp as any).fn).toBe('function');
+      // Op is an object with fn method and metadata property
+      expect(testOp.metadata.package_name).toBeDefined();
+      expect(typeof testOp.fn).toBe('function');
     });
 
     it('should execute op with Tracer (destructuring pattern)', async () => {

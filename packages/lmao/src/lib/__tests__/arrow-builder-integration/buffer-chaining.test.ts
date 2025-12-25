@@ -1,14 +1,22 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import { createChildSpanBuffer, createOverflowBuffer, createSpanBuffer, createTraceId, S } from '@smoothbricks/lmao';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
+import { S } from '../../schema/builder.js';
 import type { LogSchema } from '../../schema/LogSchema.js';
-import type { LogBinding, SpanBuffer } from '../../types.js';
-import { createTestLogBinding, createTestSchema } from '../test-helpers.js';
+import {
+  createChildSpanBuffer,
+  createOverflowBuffer,
+  createSpanBuffer,
+  getSpanBufferClass,
+  type SpanBufferConstructor,
+} from '../../spanBuffer.js';
+import { createTraceId } from '../../traceId.js';
+import type { SpanBuffer } from '../../types.js';
+import { createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Chaining', () => {
-  let module: LogBinding;
   let schema: LogSchema<any>;
+  let SpanBufferClass: SpanBufferConstructor;
 
   beforeEach(() => {
     // Use LogSchema directly - createSpanBuffer requires LogSchema, not plain object
@@ -19,12 +27,12 @@ describe('Buffer Chaining', () => {
       duration: S.number(),
     });
 
-    module = createTestLogBinding(schema);
+    SpanBufferClass = getSpanBufferClass(schema);
   });
 
   describe('createOverflowBuffer', () => {
     it('should create a chained buffer with same spanId and traceId', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span');
+      const buffer = createSpanBuffer(schema, 'test-span');
       const nextBuffer = createOverflowBuffer(buffer);
 
       // Should inherit spanId and traceId
@@ -36,25 +44,22 @@ describe('Buffer Chaining', () => {
 
       // Should have same parent
       expect(nextBuffer._parent).toBe(buffer._parent);
-
-      // Should have same task context
-      expect(nextBuffer.task).toBe(buffer.task);
     });
 
     it('should create buffer with current capacity from stats', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span');
+      const buffer = createSpanBuffer(schema, 'test-span');
 
       // Update capacity stats
-      module.sb_capacity = 128;
+      SpanBufferClass.stats.capacity = 128;
 
       const nextBuffer = createOverflowBuffer(buffer);
 
-      // Should use updated capacity
+      // Should use updated capacity (rounded to multiple of 8)
       expect(nextBuffer._capacity).toBe(128);
     });
 
     it('should create independent writeIndex for chained buffer', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span');
+      const buffer = createSpanBuffer(schema, 'test-span');
 
       // Write some data to original buffer
       buffer._writeIndex = 50;
@@ -68,7 +73,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should maintain schema structure in chained buffer', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span');
+      const buffer = createSpanBuffer(schema, 'test-span');
       const nextBuffer = createOverflowBuffer(buffer);
 
       // Should have same attribute columns (use _values suffix to access storage)
@@ -83,7 +88,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should handle multiple chained buffers', () => {
-      const buffer1 = createSpanBuffer(schema, module, 'test-span');
+      const buffer1 = createSpanBuffer(schema, 'test-span');
       const buffer2 = createOverflowBuffer(buffer1);
       const buffer3 = createOverflowBuffer(buffer2);
 
@@ -99,18 +104,24 @@ describe('Buffer Chaining', () => {
     });
 
     it('should increment totalBuffersCreated stat', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span');
-      const initialCount = module.sb_totalCreated;
+      const buffer = createSpanBuffer(schema, 'test-span');
+      const initialCount = SpanBufferClass.stats.totalCreated;
 
       createOverflowBuffer(buffer);
 
-      expect(module.sb_totalCreated).toBe(initialCount + 1);
+      expect(SpanBufferClass.stats.totalCreated).toBe(initialCount + 1);
     });
 
     it('should handle buffer with parent correctly', () => {
-      const parentBuffer = createSpanBuffer(schema, module, 'test-span');
+      const parentBuffer = createSpanBuffer(schema, 'test-span');
 
-      const childBuffer = createChildSpanBuffer(parentBuffer, module, 'child-span', DEFAULT_METADATA);
+      const childBuffer = createChildSpanBuffer(
+        parentBuffer,
+        SpanBufferClass,
+        'child-span',
+        DEFAULT_METADATA,
+        DEFAULT_METADATA,
+      );
       parentBuffer._children.push(childBuffer);
 
       const nextChildBuffer = createOverflowBuffer(childBuffer);
@@ -124,10 +135,16 @@ describe('Buffer Chaining', () => {
     });
 
     it('should create empty children array for chained buffer', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span');
+      const buffer = createSpanBuffer(schema, 'test-span');
 
       // Add a child to original buffer
-      const childBuffer = createChildSpanBuffer(buffer, module, 'child-span', DEFAULT_METADATA);
+      const childBuffer = createChildSpanBuffer(
+        buffer,
+        SpanBufferClass,
+        'child-span',
+        DEFAULT_METADATA,
+        DEFAULT_METADATA,
+      );
       buffer._children.push(childBuffer);
 
       const nextBuffer = createOverflowBuffer(buffer);
@@ -139,17 +156,17 @@ describe('Buffer Chaining', () => {
 
   describe('Buffer Chaining Edge Cases', () => {
     it('should handle buffer at exact capacity', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span', undefined, 10);
+      const buffer = createSpanBuffer(schema, 'test-span', undefined, 10);
       buffer._writeIndex = 10; // At exact capacity
 
       const nextBuffer = createOverflowBuffer(buffer);
 
       expect(nextBuffer._writeIndex).toBe(0);
-      expect(nextBuffer._capacity).toBe(module.sb_capacity);
+      expect(nextBuffer._capacity).toBe(SpanBufferClass.stats.capacity);
     });
 
     it('should preserve null bitmaps structure in chained buffer', () => {
-      const buffer = createSpanBuffer(schema, module, 'test-span');
+      const buffer = createSpanBuffer(schema, 'test-span');
       const nextBuffer = createOverflowBuffer(buffer);
 
       // Should have null bitmaps for each attribute (direct properties)
@@ -160,17 +177,17 @@ describe('Buffer Chaining', () => {
     });
 
     it('should handle capacity changes between chained buffers', () => {
-      const buffer1 = createSpanBuffer(schema, module, 'test-span');
+      const buffer1 = createSpanBuffer(schema, 'test-span');
       expect(buffer1._capacity).toBe(DEFAULT_BUFFER_CAPACITY);
 
       // Simulate capacity tuning - double it
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 2;
+      SpanBufferClass.stats.capacity = DEFAULT_BUFFER_CAPACITY * 2;
 
       const buffer2 = createOverflowBuffer(buffer1);
       expect(buffer2._capacity).toBe(DEFAULT_BUFFER_CAPACITY * 2);
 
       // Change capacity again - double again
-      module.sb_capacity = DEFAULT_BUFFER_CAPACITY * 4;
+      SpanBufferClass.stats.capacity = DEFAULT_BUFFER_CAPACITY * 4;
 
       const buffer3 = createOverflowBuffer(buffer2);
       expect(buffer3._capacity).toBe(DEFAULT_BUFFER_CAPACITY * 4);
@@ -180,7 +197,7 @@ describe('Buffer Chaining', () => {
   describe('Enhanced Buffer Chaining Tests', () => {
     it('should preserve data integrity across multiple buffer overflows', () => {
       const traceId = createTraceId('complex-trace');
-      const rootBuffer = createSpanBuffer(schema, module, 'root-span', traceId, 4); // Small capacity
+      const rootBuffer = createSpanBuffer(schema, 'root-span', traceId, 4); // Small capacity
 
       // Write entries that will cause multiple overflows
       const testEntries = Array.from({ length: 10 }, (_, i) => ({
@@ -235,17 +252,17 @@ describe('Buffer Chaining', () => {
 
     it('should maintain buffer topology with mixed relationships', () => {
       const traceId = createTraceId('topology-test');
-      const rootBuffer = createSpanBuffer(schema, module, 'root', traceId);
+      const rootBuffer = createSpanBuffer(schema, 'root', traceId);
 
       // Create first chained buffer with children
       const buffer1 = createOverflowBuffer(rootBuffer);
-      const child1 = createChildSpanBuffer(buffer1, module, 'child1', DEFAULT_METADATA);
-      const child2 = createChildSpanBuffer(buffer1, module, 'child2', DEFAULT_METADATA);
+      const child1 = createChildSpanBuffer(buffer1, SpanBufferClass, 'child1', DEFAULT_METADATA, DEFAULT_METADATA);
+      const child2 = createChildSpanBuffer(buffer1, SpanBufferClass, 'child2', DEFAULT_METADATA, DEFAULT_METADATA);
       buffer1._children.push(child1, child2);
 
       // Create second chained buffer with children
       const buffer2 = createOverflowBuffer(buffer1);
-      const child3 = createChildSpanBuffer(buffer2, module, 'child3', DEFAULT_METADATA);
+      const child3 = createChildSpanBuffer(buffer2, SpanBufferClass, 'child3', DEFAULT_METADATA, DEFAULT_METADATA);
       buffer2._children.push(child3);
 
       // Verify topology
@@ -291,11 +308,11 @@ describe('Buffer Chaining', () => {
     });
 
     it('should track overflow statistics accurately', () => {
-      const initialCreated = module.sb_totalCreated;
+      const initialCreated = SpanBufferClass.stats.totalCreated;
 
-      const rootBuffer = createSpanBuffer(schema, module, 'stats-test', undefined, 3); // Very small capacity
+      const rootBuffer = createSpanBuffer(schema, 'stats-test', undefined, 3); // Very small capacity
 
-      // Manually create overflow buffers (note: sb_overflows is only tracked by SpanLogger, not createOverflowBuffer)
+      // Manually create overflow buffers
       let currentBuffer = rootBuffer;
       for (let i = 0; i < 10; i++) {
         if (currentBuffer._writeIndex >= currentBuffer._capacity) {
@@ -319,14 +336,12 @@ describe('Buffer Chaining', () => {
 
       // Should have created multiple buffers for 10 entries with capacity 3
       expect(bufferCount).toBeGreaterThan(1);
-      // sb_totalCreated is incremented by createOverflowBuffer
-      expect(module.sb_totalCreated).toBe(initialCreated + (bufferCount - 1));
-      // Note: sb_overflows is only tracked by SpanLogger's _getNextBuffer(), not by createOverflowBuffer directly
-      // If you need to track overflows, use SpanLogger which calls _getNextBuffer() automatically
+      // totalCreated is incremented by createOverflowBuffer
+      expect(SpanBufferClass.stats.totalCreated).toBe(initialCreated + (bufferCount - 1));
     });
 
     it('should preserve schema consistency across chain boundaries', () => {
-      const rootBuffer = createSpanBuffer(schema, module, 'schema-test');
+      const rootBuffer = createSpanBuffer(schema, 'schema-test');
       const buffer1 = createOverflowBuffer(rootBuffer);
       const buffer2 = createOverflowBuffer(buffer1);
       const buffer3 = createOverflowBuffer(buffer2);

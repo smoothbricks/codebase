@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test';
-import { createTestSchema, createTestSpanBuffer } from '../../__tests__/test-helpers.js';
+import { createTestSchema } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
 import { type BooleanFlagContext, InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../../schema/systemSchema.js';
 import type { LogSchema } from '../../schema/types.js';
+import { createSpanBuffer, type SpanBufferConstructor } from '../../spanBuffer.js';
 import type { AnySpanBuffer, SpanBuffer } from '../../types.js';
 import { createEvaluatorClass, generateEvaluatorClass } from '../evaluatorGenerator.js';
 import { createSpanLogger } from '../spanLoggerGenerator.js';
@@ -23,8 +24,8 @@ import { createSpanLogger } from '../spanLoggerGenerator.js';
  */
 // biome-ignore lint/suspicious/noExplicitAny: Test utility - mock context for evaluator testing
 function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): any {
-  // Create a real SpanLogger for the buffer using the schema from module
-  const schema = spanBuffer._logBinding.logSchema as T;
+  // Get schema from constructor (Phase 2 API)
+  const schema = spanBuffer._logSchema as T;
   const logger = createSpanLogger(schema, spanBuffer);
 
   // Mock SpanContext with the essential properties
@@ -114,7 +115,7 @@ describe('EvaluatorGenerator', () => {
         debugMode: S.boolean().default(false).sync(),
       });
       const logSchema = createTestSchema({});
-      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const spanBuffer = createSpanBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
@@ -167,7 +168,7 @@ describe('EvaluatorGenerator', () => {
         debugMode: S.boolean().default(false).sync(),
       });
       const logSchema = createTestSchema({});
-      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const spanBuffer = createSpanBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
@@ -192,7 +193,7 @@ describe('EvaluatorGenerator', () => {
         debugMode: S.boolean().default(false).sync(),
       });
       const logSchema = createTestSchema({});
-      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const spanBuffer = createSpanBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
@@ -213,7 +214,7 @@ describe('EvaluatorGenerator', () => {
         debugMode: S.boolean().default(false).sync(),
       });
       const logSchema = createTestSchema({});
-      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const spanBuffer = createSpanBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
@@ -226,7 +227,7 @@ describe('EvaluatorGenerator', () => {
       const instance = new GeneratedClass(mockCtx, evaluator);
 
       // Create a new SpanContext for child span
-      const { spanBuffer: childBuffer } = createTestSpanBuffer(logSchema, { spanName: 'child-span' });
+      const childBuffer = createSpanBuffer(logSchema, 'child-span');
       const childCtx = createMockSpanContext(childBuffer);
 
       const childInstance = instance.forContext(childCtx);
@@ -241,7 +242,7 @@ describe('EvaluatorGenerator', () => {
         debugMode: S.boolean().default(false).sync(),
       });
       const logSchema = createTestSchema({});
-      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const spanBuffer = createSpanBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
       let evalCount = 0;
@@ -280,7 +281,7 @@ describe('EvaluatorGenerator', () => {
         asyncFlag: S.number().default(100).async(),
       });
       const logSchema = createTestSchema({});
-      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const spanBuffer = createSpanBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
@@ -302,7 +303,7 @@ describe('EvaluatorGenerator', () => {
         debugMode: S.boolean().default(false).sync(),
       });
       const logSchema = createTestSchema({});
-      const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+      const spanBuffer = createSpanBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
       const GeneratedClass = createEvaluatorClass(
@@ -342,7 +343,7 @@ describe('EvaluatorGenerator', () => {
       const mockEvaluator = new InMemoryFlagEvaluator(schema.schema, {});
 
       const createInstance = () => {
-        const { spanBuffer } = createTestSpanBuffer(logSchema, { spanName: 'test-span' });
+        const spanBuffer = createSpanBuffer(logSchema, 'test-span');
         const mockCtx = createMockSpanContext(spanBuffer);
         return new GeneratedClass(mockCtx, mockEvaluator);
       };

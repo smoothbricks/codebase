@@ -15,10 +15,10 @@ import {
   ENTRY_TYPE_SPAN_OK,
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
-import { createSpanBuffer } from '../spanBuffer.js';
+import { createSpanBuffer, type SpanBufferConstructor } from '../spanBuffer.js';
 import { Tracer } from '../tracer.js';
 import type { AnySpanBuffer } from '../types.js';
-import { createTestLogBinding } from './test-helpers.js';
+import { createTestOpMetadata } from './test-helpers.js';
 
 // Test schema
 // Note: resultMessage, exceptionMessage, errorCode, and exceptionStack are now system columns
@@ -229,7 +229,7 @@ describe('Child Span Lifecycle', () => {
         const parent = parentBuffer as NonNullable<typeof parentBuffer>;
 
         // Verify child span inherits parent's schema
-        expect(childCtx.buffer._logBinding.logSchema).toBe(parent._logBinding.logSchema);
+        expect(childCtx.buffer.logSchema).toBe(parent.logSchema);
 
         // Verify child span has different spanId but same traceId
         expect(childCtx.buffer.span_id).not.toBe(parent.span_id);
@@ -284,21 +284,15 @@ describe('Child Span Lifecycle', () => {
 
     const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
 
-    // Find root span-start (entry_type = span-start, package_name matches)
-    const rootSpanStart = rows.find(
-      (r) => r?.entry_type === 'span-start' && r?.package_name === '@test/pkg' && r?.message === 'root-task',
-    );
-    const childSpanStart = rows.find(
-      (r) => r?.entry_type === 'span-start' && r?.package_name === '@test/pkg' && r?.message === 'child-task',
-    );
+    // Find root span-start (entry_type = span-start, message matches)
+    const rootSpanStart = rows.find((r) => r?.entry_type === 'span-start' && r?.message === 'root-task');
+    const childSpanStart = rows.find((r) => r?.entry_type === 'span-start' && r?.message === 'child-task');
 
     expect(rootSpanStart).toBeDefined();
     expect(childSpanStart).toBeDefined();
 
-    // Root op's span is a child of the trace root (via traceCtx.span())
-    // So it HAS a parent_span_id (the trace root's span_id)
-    expect(rootSpanStart?.parent_span_id).toBeDefined();
-    expect(typeof rootSpanStart?.parent_span_id).toBe('number');
+    // Root span has no parent (it's the trace root itself)
+    expect(rootSpanStart?.parent_span_id).toBeNull();
 
     // Child span should reference root span's span_id
     expect(childSpanStart?.parent_span_id).toBe(rootSpanStart?.span_id);
@@ -342,7 +336,7 @@ describe('Child Span Lifecycle', () => {
         // All ops in the factory share the same schema
         expect(parentBuffer).toBeDefined();
         const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-        expect(childCtx.buffer._logBinding.logSchema).toEqual(parent._logBinding.logSchema);
+        expect(childCtx.buffer.logSchema).toEqual(parent.logSchema);
 
         // Child should be able to access parent's schema fields
         childCtx.tag.userId('user123').operation('READ');
@@ -356,10 +350,9 @@ describe('Child Span Lifecycle', () => {
     expect(parentBuffer).toBeDefined();
     expect(childBuffer).toBeDefined();
     expect(childBuffer?._parent).toBe(parentBuffer);
-    // Child buffer's schema should be the same as parent's schema (inherited)
-    // Note: We use toEqual because the schemas are equal but may be different object references
-    // The important thing is that the child buffer can write to parent's schema fields
-    expect(childBuffer?._logBinding.logSchema).toEqual(parentBuffer?._logBinding.logSchema);
+    // Child buffer's schema is the same as parent's schema (inherited)
+    // Both buffers are instances of the same SpanBuffer class, so they share the same static schema
+    expect(childBuffer?.logSchema).toEqual(parentBuffer?.logSchema);
   });
 });
 
@@ -517,10 +510,9 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should create buffer with proper structure for fixed layout', () => {
-    // Use the LogSchema directly (not a plain object extraction)
-    // testSchema is already a LogSchema from defineLogSchema()
-    const module = createTestLogBinding(testSchema);
-    const buffer = createSpanBuffer(testSchema, module, 'test-span');
+    // Create buffer using the new Phase 2 API
+    const opMetadata = createTestOpMetadata();
+    const buffer = createSpanBuffer(testSchema, 'test-span', undefined, undefined, opMetadata);
 
     // Buffer should have timestamps array for duration calculation
     expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);

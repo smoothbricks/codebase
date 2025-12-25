@@ -7,7 +7,8 @@ import {
 } from '@smoothbricks/arrow-builder';
 import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
-import { createTestLogBinding, createTestSchema } from '../test-helpers.js';
+import type { SpanBufferConstructor } from '../../spanBuffer.js';
+import { createTestOpMetadata, createTestSchema } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
   it('generates TypedArray columns with proper names for defined schema', () => {
@@ -38,9 +39,8 @@ describe('Buffer Integration', () => {
       score: S.number(),
     });
 
-    const module = createTestLogBinding(schema);
     const capacity = 64;
-    const buf = createSpanBuffer(schema, module, 'test-span', undefined, capacity);
+    const buf = createSpanBuffer(schema, 'test-span', undefined, capacity, createTestOpMetadata());
 
     // Core TypedArrays exist
     expect(buf.timestamp).toBeInstanceOf(BigInt64Array);
@@ -65,17 +65,15 @@ describe('Buffer Integration', () => {
     });
 
     // Create buffer with schema
-    const module = createTestLogBinding(schema);
-    const buffer = createSpanBuffer(schema, module, 'test-span');
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, createTestOpMetadata());
 
     // Verify all attribute columns created as TypedArrays with correct types (use _values suffix)
     expect(Array.isArray(buffer.requestId_values)).toBe(true); // category (raw strings)
     expect(buffer.httpStatus_values).toBeInstanceOf(Float64Array); // number
     expect(buffer.operation_values).toBeInstanceOf(Uint8Array); // enum
 
-    // Verify module is set
-    expect(buffer._logBinding).toBe(module);
-    expect(buffer._logBinding.logSchema.fields).toBe(schema.fields);
+    // Verify schema is accessible via constructor
+    expect(buffer.logSchema.fields).toBe(schema.fields);
   });
 
   it('handles optional fields in schema', () => {
@@ -84,8 +82,7 @@ describe('Buffer Integration', () => {
       optional: S.optional(S.number()),
     });
 
-    const module = createTestLogBinding(schema);
-    const buffer = createSpanBuffer(schema, module, 'test-span');
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, createTestOpMetadata());
 
     // Both should have TypedArray columns (use _values suffix)
     expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
@@ -101,8 +98,7 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // Text: unmasked plain text
     });
 
-    const module = createTestLogBinding(schema);
-    const buffer = createSpanBuffer(schema, module, 'test-span');
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, createTestOpMetadata());
 
     // All should have TypedArray columns (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
@@ -118,8 +114,7 @@ describe('Buffer Integration', () => {
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
     });
 
-    const smallModule = createTestLogBinding(smallEnumSchema);
-    const smallBuffer = createSpanBuffer(smallEnumSchema, smallModule, 'test-span');
+    const smallBuffer = createSpanBuffer(smallEnumSchema, 'test-span', undefined, undefined, createTestOpMetadata());
 
     // Should use Uint8Array for enums with ≤255 values (use _values suffix)
     expect(smallBuffer.operation_values).toBeInstanceOf(Uint8Array);
@@ -131,8 +126,7 @@ describe('Buffer Integration', () => {
       plainUserId: S.category(), // No masking
     });
 
-    const module = createTestLogBinding(schema);
-    const buffer = createSpanBuffer(schema, module, 'test-span');
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, createTestOpMetadata());
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -172,8 +166,7 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // No masking
     });
 
-    const module = createTestLogBinding(schema);
-    const buffer = createSpanBuffer(schema, module, 'test-span');
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, createTestOpMetadata());
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -218,8 +211,7 @@ describe('Buffer Integration', () => {
       secretKey: S.text().mask(customMask),
     });
 
-    const module = createTestLogBinding(schema);
-    const buffer = createSpanBuffer(schema, module, 'test-span');
+    const buffer = createSpanBuffer(schema, 'test-span', undefined, undefined, createTestOpMetadata());
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -253,8 +245,7 @@ describe('Buffer Integration', () => {
         optionalField: S.optional(S.number()), // Maps to Uint32Array
       });
 
-      const module = createTestLogBinding(schema);
-      const buffer = createSpanBuffer(schema, module, 'integration-test');
+      const buffer = createSpanBuffer(schema, 'integration-test', undefined, undefined, createTestOpMetadata());
 
       // Verify arrow-builder created correct TypedArray types for each schema type
       expect(buffer.enumField_values).toBeInstanceOf(Uint8Array);
@@ -281,14 +272,13 @@ describe('Buffer Integration', () => {
         error: S.text().mask('email'),
       });
 
-      const module = createTestLogBinding(schema);
-      const buffer = createSpanBuffer(schema, module, 'data-flow-test');
+      const buffer = createSpanBuffer(schema, 'data-flow-test', undefined, undefined, createTestOpMetadata());
 
       // Use ColumnWriter API to write data (more robust than direct array access)
       const writer = createColumnWriter(schema, buffer);
       (writer.nextRow() as any)
         .userId('user-123')
-        .operation(1) // Use numeric value for POST (index 1 in ['GET', 'POST'])
+        .operation('POST') // Use enum value string (ColumnWriter validates against enum values)
         .httpStatus(200)
         .error('john@example.com');
 
@@ -313,13 +303,10 @@ describe('Buffer Integration', () => {
         requestId: S.category(),
       });
 
-      const module = createTestLogBinding(schema);
+      const buffer = createSpanBuffer(schema, 'context-integration', undefined, undefined, createTestOpMetadata());
 
-      const buffer = createSpanBuffer(schema, module, 'context-integration');
-
-      // Verify buffer properly references module context
-      expect(buffer._logBinding).toBe(module);
-      expect(buffer._logBinding.logSchema).toBe(module.logSchema);
+      // Verify buffer properly references schema via constructor
+      expect(buffer.logSchema).toBe(schema);
       expect(buffer._spanName).toBe('context-integration');
 
       // Verify system metadata columns are accessible

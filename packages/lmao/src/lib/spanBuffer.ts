@@ -317,6 +317,8 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
     copyParentThreadIdTo(dest, offset) {
       this._parent?.copyThreadIdTo(dest, offset) ?? new DataView(dest.buffer, dest.byteOffset + offset).setBigUint64(0, 0n, true);
     }
+    get _logSchema() { return this.constructor.schema; }
+    get _stats() { return this.constructor.stats; }
     `,
   };
 

@@ -1,25 +1,27 @@
 import { describe, expect, it } from 'bun:test';
 import * as arrow from 'apache-arrow';
 import { convertToArrowTable } from '../../convertToArrow.js';
+import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
 import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 import { createTraceId } from '../../traceId.js';
-import { createTestLogBinding } from '../test-helpers.js';
+import { createTestSchema } from '../test-helpers.js';
 
 describe('Arrow Binary Format Compliance', () => {
   describe('IPC Message Structure', () => {
     it('should write correct IPC continuation bytes', () => {
-      const schema = {
+      const schema = createTestSchema({
         numberValue: S.number(),
-      };
+      });
 
-      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      buffer._opMetadata = DEFAULT_METADATA;
 
-      // Write some data using generated methods
-      buffer.timestamp[0] = BigInt(Date.now()) * 1000000n;
+      // Donbuffer._opMetadata = DEFAULT_METADATA;
+
+      // Writebuffer.timestamp[0] = BigInt(Date.now()) * 1000000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer.numberValue(0, 42);
       buffer._writeIndex = 1;
@@ -37,13 +39,13 @@ describe('Arrow Binary Format Compliance', () => {
 
   describe('Endianness', () => {
     it('should preserve number values through round-trip', () => {
-      const schema = {
+      const schema = createTestSchema({
         uint32Value: S.number(),
-      };
+      });
 
-      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data using generated methods
       const testValue = 0x12345678;
@@ -75,13 +77,13 @@ describe('Arrow Binary Format Compliance', () => {
 
   describe('Null Bitmaps', () => {
     it('should handle null values correctly in round-trip', () => {
-      const schema = {
+      const schema = createTestSchema({
         numberValue: S.number(),
-      };
+      });
 
-      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      buffer._opMetadata = DEFAULT_METADATA;
 
       // Write data with some nulls
       const testData = [1, null, 3, null, 5];
@@ -126,13 +128,13 @@ describe('Arrow Binary Format Compliance', () => {
 
   describe('Dictionary Encoding', () => {
     it('should handle enum values correctly in round-trip', () => {
-      const schema = {
+      const schema = createTestSchema({
         enumValue: S.enum(['a', 'b', 'c']),
-      };
+      });
 
-      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data using generated methods
       // For enums, we pass the index, not the string value
@@ -171,13 +173,13 @@ describe('Arrow Binary Format Compliance', () => {
 
   describe('Variable Size Binary', () => {
     it('should handle string values correctly in round-trip', () => {
-      const schema = {
+      const schema = createTestSchema({
         textValue: S.text(),
-      };
+      });
 
-      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data with various string lengths
       const testValues = ['', 'hello', '', 'world!'];
@@ -215,13 +217,13 @@ describe('Arrow Binary Format Compliance', () => {
 
   describe('Edge Cases', () => {
     it('should handle empty buffers correctly', () => {
-      const schema = {
+      const schema = createTestSchema({
         numberValue: S.number(),
-      };
+      });
 
-      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      buffer._opMetadata = DEFAULT_METADATA;
 
       // Don't write any data
 
@@ -237,13 +239,13 @@ describe('Arrow Binary Format Compliance', () => {
     });
 
     it('should handle boolean values correctly', () => {
-      const schema = {
+      const schema = createTestSchema({
         boolValue: S.boolean(),
-      };
+      });
 
-      const module = createTestLogBinding(schema);
       const traceId = createTraceId('trace-123');
-      const buffer = createSpanBuffer(module.logSchema, module, 'test-span', traceId);
+      const buffer = createSpanBuffer(schema, 'test-span', traceId);
+      buffer._opMetadata = DEFAULT_METADATA;
 
       // Write test data using generated methods
       const testValues = [true, false, true, false, true];
