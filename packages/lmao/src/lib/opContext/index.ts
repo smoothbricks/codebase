@@ -10,5 +10,7 @@
 // Re-export implementation functions
 export { createOpGroup } from './createOpGroup.js';
 export { createDefineOp, createDefineOps, createOpMetadata, DEFAULT_METADATA } from './defineOp.js';
+// Re-export OpGroup types and helpers
+export * from './opGroupTypes.js';
 // Re-export all types from the hub
 export * from './types.js';

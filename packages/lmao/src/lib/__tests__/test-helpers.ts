@@ -8,7 +8,16 @@
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { createOpMetadata, DEFAULT_METADATA } from '../opContext/defineOp.js';
+import type {
+  ColumnMapping,
+  MappedOpGroup,
+  MappedOpGroupInternal,
+  OpGroup,
+  OpGroupInternal,
+  SchemaFieldsOf,
+} from '../opContext/opGroupTypes.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
+import type { OpContext } from '../opContext/types.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
@@ -42,33 +51,21 @@ export function createTestSchema<T extends SchemaFields>(fields: T): LogSchema<T
  * Create a LogBinding for testing.
  *
  * LogBinding is the infrastructure object that ops use to create buffers.
- * It contains the schema, capacity stats, and optional remapping class.
+ * It contains the schema and optional remapping class.
+ *
+ * NOTE: Stats are NO LONGER on LogBinding - they are on SpanBufferClass.stats (static property).
+ * See agent-todo/opgroup-refactor.md lines 58-70, 525-547 for rationale.
  *
  * @param schema - LogSchema or SchemaFields to use (will be wrapped in LogSchema if needed)
- * @param options - Optional capacity and stats overrides
  * @returns LogBinding ready for use with createSpanBuffer
  */
-export function createTestLogBinding<T extends SchemaFields>(
-  schema: SchemaFields | LogSchema<T>,
-  options: {
-    capacity?: number;
-    sb_totalWrites?: number;
-    sb_overflowWrites?: number;
-    sb_totalCreated?: number;
-    sb_overflows?: number;
-  } = {},
-): LogBinding {
+export function createTestLogBinding<T extends SchemaFields>(schema: SchemaFields | LogSchema<T>): LogBinding {
   // Wrap in LogSchema if plain SchemaFields provided
   const logSchema = schema instanceof LogSchema ? schema : createTestSchema(schema);
 
   return {
     logSchema,
     remappedViewClass: undefined,
-    sb_capacity: options.capacity ?? DEFAULT_BUFFER_CAPACITY,
-    sb_totalWrites: options.sb_totalWrites ?? 0,
-    sb_overflowWrites: options.sb_overflowWrites ?? 0,
-    sb_totalCreated: options.sb_totalCreated ?? 0,
-    sb_overflows: options.sb_overflows ?? 0,
   };
 }
 
@@ -93,10 +90,8 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   // Wrap in LogSchema if plain SchemaFields provided
   const logSchema = schema instanceof LogSchema ? (schema as LogSchema<T>) : createTestSchema(schema);
 
-  // Create LogBinding
-  const logBinding = createTestLogBinding(logSchema, {
-    capacity: options.capacity,
-  });
+  // Create LogBinding (stats are on SpanBufferClass.stats, not LogBinding)
+  const logBinding = createTestLogBinding(logSchema);
 
   // Create SpanBuffer using the Phase 2 API (no LogBinding parameter)
   const spanBuffer = createSpanBuffer(
@@ -131,3 +126,42 @@ export function createTestLogger<T extends LogSchema>(
   const logger = createSpanLogger(schema, buffer);
   return { buffer, logger, logBinding };
 }
+
+// =============================================================================
+// OPGROUP INTERNAL ACCESS HELPERS
+// =============================================================================
+
+/**
+ * Get internal properties from an OpGroup.
+ *
+ * OpGroup's internal properties (_logSchema, _flags) are hidden from
+ * intellisense but accessible at runtime. This helper provides typed
+ * access for tests that need to verify internal state.
+ *
+ * @param opGroup - The OpGroup to access
+ * @returns Internal interface with _logSchema and _flags
+ */
+export function getOpGroupInternals<Ctx extends OpContext>(opGroup: OpGroup<Ctx>): OpGroupInternal<Ctx> {
+  return opGroup as unknown as OpGroupInternal<Ctx>;
+}
+
+/**
+ * Get internal properties from a MappedOpGroup.
+ *
+ * MappedOpGroup's internal properties (_logSchema, _flags, _columnMapping,
+ * _contributedSchema) are hidden from intellisense but accessible at runtime.
+ * This helper provides typed access for tests.
+ *
+ * @param opGroup - The MappedOpGroup to access
+ * @returns Internal interface with all internal properties
+ */
+export function getMappedOpGroupInternals<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
+  opGroup: MappedOpGroup<Ctx, ContributedSchema>,
+): MappedOpGroupInternal<Ctx, ContributedSchema> {
+  return opGroup as unknown as MappedOpGroupInternal<Ctx, ContributedSchema>;
+}
+
+/**
+ * Convenience type alias for accessing column mapping from a MappedOpGroup.
+ */
+export type { ColumnMapping, SchemaFieldsOf };

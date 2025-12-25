@@ -7,6 +7,11 @@
  * - Schema contribution tracking
  * - Type-safe dependency resolution
  *
+ * Public interfaces (OpGroup, MappedOpGroup) hide internal properties from
+ * intellisense - users only see ops and methods they need.
+ * Internal interfaces (OpGroupInternal, MappedOpGroupInternal) expose all
+ * properties for library implementation.
+ *
  * @module opContext/opGroupTypes
  */
 
@@ -60,7 +65,39 @@ export type MappedSchema<T extends SchemaFields, M extends ColumnMapping<T>> = {
 };
 
 // =============================================================================
-// OP GROUP INTERFACES
+// RESERVED OP NAMES
+// =============================================================================
+
+/**
+ * Reserved names that cannot be used as op names.
+ * These conflict with OpGroup methods or internal properties.
+ */
+export const RESERVED_OP_NAMES = ['prefix', 'mapColumns'] as const;
+
+/**
+ * Validate that an op name is allowed.
+ * Throws if the name is reserved or starts with underscore.
+ *
+ * @param name - The op name to validate
+ * @throws Error if name is invalid
+ */
+export function validateOpName(name: string): void {
+  if (name.startsWith('_')) {
+    throw new Error(
+      `Op name "${name}" cannot start with underscore (reserved for internal properties). ` +
+        `Consider using "${name.slice(1)}" instead.`,
+    );
+  }
+  if ((RESERVED_OP_NAMES as readonly string[]).includes(name)) {
+    throw new Error(
+      `Op name "${name}" is reserved (conflicts with OpGroup method). ` +
+        `Consider using a more descriptive name like "${name}Op" or "${name}Operation".`,
+    );
+  }
+}
+
+// =============================================================================
+// PUBLIC OP GROUP INTERFACES (visible to users in intellisense)
 // =============================================================================
 
 /**
@@ -71,14 +108,11 @@ export type MappedSchema<T extends SchemaFields, M extends ColumnMapping<T>> = {
  *
  * Note: Ops are accessed directly as properties (`.opName` not `.ops.opName`)
  * for V8 hidden class optimization and cleaner API ergonomics.
+ *
+ * Internal properties (_logSchema, _flags) are hidden from intellisense
+ * but accessible at runtime for library implementation.
  */
 export interface OpGroup<Ctx extends OpContext> {
-  /** The log schema for this group's ops */
-  readonly logSchema: Ctx['logSchema'];
-
-  /** The feature flag schema */
-  readonly flags: Ctx['flags'];
-
   /**
    * Apply a prefix to all schema columns.
    *
@@ -130,22 +164,13 @@ export interface OpGroup<Ctx extends OpContext> {
  * Note: Ops are accessed directly as properties (`.opName` not `.ops.opName`)
  * for V8 hidden class optimization and cleaner API ergonomics.
  *
+ * Internal properties (_logSchema, _flags, _contributedSchema, _columnMapping)
+ * are hidden from intellisense but accessible at runtime.
+ *
  * @template Ctx - OpContext (bundled type with logSchema, flags, deps, userCtx)
  * @template ContributedSchema - Schema fields this group contributes to app (after mapping)
  */
 export interface MappedOpGroup<Ctx extends OpContext, ContributedSchema extends SchemaFields> {
-  /** The log schema for this group's ops */
-  readonly logSchema: Ctx['logSchema'];
-
-  /** The feature flag schema */
-  readonly flags: Ctx['flags'];
-
-  /** The schema fields this group contributes to the app's combined schema */
-  readonly contributedSchema: ContributedSchema;
-
-  /** The column mapping (library column -> app column, or null to drop) */
-  readonly columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
-
   /** Chain with prefix (applies prefix to current mapping) */
   prefix<P extends string>(prefix: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>>;
 
@@ -156,22 +181,87 @@ export interface MappedOpGroup<Ctx extends OpContext, ContributedSchema extends 
 }
 
 // =============================================================================
+// INTERNAL OP GROUP INTERFACES (for library implementation)
+// =============================================================================
+
+/**
+ * Internal OpGroup interface with all properties exposed.
+ * Used by library implementation code that needs access to schema/flags.
+ *
+ * NOT exported from public API - use type assertion to access:
+ * `(opGroup as OpGroupInternal<Ctx>)._logSchema`
+ */
+export interface OpGroupInternal<Ctx extends OpContext> extends OpGroup<Ctx> {
+  /** The log schema for this group's ops (internal) */
+  readonly _logSchema: Ctx['logSchema'];
+
+  /** The feature flag schema (internal) */
+  readonly _flags: Ctx['flags'];
+}
+
+/**
+ * Internal MappedOpGroup interface with all properties exposed.
+ * Used by library implementation code that needs access to mapping details.
+ */
+export interface MappedOpGroupInternal<Ctx extends OpContext, ContributedSchema extends SchemaFields>
+  extends MappedOpGroup<Ctx, ContributedSchema> {
+  /** The log schema for this group's ops (internal) */
+  readonly _logSchema: Ctx['logSchema'];
+
+  /** The feature flag schema (internal) */
+  readonly _flags: Ctx['flags'];
+
+  /** The schema fields this group contributes to the app's combined schema (internal) */
+  readonly _contributedSchema: ContributedSchema;
+
+  /** The column mapping (library column -> app column, or null to drop) (internal) */
+  readonly _columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
+}
+
+// =============================================================================
 // DEPENDENCY CONFIG TYPES
 // =============================================================================
 
 /**
- * Minimal structural interface for any OpGroup.
+ * Minimal structural interface for any OpGroup (internal use only).
  *
- * This captures only the properties we need to read from an OpGroup
- * in dependency wiring. By using a minimal interface with covariant
- * properties (readonly), TypeScript allows specific OpGroup<Ctx>
- * variants to be assigned to this type.
+ * This captures only the internal properties we need to read from an OpGroup
+ * in dependency wiring. The internal properties exist at runtime but are
+ * hidden from the public TypeScript interfaces.
  *
  * Note: No `.ops` property - ops are accessed directly as own properties.
  */
 export interface AnyOpGroup {
-  /** The log schema - read-only access for wiring */
-  readonly logSchema: LogSchema;
+  /** The log schema - read-only access for wiring (internal property) */
+  readonly _logSchema: LogSchema;
+}
+
+/**
+ * Minimal structural interface for a MappedOpGroup (internal use only).
+ * Used for dependency wiring when we need access to contributed schema.
+ */
+export interface AnyMappedOpGroup extends AnyOpGroup {
+  /** The contributed schema after mapping (internal property) */
+  readonly _contributedSchema: SchemaFields;
+}
+
+/**
+ * Type guard to check if an OpGroup has been mapped (has _contributedSchema)
+ */
+export function isMappedOpGroup(dep: AnyOpGroup): dep is AnyMappedOpGroup {
+  return '_contributedSchema' in dep;
+}
+
+/**
+ * Minimal public interface for OpGroups used in deps config.
+ * Accepts any OpGroup or MappedOpGroup without requiring internal properties.
+ * Internal properties are accessed at runtime via type assertion.
+ */
+export interface AnyOpGroupPublic {
+  /** Apply a prefix to all schema columns */
+  prefix(prefix: string): AnyOpGroupPublic;
+  /** Map schema columns to different names */
+  mapColumns(mapping: ColumnMapping): AnyOpGroupPublic;
 }
 
 /**
@@ -179,8 +269,11 @@ export interface AnyOpGroup {
  *
  * This is used as a constraint (`Deps extends DepsConfig`) so it needs
  * to be wide enough to accept any specific deps configuration.
+ *
+ * Uses AnyOpGroupPublic to accept OpGroup/MappedOpGroup without requiring
+ * internal properties in the type signature.
  */
-export type DepsConfig = Record<string, AnyOpGroup>;
+export type DepsConfig = Record<string, AnyOpGroupPublic>;
 
 // =============================================================================
 // SCHEMA COMBINATION TYPES

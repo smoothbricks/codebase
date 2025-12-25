@@ -20,13 +20,15 @@
  * ```
  */
 
-import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import {
+  type AnyOpGroup,
   createDefineOp,
   createDefineOps,
   createOpGroup,
   type DepsConfig,
+  type EffectiveSchema,
   type FeatureFlagSchema,
+  isMappedOpGroup,
   type OpContext,
   type OpContextConfig,
   type OpContextFactory,
@@ -34,7 +36,7 @@ import {
   RESERVED_CONTEXT_PROPS,
 } from './opContext/index.js';
 import { LogSchema } from './schema/LogSchema.js';
-import { mergeWithSystemSchema } from './schema/systemSchema.js';
+import { mergeWithSystemSchema, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
 import { EMPTY_SCOPE } from './spanBuffer.js';
 import type { LogBinding } from './types.js';
@@ -43,9 +45,134 @@ import type { LogBinding } from './types.js';
 // EFFECTIVE SCHEMA COMPUTATION
 // =============================================================================
 
-// NOTE: getContributedSchemaFromDep and computeEffectiveSchema were removed - not yet used.
-// Will be re-added when dependency schema merging feature is implemented.
-// See specs/01l_module_builder_pattern.md for details.
+// isMappedOpGroup is imported from opContext/index.js
+
+/**
+ * Check if a field name is a system field (original or prefixed).
+ *
+ * System fields can appear as:
+ * - Original names: 'message', 'line', 'error_code', etc.
+ * - Prefixed names: 'http_message', 'db_line', 'auth_error_code', etc.
+ *
+ * @param fieldName - The field name to check
+ * @returns True if the field is a system field
+ */
+function isSystemField(fieldName: string): boolean {
+  // Check direct match first
+  if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) {
+    return true;
+  }
+  // Check if it's a prefixed system field (e.g., 'http_message' -> 'message')
+  const underscoreIdx = fieldName.indexOf('_');
+  if (underscoreIdx !== -1) {
+    const suffix = fieldName.slice(underscoreIdx + 1);
+    if (SYSTEM_SCHEMA_FIELD_NAMES.has(suffix)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Filter out system schema fields from a schema.
+ *
+ * System fields (message, line, error_code, etc.) are merged into every logSchema
+ * by defineOpContext, but they should NOT be contributed when a dep is wired.
+ * Each app gets its own system fields via mergeWithSystemSchema.
+ *
+ * This function handles both original and prefixed system field names.
+ *
+ * @param fields - Schema fields to filter
+ * @returns Schema fields without system fields
+ */
+function filterOutSystemFields(fields: SchemaFields): SchemaFields {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    if (!isSystemField(key)) {
+      result[key] = value;
+    }
+  }
+  return result as SchemaFields;
+}
+
+/**
+ * Get the schema fields contributed by a dep (OpGroup or MappedOpGroup).
+ *
+ * - For OpGroup: returns original schema fields (no transformation), excluding system fields
+ * - For MappedOpGroup: returns contributedSchema (after prefix/mapping)
+ *
+ * System fields (message, line, error_code, etc.) are always filtered out because
+ * each app gets its own system fields via mergeWithSystemSchema - deps should NOT
+ * contribute system fields.
+ *
+ * The returned object maps field names to their schema definitions.
+ *
+ * @param dep - An OpGroup or MappedOpGroup (with internal properties _logSchema, _contributedSchema)
+ * @returns The schema fields this dep contributes (user fields only, no system fields)
+ */
+function getContributedSchemaFromDep(dep: AnyOpGroup): SchemaFields {
+  if (isMappedOpGroup(dep)) {
+    // MappedOpGroup has _contributedSchema with mapped field names
+    // This already excludes null-mapped columns (they were dropped in buildContributedSchema)
+    // Filter out system fields in case the original schema included them
+    return filterOutSystemFields(dep._contributedSchema);
+  }
+  // OpGroup contributes its original schema fields, excluding system fields
+  return filterOutSystemFields(dep._logSchema.fields);
+}
+
+/**
+ * Compute the effective schema by merging app schema with all dep contributions.
+ *
+ * The effective schema is the union of:
+ * 1. App's own schema fields
+ * 2. All dep contributed fields (after prefix/mapping)
+ *
+ * Throws if multiple deps contribute the same field name (conflict detection).
+ *
+ * @param appFields - The app's own schema fields
+ * @param deps - The deps config (name -> OpGroup | MappedOpGroup)
+ * @returns Combined schema fields for the effective schema
+ * @throws Error if deps contribute conflicting field names
+ */
+function computeEffectiveSchema(appFields: SchemaFields, deps: DepsConfig | undefined): SchemaFields {
+  if (!deps || Object.keys(deps).length === 0) {
+    return appFields;
+  }
+
+  // Start with app fields
+  const effective: Record<string, unknown> = { ...appFields };
+
+  // Track which dep contributed each field for conflict detection
+  const fieldSource: Record<string, string> = {};
+  for (const fieldName of Object.keys(appFields)) {
+    fieldSource[fieldName] = 'app';
+  }
+
+  // Add each dep's contributed fields
+  for (const [depName, dep] of Object.entries(deps)) {
+    // Cast to AnyOpGroup to access internal properties (_logSchema, _contributedSchema)
+    // These exist at runtime but are hidden from public TypeScript interfaces
+    const contributed = getContributedSchemaFromDep(dep as unknown as AnyOpGroup);
+
+    for (const [fieldName, fieldDef] of Object.entries(contributed)) {
+      // Check for conflict
+      if (fieldName in effective) {
+        const existingSource = fieldSource[fieldName];
+        throw new Error(
+          `Schema conflict: field '${fieldName}' contributed by dep '${depName}' ` +
+            `conflicts with field from '${existingSource}'. ` +
+            'Use .prefix() or .mapColumns() to resolve the conflict.',
+        );
+      }
+
+      effective[fieldName] = fieldDef;
+      fieldSource[fieldName] = depName;
+    }
+  }
+
+  return effective as SchemaFields;
+}
 
 /**
  * Define an Op context factory
@@ -109,43 +236,49 @@ export function defineOpContext<
     }
   }
 
-  // Merge user schema with system schema (message, line, error_code, etc.)
+  // Compute effective schema by combining app schema with dep contributions
+  // This merges app fields + all dep contributed fields (after prefix/mapping)
+  const effectiveFields = computeEffectiveSchema(config.logSchema.fields, config.deps);
+
+  // Merge effective schema with system schema (message, line, error_code, etc.)
   // System columns are always available on SpanBuffer regardless of user schema
-  const mergedFields = mergeWithSystemSchema(config.logSchema.fields);
+  const mergedFields = mergeWithSystemSchema(effectiveFields);
   const mergedSchema = new LogSchema(mergedFields);
 
-  // Create a LogBinding with initial capacity stats
-  // The logBinding serves as the infrastructure for ops to write logs
-  // Type is LogBinding<LogSchema<T>> to preserve schema type for Op type safety
+  // Create a LogBinding for ops to use.
+  // NOTE: Stats are NO LONGER on LogBinding - they are on SpanBufferClass.stats (static property).
+  // This avoids sync bugs from having two stat objects and reduces per-instance memory.
+  // See agent-todo/opgroup-refactor.md lines 58-70, 525-547 for rationale.
   const logBinding: LogBinding<LogSchema<T>> = {
-    logSchema: mergedSchema as LogSchema<T>,
+    logSchema: mergedSchema as unknown as LogSchema<T>,
     remappedViewClass: undefined, // Will be set if prefixing is applied
-    sb_capacity: DEFAULT_BUFFER_CAPACITY, // Initial capacity (self-tuning will grow this)
-    sb_totalWrites: 0,
-    sb_overflowWrites: 0,
-    sb_totalCreated: 0,
-    sb_overflows: 0,
   };
 
   // Create the defineOp and defineOps functions bound to this config
+  // CRITICAL: Use mergedSchema (with system columns), not config.logSchema
+  // Cast via unknown because mergedSchema includes SystemSchemaFieldTypes which
+  // doesn't overlap with T directly, but is correct at runtime.
   const defineOp = createDefineOp<OpContext<LogSchema<T>, FF, Deps, UserCtx>>({
-    logSchema: config.logSchema,
+    logSchema: mergedSchema as unknown as LogSchema<T>,
     flags: config.flags as FF,
   });
 
   const defineOps = createDefineOps<OpContext<LogSchema<T>, FF, Deps, UserCtx>>(
-    { logSchema: config.logSchema, flags: config.flags as FF },
+    { logSchema: mergedSchema as unknown as LogSchema<T>, flags: config.flags as FF },
     createOpGroup,
   );
 
+  // Create effective schema LogSchema instance for factory.logSchema
+  // This contains app fields + all dep contributed fields (user fields only, no system)
+  const effectiveLogSchema = new LogSchema(effectiveFields);
+
   // Return the factory with phantom type property
-  // Note: logSchema needs a cast because the effective schema
-  // (which includes deps schemas) requires runtime computation.
+  // Note: logSchema is the effective schema (app + deps), not just app's schema
   // OpContextFactory expects LogSchema<EffectiveSchema<T, Deps>>,
-  // but at this point we only have T. The type is correct at the call site.
+  // which is computed at runtime above.
   return {
-    [opContextType]: undefined as any as OpContext<LogSchema<T>, FF, Deps, UserCtx>,
-    logSchema: config.logSchema as unknown as LogSchema<any>,
+    [opContextType]: undefined as unknown as OpContext<LogSchema<T>, FF, Deps, UserCtx>,
+    logSchema: effectiveLogSchema as unknown as LogSchema<EffectiveSchema<T, Deps>>,
     flags: config.flags as FF,
     logBinding,
     ctxDefaults: (config.ctx ?? EMPTY_SCOPE) as UserCtx,
