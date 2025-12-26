@@ -114,14 +114,42 @@ avg_err_duration: 29800ms -- Errors are slow = timeout issue, not validation
 
 - `timestamp`: Exact nanosecond of flush (period end)
 - `thread_id`: Process/worker identity
-- `package_name` + `package_path`: Module identity
+- `package_name` + `package_file`: Module identity
+- `message`: Op name for per-op granularity
 - No new grouping columns needed
 
-Queries naturally aggregate:
+Queries naturally aggregate at different granularities:
 
 ```sql
-GROUP BY timestamp, thread_id, package_name
+-- Per-op metrics
+GROUP BY timestamp, package_name, package_file, message
+
+-- Per-file metrics (aggregate ops within a file)
+GROUP BY timestamp, package_name, package_file
+
+-- Per-package metrics (aggregate all ops in the package)
+GROUP BY timestamp, package_name
 ```
+
+#### 8. Hierarchical Aggregation Support
+
+**Decision:** Op metrics include `package_file` to enable file-level and package-level aggregation.
+
+**Why:**
+
+- A package can contain multiple files, each with multiple ops
+- Without `package_file`, you can only group by `package_name` (too coarse) or `message` (op name, but ambiguous across
+  files)
+- With `package_file`, queries can aggregate at three levels:
+  - **Per-op**: `GROUP BY package_name, package_file, message` — "How is `createUser` in `users.ts` performing?"
+  - **Per-file**: `GROUP BY package_name, package_file` — "How are all ops in `users.ts` performing?"
+  - **Per-package**: `GROUP BY package_name` — "How is the entire `@mycompany/user-service` performing?"
+
+**Example use cases:**
+
+- Identify which file in a package has the highest error rate
+- Compare performance between different modules within a service
+- Roll up file-level metrics to package-level dashboards
 
 ## Entry Types for Metrics
 
@@ -137,21 +165,24 @@ The period ends at `timestamp` (the flush time). Duration = `timestamp - uint64_
 
 ### Op Metrics (8)
 
-| Entry Type        | message | uint64_value                       |
-| ----------------- | ------- | ---------------------------------- |
-| op-invocations    | Op name | Total invocation count             |
-| op-errors         | Op name | Count of `span-err` outcomes       |
-| op-exceptions     | Op name | Count of `span-exception` outcomes |
-| op-duration-total | Op name | Sum of all durations (nanoseconds) |
-| op-duration-ok    | Op name | Sum of `span-ok` durations (ns)    |
-| op-duration-err   | Op name | Sum of error durations (ns)        |
-| op-duration-min   | Op name | Minimum duration (nanoseconds)     |
-| op-duration-max   | Op name | Maximum duration (nanoseconds)     |
+| Entry Type        | package_file | message | uint64_value                       |
+| ----------------- | ------------ | ------- | ---------------------------------- |
+| op-invocations    | File path    | Op name | Total invocation count             |
+| op-errors         | File path    | Op name | Count of `span-err` outcomes       |
+| op-exceptions     | File path    | Op name | Count of `span-exception` outcomes |
+| op-duration-total | File path    | Op name | Sum of all durations (nanoseconds) |
+| op-duration-ok    | File path    | Op name | Sum of `span-ok` durations (ns)    |
+| op-duration-err   | File path    | Op name | Sum of error durations (ns)        |
+| op-duration-min   | File path    | Op name | Minimum duration (nanoseconds)     |
+| op-duration-max   | File path    | Op name | Maximum duration (nanoseconds)     |
 
 **Notes:**
 
 - `op-duration-err` includes both `span-err` and `span-exception` outcomes
 - `message` contains the Op name for grouping (e.g., "GET", "createUser", "processOrder")
+- `package_file` contains the relative file path within the package (e.g., "src/users.ts", "src/orders/create.ts")
+- Both `package_file` and `message` enable hierarchical aggregation (see
+  [Hierarchical Aggregation Support](#8-hierarchical-aggregation-support))
 
 ### Buffer Metrics (4)
 
@@ -273,29 +304,37 @@ Metrics flush alongside trace data using the same `FlushScheduler` triggers:
 ### Example Flush Output
 
 ```
-timestamp | thread_id | package_name | entry_type             | message | uint64_value
-----------|-----------|--------------|------------------------|---------|---------------
-1000      | 1         | @myco/http   | period-start           |         | 0
-1000      | 1         | @myco/http   | op-invocations         | GET     | 1523
-1000      | 1         | @myco/http   | op-errors              | GET     | 8
-1000      | 1         | @myco/http   | op-exceptions          | GET     | 4
-1000      | 1         | @myco/http   | op-duration-total      | GET     | 68535000000
-1000      | 1         | @myco/http   | op-duration-ok         | GET     | 65000000000
-1000      | 1         | @myco/http   | op-duration-err        | GET     | 3535000000
-1000      | 1         | @myco/http   | op-duration-min        | GET     | 2100000
-1000      | 1         | @myco/http   | op-duration-max        | GET     | 1203500000
-1000      | 1         | @myco/http   | op-invocations         | POST    | 892
-1000      | 1         | @myco/http   | op-errors              | POST    | 2
-1000      | 1         | @myco/http   | op-duration-total      | POST    | 44600000000
-1000      | 1         | @myco/http   | op-duration-ok         | POST    | 44100000000
-1000      | 1         | @myco/http   | op-duration-err        | POST    | 500000000
-1000      | 1         | @myco/http   | op-duration-min        | POST    | 8500000
-1000      | 1         | @myco/http   | op-duration-max        | POST     | 892000000
-1000      | 1         | @myco/http   | buffer-writes          |         | 50000
-1000      | 1         | @myco/http   | buffer-overflow-writes |         | 1200
-1000      | 1         | @myco/http   | buffer-created         |         | 47
-1000      | 1         | @myco/http   | buffer-overflows       |         | 3
+timestamp | thread_id | package_name | package_file       | entry_type             | message | uint64_value
+----------|-----------|--------------|--------------------|-----------------------|---------|---------------
+1000      | 1         | @myco/http   |                    | period-start           |         | 0
+1000      | 1         | @myco/http   | src/handlers.ts    | op-invocations         | GET     | 1523
+1000      | 1         | @myco/http   | src/handlers.ts    | op-errors              | GET     | 8
+1000      | 1         | @myco/http   | src/handlers.ts    | op-exceptions          | GET     | 4
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-total      | GET     | 68535000000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-ok         | GET     | 65000000000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-err        | GET     | 3535000000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-min        | GET     | 2100000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-max        | GET     | 1203500000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-invocations         | POST    | 892
+1000      | 1         | @myco/http   | src/handlers.ts    | op-errors              | POST    | 2
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-total      | POST    | 44600000000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-ok         | POST    | 44100000000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-err        | POST    | 500000000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-min        | POST    | 8500000
+1000      | 1         | @myco/http   | src/handlers.ts    | op-duration-max        | POST    | 892000000
+1000      | 1         | @myco/http   | src/auth.ts        | op-invocations         | verify  | 2415
+1000      | 1         | @myco/http   | src/auth.ts        | op-duration-total      | verify  | 24150000000
+1000      | 1         | @myco/http   | src/auth.ts        | op-duration-ok         | verify  | 24150000000
+1000      | 1         | @myco/http   | src/auth.ts        | op-duration-min        | verify  | 5000000
+1000      | 1         | @myco/http   | src/auth.ts        | op-duration-max        | verify  | 15000000
+1000      | 1         | @myco/http   |                    | buffer-writes          |         | 50000
+1000      | 1         | @myco/http   |                    | buffer-overflow-writes |         | 1200
+1000      | 1         | @myco/http   |                    | buffer-created         |         | 47
+1000      | 1         | @myco/http   |                    | buffer-overflows       |         | 3
 ```
+
+**Note:** Buffer metrics don't have `package_file` since they're aggregated at the package level. Op metrics include
+`package_file` to enable file-level aggregation.
 
 ## User-Facing API
 
@@ -322,13 +361,14 @@ const processRecords = op(async ({ log, tag, ok }, records) => {
 
 ## Query Examples (ClickHouse)
 
-### Op Performance Summary
+### Op Performance Summary (Per-Op Granularity)
 
 Get a complete picture of each operation's performance:
 
 ```sql
 SELECT
   package_name,
+  package_file,
   message as op_name,
   anyIf(uint64_value, entry_type = 'op-invocations') as invocations,
   anyIf(uint64_value, entry_type = 'op-errors') as errors,
@@ -344,8 +384,55 @@ SELECT
   anyIf(uint64_value, entry_type = 'op-duration-max') / 1e6 as max_duration_ms
 FROM traces
 WHERE entry_type LIKE 'op-%'
-GROUP BY timestamp, package_name, message
+GROUP BY timestamp, package_name, package_file, message
 ORDER BY invocations DESC
+```
+
+### File-Level Aggregation
+
+Aggregate all ops within each file to identify problematic modules:
+
+```sql
+SELECT
+  package_name,
+  package_file,
+  sum(anyIf(uint64_value, entry_type = 'op-invocations')) as total_invocations,
+  sum(anyIf(uint64_value, entry_type = 'op-errors')) as total_errors,
+  sum(anyIf(uint64_value, entry_type = 'op-exceptions')) as total_exceptions,
+  -- File-level error rate
+  (sum(anyIf(uint64_value, entry_type = 'op-errors')) +
+   sum(anyIf(uint64_value, entry_type = 'op-exceptions'))) /
+    sum(anyIf(uint64_value, entry_type = 'op-invocations')) as file_error_rate,
+  -- File-level total duration
+  sum(anyIf(uint64_value, entry_type = 'op-duration-total')) / 1e6 as total_duration_ms
+FROM traces
+WHERE entry_type LIKE 'op-%'
+GROUP BY timestamp, package_name, package_file
+ORDER BY file_error_rate DESC
+```
+
+### Package-Level Aggregation
+
+Roll up all ops to package-level metrics for service health dashboards:
+
+```sql
+SELECT
+  package_name,
+  sum(anyIf(uint64_value, entry_type = 'op-invocations')) as total_invocations,
+  sum(anyIf(uint64_value, entry_type = 'op-errors')) as total_errors,
+  sum(anyIf(uint64_value, entry_type = 'op-exceptions')) as total_exceptions,
+  -- Package-level error rate
+  (sum(anyIf(uint64_value, entry_type = 'op-errors')) +
+   sum(anyIf(uint64_value, entry_type = 'op-exceptions'))) /
+    sum(anyIf(uint64_value, entry_type = 'op-invocations')) as package_error_rate,
+  -- Package-level throughput (ops per flush period)
+  sum(anyIf(uint64_value, entry_type = 'op-invocations')) as ops_per_period,
+  -- Package-level total duration
+  sum(anyIf(uint64_value, entry_type = 'op-duration-total')) / 1e6 as total_duration_ms
+FROM traces
+WHERE entry_type LIKE 'op-%'
+GROUP BY timestamp, package_name
+ORDER BY total_invocations DESC
 ```
 
 ### Error Duration Analysis
@@ -354,6 +441,8 @@ Determine if errors are fast-fails (validation) or slow timeouts:
 
 ```sql
 SELECT
+  package_name,
+  package_file,
   message as op_name,
   -- Average duration for successful calls
   anyIf(uint64_value, entry_type = 'op-duration-ok') /
@@ -375,7 +464,7 @@ WHERE entry_type IN (
   'op-duration-ok', 'op-duration-err',
   'op-invocations', 'op-errors', 'op-exceptions'
 )
-GROUP BY timestamp, message
+GROUP BY timestamp, package_name, package_file, message
 -- If avg_err_duration >> avg_ok_duration: timeout issue
 -- If avg_err_duration << avg_ok_duration: fast validation failures
 ```
@@ -407,6 +496,7 @@ Calculate operations per second:
 ```sql
 SELECT
   package_name,
+  package_file,
   message as op_name,
   anyIf(uint64_value, entry_type = 'op-invocations') as invocations,
   -- Period duration in seconds
@@ -417,7 +507,7 @@ SELECT
     as invocations_per_sec
 FROM traces
 WHERE entry_type IN ('op-invocations', 'period-start')
-GROUP BY timestamp, package_name, message
+GROUP BY timestamp, package_name, package_file, message
 ORDER BY invocations_per_sec DESC
 ```
 
@@ -429,6 +519,7 @@ Track p50/p90/p99 approximations across periods:
 SELECT
   toStartOfMinute(fromUnixTimestamp64Nano(timestamp)) as minute,
   package_name,
+  package_file,
   message as op_name,
   avg(anyIf(uint64_value, entry_type = 'op-duration-total') /
       anyIf(uint64_value, entry_type = 'op-invocations')) / 1e6 as avg_duration_ms,
@@ -436,8 +527,28 @@ SELECT
   avg(anyIf(uint64_value, entry_type = 'op-duration-max')) / 1e6 as max_duration_ms
 FROM traces
 WHERE entry_type LIKE 'op-duration-%' OR entry_type = 'op-invocations'
-GROUP BY minute, package_name, message
-ORDER BY minute, package_name, op_name
+GROUP BY minute, package_name, package_file, message
+ORDER BY minute, package_name, package_file, op_name
+```
+
+### Package Throughput Over Time
+
+Track package-level throughput trends:
+
+```sql
+SELECT
+  toStartOfMinute(fromUnixTimestamp64Nano(timestamp)) as minute,
+  package_name,
+  sum(anyIf(uint64_value, entry_type = 'op-invocations')) as total_invocations,
+  sum(anyIf(uint64_value, entry_type = 'op-errors') +
+      anyIf(uint64_value, entry_type = 'op-exceptions')) as total_failures,
+  sum(anyIf(uint64_value, entry_type = 'op-errors') +
+      anyIf(uint64_value, entry_type = 'op-exceptions')) /
+    sum(anyIf(uint64_value, entry_type = 'op-invocations')) as error_rate
+FROM traces
+WHERE entry_type LIKE 'op-%'
+GROUP BY minute, package_name
+ORDER BY minute, package_name
 ```
 
 ## Integration with Other Specs
