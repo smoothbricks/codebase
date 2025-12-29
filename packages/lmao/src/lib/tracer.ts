@@ -57,7 +57,7 @@ import type { LogBinding } from './logBinding.js';
 import { Op } from './op.js';
 import { createOpMetadata } from './opContext/defineOp.js';
 import type { OpContext, OpContextBinding, OpContextOf, SpanContext } from './opContext/types.js';
-import { FluentErr, FluentOk, type Result } from './result.js';
+import { Err, Ok, type Result } from './result.js';
 import type { FlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 
@@ -599,7 +599,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
    * Promise-agnostic: returns sync for sync fn, Promise for async fn
    *
    * Writes span-end entry (entry_type, timestamp, error_code) and applies deferred tags
-   * when the function returns a FluentOk/FluentErr result.
+   * when the function returns an Ok/Err result.
    */
   private _executeWithContext<R>(
     ctx: SpanContextInstance<OpContextOf<B>>,
@@ -622,7 +622,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
           .then(
             (resolved) => {
               // Write span-end: entry_type, timestamp, error_code (if err), deferred tags
-              if (resolved instanceof FluentOk || resolved instanceof FluentErr) {
+              if (resolved instanceof Ok || resolved instanceof Err) {
                 writeSpanEnd(buffer, resolved);
               } else {
                 // Fallback for non-FluentResult returns
@@ -658,7 +658,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
       }
 
       // Sync path - write span-end
-      if (result instanceof FluentOk || result instanceof FluentErr) {
+      if (result instanceof Ok || result instanceof Err) {
         writeSpanEnd(buffer, result);
       } else {
         // Fallback for non-FluentResult returns

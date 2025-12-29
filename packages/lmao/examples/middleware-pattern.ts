@@ -200,7 +200,7 @@ const getUser = apiModule.task('get-user', async (ctx, userId: string) => {
     return { id: userId, email: 'user@example.com', name: 'John Doe' };
   })();
 
-  // Error case - TypeScript knows this returns FluentErrorResult
+  // Error case - TypeScript knows this returns Err
   if (!user) {
     ctx.setScope({ httpStatus: 404 });
     ctx.log.info('User not found');
@@ -286,7 +286,7 @@ async function handleCreateUser(req: Request, res: Response) {
 async function handleGetUser(req: Request, res: Response) {
   const result = await getUser(req.ctx, 'user-123');
 
-  // TypeScript knows result is a union: FluentSuccessResult | FluentErrorResult
+  // TypeScript knows result is a union: Ok | Err
   // Type narrowing with 'if (result.success)' gives us type safety
   if (result.success) {
     // TypeScript knows: result.value exists, result.error doesn't

@@ -277,17 +277,97 @@ async (ctx, ...args) => {
 
 ## Result Types
 
-Ops return `Result<S, E>` which is a discriminated union:
+LMAO provides two result patterns:
 
-### Type Definitions
+1. **`Result` class** - For type-safe error handling with `isErr(Tag)` discrimination
+2. **`FluentOk`/`FluentErr`** - For fluent result builders with deferred tag application (returned by
+   `ctx.ok()`/`ctx.err()`)
+
+### Result Class
+
+The `Result` class wraps success/error values and provides methods for type-safe error handling:
 
 ```typescript
-type Ok<V> = { success: true; value: V };
-type Err<E> = { success: false; error: { code: string; details: E } };
-type Result<V, E = unknown> = Ok<V> | Err<E>;
+import { Result } from '@smoothbricks/lmao';
+
+// Creating results
+const success = Result.ok(user);
+const failure = Result.err(new NotFoundError('user', userId));
+
+// Basic checks
+if (result.isOk()) {
+  console.log(result.value);
+}
+if (result.isErr()) {
+  console.log(result.error);
+}
+
+if (result.isErr(Blocked)) {
+  return result; // Pass through - engine handles retry
+}
+if (result.isErr(NotFound)) {
+  return Result.ok(null); // Handle specifically
+}
+
+// Predicate-based checks
+if (result.isErr((e) => e.code === 'TIMEOUT')) {
+  // Handle timeout
+}
+
+// Functional methods
+const mapped = result.map((user) => user.name);
+const recovered = result.unwrapOr(defaultUser);
+const matched = result.match({
+  ok: (user) => `Found: ${user.name}`,
+  err: (error) => `Error: ${error.message}`,
+});
 ```
 
-### Fluent Builders
+### Tagged Errors
+
+Tagged errors implement `TaggedError<Tag>` for use with `Result.isErr(Tag)`:
+
+```typescript
+import { TaggedError } from '@smoothbricks/lmao';
+
+// Define a tagged error class
+class NotFound implements TaggedError<'NotFound'> {
+  static readonly _tag = 'NotFound' as const;
+  readonly _tag = 'NotFound' as const;
+
+  constructor(
+    readonly resource: string,
+    readonly id: string
+  ) {}
+}
+
+// Use with isErr()
+const result = await fetchUser(id);
+if (result.isErr(NotFound)) {
+  // TypeScript knows result.error is NotFound
+  console.log(`${result.error.resource} ${result.error.id} not found`);
+}
+```
+
+**Built-in Tagged Errors (tree-shakable):**
+
+
+```typescript
+import { Blocked, RetriesExhausted } from '@smoothbricks/lmao';
+
+// In an Op that calls external services
+const result = await ctx.deps.indexStore.query(args);
+if (result.isErr(Blocked)) {
+}
+
+// After max retries exhausted
+if (result.isErr(RetriesExhausted)) {
+  // Service was unavailable too long - compensate
+  return ctx.err('SERVICE_UNAVAILABLE', { service: result.error.reason });
+}
+```
+
+### Fluent Builders (ctx.ok / ctx.err)
 
 `ctx.ok()` and `ctx.err()` return fluent builders that write to buffer row 1:
 

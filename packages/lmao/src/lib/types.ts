@@ -18,6 +18,7 @@ import type { TraceId, TraceRoot } from './traceId.js';
 // Re-export infrastructure types
 export type { LogBinding, RemappedViewConstructor } from './logBinding.js';
 export type { OpMetadata } from './opContext/opTypes.js';
+export type { extractSpanIdentity, SpanIdentity } from './traceId.js';
 
 // Tracer interface for lifecycle hook calls from span lifecycle events
 // The Tracer provides these methods that are called during span execution

@@ -19,7 +19,7 @@
  */
 
 import type { FluentLogEntry as FluentLogEntryFromGenerator } from '../codegen/spanLoggerGenerator.js';
-import type { FluentErr, FluentOk, Result } from '../result.js';
+import type { Err, Ok, Result } from '../result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { InferSchema } from '../schema/types.js';
@@ -302,7 +302,7 @@ export type SpanContext<Ctx extends OpContext> = {
    * @example
    * return ctx.ok(user).with({ userId: user.id });
    */
-  ok<S>(value: S): FluentOk<S, Ctx['logSchema']>;
+  ok<S>(value: S): Ok<S, Ctx['logSchema']>;
 
   /**
    * Create an error result with optional attributes.
@@ -315,9 +315,10 @@ export type SpanContext<Ctx extends OpContext> = {
    * @returns Fluent result builder
    *
    * @example
-   * return ctx.err('NOT_FOUND', { userId }).message('User not found');
+   * const NOT_FOUND = defineCodeError('NOT_FOUND')<{ userId: string }>();
+   * return ctx.err(NOT_FOUND({ userId })).message('User not found');
    */
-  err<E>(code: string, details: E): FluentErr<E, Ctx['logSchema']>;
+  err<E>(error: E): Err<E, Ctx['logSchema']>;
 
   /**
    * Create a child span with its own buffer.

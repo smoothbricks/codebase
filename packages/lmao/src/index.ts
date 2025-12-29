@@ -14,8 +14,12 @@ export { Op } from './lib/op.js';
 // Result Types
 // =============================================================================
 
-export type { Err, FluentResult, Ok, Result } from './lib/result.js';
-export { FluentErr, FluentOk } from './lib/result.js';
+export type { Result, TaggedError, TaggedErrorConstructor } from './lib/result.js';
+export { Err, hasErrorCode, Ok } from './lib/result.js';
+
+// Tagged Error Types - tree-shakable subpath exports:
+// import { Blocked } from '@smoothbricks/lmao/errors/Blocked'
+// import { RetriesExhausted } from '@smoothbricks/lmao/errors/RetriesExhausted'
 
 // =============================================================================
 // TraceContext Types
@@ -141,9 +145,11 @@ export {
 
 export {
   createTraceId,
+  extractSpanIdentity,
   generateTraceId,
   isValidTraceId,
   MAX_TRACE_ID_LENGTH,
+  type SpanIdentity,
   type TraceId,
   type TraceRoot,
 } from './lib/traceId.js';

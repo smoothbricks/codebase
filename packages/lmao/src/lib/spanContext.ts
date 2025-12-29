@@ -32,7 +32,7 @@ import {
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger } from './opContext/types.js';
-import { type Err, FluentErr, FluentOk, type Result } from './result.js';
+import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import {
   ENTRY_TYPE_SPAN_ERR,
@@ -127,7 +127,7 @@ export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuf
  * Called by span methods after fn() returns to write:
  * - entry_type (SPAN_OK or SPAN_ERR based on result instanceof)
  * - timestamp
- * - error_code (for FluentErr only)
+ * - error_code (for Err only)
  * - deferred tags via result.applyTags()
  *
  * @param buffer - SpanBuffer to write to
@@ -135,17 +135,13 @@ export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuf
  */
 export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, result: Result<S, E>): void {
   // Write entry_type based on result type
-  if (result instanceof FluentOk) {
+  if (result instanceof Ok) {
     buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-  } else if (result instanceof FluentErr) {
+  } else if (result instanceof Err) {
     buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
-    // Write error_code from the result
-    buffer.error_code(1, result.error.code);
-  } else {
-    // Fallback for plain Result objects (not FluentOk/FluentErr)
-    buffer.entry_type[1] = (result as Result<S, E>).success ? ENTRY_TYPE_SPAN_OK : ENTRY_TYPE_SPAN_ERR;
-    if (!(result as Result<S, E>).success) {
-      buffer.error_code(1, ((result as Err<E>).error as { code: string }).code);
+    // Write error_code if the error has a code property
+    if (hasErrorCode(result.error)) {
+      buffer.error_code(1, result.error.code);
     }
   }
 
@@ -153,8 +149,8 @@ export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, r
   buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
   // Apply deferred tags if present
-  if (result instanceof FluentOk || result instanceof FluentErr) {
-    const applyTags = (result as FluentOk<S, T> | FluentErr<E, T>).applyTags;
+  if (result instanceof Ok || result instanceof Err) {
+    const applyTags = (result as Ok<S, T> | Err<E, T>).applyTags;
     if (applyTags) {
       applyTags(buffer);
     }
@@ -386,8 +382,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
     // Arrow functions that close over constructor args directly
     setScope: (attributes: Partial<InferSchema<Ctx['logSchema']>> | null) => void;
-    ok: <V>(value: V) => FluentOk<V, Ctx['logSchema']>;
-    err: <E>(code: string, error: E) => FluentErr<E, Ctx['logSchema']>;
+    ok: <V>(value: V) => Ok<V, Ctx['logSchema']>;
+    err: <E>(error: E) => Err<E, Ctx['logSchema']>;
     span: SpanFn<Ctx>;
 
     constructor(
@@ -408,10 +404,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
         spanLogger._setScope(attributes as Partial<InferSchema<Ctx['logSchema']>>);
       };
 
-      this.ok = <V>(value: V): FluentOk<V, Ctx['logSchema']> => new FluentOk<V, Ctx['logSchema']>(value);
+      this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value);
 
-      this.err = <E>(code: string, error: E): FluentErr<E, Ctx['logSchema']> =>
-        new FluentErr<E, Ctx['logSchema']>(code, error);
+      this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error);
 
       // span uses regular function to access `arguments` (no ...rest spread allocation)
       // Closes over `self` for calling prototype methods
@@ -888,11 +883,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
         }
       } as SpanFn<Ctx>;
 
-      ctx.ok = function ok<V>(value: V): FluentOk<V, Ctx['logSchema']> {
-        return new FluentOk<V, Ctx['logSchema']>(value);
+      ctx.ok = function ok<V>(value: V): Ok<V, Ctx['logSchema']> {
+        return new Ok<V, Ctx['logSchema']>(value);
       };
-      ctx.err = function err<E>(code: string, error: E): FluentErr<E, Ctx['logSchema']> {
-        return new FluentErr<E, Ctx['logSchema']>(code, error);
+      ctx.err = function err<E>(error: E): Err<E, Ctx['logSchema']> {
+        return new Err<E, Ctx['logSchema']>(error);
       };
       ctx.setScope = function setScope(attributes: Partial<InferSchema<Ctx['logSchema']>> | null): void {
         childLogger._setScope(attributes as Partial<InferSchema<Ctx['logSchema']>>);

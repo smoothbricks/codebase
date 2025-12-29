@@ -6,6 +6,7 @@
 import { describe, expect, it } from 'bun:test';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
+import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import {
@@ -20,6 +21,11 @@ import { createSpanBuffer } from '../spanBuffer.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestOpMetadata, createTestTraceRoot } from './test-helpers.js';
+
+// Error code factories for tests
+const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string; message?: string }>();
+const TEST_ERROR = defineCodeError('TEST_ERROR')<{ message: string }>();
+const ERROR_CODE = defineCodeError('ERROR_CODE')<{ detail: string }>();
 
 // Test schema
 // Note: resultMessage, exceptionMessage, errorCode, and exceptionStack are now system columns
@@ -70,13 +76,14 @@ describe('Span Lifecycle', () => {
     const { trace } = new TestTracer(ctx);
 
     const result = await trace('testTask', async (ctx) => {
-      return ctx.err('VALIDATION_ERROR', { field: 'email', message: 'Invalid email' });
+      return ctx.err(VALIDATION_ERROR({ field: 'email', message: 'Invalid email' }));
     });
 
     expect(result.success).toBe(false);
     if (!result.success) {
       expect(result.error.code).toBe('VALIDATION_ERROR');
-      expect(result.error.details).toEqual({ field: 'email', message: 'Invalid email' });
+      expect(result.error.field).toBe('email');
+      expect(result.error.message).toBe('Invalid email');
     }
   });
 
@@ -139,7 +146,7 @@ describe('Fluent Result API', () => {
     const { trace } = new TestTracer(ctx);
 
     const result = await trace('testTask', async (ctx) => {
-      return ctx.err('VALIDATION_ERROR', { field: 'email' }).with({ userId: 'user1', operation: 'CREATE' });
+      return ctx.err(VALIDATION_ERROR({ field: 'email' })).with({ userId: 'user1', operation: 'CREATE' });
     });
 
     expect(result.success).toBe(false);
@@ -152,7 +159,7 @@ describe('Fluent Result API', () => {
     const { trace } = new TestTracer(ctx);
 
     const result = await trace('testTask', async (ctx) => {
-      return ctx.err('VALIDATION_ERROR', { field: 'email' }).message('Invalid email format');
+      return ctx.err(VALIDATION_ERROR({ field: 'email' })).message('Invalid email format');
     });
 
     expect(result.success).toBe(false);
@@ -381,7 +388,7 @@ describe('FluentResult Type Compatibility', () => {
     const { trace } = new TestTracer(ctx);
 
     const result = await trace('testTask', async (ctx) => {
-      const result = ctx.err('TEST_ERROR', { message: 'test' });
+      const result = ctx.err(TEST_ERROR({ message: 'test' }));
 
       // Should be able to access error property directly
       if (!result.success) {
@@ -426,7 +433,7 @@ describe('Fixed Row Layout', () => {
     const { trace } = new TestTracer(ctx);
     const result = await trace('test', async (ctx) => {
       capturedBuffer = ctx.buffer;
-      return ctx.err('ERROR_CODE', { detail: 'error detail' });
+      return ctx.err(ERROR_CODE({ detail: 'error detail' }));
     });
 
     expect(result.success).toBe(false);

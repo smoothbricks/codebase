@@ -1,85 +1,63 @@
 /**
- * Result types and fluent result builders for ctx.ok()/ctx.err()
+ * Result types for type-safe error handling without exceptions.
  *
- * Provides type-safe error handling without exceptions using discriminated unions.
+ * ## Classes
+ * - `Ok<V, T>` - Success result with fluent tag API
+ * - `Err<E, T>` - Error result with fluent tag API
+ *
+ * ## Error Factories
+ * - `defineCodeError(code)` - Create callable error class with `code` on prototype
  *
  * ## Deferred Tag Application
  *
- * FluentOk and FluentErr are buffer-agnostic - they capture tag operations as closures
- * via the `applyTags` property. When span()/trace() completes, it calls `result.applyTags(buffer)`
- * to apply all captured tags to the correct buffer.
+ * Ok and Err capture tag operations as closures via the `applyTags` property.
+ * When span()/trace() completes, it calls `result.applyTags(buffer)` to apply
+ * all captured tags to the correct buffer row 1.
  *
- * This ensures type safety - tags are always applied to the span that created the result,
- * preventing accidental writes to wrong buffers if a result is captured and used later.
+ * @example
+ * ```typescript
+ * // Define error codes as callable classes
+ * const NOT_FOUND = defineCodeError('NOT_FOUND')<{ userId: string }>();
+ * const VALIDATION_FAILED = defineCodeError('VALIDATION_FAILED')<{ field: string }>();
+ *
+ * // Use in ops - no 'new' required
+ * return ctx.err(NOT_FOUND({ userId }));
+ * return ctx.err(VALIDATION_FAILED({ field: 'email' })).message('Invalid email');
+ *
+ * // instanceof works for type narrowing
+ * if (result.isErr(NOT_FOUND)) {
+ *   console.log(result.error.userId); // typed!
+ * }
+ * ```
  */
 
 import type { InferSchema, LogSchema } from './schema/types.js';
 import type { SpanBuffer } from './types.js';
 
-/**
- * Discriminated union representing a successful operation result.
- *
- * Use with {@link Err} and {@link Result} for type-safe error handling
- * without exceptions. The `success: true` literal enables TypeScript narrowing.
- *
- * @typeParam V - The type of the success value
- *
- * @example
- * ```typescript
- * function parseUserId(input: string): Result<number, string> {
- *   const id = parseInt(input);
- *   if (isNaN(id)) {
- *     return { success: false, error: { code: 'INVALID_ID', details: 'Not a number' } };
- *   }
- *   return { success: true, value: id };
- * }
- * ```
- *
- * @see {@link SpanContext.ok} - Create success result with trace logging
- */
-export type Ok<V> = { success: true; value: V };
+// =============================================================================
+// TAGGED ERROR INTERFACE
+// =============================================================================
 
 /**
- * Discriminated union representing a failed operation result.
- *
- * Use with {@link Ok} and {@link Result} for type-safe error handling
- * without exceptions. The `success: false` literal enables TypeScript narrowing.
- *
- * @typeParam E - The type of the error details
- *
- * @see {@link SpanContext.err} - Create error result with trace logging
+ * Interface for tagged errors that can be discriminated with isErr(Tag).
+ * Used by Blocked, RetriesExhausted, and user-defined error classes.
  */
-export type Err<E> = { success: false; error: { code: string; details: E } };
+export interface TaggedError<Tag extends string = string> {
+  readonly _tag: Tag;
+}
 
 /**
- * Union type for operation results - either success or error.
- *
- * Provides type-safe error handling without exceptions. Use with `ctx.ok()` and
- * `ctx.err()` methods in span contexts for automatic trace logging.
- *
- * @typeParam V - The type of the success value
- * @typeParam E - The type of the error details (defaults to unknown)
- *
- * @example
- * ```typescript
- * async function createUser(ctx: SpanContext, data: UserData): Promise<Result<User, ValidationError>> {
- *   if (!data.email) {
- *     return ctx.err('MISSING_EMAIL', { field: 'email' });
- *   }
- *   const user = await db.insert(data);
- *   return ctx.ok(user);
- * }
- *
- * // Type narrowing works automatically
- * const result = await createUser(ctx, data);
- * if (result.success) {
- *   console.log(result.value); // TypeScript knows this is User
- * } else {
- *   console.log(result.error.code); // 'MISSING_EMAIL'
- * }
- * ```
+ * Constructor type for tagged errors.
+ * Used with Result.isErr(Tag) to check error type via instanceof.
  */
-export type Result<V, E = unknown> = Ok<V> | Err<E>;
+export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> {
+  readonly _tag: T['_tag'];
+  new (...args: never[]): T;
+}
+
+// =============================================================================
+// APPLY TAGS FUNCTION TYPE
+// =============================================================================
 
 /**
  * Type for the deferred tag application closure.
@@ -87,22 +65,26 @@ export type Result<V, E = unknown> = Ok<V> | Err<E>;
  */
 export type ApplyTagsFn<T extends LogSchema> = (buffer: SpanBuffer<T>) => void;
 
+// =============================================================================
+// OK CLASS
+// =============================================================================
+
 /**
- * Fluent success result - buffer-agnostic with deferred tag application.
+ * Success result with fluent tag application.
  *
- * Created by ctx.ok(value). Tags are captured as closures and applied when
+ * Created by `ctx.ok(value)`. Tags are captured as closures and applied when
  * span()/trace() completes, ensuring writes go to the correct buffer.
+ *
+ * @typeParam V - The type of the success value
+ * @typeParam T - The log schema for buffer tag application
  *
  * @example
  * ```typescript
- * // Basic usage
  * return ctx.ok(user);
- *
- * // With chained tags (applied at span-end)
- * return ctx.ok(user).message('User created').with({ userId: user.id });
+ * return ctx.ok(user).with({ userId: user.id }).message('Created');
  * ```
  */
-export class FluentOk<V, T extends LogSchema = LogSchema> implements Ok<V> {
+export class Ok<V, T extends LogSchema = LogSchema> {
   readonly value: V;
 
   /**
@@ -116,19 +98,63 @@ export class FluentOk<V, T extends LogSchema = LogSchema> implements Ok<V> {
     this.value = value;
   }
 
-  /** Getter for Ok interface - derived from class identity */
+  /** Discriminant for type narrowing. */
   get success(): true {
     return true;
   }
 
-  /** Clean output for console.log in Node.js */
-  [Symbol.for('nodejs.util.inspect.custom')](): { success: true; value: V } {
-    return { success: true, value: this.value };
+  /** Type guard - always returns true for Ok. */
+  isOk(): this is Ok<V, T> {
+    return true;
   }
 
-  /** Clean output for JSON.stringify */
-  toJSON(): { success: true; value: V } {
-    return { success: true, value: this.value };
+  /** Type guard - always returns false for Ok. */
+  isErr(): false;
+  isErr<Tag extends TaggedError>(_Tag: TaggedErrorConstructor<Tag>): false;
+  isErr(_predicate?: unknown): false {
+    return false;
+  }
+
+  /** Get the value (always present for Ok). */
+  get maybeValue(): V {
+    return this.value;
+  }
+
+  /** Get the error (always undefined for Ok). */
+  get maybeError(): undefined {
+    return undefined;
+  }
+
+  /** Transform the success value. */
+  map<U>(fn: (value: V) => U): Ok<U, T> {
+    const mapped = new Ok<U, T>(fn(this.value));
+    mapped.applyTags = this.applyTags;
+    return mapped;
+  }
+
+  /** No-op for Ok (error transformation). */
+  mapErr<F>(_fn: (error: never) => F): Ok<V, T> {
+    return this;
+  }
+
+  /** Transform the success value, potentially returning an error. */
+  flatMap<U, F>(fn: (value: V) => Result<U, F>): Result<U, F> {
+    return fn(this.value);
+  }
+
+  /** Get the value (always returns value for Ok). */
+  unwrapOr<U>(_defaultValue: U): V {
+    return this.value;
+  }
+
+  /** Get the value (always returns value for Ok). */
+  unwrapOrElse<U>(_fn: (error: never) => U): V {
+    return this.value;
+  }
+
+  /** Pattern match on the result. */
+  match<U>(handlers: { ok: (value: V) => U; err: (error: never) => U }): U {
+    return handlers.ok(this.value);
   }
 
   /**
@@ -179,25 +205,41 @@ export class FluentOk<V, T extends LogSchema = LogSchema> implements Ok<V> {
     };
     return this;
   }
+
+  [Symbol.for('nodejs.util.inspect.custom')](): { ok: true; value: V } {
+    return { ok: true, value: this.value };
+  }
+
+  toJSON(): { ok: true; value: V } {
+    return { ok: true, value: this.value };
+  }
 }
 
+// =============================================================================
+// ERR CLASS
+// =============================================================================
+
 /**
- * Fluent error result - buffer-agnostic with deferred tag application.
+ * Error result with fluent tag application.
  *
- * Created by ctx.err(code, details). The error code is stored in the result
- * and written to buffer by span()/trace() at span-end (not via closure).
+ * Created by `ctx.err(error)`. The error is stored directly (flat structure).
+ * Supports fluent `.with()`, `.message()`, `.line()` for deferred tag application.
+ *
+ * @typeParam E - The type of the error
+ * @typeParam T - The log schema for buffer tag application
  *
  * @example
  * ```typescript
- * // Basic usage
- * return ctx.err('VALIDATION_FAILED', { field: 'email' });
+ * const NOT_FOUND = defineCodeError('NOT_FOUND')<{ userId: string }>();
+ * return ctx.err(NOT_FOUND({ userId }));
+ * return ctx.err(NOT_FOUND({ userId })).message('User not found');
  *
- * // With chained tags (applied at span-end)
- * return ctx.err('NOT_FOUND', null).message('User not found');
+ * // Tagged errors work too
+ * return ctx.err(Blocked.service('payment-api'));
  * ```
  */
-export class FluentErr<E, T extends LogSchema = LogSchema> implements Err<E> {
-  readonly error: { code: string; details: E };
+export class Err<E, T extends LogSchema = LogSchema> {
+  readonly error: E;
 
   /**
    * Closure chain for deferred tag application.
@@ -207,30 +249,105 @@ export class FluentErr<E, T extends LogSchema = LogSchema> implements Err<E> {
    */
   applyTags?: ApplyTagsFn<T>;
 
-  constructor(code: string, details: E) {
-    this.error = { code, details };
+  constructor(error: E) {
+    this.error = error;
   }
 
-  /** Getter for Err interface - derived from class identity */
+  /** Discriminant for type narrowing. */
   get success(): false {
     return false;
   }
 
-  /** Clean output for console.log in Node.js */
-  [Symbol.for('nodejs.util.inspect.custom')](): { success: false; error: { code: string; details: E } } {
-    return { success: false, error: this.error };
+  /** Type guard - always returns false for Err. */
+  isOk(): false {
+    return false;
   }
 
-  /** Clean output for JSON.stringify */
-  toJSON(): { success: false; error: { code: string; details: E } } {
-    return { success: false, error: this.error };
+  /**
+   * Check if this is an error result, optionally matching a tagged type or predicate.
+   *
+   * @example
+   * ```typescript
+   * if (result.isErr()) { ... }  // Always true for Err
+   * if (result.isErr(Blocked)) { ... }  // Check instanceof Blocked
+   * if (result.isErr(NOT_FOUND)) { ... }  // Check instanceof NOT_FOUND
+   * if (result.isErr(e => e.code === 'X')) { ... }  // Predicate
+   * ```
+   */
+  isErr(): this is Err<E, T>;
+  isErr<Tag extends TaggedError>(Tag: TaggedErrorConstructor<Tag>): this is Err<Tag, T>;
+  isErr<C extends abstract new (...args: never[]) => unknown>(Class: C): this is Err<InstanceType<C>, T>;
+  isErr(predicate: (error: E) => boolean): boolean;
+  isErr<Tag extends TaggedError>(
+    tagOrPredicate?:
+      | TaggedErrorConstructor<Tag>
+      | (abstract new (
+          ...args: never[]
+        ) => unknown)
+      | ((error: E) => boolean),
+  ): boolean {
+    if (tagOrPredicate === undefined) return true;
+
+    // instanceof check for classes (including TaggedError and CodeError)
+    if (typeof tagOrPredicate === 'function') {
+      // Check if it's a predicate function (not a constructor)
+      if (tagOrPredicate.prototype === undefined || tagOrPredicate.prototype === Function.prototype) {
+        return (tagOrPredicate as (error: E) => boolean)(this.error);
+      }
+      // It's a constructor - use instanceof
+      return this.error instanceof (tagOrPredicate as abstract new (...args: never[]) => unknown);
+    }
+
+    return false;
+  }
+
+  /** Get the value (always undefined for Err). */
+  get maybeValue(): undefined {
+    return undefined;
+  }
+
+  /** Get the error (always present for Err). */
+  get maybeError(): E {
+    return this.error;
+  }
+
+  /** No-op for Err (value transformation). */
+  map<U>(_fn: (value: never) => U): Err<E, T> {
+    return this;
+  }
+
+  /** Transform the error. */
+  mapErr<F>(fn: (error: E) => F): Err<F, T> {
+    const mapped = new Err<F, T>(fn(this.error));
+    mapped.applyTags = this.applyTags as ApplyTagsFn<T> | undefined;
+    return mapped;
+  }
+
+  /** No-op for Err (returns self). */
+  flatMap<U, F>(_fn: (value: never) => Result<U, F>): Err<E, T> {
+    return this;
+  }
+
+  /** Get the default value (error is ignored). */
+  unwrapOr<U>(defaultValue: U): U {
+    return defaultValue;
+  }
+
+  /** Compute a value from the error. */
+  unwrapOrElse<U>(fn: (error: E) => U): U {
+    return fn(this.error);
+  }
+
+  /** Pattern match on the result. */
+  match<U>(handlers: { ok: (value: never) => U; err: (error: E) => U }): U {
+    return handlers.err(this.error);
   }
 
   /**
    * Set multiple attributes on the span-end entry (row 1).
    * Deferred - applied when span()/trace() completes.
    *
-   * @example ctx.err('ERROR', details).with({ userId: 'u1' })
+   * @example ctx.err(error).with({ user_id: 'u1' })
    */
   with(attributes: Partial<InferSchema<T>>): this {
     const prev = this.applyTags;
@@ -274,16 +391,109 @@ export class FluentErr<E, T extends LogSchema = LogSchema> implements Err<E> {
     };
     return this;
   }
+
+  [Symbol.for('nodejs.util.inspect.custom')](): { ok: false; error: E } {
+    return { ok: false, error: this.error };
+  }
+
+  toJSON(): { ok: false; error: E } {
+    return { ok: false, error: this.error };
+  }
+}
+
+// =============================================================================
+// RESULT TYPE
+// =============================================================================
+
+/** Union type for Result - either Ok or Err. */
+export type Result<V, E> = Ok<V> | Err<E>;
+
+// =============================================================================
+// CODE ERROR FACTORY
+// =============================================================================
+
+/**
+ * Code error instance type - has `code` on prototype plus fields as own properties.
+ */
+export interface CodeErrorInstance<Code extends string, Fields extends object> {
+  readonly code: Code;
 }
 
 /**
- * Union type for fluent result builders - either success or error with chaining support.
- *
- * @typeParam S - The type of the success value
- * @typeParam E - The type of the error details
- * @typeParam T - The log schema for the span buffer
+ * Callable class type returned by defineCodeError.
+ * Can be called without `new`, instanceof works.
  */
-export type FluentResult<S, E, T extends LogSchema = LogSchema> = FluentOk<S, T> | FluentErr<E, T>;
+export interface CodeErrorClass<Code extends string, Fields extends object> {
+  (fields: Fields): CodeErrorInstance<Code, Fields> & Fields;
+  new (fields: Fields): CodeErrorInstance<Code, Fields> & Fields;
+  readonly prototype: { readonly code: Code };
+}
+
+/**
+ * Create a callable error class with `code` on prototype.
+ *
+ * The returned class can be called without `new` and supports `instanceof`.
+ *
+ * @param code - The error code string (becomes a literal type)
+ * @returns A curried function that takes type parameter for fields
+ *
+ * @example
+ * ```typescript
+ * const NOT_FOUND = defineCodeError('NOT_FOUND')<{ userId: string }>();
+ * const VALIDATION_FAILED = defineCodeError('VALIDATION_FAILED')<{ field: string }>();
+ *
+ * // Call without 'new'
+ * const err = NOT_FOUND({ userId: 'u1' });
+ * err.code;     // 'NOT_FOUND' (from prototype)
+ * err.userId;   // 'u1' (own property)
+ *
+ * // instanceof works
+ * err instanceof NOT_FOUND;  // true
+ *
+ * // Use with ctx.err()
+ * return ctx.err(NOT_FOUND({ userId }));
+ *
+ * // Type narrowing with isErr()
+ * if (result.isErr(NOT_FOUND)) {
+ *   result.error.userId;  // typed!
+ * }
+ * ```
+ */
+export function defineCodeError<Code extends string>(code: Code) {
+  return <Fields extends object = Record<string, never>>(): CodeErrorClass<Code, Fields> => {
+    // Constructor function that works with or without 'new'
+    const CodeError = function (
+      this: (CodeErrorInstance<Code, Fields> & Fields) | undefined,
+      fields: Fields,
+    ): CodeErrorInstance<Code, Fields> & Fields {
+      // Allow calling without 'new'
+      if (!(this instanceof CodeError)) {
+        return new CodeError(fields);
+      }
+      // Assign fields as own properties
+      Object.assign(this, fields);
+      return this;
+    } as unknown as CodeErrorClass<Code, Fields>;
+
+    // Put code on prototype so all instances share it
+    (CodeError.prototype as { code: Code }).code = code;
+
+    return CodeError;
+  };
+}
+
+/**
+ * Check if an error has a `code` property.
+ * Used by writeSpanEnd to extract error_code for logging.
+ */
+export function hasErrorCode(error: unknown): error is { code: string } {
+  return (
+    error !== null &&
+    typeof error === 'object' &&
+    'code' in error &&
+    typeof (error as { code: unknown }).code === 'string'
+  );
+}
 
 // =============================================================================
 // RESULT TYPE EXTRACTION UTILITIES

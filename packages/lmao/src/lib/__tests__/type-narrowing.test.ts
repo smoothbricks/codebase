@@ -5,9 +5,14 @@
 
 import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../defineOpContext.js';
+import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+
+// Error code factories for tests
+const TEST_ERROR = defineCodeError('TEST_ERROR')<{ field: string; reason: string }>();
+const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ message: string }>();
 
 const testSchema = defineLogSchema({
   userId: S.category(),
@@ -59,15 +64,15 @@ describe('Type Narrowing with FluentResult', () => {
     const { trace } = createTestTracer();
 
     const testOp = defineOp('testOp', async (ctx) => {
-      const result = ctx.err('TEST_ERROR', { field: 'email', reason: 'invalid' });
+      const result = ctx.err(TEST_ERROR({ field: 'email', reason: 'invalid' }));
 
       // Type narrowing should work with FluentResult
       if (!result.success) {
         // result.error should be accessible and typed correctly
         const error = result.error;
         expect(error.code).toBe('TEST_ERROR');
-        expect(error.details.field).toBe('email');
-        expect(error.details.reason).toBe('invalid');
+        expect(error.field).toBe('email');
+        expect(error.reason).toBe('invalid');
         return ctx.ok(error.code);
       }
 
@@ -108,14 +113,14 @@ describe('Type Narrowing with FluentResult', () => {
 
     const testOp = defineOp('testOp', async (ctx) => {
       const result = ctx
-        .err('VALIDATION_ERROR', { message: 'Invalid input' })
+        .err(VALIDATION_ERROR({ message: 'Invalid input' }))
         .with({ userId: 'user1' })
         .message('Validation failed');
 
       // Type narrowing should work after chaining
       if (!result.success) {
         expect(result.error.code).toBe('VALIDATION_ERROR');
-        expect(result.error.details.message).toBe('Invalid input');
+        expect(result.error.message).toBe('Invalid input');
         return ctx.ok(result.error.code);
       }
 

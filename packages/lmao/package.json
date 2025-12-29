@@ -24,6 +24,24 @@
       "types": "./dist/es.d.ts",
       "import": "./dist/es.js",
       "default": "./dist/es.js"
+    },
+    "./errors/Blocked": {
+      "development": "./src/lib/errors/Blocked.ts",
+      "types": "./dist/lib/errors/Blocked.d.ts",
+      "import": "./dist/lib/errors/Blocked.js",
+      "default": "./dist/lib/errors/Blocked.js"
+    },
+    "./errors/RetriesExhausted": {
+      "development": "./src/lib/errors/RetriesExhausted.ts",
+      "types": "./dist/lib/errors/RetriesExhausted.d.ts",
+      "import": "./dist/lib/errors/RetriesExhausted.js",
+      "default": "./dist/lib/errors/RetriesExhausted.js"
+    },
+    "./errors/CodeError": {
+      "development": "./src/lib/errors/CodeError.ts",
+      "types": "./dist/lib/errors/CodeError.d.ts",
+      "import": "./dist/lib/errors/CodeError.js",
+      "default": "./dist/lib/errors/CodeError.js"
     }
   },
   "files": [

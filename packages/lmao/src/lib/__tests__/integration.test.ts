@@ -13,11 +13,17 @@ import { describe, expect, it } from 'bun:test';
 // Must import test-helpers first to initialize timestamp implementation
 import './test-helpers.js';
 import { defineOpContext } from '../defineOpContext.js';
+import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+
+// Error code factories for tests
+const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string }>();
+const VALIDATION_FAILED = defineCodeError('VALIDATION_FAILED')<{ error: unknown }>();
+const USER_EXISTS = defineCodeError('USER_EXISTS')<{ email: string }>();
 
 describe('Schema Integration Patterns', () => {
   // Define log schema for DB operations
@@ -409,7 +415,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       const errorOp = defineOp('error-task', async (ctx) => {
-        return ctx.err('VALIDATION_ERROR', { field: 'email' });
+        return ctx.err(VALIDATION_ERROR({ field: 'email' }));
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
@@ -425,7 +431,7 @@ describe('Schema Integration Patterns', () => {
       expect(errorResult.success).toBe(false);
       if (!errorResult.success) {
         expect(errorResult.error.code).toBe('VALIDATION_ERROR');
-        expect(errorResult.error.details).toEqual({ field: 'email' });
+        expect(errorResult.error.field).toBe('email');
       }
     });
 

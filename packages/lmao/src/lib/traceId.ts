@@ -83,6 +83,61 @@ export function generateTraceId(): TraceId {
 }
 
 // ============================================================================
+// SpanIdentity - Span identification for external systems
+// ============================================================================
+
+/**
+ * SpanIdentity - Identifies a specific span for external correlation.
+ *
+ * distributed tracing headers, error reporting). Contains the minimal fields needed
+ * to uniquely identify a span within a trace.
+ *
+ * **Usage:**
+ * ```typescript
+ * // Extract from buffer
+ * const identity: SpanIdentity = {
+ *   trace_id: buffer.trace_id,
+ *   span_id: buffer.span_id,
+ *   thread_id: buffer.thread_id,
+ * };
+ *
+ * // Use in signals/messages
+ * signalReportDown({ service, reporter, span: identity });
+ * ```
+ *
+ * **Fields:**
+ * - `trace_id`: 128-bit UUID identifying the entire trace (branded string)
+ * - `span_id`: 32-bit counter unique within the trace
+ * - `thread_id`: 64-bit identifier for execution thread/context
+ *
+ * @see specs/01b4_span_identity.md for full identity design
+ */
+export interface SpanIdentity {
+  /** Trace ID - 128-bit UUID identifying the entire trace */
+  readonly trace_id: TraceId;
+
+  /** Span ID - 32-bit counter unique within this trace */
+  readonly span_id: number;
+
+  /** Thread ID - 64-bit identifier for execution thread/context */
+  readonly thread_id: bigint;
+}
+
+/**
+ * Extract SpanIdentity from a span buffer.
+ *
+ * @param buffer - Any object with trace_id, span_id, thread_id properties
+ * @returns SpanIdentity for external correlation
+ */
+export function extractSpanIdentity(buffer: { trace_id: TraceId; span_id: number; thread_id: bigint }): SpanIdentity {
+  return {
+    trace_id: buffer.trace_id,
+    span_id: buffer.span_id,
+    thread_id: buffer.thread_id,
+  };
+}
+
+// ============================================================================
 // TraceRoot - Per-trace anchor data
 // ============================================================================
 
