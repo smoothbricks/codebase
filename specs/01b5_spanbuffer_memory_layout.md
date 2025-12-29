@@ -22,36 +22,36 @@ minimal allocations, and zero conditional logic for system column access.
 ### Buffer Type Layouts
 
 ```
-┌─────────────────────────────────────────────────────────────────────────────────┐
-│ ROOT SPAN BUFFER                                                                │
-│                                                                                 │
-│ _system: ArrayBuffer                                                            │
-│ ┌────────────────────────┬──────────────────┬────────────────────────────────┐  │
-│ │ timestamp              │ entry_type       │ identity                       │  │
-│ │ BigInt64Array          │ Uint8Array       │ [thread_id][span_id][len][trace] │  │
-│ │ 8 * capacity bytes     │ 1 * capacity     │ 8 + 4 + 1 + trace_id.length     │  │
-│ └────────────────────────┴──────────────────┴────────────────────────────────┘  │
-│  offset: 0                capacity * 8       capacity * 9                       │
-│                                                                                 │
-│ Views:                                                                          │
-│   timestamp ──► BigInt64Array(this._system, 0, capacity)                        │
-│   entry_type ──► Uint8Array(this._system, capacity * 8, capacity)               │
+┌──────────────────────────────────────────────────────────────────────────────-───┐
+│ ROOT SPAN BUFFER                                                                 │
+│                                                                                  │
+│ _system: ArrayBuffer                                                             │
+│ ┌────────────────────────┬──────────────────┬──────────────────────────────────┐ │
+│ │ timestamp              │ entry_type       │ identity                         │ │
+│ │ BigInt64Array          │ Uint8Array       │ [thread_id][span_id][len][trace]   │
+│ │ 8 * capacity bytes     │ 1 * capacity     │ 8 + 4 + 1 + trace_id.length      │ │
+│ └────────────────────────┴──────────────────┴──────────────────────────────────┘ │
+│  offset: 0                capacity * 8       capacity * 9                        │
+│                                                                                  │
+│ Views:                                                                           │
+│   timestamp ──► BigInt64Array(this._system, 0, capacity)                         │
+│   entry_type ──► Uint8Array(this._system, capacity * 8, capacity)                │
 │   _identity  ──► Uint8Array(this._system, capacity * 9, 13 + trace_id.length)    │
-│                                                                                 │
+│                                                                                  │
 │ Identity layout (13 + trace_id.length bytes):                                    │
 │   [0-7]   thread_id    (8 bytes, crypto-secure random, same for all spans)       │
 │   [8-11]  span_id      (4 bytes, Uint32, incrementing counter)                   │
-│   [12]    trace_idLen  (1 byte, length of trace_id string)                        │
+│   [12]    trace_idLen  (1 byte, length of trace_id string)                       │
 │   [13+]   trace_id     (1-128 bytes, ASCII string)                               │
-│                                                                                 │
-│ Properties:                                                                     │
-│   parent: undefined (root has no parent)                                        │
+│                                                                                  │
+│ Properties:                                                                      │
+│   parent: undefined (root has no parent)                                         │
 │   _children: SpanBuffer[]                                                        │
-│   callsiteModule: ModuleContext (caller's module for row 0 metadata)            │
-│   module: ModuleContext (Op's module for rows 1+ metadata)                      │
-│   spanName: string (per-span data)                                              │
-│   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property           │
-└─────────────────────────────────────────────────────────────────────────────────┘
+│   callsiteModule: ModuleContext (caller's module for row 0 metadata)             │
+│   module: ModuleContext (Op's module for rows 1+ metadata)                       │
+│   spanName: string (per-span data)                                               │
+│   NOTE: lineNumber is in lineNumber_values TypedArray, NOT a property            │
+└──────────────────────────────────────────────────────────────────────────────────┘
 
 ┌─────────────────────────────────────────────────────────────────────────────────┐
 │ CHILD SPAN BUFFER                                                               │
@@ -70,12 +70,12 @@ minimal allocations, and zero conditional logic for system column access.
 │   _identity  ──► Uint8Array(this._system, capacity * 9, 12)                     │
 │                                                                                 │
 │ Identity layout (12 bytes):                                                     │
-│   [0-7]   thread_id    (8 bytes, same as process thread_id)                       │
-│   [8-11]  span_id      (4 bytes, Uint32, incrementing counter)                   │
+│   [0-7]   thread_id    (8 bytes, same as process thread_id)                     │
+│   [8-11]  span_id      (4 bytes, Uint32, incrementing counter)                  │
 │                                                                                 │
 │ Properties:                                                                     │
-│   parent ──────────────► (parent SpanBuffer - for trace_id + parentSpanId)       │
-│   _children: SpanBuffer[]                                                        │
+│   parent ──────────────► (parent SpanBuffer - for trace_id + parentSpanId)      │
+│   _children: SpanBuffer[]                                                       │
 │   callsiteModule: ModuleContext (caller's module for row 0 metadata)            │
 │   module: ModuleContext (Op's module for rows 1+ metadata)                      │
 │   spanName: string (per-span data)                                              │
@@ -100,7 +100,7 @@ minimal allocations, and zero conditional logic for system column access.
 │                                                                                 │
 │ Properties:                                                                     │
 │   parent ──────────────► (same as first buffer's parent)                        │
-│   _children: [] (only root buffer tracks _children)                               │
+│   _children: [] (only root buffer tracks _children)                             │
 │   callsiteModule: ModuleContext (shared from first buffer)                      │
 │   module: ModuleContext (Op's module, shared reference)                         │
 │   spanName: string (per-span data)                                              │
