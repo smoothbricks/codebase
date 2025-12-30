@@ -9,6 +9,7 @@ _bmad
 dist
 tmp
 out-tsc
+.zig-cache
 
 # dependencies
 node_modules
