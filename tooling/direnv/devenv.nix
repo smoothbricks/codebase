@@ -20,6 +20,8 @@ in {
     nodejs_24
     # Bun.sh for javascript dependencies
     bun
+    # WASM and NAPI extensions
+    zig
     # Git hooks and formatters
     git-format-staged
     jq # Used in pre-commit hook and generally useful
