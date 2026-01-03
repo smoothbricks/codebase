@@ -1,23 +1,37 @@
-import { afterEach, beforeEach, describe, expect, it } from 'bun:test';
+import { describe, expect, it } from 'bun:test';
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
-import { SPAN_LOGGER_HELPERS, setTimestampNanosImpl } from '../codegen/spanLoggerGenerator.js';
 
-describe('Node.js Timestamp (process.hrtime.bigint)', () => {
-  it('should return a bigint', async () => {
-    const nodeModule = await import('../timestamp.node.js');
-    const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
-    const ts = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
+  it('should return a bigint from getTimestampNanos()', async () => {
+    const { createTraceRoot } = await import('../traceRoot.node.js');
+    const mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+    };
+    const traceRoot = createTraceRoot('test-trace', mockTracer);
+
+    const ts = traceRoot.getTimestampNanos();
     expect(typeof ts).toBe('bigint');
   });
 
   it('should return increasing timestamps', async () => {
-    const nodeModule = await import('../timestamp.node.js');
-    const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
+    const { createTraceRoot } = await import('../traceRoot.node.js');
+    const mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+    };
+    const traceRoot = createTraceRoot('test-trace', mockTracer);
 
-    const ts1 = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+    const ts1 = traceRoot.getTimestampNanos();
     await new Promise((r) => setTimeout(r, 10));
-    const ts2 = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+    const ts2 = traceRoot.getTimestampNanos();
 
     expect(ts2).toBeGreaterThan(ts1);
     // Should be roughly 10ms apart
@@ -27,13 +41,20 @@ describe('Node.js Timestamp (process.hrtime.bigint)', () => {
   });
 
   it('should be within 1ms of Date.now()', async () => {
-    const nodeModule = await import('../timestamp.node.js');
+    const { createTraceRoot } = await import('../traceRoot.node.js');
+    const mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+    };
+
     // Sample multiple times and check they're all close
-    // Node.js anchor may be up to 1ms off due to Date.now() millisecond precision
     for (let i = 0; i < 10; i++) {
-      const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
+      const traceRoot = createTraceRoot('test-trace', mockTracer);
       const dateNowMs = Date.now();
-      const ts = nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+      const ts = traceRoot.getTimestampNanos();
       const tsMs = Nanoseconds.toMillis(ts);
 
       const diffMs = Math.abs(tsMs - dateNowMs);
@@ -42,13 +63,20 @@ describe('Node.js Timestamp (process.hrtime.bigint)', () => {
   });
 
   it('should have sub-millisecond precision (true nanoseconds)', async () => {
-    const nodeModule = await import('../timestamp.node.js');
-    const { anchorEpochNanos, anchorPerfNow } = nodeModule.createTimestampAnchor();
+    const { createTraceRoot } = await import('../traceRoot.node.js');
+    const mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+    };
+    const traceRoot = createTraceRoot('test-trace', mockTracer);
     const timestamps: bigint[] = [];
 
     // Rapid-fire timestamps
     for (let i = 0; i < 100; i++) {
-      timestamps.push(nodeModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow));
+      timestamps.push(traceRoot.getTimestampNanos());
     }
 
     // Should see sub-millisecond differences (< 1_000_000 nanoseconds)
@@ -64,21 +92,36 @@ describe('Node.js Timestamp (process.hrtime.bigint)', () => {
   });
 });
 
-describe('Browser Timestamp (performance.now)', () => {
-  it('should return a bigint', async () => {
-    const browserModule = await import('../timestamp.js');
-    const { anchorEpochNanos, anchorPerfNow } = browserModule.createTimestampAnchor();
-    const ts = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+describe('Browser TraceRoot Timestamps (performance.now)', () => {
+  it('should return a bigint from getTimestampNanos()', async () => {
+    const { createTraceRoot } = await import('../traceRoot.es.js');
+    const mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+    };
+    const traceRoot = createTraceRoot('test-trace', mockTracer);
+
+    const ts = traceRoot.getTimestampNanos();
     expect(typeof ts).toBe('bigint');
   });
 
   it('should return increasing timestamps', async () => {
-    const browserModule = await import('../timestamp.js');
-    const { anchorEpochNanos, anchorPerfNow } = browserModule.createTimestampAnchor();
+    const { createTraceRoot } = await import('../traceRoot.es.js');
+    const mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+    };
+    const traceRoot = createTraceRoot('test-trace', mockTracer);
 
-    const ts1 = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+    const ts1 = traceRoot.getTimestampNanos();
     await new Promise((r) => setTimeout(r, 10));
-    const ts2 = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+    const ts2 = traceRoot.getTimestampNanos();
 
     expect(ts2).toBeGreaterThan(ts1);
     // Should be roughly 10ms apart
@@ -88,12 +131,20 @@ describe('Browser Timestamp (performance.now)', () => {
   });
 
   it('should be within 1ms of Date.now()', async () => {
-    const browserModule = await import('../timestamp.js');
+    const { createTraceRoot } = await import('../traceRoot.es.js');
+    const mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+    };
+
     // Sample multiple times and check they're all close
     for (let i = 0; i < 10; i++) {
-      const { anchorEpochNanos, anchorPerfNow } = browserModule.createTimestampAnchor();
+      const traceRoot = createTraceRoot('test-trace', mockTracer);
       const dateNowMs = Date.now();
-      const ts = browserModule.getTimestampNanos(anchorEpochNanos, anchorPerfNow);
+      const ts = traceRoot.getTimestampNanos();
       const tsMs = Nanoseconds.toMillis(ts);
 
       const diffMs = Math.abs(tsMs - dateNowMs);
@@ -126,66 +177,16 @@ describe('Nanoseconds utilities', () => {
   });
 });
 
-describe('Platform entry point timestamp configuration', () => {
-  // Save original value to restore after each test
-  let originalGetTimestampNanos: typeof SPAN_LOGGER_HELPERS.getTimestampNanos;
-
-  beforeEach(() => {
-    originalGetTimestampNanos = SPAN_LOGGER_HELPERS.getTimestampNanos;
+describe('Platform entry points export createTraceRoot', () => {
+  it('should export createTraceRoot from /node', async () => {
+    const nodeModule = await import('../../node.js');
+    expect(nodeModule.createTraceRoot).toBeDefined();
+    expect(typeof nodeModule.createTraceRoot).toBe('function');
   });
 
-  // Restore after each test to avoid polluting other tests
-  afterEach(() => {
-    SPAN_LOGGER_HELPERS.getTimestampNanos = originalGetTimestampNanos;
-  });
-
-  it('should set Node.js timestamp implementation when importing /node', async () => {
-    // Clear the implementation first
-    SPAN_LOGGER_HELPERS.getTimestampNanos = undefined;
-    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeUndefined();
-
-    // Import the node entry point (use cache-busting to force re-evaluation)
-    await import(`../../node.js?t=${Date.now()}`);
-
-    // Should have set the implementation
-    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeDefined();
-    expect(typeof SPAN_LOGGER_HELPERS.getTimestampNanos).toBe('function');
-
-    // The function should be the Node.js implementation
-    const nodeTimestamp = await import('../timestamp.node.js');
-    expect(SPAN_LOGGER_HELPERS.getTimestampNanos === nodeTimestamp.getTimestampNanos).toBe(true);
-  });
-
-  it('should set browser timestamp implementation when importing /es', async () => {
-    // Clear the implementation first
-    SPAN_LOGGER_HELPERS.getTimestampNanos = undefined;
-    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeUndefined();
-
-    // Import the es entry point (use cache-busting to force re-evaluation)
-    await import(`../../es.js?t=${Date.now()}`);
-
-    // Should have set the implementation
-    expect(SPAN_LOGGER_HELPERS.getTimestampNanos).toBeDefined();
-    expect(typeof SPAN_LOGGER_HELPERS.getTimestampNanos).toBe('function');
-
-    // The function should be the browser implementation
-    const browserTimestamp = await import('../timestamp.js');
-    expect(SPAN_LOGGER_HELPERS.getTimestampNanos === browserTimestamp.getTimestampNanos).toBe(true);
-  });
-
-  it('should allow setting timestamp implementation via setTimestampNanosImpl', () => {
-    // Clear first
-    SPAN_LOGGER_HELPERS.getTimestampNanos = undefined;
-
-    // Create a mock implementation
-    const mockImpl = (anchorEpochNanos: bigint, anchorPerfNow: number) => {
-      return Nanoseconds.unsafe(anchorEpochNanos + BigInt(anchorPerfNow));
-    };
-
-    // Set it
-    setTimestampNanosImpl(mockImpl);
-
-    // Verify
-    expect(SPAN_LOGGER_HELPERS.getTimestampNanos === mockImpl).toBe(true);
+  it('should export createTraceRoot from /es', async () => {
+    const esModule = await import('../../es.js');
+    expect(esModule.createTraceRoot).toBeDefined();
+    expect(typeof esModule.createTraceRoot).toBe('function');
   });
 });

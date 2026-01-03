@@ -159,11 +159,11 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
   private readonly err: NodeJS.WriteStream;
   private readonly colorEnabled: boolean;
 
-  constructor(binding: B, options?: StdioTracerOptions) {
+  constructor(binding: B, options: StdioTracerOptions) {
     super(binding, options);
-    this.out = options?.out ?? process.stdout;
-    this.err = options?.err ?? process.stderr;
-    this.colorEnabled = options?.colorEnabled ?? true;
+    this.out = options.out ?? process.stdout;
+    this.err = options.err ?? process.stderr;
+    this.colorEnabled = options.colorEnabled ?? true;
   }
 
   // --------------------------------------------------------------------------

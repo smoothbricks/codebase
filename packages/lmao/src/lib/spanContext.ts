@@ -34,16 +34,14 @@ import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger } from './opContext/types.js';
 import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
-import {
-  ENTRY_TYPE_SPAN_ERR,
-  ENTRY_TYPE_SPAN_EXCEPTION,
-  ENTRY_TYPE_SPAN_OK,
-  ENTRY_TYPE_SPAN_START,
-} from './schema/systemSchema.js';
+import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import { createChildSpanBuffer, createOverflowBuffer, type SpanBufferConstructor } from './spanBuffer.js';
-import { getTimestampNanos } from './timestamp.js';
 import type { LogBinding, SpanBuffer } from './types.js';
+
+// Note: TraceRoot.writeSpanStart() is used instead of direct timestamp writes.
+// The platform-specific TraceRoot (traceRoot.es.ts or traceRoot.node.ts) handles
+// timestamp calculation and writes to buffer._system columns.
 
 // =============================================================================
 // SpanContext Symbol Marker
@@ -94,17 +92,8 @@ export type SpanLoggerInternal<T extends LogSchema> = SpanLoggerImpl<T> & {
  * @param spanName - Name for this span
  */
 export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanName: string): void {
-  // Row 0: span-start (fixed layout)
-  buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
-  buffer.timestamp[0] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
-  buffer.message(0, spanName); // Unified message column for span name
-
-  // Row 1: pre-initialize as span-exception (will be overwritten on ok/err)
-  buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-  buffer.timestamp[1] = 0n; // Will be set on completion
-
-  // Events start at row 2
-  buffer._writeIndex = 2;
+  // Delegate to TraceRoot - platform-specific implementation handles timestamps
+  buffer._traceRoot.writeSpanStart(buffer, spanName);
 }
 
 /**
@@ -134,19 +123,16 @@ export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuf
  * @param result - The result returned by the span function
  */
 export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, result: Result<S, E>): void {
-  // Write entry_type based on result type
+  // Write entry_type and timestamp via TraceRoot (platform-specific)
   if (result instanceof Ok) {
-    buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
+    buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
   } else if (result instanceof Err) {
-    buffer.entry_type[1] = ENTRY_TYPE_SPAN_ERR;
+    buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_ERR);
     // Write error_code if the error has a code property
     if (hasErrorCode(result.error)) {
       buffer.error_code(1, result.error.code);
     }
   }
-
-  // Write timestamp
-  buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
 
   // Apply deferred tags if present
   if (result instanceof Ok || result instanceof Err) {
@@ -905,10 +891,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * Called in catch blocks of span methods.
      */
     _spanException(childBuffer: SpanBuffer<Ctx['logSchema']>, error: unknown): void {
-      childBuffer.timestamp[1] = getTimestampNanos(
-        childBuffer._traceRoot.anchorEpochNanos,
-        childBuffer._traceRoot.anchorPerfNow,
-      );
+      // Write entry_type and timestamp via TraceRoot (platform-specific)
+      childBuffer._traceRoot.writeSpanEnd(childBuffer, ENTRY_TYPE_SPAN_EXCEPTION);
       const errorMessage = error instanceof Error ? error.message : String(error);
       const errorStack = error instanceof Error ? error.stack : undefined;
       childBuffer.message(1, errorMessage);

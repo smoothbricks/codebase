@@ -69,8 +69,8 @@ import {
   writeSpanEnd,
   writeSpanStart,
 } from './spanContext.js';
-import { getTimestampNanos } from './timestamp.js';
-import { generateTraceId, type TraceId, type TraceRoot } from './traceId.js';
+import { generateTraceId, type TraceId } from './traceId.js';
+import type { TraceRootFactory } from './traceRoot.js';
 import type { SpanBuffer } from './types.js';
 
 // =============================================================================
@@ -85,6 +85,12 @@ import type { SpanBuffer } from './types.js';
  * the OpContext's flags schema, not from the evaluator's type parameter.
  */
 export interface TracerOptions {
+  /**
+   * Factory for creating platform-specific TraceRoot instances.
+   * Import from '@smoothbricks/lmao/node' or '@smoothbricks/lmao/es'.
+   */
+  createTraceRoot: TraceRootFactory;
+
   /** Feature flag evaluator - provides flag values at runtime */
   flagEvaluator?: FlagEvaluator<OpContext>;
 }
@@ -211,12 +217,14 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   private readonly flagEvaluator?: FlagEvaluator<OpContext>;
   private readonly ctxDefaults: Record<string, unknown>;
   private readonly deps: Record<string, unknown>;
+  private readonly createTraceRoot: TraceRootFactory;
 
-  constructor(binding: B, options?: TracerOptions) {
+  constructor(binding: B, options: TracerOptions) {
     this.logBinding = binding.logBinding;
     this.ctxDefaults = binding.ctxDefaults ?? EMPTY_SCOPE;
     this.deps = binding.deps ?? EMPTY_SCOPE;
-    this.flagEvaluator = options?.flagEvaluator;
+    this.flagEvaluator = options.flagEvaluator;
+    this.createTraceRoot = options.createTraceRoot;
 
     // Create SpanContext class for all contexts created by this tracer
     // The class closes over schema/logBinding and provides typed methods
@@ -506,18 +514,8 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     const { trace_id: _, ...userCtxOverrides } = overrides;
     const resolvedUserCtx = this._resolveUserContext(userCtxOverrides);
 
-    // Build TraceRoot with timestamp anchors and tracer reference
-    // Platform-specific: Node.js uses process.hrtime.bigint(), Browser uses performance.now()
-    const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
-    const anchorPerfNow =
-      typeof process !== 'undefined' && process.hrtime ? Number(process.hrtime.bigint()) : performance.now();
-
-    const traceRoot: TraceRoot = {
-      trace_id: traceId,
-      anchorEpochNanos,
-      anchorPerfNow,
-      tracer: this,
-    };
+    // Create TraceRoot via platform-specific factory
+    const traceRoot = this.createTraceRoot(traceId, this);
 
     // Create root SpanBuffer with pre-built TraceRoot
     const buffer = createSpanBuffer(
@@ -626,21 +624,13 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
                 writeSpanEnd(buffer, resolved);
               } else {
                 // Fallback for non-FluentResult returns
-                buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-                buffer.timestamp[1] = getTimestampNanos(
-                  buffer._traceRoot.anchorEpochNanos,
-                  buffer._traceRoot.anchorPerfNow,
-                );
+                buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
               }
               return resolved;
             },
             (error: unknown) => {
               // Write span-exception to row 1
-              buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-              buffer.timestamp[1] = getTimestampNanos(
-                buffer._traceRoot.anchorEpochNanos,
-                buffer._traceRoot.anchorPerfNow,
-              );
+              buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
               // Write exception details
               const errorMessage = error instanceof Error ? error.message : String(error);
@@ -662,15 +652,13 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
         writeSpanEnd(buffer, result);
       } else {
         // Fallback for non-FluentResult returns
-        buffer.entry_type[1] = ENTRY_TYPE_SPAN_OK;
-        buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
+        buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
       }
 
       return result;
     } catch (error) {
       // Sync exception path
-      buffer.entry_type[1] = ENTRY_TYPE_SPAN_EXCEPTION;
-      buffer.timestamp[1] = getTimestampNanos(buffer._traceRoot.anchorEpochNanos, buffer._traceRoot.anchorPerfNow);
+      buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
       // Write exception details
       const errorMessage = error instanceof Error ? error.message : String(error);

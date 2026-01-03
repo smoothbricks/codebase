@@ -10,6 +10,7 @@
 
 import type { OpContextBinding } from '../opContext/types.js';
 import type { LogSchema } from '../schema/LogSchema.js';
+import type { TracerOptions } from '../tracer.js';
 import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
 
@@ -66,6 +67,10 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
    * Used to verify onStatsWillResetFor hook is called correctly.
    */
   readonly statsSnapshots: StatsSnapshot<B['logBinding']['logSchema']>[] = [];
+
+  constructor(binding: B, options: TracerOptions) {
+    super(binding, options);
+  }
 
   // ===========================================================================
   // Lifecycle hook implementations

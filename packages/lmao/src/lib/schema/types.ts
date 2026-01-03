@@ -61,19 +61,20 @@ import type { LogSchema } from './LogSchema.js';
  * If T has the brand marker, extract the original schema from it.
  * Otherwise, return T unchanged.
  */
-type ExtractSchemaFields<T> = T extends LogSchema<infer Fields>
-  ? Fields
-  : T extends {
-        readonly [DEFINED_LOG_SCHEMA_BRAND]?: infer Original;
-      }
-    ? Original extends SchemaFields
-      ? Original
+type ExtractSchemaFields<T> =
+  T extends LogSchema<infer Fields>
+    ? Fields
+    : T extends {
+          readonly [DEFINED_LOG_SCHEMA_BRAND]?: infer Original;
+        }
+      ? Original extends SchemaFields
+        ? Original
+        : T extends SchemaFields
+          ? T
+          : never
       : T extends SchemaFields
         ? T
-        : never
-    : T extends SchemaFields
-      ? T
-      : never;
+        : never;
 
 /**
  * Filter out function keys from a schema type.
@@ -82,15 +83,16 @@ type ExtractSchemaFields<T> = T extends LogSchema<infer Fields>
  *
  * Works on LogSchema fields or plain schema objects.
  */
-type SchemaFieldKeys<T> = T extends LogSchema<infer Fields>
-  ? keyof Fields
-  : ExtractSchemaFields<T> extends infer Fields
-    ? keyof Fields extends infer K
-      ? K extends string
-        ? K
+type SchemaFieldKeys<T> =
+  T extends LogSchema<infer Fields>
+    ? keyof Fields
+    : ExtractSchemaFields<T> extends infer Fields
+      ? keyof Fields extends infer K
+        ? K extends string
+          ? K
+          : never
         : never
-      : never
-    : never;
+      : never;
 
 /**
  * Extract TypeScript output types from log schema

@@ -151,8 +151,13 @@ export {
   MAX_TRACE_ID_LENGTH,
   type SpanIdentity,
   type TraceId,
-  type TraceRoot,
 } from './lib/traceId.js';
+
+// =============================================================================
+// TraceRoot (Platform-specific)
+// =============================================================================
+
+export type { ITraceRoot, TraceRootFactory, TracerLifecycleHooks } from './lib/traceRoot.js';
 
 // =============================================================================
 // UTF-8 Cache (for Arrow conversion)

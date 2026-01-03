@@ -282,11 +282,12 @@ export type DepsConfig = Record<string, AnyOpGroupPublic>;
 /**
  * Extract the contributed schema from a dep (for combining into app schema)
  */
-export type ContributedSchemaOf<D> = D extends MappedOpGroup<infer _Ctx, infer CS>
-  ? CS
-  : D extends OpGroup<infer Ctx>
-    ? SchemaFieldsOf<Ctx['logSchema']>
-    : never;
+export type ContributedSchemaOf<D> =
+  D extends MappedOpGroup<infer _Ctx, infer CS>
+    ? CS
+    : D extends OpGroup<infer Ctx>
+      ? SchemaFieldsOf<Ctx['logSchema']>
+      : never;
 
 /**
  * Combine all contributed schemas from deps into a union of all their fields.

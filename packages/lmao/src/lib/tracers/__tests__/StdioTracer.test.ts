@@ -11,9 +11,14 @@ import '../../__tests__/test-helpers.js';
 import { describe, expect, it } from 'bun:test';
 import { Writable } from 'node:stream';
 import { defineOpContext } from '../../defineOpContext.js';
+import { defineCodeError } from '../../result.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import { createTraceRoot } from '../../traceRoot.node.js';
 import { StdioTracer } from '../StdioTracer.js';
+
+// Error code factory for tests
+const TEST_ERROR = defineCodeError('CODE')<{ message: string }>();
 
 // Create a mock writable stream that captures output
 function createMockStream(): { stream: NodeJS.WriteStream; output: string[] } {
@@ -44,7 +49,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -59,7 +64,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -73,7 +78,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -89,7 +94,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const childOp = defineOp('child', (ctx) => ctx.ok('c'));
@@ -113,7 +118,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const childOp = defineOp('child', (ctx) => ctx.ok('c'));
@@ -138,7 +143,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -151,10 +156,10 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
-      const testOp = defineOp('test', (ctx) => ctx.err('CODE', 'error'));
+      const testOp = defineOp('test', (ctx) => ctx.err(TEST_ERROR({ message: 'error' })));
       await trace('err-test', testOp);
 
       expect(output.some((line) => line.includes('[ERR]'))).toBe(true);
@@ -164,7 +169,7 @@ describe('StdioTracer', () => {
       const { stream: out, output: stdout } = createMockStream();
       const { stream: err, output: stderr } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const failOp = defineOp('fail', async () => {
@@ -185,7 +190,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', async (ctx) => {
@@ -205,7 +210,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const childOp = defineOp('child', async (ctx) => {
@@ -234,7 +239,7 @@ describe('StdioTracer', () => {
       const { stream: err } = createMockStream();
 
       // Enable colors
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: true });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: true });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -253,7 +258,7 @@ describe('StdioTracer', () => {
       const { stream: err } = createMockStream();
 
       // Disable colors
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));
@@ -273,7 +278,7 @@ describe('StdioTracer', () => {
       const { stream: out, output } = createMockStream();
       const { stream: err } = createMockStream();
 
-      const tracer = new StdioTracer(ctx, { out, err, colorEnabled: false });
+      const tracer = new StdioTracer(ctx, { createTraceRoot, out, err, colorEnabled: false });
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => ctx.ok('done'));

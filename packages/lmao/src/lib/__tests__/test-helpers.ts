@@ -5,13 +5,6 @@
  * without requiring full Op/trace context setup.
  */
 
-// Initialize Node.js timestamp implementation for tests
-// This MUST be imported before any SpanLogger is created
-import { setTimestampNanosImpl } from '../codegen/spanLoggerGenerator.js';
-import { getTimestampNanos } from '../timestamp.node.js';
-
-setTimestampNanosImpl(getTimestampNanos);
-
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
@@ -30,7 +23,9 @@ import { LogSchema } from '../schema/LogSchema.js';
 import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import { createTraceId, type TraceId, type TraceRoot } from '../traceId.js';
+import { createTraceId, type TraceId } from '../traceId.js';
+import type { ITraceRoot, TracerLifecycleHooks } from '../traceRoot.js';
+import { createTraceRoot } from '../traceRoot.node.js';
 import { NoOpTracer } from '../tracers/NoOpTracer.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
 
@@ -40,9 +35,9 @@ const minimalOpContext = defineOpContext({ logSchema: minimalSchema });
 
 /**
  * Shared NoOpTracer instance for tests that create buffers directly.
- * Cast to TraceRoot['tracer'] since that's what createSpanBuffer expects.
+ * Cast to TracerLifecycleHooks since that's what TraceRoot expects.
  */
-export const TEST_TRACER = new NoOpTracer(minimalOpContext) as unknown as TraceRoot['tracer'];
+export const TEST_TRACER = new NoOpTracer(minimalOpContext, { createTraceRoot }) as unknown as TracerLifecycleHooks;
 
 /**
  * Create a TraceRoot for testing.
@@ -53,11 +48,7 @@ export const TEST_TRACER = new NoOpTracer(minimalOpContext) as unknown as TraceR
  * @param traceId - Optional trace ID (defaults to 'test-trace')
  * @param tracer - Optional tracer (defaults to TEST_TRACER)
  */
-export function createTestTraceRoot(traceId?: TraceId | string, tracer?: TraceRoot['tracer']): TraceRoot {
-  const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
-  const anchorPerfNow =
-    typeof process !== 'undefined' && process.hrtime ? Number(process.hrtime.bigint()) : performance.now();
-
+export function createTestTraceRoot(traceId?: TraceId | string, tracer?: TracerLifecycleHooks): ITraceRoot {
   // Accept string or TraceId - convert string to TraceId
   const resolvedTraceId = traceId
     ? typeof traceId === 'string'
@@ -65,12 +56,7 @@ export function createTestTraceRoot(traceId?: TraceId | string, tracer?: TraceRo
       : traceId
     : createTraceId('test-trace');
 
-  return {
-    trace_id: resolvedTraceId,
-    anchorEpochNanos,
-    anchorPerfNow,
-    tracer: tracer ?? TEST_TRACER,
-  };
+  return createTraceRoot(resolvedTraceId, tracer ?? TEST_TRACER);
 }
 
 /**

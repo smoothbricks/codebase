@@ -36,11 +36,11 @@ import type { LogSchema } from './schema/LogSchema.js';
 import { textEncoder } from './spanBufferHelpers.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import { writeThreadIdToUint64Array } from './threadId.js';
-import type { TraceRoot } from './traceId.js';
+import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 
-// Re-export TraceRoot for external consumers (and to satisfy linter - it's used in generated code)
-export type { TraceRoot };
+// Re-export ITraceRoot for external consumers (and to satisfy linter - it's used in generated code)
+export type { ITraceRoot };
 
 /**
  * Empty frozen scope object - shared singleton to avoid allocations.
@@ -135,7 +135,7 @@ export interface SpanBufferConstructor {
     isChained: boolean,
     callsiteMetadata: OpMetadata | undefined,
     opMetadata: OpMetadata | undefined,
-    traceRoot: TraceRoot,
+    traceRoot: ITraceRoot,
   ): AnySpanBuffer;
 
   // Static properties added after class generation
@@ -373,7 +373,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
  *
  * @param schema - Tag attribute schema defining column types (must be LogSchema)
  * @param spanName - Name of the span
- * @param traceRoot - Pre-built TraceRoot with trace_id, anchors, and tracer
+ * @param traceRoot - Pre-built ITraceRoot with trace_id, anchors, and tracer
  * @param opMetadata - Op metadata for attribution (package_name, package_file, git_sha, line)
  * @param capacity - Buffer capacity (optional, uses class.stats.capacity if omitted)
  *
@@ -382,7 +382,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
   spanName: string,
-  traceRoot: TraceRoot,
+  traceRoot: ITraceRoot,
   opMetadata: OpMetadata,
   capacity?: number,
 ): SpanBuffer<T> {

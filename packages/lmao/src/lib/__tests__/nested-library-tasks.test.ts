@@ -23,6 +23,7 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
 
@@ -47,7 +48,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext);
+      const { trace } = new TestTracer(opContext, { createTraceRoot });
 
       // Capture buffers for verification
       let rootBuffer: AnySpanBuffer | undefined;
@@ -148,7 +149,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext);
+      const { trace } = new TestTracer(opContext, { createTraceRoot });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -333,7 +334,7 @@ describe('Nested Library Tasks', () => {
     it('should compose 4 separate library contexts with prefixed columns', async () => {
       const { defineOp } = appContext;
 
-      const { trace } = new TestTracer(appContext);
+      const { trace } = new TestTracer(appContext, { createTraceRoot });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -385,7 +386,7 @@ describe('Nested Library Tasks', () => {
     it('should maintain correct tree structure with 4 levels of library tasks', async () => {
       const { defineOp } = appContext;
 
-      const { trace } = new TestTracer(appContext);
+      const { trace } = new TestTracer(appContext, { createTraceRoot });
 
       let appBuffer: AnySpanBuffer | undefined;
 
@@ -451,7 +452,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext);
+      const { trace } = new TestTracer(opContext, { createTraceRoot });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -546,7 +547,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext);
+      const { trace } = new TestTracer(opContext, { createTraceRoot });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -629,7 +630,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext);
+      const { trace } = new TestTracer(opContext, { createTraceRoot });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -698,7 +699,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext);
+      const { trace } = new TestTracer(opContext, { createTraceRoot });
 
       let rootBuffer: AnySpanBuffer | undefined;
       let order = 0;
@@ -764,7 +765,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext);
+      const { trace } = new TestTracer(opContext, { createTraceRoot });
 
       let rootBuffer: AnySpanBuffer | undefined;
 

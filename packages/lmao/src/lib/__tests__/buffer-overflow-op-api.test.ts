@@ -23,9 +23,14 @@ import './test-helpers.js';
 import fc from 'fast-check';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
+import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+
+// Error code factory for tests
+const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string }>();
 
 // biome-ignore lint/suspicious/noExplicitAny: SpanBuffer generic types are complex, using any for test buffer capture
 type CapturedBuffer = any;
@@ -52,7 +57,7 @@ const { defineOp } = ctx;
  * Helper to create a properly typed tracer for tests
  */
 function createTestTracer() {
-  return new TestTracer(ctx);
+  return new TestTracer(ctx, { createTraceRoot });
 }
 
 /**
@@ -461,7 +466,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const testOp = defineOp('error-span', async (ctx) => {
         capturedBuffer = ctx.buffer;
         ctx.log.info('before error');
-        return ctx.err('VALIDATION_ERROR', { field: 'email' });
+        return ctx.err(VALIDATION_ERROR({ field: 'email' }));
       });
 
       const { trace } = createTestTracer();

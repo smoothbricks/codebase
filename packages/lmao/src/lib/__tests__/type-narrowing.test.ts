@@ -8,6 +8,7 @@ import { defineOpContext } from '../defineOpContext.js';
 import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 
 // Error code factories for tests
@@ -31,7 +32,7 @@ const { defineOp } = opContext;
 
 // Create a properly typed tracer - new API passes opContext directly
 function createTestTracer() {
-  return new TestTracer(opContext);
+  return new TestTracer(opContext, { createTraceRoot });
 }
 
 describe('Type Narrowing with FluentResult', () => {

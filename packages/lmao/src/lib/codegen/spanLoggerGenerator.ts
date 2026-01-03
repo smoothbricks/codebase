@@ -21,7 +21,6 @@ import {
   type ColumnWriter,
   type ColumnWriterExtension,
   getColumnWriterClass,
-  type Nanoseconds,
 } from '@smoothbricks/arrow-builder';
 import { trackOverflowAndTune } from '../capacityTuning.js';
 import {
@@ -39,54 +38,21 @@ import { createOverflowBuffer as createOverflowSpanBuffer } from '../spanBuffer.
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
 // =============================================================================
-// PLATFORM TIMESTAMP CONFIGURATION
-// =============================================================================
-// The timestamp implementation is set by platform entry points (/node or /es).
-// Default is undefined to enable tree-shaking when only importing types/schemas.
-
-/**
- * Type for platform-specific timestamp function.
- * Takes anchor values from trace creation, returns current time as Nanoseconds.
- */
-export type GetTimestampNanos = (anchorEpochNanos: bigint, anchorPerfNow: number) => Nanoseconds;
-
-/**
- * Set the platform-specific timestamp implementation.
- *
- * Called by platform entry points before any SpanLogger is created:
- * - `@smoothbricks/lmao/node` sets Node.js impl (process.hrtime.bigint)
- * - `@smoothbricks/lmao/es` sets browser impl (performance.now)
- *
- * @param impl - Platform-specific timestamp function
- */
-export function setTimestampNanosImpl(impl: GetTimestampNanos): void {
-  SPAN_LOGGER_HELPERS.getTimestampNanos = impl;
-}
-
-// =============================================================================
 // SINGLETON HELPERS OBJECT
 // =============================================================================
 // Created once at module load, closed over by all generated SpanLogger classes.
 // This avoids recreating the helpers object for each schema.
-//
-// getTimestampNanos is undefined by default to enable tree-shaking.
-// Platform entry points (/node, /es) set it before any SpanLogger is created.
 
 /**
  * Helper functions injected into generated SpanLogger code.
  * Singleton - same object shared by all generated SpanLogger classes.
- *
- * NOTE: Not frozen because getTimestampNanos must be set by platform entry points.
  */
 export const SPAN_LOGGER_HELPERS: {
-  getTimestampNanos: GetTimestampNanos | undefined;
   trackOverflowAndTune: typeof trackOverflowAndTune;
   setNullBit: (bitmap: Uint8Array, idx: number) => void;
   fillNullBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number) => void;
   fillBooleanBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number, value: boolean) => void;
 } = {
-  // undefined by default - set by platform entry points for tree-shaking
-  getTimestampNanos: undefined,
   trackOverflowAndTune,
   setNullBit: (bitmap: Uint8Array, idx: number) => {
     bitmap[idx >>> 3] |= 1 << (idx & 7);
@@ -486,8 +452,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `info(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      this._buffer.entry_type[idx] = ENTRY_TYPE_INFO;
+      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_INFO);
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -506,8 +471,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `debug(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      this._buffer.entry_type[idx] = ENTRY_TYPE_DEBUG;
+      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_DEBUG);
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -526,8 +490,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `warn(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      this._buffer.entry_type[idx] = ENTRY_TYPE_WARN;
+      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_WARN);
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -546,8 +509,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `error(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      this._buffer.entry_type[idx] = ENTRY_TYPE_ERROR;
+      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_ERROR);
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -566,8 +528,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `trace(message) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      this._buffer.entry_type[idx] = ENTRY_TYPE_TRACE;
+      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_TRACE);
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -587,8 +548,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `ffAccess(flagName, value) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      this._buffer.entry_type[idx] = ENTRY_TYPE_FF_ACCESS;
+      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_FF_ACCESS);
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
         if (this._buffer.message_nulls) {
@@ -614,8 +574,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       `ffUsage(flagName, context) {
       this._nextRow();
       const idx = this._writeIndex;
-      this._buffer.timestamp[idx] = helpers.getTimestampNanos(this._buffer._traceRoot.anchorEpochNanos, this._buffer._traceRoot.anchorPerfNow);
-      this._buffer.entry_type[idx] = ENTRY_TYPE_FF_USAGE;
+      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_FF_USAGE);
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
         if (this._buffer.message_nulls) {
@@ -739,15 +698,6 @@ export function createSpanLoggerClass<T extends LogSchema>(
   buffer: AnySpanBuffer,
   createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
 ) => SpanLoggerImpl<T> {
-  // Cold-path check: ensure platform timestamp implementation is configured
-  if (!SPAN_LOGGER_HELPERS.getTimestampNanos) {
-    throw new Error(
-      'LMAO: Timestamp implementation not configured. ' +
-        "Import from '@smoothbricks/lmao/node' (Node.js) or '@smoothbricks/lmao/es' (browser) " +
-        "instead of '@smoothbricks/lmao'.",
-    );
-  }
-
   // Check cache first
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
 

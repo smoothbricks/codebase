@@ -13,33 +13,14 @@ import type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray } from 
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
-import type { TraceId, TraceRoot } from './traceId.js';
+import type { TraceId } from './traceId.js';
+import type { ITraceRoot } from './traceRoot.js';
 
 // Re-export infrastructure types
 export type { LogBinding, RemappedViewConstructor } from './logBinding.js';
 export type { OpMetadata } from './opContext/opTypes.js';
 export type { extractSpanIdentity, SpanIdentity } from './traceId.js';
-
-// Tracer interface for lifecycle hook calls from span lifecycle events
-// The Tracer provides these methods that are called during span execution
-export interface TracerLifecycleHooks {
-  onTraceStart(buffer: AnySpanBuffer): void;
-  onTraceEnd(buffer: AnySpanBuffer): void;
-  onSpanStart(buffer: AnySpanBuffer): void;
-  onSpanEnd(buffer: AnySpanBuffer): void;
-  /**
-   * Called before stats are reset during capacity tuning.
-   * Allows tracer to capture stats for observability before they're lost.
-   *
-   * The buffer provides all necessary context:
-   * - buffer._stats → SpanBufferStats about to be reset
-   * - buffer._opMetadata → which Op/module these stats belong to
-   * - buffer.constructor → SpanBufferClass (schema info)
-   *
-   * @param buffer - The buffer that triggered overflow
-   */
-  onStatsWillResetFor(buffer: AnySpanBuffer): void;
-}
+export type { TracerLifecycleHooks } from './traceRoot.js';
 
 // Re-export arrow-builder types for convenience
 export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
@@ -235,7 +216,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Root trace context - shared by all buffers in a trace.
    * Contains anchorEpochNanos/anchorPerfNow for timestamp calculation.
    */
-  _traceRoot: TraceRoot;
+  _traceRoot: ITraceRoot;
 
   /**
    * Op metadata for this span - identifies WHICH OP IS EXECUTING.

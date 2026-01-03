@@ -16,6 +16,7 @@ import './test-helpers.js';
 import { S } from '@smoothbricks/arrow-builder';
 import { defineOpContext } from '../defineOpContext.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 
 // =============================================================================
@@ -33,7 +34,7 @@ const testFactory = defineOpContext({
     userId: undefined as string | undefined, // Optional - has default
   },
 }); // Create a tracer for testing with proper type
-const { trace: testTrace } = new TestTracer(testFactory);
+const { trace: testTrace } = new TestTracer(testFactory, { createTraceRoot });
 
 // =============================================================================
 // Type Enforcement Tests
@@ -120,7 +121,7 @@ describe('Context Type Flow Through Factory', () => {
       },
     });
 
-    const { trace } = new TestTracer(factory);
+    const { trace } = new TestTracer(factory, { createTraceRoot });
 
     // Type should be preserved - required is required, optional is optional
     const result = await trace(
@@ -145,7 +146,7 @@ describe('Context Type Flow Through Factory', () => {
       logSchema: defineLogSchema({}),
     });
 
-    const { trace } = new TestTracer(factory);
+    const { trace } = new TestTracer(factory, { createTraceRoot });
 
     // Should accept empty options or no options
     const result = await trace('test-span', (ctx) => {

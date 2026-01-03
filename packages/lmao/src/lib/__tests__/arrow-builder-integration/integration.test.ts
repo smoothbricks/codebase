@@ -8,6 +8,7 @@ import {
 import type { SpanBuffer } from '@smoothbricks/lmao';
 import { convertToArrowTable, createSpanBuffer, defineOpContext, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
+import { createTraceRoot } from '../../traceRoot.node.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';
 
@@ -358,7 +359,7 @@ describe('Buffer Integration', () => {
       // Use the full system (Tracer + SpanLogger) to verify entries have increasing timestamps.
       const schema = createTestSchema({ userId: S.category() });
       const ctx = defineOpContext({ logSchema: schema });
-      const { trace } = new TestTracer(ctx);
+      const { trace } = new TestTracer(ctx, { createTraceRoot });
 
       let capturedBuffer: SpanBuffer<typeof schema> | undefined;
       await trace('test', async (ctx) => {

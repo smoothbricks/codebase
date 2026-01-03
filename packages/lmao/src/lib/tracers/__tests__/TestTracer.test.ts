@@ -11,6 +11,7 @@ import { convertSpanTreeToArrowTable } from '../../convertToArrow.js';
 import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import { createTraceRoot } from '../../traceRoot.node.js';
 import { TestTracer } from '../TestTracer.js';
 
 describe('TestTracer', () => {
@@ -25,12 +26,12 @@ describe('TestTracer', () => {
 
   describe('rootBuffers accumulation', () => {
     it('should start with empty rootBuffers', () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       expect(tracer.rootBuffers).toHaveLength(0);
     });
 
     it('should accumulate root buffer after trace completes', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('my-trace', async (ctx) => ctx.ok('done'));
@@ -40,7 +41,7 @@ describe('TestTracer', () => {
     });
 
     it('should accumulate multiple traces', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('trace-1', async (ctx) => ctx.ok('done'));
@@ -54,7 +55,7 @@ describe('TestTracer', () => {
     });
 
     it('should accumulate buffer even if trace throws', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await expect(
@@ -71,7 +72,7 @@ describe('TestTracer', () => {
 
   describe('child span access', () => {
     it('should include child spans in buffer tree', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('root-trace', async (ctx) => {
@@ -90,7 +91,7 @@ describe('TestTracer', () => {
     });
 
     it('should support deeply nested spans', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('root', async (ctx) => {
@@ -113,7 +114,7 @@ describe('TestTracer', () => {
 
   describe('clear()', () => {
     it('should clear all accumulated buffers', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('trace-1', async (ctx) => ctx.ok('done'));
@@ -127,7 +128,7 @@ describe('TestTracer', () => {
     });
 
     it('should allow new traces after clear', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('before-clear', async (ctx) => ctx.ok('done'));
@@ -141,7 +142,7 @@ describe('TestTracer', () => {
 
   describe('Arrow conversion', () => {
     it('should produce valid Arrow table from root buffer', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('arrow-test', async (ctx) => {
@@ -156,7 +157,7 @@ describe('TestTracer', () => {
     });
 
     it('should include child spans in Arrow table', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('root', async (ctx) => {
@@ -174,7 +175,7 @@ describe('TestTracer', () => {
 
   describe('tag values', () => {
     it('should preserve tag values in buffer', async () => {
-      const tracer = new TestTracer(ctx);
+      const tracer = new TestTracer(ctx, { createTraceRoot });
       const { trace } = tracer;
 
       await trace('tag-test', async (ctx) => {

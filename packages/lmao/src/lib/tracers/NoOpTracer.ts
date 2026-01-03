@@ -9,8 +9,10 @@
  *
  * @example
  * ```typescript
+ * import { createTraceRoot } from '@smoothbricks/lmao/node';
+ *
  * const ctx = defineOpContext({ logSchema });
- * const { trace } = new NoOpTracer(ctx);
+ * const { trace } = new NoOpTracer(ctx, { createTraceRoot });
  *
  * // Trace executes, result returned, no side effects
  * const result = await trace('fetch', fetchOp);
@@ -18,6 +20,7 @@
  */
 
 import type { OpContextBinding } from '../opContext/types.js';
+import type { TracerOptions } from '../tracer.js';
 import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
 
@@ -30,6 +33,9 @@ import type { SpanBuffer } from '../types.js';
  * @typeParam B - OpContextBinding type
  */
 export class NoOpTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
+  constructor(binding: B, options: TracerOptions) {
+    super(binding, options);
+  }
   /**
    * No-op hook for trace start.
    */
