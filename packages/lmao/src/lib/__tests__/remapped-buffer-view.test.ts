@@ -16,9 +16,9 @@ import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { TraceId } from '../traceId.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 describe('generateRemappedBufferViewClass', () => {
   describe('class generation', () => {
@@ -474,7 +474,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         return ctx.ok({ level: 1, child: result });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace('root', level1Op);
       expect(result.success).toBe(true);
@@ -527,7 +527,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         return ctx.span('to-level2', level2Op);
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       await trace('root', level1Op);
 
@@ -596,7 +596,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       expect(httpOp).toBeDefined();
 
       // Create a trace context and run the op via Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
       const result = await trace('http-request', httpOp as any);
 
       expect(opExecuted).toBe(true);

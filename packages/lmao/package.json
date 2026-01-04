@@ -56,12 +56,25 @@
     "tslib": "^2.3.0"
   },
   "scripts": {
-    "bench": "bun run benchmarks/*.bench.ts"
+    "bench": "bun run benchmarks/*.bench.ts",
+    "build:wasm": "zig build -Doptimize=ReleaseSmall"
   },
   "nx": {
     "sourceRoot": "packages/lmao/src",
     "projectType": "library",
     "targets": {
+      "build:wasm": {
+        "executor": "nx:run-commands",
+        "options": {
+          "command": "zig build -Doptimize=ReleaseSmall",
+          "cwd": "packages/lmao"
+        }
+      },
+      "build": {
+        "dependsOn": [
+          "build:wasm"
+        ]
+      },
       "typecheck-tests": {
         "executor": "nx:run-commands",
         "options": {

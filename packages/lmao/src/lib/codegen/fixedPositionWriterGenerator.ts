@@ -414,36 +414,3 @@ export function createResultWriter<T extends LogSchema, R = unknown, E = unknown
   const WriterClass = getResultWriterClass(schema);
   return new WriterClass(buffer, resultOrError, isError) as ResultWriter<T, R, E>;
 }
-
-/**
- * Get or create a cached fixed-position writer class.
- * This is the generic version - prefer getTagWriterClass/getResultWriterClass for standard use.
- *
- * @param schema - Tag attribute schema
- * @param position - Fixed position to write to
- * @param extension - Optional extension for constructor code, methods, params
- * @returns Writer class constructor
- */
-export function getFixedPositionWriterClass<T extends LogSchema>(
-  schema: T,
-  position: number,
-  extension?: FixedPositionWriterExtension,
-): new (
-  buffer: AnySpanBuffer,
-  ...args: unknown[]
-) => { _buffer: AnySpanBuffer; _pos: number } & Record<string, unknown> {
-  // For custom positions/extensions, generate without caching
-  // (TagWriter at 0 and ResultWriter at 1 use their own caches)
-  const className = `FixedPositionWriter_${position}`;
-  const classCode = generateFixedPositionWriterClass(schema, position, className, extension).trim();
-
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-  const factory = new Function('helpers', classCode) as (
-    helpers: typeof bufferHelpers,
-  ) => new (
-    buffer: AnySpanBuffer,
-    ...args: unknown[]
-  ) => { _buffer: AnySpanBuffer; _pos: number };
-
-  return factory(bufferHelpers);
-}

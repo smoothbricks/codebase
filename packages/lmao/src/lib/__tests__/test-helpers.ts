@@ -8,6 +8,7 @@
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
+import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import { createOpMetadata, DEFAULT_METADATA } from '../opContext/defineOp.js';
 import type {
   ColumnMapping,
@@ -26,6 +27,7 @@ import { createSpanBuffer } from '../spanBuffer.js';
 import { createTraceId, type TraceId } from '../traceId.js';
 import type { ITraceRoot, TracerLifecycleHooks } from '../traceRoot.js';
 import { createTraceRoot } from '../traceRoot.node.js';
+import type { TracerOptions } from '../tracer.js';
 import { NoOpTracer } from '../tracers/NoOpTracer.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
 
@@ -34,10 +36,24 @@ const minimalSchema = new LogSchema(mergeWithSystemSchema({}));
 const minimalOpContext = defineOpContext({ logSchema: minimalSchema });
 
 /**
+ * Default TracerOptions for tests.
+ * Includes JsBufferStrategy and createTraceRoot.
+ */
+export function createTestTracerOptions<T extends LogSchema>(): TracerOptions<T> {
+  return {
+    bufferStrategy: new JsBufferStrategy<T>(),
+    createTraceRoot,
+  };
+}
+
+/**
  * Shared NoOpTracer instance for tests that create buffers directly.
  * Cast to TracerLifecycleHooks since that's what TraceRoot expects.
  */
-export const TEST_TRACER = new NoOpTracer(minimalOpContext, { createTraceRoot }) as unknown as TracerLifecycleHooks;
+export const TEST_TRACER = new NoOpTracer(
+  minimalOpContext,
+  createTestTracerOptions(),
+) as unknown as TracerLifecycleHooks;
 
 /**
  * Create a TraceRoot for testing.

@@ -10,8 +10,7 @@ import { mergeWithSystemSchema } from '../schema/systemSchema.js';
 import { createSpanBuffer, getSpanBufferClass } from '../spanBuffer.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 
-import { createTraceRoot } from '../traceRoot.node.js';
-import { createTestTraceRoot } from './test-helpers.js';
+import { createTestTraceRoot, createTestTracerOptions } from './test-helpers.js';
 
 /**
  * Create mock SpanBufferStats for testing capacity tuning.
@@ -658,7 +657,7 @@ describe('Capacity Tuning Algorithm', () => {
       });
 
       // Create TestTracer to capture stats snapshots
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
       const { trace } = tracer;
 
       // Set small capacity to trigger overflow quickly

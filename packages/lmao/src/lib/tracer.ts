@@ -8,38 +8,47 @@
  *
  * ## Design Philosophy
  *
- * Tracer is ABSTRACT - no sink, no persistence assumptions:
- * - `trace()` executes ops and collects buffers
- * - `flush()` is abstract - subclasses decide what "flush" means
- * - Flushing is always a hint (batching, rate limiting, async queues)
+ * Tracer separates two concerns:
+ * 1. **BufferStrategy**: HOW buffers are allocated (JS TypedArrays vs WASM memory)
+ * 2. **Sink behavior** (lifecycle hooks): WHAT happens with completed buffers
  *
- * Concrete implementations might:
- * - Send to queue (Cloudflare Queue, SQS, Kafka)
- * - Write to disk/database
- * - Send to observability backend (DataDog, Honeycomb)
- * - Accumulate in memory for testing
- * - Drop buffers (dev/testing no-op)
+ * Tracer is ABSTRACT - subclasses implement lifecycle hooks:
+ * - `onTraceEnd()` - called when root trace completes
+ * - `onSpanEnd()` - called when child span completes
+ * - `flush()` - optional, for batching strategies
+ *
+ * BufferStrategy is INJECTED via constructor:
+ * - `JsBufferStrategy` - GC-managed TypedArrays, zero-copy Arrow
+ * - `WasmBufferStrategy` - WASM memory with freelist, Arrow built in WASM
+ *
+ * The sink controls WHEN to convert/release:
+ * - StdioTracer: prints then releases immediately
+ * - TestTracer: holds buffers until clear()
+ * - SqsTracer: accumulates, converts on flush(), then releases
  *
  * @example
  * ```typescript
  * // Concrete implementation - Cloudflare Queue
  * class QueueTracer extends Tracer {
- *   constructor(config, private queue: Queue) {
- *     super(config);
+ *   constructor(binding, strategy, options, private queue: Queue) {
+ *     super(binding, strategy, options);
  *   }
  *
  *   async flush() {
- *     const buffers = this.takePendingBuffers();
+ *     const buffers = [...this.pending];
+ *     this.pending.length = 0;
  *     for (const buffer of buffers) {
- *       const table = convertSpanTreeToArrowTable(buffer);
+ *       const table = await this.bufferStrategy.toArrowTable(buffer);
  *       await this.queue.send(table);
+ *       this.bufferStrategy.releaseBuffer(buffer);
  *     }
  *   }
  * }
  *
  * // Usage
  * const ctx = defineOpContext({ logSchema, ctx: { env: null as Env } });
- * const { trace, flush } = new QueueTracer(ctx, env.TRACES);
+ * const strategy = new JsBufferStrategy();
+ * const { trace, flush } = new QueueTracer(ctx, strategy, options, env.TRACES);
  * await trace('fetch', { env: myEnv }, async (ctx) => {
  *   ctx.tag.userId('user-123');
  *   return ctx.ok('done');
@@ -50,6 +59,7 @@
  * @module tracer
  */
 
+import type { BufferStrategy } from './bufferStrategy.js';
 import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createSpanLogger as createSpanLoggerFromGenerator } from './codegen/spanLoggerGenerator.js';
@@ -61,7 +71,7 @@ import { Err, Ok, type Result } from './result.js';
 import type { FlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 
-import { createOverflowBuffer, createSpanBuffer, EMPTY_SCOPE } from './spanBuffer.js';
+import { EMPTY_SCOPE } from './spanBuffer.js';
 import {
   createSpanContextClass,
   type SpanContextClass,
@@ -84,7 +94,18 @@ import type { SpanBuffer } from './types.js';
  * implement the FlagEvaluator interface. Type safety for flag access comes from
  * the OpContext's flags schema, not from the evaluator's type parameter.
  */
-export interface TracerOptions {
+export interface TracerOptions<
+  T extends import('./schema/LogSchema.js').LogSchema = import('./schema/LogSchema.js').LogSchema,
+> {
+  /**
+   * Buffer strategy for memory management and Arrow conversion.
+   *
+   * Controls HOW buffers are allocated:
+   * - JsBufferStrategy: GC-managed TypedArrays, zero-copy Arrow
+   * - WasmBufferStrategy: WASM memory with freelist, Arrow built in WASM
+   */
+  bufferStrategy: BufferStrategy<T>;
+
   /**
    * Factory for creating platform-specific TraceRoot instances.
    * Import from '@smoothbricks/lmao/node' or '@smoothbricks/lmao/es'.
@@ -209,6 +230,8 @@ export type TraceFn<Ctx extends OpContext> = {
  * Subclasses implement onTraceStart, onTraceEnd, onSpanStart, onSpanEnd to define
  * how spans are collected and processed.
  *
+ * BufferStrategy is injected to control memory management and Arrow conversion.
+ *
  * @typeParam B - OpContextBinding type (inferred from constructor argument)
  */
 export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
@@ -219,8 +242,15 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   private readonly deps: Record<string, unknown>;
   private readonly createTraceRoot: TraceRootFactory;
 
-  constructor(binding: B, options: TracerOptions) {
+  /**
+   * Buffer strategy for memory management and Arrow conversion.
+   * Protected so subclasses can access for toArrowTable/releaseBuffer calls.
+   */
+  protected readonly bufferStrategy: BufferStrategy<B['logBinding']['logSchema']>;
+
+  constructor(binding: B, options: TracerOptions<B['logBinding']['logSchema']>) {
     this.logBinding = binding.logBinding;
+    this.bufferStrategy = options.bufferStrategy;
     this.ctxDefaults = binding.ctxDefaults ?? EMPTY_SCOPE;
     this.deps = binding.deps ?? EMPTY_SCOPE;
     this.flagEvaluator = options.flagEvaluator;
@@ -517,20 +547,24 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     // Create TraceRoot via platform-specific factory
     const traceRoot = this.createTraceRoot(traceId, this);
 
-    // Create root SpanBuffer with pre-built TraceRoot
-    const buffer = createSpanBuffer(
+    // Create root SpanBuffer with pre-built TraceRoot via strategy
+    const buffer = this.bufferStrategy.createSpanBuffer(
       schema,
       name, // spanName
       traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
       metadata, // opMetadata (for both callsite and op at root level)
-    ) as SpanBuffer<B['logBinding']['logSchema']>;
+    );
 
     // Write span-start entry (row 0)
     writeSpanStart(buffer, name);
 
     // Create tag writer and span logger (needed for constructor)
     const tagWriter = createTagWriter(schema, buffer) as TagWriter<B['logBinding']['logSchema']>;
-    const spanLogger = createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer);
+    const spanLogger = createSpanLoggerFromGenerator(
+      schema,
+      buffer,
+      this.bufferStrategy.createOverflowBuffer.bind(this.bufferStrategy) as any,
+    );
 
     // Instantiate SpanContext class with direct arguments (no temp object allocation)
     const ctx = new this.SpanContextClass(buffer, schema, spanLogger, tagWriter) as SpanContextInstance<OpContextOf<B>>;

@@ -17,10 +17,9 @@ import {
   ENTRY_TYPE_SPAN_START,
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
-import { createTestOpMetadata, createTestTraceRoot } from './test-helpers.js';
+import { createTestOpMetadata, createTestTraceRoot, createTestTracerOptions } from './test-helpers.js';
 
 // Error code factories for tests
 const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string; message?: string }>();
@@ -48,7 +47,7 @@ const ctx = defineOpContext({
 
 describe('Span Lifecycle', () => {
   it('should write span-start entry when task begins', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     await trace('testTask', async (ctx) => {
       return ctx.ok('success');
@@ -60,7 +59,7 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-ok entry with ctx.ok()', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       return ctx.ok({ id: 123, name: 'test' });
@@ -73,7 +72,7 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-err entry with ctx.err()', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       return ctx.err(VALIDATION_ERROR({ field: 'email', message: 'Invalid email' }));
@@ -88,7 +87,7 @@ describe('Span Lifecycle', () => {
   });
 
   it('should write span-exception entry when task throws', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     await expect(
       trace('testTask', async (_ctx) => {
@@ -100,7 +99,7 @@ describe('Span Lifecycle', () => {
 
 describe('Fluent Result API', () => {
   it('should support .with() for setting attributes on ok result', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123 }).with({
@@ -117,7 +116,7 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .message() for setting message on ok result', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       return ctx.ok({ id: 123 }).message('User created successfully');
@@ -130,7 +129,7 @@ describe('Fluent Result API', () => {
   });
 
   it('should support chaining .with() and .message()', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       return ctx.ok({ id: 123 }).with({ userId: 'user1', operation: 'CREATE' }).message('User created successfully');
@@ -143,7 +142,7 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .with() on err result', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       return ctx.err(VALIDATION_ERROR({ field: 'email' })).with({ userId: 'user1', operation: 'CREATE' });
@@ -156,7 +155,7 @@ describe('Fluent Result API', () => {
   });
 
   it('should support .message() on err result', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       return ctx.err(VALIDATION_ERROR({ field: 'email' })).message('Invalid email format');
@@ -171,7 +170,7 @@ describe('Fluent Result API', () => {
 
 describe('Child Span Lifecycle', () => {
   it('should write span-start for child spans', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('parentTask', async (ctx) => {
       const childResult = await ctx.span('childSpan', async (childCtx) => {
@@ -185,7 +184,7 @@ describe('Child Span Lifecycle', () => {
   });
 
   it('should write span-exception for child span errors', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     await expect(
       trace('parentTask', async (ctx) => {
@@ -198,7 +197,7 @@ describe('Child Span Lifecycle', () => {
   });
 
   it('should handle nested child spans', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('parentTask', async (ctx) => {
       const result1 = await ctx.span('child1', async (child1Ctx) => {
@@ -220,7 +219,7 @@ describe('Child Span Lifecycle', () => {
     let parentBuffer: AnySpanBuffer | undefined;
     let childBuffer: AnySpanBuffer | undefined;
 
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
     const result = await trace('parent-task', async (ctx) => {
       parentBuffer = ctx.buffer;
 
@@ -260,7 +259,7 @@ describe('Child Span Lifecycle', () => {
     // child span appears correctly in Arrow conversion with proper parent_span_id relationships.
     let rootBuffer: AnySpanBuffer | undefined;
 
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     await trace('root-task', async (ctx) => {
       rootBuffer = ctx.buffer;
@@ -329,7 +328,7 @@ describe('Child Span Lifecycle', () => {
     let parentBuffer: AnySpanBuffer | undefined;
     let childBuffer: AnySpanBuffer | undefined;
 
-    const { trace } = new TestTracer(sharedCtx, { createTraceRoot });
+    const { trace } = new TestTracer(sharedCtx, { ...createTestTracerOptions() });
 
     await trace('parent-task', async (ctx) => {
       parentBuffer = ctx.buffer;
@@ -366,7 +365,7 @@ describe('Child Span Lifecycle', () => {
 
 describe('FluentResult Type Compatibility', () => {
   it('should allow direct access to success property', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       const result = ctx.ok({ id: 123 });
@@ -385,7 +384,7 @@ describe('FluentResult Type Compatibility', () => {
   });
 
   it('should allow direct access to error property', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     const result = await trace('testTask', async (ctx) => {
       const result = ctx.err(TEST_ERROR({ message: 'test' }));
@@ -415,7 +414,7 @@ describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 and span-ok at row 1 after ctx.ok()', async () => {
     let capturedBuffer: AnySpanBuffer | undefined;
 
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
     const result = await trace('test-task', async (ctx) => {
       capturedBuffer = ctx.buffer;
       return ctx.ok('done');
@@ -430,7 +429,7 @@ describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 and span-err at row 1 after ctx.err()', async () => {
     let capturedBuffer: AnySpanBuffer | undefined;
 
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
     const result = await trace('test', async (ctx) => {
       capturedBuffer = ctx.buffer;
       return ctx.err(ERROR_CODE({ detail: 'error detail' }));
@@ -445,7 +444,7 @@ describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {
     let capturedBuffer: AnySpanBuffer | undefined;
 
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
     await expect(
       trace('test', async (ctx) => {
@@ -462,7 +461,7 @@ describe('Fixed Row Layout', () => {
     // This tests the writeSpanStart function behavior
     // After writeSpanStart, writeIndex should be 2 (row 0 = span-start, row 1 = pre-init, events at row 2+)
 
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
     await trace('test', async (ctx) => {
       // At this point, writeSpanStart has been called
       // Events logged here should go to row 2+
@@ -478,7 +477,7 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should append events starting at row 2', async () => {
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
     const result = await trace('test', async (ctx) => {
       ctx.log.info('first event'); // Should be row 2
       ctx.log.info('second event'); // Should be row 3
@@ -492,7 +491,7 @@ describe('Fixed Row Layout', () => {
 
   it('should allow duration calculation as timestamps[1] - timestamps[0]', async () => {
     // This tests the fixed layout enables simple duration calculation
-    const { trace } = new TestTracer(ctx, { createTraceRoot });
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
     await trace('test', async (ctx) => {
       // Small delay to ensure non-zero duration
       await new Promise((resolve) => setTimeout(resolve, 5));

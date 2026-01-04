@@ -23,9 +23,9 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 describe('Nested Library Tasks', () => {
   describe('4-level nesting WITHOUT library prefixes (regular module contexts)', () => {
@@ -48,7 +48,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       // Capture buffers for verification
       let rootBuffer: AnySpanBuffer | undefined;
@@ -149,7 +149,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -334,7 +334,7 @@ describe('Nested Library Tasks', () => {
     it('should compose 4 separate library contexts with prefixed columns', async () => {
       const { defineOp } = appContext;
 
-      const { trace } = new TestTracer(appContext, { createTraceRoot });
+      const { trace } = new TestTracer(appContext, { ...createTestTracerOptions() });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -386,7 +386,7 @@ describe('Nested Library Tasks', () => {
     it('should maintain correct tree structure with 4 levels of library tasks', async () => {
       const { defineOp } = appContext;
 
-      const { trace } = new TestTracer(appContext, { createTraceRoot });
+      const { trace } = new TestTracer(appContext, { ...createTestTracerOptions() });
 
       let appBuffer: AnySpanBuffer | undefined;
 
@@ -452,7 +452,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -547,7 +547,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -630,7 +630,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       let rootBuffer: AnySpanBuffer | undefined;
 
@@ -699,7 +699,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       let rootBuffer: AnySpanBuffer | undefined;
       let order = 0;
@@ -765,7 +765,7 @@ describe('Nested Library Tasks', () => {
       });
 
       const { defineOp } = opContext;
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       let rootBuffer: AnySpanBuffer | undefined;
 

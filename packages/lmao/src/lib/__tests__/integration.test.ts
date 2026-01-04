@@ -18,8 +18,8 @@ import { S } from '../schema/builder.js';
 import { defineFeatureFlags } from '../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { InMemoryFlagEvaluator } from '../schema/evaluator.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 // Error code factories for tests
 const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string }>();
@@ -97,7 +97,7 @@ describe('Schema Integration Patterns', () => {
 
   describe('Tracer API', () => {
     it('should create trace context with environment via Tracer', async () => {
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       // Use function overload to test user context properties
       const result = await trace(
@@ -117,7 +117,7 @@ describe('Schema Integration Patterns', () => {
     });
 
     it('should provide access to environment config as plain properties', async () => {
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace(
         'check-env',
@@ -160,7 +160,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -175,7 +175,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ checked: true });
       });
 
-      const { trace } = new TestTracer(opContextWithFlags, { createTraceRoot, flagEvaluator });
+      const { trace } = new TestTracer(opContextWithFlags, { ...createTestTracerOptions(), flagEvaluator });
 
       const result = await trace('check-ff', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
@@ -197,7 +197,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: true });
       });
 
-      const { trace } = new TestTracer(opContextWithFlags, { createTraceRoot, flagEvaluator });
+      const { trace } = new TestTracer(opContextWithFlags, { ...createTestTracerOptions(), flagEvaluator });
 
       const result = await trace('test-ff', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
@@ -215,7 +215,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ experimental: false });
       });
 
-      const { trace } = new TestTracer(opContextWithFlags, { createTraceRoot, flagEvaluator });
+      const { trace } = new TestTracer(opContextWithFlags, { ...createTestTracerOptions(), flagEvaluator });
 
       const result = await trace('test-async-ff', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
@@ -240,7 +240,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ tracked: true });
       });
 
-      const { trace } = new TestTracer(opContextWithFlags, { createTraceRoot, flagEvaluator });
+      const { trace } = new TestTracer(opContextWithFlags, { ...createTestTracerOptions(), flagEvaluator });
 
       const result = await trace('test-ff-tracking', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
@@ -266,7 +266,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ validated: !!ctx.ff.advancedValidation });
       });
 
-      const { trace } = new TestTracer(opContextWithFlags, { createTraceRoot, flagEvaluator });
+      const { trace } = new TestTracer(opContextWithFlags, { ...createTestTracerOptions(), flagEvaluator });
 
       const result = await trace('conditional-logic', { requestId: 'req-123', env: environmentConfig }, testOp);
       expect(result.success).toBe(true);
@@ -297,7 +297,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace('test-chaining', testOp);
       expect(result.success).toBe(true);
@@ -326,7 +326,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace('test-with-chaining', testOp);
       expect(result.success).toBe(true);
@@ -346,7 +346,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, amount });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       // Use trace_fn to wrap the op invocation with args
       const result = await trace(
@@ -385,7 +385,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -404,7 +404,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace('test-task', testOp);
       expect(result.success).toBe(true);
@@ -420,7 +420,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const successResult = await trace('success-task', successOp);
       expect(successResult.success).toBe(true);
@@ -457,7 +457,7 @@ describe('Schema Integration Patterns', () => {
       });
 
       // ✅ CORRECT PATTERN - Destructure trace from Tracer
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace('parent-task', testOp);
       expect(result.success).toBe(true);
@@ -479,7 +479,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ orderId, processed: true });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       const result = await trace(
         'process-order',
@@ -537,7 +537,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ id: 'user-123', ...userData });
       });
 
-      const { trace } = new TestTracer(opContextWithFlags, { createTraceRoot, flagEvaluator });
+      const { trace } = new TestTracer(opContextWithFlags, { ...createTestTracerOptions(), flagEvaluator });
 
       const result = await trace(
         'create-user',
@@ -576,7 +576,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       await trace(
         'parent-task',
@@ -602,7 +602,7 @@ describe('Schema Integration Patterns', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
       await trace('parent-task', { requestId: 'req-env-test', env: environmentConfig }, testOp);
 

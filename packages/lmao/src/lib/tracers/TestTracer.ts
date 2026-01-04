@@ -5,12 +5,31 @@
  * This is the primary tracer for tests that need to inspect trace output, convert to Arrow tables,
  * or verify buffer contents.
  *
+ * @example
+ * ```typescript
+ * import { createTraceRoot } from '@smoothbricks/lmao/node';
+ * import { JsBufferStrategy } from '@smoothbricks/lmao';
+ *
+ * const ctx = defineOpContext({ logSchema });
+ * const tracer = new TestTracer(ctx, {
+ *   bufferStrategy: new JsBufferStrategy(),
+ *   createTraceRoot,
+ * });
+ *
+ * await tracer.trace('my-op', myOp);
+ *
+ * // Inspect buffers
+ * expect(tracer.rootBuffers).toHaveLength(1);
+ *
+ * // Convert to Arrow using strategy
+ * const table = await tracer.bufferStrategy.toArrowTable(tracer.rootBuffers[0]);
+ * ```
+ *
  * @module tracers/TestTracer
  */
 
 import type { OpContextBinding } from '../opContext/types.js';
 import type { LogSchema } from '../schema/LogSchema.js';
-import type { TracerOptions } from '../tracer.js';
 import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
 
@@ -67,10 +86,6 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
    * Used to verify onStatsWillResetFor hook is called correctly.
    */
   readonly statsSnapshots: StatsSnapshot<B['logBinding']['logSchema']>[] = [];
-
-  constructor(binding: B, options: TracerOptions) {
-    super(binding, options);
-  }
 
   // ===========================================================================
   // Lifecycle hook implementations

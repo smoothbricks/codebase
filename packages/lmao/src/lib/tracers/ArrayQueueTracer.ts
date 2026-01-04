@@ -11,8 +11,14 @@ import type { SpanBuffer } from '../types.js';
  *
  * @example
  * ```typescript
+ * import { createTraceRoot } from '@smoothbricks/lmao/node';
+ * import { JsBufferStrategy } from '@smoothbricks/lmao';
+ *
  * const ctx = defineOpContext({ logSchema });
- * const tracer = new ArrayQueueTracer(ctx);
+ * const tracer = new ArrayQueueTracer(ctx, {
+ *   bufferStrategy: new JsBufferStrategy(),
+ *   createTraceRoot,
+ * });
  * const { trace } = tracer;
  *
  * // Process requests, traces accumulate
@@ -22,8 +28,9 @@ import type { SpanBuffer } from '../types.js';
  * // Periodically drain and process
  * const batch = tracer.drain();
  * for (const buf of batch) {
- *   const table = convertSpanTreeToArrowTable(buf);
+ *   const table = await tracer.bufferStrategy.toArrowTable(buf);
  *   await sendToBackend(table);
+ *   tracer.bufferStrategy.releaseBuffer(buf);
  * }
  * ```
  */

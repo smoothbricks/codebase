@@ -47,7 +47,10 @@ One `WebAssembly.Memory` per `OpContext`:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│ Header (64 bytes, cache-aligned)                                 │
+│ Header (192 bytes, 3 cache lines)                                │
+│ - bump_ptr, span_id_counter, alloc/free counts                   │
+│ - 28 tiered freelists (7 tiers × 4 size classes)                 │
+│ - thread_id, freelist_identity                                   │
 ├─────────────────────────────────────────────────────────────────┤
 │ Allocated Blocks                                                 │
 │ ┌─────────────┬─────────────┬─────────────┬─────────────┐       │
@@ -60,34 +63,56 @@ One `WebAssembly.Memory` per `OpContext`:
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-### Header Structure
+### Header Structure (192 bytes, 3 cache lines)
+
+The header uses tiered freelists for buddy allocation. Each size class has 7 tiers corresponding to capacities 8, 16,
+32, 64, 128, 256, 512.
 
 ```
 Offset  Size  Field
 ------  ----  -----
 0       4     bump_ptr          // Next free byte for bump allocation
-4       4     capacity          // Block sizing (rows per span)
-8       4     freelist_span     // Head of Span System freelist
-12      4     freelist_1b       // Head of 1-byte column freelist (nulls + values)
-16      4     freelist_4b       // Head of 4-byte column freelist (nulls + values)
-20      4     freelist_8b       // Head of 8-byte column freelist (nulls + values)
-24      40    reserved          // Pad to 64 bytes (cache line)
+4       4     span_id_counter   // Global span ID counter (monotonically increasing)
+8       4     alloc_count       // Total allocations (debug)
+12      4     free_count        // Total frees (debug)
+16      4     freelist_identity // Head of Identity block freelist (fixed size)
+20      4     _pad0             // Alignment padding
+24      8     thread_id         // Process/worker thread ID (set once from JS)
+32      112   freelists[28]     // 7 tiers × 4 size classes = 28 freelists (112 bytes)
+                                // Index = size_class * 7 + tier
+                                // Size classes: 0=span_system, 1=col_1b, 2=col_4b, 3=col_8b
+                                // Tiers: 0=cap8, 1=cap16, 2=cap32, 3=cap64, 4=cap128, 5=cap256, 6=cap512
+144     1     thread_id_set     // 1 if thread_id has been set, 0 otherwise
+145     47    _reserved         // Pad to 192 bytes (3 cache lines)
 ```
+
+**Capacity per-call API**: Capacity is NOT stored in the header. Each `alloc_*` and `free_*` call takes capacity as a
+parameter, allowing different OpContexts to share the same WASM memory with different capacities.
 
 ### Size Classes
 
 Each column block contains **both null bitmap and values** - they're always allocated together:
 
-| Size Class  | Block Size                        | Used For                                                |
-| ----------- | --------------------------------- | ------------------------------------------------------- |
-| Span System | `capacity × 9 + identity_size`    | timestamp (8B) + entry_type (1B) per row, plus identity |
-| 1B Column   | `ceil(capacity/8) + capacity × 1` | Null bitmap + Uint8 values (enum, boolean)              |
-| 4B Column   | `ceil(capacity/8) + capacity × 4` | Null bitmap + Uint32/Float32 values                     |
-| 8B Column   | `ceil(capacity/8) + capacity × 8` | Null bitmap + Float64/BigInt64 values                   |
+| Size Class  | Block Size                        | Used For                                          |
+| ----------- | --------------------------------- | ------------------------------------------------- |
+| Span System | `capacity × 9`                    | timestamp (8B) + entry_type (1B) per row          |
+| 1B Column   | `ceil(capacity/8) + capacity × 1` | Null bitmap + Uint8 values (enum, boolean)        |
+| 4B Column   | `ceil(capacity/8) + capacity × 4` | Null bitmap + Uint32/Float32 values               |
+| 8B Column   | `ceil(capacity/8) + capacity × 8` | Null bitmap + Float64/BigInt64 values             |
+| Identity    | 128 bytes (fixed)                 | write_index, span_id, trace_id (for root buffers) |
 
-All blocks within a size class are **identical size** because capacity is fixed per OpContext.
+All capacity-dependent blocks are sized to enable **buddy allocation** - when capacity halves, block size halves
+exactly:
 
-Block layout:
+- `span_system(C) = C × 9` → `span_system(C/2) = C/2 × 9 = span_system(C) / 2` ✓
+- `col_1b(C) ≈ C × 1.125` → scales linearly with capacity ✓
+- `col_4b(C) ≈ C × 4.125` → scales linearly with capacity ✓
+- `col_8b(C) ≈ C × 8.125` → scales linearly with capacity ✓
+
+**Note**: `writeIndex` was moved from span_system to the identity block to make span_system size exactly `C × 9`,
+enabling clean buddy splits.
+
+Block layout (column blocks):
 
 ```
 ┌─────────────────────────────────────────────────────────┐
@@ -96,6 +121,118 @@ Block layout:
 │ Values: capacity × element_size bytes                   │
 └─────────────────────────────────────────────────────────┘
 ```
+
+### Identity Block Layout
+
+Each span has an identity block (128 bytes, fixed size) that stores per-span metadata:
+
+```
+Offset  Size  Field
+------  ----  -----
+0       4     write_index     // Current write position (hot path, at offset 0 for fast access)
+4       4     span_id         // Unique span ID (from global counter)
+8       1     trace_id_len    // Length of trace_id (0 for child buffers)
+9       119   trace_id        // UTF-8 trace_id bytes (only for root buffers)
+                              // Total: 4 + 4 + 1 + 119 = 128 bytes
+```
+
+**Root buffers** store the trace_id in their identity block. **Child buffers** have `trace_id_len = 0` and inherit
+trace_id from their parent via the `_parent` buffer reference.
+
+**Thread ID** is stored globally in the header (not per-span) since all spans in a process/worker share the same thread
+ID.
+
+## Buddy Allocation
+
+### Why Buddy Allocation?
+
+When capacity changes (e.g., self-tuning adjusts from 64 to 32 rows), blocks in the freelist become the wrong size.
+Buddy allocation allows:
+
+1. **Splitting**: A capacity-64 block can split into two capacity-32 blocks
+2. **Merging**: Two adjacent capacity-32 blocks can merge into one capacity-64 block
+
+This eliminates memory waste when capacity changes and enables memory compaction.
+
+### Tiered Freelists
+
+The allocator maintains 28 freelists organized by size class and capacity tier:
+
+- **7 capacity tiers**: 8, 16, 32, 64, 128, 256, 512 (tier index 0-6)
+- **4 size classes**: span_system, col_1b, col_4b, col_8b
+- **Total**: 7 × 4 = 28 freelists
+
+Freelist index: `size_class * NUM_TIERS + tier`
+
+### Buddy Relationship
+
+For capacity `C`, blocks can split/merge with capacity `C/2`:
+
+| Size Class  | C=64 | C=32 | C=16 | Relationship                |
+| ----------- | ---- | ---- | ---- | --------------------------- |
+| span_system | 576  | 288  | 144  | `size(C) = 2 × size(C/2)` ✓ |
+| col_1b      | 72   | 36   | 18   | `size(C) = 2 × size(C/2)` ✓ |
+| col_4b      | 264  | 132  | 66   | `size(C) = 2 × size(C/2)` ✓ |
+| col_8b      | 520  | 260  | 130  | `size(C) = 2 × size(C/2)` ✓ |
+
+### Split Operation (allocAtTier)
+
+When allocating a block for capacity tier `T` but freelist is empty:
+
+1. Recursively try to allocate from tier `T+1`
+2. If tier `T+1` returns a block, split it:
+   - First half returned to caller
+   - Second half pushed to tier `T` freelist
+3. If all tiers exhausted, bump allocate at current tier
+
+### Merge Operation (freeAtTier) - Address-Based
+
+When freeing a block at offset `O` with block size `B`:
+
+1. **Check right neighbor** at `O + B`:
+   - If found in freelist at same tier, remove it
+   - Merge: freed block + right neighbor → parent at `O`
+   - Recursively try to merge at tier `T+1`
+
+2. **Check left neighbor** at `O - B`:
+   - If found in freelist at same tier, remove it
+   - Merge: left neighbor + freed block → parent at left neighbor's offset
+   - Recursively try to merge at tier `T+1`
+
+3. If no merge possible, push to freelist at tier `T`
+
+### Address-Based Buddy Identification (Implemented)
+
+Buddies are identified by address arithmetic, not stored pointers:
+
+- **Right buddy** of block at offset `O`: `O + block_size`
+- **Left buddy** of block at offset `O`: `O - block_size`
+
+This works for ALL adjacent blocks, not just those from the same split. When freeing, we scan the freelist for neighbors
+at `O ± block_size`. If found, we merge.
+
+**O(n) freelist scan**: `findAndRemoveByOffset` scans the freelist to find a neighbor. Freelists are expected to be
+short in practice (typically 0-10 blocks), so O(n) is acceptable.
+
+### Cascading Merge Behavior
+
+When blocks are allocated by splitting from the max tier (512), sibling blocks are left at every intermediate tier. When
+freeing, merges cascade all the way back up:
+
+```
+Alloc(32) → bump alloc at tier 6 (512), split to:
+  tier 5 (256): sibling pushed to freelist
+  tier 4 (128): sibling pushed to freelist
+  tier 3 (64):  sibling pushed to freelist
+  tier 2 (32):  returned to caller
+
+Free(32) → merge with tier-2 sibling → tier 3
+         → merge with tier-3 sibling → tier 4
+         → merge with tier-4 sibling → tier 5
+         → merge with tier-5 sibling → tier 6 (max, stop)
+```
+
+The final merged block ends up at max tier (512).
 
 ## Freelist Implementation
 
@@ -206,7 +343,7 @@ STEP 5: ALLOCATE (new trace starts, pops from freelist)
 
 The first 4 bytes serve dual purpose:
 
-- When **free**: `next` pointer to chain free blocks
+- When **free**: `next` pointer to chain free blocks, followed by cascading stats
 - When **in use**: Start of null bitmap (overwritten with valid data)
 
 ### Minimum Capacity Requirement
@@ -255,6 +392,73 @@ fn free(offset: u32, size_class: SizeClass):
     freelist_heads[size_class] = offset
 ```
 
+### Freelist Statistics (Zero-Overhead)
+
+Since freed blocks have unused space after the `next` pointer, we store cascading statistics that aggregate as blocks
+are pushed/popped. This is the `FreeBlock` struct (20 bytes):
+
+```
+Freed Block Layout (FreeBlock, 20 bytes):
+Offset  Size  Field
+------  ----  -----
+0       4     next_ptr            // Pointer to next free block (0 = end of list)
+4       4     freelist_len        // Number of blocks in freelist (cascading sum)
+8       4     reuse_count         // Times allocated from freelist (cascading sum)
+12      4     split_count         // Times this size class was split from larger (cascading)
+16      4     merge_count         // Times blocks merged to larger (cascading)
+20+     ...   unused              // Rest of block unused when free
+```
+
+**Cascading Aggregation**: Each freed block carries forward the stats from the entire chain.
+
+On **pushToFreelist(offset, is_merge)**:
+
+```zig
+block.next = old_head
+if (old_head != 0) {
+    block.freelist_len = old_head.freelist_len + 1
+    block.reuse_count = old_head.reuse_count
+    block.split_count = old_head.split_count
+    block.merge_count = old_head.merge_count + (is_merge ? 1 : 0)
+} else {
+    block.freelist_len = 1
+    block.reuse_count = 0
+    block.split_count = 0
+    block.merge_count = is_merge ? 1 : 0
+}
+HEAD = block
+```
+
+On **allocAtTier() from freelist**:
+
+```zig
+block = HEAD
+HEAD = block.next
+// Cascade stats to new head and increment reuse count
+if (HEAD != 0) {
+    HEAD.freelist_len = block.freelist_len - 1
+    HEAD.reuse_count = block.reuse_count + 1
+    HEAD.split_count = block.split_count
+    HEAD.merge_count = block.merge_count
+}
+return block
+```
+
+**O(1) Stats Access**: Read directly from `HEAD`:
+
+- `freelist_len`: `HEAD.freelist_len` — blocks available for reuse
+- `reuse_count`: `HEAD.reuse_count` — times allocated from freelist
+- `split_count`: `HEAD.split_count` — buddy splits performed
+- `merge_count`: `HEAD.merge_count` — buddy merges performed
+
+If freelist is empty (`HEAD == 0`), all stats return 0.
+
+**Derived Metrics**:
+
+- `bump_allocs = header.alloc_count - total_reuse_count`
+- `reuse_ratio = total_reuse_count / header.alloc_count`
+- `fragmentation_indicator`: high `freelist_len` with low `reuse_ratio` suggests fragmentation
+
 ### Freelist Growth
 
 Freelists start empty and grow dynamically:
@@ -269,10 +473,13 @@ This naturally adapts to the OpContext's usage pattern without pre-reservation.
 
 ## What WASM Manages
 
-| Data                   | Storage    | Notes                                                   |
-| ---------------------- | ---------- | ------------------------------------------------------- |
-| Span System            | WASM block | timestamp + entry_type + identity per span              |
-| Numeric columns (lazy) | WASM block | Null bitmap + values together, allocated on first write |
+| Data                   | Storage     | Notes                                                   |
+| ---------------------- | ----------- | ------------------------------------------------------- |
+| Span System            | WASM block  | timestamp (8B × capacity) + entry_type (1B × capacity)  |
+| Identity               | WASM block  | writeIndex, span_id, trace_id (144 bytes fixed)         |
+| Numeric columns (lazy) | WASM block  | Null bitmap + values together, allocated on first write |
+| Thread ID              | WASM header | Global for all spans (set once per worker/process)      |
+| Span ID counter        | WASM header | Monotonically increasing, used to assign span_id        |
 
 ## What JS Manages
 
@@ -478,46 +685,60 @@ For servers handling many requests:
 - One extra indirection: `_columnOffsets[colId]` lookup
 - Offset cached after first write per column
 
-## Implementation Phases
+## Implementation Status
 
-### Phase 1: WASM Allocator Module
+### Phase 1: WASM Allocator Module ✅ COMPLETE
 
-Implement in Zig:
+Implemented in Zig (`packages/lmao/src/lib/wasm/allocator.zig`):
 
-- Header initialization
-- `allocSpanSystem()`, `alloc1B()`, `alloc4B()`, `alloc8B()` (each includes nulls + values)
-- `freeSpanSystem()`, `free1B()`, `free4B()`, `free8B()`
-- `init(capacity)`, `reset()`
+- Header initialization: `init()`, `reset()`
+- Tiered allocation: `alloc_span_system(capacity)`, `alloc_col_1b(capacity)`, `alloc_col_4b(capacity)`,
+  `alloc_col_8b(capacity)`
+- Tiered deallocation with buddy merge: `free_span_system(offset, capacity)`, `free_col_1b(offset, capacity)`, etc.
+- Identity block allocation: `alloc_identity_root(trace_id_ptr, trace_id_len)`, `alloc_identity_child()`,
+  `free_identity(offset)`
+- Span lifecycle: `span_start()`, `span_end_ok()`, `span_end_err()`, `write_log_entry()`
+- Column writes: `write_col_f64()`, `write_col_u32()`, `write_col_u8()`
+- Thread ID management: `set_thread_id()`, `get_thread_id_high()`, `get_thread_id_low()`
+- Freelist statistics: `get_freelist_len()`, `get_freelist_reuse_count()`, `get_freelist_split_count()`,
+  `get_freelist_merge_count()`
 
-### Phase 2: OpContext Integration
+TypeScript wrapper (`packages/lmao/src/lib/wasm/wasmAllocator.ts`):
 
-- OpContext owns `WebAssembly.Memory` + allocator instance
-- Expose typed views: `u8View`, `u32View`, `f64View`, `i64View`
-- Handle memory growth (recreate views)
+- `createWasmAllocator(options)` - async factory
+- `createWasmAllocatorSync(wasmModule, options)` - sync factory
+- All WASM functions exposed with TypeScript types
+- Capacity defaults to allocator's configured capacity but can be overridden per-call
 
-### Phase 3: SpanBuffer Migration
+### Phase 2: OpContext Integration 🚧 IN PROGRESS
 
-- Replace per-column TypedArrays with WASM offsets
-- Keep string columns as JS arrays
-- Update `createSpanBuffer`, `createChildSpanBuffer`
+- [ ] OpContext owns `WebAssembly.Memory` + allocator instance
+- [ ] Expose typed views: `u8`, `u32`, `f64`, `i64`
+- [ ] Handle memory growth (recreate views)
 
-### Phase 4: SpanLogger Codegen
+### Phase 3: SpanBuffer Migration 🚧 PENDING
 
-- Generate numeric writers that use WASM offsets
-- Generate string writers that use JS arrays
-- Maintain fluent API (return `this`)
+- [ ] Replace per-column TypedArrays with WASM offsets
+- [ ] Keep string columns as JS arrays
+- [ ] Update `createSpanBuffer`, `createChildSpanBuffer`
 
-### Phase 5: Trace Completion
+### Phase 4: SpanLogger Codegen 🚧 PENDING
 
-- Implement block return to freelists
-- Walk span tree, collect all allocated blocks
-- Return in reverse allocation order (optional optimization)
+- [ ] Generate numeric writers that use WASM offsets
+- [ ] Generate string writers that use JS arrays
+- [ ] Maintain fluent API (return `this`)
 
-### Phase 6: Benchmarking
+### Phase 5: Trace Completion 🚧 PENDING
 
-- Compare write throughput: current vs WASM
-- Measure memory usage patterns
-- Profile cache behavior with perf/cachegrind
+- [ ] Implement block return to freelists
+- [ ] Walk span tree, collect all allocated blocks
+- [ ] Return in reverse allocation order (optional optimization)
+
+### Phase 6: Benchmarking 🚧 PENDING
+
+- [ ] Compare write throughput: current vs WASM
+- [ ] Measure memory usage patterns
+- [ ] Profile cache behavior with perf/cachegrind
 
 ## Open Questions
 

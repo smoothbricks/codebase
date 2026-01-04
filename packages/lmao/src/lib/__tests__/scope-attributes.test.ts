@@ -12,8 +12,8 @@ import { describe, expect, test } from 'bun:test';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 describe('Span Scope Attributes', () => {
   describe('Basic Scope Setting', () => {
@@ -42,7 +42,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -74,7 +74,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       await trace('test-span', testOp);
       // If this completes without error, scope inheritance is working
     });
@@ -124,7 +124,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -163,7 +163,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -204,7 +204,7 @@ describe('Span Scope Attributes', () => {
         return childResult;
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('parent-span', parentOp);
       expect(result.success).toBe(true);
     });
@@ -255,7 +255,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok(businessResult);
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('middleware-span', middlewareOp);
       expect(result.success).toBe(true);
     });
@@ -290,7 +290,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });
@@ -340,7 +340,7 @@ describe('Span Scope Attributes', () => {
         return ctx.ok('done');
       });
 
-      const { trace } = new TestTracer(ctx, { createTraceRoot });
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
       const result = await trace('test-span', testOp);
       expect(result.success).toBe(true);
     });

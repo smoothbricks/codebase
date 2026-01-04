@@ -12,8 +12,14 @@
  *
  * @example
  * ```typescript
+ * import { createTraceRoot } from '@smoothbricks/lmao/node';
+ * import { JsBufferStrategy } from '@smoothbricks/lmao';
+ *
  * const ctx = defineOpContext({ logSchema: mySchema });
- * const { trace } = new StdioTracer(ctx);
+ * const { trace } = new StdioTracer(ctx, {
+ *   bufferStrategy: new JsBufferStrategy(),
+ *   createTraceRoot,
+ * });
  *
  * await trace('fetch-user', fetchOp);
  *
@@ -125,7 +131,9 @@ function getStatus(entryType: number): string {
 /**
  * Options for StdioTracer
  */
-export interface StdioTracerOptions extends TracerOptions {
+export interface StdioTracerOptions<
+  T extends import('../schema/LogSchema.js').LogSchema = import('../schema/LogSchema.js').LogSchema,
+> extends TracerOptions<T> {
   /** Output stream (defaults to process.stdout) */
   out?: NodeJS.WriteStream;
   /** Error stream (defaults to process.stderr) */
@@ -159,7 +167,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
   private readonly err: NodeJS.WriteStream;
   private readonly colorEnabled: boolean;
 
-  constructor(binding: B, options: StdioTracerOptions) {
+  constructor(binding: B, options: StdioTracerOptions<B['logBinding']['logSchema']>) {
     super(binding, options);
     this.out = options.out ?? process.stdout;
     this.err = options.err ?? process.stderr;

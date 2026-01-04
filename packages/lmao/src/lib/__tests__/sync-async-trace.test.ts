@@ -17,9 +17,9 @@ import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 // Test schema
 const testSchema = defineLogSchema({
@@ -36,7 +36,7 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       // Execute sync function - trace() returns sync result
       const result = tracer.trace('sync-trace', (ctx) => {
@@ -68,7 +68,7 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       const testError = new Error('Sync error');
 
@@ -107,7 +107,7 @@ describe('Sync/Async Trace Execution', () => {
       let capturedBuffer: AnySpanBuffer | undefined;
       let promiseResolved = false;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       // Execute async function - trace() returns Promise
       const resultPromise = tracer.trace('async-trace', async (ctx) => {
@@ -157,7 +157,7 @@ describe('Sync/Async Trace Execution', () => {
       let capturedBuffer: AnySpanBuffer | undefined;
       let promiseRejected = false;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       const testError = new Error('Async error');
 
@@ -206,7 +206,7 @@ describe('Sync/Async Trace Execution', () => {
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       // Execute multiple sync traces
       const result1 = tracer.trace('sync-1', (ctx) => {
@@ -241,7 +241,7 @@ describe('Sync/Async Trace Execution', () => {
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       // Execute multiple async traces in parallel
       const promise1 = tracer.trace('async-1', async (ctx) => {
@@ -284,7 +284,7 @@ describe('Sync/Async Trace Execution', () => {
 
       const buffers: AnySpanBuffer[] = [];
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       // Sync trace
       const syncResult = tracer.trace('sync', (ctx) => {
@@ -332,7 +332,7 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       const result = tracer.trace('sync-with-tags', (ctx) => {
         capturedBuffer = ctx.buffer;
@@ -357,7 +357,7 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       const result = await tracer.trace('async-with-tags', async (ctx) => {
         capturedBuffer = ctx.buffer;
@@ -384,7 +384,7 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       const result = tracer.trace('sync-with-logging', (ctx) => {
         capturedBuffer = ctx.buffer;
@@ -411,7 +411,7 @@ describe('Sync/Async Trace Execution', () => {
 
       let capturedBuffer: AnySpanBuffer | undefined;
 
-      const tracer = new TestTracer(ctx, { createTraceRoot });
+      const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       const result = await tracer.trace('async-with-logging', async (ctx) => {
         capturedBuffer = ctx.buffer;

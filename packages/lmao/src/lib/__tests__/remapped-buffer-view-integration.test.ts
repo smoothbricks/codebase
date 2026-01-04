@@ -16,9 +16,9 @@ import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 describe('RemappedBufferView Integration', () => {
   describe('basic span execution', () => {
@@ -48,7 +48,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ parent: true, childResult });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
       const result = await trace('parent-span', parentOp);
 
       expect(parentExecuted).toBe(true);
@@ -79,7 +79,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ success: true });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
       await trace('parent-span', parentOp);
 
       expect(rootBuffer).toBeDefined();
@@ -168,7 +168,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ level: 1 });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
       const result = await trace('level1-span', level1Op);
 
       expect(result.success).toBe(true);
@@ -221,7 +221,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ done: true });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
       const result = await trace('parent-span', parentOp);
 
       expect(result.success).toBe(true);
@@ -260,7 +260,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ app: true });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
       const result = await trace('app-span', appOp);
 
       expect(result.success).toBe(true);
@@ -296,7 +296,7 @@ describe('RemappedBufferView Integration', () => {
         return ctx.ok({ done: true });
       });
 
-      const { trace } = new TestTracer(opContext, { createTraceRoot });
+      const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
       const result = await trace('parent-span', parentOp);
 
       expect(result.success).toBe(true);

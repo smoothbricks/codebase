@@ -12,8 +12,8 @@ import { defineOpContext } from '../defineOpContext.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { createTraceId } from '../traceId.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 // Test schema
 const testSchema = defineLogSchema({
@@ -35,7 +35,7 @@ describe('Tracer', () => {
         ctx: { env: null as unknown as TestEnv },
       });
 
-      const tracer = new TestTracer(factory, { createTraceRoot });
+      const tracer = new TestTracer(factory, { ...createTestTracerOptions() });
       const { trace } = tracer;
 
       const result = await trace('test-trace', { env: { API_KEY: 'test' } }, async (ctx) => {
@@ -53,7 +53,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const tracer = new TestTracer(factory, { createTraceRoot });
+      const tracer = new TestTracer(factory, { ...createTestTracerOptions() });
       const { trace } = tracer;
 
       await trace('trace-1', async (ctx) => {
@@ -81,7 +81,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const tracer = new TestTracer(factory, { createTraceRoot });
+      const tracer = new TestTracer(factory, { ...createTestTracerOptions() });
       const { trace } = tracer;
 
       const error = new Error('test error');
@@ -101,7 +101,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const { trace } = new TestTracer(factory, { createTraceRoot });
+      const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       const customTraceId = createTraceId('custom-trace-id-12345');
 
@@ -122,7 +122,7 @@ describe('Tracer', () => {
         },
       });
 
-      const { trace } = new TestTracer(factory, { createTraceRoot });
+      const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
       const customTraceId = createTraceId('combined-override-test');
 
       // biome-ignore lint/suspicious/noExplicitAny: Testing combined overrides
@@ -148,7 +148,7 @@ describe('Tracer', () => {
         },
       });
 
-      const { trace } = new TestTracer(factory, { createTraceRoot });
+      const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       await trace('ctx-test', { env: { API_KEY: 'secret' } }, async (ctx) => {
         // env should be from overrides
@@ -180,7 +180,7 @@ describe('Tracer', () => {
         logSchema: testSchema,
       });
 
-      const { trace } = new TestTracer(factory, { createTraceRoot });
+      const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       const result = await trace('simple', async () => {
         return 42;
@@ -195,7 +195,7 @@ describe('Tracer', () => {
         ctx: { value: 0 },
       });
 
-      const { trace } = new TestTracer(factory, { createTraceRoot });
+      const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       const result = await trace('with-overrides', { value: 100 }, async (ctx) => {
         // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property

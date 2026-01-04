@@ -26,8 +26,8 @@ import { defineOpContext } from '../defineOpContext.js';
 import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import { createTraceRoot } from '../traceRoot.node.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { createTestTracerOptions } from './test-helpers.js';
 
 // Error code factory for tests
 const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string }>();
@@ -57,7 +57,7 @@ const { defineOp } = ctx;
  * Helper to create a properly typed tracer for tests
  */
 function createTestTracer() {
-  return new TestTracer(ctx, { createTraceRoot });
+  return new TestTracer(ctx, { ...createTestTracerOptions() });
 }
 
 /**

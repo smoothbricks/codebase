@@ -6,10 +6,9 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-
+import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { defineLogSchema, defineOpContext, S } from '../../defineOpContext.js';
 import { defineCodeError } from '../../result.js';
-import { createTraceRoot } from '../../traceRoot.node.js';
 import { NoOpTracer } from '../NoOpTracer.js';
 
 // Test schema
@@ -26,7 +25,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const tracer = new NoOpTracer(ctx, { createTraceRoot });
+      const tracer = new NoOpTracer(ctx, { ...createTestTracerOptions() });
       expect(tracer).toBeDefined();
       expect(tracer.trace).toBeDefined();
       expect(tracer.flush).toBeDefined();
@@ -36,7 +35,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace, flush } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace, flush } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
       expect(typeof trace).toBe('function');
       expect(typeof flush).toBe('function');
     });
@@ -47,7 +46,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       const result = await trace('test-trace', async (ctx) => {
         ctx.tag.userId('user-123');
@@ -61,7 +60,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       const result = await trace('test-trace', async (ctx) => {
         await Promise.resolve();
@@ -76,7 +75,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       await expect(
         trace('test-trace', async () => {
@@ -90,7 +89,7 @@ describe('NoOpTracer', () => {
         logSchema: testSchema,
       });
       const { defineOp } = ctx;
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       const childOp = defineOp('child', (ctx) => {
         return ctx.ok('child-done');
@@ -112,7 +111,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { flush } = new NoOpTracer(ctx, { createTraceRoot });
+      const { flush } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       // Should not throw, should resolve immediately
       await expect(flush()).resolves.toBeUndefined();
@@ -122,7 +121,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace, flush } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace, flush } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       // Create a trace
       await trace('test-trace', async () => {
@@ -140,7 +139,7 @@ describe('NoOpTracer', () => {
         logSchema: testSchema,
       });
       const { defineOp } = ctx;
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       const childOp1 = defineOp('c1', (c) => c.ok(1));
       const childOp2 = defineOp('c2', (c) => c.ok(2));
@@ -166,7 +165,7 @@ describe('NoOpTracer', () => {
       const ctx = defineOpContext({
         logSchema: testSchema,
       });
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       const result = await trace('math-test', async () => {
         return 2 + 2;
@@ -180,7 +179,7 @@ describe('NoOpTracer', () => {
         logSchema: testSchema,
       });
       const { defineOp } = ctx;
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       const successOp = defineOp('success', (ctx) => {
         return ctx.ok({ status: 'success' });
@@ -196,7 +195,7 @@ describe('NoOpTracer', () => {
         logSchema: testSchema,
       });
       const { defineOp } = ctx;
-      const { trace } = new NoOpTracer(ctx, { createTraceRoot });
+      const { trace } = new NoOpTracer(ctx, { ...createTestTracerOptions() });
 
       const failingOp = defineOp('failing', (ctx) => {
         return ctx.err(VALIDATION_ERROR({ field: 'email' }));

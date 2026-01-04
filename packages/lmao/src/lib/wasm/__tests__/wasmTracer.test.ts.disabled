@@ -1,0 +1,444 @@
+import { beforeEach, describe, expect, it, mock } from 'bun:test';
+import type { OpContextBinding } from '../../opContext/types.js';
+import { S } from '../../schema/builder.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import type { TracerOptions } from '../../tracer.js';
+import type { SpanBuffer } from '../../types.js';
+import { createWasmAllocator, type WasmAllocator } from '../wasmAllocator.js';
+import { WasmTestTracer, WasmTracer, type WasmTracerOptions } from '../wasmTracer.js';
+
+// =============================================================================
+// Test Fixtures
+// =============================================================================
+
+const testSchema = defineLogSchema({
+  userId: S.category(),
+  count: S.number(),
+});
+
+type TestSchema = typeof testSchema;
+
+/**
+ * Create minimal mock OpContextBinding for testing.
+ */
+function createMockBinding(): OpContextBinding<TestSchema> {
+  return {
+    logBinding: {
+      logSchema: testSchema,
+      stats: {
+        totalWrites: 0,
+        overflowWrites: 0,
+        totalCreated: 0,
+        capacity: 64,
+      },
+    },
+    ctxDefaults: {},
+    deps: {},
+  } as unknown as OpContextBinding<TestSchema>;
+}
+
+/**
+ * Create minimal mock TracerOptions for testing.
+ */
+function createMockTracerOptions(): TracerOptions {
+  return {
+    createTraceRoot: () => ({
+      trace_id: 'test-trace-id',
+      anchors: {
+        startMs: 0,
+        performanceNow: 0,
+      },
+      tracer: {} as unknown,
+      writeSpanEnd: () => {},
+      writeSpanStart: () => {},
+    }),
+  } as unknown as TracerOptions;
+}
+
+/**
+ * Create a mock buffer with free() method for testing freeSpanTree.
+ */
+interface MockBuffer {
+  free?: () => void;
+  _children?: MockBuffer[];
+  _next?: MockBuffer;
+  _stats?: {
+    totalWrites: number;
+    overflowWrites: number;
+    totalCreated: number;
+    capacity: number;
+  };
+  _spanName?: string;
+}
+
+function createMockBuffer(name: string): MockBuffer {
+  return {
+    free: mock(() => {}),
+    _children: [],
+    _next: undefined,
+    _stats: {
+      totalWrites: 10,
+      overflowWrites: 2,
+      totalCreated: 3,
+      capacity: 64,
+    },
+    _spanName: name,
+  };
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+describe('WasmTracer', () => {
+  let allocator: WasmAllocator;
+  let binding: OpContextBinding<TestSchema>;
+  let tracerOptions: TracerOptions;
+
+  beforeEach(async () => {
+    allocator = await createWasmAllocator({ capacity: 64 });
+    binding = createMockBinding();
+    tracerOptions = createMockTracerOptions();
+  });
+
+  describe('WasmTracer.create()', () => {
+    it('creates instance with provided allocator', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTracer.create(binding, options);
+
+      expect(tracer).toBeInstanceOf(WasmTracer);
+      expect(tracer.allocator).toBe(allocator);
+    });
+
+    it('creates new allocator when not provided', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocatorOptions: { capacity: 128 },
+      };
+
+      const tracer = await WasmTracer.create(binding, options);
+
+      expect(tracer).toBeInstanceOf(WasmTracer);
+      expect(tracer.allocator).toBeDefined();
+      expect(tracer.allocator.getCapacity()).toBe(128);
+    });
+
+    it('allocator property is accessible', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTracer.create(binding, options);
+
+      // Allocator should have all the expected methods
+      expect(tracer.allocator.memory).toBeInstanceOf(WebAssembly.Memory);
+      expect(typeof tracer.allocator.allocSpanSystem).toBe('function');
+      expect(typeof tracer.allocator.freeSpanSystem).toBe('function');
+      expect(typeof tracer.allocator.getAllocCount).toBe('function');
+    });
+  });
+
+  describe('freeSpanTree()', () => {
+    it('frees a single buffer', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+      const tracer = await WasmTracer.create(binding, options);
+
+      const buffer = createMockBuffer('root');
+
+      // Access protected method via type assertion
+      (tracer as unknown as { freeSpanTree: (b: MockBuffer) => void }).freeSpanTree(buffer);
+
+      expect(buffer.free).toHaveBeenCalledTimes(1);
+    });
+
+    it('frees children recursively (depth-first)', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+      const tracer = await WasmTracer.create(binding, options);
+
+      const child1 = createMockBuffer('child1');
+      const child2 = createMockBuffer('child2');
+      const root = createMockBuffer('root');
+      root._children = [child1, child2];
+
+      const freeOrder: string[] = [];
+      child1.free = mock(() => freeOrder.push('child1'));
+      child2.free = mock(() => freeOrder.push('child2'));
+      root.free = mock(() => freeOrder.push('root'));
+
+      (tracer as unknown as { freeSpanTree: (b: MockBuffer) => void }).freeSpanTree(root);
+
+      // Children should be freed before parent (depth-first)
+      expect(freeOrder).toEqual(['child1', 'child2', 'root']);
+    });
+
+    it('frees overflow chain', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+      const tracer = await WasmTracer.create(binding, options);
+
+      const overflow = createMockBuffer('overflow');
+      const root = createMockBuffer('root');
+      root._next = overflow;
+
+      const freeOrder: string[] = [];
+      overflow.free = mock(() => freeOrder.push('overflow'));
+      root.free = mock(() => freeOrder.push('root'));
+
+      (tracer as unknown as { freeSpanTree: (b: MockBuffer) => void }).freeSpanTree(root);
+
+      // Overflow should be freed before the buffer that references it
+      expect(freeOrder).toEqual(['overflow', 'root']);
+    });
+
+    it('handles complex tree with children and overflow', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+      const tracer = await WasmTracer.create(binding, options);
+
+      // Build tree:
+      //   root (with overflow)
+      //     └── child (with overflow)
+      //           └── grandchild
+      const grandchild = createMockBuffer('grandchild');
+      const childOverflow = createMockBuffer('childOverflow');
+      const child = createMockBuffer('child');
+      child._children = [grandchild];
+      child._next = childOverflow;
+
+      const rootOverflow = createMockBuffer('rootOverflow');
+      const root = createMockBuffer('root');
+      root._children = [child];
+      root._next = rootOverflow;
+
+      const freeOrder: string[] = [];
+      grandchild.free = mock(() => freeOrder.push('grandchild'));
+      childOverflow.free = mock(() => freeOrder.push('childOverflow'));
+      child.free = mock(() => freeOrder.push('child'));
+      rootOverflow.free = mock(() => freeOrder.push('rootOverflow'));
+      root.free = mock(() => freeOrder.push('root'));
+
+      (tracer as unknown as { freeSpanTree: (b: MockBuffer) => void }).freeSpanTree(root);
+
+      // Verify depth-first order: grandchild, childOverflow, child, rootOverflow, root
+      expect(freeOrder).toEqual(['grandchild', 'childOverflow', 'child', 'rootOverflow', 'root']);
+    });
+
+    it('handles buffer without free() method gracefully', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+      const tracer = await WasmTracer.create(binding, options);
+
+      const buffer: MockBuffer = {
+        _children: [],
+        _next: undefined,
+        // No free method
+      };
+
+      // Should not throw
+      expect(() => {
+        (tracer as unknown as { freeSpanTree: (b: MockBuffer) => void }).freeSpanTree(buffer);
+      }).not.toThrow();
+    });
+  });
+});
+
+describe('WasmTestTracer', () => {
+  let allocator: WasmAllocator;
+  let binding: OpContextBinding<TestSchema>;
+  let tracerOptions: TracerOptions;
+
+  beforeEach(async () => {
+    allocator = await createWasmAllocator({ capacity: 64 });
+    binding = createMockBinding();
+    tracerOptions = createMockTracerOptions();
+  });
+
+  describe('WasmTestTracer.create()', () => {
+    it('creates instance with provided allocator', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+
+      expect(tracer).toBeInstanceOf(WasmTestTracer);
+      expect(tracer).toBeInstanceOf(WasmTracer);
+      expect(tracer.allocator).toBe(allocator);
+    });
+
+    it('creates new allocator when not provided', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocatorOptions: { capacity: 256 },
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+
+      expect(tracer.allocator.getCapacity()).toBe(256);
+    });
+
+    it('has empty rootBuffers array initially', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+
+      expect(tracer.rootBuffers).toEqual([]);
+    });
+
+    it('has empty statsSnapshots array initially', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+
+      expect(tracer.statsSnapshots).toEqual([]);
+    });
+  });
+
+  describe('rootBuffers accumulation', () => {
+    it('accumulates buffers on onTraceEnd()', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+      const buffer1 = createMockBuffer('trace1') as unknown as SpanBuffer<TestSchema>;
+      const buffer2 = createMockBuffer('trace2') as unknown as SpanBuffer<TestSchema>;
+
+      tracer.onTraceEnd(buffer1);
+      tracer.onTraceEnd(buffer2);
+
+      expect(tracer.rootBuffers).toHaveLength(2);
+      expect((tracer.rootBuffers[0] as unknown as MockBuffer)._spanName).toBe('trace1');
+      expect((tracer.rootBuffers[1] as unknown as MockBuffer)._spanName).toBe('trace2');
+    });
+  });
+
+  describe('statsSnapshots accumulation', () => {
+    it('captures stats on onStatsWillResetFor()', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+      const buffer = createMockBuffer('test');
+      buffer._stats = {
+        totalWrites: 100,
+        overflowWrites: 5,
+        totalCreated: 10,
+        capacity: 64,
+      };
+
+      tracer.onStatsWillResetFor(buffer as unknown as SpanBuffer<TestSchema>);
+
+      expect(tracer.statsSnapshots).toHaveLength(1);
+      expect(tracer.statsSnapshots[0].totalWrites).toBe(100);
+      expect(tracer.statsSnapshots[0].overflowWrites).toBe(5);
+      expect(tracer.statsSnapshots[0].totalCreated).toBe(10);
+      expect(tracer.statsSnapshots[0].capacity).toBe(64);
+    });
+  });
+
+  describe('clear()', () => {
+    it('frees all accumulated buffers', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+
+      const buffer1 = createMockBuffer('trace1');
+      const buffer2 = createMockBuffer('trace2');
+
+      tracer.onTraceEnd(buffer1 as unknown as SpanBuffer<TestSchema>);
+      tracer.onTraceEnd(buffer2 as unknown as SpanBuffer<TestSchema>);
+
+      tracer.clear();
+
+      expect(buffer1.free).toHaveBeenCalledTimes(1);
+      expect(buffer2.free).toHaveBeenCalledTimes(1);
+    });
+
+    it('clears rootBuffers array', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+
+      tracer.onTraceEnd(createMockBuffer('trace1') as unknown as SpanBuffer<TestSchema>);
+      tracer.onTraceEnd(createMockBuffer('trace2') as unknown as SpanBuffer<TestSchema>);
+
+      expect(tracer.rootBuffers).toHaveLength(2);
+
+      tracer.clear();
+
+      expect(tracer.rootBuffers).toHaveLength(0);
+    });
+
+    it('clears statsSnapshots array', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+      const buffer = createMockBuffer('test');
+
+      tracer.onStatsWillResetFor(buffer as unknown as SpanBuffer<TestSchema>);
+
+      expect(tracer.statsSnapshots).toHaveLength(1);
+
+      tracer.clear();
+
+      expect(tracer.statsSnapshots).toHaveLength(0);
+    });
+
+    it('frees children of accumulated buffers', async () => {
+      const options: WasmTracerOptions<typeof binding> = {
+        ...tracerOptions,
+        allocator,
+      };
+
+      const tracer = await WasmTestTracer.create(binding, options);
+
+      const child = createMockBuffer('child');
+      const root = createMockBuffer('root');
+      root._children = [child];
+
+      tracer.onTraceEnd(root as unknown as SpanBuffer<TestSchema>);
+      tracer.clear();
+
+      // Both child and root should be freed
+      expect(child.free).toHaveBeenCalledTimes(1);
+      expect(root.free).toHaveBeenCalledTimes(1);
+    });
+  });
+});
