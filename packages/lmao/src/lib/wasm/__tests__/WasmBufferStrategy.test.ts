@@ -1,0 +1,248 @@
+/**
+ * Tests for WasmBufferStrategy
+ */
+
+import { afterEach, beforeAll, describe, expect, it } from 'bun:test';
+import { createOpMetadata } from '../../opContext/defineOp.js';
+import { S } from '../../schema/builder.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import type { TracerLifecycleHooks } from '../../traceRoot.js';
+import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
+import { createWasmAllocator } from '../wasmAllocator.js';
+import { createWasmTraceRoot } from '../wasmTraceRoot.js';
+
+describe('WasmBufferStrategy', () => {
+  // Simple schema for testing
+  const testSchema = defineLogSchema({
+    userId: S.category(),
+    latency: S.number(),
+    success: S.boolean(),
+    operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
+  });
+
+  // Test metadata for buffer creation
+  const testMetadata = createOpMetadata('test-op', 'test-package', 'test.ts', 'abc123', 1);
+
+  // Mock tracer lifecycle hooks for WasmTraceRoot
+  const mockTracer: TracerLifecycleHooks = {
+    onTraceStart: () => {},
+    onTraceEnd: () => {},
+    onSpanStart: () => {},
+    onSpanEnd: () => {},
+    onStatsWillResetFor: () => {},
+  };
+
+  let strategy: WasmBufferStrategy<typeof testSchema>;
+
+  beforeAll(async () => {
+    strategy = await WasmBufferStrategy.create<typeof testSchema>({
+      capacity: 64,
+      initialPages: 16, // 1MB
+      maxPages: 16,
+    });
+  });
+
+  afterEach(() => {
+    // Reset allocator between tests to ensure clean state
+    strategy.reset();
+  });
+
+  describe('create()', () => {
+    it('creates a strategy with default options', async () => {
+      const s = await WasmBufferStrategy.create();
+      expect(s).toBeDefined();
+      expect(s.allocator).toBeDefined();
+    });
+
+    it('creates a strategy with custom options', async () => {
+      const s = await WasmBufferStrategy.create({
+        capacity: 128,
+        initialPages: 32,
+      });
+      expect(s).toBeDefined();
+      expect(s.allocator.capacity).toBe(128);
+    });
+
+    it('accepts a pre-created allocator', async () => {
+      const allocator = await createWasmAllocator({ capacity: 32 });
+      const s = await WasmBufferStrategy.create({ allocator });
+      expect(s.allocator).toBe(allocator);
+    });
+  });
+
+  describe('createSpanBuffer()', () => {
+    it('creates a root span buffer', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+
+      expect(buffer).toBeDefined();
+      expect(buffer._capacity).toBe(64);
+      expect(buffer._spanName).toBe('test-span');
+      expect(String(buffer.trace_id)).toBe('test-trace-id');
+    });
+
+    it('creates buffer with custom capacity', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const buffer = strategy.createSpanBuffer(
+        testSchema,
+        'test-span',
+        traceRoot,
+        testMetadata,
+        32, // Custom capacity
+      );
+
+      expect(buffer._capacity).toBe(32);
+    });
+
+    it('allocates WASM memory for buffer', async () => {
+      const statsBefore = strategy.getStats();
+
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+      strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+
+      const statsAfter = strategy.getStats();
+      expect(statsAfter.allocCount).toBeGreaterThan(statsBefore.allocCount);
+    });
+  });
+
+  describe('createChildSpanBuffer()', () => {
+    it('creates a child span linked to parent', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+
+      const child = strategy.createChildSpanBuffer(parent, 'child-span', testMetadata, testMetadata);
+
+      expect(child).toBeDefined();
+      expect(child._spanName).toBe('child-span');
+      expect(child.trace_id).toBe(parent.trace_id);
+      expect(child.parent_span_id).toBe(parent.span_id);
+      expect((parent as any)._children).toContain(child);
+    });
+
+    it('inherits capacity from parent by default', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+
+      const child = strategy.createChildSpanBuffer(parent, 'child-span', testMetadata, testMetadata);
+
+      expect(child._capacity).toBe(parent._capacity);
+    });
+
+    it('allows custom capacity for child', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+
+      const child = strategy.createChildSpanBuffer(
+        parent,
+        'child-span',
+        testMetadata,
+        testMetadata,
+        32, // Custom capacity
+      );
+
+      expect(child._capacity).toBe(32);
+    });
+  });
+
+  describe('createOverflowBuffer()', () => {
+    it('creates overflow buffer linked to parent', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+
+      const overflow = strategy.createOverflowBuffer(buffer);
+
+      expect(overflow).toBeDefined();
+      expect(overflow._capacity).toBe(buffer._capacity);
+      // Note: Currently overflow allocates its own identity block with new span_id
+      // TODO: Overflow should share identity with parent buffer
+      expect(overflow.trace_id).toBe(buffer.trace_id);
+      expect((buffer as any)._overflow).toBe(overflow);
+    });
+  });
+
+  describe('releaseBuffer()', () => {
+    it('frees WASM memory for a single buffer', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+
+      const statsBefore = strategy.getStats();
+      strategy.releaseBuffer(buffer as any);
+      const statsAfter = strategy.getStats();
+
+      expect(statsAfter.freeCount).toBeGreaterThan(statsBefore.freeCount);
+    });
+
+    it('frees entire span tree recursively', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+
+      strategy.createChildSpanBuffer(parent, 'child-1', testMetadata, testMetadata);
+
+      strategy.createChildSpanBuffer(parent, 'child-2', testMetadata, testMetadata);
+
+      const statsBefore = strategy.getStats();
+      strategy.releaseBuffer(parent as any);
+      const statsAfter = strategy.getStats();
+
+      // Should have freed 3 buffers worth of memory
+      expect(statsAfter.freeCount).toBeGreaterThan(statsBefore.freeCount);
+    });
+
+    it('frees overflow chain', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+
+      strategy.createOverflowBuffer(buffer);
+
+      const statsBefore = strategy.getStats();
+      strategy.releaseBuffer(buffer as any);
+      const statsAfter = strategy.getStats();
+
+      // Should have freed both buffers
+      expect(statsAfter.freeCount).toBeGreaterThan(statsBefore.freeCount);
+    });
+  });
+
+  describe('getStats()', () => {
+    it('returns allocator statistics', async () => {
+      const stats = strategy.getStats();
+
+      expect(stats).toHaveProperty('allocCount');
+      expect(stats).toHaveProperty('freeCount');
+      expect(stats).toHaveProperty('bumpPtr');
+      expect(stats).toHaveProperty('capacity');
+      expect(typeof stats.allocCount).toBe('number');
+      expect(typeof stats.freeCount).toBe('number');
+      expect(typeof stats.bumpPtr).toBe('number');
+      expect(typeof stats.capacity).toBe('number');
+    });
+  });
+
+  describe('reset()', () => {
+    it('resets allocator state', async () => {
+      const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
+
+      // Create some buffers
+      strategy.createSpanBuffer(testSchema, 'test-span-1', traceRoot, testMetadata);
+      strategy.createSpanBuffer(testSchema, 'test-span-2', traceRoot, testMetadata);
+
+      const statsBeforeReset = strategy.getStats();
+      expect(statsBeforeReset.allocCount).toBeGreaterThan(0);
+
+      strategy.reset();
+
+      const statsAfterReset = strategy.getStats();
+      expect(statsAfterReset.allocCount).toBe(0);
+      expect(statsAfterReset.freeCount).toBe(0);
+    });
+  });
+});

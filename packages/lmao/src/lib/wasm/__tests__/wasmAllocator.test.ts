@@ -631,7 +631,6 @@ describe('WasmAllocator', () => {
         const alloc = await createWasmAllocator({ capacity: 16 });
 
         // Allocate 4 blocks at capacity 16
-        const blockSize16 = alloc.getSpanSystemSize(16);
         const blocks = [
           alloc.allocSpanSystem(16),
           alloc.allocSpanSystem(16),

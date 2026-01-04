@@ -330,9 +330,9 @@ function createImports(memory: WebAssembly.Memory) {
 async function loadWasmBytes(): Promise<ArrayBuffer> {
   // Try Node.js first
   if (typeof process !== 'undefined' && process.versions?.node) {
-    const { readFile } = await import('fs/promises');
-    const { fileURLToPath } = await import('url');
-    const { dirname, join } = await import('path');
+    const { readFile } = await import('node:fs/promises');
+    const { fileURLToPath } = await import('node:url');
+    const { dirname, join } = await import('node:path');
 
     // __dirname equivalent for ESM
     const currentFile = fileURLToPath(import.meta.url);
