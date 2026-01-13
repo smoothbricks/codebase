@@ -50,7 +50,7 @@ let wasmStrategy: WasmBufferStrategy<SchemaType> | null = null;
 async function setup() {
   // JS tracer with JsBufferStrategy
   jsTracer = new TestTracer(opContext, {
-    bufferStrategy: new JsBufferStrategy<SchemaType>(),
+    bufferStrategy: new JsBufferStrategy<SchemaType>({ capacity: 64 }),
     createTraceRoot,
   });
 
@@ -80,10 +80,12 @@ summary(() => {
       jsTracer.clear();
     });
 
-    bench('WASM', async () => {
-      await wasmTracer!.trace('test', async (ctx) => ctx.ok('done'));
-      wasmTracer!.clear();
-    });
+    if (wasmTracer) {
+      bench('WASM', async () => {
+        await wasmTracer!.trace('test', async (ctx) => ctx.ok('done'));
+        wasmTracer!.clear();
+      });
+    }
   });
 });
 
@@ -102,18 +104,20 @@ summary(() => {
       jsTracer.clear();
     });
 
-    bench('WASM', async () => {
-      await wasmTracer!.trace('test', async (ctx) => {
-        ctx.tag.userId('user-123');
-        ctx.tag.requestId('req-456');
-        ctx.tag.latency(42.5);
-        ctx.tag.statusCode(200);
-        ctx.tag.success(true);
-        ctx.tag.operation('READ');
-        return ctx.ok('done');
+    if (wasmTracer) {
+      bench('WASM', async () => {
+        await wasmTracer!.trace('test', async (ctx) => {
+          ctx.tag.userId('user-123');
+          ctx.tag.requestId('req-456');
+          ctx.tag.latency(42.5);
+          ctx.tag.statusCode(200);
+          ctx.tag.success(true);
+          ctx.tag.operation('READ');
+          return ctx.ok('done');
+        });
+        wasmTracer!.clear();
       });
-      wasmTracer!.clear();
-    });
+    }
   });
 });
 
@@ -132,18 +136,20 @@ summary(() => {
       jsTracer.clear();
     });
 
-    bench('WASM', async () => {
-      await wasmTracer!.trace('level1', async (ctx) => {
-        await ctx.span('level2', async (ctx2) => {
-          await ctx2.span('level3', async (ctx3) => {
-            return ctx3.ok('done');
+    if (wasmTracer) {
+      bench('WASM', async () => {
+        await wasmTracer!.trace('level1', async (ctx) => {
+          await ctx.span('level2', async (ctx2) => {
+            await ctx2.span('level3', async (ctx3) => {
+              return ctx3.ok('done');
+            });
+            return ctx2.ok('done');
           });
-          return ctx2.ok('done');
+          return ctx.ok('done');
         });
-        return ctx.ok('done');
+        wasmTracer!.clear();
       });
-      wasmTracer!.clear();
-    });
+    }
   });
 });
 
@@ -159,15 +165,17 @@ summary(() => {
       jsTracer.clear();
     });
 
-    bench('WASM', async () => {
-      await wasmTracer!.trace('test', async (ctx) => {
-        for (let i = 0; i < 50; i++) {
-          ctx.log.info(`message ${i}`);
-        }
-        return ctx.ok('done');
+    if (wasmTracer) {
+      bench('WASM', async () => {
+        await wasmTracer!.trace('test', async (ctx) => {
+          for (let i = 0; i < 50; i++) {
+            ctx.log.info(`message ${i}`);
+          }
+          return ctx.ok('done');
+        });
+        wasmTracer!.clear();
       });
-      wasmTracer!.clear();
-    });
+    }
   });
 });
 
@@ -180,13 +188,15 @@ summary(() => {
       jsTracer.clear();
     });
 
-    bench('WASM', async () => {
-      for (let i = 0; i < 100; i++) {
-        await wasmTracer!.trace('test', async (ctx) => ctx.ok('done'));
-      }
-      wasmTracer!.clear();
-      wasmStrategy!.reset();
-    });
+    if (wasmTracer && wasmStrategy) {
+      bench('WASM', async () => {
+        for (let i = 0; i < 100; i++) {
+          await wasmTracer!.trace('test', async (ctx) => ctx.ok('done'));
+        }
+        wasmTracer!.clear();
+        wasmStrategy!.reset();
+      });
+    }
   });
 });
 
@@ -208,21 +218,23 @@ summary(() => {
       jsTracer.clear();
     });
 
-    bench('WASM', async () => {
-      await wasmTracer!.trace('parent', async (ctx) => {
-        ctx.tag.userId('user-123');
-        ctx.tag.operation('CREATE');
+    if (wasmTracer) {
+      bench('WASM', async () => {
+        await wasmTracer!.trace('parent', async (ctx) => {
+          ctx.tag.userId('user-123');
+          ctx.tag.operation('CREATE');
 
-        await ctx.span('child', async (ctx2) => {
-          ctx2.tag.latency(15.5);
-          ctx2.tag.statusCode(201);
-          return ctx2.ok('created');
+          await ctx.span('child', async (ctx2) => {
+            ctx2.tag.latency(15.5);
+            ctx2.tag.statusCode(201);
+            return ctx2.ok('created');
+          });
+
+          return ctx.ok('done');
         });
-
-        return ctx.ok('done');
+        wasmTracer!.clear();
       });
-      wasmTracer!.clear();
-    });
+    }
   });
 });
 
@@ -234,8 +246,12 @@ await setup();
 
 console.log('JS vs WASM Buffer Strategy Benchmark\n');
 console.log('Setup:');
-console.log('  - JS: JsBufferStrategy (GC-managed TypedArrays)');
-console.log('  - WASM: WasmBufferStrategy (freelist allocation, capacity=64)');
+console.log('  - JS: JsBufferStrategy (GC-managed TypedArrays, capacity=64)');
+if (wasmStrategy) {
+  console.log('  - WASM: WasmBufferStrategy (freelist allocation, capacity=64)');
+} else {
+  console.log('  - WASM: DISABLED (initialization failed - see warning above)');
+}
 console.log('  - Schema: 6 columns (2 category, 2 number, 1 boolean, 1 enum)');
 console.log('');
 
