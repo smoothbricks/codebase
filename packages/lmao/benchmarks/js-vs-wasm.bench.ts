@@ -1,12 +1,20 @@
 /**
  * Benchmark comparing JS (JsBufferStrategy) vs WASM (WasmBufferStrategy) performance.
  *
- * This benchmark measures:
- * 1. Simple trace throughput - baseline trace creation
- * 2. Trace with tags - impact of column writes
- * 3. Nested spans - child span overhead
- * 4. Multiple log entries - log write throughput
- * 5. Memory reuse - freelist efficiency over many traces
+ * This benchmark measures two scenarios:
+ *
+ * **Cold start** - Initialization cost (realistic for Lambda, short-lived processes, first trace):
+ *   - Simple trace throughput
+ *   - Trace with tags - impact of column writes
+ *   - Multiple log entries - log write throughput
+ *
+ * **Warm/steady-state** - Reuse performance (realistic for long-running services, high-throughput APIs):
+ *   - Simple trace throughput
+ *   - Trace with tags - impact of column writes
+ *   - Nested spans - child span overhead
+ *   - Multiple log entries - log write throughput
+ *   - Memory reuse - freelist efficiency over many traces
+ *   - Trace with tags + nested spans - combined overhead
  *
  * Run with: bun run benchmarks/js-vs-wasm.bench.ts
  */
@@ -74,7 +82,7 @@ async function setup() {
 // =============================================================================
 
 summary(() => {
-  group('Simple trace', () => {
+  group('Warm: Simple trace', () => {
     bench('JS', async () => {
       await jsTracer.trace('test', async (ctx) => ctx.ok('done'));
       jsTracer.clear();
@@ -90,7 +98,7 @@ summary(() => {
 });
 
 summary(() => {
-  group('Trace with tags (6 columns)', () => {
+  group('Warm: Trace with tags (6 columns)', () => {
     bench('JS', async () => {
       await jsTracer.trace('test', async (ctx) => {
         ctx.tag.userId('user-123');
@@ -122,7 +130,7 @@ summary(() => {
 });
 
 summary(() => {
-  group('Nested spans (3 levels)', () => {
+  group('Warm: Nested spans (3 levels)', () => {
     bench('JS', async () => {
       await jsTracer.trace('level1', async (ctx) => {
         await ctx.span('level2', async (ctx2) => {
@@ -154,7 +162,7 @@ summary(() => {
 });
 
 summary(() => {
-  group('Multiple log entries (50)', () => {
+  group('Warm: Multiple log entries (50)', () => {
     bench('JS', async () => {
       await jsTracer.trace('test', async (ctx) => {
         for (let i = 0; i < 50; i++) {
@@ -201,7 +209,7 @@ summary(() => {
 });
 
 summary(() => {
-  group('Trace with tags + nested spans', () => {
+  group('Warm: Trace with tags + nested spans', () => {
     bench('JS', async () => {
       await jsTracer.trace('parent', async (ctx) => {
         ctx.tag.userId('user-123');
@@ -235,6 +243,97 @@ summary(() => {
         wasmTracer!.clear();
       });
     }
+  });
+});
+
+summary(() => {
+  group('Cold start: Simple trace', () => {
+    bench('JS', async () => {
+      // Create fresh tracer each iteration
+      const tracer = new TestTracer(opContext, {
+        bufferStrategy: new JsBufferStrategy<SchemaType>({ capacity: 8 }),
+        createTraceRoot,
+      });
+      await tracer.trace('test', async (ctx) => ctx.ok('done'));
+    });
+
+    bench('WASM', async () => {
+      // Create fresh strategy + tracer each iteration
+      const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
+      const tracer = new TestTracer(opContext, {
+        bufferStrategy: strategy,
+        createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+      });
+      await tracer.trace('test', async (ctx) => ctx.ok('done'));
+    });
+  });
+});
+
+summary(() => {
+  group('Cold start: Trace with tags (6 columns)', () => {
+    bench('JS', async () => {
+      const tracer = new TestTracer(opContext, {
+        bufferStrategy: new JsBufferStrategy<SchemaType>({ capacity: 8 }),
+        createTraceRoot,
+      });
+      await tracer.trace('test', async (ctx) => {
+        ctx.tag.userId('user-123');
+        ctx.tag.requestId('req-456');
+        ctx.tag.latency(42.5);
+        ctx.tag.statusCode(200);
+        ctx.tag.success(true);
+        ctx.tag.operation('READ');
+        return ctx.ok('done');
+      });
+    });
+
+    bench('WASM', async () => {
+      const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
+      const tracer = new TestTracer(opContext, {
+        bufferStrategy: strategy,
+        createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+      });
+      await tracer.trace('test', async (ctx) => {
+        ctx.tag.userId('user-123');
+        ctx.tag.requestId('req-456');
+        ctx.tag.latency(42.5);
+        ctx.tag.statusCode(200);
+        ctx.tag.success(true);
+        ctx.tag.operation('READ');
+        return ctx.ok('done');
+      });
+    });
+  });
+});
+
+summary(() => {
+  group('Cold start: Multiple log entries (50)', () => {
+    bench('JS', async () => {
+      const tracer = new TestTracer(opContext, {
+        bufferStrategy: new JsBufferStrategy<SchemaType>({ capacity: 8 }),
+        createTraceRoot,
+      });
+      await tracer.trace('test', async (ctx) => {
+        for (let i = 0; i < 50; i++) {
+          ctx.log.info(`message ${i}`);
+        }
+        return ctx.ok('done');
+      });
+    });
+
+    bench('WASM', async () => {
+      const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
+      const tracer = new TestTracer(opContext, {
+        bufferStrategy: strategy,
+        createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+      });
+      await tracer.trace('test', async (ctx) => {
+        for (let i = 0; i < 50; i++) {
+          ctx.log.info(`message ${i}`);
+        }
+        return ctx.ok('done');
+      });
+    });
   });
 });
 
