@@ -387,7 +387,7 @@ function generateNumericSetter(col: ColumnMeta): string {
     // Eager: column is pre-allocated, just write value
     return `${col.name}(idx, value) {
     const ptr = this._columnPtrs[${col.columnIndex}];
-    this._allocator.${writeMethod}(ptr, idx, value);
+    this._${writeMethod}(ptr, idx, value, this._capacity);
     return this;
   }`;
   }
@@ -399,7 +399,7 @@ function generateNumericSetter(col: ColumnMeta): string {
       ptr = this._allocator.${allocMethod}();
       this._columnPtrs[${col.columnIndex}] = ptr;
     }
-    this._allocator.${writeMethod}(ptr, idx, value);
+    this._${writeMethod}(ptr, idx, value, this._capacity);
     return this;
   }`;
 }
