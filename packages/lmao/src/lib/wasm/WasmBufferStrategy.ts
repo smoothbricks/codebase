@@ -123,35 +123,36 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     // Use provided schema (for cross-library calls) or parent's schema
     const childSchema = schema ?? (parentBuffer._logSchema as T);
 
-    const child = createWasmChildSpanBuffer(wasmParent, {
-      allocator: this.allocator,
-      capacity: effectiveCapacity,
-      thread_id: 0n, // Will be read from WASM header
-      span_id: 0, // Will be assigned by WASM allocator
-      schema: childSchema, // Pass schema for correct buffer class
-    });
+    const child = createWasmChildSpanBuffer(
+      wasmParent,
+      {
+        allocator: this.allocator,
+        capacity: effectiveCapacity,
+        thread_id: 0n, // Will be read from WASM header
+        span_id: 0, // Will be assigned by WASM allocator
+        schema: childSchema, // Pass schema for correct buffer class
+      },
+      parentBuffer._traceRoot, // _traceRoot (inherit from parent)
+      parentBuffer._scopeValues, // _scopeValues (inherit from parent)
+      opMetadata, // _opMetadata
+      callsiteMetadata, // _callsiteMetadata
+    );
 
-    // Set runtime properties needed by Tracer
     const childBuffer = child as unknown as SpanBuffer<T>;
-    childBuffer._traceRoot = parentBuffer._traceRoot;
-    childBuffer._opMetadata = opMetadata;
-    childBuffer._callsiteMetadata = callsiteMetadata;
-    childBuffer._scopeValues = parentBuffer._scopeValues; // Inherit from parent
-
     return childBuffer;
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
     const wasmBuffer = buffer as unknown as WasmSpanBufferInstance;
-    const overflow = createWasmOverflowBuffer(wasmBuffer);
+    const overflow = createWasmOverflowBuffer(
+      wasmBuffer,
+      buffer._traceRoot, // _traceRoot (same as original)
+      buffer._scopeValues, // _scopeValues (same as original)
+      buffer._opMetadata, // _opMetadata (same as original)
+      buffer._callsiteMetadata ?? buffer._opMetadata, // _callsiteMetadata (same as original, fallback to opMetadata)
+    );
 
-    // Set runtime properties from original buffer
     const overflowBuffer = overflow as unknown as SpanBuffer<T>;
-    overflowBuffer._traceRoot = buffer._traceRoot;
-    overflowBuffer._opMetadata = buffer._opMetadata;
-    overflowBuffer._callsiteMetadata = buffer._callsiteMetadata;
-    overflowBuffer._scopeValues = buffer._scopeValues;
-
     return overflowBuffer;
   }
 
