@@ -257,15 +257,17 @@ summary(() => {
       await tracer.trace('test', async (ctx) => ctx.ok('done'));
     });
 
-    bench('WASM', async () => {
-      // Create fresh strategy + tracer each iteration
-      const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
-      const tracer = new TestTracer(opContext, {
-        bufferStrategy: strategy,
-        createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+    if (wasmStrategy) {
+      bench('WASM', async () => {
+        // Create fresh strategy + tracer each iteration
+        const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
+        const tracer = new TestTracer(opContext, {
+          bufferStrategy: strategy,
+          createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+        });
+        await tracer.trace('test', async (ctx) => ctx.ok('done'));
       });
-      await tracer.trace('test', async (ctx) => ctx.ok('done'));
-    });
+    }
   });
 });
 
@@ -287,22 +289,24 @@ summary(() => {
       });
     });
 
-    bench('WASM', async () => {
-      const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
-      const tracer = new TestTracer(opContext, {
-        bufferStrategy: strategy,
-        createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+    if (wasmStrategy) {
+      bench('WASM', async () => {
+        const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
+        const tracer = new TestTracer(opContext, {
+          bufferStrategy: strategy,
+          createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+        });
+        await tracer.trace('test', async (ctx) => {
+          ctx.tag.userId('user-123');
+          ctx.tag.requestId('req-456');
+          ctx.tag.latency(42.5);
+          ctx.tag.statusCode(200);
+          ctx.tag.success(true);
+          ctx.tag.operation('READ');
+          return ctx.ok('done');
+        });
       });
-      await tracer.trace('test', async (ctx) => {
-        ctx.tag.userId('user-123');
-        ctx.tag.requestId('req-456');
-        ctx.tag.latency(42.5);
-        ctx.tag.statusCode(200);
-        ctx.tag.success(true);
-        ctx.tag.operation('READ');
-        return ctx.ok('done');
-      });
-    });
+    }
   });
 });
 
@@ -321,19 +325,21 @@ summary(() => {
       });
     });
 
-    bench('WASM', async () => {
-      const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
-      const tracer = new TestTracer(opContext, {
-        bufferStrategy: strategy,
-        createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+    if (wasmStrategy) {
+      bench('WASM', async () => {
+        const strategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
+        const tracer = new TestTracer(opContext, {
+          bufferStrategy: strategy,
+          createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+        });
+        await tracer.trace('test', async (ctx) => {
+          for (let i = 0; i < 50; i++) {
+            ctx.log.info(`message ${i}`);
+          }
+          return ctx.ok('done');
+        });
       });
-      await tracer.trace('test', async (ctx) => {
-        for (let i = 0; i < 50; i++) {
-          ctx.log.info(`message ${i}`);
-        }
-        return ctx.ok('done');
-      });
-    });
+    }
   });
 });
 
