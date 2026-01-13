@@ -223,7 +223,8 @@ function createViews(memory: WebAssembly.Memory) {
  */
 function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Memory, capacity: number): WasmAllocator {
   const exports = instance.exports as unknown as WasmExports;
-  const views = createViews(memory);
+  let views = createViews(memory);
+  let currentBuffer = memory.buffer;
 
   // Initialize the allocator header
   exports.init();
@@ -233,15 +234,32 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     capacity,
 
     get u8() {
+      // Check if memory grew since last access
+      if (memory.buffer !== currentBuffer) {
+        currentBuffer = memory.buffer;
+        views = createViews(memory);
+      }
       return views.u8;
     },
     get u32() {
+      if (memory.buffer !== currentBuffer) {
+        currentBuffer = memory.buffer;
+        views = createViews(memory);
+      }
       return views.u32;
     },
     get i64() {
+      if (memory.buffer !== currentBuffer) {
+        currentBuffer = memory.buffer;
+        views = createViews(memory);
+      }
       return views.i64;
     },
     get f64() {
+      if (memory.buffer !== currentBuffer) {
+        currentBuffer = memory.buffer;
+        views = createViews(memory);
+      }
       return views.f64;
     },
 
