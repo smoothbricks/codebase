@@ -40,10 +40,9 @@ export { isSpanContext, SPAN_CONTEXT_MARKER } from './lib/spanContext.js';
 // =============================================================================
 
 export {
-  ENTRY_TYPE_BUFFER_CREATED,
-  ENTRY_TYPE_BUFFER_OVERFLOW_WRITES,
-  ENTRY_TYPE_BUFFER_OVERFLOWS,
-  // Buffer metrics
+  // Buffer metrics (utilization-based capacity tuning)
+  ENTRY_TYPE_BUFFER_CAPACITY,
+  ENTRY_TYPE_BUFFER_SPANS,
   ENTRY_TYPE_BUFFER_WRITES,
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,

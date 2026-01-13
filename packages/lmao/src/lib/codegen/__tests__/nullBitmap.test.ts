@@ -39,11 +39,6 @@ function createTestBufferWithCapacity(schema: LogSchema, capacity: number): AnyS
   return createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
 }
 
-/**
- * Mock createNextBuffer that just returns the same buffer (for tests that don't need overflow)
- */
-const mockCreateNextBuffer = (buffer: AnySpanBuffer): AnySpanBuffer => buffer;
-
 describe('null bitmap correctness', () => {
   describe('immutable scope semantics', () => {
     it('should store scope values in buffer._scopeValues as frozen object', () => {
@@ -53,7 +48,7 @@ describe('null bitmap correctness', () => {
       const buffer = createTestBuffer(schema);
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer);
 
       // _setScope should store values in buffer._scopeValues (not fill buffer columns)
       logger._setScope({ requestId: 'req-123' });
@@ -74,7 +69,7 @@ describe('null bitmap correctness', () => {
       const buffer = createTestBuffer(schema);
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer);
 
       // First setScope call
       logger._setScope({ requestId: 'req-123' });
@@ -106,7 +101,7 @@ describe('null bitmap correctness', () => {
       const buffer = createTestBuffer(schema);
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer);
 
       // Set initial values
       logger._setScope({ requestId: 'req-123', userId: 'user-456' });
@@ -128,7 +123,7 @@ describe('null bitmap correctness', () => {
       const buffer = createTestBuffer(schema);
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer);
 
       // _setScope should NOT fill buffer columns
       logger._setScope({ requestId: 'req-123' });
@@ -157,7 +152,7 @@ describe('null bitmap correctness', () => {
       buffer._scopeValues = Object.freeze({ requestId: 'req-123' });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer);
 
       // Set _writeIndex to 4 so nextRow() makes it 5
       logger._writeIndex = 4;
@@ -188,7 +183,7 @@ describe('null bitmap correctness', () => {
       buffer._scopeValues = Object.freeze({ requestId: 'req-456' });
 
       const SpanLoggerClass = createSpanLoggerClass(schema);
-      const logger = new SpanLoggerClass(buffer, mockCreateNextBuffer);
+      const logger = new SpanLoggerClass(buffer);
 
       // Set _writeIndex to 8 so nextRow() makes it 9
       logger._writeIndex = 8;

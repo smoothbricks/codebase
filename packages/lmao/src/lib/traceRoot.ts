@@ -30,6 +30,22 @@ export interface TracerLifecycleHooks {
   onSpanStart(buffer: unknown): void;
   onSpanEnd(buffer: unknown): void;
   onStatsWillResetFor(buffer: unknown): void;
+
+  /**
+   * Buffer strategy for creating child and overflow buffers.
+   * SpanContext uses this to create child spans with the correct strategy (JS or WASM).
+   * Note: Caller must call writeSpanStart() after createChildSpanBuffer() to set span name.
+   */
+  readonly bufferStrategy: {
+    createChildSpanBuffer(
+      parentBuffer: AnySpanBuffer,
+      callsiteMetadata: unknown,
+      opMetadata: unknown,
+      capacity?: number,
+      schema?: unknown,
+    ): AnySpanBuffer;
+    createOverflowBuffer(buffer: AnySpanBuffer): AnySpanBuffer;
+  };
 }
 
 /**
@@ -127,12 +143,12 @@ export interface ITraceRoot {
   writeSpanEnd(buffer: AnySpanBuffer, entryType: number): void;
 
   /**
-   * Write log entry timestamp and entry_type at the given index.
-   * Used by SpanLogger for info/debug/warn/error/trace/ff entries.
+   * Write log entry: bump writeIndex, write timestamp + entry_type, return idx.
+   * SpanLogger uses returned idx for string column writes.
    *
    * @param buffer - SpanBuffer to write to
-   * @param idx - Row index to write at
    * @param entryType - Entry type (INFO, DEBUG, WARN, ERROR, TRACE, FF_ACCESS, FF_USAGE)
+   * @returns The row index where entry was written
    */
-  writeLogEntry(buffer: AnySpanBuffer, idx: number, entryType: number): void;
+  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number;
 }

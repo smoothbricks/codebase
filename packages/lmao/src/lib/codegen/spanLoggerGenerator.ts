@@ -22,7 +22,6 @@ import {
   type ColumnWriterExtension,
   getColumnWriterClass,
 } from '@smoothbricks/arrow-builder';
-import { trackOverflowAndTune } from '../capacityTuning.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_ERROR,
@@ -34,7 +33,7 @@ import {
 } from '../schema/systemSchema.js';
 import { getEnumValues, getSchemaType } from '../schema/typeGuards.js';
 import type { InferSchema, LogSchema } from '../schema/types.js';
-import { createOverflowBuffer as createOverflowSpanBuffer } from '../spanBuffer.js';
+
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
 // =============================================================================
@@ -48,12 +47,10 @@ import type { AnySpanBuffer, SpanBuffer } from '../types.js';
  * Singleton - same object shared by all generated SpanLogger classes.
  */
 export const SPAN_LOGGER_HELPERS: {
-  trackOverflowAndTune: typeof trackOverflowAndTune;
   setNullBit: (bitmap: Uint8Array, idx: number) => void;
   fillNullBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number) => void;
   fillBooleanBitmapRange: (bitmap: Uint8Array, startIdx: number, endIdx: number, value: boolean) => void;
 } = {
-  trackOverflowAndTune,
   setNullBit: (bitmap: Uint8Array, idx: number) => {
     bitmap[idx >>> 3] |= 1 << (idx & 7);
   },
@@ -290,7 +287,11 @@ function generateSetScopeMethod(): string {
 }
 
 /**
- * Generate _prefillScopedAttributes() method - UNROLLED per-column with BULK null bitmap fill
+ * Generate _prefillScopedAttributesOn(buffer) method - UNROLLED per-column with BULK null bitmap fill
+ *
+ * Takes buffer as argument instead of using this._buffer. This avoids the convoluted
+ * pattern of temporarily switching this._buffer for prefill then switching back.
+ * Called by _checkOverflow after getting overflow buffer.
  */
 function generatePrefillScopedAttributesMethod(
   schemaFields: readonly ColumnEntry[],
@@ -304,10 +305,10 @@ function generatePrefillScopedAttributesMethod(
     if (lmaoType === 'boolean') {
       return `
       {
-        const scopeValue = this._buffer._scopeValues?.${fieldName};
-        if (scopeValue !== null && scopeValue !== undefined) {
-          helpers.fillBooleanBitmapRange(this._buffer.${columnName}_values, startIdx, endIdx, scopeValue);
-          helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
+        const scopeValue = buffer._scopeValues?.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined && buffer._${columnName}_values !== undefined) {
+          helpers.fillBooleanBitmapRange(buffer.${columnName}_values, startIdx, endIdx, scopeValue);
+          helpers.fillNullBitmapRange(buffer.${columnName}_nulls, startIdx, endIdx);
         }
       }`;
     }
@@ -322,31 +323,34 @@ function generatePrefillScopedAttributesMethod(
     if (lmaoType === 'category' || lmaoType === 'text') {
       return `
       {
-        const scopeValue = this._buffer._scopeValues?.${fieldName};
-        if (scopeValue !== null && scopeValue !== undefined) {
-          const values = this._buffer.${columnName}_values;
+        const scopeValue = buffer._scopeValues?.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined && buffer._${columnName}_values !== undefined) {
+          const values = buffer.${columnName}_values;
           for (let i = startIdx; i < endIdx; i++) {
             values[i] = scopeValue;
           }
-          helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
+          helpers.fillNullBitmapRange(buffer.${columnName}_nulls, startIdx, endIdx);
         }
       }`;
     }
 
     return `
       {
-        const scopeValue = this._buffer._scopeValues?.${fieldName};
-        if (scopeValue !== null && scopeValue !== undefined) {
-          this._buffer.${columnName}_values.fill(${valueExpr}, startIdx, endIdx);
-          helpers.fillNullBitmapRange(this._buffer.${columnName}_nulls, startIdx, endIdx);
+        const scopeValue = buffer._scopeValues?.${fieldName};
+        if (scopeValue !== null && scopeValue !== undefined && buffer._${columnName}_values !== undefined) {
+          buffer.${columnName}_values.fill(${valueExpr}, startIdx, endIdx);
+          helpers.fillNullBitmapRange(buffer.${columnName}_nulls, startIdx, endIdx);
         }
       }`;
   });
 
+  // Initial buffer: rows 0-1 reserved for span-start/end, data starts at _writeIndex=2
+  // Overflow buffer: no reserved rows, data starts at _writeIndex=0
+  // Use buffer._writeIndex as startIdx to handle both cases correctly
   return `
-    _prefillScopedAttributes() {
-      const startIdx = this._writeIndex + 1;
-      const endIdx = this._buffer._capacity;
+    _prefillScopedAttributesOn(buffer) {
+      const startIdx = buffer._writeIndex;
+      const endIdx = buffer._capacity;
       ${columnFills.join('\n')}
     }`;
 }
@@ -377,7 +381,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
   const enumFluentSetters = generateEnumFluentSetters(enumFieldNames);
 
   return {
-    constructorParams: 'createOverflowBuffer',
+    constructorParams: '',
 
     // Entry type constants (inlined from lmao.ts)
     preamble: `
@@ -398,61 +402,28 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     constructorCode: `
       this._writeIndex = 1;
       this._buffer._writeIndex = 2;
-      this._createOverflowBuffer = createOverflowBuffer;
-      this._inOverflow = false;
 `,
 
-    // Override _getNextBuffer to create new SpanBuffer on overflow.
-    // Called by _nextRow() when buffer is full.
-    // Track overflow and check if capacity should be tuned (per specs/01b2_buffer_self_tuning.md)
-    // This happens on overflow to adapt quickly to workload changes
-    // Link the chain
-    // Pre-fill new buffer with scoped attributes
+    // Check for overflow before writing, switch to overflow buffer if needed.
+    // Overflow when _writeIndex >= capacity (buffer is full, no room for this write).
+    // Buffer.getOrCreateOverflow() handles: stats notification, capacity tuning, buffer creation.
+    // We just need to switch this._buffer and prefill scope on the new buffer.
     methods:
-      `
-    _getNextBuffer() {
-      const oldBuffer = this._buffer;
-      const stats = oldBuffer.constructor.stats;
-      // Notify tracer before stats reset (tracer captures for observability)
-      oldBuffer._traceRoot.tracer.onStatsWillResetFor(oldBuffer);
-      helpers.trackOverflowAndTune(stats);
-      this._inOverflow = true;
-      const overflowBuffer = this._createOverflowBuffer(oldBuffer);
-      oldBuffer._overflow = overflowBuffer;
-      this._buffer = overflowBuffer;
-      this._prefillScopedAttributes();
-      this._buffer = oldBuffer;
-      return overflowBuffer;
-    }
-
-    ` +
-      // Override _nextRow to sync buffer's writeIndex for Arrow conversion.
-      // Check overflow BEFORE incrementing
-      // Sync buffer writeIndex for new buffer
-      // Sync buffer's writeIndex - Arrow conversion uses this
-      `_nextRow() {
-      if (this._writeIndex >= this._buffer._capacity - 1) {
-        this._buffer = this._getNextBuffer();
-        this._writeIndex = -1;
-        this._buffer._writeIndex = 0;
+      `_checkOverflow() {
+      if (this._buffer._writeIndex >= this._buffer._capacity) {
+        this._buffer = this._buffer.getOrCreateOverflow();
+        this._prefillScopedAttributesOn(this._buffer);
       }
-      this._writeIndex++;
-      this._buffer._writeIndex = this._writeIndex + 1;
-      return this;
     }
 
     ` +
       // Write an info log entry.
-      // Advances to next row, writes system columns, returns this for fluent chaining.
-      // Write system columns
-      // Write message to unified message column (log message template)
-      // For eager columns (like message), there's no null bitmap - the column is always present
-      // NOTE: Scope values are NOT written here - they are filled at Arrow conversion time
-      // Track write for capacity tuning (per specs/01b2_buffer_self_tuning.md)
+      // writeLogEntry bumps buffer._writeIndex, writes timestamp+entry_type, returns idx.
+      // We sync this._writeIndex so fluent setters write at correct row.
       `info(message) {
-      this._nextRow();
-      const idx = this._writeIndex;
-      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_INFO);
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_INFO);
+      this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -460,18 +431,15 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         }
       }
       this._buffer.constructor.stats.totalWrites++;
-      if (this._inOverflow) {
-        this._buffer.constructor.stats.overflowWrites++;
-      }
       return this;
     }
 
     ` +
       // Write a debug log entry.
       `debug(message) {
-      this._nextRow();
-      const idx = this._writeIndex;
-      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_DEBUG);
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_DEBUG);
+      this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -479,18 +447,15 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         }
       }
       this._buffer.constructor.stats.totalWrites++;
-      if (this._inOverflow) {
-        this._buffer.constructor.stats.overflowWrites++;
-      }
       return this;
     }
 
     ` +
       // Write a warn log entry.
       `warn(message) {
-      this._nextRow();
-      const idx = this._writeIndex;
-      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_WARN);
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_WARN);
+      this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -498,18 +463,15 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         }
       }
       this._buffer.constructor.stats.totalWrites++;
-      if (this._inOverflow) {
-        this._buffer.constructor.stats.overflowWrites++;
-      }
       return this;
     }
 
     ` +
       // Write an error log entry.
       `error(message) {
-      this._nextRow();
-      const idx = this._writeIndex;
-      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_ERROR);
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_ERROR);
+      this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -517,18 +479,15 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         }
       }
       this._buffer.constructor.stats.totalWrites++;
-      if (this._inOverflow) {
-        this._buffer.constructor.stats.overflowWrites++;
-      }
       return this;
     }
 
     ` +
       // Write a trace log entry.
       `trace(message) {
-      this._nextRow();
-      const idx = this._writeIndex;
-      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_TRACE);
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_TRACE);
+      this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = message;
         if (this._buffer.message_nulls) {
@@ -536,9 +495,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         }
       }
       this._buffer.constructor.stats.totalWrites++;
-      if (this._inOverflow) {
-        this._buffer.constructor.stats.overflowWrites++;
-      }
       return this;
     }
 
@@ -546,9 +502,9 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Write a feature flag access entry (internal method, not on public type).
       // Called by FeatureFlagEvaluator to log flag access.
       `ffAccess(flagName, value) {
-      this._nextRow();
-      const idx = this._writeIndex;
-      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_FF_ACCESS);
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_FF_ACCESS);
+      this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
         if (this._buffer.message_nulls) {
@@ -563,18 +519,15 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
         }
       }
       this._buffer.constructor.stats.totalWrites++;
-      if (this._inOverflow) {
-        this._buffer.constructor.stats.overflowWrites++;
-      }
     }
 
     ` +
       // Write a feature flag usage entry (internal method, not on public type).
       // Called by FeatureFlagEvaluator to log flag usage.
       `ffUsage(flagName, context) {
-      this._nextRow();
-      const idx = this._writeIndex;
-      this._buffer._traceRoot.writeLogEntry(this._buffer, idx, ENTRY_TYPE_FF_USAGE);
+      this._checkOverflow();
+      const idx = this._buffer._traceRoot.writeLogEntry(this._buffer, ENTRY_TYPE_FF_USAGE);
+      this._writeIndex = idx;
       if (this._buffer.message_values) {
         this._buffer.message_values[idx] = flagName;
         if (this._buffer.message_nulls) {
@@ -584,9 +537,6 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
       // Context attributes can be written to user schema columns if provided
       // For now, just log the flag name - context can be added later if needed
       this._buffer.constructor.stats.totalWrites++;
-      if (this._inOverflow) {
-        this._buffer.constructor.stats.overflowWrites++;
-      }
     }
 
     ` +
@@ -673,13 +623,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 /**
  * Cache for generated SpanLogger classes per schema.
  */
-const spanLoggerClassCache = new WeakMap<
-  LogSchema,
-  new (
-    buffer: AnySpanBuffer,
-    createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-  ) => SpanLoggerImpl<LogSchema>
->();
+const spanLoggerClassCache = new WeakMap<LogSchema, new (buffer: AnySpanBuffer) => SpanLoggerImpl<LogSchema>>();
 
 /**
  * Create SpanLogger class constructor from schema.
@@ -696,7 +640,6 @@ export function createSpanLoggerClass<T extends LogSchema>(
   schema: T,
 ): new (
   buffer: AnySpanBuffer,
-  createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
 ) => SpanLoggerImpl<T> {
   // Check cache first
   let SpanLoggerClass = spanLoggerClassCache.get(schema);
@@ -707,17 +650,13 @@ export function createSpanLoggerClass<T extends LogSchema>(
     // Use arrow-builder's getColumnWriterClass with our extension
     const WriterClass = getColumnWriterClass(schema, extension);
 
-    SpanLoggerClass = WriterClass as unknown as new (
-      buffer: AnySpanBuffer,
-      createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-    ) => SpanLoggerImpl<LogSchema>;
+    SpanLoggerClass = WriterClass as unknown as new (buffer: AnySpanBuffer) => SpanLoggerImpl<LogSchema>;
 
     spanLoggerClassCache.set(schema, SpanLoggerClass);
   }
 
   return SpanLoggerClass as new (
     buffer: AnySpanBuffer,
-    createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
   ) => SpanLoggerImpl<T>;
 }
 
@@ -726,15 +665,8 @@ export function createSpanLoggerClass<T extends LogSchema>(
  *
  * @param schema - Tag attribute schema
  * @param buffer - SpanBuffer to write to
- * @param createOverflowBuffer - Function to create overflow buffer on overflow (defaults to createOverflowSpanBuffer)
  */
-export function createSpanLogger<T extends LogSchema>(
-  schema: T,
-  buffer: SpanBuffer<T>,
-  createOverflowBuffer: (buffer: SpanBuffer<T>) => SpanBuffer<T> = createOverflowSpanBuffer as unknown as (
-    buffer: SpanBuffer<T>,
-  ) => SpanBuffer<T>,
-): SpanLoggerImpl<T> {
+export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
   const SpanLoggerClass = createSpanLoggerClass(schema);
-  return new SpanLoggerClass(buffer, createOverflowBuffer as unknown as (buffer: AnySpanBuffer) => AnySpanBuffer);
+  return new SpanLoggerClass(buffer);
 }

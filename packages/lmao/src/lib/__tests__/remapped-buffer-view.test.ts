@@ -51,7 +51,6 @@ describe('generateRemappedBufferViewClass', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: { name: 'test-module' },
-        _spanName: 'test-span',
         getColumnIfAllocated: (name: string) => mockBuffer[`${name}_values` as keyof typeof mockBuffer],
         getNullsIfAllocated: (name: string) => mockBuffer[`${name}_nulls` as keyof typeof mockBuffer],
       } as unknown as AnySpanBuffer;
@@ -105,7 +104,6 @@ describe('generateRemappedBufferViewClass', () => {
         parent_span_id: 41,
         _identity: new Uint8Array(32),
         _logBinding: { name: 'test-module' },
-        _spanName: 'test-span',
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
@@ -177,7 +175,7 @@ describe('generateRemappedBufferViewClass', () => {
       const view = new ViewClass(buffer);
 
       // The underlying buffer is accessible via _buffer
-      expect((view as unknown as { _buffer: AnySpanBuffer })._buffer._spanName).toBe(buffer._spanName);
+      expect((view as unknown as { _buffer: AnySpanBuffer })._buffer).toBe(buffer);
     });
   });
 
@@ -204,7 +202,6 @@ describe('generateRemappedBufferViewClass', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         status_values: statusValues, // unprefixed column
         method_values: methodValues, // unprefixed column
         getColumnIfAllocated(name: string) {
@@ -242,7 +239,6 @@ describe('generateRemappedBufferViewClass', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         status_nulls: statusNulls,
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -278,7 +274,6 @@ describe('generateRemappedBufferViewClass', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         userId_values: userIdValues,
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -312,7 +307,6 @@ describe('generateRemappedBufferViewClass', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         getColumnIfAllocated() {
           return undefined;
         },
@@ -372,7 +366,6 @@ describe('generateRemappedBufferViewClass', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         status_values: statusValues,
         method_values: methodValues,
         getColumnIfAllocated(name: string) {
@@ -626,7 +619,6 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         parent_span_id: 1,
         _identity: new Uint8Array(32),
         _logBinding: { name: 'child-module' },
-        _spanName: 'child-task',
         status_values: new Float64Array([404]),
         status_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -655,7 +647,6 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: { name: 'parent-module' },
-        _spanName: 'parent-task',
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
         },
@@ -702,7 +693,6 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         parent_span_id: 2,
         _identity: new Uint8Array(32),
         _logBinding: { name: 'db-module' },
-        _spanName: 'db-task',
         query_values: ['SELECT * FROM users'],
         query_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -730,7 +720,6 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         parent_span_id: 1,
         _identity: new Uint8Array(32),
         _logBinding: { name: 'http-module' },
-        _spanName: 'http-task',
         status_values: new Float64Array([200]),
         status_nulls: new Uint8Array([0b01]),
         getColumnIfAllocated(name: string) {
@@ -781,7 +770,6 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         status_values: new Float64Array([200]),
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -816,7 +804,6 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         field_with_underscores_values: ['test'],
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];
@@ -854,7 +841,6 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
         parent_span_id: 0,
         _identity: new Uint8Array(32),
         _logBinding: {},
-        _spanName: 'test-span',
         field50_values: ['value50'],
         getColumnIfAllocated(name: string) {
           return (this as Record<string, unknown>)[`${name}_values`];

@@ -120,11 +120,9 @@ describe('Buffer Foundation', () => {
     const buf = createBuffer(schema);
     const SpanBufferClass = buf.constructor as SpanBufferConstructor;
 
-    // Stats are accessible via static property (clean names, no sb_ prefix)
+    // Stats are accessible via static property (utilization-based tuning)
     expect(typeof SpanBufferClass.stats.capacity).toBe('number');
     expect(typeof SpanBufferClass.stats.totalWrites).toBe('number');
-    expect(typeof SpanBufferClass.stats.overflowWrites).toBe('number');
-    expect(typeof SpanBufferClass.stats.totalCreated).toBe('number');
-    expect(typeof SpanBufferClass.stats.overflows).toBe('number');
+    expect(typeof SpanBufferClass.stats.spansCreated).toBe('number');
   });
 });

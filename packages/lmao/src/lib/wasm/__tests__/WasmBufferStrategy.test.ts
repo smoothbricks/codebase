@@ -24,15 +24,8 @@ describe('WasmBufferStrategy', () => {
   const testMetadata = createOpMetadata('test-op', 'test-package', 'test.ts', 'abc123', 1);
 
   // Mock tracer lifecycle hooks for WasmTraceRoot
-  const mockTracer: TracerLifecycleHooks = {
-    onTraceStart: () => {},
-    onTraceEnd: () => {},
-    onSpanStart: () => {},
-    onSpanEnd: () => {},
-    onStatsWillResetFor: () => {},
-  };
-
   let strategy: WasmBufferStrategy<typeof testSchema>;
+  let mockTracer: TracerLifecycleHooks;
 
   beforeAll(async () => {
     strategy = await WasmBufferStrategy.create<typeof testSchema>({
@@ -40,6 +33,17 @@ describe('WasmBufferStrategy', () => {
       initialPages: 16, // 1MB
       maxPages: 16,
     });
+
+    // Mock tracer lifecycle hooks for WasmTraceRoot
+    // Must be created after strategy so we can reference it
+    mockTracer = {
+      onTraceStart: () => {},
+      onTraceEnd: () => {},
+      onSpanStart: () => {},
+      onSpanEnd: () => {},
+      onStatsWillResetFor: () => {},
+      bufferStrategy: strategy,
+    };
   });
 
   afterEach(() => {
@@ -75,10 +79,12 @@ describe('WasmBufferStrategy', () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
       const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+      // Caller must set span name via message() - simulating writeSpanStart behavior
+      buffer.message(0, 'test-span');
 
       expect(buffer).toBeDefined();
       expect(buffer._capacity).toBe(64);
-      expect(buffer._spanName).toBe('test-span');
+      expect(buffer.message_values[0]).toBe('test-span');
       expect(String(buffer.trace_id)).toBe('test-trace-id');
     });
 
@@ -113,13 +119,17 @@ describe('WasmBufferStrategy', () => {
 
       const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
 
-      const child = strategy.createChildSpanBuffer(parent, 'child-span', testMetadata, testMetadata);
+      const child = strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
+      // Caller must set span name via message() - simulating writeSpanStart behavior
+      child.message(0, 'child-span');
 
       expect(child).toBeDefined();
-      expect(child._spanName).toBe('child-span');
+      expect(child.message_values[0]).toBe('child-span');
       expect(child.trace_id).toBe(parent.trace_id);
       expect(child.parent_span_id).toBe(parent.span_id);
-      expect((parent as any)._children).toContain(child);
+      // Note: parent._children is NOT populated by the strategy - SpanContext handles that.
+      // The strategy only sets up the parent-child relationship via child._parent.
+      expect((child as any)._parent).toBe(parent);
     });
 
     it('inherits capacity from parent by default', async () => {
@@ -127,7 +137,7 @@ describe('WasmBufferStrategy', () => {
 
       const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
 
-      const child = strategy.createChildSpanBuffer(parent, 'child-span', testMetadata, testMetadata);
+      const child = strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
 
       expect(child._capacity).toBe(parent._capacity);
     });
@@ -139,7 +149,6 @@ describe('WasmBufferStrategy', () => {
 
       const child = strategy.createChildSpanBuffer(
         parent,
-        'child-span',
         testMetadata,
         testMetadata,
         32, // Custom capacity
@@ -184,9 +193,9 @@ describe('WasmBufferStrategy', () => {
 
       const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
 
-      strategy.createChildSpanBuffer(parent, 'child-1', testMetadata, testMetadata);
+      strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
 
-      strategy.createChildSpanBuffer(parent, 'child-2', testMetadata, testMetadata);
+      strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
 
       const statsBefore = strategy.getStats();
       strategy.releaseBuffer(parent as any);

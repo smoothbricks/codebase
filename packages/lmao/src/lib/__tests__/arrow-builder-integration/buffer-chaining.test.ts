@@ -103,25 +103,20 @@ describe('Buffer Chaining', () => {
       expect(buffer2._overflow).toBe(buffer3);
     });
 
-    it('should increment totalBuffersCreated stat', () => {
+    it('should not affect spansCreated stat (overflow is continuation, not new span)', () => {
       const buffer = createBuffer(schema);
-      const initialCount = SpanBufferClass.stats.totalCreated;
+      const initialSpans = SpanBufferClass.stats.spansCreated;
 
       createOverflowBuffer(buffer);
 
-      expect(SpanBufferClass.stats.totalCreated).toBe(initialCount + 1);
+      // Overflow buffers don't increment spansCreated - they're continuations, not new spans
+      expect(SpanBufferClass.stats.spansCreated).toBe(initialSpans);
     });
 
     it('should handle buffer with parent correctly', () => {
       const parentBuffer = createBuffer(schema);
 
-      const childBuffer = createChildSpanBuffer(
-        parentBuffer,
-        SpanBufferClass,
-        'child-span',
-        DEFAULT_METADATA,
-        DEFAULT_METADATA,
-      );
+      const childBuffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
       parentBuffer._children.push(childBuffer);
 
       const nextChildBuffer = createOverflowBuffer(childBuffer);
@@ -138,13 +133,7 @@ describe('Buffer Chaining', () => {
       const buffer = createBuffer(schema);
 
       // Add a child to original buffer
-      const childBuffer = createChildSpanBuffer(
-        buffer,
-        SpanBufferClass,
-        'child-span',
-        DEFAULT_METADATA,
-        DEFAULT_METADATA,
-      );
+      const childBuffer = createChildSpanBuffer(buffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
       buffer._children.push(childBuffer);
 
       const nextBuffer = createOverflowBuffer(buffer);
@@ -256,13 +245,13 @@ describe('Buffer Chaining', () => {
 
       // Create first chained buffer with children
       const buffer1 = createOverflowBuffer(rootBuffer);
-      const child1 = createChildSpanBuffer(buffer1, SpanBufferClass, 'child1', DEFAULT_METADATA, DEFAULT_METADATA);
-      const child2 = createChildSpanBuffer(buffer1, SpanBufferClass, 'child2', DEFAULT_METADATA, DEFAULT_METADATA);
+      const child1 = createChildSpanBuffer(buffer1, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
+      const child2 = createChildSpanBuffer(buffer1, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
       buffer1._children.push(child1, child2);
 
       // Create second chained buffer with children
       const buffer2 = createOverflowBuffer(buffer1);
-      const child3 = createChildSpanBuffer(buffer2, SpanBufferClass, 'child3', DEFAULT_METADATA, DEFAULT_METADATA);
+      const child3 = createChildSpanBuffer(buffer2, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
       buffer2._children.push(child3);
 
       // Verify topology
@@ -307,14 +296,13 @@ describe('Buffer Chaining', () => {
       expect(child3._overflow).toBeUndefined();
     });
 
-    it('should track overflow statistics accurately', () => {
-      const initialCreated = SpanBufferClass.stats.totalCreated;
+    it('should create overflow chain for many entries', () => {
+      // Use minimum capacity (8) to force overflow with fewer entries
+      const rootBuffer = createSpanBuffer(schema, 'stats-test', createTestTraceRoot('test-trace'), DEFAULT_METADATA, 8);
 
-      const rootBuffer = createSpanBuffer(schema, 'stats-test', createTestTraceRoot('test-trace'), DEFAULT_METADATA, 3); // Very small capacity
-
-      // Manually create overflow buffers
+      // Write 20 entries to force multiple overflows
       let currentBuffer = rootBuffer;
-      for (let i = 0; i < 10; i++) {
+      for (let i = 0; i < 20; i++) {
         if (currentBuffer._writeIndex >= currentBuffer._capacity) {
           currentBuffer = createOverflowBuffer(currentBuffer);
         }
@@ -334,10 +322,8 @@ describe('Buffer Chaining', () => {
         countBuffer = countBuffer._overflow as SpanBuffer<typeof schema> | undefined;
       }
 
-      // Should have created multiple buffers for 10 entries with capacity 3
-      expect(bufferCount).toBeGreaterThan(1);
-      // totalCreated is incremented by createOverflowBuffer
-      expect(SpanBufferClass.stats.totalCreated).toBe(initialCreated + (bufferCount - 1));
+      // With capacity 8 and 20 entries, we need ceil(20/8) = 3 buffers
+      expect(bufferCount).toBe(3);
     });
 
     it('should preserve schema consistency across chain boundaries', () => {

@@ -82,7 +82,7 @@ function createMockBuffer(name: string): MockBuffer {
       totalCreated: 3,
       capacity: 64,
     },
-    _spanName: name,
+    _
   };
 }
 
@@ -333,8 +333,8 @@ describe('WasmTestTracer', () => {
       tracer.onTraceEnd(buffer2);
 
       expect(tracer.rootBuffers).toHaveLength(2);
-      expect((tracer.rootBuffers[0] as unknown as MockBuffer)._spanName).toBe('trace1');
-      expect((tracer.rootBuffers[1] as unknown as MockBuffer)._spanName).toBe('trace2');
+      expect((tracer.rootBuffers[0] as unknown as MockBuffer).message_values[0]).toBe('trace1');
+      expect((tracer.rootBuffers[1] as unknown as MockBuffer).message_values[0]).toBe('trace2');
     });
   });
 

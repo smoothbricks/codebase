@@ -229,11 +229,6 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   _opMetadata: OpMetadata;
 
   /**
-   * Span name - written to row 0's message column.
-   */
-  _spanName: string;
-
-  /**
    * Callsite metadata - where ctx.span() was called from.
    * Different from _opMetadata when calling into another op.
    * Per specs/01j: Row 0 gets callsite, rows 1+ get op metadata.
@@ -332,6 +327,22 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   // ===========================================================================
   // Methods
   // ===========================================================================
+
+  /**
+   * Get or create an overflow buffer for this span.
+   *
+   * This method handles the full overflow lifecycle:
+   * 1. Returns existing _overflow if already created
+   * 2. Notifies tracer.onStatsWillResetFor() before stats may reset
+   * 3. Checks capacity tuning based on utilization
+   * 4. Creates new overflow buffer via bufferStrategy
+   * 5. Links this._overflow to the new buffer
+   *
+   * SpanLogger calls this when buffer is full, then prefills scope on the new buffer.
+   *
+   * @returns The overflow buffer (existing or newly created)
+   */
+  getOrCreateOverflow(): AnySpanBuffer;
 
   /**
    * Check if this span is a parent of another span.

@@ -29,9 +29,8 @@ import {
   type Vector,
 } from 'apache-arrow';
 import {
-  ENTRY_TYPE_BUFFER_CREATED,
-  ENTRY_TYPE_BUFFER_OVERFLOW_WRITES,
-  ENTRY_TYPE_BUFFER_OVERFLOWS,
+  ENTRY_TYPE_BUFFER_CAPACITY,
+  ENTRY_TYPE_BUFFER_SPANS,
   ENTRY_TYPE_BUFFER_WRITES,
   ENTRY_TYPE_NAMES,
   ENTRY_TYPE_PERIOD_START,
@@ -45,15 +44,14 @@ import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
 /**
  * Create a RecordBatch with buffer metric entries for the given modules.
  *
- * Per specs/01n_op_and_buffer_metrics.md, each module emits 5 rows:
+ * Per utilization-based capacity tuning, each module emits 4 rows:
  * - period-start: uint64_value = periodStartNs (when the metrics period began)
  * - buffer-writes: uint64_value = total entries written to buffers
- * - buffer-overflow-writes: uint64_value = entries written to overflow buffers
- * - buffer-created: uint64_value = number of SpanBuffer instances allocated
- * - buffer-overflows: uint64_value = number of overflow events
+ * - buffer-spans: uint64_value = number of spans created (for utilization = writes / (spans * usableRows))
+ * - buffer-capacity: uint64_value = current buffer capacity
  *
  * The `message` column is null for all buffer-* entry types (only op-* uses message).
- * Ratios like efficiency and overflow_rate are computed at query time, not here.
+ * Utilization = totalWrites / (spansCreated * (capacity - 2)) is computed at query time.
  *
  * **Dictionary handling**: Each RecordBatch has its own dictionary data.
  * This function builds dictionaries containing only the modules that have capacity stats,
@@ -73,7 +71,7 @@ import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
  * Entry for capacity stats: pairs SpanBufferConstructor (with stats) with OpMetadata (with package info).
  *
  * When collecting modules for capacity stats, we need both:
- * - SpanBufferConstructor: has static stats property with capacity, totalWrites, overflowWrites, totalCreated, overflows
+ * - SpanBufferConstructor: has static stats property with capacity, totalWrites, spansCreated
  * - OpMetadata: has package_name, package_file, git_sha
  */
 export interface CapacityStatsEntry {
@@ -81,8 +79,8 @@ export interface CapacityStatsEntry {
   readonly metadata: OpMetadata;
 }
 
-/** Number of metric rows per module (period-start + 4 buffer metrics) */
-const ROWS_PER_MODULE = 5;
+/** Number of metric rows per module (period-start + 3 buffer metrics) */
+const ROWS_PER_MODULE = 4;
 
 export function createCapacityStatsRecordBatch(
   modulesToLogStats: CapacityStatsEntry[],
@@ -303,20 +301,18 @@ export function createCapacityStatsRecordBatch(
     );
   }
 
-  // Entry type - 5 rows per module with different entry types:
-  // Row 0: period-start
-  // Row 1: buffer-writes
-  // Row 2: buffer-overflow-writes
-  // Row 3: buffer-created
-  // Row 4: buffer-overflows
+  // Entry type - 4 rows per module with different entry types:
+  // Row 0: period-start (when the metrics period began)
+  // Row 1: buffer-writes (total entries written to buffers)
+  // Row 2: buffer-spans (number of spans created - for utilization calculation)
+  // Row 3: buffer-capacity (current buffer capacity)
   const entryTypeIndices = new Int8Array(capacityStatsRows);
   for (let m = 0; m < moduleCount; m++) {
     const baseRow = m * ROWS_PER_MODULE;
     entryTypeIndices[baseRow + 0] = ENTRY_TYPE_PERIOD_START;
     entryTypeIndices[baseRow + 1] = ENTRY_TYPE_BUFFER_WRITES;
-    entryTypeIndices[baseRow + 2] = ENTRY_TYPE_BUFFER_OVERFLOW_WRITES;
-    entryTypeIndices[baseRow + 3] = ENTRY_TYPE_BUFFER_CREATED;
-    entryTypeIndices[baseRow + 4] = ENTRY_TYPE_BUFFER_OVERFLOWS;
+    entryTypeIndices[baseRow + 2] = ENTRY_TYPE_BUFFER_SPANS;
+    entryTypeIndices[baseRow + 3] = ENTRY_TYPE_BUFFER_CAPACITY;
   }
   vectors.push(
     makeVector(
@@ -479,9 +475,8 @@ export function createCapacityStatsRecordBatch(
   // Per spec 01n_op_and_buffer_metrics.md:
   // - period-start: periodStartNs (nanosecond timestamp when period began)
   // - buffer-writes: bufferClass.stats.totalWrites
-  // - buffer-overflow-writes: bufferClass.stats.overflowWrites
-  // - buffer-created: bufferClass.stats.totalCreated
-  // - buffer-overflows: bufferClass.stats.overflows
+  // - buffer-spans: bufferClass.stats.spansCreated
+  // - buffer-capacity: bufferClass.stats.capacity
   if (hasSpanData) {
     const uint64Values = new BigUint64Array(capacityStatsRows);
     for (let m = 0; m < moduleCount; m++) {
@@ -489,9 +484,8 @@ export function createCapacityStatsRecordBatch(
       const baseRow = m * ROWS_PER_MODULE;
       uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
       uint64Values[baseRow + 1] = BigInt(bufferClass.stats.totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.overflowWrites); // buffer-overflow-writes
-      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.totalCreated); // buffer-created
-      uint64Values[baseRow + 4] = BigInt(bufferClass.stats.overflows); // buffer-overflows
+      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.spansCreated); // buffer-spans
+      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.capacity); // buffer-capacity
     }
     vectors.push(
       makeVector(
@@ -682,9 +676,8 @@ export function createCapacityStatsRecordBatch(
       const baseRow = m * ROWS_PER_MODULE;
       uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
       uint64Values[baseRow + 1] = BigInt(bufferClass.stats.totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.overflowWrites); // buffer-overflow-writes
-      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.totalCreated); // buffer-created
-      uint64Values[baseRow + 4] = BigInt(bufferClass.stats.overflows); // buffer-overflows
+      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.spansCreated); // buffer-spans
+      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.capacity); // buffer-capacity
     }
     vectors.push(
       makeVector(

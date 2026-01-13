@@ -190,7 +190,8 @@ export function createDefineOp<Ctx extends OpContext>(
     // This provides useful file/line info for debugging even without build-time injection
     // skipFrames=3: Error -> extractMetadataFromStack -> defineOpImpl -> caller
     const baseMetadata = metadata?.package_file ? DEFAULT_METADATA : extractMetadataFromStack(3);
-    const finalMetadata = { ...baseMetadata, ...metadata };
+    // Use name from: 1) explicit metadata.name (transformer), 2) defineOp('name', fn), 3) baseMetadata
+    const finalMetadata = { ...baseMetadata, ...metadata, name: metadata?.name ?? name };
 
     // Use the Op class which handles all span/buffer management:
     // - Creates SpanBuffer for the op

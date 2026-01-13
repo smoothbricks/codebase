@@ -1155,12 +1155,12 @@ performance. Statistics use structured entry types with the `uint64_value` syste
 
 ### Entry Types
 
-| Entry Type               | Description                                    | uint64_value              |
-| ------------------------ | ---------------------------------------------- | ------------------------- |
-| `buffer-writes`          | Total entries written across all buffers       | Count of log entries      |
-| `buffer-overflow-writes` | Entries written to overflow buffers            | Count of overflow entries |
-| `buffer-created`         | Number of SpanBuffers allocated                | Buffer count              |
-| `buffer-overflows`       | Times a buffer overflowed (triggered chaining) | Overflow event count      |
+| Entry Type               | Description                                    | uint64_value         |
+| ------------------------ | ---------------------------------------------- | -------------------- |
+| `buffer-writes`          | Total entries written across all buffers       | Count of log entries |
+| `buffer-overflow-writes` | Times a buffer overflowed (same as overflows)  | Overflow event count |
+| `buffer-created`         | Number of SpanBuffers allocated                | Buffer count         |
+| `buffer-overflows`       | Times a buffer overflowed (triggered chaining) | Overflow event count |
 
 ### Why Structured Entry Types
 

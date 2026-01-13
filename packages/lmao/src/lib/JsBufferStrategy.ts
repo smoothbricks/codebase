@@ -71,13 +71,15 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
 
   createChildSpanBuffer(
     parentBuffer: SpanBuffer<T>,
-    spanName: string,
     callsiteMetadata: OpMetadata,
     opMetadata: OpMetadata,
     capacity?: number,
+    schema?: T,
   ): SpanBuffer<T> {
-    const SpanBufferClass = this.getSpanBufferClassForSchema(parentBuffer._logSchema as T);
-    return createChildSpanBufferImpl(parentBuffer, SpanBufferClass, spanName, callsiteMetadata, opMetadata, capacity);
+    // Use provided schema (for cross-library calls) or parent's schema
+    const childSchema = schema ?? (parentBuffer._logSchema as T);
+    const SpanBufferClass = this.getSpanBufferClassForSchema(childSchema);
+    return createChildSpanBufferImpl(parentBuffer, SpanBufferClass, callsiteMetadata, opMetadata, capacity);
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {

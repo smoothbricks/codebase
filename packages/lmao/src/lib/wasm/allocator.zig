@@ -823,7 +823,8 @@ export fn span_end_err(system_ptr: u32, trace_root_ptr: u32, capacity: u32) void
 }
 
 /// Write a log entry (info/debug/warn/error).
-/// Returns the row index where the entry was written.
+/// Bumps write_index, writes timestamp+entry_type, returns the idx written to.
+/// SpanLogger uses returned idx for string column writes.
 export fn write_log_entry(system_ptr: u32, identity_ptr: u32, trace_root_ptr: u32, entry_type: u8, capacity: u32) u32 {
     const identity = ptrAt(Identity, identity_ptr);
     const idx = identity.write_index;

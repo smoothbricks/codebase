@@ -137,12 +137,15 @@ export class TraceRoot implements ITraceRoot {
   }
 
   /**
-   * Write log entry timestamp and entry_type at the given index.
-   * Used by SpanLogger for info/debug/warn/error/trace/ff entries.
+   * Write log entry: bump writeIndex, write timestamp + entry_type, return idx.
+   * SpanLogger uses returned idx for string column writes.
    */
-  writeLogEntry(buffer: AnySpanBuffer, idx: number, entryType: number): void {
+  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
+    const idx = buffer._writeIndex;
     buffer.timestamp[idx] = this.getTimestampNanos();
     buffer.entry_type[idx] = entryType;
+    buffer._writeIndex = idx + 1;
+    return idx;
   }
 }
 

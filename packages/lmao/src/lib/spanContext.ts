@@ -36,7 +36,7 @@ import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
-import { createChildSpanBuffer, createOverflowBuffer, type SpanBufferConstructor } from './spanBuffer.js';
+import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { LogBinding, SpanBuffer } from './types.js';
 
 // Note: TraceRoot.writeSpanStart() is used instead of direct timestamp writes.
@@ -107,7 +107,7 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
  * @returns SpanLogger with typed methods matching schema
  */
 export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
-  return createSpanLoggerFromGenerator(schema, buffer, createOverflowBuffer) as SpanLoggerImpl<T>;
+  return createSpanLoggerFromGenerator(schema, buffer) as SpanLoggerImpl<T>;
 }
 
 /**
@@ -341,7 +341,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
  * @returns Class constructor for SpanContext instances
  */
 export function createSpanContextClass<Ctx extends OpContext>(
-  schemaOnly: Ctx['logSchema'],
+  _schemaOnly: Ctx['logSchema'],
   logBinding: LogBinding,
 ): SpanContextClass<Ctx> {
   /**
@@ -658,14 +658,18 @@ export function createSpanContextClass<Ctx extends OpContext>(
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
     ): SpanContextInstance<Ctx> {
-      // Why use Op's class: Child buffer gets correct schema for tag methods and shared stats for self-tuning
-      const childBuffer = createChildSpanBuffer<Ctx['logSchema']>(
+      // Get Op's schema for cross-library calls (child may have different schema than parent)
+      const childSchema = (SpanBufferClass as any).schema as Ctx['logSchema'];
+
+      // Use buffer strategy for child span creation (supports both JS and WASM buffers)
+      // Pass schema for cross-library calls where child has different schema than parent
+      const childBuffer = this._buffer._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
         this._buffer, // parentBuffer
-        SpanBufferClass, // Op's class or parent's class
-        name, // spanName
         this._buffer._opMetadata, // callsiteMetadata - WHO called span() (for row 0)
         opMetadata, // opMetadata - WHICH op is executing (for rows 1+)
-      );
+        undefined, // capacity - use default
+        childSchema, // schema - Op's schema for correct tag methods
+      ) as SpanBuffer<Ctx['logSchema']>;
 
       // Why wrap buffer: RemappedBufferView translates prefixed column names during Arrow conversion
       // Parent sees remapped names, child sees unprefixed names (transparent to child)
@@ -679,10 +683,6 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
       // Write line number to row 0 (line() takes pos and value)
       childBuffer.line(0, line);
-
-      // Create child span logger and tag writer using Op's schema (from SpanBufferClass.schema)
-      // Why Op's schema: Cross-module spans need the Op's tag methods (e.g., http lib needs .status())
-      const childSchema = (SpanBufferClass as any).schema as Ctx['logSchema'];
       const childLogger = createSpanLogger(childSchema, childBuffer);
       const childTagAPI = createTagWriter(childSchema, childBuffer);
 

@@ -11,6 +11,10 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      bufferStrategy: {
+        createChildSpanBuffer: () => ({}) as any,
+        createOverflowBuffer: () => ({}) as any,
+      },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
 
@@ -26,6 +30,10 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      bufferStrategy: {
+        createChildSpanBuffer: () => ({}) as any,
+        createOverflowBuffer: () => ({}) as any,
+      },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
 
@@ -48,6 +56,10 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      bufferStrategy: {
+        createChildSpanBuffer: () => ({}) as any,
+        createOverflowBuffer: () => ({}) as any,
+      },
     };
 
     // Sample multiple times and check they're all close
@@ -70,6 +82,10 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      bufferStrategy: {
+        createChildSpanBuffer: () => ({}) as any,
+        createOverflowBuffer: () => ({}) as any,
+      },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
     const timestamps: bigint[] = [];
@@ -101,6 +117,10 @@ describe('Browser TraceRoot Timestamps (performance.now)', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      bufferStrategy: {
+        createChildSpanBuffer: () => ({}) as any,
+        createOverflowBuffer: () => ({}) as any,
+      },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
 
@@ -116,6 +136,10 @@ describe('Browser TraceRoot Timestamps (performance.now)', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      bufferStrategy: {
+        createChildSpanBuffer: () => ({}) as any,
+        createOverflowBuffer: () => ({}) as any,
+      },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
 
@@ -138,6 +162,10 @@ describe('Browser TraceRoot Timestamps (performance.now)', () => {
       onSpanStart: () => {},
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
+      bufferStrategy: {
+        createChildSpanBuffer: () => ({}) as any,
+        createOverflowBuffer: () => ({}) as any,
+      },
     };
 
     // Sample multiple times and check they're all close

@@ -39,8 +39,7 @@ import type { SpanBuffer } from '../types.js';
 export interface StatsSnapshot<T extends LogSchema = LogSchema> {
   buffer: SpanBuffer<T>;
   totalWrites: number;
-  overflowWrites: number;
-  totalCreated: number;
+  spansCreated: number;
   capacity: number;
 }
 
@@ -64,7 +63,7 @@ export interface StatsSnapshot<T extends LogSchema = LogSchema> {
  *
  * // Inspect buffer
  * expect(tracer.rootBuffers).toHaveLength(1);
- * expect(tracer.rootBuffers[0]._spanName).toBe('my-op');
+ * expect(tracer.rootBuffers[0].message_values[0]).toBe('my-op');
  *
  * // Convert to Arrow for detailed inspection
  * const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
@@ -114,8 +113,7 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
     this.statsSnapshots.push({
       buffer,
       totalWrites: stats.totalWrites,
-      overflowWrites: stats.overflowWrites,
-      totalCreated: stats.totalCreated,
+      spansCreated: stats.spansCreated,
       capacity: stats.capacity,
     });
   }

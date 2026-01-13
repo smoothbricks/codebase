@@ -18,6 +18,7 @@ import type { BufferStrategy } from '../bufferStrategy.js';
 import { convertSpanTreeToArrowTable, convertToRecordBatch } from '../convertToArrow.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { LogSchema } from '../schema/LogSchema.js';
+import { EMPTY_SCOPE } from '../spanBuffer.js';
 import type { ITraceRoot } from '../traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { createWasmAllocator, type WasmAllocator, type WasmAllocatorOptions } from './wasmAllocator.js';
@@ -83,7 +84,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     schema: T,
     spanName: string,
     traceRoot: ITraceRoot,
-    _opMetadata: OpMetadata,
+    opMetadata: OpMetadata,
     capacity?: number,
   ): SpanBuffer<T> {
     const effectiveCapacity = capacity ?? this.allocator.capacity;
@@ -92,42 +93,66 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     const wasmBuffer = createWasmSpanBuffer(schema, {
       allocator: this.allocator,
       capacity: effectiveCapacity,
-      spanName,
       trace_id: traceRoot.trace_id,
       // thread_id and span_id come from WASM (global header and allocator respectively)
       thread_id: 0n, // Will be read from WASM header
       span_id: 0, // Will be assigned by WASM allocator
     });
 
-    // Cast to SpanBuffer<T> - the interface is compatible
-    return wasmBuffer as unknown as SpanBuffer<T>;
+    // Set runtime properties needed by Tracer
+    // These are set after creation because WASM buffer constructor doesn't take them
+    const buffer = wasmBuffer as unknown as SpanBuffer<T>;
+    buffer._traceRoot = traceRoot;
+    buffer._opMetadata = opMetadata;
+    buffer._scopeValues = EMPTY_SCOPE;
+    buffer._callsiteMetadata = opMetadata; // Same as opMetadata for root
+
+    return buffer;
   }
 
   createChildSpanBuffer(
     parentBuffer: SpanBuffer<T>,
-    spanName: string,
-    _callsiteMetadata: OpMetadata,
-    _opMetadata: OpMetadata,
+    callsiteMetadata: OpMetadata,
+    opMetadata: OpMetadata,
     capacity?: number,
+    schema?: T,
   ): SpanBuffer<T> {
     const wasmParent = parentBuffer as unknown as WasmSpanBufferInstance;
     const effectiveCapacity = capacity ?? wasmParent._capacity;
 
+    // Use provided schema (for cross-library calls) or parent's schema
+    const childSchema = schema ?? (parentBuffer._logSchema as T);
+
     const child = createWasmChildSpanBuffer(wasmParent, {
       allocator: this.allocator,
       capacity: effectiveCapacity,
-      spanName,
       thread_id: 0n, // Will be read from WASM header
       span_id: 0, // Will be assigned by WASM allocator
+      schema: childSchema, // Pass schema for correct buffer class
     });
 
-    return child as unknown as SpanBuffer<T>;
+    // Set runtime properties needed by Tracer
+    const childBuffer = child as unknown as SpanBuffer<T>;
+    childBuffer._traceRoot = parentBuffer._traceRoot;
+    childBuffer._opMetadata = opMetadata;
+    childBuffer._callsiteMetadata = callsiteMetadata;
+    childBuffer._scopeValues = parentBuffer._scopeValues; // Inherit from parent
+
+    return childBuffer;
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
     const wasmBuffer = buffer as unknown as WasmSpanBufferInstance;
     const overflow = createWasmOverflowBuffer(wasmBuffer);
-    return overflow as unknown as SpanBuffer<T>;
+
+    // Set runtime properties from original buffer
+    const overflowBuffer = overflow as unknown as SpanBuffer<T>;
+    overflowBuffer._traceRoot = buffer._traceRoot;
+    overflowBuffer._opMetadata = buffer._opMetadata;
+    overflowBuffer._callsiteMetadata = buffer._callsiteMetadata;
+    overflowBuffer._scopeValues = buffer._scopeValues;
+
+    return overflowBuffer;
   }
 
   toArrowRecordBatch(buffer: AnySpanBuffer): RecordBatch {

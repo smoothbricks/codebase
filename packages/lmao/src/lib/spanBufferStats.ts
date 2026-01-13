@@ -5,8 +5,9 @@
  * Stored as a static property on the generated SpanBuffer class for optimal memory usage.
  *
  * Per specs/01b2_buffer_self_tuning.md:
- * - Capacity grows when overflow ratio > 15%
- * - Capacity shrinks when overflow ratio < 5% with enough buffers
+ * - Track row utilization = totalWrites / (spansCreated * usableRowsPerSpan)
+ * - Capacity grows when utilization > 150% (regularly overflowing)
+ * - Capacity shrinks when utilization < 50% with enough spans (wasting space)
  * - Stats reset after each adjustment to measure new capacity effectiveness
  *
  * ## Key Architectural Decision
@@ -28,18 +29,12 @@
  * SpanBuffer class. All buffers from same context share these stats.
  */
 export interface SpanBufferStats {
-  /** Current buffer capacity for new buffers (grows/shrinks based on overflow ratio) */
+  /** Current buffer capacity for new buffers (grows/shrinks based on utilization) */
   capacity: number;
 
   /** Total entries written across all buffers */
   totalWrites: number;
 
-  /** How many times an overflow occurred (buffer count = 1 + overflows) */
-  overflowWrites: number;
-
-  /** Total buffers created (root + children + chains) */
-  totalCreated: number;
-
-  /** Number of overflow events (incremented when buffer fills) */
-  overflows: number;
+  /** Number of non-chained spans created (root + child spans, NOT overflow buffers) */
+  spansCreated: number;
 }

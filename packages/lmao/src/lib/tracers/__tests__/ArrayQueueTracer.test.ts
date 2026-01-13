@@ -31,7 +31,7 @@ describe('ArrayQueueTracer', () => {
       await trace('queued-trace', testOp);
 
       expect(tracer.queue).toHaveLength(1);
-      expect(tracer.queue[0]._spanName).toBe('queued-trace');
+      expect(tracer.queue[0].message_values[0]).toBe('queued-trace');
     });
 
     it('should queue multiple traces in order', async () => {
@@ -45,9 +45,9 @@ describe('ArrayQueueTracer', () => {
       await trace('third', testOp);
 
       expect(tracer.queue).toHaveLength(3);
-      expect(tracer.queue[0]._spanName).toBe('first');
-      expect(tracer.queue[1]._spanName).toBe('second');
-      expect(tracer.queue[2]._spanName).toBe('third');
+      expect(tracer.queue[0].message_values[0]).toBe('first');
+      expect(tracer.queue[1].message_values[0]).toBe('second');
+      expect(tracer.queue[2].message_values[0]).toBe('third');
     });
 
     it('should queue buffer even if trace throws', async () => {
@@ -61,7 +61,7 @@ describe('ArrayQueueTracer', () => {
       await expect(trace('failing', failOp)).rejects.toThrow('boom');
 
       expect(tracer.queue).toHaveLength(1);
-      expect(tracer.queue[0]._spanName).toBe('failing');
+      expect(tracer.queue[0].message_values[0]).toBe('failing');
     });
   });
 
@@ -78,8 +78,8 @@ describe('ArrayQueueTracer', () => {
       const drained = tracer.drain();
 
       expect(drained).toHaveLength(2);
-      expect(drained[0]._spanName).toBe('a');
-      expect(drained[1]._spanName).toBe('b');
+      expect(drained[0].message_values[0]).toBe('a');
+      expect(drained[1].message_values[0]).toBe('b');
     });
 
     it('should clear queue after drain', async () => {
@@ -116,7 +116,7 @@ describe('ArrayQueueTracer', () => {
       await trace('after', testOp);
 
       expect(tracer.queue).toHaveLength(1);
-      expect(tracer.queue[0]._spanName).toBe('after');
+      expect(tracer.queue[0].message_values[0]).toBe('after');
     });
 
     it('should return independent array (not reference to internal queue)', async () => {
@@ -178,7 +178,7 @@ describe('ArrayQueueTracer', () => {
 
       const [buffer] = tracer.drain();
       expect(buffer._children).toHaveLength(1);
-      expect(buffer._children[0]._spanName).toBe('child-span');
+      expect(buffer._children[0].message_values[0]).toBe('child-span');
     });
   });
 });

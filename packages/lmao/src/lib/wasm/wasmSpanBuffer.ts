@@ -11,7 +11,9 @@
  */
 
 import { getSchemaType } from '@smoothbricks/arrow-builder';
+import { checkCapacityTuning } from '../capacityTuning.js';
 import type { LogSchema } from '../schema/LogSchema.js';
+import type { SpanBufferStats } from '../spanBufferStats.js';
 import type { WasmAllocator } from './wasmAllocator.js';
 
 // =============================================================================
@@ -52,7 +54,6 @@ export interface WasmSpanBufferChildOptions {
 export interface WasmSpanBufferOptions {
   allocator: WasmAllocator;
   capacity: number;
-  spanName: string;
   trace_id: string;
   thread_id: bigint;
   span_id: number;
@@ -98,7 +99,6 @@ export interface WasmSpanBufferInstance {
   // Schema
   // ===========================================================================
   readonly _logSchema: LogSchema;
-  readonly _spanName: string;
 
   // ===========================================================================
   // Tree structure
@@ -233,7 +233,6 @@ function generateConstructorCode(columnMeta: ColumnMeta[]): string {
     'this._allocator = opts.allocator;',
     'this._capacity = opts.capacity;',
     'this._logSchema = opts.logSchema;',
-    'this._spanName = opts.spanName;',
     '',
     // Allocate identity block from WASM (root has trace_id, child does not)
     'if (opts.trace_id) {',
@@ -265,7 +264,13 @@ function generateConstructorCode(columnMeta: ColumnMeta[]): string {
   ];
 
   // Initialize string arrays for string columns
+  // Note: 'message' is handled separately above with this._message
   for (const col of columnMeta) {
+    // Skip 'message' - handled specially above
+    if (col.name === 'message') {
+      continue;
+    }
+
     if (col.sizeClass === 'string') {
       if (col.isEager) {
         lines.push(`this._${col.name}_values = new Array(opts.capacity);`);
@@ -311,11 +316,20 @@ function generateEntryTypeGetter(): string {
 
 /**
  * Generate message column methods (eager string, system column).
+ * Includes both the setter method and the _values getter for SpanLogger compatibility.
  */
 function generateMessageMethods(): string {
   return `message(idx, value) {
     this._message[idx] = value;
     return this;
+  }
+  
+  get message_values() {
+    return this._message;
+  }
+  
+  get message_nulls() {
+    return undefined;
   }`;
 }
 
@@ -473,11 +487,17 @@ function generateStringNullsGetter(col: ColumnMeta): string {
 
 /**
  * Generate column methods for all schema columns.
+ * Note: 'message' column is handled specially by generateMessageMethods() and excluded here.
  */
 function generateColumnMethods(columnMeta: ColumnMeta[]): string {
   const methods: string[] = [];
 
   for (const col of columnMeta) {
+    // Skip 'message' - handled specially by generateMessageMethods()
+    if (col.name === 'message') {
+      continue;
+    }
+
     if (col.sizeClass === 'string') {
       methods.push(generateStringSetter(col));
       methods.push(generateStringValuesGetter(col));
@@ -683,6 +703,15 @@ class WasmSpanBuffer {
   // Utility methods
   ${generateUtilityMethods(columnMeta)}
 
+  // Overflow handling (called by SpanLogger._checkOverflow)
+  getOrCreateOverflow() {
+    if (this._overflow) return this._overflow;
+    const tracer = this._traceRoot.tracer;
+    tracer.onStatsWillResetFor(this);
+    checkCapacityTuning(this.constructor.stats);
+    return tracer.bufferStrategy.createOverflowBuffer(this);
+  }
+
   // Custom inspect
   ${generateInspect()}
 }
@@ -690,12 +719,22 @@ class WasmSpanBuffer {
 return WasmSpanBuffer;
 `;
 
-  // Create the class using Function constructor (same pattern as arrow-builder's columnBufferGenerator)
-  const factory = new Function(classCode) as () => WasmSpanBufferConstructor;
-  const WasmSpanBufferClass = factory();
+  // Create the class using Function constructor, passing checkCapacityTuning as dependency
+  const factory = new Function('checkCapacityTuning', classCode) as (
+    fn: typeof checkCapacityTuning,
+  ) => WasmSpanBufferConstructor;
+  const WasmSpanBufferClass = factory(checkCapacityTuning);
 
   // Add static schema property
   (WasmSpanBufferClass as unknown as { schema: LogSchema }).schema = schema;
+
+  // Add static stats property (required by SpanContext and arrow-builder's ColumnWriter)
+  // This matches the structure in spanBuffer.ts
+  (WasmSpanBufferClass as unknown as { stats: SpanBufferStats }).stats = {
+    capacity: 64, // Default capacity, will be overridden by allocator
+    totalWrites: 0,
+    spansCreated: 0,
+  };
 
   // Cache the class
   wasmSpanBufferClassCache.set(schema, WasmSpanBufferClass);
@@ -725,27 +764,33 @@ export function createWasmSpanBuffer(
 /**
  * Create a child WASM SpanBuffer linked to a parent.
  *
+ * For cross-library calls, the child buffer may use a different schema than the parent.
+ * Pass the schema option to use a different schema.
+ *
  * @param parent - Parent WASM SpanBuffer
- * @param opts - Options for child buffer creation
+ * @param opts - Options for child buffer creation (schema is optional, defaults to parent's)
  * @returns WasmSpanBufferInstance linked to parent
  */
 export function createWasmChildSpanBuffer(
   parent: WasmSpanBufferInstance,
-  opts: Omit<WasmSpanBufferOptions, 'logSchema' | 'trace_id' | 'parent_thread_id' | 'parent_span_id'>,
+  opts: Omit<WasmSpanBufferOptions, 'logSchema' | 'trace_id' | 'parent_thread_id' | 'parent_span_id'> & {
+    schema?: LogSchema;
+  },
 ): WasmSpanBufferInstance {
-  const WasmSpanBufferClass = getWasmSpanBufferClass(parent._logSchema);
+  // Use provided schema (for cross-library calls) or parent's schema
+  const childSchema = opts.schema ?? parent._logSchema;
+  const WasmSpanBufferClass = getWasmSpanBufferClass(childSchema);
 
   const child = new WasmSpanBufferClass({
     ...opts,
-    logSchema: parent._logSchema,
+    logSchema: childSchema, // Use the child's schema (may differ from parent)
     trace_id: parent.trace_id,
     parent_thread_id: parent.thread_id,
     parent_span_id: parent.span_id,
   });
 
-  // Link to parent
+  // Link to parent (SpanContext will push to parent._children with possible RemappedBufferView wrapper)
   child._parent = parent;
-  parent._children.push(child);
 
   return child;
 }
@@ -762,7 +807,6 @@ export function createWasmOverflowBuffer(buffer: WasmSpanBufferInstance): WasmSp
   const overflow = new WasmSpanBufferClass({
     allocator: buffer._allocator,
     capacity: buffer._capacity,
-    spanName: buffer._spanName,
     trace_id: buffer.trace_id,
     thread_id: buffer.thread_id,
     span_id: buffer.span_id,

@@ -31,6 +31,7 @@ import {
   DEFAULT_BUFFER_CAPACITY,
   getColumnBufferClass,
 } from '@smoothbricks/arrow-builder';
+import { checkCapacityTuning } from './capacityTuning.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import { textEncoder } from './spanBufferHelpers.js';
@@ -130,7 +131,6 @@ export interface SpanBufferConstructor {
   new (
     capacity: number,
     stats: SpanBufferStats,
-    spanName: string,
     parent: AnySpanBuffer | undefined,
     isChained: boolean,
     callsiteMetadata: OpMetadata | undefined,
@@ -195,11 +195,12 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 
   // Define extension for arrow-builder's class generator
   const extension: ColumnBufferExtension = {
-    constructorParams: 'stats, spanName, parent, isChained, callsiteMetadata, opMetadata, traceRoot',
+    constructorParams: 'stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot',
     dependencies: {
       writeThreadIdToUint64Array,
       textEncoder,
       EMPTY_SCOPE,
+      checkCapacityTuning,
     },
     // ==========================================================================
     // GENERATED CONSTRUCTOR PREAMBLE
@@ -230,8 +231,8 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
     // Slots 4-5: HOT (TypedArray refs) - timestamp, entry_type
     // Slots 6-7: WARM (tree structure) - _children, _parent
     // Slots 8-10: WARM (context) - _traceRoot, _scopeValues, _identity
-    // Slots 11-12: WARM (system) - _system, _spanName
-    // Slots 13+: COLD (Arrow conversion only) - _callsiteMetadata, _opMetadata
+    // Slots 11: WARM (system) - _system
+    // Slots 12+: COLD (Arrow conversion only) - _callsiteMetadata, _opMetadata
     // ==========================================================================
     preamble:
       // Thread-local span counter (per-process/worker, see threadId.ts docs)
@@ -292,11 +293,10 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
        this._parent = isChained ? parent._parent : parent;
        this._traceRoot = traceRoot;
        this._scopeValues = parent ? parent._scopeValues : EMPTY_SCOPE;
-       this._identity = identityView;
-       this._system = systemBuffer;
-       this._spanName = spanName;
-       this._callsiteMetadata = callsiteMetadata;
-       this._opMetadata = opMetadata;
+        this._identity = identityView;
+        this._system = systemBuffer;
+        this._callsiteMetadata = callsiteMetadata;
+        this._opMetadata = opMetadata;
     `,
     // Generated methods for SpanBuffer - no comments in output
     // span_id: extract from identity bytes [8:12]
@@ -339,6 +339,13 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
     get _logSchema() { return this.constructor.schema; }
     get _columns() { return this.constructor.schema._columns; }
     get _stats() { return this.constructor.stats; }
+    getOrCreateOverflow() {
+      if (this._overflow) return this._overflow;
+      const tracer = this._traceRoot.tracer;
+      tracer.onStatsWillResetFor(this);
+      checkCapacityTuning(this.constructor.stats);
+      return tracer.bufferStrategy.createOverflowBuffer(this);
+    }
     `,
   };
 
@@ -351,9 +358,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
   (SpanBufferClass as any).stats = {
     capacity: DEFAULT_BUFFER_CAPACITY,
     totalWrites: 0,
-    overflowWrites: 0,
-    totalCreated: 0,
-    overflows: 0,
+    spansCreated: 0,
   } satisfies SpanBufferStats;
 
   // Cache for future use
@@ -379,6 +384,8 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
  *
  * @returns SpanBuffer with typed setters for schema fields
  */
+const MIN_CAPACITY = 8;
+
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
   spanName: string,
@@ -387,16 +394,19 @@ export function createSpanBuffer<T extends LogSchema>(
   capacity?: number,
 ): SpanBuffer<T> {
   const SpanBufferClass = getSpanBufferClass(schema);
+  const stats = SpanBufferClass.stats;
 
-  // Use provided capacity or default from class stats
-  const actualCapacity = capacity ?? SpanBufferClass.stats.capacity;
+  // Use provided capacity or default from class stats, enforce minimum
+  const actualCapacity = Math.max(MIN_CAPACITY, capacity ?? stats.capacity);
+
+  // Track non-chained buffer creation for capacity tuning
+  stats.spansCreated++;
 
   // Create root buffer (no parent)
   // Root spans use same metadata for both callsite and op (no distinction at root)
   return new SpanBufferClass(
     actualCapacity,
-    SpanBufferClass.stats,
-    spanName,
+    stats,
     undefined, // no parent
     false, // not chained
     opMetadata, // callsiteMetadata for row 0
@@ -427,7 +437,6 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
   const nextBuffer = new SpanBufferClass(
     capacity,
     stats,
-    buffer._spanName,
     buffer, // Used for identity sharing, _parent set to buffer._parent in constructor
     true, // isChained
     buffer._callsiteMetadata,
@@ -438,9 +447,6 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
   // Link current buffer to next
   buffer._overflow = nextBuffer;
 
-  // Track buffer creation for capacity tuning
-  stats.totalCreated++;
-
   return nextBuffer;
 }
 
@@ -450,9 +456,10 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
  * Child buffers have their own identity but reference their parent
  * for trace hierarchy and scope inheritance.
  *
+ * Note: Caller must call writeSpanStart() after this to set span name in message_values[0].
+ *
  * @param parentBuffer - The parent span buffer
  * @param SpanBufferClass - The SpanBuffer class to instantiate (has static schema + stats)
- * @param spanName - Name of the child span
  * @param callsiteMetadata - Caller's op metadata (for row 0 attribution)
  * @param opMetadata - Op metadata for this span (for rows 1+ attribution)
  * @param capacity - Optional capacity override (uses class.stats.capacity if omitted)
@@ -462,7 +469,6 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
 export function createChildSpanBuffer<T extends LogSchema>(
   parentBuffer: AnySpanBuffer,
   SpanBufferClass: SpanBufferConstructor,
-  spanName: string,
   callsiteMetadata: OpMetadata,
   opMetadata: OpMetadata,
   capacity?: number,
@@ -470,11 +476,13 @@ export function createChildSpanBuffer<T extends LogSchema>(
   const stats = (SpanBufferClass as any).stats as SpanBufferStats;
   const actualCapacity = capacity ?? stats.capacity;
 
+  // Track non-chained buffer creation for capacity tuning
+  stats.spansCreated++;
+
   // Create child buffer with parent reference
   const childBuffer = new SpanBufferClass(
     actualCapacity,
     stats,
-    spanName,
     parentBuffer, // parent
     false, // not chained
     callsiteMetadata, // callsiteMetadata - CALLER's op metadata (for row 0)

@@ -117,7 +117,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
 
             // Should have: 1 span-start + numEntries info + 1 span-ok
             expect(counts['span-start']).toBe(1);
-            expect(counts['info']).toBe(numEntries);
+            expect(counts.info).toBe(numEntries);
             expect(counts['span-ok']).toBe(1);
             expect(table.numRows).toBe(2 + numEntries); // span-start + span-ok + entries
           },
@@ -157,7 +157,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const counts = countRowsByEntryType(table);
 
       // All entries should be present
-      expect(counts['info']).toBe(numEntries);
+      expect(counts.info).toBe(numEntries);
       expect(table.numRows).toBe(2 + numEntries);
 
       // Verify some sample data
@@ -258,7 +258,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
             .info(`text-message-${i}`) // text in message (system column)
             .userId(`category-${i % 5}`) // category
             .operation(['GET', 'POST', 'PUT', 'DELETE'][i % 4] as 'GET') // enum
-            .duration(i * 3.14159) // number (float)
+            .duration(i * Math.PI) // number (float)
             .index(i) // number (int stored as float)
             .errorMsg(`unique-error-${i}-${Date.now()}`); // text (unique values)
         }
@@ -284,7 +284,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       expect((infoRows[0].errorMsg as string).startsWith('unique-error-0-')).toBe(true);
 
       expect(infoRows[25].message).toBe('text-message-25');
-      expect(infoRows[25].duration).toBeCloseTo(25 * 3.14159, 5);
+      expect(infoRows[25].duration).toBeCloseTo(25 * Math.PI, 5);
     });
   });
 
@@ -341,7 +341,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       // Total: 84 rows
       expect(counts['span-start']).toBe(2); // parent + child
       expect(counts['span-ok']).toBe(2); // parent + child
-      expect(counts['info']).toBe(80); // 30 parent + 50 child
+      expect(counts.info).toBe(80); // 30 parent + 50 child
       expect(table.numRows).toBe(84);
 
       // Verify hierarchy in Arrow output
@@ -411,7 +411,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       // 4 levels * (1 span-start + 15 info + 1 span-ok) = 4 * 17 = 68
       expect(counts['span-start']).toBe(4);
       expect(counts['span-ok']).toBe(4);
-      expect(counts['info']).toBe(60); // 15 * 4 levels
+      expect(counts.info).toBe(60); // 15 * 4 levels
       expect(table.numRows).toBe(68);
     });
   });
@@ -476,7 +476,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const counts = countRowsByEntryType(table);
 
       expect(counts['span-start']).toBe(1);
-      expect(counts['info']).toBe(1);
+      expect(counts.info).toBe(1);
       expect(counts['span-err']).toBe(1);
       expect(table.numRows).toBe(3);
     });
@@ -501,7 +501,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const counts = countRowsByEntryType(table);
 
       expect(counts['span-start']).toBe(1);
-      expect(counts['info']).toBe(1);
+      expect(counts.info).toBe(1);
       expect(counts['span-exception']).toBe(1);
       expect(table.numRows).toBe(3);
     });
@@ -546,10 +546,10 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       // debug: i % 4 === 1: indices 1,5,9,13,17,21,25,29,33,37,41,45,49 = 13
       // warn:  i % 4 === 2: indices 2,6,10,14,18,22,26,30,34,38,42,46 = 12
       // error: i % 4 === 3: indices 3,7,11,15,19,23,27,31,35,39,43,47 = 12
-      expect(counts['info']).toBe(13);
-      expect(counts['debug']).toBe(13);
-      expect(counts['warn']).toBe(12);
-      expect(counts['error']).toBe(12);
+      expect(counts.info).toBe(13);
+      expect(counts.debug).toBe(13);
+      expect(counts.warn).toBe(12);
+      expect(counts.error).toBe(12);
 
       expect(counts['span-start']).toBe(1);
       expect(counts['span-ok']).toBe(1);

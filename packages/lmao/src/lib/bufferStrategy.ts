@@ -54,21 +54,24 @@ export interface BufferStrategy<T extends LogSchema = LogSchema> {
   ): SpanBuffer<T>;
 
   /**
-   * Create a child SpanBuffer linked to a parent.
+   * Create a child span buffer linked to a parent.
    *
-   * @param parentBuffer - Parent span's buffer
-   * @param spanName - Name of the child span
+   * @param parentBuffer - Parent buffer for tree linkage
+   * @param spanName - Name for this span
+   * Note: Caller must call writeSpanStart() after this to set span name in message_values[0].
+   *
    * @param callsiteMetadata - Metadata for WHERE span() was called (row 0)
    * @param opMetadata - Metadata for WHAT op is executing (rows 1+)
    * @param capacity - Optional capacity override
+   * @param schema - Optional schema for the child (if different from parent, e.g., library ops)
    * @returns New SpanBuffer linked to parent
    */
   createChildSpanBuffer(
     parentBuffer: SpanBuffer<T>,
-    spanName: string,
     callsiteMetadata: OpMetadata,
     opMetadata: OpMetadata,
     capacity?: number,
+    schema?: T,
   ): SpanBuffer<T>;
 
   /**

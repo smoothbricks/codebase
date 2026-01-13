@@ -277,7 +277,6 @@ describe('Arrow Table Conversion', () => {
       const childBuffer = createChildSpanBuffer(
         parentBuffer,
         SpanBufferClass,
-        'child-span',
         DEFAULT_METADATA,
         DEFAULT_METADATA,
       ) as SpanBuffer<typeof schema>;
@@ -340,13 +339,7 @@ describe('Arrow Table Conversion', () => {
       parentBuffer._writeIndex = 1;
 
       // Create first child and register with parent
-      const child1Buffer = createChildSpanBuffer(
-        parentBuffer,
-        SpanBufferClass,
-        'child1-span',
-        DEFAULT_METADATA,
-        DEFAULT_METADATA,
-      );
+      const child1Buffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
       parentBuffer._children.push(child1Buffer); // Explicit registration per spanBuffer.ts
       child1Buffer.timestamp[0] = 1100n;
       child1Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -357,13 +350,7 @@ describe('Arrow Table Conversion', () => {
       child1Buffer._writeIndex = 2;
 
       // Create second child and register with parent
-      const child2Buffer = createChildSpanBuffer(
-        parentBuffer,
-        SpanBufferClass,
-        'child2-span',
-        DEFAULT_METADATA,
-        DEFAULT_METADATA,
-      );
+      const child2Buffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
       parentBuffer._children.push(child2Buffer); // Explicit registration per spanBuffer.ts
       child2Buffer.timestamp[0] = 1300n;
       child2Buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
@@ -459,19 +446,17 @@ describe('Arrow Table Conversion', () => {
       buffer.message(1, 'Test log message');
       buffer._writeIndex = 2;
 
-      // Update capacity stats to have meaningful values
+      // Update capacity stats to have meaningful values (utilization-based tuning)
       SpanBufferClass.stats.capacity = 128;
       SpanBufferClass.stats.totalWrites = 50;
-      SpanBufferClass.stats.overflowWrites = 5;
-      SpanBufferClass.stats.totalCreated = 2;
-      SpanBufferClass.stats.overflows = 1;
+      SpanBufferClass.stats.spansCreated = 5;
 
       // Convert with statsToLog - now requires CapacityStatsEntry[] with both SpanBufferClass and metadata
       const statsToLog: CapacityStatsEntry[] = [{ bufferClass: SpanBufferClass, metadata }];
       const table = convertSpanTreeToArrowTable(buffer, undefined, statsToLog);
 
-      // Should have span entries (2) + buffer metric entries (5) = 7 rows total
-      expect(table.numRows).toBe(7);
+      // Should have span entries (2) + buffer metric entries (4) = 6 rows total
+      expect(table.numRows).toBe(6);
       expect(table.batches.length).toBe(2); // One batch for span data, one for buffer metrics
 
       // Verify span entries
@@ -483,7 +468,7 @@ describe('Arrow Table Conversion', () => {
       expect(row1?.entry_type).toBe('info');
       expect(row1?.message).toBe('Test log message');
 
-      // Verify buffer metric entries (5 rows per module)
+      // Verify buffer metric entries (4 rows per module for utilization-based tuning)
       // Per spec, buffer metrics use uint64_value column, NOT JSON in message
       const row2 = table.get(2)?.toJSON();
       expect(row2?.entry_type).toBe('period-start');
@@ -495,16 +480,12 @@ describe('Arrow Table Conversion', () => {
       expect(row3?.uint64_value).toBe(50n); // totalWrites
 
       const row4 = table.get(4)?.toJSON();
-      expect(row4?.entry_type).toBe('buffer-overflow-writes');
-      expect(row4?.uint64_value).toBe(5n); // overflowWrites
+      expect(row4?.entry_type).toBe('buffer-spans');
+      expect(row4?.uint64_value).toBe(5n); // spansCreated
 
       const row5 = table.get(5)?.toJSON();
-      expect(row5?.entry_type).toBe('buffer-created');
-      expect(row5?.uint64_value).toBe(2n); // totalCreated
-
-      const row6 = table.get(6)?.toJSON();
-      expect(row6?.entry_type).toBe('buffer-overflows');
-      expect(row6?.uint64_value).toBe(1n); // overflows
+      expect(row5?.entry_type).toBe('buffer-capacity');
+      expect(row5?.uint64_value).toBe(128n); // capacity
     });
 
     test('includes only buffer metrics when no span data', () => {
@@ -516,19 +497,17 @@ describe('Arrow Table Conversion', () => {
       // Buffer has no entries (writeIndex = 0)
       buffer._writeIndex = 0;
 
-      // Update capacity stats
+      // Update capacity stats (utilization-based tuning)
       SpanBufferClass.stats.capacity = 64;
       SpanBufferClass.stats.totalWrites = 10;
-      SpanBufferClass.stats.overflowWrites = 0;
-      SpanBufferClass.stats.totalCreated = 1;
-      SpanBufferClass.stats.overflows = 0;
+      SpanBufferClass.stats.spansCreated = 2;
 
       // Convert with statsToLog - now requires CapacityStatsEntry[] with both SpanBufferClass and metadata
       const statsToLog: CapacityStatsEntry[] = [{ bufferClass: SpanBufferClass, metadata }];
       const table = convertSpanTreeToArrowTable(buffer, undefined, statsToLog);
 
-      // Should have only buffer metric entries (5 rows)
-      expect(table.numRows).toBe(5);
+      // Should have only buffer metric entries (4 rows)
+      expect(table.numRows).toBe(4);
       expect(table.batches.length).toBe(1); // Only buffer metrics batch
 
       const row0 = table.get(0)?.toJSON();
@@ -540,16 +519,12 @@ describe('Arrow Table Conversion', () => {
       expect(row1?.uint64_value).toBe(10n);
 
       const row2 = table.get(2)?.toJSON();
-      expect(row2?.entry_type).toBe('buffer-overflow-writes');
-      expect(row2?.uint64_value).toBe(0n);
+      expect(row2?.entry_type).toBe('buffer-spans');
+      expect(row2?.uint64_value).toBe(2n); // spansCreated
 
       const row3 = table.get(3)?.toJSON();
-      expect(row3?.entry_type).toBe('buffer-created');
-      expect(row3?.uint64_value).toBe(1n);
-
-      const row4 = table.get(4)?.toJSON();
-      expect(row4?.entry_type).toBe('buffer-overflows');
-      expect(row4?.uint64_value).toBe(0n);
+      expect(row3?.entry_type).toBe('buffer-capacity');
+      expect(row3?.uint64_value).toBe(64n); // capacity
     });
   });
 });

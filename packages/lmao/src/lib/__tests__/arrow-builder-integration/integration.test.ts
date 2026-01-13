@@ -344,10 +344,12 @@ describe('Buffer Integration', () => {
         createTestTraceRoot('test-trace'),
         createTestOpMetadata(),
       );
+      // Caller must set span name via message() - simulating writeSpanStart behavior
+      buffer.message(0, 'context-integration');
 
       // Verify buffer properly references schema via constructor
       expect(buffer._logSchema).toBe(schema);
-      expect(buffer._spanName).toBe('context-integration');
+      expect(buffer.message_values[0]).toBe('context-integration');
 
       // Verify system metadata columns are accessible
       expect(buffer.span_id).toBeGreaterThan(0);

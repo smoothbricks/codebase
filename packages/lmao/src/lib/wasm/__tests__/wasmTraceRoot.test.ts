@@ -22,6 +22,10 @@ const mockTracer: TracerLifecycleHooks = {
   onSpanStart: () => {},
   onSpanEnd: () => {},
   onStatsWillResetFor: () => {},
+  bufferStrategy: {
+    createChildSpanBuffer: () => ({}) as any,
+    createOverflowBuffer: () => ({}) as any,
+  },
 };
 
 describe('WasmTraceRoot', () => {

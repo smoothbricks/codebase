@@ -244,9 +244,10 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
 
   /**
    * Buffer strategy for memory management and Arrow conversion.
-   * Protected so subclasses can access for toArrowTable/releaseBuffer calls.
+   * Public because SpanContext needs access for child span creation.
+   * Also accessible to subclasses for toArrowTable/releaseBuffer calls.
    */
-  protected readonly bufferStrategy: BufferStrategy<B['logBinding']['logSchema']>;
+  readonly bufferStrategy: BufferStrategy<B['logBinding']['logSchema']>;
 
   constructor(binding: B, options: TracerOptions<B['logBinding']['logSchema']>) {
     this.logBinding = binding.logBinding;
@@ -560,11 +561,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
 
     // Create tag writer and span logger (needed for constructor)
     const tagWriter = createTagWriter(schema, buffer) as TagWriter<B['logBinding']['logSchema']>;
-    const spanLogger = createSpanLoggerFromGenerator(
-      schema,
-      buffer,
-      this.bufferStrategy.createOverflowBuffer.bind(this.bufferStrategy) as any,
-    );
+    const spanLogger = createSpanLoggerFromGenerator(schema, buffer);
 
     // Instantiate SpanContext class with direct arguments (no temp object allocation)
     const ctx = new this.SpanContextClass(buffer, schema, spanLogger, tagWriter) as SpanContextInstance<OpContextOf<B>>;

@@ -698,7 +698,7 @@ Each `SpanBufferClass` (generated per schema) has a static `stats` property for 
 interface SpanBufferStats {
   capacity: number; // Current capacity for new buffers
   totalWrites: number; // Total entries written across all buffers
-  overflowWrites: number; // Writes that triggered overflow
+  overflowWrites: number; // Number of overflow events (incremented once per overflow)
   totalCreated: number; // Total buffers created (root + children + chains)
   overflows: number; // Number of overflow events
 }
@@ -721,9 +721,9 @@ Stats are per-schema, not per-buffer:
 
 ### Stats Updates
 
-| Event              | Stats Updated                                       |
-| ------------------ | --------------------------------------------------- |
-| Buffer created     | `totalCreated++`                                    |
-| Entry written      | `totalWrites++`                                     |
-| Overflow triggered | `overflows++`, `overflowWrites += remainingEntries` |
-| Capacity adjusted  | `capacity` updated, stats reset                     |
+| Event              | Stats Updated                     |
+| ------------------ | --------------------------------- |
+| Buffer created     | `totalCreated++`                  |
+| Entry written      | `totalWrites++`                   |
+| Overflow triggered | `overflows++`, `overflowWrites++` |
+| Capacity adjusted  | `capacity` updated, stats reset   |

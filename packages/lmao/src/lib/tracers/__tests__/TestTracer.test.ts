@@ -37,7 +37,7 @@ describe('TestTracer', () => {
       await trace('my-trace', async (ctx) => ctx.ok('done'));
 
       expect(tracer.rootBuffers).toHaveLength(1);
-      expect(tracer.rootBuffers[0]._spanName).toBe('my-trace');
+      expect(tracer.rootBuffers[0].message_values[0]).toBe('my-trace');
     });
 
     it('should accumulate multiple traces', async () => {
@@ -49,9 +49,9 @@ describe('TestTracer', () => {
       await trace('trace-3', async (ctx) => ctx.ok('done'));
 
       expect(tracer.rootBuffers).toHaveLength(3);
-      expect(tracer.rootBuffers[0]._spanName).toBe('trace-1');
-      expect(tracer.rootBuffers[1]._spanName).toBe('trace-2');
-      expect(tracer.rootBuffers[2]._spanName).toBe('trace-3');
+      expect(tracer.rootBuffers[0].message_values[0]).toBe('trace-1');
+      expect(tracer.rootBuffers[1].message_values[0]).toBe('trace-2');
+      expect(tracer.rootBuffers[2].message_values[0]).toBe('trace-3');
     });
 
     it('should accumulate buffer even if trace throws', async () => {
@@ -66,7 +66,7 @@ describe('TestTracer', () => {
 
       // Buffer should still be collected
       expect(tracer.rootBuffers).toHaveLength(1);
-      expect(tracer.rootBuffers[0]._spanName).toBe('failing-trace');
+      expect(tracer.rootBuffers[0].message_values[0]).toBe('failing-trace');
     });
   });
 
@@ -87,7 +87,7 @@ describe('TestTracer', () => {
 
       // Child spans are in _children array
       expect(rootBuffer._children).toHaveLength(1);
-      expect(rootBuffer._children[0]._spanName).toBe('child-span');
+      expect(rootBuffer._children[0].message_values[0]).toBe('child-span');
     });
 
     it('should support deeply nested spans', async () => {
@@ -106,9 +106,9 @@ describe('TestTracer', () => {
 
       const root = tracer.rootBuffers[0];
       expect(root._children).toHaveLength(1);
-      expect(root._children[0]._spanName).toBe('span-l2');
+      expect(root._children[0].message_values[0]).toBe('span-l2');
       expect(root._children[0]._children).toHaveLength(1);
-      expect(root._children[0]._children[0]._spanName).toBe('span-l3');
+      expect(root._children[0]._children[0].message_values[0]).toBe('span-l3');
     });
   });
 
@@ -136,7 +136,7 @@ describe('TestTracer', () => {
       await trace('after-clear', async (ctx) => ctx.ok('done'));
 
       expect(tracer.rootBuffers).toHaveLength(1);
-      expect(tracer.rootBuffers[0]._spanName).toBe('after-clear');
+      expect(tracer.rootBuffers[0].message_values[0]).toBe('after-clear');
     });
   });
 

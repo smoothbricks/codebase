@@ -203,23 +203,24 @@ export class WasmTraceRoot implements ITraceRoot {
   }
 
   /**
-   * Write log entry timestamp and entry_type at the given index.
-   * Used by SpanLogger for info/debug/warn/error/trace/ff entries.
+   * Write log entry: bump writeIndex, write timestamp + entry_type, return idx.
+   * SpanLogger uses returned idx for string column writes.
    *
    * @param buffer - SpanBuffer to write to
-   * @param idx - Row index to write at
    * @param entryType - Entry type (INFO, DEBUG, WARN, ERROR, TRACE, FF_ACCESS, FF_USAGE)
+   * @returns The row index where entry was written
    */
-  writeLogEntry(buffer: AnySpanBuffer, idx: number, entryType: number): void {
+  writeLogEntry(buffer: AnySpanBuffer, entryType: number): number {
     if (isWasmSpanBuffer(buffer)) {
-      // WASM path: delegate to allocator
-      // writeLogEntry uses writeIndex from identity block to determine row
-      this.allocator.writeLogEntry(buffer._systemPtr, buffer._identityPtr, this._traceRootPtr, entryType);
-    } else {
-      // JS path
-      buffer.timestamp[idx] = this.getTimestampNanos();
-      buffer.entry_type[idx] = entryType;
+      // WASM path: bump writeIndex, write timestamp + entry_type, return idx
+      return this.allocator.writeLogEntry(buffer._systemPtr, buffer._identityPtr, this._traceRootPtr, entryType);
     }
+    // JS path: bump writeIndex, write directly, return idx
+    const idx = buffer._writeIndex;
+    buffer.timestamp[idx] = this.getTimestampNanos();
+    buffer.entry_type[idx] = entryType;
+    buffer._writeIndex = idx + 1;
+    return idx;
   }
 
   // ===========================================================================

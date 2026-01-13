@@ -280,14 +280,19 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
 
   onStatsWillResetFor(_buffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     const stats = _buffer._stats;
-    const overflowRatio = stats.totalWrites > 0 ? ((stats.overflowWrites / stats.totalWrites) * 100).toFixed(1) : '0.0';
+    // Compute utilization = totalWrites / (spansCreated * usableRowsPerSpan)
+    const usableRowsPerSpan = stats.capacity - 2;
+    const utilization =
+      stats.spansCreated > 0
+        ? ((stats.totalWrites / (stats.spansCreated * usableRowsPerSpan)) * 100).toFixed(1)
+        : '0.0';
     const traceId = _buffer.trace_id;
     const ts = formatTimestamp(_buffer.timestamp[0]);
 
     this.out.write(
       `[${ts}] ${this.color(traceId)}[${traceId}]${this.reset()} ` +
-        `[CAPACITY] writes=${stats.totalWrites} overflow=${stats.overflowWrites} (${overflowRatio}%) ` +
-        `buffers=${stats.totalCreated} capacity=${stats.capacity}\n`,
+        `[CAPACITY] writes=${stats.totalWrites} spans=${stats.spansCreated} utilization=${utilization}% ` +
+        `capacity=${stats.capacity}\n`,
     );
   }
 }

@@ -62,7 +62,7 @@ describe('WasmSpanBuffer', () => {
       const buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 42n,
         span_id: 1,
@@ -82,7 +82,7 @@ describe('WasmSpanBuffer', () => {
       const parent = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'parent-span',
+
         trace_id: 'trace-456',
         thread_id: 100n, // Legacy param, now uses global
         span_id: 2,
@@ -91,7 +91,7 @@ describe('WasmSpanBuffer', () => {
       const child = createWasmChildSpanBuffer(parent, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'child-span',
+
         thread_id: 100n, // Legacy param, now uses global
         span_id: 5,
       });
@@ -108,7 +108,7 @@ describe('WasmSpanBuffer', () => {
       createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -122,7 +122,7 @@ describe('WasmSpanBuffer', () => {
       const buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -141,7 +141,7 @@ describe('WasmSpanBuffer', () => {
       buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -189,7 +189,7 @@ describe('WasmSpanBuffer', () => {
       buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -219,7 +219,7 @@ describe('WasmSpanBuffer', () => {
       buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -295,7 +295,7 @@ describe('WasmSpanBuffer', () => {
       buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -338,7 +338,7 @@ describe('WasmSpanBuffer', () => {
       const buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -354,7 +354,7 @@ describe('WasmSpanBuffer', () => {
       const buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -370,7 +370,7 @@ describe('WasmSpanBuffer', () => {
       const buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n,
         span_id: 1,
@@ -400,7 +400,7 @@ describe('WasmSpanBuffer', () => {
       const parent = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'parent-span',
+
         trace_id: 'trace-123',
         thread_id: 1n, // Legacy param, now ignored - uses global
         span_id: 1,
@@ -409,10 +409,13 @@ describe('WasmSpanBuffer', () => {
       const child = createWasmChildSpanBuffer(parent, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'child-span',
+
         thread_id: 2n, // Legacy param, now ignored - uses global
         span_id: 2,
       });
+
+      // Manually push to _children - SpanContext does this with possible RemappedBufferView wrapper
+      parent._children.push(child);
 
       expect(child._parent).toBe(parent);
       expect(parent._children).toContain(child);
@@ -431,7 +434,7 @@ describe('WasmSpanBuffer', () => {
       const buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n, // Legacy param, now ignored - uses global
         span_id: 1,
@@ -457,7 +460,7 @@ describe('WasmSpanBuffer', () => {
       const buffer = createWasmSpanBuffer(testSchema, {
         allocator,
         capacity: CAPACITY,
-        spanName: 'test-span',
+
         trace_id: 'trace-123',
         thread_id: 1n, // Legacy param, now ignored - uses global
         span_id: 1,

@@ -244,7 +244,6 @@ export function generateRemappedBufferViewClass(
     
     // Metadata (pass-through)
     get module() { return this._buffer._module; }
-    get spanName() { return this._buffer._spanName; }
     get _opMetadata() { return this._buffer._opMetadata; }
     get _callsiteMetadata() { return this._buffer._callsiteMetadata; }
     // Remapped column access (for Arrow conversion iteration)

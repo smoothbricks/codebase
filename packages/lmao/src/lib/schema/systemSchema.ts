@@ -273,20 +273,17 @@ export const ENTRY_TYPE_OP_DURATION_MIN = 19;
 export const ENTRY_TYPE_OP_DURATION_MAX = 20;
 
 // =============================================================================
-// Buffer Metrics (per specs/01n_op_and_buffer_metrics.md)
+// Buffer Metrics (utilization-based capacity tuning)
 // =============================================================================
 
-/** Buffer writes counter - total writes to primary buffers */
+/** Buffer writes counter - total writes across all buffers */
 export const ENTRY_TYPE_BUFFER_WRITES = 21;
 
-/** Buffer overflow writes counter - writes to overflow buffers */
-export const ENTRY_TYPE_BUFFER_OVERFLOW_WRITES = 22;
+/** Buffer spans counter - number of spans created (non-overflow buffers) */
+export const ENTRY_TYPE_BUFFER_SPANS = 22;
 
-/** Buffer created counter - total buffers allocated */
-export const ENTRY_TYPE_BUFFER_CREATED = 23;
-
-/** Buffer overflows counter - times a buffer overflowed to next */
-export const ENTRY_TYPE_BUFFER_OVERFLOWS = 24;
+/** Buffer capacity - current buffer capacity for this module */
+export const ENTRY_TYPE_BUFFER_CAPACITY = 23;
 
 /**
  * Human-readable names for entry types, indexed by entry type code.
@@ -323,7 +320,6 @@ export const ENTRY_TYPE_NAMES = [
   'op-duration-min', // 19
   'op-duration-max', // 20
   'buffer-writes', // 21
-  'buffer-overflow-writes', // 22
-  'buffer-created', // 23
-  'buffer-overflows', // 24
+  'buffer-spans', // 22
+  'buffer-capacity', // 23
 ] as const;

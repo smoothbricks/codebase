@@ -47,10 +47,11 @@ export interface WasmAllocator {
   free4B(offset: number, capacity?: number): void;
   free8B(offset: number, capacity?: number): void;
 
-  // Span lifecycle (writes timestamp + entry_type, writeIndex in identity)
+  // Span lifecycle (writes timestamp + entry_type)
   spanStart(systemPtr: number, identityPtr: number, traceRootPtr: number, capacity?: number): void;
   spanEndOk(systemPtr: number, traceRootPtr: number, capacity?: number): void;
   spanEndErr(systemPtr: number, traceRootPtr: number, capacity?: number): void;
+  /** Write log entry, bump writeIndex, return idx written to */
   writeLogEntry(
     systemPtr: number,
     identityPtr: number,
@@ -264,8 +265,8 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
       exports.span_start(systemPtr, identityPtr, traceRootPtr, cap),
     spanEndOk: (systemPtr, traceRootPtr, cap = capacity) => exports.span_end_ok(systemPtr, traceRootPtr, cap),
     spanEndErr: (systemPtr, traceRootPtr, cap = capacity) => exports.span_end_err(systemPtr, traceRootPtr, cap),
-    writeLogEntry: (systemPtr, identityPtr, traceRootPtr, entryType, cap = capacity) =>
-      exports.write_log_entry(systemPtr, identityPtr, traceRootPtr, entryType, cap),
+    writeLogEntry: (systemPtr, traceRootPtr, idx, entryType, cap = capacity) =>
+      exports.write_log_entry(systemPtr, traceRootPtr, idx, entryType, cap),
 
     // Column writes with optional capacity
     writeColF64: (colOffset, rowIdx, value, cap = capacity) => exports.write_col_f64(colOffset, rowIdx, value, cap),

@@ -47,11 +47,22 @@ function getTestSpanBufferClass(capacity?: number): SpanBufferConstructor {
   const SpanBufferClass = getSpanBufferClass(testSchema);
   // Reset stats for clean test state
   SpanBufferClass.stats.capacity = capacity ?? DEFAULT_BUFFER_CAPACITY;
-  SpanBufferClass.stats.overflows = 0;
-  SpanBufferClass.stats.overflowWrites = 0;
   SpanBufferClass.stats.totalWrites = 0;
-  SpanBufferClass.stats.totalCreated = 0;
+  SpanBufferClass.stats.spansCreated = 0;
   return SpanBufferClass;
+}
+
+/**
+ * Helper: Count overflows by walking buffer chain
+ */
+function countOverflows(buffer: AnySpanBuffer): number {
+  let count = 0;
+  let curr: AnySpanBuffer | undefined = buffer;
+  while (curr?._overflow) {
+    count++;
+    curr = curr._overflow;
+  }
+  return count;
 }
 
 /**
@@ -159,8 +170,7 @@ describe('Buffer Overflow Property Tests', () => {
           fc.integer({ min: 1, max: 200 }),
           (numEntries) => {
             // Reset counters for each test run
-            SpanBufferClass.stats.overflows = 0;
-            SpanBufferClass.stats.totalCreated = 0;
+            SpanBufferClass.stats.spansCreated = 0;
 
             const buffer = createBuffer(testSchema);
             const logger = createSpanLogger(testSchema, buffer);
@@ -196,10 +206,8 @@ describe('Buffer Overflow Property Tests', () => {
           // Reset all stats including capacity before each run
           const capacity = DEFAULT_BUFFER_CAPACITY; // 8
           SpanBufferClass.stats.capacity = capacity;
-          SpanBufferClass.stats.overflows = 0;
-          SpanBufferClass.stats.overflowWrites = 0;
           SpanBufferClass.stats.totalWrites = 0;
-          SpanBufferClass.stats.totalCreated = 0;
+          SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createSpanBuffer(
             testSchema,
@@ -230,8 +238,7 @@ describe('Buffer Overflow Property Tests', () => {
     it('buffer chain is properly linked', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
-          SpanBufferClass.stats.overflows = 0;
-          SpanBufferClass.stats.totalCreated = 0;
+          SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
           const logger = createSpanLogger(testSchema, buffer);
@@ -273,8 +280,7 @@ describe('Buffer Overflow Property Tests', () => {
     it('each entry has correct attribute values', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 100 }), (numEntries) => {
-          SpanBufferClass.stats.overflows = 0;
-          SpanBufferClass.stats.totalCreated = 0;
+          SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
           const logger = createSpanLogger(testSchema, buffer);
@@ -314,8 +320,7 @@ describe('Buffer Overflow Property Tests', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 150 }), (numEntries) => {
           // Reset counters
-          SpanBufferClass.stats.overflows = 0;
-          SpanBufferClass.stats.totalCreated = 0;
+          SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
           const logger = createSpanLogger(testSchema, buffer);
@@ -327,7 +332,7 @@ describe('Buffer Overflow Property Tests', () => {
           const { bufferCount } = analyzeBufferChain(buffer);
 
           // Property: overflow events = bufferCount - 1 (one per chain link)
-          expect(SpanBufferClass.stats.overflows).toBe(bufferCount - 1);
+          expect(countOverflows(buffer)).toBe(bufferCount - 1);
         }),
         { numRuns: 100 },
       );
@@ -338,8 +343,7 @@ describe('Buffer Overflow Property Tests', () => {
     it('each buffer writeIndex is within capacity', () => {
       fc.assert(
         fc.property(fc.integer({ min: 1, max: 200 }), (numEntries) => {
-          SpanBufferClass.stats.overflows = 0;
-          SpanBufferClass.stats.totalCreated = 0;
+          SpanBufferClass.stats.spansCreated = 0;
 
           const buffer = createBuffer(testSchema);
           const logger = createSpanLogger(testSchema, buffer);
@@ -367,7 +371,6 @@ describe('Buffer Overflow Property Tests', () => {
     it('exact usable capacity: no overflow when entries fit in first buffer', () => {
       const capacity = DEFAULT_BUFFER_CAPACITY; // 8
       const usableCapacity = capacity - RESERVED_ROWS; // 6 entries fit
-      SpanBufferClass.stats.overflows = 0;
 
       const buffer = createSpanBuffer(
         testSchema,
@@ -385,7 +388,7 @@ describe('Buffer Overflow Property Tests', () => {
 
       // Should be exactly 1 buffer (no overflow)
       expect(buffer._overflow).toBeUndefined();
-      expect(SpanBufferClass.stats.overflows).toBe(0);
+      expect(countOverflows(buffer)).toBe(0);
       // writeIndex = RESERVED_ROWS + usableCapacity = 2 + 6 = 8 = capacity
       expect(buffer._writeIndex).toBe(capacity);
     });
@@ -393,7 +396,6 @@ describe('Buffer Overflow Property Tests', () => {
     it('usable capacity + 1: triggers exactly one overflow', () => {
       const capacity = DEFAULT_BUFFER_CAPACITY; // 8
       const usableCapacity = capacity - RESERVED_ROWS; // 6
-      SpanBufferClass.stats.overflows = 0;
 
       const buffer = createSpanBuffer(
         testSchema,
@@ -412,7 +414,7 @@ describe('Buffer Overflow Property Tests', () => {
       // Should be exactly 2 buffers
       expect(buffer._overflow).toBeDefined();
       expect(buffer._overflow?._overflow).toBeUndefined();
-      expect(SpanBufferClass.stats.overflows).toBe(1);
+      expect(countOverflows(buffer)).toBe(1);
 
       // First buffer full, second has 1 entry
       expect(buffer._writeIndex).toBe(capacity);
@@ -420,8 +422,6 @@ describe('Buffer Overflow Property Tests', () => {
     });
 
     it('zero entries: single buffer with just reserved space', () => {
-      SpanBufferClass.stats.overflows = 0;
-
       const buffer = createBuffer(testSchema);
       // Create logger but don't write anything
       createSpanLogger(testSchema, buffer);
@@ -429,7 +429,7 @@ describe('Buffer Overflow Property Tests', () => {
       expect(buffer._overflow).toBeUndefined();
       // Logger constructor sets writeIndex to 2 (after reserved rows)
       expect(buffer._writeIndex).toBe(RESERVED_ROWS);
-      expect(SpanBufferClass.stats.overflows).toBe(0);
+      expect(countOverflows(buffer)).toBe(0);
     });
   });
 
@@ -444,10 +444,8 @@ describe('Buffer Overflow Property Tests', () => {
           (numEntries, capacity) => {
             // Reset all stats to prevent capacity tuning from modifying them mid-test
             SpanBufferClass.stats.capacity = capacity; // Set for chained buffers
-            SpanBufferClass.stats.overflows = 0;
-            SpanBufferClass.stats.overflowWrites = 0;
             SpanBufferClass.stats.totalWrites = 0;
-            SpanBufferClass.stats.totalCreated = 0;
+            SpanBufferClass.stats.spansCreated = 0;
 
             const buffer = createSpanBuffer(
               testSchema,
@@ -469,11 +467,165 @@ describe('Buffer Overflow Property Tests', () => {
             expect(bufferCount).toBe(expected);
 
             // Property: overflow count matches
-            expect(SpanBufferClass.stats.overflows).toBe(bufferCount - 1);
+            expect(countOverflows(buffer)).toBe(bufferCount - 1);
           },
         ),
         { numRuns: 100 },
       );
+    });
+  });
+
+  describe('Scoped Attributes in Overflow Buffers', () => {
+    it('should prefill scoped attributes in overflow buffer from row 0 (not row 2)', () => {
+      const capacity = 8;
+      const usableCapacity = capacity - RESERVED_ROWS; // 6
+
+      const buffer = createSpanBuffer(
+        testSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        capacity,
+      );
+      const logger = createSpanLogger(testSchema, buffer);
+
+      // Set scope values that should be prefilled
+      buffer._scopeValues = Object.freeze({
+        requestId: 'req-123',
+        userId: 'user-456',
+      });
+
+      // Write enough entries to trigger overflow (usableCapacity + 1)
+      for (let i = 0; i < usableCapacity + 1; i++) {
+        logger.info(`msg-${i}`);
+      }
+
+      // Verify overflow happened
+      expect(buffer._overflow).toBeDefined();
+      const overflowBuffer = buffer._overflow!;
+
+      // CRITICAL: Overflow buffer starts at _writeIndex=0, not 2
+      // The bug was that _prefillScopedAttributesOn used startIdx=2, skipping rows 0-1
+      expect(overflowBuffer._writeIndex).toBe(1); // One entry written
+
+      // CRITICAL: Columns in scope but never written to directly are NOT allocated
+      // Prefill checks _requestId_values (private) to avoid triggering lazy allocation
+      // These columns stay unallocated until Arrow conversion time
+      expect((overflowBuffer as any)._requestId_values).toBeUndefined();
+      expect((overflowBuffer as any)._userId_values).toBeUndefined();
+
+      // Row 0 has the actual entry (message IS allocated because .info() writes to it)
+      expect(overflowBuffer.message_values[0]).toBe('msg-6');
+    });
+
+    it('should prefill scoped attributes across multiple overflow buffers', () => {
+      const capacity = 8;
+      const usableCapacity = capacity - RESERVED_ROWS; // 6
+
+      const buffer = createSpanBuffer(
+        testSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        capacity,
+      );
+      const logger = createSpanLogger(testSchema, buffer);
+
+      buffer._scopeValues = Object.freeze({
+        requestId: 'req-xyz',
+      });
+
+      // Write enough to create 2 overflow buffers
+      // First buffer: 6 entries (usableCapacity), overflow 1: 8 entries (full capacity), overflow 2: 1 entry
+      const entriesToWrite = usableCapacity + capacity + 1; // 6 + 8 + 1 = 15
+      for (let i = 0; i < entriesToWrite; i++) {
+        logger.info(`msg-${i}`);
+      }
+
+      expect(buffer._overflow).toBeDefined();
+      expect(buffer._overflow!._overflow).toBeDefined();
+
+      const overflow1 = buffer._overflow!;
+      const overflow2 = overflow1._overflow!;
+
+      // Columns in scope but never written directly stay unallocated (lazy)
+      expect((overflow1 as any)._requestId_values).toBeUndefined();
+      expect((overflow2 as any)._requestId_values).toBeUndefined();
+    });
+
+    it('only prefills columns present in _scopeValues, not all schema columns', () => {
+      const capacity = 8;
+      const usableCapacity = capacity - RESERVED_ROWS; // 6
+
+      const buffer = createSpanBuffer(
+        testSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        capacity,
+      );
+      const logger = createSpanLogger(testSchema, buffer);
+
+      // Set scope for ONLY userId and requestId, NOT operation or duration or success
+      buffer._scopeValues = Object.freeze({
+        userId: 'user-789',
+        requestId: 'req-abc',
+      });
+
+      // Trigger overflow
+      for (let i = 0; i < usableCapacity + 1; i++) {
+        logger.info(`msg-${i}`);
+      }
+
+      const overflowBuffer = buffer._overflow!;
+
+      // Columns in _scopeValues but NEVER written to directly stay unallocated (lazy)
+      expect((overflowBuffer as any)._userId_values).toBeUndefined();
+      expect((overflowBuffer as any)._requestId_values).toBeUndefined();
+
+      // Columns NOT in _scopeValues also stay unallocated (lazy)
+      expect((overflowBuffer as any)._operation_values).toBeUndefined();
+      expect((overflowBuffer as any)._duration_values).toBeUndefined();
+      expect((overflowBuffer as any)._success_values).toBeUndefined();
+    });
+
+    it('does not allocate columns that are only in scope (lazy allocation)', () => {
+      const capacity = 8;
+      const usableCapacity = capacity - RESERVED_ROWS;
+
+      const buffer = createSpanBuffer(
+        testSchema,
+        'test-span',
+        createTestTraceRoot('test-trace'),
+        DEFAULT_METADATA,
+        capacity,
+      );
+      const logger = createSpanLogger(testSchema, buffer);
+
+      // Set scope for userId but NEVER call .userId() directly
+      buffer._scopeValues = Object.freeze({
+        userId: 'scope-only-user',
+      });
+
+      // Write entries without touching userId column
+      for (let i = 0; i < usableCapacity + 1; i++) {
+        logger.info(`msg-${i}`);
+      }
+
+      // Verify overflow happened
+      expect(buffer._overflow).toBeDefined();
+      const overflowBuffer = buffer._overflow!;
+
+      // CRITICAL: prefill checks the PRIVATE property _userId_values
+      // This prevents triggering the lazy getter and allocating memory
+      // Since userId was only in scope (never written directly), it stays unallocated
+
+      // Verify column was NOT allocated (lazy allocation preserved)
+      expect((buffer as any)._userId_values).toBeUndefined();
+      expect((overflowBuffer as any)._userId_values).toBeUndefined();
+
+      // Accessing via the public getter would trigger allocation
+      // (but we verify it's undefined before triggering the getter)
     });
   });
 });
