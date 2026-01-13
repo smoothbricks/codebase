@@ -129,5 +129,10 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
   clear(): void {
     this.rootBuffers.length = 0;
     this.statsSnapshots.length = 0;
+
+    // Reset the buffer strategy if it supports it (e.g., WasmBufferStrategy)
+    if ('reset' in this.bufferStrategy && typeof (this.bufferStrategy as any).reset === 'function') {
+      (this.bufferStrategy as any).reset();
+    }
   }
 }

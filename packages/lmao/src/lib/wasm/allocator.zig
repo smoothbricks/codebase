@@ -690,7 +690,9 @@ export fn alloc_identity_root_for_js_write(trace_id_len: u32) u64 {
     identity.trace_id_len = @truncate(trace_id_len);
 
     // Calculate absolute byte offset to trace_id field
-    const trace_id_field_offset = offset + @offsetOf(Identity, "trace_id");
+    // Cast to u32 explicitly to ensure proper type handling
+    const field_offset_in_struct: u32 = @offsetOf(Identity, "trace_id");
+    const trace_id_field_offset: u32 = offset + field_offset_in_struct;
 
     // Pack both offsets into u64: upper 32 bits = identity offset, lower 32 bits = trace_id field offset
     return (@as(u64, offset) << 32) | @as(u64, trace_id_field_offset);

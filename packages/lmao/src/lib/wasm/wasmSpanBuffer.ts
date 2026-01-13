@@ -147,6 +147,7 @@ export interface WasmSpanBufferInstance {
 export interface WasmSpanBufferConstructor {
   new (opts: WasmSpanBufferOptions): WasmSpanBufferInstance;
   readonly schema: LogSchema;
+  stats: SpanBufferStats; // Mutable stats shared across all instances
 }
 
 // =============================================================================
@@ -238,7 +239,7 @@ function generateConstructorCode(columnMeta: ColumnMeta[]): string {
     // Store allocator and capacity
     'this._allocator = opts.allocator;',
     'this._capacity = opts.capacity;',
-    'this._logSchema = opts.logSchema;',
+    // Note: _logSchema, _columns, and _stats are provided by getters (not stored)
     '',
     // Allocate identity block from WASM (root has trace_id, child does not)
     'if (opts.trace_id) {',
@@ -608,7 +609,19 @@ function generateUtilityMethods(columnMeta: ColumnMeta[]): string {
     {} as Record<string, number>,
   );
 
-  return `isColumnAllocated(columnIndex) {
+  return `get _stats() {
+    return this.constructor.stats;
+  }
+
+  get _logSchema() {
+    return this.constructor.schema;
+  }
+
+  get _columns() {
+    return this.constructor.schema._columns;
+  }
+
+  isColumnAllocated(columnIndex) {
     return this._columnPtrs[columnIndex] >= 0;
   }
 
@@ -685,8 +698,7 @@ export function getWasmSpanBufferClass(schema: LogSchema): WasmSpanBufferConstru
   const columnMeta = buildColumnMeta(schema);
 
   // Generate class code
-  const classCode = `'use strict';
-
+  const classCode = `
 class WasmSpanBuffer {
   constructor(opts) {
     ${generateConstructorCode(columnMeta)}
@@ -738,15 +750,27 @@ return WasmSpanBuffer;
   const WasmSpanBufferClass = factory(checkCapacityTuning);
 
   // Add static schema property
-  (WasmSpanBufferClass as unknown as { schema: LogSchema }).schema = schema;
+  Object.defineProperty(WasmSpanBufferClass, 'schema', {
+    value: schema,
+    writable: false,
+    enumerable: true,
+    configurable: false,
+  });
 
   // Add static stats property (required by SpanContext and arrow-builder's ColumnWriter)
   // This matches the structure in spanBuffer.ts
-  (WasmSpanBufferClass as unknown as { stats: SpanBufferStats }).stats = {
+  // IMPORTANT: stats object itself must be writable so totalWrites++ and spansCreated++ can modify it
+  const statsObject = {
     capacity: 64, // Default capacity, will be overridden by allocator
     totalWrites: 0,
     spansCreated: 0,
   };
+  Object.defineProperty(WasmSpanBufferClass, 'stats', {
+    value: statsObject,
+    writable: true, // Allow the reference to be replaced if needed
+    enumerable: true,
+    configurable: true,
+  });
 
   // Cache the class
   wasmSpanBufferClassCache.set(schema, WasmSpanBufferClass);

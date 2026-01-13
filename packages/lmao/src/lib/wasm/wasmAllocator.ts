@@ -346,6 +346,10 @@ function createImports(memory: WebAssembly.Memory) {
   };
 }
 
+// Cache for compiled WASM module (shared across all allocators)
+// This eliminates recompilation cost in benchmarks and production
+let cachedWasmModule: WebAssembly.Module | null = null;
+
 /**
  * Load WASM bytes - handles both Node.js and browser environments.
  */
@@ -374,6 +378,19 @@ async function loadWasmBytes(): Promise<ArrayBuffer> {
 }
 
 /**
+ * Get compiled WASM module (cached after first load).
+ */
+async function getWasmModule(): Promise<WebAssembly.Module> {
+  if (cachedWasmModule) {
+    return cachedWasmModule;
+  }
+
+  const wasmBytes = await loadWasmBytes();
+  cachedWasmModule = await WebAssembly.compile(wasmBytes);
+  return cachedWasmModule;
+}
+
+/**
  * Create a WASM allocator instance.
  *
  * The allocator uses freelist for O(1) alloc/free with memory reuse.
@@ -390,9 +407,8 @@ export async function createWasmAllocator(options?: WasmAllocatorOptions): Promi
     maximum: maxPages,
   });
 
-  // Load and compile WASM
-  const wasmBytes = await loadWasmBytes();
-  const module = await WebAssembly.compile(wasmBytes);
+  // Get cached compiled module (only compiles once)
+  const module = await getWasmModule();
 
   // Instantiate with our memory
   const imports = createImports(memory);
