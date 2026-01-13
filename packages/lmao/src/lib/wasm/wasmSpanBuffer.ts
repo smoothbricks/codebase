@@ -90,6 +90,20 @@ export interface WasmSpanBufferInstance {
   _writeIndex: number;
 
   // ===========================================================================
+  // Cached WASM function refs (hot path optimization)
+  // ===========================================================================
+  readonly _writeColF64: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
+  readonly _writeColU32: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
+  readonly _writeColU8: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
+  readonly _writeLogEntry: (
+    systemPtr: number,
+    identityPtr: number,
+    traceRootPtr: number,
+    entryType: number,
+    capacity: number,
+  ) => number;
+
+  // ===========================================================================
   // WASM pointers
   // ===========================================================================
   /** Byte offset into WASM memory for system columns (timestamp + entry_type) */
@@ -240,6 +254,13 @@ function generateConstructorCode(columnMeta: ColumnMeta[]): string {
     'this._allocator = opts.allocator;',
     'this._capacity = opts.capacity;',
     // Note: _logSchema, _columns, and _stats are provided by getters (not stored)
+    '',
+    // Cache WASM function refs for hot path (avoid allocator wrapper indirection)
+    'const exports = opts.allocator.exports;',
+    'this._writeColF64 = exports.write_col_f64;',
+    'this._writeColU32 = exports.write_col_u32;',
+    'this._writeColU8 = exports.write_col_u8;',
+    'this._writeLogEntry = exports.write_log_entry;',
     '',
     // Allocate identity block from WASM (root has trace_id, child does not)
     'if (opts.trace_id) {',
