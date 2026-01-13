@@ -58,13 +58,13 @@ let wasmStrategy: WasmBufferStrategy<SchemaType> | null = null;
 async function setup() {
   // JS tracer with JsBufferStrategy
   jsTracer = new TestTracer(opContext, {
-    bufferStrategy: new JsBufferStrategy<SchemaType>({ capacity: 64 }),
+    bufferStrategy: new JsBufferStrategy<SchemaType>({ capacity: 8 }),
     createTraceRoot,
   });
 
   // WASM tracer with WasmBufferStrategy
   try {
-    wasmStrategy = (await WasmBufferStrategy.create({ capacity: 64 })) as WasmBufferStrategy<SchemaType>;
+    wasmStrategy = (await WasmBufferStrategy.create({ capacity: 8 })) as WasmBufferStrategy<SchemaType>;
     wasmTracer = new TestTracer(opContext, {
       bufferStrategy: wasmStrategy,
       createTraceRoot: createWasmTraceRootFactory(wasmStrategy.allocator),
@@ -345,13 +345,16 @@ await setup();
 
 console.log('JS vs WASM Buffer Strategy Benchmark\n');
 console.log('Setup:');
-console.log('  - JS: JsBufferStrategy (GC-managed TypedArrays, capacity=64)');
+console.log('  - JS: JsBufferStrategy (GC-managed TypedArrays, capacity=8)');
 if (wasmStrategy) {
-  console.log('  - WASM: WasmBufferStrategy (freelist allocation, capacity=64)');
+  console.log('  - WASM: WasmBufferStrategy (freelist allocation, capacity=8)');
 } else {
   console.log('  - WASM: DISABLED (initialization failed - see warning above)');
 }
 console.log('  - Schema: 6 columns (2 category, 2 number, 1 boolean, 1 enum)');
+console.log('\nScenarios:');
+console.log('  - Cold start: Fresh tracer/strategy each iteration (initialization cost)');
+console.log('  - Warm/steady-state: Reused tracer/strategy (reuse performance)');
 console.log('');
 
 await run({
