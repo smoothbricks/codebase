@@ -90,23 +90,23 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     const effectiveCapacity = capacity ?? this.allocator.capacity;
 
     // Create WASM buffer
-    const wasmBuffer = createWasmSpanBuffer(schema, {
-      allocator: this.allocator,
-      capacity: effectiveCapacity,
-      trace_id: traceRoot.trace_id,
-      // thread_id and span_id come from WASM (global header and allocator respectively)
-      thread_id: 0n, // Will be read from WASM header
-      span_id: 0, // Will be assigned by WASM allocator
-    });
+    const wasmBuffer = createWasmSpanBuffer(
+      schema,
+      {
+        allocator: this.allocator,
+        capacity: effectiveCapacity,
+        trace_id: traceRoot.trace_id,
+        // thread_id and span_id come from WASM (global header and allocator respectively)
+        thread_id: 0n, // Will be read from WASM header
+        span_id: 0, // Will be assigned by WASM allocator
+      },
+      traceRoot, // _traceRoot
+      EMPTY_SCOPE, // _scopeValues
+      opMetadata, // _opMetadata
+      opMetadata, // _callsiteMetadata (same as opMetadata for root)
+    );
 
-    // Set runtime properties needed by Tracer
-    // These are set after creation because WASM buffer constructor doesn't take them
     const buffer = wasmBuffer as unknown as SpanBuffer<T>;
-    buffer._traceRoot = traceRoot;
-    buffer._opMetadata = opMetadata;
-    buffer._scopeValues = EMPTY_SCOPE;
-    buffer._callsiteMetadata = opMetadata; // Same as opMetadata for root
-
     return buffer;
   }
 
