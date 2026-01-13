@@ -12,8 +12,10 @@
 
 import { getSchemaType } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from '../capacityTuning.js';
+import type { OpMetadata } from '../op.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
+import type { ITraceRoot } from '../traceRoot.js';
 import type { WasmAllocator } from './wasmAllocator.js';
 
 // =============================================================================
@@ -60,6 +62,10 @@ export interface WasmSpanBufferOptions {
   parent_thread_id?: bigint;
   parent_span_id?: number;
   logSchema: LogSchema;
+  _traceRoot: ITraceRoot;
+  _scopeValues: Readonly<Record<string, unknown>>;
+  _opMetadata: OpMetadata;
+  _callsiteMetadata: OpMetadata;
 }
 
 /**
@@ -258,6 +264,12 @@ function generateConstructorCode(columnMeta: ColumnMeta[]): string {
     'this._parent = null;',
     'this._children = [];',
     'this._overflow = null;',
+    '',
+    // Assign context properties from opts
+    'this._traceRoot = opts._traceRoot;',
+    'this._scopeValues = opts._scopeValues;',
+    'this._opMetadata = opts._opMetadata;',
+    'this._callsiteMetadata = opts._callsiteMetadata;',
     '',
     // Initialize string arrays for string columns and eager message
     'this._message = new Array(opts.capacity);',
@@ -751,14 +763,29 @@ return WasmSpanBuffer;
  *
  * @param schema - LogSchema defining the buffer structure
  * @param opts - Options for buffer creation
+ * @param _traceRoot - Trace root context
+ * @param _scopeValues - Scope values for this span
+ * @param _opMetadata - Op metadata for attribution
+ * @param _callsiteMetadata - Callsite metadata for attribution
  * @returns WasmSpanBufferInstance
  */
 export function createWasmSpanBuffer(
   schema: LogSchema,
-  opts: Omit<WasmSpanBufferOptions, 'logSchema'>,
+  opts: Omit<WasmSpanBufferOptions, 'logSchema' | '_traceRoot' | '_scopeValues' | '_opMetadata' | '_callsiteMetadata'>,
+  _traceRoot: ITraceRoot,
+  _scopeValues: Readonly<Record<string, unknown>>,
+  _opMetadata: OpMetadata,
+  _callsiteMetadata: OpMetadata,
 ): WasmSpanBufferInstance {
   const WasmSpanBufferClass = getWasmSpanBufferClass(schema);
-  return new WasmSpanBufferClass({ ...opts, logSchema: schema });
+  return new WasmSpanBufferClass({
+    ...opts,
+    logSchema: schema,
+    _traceRoot,
+    _scopeValues,
+    _opMetadata,
+    _callsiteMetadata,
+  });
 }
 
 /**
@@ -769,13 +796,31 @@ export function createWasmSpanBuffer(
  *
  * @param parent - Parent WASM SpanBuffer
  * @param opts - Options for child buffer creation (schema is optional, defaults to parent's)
+ * @param _traceRoot - Trace root context
+ * @param _scopeValues - Scope values for this span
+ * @param _opMetadata - Op metadata for attribution
+ * @param _callsiteMetadata - Callsite metadata for attribution
  * @returns WasmSpanBufferInstance linked to parent
  */
 export function createWasmChildSpanBuffer(
   parent: WasmSpanBufferInstance,
-  opts: Omit<WasmSpanBufferOptions, 'logSchema' | 'trace_id' | 'parent_thread_id' | 'parent_span_id'> & {
+  opts: Omit<
+    WasmSpanBufferOptions,
+    | 'logSchema'
+    | 'trace_id'
+    | 'parent_thread_id'
+    | 'parent_span_id'
+    | '_traceRoot'
+    | '_scopeValues'
+    | '_opMetadata'
+    | '_callsiteMetadata'
+  > & {
     schema?: LogSchema;
   },
+  _traceRoot: ITraceRoot,
+  _scopeValues: Readonly<Record<string, unknown>>,
+  _opMetadata: OpMetadata,
+  _callsiteMetadata: OpMetadata,
 ): WasmSpanBufferInstance {
   // Use provided schema (for cross-library calls) or parent's schema
   const childSchema = opts.schema ?? parent._logSchema;
@@ -787,6 +832,10 @@ export function createWasmChildSpanBuffer(
     trace_id: parent.trace_id,
     parent_thread_id: parent.thread_id,
     parent_span_id: parent.span_id,
+    _traceRoot,
+    _scopeValues,
+    _opMetadata,
+    _callsiteMetadata,
   });
 
   // Link to parent (SpanContext will push to parent._children with possible RemappedBufferView wrapper)
@@ -799,9 +848,19 @@ export function createWasmChildSpanBuffer(
  * Create an overflow WASM SpanBuffer for chaining.
  *
  * @param buffer - The full buffer that needs overflow handling
+ * @param _traceRoot - Trace root context
+ * @param _scopeValues - Scope values for this span
+ * @param _opMetadata - Op metadata for attribution
+ * @param _callsiteMetadata - Callsite metadata for attribution
  * @returns WasmSpanBufferInstance linked as overflow
  */
-export function createWasmOverflowBuffer(buffer: WasmSpanBufferInstance): WasmSpanBufferInstance {
+export function createWasmOverflowBuffer(
+  buffer: WasmSpanBufferInstance,
+  _traceRoot: ITraceRoot,
+  _scopeValues: Readonly<Record<string, unknown>>,
+  _opMetadata: OpMetadata,
+  _callsiteMetadata: OpMetadata,
+): WasmSpanBufferInstance {
   const WasmSpanBufferClass = getWasmSpanBufferClass(buffer._logSchema);
 
   const overflow = new WasmSpanBufferClass({
@@ -813,6 +872,10 @@ export function createWasmOverflowBuffer(buffer: WasmSpanBufferInstance): WasmSp
     parent_thread_id: buffer.parent_thread_id,
     parent_span_id: buffer.parent_span_id,
     logSchema: buffer._logSchema,
+    _traceRoot,
+    _scopeValues,
+    _opMetadata,
+    _callsiteMetadata,
   });
 
   // Link as overflow (not child - same logical span)
