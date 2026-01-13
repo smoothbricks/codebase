@@ -670,6 +670,32 @@ export fn alloc_identity_root(trace_id_ptr: u32, trace_id_len: u32) u32 {
     return offset;
 }
 
+/// Allocate identity block and provide offset where JS should write trace_id bytes.
+/// Returns packed u64: (identity_offset << 32) | trace_id_field_offset
+/// JS can write bytes directly to memory[trace_id_field_offset..trace_id_field_offset+len]
+export fn alloc_identity_root_for_js_write(trace_id_len: u32) u64 {
+    const max_len = @sizeOf(@TypeOf(@as(Identity, undefined).trace_id));
+    if (trace_id_len > max_len) {
+        return 0; // trace_id too long
+    }
+
+    const offset = allocIdentity();
+    const identity = ptrAt(Identity, offset);
+
+    // Initialize identity (same as alloc_identity_root)
+    const h = header();
+    h.span_id_counter += 1;
+    identity.span_id = h.span_id_counter;
+    identity.write_index = 0;
+    identity.trace_id_len = @truncate(trace_id_len);
+
+    // Calculate absolute byte offset to trace_id field
+    const trace_id_field_offset = offset + @offsetOf(Identity, "trace_id");
+
+    // Pack both offsets into u64: upper 32 bits = identity offset, lower 32 bits = trace_id field offset
+    return (@as(u64, offset) << 32) | @as(u64, trace_id_field_offset);
+}
+
 /// Allocate and initialize a CHILD identity block.
 export fn alloc_identity_child() u32 {
     const offset = allocIdentity();
