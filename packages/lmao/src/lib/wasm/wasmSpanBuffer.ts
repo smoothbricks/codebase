@@ -423,13 +423,6 @@ function wasmGetStats(this: WasmSpanBufferInstance): SpanBufferStats {
 }
 
 /**
- * Get _logSchema property.
- */
-function wasmGetLogSchema(this: WasmSpanBufferInstance): LogSchema {
-  return (this.constructor as WasmSpanBufferConstructor).schema;
-}
-
-/**
  * Get _columns property.
  */
 function wasmGetColumns(this: WasmSpanBufferInstance): LogSchema['_columns'] {
@@ -448,128 +441,28 @@ function wasmInspect(this: WasmSpanBufferInstance): string {
 // =============================================================================
 
 /**
- * Generate constructor body code.
- * Note: For root buffers, identity is allocated with trace_id.
- * For child buffers, identity is allocated without trace_id.
- * The constructor handles both via opts.trace_id presence.
+ * Generate eager column initialization code for constructor.
+ * Eager columns are pre-allocated, lazy columns start as undefined/-1.
  */
-function generateConstructorCode(columnMeta: ColumnMeta[]): string {
-  const lines: string[] = [
-    // Store allocator and capacity
-    'this._allocator = opts.allocator;',
-    'this._capacity = opts.capacity;',
-    // Note: _logSchema, _columns, and _stats are provided by getters (not stored)
-    '',
-    // Cache WASM function refs for hot path (avoid allocator wrapper indirection)
-    'const exports = opts.allocator.exports;',
-    'this._writeColF64 = exports.write_col_f64;',
-    'this._writeColU32 = exports.write_col_u32;',
-    'this._writeColU8 = exports.write_col_u8;',
-    'this._writeLogEntry = exports.write_log_entry;',
-    '',
-    // Allocate identity block from WASM (root has trace_id, child does not)
-    'if (opts.trace_id) {',
-    '  // Root buffer: allocate identity with trace_id',
-    '  const traceIdBytes = new TextEncoder().encode(opts.trace_id);',
-    '  const packed = opts.allocator.allocIdentityRootForJsWrite(traceIdBytes.length);',
-    '  this._identityPtr = Number(packed >> 32n);  // Upper 32 bits = identity offset',
-    '  const traceIdOffset = Number(packed & 0xFFFFFFFFn);  // Lower 32 bits = trace_id field offset',
-    '  // Write trace_id bytes directly to identity block (no scratch, no allocator.u8)',
-    '  new Uint8Array(opts.allocator.memory.buffer).set(traceIdBytes, traceIdOffset);',
-    '} else {',
-    '  // Child buffer: allocate identity without trace_id',
-    '  this._identityPtr = opts.allocator.allocIdentityChild();',
-    '}',
-    '',
-    // Allocate system block from WASM
-    'this._systemPtr = opts.allocator.allocSpanSystem();',
-    '',
-    // Initialize column pointers as unallocated (-1)
-    `this._columnPtrs = new Int32Array(${columnMeta.length}).fill(-1);`,
-    '',
-    // Tree structure
-    'this._parent = null;',
-    'this._children = [];',
-    'this._overflow = null;',
-    '',
-    // Assign context properties from opts
-    'this._traceRoot = opts._traceRoot;',
-    'this._scopeValues = opts._scopeValues;',
-    'this._opMetadata = opts._opMetadata;',
-    'this._callsiteMetadata = opts._callsiteMetadata;',
-    '',
-    // Initialize string arrays for string columns and eager message
-    'this._message = new Array(opts.capacity);',
-  ];
+function generateEagerColumnInit(columnMeta: ColumnMeta[]): string {
+  const lines: string[] = [];
 
-  // Initialize string arrays for string columns
-  // Note: 'message' is handled separately above with this._message
   for (const col of columnMeta) {
-    // Skip 'message' - handled specially above
-    if (col.name === 'message') {
-      continue;
-    }
+    if (col.name === 'message') continue; // Message handled separately
 
     if (col.sizeClass === 'string') {
       if (col.isEager) {
-        lines.push(`this._${col.name}_values = new Array(opts.capacity);`);
+        lines.push(`this._${col.name}_values = new Array(this._capacity);`);
       } else {
-        // Lazy string columns start as undefined
         lines.push(`this._${col.name}_values = undefined;`);
         lines.push(`this._${col.name}_nulls = undefined;`);
       }
     } else if (col.isEager) {
-      // Eager non-string columns: pre-allocate from WASM
-      lines.push(`this._columnPtrs[${col.columnIndex}] = opts.allocator.alloc${col.sizeClass.toUpperCase()}();`);
+      lines.push(`this._columnPtrs[${col.columnIndex}] = this._allocator.alloc${col.sizeClass.toUpperCase()}();`);
     }
   }
 
   return lines.join('\n    ');
-}
-
-/**
- * Generate getter for timestamp system column.
- */
-function generateTimestampGetter(): string {
-  return `get timestamp() {
-    return new BigInt64Array(
-      this._allocator.memory.buffer,
-      this._systemPtr,
-      this._capacity
-    );
-  }`;
-}
-
-/**
- * Generate getter for entry_type system column.
- */
-function generateEntryTypeGetter(): string {
-  return `get entry_type() {
-    return new Uint8Array(
-      this._allocator.memory.buffer,
-      this._systemPtr + this._capacity * 8,
-      this._capacity
-    );
-  }`;
-}
-
-/**
- * Generate message column methods (eager string, system column).
- * Includes both the setter method and the _values getter for SpanLogger compatibility.
- */
-function generateMessageMethods(): string {
-  return `message(idx, value) {
-    this._message[idx] = value;
-    return this;
-  }
-  
-  get message_values() {
-    return this._message;
-  }
-  
-  get message_nulls() {
-    return undefined;
-  }`;
 }
 
 /**
@@ -751,151 +644,6 @@ function generateColumnMethods(columnMeta: ColumnMeta[]): string {
   return methods.join('\n\n  ');
 }
 
-/**
- * Generate free() method to return all WASM memory to freelists.
- */
-function generateFreeMethod(columnMeta: ColumnMeta[]): string {
-  const freeStatements: string[] = [
-    '// Free identity block',
-    'this._allocator.freeIdentity(this._identityPtr);',
-    '',
-    '// Free system block',
-    'this._allocator.freeSpanSystem(this._systemPtr);',
-    '',
-    '// Free column blocks',
-  ];
-
-  for (const col of columnMeta) {
-    if (col.sizeClass !== 'string') {
-      const freeMethod = `free${col.sizeClass.toUpperCase()}`;
-      freeStatements.push(`if (this._columnPtrs[${col.columnIndex}] >= 0) {
-      this._allocator.${freeMethod}(this._columnPtrs[${col.columnIndex}]);
-    }`);
-    }
-  }
-
-  return `free() {
-    ${freeStatements.join('\n    ')}
-  }`;
-}
-
-/**
- * Generate identity getters.
- * Identity data is stored in WASM memory at _identityPtr:
- * - writeIndex: u32 at offset 0 (managed separately via _writeIndex getter)
- * - span_id: u32 at offset 4
- * - trace_id_len: u8 at offset 8
- * - trace_id: u8[128] at offset 9
- * Thread ID is global in WASM header, accessed via getThreadIdHigh/Low.
- * Parent info is stored in JS (parent buffer reference).
- */
-function generateIdentityGetters(): string {
-  return `get trace_id() {
-    // Read trace_id from WASM identity block
-    const len = this._allocator.readIdentityTraceIdLen(this._identityPtr);
-    if (len === 0) {
-      // Child buffer - get trace_id from root parent
-      let p = this._parent;
-      while (p && p._parent) p = p._parent;
-      return p ? p.trace_id : '';
-    }
-    const traceIdPtr = this._allocator.getIdentityTraceIdPtr(this._identityPtr);
-    return new TextDecoder().decode(
-      new Uint8Array(this._allocator.memory.buffer, traceIdPtr, len)
-    );
-  }
-  get thread_id() {
-    // Thread ID is global in WASM header
-    const high = this._allocator.getThreadIdHigh();
-    const low = this._allocator.getThreadIdLow();
-    return (BigInt(high) << 32n) | BigInt(low >>> 0);
-  }
-  get span_id() {
-    return this._allocator.readIdentitySpanId(this._identityPtr);
-  }
-  get parent_thread_id() {
-    // Parent info comes from parent buffer reference
-    return this._parent ? this._parent.thread_id : 0n;
-  }
-  get parent_span_id() {
-    return this._parent ? this._parent.span_id : 0;
-  }
-  get _hasParent() { return this._parent !== null; }`;
-}
-
-/**
- * Generate utility methods.
- */
-function generateUtilityMethods(columnMeta: ColumnMeta[]): string {
-  const columnNameToIndex = columnMeta.reduce(
-    (acc, col, idx) => {
-      acc[col.name] = idx;
-      return acc;
-    },
-    {} as Record<string, number>,
-  );
-
-  return `get _stats() {
-    return this.constructor.stats;
-  }
-
-  get _logSchema() {
-    return this.constructor.schema;
-  }
-
-  get _columns() {
-    return this.constructor.schema._columns;
-  }
-
-  isColumnAllocated(columnIndex) {
-    return this._columnPtrs[columnIndex] >= 0;
-  }
-
-  getColumnIfAllocated(columnName) {
-    const COLUMN_NAME_TO_INDEX = ${JSON.stringify(columnNameToIndex)};
-    const idx = COLUMN_NAME_TO_INDEX[columnName];
-    if (idx === undefined) return undefined;
-    // Try to get the values getter
-    const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), columnName + '_values');
-    if (getter && getter.get) {
-      return getter.get.call(this);
-    }
-    return this['_' + columnName + '_values'];
-  }
-
-  getNullsIfAllocated(columnName) {
-    // Try to get the nulls getter
-    const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), columnName + '_nulls');
-    if (getter && getter.get) {
-      return getter.get.call(this);
-    }
-    return this['_' + columnName + '_nulls'];
-  }`;
-}
-
-/**
- * Generate writeIndex getter/setter.
- * writeIndex is stored at offset 0 of the identity block.
- */
-function generateWriteIndexAccessor(): string {
-  return `get _writeIndex() {
-    return this._allocator.readWriteIndex(this._identityPtr);
-  }
-  set _writeIndex(value) {
-    // Write directly to WASM memory at identity block offset 0
-    new DataView(this._allocator.memory.buffer).setUint32(this._identityPtr, value, true);
-  }`;
-}
-
-/**
- * Generate custom inspect for debugging.
- */
-function generateInspect(): string {
-  return `[Symbol.for('nodejs.util.inspect.custom')](depth, opts) {
-    return \`WasmSpanBuffer { _writeIndex: \${this._writeIndex}, _capacity: \${this._capacity}, trace_id: \${this.trace_id ?? 'N/A'}, _systemPtr: \${this._systemPtr} }\`;
-  }`;
-}
-
 // =============================================================================
 // Class Cache and Generation
 // =============================================================================
@@ -909,7 +657,7 @@ const wasmSpanBufferClassCache = new WeakMap<LogSchema, WasmSpanBufferConstructo
 /**
  * Generate a WASM SpanBuffer class for the given schema.
  *
- * Similar to getSpanBufferClass but uses WASM memory backing.
+ * Generates minimal constructor + column methods, then assigns common methods to prototype.
  *
  * @param schema - LogSchema defining the buffer structure
  * @returns WasmSpanBufferConstructor for creating buffer instances
@@ -923,57 +671,136 @@ export function getWasmSpanBufferClass(schema: LogSchema): WasmSpanBufferConstru
   // Pre-compute column metadata
   const columnMeta = buildColumnMeta(schema);
 
-  // Generate class code
+  // Generate ONLY schema-specific code (constructor + column methods)
   const classCode = `
 class WasmSpanBuffer {
   constructor(opts) {
-    ${generateConstructorCode(columnMeta)}
+    // Store allocator and capacity
+    this._allocator = opts.allocator;
+    this._capacity = opts.capacity;
+    this._logSchema = opts.logSchema;
+
+    // Allocate identity block from WASM (root has trace_id, child does not)
+    if (opts.trace_id) {
+      const traceIdBytes = new TextEncoder().encode(opts.trace_id);
+      const packed = opts.allocator.allocIdentityRootForJsWrite(traceIdBytes.length);
+      this._identityPtr = Number(packed >> 32n);
+      const traceIdOffset = Number(packed & 0xFFFFFFFFn);
+      new Uint8Array(opts.allocator.memory.buffer).set(traceIdBytes, traceIdOffset);
+    } else {
+      this._identityPtr = opts.allocator.allocIdentityChild();
+    }
+
+    // Allocate system block from WASM
+    this._systemPtr = opts.allocator.allocSpanSystem();
+
+    // Initialize column pointers as unallocated (-1)
+    this._columnPtrs = new Int32Array(${columnMeta.length}).fill(-1);
+
+    // Tree structure
+    this._parent = null;
+    this._children = [];
+    this._overflow = null;
+
+    // Assign context properties from opts
+    this._traceRoot = opts._traceRoot;
+    this._scopeValues = opts._scopeValues;
+    this._opMetadata = opts._opMetadata;
+    this._callsiteMetadata = opts._callsiteMetadata;
+
+    // Initialize message array
+    this._message = new Array(opts.capacity);
+
+    // Initialize eager columns
+    ${generateEagerColumnInit(columnMeta)}
   }
 
-  // writeIndex accessor (stored in WASM identity block)
-  ${generateWriteIndexAccessor()}
-
-  // Identity getters
-  ${generateIdentityGetters()}
-
-  // System column getters (create views on demand from WASM memory)
-  ${generateTimestampGetter()}
-
-  ${generateEntryTypeGetter()}
-
-  // Message column (system, eager string)
-  ${generateMessageMethods()}
-
-  // Schema column methods
+  // Schema-specific column methods (ONLY part that differs per schema)
   ${generateColumnMethods(columnMeta)}
-
-  // Free all WASM memory
-  ${generateFreeMethod(columnMeta)}
-
-  // Utility methods
-  ${generateUtilityMethods(columnMeta)}
-
-  // Overflow handling (called by SpanLogger._checkOverflow)
-  getOrCreateOverflow() {
-    if (this._overflow) return this._overflow;
-    const tracer = this._traceRoot.tracer;
-    tracer.onStatsWillResetFor(this);
-    checkCapacityTuning(this.constructor.stats);
-    return tracer.bufferStrategy.createOverflowBuffer(this);
-  }
-
-  // Custom inspect
-  ${generateInspect()}
 }
 
 return WasmSpanBuffer;
 `;
 
-  // Create the class using Function constructor, passing checkCapacityTuning as dependency
-  const factory = new Function('checkCapacityTuning', classCode) as (
-    fn: typeof checkCapacityTuning,
-  ) => WasmSpanBufferConstructor;
-  const WasmSpanBufferClass = factory(checkCapacityTuning);
+  // Create the class using Function constructor
+  const factory = new Function(classCode) as () => WasmSpanBufferConstructor;
+  const WasmSpanBufferClass = factory();
+
+  // Assign common methods to prototype (shared by all schemas)
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'timestamp', {
+    get: wasmGetTimestamp,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'entry_type', {
+    get: wasmGetEntryType,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_writeIndex', {
+    get: wasmGetWriteIndex,
+    set: wasmSetWriteIndex,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'trace_id', {
+    get: wasmGetTraceId,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'thread_id', {
+    get: wasmGetThreadId,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'span_id', {
+    get: wasmGetSpanId,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'parent_thread_id', {
+    get: wasmGetParentThreadId,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'parent_span_id', {
+    get: wasmGetParentSpanId,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_hasParent', {
+    get: wasmGetHasParent,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'message_values', {
+    get: wasmGetMessageValues,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, 'message_nulls', {
+    get: wasmGetMessageNulls,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_stats', {
+    get: wasmGetStats,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_columns', {
+    get: wasmGetColumns,
+    enumerable: true,
+    configurable: true,
+  });
+
+  WasmSpanBufferClass.prototype.message = wasmMessage;
+  WasmSpanBufferClass.prototype.free = wasmFree;
+  WasmSpanBufferClass.prototype.isColumnAllocated = wasmIsColumnAllocated;
+  WasmSpanBufferClass.prototype.getColumnIfAllocated = wasmGetColumnIfAllocated;
+  WasmSpanBufferClass.prototype.getNullsIfAllocated = wasmGetNullsIfAllocated;
+  WasmSpanBufferClass.prototype.getOrCreateOverflow = wasmGetOrCreateOverflow;
+  WasmSpanBufferClass.prototype[Symbol.for('nodejs.util.inspect.custom')] = wasmInspect;
 
   // Add static schema property
   Object.defineProperty(WasmSpanBufferClass, 'schema', {
@@ -993,7 +820,7 @@ return WasmSpanBuffer;
   };
   Object.defineProperty(WasmSpanBufferClass, 'stats', {
     value: statsObject,
-    writable: true, // Allow the reference to be replaced if needed
+    writable: true,
     enumerable: true,
     configurable: true,
   });
