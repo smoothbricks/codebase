@@ -700,7 +700,7 @@ export const httpOps = defineOps({ request, get, post, put, delete: del });
 import { httpOps } from 'my-http-lib';
 import { dbOps } from 'my-db-lib';
 
-const { defineOp, createTrace } = defineOpContext({
+const { defineOp } = defineOpContext({
   logSchema: defineLogSchema({ request_id: S.category() }),
   deps: {
     http: httpOps.prefix('http'),
