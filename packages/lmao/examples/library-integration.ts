@@ -42,7 +42,7 @@ const cacheModule = defineModule({
   .make();
 
 // Cache operations - these will be accessible via ctx.deps.cache
-const cacheGet = cacheModule.op('cache-get', async (ctx, key: string) => {
+const _cacheGet = cacheModule.op('cache-get', async (ctx, key: string) => {
   ctx.tag.operation('GET').key(key);
 
   // Mock: simulate cache lookup
@@ -53,7 +53,7 @@ const cacheGet = cacheModule.op('cache-get', async (ctx, key: string) => {
   return ctx.ok({ value, hit });
 });
 
-const cacheSet = cacheModule.op('cache-set', async (ctx, key: string, value: unknown, ttl = 3600) => {
+const _cacheSet = cacheModule.op('cache-set', async (ctx, key: string, _value: unknown, ttl = 3600) => {
   ctx.tag
     .operation('SET')
     .key(key)
@@ -235,7 +235,7 @@ const getUserProfile = wiredApp.op('get-user-profile', async (ctx, userId: strin
 // RUN EXAMPLE
 // ============================================================================
 
-async function runExample() {
+async function _runExample() {
   console.log('\n🚀 IDEAL Library Integration Example\n');
 
   // Create app context

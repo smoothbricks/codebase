@@ -42,6 +42,12 @@
       "types": "./dist/lib/errors/CodeError.d.ts",
       "import": "./dist/lib/errors/CodeError.js",
       "default": "./dist/lib/errors/CodeError.js"
+    },
+    "./testing": {
+      "development": "./src/testing.ts",
+      "types": "./dist/testing.d.ts",
+      "import": "./dist/testing.js",
+      "default": "./dist/testing.js"
     }
   },
   "files": [
@@ -57,6 +63,7 @@
   },
   "scripts": {
     "bench": "bun run benchmarks/*.bench.ts",
+    "bench:wasm": "bun run benchmarks/js-vs-wasm.bench.ts",
     "build:wasm": "zig build -Doptimize=ReleaseSmall"
   },
   "nx": {

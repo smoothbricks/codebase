@@ -722,7 +722,7 @@ function buildMetadataColumnsWithFields(
 /**
  * Convert SpanBuffer (and its overflow chain) to Arrow Table
  */
-export function convertToArrowTable<T extends LogSchema = LogSchema>(
+export function convertToArrowTable<_T extends LogSchema = LogSchema>(
   buffer: AnySpanBuffer,
   systemColumnBuilder?: SystemColumnBuilder,
 ): Table {

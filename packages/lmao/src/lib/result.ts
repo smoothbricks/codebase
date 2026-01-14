@@ -415,7 +415,7 @@ export type Result<V, E> = Ok<V> | Err<E>;
 /**
  * Code error instance type - has `code` on prototype plus fields as own properties.
  */
-export interface CodeErrorInstance<Code extends string, Fields extends object> {
+export interface CodeErrorInstance<Code extends string, _Fields extends object> {
   readonly code: Code;
 }
 

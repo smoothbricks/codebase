@@ -8,7 +8,6 @@
 
 import { bench, group, run } from 'mitata';
 import { defineModule, S } from '../src/index.js';
-import { createSpanBuffer } from '../src/lib/spanBuffer.js';
 import { createTraceId } from '../src/lib/traceId.js';
 
 // Setup module and ops
@@ -19,7 +18,7 @@ const module = defineModule('bench-module', {
   },
 });
 
-const trivialOp = module.op('trivial', async (ctx) => {
+const trivialOp = module.op('trivial', async (_ctx) => {
   return 42;
 });
 
