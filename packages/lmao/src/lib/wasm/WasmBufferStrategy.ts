@@ -106,8 +106,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       opMetadata, // _callsiteMetadata (same as opMetadata for root)
     );
 
-    const buffer = wasmBuffer as unknown as SpanBuffer<T>;
-    return buffer;
+    return wasmBuffer as unknown as SpanBuffer<T>;
   }
 
   createChildSpanBuffer(
@@ -138,8 +137,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       callsiteMetadata, // _callsiteMetadata
     );
 
-    const childBuffer = child as unknown as SpanBuffer<T>;
-    return childBuffer;
+    return child as unknown as SpanBuffer<T>;
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
@@ -152,8 +150,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       buffer._callsiteMetadata ?? buffer._opMetadata, // _callsiteMetadata (same as original, fallback to opMetadata)
     );
 
-    const overflowBuffer = overflow as unknown as SpanBuffer<T>;
-    return overflowBuffer;
+    return overflow as unknown as SpanBuffer<T>;
   }
 
   toArrowRecordBatch(buffer: AnySpanBuffer): RecordBatch {
