@@ -10,12 +10,14 @@
  * - All TypedArray views created on-demand from WASM memory.buffer
  */
 
+import type { ColumnValueType } from '@smoothbricks/arrow-builder';
 import { getSchemaType } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from '../capacityTuning.js';
 import type { OpMetadata } from '../op.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { SpanBufferStats } from '../spanBufferStats.js';
 import type { ITraceRoot } from '../traceRoot.js';
+import type { AnySpanBuffer } from '../types.js';
 import type { WasmAllocator } from './wasmAllocator.js';
 
 // =============================================================================
@@ -70,27 +72,11 @@ export interface WasmSpanBufferOptions {
 
 /**
  * WASM SpanBuffer instance interface.
- * Mirrors AnySpanBuffer but with WASM-specific internals.
+ * Extends AnySpanBuffer with WASM-specific pointer properties.
  */
-export interface WasmSpanBufferInstance {
+export interface WasmSpanBufferInstance extends AnySpanBuffer {
   // ===========================================================================
-  // Identity (same as JS SpanBuffer)
-  // ===========================================================================
-  readonly trace_id: string;
-  readonly thread_id: bigint;
-  readonly span_id: number;
-  readonly parent_thread_id: bigint;
-  readonly parent_span_id: number;
-  readonly _hasParent: boolean;
-
-  // ===========================================================================
-  // Capacity and write tracking
-  // ===========================================================================
-  readonly _capacity: number;
-  _writeIndex: number;
-
-  // ===========================================================================
-  // WASM pointers
+  // WASM pointers (internal implementation details)
   // ===========================================================================
   /** Byte offset into WASM memory for system columns (timestamp + entry_type) */
   readonly _systemPtr: number;
@@ -101,40 +87,16 @@ export interface WasmSpanBufferInstance {
   /** Reference to the WASM allocator */
   readonly _allocator: WasmAllocator;
 
-  // ===========================================================================
-  // Schema
-  // ===========================================================================
-  readonly _logSchema: LogSchema;
-
-  // ===========================================================================
-  // Tree structure
-  // ===========================================================================
-  _parent: WasmSpanBufferInstance | null;
+  // Override tree structure with WASM-typed versions
+  _parent?: WasmSpanBufferInstance;
   _children: WasmSpanBufferInstance[];
-  _overflow: WasmSpanBufferInstance | null;
+  _overflow?: WasmSpanBufferInstance;
 
-  // ===========================================================================
-  // Context (assigned from constructor opts)
-  // ===========================================================================
-  readonly _traceRoot: ITraceRoot;
-  readonly _scopeValues: Readonly<Record<string, unknown>>;
-  readonly _opMetadata: OpMetadata;
-  readonly _callsiteMetadata: OpMetadata;
-
-  // ===========================================================================
-  // System column views (created on demand from WASM memory)
-  // ===========================================================================
-  get timestamp(): BigInt64Array;
-  get entry_type(): Uint8Array;
-
-  // ===========================================================================
-  // Message column (system, eager string)
-  // ===========================================================================
+  // Override message column - WASM stores as JS array (not WASM memory)
   readonly _message: string[];
-  message(idx: number, value: string): this;
 
   // ===========================================================================
-  // Methods
+  // WASM-specific methods
   // ===========================================================================
   /** Free all WASM memory for this buffer */
   free(): void;
@@ -143,7 +105,7 @@ export interface WasmSpanBufferInstance {
   isColumnAllocated(columnIndex: number): boolean;
 
   /** Get column values array if allocated */
-  getColumnIfAllocated(columnName: string): unknown;
+  getColumnIfAllocated(columnName: string): ColumnValueType | undefined;
 
   /** Get column nulls array if allocated */
   getNullsIfAllocated(columnName: string): Uint8Array | undefined;
@@ -369,12 +331,12 @@ function wasmIsColumnAllocated(this: WasmSpanBufferInstance, columnIndex: number
 /**
  * Get column values if allocated.
  */
-function wasmGetColumnIfAllocated(this: WasmSpanBufferInstance, columnName: string): unknown {
+function wasmGetColumnIfAllocated(this: WasmSpanBufferInstance, columnName: string): ColumnValueType | undefined {
   const idx = this._logSchema._columnNames.indexOf(columnName);
   if (idx === -1) return undefined;
   const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), columnName + '_values');
   if (getter && getter.get) {
-    return getter.get.call(this);
+    return getter.get.call(this) as ColumnValueType | undefined;
   }
   return undefined;
 }
@@ -391,16 +353,33 @@ function wasmGetNullsIfAllocated(this: WasmSpanBufferInstance, columnName: strin
 }
 
 /**
+ * Get system ArrayBuffer for compatibility with AnySpanBuffer.
+ * WASM uses shared memory, so this returns the entire WASM memory buffer.
+ */
+function wasmGetSystem(this: WasmSpanBufferInstance): ArrayBuffer {
+  return this._allocator.memory.buffer;
+}
+
+/**
+ * Get identity Uint8Array for compatibility with AnySpanBuffer.
+ * Returns a view of the identity block (48 bytes) in WASM memory.
+ */
+function wasmGetIdentity(this: WasmSpanBufferInstance): Uint8Array {
+  // Identity block is 48 bytes: writeIndex(4) + reserved(4) + span_id(4) + trace_id_len(1) + trace_id(up to 35)
+  return new Uint8Array(this._allocator.memory.buffer, this._identityPtr, 48);
+}
+
+/**
  * Get or create overflow buffer.
  */
 function wasmGetOrCreateOverflow(this: WasmSpanBufferInstance): WasmSpanBufferInstance {
   if (this._overflow) return this._overflow;
   const tracer = this._traceRoot.tracer;
-  tracer.onStatsWillResetFor(this as any);
+  tracer.onStatsWillResetFor(this);
   checkCapacityTuning((this.constructor as WasmSpanBufferConstructor).stats);
-  // @ts-expect-error: WasmSpanBufferInstance uses pointers (_systemPtr) instead of buffers (_system)
-  // but BufferStrategy interface expects SpanBuffer<T>. Runtime works via structural compatibility.
-  return tracer.bufferStrategy.createOverflowBuffer(this);
+  // WasmSpanBufferInstance extends AnySpanBuffer and has all SpanBuffer properties at runtime
+  const overflow = tracer.bufferStrategy.createOverflowBuffer(this);
+  return overflow as WasmSpanBufferInstance;
 }
 
 /**
@@ -779,6 +758,17 @@ return WasmSpanBuffer;
   });
   Object.defineProperty(WasmSpanBufferClass.prototype, '_columns', {
     get: wasmGetColumns,
+    enumerable: true,
+    configurable: true,
+  });
+  // Assign compatibility getters for AnySpanBuffer interface
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_system', {
+    get: wasmGetSystem,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_identity', {
+    get: wasmGetIdentity,
     enumerable: true,
     configurable: true,
   });
