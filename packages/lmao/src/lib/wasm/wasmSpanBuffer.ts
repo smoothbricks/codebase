@@ -398,7 +398,9 @@ function wasmGetOrCreateOverflow(this: WasmSpanBufferInstance): WasmSpanBufferIn
   const tracer = this._traceRoot.tracer;
   tracer.onStatsWillResetFor(this as any);
   checkCapacityTuning((this.constructor as WasmSpanBufferConstructor).stats);
-  return tracer.bufferStrategy.createOverflowBuffer(this as any);
+  // @ts-expect-error: WasmSpanBufferInstance uses pointers (_systemPtr) instead of buffers (_system)
+  // but BufferStrategy interface expects SpanBuffer<T>. Runtime works via structural compatibility.
+  return tracer.bufferStrategy.createOverflowBuffer(this);
 }
 
 /**
