@@ -20,6 +20,20 @@ export interface WasmAllocator {
   /** The underlying WASM memory */
   readonly memory: WebAssembly.Memory;
 
+  /** WASM exports for direct function calls (hot path optimization) */
+  readonly exports: {
+    write_col_f64: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
+    write_col_u32: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
+    write_col_u8: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
+    write_log_entry: (
+      systemPtr: number,
+      identityPtr: number,
+      traceRootPtr: number,
+      entryType: number,
+      capacity: number,
+    ) => number;
+  };
+
   /** Cached views (recreated after grow, but pre-sized to avoid grow for benchmarks) */
   readonly u8: Uint8Array;
   readonly u32: Uint32Array;
@@ -234,6 +248,12 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
   return {
     memory,
     capacity,
+    exports: {
+      write_col_f64: exports.write_col_f64,
+      write_col_u32: exports.write_col_u32,
+      write_col_u8: exports.write_col_u8,
+      write_log_entry: exports.write_log_entry,
+    },
 
     get u8() {
       // Check if memory grew since last access

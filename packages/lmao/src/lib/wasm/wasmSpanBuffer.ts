@@ -90,20 +90,6 @@ export interface WasmSpanBufferInstance {
   _writeIndex: number;
 
   // ===========================================================================
-  // Cached WASM function refs (hot path optimization)
-  // ===========================================================================
-  readonly _writeColF64: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
-  readonly _writeColU32: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
-  readonly _writeColU8: (colOffset: number, rowIdx: number, value: number, capacity: number) => number;
-  readonly _writeLogEntry: (
-    systemPtr: number,
-    identityPtr: number,
-    traceRootPtr: number,
-    entryType: number,
-    capacity: number,
-  ) => number;
-
-  // ===========================================================================
   // WASM pointers
   // ===========================================================================
   /** Byte offset into WASM memory for system columns (timestamp + entry_type) */
@@ -467,37 +453,38 @@ function generateEagerColumnInit(columnMeta: ColumnMeta[]): string {
 
 /**
  * Generate setter method for a numeric column (stored in WASM).
+ * Calls WASM exports directly for hot path optimization.
  */
 function generateNumericSetter(col: ColumnMeta): string {
   const allocMethod = `alloc${col.sizeClass.toUpperCase()}`;
-  const writeMethod =
-    col.schemaType === 'number'
-      ? 'writeColF64'
-      : col.schemaType === 'bigUint64'
-        ? 'writeColF64' // BigUint64 uses F64 write for now
-        : col.sizeClass === '1b'
-          ? 'writeColU8'
-          : col.sizeClass === '4b'
-            ? 'writeColU32'
-            : 'writeColF64';
+
+  // Map to WASM export names
+  const writeExportName =
+    col.schemaType === 'number' || col.schemaType === 'bigUint64'
+      ? 'write_col_f64'
+      : col.sizeClass === '1b'
+        ? 'write_col_u8'
+        : col.sizeClass === '4b'
+          ? 'write_col_u32'
+          : 'write_col_f64';
 
   if (col.isEager) {
-    // Eager: column is pre-allocated, just write value
+    // Eager: column is pre-allocated, just write value (call WASM export directly)
     return `${col.name}(idx, value) {
     const ptr = this._columnPtrs[${col.columnIndex}];
-    this._${writeMethod}(ptr, idx, value, this._capacity);
+    this._allocator.exports.${writeExportName}(ptr, idx, value, this._capacity);
     return this;
   }`;
   }
 
-  // Lazy: allocate on first write
+  // Lazy: allocate on first write (call WASM export directly)
   return `${col.name}(idx, value) {
     let ptr = this._columnPtrs[${col.columnIndex}];
     if (ptr < 0) {
       ptr = this._allocator.${allocMethod}();
       this._columnPtrs[${col.columnIndex}] = ptr;
     }
-    this._${writeMethod}(ptr, idx, value, this._capacity);
+    this._allocator.exports.${writeExportName}(ptr, idx, value, this._capacity);
     return this;
   }`;
 }
