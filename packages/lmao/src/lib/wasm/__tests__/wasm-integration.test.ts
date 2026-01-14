@@ -362,15 +362,17 @@ describe('WASM Integration Tests', () => {
       const statsBeforeClear = strategy.getStats();
       const allocCountBefore = statsBeforeClear.allocCount;
 
-      // Release and clear all buffers
+      // Release all buffers
       for (const buffer of tracer.rootBuffers) {
         strategy.releaseBuffer(buffer as any);
       }
-      tracer.clear();
 
-      const statsAfterClear = strategy.getStats();
-      // Free count should have increased
-      expect(statsAfterClear.freeCount).toBeGreaterThan(0);
+      const statsAfterFree = strategy.getStats();
+      // Free count should have increased after releasing buffers
+      expect(statsAfterFree.freeCount).toBeGreaterThan(0);
+
+      // Clear tracer (this will reset the allocator)
+      tracer.clear();
 
       // Run more traces - should reuse freed memory
       for (let i = 0; i < 5; i++) {
