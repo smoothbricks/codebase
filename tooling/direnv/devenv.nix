@@ -26,6 +26,8 @@ in {
     git-format-staged
     jq # Used in pre-commit hook and generally useful
     alejandra # Nix formatter
+    # Python with pyarrow for Arrow IPC verification tests
+    (python312.withPackages (ps: [ps.pyarrow ps.pandas]))
   ];
 
   # https://devenv.sh/languages/
