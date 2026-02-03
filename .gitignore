@@ -1,5 +1,8 @@
 # See https://docs.github.com/en/get-started/getting-started-with-git/ignoring-files for more about ignoring files.
 
+# Local env
+.envrc-local
+
 # LLMs
 .opencode
 .serena
@@ -13,6 +16,7 @@ out-tsc
 
 # dependencies
 node_modules
+extern/
 
 # IDEs and editors
 /.idea
