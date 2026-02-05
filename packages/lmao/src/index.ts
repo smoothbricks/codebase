@@ -116,6 +116,13 @@ export * from './lib/types.js';
 export * from './lib/flushScheduler.js';
 
 // =============================================================================
+// Buffer Strategy
+// =============================================================================
+
+export type { BufferStrategy } from './lib/bufferStrategy.js';
+export { JsBufferStrategy } from './lib/JsBufferStrategy.js';
+
+// =============================================================================
 // Tracer
 // =============================================================================
 
