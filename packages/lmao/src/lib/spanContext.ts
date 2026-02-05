@@ -29,12 +29,20 @@ import {
   createSpanLogger as createSpanLoggerFromGenerator,
   type SpanLoggerImpl,
 } from './codegen/spanLoggerGenerator.js';
+import { Blocked } from './errors/Blocked.js';
+import type { RetryPolicy } from './errors/retry-policy.js';
+import { TransientError } from './errors/Transient.js';
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger } from './opContext/types.js';
 import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
-import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
+import {
+  ENTRY_TYPE_SPAN_ERR,
+  ENTRY_TYPE_SPAN_EXCEPTION,
+  ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_SPAN_RETRY,
+} from './schema/systemSchema.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { LogBinding, SpanBuffer } from './types.js';
@@ -108,6 +116,158 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
  */
 export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
   return createSpanLoggerFromGenerator(schema, buffer) as SpanLoggerImpl<T>;
+}
+
+/**
+ * Calculate delay for retry based on policy and attempt number.
+ *
+ * @param policy - RetryPolicy from TransientError
+ * @param attempt - Current attempt number (1-indexed)
+ * @returns Delay in milliseconds before next retry
+ */
+function calculateDelay(policy: RetryPolicy, attempt: number): number {
+  let delay: number;
+
+  switch (policy.backoff) {
+    case 'exponential':
+      // Delay doubles each attempt: baseDelay * 2^(attempt-1)
+      delay = Math.min(policy.baseDelayMs * 2 ** (attempt - 1), policy.maxDelayMs ?? 30000);
+      break;
+    case 'linear':
+      // Delay increases linearly: baseDelay * attempt
+      delay = Math.min(policy.baseDelayMs * attempt, policy.maxDelayMs ?? 30000);
+      break;
+    case 'fixed':
+      // Same delay between each attempt
+      delay = policy.baseDelayMs;
+      break;
+    default:
+      delay = policy.baseDelayMs;
+  }
+
+  // Apply jitter if enabled (default true) - random value between 0 and delay
+  if (policy.jitter !== false) {
+    delay = Math.floor(Math.random() * delay);
+  }
+
+  return delay;
+}
+
+/**
+ * Write span-retry entry to buffer.
+ *
+ * Per specs/01h_entry_types_and_logging_primitives.md:
+ * - span-retry appends to Row 2+ in parent span buffer (like log entries)
+ * - Trace-only entry (NOT written to event log)
+ * - Contains: attempt number, error message, delay until next attempt
+ *
+ * @param buffer - SpanBuffer to write to (appends at _writeIndex)
+ * @param attempt - Attempt number (1-indexed)
+ * @param error - TransientError that triggered the retry
+ * @param delayMs - Delay before next attempt
+ */
+function writeRetryEntry<T extends LogSchema>(
+  buffer: SpanBuffer<T>,
+  attempt: number,
+  error: TransientError<string, unknown>,
+  delayMs: number,
+): void {
+  // Get current write index and advance for next write
+  const index = buffer._writeIndex;
+
+  // Write entry via TraceRoot for timestamp handling
+  // TraceRoot.writeLogEntry writes timestamp and entry_type at the given index
+  buffer._traceRoot.writeLogEntry(buffer, ENTRY_TYPE_SPAN_RETRY);
+
+  // Write retry-specific message: retry:op:{opName} for prefix-based querying
+  const opName = buffer._opMetadata?.name ?? 'unknown';
+  buffer.message(index, `retry:op:${opName}`);
+
+  // Write error code if available
+  if (error.code) {
+    buffer.error_code(index, error.code);
+  }
+
+  // Note: Full retry metadata (attempt, delay, error details) is available via:
+  // - The error code for error classification
+  // - The message for query patterns
+  // - Count of span-retry entries = number of retries that occurred
+  // Additional fields like retry_attempt, retry_delay_ms would require schema extension
+}
+
+/**
+ * Sleep for the specified duration.
+ *
+ * @param ms - Duration in milliseconds
+ * @returns Promise that resolves after the delay
+ */
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/**
+ * Execute function with retry loop for TransientError handling.
+ *
+ * Per plan 19-03: Op class handles retry loop internally.
+ * - TransientError from op body triggers retry based on error.policy
+ * - Retry respects maxAttempts from TransientError.policy
+ * - span-retry entry written for each transient failure
+ * - Only final result written as span-ok or span-err
+ * - BlockedError returns immediately without retry
+ *
+ * @param buffer - SpanBuffer to write retry entries to
+ * @param fn - Function to execute (may be retried)
+ * @returns Final result (success, non-transient error, or exhausted transient error)
+ */
+async function executeWithRetry<S, E>(
+  buffer: SpanBuffer<LogSchema>,
+  fn: () => Result<S, E> | Promise<Result<S, E>>,
+): Promise<Result<S, E>> {
+  let attempt = 0;
+
+  while (true) {
+    attempt++;
+
+    // Execute the function
+    const result = await fn();
+
+    // Success - return immediately
+    if (result instanceof Ok) {
+      return result;
+    }
+
+    // Error result - check error type for retry behavior
+    const error = (result as Err<E>).error;
+
+    // BlockedError - return immediately, no retry
+    if (error instanceof Blocked) {
+      return result;
+    }
+
+    // TransientError - check if we should retry
+    if (error instanceof TransientError) {
+      const { policy } = error;
+
+      // Check attempt limit (maxAttempts includes initial attempt)
+      if (attempt >= policy.maxAttempts) {
+        // Exhausted - return final error
+        return result;
+      }
+
+      // Calculate delay based on policy and attempt number
+      const delay = calculateDelay(policy, attempt);
+
+      // Write span-retry entry to buffer for observability
+      writeRetryEntry(buffer, attempt, error, delay);
+
+      // Wait before retry
+      await sleep(delay);
+      continue;
+    }
+
+    // Non-transient error - return immediately
+    return result;
+  }
 }
 
 /**
@@ -928,7 +1088,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -960,7 +1123,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -993,7 +1159,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1, a2),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1027,7 +1196,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1062,7 +1234,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1098,7 +1273,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1143,7 +1321,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1190,7 +1371,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1239,7 +1423,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = await fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7, a8);
+        // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
+        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
+          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7, a8),
+        );
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
