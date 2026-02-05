@@ -43,6 +43,18 @@
       "import": "./dist/lib/errors/CodeError.js",
       "default": "./dist/lib/errors/CodeError.js"
     },
+    "./errors/retry-policy": {
+      "development": "./src/lib/errors/retry-policy.ts",
+      "types": "./dist/lib/errors/retry-policy.d.ts",
+      "import": "./dist/lib/errors/retry-policy.js",
+      "default": "./dist/lib/errors/retry-policy.js"
+    },
+    "./errors/Transient": {
+      "development": "./src/lib/errors/Transient.ts",
+      "types": "./dist/lib/errors/Transient.d.ts",
+      "import": "./dist/lib/errors/Transient.js",
+      "default": "./dist/lib/errors/Transient.js"
+    },
     "./testing": {
       "development": "./src/testing.ts",
       "types": "./dist/testing.d.ts",
