@@ -789,3 +789,85 @@ This metadata flows to all Ops created from this context, enabling:
 - Package attribution in traces
 - Source file tracking
 - Git SHA for deployment correlation
+
+## Retry Handling
+
+Ops support automatic retry for transient failures. Retry policy is embedded in the error itself via
+`TransientError.policy`.
+
+### Defining Retryable Errors
+
+Use the `Transient()` factory with a default retry policy:
+
+```typescript
+import { Transient, exponentialBackoff, fixedDelay } from '@smoothbricks/lmao/errors/Transient';
+
+// Define transient error codes with retry policies
+const SERVICE_UNAVAILABLE = Transient<{ service: string }>('SERVICE_UNAVAILABLE', exponentialBackoff(5));
+const RATE_LIMITED = Transient<{ retryAfter?: number }>('RATE_LIMITED', fixedDelay(3, 5000));
+
+// In op body:
+const fetchData = defineOp('fetchData', async (ctx, url: string) => {
+  const response = await fetch(url);
+
+  if (response.status === 503) {
+    // Uses default exponential backoff (5 attempts)
+    return ctx.err(SERVICE_UNAVAILABLE({ service: url }));
+  }
+
+  if (response.status === 429) {
+    const retryAfter = parseInt(response.headers.get('Retry-After') ?? '5000', 10);
+    // Override policy based on server hint
+    return ctx.err(RATE_LIMITED({ retryAfter }, fixedDelay(1, retryAfter)));
+  }
+
+  return ctx.ok(await response.json());
+});
+```
+
+### How Retry Works
+
+1. Op `fn` is invoked
+2. If result is `TransientError`:
+   - Check `error.policy.maxAttempts` - if exhausted, return error
+   - Calculate delay based on `error.policy.backoff`
+   - Write `span-retry` entry to buffer (observability)
+   - Wait for delay
+   - Re-invoke `fn` (same SpanContext, fresh execution)
+3. If result is `BlockedError`: return immediately (no retry)
+4. If result is any other error: return immediately (no retry)
+5. If result is success: return immediately
+
+### Key Design Decisions
+
+- **Retry in span execution, not caller**: Retry is transparent to span() callers
+- **Policy on error, not op**: Each error type declares its own retry behavior
+- **Per-call override**: Can adjust policy for specific cases (e.g., Retry-After header)
+- **Blocked is NOT transient**: BlockedError returns to decide() for canary pattern
+- **Trace-only logging**: span-retry entries are in trace, not event log
+
+### Retry vs Blocked
+
+| Error Type     | instanceof Check                  | Retry Behavior                 |
+| -------------- | --------------------------------- | ------------------------------ |
+| TransientError | `error instanceof TransientError` | Retry up to policy.maxAttempts |
+| BlockedError   | `error instanceof Blocked`        | Return to caller immediately   |
+| Other errors   | Neither                           | Return to caller immediately   |
+
+**Why the distinction?**
+
+- `TransientError`: Temporary failure, same call will likely succeed soon (network blip, service restart)
+- `BlockedError`: Structural unavailability, needs coordination (service down, quota exceeded)
+
+### Observability
+
+Each retry attempt writes a `span-retry` entry:
+
+```
+span-start: op:fetchPayment
+span-retry: retry:op:fetchPayment (attempt=1, delay=100ms)
+span-retry: retry:op:fetchPayment (attempt=2, delay=200ms)
+span-ok: op:fetchPayment (success on attempt 3)
+```
+
+Count span-retry entries to measure retry frequency. Alert on patterns like "P99 of retries > 2".
