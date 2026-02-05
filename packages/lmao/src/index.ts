@@ -36,6 +36,13 @@ export type { FluentLogEntry, SpanContext, SpanFn, SpanLogger } from './lib/span
 export { isSpanContext, SPAN_CONTEXT_MARKER } from './lib/spanContext.js';
 
 // =============================================================================
+// LogAPI - Simple logging interface for contexts without SpanBuffer access
+// =============================================================================
+
+export type { LogAPI } from './lib/logApi.js';
+export { noopLogAPI } from './lib/logApi.js';
+
+// =============================================================================
 // System Schema & Entry Type Constants
 // =============================================================================
 
