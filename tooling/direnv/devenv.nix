@@ -8,8 +8,6 @@
 # https://devenv.sh/inputs/
 let
   git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
-  # Python with packages for Arrow IPC verification tests
-  pythonEnv = pkgs.python312.withPackages (ps: [ps.pyarrow ps.pandas]);
 in {
   # https://devenv.sh/overlays/
   overlays = [
@@ -28,12 +26,19 @@ in {
     git-format-staged
     jq # Used in pre-commit hook and generally useful
     alejandra # Nix formatter
-    # Python with pyarrow for Arrow IPC verification tests
-    pythonEnv
   ];
 
   # https://devenv.sh/languages/
-  # languages.nix.enable = true;
+  # Python with pyarrow for Arrow IPC verification tests.
+  # Must use languages.python instead of adding pythonEnv to packages because:
+  # - Shells pass argv[0] as just "python" (not full path) when running via PATH
+  # - Nix's python wrapper uses --inherit-argv0, passing this bare name to the real Python
+  # - Python uses argv[0] to find its prefix/site-packages, fails with just "python"
+  # - languages.python sets up shell hooks that ensure argv[0] contains the full path
+  languages.python = {
+    enable = true;
+    package = pkgs.python312.withPackages (ps: [ps.pyarrow ps.pandas]);
+  };
 
   # We're not using Devenv's pre-commit-hooks, because this repo's pre-commit hook
   # uses `git-format-staged` to format only the content that is about to be committed.
@@ -51,8 +56,6 @@ in {
   enterShell = ''
     cd "$DEVENV_ROOT/../.."
     export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
-    # Set PYTHONHOME so nix python wrapper finds its packages
-    export PYTHONHOME="${pythonEnv}"
     bun ${./setup-environment.ts}
 
     if [ -n "$DEVENV_SHELL_PWD" ]; then
