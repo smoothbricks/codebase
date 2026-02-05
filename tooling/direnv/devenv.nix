@@ -8,6 +8,8 @@
 # https://devenv.sh/inputs/
 let
   git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
+  # Python with packages for Arrow IPC verification tests
+  pythonEnv = pkgs.python312.withPackages (ps: [ps.pyarrow ps.pandas]);
 in {
   # https://devenv.sh/overlays/
   overlays = [
@@ -27,7 +29,7 @@ in {
     jq # Used in pre-commit hook and generally useful
     alejandra # Nix formatter
     # Python with pyarrow for Arrow IPC verification tests
-    (python312.withPackages (ps: [ps.pyarrow ps.pandas]))
+    pythonEnv
   ];
 
   # https://devenv.sh/languages/
@@ -49,6 +51,8 @@ in {
   enterShell = ''
     cd "$DEVENV_ROOT/../.."
     export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
+    # Set PYTHONHOME so nix python wrapper finds its packages
+    export PYTHONHOME="${pythonEnv}"
     bun ${./setup-environment.ts}
 
     if [ -n "$DEVENV_SHELL_PWD" ]; then
