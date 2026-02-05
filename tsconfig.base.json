@@ -26,6 +26,9 @@
       "@smoothbricks/arrow-builder": [
         "./packages/arrow-builder/src/index.ts"
       ],
+      "@smoothbricks/duration": [
+        "./packages/duration/src/index.ts"
+      ],
       "@smoothbricks/lmao": [
         "./packages/lmao/src/index.ts"
       ],

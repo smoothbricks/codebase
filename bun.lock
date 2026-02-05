@@ -36,6 +36,13 @@
         "tslib": "^2.3.0",
       },
     },
+    "packages/duration": {
+      "name": "@smoothbricks/duration",
+      "version": "0.0.1",
+      "dependencies": {
+        "tslib": "^2.3.0",
+      },
+    },
     "packages/eslint-stdout": {
       "name": "eslint-stdout",
       "version": "1.0.1",
@@ -756,6 +763,8 @@
     "@sinonjs/fake-timers": ["@sinonjs/fake-timers@15.3.2", "", { "dependencies": { "@sinonjs/commons": "^3.0.1" } }, "sha512-mrn35Jl2pCpns+mE3HaZa1yPN5EYCRgiMI+135COjr2hr8Cls9DXqIZ57vZe2cz7y2XVSq92tcs6kGQcT1J8Rw=="],
 
     "@smoothbricks/arrow-builder": ["@smoothbricks/arrow-builder@workspace:packages/arrow-builder"],
+
+    "@smoothbricks/duration": ["@smoothbricks/duration@workspace:packages/duration"],
 
     "@smoothbricks/lmao": ["@smoothbricks/lmao@workspace:packages/lmao"],
 

@@ -13,6 +13,9 @@
       "path": "./packages/lmao-transformer"
     },
     {
+      "path": "./packages/duration"
+    },
+    {
       "path": "./packages/statebus-core"
     },
     {
