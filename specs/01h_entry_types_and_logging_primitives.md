@@ -33,6 +33,7 @@ SpanBuffer row layout:
 │                       │            or err() → span-err                   │
 ├──────────────────────────────────────────────────────────────────────────┤
 │ Row 2+: events        │ log.info/debug/warn/error appends here           │
+│                       │ span-retry also appends here (transient failures)│
 └──────────────────────────────────────────────────────────────────────────┘
 
 Span completion entry types (all written to row 1):
@@ -66,6 +67,16 @@ Span completion entry types (all written to row 1):
   - Contains exception details in the `message` column (see "The `message` Column" below)
   - Indicates truly exceptional circumstances
   - Duration still valid: `timestamps[1] - timestamps[0]`
+
+- **`span-retry`** - Transient failure triggering retry - **Row 2+ (appended)**
+  - Written by Op class when result is TransientError and retry will occur
+  - Contains timing info for the failed attempt
+  - Parent span has full context tags (op name, key, etc.)
+  - Minimal child span with retry-specific data:
+    - `retry_attempt`: Attempt number (1, 2, 3...)
+    - `retry_error`: Error message that triggered retry
+    - `retry_delay_ms`: Delay before next attempt
+  - Duration measures the failed attempt (not including retry delay)
 
 #### Buffer Initialization Code
 
@@ -208,6 +219,45 @@ return ctx.ok(user).message('User created successfully');
 | Exception thrown             | `span-exception` (4) | span()/trace() |
 
 **Note**: Entry types are always written by `span()`/`trace()` at span-end, never by the result constructor.
+
+### Retry Entry Type
+
+The `span-retry` entry type provides observability for transient failure handling in Op execution:
+
+**When written:**
+
+- Op returns TransientError (via `ctx.err(TRANSIENT_CODE({ data }))`)
+- Op has retry policy and attempt limit not reached
+- Logged BEFORE the delay wait, captures the failed attempt
+
+**What it contains:**
+
+- Timestamp of the failure
+- Entry type: span-retry (5)
+- Message: retry:op:{opName} (for prefix-based querying)
+- retry_attempt: Which attempt failed (1-indexed)
+- retry_error: Error message or code
+- retry_delay_ms: How long until next attempt
+
+**Key design decisions:**
+
+- **Appended to parent span buffer**: Not a separate span, just a log entry
+- **Prefix naming**: `retry:op:{name}` enables `retry:*` queries
+- **Minimal data**: Parent span has full context (op_name, op_key, args)
+
+**Counting retries:**
+
+Count `span-retry` entries for a span to know how many retries occurred. If the final result is `span-ok`, all retries
+succeeded eventually. If the final result is `span-err` with code RETRIES_EXHAUSTED, retries failed.
+
+**Example trace:**
+
+```
+span-start: op:fetchPayment
+span-retry: retry:op:fetchPayment (attempt=1, error="503 Service Unavailable", delay=100ms)
+span-retry: retry:op:fetchPayment (attempt=2, error="503 Service Unavailable", delay=200ms)
+span-ok: op:fetchPayment (success on attempt 3)
+```
 
 ### Log Level Entry Types
 
