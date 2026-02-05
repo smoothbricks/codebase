@@ -216,74 +216,77 @@ export const ENTRY_TYPE_SPAN_ERR = 3;
 /** Span exception - written to row 1 when an unhandled exception occurs */
 export const ENTRY_TYPE_SPAN_EXCEPTION = 4;
 
+/** Span retry - written when a transient failure triggers a retry attempt (Phase 19) */
+export const ENTRY_TYPE_SPAN_RETRY = 5;
+
 /** Trace log level entry - via ctx.log.trace() (most verbose) */
-export const ENTRY_TYPE_TRACE = 5;
+export const ENTRY_TYPE_TRACE = 6;
 
 /** Debug log level entry - via ctx.log.debug() */
-export const ENTRY_TYPE_DEBUG = 6;
+export const ENTRY_TYPE_DEBUG = 7;
 
 /** Info log level entry - via ctx.log.info() */
-export const ENTRY_TYPE_INFO = 7;
+export const ENTRY_TYPE_INFO = 8;
 
 /** Warning log level entry - via ctx.log.warn() */
-export const ENTRY_TYPE_WARN = 8;
+export const ENTRY_TYPE_WARN = 9;
 
 /** Error log level entry - via ctx.log.error() */
-export const ENTRY_TYPE_ERROR = 9;
+export const ENTRY_TYPE_ERROR = 10;
 
 /** Feature flag access event - logged when a flag value is first read in a span */
-export const ENTRY_TYPE_FF_ACCESS = 10;
+export const ENTRY_TYPE_FF_ACCESS = 11;
 
 /** Feature flag usage event - logged when a flag influences a code path decision */
-export const ENTRY_TYPE_FF_USAGE = 11;
+export const ENTRY_TYPE_FF_USAGE = 12;
 
 // =============================================================================
 // Period Markers
 // =============================================================================
 
 /** Period start marker - written at the beginning of each metrics collection period */
-export const ENTRY_TYPE_PERIOD_START = 12;
+export const ENTRY_TYPE_PERIOD_START = 13;
 
 // =============================================================================
 // Op Metrics (per specs/01n_op_and_buffer_metrics.md)
 // =============================================================================
 
 /** Op invocations counter - total calls to this operation */
-export const ENTRY_TYPE_OP_INVOCATIONS = 13;
+export const ENTRY_TYPE_OP_INVOCATIONS = 14;
 
 /** Op errors counter - calls that returned err() */
-export const ENTRY_TYPE_OP_ERRORS = 14;
+export const ENTRY_TYPE_OP_ERRORS = 15;
 
 /** Op exceptions counter - calls that threw unhandled exceptions */
-export const ENTRY_TYPE_OP_EXCEPTIONS = 15;
+export const ENTRY_TYPE_OP_EXCEPTIONS = 16;
 
 /** Op duration total - sum of all invocation durations (ms) */
-export const ENTRY_TYPE_OP_DURATION_TOTAL = 16;
+export const ENTRY_TYPE_OP_DURATION_TOTAL = 17;
 
 /** Op duration ok - sum of successful invocation durations (ms) */
-export const ENTRY_TYPE_OP_DURATION_OK = 17;
+export const ENTRY_TYPE_OP_DURATION_OK = 18;
 
 /** Op duration err - sum of error invocation durations (ms) */
-export const ENTRY_TYPE_OP_DURATION_ERR = 18;
+export const ENTRY_TYPE_OP_DURATION_ERR = 19;
 
 /** Op duration min - minimum invocation duration (ms) */
-export const ENTRY_TYPE_OP_DURATION_MIN = 19;
+export const ENTRY_TYPE_OP_DURATION_MIN = 20;
 
 /** Op duration max - maximum invocation duration (ms) */
-export const ENTRY_TYPE_OP_DURATION_MAX = 20;
+export const ENTRY_TYPE_OP_DURATION_MAX = 21;
 
 // =============================================================================
 // Buffer Metrics (utilization-based capacity tuning)
 // =============================================================================
 
 /** Buffer writes counter - total writes across all buffers */
-export const ENTRY_TYPE_BUFFER_WRITES = 21;
+export const ENTRY_TYPE_BUFFER_WRITES = 22;
 
 /** Buffer spans counter - number of spans created (non-overflow buffers) */
-export const ENTRY_TYPE_BUFFER_SPANS = 22;
+export const ENTRY_TYPE_BUFFER_SPANS = 23;
 
 /** Buffer capacity - current buffer capacity for this module */
-export const ENTRY_TYPE_BUFFER_CAPACITY = 23;
+export const ENTRY_TYPE_BUFFER_CAPACITY = 24;
 
 /**
  * Human-readable names for entry types, indexed by entry type code.
@@ -303,23 +306,24 @@ export const ENTRY_TYPE_NAMES = [
   'span-ok', // 2
   'span-err', // 3
   'span-exception', // 4
-  'trace', // 5 (most verbose)
-  'debug', // 6
-  'info', // 7
-  'warn', // 8
-  'error', // 9
-  'ff-access', // 10
-  'ff-usage', // 11
-  'period-start', // 12
-  'op-invocations', // 13
-  'op-errors', // 14
-  'op-exceptions', // 15
-  'op-duration-total', // 16
-  'op-duration-ok', // 17
-  'op-duration-err', // 18
-  'op-duration-min', // 19
-  'op-duration-max', // 20
-  'buffer-writes', // 21
-  'buffer-spans', // 22
-  'buffer-capacity', // 23
+  'span-retry', // 5 (Phase 19 - transient failure retry)
+  'trace', // 6 (most verbose)
+  'debug', // 7
+  'info', // 8
+  'warn', // 9
+  'error', // 10
+  'ff-access', // 11
+  'ff-usage', // 12
+  'period-start', // 13
+  'op-invocations', // 14
+  'op-errors', // 15
+  'op-exceptions', // 16
+  'op-duration-total', // 17
+  'op-duration-ok', // 18
+  'op-duration-err', // 19
+  'op-duration-min', // 20
+  'op-duration-max', // 21
+  'buffer-writes', // 22
+  'buffer-spans', // 23
+  'buffer-capacity', // 24
 ] as const;

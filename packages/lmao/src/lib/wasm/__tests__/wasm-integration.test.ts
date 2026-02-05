@@ -15,10 +15,14 @@ import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
+  ENTRY_TYPE_DEBUG,
+  ENTRY_TYPE_ERROR,
+  ENTRY_TYPE_INFO,
   ENTRY_TYPE_SPAN_ERR,
   ENTRY_TYPE_SPAN_EXCEPTION,
   ENTRY_TYPE_SPAN_OK,
   ENTRY_TYPE_SPAN_START,
+  ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { WasmBufferStrategy } from '../WasmBufferStrategy.js';
@@ -315,10 +319,10 @@ describe('WASM Integration Tests', () => {
       // Log entries are written at indices 2+
       const entryTypes = Array.from(buffer.entry_type.slice(0, buffer._writeIndex));
 
-      // INFO=7, DEBUG=6, WARN=8 (from systemSchema)
-      expect(entryTypes).toContain(7); // INFO
-      expect(entryTypes).toContain(6); // DEBUG
-      expect(entryTypes).toContain(8); // WARN
+      // Use entry type constants from systemSchema
+      expect(entryTypes).toContain(ENTRY_TYPE_INFO);
+      expect(entryTypes).toContain(ENTRY_TYPE_DEBUG);
+      expect(entryTypes).toContain(ENTRY_TYPE_WARN);
 
       // Messages are written via message_values getter (SpanLogger uses this)
       // Access via the getter since that's what SpanLogger writes to
@@ -336,9 +340,9 @@ describe('WASM Integration Tests', () => {
       });
 
       const buffer = asWasm(tracer.rootBuffers[0]);
-      // ERROR = 9 (from systemSchema)
+      // Use entry type constant from systemSchema
       const entryTypes = Array.from(buffer.entry_type.slice(0, buffer._writeIndex));
-      expect(entryTypes).toContain(9); // ERROR
+      expect(entryTypes).toContain(ENTRY_TYPE_ERROR);
     });
   });
 
