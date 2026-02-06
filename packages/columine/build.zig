@@ -25,6 +25,13 @@ pub fn build(b: *std.Build) void {
     });
 
     // ==========================================================================
+    // and get the reducer VM's public API (vm.zig).
+    // ==========================================================================
+    _ = b.addModule("columine", .{
+        .root_source_file = b.path("src/vm/vm.zig"),
+    });
+
+    // ==========================================================================
     // Columine WASM - Reducer-only binary (no RETE)
     // ==========================================================================
     // This is the standalone columine binary for users who only need
