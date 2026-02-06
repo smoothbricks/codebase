@@ -19,6 +19,21 @@ export {
   setBackend,
   setBackendLoader,
 } from './backend.js';
+// Parse/Compact backend (event_processor WASM bridge)
+export type { EventProcessorWasmExports, ParseCompactBackend } from './parse-backend.js';
+export { createParseCompactWasmBackend, loadParseBackend } from './parse-backend.js';
+// Pipeline composition API
+export type {
+  ColumineStages,
+  CompactStage,
+  ParseConfig,
+  ParseResult,
+  ParseStage,
+  ReduceStage,
+  UndoStage,
+  UndoToken,
+} from './pipeline.js';
+export { createPipeline } from './pipeline.js';
 // Types and interfaces
 export type {
   ColumineBackend,
