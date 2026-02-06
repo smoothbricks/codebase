@@ -36,3 +36,5 @@ export {
   SlotType,
   ValueType,
 } from './types.js';
+// WASM backend (for standalone columine usage)
+export { createColumineWasmBackend, loadColumineWasm } from './wasm-backend.js';
