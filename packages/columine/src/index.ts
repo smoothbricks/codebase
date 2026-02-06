@@ -29,6 +29,7 @@ export type {
   ParseConfig,
   ParseResult,
   ParseStage,
+  PipelineOptions,
   ReduceStage,
   UndoStage,
   UndoToken,
