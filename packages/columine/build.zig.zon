@@ -3,7 +3,7 @@
     .name = .columine,
     .version = "0.0.0",
     // Unique fingerprint for this package
-    .fingerprint = 0xa3e7b2c91f04d8e6, // Changing this has security and trust implications.
+    .fingerprint = 0x4050e82ce1a0e7b2, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
     // zig-msgpack for serializing data to/from msgpack format in the reducer
     .dependencies = .{
