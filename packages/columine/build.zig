@@ -83,7 +83,61 @@ pub fn build(b: *std.Build) void {
     b.getInstallStep().dependOn(&copy_ffi.step);
 
     // ==========================================================================
-    // Test step - runs VM tests on native target
+    // EventProcessor WASM - Parse + Compact pipeline (no dedup)
+    // ==========================================================================
+    // Standalone event processor for JSON-to-Arrow-IPC conversion.
+    const ep_wasm = b.addExecutable(.{
+        .name = "event_processor",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/event_processor.zig"),
+            .target = wasm_target,
+            .optimize = if (optimize == .Debug) .Debug else .ReleaseSmall,
+        }),
+    });
+    ep_wasm.entry = .disabled;
+    ep_wasm.rdynamic = true;
+    ep_wasm.export_memory = true;
+    ep_wasm.initial_memory = 128 * 64 * 1024;
+    ep_wasm.max_memory = 1024 * 64 * 1024;
+
+    // msgpack needed for json_extractor's undeclared field serialization
+    ep_wasm.root_module.addImport("msgpack", msgpack_wasm_dep.module("msgpack"));
+
+    b.installArtifact(ep_wasm);
+
+    const copy_ep_wasm = b.addInstallFileWithDir(
+        ep_wasm.getEmittedBin(),
+        .{ .custom = "../dist" },
+        "event_processor.wasm",
+    );
+    b.getInstallStep().dependOn(&copy_ep_wasm.step);
+
+    // ==========================================================================
+    // EventProcessor FFI dylib - Parse + Compact native library for Bun FFI
+    // ==========================================================================
+    const ep_ffi = b.addLibrary(.{
+        .name = "event_processor",
+        .linkage = .dynamic,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/event_processor.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+
+    ep_ffi.root_module.addImport("msgpack", msgpack_dep.module("msgpack"));
+
+    b.installArtifact(ep_ffi);
+
+    const copy_ep_ffi = b.addInstallFileWithDir(
+        ep_ffi.getEmittedBin(),
+        .{ .custom = "../dist" },
+        "libevent_processor.dylib",
+    );
+    b.getInstallStep().dependOn(&copy_ep_ffi.step);
+
+    // ==========================================================================
+    // Test step - runs VM and EventProcessor tests on native target
     // ==========================================================================
     const test_step = b.step("test", "Run unit tests");
 
@@ -97,4 +151,17 @@ pub fn build(b: *std.Build) void {
 
     const run_vm_test = b.addRunArtifact(vm_test);
     test_step.dependOn(&run_vm_test.step);
+
+    // EventProcessor tests (Parse + Compact pipeline)
+    const ep_test = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/event_processor.zig"),
+            .target = target,
+            .optimize = optimize,
+        }),
+    });
+    ep_test.root_module.addImport("msgpack", msgpack_dep.module("msgpack"));
+
+    const run_ep_test = b.addRunArtifact(ep_test);
+    test_step.dependOn(&run_ep_test.step);
 }
