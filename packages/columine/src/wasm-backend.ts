@@ -19,7 +19,8 @@ import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from '
 // =============================================================================
 
 const STATE_HEADER_SIZE = 32;
-const SLOT_META_SIZE = 24;
+// Must match vm.zig SLOT_META_SIZE (48 bytes with TTL/eviction fields)
+const SLOT_META_SIZE = 48;
 
 // WASM returns u32 as signed i32, so 0xFFFFFFFF becomes -1
 const EMPTY_KEY_SIGNED = -1;
@@ -334,11 +335,13 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
 
     getAggregateValue(state: StateHandle, _program: ReducerProgram, slot: number): number {
       const s = state as WasmStateHandle;
+      const u8 = new Uint8Array(s.buffer);
       const u32 = new Uint32Array(s.buffer);
       const f64 = new Float64Array(s.buffer);
-      const metaIdx = (STATE_HEADER_SIZE + slot * SLOT_META_SIZE) / 4;
-      const dataOffset = u32[metaIdx];
-      const aggType = u32[metaIdx + 4]; // aggType field
+      const metaStart = STATE_HEADER_SIZE + slot * SLOT_META_SIZE;
+      const dataOffset = u32[metaStart / 4];
+      // aggType is a single byte at offset 13 within the slot meta (SlotMetaOffset.AGG_TYPE)
+      const aggType = u8[metaStart + 13];
 
       if (aggType === 2) {
         // COUNT - return count (u64 at dataOffset + 8)
