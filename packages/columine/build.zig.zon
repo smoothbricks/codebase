@@ -1,0 +1,20 @@
+.{
+    // Columine - Generic columnar processing pipeline (Parse, Reduce, Compact, Undo)
+    .name = .columine,
+    .version = "0.0.0",
+    // Unique fingerprint for this package
+    .fingerprint = 0xa3e7b2c91f04d8e6, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.15.2",
+    // zig-msgpack for serializing data to/from msgpack format in the reducer
+    .dependencies = .{
+        .zig_msgpack = .{
+            .url = "https://github.com/zigcc/zig-msgpack/archive/main.tar.gz",
+            .hash = "zig_msgpack-0.0.14-evvueGolBQBs_m726tBf4ISJQqC926AM96EtxZy9LUaI",
+        },
+    },
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
