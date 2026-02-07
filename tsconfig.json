@@ -16,6 +16,9 @@
       "path": "./packages/duration"
     },
     {
+      "path": "./packages/columine"
+    },
+    {
       "path": "./packages/statebus-core"
     },
     {
