@@ -59,6 +59,13 @@ interface VmExports {
   // Lookups
   vm_map_get(stateBase: number, slotOffset: number, capacity: number, key: number): number;
   vm_set_contains(stateBase: number, slotOffset: number, capacity: number, elem: number): number;
+
+  // Undo log operations (Phase 29)
+  vm_undo_enable(stateBase: number): void;
+  vm_undo_checkpoint(stateBase: number): number;
+  vm_undo_rollback(stateBase: number, checkpointPos: number): void;
+  vm_undo_commit(stateBase: number, checkpointPos: number): void;
+  vm_undo_has_overflow(): number;
 }
 
 // =============================================================================
@@ -403,6 +410,43 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
         buffer,
         size: data.length,
       } as WasmStateHandle;
+    },
+
+    // =========================================================================
+    // Undo Log (Phase 29)
+    // =========================================================================
+
+    undoEnable(state: StateHandle): void {
+      const s = state as WasmStateHandle;
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      // Copy state INTO WASM so enable can save change flags
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+      wasmInstance.exports.vm_undo_enable(statePtr);
+    },
+
+    undoCheckpoint(state: StateHandle): number {
+      const statePtr = wasmInstance.stateRegionOffset;
+      return wasmInstance.exports.vm_undo_checkpoint(statePtr);
+    },
+
+    undoRollback(state: StateHandle, checkpointPos: number): void {
+      const s = state as WasmStateHandle;
+      const statePtr = wasmInstance.stateRegionOffset;
+      // State is already in WASM memory from the last executeBatch
+      wasmInstance.exports.vm_undo_rollback(statePtr, checkpointPos);
+      // Copy rolled-back state OUT of WASM to JS ArrayBuffer
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      new Uint8Array(s.buffer).set(wasmU8.subarray(statePtr, statePtr + s.size));
+    },
+
+    undoCommit(state: StateHandle, checkpointPos: number): void {
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmInstance.exports.vm_undo_commit(statePtr, checkpointPos);
+    },
+
+    undoHasOverflow(): boolean {
+      return wasmInstance.exports.vm_undo_has_overflow() !== 0;
     },
   };
 }

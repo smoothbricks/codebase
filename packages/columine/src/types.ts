@@ -204,4 +204,35 @@ export interface ColumineBackend {
    * Returns new state handle.
    */
   deserialize(program: ReducerProgram, data: Uint8Array): StateHandle;
+
+  // ===========================================================================
+  // Undo Log (Phase 29 - optional, backward compatible)
+  // ===========================================================================
+
+  /**
+   * Enable undo logging. Call before speculative execution.
+   * Saves change flags for rollback restoration.
+   */
+  undoEnable?(state: StateHandle): void;
+
+  /**
+   * Save current undo log position. Returns position as number.
+   */
+  undoCheckpoint?(state: StateHandle): number;
+
+  /**
+   * Rollback all mutations since the given checkpoint position.
+   * After calling, the state buffer contains rolled-back state.
+   */
+  undoRollback?(state: StateHandle, checkpointPos: number): void;
+
+  /**
+   * Commit (discard) undo entries since the given checkpoint position.
+   */
+  undoCommit?(state: StateHandle, checkpointPos: number): void;
+
+  /**
+   * Check if undo log overflowed during speculation.
+   */
+  undoHasOverflow?(): boolean;
 }
