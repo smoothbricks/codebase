@@ -233,6 +233,8 @@ export interface ColumineBackend {
 
   /**
    * Check if undo log overflowed during speculation.
+   * @deprecated Overflow is now handled internally by the Zig shadow buffer.
+   * Kept for debugging/testing only.
    */
   undoHasOverflow?(): boolean;
 }

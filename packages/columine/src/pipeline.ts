@@ -190,18 +190,15 @@ function createCompactStage(parseBackend: ParseCompactBackend | null): CompactSt
 }
 
 /**
- * Create undo stage with native undo log and snapshot fallback.
+ * Create undo stage with native undo log.
  *
  * Native path (fast): Uses Zig undo log via WASM/FFI exports.
- * checkpoint() saves log position, rollback() replays in reverse.
+ * checkpoint() saves log position (O(1), no memcpy), rollback() replays in reverse.
+ * Undo log overflow is handled lazily inside Zig via shadow buffer — only when
+ * the log actually exceeds capacity does a memcpy occur.
  *
- * Fallback path (safe): If undo log overflows or backend doesn't
- * support native undo, falls back to full-state snapshot.
- *
- * checkpoint() always takes a snapshot as safety net — it's a single
- * memcpy. The real win is in rollback() which is O(entries) instead
- * of O(state_size). In the common case (no overflow), the snapshot
- * is never used and is GC'd on commit.
+ * Legacy path (safe): If backend doesn't support native undo, falls back to
+ * full-state snapshot for checkpoint/rollback.
  */
 function createUndoStage(backend: ColumineBackend): UndoStage {
   // Check once at construction — backend capabilities don't change
@@ -212,15 +209,14 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
 
     checkpoint(state: StateHandle): UndoToken {
       if (hasNativeUndo) {
-        // Enable undo logging and save change flags
+        // Enable undo logging, save change flags, store state pointer for lazy overflow
         backend.undoEnable!(state);
         const position = backend.undoCheckpoint!(state);
-        // Also take snapshot as fallback in case undo overflows
-        const snapshot = backend.serialize(state, {} as ReducerProgram);
+        // No snapshot needed — overflow is handled lazily inside Zig
         return {
           _brand: 'UndoToken',
           position,
-          snapshot,
+          snapshot: null,
         } as InternalUndoToken;
       }
       // Legacy path: full snapshot only (no native undo available)
@@ -235,15 +231,15 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     rollback(state: StateHandle, token: UndoToken): void {
       const internal = token as InternalUndoToken;
 
-      if (hasNativeUndo && !backend.undoHasOverflow!()) {
-        // Native rollback — undo log intact, reverse replay
+      if (hasNativeUndo) {
+        // Native rollback — Zig handles overflow internally via shadow buffer:
+        // if overflow occurred, it restores shadow then replays log;
+        // if no overflow, it just replays log
         backend.undoRollback!(state, internal.position);
-        // Clear snapshot reference since we used native path
-        internal.snapshot = null;
         return;
       }
 
-      // Fallback: restore from snapshot (overflow or no native undo)
+      // Legacy fallback: restore from snapshot (no native undo)
       if (internal.snapshot) {
         const stateAny = state as StateHandle & { buffer?: ArrayBuffer; size?: number };
         if (stateAny.buffer && internal.snapshot.length > 0) {

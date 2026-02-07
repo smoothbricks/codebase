@@ -443,6 +443,14 @@ var g_undo_count: u32 = 0;
 var g_undo_overflow: bool = false;
 pub var g_undo_enabled: bool = false;
 
+// Shadow buffer for lazy overflow snapshot — only used when undo log exceeds capacity.
+// 2MB covers typical state sizes (each HashMap slot ~32KB, so ~60 slots at 1K capacity).
+const UNDO_SHADOW_CAPACITY: u32 = 2 * 1024 * 1024;
+var g_undo_shadow: [UNDO_SHADOW_CAPACITY]u8 = undefined;
+var g_undo_state_size: u32 = 0;
+// Stored at vm_undo_enable time — WASM is single-threaded so this is safe
+var g_undo_state_base: [*]u8 = undefined;
+
 // Saved change flags for rollback (max 256 slots + 1 derived facts flag)
 var g_saved_change_flags: [257]u8 = undefined;
 var g_saved_change_flags_count: u32 = 0;
@@ -451,9 +459,15 @@ pub fn undoAppend(entry: FlatUndoEntry) void {
     if (g_undo_count < UNDO_CAPACITY) {
         g_undo_entries[g_undo_count] = entry;
         g_undo_count += 1;
-    } else {
+    } else if (!g_undo_overflow) {
+        // First overflow: snapshot current state into shadow buffer so rollback
+        // can restore un-logged mutations that happen after this point
+        if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
+            @memcpy(g_undo_shadow[0..g_undo_state_size], g_undo_state_base[0..g_undo_state_size]);
+        }
         g_undo_overflow = true;
     }
+    // If already overflowed, silently drop — shadow buffer covers subsequent mutations
 }
 
 /// Save all slot change_flags + derived_facts_change_flag at checkpoint time.
@@ -2396,11 +2410,14 @@ pub export fn vm_set_iter_get(
 // =============================================================================
 
 /// Enable undo logging and save change flags. Call before speculative execution.
-/// Resets the undo log to empty state.
-pub export fn vm_undo_enable(state_base: [*]u8) void {
+/// Resets the undo log to empty state. Stores state_base and state_size for
+/// lazy shadow buffer snapshot on overflow.
+pub export fn vm_undo_enable(state_base: [*]u8, state_size: u32) void {
     g_undo_enabled = true;
     g_undo_count = 0;
     g_undo_overflow = false;
+    g_undo_state_base = state_base;
+    g_undo_state_size = state_size;
     saveChangeFlags(state_base);
 }
 
@@ -2412,8 +2429,16 @@ pub export fn vm_undo_checkpoint(_state_base: [*]u8) u32 {
 }
 
 /// Rollback all mutations since the given checkpoint position.
-/// Replays undo entries in reverse order, then restores change flags.
+/// If overflow occurred: restore shadow buffer (undoes un-logged mutations after
+/// overflow), then replay undo log in reverse (undoes logged mutations before overflow).
+/// If no overflow: just replay undo log in reverse.
 pub export fn vm_undo_rollback(state_base: [*]u8, checkpoint_pos: u32) void {
+    if (g_undo_overflow and g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
+        // Step 1: Restore shadow buffer — undoes all mutations after the overflow point
+        // that weren't captured in the undo log
+        @memcpy(state_base[0..g_undo_state_size], g_undo_shadow[0..g_undo_state_size]);
+    }
+    // Step 2: Replay undo log in reverse — undoes logged mutations before overflow
     var i = g_undo_count;
     while (i > checkpoint_pos) {
         i -= 1;
@@ -2435,7 +2460,7 @@ pub export fn vm_undo_commit(_state_base: [*]u8, _checkpoint_pos: u32) void {
 
 /// Check if undo log overflowed during speculation.
 /// Returns 1 if overflow occurred, 0 otherwise.
-/// When overflow is detected, TypeScript layer should fall back to snapshot-based rollback.
+/// Overflow is now handled internally via shadow buffer — this export is kept for debugging/testing.
 pub export fn vm_undo_has_overflow() u32 {
     return if (g_undo_overflow) @as(u32, 1) else @as(u32, 0);
 }

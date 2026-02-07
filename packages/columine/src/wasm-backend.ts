@@ -61,7 +61,7 @@ interface VmExports {
   vm_set_contains(stateBase: number, slotOffset: number, capacity: number, elem: number): number;
 
   // Undo log operations (Phase 29)
-  vm_undo_enable(stateBase: number): void;
+  vm_undo_enable(stateBase: number, stateSize: number): void;
   vm_undo_checkpoint(stateBase: number): number;
   vm_undo_rollback(stateBase: number, checkpointPos: number): void;
   vm_undo_commit(stateBase: number, checkpointPos: number): void;
@@ -422,7 +422,8 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       // Copy state INTO WASM so enable can save change flags
       const statePtr = wasmInstance.stateRegionOffset;
       wasmU8.set(new Uint8Array(s.buffer), statePtr);
-      wasmInstance.exports.vm_undo_enable(statePtr);
+      // Pass state size so Zig can snapshot into shadow buffer on undo log overflow
+      wasmInstance.exports.vm_undo_enable(statePtr, s.size);
     },
 
     undoCheckpoint(state: StateHandle): number {
