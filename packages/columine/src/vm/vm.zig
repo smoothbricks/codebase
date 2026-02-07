@@ -441,13 +441,13 @@ const UNDO_CAPACITY: u32 = 16384;
 var g_undo_entries: [UNDO_CAPACITY]FlatUndoEntry = undefined;
 var g_undo_count: u32 = 0;
 var g_undo_overflow: bool = false;
-var g_undo_enabled: bool = false;
+pub var g_undo_enabled: bool = false;
 
 // Saved change flags for rollback (max 256 slots + 1 derived facts flag)
 var g_saved_change_flags: [257]u8 = undefined;
 var g_saved_change_flags_count: u32 = 0;
 
-fn undoAppend(entry: FlatUndoEntry) void {
+pub fn undoAppend(entry: FlatUndoEntry) void {
     if (g_undo_count < UNDO_CAPACITY) {
         g_undo_entries[g_undo_count] = entry;
         g_undo_count += 1;
@@ -840,6 +840,7 @@ pub export fn vm_evict_all_expired(state_base: [*]u8, now: f64) u32 {
 fn batchMapUpsertLatest(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     key_col: [*]const u32,
     val_col: [*]const u32,
     ts_col: [*]const f64,
@@ -873,6 +874,11 @@ fn batchMapUpsertLatest(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
+                // Undo: record new insertion so rollback can tombstone it
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = key, .prev_value = 0, .aux = 0,
+                });
                 keys[slot] = key;
                 values[slot] = val;
                 timestamps[slot] = ts;
@@ -881,6 +887,11 @@ fn batchMapUpsertLatest(
                 break;
             } else if (k == key) {
                 if (ts > timestamps[slot]) {
+                    // Undo: save previous value + timestamp before overwrite
+                    if (g_undo_enabled) undoAppend(.{
+                        .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                        .key = key, .prev_value = values[slot], .aux = @bitCast(timestamps[slot]),
+                    });
                     values[slot] = val;
                     timestamps[slot] = ts;
                     had_update = true;
@@ -900,6 +911,7 @@ fn batchMapUpsertLatest(
 fn batchMapUpsertFirst(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     key_col: [*]const u32,
     val_col: [*]const u32,
     batch_len: u32,
@@ -928,6 +940,11 @@ fn batchMapUpsertFirst(
                     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
                     return .CAPACITY_EXCEEDED;
                 }
+                // Undo: record new insertion (first wins has no update path)
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = key, .prev_value = 0, .aux = 0,
+                });
                 keys[slot] = key;
                 values[slot] = val;
                 size += 1;
@@ -949,6 +966,7 @@ fn batchMapUpsertFirst(
 fn batchMapUpsertLast(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     key_col: [*]const u32,
     val_col: [*]const u32,
     batch_len: u32,
@@ -979,12 +997,22 @@ fn batchMapUpsertLast(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
+                // Undo: record new insertion so rollback can tombstone it
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = key, .prev_value = 0, .aux = 0,
+                });
                 keys[slot] = key;
                 values[slot] = val;
                 size += 1;
                 had_insert = true;
                 break;
             } else if (k == key) {
+                // Undo: save previous value before overwrite (no timestamp for Last)
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = key, .prev_value = values[slot], .aux = 0,
+                });
                 // Last wins - always update
                 values[slot] = val;
                 had_update = true;
@@ -1005,6 +1033,7 @@ fn batchMapUpsertLast(
 fn batchMapUpsertMax(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     key_col: [*]const u32,
     val_col: [*]const u32,
     cmp_col: [*]const f64,
@@ -1039,6 +1068,11 @@ fn batchMapUpsertMax(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
+                // Undo: record new insertion so rollback can tombstone it
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = key, .prev_value = 0, .aux = 0,
+                });
                 keys[slot] = key;
                 values[slot] = val;
                 cmp_vals[slot] = cmp;
@@ -1048,6 +1082,11 @@ fn batchMapUpsertMax(
             } else if (k == key) {
                 // MAX: only update if new comparison value is greater
                 if (cmp > cmp_vals[slot]) {
+                    // Undo: save previous value + cmp value before overwrite
+                    if (g_undo_enabled) undoAppend(.{
+                        .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                        .key = key, .prev_value = values[slot], .aux = @bitCast(cmp_vals[slot]),
+                    });
                     values[slot] = val;
                     cmp_vals[slot] = cmp;
                     had_update = true;
@@ -1069,6 +1108,7 @@ fn batchMapUpsertMax(
 fn batchMapUpsertMin(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     key_col: [*]const u32,
     val_col: [*]const u32,
     cmp_col: [*]const f64,
@@ -1103,6 +1143,11 @@ fn batchMapUpsertMin(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
+                // Undo: record new insertion so rollback can tombstone it
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = key, .prev_value = 0, .aux = 0,
+                });
                 keys[slot] = key;
                 values[slot] = val;
                 cmp_vals[slot] = cmp;
@@ -1112,6 +1157,11 @@ fn batchMapUpsertMin(
             } else if (k == key) {
                 // MIN: only update if new comparison value is smaller
                 if (cmp < cmp_vals[slot]) {
+                    // Undo: save previous value + cmp value before overwrite
+                    if (g_undo_enabled) undoAppend(.{
+                        .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                        .key = key, .prev_value = values[slot], .aux = @bitCast(cmp_vals[slot]),
+                    });
                     values[slot] = val;
                     cmp_vals[slot] = cmp;
                     had_update = true;
@@ -1131,11 +1181,14 @@ fn batchMapUpsertMin(
 fn batchMapRemove(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     key_col: [*]const u32,
     batch_len: u32,
 ) void {
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
+    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
 
     var size = meta.size_ptr.*;
     var had_remove = false;
@@ -1150,6 +1203,11 @@ fn batchMapRemove(
             const k = keys[slot];
             if (k == EMPTY_KEY) break;
             if (k == key) {
+                // Undo: save key + value + timestamp so rollback can restore
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = key, .prev_value = values[slot], .aux = @bitCast(timestamps[slot]),
+                });
                 keys[slot] = TOMBSTONE;
                 size -= 1;
                 had_remove = true;
@@ -1170,6 +1228,7 @@ fn batchMapRemove(
 fn batchSetInsert(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     elem_col: [*]const u32,
     batch_len: u32,
 ) ErrorCode {
@@ -1194,6 +1253,11 @@ fn batchSetInsert(
                     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
                     return .CAPACITY_EXCEEDED;
                 }
+                // Undo: record new set insertion so rollback can tombstone it
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .SET_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = elem, .prev_value = 0, .aux = 0,
+                });
                 keys[slot] = elem;
                 size += 1;
                 had_insert = true;
@@ -1213,6 +1277,7 @@ fn batchSetInsert(
 fn batchSetRemove(
     state_base: [*]u8,
     meta: SlotMeta,
+    slot_idx: u8,
     elem_col: [*]const u32,
     batch_len: u32,
 ) void {
@@ -1232,6 +1297,11 @@ fn batchSetRemove(
             const k = keys[slot];
             if (k == EMPTY_KEY) break;
             if (k == elem) {
+                // Undo: save element so rollback can restore it
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .SET_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0,
+                    .key = elem, .prev_value = 0, .aux = 0,
+                });
                 keys[slot] = TOMBSTONE;
                 size -= 1;
                 had_remove = true;
@@ -1385,6 +1455,7 @@ pub export fn vm_execute_batch(
                 const result = batchMapUpsertLatest(
                     state_base,
                     meta,
+                    slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
                     getColF64(col_ptrs_ptr, ts_col),
@@ -1403,6 +1474,7 @@ pub export fn vm_execute_batch(
                 const result = batchMapUpsertFirst(
                     state_base,
                     meta,
+                    slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
                     batch_len,
@@ -1420,6 +1492,7 @@ pub export fn vm_execute_batch(
                 const result = batchMapUpsertLast(
                     state_base,
                     meta,
+                    slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
                     batch_len,
@@ -1433,7 +1506,7 @@ pub export fn vm_execute_batch(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                batchMapRemove(state_base, meta, getColU32(col_ptrs_ptr, key_col), batch_len);
+                batchMapRemove(state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), batch_len);
             },
 
             .BATCH_MAP_UPSERT_MAX => {
@@ -1447,6 +1520,7 @@ pub export fn vm_execute_batch(
                 const result = batchMapUpsertMax(
                     state_base,
                     meta,
+                    slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
                     getColF64(col_ptrs_ptr, cmp_col),
@@ -1466,6 +1540,7 @@ pub export fn vm_execute_batch(
                 const result = batchMapUpsertMin(
                     state_base,
                     meta,
+                    slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
                     getColF64(col_ptrs_ptr, cmp_col),
@@ -1480,7 +1555,7 @@ pub export fn vm_execute_batch(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchSetInsert(state_base, meta, getColU32(col_ptrs_ptr, elem_col), batch_len);
+                const result = batchSetInsert(state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
                 if (result != .OK) return @intFromEnum(result);
             },
 
@@ -1490,7 +1565,7 @@ pub export fn vm_execute_batch(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                batchSetRemove(state_base, meta, getColU32(col_ptrs_ptr, elem_col), batch_len);
+                batchSetRemove(state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
             },
 
             .BATCH_AGG_SUM => {
@@ -1500,6 +1575,12 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                // Undo: save previous f64 value (aux) and count (prev_value) before mutation
+                if (g_undo_enabled) undoAppend(.{
+                    .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0,
+                    .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(agg_ptr.*),
+                });
                 const old_val = agg_ptr.*;
                 agg_ptr.* += batchAggSum(getColF64(col_ptrs_ptr, val_col), batch_len);
                 if (agg_ptr.* != old_val) setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
@@ -1510,8 +1591,14 @@ pub export fn vm_execute_batch(
                 pc += 1;
 
                 const meta = getSlotMeta(state_base, slot);
+                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
                 const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
                 if (batch_len > 0) {
+                    // Undo: save previous f64 value (aux) and count (prev_value) before mutation
+                    if (g_undo_enabled) undoAppend(.{
+                        .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0,
+                        .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(agg_ptr.*),
+                    });
                     count_ptr.* += batch_len;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
                 }
@@ -1524,9 +1611,18 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
                 const old_val = agg_ptr.*;
-                agg_ptr.* = batchAggMin(getColF64(col_ptrs_ptr, val_col), batch_len, agg_ptr.*);
-                if (agg_ptr.* != old_val) setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                const new_val = batchAggMin(getColF64(col_ptrs_ptr, val_col), batch_len, agg_ptr.*);
+                if (new_val != old_val) {
+                    // Undo: save previous f64 value (aux) and count (prev_value) before mutation
+                    if (g_undo_enabled) undoAppend(.{
+                        .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0,
+                        .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val),
+                    });
+                    agg_ptr.* = new_val;
+                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                }
             },
 
             .BATCH_AGG_MAX => {
@@ -1536,9 +1632,18 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
                 const old_val = agg_ptr.*;
-                agg_ptr.* = batchAggMax(getColF64(col_ptrs_ptr, val_col), batch_len, agg_ptr.*);
-                if (agg_ptr.* != old_val) setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                const new_val = batchAggMax(getColF64(col_ptrs_ptr, val_col), batch_len, agg_ptr.*);
+                if (new_val != old_val) {
+                    // Undo: save previous f64 value (aux) and count (prev_value) before mutation
+                    if (g_undo_enabled) undoAppend(.{
+                        .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0,
+                        .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val),
+                    });
+                    agg_ptr.* = new_val;
+                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                }
             },
 
             else => return @intFromEnum(ErrorCode.INVALID_PROGRAM),
