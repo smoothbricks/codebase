@@ -144,8 +144,10 @@ export interface ColumineStages {
  * The undo log itself lives in the native state buffer (managed by Zig).
  */
 interface InternalUndoToken extends UndoToken {
-  /** Serialized state snapshot for rollback (until native undo exports exist) */
-  snapshot: Uint8Array;
+  /** Undo log position from native checkpoint (lightweight) */
+  position: number;
+  /** Fallback snapshot — only used if undo overflow detected or no native undo */
+  snapshot: Uint8Array | null;
 }
 
 function createReduceStage(backend: ColumineBackend): ReduceStage {
@@ -188,40 +190,77 @@ function createCompactStage(parseBackend: ParseCompactBackend | null): CompactSt
 }
 
 /**
- * Create undo stage that uses state serialization for checkpoint/rollback.
+ * Create undo stage with native undo log and snapshot fallback.
  *
- * The Zig undo_log exists in the native code but is not yet exposed via
- * WASM/FFI exports. Until native undo exports are added (Phase 29),
- * we use state serialization: checkpoint() serializes state, rollback()
- * deserializes back, commit() discards the snapshot.
+ * Native path (fast): Uses Zig undo log via WASM/FFI exports.
+ * checkpoint() saves log position, rollback() replays in reverse.
+ *
+ * Fallback path (safe): If undo log overflows or backend doesn't
+ * support native undo, falls back to full-state snapshot.
+ *
+ * checkpoint() always takes a snapshot as safety net — it's a single
+ * memcpy. The real win is in rollback() which is O(entries) instead
+ * of O(state_size). In the common case (no overflow), the snapshot
+ * is never used and is GC'd on commit.
  */
 function createUndoStage(backend: ColumineBackend): UndoStage {
+  // Check once at construction — backend capabilities don't change
+  const hasNativeUndo = typeof backend.undoEnable === 'function';
+
   return {
     name: 'undo',
+
     checkpoint(state: StateHandle): UndoToken {
-      // Serialize full state as snapshot — the Zig undo_log ops aren't
-      // exported to WASM/FFI yet, so we do a full-state checkpoint
+      if (hasNativeUndo) {
+        // Enable undo logging and save change flags
+        backend.undoEnable!(state);
+        const position = backend.undoCheckpoint!(state);
+        // Also take snapshot as fallback in case undo overflows
+        const snapshot = backend.serialize(state, {} as ReducerProgram);
+        return {
+          _brand: 'UndoToken',
+          position,
+          snapshot,
+        } as InternalUndoToken;
+      }
+      // Legacy path: full snapshot only (no native undo available)
       const snapshot = backend.serialize(state, {} as ReducerProgram);
       return {
         _brand: 'UndoToken',
+        position: 0,
         snapshot,
       } as InternalUndoToken;
     },
+
     rollback(state: StateHandle, token: UndoToken): void {
       const internal = token as InternalUndoToken;
-      // Restore state from snapshot by copying bytes back
-      // This relies on the state handle's buffer being the same size
-      const restored = internal.snapshot;
-      const stateAny = state as StateHandle & { buffer?: ArrayBuffer; size?: number };
-      if (stateAny.buffer && restored.length > 0) {
-        new Uint8Array(stateAny.buffer).set(restored);
+
+      if (hasNativeUndo && !backend.undoHasOverflow!()) {
+        // Native rollback — undo log intact, reverse replay
+        backend.undoRollback!(state, internal.position);
+        // Clear snapshot reference since we used native path
+        internal.snapshot = null;
+        return;
+      }
+
+      // Fallback: restore from snapshot (overflow or no native undo)
+      if (internal.snapshot) {
+        const stateAny = state as StateHandle & { buffer?: ArrayBuffer; size?: number };
+        if (stateAny.buffer && internal.snapshot.length > 0) {
+          new Uint8Array(stateAny.buffer).set(internal.snapshot);
+        }
       }
     },
-    commit(_state: StateHandle, token: UndoToken): void {
-      // Discard the snapshot — mutations are now permanent
+
+    commit(state: StateHandle, token: UndoToken): void {
       const internal = token as InternalUndoToken;
-      // Clear reference to allow GC of the snapshot
-      (internal as { snapshot: Uint8Array | null }).snapshot = null;
+
+      if (hasNativeUndo) {
+        backend.undoCommit!(state, internal.position);
+      }
+
+      // Discard snapshot in all cases — mutations are now permanent
+      internal.snapshot = null;
     },
   };
 }
