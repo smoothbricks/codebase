@@ -233,8 +233,7 @@ export interface ColumineBackend {
 
   /**
    * Check if undo log overflowed during speculation.
-   * @deprecated Overflow is now handled internally by the Zig shadow buffer.
-   * Kept for debugging/testing only.
+   * Used by UndoStage to report overflow status to callers for perf monitoring.
    */
   undoHasOverflow?(): boolean;
 }
