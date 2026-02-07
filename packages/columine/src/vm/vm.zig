@@ -482,6 +482,153 @@ fn restoreChangeFlags(state_base: [*]u8) void {
     state_base[StateHeaderOffset.DERIVED_FACTS_CHANGE_FLAG] = g_saved_change_flags[num_slots];
 }
 
+/// Find the array slot for a given key via hash probing.
+/// Returns the slot index, or capacity if not found.
+fn findKeyInMap(keys: [*]u32, capacity: u32, key: u32) u32 {
+    var slot = hashKey(key, capacity);
+    var probes: u32 = 0;
+    while (probes < capacity) : (probes += 1) {
+        if (keys[slot] == key) return slot;
+        if (keys[slot] == EMPTY_KEY) return capacity; // Not found
+        slot = (slot + 1) & (capacity - 1);
+    }
+    return capacity; // Not found
+}
+
+/// Find a TOMBSTONE or EMPTY slot at the hash position for restoring a deleted key.
+/// Used by MAP_DELETE/SET_DELETE rollback to re-insert at the correct probe position.
+fn findInsertSlot(keys: [*]u32, capacity: u32, key: u32) u32 {
+    var slot = hashKey(key, capacity);
+    var probes: u32 = 0;
+    while (probes < capacity) : (probes += 1) {
+        const k = keys[slot];
+        if (k == EMPTY_KEY or k == TOMBSTONE) return slot;
+        if (k == key) return slot; // Key already exists (shouldn't happen, but safe)
+        slot = (slot + 1) & (capacity - 1);
+    }
+    return capacity; // Full (shouldn't happen with proper load factor)
+}
+
+/// Roll back a single undo entry by reversing its mutation on the flat state buffer.
+fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
+    switch (entry.op) {
+        .MAP_INSERT => {
+            // Undo insert: tombstone the key, decrement size
+            // Use TOMBSTONE (not EMPTY_KEY) to preserve probe chains
+            const meta = getSlotMeta(state_base, entry.slot);
+            const data_ptr = state_base + meta.offset;
+            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+            const idx = findKeyInMap(keys, meta.capacity, entry.key);
+            if (idx < meta.capacity) {
+                keys[idx] = TOMBSTONE;
+                meta.size_ptr.* -= 1;
+            }
+        },
+        .MAP_UPDATE => {
+            // Undo update: restore previous value and timestamp
+            const meta = getSlotMeta(state_base, entry.slot);
+            const data_ptr = state_base + meta.offset;
+            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+            const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
+            const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
+            const idx = findKeyInMap(keys, meta.capacity, entry.key);
+            if (idx < meta.capacity) {
+                values[idx] = entry.prev_value;
+                timestamps[idx] = @bitCast(entry.aux);
+            }
+        },
+        .MAP_DELETE => {
+            // Undo delete: restore key + value + timestamp, increment size
+            const meta = getSlotMeta(state_base, entry.slot);
+            const data_ptr = state_base + meta.offset;
+            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+            const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
+            const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
+            const idx = findInsertSlot(keys, meta.capacity, entry.key);
+            if (idx < meta.capacity) {
+                keys[idx] = entry.key;
+                values[idx] = entry.prev_value;
+                timestamps[idx] = @bitCast(entry.aux);
+                meta.size_ptr.* += 1;
+            }
+        },
+        .SET_INSERT => {
+            // Undo insert: tombstone the element, decrement size
+            const meta = getSlotMeta(state_base, entry.slot);
+            const data_ptr = state_base + meta.offset;
+            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+            const idx = findKeyInMap(keys, meta.capacity, entry.key);
+            if (idx < meta.capacity) {
+                keys[idx] = TOMBSTONE;
+                meta.size_ptr.* -= 1;
+            }
+        },
+        .SET_DELETE => {
+            // Undo delete: restore element, increment size
+            const meta = getSlotMeta(state_base, entry.slot);
+            const data_ptr = state_base + meta.offset;
+            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+            const idx = findInsertSlot(keys, meta.capacity, entry.key);
+            if (idx < meta.capacity) {
+                keys[idx] = entry.key;
+                meta.size_ptr.* += 1;
+            }
+        },
+        .AGG_UPDATE => {
+            // Undo aggregate update: restore prev f64 value and prev u64 count
+            // aux stores the previous f64 value bits, prev_value stores previous count (truncated to u32)
+            const meta = getSlotMeta(state_base, entry.slot);
+            const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+            const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+            agg_ptr.* = @bitCast(entry.aux);
+            count_ptr.* = entry.prev_value;
+        },
+        .FACT_INSERT_NEW => {
+            // Undo derived fact new insertion: tombstone the key
+            // entry.slot = 0xFF sentinel, entry.prev_value = HashMap slot index
+            const derived_offset = getDerivedFactsOffset(state_base);
+            const capacity = getDerivedFactsCapacity(state_base);
+            const fact_data = state_base + derived_offset;
+            const keys: [*]u32 = @ptrCast(@alignCast(fact_data));
+            const slot_idx = entry.prev_value;
+            if (slot_idx < capacity) {
+                keys[slot_idx] = TOMBSTONE;
+            }
+        },
+        .FACT_INSERT_UPDATE => {
+            // Undo derived fact update: restore previous values_lo and values_hi
+            // entry.prev_value = HashMap slot index, entry.aux = packed (lo << 32 | hi)
+            const derived_offset = getDerivedFactsOffset(state_base);
+            const capacity = getDerivedFactsCapacity(state_base);
+            const fact_data = state_base + derived_offset;
+            const values_lo: [*]u32 = @ptrCast(@alignCast(fact_data + @as(u32, capacity) * 4));
+            const values_hi: [*]u32 = @ptrCast(@alignCast(fact_data + @as(u32, capacity) * 8));
+            const slot_idx = entry.prev_value;
+            if (slot_idx < capacity) {
+                values_lo[slot_idx] = @truncate(entry.aux >> 32);
+                values_hi[slot_idx] = @truncate(entry.aux);
+            }
+        },
+        .FACT_RETRACT => {
+            // Undo derived fact retract: restore key + values_lo + values_hi
+            // entry.key = combined_key, entry.prev_value = HashMap slot index
+            // entry.aux = packed (lo << 32 | hi)
+            const derived_offset = getDerivedFactsOffset(state_base);
+            const capacity = getDerivedFactsCapacity(state_base);
+            const fact_data = state_base + derived_offset;
+            const keys: [*]u32 = @ptrCast(@alignCast(fact_data));
+            const values_lo: [*]u32 = @ptrCast(@alignCast(fact_data + @as(u32, capacity) * 4));
+            const values_hi: [*]u32 = @ptrCast(@alignCast(fact_data + @as(u32, capacity) * 8));
+            const slot_idx = entry.prev_value;
+            if (slot_idx < capacity) {
+                keys[slot_idx] = entry.key;
+                values_lo[slot_idx] = @truncate(entry.aux >> 32);
+                values_hi[slot_idx] = @truncate(entry.aux);
+            }
+        },
+    }
+}
+
 // =============================================================================
 // TTL Eviction Operations
 // =============================================================================
@@ -2137,4 +2284,53 @@ pub export fn vm_set_iter_get(
     const data_ptr = state_base + slot_offset;
     const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
     return keys[pos];
+}
+
+// =============================================================================
+// Undo Log WASM Exports
+// =============================================================================
+
+/// Enable undo logging and save change flags. Call before speculative execution.
+/// Resets the undo log to empty state.
+pub export fn vm_undo_enable(state_base: [*]u8) void {
+    g_undo_enabled = true;
+    g_undo_count = 0;
+    g_undo_overflow = false;
+    saveChangeFlags(state_base);
+}
+
+/// Save current undo log position. Returns position as u32.
+/// The returned position can be passed to vm_undo_rollback or vm_undo_commit.
+pub export fn vm_undo_checkpoint(_state_base: [*]u8) u32 {
+    _ = _state_base;
+    return g_undo_count;
+}
+
+/// Rollback all mutations since the given checkpoint position.
+/// Replays undo entries in reverse order, then restores change flags.
+pub export fn vm_undo_rollback(state_base: [*]u8, checkpoint_pos: u32) void {
+    var i = g_undo_count;
+    while (i > checkpoint_pos) {
+        i -= 1;
+        rollbackEntry(state_base, g_undo_entries[i]);
+    }
+    g_undo_count = checkpoint_pos;
+    restoreChangeFlags(state_base);
+}
+
+/// Commit (discard) undo entries and disable undo logging.
+/// Call after speculative execution succeeds.
+pub export fn vm_undo_commit(_state_base: [*]u8, _checkpoint_pos: u32) void {
+    _ = _state_base;
+    _ = _checkpoint_pos;
+    g_undo_count = 0;
+    g_undo_overflow = false;
+    g_undo_enabled = false;
+}
+
+/// Check if undo log overflowed during speculation.
+/// Returns 1 if overflow occurred, 0 otherwise.
+/// When overflow is detected, TypeScript layer should fall back to snapshot-based rollback.
+pub export fn vm_undo_has_overflow() u32 {
+    return if (g_undo_overflow) @as(u32, 1) else @as(u32, 0);
 }
