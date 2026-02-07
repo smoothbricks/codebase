@@ -405,6 +405,84 @@ pub fn hasRelevantChanges(state_base: [*]u8, num_slots: u8) bool {
 }
 
 // =============================================================================
+// Flat-Buffer Undo Log Infrastructure
+// =============================================================================
+//
+// Global undo log for speculative execution rollback.
+// Operates on the flat-buffer state model (vm.zig), NOT the high-level
+// state.zig model that undo_log.zig targets.
+//
+// Pre-allocated in WASM BSS — no dynamic allocation on the hot path.
+// WASM is single-threaded, so global state is safe.
+
+pub const FlatUndoOp = enum(u8) {
+    MAP_INSERT = 1, // Rollback: tombstone key, decrement size
+    MAP_UPDATE = 2, // Rollback: restore prev value + timestamp
+    MAP_DELETE = 3, // Rollback: restore key + value + timestamp, increment size
+    SET_INSERT = 4, // Rollback: tombstone elem, decrement size
+    SET_DELETE = 5, // Rollback: restore elem, increment size
+    AGG_UPDATE = 6, // Rollback: restore prev value + count
+    FACT_INSERT_NEW = 7, // Rollback: tombstone derived fact key
+    FACT_INSERT_UPDATE = 8, // Rollback: restore prev derived fact values
+    FACT_RETRACT = 9, // Rollback: restore derived fact key + values
+};
+
+pub const FlatUndoEntry = extern struct {
+    op: FlatUndoOp,
+    slot: u8, // Slot index (0xFF = derived fact)
+    _pad1: u8,
+    _pad2: u8,
+    key: u32, // HashMap/HashSet key or derived fact combined_key
+    prev_value: u32, // Previous value (for updates/deletes), or slot_index for facts
+    aux: u64, // Previous timestamp bits (f64), or packed prev values for facts
+};
+
+const UNDO_CAPACITY: u32 = 16384;
+var g_undo_entries: [UNDO_CAPACITY]FlatUndoEntry = undefined;
+var g_undo_count: u32 = 0;
+var g_undo_overflow: bool = false;
+var g_undo_enabled: bool = false;
+
+// Saved change flags for rollback (max 256 slots + 1 derived facts flag)
+var g_saved_change_flags: [257]u8 = undefined;
+var g_saved_change_flags_count: u32 = 0;
+
+fn undoAppend(entry: FlatUndoEntry) void {
+    if (g_undo_count < UNDO_CAPACITY) {
+        g_undo_entries[g_undo_count] = entry;
+        g_undo_count += 1;
+    } else {
+        g_undo_overflow = true;
+    }
+}
+
+/// Save all slot change_flags + derived_facts_change_flag at checkpoint time.
+/// Restored during rollback to undo flag-level side effects.
+fn saveChangeFlags(state_base: [*]u8) void {
+    const num_slots = state_base[StateHeaderOffset.NUM_SLOTS];
+    var i: u32 = 0;
+    while (i < num_slots) : (i += 1) {
+        const meta_offset = STATE_HEADER_SIZE + i * SLOT_META_SIZE;
+        g_saved_change_flags[i] = state_base[meta_offset + SlotMetaOffset.CHANGE_FLAGS];
+    }
+    // Save derived facts change flag
+    g_saved_change_flags[num_slots] = state_base[StateHeaderOffset.DERIVED_FACTS_CHANGE_FLAG];
+    g_saved_change_flags_count = num_slots + 1;
+}
+
+/// Restore all slot change_flags + derived_facts_change_flag from saved state.
+fn restoreChangeFlags(state_base: [*]u8) void {
+    if (g_saved_change_flags_count == 0) return;
+    const num_slots = g_saved_change_flags_count - 1;
+    var i: u32 = 0;
+    while (i < num_slots) : (i += 1) {
+        const meta_offset = STATE_HEADER_SIZE + i * SLOT_META_SIZE;
+        state_base[meta_offset + SlotMetaOffset.CHANGE_FLAGS] = g_saved_change_flags[i];
+    }
+    state_base[StateHeaderOffset.DERIVED_FACTS_CHANGE_FLAG] = g_saved_change_flags[num_slots];
+}
+
+// =============================================================================
 // TTL Eviction Operations
 // =============================================================================
 
