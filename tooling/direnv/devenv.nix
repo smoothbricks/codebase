@@ -26,6 +26,7 @@ in {
     git-format-staged
     jq # Used in pre-commit hook and generally useful
     alejandra # Nix formatter
+    awscli2 # For DynamoDB Local CLI testing/debugging
   ];
 
   # https://devenv.sh/languages/
@@ -45,7 +46,9 @@ in {
   # See https://devenv.sh/pre-commit-hooks/ for more details (uses Python pre-commit)
 
   # https://devenv.sh/processes/
-  # processes.ping.exec = "ping example.com";
+  # DynamoDB Local for index store integration tests
+  services.dynamodb-local.enable = true;
+  # Default port 8000; available at http://127.0.0.1:8000 when `devenv up` is running
 
   # https://devenv.sh/scripts/#entershell
   # This runs when entering the devenv shell
