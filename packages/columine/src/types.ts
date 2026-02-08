@@ -31,6 +31,7 @@ export enum SlotType {
   HASHSET = 1,
   AGGREGATE = 2,
   ARRAY = 3,
+  CONDITION_TREE = 4,
 }
 
 // =============================================================================
@@ -47,7 +48,8 @@ export interface ReducerProgram {
 export type SlotDef =
   | { type: SlotType.HASHMAP; capacity: number }
   | { type: SlotType.HASHSET; capacity: number }
-  | { type: SlotType.AGGREGATE; aggType: AggType };
+  | { type: SlotType.AGGREGATE; aggType: AggType }
+  | { type: SlotType.CONDITION_TREE };
 
 // =============================================================================
 // State Handle - opaque reference to per-instance state

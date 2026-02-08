@@ -181,7 +181,8 @@ pub const SlotType = enum(u4) {
     HASHSET = 1,
     AGGREGATE = 2,
     ARRAY = 3, // For `.within()` without keyBy - stores array of events
-    // Room for 12 more types (4-15) without needing TTL variants
+    CONDITION_TREE = 4, // JS-only: condition router tree (no VM handler)
+    // Room for 11 more types (5-15) without needing TTL variants
 };
 
 pub const SlotTypeFlags = packed struct(u8) {
