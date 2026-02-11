@@ -198,7 +198,7 @@ function createCompactStage(parseBackend: ParseCompactBackend | null): CompactSt
  * Undo log overflow is handled lazily inside Zig via shadow buffer — only when
  * the log actually exceeds capacity does a memcpy occur.
  *
- * Legacy path (safe): If backend doesn't support native undo, falls back to
+ * Fallback path: If backend doesn't support native undo, falls back to
  * full-state snapshot for checkpoint/rollback.
  */
 function createUndoStage(backend: ColumineBackend): UndoStage {
@@ -220,7 +220,7 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
           snapshot: null,
         } as InternalUndoToken;
       }
-      // Legacy path: full snapshot only (no native undo available)
+      // Fallback path: full snapshot only (no native undo available)
       const snapshot = backend.serialize(state, {} as ReducerProgram);
       return {
         _brand: 'UndoToken',
@@ -241,7 +241,7 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
         return overflowed ? 'overflow' : 'ok';
       }
 
-      // Legacy fallback: restore from snapshot (no native undo)
+      // Fallback: restore from snapshot (no native undo)
       if (internal.snapshot) {
         const stateAny = state as StateHandle & { buffer?: ArrayBuffer; size?: number };
         if (stateAny.buffer && internal.snapshot.length > 0) {
