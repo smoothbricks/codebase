@@ -2,6 +2,7 @@
   "name": "@smoothbricks/lmao-transformer",
   "version": "0.0.1",
   "type": "module",
+  "sideEffects": false,
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
   "exports": {
@@ -27,7 +28,6 @@
     "sourceRoot": "packages/lmao-transformer/src",
     "projectType": "library",
     "targets": {
-      "lint": {},
       "typecheck-tests": {
         "executor": "nx:run-commands",
         "options": {
