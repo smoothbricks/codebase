@@ -344,27 +344,22 @@ describe('WasmAllocator', () => {
       expect(spanId2).toBeGreaterThan(spanId1);
     });
 
-    it('allocIdentityRoot stores trace_id', () => {
-      // Allocate a scratch buffer first to use as temp storage for trace_id
-      // We can't use getBumpPtr() directly since alloc_identity_root will overwrite it
-      const scratchPtr = allocator.alloc8B(); // Use an 8B block as scratch space
-
+    it('allocIdentityRootForJsWrite stores trace_id', () => {
       const traceId = 'test-trace-id-123';
       const traceIdBytes = new TextEncoder().encode(traceId);
-      allocator.u8.set(traceIdBytes, scratchPtr);
 
-      const identityPtr = allocator.allocIdentityRoot(scratchPtr, traceIdBytes.length);
+      const packed = allocator.allocIdentityRootForJsWrite(traceIdBytes.length);
+      const identityPtr = Number(packed >> 32n);
+      const traceIdOffset = Number(packed & 0xffffffffn);
+
+      allocator.u8.set(traceIdBytes, traceIdOffset);
 
       expect(allocator.readIdentityTraceIdLen(identityPtr)).toBe(traceIdBytes.length);
 
-      // Read back trace_id
       const storedTraceIdPtr = allocator.getIdentityTraceIdPtr(identityPtr);
       const storedBytes = allocator.u8.slice(storedTraceIdPtr, storedTraceIdPtr + traceIdBytes.length);
       const storedTraceId = new TextDecoder().decode(storedBytes);
       expect(storedTraceId).toBe(traceId);
-
-      // Clean up scratch buffer
-      allocator.free8B(scratchPtr);
     });
   });
 

@@ -106,7 +106,6 @@ export interface WasmAllocator {
   getSpanIdCounter(): number;
 
   // Identity block operations (thread_id is global in header, use getThreadIdHigh/Low)
-  allocIdentityRoot(traceIdPtr: number, traceIdLen: number): number;
   allocIdentityRootForJsWrite(traceIdLen: number): bigint;
   allocIdentityChild(): number;
   freeIdentity(offset: number): void;
@@ -198,7 +197,6 @@ interface WasmExports {
   get_span_id_counter(): number;
 
   // Identity block operations (thread_id is global, use get_thread_id_high/low)
-  alloc_identity_root(traceIdPtr: number, traceIdLen: number): number;
   alloc_identity_root_for_js_write(traceIdLen: number): bigint;
   alloc_identity_child(): number;
   free_identity(offset: number): void;
@@ -337,7 +335,6 @@ function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Me
     getSpanIdCounter: exports.get_span_id_counter,
 
     // Identity block operations (thread_id is global, use getThreadIdHigh/Low)
-    allocIdentityRoot: exports.alloc_identity_root,
     allocIdentityRootForJsWrite: exports.alloc_identity_root_for_js_write,
     allocIdentityChild: exports.alloc_identity_child,
     freeIdentity: exports.free_identity,

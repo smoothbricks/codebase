@@ -644,32 +644,6 @@ fn freeIdentity(offset: u32) void {
     h.free_count += 1;
 }
 
-/// Allocate and initialize a ROOT identity block.
-export fn alloc_identity_root(trace_id_ptr: u32, trace_id_len: u32) u32 {
-    const max_len = @sizeOf(@TypeOf(@as(Identity, undefined).trace_id));
-    if (trace_id_len > max_len) {
-        return 0; // trace_id too long
-    }
-
-    const offset = allocIdentity();
-    const identity = ptrAt(Identity, offset);
-
-    // Initialize identity
-    const h = header();
-    h.span_id_counter += 1;
-    identity.span_id = h.span_id_counter;
-    identity.write_index = 0; // Will be set to 2 by span_start
-    identity.trace_id_len = @truncate(trace_id_len);
-
-    // Copy trace_id bytes
-    const src = bytesAt(trace_id_ptr);
-    for (0..trace_id_len) |i| {
-        identity.trace_id[i] = src[i];
-    }
-
-    return offset;
-}
-
 /// Allocate identity block and provide offset where JS should write trace_id bytes.
 /// Returns packed u64: (identity_offset << 32) | trace_id_field_offset
 /// JS can write bytes directly to memory[trace_id_field_offset..trace_id_field_offset+len]
