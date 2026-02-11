@@ -12,6 +12,7 @@ _bmad
 
 # compiled output
 dist
+dist-node
 dist-ts-plugin
 tmp
 out-tsc
