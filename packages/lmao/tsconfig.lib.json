@@ -11,7 +11,8 @@
       "node",
       "bun"
     ],
-    "skipLibCheck": true
+    "skipLibCheck": true,
+    "customConditions": []
   },
   "include": [
     "src/**/*.ts"
