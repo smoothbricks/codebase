@@ -208,7 +208,7 @@ export interface ColumineBackend {
   deserialize(program: ReducerProgram, data: Uint8Array): StateHandle;
 
   // ===========================================================================
-  // Undo Log (Phase 29 - optional, backward compatible)
+  // Undo Log (Phase 29 - optional)
   // ===========================================================================
 
   /**

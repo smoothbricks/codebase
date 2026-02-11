@@ -230,7 +230,7 @@ pub const Opcode = enum(u8) {
     // See SlotTypeFlags for type_flags encoding (slot_type + has_ttl + has_evict_trigger)
     // TTL params (10 bytes): ttl_seconds:f32, grace_seconds:f32, ts_field_idx:u8, start_of:u8
     SLOT_DEF = 0x10, // slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8 [, ttl:f32, grace:f32, ts_field:u8, start_of:u8]
-    // Legacy opcodes (deprecated, will be removed)
+    // Superseded by SLOT_DEF (still supported for existing bytecode)
     SLOT_HASHMAP = 0x11,
     SLOT_HASHSET = 0x12,
     SLOT_AGGREGATE = 0x13,
@@ -1844,7 +1844,7 @@ pub export fn vm_calculate_state_size(
                 }
             },
 
-            // Legacy opcodes (for backward compatibility)
+            // Superseded by SLOT_DEF (still supported for existing bytecode)
             .SLOT_HASHMAP => {
                 const cap_lo = init_code[pc + 1];
                 const cap_hi = init_code[pc + 2];
@@ -2129,7 +2129,7 @@ pub export fn vm_init_state(
                 );
             },
 
-            // Legacy opcodes (for backward compatibility)
+            // Superseded by SLOT_DEF (still supported for existing bytecode)
             .SLOT_HASHMAP => {
                 const slot = init_code[pc];
                 const cap_lo = init_code[pc + 1];
