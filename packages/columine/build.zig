@@ -104,7 +104,8 @@ pub fn build(b: *std.Build) void {
     ep_wasm.entry = .disabled;
     ep_wasm.rdynamic = true;
     ep_wasm.export_memory = true;
-    ep_wasm.initial_memory = 128 * 64 * 1024;
+    // 160 pages (10MB) — event_processor needs ~9.5MB for msgpack + schema
+    ep_wasm.initial_memory = 160 * 64 * 1024;
     ep_wasm.max_memory = 1024 * 64 * 1024;
 
     // msgpack needed for json_extractor's undeclared field serialization

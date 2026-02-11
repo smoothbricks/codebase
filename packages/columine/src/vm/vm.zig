@@ -181,7 +181,7 @@ pub const SlotType = enum(u4) {
     HASHSET = 1,
     AGGREGATE = 2,
     ARRAY = 3, // For `.within()` without keyBy - stores array of events
-    CONDITION_TREE = 4, // JS-only: condition router tree (no VM handler)
+    CONDITION_TREE = 4, // Condition router tree (VM handlers: Phase 37)
     // Room for 11 more types (5-15) without needing TTL variants
 };
 
@@ -792,6 +792,9 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
         .AGGREGATE => {
             // Aggregates don't support individual entry removal
             // TTL for aggregates means the whole aggregate expires
+        },
+        .CONDITION_TREE => {
+            // Placeholder until VM-native tree handlers (Phase 37)
         },
     }
 }
@@ -1819,6 +1822,9 @@ pub export fn vm_calculate_state_size(
                         // values (u32) + timestamps (f64)
                         size += capacity * 4 + capacity * 8;
                     },
+                    .CONDITION_TREE => {
+                        // Placeholder until Phase 37 (tree layout TBD)
+                    },
                 }
                 size = align8(size);
 
@@ -2044,6 +2050,9 @@ pub export fn vm_init_state(
                         }
 
                         data_offset += capacity * 4 + capacity * 4 + capacity * 8;
+                    },
+                    .CONDITION_TREE => {
+                        // Placeholder until Phase 37
                     },
                     .HASHSET => {
                         const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
