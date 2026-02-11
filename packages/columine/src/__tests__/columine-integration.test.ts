@@ -68,23 +68,15 @@ function buildProgram(opts: {
     const slot = opts.slots[i];
     switch (slot.type) {
       case 'hashmap':
-        // SLOT_HASHMAP: slot, cap_lo, cap_hi, keyType, valType
-        initCode.push(
-          Opcode.SLOT_HASHMAP,
-          i,
-          slot.capacity & 0xff,
-          (slot.capacity >> 8) & 0xff,
-          ValueType.UINT32,
-          ValueType.UINT32,
-        );
+        // SLOT_DEF: slot, type_flags(HASHMAP), cap_lo, cap_hi
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.HASHMAP, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff);
         break;
       case 'hashset':
-        // SLOT_HASHSET: slot, cap_lo, cap_hi, keyType
-        initCode.push(Opcode.SLOT_HASHSET, i, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff, ValueType.UINT32);
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.HASHSET, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff);
         break;
       case 'aggregate':
-        // SLOT_AGGREGATE: slot, aggType
-        initCode.push(Opcode.SLOT_AGGREGATE, i, slot.aggType);
+        // SLOT_DEF: slot, type_flags(AGGREGATE), aggType in cap_lo, 0
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.AGGREGATE, slot.aggType, 0);
         break;
     }
   }

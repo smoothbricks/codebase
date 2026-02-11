@@ -21,6 +21,7 @@ import {
   Opcode,
   PROGRAM_HASH_PREFIX,
   resetBackend,
+  SlotType,
   setBackend,
   ValueType,
 } from '../index.js';
@@ -51,20 +52,13 @@ function buildProgram(opts: {
     const slot = opts.slots[i];
     switch (slot.type) {
       case 'hashmap':
-        initCode.push(
-          Opcode.SLOT_HASHMAP,
-          i,
-          slot.capacity & 0xff,
-          (slot.capacity >> 8) & 0xff,
-          ValueType.UINT32,
-          ValueType.UINT32,
-        );
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.HASHMAP, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff);
         break;
       case 'hashset':
-        initCode.push(Opcode.SLOT_HASHSET, i, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff, ValueType.UINT32);
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.HASHSET, slot.capacity & 0xff, (slot.capacity >> 8) & 0xff);
         break;
       case 'aggregate':
-        initCode.push(Opcode.SLOT_AGGREGATE, i, slot.aggType);
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.AGGREGATE, slot.aggType, 0);
         break;
     }
   }

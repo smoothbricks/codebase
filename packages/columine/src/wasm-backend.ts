@@ -97,9 +97,7 @@ import type { SlotDef } from './types.js';
 import { AggType, PROGRAM_HASH_PREFIX, SlotType } from './types.js';
 
 // Slot type opcodes (must match vm.zig)
-const SLOT_HASHMAP = 0x11;
-const SLOT_HASHSET = 0x12;
-const SLOT_AGGREGATE = 0x13;
+const SLOT_DEF = 0x10;
 const HALT = 0x00;
 
 function parseProgram(bytecode: Uint8Array, defaultCapacity = 1024): ReducerProgram {
@@ -140,29 +138,26 @@ function parseSlotDefs(initCode: Uint8Array, expectedSlots: number, defaultCapac
     const op = initCode[pc++];
 
     switch (op) {
-      case SLOT_HASHMAP: {
+      case SLOT_DEF: {
         const slot = initCode[pc];
-        const capLo = initCode[pc + 1];
-        const capHi = initCode[pc + 2];
-        const capacity = (capHi << 8) | capLo || defaultCapacity;
-        pc += 5; // slot, cap_lo, cap_hi, keyType, valType
-        slotDefs[slot] = { type: SlotType.HASHMAP, capacity };
-        break;
-      }
-      case SLOT_HASHSET: {
-        const slot = initCode[pc];
-        const capLo = initCode[pc + 1];
-        const capHi = initCode[pc + 2];
-        const capacity = (capHi << 8) | capLo || defaultCapacity;
-        pc += 4; // slot, cap_lo, cap_hi, keyType
-        slotDefs[slot] = { type: SlotType.HASHSET, capacity };
-        break;
-      }
-      case SLOT_AGGREGATE: {
-        const slot = initCode[pc];
-        const aggType = initCode[pc + 1] as AggType;
-        pc += 2;
-        slotDefs[slot] = { type: SlotType.AGGREGATE, aggType };
+        const typeFlags = initCode[pc + 1];
+        const capLo = initCode[pc + 2];
+        const capHi = initCode[pc + 3];
+        pc += 5; // slot, type_flags, cap_lo, cap_hi
+
+        switch (typeFlags) {
+          case SlotType.HASHMAP:
+            slotDefs[slot] = { type: SlotType.HASHMAP, capacity: (capHi << 8) | capLo || defaultCapacity };
+            break;
+          case SlotType.HASHSET:
+            slotDefs[slot] = { type: SlotType.HASHSET, capacity: (capHi << 8) | capLo || defaultCapacity };
+            break;
+          case SlotType.AGGREGATE:
+            slotDefs[slot] = { type: SlotType.AGGREGATE, aggType: (capLo || AggType.SUM) as AggType };
+            break;
+          default:
+            break;
+        }
         break;
       }
       case HALT:

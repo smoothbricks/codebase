@@ -231,10 +231,7 @@ pub const Opcode = enum(u8) {
     // See SlotTypeFlags for type_flags encoding (slot_type + has_ttl + has_evict_trigger)
     // TTL params (10 bytes): ttl_seconds:f32, grace_seconds:f32, ts_field_idx:u8, start_of:u8
     SLOT_DEF = 0x10, // slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8 [, ttl:f32, grace:f32, ts_field:u8, start_of:u8]
-    // Superseded by SLOT_DEF (still supported for existing bytecode)
-    SLOT_HASHMAP = 0x11,
-    SLOT_HASHSET = 0x12,
-    SLOT_AGGREGATE = 0x13,
+    // For AGGREGATE: cap_lo=aggType, cap_hi=0
     SLOT_ARRAY = 0x14, // For .within() without keyBy - stores array of events
 
     // HashMap batch ops - process entire column
@@ -1796,8 +1793,8 @@ pub export fn vm_calculate_state_size(
                 const cap_lo = init_code[pc + 2];
                 const cap_hi = init_code[pc + 3];
                 var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (capacity == 0) capacity = 1024;
-                capacity = nextPowerOf2(capacity * 2); // 2x for load factor
+                if (type_flags.slot_type != .AGGREGATE and capacity == 0) capacity = 1024;
+                if (type_flags.slot_type != .AGGREGATE) capacity = nextPowerOf2(capacity * 2); // 2x for load factor
 
                 // Skip base bytes
                 pc += 4;
@@ -1847,37 +1844,6 @@ pub export fn vm_calculate_state_size(
                 }
             },
 
-            // Superseded by SLOT_DEF (still supported for existing bytecode)
-            .SLOT_HASHMAP => {
-                const cap_lo = init_code[pc + 1];
-                const cap_hi = init_code[pc + 2];
-                var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (capacity == 0) capacity = 1024;
-                capacity = nextPowerOf2(capacity * 2);
-                pc += 5;
-
-                // keys (u32) + values (u32) + timestamps (f64)
-                size += capacity * 4 + capacity * 4 + capacity * 8;
-                size = align8(size);
-            },
-            .SLOT_HASHSET => {
-                const cap_lo = init_code[pc + 1];
-                const cap_hi = init_code[pc + 2];
-                var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (capacity == 0) capacity = 1024;
-                capacity = nextPowerOf2(capacity * 2);
-                pc += 4;
-
-                // keys (u32)
-                size += capacity * 4;
-                size = align8(size);
-            },
-            .SLOT_AGGREGATE => {
-                pc += 2;
-                // value (f64) + count (u64)
-                size += 16;
-                size = align8(size);
-            },
             .SLOT_ARRAY => {
                 const cap_lo = init_code[pc + 1];
                 const cap_hi = init_code[pc + 2];
@@ -2015,8 +1981,12 @@ pub export fn vm_init_state(
                 const cap_lo = init_code[pc + 2];
                 const cap_hi = init_code[pc + 3];
                 var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (capacity == 0) capacity = 1024;
-                capacity = nextPowerOf2(capacity * 2);
+                if (type_flags.slot_type != .AGGREGATE and capacity == 0) capacity = 1024;
+                if (type_flags.slot_type != .AGGREGATE) capacity = nextPowerOf2(capacity * 2);
+                const agg_type: AggType = if (type_flags.slot_type == .AGGREGATE)
+                    (if (cap_lo > 0) @enumFromInt(cap_lo) else .SUM)
+                else
+                    .SUM;
                 pc += 4;
 
                 // Read TTL params if present (10 bytes: f32 ttl + f32 grace + u8 ts_field + u8 start_of)
@@ -2067,7 +2037,11 @@ pub export fn vm_init_state(
                     },
                     .AGGREGATE => {
                         const agg_ptr: *f64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                        agg_ptr.* = 0.0; // Will be set properly below
+                        agg_ptr.* = switch (agg_type) {
+                            .MIN => std.math.inf(f64),
+                            .MAX => -std.math.inf(f64),
+                            else => 0.0,
+                        };
                         const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset + 8));
                         count_ptr.* = 0;
                         data_offset += 16;
@@ -2122,7 +2096,7 @@ pub export fn vm_init_state(
                     primary_data_offset,
                     capacity,
                     type_flags,
-                    .SUM, // agg_type not used for non-aggregates
+                    agg_type,
                     ttl_seconds,
                     grace_seconds,
                     timestamp_field_idx,
@@ -2133,97 +2107,6 @@ pub export fn vm_init_state(
                 );
             },
 
-            // Superseded by SLOT_DEF (still supported for existing bytecode)
-            .SLOT_HASHMAP => {
-                const slot = init_code[pc];
-                const cap_lo = init_code[pc + 1];
-                const cap_hi = init_code[pc + 2];
-                var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (capacity == 0) capacity = 1024;
-                capacity = nextPowerOf2(capacity * 2);
-                pc += 5;
-
-                const type_flags = SlotTypeFlags{
-                    .slot_type = .HASHMAP,
-                    .has_ttl = false,
-                    .has_evict_trigger = false,
-                };
-
-                // Initialize keys to EMPTY_KEY
-                const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
-                for (0..capacity) |i| {
-                    keys_ptr[i] = EMPTY_KEY;
-                }
-
-                // Timestamps start after values - initialize to -Infinity
-                const ts_offset = data_offset + capacity * 8;
-                const ts_ptr: [*]f64 = @ptrCast(@alignCast(state_ptr + ts_offset));
-                for (0..capacity) |i| {
-                    ts_ptr[i] = -std.math.inf(f64);
-                }
-
-                const primary_offset = data_offset;
-                data_offset += capacity * 4 + capacity * 4 + capacity * 8;
-                data_offset = align8(data_offset);
-
-                writeSlotMeta(state_ptr, slot, primary_offset, capacity, type_flags, .SUM, 0.0, 0.0, 0, .NONE, 0, 0, 0);
-            },
-            .SLOT_HASHSET => {
-                const slot = init_code[pc];
-                const cap_lo = init_code[pc + 1];
-                const cap_hi = init_code[pc + 2];
-                var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (capacity == 0) capacity = 1024;
-                capacity = nextPowerOf2(capacity * 2);
-                pc += 4;
-
-                const type_flags = SlotTypeFlags{
-                    .slot_type = .HASHSET,
-                    .has_ttl = false,
-                    .has_evict_trigger = false,
-                };
-
-                // Initialize keys to EMPTY_KEY
-                const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
-                for (0..capacity) |i| {
-                    keys_ptr[i] = EMPTY_KEY;
-                }
-
-                const primary_offset = data_offset;
-                data_offset += capacity * 4;
-                data_offset = align8(data_offset);
-
-                writeSlotMeta(state_ptr, slot, primary_offset, capacity, type_flags, .SUM, 0.0, 0.0, 0, .NONE, 0, 0, 0);
-            },
-            .SLOT_AGGREGATE => {
-                const slot = init_code[pc];
-                const agg_type: AggType = @enumFromInt(init_code[pc + 1]);
-                pc += 2;
-
-                const type_flags = SlotTypeFlags{
-                    .slot_type = .AGGREGATE,
-                    .has_ttl = false,
-                    .has_evict_trigger = false,
-                };
-
-                // Initialize aggregate value
-                const agg_ptr: *f64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                agg_ptr.* = switch (agg_type) {
-                    .MIN => std.math.inf(f64),
-                    .MAX => -std.math.inf(f64),
-                    else => 0.0,
-                };
-
-                // Initialize count to 0
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset + 8));
-                count_ptr.* = 0;
-
-                const primary_offset = data_offset;
-                data_offset += 16;
-                data_offset = align8(data_offset);
-
-                writeSlotMeta(state_ptr, slot, primary_offset, 0, type_flags, agg_type, 0.0, 0.0, 0, .NONE, 0, 0, 0);
-            },
             .SLOT_ARRAY => {
                 const slot = init_code[pc];
                 const cap_lo = init_code[pc + 1];

@@ -103,9 +103,7 @@ export enum Opcode {
   HALT = 0x00,
 
   // Slot creation (init section) - must match vm.zig Opcode enum
-  SLOT_HASHMAP = 0x11,
-  SLOT_HASHSET = 0x12,
-  SLOT_AGGREGATE = 0x13,
+  SLOT_DEF = 0x10, // slot, type_flags, cap_lo, cap_hi [aggType in cap_lo when type=AGGREGATE]
 
   // Batch HashMap ops
   BATCH_MAP_UPSERT_LATEST = 0x20,
