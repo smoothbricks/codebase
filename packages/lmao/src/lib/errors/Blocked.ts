@@ -4,9 +4,7 @@
  * A tagged error type for use with `result.isErr(Blocked)` to discriminate
  * blocked states from other errors. Useful for retry logic and dependency waiting.
  *
- * Supports two configuration styles:
- * - **RetryPolicy** (legacy): Declarative config with `delay`, `backoff`, `maxAttempts` strings
- * - **BlockedConfig** (spec): Closure-based `nextRetry(attempt) => ms` that captures Op context
+ * Uses BlockedConfig for retry configuration (closure-based nextRetry).
  *
  * @example
  * ```typescript
@@ -64,24 +62,7 @@ export type BlockedReason =
   | { readonly type: 'index'; readonly indexName: string };
 
 /**
- * Retry policy for blocked errors (legacy declarative style).
- *
- * When not specified, engine uses defaults based on reason type:
- * - `service`: `{ delay: '5s', backoff: 'exponential', maxAttempts: 5 }`
- * - `ended`: `{ maxAttempts: undefined }` (wait indefinitely)
- * - `index`: `{ delay: '1s', backoff: 'linear', maxAttempts: 10 }`
- */
-export interface RetryPolicy {
-  /** Initial delay before retry (e.g., '2s', '500ms', '1 minute') */
-  readonly delay?: string;
-  /** Backoff strategy */
-  readonly backoff?: 'fixed' | 'exponential' | 'linear';
-  /** Maximum retry attempts (undefined = infinite) */
-  readonly maxAttempts?: number;
-}
-
-/**
- * Engine-level retry configuration for blocked operations (spec style).
+ * Engine-level retry configuration for blocked operations.
  *
  * The nextRetry closure is powerful because it captures the Op's execution context.
  * Each time the Op re-executes, it produces a new Blocked error with a new closure
@@ -94,13 +75,6 @@ export interface BlockedConfig {
   readonly nextRetry?: (attempt: number) => number;
 }
 
-/**
- * Type guard: is this a legacy RetryPolicy (has `delay` or `backoff`)?
- */
-function isRetryPolicy(config: RetryPolicy | BlockedConfig): config is RetryPolicy {
-  return 'delay' in config || 'backoff' in config;
-}
-
 export class Blocked extends Error implements TaggedError<'Blocked'> {
   static readonly _tag = 'Blocked' as const;
 
@@ -108,75 +82,46 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
     return 'Blocked';
   }
 
-  /** Unified storage for either config style */
-  readonly retryConfig: RetryPolicy | BlockedConfig | undefined;
+  /** Retry configuration */
+  readonly blockedConfig: BlockedConfig | undefined;
 
   constructor(
     /** The reason this Op is blocked */
     readonly reason: BlockedReason,
-    /** Optional retry configuration (RetryPolicy or BlockedConfig) */
-    retryOrConfig?: RetryPolicy | BlockedConfig,
+    /** Optional retry configuration */
+    config?: BlockedConfig,
   ) {
     super(
       `Blocked: ${reason.type === 'service' ? reason.name : reason.type === 'ended' ? reason.target : reason.indexName}`,
     );
     this.name = 'Blocked';
-    this.retryConfig = retryOrConfig;
-  }
-
-  /**
-   * Backward-compatible getter: returns RetryPolicy if one was provided.
-   * Returns undefined if a BlockedConfig was used instead.
-   */
-  get retry(): RetryPolicy | undefined {
-    if (this.retryConfig && isRetryPolicy(this.retryConfig)) {
-      return this.retryConfig;
-    }
-    return undefined;
-  }
-
-  /**
-   * Returns BlockedConfig if one was provided.
-   * Returns undefined if a legacy RetryPolicy was used instead.
-   */
-  get blockedConfig(): BlockedConfig | undefined {
-    if (!this.retryConfig) return undefined;
-    if (isRetryPolicy(this.retryConfig)) return undefined;
-    return this.retryConfig;
+    this.blockedConfig = config;
   }
 
   /** Create a Blocked error for a service being unavailable */
-  static service(name: string, retry?: RetryPolicy): Blocked;
-  static service(name: string, config?: BlockedConfig): Blocked;
-  static service(name: string, retryOrConfig?: RetryPolicy | BlockedConfig): Blocked {
-    return new Blocked({ type: 'service', name }, retryOrConfig);
+  static service(name: string, config?: BlockedConfig): Blocked {
+    return new Blocked({ type: 'service', name }, config);
   }
 
   /** Create a Blocked error waiting for another execution to end */
-  static ended(target: string, retry?: RetryPolicy): Blocked;
-  static ended(target: string, config?: BlockedConfig): Blocked;
-  static ended(target: string, retryOrConfig?: RetryPolicy | BlockedConfig): Blocked {
-    return new Blocked({ type: 'ended', target }, retryOrConfig);
+  static ended(target: string, config?: BlockedConfig): Blocked {
+    return new Blocked({ type: 'ended', target }, config);
   }
 
   /** Create a Blocked error for an index being rebuilt */
-  static index(indexName: string, retry?: RetryPolicy): Blocked;
-  static index(indexName: string, config?: BlockedConfig): Blocked;
-  static index(indexName: string, retryOrConfig?: RetryPolicy | BlockedConfig): Blocked {
-    return new Blocked({ type: 'index', indexName }, retryOrConfig);
+  static index(indexName: string, config?: BlockedConfig): Blocked {
+    return new Blocked({ type: 'index', indexName }, config);
   }
 
   /** Clean output for console.log in Node.js */
   [Symbol.for('nodejs.util.inspect.custom')](): {
     _tag: 'Blocked';
     reason: BlockedReason;
-    retry?: RetryPolicy;
     blockedConfig?: BlockedConfig;
   } {
     return {
       _tag: this._tag,
       reason: this.reason,
-      ...(this.retry ? { retry: this.retry } : {}),
       ...(this.blockedConfig ? { blockedConfig: this.blockedConfig } : {}),
     };
   }
@@ -185,15 +130,12 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
   toJSON(): {
     _tag: 'Blocked';
     reason: BlockedReason;
-    retry?: RetryPolicy;
     blockedConfig?: Omit<BlockedConfig, 'nextRetry'> & { nextRetry?: string };
   } {
     const config = this.blockedConfig;
     return {
       _tag: this._tag,
       reason: this.reason,
-      ...(this.retry ? { retry: this.retry } : {}),
-      // Closures aren't serializable - represent as string indicator
       ...(config
         ? {
             blockedConfig: {

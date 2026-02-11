@@ -54,7 +54,7 @@ export interface WasmSpanBufferChildOptions {
   capacity?: number;
 }
 
-// Legacy options type for compatibility during migration
+// Alternative options shape (WasmSpanBufferOptions)
 export interface WasmSpanBufferOptions {
   allocator: WasmAllocator;
   capacity: number;

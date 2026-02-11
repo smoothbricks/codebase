@@ -231,7 +231,7 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
           oldOp.metadata,
           oldOp.SpanBufferClass, // SAME class - shared schema + stats
           oldOp.fn,
-          remappedViewClass, // NEW - for child buffer wrapping
+          remappedViewClass, // for child buffer wrapping
         );
       }
     }

@@ -1,7 +1,7 @@
 /**
  * Retries exhausted error - returned when a Blocked error has exceeded max attempts.
  *
- * When an Op repeatedly returns `Blocked` and the retry policy's `maxAttempts`
+ * When an Op repeatedly returns `Blocked` and the retry config's `maxAttempts`
  * is exhausted, the retry layer converts the final failure to `RetriesExhausted`.
  *
  * Unlike `Blocked`, this represents a permanent failure that callers must handle
@@ -38,7 +38,7 @@
  */
 
 import type { TaggedError } from '../result.js';
-import type { BlockedReason, RetryPolicy } from './Blocked.js';
+import type { BlockedReason } from './Blocked.js';
 
 export class RetriesExhausted extends Error implements TaggedError<'RetriesExhausted'> {
   static readonly _tag = 'RetriesExhausted' as const;
@@ -52,8 +52,8 @@ export class RetriesExhausted extends Error implements TaggedError<'RetriesExhau
     readonly reason: BlockedReason,
     /** How many attempts were made */
     readonly attempts: number,
-    /** The retry policy that was used */
-    readonly policy: RetryPolicy,
+    /** Max attempts that was configured (the limit that was hit) */
+    readonly maxAttempts: number,
   ) {
     const reasonName =
       reason.type === 'service' ? reason.name : reason.type === 'ended' ? reason.target : reason.indexName;
@@ -66,13 +66,13 @@ export class RetriesExhausted extends Error implements TaggedError<'RetriesExhau
     _tag: 'RetriesExhausted';
     reason: BlockedReason;
     attempts: number;
-    policy: RetryPolicy;
+    maxAttempts: number;
   } {
-    return { _tag: this._tag, reason: this.reason, attempts: this.attempts, policy: this.policy };
+    return { _tag: this._tag, reason: this.reason, attempts: this.attempts, maxAttempts: this.maxAttempts };
   }
 
   /** Clean output for JSON.stringify */
-  toJSON(): { _tag: 'RetriesExhausted'; reason: BlockedReason; attempts: number; policy: RetryPolicy } {
-    return { _tag: this._tag, reason: this.reason, attempts: this.attempts, policy: this.policy };
+  toJSON(): { _tag: 'RetriesExhausted'; reason: BlockedReason; attempts: number; maxAttempts: number } {
+    return { _tag: this._tag, reason: this.reason, attempts: this.attempts, maxAttempts: this.maxAttempts };
   }
 }
