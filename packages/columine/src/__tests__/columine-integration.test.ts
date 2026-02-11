@@ -27,6 +27,7 @@ import {
   hasBackend,
   MAGIC,
   Opcode,
+  PROGRAM_HASH_PREFIX,
   type ReducerProgram,
   resetBackend,
   SlotType,
@@ -89,40 +90,43 @@ function buildProgram(opts: {
   }
 
   const reduceCode = [...opts.reduceOps, Opcode.HALT];
-  const totalLen = HEADER_SIZE + initCode.length + reduceCode.length;
-  const program = new Uint8Array(totalLen);
+  const contentLen = HEADER_SIZE + initCode.length + reduceCode.length;
+  const program = new Uint8Array(PROGRAM_HASH_PREFIX + contentLen);
+  // [0..31] hash prefix (zeros - filled by fillProgramHash at async use)
+  // [32..] content header + init + reduce
 
+  const base = PROGRAM_HASH_PREFIX;
   // Magic "CLM1" (little-endian)
-  program[0] = MAGIC & 0xff;
-  program[1] = (MAGIC >> 8) & 0xff;
-  program[2] = (MAGIC >> 16) & 0xff;
-  program[3] = (MAGIC >> 24) & 0xff;
+  program[base + 0] = MAGIC & 0xff;
+  program[base + 1] = (MAGIC >> 8) & 0xff;
+  program[base + 2] = (MAGIC >> 16) & 0xff;
+  program[base + 3] = (MAGIC >> 24) & 0xff;
 
   // Version 1.0
-  program[4] = 1;
-  program[5] = 0;
+  program[base + 4] = 1;
+  program[base + 5] = 0;
 
   // num_slots, num_cols
-  program[6] = opts.slots.length;
-  program[7] = opts.numInputs;
+  program[base + 6] = opts.slots.length;
+  program[base + 7] = opts.numInputs;
 
   // Reserved
-  program[8] = 0;
-  program[9] = 0;
+  program[base + 8] = 0;
+  program[base + 9] = 0;
 
   // init_len (u16 LE)
-  program[10] = initCode.length & 0xff;
-  program[11] = (initCode.length >> 8) & 0xff;
+  program[base + 10] = initCode.length & 0xff;
+  program[base + 11] = (initCode.length >> 8) & 0xff;
 
   // reduce_len (u16 LE)
-  program[12] = reduceCode.length & 0xff;
-  program[13] = (reduceCode.length >> 8) & 0xff;
+  program[base + 12] = reduceCode.length & 0xff;
+  program[base + 13] = (reduceCode.length >> 8) & 0xff;
 
   // Init section
-  program.set(initCode, HEADER_SIZE);
+  program.set(initCode, base + HEADER_SIZE);
 
   // Reduce section
-  program.set(reduceCode, HEADER_SIZE + initCode.length);
+  program.set(reduceCode, base + HEADER_SIZE + initCode.length);
 
   return program;
 }

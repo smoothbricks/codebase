@@ -40,8 +40,9 @@ pub const STATE_MAGIC: u32 = 0x53544154; // "STAT"
 pub const PROGRAM_MAGIC: u32 = 0x314D4C43; // "CLM1"
 pub const RETE_MAGIC: u32 = 0x45544552; // "RETE"
 pub const STATE_HEADER_SIZE: u32 = 32;
-// NOTE: SLOT_META_SIZE moved below with expanded TTL fields (now 48 bytes)
-pub const PROGRAM_HEADER_SIZE: u32 = 14;
+// Program layout: [0..31] hash, [32..45] content header (magic, version, init_len, reduce_len), [46..] init+reduce
+pub const PROGRAM_HASH_PREFIX: u32 = 32;
+pub const PROGRAM_HEADER_SIZE: u32 = 46; // 32 + 14 (content header)
 pub const RETE_HEADER_SIZE: u32 = 16;
 
 // State format version - increment when header layout changes
@@ -1424,21 +1425,22 @@ pub export fn vm_execute_batch(
     const state_magic: *const u32 = @ptrCast(@alignCast(state_base));
     if (state_magic.* != STATE_MAGIC) return @intFromEnum(ErrorCode.INVALID_STATE);
 
-    // Validate program
+    // Validate program (layout: [0..31] hash, [32..45] content header, [46..] init+reduce)
     const program = program_ptr[0..program_len];
     if (program_len < PROGRAM_HEADER_SIZE) return @intFromEnum(ErrorCode.INVALID_PROGRAM);
 
-    const prog_magic = @as(u32, program[0]) | (@as(u32, program[1]) << 8) | (@as(u32, program[2]) << 16) | (@as(u32, program[3]) << 24);
+    const content = program[PROGRAM_HASH_PREFIX..];
+    const prog_magic = @as(u32, content[0]) | (@as(u32, content[1]) << 8) | (@as(u32, content[2]) << 16) | (@as(u32, content[3]) << 24);
     if (prog_magic != PROGRAM_MAGIC) return @intFromEnum(ErrorCode.INVALID_PROGRAM);
 
-    // Parse header
-    const init_len: u16 = @as(u16, program[10]) | (@as(u16, program[11]) << 8);
-    const reduce_len: u16 = @as(u16, program[12]) | (@as(u16, program[13]) << 8);
+    // Parse header (content header is 14 bytes: magic(4) version(2) numSlots(1) numInputs(1) reserved(2) initLen(2) reduceLen(2))
+    const init_len: u16 = @as(u16, content[10]) | (@as(u16, content[11]) << 8);
+    const reduce_len: u16 = @as(u16, content[12]) | (@as(u16, content[13]) << 8);
     const code_len = init_len + reduce_len;
     if (PROGRAM_HEADER_SIZE + code_len > program_len) return @intFromEnum(ErrorCode.INVALID_PROGRAM);
 
     // Execute only reduce section (init section parsed by JS)
-    const code = program[PROGRAM_HEADER_SIZE + init_len .. PROGRAM_HEADER_SIZE + init_len + reduce_len];
+    const code = content[14 + init_len .. 14 + init_len + reduce_len];
 
     // Helper to get column as u32 array
     const getColU32 = struct {
@@ -1763,13 +1765,14 @@ pub export fn vm_calculate_state_size(
     if (program_len < PROGRAM_HEADER_SIZE) return 0;
 
     const program = program_ptr[0..program_len];
+    const content = program[PROGRAM_HASH_PREFIX..];
 
     // Check magic
-    const magic = @as(u32, program[0]) | (@as(u32, program[1]) << 8) | (@as(u32, program[2]) << 16) | (@as(u32, program[3]) << 24);
+    const magic = @as(u32, content[0]) | (@as(u32, content[1]) << 8) | (@as(u32, content[2]) << 16) | (@as(u32, content[3]) << 24);
     if (magic != PROGRAM_MAGIC) return 0;
 
-    const num_slots = program[6];
-    const init_len: u16 = @as(u16, program[10]) | (@as(u16, program[11]) << 8);
+    const num_slots = content[6];
+    const init_len: u16 = @as(u16, content[10]) | (@as(u16, content[11]) << 8);
 
     if (PROGRAM_HEADER_SIZE + init_len > program_len) return 0;
 
@@ -1777,8 +1780,8 @@ pub export fn vm_calculate_state_size(
     var size: u32 = STATE_HEADER_SIZE + @as(u32, num_slots) * SLOT_META_SIZE;
     size = align8(size);
 
-    // Parse init section to calculate slot data sizes
-    const init_code = program[PROGRAM_HEADER_SIZE .. PROGRAM_HEADER_SIZE + init_len];
+    // Parse init section to calculate slot data sizes (content header 14 bytes, then init)
+    const init_code = content[14..14 + init_len];
     var pc: usize = 0;
 
     while (pc < init_code.len) {
@@ -1958,13 +1961,14 @@ pub export fn vm_init_state(
     if (program_len < PROGRAM_HEADER_SIZE) return @intFromEnum(ErrorCode.INVALID_PROGRAM);
 
     const program = program_ptr[0..program_len];
+    const content = program[PROGRAM_HASH_PREFIX..];
 
     // Check magic
-    const magic = @as(u32, program[0]) | (@as(u32, program[1]) << 8) | (@as(u32, program[2]) << 16) | (@as(u32, program[3]) << 24);
+    const magic = @as(u32, content[0]) | (@as(u32, content[1]) << 8) | (@as(u32, content[2]) << 16) | (@as(u32, content[3]) << 24);
     if (magic != PROGRAM_MAGIC) return @intFromEnum(ErrorCode.INVALID_PROGRAM);
 
-    const num_slots = program[6];
-    const init_len: u16 = @as(u16, program[10]) | (@as(u16, program[11]) << 8);
+    const num_slots = content[6];
+    const init_len: u16 = @as(u16, content[10]) | (@as(u16, content[11]) << 8);
 
     if (PROGRAM_HEADER_SIZE + init_len > program_len) return @intFromEnum(ErrorCode.INVALID_PROGRAM);
 
@@ -1976,9 +1980,9 @@ pub export fn vm_init_state(
 
     // Byte-level access for the rest of the header
     state_ptr[StateHeaderOffset.FORMAT_VERSION] = STATE_FORMAT_VERSION;
-    // Program version from program header (bytes 4-5)
-    state_ptr[StateHeaderOffset.PROGRAM_VERSION] = program[4];
-    state_ptr[StateHeaderOffset.PROGRAM_VERSION + 1] = program[5];
+    // Program version from content header (bytes 4-5)
+    state_ptr[StateHeaderOffset.PROGRAM_VERSION] = content[4];
+    state_ptr[StateHeaderOffset.PROGRAM_VERSION + 1] = content[5];
     // Ruleset version defaults to 0 (no RETE program loaded yet)
     state_ptr[StateHeaderOffset.RULESET_VERSION] = 0;
     state_ptr[StateHeaderOffset.RULESET_VERSION + 1] = 0;
@@ -1995,8 +1999,8 @@ pub export fn vm_init_state(
     // Calculate where slot data starts (after 48-byte slot metadata)
     var data_offset: u32 = align8(STATE_HEADER_SIZE + @as(u32, num_slots) * SLOT_META_SIZE);
 
-    // Parse init section and initialize slots
-    const init_code = program[PROGRAM_HEADER_SIZE .. PROGRAM_HEADER_SIZE + init_len];
+    // Parse init section and initialize slots (content header 14 bytes, then init)
+    const init_code = content[14..14 + init_len];
     var pc: usize = 0;
 
     while (pc < init_code.len) {

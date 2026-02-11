@@ -49,6 +49,7 @@ export {
   HEADER_SIZE,
   MAGIC,
   Opcode,
+  PROGRAM_HASH_PREFIX,
   SlotType,
   ValueType,
 } from './types.js';

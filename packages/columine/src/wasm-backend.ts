@@ -93,38 +93,40 @@ function align8(n: number): number {
 const MAGIC = 0x314D4C43; // "CLM1"
 const HEADER_SIZE = 14;
 
+import type { SlotDef } from './types.js';
+import { AggType, PROGRAM_HASH_PREFIX, SlotType } from './types.js';
+
 // Slot type opcodes (must match vm.zig)
 const SLOT_HASHMAP = 0x11;
 const SLOT_HASHSET = 0x12;
 const SLOT_AGGREGATE = 0x13;
 const HALT = 0x00;
 
-import type { SlotDef } from './types.js';
-import { AggType, SlotType } from './types.js';
-
 function parseProgram(bytecode: Uint8Array, defaultCapacity = 1024): ReducerProgram {
-  if (bytecode.length < HEADER_SIZE) {
+  const minLen = PROGRAM_HASH_PREFIX + HEADER_SIZE;
+  if (bytecode.length < minLen) {
     throw new Error('Invalid program: too short');
   }
 
-  const magic = bytecode[0] | (bytecode[1] << 8) | (bytecode[2] << 16) | (bytecode[3] << 24);
+  const content = bytecode.subarray(PROGRAM_HASH_PREFIX);
+  const magic = content[0] | (content[1] << 8) | (content[2] << 16) | (content[3] << 24);
   if (magic !== MAGIC) {
     throw new Error('Invalid program: bad magic');
   }
 
-  if (bytecode[4] !== 1 || bytecode[5] !== 0) {
+  if (content[4] !== 1 || content[5] !== 0) {
     throw new Error('Invalid program: unsupported version');
   }
 
-  const numSlots = bytecode[6];
-  const numInputs = bytecode[7];
-  const initLen = bytecode[10] | (bytecode[11] << 8);
+  const numSlots = content[6];
+  const numInputs = content[7];
+  const initLen = content[10] | (content[11] << 8);
 
-  if (HEADER_SIZE + initLen > bytecode.length) {
+  if (PROGRAM_HASH_PREFIX + HEADER_SIZE + initLen > bytecode.length) {
     throw new Error('Invalid program: init section overflow');
   }
 
-  const initCode = bytecode.subarray(HEADER_SIZE, HEADER_SIZE + initLen);
+  const initCode = content.subarray(HEADER_SIZE, HEADER_SIZE + initLen);
   const slotDefs = parseSlotDefs(initCode, numSlots, defaultCapacity);
 
   return { bytecode, numSlots, numInputs, slotDefs };
