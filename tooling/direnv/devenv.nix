@@ -50,6 +50,12 @@ in {
   services.dynamodb-local.enable = true;
   # Default port 8000; available at http://127.0.0.1:8000 when `devenv up` is running
 
+  # MinIO (S3-compatible) for BunS3Archive integration tests
+  services.minio.enable = true;
+  services.minio.buckets = ["test"];
+  # S3 API on port 9000; web UI on 9001 when `devenv up` is running
+  # Note: MinIO requires ~5% free disk. If tests fail with XMinioStorageFull, free disk space.
+
   # https://devenv.sh/scripts/#entershell
   # This runs when entering the devenv shell
   # - When using the devenv wrapper from tooling/, restore the original working directory
@@ -60,6 +66,10 @@ in {
     cd "$DEVENV_ROOT/../.."
     export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
     bun ${./setup-environment.ts}
+
+    # S3 integration tests (BunS3Archive) - MinIO runs when devenv up
+    export S3_TEST_ENDPOINT="http://127.0.0.1:9000"
+    export S3_TEST_BUCKET="test"
 
     if [ -n "$DEVENV_SHELL_PWD" ]; then
       cd "$DEVENV_SHELL_PWD"
