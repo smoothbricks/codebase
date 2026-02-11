@@ -85,11 +85,6 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
       };
     }
 
-    #logAccess(flagName, value) {
-      const log = this.#spanContext.log;
-      log.ffAccess(flagName, value);
-    }
-
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
       log.ffUsage(flagName, context);
@@ -219,11 +214,6 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
         value,
         track(context) { self.#logUsage(flagName, context); }
       };
-    }
-
-    #logAccess(flagName, value) {
-      const log = this.#spanContext.log;
-      log.ffAccess(flagName, value);
     }
 
     #logUsage(flagName, context) {
@@ -365,11 +355,6 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
       };
     }
 
-    #logAccess(flagName, value) {
-      const log = this.#spanContext.log;
-      log.ffAccess(flagName, value);
-    }
-
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
       log.ffUsage(flagName, context);
@@ -505,11 +490,6 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
       };
     }
 
-    #logAccess(flagName, value) {
-      const log = this.#spanContext.log;
-      log.ffAccess(flagName, value);
-    }
-
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
       log.ffUsage(flagName, context);
@@ -639,11 +619,6 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
         value,
         track(context) { self.#logUsage(flagName, context); }
       };
-    }
-
-    #logAccess(flagName, value) {
-      const log = this.#spanContext.log;
-      log.ffAccess(flagName, value);
     }
 
     #logUsage(flagName, context) {

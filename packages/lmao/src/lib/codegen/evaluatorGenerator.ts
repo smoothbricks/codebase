@@ -182,14 +182,6 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
       };
     }
 ` +
-    // Generated code: #logAccess() - logs flag access via logger (now handled in #getFlag)
-    // This method is no longer used - kept for compatibility if needed
-    `
-    #logAccess(flagName, value) {
-      const log = this.#spanContext.log;
-      log.ffAccess(flagName, value);
-    }
-` +
     // Generated code: #logUsage() - logs flag usage via logger
     `
     #logUsage(flagName, context) {
