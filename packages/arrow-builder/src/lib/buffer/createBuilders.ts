@@ -12,7 +12,7 @@
 
 import type * as Sury from '@sury/sury';
 import type { ColumnSchema, SchemaWithMetadata } from '../schema-types.js';
-import { DEFAULT_BUFFER_CAPACITY, type TypedArray, type TypedArrayConstructor } from './types.js';
+import { type ColumnValueType, DEFAULT_BUFFER_CAPACITY, type TypedArrayConstructor } from './types.js';
 
 /**
  * Create TypedArray columns for attribute columns based on schema
@@ -23,8 +23,8 @@ import { DEFAULT_BUFFER_CAPACITY, type TypedArray, type TypedArrayConstructor } 
 export function createAttributeColumns(
   schema: ColumnSchema,
   capacity = DEFAULT_BUFFER_CAPACITY,
-): Record<string, TypedArray> {
-  const columns: Record<string, TypedArray> = {};
+): Record<string, ColumnValueType> {
+  const columns: Record<string, ColumnValueType> = {};
 
   // Use ColumnSchema.fieldEntries() directly
   for (const [fieldName, surySchema] of schema._columns) {
@@ -40,8 +40,8 @@ export function createAttributeColumns(
  *
  * STRING TYPE SYSTEM (See specs/01a_trace_schema_system.md):
  * - enum: Uint8/16/32Array (size based on enum value count: <256=8bit, <65536=16bit, else 32bit)
- * - category: Uint32Array (runtime string interning indices)
- * - text: Uint32Array (raw string indices)
+ * - category: string[] (raw strings, dictionary built at Arrow conversion)
+ * - text: string[] (raw strings, no dictionary)
  *
  * OTHER TYPES:
  * - number: Float64Array (full precision)
@@ -49,7 +49,7 @@ export function createAttributeColumns(
  *
  * We attach metadata to schemas in builder.ts to identify the type.
  */
-function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capacity: number): TypedArray {
+function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capacity: number): ColumnValueType {
   const schemaWithMetadata = schema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata.__schema_type;
 
@@ -76,13 +76,13 @@ function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capaci
   }
 
   if (schemaType === 'category') {
-    // Category: Uint32Array for string interning indices
-    return new Uint32Array(capacity);
+    // Category: raw string array (dictionary built at Arrow conversion)
+    return new Array<string>(capacity);
   }
 
   if (schemaType === 'text') {
-    // Text: Uint32Array for raw string indices (no interning)
-    return new Uint32Array(capacity);
+    // Text: raw string array (no dictionary)
+    return new Array<string>(capacity);
   }
 
   // Handle number and boolean types

@@ -18,7 +18,7 @@ import {
 } from '../test-helpers.js';
 
 describe('Buffer Integration', () => {
-  it('generates TypedArray columns with proper names for defined schema', () => {
+  it('generates columns with proper names for defined schema', () => {
     const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       isActive: S.boolean(),
@@ -34,13 +34,13 @@ describe('Buffer Integration', () => {
     expect(columns).toHaveProperty('isActive');
     expect(columns).toHaveProperty('score');
 
-    // All columns should be TypedArrays
-    expect(columns.userId).toBeInstanceOf(Uint32Array); // category
+    // All columns should have correct storage types
+    expect(Array.isArray(columns.userId)).toBe(true); // category (raw strings)
     expect(columns.isActive).toBeInstanceOf(Uint8Array); // boolean
     expect(columns.score).toBeInstanceOf(Float64Array); // number
   });
 
-  it('creates a SpanBuffer with core and attribute TypedArray columns', () => {
+  it('creates a SpanBuffer with core and attribute columns', () => {
     const schema = createTestSchema({
       userId: S.category(), // Category: user IDs repeat
       score: S.number(),
@@ -80,7 +80,7 @@ describe('Buffer Integration', () => {
     // Create buffer with schema
     const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
 
-    // Verify all attribute columns created as TypedArrays with correct types (use _values suffix)
+    // Verify all attribute columns created with correct types (use _values suffix)
     expect(Array.isArray(buffer.requestId_values)).toBe(true); // category (raw strings)
     expect(buffer.httpStatus_values).toBeInstanceOf(Float64Array); // number
     expect(buffer.operation_values).toBeInstanceOf(Uint8Array); // enum
@@ -97,7 +97,7 @@ describe('Buffer Integration', () => {
 
     const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
 
-    // Both should have TypedArray columns (use _values suffix)
+    // Both should have column storage (use _values suffix)
     expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
     // Note: S.optional() wraps the inner schema, losing __schema_type metadata
     // This falls back to Uint32Array (default)
@@ -113,7 +113,7 @@ describe('Buffer Integration', () => {
 
     const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
 
-    // All should have TypedArray columns (use _values suffix)
+    // All should have column storage (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
     // With chainable .mask(), the __schema_type metadata is preserved
     expect(Array.isArray(buffer.userId_values)).toBe(true); // category (raw strings) - masked during Arrow conversion
@@ -253,7 +253,7 @@ describe('Buffer Integration', () => {
   });
 
   describe('Cross-Package Integration', () => {
-    it('validates lmao schema creates correct arrow-builder TypedArray types', () => {
+    it('validates lmao schema creates correct arrow-builder column types', () => {
       const schema = createTestSchema({
         enumField: S.enum(['A', 'B', 'C']), // Maps to Uint8Array
         categoryField: S.category(), // Maps to string[]
@@ -270,7 +270,7 @@ describe('Buffer Integration', () => {
         createTestOpMetadata(),
       );
 
-      // Verify arrow-builder created correct TypedArray types for each schema type
+      // Verify arrow-builder created correct column types for each schema type
       expect(buffer.enumField_values).toBeInstanceOf(Uint8Array);
       expect(Array.isArray(buffer.categoryField_values)).toBe(true);
       expect(Array.isArray(buffer.textField_values)).toBe(true);

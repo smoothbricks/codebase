@@ -57,7 +57,7 @@ function createSchemaWithFlagBuilder<T>(schema: Sury.Schema<T, unknown>): Schema
  * STRING TYPE SYSTEM (See specs/01a_trace_schema_system.md):
  * Three distinct string types, each with different storage strategies:
  * - S.enum(['A', 'B', 'C']) - Known values at compile time (Uint8Array, 1 byte)
- * - S.category() - Repeated values (Uint32Array with string interning)
+ * - S.category() - Repeated values (raw string storage, dictionary built at Arrow conversion)
  * - S.text() - Unique values (no dictionary overhead)
  */
 const schemaBuilderImpl: SchemaBuilder = {
@@ -137,8 +137,8 @@ const schemaBuilderImpl: SchemaBuilder = {
   /**
    * Category - Values that often repeat (limited cardinality)
    *
-   * Storage: Uint32Array indices with string interning
-   * Arrow: Dictionary built dynamically from interned strings
+   * Storage: Raw strings (no hot-path interning)
+   * Arrow: Dictionary built dynamically from values at Arrow conversion
    * Use for: userIds, sessionIds, moduleNames, spanNames, table names
    *
    * Usage:
@@ -147,7 +147,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    * - S.category().default('default-value').sync() - feature flag
    *
    * Hot path write:
-   * buffer.attr_userId[idx] = internString(userId); // Returns Uint32 index
+   * buffer.attr_userId[idx] = userId;
    */
   category: (): SchemaOrFlagBuilder<string> & LazyCategorySchema => {
     const schema = ArrowS.category();
