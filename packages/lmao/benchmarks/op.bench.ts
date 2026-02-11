@@ -23,14 +23,14 @@ const trivialOp = module.op('trivial', async (_ctx) => {
 });
 
 const traceId = createTraceId('bench-trace');
-const traceCtx = module.traceContext();
+const traceCtx = module.traceContext() as { traceId: string };
 // Mock traceId since we're using the real TraceContext but need it stable
-(traceCtx as any).traceId = traceId;
+traceCtx.traceId = traceId;
 
 // 1. Direct Op._invoke (simulated)
 group('Op._invoke performance', () => {
   bench('trivial op', async () => {
-    return await (trivialOp as any)._invoke(
+    return await (trivialOp as unknown as { _invoke: (...args: unknown[]) => Promise<unknown> })._invoke(
       traceCtx,
       null, // parentBuffer
       module._context, // callsiteModule
@@ -50,7 +50,14 @@ const traceCtxWithExtra = module.traceContext({
 
 group('Op._invoke with Extra properties', () => {
   bench('op with 3 extras', async () => {
-    return await (trivialOp as any)._invoke(traceCtxWithExtra, null, module._context, 'bench-span', 123, []);
+    return await (trivialOp as unknown as { _invoke: (...args: unknown[]) => Promise<unknown> })._invoke(
+      traceCtxWithExtra,
+      null,
+      module._context,
+      'bench-span',
+      123,
+      [],
+    );
   });
 });
 

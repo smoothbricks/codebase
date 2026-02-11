@@ -36,7 +36,6 @@ const testSchema = defineLogSchema({
 // Test op context
 const testOpContext = defineOpContext({
   logSchema: testSchema,
-  ctx: {},
 });
 
 const { defineOp } = testOpContext;
@@ -55,13 +54,6 @@ const NETWORK_ERROR = Transient<{ service: string }>('NETWORK_ERROR', {
   baseDelayMs: 0,
   jitter: false,
 });
-const RATE_LIMITED = Transient<{ retryAfter?: number }>('RATE_LIMITED', {
-  backoff: 'fixed',
-  maxAttempts: 3,
-  baseDelayMs: 0,
-  jitter: false,
-});
-
 // Non-transient error codes
 const VALIDATION_ERROR = Code<{ field: string }>('VALIDATION_ERROR');
 
@@ -71,7 +63,13 @@ describe('LMAO Op Retry', () => {
   const executeWithRetry = async (
     tracer: TestTracer<typeof testOpContext>,
     spanName: string,
-    opFn: (ctx: Parameters<Parameters<typeof tracer.trace>[1]>[0]) => ReturnType<typeof opFn>,
+    opFn: (
+      ctx: import('../../opContext/types.js').SpanContext<
+        import('../../opContext/types.js').OpContextOf<typeof testOpContext>
+      >,
+    ) =>
+      | import('../../result.js').Result<unknown, unknown>
+      | Promise<import('../../result.js').Result<unknown, unknown>>,
   ) => {
     return tracer.trace('root', async (ctx) => {
       // Use ctx.span() to trigger span execution with retry logic
@@ -171,8 +169,9 @@ describe('LMAO Op Retry', () => {
       expect(attempts).toBe(1); // No retries
       expect(result.success).toBe(false);
       if (!result.success) {
-        expect(result.error).toBeInstanceOf(Blocked);
-        expect(result.error.reason.type).toBe('ended');
+        const error = result.error as Blocked;
+        expect(error).toBeInstanceOf(Blocked);
+        expect(error.reason.type).toBe('ended');
       }
     });
   });
@@ -604,7 +603,8 @@ describe('LMAO Op Retry', () => {
       expect(attempts).toBe(1);
       expect(result.success).toBe(true);
       if (result.success) {
-        expect(result.value.immediate).toBe(true);
+        const value = result.value as { immediate: boolean };
+        expect(value.immediate).toBe(true);
       }
     });
 

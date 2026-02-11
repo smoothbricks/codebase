@@ -175,7 +175,8 @@ describe('Blocked with BlockedConfig', () => {
     it('should include blockedConfig in inspect for BlockedConfig', () => {
       const config: BlockedConfig = { maxAttempts: 3, nextRetry: () => 1000 };
       const err = Blocked.service('api', config);
-      const inspected = err[Symbol.for('nodejs.util.inspect.custom')]();
+      const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
+      const inspected = (err as unknown as Record<symbol, () => unknown>)[inspectSymbol]!();
       expect(inspected).toEqual({
         _tag: 'Blocked',
         reason: { type: 'service', name: 'api' },
@@ -186,7 +187,8 @@ describe('Blocked with BlockedConfig', () => {
     it('should include retry in inspect for RetryPolicy', () => {
       const policy: RetryPolicy = { delay: '5s' };
       const err = Blocked.service('api', policy);
-      const inspected = err[Symbol.for('nodejs.util.inspect.custom')]();
+      const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
+      const inspected = (err as unknown as Record<symbol, () => unknown>)[inspectSymbol]!();
       expect(inspected).toEqual({
         _tag: 'Blocked',
         reason: { type: 'service', name: 'api' },
