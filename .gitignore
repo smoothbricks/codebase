@@ -2,6 +2,8 @@
 
 # Local env
 .envrc-local
+dynamodb-local-metadata.json
+opencode.json
 
 # LLMs
 .opencode
@@ -10,9 +12,11 @@ _bmad
 
 # compiled output
 dist
+dist-ts-plugin
 tmp
 out-tsc
 .zig-cache
+zig-out/
 
 # dependencies
 node_modules
