@@ -48,8 +48,8 @@ pub fn build(b: *std.Build) void {
     columine_wasm.rdynamic = true;
     // Let Zig export memory so wasm_allocator works correctly
     columine_wasm.export_memory = true;
-    // 8MB initial (128 pages of 64KB), 64MB max (1024 pages)
-    columine_wasm.initial_memory = 128 * 64 * 1024;
+    // 4MB initial (linker needs ~3.5MB for static data)
+    columine_wasm.initial_memory = 64 * 64 * 1024;
     columine_wasm.max_memory = 1024 * 64 * 1024;
 
     // msgpack available for WASM (future Parse/Compact stages)
