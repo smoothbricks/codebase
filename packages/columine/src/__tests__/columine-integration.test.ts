@@ -147,7 +147,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     resetBackend();
   });
 
-  it.skipIf(!WASM_EXISTS)('executes HashMap upsert-last program', () => {
+  it.skipIf(!WASM_EXISTS)('executes HashMap upsert-last program', async () => {
     // Build: 1 HashMap (capacity 64), 2 inputs (key, value)
     // Op: BATCH_MAP_UPSERT_LAST slot=0, keyCol=0, valCol=1
     const bytecode = buildProgram({
@@ -156,7 +156,7 @@ describe('SC1: Reduce stage for aggregation', () => {
       reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Keys: [1, 2, 3, 1] -> last wins for key 1
@@ -179,7 +179,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.mapGet(state, program, 0, 3)).toBe(30);
   });
 
-  it.skipIf(!WASM_EXISTS)('executes Aggregate SUM program', () => {
+  it.skipIf(!WASM_EXISTS)('executes Aggregate SUM program', async () => {
     // Build: 1 Aggregate SUM, 1 input (values)
     // Op: BATCH_AGG_SUM slot=0, valCol=0
     const bytecode = buildProgram({
@@ -188,7 +188,7 @@ describe('SC1: Reduce stage for aggregation', () => {
       reduceOps: [Opcode.BATCH_AGG_SUM, 0, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // SUM reads Float64 values from the column
@@ -201,7 +201,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(100);
   });
 
-  it.skipIf(!WASM_EXISTS)('executes Aggregate COUNT program', () => {
+  it.skipIf(!WASM_EXISTS)('executes Aggregate COUNT program', async () => {
     // Build: 1 Aggregate COUNT, 1 input (dummy, COUNT ignores column values)
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.COUNT }],
@@ -209,7 +209,7 @@ describe('SC1: Reduce stage for aggregation', () => {
       reduceOps: [Opcode.BATCH_AGG_COUNT, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // COUNT ignores values, just counts rows
@@ -222,7 +222,7 @@ describe('SC1: Reduce stage for aggregation', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(7);
   });
 
-  it.skipIf(!WASM_EXISTS)('executes HashMap + Aggregate SUM combined program', () => {
+  it.skipIf(!WASM_EXISTS)('executes HashMap + Aggregate SUM combined program', async () => {
     // Build: 1 HashMap (cap 64) + 1 Aggregate SUM, 3 inputs (key, val, amount)
     const bytecode = buildProgram({
       slots: [
@@ -241,7 +241,7 @@ describe('SC1: Reduce stage for aggregation', () => {
       ],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     const keys = new Uint32Array([1, 2, 1, 3]);
@@ -295,7 +295,7 @@ describe('SC2: Undo stage for event cancellation', () => {
       reduceOps: [Opcode.BATCH_AGG_SUM, 0, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // First batch: sum = 100
@@ -326,7 +326,7 @@ describe('SC2: Undo stage for event cancellation', () => {
       reduceOps: [Opcode.BATCH_AGG_SUM, 0, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // First batch: sum = 50
@@ -629,14 +629,14 @@ describe('SC5: Streaming processing', () => {
     resetBackend();
   });
 
-  it.skipIf(!WASM_EXISTS)('multiple batches accumulate SUM correctly', () => {
+  it.skipIf(!WASM_EXISTS)('multiple batches accumulate SUM correctly', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.SUM }],
       numInputs: 1,
       reduceOps: [Opcode.BATCH_AGG_SUM, 0, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Batch 1: sum = 10 + 20 = 30 (SUM reads Float64 values)
@@ -652,14 +652,14 @@ describe('SC5: Streaming processing', () => {
     expect(backend.getAggregateValue(state, program, 0)).toBe(150);
   });
 
-  it.skipIf(!WASM_EXISTS)('multiple batches accumulate HashMap entries', () => {
+  it.skipIf(!WASM_EXISTS)('multiple batches accumulate HashMap entries', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'hashmap', capacity: 64 }],
       numInputs: 2,
       reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Batch 1: key 1 -> 100, key 2 -> 200
@@ -690,14 +690,14 @@ describe('SC5: Streaming processing', () => {
     expect(backend.mapGet(state, program, 0, 3)).toBe(300); // New
   });
 
-  it.skipIf(!WASM_EXISTS)('state serialization and deserialization preserves accumulated state', () => {
+  it.skipIf(!WASM_EXISTS)('state serialization and deserialization preserves accumulated state', async () => {
     const bytecode = buildProgram({
       slots: [{ type: 'aggregate', aggType: AggType.SUM }],
       numInputs: 1,
       reduceOps: [Opcode.BATCH_AGG_SUM, 0, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Accumulate some state (SUM reads Float64 values)

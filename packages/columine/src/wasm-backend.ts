@@ -231,7 +231,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
   return {
     backend: 'wasm',
 
-    loadProgram(bytecode: Uint8Array): ReducerProgram {
+    async loadProgram(bytecode: Uint8Array): Promise<ReducerProgram> {
       return parseProgram(bytecode);
     },
 

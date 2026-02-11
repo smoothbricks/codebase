@@ -141,7 +141,7 @@ describe('Pipeline undo integration', () => {
       reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Checkpoint
@@ -179,7 +179,7 @@ describe('Pipeline undo integration', () => {
       reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Insert initial entries
@@ -245,7 +245,7 @@ describe('Pipeline undo integration', () => {
       reduceOps: [Opcode.BATCH_AGG_SUM, 0, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // First batch: sum = 10 + 20 + 30 = 60
@@ -280,7 +280,7 @@ describe('Pipeline undo integration', () => {
       reduceOps: [Opcode.BATCH_SET_INSERT, 0, 0],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Insert initial elements
@@ -329,7 +329,7 @@ describe('Pipeline undo integration', () => {
       reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // === Cycle 1: checkpoint, execute, COMMIT ===
@@ -407,7 +407,7 @@ describe('Pipeline undo integration', () => {
       ],
     });
 
-    const program = backend.loadProgram(bytecode);
+    const program = await backend.loadProgram(bytecode);
     const state = backend.createState(program);
 
     // Checkpoint

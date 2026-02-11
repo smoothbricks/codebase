@@ -145,10 +145,10 @@ export interface ColumineBackend {
   // ===========================================================================
 
   /**
-   * Parse and validate a program.
-   * Call ONCE per agent TYPE.
+   * Parse and validate a program. Fills embedded hash if needed; caches by hash when available.
+   * Call once per agent type.
    */
-  loadProgram(bytecode: Uint8Array): ReducerProgram;
+  loadProgram(bytecode: Uint8Array): Promise<ReducerProgram>;
 
   // ===========================================================================
   // State Management
