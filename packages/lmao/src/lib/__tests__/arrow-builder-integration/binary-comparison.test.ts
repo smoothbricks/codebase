@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import * as arrow from 'apache-arrow';
+import { dictionary, type Table, tableFromIPC, tableToIPC, uint8, uint16, utf8 } from '@uwdata/flechette';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
@@ -26,18 +26,38 @@ import { createTestSchema, createTestTraceRoot } from '../test-helpers.js';
 /**
  * Round-trip test: serialize to IPC, deserialize, verify data matches
  */
-function verifyRoundTrip(table: arrow.Table): arrow.Table {
+const DICTIONARY_TYPE_ID = dictionary(utf8(), uint8()).typeId;
+const UINT8_TYPE_ID = uint8().typeId;
+const UINT16_TYPE_ID = uint16().typeId;
+
+type ComparableColumn = {
+  type: { typeId?: unknown; toString(): string; dictionary?: unknown; indices?: { typeId?: unknown } };
+  data: Array<{
+    length: number;
+    nullCount: number;
+    nullBitmap?: Uint8Array;
+    validity?: Uint8Array;
+    data?: ArrayBufferView;
+    dictionary?: { length: number; at(index: number): unknown };
+  }>;
+  get(index: number): unknown;
+};
+
+function verifyRoundTrip(table: Table): Table {
   // Serialize to IPC format
-  const ipcBytes = arrow.tableToIPC(table);
+  const ipcBytes = tableToIPC(table, { format: 'stream' });
+  if (!ipcBytes) {
+    throw new Error('Failed to serialize Arrow table');
+  }
 
   // Deserialize back
-  const roundTripped = arrow.tableFromIPC(ipcBytes);
+  const roundTripped = tableFromIPC(ipcBytes);
 
   // Verify schema matches
   expect(roundTripped.schema.fields.length).toBe(table.schema.fields.length);
   for (let i = 0; i < table.schema.fields.length; i++) {
     expect(roundTripped.schema.fields[i].name).toBe(table.schema.fields[i].name);
-    expect(roundTripped.schema.fields[i].typeId).toBe(table.schema.fields[i].typeId);
+    expect(roundTripped.schema.fields[i].type.typeId).toBe(table.schema.fields[i].type.typeId);
     expect(roundTripped.schema.fields[i].nullable).toBe(table.schema.fields[i].nullable);
   }
 
@@ -187,16 +207,20 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table);
-      const roundTripped = arrow.tableFromIPC(ipcBytes);
+      const ipcBytes = tableToIPC(table, { format: 'stream' });
+      if (!ipcBytes) {
+        throw new Error('Failed to serialize Arrow table');
+      }
+      const roundTripped = tableFromIPC(ipcBytes);
 
-      const originalBatch = table.batches[0];
-      const roundTrippedBatch = roundTripped.batches[0];
+      const originalBatch = (table as unknown as { data: Array<{ getChildAt(index: number): unknown }> }).data[0];
+      const roundTrippedBatch = (roundTripped as unknown as { data: Array<{ getChildAt(index: number): unknown }> })
+        .data[0];
 
       // Compare each column in detail
       for (let colIdx = 0; colIdx < table.schema.fields.length; colIdx++) {
-        const originalCol = originalBatch.getChildAt(colIdx);
-        const roundTrippedCol = roundTrippedBatch.getChildAt(colIdx);
+        const originalCol = originalBatch.getChildAt(colIdx) as ComparableColumn | undefined;
+        const roundTrippedCol = roundTrippedBatch.getChildAt(colIdx) as ComparableColumn | undefined;
 
         expect(roundTrippedCol).toBeDefined();
         expect(originalCol?.type.toString()).toBe(roundTrippedCol?.type.toString());
@@ -217,13 +241,13 @@ describe('Arrow IPC Round-Trip', () => {
             // Just verify both have nullCount 0
             expect(origData.nullCount).toBe(0);
             expect(roundData.nullCount).toBe(0);
-          } else if (origData?.nullBitmap && roundData?.nullBitmap) {
+          } else if ((origData?.nullBitmap ?? origData?.validity) && (roundData?.nullBitmap ?? roundData?.validity)) {
             // When nullCount > 0, both must have bitmaps and they must match
             const origBytes = Math.ceil(origData.length / 8);
             const roundBytes = Math.ceil(roundData.length / 8);
             const minBytes = Math.min(origBytes, roundBytes);
-            const origTrimmed = origData.nullBitmap.subarray(0, minBytes);
-            const roundTrimmed = roundData.nullBitmap.subarray(0, minBytes);
+            const origTrimmed = (origData.nullBitmap ?? origData.validity)?.subarray(0, minBytes);
+            const roundTrimmed = (roundData.nullBitmap ?? roundData.validity)?.subarray(0, minBytes);
             expect(origTrimmed).toEqual(roundTrimmed);
           } else {
             // One has bitmap, one doesn't - only valid if nullCount is 0
@@ -232,32 +256,31 @@ describe('Arrow IPC Round-Trip', () => {
           }
 
           // Compare data arrays (for non-dictionary columns)
-          const origDataBuffer = (origData as { data?: ArrayBufferView })?.data;
-          const roundDataBuffer = (roundData as { data?: ArrayBufferView })?.data;
-          if (origDataBuffer && roundDataBuffer && !(originalCol.type instanceof arrow.Dictionary)) {
+          const origDataBuffer = origData?.data;
+          const roundDataBuffer = roundData?.data;
+          if (origDataBuffer && roundDataBuffer && originalCol.type.typeId !== DICTIONARY_TYPE_ID) {
             expect(origDataBuffer).toEqual(roundDataBuffer);
           }
 
           // For dictionary columns, compare indices and dictionary
-          if (originalCol.type instanceof arrow.Dictionary && roundTrippedCol.type instanceof arrow.Dictionary) {
+          if (originalCol.type.typeId === DICTIONARY_TYPE_ID && roundTrippedCol.type.typeId === DICTIONARY_TYPE_ID) {
             const origDict = originalCol.type.dictionary;
             const roundDict = roundTrippedCol.type.dictionary;
 
             // Compare dictionary values
             if (origDict && roundDict) {
-              const origDictVector = (originalCol as { dictionary?: arrow.Vector })?.dictionary;
-              const roundDictVector = (roundTrippedCol as { dictionary?: arrow.Vector })?.dictionary;
+              const origDictVector = origData.dictionary;
+              const roundDictVector = roundData.dictionary;
               expect(origDictVector?.length).toBe(roundDictVector?.length);
 
               for (let i = 0; i < (origDictVector?.length || 0); i++) {
-                expect(origDictVector?.get(i)).toBe(roundDictVector?.get(i));
+                expect(origDictVector?.at(i)).toBe(roundDictVector?.at(i));
               }
             }
 
             // Compare indices using the actual dictionary index type
             if (origDataBuffer && roundDataBuffer) {
-              const origDictType = originalCol.type as arrow.Dictionary;
-              const indexType = origDictType.indices;
+              const indexType = originalCol.type.indices;
 
               // Read indices based on the actual type (Uint8, Uint16, or Uint32)
               let origIndices: Uint8Array | Uint16Array | Uint32Array;
@@ -267,10 +290,10 @@ describe('Arrow IPC Round-Trip', () => {
               const origView = origDataBuffer as { buffer: ArrayBuffer; byteOffset: number };
               const roundView = roundDataBuffer as { buffer: ArrayBuffer; byteOffset: number };
 
-              if (indexType.typeId === arrow.Type.Uint8) {
+              if (indexType?.typeId === UINT8_TYPE_ID) {
                 origIndices = new Uint8Array(origView.buffer, origView.byteOffset, origData.length);
                 roundIndices = new Uint8Array(roundView.buffer, roundView.byteOffset, roundData.length);
-              } else if (indexType.typeId === arrow.Type.Uint16) {
+              } else if (indexType?.typeId === UINT16_TYPE_ID) {
                 origIndices = new Uint16Array(origView.buffer, origView.byteOffset, origData.length);
                 roundIndices = new Uint16Array(roundView.buffer, roundView.byteOffset, roundData.length);
               } else {
@@ -565,14 +588,14 @@ describe('Arrow IPC Round-Trip', () => {
 
       // Category and text should be Dictionary<Utf8, Uint32>
       const categoryField = table.schema.fields.find((f) => f.name === 'category');
-      expect(categoryField?.type.typeId).toBe(arrow.Type.Dictionary);
+      expect(categoryField?.type.typeId).toBe(DICTIONARY_TYPE_ID);
 
       const textField = table.schema.fields.find((f) => f.name === 'text');
-      expect(textField?.type.typeId).toBe(arrow.Type.Dictionary);
+      expect(textField?.type.typeId).toBe(DICTIONARY_TYPE_ID);
 
       // Enum should be Dictionary<Utf8, Uint8>
       const enumField = table.schema.fields.find((f) => f.name === 'status');
-      expect(enumField?.type.typeId).toBe(arrow.Type.Dictionary);
+      expect(enumField?.type.typeId).toBe(DICTIONARY_TYPE_ID);
     });
   });
 
@@ -614,14 +637,14 @@ describe('Arrow IPC Round-Trip', () => {
       if (!valueVector) {
         throw new Error('Value vector not found');
       }
-      const valueData = valueVector.data[0];
+      const valueData = valueVector.data[0] as { nullCount: number; nullBitmap?: Uint8Array; validity?: Uint8Array };
 
       // Verify null count
       expect(valueData.nullCount).toBe(4);
 
       // Verify null bitmap (1=valid, 0=null)
       // Pattern: 01010101 = 0x55
-      const nullBitmap = valueData.nullBitmap;
+      const nullBitmap = valueData.nullBitmap ?? valueData.validity;
       expect(nullBitmap).toBeDefined();
       expect(nullBitmap?.[0]).toBe(0b01010101);
     });
@@ -767,7 +790,7 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       // Dictionary should only have 1 unique value
-      const dictData = userIdVector.data[0];
+      const dictData = userIdVector.data[0] as { dictionary?: { length: number } };
       expect(dictData.dictionary?.length).toBe(1);
     });
   });

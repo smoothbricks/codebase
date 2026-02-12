@@ -10,7 +10,7 @@
  */
 
 import { describe, expect, test } from 'bun:test';
-import type { Table } from 'apache-arrow';
+import type { Table } from '@uwdata/flechette';
 import type { CapacityStatsEntry } from '../../arrow/capacityStats.js';
 import { convertSpanTreeToArrowTable, convertToArrowTable } from '../../convertToArrow.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
@@ -457,7 +457,7 @@ describe('Arrow Table Conversion', () => {
 
       // Should have span entries (2) + buffer metric entries (4) = 6 rows total
       expect(table.numRows).toBe(6);
-      expect(table.batches.length).toBe(2); // One batch for span data, one for buffer metrics
+      expect((table as unknown as { data: unknown[] }).data.length).toBe(2); // One batch for span data, one for buffer metrics
 
       // Verify span entries
       const row0 = table.get(0)?.toJSON();
@@ -508,7 +508,7 @@ describe('Arrow Table Conversion', () => {
 
       // Should have only buffer metric entries (4 rows)
       expect(table.numRows).toBe(4);
-      expect(table.batches.length).toBe(1); // Only buffer metrics batch
+      expect((table as unknown as { data: unknown[] }).data.length).toBe(1); // Only buffer metrics batch
 
       const row0 = table.get(0)?.toJSON();
       expect(row0?.entry_type).toBe('period-start');

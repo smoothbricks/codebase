@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import * as arrow from 'apache-arrow';
+import { tableFromIPC, tableToIPC } from '@uwdata/flechette';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
@@ -7,6 +7,14 @@ import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { createSpanBuffer } from '../../spanBuffer.js';
 
 import { createTestSchema, createTestTraceRoot, createTraceId } from '../test-helpers.js';
+
+function serializeToIpcStream(table: ReturnType<typeof convertToArrowTable>): Uint8Array {
+  const ipcBytes = tableToIPC(table, { format: 'stream' });
+  if (!ipcBytes) {
+    throw new Error('Failed to serialize Arrow table');
+  }
+  return ipcBytes;
+}
 
 describe('Arrow Binary Format Compliance', () => {
   describe('IPC Message Structure', () => {
@@ -27,7 +35,7 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table, 'stream');
+      const ipcBytes = serializeToIpcStream(table);
 
       // IPC stream should start with 0xFFFFFFFF continuation marker
       expect(ipcBytes[0]).toBe(0xff);
@@ -55,10 +63,10 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table, 'stream');
+      const ipcBytes = serializeToIpcStream(table);
 
       // Round-trip test
-      const reader = arrow.tableFromIPC(ipcBytes);
+      const reader = tableFromIPC(ipcBytes);
       expect(reader.numRows).toBe(1);
 
       // Find our data column (skip system columns)
@@ -102,10 +110,10 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testData.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table, 'stream');
+      const ipcBytes = serializeToIpcStream(table);
 
       // Round-trip test
-      const reader = arrow.tableFromIPC(ipcBytes);
+      const reader = tableFromIPC(ipcBytes);
       expect(reader.numRows).toBe(5);
 
       // Find our data column and verify null handling
@@ -148,10 +156,10 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table, 'stream');
+      const ipcBytes = serializeToIpcStream(table);
 
       // Round-trip test
-      const reader = arrow.tableFromIPC(ipcBytes);
+      const reader = tableFromIPC(ipcBytes);
       expect(reader.numRows).toBe(4);
 
       // Find our data column and verify enum handling
@@ -192,10 +200,10 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table, 'stream');
+      const ipcBytes = serializeToIpcStream(table);
 
       // Round-trip test
-      const reader = arrow.tableFromIPC(ipcBytes);
+      const reader = tableFromIPC(ipcBytes);
       expect(reader.numRows).toBe(4);
 
       // Find our data column and verify string handling
@@ -228,13 +236,13 @@ describe('Arrow Binary Format Compliance', () => {
       // Don't write any data
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table, 'stream');
+      const ipcBytes = serializeToIpcStream(table);
 
       // Should still produce valid IPC
       expect(ipcBytes.length).toBeGreaterThan(0);
 
       // Should round-trip
-      const reader = arrow.tableFromIPC(ipcBytes);
+      const reader = tableFromIPC(ipcBytes);
       expect(reader.numRows).toBe(0);
     });
 
@@ -258,10 +266,10 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = arrow.tableToIPC(table, 'stream');
+      const ipcBytes = serializeToIpcStream(table);
 
       // Round-trip test
-      const reader = arrow.tableFromIPC(ipcBytes);
+      const reader = tableFromIPC(ipcBytes);
       expect(reader.numRows).toBe(5);
 
       // Find our data column and verify boolean handling

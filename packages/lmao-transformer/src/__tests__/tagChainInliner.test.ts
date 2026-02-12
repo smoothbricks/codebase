@@ -28,7 +28,7 @@ import {
   S,
   type SpanBuffer,
 } from '@smoothbricks/lmao';
-import * as arrow from 'apache-arrow';
+import { type Table, tableFromIPC, tableToIPC } from '@uwdata/flechette';
 import { createTestTraceRoot } from './test-helpers.js';
 
 // ============================================================================
@@ -49,8 +49,8 @@ const IGNORED_SYSTEM_COLUMNS = new Set([
  * Ignores system columns that vary between buffer creations.
  */
 function compareArrowTablesDetailed(
-  table1: arrow.Table,
-  table2: arrow.Table,
+  table1: Table,
+  table2: Table,
   options: { ignoreSystemColumns?: boolean } = { ignoreSystemColumns: true },
 ): { equal: boolean; diff?: string } {
   // Compare row counts
@@ -71,8 +71,8 @@ function compareArrowTablesDetailed(
 
   // Compare each row's data
   for (let row = 0; row < table1.numRows; row++) {
-    const row1 = table1.get(row)?.toJSON();
-    const row2 = table2.get(row)?.toJSON();
+    const row1 = table1.at(row) as Record<string, unknown>;
+    const row2 = table2.at(row) as Record<string, unknown>;
 
     for (const field of table1.schema.fields) {
       // Skip system columns that vary between buffer creations
@@ -174,14 +174,14 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       if (!result.equal) {
         console.error('Diff:', result.diff);
-        console.error('Row1:', table1.get(0)?.toJSON());
-        console.error('Row2:', table2.get(0)?.toJSON());
+        console.error('Row1:', table1.at(0));
+        console.error('Row2:', table2.at(0));
       }
       expect(result.equal).toBe(true);
 
       // Verify the enum value is correct
-      expect(table1.get(0)?.toJSON().operation).toBe('CREATE');
-      expect(table2.get(0)?.toJSON().operation).toBe('CREATE');
+      expect(table1.at(0).operation).toBe('CREATE');
+      expect(table2.at(0).operation).toBe('CREATE');
     });
 
     it('category (string) literal produces identical output', () => {
@@ -200,8 +200,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      expect(table1.get(0)?.toJSON().userId).toBe('user-123');
-      expect(table2.get(0)?.toJSON().userId).toBe('user-123');
+      expect(table1.at(0).userId).toBe('user-123');
+      expect(table2.at(0).userId).toBe('user-123');
     });
 
     it('text literal produces identical output', () => {
@@ -220,8 +220,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      expect(table1.get(0)?.toJSON().description).toBe('hello world');
-      expect(table2.get(0)?.toJSON().description).toBe('hello world');
+      expect(table1.at(0).description).toBe('hello world');
+      expect(table2.at(0).description).toBe('hello world');
     });
 
     it('number literal produces identical output', () => {
@@ -240,8 +240,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      expect(table1.get(0)?.toJSON().count).toBe(42);
-      expect(table2.get(0)?.toJSON().count).toBe(42);
+      expect(table1.at(0).count).toBe(42);
+      expect(table2.at(0).count).toBe(42);
     });
 
     it('boolean true produces identical output', () => {
@@ -260,8 +260,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      expect(table1.get(0)?.toJSON().enabled).toBe(true);
-      expect(table2.get(0)?.toJSON().enabled).toBe(true);
+      expect(table1.at(0).enabled).toBe(true);
+      expect(table2.at(0).enabled).toBe(true);
     });
 
     it('boolean false produces identical output', () => {
@@ -280,8 +280,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      expect(table1.get(0)?.toJSON().enabled).toBe(false);
-      expect(table2.get(0)?.toJSON().enabled).toBe(false);
+      expect(table1.at(0).enabled).toBe(false);
+      expect(table2.at(0).enabled).toBe(false);
     });
   });
 
@@ -311,8 +311,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      const row1 = table1.get(0)?.toJSON();
-      const row2 = table2.get(0)?.toJSON();
+      const row1 = table1.at(0);
+      const row2 = table2.at(0);
 
       expect(row1?.operation).toBe('READ');
       expect(row2?.operation).toBe('READ');
@@ -409,8 +409,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
         expect(result.equal).toBe(true);
 
         // Verify the correct string value in Arrow output
-        expect(table1.get(0)?.toJSON().status).toBe(value);
-        expect(table2.get(0)?.toJSON().status).toBe(value);
+        expect(table1.at(0).status).toBe(value);
+        expect(table2.at(0).status).toBe(value);
       }
     });
   });
@@ -439,8 +439,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const result = compareArrowTablesDetailed(table1, table2);
       expect(result.equal).toBe(true);
 
-      expect(table1.get(0)?.toJSON().lazyField).toBe('lazy-value');
-      expect(table1.get(0)?.toJSON().eagerField).toBe('eager-value');
+      expect(table1.at(0).lazyField).toBe('lazy-value');
+      expect(table1.at(0).eagerField).toBe('eager-value');
     });
   });
 
@@ -464,8 +464,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       expect(result.equal).toBe(true);
 
       // Number defaults to 0 (Float64Array default), category defaults to null (no dictionary entry)
-      expect(table1.get(0)?.toJSON().nullableNumber).toBe(0);
-      expect(table1.get(0)?.toJSON().nullableString).toBe(null);
+      expect(table1.at(0).nullableNumber).toBe(0);
+      expect(table1.at(0).nullableString).toBe(null);
     });
 
     it('partial column writes preserve nulls in unwritten columns', () => {
@@ -484,8 +484,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       expect(result.equal).toBe(true);
 
       // Number column has value, string column is null
-      expect(table1.get(0)?.toJSON().nullableNumber).toBe(42);
-      expect(table1.get(0)?.toJSON().nullableString).toBe(null);
+      expect(table1.at(0).nullableNumber).toBe(42);
+      expect(table1.at(0).nullableString).toBe(null);
     });
   });
 
@@ -562,8 +562,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       expect(result.equal).toBe(true);
 
       // Verify row 2 is null
-      expect(table1.get(2)?.toJSON().value).toBe(null);
-      expect(table1.get(2)?.toJSON().tag_val).toBe(null);
+      expect(table1.at(2).value).toBe(null);
+      expect(table1.at(2).tag_val).toBe(null);
     });
   });
 
@@ -594,11 +594,14 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const table2 = convertToArrowTable(buffer2);
 
       // Round-trip both tables through IPC
-      const ipc1 = arrow.tableToIPC(table1);
-      const ipc2 = arrow.tableToIPC(table2);
+      const ipc1 = tableToIPC(table1, { format: 'stream' });
+      const ipc2 = tableToIPC(table2, { format: 'stream' });
+      if (!ipc1 || !ipc2) {
+        throw new Error('Failed to serialize Arrow table');
+      }
 
-      const restored1 = arrow.tableFromIPC(ipc1);
-      const restored2 = arrow.tableFromIPC(ipc2);
+      const restored1 = tableFromIPC(ipc1);
+      const restored2 = tableFromIPC(ipc2);
 
       // Verify restored tables match original
       const result1 = compareArrowTablesDetailed(table1, restored1);
