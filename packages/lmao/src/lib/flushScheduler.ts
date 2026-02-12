@@ -7,7 +7,7 @@
  * - Background processing (cold path)
  */
 
-import type { Table } from '@uwdata/flechette';
+import { Column, type Table, tableFromColumns } from '@uwdata/flechette';
 import type { CapacityStatsEntry } from './arrow/capacityStats.js';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
@@ -18,6 +18,23 @@ import type { AnySpanBuffer, OpMetadata } from './types.js';
  * Capacity stats are logged periodically to avoid overhead on every flush.
  */
 const CAPACITY_STATS_FLUSH_INTERVAL = 100;
+
+function mergeTables(first: Table, rest: Table[]): Table {
+  if (rest.length === 0) return first;
+
+  const names = first.names as string[];
+  const merged: [string, Column<unknown>][] = names.map((name, index) => {
+    const batches = [...(first.getChildAt(index)?.data ?? [])];
+    for (const table of rest) {
+      const col = table.getChild(name);
+      if (!col) continue;
+      batches.push(...col.data);
+    }
+    return [name, new Column(batches as never[])];
+  });
+
+  return tableFromColumns(merged);
+}
 
 /**
  * Flush handler function type
@@ -366,7 +383,7 @@ export class FlushScheduler {
       return;
     }
     const [firstTable, ...otherTables] = tables;
-    const combinedTable = firstTable.concat(...otherTables);
+    const combinedTable = mergeTables(firstTable, otherTables);
 
     // Call handler
     const metadata: FlushMetadata = {
