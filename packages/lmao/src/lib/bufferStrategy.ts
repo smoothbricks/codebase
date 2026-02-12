@@ -18,7 +18,7 @@
  * @module bufferStrategy
  */
 
-import type { RecordBatch, Table } from 'apache-arrow';
+import type { Table } from '@uwdata/flechette';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { ITraceRoot } from './traceRoot.js';
@@ -28,7 +28,7 @@ import type { AnySpanBuffer, SpanBuffer } from './types.js';
  * BufferStrategy interface for memory management and Arrow conversion.
  *
  * Implementations:
- * - JsBufferStrategy: GC-managed JS TypedArrays, zero-copy Arrow via apache-arrow-js
+ * - JsBufferStrategy: GC-managed JS TypedArrays, zero-copy Arrow via flechette
  * - WasmBufferStrategy: WASM memory with freelist, Arrow built in WASM
  * - (future) NapiBufferStrategy: Native code with SharedArrayBuffer
  *
@@ -83,23 +83,12 @@ export interface BufferStrategy<T extends LogSchema = LogSchema> {
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T>;
 
   /**
-   * Convert a SpanBuffer (and its tree) to Arrow RecordBatch.
-   *
-   * Each strategy knows the optimal conversion path:
-   * - JS: Zero-copy wrap TypedArrays via apache-arrow-js
-   * - WASM: Build Arrow in WASM memory, return bytes
-   * - NAPI: Call into native code for parallel conversion
-   *
-   * @param buffer - Root buffer to convert (includes children and overflow chain)
-   * @returns Arrow RecordBatch (sync) or Promise<RecordBatch> (async for WASM/NAPI)
-   */
-  toArrowRecordBatch(buffer: AnySpanBuffer): RecordBatch | Promise<RecordBatch>;
-
-  /**
    * Convert a SpanBuffer tree to Arrow Table.
    *
-   * Convenience method that wraps toArrowRecordBatch in a Table.
-   * Some strategies may provide optimized implementations.
+   * Each strategy knows the optimal conversion path:
+   * - JS: Zero-copy wrap TypedArrays via flechette
+   * - WASM: Build Arrow in WASM memory, return table
+   * - NAPI: Call into native code for parallel conversion
    *
    * @param buffer - Root buffer to convert (includes children and overflow chain)
    * @returns Arrow Table (sync) or Promise<Table> (async)

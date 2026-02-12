@@ -1,7 +1,7 @@
 /**
  * JsBufferStrategy - Default buffer strategy using JavaScript TypedArrays.
  *
- * Uses GC-managed memory with zero-copy Arrow conversion via apache-arrow-js.
+ * Uses GC-managed memory with zero-copy Arrow conversion via flechette.
  *
  * Memory characteristics:
  * - Buffers are regular JS objects with TypedArray properties
@@ -11,9 +11,9 @@
  * @module JsBufferStrategy
  */
 
-import type { RecordBatch, Table } from 'apache-arrow';
+import type { Table } from '@uwdata/flechette';
 import type { BufferStrategy } from './bufferStrategy.js';
-import { convertSpanTreeToArrowTable, convertToRecordBatch } from './convertToArrow.js';
+import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import {
@@ -84,11 +84,6 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
     return createOverflowBufferImpl(buffer);
-  }
-
-  toArrowRecordBatch(buffer: AnySpanBuffer): RecordBatch {
-    // Uses existing zero-copy conversion
-    return convertToRecordBatch(buffer);
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {

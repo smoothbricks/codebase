@@ -4,8 +4,6 @@
  * Re-exports schema type guards from arrow-builder and adds lmao-specific guards.
  */
 
-import type * as arrow from 'apache-arrow';
-
 // Re-export schema type guards from arrow-builder
 export {
   getEnumUtf8,
@@ -17,20 +15,6 @@ export {
 
 import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
 import type { FeatureFlagDefinition } from './types.js';
-
-/**
- * Type guard to check if a value is an Arrow builder
- * Arrow builders have an `append` method for adding values to columnar storage
- */
-export function isArrowBuilder(value: unknown): value is arrow.Builder {
-  return (
-    value !== null &&
-    value !== undefined &&
-    typeof value === 'object' &&
-    'append' in value &&
-    typeof (value as Record<string, unknown>).append === 'function'
-  );
-}
 
 /**
  * Type guard to check if a value is a FeatureFlagDefinition

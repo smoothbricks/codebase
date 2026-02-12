@@ -7,7 +7,7 @@
  * - Background processing (cold path)
  */
 
-import { type RecordBatch, Table } from 'apache-arrow';
+import { Table } from '@uwdata/flechette';
 import type { CapacityStatsEntry } from './arrow/capacityStats.js';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
@@ -369,10 +369,8 @@ export class FlushScheduler {
     if (tables.length === 1) {
       combinedTable = tables[0];
     } else {
-      // Concatenate by extracting all record batches
-      // Use first table's schema as reference
       const schema = tables[0].schema;
-      const allBatches: RecordBatch[] = [];
+      const allBatches = [];
 
       for (const table of tables) {
         // Cast batches to the reference schema to ensure compatibility
@@ -381,7 +379,6 @@ export class FlushScheduler {
         }
       }
 
-      // Create combined table with explicit schema
       try {
         combinedTable = new Table(schema, allBatches);
       } catch (_error) {

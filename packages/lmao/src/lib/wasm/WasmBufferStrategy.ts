@@ -13,9 +13,9 @@
  * @module WasmBufferStrategy
  */
 
-import type { RecordBatch, Table } from 'apache-arrow';
+import type { Table } from '@uwdata/flechette';
 import type { BufferStrategy } from '../bufferStrategy.js';
-import { convertSpanTreeToArrowTable, convertToRecordBatch } from '../convertToArrow.js';
+import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { EMPTY_SCOPE } from '../spanBuffer.js';
@@ -151,12 +151,6 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     );
 
     return overflow as unknown as SpanBuffer<T>;
-  }
-
-  toArrowRecordBatch(buffer: AnySpanBuffer): RecordBatch {
-    // WASM buffers expose the same interface as JS buffers (timestamp, entry_type, etc.)
-    // so we can use the existing conversion functions
-    return convertToRecordBatch(buffer);
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {

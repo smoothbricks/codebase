@@ -2,7 +2,7 @@
  * Dictionary building for Arrow conversion
  */
 
-import { Uint8, Uint16, Uint32 } from 'apache-arrow';
+import { type IntType, uint8, uint16, uint32 } from '@uwdata/flechette';
 import type { AnySpanBuffer } from '../types.js';
 import { concatenateNullBitmaps } from './utils.js';
 
@@ -15,7 +15,7 @@ export class DictionaryBuildResult {
     public readonly dictionary: string[],
     public readonly indices: Uint8Array | Uint16Array | Uint32Array,
     public readonly indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
-    public readonly arrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32,
+    public readonly arrowIndexType: IntType,
     public readonly nullBitmap: Uint8Array | undefined,
     public readonly nullCount: number,
   ) {}
@@ -56,7 +56,7 @@ export function buildSortedCategoryDictionary(
   // Determine index type constructors based on dictionary size
   const uniqueCount = dictionary.length;
   const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+  const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
   const indices = new indexArrayCtor(totalRows);
   const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
@@ -77,7 +77,7 @@ export function buildSortedCategoryDictionary(
     rowOffset += buf._writeIndex;
   }
 
-  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);
+  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexType, nullBitmap, nullCount);
 }
 
 /**
@@ -118,7 +118,7 @@ export function buildTextDictionary(
   }
 
   if (frequencyMap.size === 0) {
-    return new DictionaryBuildResult([], new Uint32Array(totalRows), Uint32Array, Uint32, undefined, totalRows);
+    return new DictionaryBuildResult([], new Uint32Array(totalRows), Uint32Array, uint32(), undefined, totalRows);
   }
 
   const dictionary = Array.from(frequencyMap.keys());
@@ -127,7 +127,7 @@ export function buildTextDictionary(
   // Determine index type constructors based on dictionary size
   const uniqueCount = dictionary.length;
   const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+  const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
   const indices = new indexArrayCtor(totalRows);
   const { nullBitmap, nullCount } = concatenateNullBitmaps(buffers, columnName);
 
@@ -148,5 +148,5 @@ export function buildTextDictionary(
     rowOffset += buf._writeIndex;
   }
 
-  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexTypeCtor, nullBitmap, nullCount);
+  return new DictionaryBuildResult(dictionary, indices, indexArrayCtor, arrowIndexType, nullBitmap, nullCount);
 }
