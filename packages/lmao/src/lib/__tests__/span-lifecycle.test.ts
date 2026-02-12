@@ -45,6 +45,18 @@ const ctx = defineOpContext({
   },
 });
 
+function getColumnValue<T>(
+  table: ReturnType<typeof convertSpanTreeToArrowTable>,
+  columnName: string,
+  rowIndex: number,
+): T {
+  const column = table.getChild(columnName);
+  if (!column) {
+    throw new Error(`column not found: ${columnName}`);
+  }
+  return column.get(rowIndex) as T;
+}
+
 describe('Span Lifecycle', () => {
   it('should write span-start entry when task begins', async () => {
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
@@ -289,7 +301,13 @@ describe('Child Span Lifecycle', () => {
     // - Row 3: child span-ok
     expect(table.numRows).toBeGreaterThanOrEqual(4);
 
-    const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+    const rows = Array.from({ length: table.numRows }, (_, rowIndex) => ({
+      entry_type: getColumnValue<string | null>(table, 'entry_type', rowIndex),
+      message: getColumnValue<string | null>(table, 'message', rowIndex),
+      span_id: getColumnValue<bigint | null>(table, 'span_id', rowIndex),
+      parent_span_id: getColumnValue<bigint | null>(table, 'parent_span_id', rowIndex),
+      trace_id: getColumnValue<bigint | null>(table, 'trace_id', rowIndex),
+    }));
 
     // Find root span-start (entry_type = span-start, message matches)
     const rootSpanStart = rows.find((r) => r?.entry_type === 'span-start' && r?.message === 'root-task');

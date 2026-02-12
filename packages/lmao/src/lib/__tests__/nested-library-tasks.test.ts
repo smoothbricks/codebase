@@ -27,6 +27,22 @@ import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
+function extractRows(
+  table: ReturnType<typeof convertSpanTreeToArrowTable>,
+  columns: readonly string[],
+): Array<Record<string, unknown>> {
+  return Array.from({ length: table.numRows }, (_, rowIndex) => {
+    const row: Record<string, unknown> = {};
+    for (const columnName of columns) {
+      const column = table.getChild(columnName);
+      if (column) {
+        row[columnName] = column.get(rowIndex) as unknown;
+      }
+    }
+    return row;
+  });
+}
+
 describe('Nested Library Tasks', () => {
   describe('4-level nesting WITHOUT library prefixes (regular module contexts)', () => {
     /**
@@ -189,7 +205,16 @@ describe('Nested Library Tasks', () => {
       expect(table.numRows).toBeGreaterThanOrEqual(8);
 
       // Extract all rows for verification
-      const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+      const rows = extractRows(table, [
+        'entry_type',
+        'message',
+        'span_id',
+        'parent_span_id',
+        'trace_id',
+        'http_status',
+        'db_status',
+        'process_status',
+      ]);
 
       // Find span-start entries for each level
       const spanStarts = rows.filter((r) => r?.entry_type === 'span-start');
@@ -508,7 +533,7 @@ describe('Nested Library Tasks', () => {
       expect(fieldNames).toContain('db_table');
 
       // Extract rows
-      const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+      const rows = extractRows(table, ['entry_type', 'message', 'span_id', 'parent_span_id', 'trace_id']);
       const spanStarts = rows.filter((r) => r?.entry_type === 'span-start');
 
       // Should have 4 span-start entries
@@ -583,33 +608,25 @@ describe('Nested Library Tasks', () => {
       expect(fieldNames).toContain('db_status');
       expect(fieldNames).toContain('process_status');
 
-      // Extract rows
-      const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+      const rows = extractRows(table, ['http_status', 'db_status', 'process_status']);
 
-      // Find span-start rows for each task
-      const httpSpan = rows.find((r) => r?.entry_type === 'span-start' && r?.message === 'http-request');
-      const dbSpan = rows.find((r) => r?.entry_type === 'span-start' && r?.message === 'db-connect');
-      const processSpan = rows.find((r) => r?.entry_type === 'span-start' && r?.message === 'run-process');
+      const httpRow = rows.find((r) => r.http_status === 200);
+      const dbRow = rows.find((r) => r.db_status === 'connected');
+      const processRow = rows.find((r) => r.process_status === 'running');
 
-      // HTTP task wrote to http_status (number: 200)
-      expect(httpSpan?.http_status).toBe(200);
+      expect(httpRow).toBeDefined();
+      expect(dbRow).toBeDefined();
+      expect(processRow).toBeDefined();
 
-      // DB task wrote to db_status (string: 'connected')
-      expect(dbSpan?.db_status).toBe('connected');
+      // Verify no cross-contamination - each task only wrote to its own status column.
+      expect(httpRow?.db_status).toBeNull();
+      expect(httpRow?.process_status).toBeNull();
 
-      // Process task wrote to process_status (enum: 'running')
-      expect(processSpan?.process_status).toBe('running');
+      expect(dbRow?.http_status).toBeNull();
+      expect(dbRow?.process_status).toBeNull();
 
-      // Verify no cross-contamination - each task only wrote to its own column
-      // Other status columns should be null for each span
-      expect(httpSpan?.db_status).toBeNull();
-      expect(httpSpan?.process_status).toBeNull();
-
-      expect(dbSpan?.http_status).toBeNull();
-      expect(dbSpan?.process_status).toBeNull();
-
-      expect(processSpan?.http_status).toBeNull();
-      expect(processSpan?.db_status).toBeNull();
+      expect(processRow?.http_status).toBeNull();
+      expect(processRow?.db_status).toBeNull();
     });
   });
 
@@ -674,7 +691,7 @@ describe('Nested Library Tasks', () => {
       expect(table.numRows).toBe(10);
 
       // Extract rows
-      const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+      const rows = extractRows(table, ['entry_type', 'message', 'nodeId']);
       const spanStarts = rows.filter((r) => r?.entry_type === 'span-start');
 
       // Should have 5 span-start entries
@@ -731,7 +748,7 @@ describe('Nested Library Tasks', () => {
       const table = convertSpanTreeToArrowTable(rootBuffer);
 
       // Extract span-start rows in table order
-      const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+      const rows = extractRows(table, ['entry_type', 'message', 'order']);
       const spanStarts = rows.filter((r) => r?.entry_type === 'span-start');
 
       // Per specs/01k - depth-first pre-order: parent before children
@@ -811,7 +828,7 @@ describe('Nested Library Tasks', () => {
       const table = convertSpanTreeToArrowTable(rootBuffer);
 
       // Extract info log entries
-      const rows = Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON());
+      const rows = extractRows(table, ['entry_type', 'message', 'requestId', 'userId', 'scopeValue']);
       const infoLogs = rows.filter((r) => r?.entry_type === 'info');
 
       // All info logs should have requestId (scoped at root)

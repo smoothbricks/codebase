@@ -60,14 +60,28 @@ function createTestTracer() {
   return new TestTracer(ctx, { ...createTestTracerOptions() });
 }
 
+function getColumnValue<T>(
+  table: ReturnType<typeof convertSpanTreeToArrowTable>,
+  columnName: string,
+  rowIndex: number,
+): T {
+  const column = table.getChild(columnName);
+  if (!column) {
+    throw new Error(`column not found: ${columnName}`);
+  }
+  return column.get(rowIndex) as T;
+}
+
 /**
  * Count rows in Arrow table by entry_type
  */
 function countRowsByEntryType(table: ReturnType<typeof convertSpanTreeToArrowTable>): Record<string, number> {
   const counts: Record<string, number> = {};
   for (let i = 0; i < table.numRows; i++) {
-    const row = table.get(i)?.toJSON();
-    const entryType = row?.entry_type as string;
+    const entryType = getColumnValue<string | null>(table, 'entry_type', i);
+    if (!entryType) {
+      continue;
+    }
     counts[entryType] = (counts[entryType] || 0) + 1;
   }
   return counts;
@@ -77,7 +91,29 @@ function countRowsByEntryType(table: ReturnType<typeof convertSpanTreeToArrowTab
  * Extract all rows from Arrow table as JSON
  */
 function extractRows(table: ReturnType<typeof convertSpanTreeToArrowTable>): Array<Record<string, unknown>> {
-  return Array.from({ length: table.numRows }, (_, i) => table.get(i)?.toJSON() as Record<string, unknown>);
+  const columns = [
+    'entry_type',
+    'message',
+    'userId',
+    'requestId',
+    'operation',
+    'duration',
+    'index',
+    'errorMsg',
+    'parent_span_id',
+    'span_id',
+    'trace_id',
+  ] as const;
+  return Array.from({ length: table.numRows }, (_, rowIndex) => {
+    const row: Record<string, unknown> = {};
+    for (const columnName of columns) {
+      const column = table.getChild(columnName);
+      if (column) {
+        row[columnName] = column.get(rowIndex) as unknown;
+      }
+    }
+    return row;
+  });
 }
 
 describe('Buffer Overflow - Op-centric API Integration', () => {

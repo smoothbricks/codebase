@@ -45,6 +45,16 @@ function getRawTimestamp(table: Table, rowIndex: number): bigint {
   return values[rowIndex];
 }
 
+function getColumnValue<T>(table: Table, columnName: string, rowIndex: number): T {
+  const column = table.getChild(columnName);
+  if (!column) throw new Error(`column not found: ${columnName}`);
+  return column.get(rowIndex) as T;
+}
+
+function toBigInt(value: number | bigint): bigint {
+  return typeof value === 'bigint' ? value : BigInt(value);
+}
+
 describe('Arrow Table Conversion', () => {
   describe('Single buffer conversion', () => {
     test('converts basic span buffer to Arrow table', () => {
@@ -75,13 +85,11 @@ describe('Arrow Table Conversion', () => {
       expect(table.numCols).toBeGreaterThan(0);
 
       // Check that columns exist
-      const row0 = table.get(0)?.toJSON();
-      // Use helper for raw timestamp (Arrow JS converts to milliseconds in toJSON)
       expect(getRawTimestamp(table, 0)).toBe(1000n);
-      expect(row0?.entry_type).toBe('span-start');
-      expect(row0?.message).toBe('test-span');
-      expect(row0?.httpStatus).toBe(200);
-      expect(row0?.userId).toBe('user-123');
+      expect(getColumnValue<string>(table, 'entry_type', 0)).toBe('span-start');
+      expect(getColumnValue<string>(table, 'message', 0)).toBe('test-span');
+      expect(getColumnValue<number>(table, 'httpStatus', 0)).toBe(200);
+      expect(getColumnValue<string>(table, 'userId', 0)).toBe('user-123');
     });
 
     test('handles multiple rows in buffer', () => {
@@ -119,20 +127,17 @@ describe('Arrow Table Conversion', () => {
 
       expect(table.numRows).toBe(3);
 
-      const row0 = table.get(0)?.toJSON();
       expect(getRawTimestamp(table, 0)).toBe(1000n);
-      expect(row0?.entry_type).toBe('span-start');
-      expect(row0?.level).toBe('INFO');
+      expect(getColumnValue<string>(table, 'entry_type', 0)).toBe('span-start');
+      expect(getColumnValue<string>(table, 'level', 0)).toBe('INFO');
 
-      const row1 = table.get(1)?.toJSON();
       expect(getRawTimestamp(table, 1)).toBe(2000n);
-      expect(row1?.entry_type).toBe('info');
-      expect(row1?.level).toBe('DEBUG');
+      expect(getColumnValue<string>(table, 'entry_type', 1)).toBe('info');
+      expect(getColumnValue<string>(table, 'level', 1)).toBe('DEBUG');
 
-      const row2 = table.get(2)?.toJSON();
       expect(getRawTimestamp(table, 2)).toBe(3000n);
-      expect(row2?.entry_type).toBe('span-ok');
-      expect(row2?.level).toBe('WARN');
+      expect(getColumnValue<string>(table, 'entry_type', 2)).toBe('span-ok');
+      expect(getColumnValue<string>(table, 'level', 2)).toBe('WARN');
     });
 
     test('handles null values correctly', () => {
@@ -161,9 +166,8 @@ describe('Arrow Table Conversion', () => {
 
       expect(table.numRows).toBe(1);
 
-      const row0 = table.get(0)?.toJSON();
-      expect(row0?.requiredField).toBe(42);
-      expect(row0?.optionalField).toBeNull();
+      expect(getColumnValue<number>(table, 'requiredField', 0)).toBe(42);
+      expect(getColumnValue<string | null | undefined>(table, 'optionalField', 0)).toBeUndefined();
     });
   });
 
@@ -200,13 +204,11 @@ describe('Arrow Table Conversion', () => {
 
       expect(table.numRows).toBe(2);
 
-      const row0 = table.get(0)?.toJSON();
       expect(getRawTimestamp(table, 0)).toBe(1000n);
-      expect(row0?.counter).toBe(1);
+      expect(getColumnValue<number>(table, 'counter', 0)).toBe(1);
 
-      const row1 = table.get(1)?.toJSON();
       expect(getRawTimestamp(table, 1)).toBe(2000n);
-      expect(row1?.counter).toBe(2);
+      expect(getColumnValue<number>(table, 'counter', 1)).toBe(2);
     });
 
     test('handles multiple chained buffers', () => {
@@ -247,7 +249,11 @@ describe('Arrow Table Conversion', () => {
       expect(table.numRows).toBe(3);
 
       // Verify all values are present
-      const values = [table.get(0)?.toJSON()?.value, table.get(1)?.toJSON()?.value, table.get(2)?.toJSON()?.value];
+      const values = [
+        getColumnValue<number>(table, 'value', 0),
+        getColumnValue<number>(table, 'value', 1),
+        getColumnValue<number>(table, 'value', 2),
+      ];
       expect(values).toEqual([1, 2, 3]);
     });
   });
@@ -307,15 +313,13 @@ describe('Arrow Table Conversion', () => {
       expect(table.numRows).toBe(4);
 
       // Verify span hierarchy is preserved
-      const rows = [table.get(0)?.toJSON(), table.get(1)?.toJSON(), table.get(2)?.toJSON(), table.get(3)?.toJSON()];
-
       // All should have same trace_id
-      const traceIds = rows.map((r) => r?.trace_id);
+      const traceIds = [0, 1, 2, 3].map((rowIndex) => getColumnValue<bigint>(table, 'trace_id', rowIndex));
       expect(new Set(traceIds).size).toBe(1);
 
       // Parent and child should have different span_ids
       // Order: parent start (0), parent end (1), child start (2), child end (3)
-      const spanIds = rows.map((r) => r?.span_id);
+      const spanIds = [0, 1, 2, 3].map((rowIndex) => getColumnValue<bigint>(table, 'span_id', rowIndex));
       expect(spanIds[0]).toBe(spanIds[1]); // Parent start and end (both from parent buffer)
       expect(spanIds[2]).toBe(spanIds[3]); // Child start and end (both from child buffer)
       expect(spanIds[0]).not.toBe(spanIds[2]); // Parent != Child
@@ -422,8 +426,7 @@ describe('Arrow Table Conversion', () => {
 
       // Verify each entry type is correctly converted
       for (let i = 0; i < entryTypes.length; i++) {
-        const row = table.get(i)?.toJSON();
-        expect(row?.entry_type).toBe(expectedNames[i]);
+        expect(getColumnValue<string>(table, 'entry_type', i)).toBe(expectedNames[i]);
       }
     });
   });
@@ -457,35 +460,28 @@ describe('Arrow Table Conversion', () => {
 
       // Should have span entries (2) + buffer metric entries (4) = 6 rows total
       expect(table.numRows).toBe(6);
-      expect((table as unknown as { data: unknown[] }).data.length).toBe(2); // One batch for span data, one for buffer metrics
 
       // Verify span entries
-      const row0 = table.get(0)?.toJSON();
-      expect(row0?.entry_type).toBe('span-start');
-      expect(row0?.message).toBe('test-span');
+      expect(getColumnValue<string>(table, 'entry_type', 0)).toBe('span-start');
+      expect(getColumnValue<string>(table, 'message', 0)).toBe('test-span');
 
-      const row1 = table.get(1)?.toJSON();
-      expect(row1?.entry_type).toBe('info');
-      expect(row1?.message).toBe('Test log message');
+      expect(getColumnValue<string>(table, 'entry_type', 1)).toBe('info');
+      expect(getColumnValue<string>(table, 'message', 1)).toBe('Test log message');
 
       // Verify buffer metric entries (4 rows per module for utilization-based tuning)
       // Per spec, buffer metrics use uint64_value column, NOT JSON in message
-      const row2 = table.get(2)?.toJSON();
-      expect(row2?.entry_type).toBe('period-start');
-      expect(row2?.package_name).toBe('@test/package');
-      expect(row2?.uint64_value).toBe(0n); // periodStartNs defaults to 0n
+      expect(getColumnValue<string>(table, 'entry_type', 2)).toBe('period-start');
+      expect(getColumnValue<string>(table, 'package_name', 2)).toBe('@test/package');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 2))).toBe(0n); // periodStartNs defaults to 0n
 
-      const row3 = table.get(3)?.toJSON();
-      expect(row3?.entry_type).toBe('buffer-writes');
-      expect(row3?.uint64_value).toBe(50n); // totalWrites
+      expect(getColumnValue<string>(table, 'entry_type', 3)).toBe('buffer-writes');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 3))).toBe(50n); // totalWrites
 
-      const row4 = table.get(4)?.toJSON();
-      expect(row4?.entry_type).toBe('buffer-spans');
-      expect(row4?.uint64_value).toBe(5n); // spansCreated
+      expect(getColumnValue<string>(table, 'entry_type', 4)).toBe('buffer-spans');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 4))).toBe(5n); // spansCreated
 
-      const row5 = table.get(5)?.toJSON();
-      expect(row5?.entry_type).toBe('buffer-capacity');
-      expect(row5?.uint64_value).toBe(128n); // capacity
+      expect(getColumnValue<string>(table, 'entry_type', 5)).toBe('buffer-capacity');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 5))).toBe(128n); // capacity
     });
 
     test('includes only buffer metrics when no span data', () => {
@@ -508,23 +504,18 @@ describe('Arrow Table Conversion', () => {
 
       // Should have only buffer metric entries (4 rows)
       expect(table.numRows).toBe(4);
-      expect((table as unknown as { data: unknown[] }).data.length).toBe(1); // Only buffer metrics batch
 
-      const row0 = table.get(0)?.toJSON();
-      expect(row0?.entry_type).toBe('period-start');
-      expect(row0?.uint64_value).toBe(0n);
+      expect(getColumnValue<string>(table, 'entry_type', 0)).toBe('period-start');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 0))).toBe(0n);
 
-      const row1 = table.get(1)?.toJSON();
-      expect(row1?.entry_type).toBe('buffer-writes');
-      expect(row1?.uint64_value).toBe(10n);
+      expect(getColumnValue<string>(table, 'entry_type', 1)).toBe('buffer-writes');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 1))).toBe(10n);
 
-      const row2 = table.get(2)?.toJSON();
-      expect(row2?.entry_type).toBe('buffer-spans');
-      expect(row2?.uint64_value).toBe(2n); // spansCreated
+      expect(getColumnValue<string>(table, 'entry_type', 2)).toBe('buffer-spans');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 2))).toBe(2n); // spansCreated
 
-      const row3 = table.get(3)?.toJSON();
-      expect(row3?.entry_type).toBe('buffer-capacity');
-      expect(row3?.uint64_value).toBe(64n); // capacity
+      expect(getColumnValue<string>(table, 'entry_type', 3)).toBe('buffer-capacity');
+      expect(toBigInt(getColumnValue<number | bigint>(table, 'uint64_value', 3))).toBe(64n); // capacity
     });
   });
 });

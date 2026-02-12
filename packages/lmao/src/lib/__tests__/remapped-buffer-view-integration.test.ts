@@ -20,6 +20,22 @@ import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
+function extractRows(
+  table: ReturnType<typeof convertSpanTreeToArrowTable>,
+  columns: readonly string[],
+): Array<Record<string, unknown>> {
+  return Array.from({ length: table.numRows }, (_, rowIndex) => {
+    const row: Record<string, unknown> = {};
+    for (const columnName of columns) {
+      const column = table.getChild(columnName);
+      if (column) {
+        row[columnName] = column.get(rowIndex) as unknown;
+      }
+    }
+    return row;
+  });
+}
+
 describe('RemappedBufferView Integration', () => {
   describe('basic span execution', () => {
     it('should execute parent and child ops correctly', async () => {
@@ -109,10 +125,7 @@ describe('RemappedBufferView Integration', () => {
 
       // Verify actual data values in rows
       // Collect all rows for easier debugging
-      const rows: Record<string, unknown>[] = [];
-      for (let i = 0; i < table.numRows; i++) {
-        rows.push(table.get(i)?.toJSON() as Record<string, unknown>);
-      }
+      const rows = extractRows(table, ['userId', 'action', 'message', 'entry_type']);
 
       // Find the row with our userId (should be the tag row or span-start row)
       const userIdRow = rows.find((r) => r.userId === 'test-user');
