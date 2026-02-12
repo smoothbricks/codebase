@@ -8,6 +8,9 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 of `npm run`. Dev tools like `nx`, `biome`, etc. are available directly on PATH (via node_modules/.bin) so use them
 directly without `bunx`.
 
+**Error handling policy:** Known operational failures must return `Err`/`Result`; reserve `throw` for invariants or
+impossible programmer/configuration bugs. For full policy and examples, follow `AGENTS.md`.
+
 ## Common Development Commands
 
 ### Build and Development

@@ -108,6 +108,29 @@ When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
 - **QUESTION ASSUMPTIONS** - implementation may have discovered better approaches than spec requirements
 - When in doubt, ask - don't blindly follow specs if implementation suggests better patterns
 
+## ERROR HANDLING POLICY (RESULT VS THROW)
+
+This repo uses a strict policy:
+
+- **Known operational failures MUST return `Err`/`Result`** (validation failures, business-rule failures, transient
+  errors, blocked state, missing optional dependencies, missing runtime data, retryable failures).
+- **`throw` is ONLY for invariants / impossible states / programmer bugs** (type exhaustiveness failures, impossible
+  internal state, broken build/runtime contracts).
+- **No SQS exception to this rule**: known retry cases MUST be represented as structured failures and mapped to platform
+  responses (e.g. Lambda SQS `batchItemFailures`), not thrown.
+
+### Trace semantics
+
+- `span-err`: expected operational error represented via `ctx.err(...)` / `Err`.
+- `span-exception`: unexpected thrown exception (bug/invariant break).
+
+### Agent implementation requirements
+
+- If code currently throws for a known operational failure, migrate it to a typed `Err` with explicit error code.
+- If a throw is retained, add a short comment explaining invariant intent, e.g.
+  `// invariant throw: programmer/config bug`.
+- Prefer type guards and exhaustive checks so impossible states are prevented at compile-time where feasible.
+
 ---
 
 ## 🔍 CRITICAL ANALYSIS APPROACH - SPECS ARE NOT SACRED

@@ -220,6 +220,13 @@ return ctx.ok(user).message('User created successfully');
 
 **Note**: Entry types are always written by `span()`/`trace()` at span-end, never by the result constructor.
 
+#### When to Return vs Throw
+
+- **Known operational failures MUST return `Err`** (including `ctx.err(...)`), which produces `span-err`.
+- **Unexpected invariant/programmer failures MAY throw**, which produces `span-exception`.
+- Operational retry signaling must stay in `Err` values; do not rely on thrown exceptions for known retry paths.
+- A thrown exception represents a bug or violated invariant, not normal control flow.
+
 ### Retry Entry Type
 
 The `span-retry` entry type provides observability for transient failure handling in Op execution:

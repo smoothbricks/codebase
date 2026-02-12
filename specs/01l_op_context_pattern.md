@@ -398,6 +398,14 @@ The Tracer detects if a function returns `FluentOk` or `FluentErr`:
 - If no (plain Result): Tracer writes `span-ok` to row 1
 - If throws: Tracer writes `span-exception` to row 1
 
+### Error Handling Policy (Return vs Throw)
+
+- Use `ctx.err(...)`/`Err` for known operational outcomes (validation failures, business rules, transient conditions,
+  blocked state, missing optional dependencies).
+- Reserve `throw` for invariant violations or programmer/configuration bugs that should not occur in normal execution.
+- `span-err` means expected failure represented as a value; `span-exception` means an unexpected thrown exception.
+- Do not use `throw` to signal known retry behavior; retry decisions should flow through typed error values.
+
 ### Defining Ops
 
 **Single op:**

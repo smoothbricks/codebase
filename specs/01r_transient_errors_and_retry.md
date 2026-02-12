@@ -427,6 +427,13 @@ Use TransientError for:
 - Temporary resource unavailability
 - Optimistic locking failures
 
+### When to Return vs Throw
+
+- Retry-eligible failures must be returned as `ctx.err(Transient(...))`, not thrown.
+- `ctx.err(...)`/`Err` covers all known operational outcomes (transient, blocked, code/business errors).
+- Throw only for unexpected invariant failures (bugs, impossible states, broken runtime contracts).
+- `span-retry` and `span-err` entries are driven by returned errors; `span-exception` indicates unexpected throw paths.
+
 ### When to Use Blocked
 
 Use Blocked for:
