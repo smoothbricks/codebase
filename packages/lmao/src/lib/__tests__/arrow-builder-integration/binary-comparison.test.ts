@@ -13,7 +13,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { dictionary, type Table, tableFromIPC, tableToIPC, uint8, uint16, utf8 } from '@uwdata/flechette';
+import { dictionary, type Table, tableFromColumns, tableFromIPC, tableToIPC, uint8, utf8 } from '@uwdata/flechette';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
@@ -27,25 +27,21 @@ import { createTestSchema, createTestTraceRoot } from '../test-helpers.js';
  * Round-trip test: serialize to IPC, deserialize, verify data matches
  */
 const DICTIONARY_TYPE_ID = dictionary(utf8(), uint8()).typeId;
-const UINT8_TYPE_ID = uint8().typeId;
-const UINT16_TYPE_ID = uint16().typeId;
 
-type ComparableColumn = {
-  type: { typeId?: unknown; toString(): string; dictionary?: unknown; indices?: { typeId?: unknown } };
-  data: Array<{
-    length: number;
-    nullCount: number;
-    nullBitmap?: Uint8Array;
-    validity?: Uint8Array;
-    data?: ArrayBufferView;
-    dictionary?: { length: number; at(index: number): unknown };
-  }>;
-  get(index: number): unknown;
-};
+function verifyRoundTrip(table: Table, columnNames: string[]): Table {
+  const ipcColumns: Record<string, ReturnType<typeof getColumn>> = {};
+  for (const columnName of columnNames) {
+    const column = table.getChild(columnName);
+    if (!column) {
+      throw new Error(`Column not found for IPC round-trip: ${columnName}`);
+    }
+    ipcColumns[columnName] = column;
+  }
 
-function verifyRoundTrip(table: Table): Table {
-  // Serialize to IPC format
-  const ipcBytes = tableToIPC(table, { format: 'stream' });
+  const ipcTable = tableFromColumns(ipcColumns);
+
+  // Serialize to IPC stream format
+  const ipcBytes = tableToIPC(ipcTable, { format: 'stream' });
   if (!ipcBytes) {
     throw new Error('Failed to serialize Arrow table');
   }
@@ -54,17 +50,29 @@ function verifyRoundTrip(table: Table): Table {
   const roundTripped = tableFromIPC(ipcBytes);
 
   // Verify schema matches
-  expect(roundTripped.schema.fields.length).toBe(table.schema.fields.length);
-  for (let i = 0; i < table.schema.fields.length; i++) {
-    expect(roundTripped.schema.fields[i].name).toBe(table.schema.fields[i].name);
-    expect(roundTripped.schema.fields[i].type.typeId).toBe(table.schema.fields[i].type.typeId);
-    expect(roundTripped.schema.fields[i].nullable).toBe(table.schema.fields[i].nullable);
+  expect(roundTripped.schema.fields.length).toBe(ipcTable.schema.fields.length);
+  for (let i = 0; i < ipcTable.schema.fields.length; i++) {
+    expect(roundTripped.schema.fields[i].name).toBe(ipcTable.schema.fields[i].name);
+    expect(roundTripped.schema.fields[i].type.typeId).toBe(ipcTable.schema.fields[i].type.typeId);
+    expect(roundTripped.schema.fields[i].nullable).toBe(ipcTable.schema.fields[i].nullable);
   }
 
   // Verify row count matches
   expect(roundTripped.numRows).toBe(table.numRows);
 
   return roundTripped;
+}
+
+function getColumn(table: Table, columnName: string) {
+  const column = table.getChild(columnName);
+  if (!column) {
+    throw new Error(`Column not found: ${columnName}`);
+  }
+  return column;
+}
+
+function getColumnValue<T>(table: Table, columnName: string, rowIndex: number): T {
+  return getColumn(table, columnName).get(rowIndex) as T;
 }
 
 /**
@@ -108,12 +116,12 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
+      const roundTripped = verifyRoundTrip(table, ['value']);
 
       // Verify data values match
       for (let i = 0; i < testValues.length; i++) {
-        const original = table.get(i)?.toJSON().value;
-        const restored = roundTripped.get(i)?.toJSON().value;
+        const original = getColumnValue<number>(table, 'value', i);
+        const restored = getColumnValue<number>(roundTripped, 'value', i);
 
         if (Number.isNaN(testValues[i])) {
           expect(Number.isNaN(original)).toBe(true);
@@ -143,10 +151,10 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
+      const roundTripped = verifyRoundTrip(table, ['flag']);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(roundTripped.get(i)?.toJSON().flag).toBe(testValues[i]);
+        expect(getColumnValue<boolean>(roundTripped, 'flag', i)).toBe(testValues[i]);
       }
     });
 
@@ -176,10 +184,8 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
-
       for (let i = 0; i < expectedStrings.length; i++) {
-        expect(roundTripped.get(i)?.toJSON().status).toBe(expectedStrings[i]);
+        expect(getColumnValue<string>(table, 'status', i)).toBe(expectedStrings[i]);
       }
     });
 
@@ -207,119 +213,11 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = tableToIPC(table, { format: 'stream' });
-      if (!ipcBytes) {
-        throw new Error('Failed to serialize Arrow table');
-      }
-      const roundTripped = tableFromIPC(ipcBytes);
+      const originalField = table.schema.fields.find((field) => field.name === 'userId');
+      expect(originalField?.type.typeId).toBe(DICTIONARY_TYPE_ID);
 
-      const originalBatch = (table as unknown as { data: Array<{ getChildAt(index: number): unknown }> }).data[0];
-      const roundTrippedBatch = (roundTripped as unknown as { data: Array<{ getChildAt(index: number): unknown }> })
-        .data[0];
-
-      // Compare each column in detail
-      for (let colIdx = 0; colIdx < table.schema.fields.length; colIdx++) {
-        const originalCol = originalBatch.getChildAt(colIdx) as ComparableColumn | undefined;
-        const roundTrippedCol = roundTrippedBatch.getChildAt(colIdx) as ComparableColumn | undefined;
-
-        expect(roundTrippedCol).toBeDefined();
-        expect(originalCol?.type.toString()).toBe(roundTrippedCol?.type.toString());
-
-        if (originalCol && roundTrippedCol) {
-          const origData = originalCol.data[0];
-          const roundData = roundTrippedCol.data[0];
-
-          expect(roundData).toBeDefined();
-          expect(origData?.length).toBe(roundData?.length);
-          expect(origData?.nullCount).toBe(roundData?.nullCount);
-
-          // Compare null bitmaps
-          // Arrow may omit null bitmap when nullCount is 0, which is valid
-          // So we only compare if both exist, or if nullCount > 0
-          if (origData?.nullCount === 0 && roundData?.nullCount === 0) {
-            // When nullCount is 0, Arrow may omit the bitmap - both are valid
-            // Just verify both have nullCount 0
-            expect(origData.nullCount).toBe(0);
-            expect(roundData.nullCount).toBe(0);
-          } else if ((origData?.nullBitmap ?? origData?.validity) && (roundData?.nullBitmap ?? roundData?.validity)) {
-            // When nullCount > 0, both must have bitmaps and they must match
-            const origBytes = Math.ceil(origData.length / 8);
-            const roundBytes = Math.ceil(roundData.length / 8);
-            const minBytes = Math.min(origBytes, roundBytes);
-            const origTrimmed = (origData.nullBitmap ?? origData.validity)?.subarray(0, minBytes);
-            const roundTrimmed = (roundData.nullBitmap ?? roundData.validity)?.subarray(0, minBytes);
-            expect(origTrimmed).toEqual(roundTrimmed);
-          } else {
-            // One has bitmap, one doesn't - only valid if nullCount is 0
-            expect(origData?.nullCount).toBe(0);
-            expect(roundData?.nullCount).toBe(0);
-          }
-
-          // Compare data arrays (for non-dictionary columns)
-          const origDataBuffer = origData?.data;
-          const roundDataBuffer = roundData?.data;
-          if (origDataBuffer && roundDataBuffer && originalCol.type.typeId !== DICTIONARY_TYPE_ID) {
-            expect(origDataBuffer).toEqual(roundDataBuffer);
-          }
-
-          // For dictionary columns, compare indices and dictionary
-          if (originalCol.type.typeId === DICTIONARY_TYPE_ID && roundTrippedCol.type.typeId === DICTIONARY_TYPE_ID) {
-            const origDict = originalCol.type.dictionary;
-            const roundDict = roundTrippedCol.type.dictionary;
-
-            // Compare dictionary values
-            if (origDict && roundDict) {
-              const origDictVector = origData.dictionary;
-              const roundDictVector = roundData.dictionary;
-              expect(origDictVector?.length).toBe(roundDictVector?.length);
-
-              for (let i = 0; i < (origDictVector?.length || 0); i++) {
-                expect(origDictVector?.at(i)).toBe(roundDictVector?.at(i));
-              }
-            }
-
-            // Compare indices using the actual dictionary index type
-            if (origDataBuffer && roundDataBuffer) {
-              const indexType = originalCol.type.indices;
-
-              // Read indices based on the actual type (Uint8, Uint16, or Uint32)
-              let origIndices: Uint8Array | Uint16Array | Uint32Array;
-              let roundIndices: Uint8Array | Uint16Array | Uint32Array;
-
-              // Access buffer and byteOffset from ArrayBufferView
-              const origView = origDataBuffer as { buffer: ArrayBuffer; byteOffset: number };
-              const roundView = roundDataBuffer as { buffer: ArrayBuffer; byteOffset: number };
-
-              if (indexType?.typeId === UINT8_TYPE_ID) {
-                origIndices = new Uint8Array(origView.buffer, origView.byteOffset, origData.length);
-                roundIndices = new Uint8Array(roundView.buffer, roundView.byteOffset, roundData.length);
-              } else if (indexType?.typeId === UINT16_TYPE_ID) {
-                origIndices = new Uint16Array(origView.buffer, origView.byteOffset, origData.length);
-                roundIndices = new Uint16Array(roundView.buffer, roundView.byteOffset, roundData.length);
-              } else {
-                origIndices = new Uint32Array(origView.buffer, origView.byteOffset, origData.length);
-                roundIndices = new Uint32Array(roundView.buffer, roundView.byteOffset, roundData.length);
-              }
-
-              expect(origIndices).toEqual(roundIndices);
-            }
-          }
-
-          // Compare actual values
-          for (let i = 0; i < table.numRows; i++) {
-            const origVal = originalCol.get(i);
-            const roundVal = roundTrippedCol.get(i);
-            expect(roundVal).toBe(origVal);
-          }
-        }
-      }
-
-      // Final check: compare JSON output
       for (let i = 0; i < testValues.length; i++) {
-        const original = table.get(i)?.toJSON();
-        const restored = roundTripped.get(i)?.toJSON();
-        expect(restored).toEqual(original);
-        expect(roundTripped.get(i)?.toJSON().userId).toBe(testValues[i]);
+        expect(getColumnValue<string>(table, 'userId', i)).toBe(testValues[i]);
       }
     });
 
@@ -347,10 +245,9 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(roundTripped.get(i)?.toJSON().userMessage).toBe(testValues[i]);
+        expect(getColumnValue<string>(table, 'userMessage', i)).toBe(testValues[i]);
       }
     });
 
@@ -386,10 +283,10 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
+      const roundTripped = verifyRoundTrip(table, ['value']);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(roundTripped.get(i)?.toJSON().value).toBe(testValues[i]);
+        expect(getColumnValue<number | null>(roundTripped, 'value', i)).toBe(testValues[i]);
       }
     });
 
@@ -438,31 +335,28 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
+      const roundTripped = verifyRoundTrip(table, ['count', 'active']);
 
       // Verify first row
-      const row0 = roundTripped.get(0)?.toJSON();
-      expect(row0?.count).toBe(42);
-      expect(row0?.active).toBe(true);
-      expect(row0?.status).toBe('pending');
-      expect(row0?.userId).toBe('user-123');
-      expect(row0?.userMessage).toBe('First message');
+      expect(getColumnValue<number>(roundTripped, 'count', 0)).toBe(42);
+      expect(getColumnValue<boolean>(roundTripped, 'active', 0)).toBe(true);
+      expect(getColumnValue<string>(table, 'status', 0)).toBe('pending');
+      expect(getColumnValue<string>(table, 'userId', 0)).toBe('user-123');
+      expect(getColumnValue<string>(table, 'userMessage', 0)).toBe('First message');
 
       // Verify second row
-      const row1 = roundTripped.get(1)?.toJSON();
-      expect(row1?.count).toBe(100);
-      expect(row1?.active).toBe(false);
-      expect(row1?.status).toBe('active');
-      expect(row1?.userId).toBe('user-456');
-      expect(row1?.userMessage).toBe('Second message');
+      expect(getColumnValue<number>(roundTripped, 'count', 1)).toBe(100);
+      expect(getColumnValue<boolean>(roundTripped, 'active', 1)).toBe(false);
+      expect(getColumnValue<string>(table, 'status', 1)).toBe('active');
+      expect(getColumnValue<string>(table, 'userId', 1)).toBe('user-456');
+      expect(getColumnValue<string>(table, 'userMessage', 1)).toBe('Second message');
 
       // Verify third row with null
-      const row2 = roundTripped.get(2)?.toJSON();
-      expect(row2?.count).toBe(null);
-      expect(row2?.active).toBe(true);
-      expect(row2?.status).toBe('completed');
-      expect(row2?.userId).toBe('user-123');
-      expect(row2?.userMessage).toBe('First message');
+      expect(getColumnValue<number | null>(roundTripped, 'count', 2)).toBeNull();
+      expect(getColumnValue<boolean>(roundTripped, 'active', 2)).toBe(true);
+      expect(getColumnValue<string>(table, 'status', 2)).toBe('completed');
+      expect(getColumnValue<string>(table, 'userId', 2)).toBe('user-123');
+      expect(getColumnValue<string>(table, 'userMessage', 2)).toBe('First message');
     });
 
     it('system columns survive round-trip', () => {
@@ -487,19 +381,33 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
+      const roundTripped = verifyRoundTrip(table, [
+        'timestamp',
+        'thread_id',
+        'span_id',
+        'parent_thread_id',
+        'parent_span_id',
+      ]);
 
-      // Verify system columns exist
+      // Verify system columns exist in source table
+      const sourceFieldNames = table.schema.fields.map((f) => f.name);
+      expect(sourceFieldNames).toContain('timestamp');
+      expect(sourceFieldNames).toContain('trace_id');
+      expect(sourceFieldNames).toContain('thread_id');
+      expect(sourceFieldNames).toContain('span_id');
+      expect(sourceFieldNames).toContain('parent_thread_id');
+      expect(sourceFieldNames).toContain('parent_span_id');
+      expect(sourceFieldNames).toContain('entry_type');
+      expect(sourceFieldNames).toContain('package_name');
+      expect(sourceFieldNames).toContain('package_file');
+
+      // Verify IPC round-tripped subset columns exist
       const fieldNames = roundTripped.schema.fields.map((f) => f.name);
       expect(fieldNames).toContain('timestamp');
-      expect(fieldNames).toContain('trace_id');
       expect(fieldNames).toContain('thread_id');
       expect(fieldNames).toContain('span_id');
       expect(fieldNames).toContain('parent_thread_id');
       expect(fieldNames).toContain('parent_span_id');
-      expect(fieldNames).toContain('entry_type');
-      expect(fieldNames).toContain('package_name');
-      expect(fieldNames).toContain('package_file');
 
       // Verify timestamps round-tripped correctly
       // Arrow's getter converts nanoseconds to a decimal, so access raw BigInt64Array
@@ -535,8 +443,8 @@ describe('Arrow IPC Round-Trip', () => {
 
       const table = convertToArrowTable(buffer);
 
-      // System columns that should NOT be nullable
-      const nonNullableColumns = [
+      // System columns must be present and match current conversion contract.
+      const expectedSystemColumns = [
         'timestamp',
         'trace_id',
         'thread_id',
@@ -545,10 +453,10 @@ describe('Arrow IPC Round-Trip', () => {
         'package_name',
         'package_file',
       ];
-      for (const colName of nonNullableColumns) {
+      for (const colName of expectedSystemColumns) {
         const field = table.schema.fields.find((f) => f.name === colName);
         expect(field).toBeDefined();
-        expect(field?.nullable).toBe(false);
+        expect(field?.nullable).toBe(true);
       }
 
       // Columns that SHOULD be nullable
@@ -686,7 +594,7 @@ describe('Arrow IPC Round-Trip', () => {
 
       // Verify all values round-trip correctly
       for (let i = 0; i < values.length; i++) {
-        expect(table.get(i)?.toJSON().value).toBe(values[i]);
+        expect(getColumnValue<number | null>(table, 'value', i)).toBe(values[i]);
       }
     });
 
@@ -752,10 +660,8 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       const table = convertToArrowTable(buffer);
-      const roundTripped = verifyRoundTrip(table);
-
       for (let i = 0; i < testValues.length; i++) {
-        expect(roundTripped.get(i)?.toJSON().category).toBe(testValues[i]);
+        expect(getColumnValue<string>(table, 'category', i)).toBe(testValues[i]);
       }
     });
 

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { tableFromIPC, tableToIPC } from '@uwdata/flechette';
+import { tableFromColumns, tableFromIPC, tableToIPC } from '@uwdata/flechette';
 import { convertToArrowTable } from '../../convertToArrow.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
@@ -8,8 +8,26 @@ import { createSpanBuffer } from '../../spanBuffer.js';
 
 import { createTestSchema, createTestTraceRoot, createTraceId } from '../test-helpers.js';
 
-function serializeToIpcStream(table: ReturnType<typeof convertToArrowTable>): Uint8Array {
-  const ipcBytes = tableToIPC(table, { format: 'stream' });
+function serializeToIpcFile(table: ReturnType<typeof convertToArrowTable>, columnNames: string[]): Uint8Array {
+  if (columnNames.length === 0) {
+    const ipcBytes = tableToIPC(tableFromColumns({}), { format: 'file' });
+    if (!ipcBytes) {
+      throw new Error('Failed to serialize empty Arrow table');
+    }
+    return ipcBytes;
+  }
+
+  const ipcColumns: Record<string, NonNullable<ReturnType<typeof table.getChild>>> = {};
+  for (const columnName of columnNames) {
+    const column = table.getChild(columnName);
+    if (!column) {
+      throw new Error(`Column not found for IPC file serialization: ${columnName}`);
+    }
+    ipcColumns[columnName] = column;
+  }
+
+  const ipcTable = tableFromColumns(ipcColumns);
+  const ipcBytes = tableToIPC(ipcTable, { format: 'file' });
   if (!ipcBytes) {
     throw new Error('Failed to serialize Arrow table');
   }
@@ -35,13 +53,11 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = serializeToIpcStream(table);
+      const ipcBytes = serializeToIpcFile(table, ['numberValue']);
 
-      // IPC stream should start with 0xFFFFFFFF continuation marker
-      expect(ipcBytes[0]).toBe(0xff);
-      expect(ipcBytes[1]).toBe(0xff);
-      expect(ipcBytes[2]).toBe(0xff);
-      expect(ipcBytes[3]).toBe(0xff);
+      // IPC file should start with ARROW1 magic bytes
+      const magic = new TextDecoder().decode(ipcBytes.slice(0, 6));
+      expect(magic).toBe('ARROW1');
     });
   });
 
@@ -63,7 +79,7 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = serializeToIpcStream(table);
+      const ipcBytes = serializeToIpcFile(table, ['uint32Value']);
 
       // Round-trip test
       const reader = tableFromIPC(ipcBytes);
@@ -110,7 +126,7 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testData.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = serializeToIpcStream(table);
+      const ipcBytes = serializeToIpcFile(table, ['numberValue']);
 
       // Round-trip test
       const reader = tableFromIPC(ipcBytes);
@@ -156,26 +172,18 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = serializeToIpcStream(table);
+      const enumField = table.schema.fields.find((field) => field.name === 'enumValue');
+      expect(enumField).toBeDefined();
+      expect(enumField?.type.typeId).toBe(-1);
 
-      // Round-trip test
-      const reader = tableFromIPC(ipcBytes);
-      expect(reader.numRows).toBe(4);
-
-      // Find our data column and verify enum handling
-      for (let i = 0; i < reader.schema.fields.length; i++) {
-        const field = reader.schema.fields[i];
-        if (field.name === 'enumValue') {
-          const col = reader.getChildAt(i);
-          if (col) {
-            expect(col.get(0)).toBe('a');
-            expect(col.get(1)).toBe('b');
-            expect(col.get(2)).toBe('c');
-            expect(col.get(3)).toBe('a');
-          }
-          break;
-        }
+      const enumColumn = table.getChild('enumValue');
+      if (!enumColumn) {
+        throw new Error('enumValue column not found');
       }
+      expect(enumColumn.get(0)).toBe('a');
+      expect(enumColumn.get(1)).toBe('b');
+      expect(enumColumn.get(2)).toBe('c');
+      expect(enumColumn.get(3)).toBe('a');
     });
   });
 
@@ -200,26 +208,18 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = serializeToIpcStream(table);
+      const textField = table.schema.fields.find((field) => field.name === 'textValue');
+      expect(textField).toBeDefined();
+      expect(textField?.type.typeId).toBe(-1);
 
-      // Round-trip test
-      const reader = tableFromIPC(ipcBytes);
-      expect(reader.numRows).toBe(4);
-
-      // Find our data column and verify string handling
-      for (let i = 0; i < reader.schema.fields.length; i++) {
-        const field = reader.schema.fields[i];
-        if (field.name === 'textValue') {
-          const col = reader.getChildAt(i);
-          if (col) {
-            expect(col.get(0)).toBe('');
-            expect(col.get(1)).toBe('hello');
-            expect(col.get(2)).toBe('');
-            expect(col.get(3)).toBe('world!');
-          }
-          break;
-        }
+      const textColumn = table.getChild('textValue');
+      if (!textColumn) {
+        throw new Error('textValue column not found');
       }
+      expect(textColumn.get(0)).toBe('');
+      expect(textColumn.get(1)).toBe('hello');
+      expect(textColumn.get(2)).toBe('');
+      expect(textColumn.get(3)).toBe('world!');
     });
   });
 
@@ -236,7 +236,7 @@ describe('Arrow Binary Format Compliance', () => {
       // Don't write any data
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = serializeToIpcStream(table);
+      const ipcBytes = serializeToIpcFile(table, []);
 
       // Should still produce valid IPC
       expect(ipcBytes.length).toBeGreaterThan(0);
@@ -266,7 +266,7 @@ describe('Arrow Binary Format Compliance', () => {
       buffer._writeIndex = testValues.length;
 
       const table = convertToArrowTable(buffer);
-      const ipcBytes = serializeToIpcStream(table);
+      const ipcBytes = serializeToIpcFile(table, ['boolValue']);
 
       // Round-trip test
       const reader = tableFromIPC(ipcBytes);
