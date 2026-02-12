@@ -142,9 +142,10 @@ export function createDictionary8Data(
   nullBitmap?: Uint8Array,
 ): ArrowColumn {
   const dictLength = dictOffsets.length - 1;
-  const Utf8BatchCtor = batchType(utf8());
+  const dictionaryValueType = utf8();
+  const Utf8BatchCtor = batchType(dictionaryValueType);
   const utf8Batch = new Utf8BatchCtor({
-    type: utf8(),
+    type: dictionaryValueType,
     length: dictLength,
     nullCount: 0,
     values: dictData,
@@ -153,7 +154,7 @@ export function createDictionary8Data(
   });
   const dictColumn = new Column([utf8Batch]) as Column<string>;
 
-  const dictionaryType = dictionary(utf8(), uint8());
+  const dictionaryType = dictionary(dictionaryValueType, uint8());
   const DictionaryBatchCtor = batchType(dictionaryType);
   const dictBatch = new DictionaryBatchCtor({
     type: dictionaryType,
@@ -176,9 +177,10 @@ export function createDictionary16Data(
   nullBitmap?: Uint8Array,
 ): ArrowColumn {
   const dictLength = dictOffsets.length - 1;
-  const Utf8BatchCtor = batchType(utf8());
+  const dictionaryValueType = utf8();
+  const Utf8BatchCtor = batchType(dictionaryValueType);
   const utf8Batch = new Utf8BatchCtor({
-    type: utf8(),
+    type: dictionaryValueType,
     length: dictLength,
     nullCount: 0,
     values: dictData,
@@ -187,7 +189,7 @@ export function createDictionary16Data(
   });
   const dictColumn = new Column([utf8Batch]) as Column<string>;
 
-  const dictionaryType = dictionary(utf8(), uint16());
+  const dictionaryType = dictionary(dictionaryValueType, uint16());
   const DictionaryBatchCtor = batchType(dictionaryType);
   const dictBatch = new DictionaryBatchCtor({
     type: dictionaryType,
@@ -210,9 +212,10 @@ export function createDictionary32Data(
   nullBitmap?: Uint8Array,
 ): ArrowColumn {
   const dictLength = dictOffsets.length - 1;
-  const Utf8BatchCtor = batchType(utf8());
+  const dictionaryValueType = utf8();
+  const Utf8BatchCtor = batchType(dictionaryValueType);
   const utf8Batch = new Utf8BatchCtor({
-    type: utf8(),
+    type: dictionaryValueType,
     length: dictLength,
     nullCount: 0,
     values: dictData,
@@ -221,7 +224,7 @@ export function createDictionary32Data(
   });
   const dictColumn = new Column([utf8Batch]) as Column<string>;
 
-  const dictionaryType = dictionary(utf8(), uint32());
+  const dictionaryType = dictionary(dictionaryValueType, uint32());
   const DictionaryBatchCtor = batchType(dictionaryType);
   const dictBatch = new DictionaryBatchCtor({
     type: dictionaryType,

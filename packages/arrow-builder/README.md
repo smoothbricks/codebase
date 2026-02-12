@@ -5,7 +5,7 @@ and zero-copy data structures.
 
 ## Overview
 
-Arrow-builder is a lightweight alternative to `apache-arrow-js` builders, designed for use cases that require:
+Arrow-builder is a lightweight alternative to Arrow JS builders, designed for use cases that require:
 
 - **Explicit allocations**: No hidden resizes or memory surprises
 - **Zero-copy construction**: Direct TypedArray access with no intermediate copies
@@ -13,8 +13,8 @@ Arrow-builder is a lightweight alternative to `apache-arrow-js` builders, design
 - **V8-optimized codegen**: Runtime class generation for monomorphic property access
 - **Predictable performance**: Hot-path operations with minimal overhead
 
-Unlike the official `apache-arrow-js` builders which automatically resize and copy data, arrow-builder gives you
-complete control over memory allocation and layout.
+Unlike official Arrow JS builders that automatically resize and copy data, arrow-builder gives you complete control over
+memory allocation and layout.
 
 ## Use Cases
 
@@ -245,16 +245,16 @@ const table = convertToArrowTable(buffer);
 - Attribute columns: **Lazily allocated** on first access
 - All allocations: **64-byte aligned** for cache efficiency
 
-## Comparison with apache-arrow-js
+## Comparison with Arrow JS builders
 
-| Feature         | arrow-builder        | apache-arrow-js  |
-| --------------- | -------------------- | ---------------- |
-| Allocations     | Explicit             | Hidden/automatic |
-| Resizing        | Manual chaining      | Automatic grow   |
-| Memory control  | Full control         | Opaque           |
-| Cache alignment | 64-byte aligned      | Not guaranteed   |
-| V8 optimization | Runtime codegen      | Generic builders |
-| Use case        | Performance-critical | General purpose  |
+| Feature         | arrow-builder        | Arrow JS builders |
+| --------------- | -------------------- | ----------------- |
+| Allocations     | Explicit             | Hidden/automatic  |
+| Resizing        | Manual chaining      | Automatic grow    |
+| Memory control  | Full control         | Opaque            |
+| Cache alignment | 64-byte aligned      | Not guaranteed    |
+| V8 optimization | Runtime codegen      | Generic builders  |
+| Use case        | Performance-critical | General purpose   |
 
 ## Examples
 
