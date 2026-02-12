@@ -29,7 +29,7 @@ This monorepo contains two distinct packages with clear separation of concerns:
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                  @smoothbricks/arrow-builder                     │
-│    Low-Level Alternative to apache-arrow for Building Tables    │
+│     Low-Level Alternative to direct flechette table building    │
 │                                                                  │
 │  • Explicit, visible allocations (NOT hidden resizing)          │
 │  • Cache-aligned TypedArray creation                             │
@@ -43,7 +43,7 @@ This monorepo contains two distinct packages with clear separation of concerns:
                               │
                               ▼
 ┌─────────────────────────────────────────────────────────────────┐
-│                        apache-arrow                              │
+│                       @uwdata/flechette                          │
 │              For final Arrow Table types only                    │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -178,7 +178,7 @@ complexity:
 
 ### Purpose
 
-A low-level alternative to `apache-arrow` for building Arrow tables and record-batches. The library focuses on:
+A low-level alternative to building Arrow tables directly with flechette constructors. The library focuses on:
 
 - **Explicit allocations**: Every memory allocation is visible and controllable
 - **Lazy column pattern**: Columns allocate on first access (getter-based)
@@ -379,7 +379,7 @@ naming.
 {
   "name": "@smoothbricks/arrow-builder",
   "dependencies": {
-    "apache-arrow": "^21.1.0" // For arrow.makeData types only
+    "@uwdata/flechette": "^2.3.0"
   }
   // NO @smoothbricks/lmao dependency!
 }
@@ -389,7 +389,7 @@ naming.
   "name": "@smoothbricks/lmao",
   "dependencies": {
     "@smoothbricks/arrow-builder": "workspace:*", // Uses arrow-builder
-    "apache-arrow": "^21.1.0"
+    "@uwdata/flechette": "^2.3.0"
   }
 }
 ```
@@ -415,7 +415,7 @@ naming.
 | **String Interning** | `intern()` for known strings (unbounded)     | `Utf8Cache` for runtime strings (SIEVE)      |
 | **UTF-8 Encoding**   | `Utf8Encoder` interface, `DictionaryBuilder` | `globalUtf8Cache`, pre-encoded contexts      |
 | **Tree Walking**     | No concept                                   | Owns tree traversal and dictionary building  |
-| **Dependencies**     | apache-arrow only                            | arrow-builder + apache-arrow                 |
+| **Dependencies**     | @uwdata/flechette only                       | arrow-builder + @uwdata/flechette            |
 
 ---
 

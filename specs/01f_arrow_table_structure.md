@@ -18,7 +18,8 @@ The Arrow Table Structure defines the final queryable format produced by the tra
 
 ### Reference Pattern
 
-The correct zero-copy approach is demonstrated in `extern/arrow-js-ffi/src/vector.ts`:
+The correct zero-copy approach uses flechette's `DirectBatch` constructor with `subarray()` views over TypedArrays (see
+`@uwdata/flechette` `batch.js`):
 
 ```typescript
 // CORRECT: Zero-copy with arrow.makeData()
@@ -1302,7 +1303,7 @@ This Arrow table structure integrates with:
 - **[Tree Walker and Arrow Conversion](./01k_tree_walker_and_arrow_conversion.md)**: Two-pass tree conversion with
   dictionary building, UTF-8 caching, and shared dictionaries across RecordBatches
 - **Background Processing Pipeline** (future document): Batch conversion process from buffers to Arrow/Parquet
-- **extern/arrow-js-ffi/src/vector.ts**: Reference implementation for zero-copy Arrow data construction
+- **@uwdata/flechette batch.js**: Reference implementation for zero-copy Arrow data construction
 
 The flat table structure enables rich analytical queries while maintaining the performance benefits of columnar storage
 and efficient null handling.
