@@ -88,7 +88,7 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
 
   toArrowTable(buffer: AnySpanBuffer): Table {
     // Uses existing tree conversion with shared dictionaries
-    return convertSpanTreeToArrowTable(buffer);
+    return convertSpanTreeToArrowTable(buffer) as unknown as Table;
   }
 
   releaseBuffer(_buffer: AnySpanBuffer): void {

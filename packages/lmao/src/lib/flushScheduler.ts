@@ -7,7 +7,7 @@
  * - Background processing (cold path)
  */
 
-import { Table } from '@uwdata/flechette';
+import type { Table } from '@uwdata/flechette';
 import type { CapacityStatsEntry } from './arrow/capacityStats.js';
 import { convertSpanTreeToArrowTable } from './convertToArrow.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
@@ -338,7 +338,7 @@ export class FlushScheduler {
     if (totalRows === 0 && !shouldLogCapacityStats) return;
 
     // Convert all buffers to Arrow tables and concatenate
-    const tables: Table[] = [];
+    const tables = [];
 
     for (const buffer of buffersToFlush) {
       try {
@@ -353,7 +353,6 @@ export class FlushScheduler {
     }
 
     // Concatenate all tables
-    let combinedTable: Table;
     if (tables.length === 0) {
       // No tables but might have capacity stats - create empty table
       // Capacity stats will be in the first table if any buffer had data
@@ -366,28 +365,8 @@ export class FlushScheduler {
       // Stats will be logged when there's actual data to flush.
       return;
     }
-    if (tables.length === 1) {
-      combinedTable = tables[0];
-    } else {
-      const schema = tables[0].schema;
-      const allBatches = [];
-
-      for (const table of tables) {
-        // Cast batches to the reference schema to ensure compatibility
-        for (let i = 0; i < table.batches.length; i++) {
-          allBatches.push(table.batches[i]);
-        }
-      }
-
-      try {
-        combinedTable = new Table(schema, allBatches);
-      } catch (_error) {
-        // If schemas don't match (shouldn't happen in production), just use first table
-        // This can occur in tests where buffers from different modules are mixed
-        console.warn('Unable to combine tables due to schema mismatch, using first table only');
-        combinedTable = tables[0];
-      }
-    }
+    const [firstTable, ...otherTables] = tables;
+    const combinedTable = firstTable.concat(...otherTables);
 
     // Call handler
     const metadata: FlushMetadata = {
@@ -398,7 +377,7 @@ export class FlushScheduler {
     };
 
     try {
-      await this.handler(combinedTable, metadata);
+      await this.handler(combinedTable as unknown as Table, metadata);
       this.lastFlushTime = now;
 
       // Reset flush counter and module tracking if we logged capacity stats
