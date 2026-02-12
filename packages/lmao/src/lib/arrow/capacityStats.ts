@@ -1,727 +1,397 @@
-/**
- * Capacity statistics RecordBatch creation
- */
-
 import {
-  compareStrings,
-  createSortedDictionary,
-  DictionaryBuilder,
-  type PreEncodedEntry,
-  sortInPlace,
-} from '@smoothbricks/arrow-builder';
-import {
-  type Bool,
-  Dictionary,
-  Field,
-  type Float64,
-  Int8,
-  makeData,
-  makeVector,
-  RecordBatch,
-  Schema,
-  Struct,
-  TimestampNanosecond,
-  Uint8,
-  type Uint16,
-  Uint32,
-  Uint64,
-  Utf8,
-  type Vector,
-} from 'apache-arrow';
-import {
-  ENTRY_TYPE_BUFFER_CAPACITY,
-  ENTRY_TYPE_BUFFER_SPANS,
-  ENTRY_TYPE_BUFFER_WRITES,
-  ENTRY_TYPE_NAMES,
-  ENTRY_TYPE_PERIOD_START,
-} from '../schema/systemSchema.js';
-import { getEnumUtf8, getEnumValues, getSchemaType } from '../schema/typeGuards.js';
+  batchType,
+  bool,
+  Column,
+  dictionary,
+  float64,
+  type IntType,
+  int8,
+  type Table,
+  TimeUnit,
+  tableFromColumns,
+  timestamp,
+  uint8,
+  uint32,
+  uint64,
+  utf8,
+} from '@uwdata/flechette';
+import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
+import { getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferConstructor } from '../spanBuffer.js';
 import type { OpMetadata } from '../types.js';
-import { globalUtf8Cache } from '../utf8Cache.js';
-import { calculateUtf8Offsets, encodeUtf8Strings } from './utils.js';
+import { getArrowFieldName } from './utils.js';
 
-/**
- * Create a RecordBatch with buffer metric entries for the given modules.
- *
- * Per utilization-based capacity tuning, each module emits 4 rows:
- * - period-start: uint64_value = periodStartNs (when the metrics period began)
- * - buffer-writes: uint64_value = total entries written to buffers
- * - buffer-spans: uint64_value = number of spans created (for utilization = writes / (spans * usableRows))
- * - buffer-capacity: uint64_value = current buffer capacity
- *
- * The `message` column is null for all buffer-* entry types (only op-* uses message).
- * Utilization = totalWrites / (spansCreated * (capacity - 2)) is computed at query time.
- *
- * **Dictionary handling**: Each RecordBatch has its own dictionary data.
- * This function builds dictionaries containing only the modules that have capacity stats,
- * not all modules from the span tree. This ensures the RecordBatch only includes dictionary
- * entries for data it actually uses, avoiding unnecessary data duplication.
- *
- * **Schema handling**: If `hasSpanData` is false (no span data in the tree), builds a minimal
- * schema with only the columns needed for capacity stats:
- * - timestamp, entry_type, package_name, package_file, git_sha, uint64_value
- * - NO trace_id, thread_id, span_id, parent_thread_id, parent_span_id
- * - NO custom attribute columns
- *
- * If `hasSpanData` is true, uses the full `arrowSchema` so RecordBatches can be combined.
- */
-
-/**
- * Entry for capacity stats: pairs SpanBufferConstructor (with stats) with OpMetadata (with package info).
- *
- * When collecting modules for capacity stats, we need both:
- * - SpanBufferConstructor: has static stats property with capacity, totalWrites, spansCreated
- * - OpMetadata: has package_name, package_file, git_sha
- */
 export interface CapacityStatsEntry {
-  readonly bufferClass: SpanBufferConstructor;
-  readonly metadata: OpMetadata;
+  bufferClass: SpanBufferConstructor;
+  metadata: OpMetadata;
 }
 
-/** Number of metric rows per module (period-start + 3 buffer metrics) */
-const ROWS_PER_MODULE = 4;
+const EMPTY_VALIDITY = new Uint8Array(0);
+const BOOL_TYPE_ID = (bool() as { typeId?: unknown }).typeId;
+const F64Array = Float64Array;
 
-export function createCapacityStatsRecordBatch(
-  modulesToLogStats: CapacityStatsEntry[],
-  periodStartNs: bigint,
-  arrowSchema: Schema,
-  lmaoSchema: Record<string, unknown>,
-  hasSpanData = true,
-): RecordBatch {
-  const moduleCount = modulesToLogStats.length;
-  const capacityStatsRows = moduleCount * ROWS_PER_MODULE;
-  if (capacityStatsRows === 0) {
-    return new RecordBatch({});
+function isBoolType(value: unknown): boolean {
+  return (value as { typeId?: unknown })?.typeId === BOOL_TYPE_ID;
+}
+
+function makeColumn(data: {
+  type: unknown;
+  length: number;
+  nullCount: number;
+  values?: unknown;
+  validity?: Uint8Array;
+  offsets?: Int32Array;
+  dict?: Column<unknown>;
+}): Column<unknown> {
+  const validity = data.validity ?? EMPTY_VALIDITY;
+
+  if (data.dict) {
+    const dictType = data.type as ReturnType<typeof dictionary>;
+    const batch = new (batchType(dictType))({
+      type: dictType,
+      length: data.length,
+      nullCount: data.nullCount,
+      validity,
+      values: data.values,
+    }) as { setDictionary(col: Column<unknown>): void };
+    batch.setDictionary(data.dict);
+    return new Column([batch as never]);
   }
 
-  const vectors: Vector[] = [];
-
-  // Build dictionaries containing only modules with capacity stats
-  // Uses pre-encoded entries from OpMetadata (interned at Op definition time)
-  const packageEntries: PreEncodedEntry[] = new Array(moduleCount);
-  const packagePathEntries: PreEncodedEntry[] = new Array(moduleCount);
-  const gitShaEntries: PreEncodedEntry[] = new Array(moduleCount);
-  for (let i = 0; i < moduleCount; i++) {
-    const { metadata } = modulesToLogStats[i];
-    packageEntries[i] = metadata.package_name_entry;
-    packagePathEntries[i] = metadata.package_file_entry;
-    gitShaEntries[i] = metadata.git_sha_entry;
+  if (data.offsets) {
+    const utf8Type = data.type as ReturnType<typeof utf8>;
+    const batch = new (batchType(utf8Type))({
+      type: utf8Type,
+      length: data.length,
+      nullCount: data.nullCount,
+      validity,
+      offsets: data.offsets,
+      values: data.values,
+    });
+    return new Column([batch]);
   }
 
-  const cmp = (a: PreEncodedEntry, b: PreEncodedEntry) => compareStrings(a.str, b.str);
-  const capacityStatsPackageDict = createSortedDictionary(sortInPlace(packageEntries, cmp));
-  const capacityStatsPackagePathDict = createSortedDictionary(sortInPlace(packagePathEntries, cmp));
-  const capacityStatsGitShaDict = createSortedDictionary(sortInPlace(gitShaEntries, cmp));
-
-  // Create minimal dictionaries for metadata columns that don't have meaningful values
-  // Trace ID (metadata column) - capacity stats aren't part of any trace
-  const traceIdBuilder = new DictionaryBuilder(globalUtf8Cache);
-  traceIdBuilder.add(''); // Single empty string entry
-  const capacityStatsTraceIdDict = traceIdBuilder.finalize(false);
-
-  // Build schema: minimal if no span data, full if combining with span data
-  let capacityStatsSchema: Schema;
-  let timestampType: TimestampNanosecond;
-  let traceIdType: Dictionary<Utf8> | undefined;
-  let entryTypeType: Dictionary<Utf8, Int8>;
-  let packageType: Dictionary<Utf8>;
-  let packagePathType: Dictionary<Utf8>;
-  let gitShaType: Dictionary<Utf8>;
-  let messageFieldIndex: number | undefined;
-
-  if (hasSpanData) {
-    // We'll create a new schema from the vectors after they're built to ensure dictionary IDs match
-    // For now, store reference to arrowSchema for field order and types
-    capacityStatsSchema = arrowSchema;
-    timestampType = arrowSchema.fields[0].type as TimestampNanosecond;
-    traceIdType = arrowSchema.fields[1].type as Dictionary<Utf8>;
-    entryTypeType = arrowSchema.fields[6].type as Dictionary<Utf8, Int8>;
-    packageType = arrowSchema.fields[7].type as Dictionary<Utf8>;
-    packagePathType = arrowSchema.fields[8].type as Dictionary<Utf8>;
-    gitShaType = arrowSchema.fields[9].type as Dictionary<Utf8>;
-    // Find message field index
-    for (let i = 0; i < arrowSchema.fields.length; i++) {
-      if (arrowSchema.fields[i].name === 'message' || arrowSchema.fields[i].name === 'attr_message') {
-        messageFieldIndex = i;
-        break;
-      }
-    }
-  } else {
-    // Build minimal schema: only columns needed for buffer metrics
-    // Per spec, buffer-* entry types don't use message column, so we skip it in minimal schema
-    const fields: Field[] = [];
-    fields.push(Field.new({ name: 'timestamp', type: new TimestampNanosecond() }));
-    fields.push(Field.new({ name: 'entry_type', type: new Dictionary(new Utf8(), new Int8()) }));
-    fields.push(
-      Field.new({
-        name: 'package_name',
-        type: new Dictionary(new Utf8(), new capacityStatsPackageDict.arrowIndexTypeCtor()),
-      }),
-    );
-    fields.push(
-      Field.new({
-        name: 'package_file',
-        type: new Dictionary(new Utf8(), new capacityStatsPackagePathDict.arrowIndexTypeCtor()),
-      }),
-    );
-    fields.push(
-      Field.new({
-        name: 'git_sha',
-        type: new Dictionary(new Utf8(), new capacityStatsGitShaDict.arrowIndexTypeCtor()),
-      }),
-    );
-    // uint64_value for metric values
-    fields.push(Field.new({ name: 'uint64_value', type: new Uint64() }));
-
-    capacityStatsSchema = new Schema(fields);
-    timestampType = new TimestampNanosecond();
-    entryTypeType = new Dictionary(new Utf8(), new Int8());
-    packageType = new Dictionary(new Utf8(), new capacityStatsPackageDict.arrowIndexTypeCtor());
-    packagePathType = new Dictionary(new Utf8(), new capacityStatsPackagePathDict.arrowIndexTypeCtor());
-    gitShaType = new Dictionary(new Utf8(), new capacityStatsGitShaDict.arrowIndexTypeCtor());
+  if (isBoolType(data.type)) {
+    const boolType = data.type as ReturnType<typeof bool>;
+    const batch = new (batchType(boolType))({
+      type: boolType,
+      length: data.length,
+      nullCount: data.nullCount,
+      validity,
+      values: data.values,
+    });
+    return new Column([batch]);
   }
 
-  // Per spec, buffer metrics don't use message column (null for all buffer-* entry types)
-  // Only period-start and op-* entry types use message.
-  // We need an empty message dict for the null values.
-  const capacityStatsMessageBuilder = new DictionaryBuilder(globalUtf8Cache);
-  capacityStatsMessageBuilder.add(''); // Single empty string for nulls
-  const capacityStatsMessageDict = capacityStatsMessageBuilder.finalize(false);
-
-  const nowNs = BigInt(Date.now()) * 1_000_000n;
-
-  // Timestamp - all current time
-  const timestamps = new BigInt64Array(capacityStatsRows);
-  timestamps.fill(nowNs);
-  vectors.push(
-    makeVector(
-      makeData({
-        type: timestampType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: timestamps,
-      }),
-    ),
-  );
-
-  // Span-specific columns: only include if combining with span data
-  if (hasSpanData) {
-    if (!traceIdType) {
-      throw new Error('traceIdType is required when hasSpanData is true');
-    }
-    // Trace ID - capacity stats aren't part of any trace, use minimal dictionary
-    const traceIdIndices = new capacityStatsTraceIdDict.indexArrayCtor(capacityStatsRows);
-    traceIdIndices.fill(0); // All point to index 0 (empty string)
-    vectors.push(
-      makeVector(
-        makeData({
-          type: traceIdType,
-          offset: 0,
-          length: capacityStatsRows,
-          nullCount: 0,
-          data: traceIdIndices,
-          dictionary: makeVector(
-            makeData({
-              type: new Utf8(),
-              offset: 0,
-              length: capacityStatsTraceIdDict.indexMap.size,
-              nullCount: 0,
-              valueOffsets: capacityStatsTraceIdDict.offsets,
-              data: capacityStatsTraceIdDict.data,
-            }),
-          ),
-        }),
-      ),
-    );
-
-    // thread_id - all 0
-    const threadIds = new BigUint64Array(capacityStatsRows);
-    threadIds.fill(0n);
-    vectors.push(
-      makeVector(
-        makeData({
-          type: new Uint64(),
-          offset: 0,
-          length: capacityStatsRows,
-          nullCount: 0,
-          data: threadIds,
-        }),
-      ),
-    );
-
-    // span_id - all 0
-    const spanIds = new Uint32Array(capacityStatsRows);
-    spanIds.fill(0);
-    vectors.push(
-      makeVector(
-        makeData({
-          type: new Uint32(),
-          offset: 0,
-          length: capacityStatsRows,
-          nullCount: 0,
-          data: spanIds,
-        }),
-      ),
-    );
-
-    // parent_thread_id - all null
-    const parentThreadIds = new BigUint64Array(capacityStatsRows);
-    const parentThreadIdNulls = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-    parentThreadIdNulls.fill(0); // All null
-    vectors.push(
-      makeVector(
-        makeData({
-          type: new Uint64(),
-          offset: 0,
-          length: capacityStatsRows,
-          nullCount: capacityStatsRows,
-          data: parentThreadIds,
-          nullBitmap: parentThreadIdNulls,
-        }),
-      ),
-    );
-
-    // parent_span_id - all null
-    const parentSpanIds = new Uint32Array(capacityStatsRows);
-    const parentSpanIdNulls = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-    parentSpanIdNulls.fill(0); // All null
-    vectors.push(
-      makeVector(
-        makeData({
-          type: new Uint32(),
-          offset: 0,
-          length: capacityStatsRows,
-          nullCount: capacityStatsRows,
-          data: parentSpanIds,
-          nullBitmap: parentSpanIdNulls,
-        }),
-      ),
-    );
-  }
-
-  // Entry type - 4 rows per module with different entry types:
-  // Row 0: period-start (when the metrics period began)
-  // Row 1: buffer-writes (total entries written to buffers)
-  // Row 2: buffer-spans (number of spans created - for utilization calculation)
-  // Row 3: buffer-capacity (current buffer capacity)
-  const entryTypeIndices = new Int8Array(capacityStatsRows);
-  for (let m = 0; m < moduleCount; m++) {
-    const baseRow = m * ROWS_PER_MODULE;
-    entryTypeIndices[baseRow + 0] = ENTRY_TYPE_PERIOD_START;
-    entryTypeIndices[baseRow + 1] = ENTRY_TYPE_BUFFER_WRITES;
-    entryTypeIndices[baseRow + 2] = ENTRY_TYPE_BUFFER_SPANS;
-    entryTypeIndices[baseRow + 3] = ENTRY_TYPE_BUFFER_CAPACITY;
-  }
-  vectors.push(
-    makeVector(
-      makeData({
-        type: entryTypeType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: entryTypeIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: ENTRY_TYPE_NAMES.length,
-            nullCount: 0,
-            valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
-            data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Package name - from modules (using capacity stats dictionary)
-  // Each module has ROWS_PER_MODULE rows, all with the same package name
-  const packageIndices = new capacityStatsPackageDict.indexArrayCtor(capacityStatsRows);
-  for (let m = 0; m < moduleCount; m++) {
-    const { metadata } = modulesToLogStats[m];
-    const pkgIdx = capacityStatsPackageDict.indexMap.get(metadata.package_name) ?? 0;
-    const baseRow = m * ROWS_PER_MODULE;
-    for (let r = 0; r < ROWS_PER_MODULE; r++) {
-      packageIndices[baseRow + r] = pkgIdx;
-    }
-  }
-  vectors.push(
-    makeVector(
-      makeData({
-        type: packageType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: packageIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: capacityStatsPackageDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: capacityStatsPackageDict.offsets,
-            data: capacityStatsPackageDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Package path - from modules (using capacity stats dictionary)
-  // Each module has ROWS_PER_MODULE rows, all with the same package path
-  const packagePathIndices = new capacityStatsPackagePathDict.indexArrayCtor(capacityStatsRows);
-  for (let m = 0; m < moduleCount; m++) {
-    const { metadata } = modulesToLogStats[m];
-    const pathIdx = capacityStatsPackagePathDict.indexMap.get(metadata.package_file) ?? 0;
-    const baseRow = m * ROWS_PER_MODULE;
-    for (let r = 0; r < ROWS_PER_MODULE; r++) {
-      packagePathIndices[baseRow + r] = pathIdx;
-    }
-  }
-  vectors.push(
-    makeVector(
-      makeData({
-        type: packagePathType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: packagePathIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: capacityStatsPackagePathDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: capacityStatsPackagePathDict.offsets,
-            data: capacityStatsPackagePathDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // Git SHA - from modules (using capacity stats dictionary)
-  // Each module has ROWS_PER_MODULE rows, all with the same git SHA
-  const gitShaIndices = new capacityStatsGitShaDict.indexArrayCtor(capacityStatsRows);
-  for (let m = 0; m < moduleCount; m++) {
-    const { metadata } = modulesToLogStats[m];
-    const idx = capacityStatsGitShaDict.indexMap.get(metadata.git_sha) ?? 0;
-    const baseRow = m * ROWS_PER_MODULE;
-    for (let r = 0; r < ROWS_PER_MODULE; r++) {
-      gitShaIndices[baseRow + r] = idx;
-    }
-  }
-  vectors.push(
-    makeVector(
-      makeData({
-        type: gitShaType,
-        offset: 0,
-        length: capacityStatsRows,
-        nullCount: 0,
-        data: gitShaIndices,
-        dictionary: makeVector(
-          makeData({
-            type: new Utf8(),
-            offset: 0,
-            length: capacityStatsGitShaDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: capacityStatsGitShaDict.offsets,
-            data: capacityStatsGitShaDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-
-  // System attribute column: message (index 10) - handle separately before user attributes
-  // Per spec, buffer-* entry types don't use message column (all null)
-  if (hasSpanData && messageFieldIndex !== undefined) {
-    const messageField = arrowSchema.fields[messageFieldIndex];
-    if (messageField && messageField.name === 'message') {
-      const messageFieldType = messageField.type as Dictionary<Utf8, Uint8 | Uint16 | Uint32>;
-      const indices = new capacityStatsMessageDict.indexArrayCtor(capacityStatsRows);
-      indices.fill(0); // All point to empty string (index 0)
-      const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-      nullBitmap.fill(0); // All null
-
-      vectors.push(
-        makeVector(
-          makeData({
-            type: messageFieldType,
-            offset: 0,
-            length: capacityStatsRows,
-            nullCount: capacityStatsRows,
-            data: indices,
-            nullBitmap,
-            dictionary: makeVector(
-              makeData({
-                type: new Utf8(),
-                offset: 0,
-                length: capacityStatsMessageDict.indexMap.size,
-                nullCount: 0,
-                valueOffsets: capacityStatsMessageDict.offsets,
-                data: capacityStatsMessageDict.data,
-              }),
-            ),
-          }),
-        ),
-      );
-    }
-  }
-
-  // uint64_value column - stores metric values per spec
-  // Per spec 01n_op_and_buffer_metrics.md:
-  // - period-start: periodStartNs (nanosecond timestamp when period began)
-  // - buffer-writes: bufferClass.stats.totalWrites
-  // - buffer-spans: bufferClass.stats.spansCreated
-  // - buffer-capacity: bufferClass.stats.capacity
-  if (hasSpanData) {
-    const uint64Values = new BigUint64Array(capacityStatsRows);
-    for (let m = 0; m < moduleCount; m++) {
-      const { bufferClass } = modulesToLogStats[m];
-      const baseRow = m * ROWS_PER_MODULE;
-      uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
-      uint64Values[baseRow + 1] = BigInt(bufferClass.stats.totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.spansCreated); // buffer-spans
-      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.capacity); // buffer-capacity
-    }
-    vectors.push(
-      makeVector(
-        makeData({
-          type: new Uint64(),
-          offset: 0,
-          length: capacityStatsRows,
-          nullCount: 0,
-          data: uint64Values,
-        }),
-      ),
-    );
-  }
-
-  // User attribute columns - only include if combining with span data
-  if (hasSpanData) {
-    // Iterate through attribute columns that actually exist in the span RecordBatch
-    // (lazy columns that were never written to won't be in arrowSchema)
-    // Schema order: Core system + metadata columns + system attribute columns:
-    //   Core system: timestamp(0), entry_type(6)
-    //   Metadata: trace_id(1), thread_id(2), span_id(3), parent_thread_id(4), parent_span_id(5),
-    //             package_name(7), package_file(8), git_sha(9)
-    //   System attribute: message(10), uint64_value(11)
-    // Total: 12 columns before user attributes
-    const METADATA_AND_SYSTEM_COLUMNS_COUNT = 12;
-
-    // Iterate through arrowSchema fields (starting after metadata+system columns) to get only columns that exist
-    for (let i = METADATA_AND_SYSTEM_COLUMNS_COUNT; i < arrowSchema.fields.length; i++) {
-      const arrowField = arrowSchema.fields[i];
-      const fieldType = arrowField.type;
-
-      // Map arrow field name back to lmao schema field name
-      // Arrow field names match lmao names (getArrowFieldName just maps 'logMessage' -> 'message')
-      const lmaoFieldName = arrowField.name === 'message' ? 'message' : arrowField.name;
-
-      const fieldSchema = lmaoSchema[lmaoFieldName];
-      if (!fieldSchema) {
-        // Skip if not in lmaoSchema (shouldn't happen, but defensive)
-        continue;
-      }
-
-      const lmaoType = getSchemaType(fieldSchema);
-
-      // Skip message as it's already handled above
-      if (lmaoFieldName === 'message') {
-        continue;
-      }
-
-      if (lmaoType === 'category') {
-        // Since all values are null, create a minimal dictionary with just one empty string
-        // This avoids copying the entire dictionary from the span tree
-        const minimalBuilder = new DictionaryBuilder(globalUtf8Cache);
-        minimalBuilder.add(''); // Single empty string entry
-        const minimalDict = minimalBuilder.finalize(false);
-
-        const indices = new minimalDict.indexArrayCtor(capacityStatsRows);
-        indices.fill(0); // All point to index 0 (empty string)
-        const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-        nullBitmap.fill(0); // All null
-        vectors.push(
-          makeVector(
-            makeData({
-              type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
-              offset: 0,
-              length: capacityStatsRows,
-              nullCount: capacityStatsRows,
-              data: indices,
-              nullBitmap,
-              dictionary: makeVector(
-                makeData({
-                  type: new Utf8(),
-                  offset: 0,
-                  length: minimalDict.indexMap.size,
-                  nullCount: 0,
-                  valueOffsets: minimalDict.offsets,
-                  data: minimalDict.data,
-                }),
-              ),
-            }),
-          ),
-        );
-      } else if (lmaoType === 'text') {
-        // Since all values are null, create a minimal dictionary with just one empty string
-        // This avoids copying the entire dictionary from the span tree
-        const minimalBuilder = new DictionaryBuilder(globalUtf8Cache);
-        minimalBuilder.add(''); // Single empty string entry
-        const minimalDict = minimalBuilder.finalize(false);
-
-        const indices = new minimalDict.indexArrayCtor(capacityStatsRows);
-        indices.fill(0); // All point to index 0 (empty string)
-        const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-        nullBitmap.fill(0); // All null
-        vectors.push(
-          makeVector(
-            makeData({
-              type: fieldType as Dictionary<Utf8, Uint8 | Uint16 | Uint32>,
-              offset: 0,
-              length: capacityStatsRows,
-              nullCount: capacityStatsRows,
-              data: indices,
-              nullBitmap,
-              dictionary: makeVector(
-                makeData({
-                  type: new Utf8(),
-                  offset: 0,
-                  length: minimalDict.indexMap.size,
-                  nullCount: 0,
-                  valueOffsets: minimalDict.offsets,
-                  data: minimalDict.data,
-                }),
-              ),
-            }),
-          ),
-        );
-      } else if (lmaoType === 'number') {
-        const allValues = new Float64Array(capacityStatsRows);
-        const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-        nullBitmap.fill(0); // All null
-        vectors.push(
-          makeVector(
-            makeData({
-              type: fieldType as Float64,
-              offset: 0,
-              length: capacityStatsRows,
-              nullCount: capacityStatsRows,
-              data: allValues,
-              nullBitmap,
-            }),
-          ),
-        );
-      } else if (lmaoType === 'boolean') {
-        const allValues = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-        const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-        nullBitmap.fill(0); // All null
-        vectors.push(
-          makeVector(
-            makeData({
-              type: fieldType as Bool,
-              offset: 0,
-              length: capacityStatsRows,
-              nullCount: capacityStatsRows,
-              data: allValues,
-              nullBitmap,
-            }),
-          ),
-        );
-      } else if (lmaoType === 'enum') {
-        const enumValues = getEnumValues(fieldSchema) || [];
-        const enumUtf8 = getEnumUtf8(fieldSchema);
-        const enumSchema = fieldSchema as { __index_array_ctor?: unknown; __arrow_index_type_ctor?: unknown };
-        const indexArrayCtor =
-          (enumSchema.__index_array_ctor as Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor) ??
-          Uint8Array;
-        const arrowIndexTypeCtor =
-          (enumSchema.__arrow_index_type_ctor as typeof Uint8 | typeof Uint16 | typeof Uint32) ?? Uint8;
-        const allIndices = new indexArrayCtor(capacityStatsRows);
-        const nullBitmap = new Uint8Array(Math.ceil(capacityStatsRows / 8));
-        nullBitmap.fill(0); // All null
-        const enumDictData = makeData({
-          type: new Utf8(),
-          offset: 0,
-          length: enumValues.length,
-          nullCount: 0,
-          valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues as readonly string[]),
-          data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
-        });
-        vectors.push(
-          makeVector(
-            makeData({
-              type: new Dictionary(new Utf8(), new arrowIndexTypeCtor()),
-              offset: 0,
-              length: capacityStatsRows,
-              nullCount: capacityStatsRows,
-              data: allIndices,
-              nullBitmap,
-              dictionary: makeVector(enumDictData),
-            }),
-          ),
-        );
-      }
-    } // end for loop
-  } else {
-    // Minimal schema: add uint64_value column with metric values
-    // Per spec, buffer-* entry types use uint64_value, not message
-    const uint64Values = new BigUint64Array(capacityStatsRows);
-    for (let m = 0; m < moduleCount; m++) {
-      const { bufferClass } = modulesToLogStats[m];
-      const baseRow = m * ROWS_PER_MODULE;
-      uint64Values[baseRow + 0] = BigInt(periodStartNs); // period-start
-      uint64Values[baseRow + 1] = BigInt(bufferClass.stats.totalWrites); // buffer-writes
-      uint64Values[baseRow + 2] = BigInt(bufferClass.stats.spansCreated); // buffer-spans
-      uint64Values[baseRow + 3] = BigInt(bufferClass.stats.capacity); // buffer-capacity
-    }
-    vectors.push(
-      makeVector(
-        makeData({
-          type: new Uint64(),
-          offset: 0,
-          length: capacityStatsRows,
-          nullCount: 0,
-          data: uint64Values,
-        }),
-      ),
-    );
-  }
-
-  // When hasSpanData is true, rebuild schema from the actual vector types
-  // This ensures dictionary IDs match exactly (Apache Arrow requires exact schema equivalence)
-  let finalSchema = capacityStatsSchema;
-  if (hasSpanData) {
-    if (vectors.length !== capacityStatsSchema.fields.length) {
-      throw new Error(
-        `Vector count (${vectors.length}) doesn't match schema field count (${capacityStatsSchema.fields.length})`,
-      );
-    }
-    // Rebuild schema from the actual vector types to ensure dictionary IDs match
-    const fields: Field[] = [];
-    for (let i = 0; i < vectors.length; i++) {
-      const vector = vectors[i];
-      const originalField = capacityStatsSchema.fields[i];
-      if (!originalField) {
-        throw new Error(`Missing field at index ${i} in capacity stats schema`);
-      }
-      // Use the actual type from the vector to ensure dictionary IDs match
-      const vectorType = vector.type;
-      fields.push(Field.new({ name: originalField.name, type: vectorType, nullable: originalField.nullable }));
-    }
-    finalSchema = new Schema(fields);
-  }
-
-  const structData = makeData({
-    type: new Struct(finalSchema.fields),
-    length: capacityStatsRows,
-    nullCount: 0,
-    children: vectors.map((v) => v.data[0]),
+  const batch = new (batchType(data.type as never))({
+    type: data.type,
+    length: data.length,
+    nullCount: data.nullCount,
+    validity,
+    values: data.values,
   });
+  return new Column([batch]);
+}
 
-  return new RecordBatch(finalSchema, structData);
+function encodeUtf8(strings: string[]): { data: Uint8Array; offsets: Int32Array } {
+  const enc = new TextEncoder();
+  const bytes = strings.map((s) => enc.encode(s));
+  const total = bytes.reduce((n, b) => n + b.length, 0);
+  const data = new Uint8Array(total);
+  const offsets = new Int32Array(strings.length + 1);
+  let pos = 0;
+  for (let i = 0; i < bytes.length; i++) {
+    data.set(bytes[i], pos);
+    offsets[i] = pos;
+    pos += bytes[i].length;
+  }
+  offsets[strings.length] = pos;
+  return { data, offsets };
+}
+
+function indexTypeForCount(count: number): IntType {
+  return count <= 255 ? uint8() : uint32();
+}
+
+function append(entries: [string, Column<unknown>][], name: string, column: Column<unknown>): void {
+  entries.push([name, column]);
+}
+
+export function createCapacityStatsTable(
+  entriesToLog: CapacityStatsEntry[],
+  periodStartNs: bigint,
+  mergedSchema: Record<string, unknown>,
+): Table {
+  if (entriesToLog.length === 0) return tableFromColumns({});
+
+  const rowsPerModule = 4;
+  const totalRows = entriesToLog.length * rowsPerModule;
+
+  const entryTypeStrings = ['period-start', 'buffer-writes', 'buffer-spans', 'buffer-capacity'];
+  const [periodStartIdx, writesIdx, spansIdx, capacityIdx] = [0, 1, 2, 3];
+
+  const traceIdStrings = [''];
+  const packageNameStrings = Array.from(new Set(entriesToLog.map((e) => e.metadata.package_name)));
+  const packageFileStrings = Array.from(new Set(entriesToLog.map((e) => e.metadata.package_file)));
+  const gitShaStrings = Array.from(new Set(entriesToLog.map((e) => e.metadata.git_sha)));
+  const messageStrings = [''];
+
+  const packageNameMap = new Map(packageNameStrings.map((v, i) => [v, i]));
+  const packageFileMap = new Map(packageFileStrings.map((v, i) => [v, i]));
+  const gitShaMap = new Map(gitShaStrings.map((v, i) => [v, i]));
+
+  const entryTypes = new Int8Array(totalRows);
+  const traceIds = new Uint8Array(totalRows);
+  const packageNames = new Uint32Array(totalRows);
+  const packageFiles = new Uint32Array(totalRows);
+  const gitShas = new Uint32Array(totalRows);
+  const messages = new Uint8Array(totalRows);
+
+  const timestamps = new BigInt64Array(totalRows);
+  const threadIds = new BigUint64Array(totalRows);
+  const spanIds = new Uint32Array(totalRows);
+  const parentThreadIds = new BigUint64Array(totalRows);
+  const parentSpanIds = new Uint32Array(totalRows);
+  const uint64Values = new BigUint64Array(totalRows);
+
+  const parentThreadValidity = new Uint8Array(Math.ceil(totalRows / 8));
+  const parentSpanValidity = new Uint8Array(Math.ceil(totalRows / 8));
+
+  for (let m = 0; m < entriesToLog.length; m++) {
+    const base = m * rowsPerModule;
+    const { bufferClass, metadata } = entriesToLog[m];
+
+    const pName = packageNameMap.get(metadata.package_name) ?? 0;
+    const pFile = packageFileMap.get(metadata.package_file) ?? 0;
+    const gSha = gitShaMap.get(metadata.git_sha) ?? 0;
+
+    const stats = bufferClass.stats;
+    const values = [periodStartNs, BigInt(stats.totalWrites), BigInt(stats.spansCreated), BigInt(stats.capacity)];
+    const kinds = [periodStartIdx, writesIdx, spansIdx, capacityIdx];
+
+    for (let i = 0; i < rowsPerModule; i++) {
+      const row = base + i;
+      entryTypes[row] = kinds[i];
+      traceIds[row] = 0;
+      packageNames[row] = pName;
+      packageFiles[row] = pFile;
+      gitShas[row] = gSha;
+      messages[row] = 0;
+      uint64Values[row] = values[i];
+      timestamps[row] = periodStartNs;
+      threadIds[row] = 0n;
+      spanIds[row] = 0;
+      parentThreadIds[row] = 0n;
+      parentSpanIds[row] = 0;
+    }
+  }
+
+  const entryTypeUtf8 = encodeUtf8(entryTypeStrings);
+  const traceIdUtf8 = encodeUtf8(traceIdStrings);
+  const packageNameUtf8 = encodeUtf8(packageNameStrings);
+  const packageFileUtf8 = encodeUtf8(packageFileStrings);
+  const gitShaUtf8 = encodeUtf8(gitShaStrings);
+  const messageUtf8 = encodeUtf8(messageStrings);
+
+  const cols: [string, Column<unknown>][] = [];
+
+  append(
+    cols,
+    'timestamp',
+    makeColumn({ type: timestamp(TimeUnit.NANOSECOND), length: totalRows, nullCount: 0, values: timestamps }),
+  );
+
+  append(
+    cols,
+    'trace_id',
+    makeColumn({
+      type: dictionary(utf8(), indexTypeForCount(traceIdStrings.length), false, 0),
+      length: totalRows,
+      nullCount: 0,
+      values: traceIds,
+      dict: makeColumn({
+        type: utf8(),
+        length: traceIdStrings.length,
+        nullCount: 0,
+        values: traceIdUtf8.data,
+        offsets: traceIdUtf8.offsets,
+      }),
+    }),
+  );
+
+  append(cols, 'thread_id', makeColumn({ type: uint64(), length: totalRows, nullCount: 0, values: threadIds }));
+  append(cols, 'span_id', makeColumn({ type: uint32(), length: totalRows, nullCount: 0, values: spanIds }));
+  append(
+    cols,
+    'parent_thread_id',
+    makeColumn({
+      type: uint64(),
+      length: totalRows,
+      nullCount: totalRows,
+      values: parentThreadIds,
+      validity: parentThreadValidity,
+    }),
+  );
+  append(
+    cols,
+    'parent_span_id',
+    makeColumn({
+      type: uint32(),
+      length: totalRows,
+      nullCount: totalRows,
+      values: parentSpanIds,
+      validity: parentSpanValidity,
+    }),
+  );
+
+  append(
+    cols,
+    'entry_type',
+    makeColumn({
+      type: dictionary(utf8(), int8(), false, 1),
+      length: totalRows,
+      nullCount: 0,
+      values: entryTypes,
+      dict: makeColumn({
+        type: utf8(),
+        length: entryTypeStrings.length,
+        nullCount: 0,
+        values: entryTypeUtf8.data,
+        offsets: entryTypeUtf8.offsets,
+      }),
+    }),
+  );
+
+  append(
+    cols,
+    'package_name',
+    makeColumn({
+      type: dictionary(utf8(), indexTypeForCount(packageNameStrings.length), false, 2),
+      length: totalRows,
+      nullCount: 0,
+      values: packageNames,
+      dict: makeColumn({
+        type: utf8(),
+        length: packageNameStrings.length,
+        nullCount: 0,
+        values: packageNameUtf8.data,
+        offsets: packageNameUtf8.offsets,
+      }),
+    }),
+  );
+  append(
+    cols,
+    'package_file',
+    makeColumn({
+      type: dictionary(utf8(), indexTypeForCount(packageFileStrings.length), false, 3),
+      length: totalRows,
+      nullCount: 0,
+      values: packageFiles,
+      dict: makeColumn({
+        type: utf8(),
+        length: packageFileStrings.length,
+        nullCount: 0,
+        values: packageFileUtf8.data,
+        offsets: packageFileUtf8.offsets,
+      }),
+    }),
+  );
+  append(
+    cols,
+    'git_sha',
+    makeColumn({
+      type: dictionary(utf8(), indexTypeForCount(gitShaStrings.length), false, 4),
+      length: totalRows,
+      nullCount: 0,
+      values: gitShas,
+      dict: makeColumn({
+        type: utf8(),
+        length: gitShaStrings.length,
+        nullCount: 0,
+        values: gitShaUtf8.data,
+        offsets: gitShaUtf8.offsets,
+      }),
+    }),
+  );
+  append(
+    cols,
+    'message',
+    makeColumn({
+      type: dictionary(utf8(), indexTypeForCount(messageStrings.length), false, 5),
+      length: totalRows,
+      nullCount: 0,
+      values: messages,
+      dict: makeColumn({
+        type: utf8(),
+        length: messageStrings.length,
+        nullCount: 0,
+        values: messageUtf8.data,
+        offsets: messageUtf8.offsets,
+      }),
+    }),
+  );
+  append(cols, 'uint64_value', makeColumn({ type: uint64(), length: totalRows, nullCount: 0, values: uint64Values }));
+
+  for (const [fieldName, fieldSchema] of Object.entries(mergedSchema)) {
+    if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) continue;
+    const lmaoType = getSchemaType(fieldSchema);
+    const arrowFieldName = getArrowFieldName(fieldName);
+
+    if (lmaoType === 'number') {
+      append(
+        cols,
+        arrowFieldName,
+        makeColumn({
+          type: float64(),
+          length: totalRows,
+          nullCount: totalRows,
+          values: new F64Array(totalRows),
+          validity: new Uint8Array(Math.ceil(totalRows / 8)),
+        }),
+      );
+      continue;
+    }
+
+    if (lmaoType === 'boolean') {
+      append(
+        cols,
+        arrowFieldName,
+        makeColumn({
+          type: bool(),
+          length: totalRows,
+          nullCount: totalRows,
+          values: new Uint8Array(Math.ceil(totalRows / 8)),
+          validity: new Uint8Array(Math.ceil(totalRows / 8)),
+        }),
+      );
+      continue;
+    }
+
+    let idxType: IntType = uint8();
+    if (lmaoType === 'enum') {
+      const meta = fieldSchema as { __arrow_index_type?: unknown };
+      idxType = (meta.__arrow_index_type as IntType) ?? uint8();
+    }
+    const dictType = dictionary(utf8(), idxType);
+    append(
+      cols,
+      arrowFieldName,
+      makeColumn({
+        type: dictType,
+        length: totalRows,
+        nullCount: totalRows,
+        values: new Uint8Array(totalRows),
+        validity: new Uint8Array(Math.ceil(totalRows / 8)),
+        dict: makeColumn({
+          type: utf8(),
+          length: 1,
+          nullCount: 0,
+          values: new Uint8Array(0),
+          offsets: new Int32Array([0, 0]),
+        }),
+      }),
+    );
+  }
+
+  return tableFromColumns(cols);
 }
