@@ -22,7 +22,7 @@
   "dependencies": {
     "tslib": "^2.3.0",
     "@sury/sury": "npm:@jsr/sury__sury",
-    "apache-arrow": "^21.1.0"
+    "@uwdata/flechette": "^2.3.0"
   },
   "nx": {
     "sourceRoot": "packages/arrow-builder/src",

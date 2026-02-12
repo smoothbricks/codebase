@@ -11,7 +11,7 @@
  */
 
 import * as Sury from '@sury/sury';
-import { Uint8, Uint16, Uint32 } from 'apache-arrow';
+import { uint8, uint16, uint32 } from '@uwdata/flechette';
 import { intern } from '../arrow/interner.js';
 import type {
   EagerBigUint64Schema,
@@ -273,7 +273,7 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     // Determine index type based on enum size
     const uniqueCount = values.length;
     const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-    const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+    const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
 
     // Use refine to validate string is one of the allowed values
     const schema = Sury.refine(Sury.string, (value, fail): T[number] => {
@@ -288,7 +288,7 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     schema.__enum_values = values;
     schema.__enum_utf8 = precomputeEnumUtf8(values);
     schema.__index_array_ctor = indexArrayCtor;
-    schema.__arrow_index_type_ctor = arrowIndexTypeCtor;
+    schema.__arrow_index_type = arrowIndexType;
 
     // Add chainable .eager() method
     schema.eager = (): EagerEnumSchema<T[number]> => {

@@ -6,8 +6,7 @@
  */
 
 import type * as Sury from '@sury/sury';
-// biome-ignore lint/style/useImportType: Used as runtime constructors (typeof Uint8)
-import { Uint8, Uint16, Uint32 } from 'apache-arrow';
+import type { IntType } from '@uwdata/flechette';
 
 /**
  * Schema type marker for columnar storage
@@ -85,8 +84,8 @@ interface EnumMetadataBase {
   __enum_utf8: EnumUtf8Precomputed;
   /** TypedArray constructor for index arrays (determined from enum size at definition time) */
   __index_array_ctor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor;
-  /** Arrow type constructor for Dictionary index type */
-  __arrow_index_type_ctor: typeof Uint8 | typeof Uint16 | typeof Uint32;
+  /** Arrow index type for Dictionary index type */
+  __arrow_index_type: IntType;
 }
 
 /**

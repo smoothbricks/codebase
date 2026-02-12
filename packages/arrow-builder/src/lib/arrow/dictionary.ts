@@ -7,7 +7,7 @@
  * 3. Determines index type (uint8/16/32) based on dictionary size
  */
 
-import { Uint8, Uint16, Uint32 } from 'apache-arrow';
+import { type IntType, uint8, uint16, uint32 } from '@uwdata/flechette';
 import { getInterned } from './interner.js';
 import type { SortedArray } from './sorted.js';
 import { defaultUtf8Encoder, type Utf8Encoder, utf8ByteLength } from './utf8.js';
@@ -26,8 +26,8 @@ export class FinalizedDictionary {
     public readonly indexMap: Map<string, number>,
     /** TypedArray constructor for creating index arrays */
     public readonly indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
-    /** Arrow type constructor for creating Dictionary types */
-    public readonly arrowIndexTypeCtor: typeof Uint8 | typeof Uint16 | typeof Uint32,
+    /** Arrow index type for creating Dictionary types */
+    public readonly arrowIndexType: IntType,
   ) {}
 }
 
@@ -53,7 +53,7 @@ export function createSortedDictionary(entries: SortedArray<PreEncodedEntry>): F
 
   // Determine index type constructors based on dictionary size
   const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+  const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
 
   // Calculate total bytes needed
   let totalBytes = 0;
@@ -76,7 +76,7 @@ export function createSortedDictionary(entries: SortedArray<PreEncodedEntry>): F
   }
   offsets[uniqueCount] = offset;
 
-  return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexTypeCtor);
+  return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexType);
 }
 
 /**
@@ -90,7 +90,7 @@ export function createDictionary(entries: readonly PreEncodedEntry[]): Finalized
 
   // Determine index type constructors based on dictionary size
   const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+  const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
 
   // Calculate total bytes needed
   let totalBytes = 0;
@@ -113,7 +113,7 @@ export function createDictionary(entries: readonly PreEncodedEntry[]): Finalized
   }
   offsets[uniqueCount] = offset;
 
-  return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexTypeCtor);
+  return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexType);
 }
 
 interface TrackedEntry {
@@ -190,7 +190,7 @@ export class DictionaryBuilder {
 
     // Determine index type constructors based on dictionary size
     const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
-    const arrowIndexTypeCtor = uniqueCount <= 255 ? Uint8 : uniqueCount <= 65535 ? Uint16 : Uint32;
+    const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
 
     // Pre-allocate output buffers
     const data = new Uint8Array(this.totalBytes);
@@ -218,7 +218,7 @@ export class DictionaryBuilder {
     }
     offsets[uniqueCount] = offset;
 
-    return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexTypeCtor);
+    return new FinalizedDictionary(data, offsets, indexMap, indexArrayCtor, arrowIndexType);
   }
 
   /**
