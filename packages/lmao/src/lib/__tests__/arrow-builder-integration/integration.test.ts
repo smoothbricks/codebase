@@ -7,6 +7,7 @@ import {
 } from '@smoothbricks/arrow-builder';
 import type { SpanBuffer } from '@smoothbricks/lmao';
 import { convertToArrowTable, createSpanBuffer, defineOpContext, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 
 import { TestTracer } from '../../tracers/TestTracer.js';
@@ -365,11 +366,18 @@ describe('Buffer Integration', () => {
       // SpanBuffer is just storage - SpanLogger writes timestamps.
       // Use the full system (Tracer + SpanLogger) to verify entries have increasing timestamps.
       const schema = createTestSchema({ userId: S.category() });
-      const ctx = defineOpContext({ logSchema: schema });
-      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+      const ctx = defineOpContext({
+        logSchema: defineLogSchema({
+          userId: S.category(),
+        }),
+      });
+      const trace = (new TestTracer(ctx as any, { ...createTestTracerOptions() }) as any).trace as (
+        name: string,
+        fn: (ctx: any) => Promise<any>,
+      ) => Promise<any>;
 
       let capturedBuffer: SpanBuffer<typeof schema> | undefined;
-      await trace('test', async (ctx) => {
+      await trace('test', async (ctx: any) => {
         // Log multiple entries with small delays
         ctx.log.info('first');
         await new Promise((r) => setTimeout(r, 5));

@@ -458,6 +458,10 @@ describe('Capacity Tuning Algorithm', () => {
   });
 
   describe('Integration with SpanLogger overflow', () => {
+    const userIntegrationSchema = new LogSchema({
+      testField: S.category(),
+    });
+
     const integrationSchema = new LogSchema(
       mergeWithSystemSchema({
         testField: S.category(),
@@ -506,7 +510,7 @@ describe('Capacity Tuning Algorithm', () => {
       const { TestTracer } = await import('../tracers/TestTracer.js');
 
       const ctx = defineOpContext({
-        logSchema: integrationSchema,
+        logSchema: userIntegrationSchema,
       });
 
       const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });

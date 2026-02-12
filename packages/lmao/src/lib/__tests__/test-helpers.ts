@@ -32,8 +32,7 @@ import { NoOpTracer } from '../tracers/NoOpTracer.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
 
 // Create a minimal OpContextBinding for the NoOpTracer (it doesn't actually use it)
-const minimalSchema = new LogSchema(mergeWithSystemSchema({}));
-const minimalOpContext = defineOpContext({ logSchema: minimalSchema });
+const minimalOpContext = defineOpContext({ logSchema: new LogSchema({}) });
 
 /**
  * Default TracerOptions for tests.

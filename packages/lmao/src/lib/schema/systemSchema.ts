@@ -170,10 +170,10 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
   });
 
   if (conflictingSystemKeys.length > 0) {
-    console.warn(
-      `!  User schema conflicts with system schema fields: ${conflictingSystemKeys.join(', ')}\n` +
-        '   User definitions will override system schema. This may cause unexpected behavior.\n' +
-        `   System fields: ${Array.from(systemKeys).join(', ')}`,
+    throw new Error(
+      `User schema conflicts with system schema fields: ${conflictingSystemKeys.join(', ')}\n` +
+        'System schema fields are reserved and cannot be overridden.\n' +
+        `System fields: ${Array.from(systemKeys).join(', ')}`,
     );
   }
 
