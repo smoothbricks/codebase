@@ -59,6 +59,7 @@ function buildProgram(opts: {
     | { type: 'hashmap'; capacity: number }
     | { type: 'hashset'; capacity: number }
     | { type: 'aggregate'; aggType: AggType }
+    | { type: 'condition-tree' }
   >;
   numInputs: number;
   reduceOps: number[];
@@ -77,6 +78,9 @@ function buildProgram(opts: {
       case 'aggregate':
         // SLOT_DEF: slot, type_flags(AGGREGATE), aggType in cap_lo, 0
         initCode.push(Opcode.SLOT_DEF, i, SlotType.AGGREGATE, slot.aggType, 0);
+        break;
+      case 'condition-tree':
+        initCode.push(Opcode.SLOT_DEF, i, SlotType.CONDITION_TREE, 0, 0);
         break;
     }
   }
@@ -256,6 +260,37 @@ describe('SC1: Reduce stage for aggregation', () => {
 
     // Aggregate: sum = 10 + 20 + 30 + 40 = 100
     expect(backend.getAggregateValue(state, program, 1)).toBe(100);
+  });
+
+  it.skipIf(!WASM_EXISTS)('parses and initializes CONDITION_TREE slots as first-class slot types', async () => {
+    const bytecode = buildProgram({
+      slots: [{ type: 'condition-tree' }, { type: 'aggregate', aggType: AggType.COUNT }],
+      numInputs: 1,
+      reduceOps: [Opcode.BATCH_AGG_COUNT, 1],
+    });
+
+    const program = await backend.loadProgram(bytecode);
+    expect(program.slotDefs[0]).toEqual({ type: SlotType.CONDITION_TREE });
+    expect(program.slotDefs[1]).toEqual({ type: SlotType.AGGREGATE, aggType: AggType.COUNT });
+
+    const state = backend.createState(program);
+    const serialized = backend.serialize(state, program);
+
+    // vm.zig slot metadata layout: TYPE_FLAGS at byte 12 of each 48-byte slot meta block.
+    const STATE_HEADER_SIZE = 32;
+    const SLOT_META_SIZE = 48;
+    const TYPE_FLAGS_OFFSET = 12;
+    const typeFlags = serialized[STATE_HEADER_SIZE + TYPE_FLAGS_OFFSET];
+    expect(typeFlags & 0x0f).toBe(SlotType.CONDITION_TREE);
+
+    // Verify the state can execute and round-trip with CONDITION_TREE metadata intact.
+    const result = backend.executeBatch(state, program, [{ data: new Float64Array([1]), type: ValueType.FLOAT64 }], 1);
+    expect(result).toBe(ErrorCode.OK);
+
+    const restored = backend.deserialize(program, serialized);
+    const restoredBytes = backend.serialize(restored, program);
+    const restoredTypeFlags = restoredBytes[STATE_HEADER_SIZE + TYPE_FLAGS_OFFSET];
+    expect(restoredTypeFlags & 0x0f).toBe(SlotType.CONDITION_TREE);
   });
 });
 

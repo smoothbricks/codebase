@@ -143,7 +143,7 @@ function parseSlotDefs(initCode: Uint8Array, expectedSlots: number, defaultCapac
         const typeFlags = initCode[pc + 1];
         const capLo = initCode[pc + 2];
         const capHi = initCode[pc + 3];
-        pc += 5; // slot, type_flags, cap_lo, cap_hi
+        pc += 4; // slot, type_flags, cap_lo, cap_hi
 
         switch (typeFlags) {
           case SlotType.HASHMAP:
@@ -154,6 +154,9 @@ function parseSlotDefs(initCode: Uint8Array, expectedSlots: number, defaultCapac
             break;
           case SlotType.AGGREGATE:
             slotDefs[slot] = { type: SlotType.AGGREGATE, aggType: (capLo || AggType.SUM) as AggType };
+            break;
+          case SlotType.CONDITION_TREE:
+            slotDefs[slot] = { type: SlotType.CONDITION_TREE };
             break;
           default:
             break;
