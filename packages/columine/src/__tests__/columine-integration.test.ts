@@ -279,9 +279,20 @@ describe('SC1: Reduce stage for aggregation', () => {
     // vm.zig slot metadata layout: TYPE_FLAGS at byte 12 of each 48-byte slot meta block.
     const STATE_HEADER_SIZE = 32;
     const SLOT_META_SIZE = 48;
+    const OFFSET_OFFSET = 0;
     const TYPE_FLAGS_OFFSET = 12;
-    const typeFlags = serialized[STATE_HEADER_SIZE + TYPE_FLAGS_OFFSET];
+    const slot0MetaBase = STATE_HEADER_SIZE;
+    const slot1MetaBase = STATE_HEADER_SIZE + SLOT_META_SIZE;
+    const stateView = new DataView(serialized.buffer, serialized.byteOffset, serialized.byteLength);
+
+    const typeFlags = serialized[slot0MetaBase + TYPE_FLAGS_OFFSET];
+    const conditionTreeOffset = stateView.getUint32(slot0MetaBase + OFFSET_OFFSET, true);
+    const aggregateOffset = stateView.getUint32(slot1MetaBase + OFFSET_OFFSET, true);
+
     expect(typeFlags & 0x0f).toBe(SlotType.CONDITION_TREE);
+    expect(aggregateOffset - conditionTreeOffset).toBe(8);
+    expect(stateView.getUint32(conditionTreeOffset, true)).toBe(1);
+    expect(stateView.getUint32(conditionTreeOffset + 4, true)).toBe(0xffffffff);
 
     // Verify the state can execute and round-trip with CONDITION_TREE metadata intact.
     const result = backend.executeBatch(state, program, [{ data: new Float64Array([1]), type: ValueType.FLOAT64 }], 1);
@@ -290,7 +301,12 @@ describe('SC1: Reduce stage for aggregation', () => {
     const restored = backend.deserialize(program, serialized);
     const restoredBytes = backend.serialize(restored, program);
     const restoredTypeFlags = restoredBytes[STATE_HEADER_SIZE + TYPE_FLAGS_OFFSET];
+    const restoredView = new DataView(restoredBytes.buffer, restoredBytes.byteOffset, restoredBytes.byteLength);
+    const restoredConditionTreeOffset = restoredView.getUint32(slot0MetaBase + OFFSET_OFFSET, true);
+
     expect(restoredTypeFlags & 0x0f).toBe(SlotType.CONDITION_TREE);
+    expect(restoredView.getUint32(restoredConditionTreeOffset, true)).toBe(1);
+    expect(restoredView.getUint32(restoredConditionTreeOffset + 4, true)).toBe(0xffffffff);
   });
 });
 
