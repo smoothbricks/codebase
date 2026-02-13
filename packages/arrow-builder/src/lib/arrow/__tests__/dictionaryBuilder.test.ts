@@ -6,8 +6,8 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { tableFromColumns, tableFromIPC, tableToIPC, uint8, uint16 } from '@uwdata/flechette';
-import { createDictionary8Data, createDictionary16Data } from '../data.js';
+import { tableFromIPC, tableToIPC, uint8, uint16 } from '@uwdata/flechette';
+import { createDictionary8Data, createDictionary16Data, createTableFromBatches } from '../data.js';
 import { DictionaryBuilder } from '../dictionary.js';
 
 function roundTripDictionary8(
@@ -16,8 +16,8 @@ function roundTripDictionary8(
   length: number,
   nullBitmap?: Uint8Array,
 ) {
-  const column = createDictionary8Data(indices, dict.data, dict.offsets, length, nullBitmap);
-  const table = tableFromColumns({ value: column });
+  const batch = createDictionary8Data(indices, dict.data, dict.offsets, length, nullBitmap);
+  const table = createTableFromBatches({ value: batch });
   const ipcBytes = tableToIPC(table, { format: 'file' });
   if (!ipcBytes) throw new Error('Failed to serialize dictionary table');
   return tableFromIPC(ipcBytes);
@@ -29,8 +29,8 @@ function roundTripDictionary16(
   length: number,
   nullBitmap?: Uint8Array,
 ) {
-  const column = createDictionary16Data(indices, dict.data, dict.offsets, length, nullBitmap);
-  const table = tableFromColumns({ value: column });
+  const batch = createDictionary16Data(indices, dict.data, dict.offsets, length, nullBitmap);
+  const table = createTableFromBatches({ value: batch });
   const ipcBytes = tableToIPC(table, { format: 'file' });
   if (!ipcBytes) throw new Error('Failed to serialize dictionary table');
   return tableFromIPC(ipcBytes);

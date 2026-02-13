@@ -3,12 +3,13 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { tableFromColumns, tableFromIPC, tableToIPC } from '@uwdata/flechette';
+import { tableFromIPC, tableToIPC } from '@uwdata/flechette';
 import {
   createBoolData,
   createDictionary8Data,
   createDictionary32Data,
   createFloat64Data,
+  createTableFromBatches,
   createUtf8Data,
 } from '../../arrow/data.js';
 import { S } from '../../schema/builder.js';
@@ -63,7 +64,7 @@ function createTextColumn(values: string[], length: number, nullBitmap?: Uint8Ar
   return createUtf8Data(data, offsets, length, nullBitmap);
 }
 
-function roundTripVerify(table: ReturnType<typeof tableFromColumns>) {
+function roundTripVerify(table: ReturnType<typeof createTableFromBatches>) {
   const ipc = tableToIPC(table, { format: 'file' });
   if (!ipc) throw new Error('Failed to serialize Arrow table');
   const roundTripped = tableFromIPC(ipc);
@@ -99,7 +100,7 @@ describe('Arrow IPC Compatibility - Enum Columns', () => {
       enumValues,
       exposed.status_nulls,
     );
-    const table = tableFromColumns({ status: statusColumn });
+    const table = createTableFromBatches({ status: statusColumn });
     const roundTripped = roundTripVerify(table);
 
     expect(roundTripped.at(0).status).toBe('pending');
@@ -120,7 +121,7 @@ describe('Arrow IPC Compatibility - Enum Columns', () => {
     buffer.status(2, 2);
     buffer.status(3, 1);
 
-    const table = tableFromColumns({
+    const table = createTableFromBatches({
       status: createEnumColumn(buffer.status_values as Uint8Array, 4, enumValues),
     });
     const roundTripped = roundTripVerify(table);
@@ -143,7 +144,7 @@ describe('Arrow IPC Compatibility - Category Columns', () => {
     buffer.userId(3, 'user-charlie');
     buffer.userId(4, 'user-bob');
 
-    const table = tableFromColumns({
+    const table = createTableFromBatches({
       userId: createCategoryColumn(buffer.userId_values as string[], 5, buffer.userId_nulls),
     });
     const roundTripped = roundTripVerify(table);
@@ -180,7 +181,7 @@ describe('Arrow IPC Compatibility - Number Columns', () => {
     buffer.count(3, 0);
     buffer.count(4, Number.MAX_SAFE_INTEGER);
 
-    const table = tableFromColumns({
+    const table = createTableFromBatches({
       count: createFloat64Data(buffer.count_values as Float64Array, 5, buffer.count_nulls),
     });
     const roundTripped = roundTripVerify(table);
@@ -201,7 +202,7 @@ describe('Arrow IPC Compatibility - Number Columns', () => {
     buffer.count(1, 2.5);
     buffer.count(2, 3.5);
 
-    const table = tableFromColumns({ count: createFloat64Data(buffer.count_values as Float64Array, 3) });
+    const table = createTableFromBatches({ count: createFloat64Data(buffer.count_values as Float64Array, 3) });
     const roundTripped = roundTripVerify(table);
 
     expect(roundTripped.at(0).count).toBe(1.5);
@@ -225,7 +226,7 @@ describe('Arrow IPC Compatibility - Boolean Columns', () => {
     buffer.active(7, true);
     buffer.active(8, true);
 
-    const table = tableFromColumns({
+    const table = createTableFromBatches({
       active: createBoolData(buffer.active_values as Uint8Array, 9, buffer.active_nulls),
     });
     const roundTripped = roundTripVerify(table);
@@ -250,7 +251,7 @@ describe('Arrow IPC Compatibility - Boolean Columns', () => {
     buffer.active(1, false);
     buffer.active(2, true);
 
-    const table = tableFromColumns({ active: createBoolData(buffer.active_values as Uint8Array, 3) });
+    const table = createTableFromBatches({ active: createBoolData(buffer.active_values as Uint8Array, 3) });
     const roundTripped = roundTripVerify(table);
 
     expect(roundTripped.at(0).active).toBe(true);
@@ -268,7 +269,7 @@ describe('Arrow IPC Compatibility - Text Columns', () => {
     buffer.message(1, 'Second message');
     buffer.message(2, 'Third message');
 
-    const table = tableFromColumns({
+    const table = createTableFromBatches({
       message: createTextColumn(buffer.message_values as string[], 3, buffer.message_nulls),
     });
     const roundTripped = roundTripVerify(table);
@@ -382,7 +383,7 @@ describe('Arrow IPC Compatibility - Large Datasets', () => {
       buffer.value(i, i * 1.5);
     }
 
-    const table = tableFromColumns({
+    const table = createTableFromBatches({
       value: createFloat64Data(buffer.value_values as Float64Array, 1000, buffer.value_nulls),
     });
     const roundTripped = roundTripVerify(table);
@@ -419,7 +420,7 @@ describe('Arrow IPC Compatibility - Format Verification', () => {
     buffer.id(0, 1).name(0, 'Alice').status(0, 0).flag(0, true);
     buffer.id(1, 2).name(1, 'Bob').status(1, 1).flag(1, false);
 
-    const table = tableFromColumns({
+    const table = createTableFromBatches({
       id: createFloat64Data(buffer.id_values as Float64Array, 2, buffer.id_nulls),
       name: createCategoryColumn(buffer.name_values as string[], 2, buffer.name_nulls),
       status: createEnumColumn(buffer.status_values as Uint8Array, 2, ['active', 'inactive'], buffer.status_nulls),
