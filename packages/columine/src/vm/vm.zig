@@ -219,9 +219,14 @@ pub const EvictionEntry = packed struct {
     // Total: 12 bytes per entry
 };
 
-// CONDITION_TREE slots currently persist metadata only.
-// Tree payload remains JS-managed until VM-native evaluation lands.
-const CONDITION_TREE_STATE_BYTES: u32 = 0;
+const ConditionTreeState = extern struct {
+    lifecycle_generation: u32,
+    last_removed_key: u32,
+};
+
+// CONDITION_TREE slots keep explicit lifecycle bytes in reducer state so
+// init/evict/checkpoint paths are not metadata-only.
+const CONDITION_TREE_STATE_BYTES: u32 = @sizeOf(ConditionTreeState);
 
 // =============================================================================
 // Opcodes - Each processes entire batch
@@ -801,12 +806,14 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
     }
 }
 
+inline fn getConditionTreeStatePtr(state_base: [*]u8, meta: SlotMeta) *ConditionTreeState {
+    return @ptrCast(@alignCast(state_base + meta.offset));
+}
+
 fn removeConditionTreeEntry(state_base: [*]u8, meta: SlotMeta, key: u32) void {
-    _ = state_base;
-    _ = meta;
-    _ = key;
-    // CONDITION_TREE is metadata-only in reducer state for now, so TTL eviction has
-    // no per-entry storage to mutate.
+    const tree_state = getConditionTreeStatePtr(state_base, meta);
+    tree_state.lifecycle_generation +%= 1;
+    tree_state.last_removed_key = key;
 }
 
 /// Insert entry with TTL tracking (maintains sorted eviction index)
@@ -2126,7 +2133,11 @@ pub export fn vm_init_state(
                         data_offset += capacity * 4 + capacity * 4 + capacity * 8;
                     },
                     .CONDITION_TREE => {
-                        @memset(state_ptr[data_offset .. data_offset + CONDITION_TREE_STATE_BYTES], 0);
+                        const tree_state: *ConditionTreeState = @ptrCast(@alignCast(state_ptr + data_offset));
+                        tree_state.* = .{
+                            .lifecycle_generation = 1,
+                            .last_removed_key = EMPTY_KEY,
+                        };
                         data_offset += CONDITION_TREE_STATE_BYTES;
                     },
                     .HASHSET => {
