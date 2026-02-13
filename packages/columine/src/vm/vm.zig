@@ -224,6 +224,10 @@ const ConditionTreeState = extern struct {
     last_removed_key: u32,
 };
 
+// Version marker for condition-tree matcher payloads consumed by ax_eval.zig.
+// Kept in columine so state/matcher evolution stays synchronized.
+pub const CONDITION_TREE_MATCHER_PLAN_VERSION: u16 = 1;
+
 // CONDITION_TREE slots keep explicit lifecycle bytes in reducer state so
 // init/evict/checkpoint paths are not metadata-only.
 const CONDITION_TREE_STATE_BYTES: u32 = @sizeOf(ConditionTreeState);
