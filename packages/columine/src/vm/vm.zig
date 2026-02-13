@@ -228,6 +228,20 @@ const ConditionTreeState = extern struct {
 // Kept in columine so state/matcher evolution stays synchronized.
 pub const CONDITION_TREE_MATCHER_PLAN_VERSION: u16 = 1;
 
+// Condition tree node type constants (must match TypeScript condition node types
+// and CT_NODE_* constants in ax_eval.zig).
+pub const CT_NODE_EQ: u8 = 1;
+pub const CT_NODE_NEQ: u8 = 2;
+pub const CT_NODE_GT: u8 = 3;
+pub const CT_NODE_GTE: u8 = 4;
+pub const CT_NODE_LT: u8 = 5;
+pub const CT_NODE_LTE: u8 = 6;
+pub const CT_NODE_IN: u8 = 7;
+pub const CT_NODE_RANGE: u8 = 8;
+pub const CT_NODE_BOOLEAN: u8 = 9;
+pub const CT_NODE_NOT: u8 = 10;
+pub const CT_NODE_DESTINATION: u8 = 11;
+
 // CONDITION_TREE slots keep explicit lifecycle bytes in reducer state so
 // init/evict/checkpoint paths are not metadata-only.
 const CONDITION_TREE_STATE_BYTES: u32 = @sizeOf(ConditionTreeState);
