@@ -301,6 +301,11 @@ function generatePrefillScopedAttributesMethod(
     const columnName = fieldName;
     const lmaoType = getSchemaType(fieldSchema);
 
+    // Binary columns are not scope-fillable (object payloads can't be bulk-filled)
+    if (lmaoType === 'binary') {
+      return '';
+    }
+
     // Boolean uses bit-packed storage - bulk fill using helper
     if (lmaoType === 'boolean') {
       return `
