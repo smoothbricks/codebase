@@ -383,7 +383,9 @@ type SetterValueType<S> = S extends { __schema_type: 'enum' }
         ? bigint
         : S extends { __schema_type: 'boolean' }
           ? boolean
-          : unknown;
+          : S extends { __schema_type: 'binary' }
+            ? unknown
+            : unknown;
 
 type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
   ? Uint8Array
@@ -395,7 +397,9 @@ type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
         ? BigUint64Array
         : S extends { __schema_type: 'boolean' }
           ? Uint8Array
-          : TypedArray | string[];
+          : S extends { __schema_type: 'binary' }
+            ? unknown[]
+            : TypedArray | string[];
 
 type FilterSchemaFields<T> = {
   [K in keyof T as T[K] extends (...args: unknown[]) => unknown ? never : K]: T[K];
@@ -425,8 +429,8 @@ export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
   isParentOf(other: SpanBuffer<T>): boolean;
   isChildOf(other: SpanBuffer<T>): boolean;
 
-  // Index signatures for dynamic access
-  [key: `${string}_values`]: TypedArray | string[] | undefined;
+  // Index signatures for dynamic access (includes unknown[] for binary columns)
+  [key: `${string}_values`]: TypedArray | string[] | unknown[] | undefined;
   [key: `${string}_nulls`]: Uint8Array | undefined;
 } & {
   // Schema-specific column data

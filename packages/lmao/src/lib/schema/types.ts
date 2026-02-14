@@ -9,7 +9,10 @@ import type * as Sury from '@sury/sury';
 
 // Re-export schema metadata types from arrow-builder (single source of truth)
 export type {
+  // Binary encoder interface
+  BinaryEncoder,
   // Eager schema types (allocated immediately, no null bitmap)
+  EagerBinarySchema,
   EagerBooleanSchema,
   EagerCategorySchema,
   EagerEnumSchema,
@@ -17,6 +20,8 @@ export type {
   EagerTextSchema,
   // Metadata and utility types
   EnumUtf8Precomputed,
+  // Binary schemas
+  LazyBinarySchema,
   // Lazy schema types (default - allocated on first write)
   LazyBooleanSchema,
   LazyCategorySchema,
@@ -40,11 +45,13 @@ export { isLogSchema, LogSchema } from './LogSchema.js';
 
 // Import schema metadata types for use in InferSchema and local type definitions
 import type {
+  BinaryEncoder,
   EagerBooleanSchema,
   EagerCategorySchema,
   EagerEnumSchema,
   EagerNumberSchema,
   EagerTextSchema,
+  LazyBinarySchema,
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyEnumSchema,
@@ -227,6 +234,30 @@ export interface SchemaBuilder {
    * - .mask(preset) for masking during Arrow conversion
    */
   text(): TextSchemaOrFlagBuilder;
+
+  // Binary types - raw bytes or encoder-wrapped values
+
+  /**
+   * Binary - Raw bytes or encoder-wrapped values
+   * Storage: Array (object references, frozen at tag time)
+   * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
+   * Use for: Arbitrary payloads, serialized objects, msgpack blobs
+   */
+  binary(): LazyBinarySchema<Uint8Array>;
+  binary<T = unknown>(options: { encoder: BinaryEncoder }): LazyBinarySchema<T>;
+
+  /**
+   * Unknown - accepts any value, msgpack-encoded at flush time
+   * Sugar for S.binary({ encoder: msgpackEncoder })
+   * Use for: arbitrary objects, request bodies, error context, unknown-shape data
+   */
+  unknown(): LazyBinarySchema<unknown>;
+
+  /**
+   * Object<T> - typed variant of unknown, same underlying binary storage with msgpack encoding
+   * TypeScript enforces shape at compile time; no runtime validation on hot path
+   */
+  object<T extends object>(): LazyBinarySchema<T>;
 
   // Optional wrapper
   optional<T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined>;

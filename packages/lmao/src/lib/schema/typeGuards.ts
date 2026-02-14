@@ -6,6 +6,7 @@
 
 // Re-export schema type guards from arrow-builder
 export {
+  getBinaryEncoder,
   getEnumUtf8,
   getEnumValues,
   getSchemaType,

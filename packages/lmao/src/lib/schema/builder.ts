@@ -1,13 +1,18 @@
 /**
- * Schema builder for lmao - extends arrow-builder's schema builder with feature flags and masking
+ * Schema builder for lmao - extends arrow-builder's schema builder with feature flags, masking, and binary sugar
  *
  * This module re-exports the S object from arrow-builder and adds:
  * - Feature flag support via .default().sync()/.async() pattern
  * - Masking transformations for sensitive data
+ * - S.unknown() and S.object<T>() sugar for msgpack-encoded binary columns
+ * - S.binary() passthrough to arrow-builder's S.binary()
  */
 
+import { encode } from '@msgpack/msgpack';
 import {
   S as ArrowS,
+  type BinaryEncoder,
+  type LazyBinarySchema,
   type LazyBooleanSchema,
   type LazyCategorySchema,
   type LazyEnumSchema,
@@ -16,6 +21,17 @@ import {
 } from '@smoothbricks/arrow-builder';
 import type * as Sury from '@sury/sury';
 import type { FeatureFlagDefinition, FlagBuilderWithDefault, SchemaBuilder, SchemaOrFlagBuilder } from './types.js';
+
+/**
+ * Msgpack encoder singleton -- per-value, synchronous.
+ * Encodes at flush time (cold path), not on the hot write path.
+ * @msgpack/msgpack already handles most types; functions/symbols become undefined (dropped silently).
+ */
+const msgpackEncoder: BinaryEncoder = {
+  encode(value: unknown): Uint8Array {
+    return encode(value) as Uint8Array;
+  },
+};
 
 /**
  * Create a flag builder that wraps a Sury schema
@@ -172,6 +188,41 @@ const schemaBuilderImpl: SchemaBuilder = {
   text: (): SchemaOrFlagBuilder<string> & LazyTextSchema => {
     const schema = ArrowS.text();
     return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & LazyTextSchema;
+  },
+
+  /**
+   * Binary - Raw bytes or encoder-wrapped values
+   *
+   * Passthrough to arrow-builder's S.binary().
+   * Without encoder: accepts Uint8Array (raw binary).
+   * With encoder: accepts any value T (encoded to bytes at flush time).
+   */
+  binary: ((options?: { encoder: BinaryEncoder }): LazyBinarySchema => {
+    if (options?.encoder) {
+      return ArrowS.binary(options);
+    }
+    return ArrowS.binary();
+  }) as SchemaBuilder['binary'],
+
+  /**
+   * Unknown - accepts any value, msgpack-encoded at flush time
+   *
+   * Sugar for S.binary({ encoder: msgpackEncoder }).
+   * Use for: arbitrary objects, request bodies, error context, unknown-shape data.
+   * Hot path stores frozen object reference; flush path encodes via @msgpack/msgpack.
+   */
+  unknown: (): LazyBinarySchema<unknown> => {
+    return ArrowS.binary({ encoder: msgpackEncoder });
+  },
+
+  /**
+   * Object<T> - typed variant of unknown, same underlying binary storage with msgpack encoding
+   *
+   * TypeScript enforces shape at compile time; no runtime validation on hot path.
+   * Sugar for S.binary<T>({ encoder: msgpackEncoder }).
+   */
+  object: <T extends object>(): LazyBinarySchema<T> => {
+    return ArrowS.binary<T>({ encoder: msgpackEncoder });
   },
 };
 
