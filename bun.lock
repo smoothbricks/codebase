@@ -68,6 +68,7 @@
       "name": "@smoothbricks/lmao",
       "version": "0.0.1",
       "dependencies": {
+        "@msgpack/msgpack": "^3.1.3",
         "@neophi/sieve-cache": "^1.5.0",
         "@smoothbricks/arrow-builder": "workspace:*",
         "@sury/sury": "npm:@jsr/sury__sury",
