@@ -5,6 +5,7 @@
  */
 
 import type {
+  BinaryEncoder,
   EagerEnumSchema,
   EnumUtf8Precomputed,
   LazyCategorySchema,
@@ -18,7 +19,7 @@ import type {
 /**
  * Valid schema types
  */
-const SCHEMA_TYPES: readonly SchemaType[] = ['enum', 'category', 'text', 'number', 'boolean'];
+const SCHEMA_TYPES: readonly SchemaType[] = ['enum', 'category', 'text', 'number', 'boolean', 'bigUint64', 'binary'];
 
 /**
  * Type guard to check if a value is a SchemaWithMetadata
@@ -115,6 +116,17 @@ export function hasMaskTransform(value: unknown): value is LazyCategorySchema | 
 export function getMaskTransform(value: unknown): MaskTransform | undefined {
   if (hasMaskTransform(value)) {
     return (value as LazyCategorySchema | LazyTextSchema).__mask_transform;
+  }
+  return undefined;
+}
+
+/**
+ * Get binary encoder from a schema, returning undefined if not a binary schema
+ * or if no encoder was provided (raw Uint8Array mode).
+ */
+export function getBinaryEncoder(value: unknown): BinaryEncoder | undefined {
+  if (isSchemaWithMetadata(value) && value.__schema_type === 'binary') {
+    return (value as { __binary_encoder?: BinaryEncoder }).__binary_encoder;
   }
   return undefined;
 }

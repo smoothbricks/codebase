@@ -17,7 +17,7 @@ import type { IntType } from '@uwdata/flechette';
  * - number: Float64Array
  * - boolean: Uint8Array (0/1)
  */
-export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean' | 'bigUint64';
+export type SchemaType = 'enum' | 'category' | 'text' | 'number' | 'boolean' | 'bigUint64' | 'binary';
 
 /**
  * Eager brand marker - columns marked as eager are allocated immediately
@@ -279,4 +279,53 @@ export type LazyBigUint64Schema = Sury.Schema<bigint, unknown> &
      * Use for columns written on every entry.
      */
     eager(): EagerBigUint64Schema;
+  };
+
+// =============================================================================
+// BINARY SCHEMA TYPES
+// =============================================================================
+
+/**
+ * Encoder interface for binary columns.
+ * Called at flush time (cold path) to encode arbitrary values to bytes.
+ *
+ * WHY per-value sync: Encoding happens during Arrow conversion (cold path),
+ * not during hot-path writes. Sync keeps the interface simple and composable.
+ */
+export interface BinaryEncoder {
+  /** Encode a single value to bytes. Called at flush time (cold path). */
+  encode(value: unknown): Uint8Array;
+}
+
+/**
+ * Base metadata for binary schema (shared between lazy and eager)
+ */
+interface BinaryMetadataBase {
+  __schema_type: 'binary';
+  __binary_encoder?: BinaryEncoder;
+}
+
+/**
+ * Eager binary schema - allocated immediately, no null bitmap
+ * Storage: Array (object references, frozen at tag time)
+ * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
+ */
+export type EagerBinarySchema<T = Uint8Array> = Sury.Schema<T, unknown> & BinaryMetadataBase & EagerBrand;
+
+/**
+ * Lazy binary schema with chainable eager method
+ * Storage: Array (object references, frozen at tag time)
+ * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
+ *
+ * T defaults to Uint8Array (raw binary). When an encoder is provided,
+ * T will be unknown (the consumer controls the type).
+ */
+export type LazyBinarySchema<T = Uint8Array> = Sury.Schema<T, unknown> &
+  BinaryMetadataBase &
+  LazyBrand & {
+    /**
+     * Mark this column as eager (always written, no null bitmap).
+     * Use for columns written on every entry.
+     */
+    eager(): EagerBinarySchema<T>;
   };

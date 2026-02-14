@@ -15,6 +15,11 @@ export { ColumnSchema, isColumnSchema } from './schema/ColumnSchema.js';
 
 // Re-export schema metadata types from the schema module
 export type {
+  // Binary encoder interface
+  BinaryEncoder,
+  EagerBigUint64Schema,
+  // Binary schemas
+  EagerBinarySchema,
   EagerBooleanSchema,
   // Brands
   EagerBrand,
@@ -24,6 +29,9 @@ export type {
   EagerTextSchema,
   // Utility types
   EnumUtf8Precomputed,
+  LazyBigUint64Schema,
+  // Binary schemas
+  LazyBinarySchema,
   // Boolean schemas
   LazyBooleanSchema,
   LazyBrand,

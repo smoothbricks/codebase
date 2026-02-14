@@ -14,7 +14,9 @@ import * as Sury from '@sury/sury';
 import { uint8, uint16, uint32 } from '@uwdata/flechette';
 import { intern } from '../arrow/interner.js';
 import type {
+  BinaryEncoder,
   EagerBigUint64Schema,
+  EagerBinarySchema,
   EagerBooleanSchema,
   EagerCategorySchema,
   EagerEnumSchema,
@@ -22,6 +24,7 @@ import type {
   EagerTextSchema,
   EnumUtf8Precomputed,
   LazyBigUint64Schema,
+  LazyBinarySchema,
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyEnumSchema,
@@ -186,6 +189,20 @@ export interface ArrowSchemaBuilder {
   text(): LazyTextSchema;
 
   /**
+   * Binary - Raw bytes or encoder-wrapped values
+   * Storage: Array (object references, frozen at tag time)
+   * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
+   * Use for: Arbitrary payloads, serialized objects, msgpack blobs
+   *
+   * Without encoder: accepts Uint8Array (raw binary)
+   * With encoder: accepts any value T (encoded to bytes at flush time)
+   *
+   * @returns Schema with chainable `.eager()` method
+   */
+  binary(): LazyBinarySchema<Uint8Array>;
+  binary<T = unknown>(options: { encoder: BinaryEncoder }): LazyBinarySchema<T>;
+
+  /**
    * Wrap schema to make it optional
    */
   optional<T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined>;
@@ -329,6 +346,31 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
         Object.getPrototypeOf(schema),
         Object.getOwnPropertyDescriptors(schema),
       ) as EagerCategorySchema;
+      (eagerSchema as { __eager: true }).__eager = true;
+      return eagerSchema;
+    };
+
+    return schema;
+  },
+
+  binary: (options?: { encoder: BinaryEncoder }): LazyBinarySchema => {
+    // Use Sury.unknown as the base schema -- binary accepts any value when encoder present
+    const schema = Object.create(
+      Object.getPrototypeOf(Sury.unknown),
+      Object.getOwnPropertyDescriptors(Sury.unknown),
+    ) as LazyBinarySchema;
+    schema.__schema_type = 'binary';
+
+    if (options?.encoder) {
+      schema.__binary_encoder = options.encoder;
+    }
+
+    // Add chainable .eager() method
+    schema.eager = (): EagerBinarySchema => {
+      const eagerSchema = Object.create(
+        Object.getPrototypeOf(schema),
+        Object.getOwnPropertyDescriptors(schema),
+      ) as EagerBinarySchema;
       (eagerSchema as { __eager: true }).__eager = true;
       return eagerSchema;
     };
