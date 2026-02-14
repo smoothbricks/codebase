@@ -172,6 +172,11 @@ function getTypedArrayInfo(schema: ColumnSchema, fieldName: string): ColumnStora
     return { constructorName: 'BigUint64Array', bytesPerElement: 8, isBitPacked: false, schemaType, isEager };
   }
 
+  if (schemaType === 'binary') {
+    // Binary columns use Array storage (same as category/text) to hold frozen object references
+    return { constructorName: 'Array', bytesPerElement: 0, isBitPacked: false, schemaType, isEager };
+  }
+
   // Default to Uint32Array for unknown types
   return { constructorName: 'Uint32Array', bytesPerElement: 4, isBitPacked: false, schemaType, isEager };
 }
@@ -245,6 +250,7 @@ function getDefaultValueLiteral(info: ColumnStorageInfo): string {
   if (schemaType === 'enum' || schemaType === 'number') return '0';
   if (schemaType === 'bigUint64') return '0n';
   if (schemaType === 'category' || schemaType === 'text') return "''";
+  if (schemaType === 'binary') return 'null';
   return '0';
 }
 

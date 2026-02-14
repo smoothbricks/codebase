@@ -149,6 +149,20 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
     return this;`;
   }
 
+  if (schemaType === 'binary') {
+    // Binary column: freeze objects to prevent mutation between tag and flush
+    // S.binary() stores Uint8Array directly (no freeze needed for typed arrays)
+    // S.unknown() / S.object() stores frozen object reference
+    return `
+    const idx = this._writeIndex;
+    if (typeof value === 'object' && value !== null && !(value instanceof Uint8Array)) {
+      Object.freeze(value);
+    }
+    this._buffer.${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7));
+    this._buffer.${columnName}_values[idx] = value;
+    return this;`;
+  }
+
   // All other types: set value in TypedArray and update null bitmap
   return `
     const idx = this._writeIndex;

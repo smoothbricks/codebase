@@ -20,11 +20,13 @@
 import type { ColumnSchema } from '../schema/ColumnSchema.js';
 import type {
   EagerBigUint64Schema,
+  EagerBinarySchema,
   EagerBooleanSchema,
   EagerCategorySchema,
   EagerNumberSchema,
   EagerTextSchema,
   LazyBigUint64Schema,
+  LazyBinarySchema,
   LazyBooleanSchema,
   LazyCategorySchema,
   LazyNumberSchema,
@@ -55,7 +57,7 @@ export type TypedArray =
  * - Hot path stores raw JavaScript strings in string[] (zero conversion cost)
  * - Cold path (Arrow conversion) handles UTF-8 encoding and dictionary building
  */
-export type ColumnValueType = TypedArray | string[];
+export type ColumnValueType = TypedArray | string[] | unknown[];
 
 /**
  * Default initial buffer capacity.
@@ -128,7 +130,9 @@ export type SetterValueType<S> = S extends { __schema_type: 'enum' }
           ? bigint
           : S extends LazyBooleanSchema | EagerBooleanSchema
             ? boolean
-            : unknown;
+            : S extends LazyBinarySchema<infer T> | EagerBinarySchema<infer T>
+              ? T
+              : unknown;
 
 /**
  * Infer the values array type for a schema field.
@@ -151,7 +155,9 @@ export type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
           ? BigUint64Array
           : S extends LazyBooleanSchema | EagerBooleanSchema
             ? Uint8Array
-            : string[] | TypedArray;
+            : S extends LazyBinarySchema | EagerBinarySchema
+              ? unknown[]
+              : string[] | TypedArray;
 
 /**
  * Filter out function properties from a schema object.
@@ -185,7 +191,7 @@ export type ColumnBuffer<Schema> = AnyColumnBuffer & {
   _overflow?: ColumnBuffer<Schema>;
 
   // Index signatures for dynamic access
-  [key: `${string}_values`]: TypedArray | string[] | undefined;
+  [key: `${string}_values`]: TypedArray | string[] | unknown[] | undefined;
   [key: `${string}_nulls`]: Uint8Array | undefined;
 } & {
   // Schema-specific column data
