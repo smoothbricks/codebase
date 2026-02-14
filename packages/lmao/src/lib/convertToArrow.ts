@@ -20,6 +20,7 @@ import {
 } from '@smoothbricks/arrow-builder';
 import {
   batchType,
+  binary,
   bool,
   Column,
   dictionary,
@@ -48,7 +49,7 @@ import {
   walkSpanTree,
 } from './arrow/utils.js';
 import { ENTRY_TYPE_NAMES, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
-import { getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
+import { getBinaryEncoder, getEnumUtf8, getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import type { LogSchema } from './schema/types.js';
 import type { AnySpanBuffer, OpMetadata } from './types.js';
 import { globalUtf8Cache } from './utf8Cache.js';
@@ -159,6 +160,90 @@ function indexTypeForCount(count: number): IntType {
   if (count <= 255) return uint8();
   if (count <= 65535) return uint16();
   return uint32();
+}
+
+/**
+ * Build a binary Arrow column from SpanBuffer data.
+ * Shared by both convertBuffersToTable and convertBuffersWithSharedDicts.
+ *
+ * Binary columns store arbitrary bytes (raw Uint8Array or encoder-encoded objects).
+ * At flush time, the encoder (if present) transforms stored values into Uint8Array.
+ */
+function buildBinaryColumnFromBuffers(
+  buffers: AnySpanBuffer[],
+  columnName: string,
+  totalRows: number,
+  fieldSchema: unknown,
+): { column: Column<unknown>; nullCount: number } {
+  const encoder = getBinaryEncoder(fieldSchema);
+
+  // Collect all values from buffers, encode each if encoder is present
+  const allValues: (Uint8Array | null)[] = [];
+  for (const buf of buffers) {
+    const col = buf.getColumnIfAllocated(columnName) as unknown[] | undefined;
+    const srcNulls = buf.getNullsIfAllocated(columnName);
+    for (let i = 0; i < buf._writeIndex; i++) {
+      if (srcNulls) {
+        const isValid = (srcNulls[i >>> 3] & (1 << (i & 7))) !== 0;
+        if (isValid && col) {
+          const raw = col[i];
+          allValues.push(encoder ? encoder.encode(raw) : (raw as Uint8Array));
+        } else {
+          allValues.push(null);
+        }
+      } else if (col) {
+        // No null bitmap -- column allocated but check for undefined/null values
+        const raw = col[i];
+        if (raw != null) {
+          allValues.push(encoder ? encoder.encode(raw) : (raw as Uint8Array));
+        } else {
+          allValues.push(null);
+        }
+      } else {
+        allValues.push(null);
+      }
+    }
+  }
+
+  // Build offsets and concatenated data buffer
+  const offsets = new Int32Array(totalRows + 1);
+  let dataLength = 0;
+  for (let i = 0; i < allValues.length; i++) {
+    offsets[i] = dataLength;
+    if (allValues[i] !== null) {
+      dataLength += allValues[i]!.length;
+    }
+  }
+  offsets[allValues.length] = dataLength;
+
+  const data = new Uint8Array(dataLength);
+  let dataOffset = 0;
+  let nullCount = 0;
+  const nullBitmapSize = Math.ceil(totalRows / 8);
+  const nullBitmap = new Uint8Array(nullBitmapSize);
+  for (let i = 0; i < allValues.length; i++) {
+    const val = allValues[i];
+    if (val !== null) {
+      data.set(val, dataOffset);
+      dataOffset += val.length;
+      // Mark valid in null bitmap
+      nullBitmap[i >>> 3] |= 1 << (i & 7);
+    } else {
+      nullCount++;
+    }
+  }
+
+  // Build Arrow Binary column via flechette
+  const binaryType = binary();
+  const batch = new (batchType(binaryType))({
+    type: binaryType,
+    length: totalRows,
+    nullCount,
+    validity: nullCount > 0 ? nullBitmap : EMPTY_VALIDITY,
+    offsets,
+    values: data,
+  });
+  return { column: new Column([batch]), nullCount };
 }
 
 /**
@@ -456,6 +541,11 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
       });
 
       vectors.push(buildColumn(boolData));
+    } else if (lmaoType === 'binary') {
+      // Binary columns: raw Uint8Array or encoder-wrapped values (e.g. msgpack)
+      const { column } = buildBinaryColumnFromBuffers(buffers, columnName, totalRows, fieldSchema);
+      fields.push(arrowFieldName);
+      vectors.push(column);
     }
   }
 
@@ -1925,6 +2015,12 @@ function convertBuffersWithSharedDicts(
         ),
       );
       fields.push(arrowFieldName);
+    } else if (lmaoType === 'binary') {
+      // Binary columns: raw Uint8Array or encoder-wrapped values (e.g. msgpack)
+      // Binary columns don't use dictionaries and are not scope-fillable
+      const { column } = buildBinaryColumnFromBuffers(buffers, columnName, totalRows, fieldSchema);
+      fields.push(arrowFieldName);
+      vectors.push(column);
     }
   }
 
