@@ -150,7 +150,8 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
   }
 
   if (schemaType === 'binary') {
-    // Binary column: freeze objects to prevent mutation between tag and flush
+    // Binary column: shallow-freeze objects to prevent top-level mutation between tag and flush.
+    // Nested objects are NOT frozen (deep freeze is expensive); callers must not mutate nested state after tagging.
     // S.binary() stores Uint8Array directly (no freeze needed for typed arrays)
     // S.unknown() / S.object() stores frozen object reference
     return `

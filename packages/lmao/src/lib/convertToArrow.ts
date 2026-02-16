@@ -64,6 +64,7 @@ export type SystemColumnBuilder = (
 ) => { fields: string[]; vectors: Column<unknown>[] };
 
 const EMPTY_VALIDITY = new Uint8Array(0);
+const BINARY_TYPE = binary();
 const BOOL_TYPE_ID = (bool() as { typeId?: unknown }).typeId;
 
 function buildData<T extends Record<string, unknown>>(data: T): T {
@@ -234,9 +235,8 @@ function buildBinaryColumnFromBuffers(
   }
 
   // Build Arrow Binary column via flechette
-  const binaryType = binary();
-  const batch = new (batchType(binaryType))({
-    type: binaryType,
+  const batch = new (batchType(BINARY_TYPE))({
+    type: BINARY_TYPE,
     length: totalRows,
     nullCount,
     validity: nullCount > 0 ? nullBitmap : EMPTY_VALIDITY,

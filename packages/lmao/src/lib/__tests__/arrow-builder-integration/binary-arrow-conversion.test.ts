@@ -237,6 +237,38 @@ describe('Binary Arrow Conversion', () => {
     });
   });
 
+  describe('Object.freeze behavioral guarantee', () => {
+    it('freezes objects at tag time so mutations after tagging do not affect flushed data', () => {
+      // Object.freeze is shallow -- intentional. This test only verifies top-level property mutation.
+      const schema = createTestSchema({
+        payload: S.unknown(),
+      });
+
+      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+      const writer = createColumnWriter(schema, buffer);
+
+      const obj: Record<string, unknown> = { x: 1, y: 2, label: 'original' };
+
+      (writer.nextRow() as any).payload(obj);
+      buffer.timestamp[0] = 1000n;
+      buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+      buffer._writeIndex = 1;
+
+      // Mutate AFTER tagging -- Object.freeze should prevent this from affecting the stored reference
+      expect(() => {
+        obj.x = 999;
+      }).toThrow(); // frozen objects throw in strict mode
+
+      const table = convertToArrowTable(buffer);
+      const payloadCol = table.getChild('payload');
+      expect(payloadCol).toBeDefined();
+
+      const bytes = payloadCol!.at(0) as Uint8Array;
+      const decoded = decode(bytes) as Record<string, unknown>;
+      expect(decoded).toEqual({ x: 1, y: 2, label: 'original' });
+    });
+  });
+
   describe('msgpack encoding correctness', () => {
     it('correctly roundtrips various JavaScript types through msgpack', () => {
       const schema = createTestSchema({

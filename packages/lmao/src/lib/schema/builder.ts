@@ -26,6 +26,8 @@ import type { FeatureFlagDefinition, FlagBuilderWithDefault, SchemaBuilder, Sche
  * Msgpack encoder singleton -- per-value, synchronous.
  * Encodes at flush time (cold path), not on the hot write path.
  * @msgpack/msgpack already handles most types; functions/symbols become undefined (dropped silently).
+ *
+ * Both wrap @msgpack/msgpack's encode(). This encoder is private to the schema builder;
  */
 const msgpackEncoder: BinaryEncoder = {
   encode(value: unknown): Uint8Array {

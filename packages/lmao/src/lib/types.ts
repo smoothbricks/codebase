@@ -9,7 +9,14 @@
  * This mirrors arrow-builder's AnyColumnBuffer/ColumnBuffer<T> pattern.
  */
 
-import type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray } from '@smoothbricks/arrow-builder';
+import type {
+  AnyColumnBuffer,
+  ColumnBuffer,
+  ColumnValueType,
+  EagerBinarySchema,
+  LazyBinarySchema,
+  TypedArray,
+} from '@smoothbricks/arrow-builder';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
@@ -383,8 +390,8 @@ type SetterValueType<S> = S extends { __schema_type: 'enum' }
         ? bigint
         : S extends { __schema_type: 'boolean' }
           ? boolean
-          : S extends { __schema_type: 'binary' }
-            ? unknown
+          : S extends LazyBinarySchema<infer T> | EagerBinarySchema<infer T>
+            ? T
             : unknown;
 
 type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
@@ -397,7 +404,7 @@ type ValuesArrayType<S> = S extends { __schema_type: 'enum' }
         ? BigUint64Array
         : S extends { __schema_type: 'boolean' }
           ? Uint8Array
-          : S extends { __schema_type: 'binary' }
+          : S extends LazyBinarySchema | EagerBinarySchema
             ? unknown[]
             : TypedArray | string[];
 
