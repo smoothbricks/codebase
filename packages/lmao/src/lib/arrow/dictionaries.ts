@@ -118,7 +118,14 @@ export function buildTextDictionary(
   }
 
   if (frequencyMap.size === 0) {
-    return new DictionaryBuildResult([], new Uint32Array(totalRows), Uint32Array, uint32(), undefined, totalRows);
+    return new DictionaryBuildResult(
+      [],
+      new Uint32Array(totalRows),
+      Uint32Array,
+      uint32(),
+      new Uint8Array(Math.ceil(totalRows / 8)),
+      totalRows,
+    );
   }
 
   const dictionary = Array.from(frequencyMap.keys());

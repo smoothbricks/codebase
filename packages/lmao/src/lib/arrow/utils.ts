@@ -2,15 +2,16 @@
  * Utility functions for Arrow conversion
  */
 
-import { countNulls } from '@smoothbricks/arrow-builder';
+import { copyBits, countNulls } from '@smoothbricks/arrow-builder';
 import type { AnySpanBuffer } from '../types.js';
+
+const UTF8_ENCODER = new TextEncoder();
 
 /**
  * Encode an array of strings into a single UTF-8 Uint8Array
  */
 export function encodeUtf8Strings(strings: readonly string[]): Uint8Array {
-  const encoder = new TextEncoder();
-  const encoded = strings.map((s) => encoder.encode(s));
+  const encoded = strings.map((s) => UTF8_ENCODER.encode(s));
   const totalLength = encoded.reduce((sum, arr) => sum + arr.length, 0);
   const result = new Uint8Array(totalLength);
   let offset = 0;
@@ -25,11 +26,10 @@ export function encodeUtf8Strings(strings: readonly string[]): Uint8Array {
  * Calculate UTF-8 byte offsets for an array of strings
  */
 export function calculateUtf8Offsets(strings: readonly string[]): Int32Array {
-  const encoder = new TextEncoder();
   const offsets = new Int32Array(strings.length + 1);
   offsets[0] = 0;
   for (let i = 0; i < strings.length; i++) {
-    const byteLength = encoder.encode(strings[i]).length;
+    const byteLength = UTF8_ENCODER.encode(strings[i]).length;
     offsets[i + 1] = offsets[i] + byteLength;
   }
   return offsets;
@@ -93,20 +93,7 @@ export function concatenateNullBitmaps(
     const rowCount = buf._writeIndex;
 
     if (sourceBitmap) {
-      const byteOffset = rowOffset >>> 3; // rowOffset / 8
-      const fullBytes = rowCount >>> 3;
-      const remainingBits = rowCount & 7;
-
-      // Bulk copy full bytes
-      if (fullBytes > 0) {
-        nullBitmap.set(sourceBitmap.subarray(0, fullBytes), byteOffset);
-      }
-      // Handle remaining bits in last partial byte
-      if (remainingBits > 0) {
-        const srcLastByte = sourceBitmap[fullBytes];
-        const mask = (1 << remainingBits) - 1;
-        nullBitmap[byteOffset + fullBytes] = (nullBitmap[byteOffset + fullBytes] & ~mask) | (srcLastByte & mask);
-      }
+      copyBits(nullBitmap, rowOffset, sourceBitmap, 0, rowCount);
       // Count nulls using countNulls from arrow-builder
       nullCount += countNulls(sourceBitmap, rowCount);
     }
