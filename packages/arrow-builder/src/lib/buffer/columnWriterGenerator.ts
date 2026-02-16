@@ -118,11 +118,25 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
   const fieldSchema = schema.fields[fieldName];
   const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata?.__schema_type;
+  const isEager = schemaWithMetadata?.__eager === true;
 
   const columnName = fieldName;
 
   if (schemaType === 'boolean') {
     // Bit-packed boolean: set bit in values bitmap
+    if (isEager) {
+      return `
+    const idx = this._writeIndex;
+    const byteIdx = idx >>> 3;
+    const bitMask = 1 << (idx & 7);
+    if (value) {
+      this._buffer.${columnName}_values[byteIdx] |= bitMask;
+    } else {
+      this._buffer.${columnName}_values[byteIdx] &= ~bitMask;
+    }
+    return this;`;
+    }
+
     return `
     const idx = this._writeIndex;
     const byteIdx = idx >>> 3;
@@ -138,6 +152,17 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
 
   if (schemaType === 'enum') {
     // Convert string enum value to numeric index
+    if (isEager) {
+      return `
+    const idx = this._writeIndex;
+    const enumIndex = this._buffer.${columnName}_enumValues.indexOf(value);
+    if (enumIndex === -1) {
+      throw new Error(\`Invalid enum value "\${value}" for field "${columnName}". Valid values: \${this._buffer.${columnName}_enumValues.join(', ')}\`);
+    }
+    this._buffer.${columnName}_values[idx] = enumIndex;
+    return this;`;
+    }
+
     return `
     const idx = this._writeIndex;
     const enumIndex = this._buffer.${columnName}_enumValues.indexOf(value);
@@ -154,12 +179,29 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
     // Nested objects are NOT frozen (deep freeze is expensive); callers must not mutate nested state after tagging.
     // S.binary() stores Uint8Array directly (no freeze needed for typed arrays)
     // S.unknown() / S.object() stores frozen object reference
+    if (isEager) {
+      return `
+    const idx = this._writeIndex;
+    if (typeof value === 'object' && value !== null && !(value instanceof Uint8Array)) {
+      Object.freeze(value);
+    }
+    this._buffer.${columnName}_values[idx] = value;
+    return this;`;
+    }
+
     return `
     const idx = this._writeIndex;
     if (typeof value === 'object' && value !== null && !(value instanceof Uint8Array)) {
       Object.freeze(value);
     }
     this._buffer.${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7));
+    this._buffer.${columnName}_values[idx] = value;
+    return this;`;
+  }
+
+  if (isEager) {
+    return `
+    const idx = this._writeIndex;
     this._buffer.${columnName}_values[idx] = value;
     return this;`;
   }

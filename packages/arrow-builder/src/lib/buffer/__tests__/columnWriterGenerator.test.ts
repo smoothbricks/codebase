@@ -209,6 +209,23 @@ transformed(value) {
 
     expect((buffer as unknown as { message_values: string[] }).message_values[0]).toBe('HELLO');
   });
+
+  it('writes eager columns without accessing null bitmaps', () => {
+    const eagerSchema = new ColumnSchema({
+      message: S.text().eager(),
+      enabled: S.boolean().eager(),
+    });
+    const buffer = createGeneratedColumnBuffer(eagerSchema, 16);
+    const writer = createColumnWriter(eagerSchema, buffer);
+
+    writer.nextRow().message('hello').enabled(true);
+    writer.nextRow().message('world').enabled(false);
+
+    expect(buffer.message_values[0]).toBe('hello');
+    expect(buffer.message_values[1]).toBe('world');
+    expect(buffer.enabled_values[0] & 0b01).toBe(0b01);
+    expect(buffer.enabled_values[0] & 0b10).toBe(0);
+  });
 });
 
 describe('null bitmap handling', () => {
