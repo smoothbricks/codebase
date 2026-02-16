@@ -287,7 +287,6 @@ export function generateColumnBufferClass(
 
   const getterMethods: string[] = [];
   const setterMethods: string[] = [];
-  const lazyColumnNames: string[] = [];
 
   for (const fieldName of schemaFields) {
     const columnName = fieldName;
@@ -325,7 +324,6 @@ export function generateColumnBufferClass(
     }
 
     // Lazy column: initialize as undefined
-    lazyColumnNames.push(columnName);
     constructorCode.push(`    this._${columnName}_nulls = undefined;`);
     constructorCode.push(`    this._${columnName}_values = undefined;`);
 
@@ -398,7 +396,6 @@ export function generateColumnBufferClass(
     }`;
 
   return `'use strict';
-const lazyColumnNames = ${JSON.stringify(lazyColumnNames)};
 class ${className} {
   constructor(${constructorSignature}) {
 ${preambleCode}
@@ -422,7 +419,8 @@ const classCache = new Map<string, new (capacity: number, ...args: unknown[]) =>
 
 function createCacheKey(schema: ColumnSchema, extension?: ColumnBufferExtension): string {
   if (!extension) return JSON.stringify(schema.fields);
-  return JSON.stringify({ schema, extension });
+  const { dependencies: _, ...extensionWithoutDeps } = extension;
+  return JSON.stringify({ schema: schema.fields, extension: extensionWithoutDeps });
 }
 
 /**
