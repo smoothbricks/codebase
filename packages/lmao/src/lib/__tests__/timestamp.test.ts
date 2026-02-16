@@ -106,6 +106,38 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
     }
     expect(hasSubMillisecond).toBe(true);
   });
+
+  it('should preserve nanosecond deltas in JS fallback above Number.MAX_SAFE_INTEGER', async () => {
+    const originalHrtimeBigint = process.hrtime.bigint;
+    const base = 9_007_199_254_740_993n; // Number.MAX_SAFE_INTEGER + 2
+    const sequence = [base, base + 1n, base + 2n];
+    let idx = 0;
+
+    process.hrtime.bigint = () => sequence[idx++] ?? sequence[sequence.length - 1];
+
+    try {
+      const { createTraceRoot } = await import('../traceRoot.node.js');
+      const mockTracer = {
+        onTraceStart: () => {},
+        onTraceEnd: () => {},
+        onSpanStart: () => {},
+        onSpanEnd: () => {},
+        onStatsWillResetFor: () => {},
+        bufferStrategy: {
+          createChildSpanBuffer: () => ({}) as any,
+          createOverflowBuffer: () => ({}) as any,
+        },
+      };
+
+      const traceRoot = createTraceRoot('test-trace', mockTracer);
+      const ts0 = traceRoot.getTimestampNanos();
+      const ts1 = traceRoot.getTimestampNanos();
+
+      expect(ts1 - ts0).toBe(1n);
+    } finally {
+      process.hrtime.bigint = originalHrtimeBigint;
+    }
+  });
 });
 
 describe('Browser TraceRoot Timestamps (performance.now)', () => {

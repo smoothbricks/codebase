@@ -54,7 +54,13 @@ export class TraceRoot implements ITraceRoot {
    */
   private readonly _anchorHrtimeBigInt: bigint;
 
-  constructor(trace_id: TraceId, anchorEpochNanos: bigint, anchorPerfNow: number, tracer: TracerLifecycleHooks) {
+  constructor(
+    trace_id: TraceId,
+    anchorEpochNanos: bigint,
+    anchorPerfNow: number,
+    anchorHrtimeBigInt: bigint,
+    tracer: TracerLifecycleHooks,
+  ) {
     // Allocate buffer: 17 bytes header + trace_id length
     // trace_id is validated to be ASCII (1 byte per char) so length === byte length
     this._system = new ArrayBuffer(TRACE_ROOT_TRACE_ID_OFFSET + trace_id.length);
@@ -68,8 +74,8 @@ export class TraceRoot implements ITraceRoot {
     this._epochView[0] = anchorEpochNanos;
     this._perfView[0] = anchorPerfNow;
 
-    // Cache BigInt conversion for JS fallback
-    this._anchorHrtimeBigInt = BigInt(Math.round(anchorPerfNow));
+    // Keep exact monotonic anchor for JS fallback (avoid Number precision loss after ~104 days uptime)
+    this._anchorHrtimeBigInt = anchorHrtimeBigInt;
 
     // Encode trace_id directly into buffer (no intermediate allocation)
     const u8View = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_LEN_OFFSET);
@@ -155,7 +161,8 @@ export class TraceRoot implements ITraceRoot {
  */
 export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
   const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
+  const anchorHrtimeBigInt = process.hrtime.bigint();
   // Store as number for NAPI to read as f64
-  const anchorPerfNow = Number(process.hrtime.bigint());
-  return new TraceRoot(trace_id as TraceId, anchorEpochNanos, anchorPerfNow, tracer);
+  const anchorPerfNow = Number(anchorHrtimeBigInt);
+  return new TraceRoot(trace_id as TraceId, anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer);
 }
