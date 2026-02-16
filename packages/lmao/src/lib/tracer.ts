@@ -540,10 +540,9 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     const traceId: TraceId = overrides.trace_id ?? generateTraceId();
     const schema = this.logBinding.logSchema;
 
-    // Validate null-sentinel required fields and merge user context
-    // Remove trace_id from overrides before merging (it's not a userCtx property)
-    const { trace_id: _, ...userCtxOverrides } = overrides;
-    const resolvedUserCtx = this._resolveUserContext(userCtxOverrides);
+    // Validate null-sentinel required fields and merge user context.
+    // _resolveUserContext ignores trace_id (transport-only field).
+    const resolvedUserCtx = this._resolveUserContext(overrides as Record<string, unknown>);
 
     // Create TraceRoot via platform-specific factory
     const traceRoot = this.createTraceRoot(traceId, this);
@@ -578,9 +577,9 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
       ctx.ff = EMPTY_SCOPE as any;
     }
 
-    // Spread resolved user context onto SpanContext
-    for (const [key, value] of Object.entries(resolvedUserCtx)) {
-      (ctx as Record<string, unknown>)[key] = value;
+    // Copy resolved user context onto SpanContext.
+    for (const key in resolvedUserCtx) {
+      (ctx as Record<string, unknown>)[key] = resolvedUserCtx[key];
     }
 
     return ctx;
@@ -614,6 +613,9 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     // Merge defaults with provided overrides (provided values win)
     const resolvedUserCtx: Record<string, unknown> = { ...ctxDefaults };
     for (const key of Object.keys(overrides)) {
+      if (key === 'trace_id') {
+        continue;
+      }
       const value = overrides[key];
       if (value !== undefined) {
         resolvedUserCtx[key] = value;
