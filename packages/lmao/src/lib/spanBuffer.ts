@@ -49,6 +49,8 @@ export type { ITraceRoot };
  */
 export const EMPTY_SCOPE: Readonly<Record<string, unknown>> = Object.freeze({});
 
+const traceIdDecoder = new TextDecoder();
+
 // ============================================================================
 // Thread-local state (generated once per process/worker)
 // These are used by the generated class code via the preamble
@@ -198,6 +200,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
     constructorParams: 'stats, parent, isChained, callsiteMetadata, opMetadata, traceRoot',
     dependencies: {
       writeThreadIdToUint64Array,
+      textDecoder: traceIdDecoder,
       textEncoder,
       EMPTY_SCOPE,
       checkCapacityTuning,
@@ -250,32 +253,32 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 ` +
       // CHAINED BUFFER: overflow storage for same logical span - shares parent identity
       `if (isChained) {
-         systemBuffer = new ArrayBuffer(systemSize);
-         identityView = parent._identity;
-       }` +
-      // ROOT BUFFER: new trace - gets identity with traceId from TraceRoot
-      ` else if (traceRoot) {
-         const traceIdUtf8 = textEncoder.encode(traceRoot.trace_id);
-         const identitySize = 13 + traceIdUtf8.length;
-         systemBuffer = new ArrayBuffer(systemSize + identitySize);
-         identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
-         const view = new DataView(systemBuffer, systemSize);
-         const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
-         writeThreadIdToUint64Array(threadIdArray, 0);
-         view.setUint32(8, spanId, true);
-         identityView[12] = traceIdUtf8.length;
-         identityView.set(traceIdUtf8, 13);
-       }` +
+          systemBuffer = new ArrayBuffer(systemSize);
+          identityView = parent._identity;
+        }` +
       // CHILD BUFFER: new span in existing trace - gets identity without traceId
       // (traceId accessed via parent chain walk in trace_id getter)
-      ` else {
+      ` else if (parent) {
          const identitySize = 12;
          systemBuffer = new ArrayBuffer(systemSize + identitySize);
          identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
          const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
          writeThreadIdToUint64Array(threadIdArray, 0);
          new DataView(systemBuffer, systemSize).setUint32(8, spanId, true);
-       }
+       }` +
+      // ROOT BUFFER: new trace - gets identity with traceId from TraceRoot
+      ` else {
+          const traceIdUtf8 = textEncoder.encode(traceRoot.trace_id);
+          const identitySize = 13 + traceIdUtf8.length;
+          systemBuffer = new ArrayBuffer(systemSize + identitySize);
+          identityView = new Uint8Array(systemBuffer, systemSize, identitySize);
+          const view = new DataView(systemBuffer, systemSize);
+         const threadIdArray = new BigUint64Array(systemBuffer, systemSize, 1);
+         writeThreadIdToUint64Array(threadIdArray, 0);
+          view.setUint32(8, spanId, true);
+          identityView[12] = traceIdUtf8.length;
+          identityView.set(traceIdUtf8, 13);
+        }
 ` +
       // Create TypedArray views for timestamps and entry_type
       `const timestampView = new BigInt64Array(systemBuffer, 0, requestedCapacity);
@@ -317,7 +320,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
       if (!current._identity) { return undefined; }
       const len = current._identity[12];
       const traceIdBytes = current._identity.subarray(13, 13 + len);
-      return new TextDecoder().decode(traceIdBytes);
+      return textDecoder.decode(traceIdBytes);
     }
     get _hasParent() { return this._parent !== undefined; }
     get parent_span_id() { return this._parent?.span_id ?? 0; }

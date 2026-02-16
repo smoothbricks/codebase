@@ -259,6 +259,26 @@ describe('Arrow Table Conversion', () => {
   });
 
   describe('Span tree conversion', () => {
+    test('stores compact identity bytes for child spans', () => {
+      const schema = createTestSchema({});
+      const SpanBufferClass = getSpanBufferClass(schema);
+
+      const parentBuffer = createSpanBuffer(
+        schema,
+        'parent-span',
+        createTestTraceRoot('trace-identity-layout'),
+        DEFAULT_METADATA,
+        undefined,
+      );
+
+      const childBuffer = createChildSpanBuffer(parentBuffer, SpanBufferClass, DEFAULT_METADATA, DEFAULT_METADATA);
+
+      // Root identity stores thread_id + span_id + trace_id metadata.
+      expect(parentBuffer._identity.byteLength).toBeGreaterThan(12);
+      // Child identity stores only thread_id + span_id.
+      expect(childBuffer._identity.byteLength).toBe(12);
+    });
+
     test('converts parent and child spans to single table', () => {
       const schema = createTestSchema({
         spanType: S.category(),
