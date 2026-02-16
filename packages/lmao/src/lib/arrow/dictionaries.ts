@@ -41,7 +41,7 @@ export function buildSortedCategoryDictionary(
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
-        if (value != null && !originalToMasked.has(value)) {
+        if (typeof value === 'string' && !originalToMasked.has(value)) {
           const maskedValue = maskTransform ? maskTransform(value) : value;
           originalToMasked.set(value, maskedValue);
           uniqueMaskedStrings.add(maskedValue);
@@ -66,7 +66,7 @@ export function buildSortedCategoryDictionary(
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
-        if (value != null) {
+        if (typeof value === 'string') {
           const maskedValue = originalToMasked.get(value) ?? value;
           indices[rowOffset + i] = maskedToIndex.get(maskedValue) ?? 0;
         } else {
@@ -99,7 +99,7 @@ export function buildTextDictionary(
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
-        if (value != null) {
+        if (typeof value === 'string') {
           let maskedValue: string;
           if (originalToMasked.has(value)) {
             const masked = originalToMasked.get(value);
@@ -137,7 +137,7 @@ export function buildTextDictionary(
     if (column && Array.isArray(column)) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const value = column[i];
-        if (value != null) {
+        if (typeof value === 'string') {
           const maskedValue = originalToMasked.get(value) ?? value;
           indices[rowOffset + i] = maskedToIndex.get(maskedValue) ?? 0;
         } else {
