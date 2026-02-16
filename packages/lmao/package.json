@@ -26,6 +26,18 @@
       "import": "./dist/es.js",
       "default": "./dist/es.js"
     },
+    "./tracers": {
+      "development": "./src/lib/tracers/index.ts",
+      "types": "./dist/lib/tracers/index.d.ts",
+      "import": "./dist/lib/tracers/index.js",
+      "default": "./dist/lib/tracers/index.js"
+    },
+    "./errors": {
+      "development": "./src/lib/errors/index.ts",
+      "types": "./dist/lib/errors/index.d.ts",
+      "import": "./dist/lib/errors/index.js",
+      "default": "./dist/lib/errors/index.js"
+    },
     "./errors/Blocked": {
       "development": "./src/lib/errors/Blocked.ts",
       "types": "./dist/lib/errors/Blocked.d.ts",
