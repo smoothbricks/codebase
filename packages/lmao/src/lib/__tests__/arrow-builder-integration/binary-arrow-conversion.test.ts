@@ -269,6 +269,89 @@ describe('Binary Arrow Conversion', () => {
     });
   });
 
+  describe('mixed binary + dictionary columns through shared-dict path', () => {
+    it('builds category dictionaries correctly when binary columns are present', () => {
+      const schema = createTestSchema({
+        payload: S.unknown(),
+        userId: S.category(),
+        action: S.text(),
+      });
+
+      // Root buffer with multiple rows to exercise dictionary deduplication
+      const rootBuffer = createSpanBuffer(
+        schema,
+        'root-span',
+        createTestTraceRoot('test-trace'),
+        createTestOpMetadata(),
+      );
+      const rootWriter = createColumnWriter(schema, rootBuffer);
+
+      (rootWriter.nextRow() as any).payload({ req: 1 }).userId('user-A').action('click');
+      rootBuffer.timestamp[0] = 1000n;
+      rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+
+      (rootWriter.nextRow() as any).payload({ req: 2 }).userId('user-A').action('scroll');
+      rootBuffer.timestamp[1] = 2000n;
+      rootBuffer.entry_type[1] = ENTRY_TYPE_INFO;
+
+      (rootWriter.nextRow() as any).payload({ req: 3 }).userId('user-B').action('click');
+      rootBuffer.timestamp[2] = 3000n;
+      rootBuffer.entry_type[2] = ENTRY_TYPE_INFO;
+
+      rootBuffer._writeIndex = 3;
+
+      // Child buffer with overlapping category values
+      const childBuffer = createSpanBuffer(
+        schema,
+        'child-span',
+        createTestTraceRoot('test-trace'),
+        createTestOpMetadata(),
+      );
+      const childWriter = createColumnWriter(schema, childBuffer);
+
+      (childWriter.nextRow() as any).payload({ req: 4 }).userId('user-B').action('submit');
+      childBuffer.timestamp[0] = 4000n;
+      childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
+
+      childBuffer._writeIndex = 1;
+      rootBuffer._children.push(childBuffer);
+      childBuffer._parent = rootBuffer;
+
+      // convertSpanTreeToArrowTable uses the shared-dict path (buildSortedCategoryDictionary)
+      const table = convertSpanTreeToArrowTable(rootBuffer);
+      expect(table.numRows).toBe(4);
+
+      // Category column should have dictionary-encoded strings (not corrupted by binary column presence)
+      const userIdCol = table.getChild('userId');
+      expect(userIdCol).toBeDefined();
+      expect(userIdCol!.at(0)).toBe('user-A');
+      expect(userIdCol!.at(1)).toBe('user-A');
+      expect(userIdCol!.at(2)).toBe('user-B');
+      expect(userIdCol!.at(3)).toBe('user-B');
+
+      // Text column should also work
+      const actionCol = table.getChild('action');
+      expect(actionCol).toBeDefined();
+      const actions = [actionCol!.at(0), actionCol!.at(1), actionCol!.at(2), actionCol!.at(3)];
+      expect(actions).toContain('click');
+      expect(actions).toContain('scroll');
+      expect(actions).toContain('submit');
+
+      // Binary column should have msgpack-encoded objects
+      const payloadCol = table.getChild('payload');
+      expect(payloadCol).toBeDefined();
+      const payloads = [];
+      for (let i = 0; i < payloadCol!.length; i++) {
+        const bytes = payloadCol!.at(i);
+        if (bytes !== null) payloads.push(decode(bytes as Uint8Array));
+      }
+      expect(payloads).toContainEqual({ req: 1 });
+      expect(payloads).toContainEqual({ req: 2 });
+      expect(payloads).toContainEqual({ req: 3 });
+      expect(payloads).toContainEqual({ req: 4 });
+    });
+  });
+
   describe('msgpack encoding correctness', () => {
     it('correctly roundtrips various JavaScript types through msgpack', () => {
       const schema = createTestSchema({
