@@ -242,6 +242,21 @@ describe('FlushScheduler', () => {
 
         expect(flushCalls[0].metadata.totalRows).toBeGreaterThan(0);
       });
+
+      it('should require re-registering a buffer after successful flush', async () => {
+        const buffer = createTestBuffer();
+        scheduler.register(buffer);
+
+        await scheduler.flush();
+        expect(flushCalls.length).toBe(1);
+
+        // Simulate later writes without re-registering.
+        buffer._writeIndex = 3;
+        await scheduler.flush();
+
+        // Buffer should have been removed from pending set after first successful flush.
+        expect(flushCalls.length).toBe(1);
+      });
     });
 
     describe('edge cases', () => {

@@ -417,6 +417,9 @@ export class FlushScheduler {
           nextBuffer = temp;
         }
         buffer._overflow = undefined; // Clear link from root buffer
+
+        // A flushed root buffer is no longer pending; callers must re-register on future writes.
+        this.buffers.delete(buffer);
       }
     } catch (error) {
       console.error('Error in flush handler:', error);
