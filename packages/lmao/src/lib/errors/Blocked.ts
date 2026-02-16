@@ -62,6 +62,20 @@ export type BlockedReason =
   | { readonly type: 'index'; readonly indexName: string };
 
 /**
+ * Convert a blocked reason union into its display name.
+ */
+export function getBlockedReasonName(reason: BlockedReason): string {
+  switch (reason.type) {
+    case 'service':
+      return reason.name;
+    case 'ended':
+      return reason.target;
+    case 'index':
+      return reason.indexName;
+  }
+}
+
+/**
  * Engine-level retry configuration for blocked operations.
  *
  * The nextRetry closure is powerful because it captures the Op's execution context.
@@ -91,9 +105,7 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
     /** Optional retry configuration */
     config?: BlockedConfig,
   ) {
-    super(
-      `Blocked: ${reason.type === 'service' ? reason.name : reason.type === 'ended' ? reason.target : reason.indexName}`,
-    );
+    super(`Blocked: ${getBlockedReasonName(reason)}`);
     this.name = 'Blocked';
     this.blockedConfig = config;
   }

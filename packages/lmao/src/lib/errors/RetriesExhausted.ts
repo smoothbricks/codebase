@@ -38,7 +38,7 @@
  */
 
 import type { TaggedError } from '../result.js';
-import type { BlockedReason } from './Blocked.js';
+import { type BlockedReason, getBlockedReasonName } from './Blocked.js';
 
 export class RetriesExhausted extends Error implements TaggedError<'RetriesExhausted'> {
   static readonly _tag = 'RetriesExhausted' as const;
@@ -55,9 +55,7 @@ export class RetriesExhausted extends Error implements TaggedError<'RetriesExhau
     /** Max attempts that was configured (the limit that was hit) */
     readonly maxAttempts: number,
   ) {
-    const reasonName =
-      reason.type === 'service' ? reason.name : reason.type === 'ended' ? reason.target : reason.indexName;
-    super(`RetriesExhausted: ${reasonName} after ${attempts} attempts`);
+    super(`RetriesExhausted: ${getBlockedReasonName(reason)} after ${attempts} attempts`);
     this.name = 'RetriesExhausted';
   }
 
