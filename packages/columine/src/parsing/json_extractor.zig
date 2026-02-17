@@ -110,6 +110,10 @@ pub fn extractJsonEvent(
     dynamic_cols: *columns.DynamicColumns,
     work_buffer: []u8,
 ) ExtractionError!void {
+    if (config.num_columns > 64) {
+        return error.OutOfMemory;
+    }
+
     // Start a new row
     if (!dynamic_cols.beginRow()) {
         return error.TooManyEvents;
@@ -148,6 +152,7 @@ pub fn extractJsonEvent(
         if (entry) |e| {
             // Declared field - extract value based on type
             try extractTypedValue(parser, e.arrow_type, dynamic_cols, e.col_idx);
+            if (e.col_idx >= columns_set.len) return error.OutOfMemory;
             columns_set[e.col_idx] = true;
         } else {
             // Undeclared field - capture for $extra column
@@ -598,4 +603,28 @@ test "extractJsonEvents - with undeclared fields" {
 
     try testing.expectEqual(@as(u32, 2), count);
     try testing.expectEqual(@as(u32, 2), cols.count);
+}
+
+test "extractJsonEvents rejects schemas wider than tracking bitmap" {
+    const testing = std.testing;
+
+    var fields: [65]dynamic_schema.SignalSchemaField = undefined;
+    var names: [65][]const u8 = undefined;
+    for (0..65) |i| {
+        fields[i] = .{ .arrow_type = .Utf8, .nullable = 1 };
+        names[i] = "f";
+    }
+
+    var config = try buildExtractionConfig(testing.allocator, &fields, &names);
+    defer freeExtractionConfig(testing.allocator, &config);
+
+    var cols = try columns.DynamicColumns.init(testing.allocator, &fields, 1);
+    defer cols.deinit();
+
+    const json =
+        \\[{"f":"v"}]
+    ;
+    var work_buffer: [256]u8 = undefined;
+
+    try testing.expectError(error.OutOfMemory, extractJsonEvents(json, &config, &cols, &work_buffer));
 }
