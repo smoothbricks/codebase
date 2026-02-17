@@ -6,10 +6,16 @@
     .fingerprint = 0x4050e82ce1a0e7b2, // Changing this has security and trust implications.
     .minimum_zig_version = "0.15.2",
     // zig-msgpack for serializing data to/from msgpack format in the reducer
+    // simdjzon: SIMD JSON parser for native targets (x86_64, aarch64).
+    // WASM targets use std.json.Scanner fallback (simdjzon requires 64-bit SIMD).
     .dependencies = .{
         .zig_msgpack = .{
             .url = "https://github.com/zigcc/zig-msgpack/archive/main.tar.gz",
             .hash = "zig_msgpack-0.0.14-evvueGolBQBs_m726tBf4ISJQqC926AM96EtxZy9LUaI",
+        },
+        .simdjzon = .{
+            .url = "git+https://github.com/travisstaloch/simdjzon#7c586bada71603a3a28e0f63dbb81cfd5dbb4619",
+            .hash = "simdjzon-0.0.1-7uNSgHJ_BQDkK6pvdhXPjeGkqSxQw_hy7TlA1USZ7Ala",
         },
     },
     .paths = .{

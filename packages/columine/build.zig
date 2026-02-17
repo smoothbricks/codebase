@@ -25,6 +25,29 @@ pub fn build(b: *std.Build) void {
     });
 
     // ==========================================================================
+    // Dependencies - simdjzon (SIMD JSON parser, native targets only)
+    // ==========================================================================
+
+    // simdjzon SIMD JSON parser - native targets only (x86_64, aarch64).
+    // WASM targets use std.json.Scanner fallback (simdjzon requires 64-bit SIMD).
+    const is_native_simdjzon_target = target.query.cpu_arch != .wasm32 and target.query.cpu_arch != .wasm64;
+
+    var simdjzon_mod: ?*std.Build.Module = null;
+    if (is_native_simdjzon_target) {
+        const simdjzon_dep = b.dependency("simdjzon", .{
+            .target = target,
+            .optimize = optimize,
+        });
+        simdjzon_mod = simdjzon_dep.module("simdjzon");
+    }
+
+    const build_opts_simdjzon = b.addOptions();
+    build_opts_simdjzon.addOption(bool, "use_simdjzon", is_native_simdjzon_target);
+
+    const build_opts_no_simdjzon = b.addOptions();
+    build_opts_no_simdjzon.addOption(bool, "use_simdjzon", false);
+
+    // ==========================================================================
     // and get the reducer VM's public API (vm.zig).
     // ==========================================================================
     _ = b.addModule("columine", .{
@@ -110,6 +133,8 @@ pub fn build(b: *std.Build) void {
 
     // msgpack needed for json_extractor's undeclared field serialization
     ep_wasm.root_module.addImport("msgpack", msgpack_wasm_dep.module("msgpack"));
+    // WASM: no simdjzon, use Scanner fallback
+    ep_wasm.root_module.addOptions("build_options", build_opts_no_simdjzon);
 
     b.installArtifact(ep_wasm);
 
@@ -134,6 +159,11 @@ pub fn build(b: *std.Build) void {
     });
 
     ep_ffi.root_module.addImport("msgpack", msgpack_dep.module("msgpack"));
+    // Native: simdjzon SIMD backend + build option
+    if (simdjzon_mod) |mod| {
+        ep_ffi.root_module.addImport("simdjzon", mod);
+    }
+    ep_ffi.root_module.addOptions("build_options", build_opts_simdjzon);
 
     b.installArtifact(ep_ffi);
 
@@ -169,6 +199,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
     ep_test.root_module.addImport("msgpack", msgpack_dep.module("msgpack"));
+    // Native: simdjzon SIMD backend + build option for tests
+    if (simdjzon_mod) |mod| {
+        ep_test.root_module.addImport("simdjzon", mod);
+    }
+    ep_test.root_module.addOptions("build_options", build_opts_simdjzon);
 
     const run_ep_test = b.addRunArtifact(ep_test);
     test_step.dependOn(&run_ep_test.step);
