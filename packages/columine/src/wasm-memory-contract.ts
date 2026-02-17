@@ -1,5 +1,5 @@
 export const WASM_PAGE_BYTES = 64 * 1024;
-export const WASM_MAX_PAGES = 1024;
+export const WASM_MAX_PAGES = 4096;
 export const WASM_MAX_BYTES = WASM_PAGE_BYTES * WASM_MAX_PAGES;
 
 export interface WasmWorkingSetBytes {
@@ -47,7 +47,7 @@ export function createInvalidWasmWorkingSetError(message: string): WasmMemoryCon
 export function createWasmMemoryCapExceededError(requiredBytes: number, maxBytes: number): WasmMemoryContractError {
   return new WasmMemoryContractError(
     'WASM_MEMORY_CAP_EXCEEDED',
-    `WASM working set requires ${requiredBytes} bytes but cap is ${maxBytes} bytes`,
+    `WASM working set requires ${requiredBytes} bytes but configured cap is ${maxBytes} bytes`,
   );
 }
 

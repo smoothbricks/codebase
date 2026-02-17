@@ -4,6 +4,7 @@ import {
   calculateRequiredWasmBytes,
   ensureWasmMemoryForWorkingSet,
   WASM_MAX_BYTES,
+  WASM_MAX_PAGES,
   WASM_PAGE_BYTES,
   WasmMemoryContractError,
 } from '../wasm-memory-contract.js';
@@ -23,8 +24,8 @@ describe('wasm-memory-contract', () => {
     expect(result.totalPages).toBe(result.requiredPages);
   });
 
-  it('succeeds at or below 64MB cap', () => {
-    const memory = new WebAssembly.Memory({ initial: 4, maximum: 1024 });
+  it('succeeds at or below configured cap', () => {
+    const memory = new WebAssembly.Memory({ initial: 4, maximum: WASM_MAX_PAGES });
     const targetBytes = WASM_MAX_BYTES - WASM_PAGE_BYTES;
 
     const result = ensureWasmMemoryForWorkingSet(memory, {
@@ -35,11 +36,11 @@ describe('wasm-memory-contract', () => {
     });
 
     expect(result.requiredBytes).toBe(targetBytes);
-    expect(result.requiredPages).toBeLessThanOrEqual(1024);
+    expect(result.requiredPages).toBeLessThanOrEqual(WASM_MAX_PAGES);
   });
 
   it('fails above cap with structured error', () => {
-    const memory = new WebAssembly.Memory({ initial: 4, maximum: 1024 });
+    const memory = new WebAssembly.Memory({ initial: 4, maximum: WASM_MAX_PAGES });
 
     expect(() =>
       ensureWasmMemoryForWorkingSet(memory, {

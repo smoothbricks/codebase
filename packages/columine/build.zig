@@ -73,7 +73,7 @@ pub fn build(b: *std.Build) void {
     columine_wasm.export_memory = true;
     // 4MB initial (linker needs ~3.5MB for static data)
     columine_wasm.initial_memory = 64 * 64 * 1024;
-    columine_wasm.max_memory = 1024 * 64 * 1024;
+    columine_wasm.max_memory = 4096 * 64 * 1024;
 
     // msgpack available for WASM (future Parse/Compact stages)
     columine_wasm.root_module.addImport("msgpack", msgpack_wasm_dep.module("msgpack"));
@@ -127,9 +127,9 @@ pub fn build(b: *std.Build) void {
     ep_wasm.entry = .disabled;
     ep_wasm.rdynamic = true;
     ep_wasm.export_memory = true;
-    // 160 pages (10MB) — event_processor needs ~9.5MB for msgpack + schema
-    ep_wasm.initial_memory = 160 * 64 * 1024;
-    ep_wasm.max_memory = 1024 * 64 * 1024;
+    // Start small and grow on demand.
+    ep_wasm.initial_memory = 64 * 64 * 1024;
+    ep_wasm.max_memory = 4096 * 64 * 1024;
 
     // msgpack needed for json_extractor's undeclared field serialization
     ep_wasm.root_module.addImport("msgpack", msgpack_wasm_dep.module("msgpack"));

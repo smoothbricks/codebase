@@ -79,17 +79,17 @@ describe('parse backend dynamic memory layout', () => {
     expect(mock.parseCalls[1]).toEqual(mock.parseCalls[0]);
   });
 
-  it('rejects parse requirements larger than 64MB with explicit error', () => {
+  it('rejects parse requirements larger than configured cap with explicit error', () => {
     const mock = createMockEventProcessor();
     const backend = createParseCompactWasmBackend(mock.exports);
 
-    const veryLargeInput = new Uint8Array(22 * 1024 * 1024);
+    const veryLargeInput = new Uint8Array(96 * 1024 * 1024);
 
     expect(() => {
       backend.parse(veryLargeInput, {
         schemaBytes: new Uint8Array([1]),
         fieldMetadata: new Uint8Array([1, 0, 0, 0]),
       });
-    }).toThrow(/exceeds 64MB limit/i);
+    }).toThrow(/configured cap|exceeds max batch input/i);
   });
 });

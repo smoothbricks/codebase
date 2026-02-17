@@ -161,12 +161,7 @@ pub fn extractJsonEvent(
                     extra_writer = ExtraMsgpackWriter.init(work_buffer) catch return error.BufferOverflow;
                 }
 
-                extra_writer.?.appendPair(field_name, raw_value) catch |err| {
-                    return switch (err) {
-                        error.BufferOverflow => error.BufferOverflow,
-                        else => error.MsgpackError,
-                    };
-                };
+                extra_writer.?.appendPair(field_name, raw_value) catch return error.BufferOverflow;
             } else {
                 _ = parser.skipValue() catch return error.InvalidJson;
             }

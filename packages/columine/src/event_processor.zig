@@ -389,16 +389,9 @@ fn freeHandle(handle: u32) void {
 // Allocator selection (WASM vs native)
 // =============================================================================
 
-// WASM allocator selection:
-// - wasm_allocator uses memory.grow but has initialization issues
-// - page_allocator uses mmap which doesn't exist in WASM
-// - We use a simple bump allocator over a static buffer for WASM
-const wasm_heap_size = 8 * 1024 * 1024; // 8MB heap
-var wasm_heap: [wasm_heap_size]u8 = undefined;
-var wasm_fba = std.heap.FixedBufferAllocator.init(&wasm_heap);
-
+// Use wasm_allocator on wasm targets so linear memory can grow with workload.
 const allocator = if (builtin.cpu.arch == .wasm32)
-    wasm_fba.allocator()
+    std.heap.wasm_allocator
 else
     std.heap.page_allocator;
 

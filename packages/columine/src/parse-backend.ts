@@ -93,6 +93,8 @@ const MIN_INPUT_BYTES = 4 * 1024;
 const MIN_OUTPUT_BYTES = 64 * 1024;
 const MIN_WORKSPACE_BYTES = 256 * 1024;
 const FIXED_LAYOUT_OVERHEAD_BYTES = 64 * 1024;
+const MAX_BATCH_INPUT_BYTES = 64 * 1024 * 1024;
+const MAX_BATCH_OUTPUT_BYTES = 64 * 1024 * 1024;
 
 const INPUT_FORMAT_JSON = 0;
 const RESULT_OK = 0;
@@ -120,10 +122,10 @@ function formatBytes(bytes: number): string {
 }
 
 function estimateOutputBytes(inputBytes: number): number {
-  // Arrow IPC output may exceed JSON input once schema + column encoding are included.
-  // Use a conservative ratio to avoid under-provisioning for large batches.
-  const estimated = inputBytes * 2;
-  return Math.max(MIN_OUTPUT_BYTES, align8(estimated));
+  // Output buffer should scale with expected Arrow payload, but a single batch payload
+  // is capped at 64MB, so over-allocating 2x input only inflates required memory.
+  const estimated = inputBytes + 1024 * 1024;
+  return Math.min(MAX_BATCH_OUTPUT_BYTES, Math.max(MIN_OUTPUT_BYTES, align8(estimated)));
 }
 
 function estimateWorkspaceBytes(inputBytes: number, outputBytes: number): number {
@@ -138,6 +140,12 @@ function planParseMemoryLayout(
   fieldMetaLen: number,
   fieldNamesLen: number,
 ): ParseMemoryLayout {
+  if (inputLen > MAX_BATCH_INPUT_BYTES) {
+    throw new Error(
+      `Parse input ${formatBytes(inputLen)} exceeds max batch input ${formatBytes(MAX_BATCH_INPUT_BYTES)}`,
+    );
+  }
+
   const inputLength = Math.max(MIN_INPUT_BYTES, align8(inputLen));
   const outputLength = Math.max(WASM_OUTPUT_HEADER_SIZE, estimateOutputBytes(inputLen));
   const workspaceLength = estimateWorkspaceBytes(inputLen, outputLength);
