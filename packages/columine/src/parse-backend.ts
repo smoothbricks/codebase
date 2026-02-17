@@ -82,18 +82,133 @@ export interface EventProcessorWasmExports {
 // WASM Memory Layout Constants
 // =============================================================================
 
-// Working buffer offsets — must be after the Zig heap (8MB)
-const WASM_INPUT_OFFSET = 9 * 1024 * 1024; // 9MB
-const WASM_INPUT_SIZE = 2 * 1024 * 1024; // 2MB
-const WASM_OUTPUT_OFFSET = WASM_INPUT_OFFSET + WASM_INPUT_SIZE; // 11MB
-const WASM_OUTPUT_SIZE = 2 * 1024 * 1024; // 2MB
-const WASM_SCHEMA_OFFSET = WASM_OUTPUT_OFFSET + WASM_OUTPUT_SIZE; // 13MB
-const WASM_SCHEMA_SIZE = 64 * 1024; // 64KB
-const WASM_FIELD_META_OFFSET = WASM_SCHEMA_OFFSET + WASM_SCHEMA_SIZE;
-const WASM_FIELD_META_SIZE = 4 * 1024; // 4KB
+const WASM_PAGE_SIZE = 64 * 1024;
+const WASM_OUTPUT_HEADER_SIZE = 16;
+
+// Keep dynamic working regions after Zig heap + safety headroom.
+const WASM_HEAP_RESERVE = 9 * 1024 * 1024;
+
+// Parse backend per-call planning limits.
+const MAX_PARSE_WORKING_SET_BYTES = 64 * 1024 * 1024;
+const MIN_INPUT_BYTES = 4 * 1024;
+const MIN_OUTPUT_BYTES = 64 * 1024;
+const MIN_WORKSPACE_BYTES = 256 * 1024;
+const FIXED_LAYOUT_OVERHEAD_BYTES = 64 * 1024;
 
 const INPUT_FORMAT_JSON = 0;
 const RESULT_OK = 0;
+
+interface ParseMemoryLayout {
+  readonly inputOffset: number;
+  readonly inputLength: number;
+  readonly outputOffset: number;
+  readonly outputLength: number;
+  readonly workspaceOffset: number;
+  readonly workspaceLength: number;
+  readonly schemaOffset: number;
+  readonly fieldMetaOffset: number;
+  readonly fieldNamesOffset: number;
+  readonly requiredWorkingSetBytes: number;
+  readonly requiredTotalMemoryBytes: number;
+}
+
+function align8(n: number): number {
+  return (n + 7) & ~7;
+}
+
+function formatBytes(bytes: number): string {
+  return `${bytes} bytes (${(bytes / (1024 * 1024)).toFixed(2)} MiB)`;
+}
+
+function estimateOutputBytes(inputBytes: number): number {
+  // Arrow IPC output may exceed JSON input once schema + column encoding are included.
+  // Use a conservative ratio to avoid under-provisioning for large batches.
+  const estimated = inputBytes * 2;
+  return Math.max(MIN_OUTPUT_BYTES, align8(estimated));
+}
+
+function estimateWorkspaceBytes(inputBytes: number, outputBytes: number): number {
+  // Workspace budget accounts for parser scratch + transient conversion buffers.
+  const estimated = Math.ceil(inputBytes * 0.5 + outputBytes * 0.25);
+  return Math.max(MIN_WORKSPACE_BYTES, align8(estimated));
+}
+
+function planParseMemoryLayout(
+  inputLen: number,
+  schemaLen: number,
+  fieldMetaLen: number,
+  fieldNamesLen: number,
+): ParseMemoryLayout {
+  const inputLength = Math.max(MIN_INPUT_BYTES, align8(inputLen));
+  const outputLength = Math.max(WASM_OUTPUT_HEADER_SIZE, estimateOutputBytes(inputLen));
+  const workspaceLength = estimateWorkspaceBytes(inputLen, outputLength);
+
+  const schemaBytes = align8(schemaLen);
+  const fieldMetaBytes = align8(fieldMetaLen);
+  const fieldNamesBytes = align8(fieldNamesLen);
+
+  const requiredWorkingSetBytes =
+    inputLength +
+    outputLength +
+    workspaceLength +
+    schemaBytes +
+    fieldMetaBytes +
+    fieldNamesBytes +
+    FIXED_LAYOUT_OVERHEAD_BYTES;
+
+  if (requiredWorkingSetBytes > MAX_PARSE_WORKING_SET_BYTES) {
+    throw new Error(
+      `Parse batch requires ${formatBytes(requiredWorkingSetBytes)}, ` +
+        `which exceeds 64MB limit (${MAX_PARSE_WORKING_SET_BYTES} bytes).`,
+    );
+  }
+
+  let offset = WASM_HEAP_RESERVE;
+
+  const inputOffset = offset;
+  offset += inputLength;
+
+  const outputOffset = offset;
+  offset += outputLength;
+
+  const workspaceOffset = offset;
+  offset += workspaceLength;
+
+  const schemaOffset = offset;
+  offset += schemaBytes;
+
+  const fieldMetaOffset = offset;
+  offset += fieldMetaBytes;
+
+  const fieldNamesOffset = offset;
+  offset += fieldNamesBytes;
+
+  const requiredTotalMemoryBytes = offset + FIXED_LAYOUT_OVERHEAD_BYTES;
+
+  return {
+    inputOffset,
+    inputLength,
+    outputOffset,
+    outputLength,
+    workspaceOffset,
+    workspaceLength,
+    schemaOffset,
+    fieldMetaOffset,
+    fieldNamesOffset,
+    requiredWorkingSetBytes,
+    requiredTotalMemoryBytes,
+  };
+}
+
+function ensureWasmMemory(memory: WebAssembly.Memory, requiredBytes: number): void {
+  const currentBytes = memory.buffer.byteLength;
+  if (requiredBytes <= currentBytes) {
+    return;
+  }
+  const missingBytes = requiredBytes - currentBytes;
+  const pagesToGrow = Math.ceil(missingBytes / WASM_PAGE_SIZE);
+  memory.grow(pagesToGrow);
+}
 
 // =============================================================================
 // Field Name Encoding
@@ -136,42 +251,45 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
     parse(input: string | Uint8Array, config: ParseConfig): ParseResult {
       // Create a new handle for each parse call — the EventProcessor is
       // stateful (tracks field names, schema) so we create per-config
-      const memory = new Uint8Array(wasm.memory.buffer);
+      const inputBytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+      const fieldNamesBuffer =
+        config.fieldNames && config.fieldNames.length > 0 ? encodeFieldNames(config.fieldNames) : null;
 
-      // Write schema to WASM memory
-      if (config.schemaBytes.length > WASM_SCHEMA_SIZE) {
-        throw new Error(`Schema bytes too large: ${config.schemaBytes.length} > ${WASM_SCHEMA_SIZE}`);
-      }
-      if (config.fieldMetadata.length > WASM_FIELD_META_SIZE) {
-        throw new Error(`Field metadata too large: ${config.fieldMetadata.length} > ${WASM_FIELD_META_SIZE}`);
-      }
+      const layout = planParseMemoryLayout(
+        inputBytes.length,
+        config.schemaBytes.length,
+        config.fieldMetadata.length,
+        fieldNamesBuffer?.length ?? 0,
+      );
 
-      memory.set(config.schemaBytes, WASM_SCHEMA_OFFSET);
-      memory.set(config.fieldMetadata, WASM_FIELD_META_OFFSET);
+      ensureWasmMemory(wasm.memory, layout.requiredTotalMemoryBytes);
+
+      let memory = new Uint8Array(wasm.memory.buffer);
+      memory.set(config.schemaBytes, layout.schemaOffset);
+      memory.set(config.fieldMetadata, layout.fieldMetaOffset);
+      if (fieldNamesBuffer) {
+        memory.set(fieldNamesBuffer, layout.fieldNamesOffset);
+      }
 
       const fieldCount = config.fieldMetadata.length / 4;
 
       let handle: number;
-      if (config.fieldNames && config.fieldNames.length > 0) {
-        const fieldNamesBuffer = encodeFieldNames(config.fieldNames);
-        const fieldNamesOffset = WASM_FIELD_META_OFFSET + config.fieldMetadata.length;
-        memory.set(fieldNamesBuffer, fieldNamesOffset);
-
+      if (fieldNamesBuffer) {
         handle = wasm.ep_create_with_schema_and_names(
           256, // default capacity
-          WASM_SCHEMA_OFFSET,
+          layout.schemaOffset,
           config.schemaBytes.length,
-          WASM_FIELD_META_OFFSET,
+          layout.fieldMetaOffset,
           fieldCount,
-          fieldNamesOffset,
+          layout.fieldNamesOffset,
           fieldNamesBuffer.length,
         );
       } else {
         handle = wasm.ep_create_with_schema(
           256,
-          WASM_SCHEMA_OFFSET,
+          layout.schemaOffset,
           config.schemaBytes.length,
-          WASM_FIELD_META_OFFSET,
+          layout.fieldMetaOffset,
           fieldCount,
         );
       }
@@ -181,24 +299,17 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       }
 
       try {
-        // Encode input
-        const inputBytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
-
-        if (inputBytes.length > WASM_INPUT_SIZE) {
-          throw new Error(`Input too large: ${inputBytes.length} > ${WASM_INPUT_SIZE}`);
-        }
-
         // Get fresh memory view (handle creation may have grown memory)
-        const mem = new Uint8Array(wasm.memory.buffer);
-        mem.set(inputBytes, WASM_INPUT_OFFSET);
+        memory = new Uint8Array(wasm.memory.buffer);
+        memory.set(inputBytes, layout.inputOffset);
 
         const result = wasm.ep_create_log_entry(
           handle,
-          WASM_INPUT_OFFSET,
+          layout.inputOffset,
           inputBytes.length,
           INPUT_FORMAT_JSON,
-          WASM_OUTPUT_OFFSET,
-          WASM_OUTPUT_SIZE,
+          layout.outputOffset,
+          layout.outputLength,
         );
 
         if (result !== RESULT_OK) {
@@ -207,19 +318,29 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
 
         // Read result header from output buffer
         const view = new DataView(wasm.memory.buffer);
-        const code = view.getUint32(WASM_OUTPUT_OFFSET, true);
-        const arrowOffset = view.getUint32(WASM_OUTPUT_OFFSET + 4, true);
-        const arrowLen = view.getUint32(WASM_OUTPUT_OFFSET + 8, true);
-        const eventsProcessed = view.getUint32(WASM_OUTPUT_OFFSET + 12, true);
+        const code = view.getUint32(layout.outputOffset, true);
+        const arrowOffset = view.getUint32(layout.outputOffset + 4, true);
+        const arrowLen = view.getUint32(layout.outputOffset + 8, true);
+        const eventsProcessed = view.getUint32(layout.outputOffset + 12, true);
 
         if (code !== RESULT_OK) {
           throw new Error(`ep_create_log_entry returned error code ${code}`);
         }
 
+        const arrowStart = layout.outputOffset + arrowOffset;
+        const arrowEnd = arrowStart + arrowLen;
+        const outputEnd = layout.outputOffset + layout.outputLength;
+        if (arrowStart < layout.outputOffset || arrowEnd > outputEnd) {
+          throw new Error(
+            'ep_create_log_entry produced out-of-bounds output: ' +
+              `offset=${arrowOffset}, len=${arrowLen}, outputLen=${layout.outputLength}`,
+          );
+        }
+
         // Copy Arrow IPC bytes out of WASM memory
         const freshMem = new Uint8Array(wasm.memory.buffer);
         const arrowIpc = new Uint8Array(arrowLen);
-        arrowIpc.set(freshMem.subarray(WASM_OUTPUT_OFFSET + arrowOffset, WASM_OUTPUT_OFFSET + arrowOffset + arrowLen));
+        arrowIpc.set(freshMem.subarray(arrowStart, arrowEnd));
 
         return { arrowIpc, eventCount: eventsProcessed };
       } finally {
