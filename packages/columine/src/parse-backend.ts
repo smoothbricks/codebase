@@ -94,6 +94,7 @@ const WASM_FIELD_META_SIZE = 4 * 1024; // 4KB
 
 const INPUT_FORMAT_JSON = 0;
 const RESULT_OK = 0;
+const textEncoder = new TextEncoder();
 
 // =============================================================================
 // Field Name Encoding
@@ -104,14 +105,20 @@ const RESULT_OK = 0;
  * e.g., ["id", "type", "timestamp"] -> "id\0type\0timestamp\0"
  */
 function encodeFieldNames(names: string[]): Uint8Array {
-  const encoder = new TextEncoder();
-  const parts = names.map((n) => encoder.encode(`${n}\0`));
-  const totalLen = parts.reduce((sum, p) => sum + p.length, 0);
+  const parts = new Array<Uint8Array>(names.length);
+  let totalLen = 0;
+  for (let i = 0; i < names.length; i++) {
+    const part = textEncoder.encode(names[i]);
+    parts[i] = part;
+    totalLen += part.length + 1;
+  }
   const result = new Uint8Array(totalLen);
   let offset = 0;
   for (const part of parts) {
     result.set(part, offset);
     offset += part.length;
+    result[offset] = 0;
+    offset += 1;
   }
   return result;
 }
@@ -145,6 +152,9 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       if (config.fieldMetadata.length > WASM_FIELD_META_SIZE) {
         throw new Error(`Field metadata too large: ${config.fieldMetadata.length} > ${WASM_FIELD_META_SIZE}`);
       }
+      if (config.fieldMetadata.length % 4 !== 0) {
+        throw new Error(`Field metadata must be a multiple of 4 bytes, got ${config.fieldMetadata.length}`);
+      }
 
       memory.set(config.schemaBytes, WASM_SCHEMA_OFFSET);
       memory.set(config.fieldMetadata, WASM_FIELD_META_OFFSET);
@@ -155,6 +165,11 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
       if (config.fieldNames && config.fieldNames.length > 0) {
         const fieldNamesBuffer = encodeFieldNames(config.fieldNames);
         const fieldNamesOffset = WASM_FIELD_META_OFFSET + config.fieldMetadata.length;
+        if (fieldNamesOffset + fieldNamesBuffer.length > memory.byteLength) {
+          throw new Error(
+            `Field names exceed available WASM memory: offset=${fieldNamesOffset}, len=${fieldNamesBuffer.length}, memory=${memory.byteLength}`,
+          );
+        }
         memory.set(fieldNamesBuffer, fieldNamesOffset);
 
         handle = wasm.ep_create_with_schema_and_names(
@@ -182,7 +197,7 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
 
       try {
         // Encode input
-        const inputBytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
+        const inputBytes = typeof input === 'string' ? textEncoder.encode(input) : input;
 
         if (inputBytes.length > WASM_INPUT_SIZE) {
           throw new Error(`Input too large: ${inputBytes.length} > ${WASM_INPUT_SIZE}`);
