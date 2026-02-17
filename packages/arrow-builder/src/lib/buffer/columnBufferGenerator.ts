@@ -71,7 +71,7 @@ export interface ColumnBufferExtension {
   methods?: string;
 
   /**
-   * Additional code to add before the class definition.
+   * Additional code to add before the class definition (module-level).
    * Useful for helper functions, symbols, constants, etc.
    * These can reference dependencies by name (they're in scope).
    * @example
@@ -79,7 +79,18 @@ export interface ColumnBufferExtension {
    * const SPAN_STATE = { PENDING: 0, OK: 1, ERR: 2 };
    * ```
    */
-  preamble?: string;
+  classPreamble?: string;
+
+  /**
+   * Additional code to add at the top of the constructor body
+   * (before system column initialization).
+   * Has access to constructor parameters including requestedCapacity.
+   * @example
+   * ```
+   * const spanId = ++globalThis.globalSpanCounter;
+   * ```
+   */
+  constructorPreamble?: string;
 
   /**
    * Constructor parameters beyond requestedCapacity.
@@ -90,7 +101,7 @@ export interface ColumnBufferExtension {
 
   /**
    * Runtime dependencies to inject into the generated class closure.
-   * Keys become variable names available in preamble, constructorCode, and methods.
+   * Keys become variable names available in classPreamble, constructorPreamble, constructorCode, and methods.
    * Values are the actual runtime objects/functions.
    *
    * NOTE: Dependencies are NOT included in the cache key - they should be
@@ -387,7 +398,10 @@ export function generateColumnBufferClass(
         .join('\n')}`
     : '';
 
-  const preambleCode = extension?.preamble ? `\n${extension.preamble}\n` : '';
+  // classPreamble: code inserted before the class definition (module-level)
+  const classPreambleCode = extension?.classPreamble ? `\n${extension.classPreamble}\n` : '';
+  // constructorPreamble: code inserted at the top of the constructor body
+  const constructorPreambleCode = extension?.constructorPreamble ? `\n${extension.constructorPreamble}\n` : '';
 
   // Custom inspect to avoid dumping huge TypedArrays in test output
   const inspectMethod = `
@@ -396,9 +410,9 @@ export function generateColumnBufferClass(
     }`;
 
   return `'use strict';
-class ${className} {
+${classPreambleCode}class ${className} {
   constructor(${constructorSignature}) {
-${preambleCode}
+${constructorPreambleCode}
 ${constructorCode.join('\n')}
   }
   getColumnIfAllocated(columnName) { return this[\`_\${columnName}_values\`]; }

@@ -53,18 +53,18 @@ const traceIdDecoder = new TextDecoder();
 
 // ============================================================================
 // Thread-local state (generated once per process/worker)
-// These are used by the generated class code via the preamble
+// These are used by the generated class code via the constructorPreamble
 // ============================================================================
 
 /**
  * Reset thread-local state (for testing only).
- * Note: The actual state is in the generated class preamble.
+ * Note: The actual state is in the generated class constructorPreamble.
  * This function resets it by clearing the class cache.
  * @internal
  */
 export function _resetSpanBufferState(): void {
   // Clear the class cache to force regeneration with fresh state
-  // The generated preamble creates its own PROCESS_THREAD_ID and nextSpanId
+  // The generated constructorPreamble creates its own PROCESS_THREAD_ID and nextSpanId
   // which are reset when the class is regenerated
   // Note: WeakMap doesn't have a clear() method, but schemas are typically
   // long-lived so this is mainly for testing where we create new schemas
@@ -172,7 +172,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
   // ==========================================================================
   // GENERATED CODE EXTENSION
   // ==========================================================================
-  // The preamble and methods strings below are passed to new Function() by
+  // The constructorPreamble and methods strings below are passed to new Function() by
   // arrow-builder's columnBufferGenerator. They MUST be pure JavaScript:
   // - NO TypeScript type annotations (: Type)
   // - NO non-null assertions (!)
@@ -208,7 +208,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
     // ==========================================================================
     // GENERATED CONSTRUCTOR PREAMBLE
     // ==========================================================================
-    // The preamble below is passed to new Function() by arrow-builder's
+    // The constructorPreamble below is passed to new Function() by arrow-builder's
     // columnBufferGenerator. It MUST be pure JavaScript:
     // - NO TypeScript type annotations (: Type)
     // - NO non-null assertions (!)
@@ -237,7 +237,7 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
     // Slots 11: WARM (system) - _system
     // Slots 12+: COLD (Arrow conversion only) - _callsiteMetadata, _opMetadata
     // ==========================================================================
-    preamble:
+    constructorPreamble:
       // Thread-local span counter (per-process/worker, see threadId.ts docs)
       `if (typeof globalThis.globalSpanCounter === 'undefined') {
          globalThis.globalSpanCounter = 0;

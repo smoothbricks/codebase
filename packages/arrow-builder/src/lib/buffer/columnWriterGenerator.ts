@@ -52,7 +52,7 @@ export interface ColumnWriterExtension {
   methods?: string;
 
   /**
-   * Additional code to add before the class definition.
+   * Additional code to add before the class definition (module-level).
    * Useful for helper functions, symbols, constants, etc.
    * These can reference dependencies by name (they're in scope).
    * @example
@@ -60,7 +60,18 @@ export interface ColumnWriterExtension {
    * const ENTRY_TYPE = { INFO: 1, WARN: 2, ERROR: 3 };
    * ```
    */
-  preamble?: string;
+  classPreamble?: string;
+
+  /**
+   * Additional code to add at the top of the constructor body
+   * (before _buffer and _writeIndex assignment).
+   * Has access to constructor parameters.
+   * @example
+   * ```
+   * const computedValue = someHelper(scope);
+   * ```
+   */
+  constructorPreamble?: string;
 
   /**
    * Constructor parameters beyond buffer.
@@ -71,7 +82,7 @@ export interface ColumnWriterExtension {
 
   /**
    * Runtime dependencies to inject into the generated class closure.
-   * Keys become variable names available in preamble, constructorCode, and methods.
+   * Keys become variable names available in classPreamble, constructorCode, and methods.
    * Values are the actual runtime objects/functions.
    *
    * NOTE: Dependencies are NOT included in the cache key - they should be
@@ -151,12 +162,12 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
   }
 
   if (schemaType === 'enum') {
-    // Convert string enum value to numeric index
+    // O(1) enum lookup via pre-built Map (generated in class preamble)
     if (isEager) {
       return `
     const idx = this._writeIndex;
-    const enumIndex = this._buffer.${columnName}_enumValues.indexOf(value);
-    if (enumIndex === -1) {
+    const enumIndex = this._${columnName}_enumLookup.get(value);
+    if (enumIndex === undefined) {
       throw new Error(\`Invalid enum value "\${value}" for field "${columnName}". Valid values: \${this._buffer.${columnName}_enumValues.join(', ')}\`);
     }
     this._buffer.${columnName}_values[idx] = enumIndex;
@@ -165,8 +176,8 @@ function getSetterBody(schema: ColumnSchema, fieldName: string): string {
 
     return `
     const idx = this._writeIndex;
-    const enumIndex = this._buffer.${columnName}_enumValues.indexOf(value);
-    if (enumIndex === -1) {
+    const enumIndex = this._${columnName}_enumLookup.get(value);
+    if (enumIndex === undefined) {
       throw new Error(\`Invalid enum value "\${value}" for field "${columnName}". Valid values: \${this._buffer.${columnName}_enumValues.join(', ')}\`);
     }
     this._buffer.${columnName}_nulls[idx >>> 3] |= (1 << (idx & 7)); // Set not-null
@@ -245,10 +256,23 @@ export function generateColumnWriterClass(
   const constructorSignature = extension?.constructorParams ? `buffer, ${extension.constructorParams}` : 'buffer';
 
   // Build constructor body
-  // Generated structure: assigns _buffer and _writeIndex, then runs extension constructor code
+  // Generated structure: assigns _buffer and _writeIndex, then enum lookup Maps, then extension constructor code
   const constructorBody: string[] = [];
   constructorBody.push('      this._buffer = buffer;');
   constructorBody.push('      this._writeIndex = -1;');
+
+  // Generate O(1) enum lookup Maps from buffer's enumValues arrays.
+  // Guard with existence check: some buffer implementations (e.g., WasmSpanBuffer)
+  // may not have enumValues, and the ColumnWriter setter may be overridden.
+  for (const fieldName of schemaFields) {
+    const fieldSchema = schema.fields[fieldName];
+    const schemaWithMetadata = fieldSchema as SchemaWithMetadata;
+    if (schemaWithMetadata?.__schema_type === 'enum') {
+      constructorBody.push(
+        `      this._${fieldName}_enumLookup = buffer.${fieldName}_enumValues ? new Map(buffer.${fieldName}_enumValues.map((v, i) => [v, i])) : undefined;`,
+      );
+    }
+  }
 
   // Extension constructor code runs after _buffer/_writeIndex assignment
   if (extension?.constructorCode) {
@@ -270,11 +294,20 @@ ${extension.methods
   .join('\n')}`
     : '';
 
-  // Build preamble (helper functions, constants, etc. before class definition)
-  const preambleCode = extension?.preamble
+  // Build classPreamble (helper functions, constants, etc. before class definition)
+  const classPreambleCode = extension?.classPreamble
     ? `
-${extension.preamble}
+${extension.classPreamble}
 `
+    : '';
+
+  // Build constructorPreamble (code at the top of the constructor body)
+  const constructorPreambleCode = extension?.constructorPreamble
+    ? extension.constructorPreamble
+        .trim()
+        .split('\n')
+        .map((line) => `      ${line.trim()}`)
+        .join('\n')
     : '';
 
   // Generate the complete class code
@@ -286,10 +319,10 @@ ${extension.preamble}
   // - Extension methods (if any)
   const classCode = `
   'use strict';
-${preambleCode}
+${classPreambleCode}
   class ${className} {
     constructor(${constructorSignature}) {
-${constructorBody.join('\n')}
+${constructorPreambleCode ? `${constructorPreambleCode}\n` : ''}${constructorBody.join('\n')}
     }
 
     nextRow() {

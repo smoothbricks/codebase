@@ -389,7 +389,7 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     constructorParams: '',
 
     // Entry type constants (inlined from lmao.ts)
-    preamble: `
+    classPreamble: `
   const ENTRY_TYPE_INFO = ${ENTRY_TYPE_INFO};
   const ENTRY_TYPE_DEBUG = ${ENTRY_TYPE_DEBUG};
   const ENTRY_TYPE_WARN = ${ENTRY_TYPE_WARN};

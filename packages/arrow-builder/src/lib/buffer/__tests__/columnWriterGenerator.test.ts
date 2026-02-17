@@ -33,11 +33,15 @@ describe('generateColumnWriterClass', () => {
     expect(code).toContain('message(value)');
   });
 
-  it('generates code with extension preamble', () => {
+  it('generates code with extension classPreamble', () => {
     const code = generateColumnWriterClass(testSchema, 'TestWriter', {
-      preamble: 'const FOO = 42;',
+      classPreamble: 'const FOO = 42;',
     });
     expect(code).toContain('const FOO = 42;');
+    // classPreamble should appear before class definition
+    const classPreambleIdx = code.indexOf('const FOO = 42;');
+    const classIdx = code.indexOf('class TestWriter');
+    expect(classPreambleIdx).toBeLessThan(classIdx);
   });
 
   it('generates code with extension constructor params', () => {
@@ -192,7 +196,7 @@ describe('createColumnWriter', () => {
     const transformFn = (s: string) => s.toUpperCase();
 
     const writer = createColumnWriter(testSchema, buffer, {
-      preamble: '',
+      classPreamble: '',
       methods: `
 transformed(value) {
   const idx = this._writeIndex;
@@ -225,6 +229,88 @@ transformed(value) {
     expect(buffer.message_values[1]).toBe('world');
     expect(buffer.enabled_values[0] & 0b01).toBe(0b01);
     expect(buffer.enabled_values[0] & 0b10).toBe(0);
+  });
+});
+
+describe('enum O(1) Map lookup', () => {
+  it('uses Map.get instead of indexOf for enum writes', () => {
+    const code = generateColumnWriterClass(testSchema);
+    // WHY: Verify the generated code uses O(1) Map lookup, not O(N) indexOf
+    expect(code).toContain('_enumLookup.get(value)');
+    expect(code).not.toContain('indexOf(value)');
+  });
+
+  it('generates enum lookup Map in constructor', () => {
+    const code = generateColumnWriterClass(testSchema);
+    // The constructor should build a Map from enumValues
+    expect(code).toContain('_status_enumLookup');
+    expect(code).toContain('new Map');
+  });
+
+  it('correctly writes enum values via Map lookup', () => {
+    const buffer = createGeneratedColumnBuffer(testSchema, 64);
+    const writer = createColumnWriter(testSchema, buffer);
+
+    writer.nextRow().status('ok');
+    writer.nextRow().status('error');
+
+    expect(buffer.status_values[0]).toBe(0); // 'ok' is index 0
+    expect(buffer.status_values[1]).toBe(1); // 'error' is index 1
+  });
+
+  it('throws on invalid enum value with Map lookup', () => {
+    const buffer = createGeneratedColumnBuffer(testSchema, 64);
+    const writer = createColumnWriter(testSchema, buffer);
+
+    writer.nextRow();
+    // biome-ignore lint/suspicious/noExplicitAny: testing invalid value
+    expect(() => writer.status('invalid' as any)).toThrow('Invalid enum value');
+  });
+
+  it('handles high-cardinality enum (64 values) via Map lookup', () => {
+    // WHY: Verifies O(1) Map lookup works for high-cardinality enums
+    // where indexOf would be measurably slow
+    const values = Array.from({ length: 64 }, (_, i) => `value_${i}`) as [string, ...string[]];
+    const highCardSchema = new ColumnSchema({
+      status: S.enum(values),
+    });
+    const buffer = createGeneratedColumnBuffer(highCardSchema, 64);
+    const writer = createColumnWriter(highCardSchema, buffer);
+
+    // Write every value
+    for (let i = 0; i < 64; i++) {
+      writer.nextRow();
+      // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
+      (writer as any).status(`value_${i}`);
+    }
+
+    // Verify each value got the correct index
+    for (let i = 0; i < 64; i++) {
+      expect(buffer.status_values[i]).toBe(i);
+    }
+  });
+});
+
+describe('preamble contract split', () => {
+  it('classPreamble appears before class definition in ColumnWriter', () => {
+    const code = generateColumnWriterClass(testSchema, 'TestWriter', {
+      classPreamble: 'const MAGIC = 99;',
+    });
+    const preambleIdx = code.indexOf('const MAGIC = 99;');
+    const classIdx = code.indexOf('class TestWriter');
+    expect(preambleIdx).toBeGreaterThan(-1);
+    expect(classIdx).toBeGreaterThan(-1);
+    expect(preambleIdx).toBeLessThan(classIdx);
+  });
+
+  it('constructorPreamble appears inside constructor body in ColumnWriter', () => {
+    const code = generateColumnWriterClass(testSchema, 'TestWriter', {
+      constructorPreamble: 'const SETUP = true;',
+    });
+    const preambleIdx = code.indexOf('const SETUP = true;');
+    const constructorIdx = code.indexOf('constructor(');
+    const firstBrace = code.indexOf('{', constructorIdx);
+    expect(preambleIdx).toBeGreaterThan(firstBrace);
   });
 });
 
