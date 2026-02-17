@@ -111,29 +111,29 @@ const httpModule = defineModule({
 See **[Feature Flags](./01p_feature_flags.md)** for the complete feature flag system specification, including:
 
 - Schema definition syntax (`defineFeatureFlags`)
-- Flag access patterns (returns primitives)
-- Tracking API (`ctx.ff.track()`)
+- Flag access patterns (`FlagContext | undefined` wrappers)
+- Tracking API (`flag.track()` returning fluent entry)
 - Context integration and inheritance
 - Evaluator implementation details
 
 ```typescript
 const featureFlags = defineFeatureFlags({
   // Boolean flags
-  darkMode: S.boolean().default(false),
+  darkMode: S.boolean().default(false).sync(),
   // Numeric flags
-  maxItems: S.number().default(100),
+  maxItems: S.number().default(100).sync(),
   // String flags (enum or category)
-  buttonColor: S.enum(['blue', 'green', 'red']).default('blue'),
-  experimentGroup: S.category().default('control'),
+  buttonColor: S.enum(['blue', 'green', 'red']).default('blue').sync(),
+  experimentGroup: S.category().default('control').async(),
 });
 ```
 
 ### Key Concepts
 
-- **Access returns value**: `ctx.ff.darkMode` returns `boolean` (not an object)
-- **Explicit tracking**: `ctx.ff.track('darkMode')` logs usage for analytics
-- **Unified schema**: Tracking uses the same attribute columns as `ctx.tag`
-- **Zero overhead**: Values cached per-span, deduped logging
+- **Access returns wrapper**: `ctx.ff.darkMode` returns `{ value, track() } | undefined`
+- **Explicit tracking**: `flag.track(...)` logs usage and returns fluent row tagging
+- **Unified event model**: Feature-flag analytics are encoded as system entry types (`ff-access`, `ff-usage`)
+- **Access dedupe**: `ff-access` is deduped per span/flag, with explicit `ff-usage` rows for tracking
 
 ## Environment Variable Configuration
 
@@ -186,10 +186,9 @@ See **[Feature Flags](./01p_feature_flags.md#evaluator-implementation)** for det
 
 ### Feature Flags
 
-- **First access**: Proxy intercept + cache + ff-access log (~0.1ms)
-- **Subsequent access**: Map lookup only (~0.01ms, no log)
-- **track() call**: Direct buffer write + chainable methods (~0.05ms)
-- **Analytics**: Deduped ff-access per span, explicit ff-usage via `ctx.ff.track()`
+- **Access**: Generated getter/`get()` calls evaluator and logs deduped `ff-access`
+- **Tracking**: `flag.track(...)` emits `ff-usage` and supports fluent `.with(...)`
+- **Analytics**: Deduped `ff-access` per span + explicit `ff-usage` entries
 
 ### Environment Variables
 

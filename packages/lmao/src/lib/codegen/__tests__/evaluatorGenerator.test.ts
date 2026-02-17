@@ -76,7 +76,7 @@ describe('EvaluatorGenerator', () => {
       // Should have new API methods (not old ones)
       expect(code).toContain('forContext(ctx)');
       expect(code).toContain('async get(flag)');
-      expect(code).toContain('trackUsage(flag, context)');
+      expect(code).toContain('track(context) { return self.#logUsage(flagName, context); }');
 
       // Should NOT have old API methods
       expect(code).not.toContain('withBuffer(');
@@ -297,11 +297,14 @@ describe('EvaluatorGenerator', () => {
       expect(result.value).toBe(200);
     });
 
-    test('trackUsage logs ff-usage entry via logger', () => {
+    test('track() logs ff-usage entry via logger', () => {
       const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),
       });
-      const logSchema = createTestSchema({});
+      const logSchema = createTestSchema({
+        action: S.category(),
+        outcome: S.category(),
+      });
       const spanBuffer = createBuffer(logSchema, 'test-span');
       const mockCtx = createMockSpanContext(spanBuffer);
 
@@ -314,14 +317,24 @@ describe('EvaluatorGenerator', () => {
       const evaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: true });
       const instance = new GeneratedClass(mockCtx, evaluator);
 
-      // Cast needed because createEvaluatorClass returns generic OpContext-typed class
-      // The actual runtime instance is correctly typed, but TypeScript can't infer it
-      // biome-ignore lint/suspicious/noExplicitAny: Test-specific type workaround
-      (instance as any).trackUsage('debugMode', { action: 'test_action', outcome: 'success' });
+      const flag = (instance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;
+      flag?.track({ action: 'test_action', outcome: 'success' });
 
       // Check buffer for ff-usage entry
       const usageCount = countEntryType(spanBuffer, ENTRY_TYPE_FF_USAGE);
       expect(usageCount).toBe(1);
+
+      // Context should be applied via with(context)
+      let usageIdx = -1;
+      for (let i = 0; i < spanBuffer._writeIndex; i++) {
+        if (spanBuffer.entry_type[i] === ENTRY_TYPE_FF_USAGE) {
+          usageIdx = i;
+          break;
+        }
+      }
+      expect(usageIdx).toBeGreaterThanOrEqual(0);
+      expect(spanBuffer.action_values?.[usageIdx]).toBe('test_action');
+      expect(spanBuffer.outcome_values?.[usageIdx]).toBe('success');
     });
   });
 

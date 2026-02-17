@@ -1162,13 +1162,10 @@ function createFeatureFlagEntry(
   // Feature flag value column (S.category for efficient storage of repeated values)
   writers.writeFfValue(String(flagValue)); // Serialized to string, category-interned
 
-  // Context flows into regular attribute columns
-  // TODO: Actual column writing API design TBD
-  for (const [key, value] of Object.entries(context)) {
-    const writerMethod = `write${capitalize(key)}`;
-    if (writers[writerMethod]) {
-      writers[writerMethod](value);
-    }
+  if (entryType === 'ff-usage' && context) {
+    // track(context) is applied as track().with(context)
+    // Unknown keys are ignored by with(); known schema fields are written to this row.
+    writers.with(context);
   }
 }
 ```

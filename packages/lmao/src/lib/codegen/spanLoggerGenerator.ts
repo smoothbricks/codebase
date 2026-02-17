@@ -170,6 +170,8 @@ export interface BaseSpanLogger<T extends LogSchema> {
  * Also includes logging methods for continued chaining (e.g., ctx.log.info('x').info('y'))
  */
 export type FluentLogEntry<T extends LogSchema> = {
+  /** Set multiple attributes for this entry */
+  with(attributes: Partial<InferSchema<T>>): FluentLogEntry<T>;
   /**
    * Set the source code line number for this log entry.
    * Injected by the LMAO transformer.
@@ -504,6 +506,22 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
     }
 
     ` +
+      // Set multiple attributes on the current log entry.
+      `with(attributes) {
+      for (const key in attributes) {
+        const value = attributes[key];
+        if (value === null || value === undefined) {
+          continue;
+        }
+        const setter = this[key];
+        if (typeof setter === 'function') {
+          setter.call(this, value);
+        }
+      }
+      return this;
+    }
+
+    ` +
       // Write a feature flag access entry (internal method, not on public type).
       // Called by FeatureFlagEvaluator to log flag access.
       `ffAccess(flagName, value) {
@@ -539,9 +557,11 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
           helpers.setNullBit(this._buffer.message_nulls, idx);
         }
       }
-      // Context attributes can be written to user schema columns if provided
-      // For now, just log the flag name - context can be added later if needed
       this._buffer.constructor.stats.totalWrites++;
+      if (context) {
+        this.with(context);
+      }
+      return this;
     }
 
     ` +

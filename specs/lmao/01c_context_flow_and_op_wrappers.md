@@ -281,6 +281,10 @@ await trace('handle-request', { env, requestId }, handleOp);
 An **Op** is a traced operation. It's created via `defineOp()` from an op context:
 
 ```typescript
+const flags = defineFeatureFlags({
+  premiumApi: S.boolean().default(false).sync(),
+});
+
 const opContext = defineOpContext({
   logSchema: defineLogSchema({
     status: S.number(),
@@ -288,7 +292,7 @@ const opContext = defineOpContext({
     url: S.category(),
   }),
   deps: { retry: retryOps },
-  flags: defineFeatureFlags({ premiumApi: S.boolean() }),
+  flags: flags.schema,
   ctx: {
     env: null as { apiTimeout: number }, // Required at trace() time
   },
@@ -667,14 +671,16 @@ Feature flags are accessed via `ff` in the op context:
 ```typescript
 const createUser = defineOp('createUser', async (ctx, userData: UserData) => {
   // Access flags via ctx.ff
-  if (await ctx.ff.advancedValidation.get()) {
+  const advancedValidation = await ctx.ff.get('advancedValidation');
+  if (advancedValidation) {
     await ctx.span('advanced-validate', advancedValidate, userData);
-    ctx.ff.advancedValidation.track(); // Log ff-usage
+    advancedValidation.track({ action: 'validation', outcome: 'advanced' }); // Log ff-usage
   }
 
-  if (await ctx.ff.betaFeatures.get()) {
+  const betaFeatures = await ctx.ff.get('betaFeatures');
+  if (betaFeatures) {
     ctx.log.info('Beta features enabled');
-    ctx.ff.betaFeatures.track({ feature: 'new_ui' });
+    betaFeatures.track({ action: 'beta_features', outcome: 'enabled' });
   }
 
   return ctx.ok({ success: true });
@@ -758,6 +764,11 @@ const GET = opContext.defineOp('GET', async (ctx, url: string) => {
 ### Feature Flags and Environment
 
 ```typescript
+const flags = defineFeatureFlags({
+  premiumProcessing: S.boolean().default(false).async(),
+  newPaymentFlow: S.boolean().default(false).async(),
+});
+
 const opContext = defineOpContext({
   logSchema: orderSchema,
   deps: {
@@ -765,10 +776,7 @@ const opContext = defineOpContext({
     newPayment: newPaymentOps,
     legacyPayment: legacyPaymentOps,
   },
-  flags: defineFeatureFlags({
-    premiumProcessing: S.boolean(),
-    newPaymentFlow: S.boolean(),
-  }),
+  flags: flags.schema,
   ctx: {
     env: null as { paymentProvider: string },
   },
@@ -777,16 +785,18 @@ const opContext = defineOpContext({
 const processOrder = opContext.defineOp('processOrder', async (ctx, order: Order) => {
   ctx.tag.orderId(order.id).total(order.total);
 
-  if (await ctx.ff.premiumProcessing.get()) {
+  const premiumProcessing = await ctx.ff.get('premiumProcessing');
+  if (premiumProcessing) {
     await ctx.span('premium-validate', ctx.deps.premiumValidation.validate, order);
-    ctx.ff.premiumProcessing.track();
+    premiumProcessing.track({ action: 'premium_validate', outcome: 'applied' });
   }
 
   const paymentProvider = ctx.env.paymentProvider;
 
-  if (await ctx.ff.newPaymentFlow.get()) {
+  const newPaymentFlow = await ctx.ff.get('newPaymentFlow');
+  if (newPaymentFlow) {
     await ctx.span('new-payment', ctx.deps.newPayment.charge, order, paymentProvider);
-    ctx.ff.newPaymentFlow.track({ provider: paymentProvider });
+    newPaymentFlow.track({ action: 'payment_flow', outcome: 'new' });
   } else {
     await ctx.span('legacy-payment', ctx.deps.legacyPayment.charge, order);
   }

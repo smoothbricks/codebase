@@ -485,7 +485,7 @@ const processUser = op(async ({ ff }, userData) => {
 
 - Extends `SpanLogger<T>` with internal methods:
   - `ffAccess(flagName: string, value: unknown): void`
-  - `ffUsage(flagName: string, context?: Record<string, unknown>): void`
+  - `ffUsage(flagName: string, context?: Record<string, unknown>): FluentLogEntry<T>`
   - `_nextRow(): this` (renamed from `nextRow()` to avoid schema field conflicts)
 
 **Implementation**:
@@ -505,7 +505,7 @@ export type SpanLogger<T extends LogSchema> = {
 // Internal type - evaluator casts to this
 export type SpanLoggerInternal<T extends LogSchema> = SpanLogger<T> & {
   ffAccess(flagName: string, value: unknown): void;
-  ffUsage(flagName: string, context?: Record<string, unknown>): void;
+  ffUsage(flagName: string, context?: Record<string, unknown>): FluentLogEntry<T>;
 };
 ```
 
@@ -548,8 +548,11 @@ ffUsage(flagName, context) {
   if (this._buffer.message_values) {
     this._buffer.message_values[idx] = flagName;
   }
-  // Context attributes can be written to user schema columns if provided
   this._buffer.module.sb_totalWrites++;
+  if (context) {
+    this.with(context); // Apply to this ff-usage row
+  }
+  return this; // FluentLogEntry for further tagging
 }
 ```
 
@@ -570,7 +573,7 @@ ffUsage(flagName, context) {
 
 track(flagName, context?) {
   const log = this.#spanContext.log as SpanLoggerInternal<T>;
-  log.ffUsage(flagName, context); // Always logged, not deduplicated
+  return log.ffUsage(flagName, context); // Always logged, not deduplicated
 }
 ```
 
@@ -579,7 +582,7 @@ track(flagName, context?) {
 - **Encapsulation**: Logger owns row lifecycle (`_nextRow()` + overflow handling)
 - **Type safety**: Users can't accidentally call `ctx.log.ffAccess()` - TypeScript error
 - **Zero allocation**: Methods exist at runtime, but hidden from public type
-- **No fluent return**: FF methods return `void` - not part of chaining API
+- **Fluent usage tagging**: `ffUsage()` returns `FluentLogEntry` for usage-row attributes
 - **Reserved key protection**: `_nextRow()` uses underscore prefix to avoid conflicts with user schema fields
 
 ## Integration Points

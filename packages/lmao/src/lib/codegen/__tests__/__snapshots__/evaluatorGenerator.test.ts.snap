@@ -64,30 +64,30 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
       if (typeof value === 'boolean') {
         return {
           value: true,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'string') {
         return {
           value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'object' && value !== null) {
         return {
           ...value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       return {
         value,
-        track(context) { self.#logUsage(flagName, context); }
+        track(context) { return self.#logUsage(flagName, context); }
       };
     }
 
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
-      log.ffUsage(flagName, context);
+      return log.ffUsage(flagName, context);
     }
 
     async get(flag) {
@@ -111,10 +111,6 @@ exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
       
       const wrapped = this.#wrapValue(flag, value);
       return wrapped;
-    }
-
-    trackUsage(flag, context) {
-      this.#logUsage(flag, context);
     }
 
     forContext(ctx) {
@@ -195,30 +191,30 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
       if (typeof value === 'boolean') {
         return {
           value: true,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'string') {
         return {
           value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'object' && value !== null) {
         return {
           ...value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       return {
         value,
-        track(context) { self.#logUsage(flagName, context); }
+        track(context) { return self.#logUsage(flagName, context); }
       };
     }
 
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
-      log.ffUsage(flagName, context);
+      return log.ffUsage(flagName, context);
     }
 
     async get(flag) {
@@ -242,10 +238,6 @@ exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different 
       
       const wrapped = this.#wrapValue(flag, value);
       return wrapped;
-    }
-
-    trackUsage(flag, context) {
-      this.#logUsage(flag, context);
     }
 
     forContext(ctx) {
@@ -334,30 +326,30 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
       if (typeof value === 'boolean') {
         return {
           value: true,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'string') {
         return {
           value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'object' && value !== null) {
         return {
           ...value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       return {
         value,
-        track(context) { self.#logUsage(flagName, context); }
+        track(context) { return self.#logUsage(flagName, context); }
       };
     }
 
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
-      log.ffUsage(flagName, context);
+      return log.ffUsage(flagName, context);
     }
 
     async get(flag) {
@@ -381,10 +373,6 @@ exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
       
       const wrapped = this.#wrapValue(flag, value);
       return wrapped;
-    }
-
-    trackUsage(flag, context) {
-      this.#logUsage(flag, context);
     }
 
     forContext(ctx) {
@@ -469,30 +457,30 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
       if (typeof value === 'boolean') {
         return {
           value: true,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'string') {
         return {
           value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'object' && value !== null) {
         return {
           ...value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       return {
         value,
-        track(context) { self.#logUsage(flagName, context); }
+        track(context) { return self.#logUsage(flagName, context); }
       };
     }
 
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
-      log.ffUsage(flagName, context);
+      return log.ffUsage(flagName, context);
     }
 
     async get(flag) {
@@ -516,10 +504,6 @@ exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
       
       const wrapped = this.#wrapValue(flag, value);
       return wrapped;
-    }
-
-    trackUsage(flag, context) {
-      this.#logUsage(flag, context);
     }
 
     forContext(ctx) {
@@ -600,30 +584,30 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
       if (typeof value === 'boolean') {
         return {
           value: true,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'string') {
         return {
           value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'object' && value !== null) {
         return {
           ...value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       return {
         value,
-        track(context) { self.#logUsage(flagName, context); }
+        track(context) { return self.#logUsage(flagName, context); }
       };
     }
 
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
-      log.ffUsage(flagName, context);
+      return log.ffUsage(flagName, context);
     }
 
     async get(flag) {
@@ -647,10 +631,6 @@ exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
       
       const wrapped = this.#wrapValue(flag, value);
       return wrapped;
-    }
-
-    trackUsage(flag, context) {
-      this.#logUsage(flag, context);
     }
 
     forContext(ctx) {

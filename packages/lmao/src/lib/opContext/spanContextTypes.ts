@@ -271,7 +271,8 @@ export type SpanContext<Ctx extends OpContext> = {
    * Feature flags (logs access to current span).
    *
    * Per specs/lmao/01p_feature_flags.md:
-   * - Access via ff.flagName() or ff['flagName']()
+   * - Sync access via ff.flagName / ff['flagName']
+   * - Async access via await ff.get('flagName')
    * - Logs flag access to span automatically
    * - Type-safe evaluation with context
    */

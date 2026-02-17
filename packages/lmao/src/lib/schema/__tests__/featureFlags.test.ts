@@ -67,7 +67,7 @@ describe('Feature Flags', () => {
       // Cast ff to access typed properties (type inference limitation)
       const ff = ctx.ff as unknown as {
         debugMode: BooleanFlagContext | undefined;
-        maxRetries: { value: number; track: () => void } | undefined;
+        maxRetries: { value: number; track: (context?: { action?: string; outcome?: string }) => unknown } | undefined;
       };
 
       expect(ff.debugMode).toBeDefined();
@@ -124,42 +124,16 @@ describe('Feature Flags', () => {
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
       // Async flags accessed via get() return FlagContext
-      const limit = (await ctx.ff.get('userSpecificLimit')) as { value: number; track: () => void };
+      const limit = (await ctx.ff.get('userSpecificLimit')) as {
+        value: number;
+        track: (context?: { action?: string; outcome?: string }) => unknown;
+      };
       expect(limit).toBeDefined();
       expect(limit.value).toBe(200);
 
       const provider = (await ctx.ff.get('dynamicProvider')) as VariantFlagContext<string>;
       expect(provider).toBeDefined();
       expect(provider.value).toBe('paypal');
-
-      return ctx.ok(null);
-    });
-  });
-
-  test('trackUsage logs usage events to buffer', async () => {
-    const flags = defineFeatureFlags({
-      advancedValidation: S.boolean().default(false).sync(),
-    });
-
-    const ctx = defineOpContext({
-      logSchema: testLogSchema,
-      flags: flags.schema,
-    });
-
-    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
-      advancedValidation: true,
-    }) as any;
-
-    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
-    await trace('test-span', async (ctx) => {
-      (ctx.ff as { trackUsage: (flag: string, context: object) => void }).trackUsage('advancedValidation', {
-        action: 'validation_performed',
-        outcome: 'success',
-      });
-
-      // Check buffer for ff-usage entry
-      const usageCount = countEntryType(ctx.buffer, ENTRY_TYPE_FF_USAGE);
-      expect(usageCount).toBe(1);
 
       return ctx.ok(null);
     });
@@ -184,8 +158,8 @@ describe('Feature Flags', () => {
       const ff = ctx.ff as unknown as { advancedValidation: BooleanFlagContext | undefined };
       const flag = ff.advancedValidation;
 
-      // Use track() on the flag context
-      flag?.track({ action: 'validation_performed', outcome: 'success' });
+      // track() returns fluent log entry so additional fields can be tagged
+      flag?.track({ action: 'validation_performed', outcome: 'success' }).ff_value('used').line(123);
 
       // Check buffer for ff-usage entry
       const usageCount = countEntryType(ctx.buffer, ENTRY_TYPE_FF_USAGE);
@@ -303,7 +277,9 @@ describe('Feature Flags', () => {
     await trace('test-span', async (ctx) => {
       const ff = ctx.ff as unknown as {
         enableFeatureX: BooleanFlagContext | undefined;
-        maxConnectionPool: { value: number; track: () => void } | undefined;
+        maxConnectionPool:
+          | { value: number; track: (context?: { action?: string; outcome?: string }) => unknown }
+          | undefined;
         logLevel: VariantFlagContext<string> | undefined;
         get(flag: string): Promise<unknown>;
       };

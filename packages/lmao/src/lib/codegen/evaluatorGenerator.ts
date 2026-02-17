@@ -29,7 +29,7 @@
 
 import type { OpContext } from '../opContext/types.js';
 import type { FeatureFlagSchema } from '../schema/defineFeatureFlags.js';
-import type { FlagEvaluator, FlagTrackContext, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
+import type { FlagEvaluator, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
 import type { Schema } from '../schema/types.js';
 import type { SpanContext } from '../spanContext.js';
 
@@ -41,7 +41,6 @@ import type { SpanContext } from '../spanContext.js';
  */
 export interface GeneratedEvaluatorBase<Ctx extends OpContext> {
   get(flag: string): Promise<unknown>;
-  trackUsage<K extends keyof Ctx['flags']>(flag: K, context?: FlagTrackContext): void;
   forContext(ctx: SpanContext<Ctx>): GeneratedEvaluatorBase<Ctx> & InferFeatureFlagsWithContext<Ctx>;
   readonly evaluator: FlagEvaluator<Ctx>;
 }
@@ -154,39 +153,39 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
     }
 ` +
     // Generated code: #wrapValue() - wraps truthy flag value with track() method
-    // Returns object with value property and track() that calls #logUsage
+    // Returns object with value property and track() that creates ff-usage entry
     `
     #wrapValue(flagName, value) {
       const self = this;
       if (typeof value === 'boolean') {
         return {
           value: true,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'string') {
         return {
           value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       if (typeof value === 'object' && value !== null) {
         return {
           ...value,
-          track(context) { self.#logUsage(flagName, context); }
+          track(context) { return self.#logUsage(flagName, context); }
         };
       }
       return {
         value,
-        track(context) { self.#logUsage(flagName, context); }
+        track(context) { return self.#logUsage(flagName, context); }
       };
     }
 ` +
-    // Generated code: #logUsage() - logs flag usage via logger
+    // Generated code: #logUsage() - logs flag usage and returns fluent entry
     `
     #logUsage(flagName, context) {
       const log = this.#spanContext.log;
-      log.ffUsage(flagName, context);
+      return log.ffUsage(flagName, context);
     }
 ` +
     // Generated code: async get() - async flag evaluation
@@ -213,12 +212,6 @@ export function generateEvaluatorClass<T extends FeatureFlagSchema>(
       
       const wrapped = this.#wrapValue(flag, value);
       return wrapped;
-    }
-` +
-    // Generated code: trackUsage() - manual usage tracking (prefer flag.track() fluent API)
-    `
-    trackUsage(flag, context) {
-      this.#logUsage(flag, context);
     }
 ` +
     // Generated code: forContext() - creates child evaluator bound to span context

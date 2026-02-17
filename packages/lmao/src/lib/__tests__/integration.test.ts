@@ -227,15 +227,9 @@ describe('Schema Integration Patterns', () => {
         const validationFlag = ctx.ff.advancedValidation;
 
         if (validationFlag) {
-          // Use track() on the flag context to log usage
-          validationFlag.track();
+          // track() creates ff-usage entries and returns fluent entry for tagging
+          validationFlag.track().operation('SELECT').duration(5);
         }
-
-        // Can also use trackUsage directly
-        ctx.ff.trackUsage('advancedValidation', {
-          action: 'retry_check',
-          outcome: 'skipped',
-        });
 
         return ctx.ok({ tracked: true });
       });

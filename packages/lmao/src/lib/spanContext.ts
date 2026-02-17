@@ -27,6 +27,7 @@ import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import {
   createSpanLogger as createSpanLoggerFromGenerator,
+  type FluentLogEntry,
   type SpanLoggerImpl,
 } from './codegen/spanLoggerGenerator.js';
 import { Blocked } from './errors/Blocked.js';
@@ -79,7 +80,7 @@ export type SpanLoggerInternal<T extends LogSchema> = SpanLoggerImpl<T> & {
    * Write feature flag usage entry (internal, not on public type).
    * Called by FeatureFlagEvaluator to log flag usage.
    */
-  ffUsage(flagName: string, context?: Record<string, unknown>): void;
+  ffUsage(flagName: string, context?: Record<string, unknown>): FluentLogEntry<T>;
 };
 
 // =============================================================================

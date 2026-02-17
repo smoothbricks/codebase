@@ -247,10 +247,12 @@ async (ctx, ...args) => {
   console.log(ctx.scope.request_id); // Read current scope
 
   // Feature flags
-  if (await ctx.ff.newCheckoutFlow.get()) {
-    ctx.ff.newCheckoutFlow.track(); // Record usage
+  const newCheckoutFlow = await ctx.ff.get('newCheckoutFlow');
+  if (newCheckoutFlow) {
+    newCheckoutFlow.track({ action: 'checkout_route', outcome: 'new' });
   }
-  const retries = ctx.ff.maxRetries.get(); // sync flag
+  const retries = ctx.ff.maxRetries; // sync flag wrapper
+  const retryCount = retries?.value ?? 0;
 
   // Child spans
   const result = await ctx.span('validate', async (child) => {

@@ -1,8 +1,10 @@
 import * as S from '@sury/sury';
 import { createEvaluatorClass } from '../codegen/evaluatorGenerator.js';
+import type { FluentLogEntry } from '../codegen/spanLoggerGenerator.js';
 import type { OpContext } from '../opContext/types.js';
 import type { SpanContext } from '../spanContext.js';
 import type { FeatureFlagSchema } from './defineFeatureFlags.js';
+import type { LogSchema } from './LogSchema.js';
 import { ENTRY_TYPE_FF_ACCESS } from './systemSchema.js';
 
 /**
@@ -138,25 +140,25 @@ export interface FlagTrackContext {
 /**
  * Boolean flag context - returned when boolean flag is true
  */
-export interface BooleanFlagContext {
+export interface BooleanFlagContext<TLog extends LogSchema = LogSchema> {
   readonly value: true;
-  track(context?: FlagTrackContext): void;
+  track(context?: FlagTrackContext): FluentLogEntry<TLog>;
 }
 
 /**
  * Variant flag context - returned when variant flag is enabled
  */
-export interface VariantFlagContext<V extends string> {
+export interface VariantFlagContext<V extends string, TLog extends LogSchema = LogSchema> {
   readonly value: V;
-  track(context?: FlagTrackContext): void;
+  track(context?: FlagTrackContext): FluentLogEntry<TLog>;
 }
 
 /**
  * Config flag context - returned when config flag is enabled
  * Spreads the config object and adds track() method
  */
-export type ConfigFlagContext<T extends Record<string, unknown>> = T & {
-  track(context?: FlagTrackContext): void;
+export type ConfigFlagContext<T extends Record<string, unknown>, TLog extends LogSchema = LogSchema> = T & {
+  track(context?: FlagTrackContext): FluentLogEntry<TLog>;
 };
 
 // ============================================================================
@@ -166,13 +168,13 @@ export type ConfigFlagContext<T extends Record<string, unknown>> = T & {
 /**
  * Infer the flag context type for a single flag definition
  */
-type InferFlagContextType<T> = T extends boolean
-  ? BooleanFlagContext
+type InferFlagContextType<Ctx extends OpContext, T> = T extends boolean
+  ? BooleanFlagContext<Ctx['logSchema']>
   : T extends string
-    ? VariantFlagContext<T>
+    ? VariantFlagContext<T, Ctx['logSchema']>
     : T extends Record<string, unknown>
-      ? ConfigFlagContext<T>
-      : { value: T; track(context?: FlagTrackContext): void };
+      ? ConfigFlagContext<T, Ctx['logSchema']>
+      : { value: T; track(context?: FlagTrackContext): FluentLogEntry<Ctx['logSchema']> };
 
 /**
  * Infer feature flag types from OpContext - returns FlagContext | undefined for each flag
@@ -182,7 +184,7 @@ type InferFlagContextType<T> = T extends boolean
  */
 export type InferFeatureFlagsWithContext<Ctx extends OpContext> = Ctx['flags'] extends FeatureFlagSchema
   ? {
-      readonly [K in keyof Ctx['flags']]: InferFlagContextType<S.Output<Ctx['flags'][K]['schema']>> | undefined;
+      readonly [K in keyof Ctx['flags']]: InferFlagContextType<Ctx, S.Output<Ctx['flags'][K]['schema']>> | undefined;
     }
   : {};
 
@@ -299,9 +301,6 @@ export abstract class FeatureFlagEvaluator<Ctx extends OpContext = OpContext> {
    * Returns undefined when false, FlagContext when truthy
    */
   abstract get(flag: string): Promise<unknown>;
-
-  /** Track flag usage. Prefer using flag.track() for the fluent API. */
-  abstract trackUsage<K extends keyof Ctx['flags']>(flag: K, context?: FlagTrackContext): void;
 
   /**
    * Create a new wrapper for a child span context.

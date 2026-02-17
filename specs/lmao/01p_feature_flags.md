@@ -6,7 +6,7 @@ The feature flag system provides type-safe, high-performance configuration and a
 behavior. It integrates deeply with the trace logging system to provide:
 
 1.  **Type Safety**: Full TypeScript inference for flag values
-2.  **Performance**: Cached evaluation with zero-allocation hot paths
+2.  **Performance**: Generated getters with stable hidden classes (no Proxy traps)
 3.  **Analytics**: Automatic tracking of flag access and usage
 4.  **Context Awareness**: Evaluation based on span context (user, region, etc.)
 
@@ -19,77 +19,73 @@ behavior. It integrates deeply with the trace logging system to provide:
 ```typescript
 const featureFlags = defineFeatureFlags({
   // Boolean flags
-  darkMode: S.boolean().default(false),
-  advancedValidation: S.boolean().default(false),
+  darkMode: S.boolean().default(false).sync(),
+  advancedValidation: S.boolean().default(false).sync(),
 
   // Numeric flags (e.g., limits, thresholds)
-  maxItems: S.number().default(100),
-  rateLimit: S.number().default(1000),
+  maxItems: S.number().default(100).sync(),
+  rateLimit: S.number().default(1000).sync(),
 
   // String flags using enum (known variants at compile time)
-  buttonColor: S.enum(['blue', 'green', 'red']).default('blue'),
+  buttonColor: S.enum(['blue', 'green', 'red']).default('blue').sync(),
 
   // String flags using category (repeated values, runtime interning)
-  experimentGroup: S.category().default('control'),
+  experimentGroup: S.category().default('control').async(),
 });
 ```
 
-### Flag Access: Returns Just the Value
+### Flag Access: Wrapper Semantics (`FlagContext | undefined`)
 
-Flag access returns the **primitive value directly** - no wrapper objects. This is optimal for V8 hidden classes and
-provides the simplest mental model.
+`ctx.ff` uses undefined/truthy semantics:
+
+- Disabled/falsy -> `undefined`
+- Enabled/truthy -> wrapper with `.value` and `.track(context?)`
 
 ```typescript
-// Access flag values - returns the primitive directly
-const enabled = ctx.ff.darkMode; // boolean
-const maxItems = ctx.ff.maxItems; // number
-const color = ctx.ff.buttonColor; // 'blue' | 'green' | 'red'
+// Sync flags via property access
+const darkMode = ctx.ff.darkMode; // { value: true, track(...) } | undefined
+const maxItems = ctx.ff.maxItems; // { value: number, track(...) } | undefined
 
-// Natural JavaScript usage
-if (ctx.ff.darkMode) {
+if (darkMode) {
+  darkMode.track({ action: 'theme_check', outcome: 'enabled' });
   applyDarkTheme();
 }
 
-// Use numeric flags directly
-const items = fetchItems({ limit: ctx.ff.maxItems });
+const items = fetchItems({ limit: maxItems?.value ?? 100 });
+
+// Async flags via get(flagName)
+const experiment = await ctx.ff.get('experimentGroup');
+if (experiment) {
+  ctx.log.info(`Experiment group: ${experiment.value}`);
+}
 ```
 
-### Tracking: Via ctx.ff.track() Method
+### Tracking: `flag.track()` Creates a New `ff-usage` Row
 
-Tracking is **separate from access**. Use `ctx.ff.track('flagName')` to record usage analytics. The `track()` method
-returns a chainable API just like `ctx.tag` and `ctx.log.info()`.
+`ctx.ff.flagName` is access-only and deduplicated (`ff-access`). It does not expose tagging methods because repeated
+accesses are deduped to a single access event per span.
+
+When flag usage influences behavior, call `flag.track(context?)`. This always creates a new `ff-usage` entry and returns
+a `FluentLogEntry` so you can tag that usage row.
 
 ```typescript
-// Track flag usage with chainable attributes
-ctx.ff.track('darkMode').variant(ctx.ff.darkMode);
-
-// Typical pattern: check flag, then track with user-defined attributes
-if (ctx.ff.darkMode) {
-  ctx.ff.track('darkMode');
+const darkMode = ctx.ff.darkMode;
+if (darkMode) {
+  darkMode.track({ action: 'apply_theme', outcome: 'success' }).region('us-east-1');
   applyDarkTheme();
 }
-
-// Track with multiple user-defined attributes (chainable)
-ctx.ff.track('buttonColor').variant(ctx.ff.buttonColor);
-
-// Track numeric flag usage with user-defined attributes
-ctx.ff.track('maxItems').requested(100).returned(ctx.ff.maxItems);
 ```
 
-### Track Uses Same Schema as Tag
+### Usage Context Storage
 
-The `track()` method returns a chainable API that writes to the **same columns** as `ctx.tag`. There is no separate
-tracking schema - this keeps the Arrow table structure unified and avoids column name collisions.
+`ff-usage` rows store the flag name in `message`. If `track(context)` is provided, it is applied as
+`track().with(context)` to write known schema fields on the same row.
 
 ```typescript
-// Your logSchema (user-defined)
-const logSchema = {
-  variant: S.category(), // flag variant value
-  userId: S.category(),
-  duration: S.number(),
-  requested: S.number(),
-  returned: S.number(),
-};
+// Persisted fields for ff-usage rows:
+// - entry_type = 'ff-usage'
+// - message = flag name
+// - optional schema attributes from track(context?) and fluent setters
 ```
 
 ## Context Flow & Integration
@@ -283,13 +279,15 @@ class LaunchDarklyEvaluator implements FlagEvaluator<AppSchema, AppFlags, Env> {
 }
 
 // Usage with defineOpContext and Tracer
+const flags = defineFeatureFlags({
+  premiumFeatures: S.boolean().default(false).async(),
+  maxRetries: S.number().default(3).sync(),
+  experimentGroup: S.category().default('control').async(),
+});
+
 const opContext = defineOpContext({
   logSchema: appSchema,
-  flags: defineFeatureFlags({
-    premiumFeatures: S.boolean().default(false).async(),
-    maxRetries: S.number().default(3).sync(),
-    experimentGroup: S.category().default('control').async(),
-  }),
+  flags: flags.schema,
   ctx: {
     env: null as Env,
     userId: undefined as string | undefined,
@@ -299,7 +297,7 @@ const opContext = defineOpContext({
 
 // Pass the evaluator to Tracer via TracerOptions
 const { trace } = new TestTracer(opContext, {
-  flagEvaluator: new LaunchDarklyEvaluator(ldClient, opContext.flags.schema),
+  flagEvaluator: new LaunchDarklyEvaluator(ldClient, flags.schema),
 });
 ```
 
@@ -479,12 +477,13 @@ class InMemoryFlagEvaluator<T, FF, Env> implements FlagEvaluator<T, FF, Env> {
 
 ```typescript
 const fetchUser = defineOp('fetchUser', async (ctx, id: string) => {
-  // Access flags - evaluator is called with ctx (minus ff)
-  const useNewApi = await ctx.ff.useNewUserApi.get(); // async flag
+  // Access async flags via ctx.ff.get('flagName')
+  // Evaluator is called with ctx (minus ff)
+  const useNewApi = await ctx.ff.get('useNewUserApi');
 
   if (useNewApi) {
     // Track that this flag influenced behavior
-    ctx.ff.useNewUserApi.track();
+    useNewApi.track({ action: 'select_api', outcome: 'new' });
 
     return ctx.span('newApi', async (child) => {
       const user = await newUserService.fetch(id);
@@ -517,7 +516,9 @@ export default {
         ctx.setScope({ request_id: crypto.randomUUID() });
 
         // Flag evaluation has access to ctx.userId, ctx.userPlan, ctx.scope.request_id
-        if (await ctx.ff.maintenanceMode.get()) {
+        const maintenanceMode = await ctx.ff.get('maintenanceMode');
+        if (maintenanceMode) {
+          maintenanceMode.track({ action: 'request_gate', outcome: 'maintenance' });
           return new Response('Service under maintenance', { status: 503 });
         }
 
@@ -530,11 +531,11 @@ export default {
 
 ## Performance Characteristics
 
-- **First access**: Evaluator call + ff-access log (~0.1ms for sync, varies for async)
-- **Subsequent access**: Cached value (~0.01ms, no log, no evaluator call)
-- **track() call**: Direct buffer write + chainable methods (~0.05ms)
-- **Analytics**: Deduped ff-access per span, explicit ff-usage via `track()`
-- **V8 Optimized**: Returns primitives, no wrapper objects
+- **Every access**: Evaluator call + access dedupe scan (sync via getter, async via `get()`)
+- **First access per flag/span**: Writes one `ff-access` row
+- **Subsequent accesses in same span**: No duplicate `ff-access` write (still evaluated)
+- **Tracking**: `flag.track()` writes `ff-usage` rows and returns fluent tagging entry
+- **V8 optimized**: Generated class with real getters (no Proxy traps)
 
 ## Complete Example
 
@@ -616,7 +617,7 @@ class AppFlagEvaluator implements FlagEvaluator<AppSchema, AppFlags, Env> {
 // Create op context - flags are defined here, evaluator is passed to Tracer
 const opContext = defineOpContext({
   logSchema: appSchema,
-  flags,
+  flags: flags.schema,
   ctx: {
     env: null as Env,
     userId: undefined as string | undefined,

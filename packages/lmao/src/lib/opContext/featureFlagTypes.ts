@@ -12,6 +12,8 @@
  * - packages/lmao/src/lib/schema/evaluator.ts
  */
 
+import type { FluentLogEntry } from '../codegen/spanLoggerGenerator.js';
+import type { LogSchema } from '../schema/LogSchema.js';
 import type { FeatureFlagDefinition } from '../schema/types.js';
 
 // =============================================================================
@@ -30,21 +32,23 @@ export interface FeatureFlagSchema {
  * Provides typed getters for each defined flag
  *
  * Access patterns:
- * - Sync flags: `ctx.ff.myFlag` returns `{ value: T, track(): void } | undefined`
- * - Async flags: `await ctx.ff.get('myFlag')` returns `{ value: T, track(): void } | undefined`
+ * - Sync flags: `ctx.ff.myFlag` returns `{ value: T, track(context?): FluentLogEntry } | undefined`
+ * - Async flags: `await ctx.ff.get('myFlag')` returns `{ value: T, track(context?): FluentLogEntry } | undefined`
  *
  * Returns `undefined` when flag is false/disabled.
  * Returns wrapper object when flag is truthy/enabled, with `.track()` for usage analytics.
  */
 export type BoundFeatureFlags<FF extends FeatureFlagSchema> = {
   readonly [K in keyof FF]: FF[K] extends FeatureFlagDefinition<infer V, 'sync'>
-    ? { value: V; track(): void } | undefined
+    ? { value: V; track(context?: { action?: string; outcome?: string }): FluentLogEntry<LogSchema> } | undefined
     : FF[K] extends FeatureFlagDefinition<infer V, 'async'>
-      ? { value: V; track(): void } | undefined
+      ? { value: V; track(context?: { action?: string; outcome?: string }): FluentLogEntry<LogSchema> } | undefined
       : never;
 } & {
   /** Get async flag value. Returns undefined when false, FlagContext when truthy. */
-  get(flag: string): Promise<{ value: unknown; track(): void } | undefined>;
-  /** Track flag usage. Prefer using flag.track() for the fluent API. */
-  trackUsage<K extends keyof FF>(flag: K, context?: { action?: string; outcome?: string }): void;
+  get(
+    flag: string,
+  ): Promise<
+    { value: unknown; track(context?: { action?: string; outcome?: string }): FluentLogEntry<LogSchema> } | undefined
+  >;
 };
