@@ -14,19 +14,20 @@ const builtin = @import("builtin");
 // Module imports
 // =============================================================================
 
-// Parsing modules - JSON to columnar format
+// Parsing modules - JSON to columnar format.
+// Named modules (wired in build.zig) so each file belongs to exactly
 pub const parsing = struct {
-    pub const columns = @import("parsing/columns.zig");
-    pub const json_scanner = @import("parsing/json_scanner.zig");
-    pub const json_parser = @import("parsing/json_parser.zig");
-    pub const json_extractor = @import("parsing/json_extractor.zig");
+    pub const columns = @import("columns");
+    pub const json_scanner = @import("json_scanner");
+    pub const json_parser = @import("json_parser");
+    pub const json_extractor = @import("json_extractor");
 };
 
 // Arrow module - IPC encoding for output
 pub const arrow = struct {
-    pub const ipc_writer = @import("arrow/ipc_writer.zig");
-    pub const dynamic_schema = @import("arrow/dynamic_schema.zig");
-    pub const dynamic_record_batch = @import("arrow/dynamic_record_batch.zig");
+    pub const ipc_writer = @import("ipc_writer");
+    pub const dynamic_schema = @import("dynamic_schema");
+    pub const dynamic_record_batch = @import("dynamic_record_batch");
 };
 
 // =============================================================================

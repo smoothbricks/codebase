@@ -14,7 +14,8 @@
 //! - Null bitmap uses Arrow's LSB-first bit packing
 
 const std = @import("std");
-const dynamic_schema = @import("../arrow/dynamic_schema.zig");
+// can provide their own dynamic_schema (they differ slightly).
+const dynamic_schema = @import("dynamic_schema");
 
 /// Maximum events per batch (prevents unbounded growth)
 pub const MAX_EVENTS_PER_BATCH: u32 = 65536;

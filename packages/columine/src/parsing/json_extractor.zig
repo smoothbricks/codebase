@@ -26,9 +26,10 @@
 //! properly typed msgpack.
 
 const std = @import("std");
-const json_parser = @import("json_parser.zig");
-const columns = @import("columns.zig");
-const dynamic_schema = @import("../arrow/dynamic_schema.zig");
+// can share this file while pointing at their own columns/dynamic_schema.
+const json_parser = @import("json_parser");
+const columns = @import("columns");
+const dynamic_schema = @import("dynamic_schema");
 
 /// Extraction errors
 pub const ExtractionError = error{

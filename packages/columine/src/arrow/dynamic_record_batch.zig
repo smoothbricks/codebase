@@ -9,7 +9,7 @@
 //! (same approach as Phase 7), but with dynamic patching based on field count.
 
 const std = @import("std");
-const dynamic_schema = @import("dynamic_schema.zig");
+const dynamic_schema = @import("dynamic_schema");
 
 /// Continuation marker for Arrow IPC messages
 pub const CONTINUATION_MARKER: u32 = 0xFFFFFFFF;

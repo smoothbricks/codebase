@@ -135,6 +135,8 @@ pub fn build(b: *std.Build) void {
     ep_wasm.root_module.addImport("msgpack", msgpack_wasm_dep.module("msgpack"));
     // WASM: no simdjzon, use Scanner fallback
     ep_wasm.root_module.addOptions("build_options", build_opts_no_simdjzon);
+    // each package wires its own columns.zig and dynamic_schema.zig.
+    addParsingModules(b, ep_wasm.root_module, build_opts_no_simdjzon, null);
 
     b.installArtifact(ep_wasm);
 
@@ -164,6 +166,7 @@ pub fn build(b: *std.Build) void {
         ep_ffi.root_module.addImport("simdjzon", mod);
     }
     ep_ffi.root_module.addOptions("build_options", build_opts_simdjzon);
+    addParsingModules(b, ep_ffi.root_module, build_opts_simdjzon, simdjzon_mod);
 
     b.installArtifact(ep_ffi);
 
@@ -204,7 +207,78 @@ pub fn build(b: *std.Build) void {
         ep_test.root_module.addImport("simdjzon", mod);
     }
     ep_test.root_module.addOptions("build_options", build_opts_simdjzon);
+    addParsingModules(b, ep_test.root_module, build_opts_simdjzon, simdjzon_mod);
 
     const run_ep_test = b.addRunArtifact(ep_test);
     test_step.dependOn(&run_ep_test.step);
+}
+
+// =============================================================================
+// Helpers
+// =============================================================================
+
+/// Wire all named modules that event_processor.zig and its transitive
+/// dependencies import. Zig 0.15 requires each file to belong to exactly
+/// one module, so every cross-file @import in the EP tree is a named module.
+/// package wires its own columns.zig and dynamic_schema.zig.
+fn addParsingModules(
+    b: *std.Build,
+    root: *std.Build.Module,
+    build_opts: *std.Build.Step.Options,
+    maybe_simdjzon: ?*std.Build.Module,
+) void {
+    // --- leaf: dynamic_schema has no cross-file deps ---
+    const ds = b.createModule(.{
+        .root_source_file = b.path("src/arrow/dynamic_schema.zig"),
+    });
+    root.addImport("dynamic_schema", ds);
+
+    // --- dynamic_record_batch depends on dynamic_schema ---
+    const drb = b.createModule(.{
+        .root_source_file = b.path("src/arrow/dynamic_record_batch.zig"),
+    });
+    drb.addImport("dynamic_schema", ds);
+    root.addImport("dynamic_record_batch", drb);
+
+    // --- columns depends on dynamic_schema ---
+    const cols = b.createModule(.{
+        .root_source_file = b.path("src/parsing/columns.zig"),
+    });
+    cols.addImport("dynamic_schema", ds);
+    root.addImport("columns", cols);
+
+    // --- json_parser depends on build_options + optional simdjzon ---
+    const jp = b.createModule(.{
+        .root_source_file = b.path("src/parsing/json_parser.zig"),
+    });
+    jp.addOptions("build_options", build_opts);
+    if (maybe_simdjzon) |mod| {
+        jp.addImport("simdjzon", mod);
+    }
+    root.addImport("json_parser", jp);
+
+    // --- json_scanner depends on columns ---
+    const js = b.createModule(.{
+        .root_source_file = b.path("src/parsing/json_scanner.zig"),
+    });
+    js.addImport("columns", cols);
+    root.addImport("json_scanner", js);
+
+    // --- json_extractor depends on json_parser, columns, dynamic_schema ---
+    const je = b.createModule(.{
+        .root_source_file = b.path("src/parsing/json_extractor.zig"),
+    });
+    je.addImport("json_parser", jp);
+    je.addImport("columns", cols);
+    je.addImport("dynamic_schema", ds);
+    root.addImport("json_extractor", je);
+
+    // --- ipc_writer depends on columns, dynamic_schema, dynamic_record_batch ---
+    const iw = b.createModule(.{
+        .root_source_file = b.path("src/arrow/ipc_writer.zig"),
+    });
+    iw.addImport("columns", cols);
+    iw.addImport("dynamic_schema", ds);
+    iw.addImport("dynamic_record_batch", drb);
+    root.addImport("ipc_writer", iw);
 }

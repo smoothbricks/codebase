@@ -11,9 +11,9 @@
 //! [EOS marker: 0xFFFFFFFF 0x00000000]
 
 const std = @import("std");
-const columns = @import("../parsing/columns.zig");
-const dynamic_schema = @import("dynamic_schema.zig");
-const dynamic_record_batch = @import("dynamic_record_batch.zig");
+const columns = @import("columns");
+const dynamic_schema = @import("dynamic_schema");
+const dynamic_record_batch = @import("dynamic_record_batch");
 
 // Re-export commonly used types from dynamic_record_batch
 pub const BufferDesc = dynamic_record_batch.BufferDesc;

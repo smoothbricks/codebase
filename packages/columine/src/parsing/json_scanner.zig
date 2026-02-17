@@ -13,7 +13,7 @@
 //! - Year range: 1970-2099 (no ancient dates or far future)
 
 const std = @import("std");
-const columns = @import("columns.zig");
+const columns = @import("columns");
 const EventColumns = columns.EventColumns;
 const ParseError = columns.ParseError;
 
