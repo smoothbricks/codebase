@@ -151,6 +151,24 @@ interface InternalUndoToken extends UndoToken {
   snapshot: Uint8Array | null;
 }
 
+function assertInternalUndoToken(token: UndoToken): InternalUndoToken {
+  const internal = token as Partial<InternalUndoToken>;
+  const position = internal.position;
+  if (!Number.isInteger(position) || (position as number) < 0) {
+    // invariant throw: caller passed a non-pipeline token or corrupted token
+    throw new Error('Invalid UndoToken: missing or invalid checkpoint position');
+  }
+  if (internal.snapshot !== null && !(internal.snapshot instanceof Uint8Array) && internal.snapshot !== undefined) {
+    // invariant throw: caller passed a non-pipeline token or corrupted token
+    throw new Error('Invalid UndoToken: snapshot must be Uint8Array | null');
+  }
+  return {
+    _brand: 'UndoToken',
+    position: position as number,
+    snapshot: internal.snapshot ?? null,
+  };
+}
+
 function createReduceStage(backend: ColumineBackend): ReduceStage {
   return {
     name: 'reduce',
@@ -230,7 +248,7 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     },
 
     rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow' {
-      const internal = token as InternalUndoToken;
+      const internal = assertInternalUndoToken(token);
 
       if (hasNativeUndo) {
         // Native rollback — Zig handles overflow internally via shadow buffer:
@@ -245,6 +263,10 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
       if (internal.snapshot) {
         const stateAny = state as StateHandle & { buffer?: ArrayBuffer; size?: number };
         if (stateAny.buffer && internal.snapshot.length > 0) {
+          if (internal.snapshot.length > stateAny.buffer.byteLength) {
+            // invariant throw: snapshot/token does not belong to this state handle
+            throw new Error('Invalid UndoToken: snapshot size exceeds target state buffer');
+          }
           new Uint8Array(stateAny.buffer).set(internal.snapshot);
         }
       }
@@ -252,7 +274,7 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     },
 
     commit(state: StateHandle, token: UndoToken): void {
-      const internal = token as InternalUndoToken;
+      const internal = assertInternalUndoToken(token);
 
       if (hasNativeUndo) {
         backend.undoCommit!(state, internal.position);
