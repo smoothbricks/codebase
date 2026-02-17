@@ -163,6 +163,232 @@ function indexTypeForCount(count: number): IntType {
   return uint32();
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// Shared metadata column helpers (used by both buildMetadataColumnsWithFields
+// and convertBuffersWithSharedDicts to avoid duplication)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/**
+ * Build non-dictionary identity columns: timestamp, thread_id, span_id, parent_thread_id, parent_span_id.
+ * These are identical in both single-batch and shared-dict paths.
+ *
+ * Callers are responsible for inserting trace_id (dictionary column) at the correct position
+ * and entry_type (dictionary column) after these columns.
+ */
+function buildNonDictIdentityColumns(
+  buffers: AnySpanBuffer[],
+  totalRows: number,
+  fields: string[],
+  vectors: Column<unknown>[],
+): void {
+  // thread_id (BigUint64Array, constant per buffer)
+  const threadIds = new BigUint64Array(totalRows);
+  let offset = 0;
+  for (const buf of buffers) {
+    threadIds.fill(buf.thread_id, offset, offset + buf._writeIndex);
+    offset += buf._writeIndex;
+  }
+  fields.push('thread_id');
+  vectors.push(buildColumn(buildData({ type: uint64(), offset: 0, length: totalRows, nullCount: 0, data: threadIds })));
+
+  // span_id (Uint32Array, constant per buffer)
+  const spanIds = new Uint32Array(totalRows);
+  offset = 0;
+  for (const buf of buffers) {
+    spanIds.fill(buf.span_id, offset, offset + buf._writeIndex);
+    offset += buf._writeIndex;
+  }
+  fields.push('span_id');
+  vectors.push(buildColumn(buildData({ type: uint32(), offset: 0, length: totalRows, nullCount: 0, data: spanIds })));
+
+  // parent_thread_id (nullable BigUint64Array)
+  const parentThreadIds = new BigUint64Array(totalRows);
+  const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
+  parentThreadIdNulls.fill(0xff);
+  let parentThreadIdNullCount = 0;
+  offset = 0;
+  for (const buf of buffers) {
+    if (buf._parent) {
+      parentThreadIds.fill(buf.parent_thread_id, offset, offset + buf._writeIndex);
+    } else {
+      clearBitRange(parentThreadIdNulls, offset, buf._writeIndex);
+      parentThreadIdNullCount += buf._writeIndex;
+    }
+    offset += buf._writeIndex;
+  }
+  fields.push('parent_thread_id');
+  vectors.push(
+    buildColumn(
+      buildData({
+        type: uint64(),
+        offset: 0,
+        length: totalRows,
+        nullCount: parentThreadIdNullCount,
+        data: parentThreadIds,
+        nullBitmap: parentThreadIdNullCount > 0 ? parentThreadIdNulls : undefined,
+      }),
+    ),
+  );
+
+  // parent_span_id (nullable Uint32Array)
+  const parentSpanIds = new Uint32Array(totalRows);
+  const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
+  parentSpanIdNulls.fill(0xff);
+  let parentSpanIdNullCount = 0;
+  offset = 0;
+  for (const buf of buffers) {
+    if (buf._hasParent) {
+      parentSpanIds.fill(buf.parent_span_id, offset, offset + buf._writeIndex);
+    } else {
+      clearBitRange(parentSpanIdNulls, offset, buf._writeIndex);
+      parentSpanIdNullCount += buf._writeIndex;
+    }
+    offset += buf._writeIndex;
+  }
+  fields.push('parent_span_id');
+  vectors.push(
+    buildColumn(
+      buildData({
+        type: uint32(),
+        offset: 0,
+        length: totalRows,
+        nullCount: parentSpanIdNullCount,
+        data: parentSpanIds,
+        nullBitmap: parentSpanIdNullCount > 0 ? parentSpanIdNulls : undefined,
+      }),
+    ),
+  );
+}
+
+/**
+ * Build timestamp column from buffers.
+ */
+function buildTimestampColumn(
+  buffers: AnySpanBuffer[],
+  totalRows: number,
+  fields: string[],
+  vectors: Column<unknown>[],
+): void {
+  const allTimestamps = new BigInt64Array(totalRows);
+  let offset = 0;
+  for (const buf of buffers) {
+    if (!buf.timestamp) {
+      throw new Error(`Buffer missing timestamps property (_writeIndex: ${buf._writeIndex})`);
+    }
+    allTimestamps.set(buf.timestamp.subarray(0, buf._writeIndex), offset);
+    offset += buf._writeIndex;
+  }
+  fields.push('timestamp');
+  vectors.push(
+    buildColumn(
+      buildData({
+        type: timestamp(TimeUnit.NANOSECOND),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: allTimestamps,
+      }),
+    ),
+  );
+}
+
+/**
+ * Build entry_type dictionary column.
+ */
+function buildEntryTypeColumn(
+  buffers: AnySpanBuffer[],
+  totalRows: number,
+  fields: string[],
+  vectors: Column<unknown>[],
+  dictType?: ReturnType<typeof dictionary>,
+): void {
+  const entryTypeIndices = new Int8Array(totalRows);
+  let offset = 0;
+  for (const buf of buffers) {
+    if (!buf.entry_type) {
+      throw new Error(`Buffer missing operations property (_writeIndex: ${buf._writeIndex})`);
+    }
+    entryTypeIndices.set(buf.entry_type.subarray(0, buf._writeIndex), offset);
+    offset += buf._writeIndex;
+  }
+  const entryTypeDictData = buildData({
+    type: utf8(),
+    offset: 0,
+    length: ENTRY_TYPE_NAMES.length,
+    nullCount: 0,
+    valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
+    data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
+  });
+  fields.push('entry_type');
+  vectors.push(
+    buildColumn(
+      buildData({
+        type: dictType ?? dictionary(utf8(), int8()),
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: entryTypeIndices,
+        dictionary: buildColumn(entryTypeDictData),
+      }),
+    ),
+  );
+}
+
+/**
+ * Build a per-buffer metadata dictionary column (package_name, package_file, git_sha).
+ * Row 0 uses callsiteMetadata, rows 1+ use opMetadata (per context flow spec).
+ */
+function buildPerBufferDictColumn(
+  buffers: AnySpanBuffer[],
+  totalRows: number,
+  fieldName: string,
+  metadataGetter: (m: OpMetadata) => string,
+  dictType: ReturnType<typeof dictionary>,
+  dictValues: string[],
+  dictMap: Map<string, number>,
+  dictUtf8Offsets: Int32Array,
+  dictUtf8Data: Uint8Array,
+  fields: string[],
+  vectors: Column<unknown>[],
+): void {
+  const uniqueCount = dictValues.length;
+  const IndexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
+  const indices = new IndexArrayCtor(totalRows);
+  let offset = 0;
+  for (const buf of buffers) {
+    const callsiteValue = metadataGetter(buf._callsiteMetadata ?? buf._opMetadata);
+    const callsiteIdx = dictMap.get(callsiteValue) ?? 0;
+    const opIdx = dictMap.get(metadataGetter(buf._opMetadata)) ?? 0;
+    indices[offset] = callsiteIdx;
+    if (buf._writeIndex > 1) {
+      indices.fill(opIdx, offset + 1, offset + buf._writeIndex);
+    }
+    offset += buf._writeIndex;
+  }
+  fields.push(fieldName);
+  vectors.push(
+    buildColumn(
+      buildData({
+        type: dictType,
+        offset: 0,
+        length: totalRows,
+        nullCount: 0,
+        data: indices,
+        dictionary: buildColumn(
+          buildData({
+            type: utf8(),
+            offset: 0,
+            length: dictValues.length,
+            nullCount: 0,
+            valueOffsets: dictUtf8Offsets,
+            data: dictUtf8Data,
+          }),
+        ),
+      }),
+    ),
+  );
+}
+
 /**
  * Build a binary Arrow column from SpanBuffer data.
  * Shared by both convertBuffersToTable and convertBuffersWithSharedDicts.
@@ -565,42 +791,22 @@ function buildMetadataColumnsWithFields(
   const fields: string[] = [];
   const vectors: Column<unknown>[] = [];
 
-  // Core system column: Timestamp
-  const timestampType = timestamp(TimeUnit.NANOSECOND);
-  fields.push('timestamp');
+  // Column order: timestamp, trace_id, thread_id, span_id, parent_thread_id, parent_span_id,
+  //               entry_type, package_name, package_file, git_sha
 
-  const allTimestamps = new BigInt64Array(totalRows);
-  let timestampOffset = 0;
-  for (const buf of buffers) {
-    if (!buf.timestamp) {
-      throw new Error(`Buffer missing timestamps property (_writeIndex: ${buf._writeIndex})`);
-    }
-    allTimestamps.set(buf.timestamp.subarray(0, buf._writeIndex), timestampOffset);
-    timestampOffset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: timestampType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: allTimestamps,
-      }),
-    ),
-  );
+  // 1. Timestamp
+  buildTimestampColumn(buffers, totalRows, fields, vectors);
 
-  // Trace ID
+  // 2. Trace ID dictionary (built inline from buffers)
   const traceIdSet = new Set<string>();
   for (const buf of buffers) traceIdSet.add(buf.trace_id);
   const traceIdArray = Array.from(traceIdSet);
   const traceIdMap = new Map(traceIdArray.map((id, idx) => [id, idx]));
-  const traceIdUniqueCount = traceIdArray.length;
-  const traceIdIndexArrayCtor =
-    traceIdUniqueCount <= 255 ? Uint8Array : traceIdUniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const traceIdArrowIndexType = indexTypeForCount(traceIdUniqueCount);
+  const traceIdArrowIndexType = indexTypeForCount(traceIdArray.length);
+  const TraceIdIndexArrayCtor =
+    traceIdArray.length <= 255 ? Uint8Array : traceIdArray.length <= 65535 ? Uint16Array : Uint32Array;
 
-  const traceIdIndices = new traceIdIndexArrayCtor(totalRows);
+  const traceIdIndices = new TraceIdIndexArrayCtor(totalRows);
   let rowOffset = 0;
   for (const buf of buffers) {
     const traceIdIndex = traceIdMap.get(buf.trace_id);
@@ -610,18 +816,8 @@ function buildMetadataColumnsWithFields(
     traceIdIndices.fill(traceIdIndex, rowOffset, rowOffset + buf._writeIndex);
     rowOffset += buf._writeIndex;
   }
-
   const traceIdDictType = dictionary(utf8(), traceIdArrowIndexType);
   fields.push('trace_id');
-
-  const traceIdDictData = buildData({
-    type: utf8(),
-    offset: 0,
-    length: traceIdArray.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(traceIdArray),
-    data: encodeUtf8Strings(traceIdArray),
-  });
   vectors.push(
     buildColumn(
       buildData({
@@ -630,274 +826,56 @@ function buildMetadataColumnsWithFields(
         length: totalRows,
         nullCount: 0,
         data: traceIdIndices,
-        dictionary: buildColumn(traceIdDictData),
+        dictionary: buildColumn(
+          buildData({
+            type: utf8(),
+            offset: 0,
+            length: traceIdArray.length,
+            nullCount: 0,
+            valueOffsets: calculateUtf8Offsets(traceIdArray),
+            data: encodeUtf8Strings(traceIdArray),
+          }),
+        ),
       }),
     ),
   );
 
-  // thread_id
-  const threadIdType = uint64();
-  fields.push('thread_id');
-  const threadIds = new BigUint64Array(totalRows);
-  rowOffset = 0;
-  for (const buf of buffers) {
-    threadIds.fill(buf.thread_id, rowOffset, rowOffset + buf._writeIndex);
-    rowOffset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(buildData({ type: threadIdType, offset: 0, length: totalRows, nullCount: 0, data: threadIds })),
-  );
+  // 3-6. thread_id, span_id, parent_thread_id, parent_span_id
+  buildNonDictIdentityColumns(buffers, totalRows, fields, vectors);
 
-  // span_id
-  const spanIdType = uint32();
-  fields.push('span_id');
-  const spanIds = new Uint32Array(totalRows);
-  rowOffset = 0;
-  for (const buf of buffers) {
-    spanIds.fill(buf.span_id, rowOffset, rowOffset + buf._writeIndex);
-    rowOffset += buf._writeIndex;
-  }
-  vectors.push(buildColumn(buildData({ type: spanIdType, offset: 0, length: totalRows, nullCount: 0, data: spanIds })));
+  // 7. Entry type
+  buildEntryTypeColumn(buffers, totalRows, fields, vectors);
 
-  // parent_thread_id (nullable)
-  const parentThreadIdType = uint64();
-  fields.push('parent_thread_id');
-  const parentThreadIds = new BigUint64Array(totalRows);
-  const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
-  parentThreadIdNulls.fill(0xff);
-  let parentThreadIdNullCount = 0;
-  rowOffset = 0;
-  for (const buf of buffers) {
-    if (buf._parent) {
-      parentThreadIds.fill(buf.parent_thread_id, rowOffset, rowOffset + buf._writeIndex);
-    } else {
-      clearBitRange(parentThreadIdNulls, rowOffset, buf._writeIndex);
-      parentThreadIdNullCount += buf._writeIndex;
+  // 8-10. Per-buffer metadata columns (package_name, package_file, git_sha)
+  for (const [fieldName, metadataGetter] of [
+    ['package_name', (m: OpMetadata) => m.package_name],
+    ['package_file', (m: OpMetadata) => m.package_file],
+    ['git_sha', (m: OpMetadata) => m.git_sha],
+  ] as [string, (m: OpMetadata) => string][]) {
+    const valueSet = new Set<string>();
+    for (const buf of buffers) {
+      valueSet.add(metadataGetter(buf._opMetadata));
+      if (buf._callsiteMetadata) valueSet.add(metadataGetter(buf._callsiteMetadata));
     }
-    rowOffset += buf._writeIndex;
+    const dictValues = Array.from(valueSet);
+    const dictMap = new Map(dictValues.map((v, i) => [v, i]));
+    const arrowIndexType = indexTypeForCount(dictValues.length);
+    const dictType = dictionary(utf8(), arrowIndexType);
+
+    buildPerBufferDictColumn(
+      buffers,
+      totalRows,
+      fieldName,
+      metadataGetter,
+      dictType,
+      dictValues,
+      dictMap,
+      calculateUtf8Offsets(dictValues),
+      encodeUtf8Strings(dictValues),
+      fields,
+      vectors,
+    );
   }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: parentThreadIdType,
-        offset: 0,
-        length: totalRows,
-        nullCount: parentThreadIdNullCount,
-        data: parentThreadIds,
-        nullBitmap: parentThreadIdNullCount > 0 ? parentThreadIdNulls : undefined,
-      }),
-    ),
-  );
-
-  // parent_span_id (nullable)
-  const parentSpanIdType = uint32();
-  fields.push('parent_span_id');
-  const parentSpanIds = new Uint32Array(totalRows);
-  const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
-  parentSpanIdNulls.fill(0xff);
-  let parentSpanIdNullCount = 0;
-  rowOffset = 0;
-  for (const buf of buffers) {
-    if (buf._hasParent) {
-      parentSpanIds.fill(buf.parent_span_id, rowOffset, rowOffset + buf._writeIndex);
-    } else {
-      clearBitRange(parentSpanIdNulls, rowOffset, buf._writeIndex);
-      parentSpanIdNullCount += buf._writeIndex;
-    }
-    rowOffset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: parentSpanIdType,
-        offset: 0,
-        length: totalRows,
-        nullCount: parentSpanIdNullCount,
-        data: parentSpanIds,
-        nullBitmap: parentSpanIdNullCount > 0 ? parentSpanIdNulls : undefined,
-      }),
-    ),
-  );
-
-  // Entry type
-  const entryTypeDictType = dictionary(utf8(), int8());
-  fields.push('entry_type');
-  const entryTypeIndices = new Int8Array(totalRows);
-  rowOffset = 0;
-  for (const buf of buffers) {
-    if (!buf.entry_type) {
-      throw new Error(`Buffer missing operations property (_writeIndex: ${buf._writeIndex})`);
-    }
-    entryTypeIndices.set(buf.entry_type.subarray(0, buf._writeIndex), rowOffset);
-    rowOffset += buf._writeIndex;
-  }
-  const entryTypeDictData = buildData({
-    type: utf8(),
-    offset: 0,
-    length: ENTRY_TYPE_NAMES.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
-    data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
-  });
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: entryTypeDictType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: entryTypeIndices,
-        dictionary: buildColumn(entryTypeDictData),
-      }),
-    ),
-  );
-
-  // Package name
-  const packageSet = new Set<string>();
-  for (const buf of buffers) {
-    packageSet.add(buf._opMetadata.package_name);
-    if (buf._callsiteMetadata) packageSet.add(buf._callsiteMetadata.package_name);
-  }
-  const packageArray = Array.from(packageSet);
-  const packageMap = new Map(packageArray.map((name, idx) => [name, idx]));
-  const packageUniqueCount = packageArray.length;
-  const packageIndexArrayCtor =
-    packageUniqueCount <= 255 ? Uint8Array : packageUniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const packageArrowIndexType = indexTypeForCount(packageUniqueCount);
-
-  const packageDictType = dictionary(utf8(), packageArrowIndexType);
-  fields.push('package_name');
-
-  const packageIndices = new packageIndexArrayCtor(totalRows);
-  rowOffset = 0;
-  for (const buf of buffers) {
-    const callsitePkgName = buf._callsiteMetadata?.package_name ?? buf._opMetadata.package_name;
-    const callsitePkgIdx = packageMap.get(callsitePkgName) ?? 0;
-    const opPkgIdx = packageMap.get(buf._opMetadata.package_name) ?? 0;
-    packageIndices[rowOffset] = callsitePkgIdx;
-    if (buf._writeIndex > 1) {
-      packageIndices.fill(opPkgIdx, rowOffset + 1, rowOffset + buf._writeIndex);
-    }
-    rowOffset += buf._writeIndex;
-  }
-  const packageDictData = buildData({
-    type: utf8(),
-    offset: 0,
-    length: packageArray.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(packageArray),
-    data: encodeUtf8Strings(packageArray),
-  });
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: packageDictType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: packageIndices,
-        dictionary: buildColumn(packageDictData),
-      }),
-    ),
-  );
-
-  // Package file
-  const modulePathSet = new Set<string>();
-  for (const buf of buffers) {
-    modulePathSet.add(buf._opMetadata.package_file);
-    if (buf._callsiteMetadata) modulePathSet.add(buf._callsiteMetadata.package_file);
-  }
-  const modulePathArray = Array.from(modulePathSet);
-  const modulePathMap = new Map(modulePathArray.map((name, idx) => [name, idx]));
-  const packagePathUniqueCount = modulePathArray.length;
-  const packagePathIndexArrayCtor =
-    packagePathUniqueCount <= 255 ? Uint8Array : packagePathUniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const packagePathArrowIndexType = indexTypeForCount(packagePathUniqueCount);
-
-  const packagePathDictType = dictionary(utf8(), packagePathArrowIndexType);
-  fields.push('package_file');
-
-  const packagePathIndices = new packagePathIndexArrayCtor(totalRows);
-  rowOffset = 0;
-  for (const buf of buffers) {
-    const callsitePathName = buf._callsiteMetadata?.package_file ?? buf._opMetadata.package_file;
-    const callsitePathIdx = modulePathMap.get(callsitePathName) ?? 0;
-    const opPathIdx = modulePathMap.get(buf._opMetadata.package_file) ?? 0;
-    packagePathIndices[rowOffset] = callsitePathIdx;
-    if (buf._writeIndex > 1) {
-      packagePathIndices.fill(opPathIdx, rowOffset + 1, rowOffset + buf._writeIndex);
-    }
-    rowOffset += buf._writeIndex;
-  }
-  const packagePathDictData = buildData({
-    type: utf8(),
-    offset: 0,
-    length: modulePathArray.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(modulePathArray),
-    data: encodeUtf8Strings(modulePathArray),
-  });
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: packagePathDictType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: packagePathIndices,
-        dictionary: buildColumn(packagePathDictData),
-      }),
-    ),
-  );
-
-  // Git SHA
-  const gitShaSet = new Set<string>();
-  for (const buf of buffers) {
-    gitShaSet.add(buf._opMetadata.git_sha);
-    if (buf._callsiteMetadata) gitShaSet.add(buf._callsiteMetadata.git_sha);
-  }
-  const gitShaArray = Array.from(gitShaSet);
-  const gitShaMap = new Map(gitShaArray.map((sha, idx) => [sha, idx]));
-  const gitShaUniqueCount = gitShaArray.length;
-  const gitShaIndexArrayCtor =
-    gitShaUniqueCount <= 255 ? Uint8Array : gitShaUniqueCount <= 65535 ? Uint16Array : Uint32Array;
-  const gitShaArrowIndexType = indexTypeForCount(gitShaUniqueCount);
-
-  const gitShaDictType = dictionary(utf8(), gitShaArrowIndexType);
-  fields.push('git_sha');
-
-  const gitShaIndices = new gitShaIndexArrayCtor(totalRows);
-  rowOffset = 0;
-  for (const buf of buffers) {
-    const callsiteGitSha = buf._callsiteMetadata?.git_sha ?? buf._opMetadata.git_sha;
-    const callsiteGitShaIdx = gitShaMap.get(callsiteGitSha) ?? 0;
-    const opGitShaIdx = gitShaMap.get(buf._opMetadata.git_sha) ?? 0;
-    gitShaIndices[rowOffset] = callsiteGitShaIdx;
-    if (buf._writeIndex > 1) {
-      gitShaIndices.fill(opGitShaIdx, rowOffset + 1, rowOffset + buf._writeIndex);
-    }
-    rowOffset += buf._writeIndex;
-  }
-  const gitShaDictData = buildData({
-    type: utf8(),
-    offset: 0,
-    length: gitShaArray.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(gitShaArray),
-    data: encodeUtf8Strings(gitShaArray),
-  });
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: gitShaDictType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: gitShaIndices,
-        dictionary: buildColumn(gitShaDictData),
-      }),
-    ),
-  );
 
   return { fields, vectors };
 }
@@ -1196,51 +1174,28 @@ function convertBuffersWithSharedDicts(
   const fields: string[] = [];
   const vectors: Column<unknown>[] = [];
 
-  const timestampType = timestamp(TimeUnit.NANOSECOND);
+  // Dictionary types with explicit IDs for IPC serialization
   const traceIdType = dictionary(utf8(), traceIdDict.arrowIndexType, false, 0);
-  const entryTypeType = dictionary(utf8(), int8(), false, 1);
+  const entryTypeDictType = dictionary(utf8(), int8(), false, 1);
   const packageType = dictionary(utf8(), packageDict.arrowIndexType, false, 2);
   const packagePathType = dictionary(utf8(), packagePathDict.arrowIndexType, false, 3);
   const gitShaType = dictionary(utf8(), gitShaDict.arrowIndexType, false, 4);
 
-  // ═══════════════════════════════════════════════════════════════════════════
-  // Core system columns and metadata columns - concatenate data from all buffers
-  // ═══════════════════════════════════════════════════════════════════════════
+  // Column order: timestamp, trace_id, thread_id, span_id, parent_thread_id, parent_span_id,
+  //               entry_type, package_name, package_file, git_sha
 
-  // Core system column: Timestamp - BigInt64Array with nanoseconds (from _system ArrayBuffer, zero-copy compatible)
-  const allTimestamps = new BigInt64Array(totalRows);
+  // 1. Timestamp
+  buildTimestampColumn(buffers, totalRows, fields, vectors);
+
+  // 2. Trace ID (using shared pre-built dictionary)
+  const traceIdIndices = new traceIdDict.indexArrayCtor(totalRows);
   let offset = 0;
   for (const buf of buffers) {
-    // Use set() with subarray - bulk copy
-    // Defensive check: timestamps should always exist, but guard against corruption
-    if (!buf.timestamp) {
-      throw new Error(`Buffer missing timestamps property (_writeIndex: ${buf._writeIndex})`);
-    }
-    allTimestamps.set(buf.timestamp.subarray(0, buf._writeIndex), offset);
-    offset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: timestampType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: allTimestamps,
-      }),
-    ),
-  );
-  fields.push('timestamp');
-
-  // Metadata column: Trace ID (computed from _identity, using shared dictionary)
-  const traceIdIndices = new traceIdDict.indexArrayCtor(totalRows);
-  offset = 0;
-  for (const buf of buffers) {
     const idx = traceIdDict.indexMap.get(buf.trace_id) ?? 0;
-    // Use fill() - constant value per buffer
     traceIdIndices.fill(idx, offset, offset + buf._writeIndex);
     offset += buf._writeIndex;
   }
+  fields.push('trace_id');
   vectors.push(
     buildColumn(
       buildData({
@@ -1262,277 +1217,37 @@ function convertBuffersWithSharedDicts(
       }),
     ),
   );
-  fields.push('trace_id');
 
-  // Metadata column: thread_id (Uint64) - computed from _identity
-  // threadId is constant per buffer, use fill()
-  const threadIds = new BigUint64Array(totalRows);
-  offset = 0;
-  for (const buf of buffers) {
-    threadIds.fill(buf.thread_id, offset, offset + buf._writeIndex);
-    offset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: uint64(),
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: threadIds,
-      }),
-    ),
-  );
-  fields.push('thread_id');
+  // 3-6. thread_id, span_id, parent_thread_id, parent_span_id
+  buildNonDictIdentityColumns(buffers, totalRows, fields, vectors);
 
-  // Metadata column: span_id (Uint32) - computed from _identity
-  const spanIds = new Uint32Array(totalRows);
-  offset = 0;
-  for (const buf of buffers) {
-    // Use fill() - constant value per buffer
-    spanIds.fill(buf.span_id, offset, offset + buf._writeIndex);
-    offset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: uint32(),
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: spanIds,
-      }),
-    ),
-  );
-  fields.push('span_id');
+  // 7. Entry type (with explicit dictionary ID for IPC)
+  buildEntryTypeColumn(buffers, totalRows, fields, vectors, entryTypeDictType);
 
-  // Metadata column: parent_thread_id (Uint64, nullable) - computed from _identity
-  // parentThreadId is constant per buffer (from parent pointer), use fill()
-  const parentThreadIds = new BigUint64Array(totalRows);
-  const parentThreadIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
-  parentThreadIdNulls.fill(0xff);
-  let parentThreadIdNullCount = 0;
-  offset = 0;
-  for (const buf of buffers) {
-    if (buf._parent) {
-      parentThreadIds.fill(buf.parent_thread_id, offset, offset + buf._writeIndex);
-    } else {
-      clearBitRange(parentThreadIdNulls, offset, buf._writeIndex);
-      parentThreadIdNullCount += buf._writeIndex;
-    }
-    offset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: uint64(),
-        offset: 0,
-        length: totalRows,
-        nullCount: parentThreadIdNullCount,
-        data: parentThreadIds,
-        nullBitmap: parentThreadIdNullCount > 0 ? parentThreadIdNulls : undefined,
-      }),
-    ),
-  );
-  fields.push('parent_thread_id');
-
-  // Metadata column: parent_span_id (Uint32, nullable) - computed from _identity
-  // Uses hasParent and parentSpanId directly on buffer
-  const parentSpanIds = new Uint32Array(totalRows);
-  const parentSpanIdNulls = new Uint8Array(Math.ceil(totalRows / 8));
-  parentSpanIdNulls.fill(0xff);
-  let parentSpanIdNullCount = 0;
-  offset = 0;
-  for (const buf of buffers) {
-    if (buf._hasParent) {
-      // Use fill() - constant value per buffer
-      parentSpanIds.fill(buf.parent_span_id, offset, offset + buf._writeIndex);
-    } else {
-      clearBitRange(parentSpanIdNulls, offset, buf._writeIndex);
-      parentSpanIdNullCount += buf._writeIndex;
-    }
-    offset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: uint32(),
-        offset: 0,
-        length: totalRows,
-        nullCount: parentSpanIdNullCount,
-        data: parentSpanIds,
-        nullBitmap: parentSpanIdNullCount > 0 ? parentSpanIdNulls : undefined,
-      }),
-    ),
-  );
-  fields.push('parent_span_id');
-
-  // Core system column: Entry type (from _system ArrayBuffer, buf.entry_type)
-  const entryTypeIndices = new Int8Array(totalRows);
-  offset = 0;
-  for (const buf of buffers) {
-    // Use set() with subarray - bulk copy
-    // Note: operations is Uint8Array but entryTypeIndices is Int8Array, same underlying representation
-    // Defensive check: operations should always exist, but guard against corruption
-    if (!buf.entry_type) {
-      throw new Error(`Buffer missing operations property (_writeIndex: ${buf._writeIndex})`);
-    }
-    entryTypeIndices.set(buf.entry_type.subarray(0, buf._writeIndex), offset);
-    offset += buf._writeIndex;
-  }
-  const entryTypeDictData = buildData({
-    type: utf8(),
-    offset: 0,
-    length: ENTRY_TYPE_NAMES.length,
-    nullCount: 0,
-    valueOffsets: calculateUtf8Offsets(ENTRY_TYPE_NAMES),
-    data: encodeUtf8Strings(ENTRY_TYPE_NAMES),
-  });
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: entryTypeType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: entryTypeIndices,
-        dictionary: buildColumn(entryTypeDictData),
-      }),
-    ),
-  );
-  fields.push('entry_type');
-
-  // Metadata column: Package name (from task._module.packageName, with callsiteModule for row 0)
+  // 8-10. Per-buffer metadata columns using shared pre-built dictionaries
   // Per specs/lmao/01c_context_flow_and_op_wrappers.md:
   // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
   // - Rows 1+ (logs, span-end): uses task._module
-  const packageIndices = new packageDict.indexArrayCtor(totalRows);
-  offset = 0;
-  for (const buf of buffers) {
-    // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsitePkgName = buf._callsiteMetadata?.package_name ?? buf._opMetadata.package_name;
-    const callsitePkgIdx = packageDict.indexMap.get(callsitePkgName) ?? 0;
-
-    // Op's module (task._module) for rows 1+
-    const opPkgIdx = packageDict.indexMap.get(buf._opMetadata.package_name) ?? 0;
-
-    // Set row 0 (span-start) to callsite module
-    packageIndices[offset] = callsitePkgIdx;
-
-    // Set rows 1+ (span-end, logs) to op's module
-    if (buf._writeIndex > 1) {
-      packageIndices.fill(opPkgIdx, offset + 1, offset + buf._writeIndex);
-    }
-    offset += buf._writeIndex;
+  for (const [fieldName, metadataGetter, dictType, dict] of [
+    ['package_name', (m: OpMetadata) => m.package_name, packageType, packageDict],
+    ['package_file', (m: OpMetadata) => m.package_file, packagePathType, packagePathDict],
+    ['git_sha', (m: OpMetadata) => m.git_sha, gitShaType, gitShaDict],
+  ] as [string, (m: OpMetadata) => string, ReturnType<typeof dictionary>, FinalizedDictionary][]) {
+    const dictValues = Array.from(dict.indexMap.keys());
+    buildPerBufferDictColumn(
+      buffers,
+      totalRows,
+      fieldName,
+      metadataGetter,
+      dictType,
+      dictValues,
+      dict.indexMap,
+      dict.offsets,
+      dict.data,
+      fields,
+      vectors,
+    );
   }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: packageType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: packageIndices,
-        dictionary: buildColumn(
-          buildData({
-            type: utf8(),
-            offset: 0,
-            length: packageDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: packageDict.offsets,
-            data: packageDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-  fields.push('package_name');
-
-  // Metadata column: Package path (from task._module.packagePath, with callsiteModule for row 0)
-  const packagePathIndices = new packagePathDict.indexArrayCtor(totalRows);
-  offset = 0;
-  for (const buf of buffers) {
-    // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsitePathName = buf._callsiteMetadata?.package_file ?? buf._opMetadata.package_file;
-    const callsitePathIdx = packagePathDict.indexMap.get(callsitePathName) ?? 0;
-
-    // Op's module (task._module) for rows 1+
-    const opPathIdx = packagePathDict.indexMap.get(buf._opMetadata.package_file) ?? 0;
-
-    // Set row 0 (span-start) to callsite module
-    packagePathIndices[offset] = callsitePathIdx;
-
-    // Set rows 1+ (span-end, logs) to op's module
-    if (buf._writeIndex > 1) {
-      packagePathIndices.fill(opPathIdx, offset + 1, offset + buf._writeIndex);
-    }
-    offset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: packagePathType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: packagePathIndices,
-        dictionary: buildColumn(
-          buildData({
-            type: utf8(),
-            offset: 0,
-            length: packagePathDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: packagePathDict.offsets,
-            data: packagePathDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-  fields.push('package_file');
-
-  // Metadata column: Git SHA (from task._module.gitSha, with callsiteModule for row 0)
-  const gitShaIndices2 = new gitShaDict.indexArrayCtor(totalRows);
-  offset = 0;
-  for (const buf of buffers) {
-    // Row 0: use callsiteModule if available, else fall back to task._module
-    const callsiteGitSha = buf._callsiteMetadata?.git_sha ?? buf._opMetadata.git_sha;
-    const callsiteGitShaIdx = gitShaDict.indexMap.get(callsiteGitSha) ?? 0;
-
-    // Op's module (task._module) for rows 1+
-    const opGitShaIdx = gitShaDict.indexMap.get(buf._opMetadata.git_sha) ?? 0;
-
-    // Set row 0 (span-start) to callsite module
-    gitShaIndices2[offset] = callsiteGitShaIdx;
-
-    // Set rows 1+ (span-end, logs) to op's module
-    if (buf._writeIndex > 1) {
-      gitShaIndices2.fill(opGitShaIdx, offset + 1, offset + buf._writeIndex);
-    }
-    offset += buf._writeIndex;
-  }
-  vectors.push(
-    buildColumn(
-      buildData({
-        type: gitShaType,
-        offset: 0,
-        length: totalRows,
-        nullCount: 0,
-        data: gitShaIndices2,
-        dictionary: buildColumn(
-          buildData({
-            type: utf8(),
-            offset: 0,
-            length: gitShaDict.indexMap.size,
-            nullCount: 0,
-            valueOffsets: gitShaDict.offsets,
-            data: gitShaDict.data,
-          }),
-        ),
-      }),
-    ),
-  );
-  fields.push('git_sha');
 
   // ═══════════════════════════════════════════════════════════════════════════
   // System attribute and user attribute columns - concatenate from all buffers

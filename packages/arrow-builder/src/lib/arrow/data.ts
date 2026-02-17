@@ -155,12 +155,17 @@ export function createUtf8Data(
   return batch;
 }
 
-/** Create Arrow Batch for Dictionary column with Uint8 indices */
-export function createDictionary8Data(
-  indices: Uint8Array,
+/**
+ * Generic dictionary batch creation - single implementation for all index widths.
+ * The public createDictionary{8,16,32}Data wrappers delegate here.
+ */
+function createDictionaryDataGeneric(
+  indices: Uint8Array | Uint16Array | Uint32Array,
   dictData: Uint8Array,
   dictOffsets: Int32Array,
   length: number,
+  indexType: ReturnType<typeof uint8> | ReturnType<typeof uint16> | ReturnType<typeof uint32>,
+  DictBatchCtor: typeof DICT8_BATCH | typeof DICT16_BATCH | typeof DICT32_BATCH,
   nullBitmap?: Uint8Array,
 ): ArrowBatch {
   const dictionaryValueType = utf8();
@@ -175,8 +180,8 @@ export function createDictionary8Data(
   });
   const dictColumn = new Column([utf8Batch]) as Column<string>;
 
-  const dictionaryType = dictionary(dictionaryValueType, UINT8_TYPE);
-  const dictBatch = new DICT8_BATCH({
+  const dictionaryType = dictionary(dictionaryValueType, indexType);
+  const dictBatch = new DictBatchCtor({
     type: dictionaryType,
     length,
     nullCount: nullBitmap ? countNulls(nullBitmap, length) : 0,
@@ -186,6 +191,17 @@ export function createDictionary8Data(
   attachDictionaryWithoutEagerCache(dictBatch as DictionaryBatchLike, dictColumn);
 
   return dictBatch;
+}
+
+/** Create Arrow Batch for Dictionary column with Uint8 indices */
+export function createDictionary8Data(
+  indices: Uint8Array,
+  dictData: Uint8Array,
+  dictOffsets: Int32Array,
+  length: number,
+  nullBitmap?: Uint8Array,
+): ArrowBatch {
+  return createDictionaryDataGeneric(indices, dictData, dictOffsets, length, UINT8_TYPE, DICT8_BATCH, nullBitmap);
 }
 
 /** Create Arrow Batch for Dictionary column with Uint16 indices */
@@ -196,29 +212,7 @@ export function createDictionary16Data(
   length: number,
   nullBitmap?: Uint8Array,
 ): ArrowBatch {
-  const dictionaryValueType = utf8();
-  const dictLength = dictOffsets.length - 1;
-  const utf8Batch = new UTF8_BATCH({
-    type: dictionaryValueType,
-    length: dictLength,
-    nullCount: 0,
-    values: dictData,
-    offsets: dictOffsets,
-    validity: EMPTY_VALIDITY,
-  });
-  const dictColumn = new Column([utf8Batch]) as Column<string>;
-
-  const dictionaryType = dictionary(dictionaryValueType, UINT16_TYPE);
-  const dictBatch = new DICT16_BATCH({
-    type: dictionaryType,
-    length,
-    nullCount: nullBitmap ? countNulls(nullBitmap, length) : 0,
-    values: indices.subarray(0, length),
-    validity: createValidity(length, nullBitmap),
-  });
-  attachDictionaryWithoutEagerCache(dictBatch as DictionaryBatchLike, dictColumn);
-
-  return dictBatch;
+  return createDictionaryDataGeneric(indices, dictData, dictOffsets, length, UINT16_TYPE, DICT16_BATCH, nullBitmap);
 }
 
 /** Create Arrow Batch for Dictionary column with Uint32 indices */
@@ -229,29 +223,7 @@ export function createDictionary32Data(
   length: number,
   nullBitmap?: Uint8Array,
 ): ArrowBatch {
-  const dictionaryValueType = utf8();
-  const dictLength = dictOffsets.length - 1;
-  const utf8Batch = new UTF8_BATCH({
-    type: dictionaryValueType,
-    length: dictLength,
-    nullCount: 0,
-    values: dictData,
-    offsets: dictOffsets,
-    validity: EMPTY_VALIDITY,
-  });
-  const dictColumn = new Column([utf8Batch]) as Column<string>;
-
-  const dictionaryType = dictionary(dictionaryValueType, UINT32_TYPE);
-  const dictBatch = new DICT32_BATCH({
-    type: dictionaryType,
-    length,
-    nullCount: nullBitmap ? countNulls(nullBitmap, length) : 0,
-    values: indices.subarray(0, length),
-    validity: createValidity(length, nullBitmap),
-  });
-  attachDictionaryWithoutEagerCache(dictBatch as DictionaryBatchLike, dictColumn);
-
-  return dictBatch;
+  return createDictionaryDataGeneric(indices, dictData, dictOffsets, length, UINT32_TYPE, DICT32_BATCH, nullBitmap);
 }
 
 /** Create flechette Table from a record of single-batch columns. */
