@@ -25,6 +25,11 @@ const SLOT_META_SIZE = 48;
 // WASM returns u32 as signed i32, so 0xFFFFFFFF becomes -1
 const EMPTY_KEY_SIGNED = -1;
 
+// Reusable scratch buffer for column pointer array in executeBatch.
+// Avoids per-batch allocation on the hot reduce path.
+let scratchColPtrs: Uint32Array | null = null;
+let scratchColPtrsWidth = 0;
+
 // =============================================================================
 // State Handle - wraps JS ArrayBuffer
 // =============================================================================
@@ -295,19 +300,26 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
 
       // 3. Copy input columns after program
       let colDataOffset = programPtr + align8(program.bytecode.length);
-      const colPtrs: number[] = [];
 
-      for (const col of columns) {
+      // Reuse scratch buffer for column pointers to avoid per-batch allocation.
+      // Grows only when schema width increases (rare — typically once on first call).
+      if (!scratchColPtrs || scratchColPtrsWidth < columns.length) {
+        scratchColPtrs = new Uint32Array(columns.length);
+        scratchColPtrsWidth = columns.length;
+      }
+
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i];
         const bytes = new Uint8Array(col.data.buffer, col.data.byteOffset, col.data.byteLength);
         wasmU8.set(bytes, colDataOffset);
-        colPtrs.push(colDataOffset);
+        scratchColPtrs[i] = colDataOffset;
         colDataOffset += align8(bytes.length);
       }
 
       // 4. Write column pointers array
       const colPtrsPtr = colDataOffset;
-      for (let i = 0; i < colPtrs.length; i++) {
-        wasmU32[(colPtrsPtr + i * 4) / 4] = colPtrs[i];
+      for (let i = 0; i < columns.length; i++) {
+        wasmU32[(colPtrsPtr + i * 4) / 4] = scratchColPtrs[i];
       }
 
       // 5. Execute

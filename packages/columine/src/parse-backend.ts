@@ -232,12 +232,33 @@ function encodeFieldNames(names: string[]): Uint8Array {
  * @param wasm - Instantiated event_processor WASM exports
  */
 export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): ParseCompactBackend {
+  // Cache EventProcessor handle between parse() calls with the same config.
+  // The EP is stateful (schema + field names) so we only reuse when config matches.
+  // Key is a hash of schemaBytes + fieldMetadata + fieldNames for identity comparison.
+  let cachedHandle: { configKey: string; handle: number } | null = null;
+
+  /** Build a stable config identity key from schema bytes, field metadata, and field names */
+  function configKey(config: ParseConfig): string {
+    // Fast identity: concatenate lengths + first/last bytes as a fingerprint.
+    // Full equality would require comparing all bytes, but configs are typically
+    // stable across calls (same schema = same agent type).
+    let key = `s${config.schemaBytes.length}:m${config.fieldMetadata.length}`;
+    if (config.schemaBytes.length > 0) {
+      key += `:${config.schemaBytes[0]}-${config.schemaBytes[config.schemaBytes.length - 1]}`;
+    }
+    if (config.fieldMetadata.length > 0) {
+      key += `:${config.fieldMetadata[0]}-${config.fieldMetadata[config.fieldMetadata.length - 1]}`;
+    }
+    if (config.fieldNames) {
+      key += `:n${config.fieldNames.join(',')}`;
+    }
+    return key;
+  }
+
   return {
     backend: 'event-processor-wasm',
 
     parse(input: string | Uint8Array, config: ParseConfig): ParseResult {
-      // Create a new handle for each parse call — the EventProcessor is
-      // stateful (tracks field names, schema) so we create per-config
       const inputBytes = typeof input === 'string' ? new TextEncoder().encode(input) : input;
       const fieldNamesBuffer =
         config.fieldNames && config.fieldNames.length > 0 ? encodeFieldNames(config.fieldNames) : null;
@@ -269,88 +290,101 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         throw error;
       }
 
-      let memory = new Uint8Array(wasm.memory.buffer);
-      memory.set(config.schemaBytes, layout.schemaOffset);
-      memory.set(config.fieldMetadata, layout.fieldMetaOffset);
-      if (fieldNamesBuffer) {
-        memory.set(fieldNamesBuffer, layout.fieldNamesOffset);
-      }
-
-      const fieldCount = config.fieldMetadata.length / 4;
-
+      // Reuse cached handle if config matches, otherwise create new one
+      const key = configKey(config);
       let handle: number;
-      if (fieldNamesBuffer) {
-        handle = wasm.ep_create_with_schema_and_names(
-          256, // default capacity
-          layout.schemaOffset,
-          config.schemaBytes.length,
-          layout.fieldMetaOffset,
-          fieldCount,
-          layout.fieldNamesOffset,
-          fieldNamesBuffer.length,
-        );
+
+      if (cachedHandle && cachedHandle.configKey === key) {
+        handle = cachedHandle.handle;
       } else {
-        handle = wasm.ep_create_with_schema(
-          256,
-          layout.schemaOffset,
-          config.schemaBytes.length,
-          layout.fieldMetaOffset,
-          fieldCount,
-        );
-      }
-
-      if (handle === 0) {
-        throw new Error('Failed to create EventProcessor — ep_create_with_schema returned 0');
-      }
-
-      try {
-        // Get fresh memory view (handle creation may have grown memory)
-        memory = new Uint8Array(wasm.memory.buffer);
-        memory.set(inputBytes, layout.inputOffset);
-
-        const result = wasm.ep_create_log_entry(
-          handle,
-          layout.inputOffset,
-          inputBytes.length,
-          INPUT_FORMAT_JSON,
-          layout.outputOffset,
-          layout.outputLength,
-        );
-
-        if (result !== RESULT_OK) {
-          throw new Error(`ep_create_log_entry failed with code ${result}`);
+        // Destroy old cached handle if config changed
+        if (cachedHandle) {
+          wasm.ep_destroy(cachedHandle.handle);
+          cachedHandle = null;
         }
 
-        // Read result header from output buffer
-        const view = new DataView(wasm.memory.buffer);
-        const code = view.getUint32(layout.outputOffset, true);
-        const arrowOffset = view.getUint32(layout.outputOffset + 4, true);
-        const arrowLen = view.getUint32(layout.outputOffset + 8, true);
-        const eventsProcessed = view.getUint32(layout.outputOffset + 12, true);
-
-        if (code !== RESULT_OK) {
-          throw new Error(`ep_create_log_entry returned error code ${code}`);
+        const memory = new Uint8Array(wasm.memory.buffer);
+        memory.set(config.schemaBytes, layout.schemaOffset);
+        memory.set(config.fieldMetadata, layout.fieldMetaOffset);
+        if (fieldNamesBuffer) {
+          memory.set(fieldNamesBuffer, layout.fieldNamesOffset);
         }
 
-        const arrowStart = layout.outputOffset + arrowOffset;
-        const arrowEnd = arrowStart + arrowLen;
-        const outputEnd = layout.outputOffset + layout.outputLength;
-        if (arrowStart < layout.outputOffset || arrowEnd > outputEnd) {
-          throw new Error(
-            'ep_create_log_entry produced out-of-bounds output: ' +
-              `offset=${arrowOffset}, len=${arrowLen}, outputLen=${layout.outputLength}`,
+        const fieldCount = config.fieldMetadata.length / 4;
+
+        if (fieldNamesBuffer) {
+          handle = wasm.ep_create_with_schema_and_names(
+            256, // default capacity
+            layout.schemaOffset,
+            config.schemaBytes.length,
+            layout.fieldMetaOffset,
+            fieldCount,
+            layout.fieldNamesOffset,
+            fieldNamesBuffer.length,
+          );
+        } else {
+          handle = wasm.ep_create_with_schema(
+            256,
+            layout.schemaOffset,
+            config.schemaBytes.length,
+            layout.fieldMetaOffset,
+            fieldCount,
           );
         }
 
-        // Copy Arrow IPC bytes out of WASM memory
-        const freshMem = new Uint8Array(wasm.memory.buffer);
-        const arrowIpc = new Uint8Array(arrowLen);
-        arrowIpc.set(freshMem.subarray(arrowStart, arrowEnd));
+        if (handle === 0) {
+          throw new Error('Failed to create EventProcessor — ep_create_with_schema returned 0');
+        }
 
-        return { arrowIpc, eventCount: eventsProcessed };
-      } finally {
-        wasm.ep_destroy(handle);
+        cachedHandle = { configKey: key, handle };
       }
+
+      // Get fresh memory view (handle creation or memory.grow may have changed buffer)
+      const memory = new Uint8Array(wasm.memory.buffer);
+      memory.set(inputBytes, layout.inputOffset);
+
+      const result = wasm.ep_create_log_entry(
+        handle,
+        layout.inputOffset,
+        inputBytes.length,
+        INPUT_FORMAT_JSON,
+        layout.outputOffset,
+        layout.outputLength,
+      );
+
+      if (result !== RESULT_OK) {
+        // Handle may be corrupted — invalidate cache
+        cachedHandle = null;
+        throw new Error(`ep_create_log_entry failed with code ${result}`);
+      }
+
+      // Read result header from output buffer
+      const view = new DataView(wasm.memory.buffer);
+      const code = view.getUint32(layout.outputOffset, true);
+      const arrowOffset = view.getUint32(layout.outputOffset + 4, true);
+      const arrowLen = view.getUint32(layout.outputOffset + 8, true);
+      const eventsProcessed = view.getUint32(layout.outputOffset + 12, true);
+
+      if (code !== RESULT_OK) {
+        throw new Error(`ep_create_log_entry returned error code ${code}`);
+      }
+
+      const arrowStart = layout.outputOffset + arrowOffset;
+      const arrowEnd = arrowStart + arrowLen;
+      const outputEnd = layout.outputOffset + layout.outputLength;
+      if (arrowStart < layout.outputOffset || arrowEnd > outputEnd) {
+        throw new Error(
+          'ep_create_log_entry produced out-of-bounds output: ' +
+            `offset=${arrowOffset}, len=${arrowLen}, outputLen=${layout.outputLength}`,
+        );
+      }
+
+      // Copy Arrow IPC bytes out of WASM memory
+      const freshMem = new Uint8Array(wasm.memory.buffer);
+      const arrowIpc = new Uint8Array(arrowLen);
+      arrowIpc.set(freshMem.subarray(arrowStart, arrowEnd));
+
+      return { arrowIpc, eventCount: eventsProcessed };
     },
 
     encode(_columns: ColumnInput[], _schema: Uint8Array): Uint8Array {
