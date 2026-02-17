@@ -139,6 +139,13 @@ integration. It consists of these main components:
 - **WHY**: Enables a rich ecosystem of traced libraries while maintaining performance and avoiding attribute name
   collisions through prefixing.
 
+### 7. [Cloudflare Fetch Trace Wrapper](./01s_cloudflare_fetch_trace_wrapper.md)
+
+**Purpose**: Define efficient request-path tracing and asynchronous flush behavior for Cloudflare Worker fetch handlers.
+
+- Uses `ctx.waitUntil(...)` for non-blocking trace chunk delivery.
+- Produces durable Arrow chunks for queue/object-storage aggregation.
+
 ## Core Architecture Principles
 
 - **Two-Phase Logging**: Separate runtime writes from background processing.
