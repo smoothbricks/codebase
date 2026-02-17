@@ -79,6 +79,8 @@ pub const ResultCode = enum(u32) {
     ENCODE_ERROR = 3,
     OUT_OF_MEMORY = 4,
     INVALID_FORMAT = 5,
+    TOO_MANY_EVENTS = 6,
+    BUFFER_OVERFLOW = 7,
 };
 
 /// Result header written to output buffer (32 bytes)
@@ -108,7 +110,6 @@ comptime {
 
 const EventProcessor = struct {
     event_columns: EventColumns,
-    output_buffer: []u8,
     allocator: std.mem.Allocator,
     /// Schema configuration (required for Arrow encoding)
     schema_config: DynamicSchemaConfig,
@@ -118,10 +119,12 @@ const EventProcessor = struct {
     extraction_config: ?parsing.json_extractor.ExtractionConfig,
     /// Work buffer for msgpack serialization (empty if using base path)
     work_buffer: []u8,
+    /// Estimated total bytes allocated by this processor.
+    working_set_estimate: usize,
 
-    // Buffer sizes for WASM (limited by 8MB fixed buffer)
-    const WASM_EVENT_CAPACITY: u32 = 256; // Max events per batch in WASM
-    const WASM_OUTPUT_BUFFER_SIZE: usize = 256 * 1024; // 256KB output buffer
+    const NATIVE_DEFAULT_WORK_BUFFER_BYTES: usize = 4 * 1024;
+    const WASM_WORKING_SET_CAP_BYTES: usize = 64 * 1024 * 1024;
+    const WASM_MAX_WORK_BUFFER_BYTES: usize = 16 * 1024 * 1024;
 
     /// Initialize EventProcessor with schema from TypeScript.
     /// Schema is required for Arrow encoding.
@@ -135,17 +138,7 @@ const EventProcessor = struct {
         const self = try alloc.create(EventProcessor);
         errdefer alloc.destroy(self);
 
-        // Use smaller event capacity for WASM to fit in memory
-        const event_cap = if (builtin.cpu.arch == .wasm32)
-            @min(capacity, WASM_EVENT_CAPACITY)
-        else
-            capacity;
-
-        // Use smaller output buffer for WASM
-        const output_size = if (builtin.cpu.arch == .wasm32)
-            WASM_OUTPUT_BUFFER_SIZE
-        else
-            4 * 1024 * 1024; // 4MB for native
+        const event_cap = @min(capacity, parsing.columns.MAX_EVENTS_PER_BATCH);
 
         // Initialize schema config
         const schema_config = try DynamicSchemaConfig.init(
@@ -159,14 +152,24 @@ const EventProcessor = struct {
             config.deinit();
         }
 
+        const estimated = estimateWorkingSetBytes(event_cap, schema_config.field_metadata, false, 0) catch {
+            return error.OutOfMemory;
+        };
+        if (builtin.cpu.arch == .wasm32 and estimated > WASM_WORKING_SET_CAP_BYTES) {
+            return error.OutOfMemory;
+        }
+
+        var cols = try EventColumns.init(alloc, event_cap);
+        errdefer cols.deinit();
+
         self.* = EventProcessor{
-            .event_columns = try EventColumns.init(alloc, event_cap),
-            .output_buffer = try alloc.alloc(u8, output_size),
+            .event_columns = cols,
             .allocator = alloc,
             .schema_config = schema_config,
             .dynamic_columns = null,
             .extraction_config = null,
             .work_buffer = &.{},
+            .working_set_estimate = estimated,
         };
 
         return self;
@@ -184,17 +187,7 @@ const EventProcessor = struct {
         const self = try alloc.create(EventProcessor);
         errdefer alloc.destroy(self);
 
-        // Use smaller event capacity for WASM to fit in memory
-        const event_cap = if (builtin.cpu.arch == .wasm32)
-            @min(capacity, WASM_EVENT_CAPACITY)
-        else
-            capacity;
-
-        // Use smaller output buffer for WASM
-        const output_size = if (builtin.cpu.arch == .wasm32)
-            WASM_OUTPUT_BUFFER_SIZE
-        else
-            4 * 1024 * 1024; // 4MB for native
+        const event_cap = @min(capacity, parsing.columns.MAX_EVENTS_PER_BATCH);
 
         // Initialize schema config with field names
         const schema_config = try DynamicSchemaConfig.initWithFieldNames(
@@ -213,6 +206,26 @@ const EventProcessor = struct {
         var dyn_cols: ?DynamicColumns = null;
         var extract_config: ?parsing.json_extractor.ExtractionConfig = null;
         var work_buf: []u8 = &.{};
+        var work_buf_size: usize = 0;
+
+        if (schema_config.has_extraction_fields) {
+            work_buf_size = if (builtin.cpu.arch == .wasm32) 64 * 1024 else NATIVE_DEFAULT_WORK_BUFFER_BYTES;
+        }
+
+        const estimated = estimateWorkingSetBytes(
+            event_cap,
+            schema_config.field_metadata,
+            schema_config.has_extraction_fields,
+            work_buf_size,
+        ) catch {
+            return error.OutOfMemory;
+        };
+        if (builtin.cpu.arch == .wasm32 and estimated > WASM_WORKING_SET_CAP_BYTES) {
+            return error.OutOfMemory;
+        }
+
+        var cols = try EventColumns.init(alloc, event_cap);
+        errdefer cols.deinit();
 
         if (schema_config.has_extraction_fields) {
             dyn_cols = try DynamicColumns.init(alloc, schema_config.field_metadata, event_cap);
@@ -225,18 +238,18 @@ const EventProcessor = struct {
             );
             errdefer if (extract_config) |*ec| parsing.json_extractor.freeExtractionConfig(alloc, ec);
 
-            work_buf = try alloc.alloc(u8, 4096); // Buffer for msgpack serialization
+            work_buf = try alloc.alloc(u8, work_buf_size);
             errdefer alloc.free(work_buf);
         }
 
         self.* = EventProcessor{
-            .event_columns = try EventColumns.init(alloc, event_cap),
-            .output_buffer = try alloc.alloc(u8, output_size),
+            .event_columns = cols,
             .allocator = alloc,
             .schema_config = schema_config,
             .dynamic_columns = dyn_cols,
             .extraction_config = extract_config,
             .work_buffer = work_buf,
+            .working_set_estimate = estimated,
         };
 
         return self;
@@ -244,13 +257,100 @@ const EventProcessor = struct {
 
     fn deinit(self: *EventProcessor) void {
         self.event_columns.deinit();
-        self.allocator.free(self.output_buffer);
         var config = self.schema_config;
         config.deinit();
         if (self.dynamic_columns) |*dc| dc.deinit();
         if (self.extraction_config) |*ec| parsing.json_extractor.freeExtractionConfig(self.allocator, ec);
         if (self.work_buffer.len > 0) self.allocator.free(self.work_buffer);
         self.allocator.destroy(self);
+    }
+
+    fn estimateWorkingSetBytes(
+        capacity: u32,
+        field_metadata: []const SignalSchemaField,
+        include_dynamic: bool,
+        work_buffer_len: usize,
+    ) !usize {
+        var total: usize = @sizeOf(EventProcessor);
+        total = try addChecked(total, estimateEventColumnsBytes(capacity));
+        if (include_dynamic) {
+            total = try addChecked(total, estimateDynamicColumnsBytes(capacity, field_metadata));
+            total = try addChecked(total, work_buffer_len);
+        }
+        return total;
+    }
+
+    fn estimateEventColumnsBytes(capacity: u32) usize {
+        const cap: usize = @intCast(capacity);
+        const offsets = (cap + 1) * @sizeOf(u32);
+        return (offsets * 3) +
+            (((cap + 7) / 8)) +
+            (cap * 36) +
+            (cap * 64) +
+            (cap * @sizeOf(i64)) +
+            (cap * 256);
+    }
+
+    fn estimateDynamicColumnsBytes(capacity: u32, field_metadata: []const SignalSchemaField) usize {
+        const cap: usize = @intCast(capacity);
+        var total: usize = @sizeOf(ColumnStorage) * field_metadata.len;
+
+        for (field_metadata) |field| {
+            total += (cap + 7) / 8; // validity bitmap
+            switch (field.arrow_type) {
+                .Utf8, .Binary => {
+                    total += (cap + 1) * @sizeOf(u32);
+                    total += cap * 128;
+                },
+                .Int, .FloatingPoint => {
+                    total += cap * 8;
+                },
+                .Bool => {
+                    total += (cap + 7) / 8;
+                },
+                .Null => {
+                    total += (cap + 1) * @sizeOf(u32);
+                    total += cap * 128;
+                },
+            }
+        }
+
+        return total;
+    }
+
+    fn addChecked(a: usize, b: usize) !usize {
+        const sum = @addWithOverflow(a, b);
+        if (sum[1] != 0) return error.OutOfMemory;
+        return sum[0];
+    }
+
+    fn ensureWorkBufferCapacity(self: *EventProcessor, required_len: usize) !void {
+        if (self.work_buffer.len >= required_len) return;
+
+        var target = if (self.work_buffer.len == 0) NATIVE_DEFAULT_WORK_BUFFER_BYTES else self.work_buffer.len;
+        while (target < required_len) {
+            const next = target * 2;
+            if (next < target) return error.OutOfMemory;
+            target = next;
+        }
+
+        if (builtin.cpu.arch == .wasm32 and target > WASM_MAX_WORK_BUFFER_BYTES) {
+            return error.OutOfMemory;
+        }
+
+        const delta = target - self.work_buffer.len;
+        if (builtin.cpu.arch == .wasm32 and self.working_set_estimate + delta > WASM_WORKING_SET_CAP_BYTES) {
+            return error.OutOfMemory;
+        }
+
+        const next_buf = try self.allocator.alloc(u8, target);
+        errdefer self.allocator.free(next_buf);
+        if (self.work_buffer.len > 0) {
+            @memcpy(next_buf[0..self.work_buffer.len], self.work_buffer);
+            self.allocator.free(self.work_buffer);
+        }
+        self.work_buffer = next_buf;
+        self.working_set_estimate += delta;
     }
 };
 
@@ -436,15 +536,11 @@ pub export fn ep_create_log_entry(
         dyn_cols.reset();
 
         // Parse with extraction
+        var extraction_error_code: ResultCode = .PARSE_ERROR;
         const extracted: u32 = switch (input_format) {
-            .JSON => parsing.json_extractor.extractJsonEvents(
-                input,
-                &ep.extraction_config.?,
-                dyn_cols,
-                ep.work_buffer,
-            ) catch {
-                writeResultHeader(output, .PARSE_ERROR, 0, 0, 0, 0);
-                return @intFromEnum(ResultCode.PARSE_ERROR);
+            .JSON => extractJsonEventsWithWorkspaceGrowth(ep, input, dyn_cols, &extraction_error_code) catch {
+                writeResultHeader(output, extraction_error_code, 0, 0, 0, 0);
+                return @intFromEnum(extraction_error_code);
             },
             .MSGPACK => {
                 writeResultHeader(output, .INVALID_FORMAT, 0, 0, 0, 0);
@@ -465,9 +561,10 @@ pub export fn ep_create_log_entry(
             dyn_cols,
             &ep.schema_config,
             output[arrow_offset..],
-        ) catch {
-            writeResultHeader(output, .ENCODE_ERROR, 0, 0, 0, 0);
-            return @intFromEnum(ResultCode.ENCODE_ERROR);
+        ) catch |err| {
+            const code = mapEncodeError(err);
+            writeResultHeader(output, code, 0, 0, 0, 0);
+            return @intFromEnum(code);
         };
 
         const arrow_len: u32 = @intCast(arrow_bytes.len);
@@ -484,8 +581,9 @@ pub export fn ep_create_log_entry(
         };
 
         if (parse_result != .OK) {
-            writeResultHeader(output, .PARSE_ERROR, 0, 0, 0, 0);
-            return @intFromEnum(ResultCode.PARSE_ERROR);
+            const code = mapParseError(parse_result);
+            writeResultHeader(output, code, 0, 0, 0, 0);
+            return @intFromEnum(code);
         }
 
         // No dedup in columine - all events are processed
@@ -497,9 +595,10 @@ pub export fn ep_create_log_entry(
             &ep.event_columns,
             &ep.schema_config,
             output[arrow_offset..],
-        ) catch {
-            writeResultHeader(output, .ENCODE_ERROR, 0, 0, 0, 0);
-            return @intFromEnum(ResultCode.ENCODE_ERROR);
+        ) catch |err| {
+            const code = mapEncodeError(err);
+            writeResultHeader(output, code, 0, 0, 0, 0);
+            return @intFromEnum(code);
         };
 
         const arrow_len: u32 = @intCast(arrow_bytes.len);
@@ -529,6 +628,68 @@ fn writeResultHeader(
         .duplicates_filtered = duplicates_filtered,
     };
     @memcpy(output[0..@sizeOf(ResultHeader)], std.mem.asBytes(&header));
+}
+
+fn mapParseError(err: ParseError) ResultCode {
+    return switch (err) {
+        .TOO_MANY_EVENTS => .TOO_MANY_EVENTS,
+        .BUFFER_OVERFLOW => .BUFFER_OVERFLOW,
+        .OUT_OF_MEMORY => .OUT_OF_MEMORY,
+        else => .PARSE_ERROR,
+    };
+}
+
+fn mapExtractionError(err: ExtractionError) ResultCode {
+    return switch (err) {
+        error.TooManyEvents => .TOO_MANY_EVENTS,
+        error.BufferOverflow => .BUFFER_OVERFLOW,
+        error.OutOfMemory => .OUT_OF_MEMORY,
+        else => .PARSE_ERROR,
+    };
+}
+
+fn mapEncodeError(err: anyerror) ResultCode {
+    return switch (err) {
+        error.BufferOverflow => .BUFFER_OVERFLOW,
+        error.OutOfMemory => .OUT_OF_MEMORY,
+        else => .ENCODE_ERROR,
+    };
+}
+
+fn extractJsonEventsWithWorkspaceGrowth(
+    ep: *EventProcessor,
+    input: []const u8,
+    dyn_cols: *DynamicColumns,
+    out_error_code: *ResultCode,
+) error{ExtractionFailed}!u32 {
+    const extraction_config = &ep.extraction_config.?;
+
+    while (true) {
+        const extracted = parsing.json_extractor.extractJsonEvents(
+            input,
+            extraction_config,
+            dyn_cols,
+            ep.work_buffer,
+        ) catch |err| {
+            if (err == error.BufferOverflow) {
+                const min_needed = if (ep.work_buffer.len == 0)
+                    @min(input.len + 64, EventProcessor.WASM_MAX_WORK_BUFFER_BYTES)
+                else
+                    @min(ep.work_buffer.len * 2, EventProcessor.WASM_MAX_WORK_BUFFER_BYTES);
+
+                ep.ensureWorkBufferCapacity(min_needed) catch {
+                    out_error_code.* = .OUT_OF_MEMORY;
+                    return error.ExtractionFailed;
+                };
+                continue;
+            }
+
+            out_error_code.* = mapExtractionError(err);
+            return error.ExtractionFailed;
+        };
+
+        return extracted;
+    }
 }
 
 // =============================================================================
@@ -583,4 +744,14 @@ test "ep_create_log_entry with schema" {
     try std.testing.expectEqual(@as(u32, 1), header.events_processed);
     // No dedup in columine
     try std.testing.expectEqual(@as(u32, 0), header.duplicates_filtered);
+}
+
+test "parse and extraction errors map to explicit result codes" {
+    try std.testing.expectEqual(ResultCode.TOO_MANY_EVENTS, mapParseError(.TOO_MANY_EVENTS));
+    try std.testing.expectEqual(ResultCode.BUFFER_OVERFLOW, mapParseError(.BUFFER_OVERFLOW));
+    try std.testing.expectEqual(ResultCode.OUT_OF_MEMORY, mapParseError(.OUT_OF_MEMORY));
+
+    try std.testing.expectEqual(ResultCode.TOO_MANY_EVENTS, mapExtractionError(error.TooManyEvents));
+    try std.testing.expectEqual(ResultCode.BUFFER_OVERFLOW, mapExtractionError(error.BufferOverflow));
+    try std.testing.expectEqual(ResultCode.OUT_OF_MEMORY, mapExtractionError(error.OutOfMemory));
 }

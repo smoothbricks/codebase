@@ -22,7 +22,6 @@
 //! with msgpack for serializing complex/undeclared fields.
 
 const std = @import("std");
-const msgpack = @import("msgpack");
 const json_parser = @import("json_parser.zig");
 const columns = @import("columns.zig");
 const dynamic_schema = @import("../arrow/dynamic_schema.zig");
@@ -122,10 +121,9 @@ pub fn extractJsonEvent(
     // Track which columns have been set (for null detection)
     var columns_set: [64]bool = [_]bool{false} ** 64;
 
-    // Buffer for collecting undeclared fields (for $extra column)
-    var undeclared_count: u32 = 0;
-    var undeclared_names: [32][]const u8 = undefined;
-    var undeclared_values: [32][]const u8 = undefined;
+    // Streaming msgpack writer for undeclared fields ($extra column)
+    // Created lazily only when we encounter the first undeclared field.
+    var extra_writer: ?ExtraMsgpackWriter = null;
 
     // Expect object begin (should be at this position already)
     parser.expectObjectBegin() catch return error.InvalidJson;
@@ -155,15 +153,21 @@ pub fn extractJsonEvent(
             if (e.col_idx >= columns_set.len) return error.OutOfMemory;
             columns_set[e.col_idx] = true;
         } else {
-            // Undeclared field - capture for $extra column
-            if (undeclared_count < 32) {
-                undeclared_names[undeclared_count] = field_name;
-                // Capture the raw JSON value
+            // Undeclared field - preserve in $extra if configured.
+            if (config.fallback_col_idx != null) {
                 const raw_value = parser.captureRawValue() catch return error.InvalidJson;
-                undeclared_values[undeclared_count] = raw_value;
-                undeclared_count += 1;
+
+                if (extra_writer == null) {
+                    extra_writer = ExtraMsgpackWriter.init(work_buffer) catch return error.BufferOverflow;
+                }
+
+                extra_writer.?.appendPair(field_name, raw_value) catch |err| {
+                    return switch (err) {
+                        error.BufferOverflow => error.BufferOverflow,
+                        else => error.MsgpackError,
+                    };
+                };
             } else {
-                // Too many undeclared fields, just skip
                 _ = parser.skipValue() catch return error.InvalidJson;
             }
         }
@@ -178,12 +182,8 @@ pub fn extractJsonEvent(
 
     // Serialize undeclared fields to $extra column if present
     if (config.fallback_col_idx) |fallback_idx| {
-        if (undeclared_count > 0) {
-            const msgpack_bytes = serializeUndeclaredFields(
-                undeclared_names[0..undeclared_count],
-                undeclared_values[0..undeclared_count],
-                work_buffer,
-            ) catch return error.MsgpackError;
+        if (extra_writer) |*writer| {
+            const msgpack_bytes = writer.finish();
 
             const result = dynamic_cols.appendBinary(fallback_idx, msgpack_bytes);
             if (result != .OK) return error.BufferOverflow;
@@ -371,42 +371,95 @@ fn serializeUndeclaredFields(
     // Format: fixmap header + (key,value) pairs
 
     if (names.len == 0) return buffer[0..0];
-    if (names.len > 15) return error.OutOfMemory; // Max fixmap size
 
-    var offset: usize = 0;
-
-    // Write fixmap header (0x80 + count)
-    buffer[offset] = @as(u8, 0x80) | @as(u8, @intCast(names.len));
-    offset += 1;
+    var writer = try ExtraMsgpackWriter.init(buffer);
 
     for (names, values) |name, value| {
-        // Write key as fixstr
-        if (name.len > 31) return error.OutOfMemory;
-        buffer[offset] = @as(u8, 0xa0) | @as(u8, @intCast(name.len));
-        offset += 1;
-        if (offset + name.len > buffer.len) return error.OutOfMemory;
-        @memcpy(buffer[offset..][0..name.len], name);
-        offset += name.len;
-
-        // Write value as fixstr (raw JSON for now)
-        if (value.len <= 31) {
-            buffer[offset] = @as(u8, 0xa0) | @as(u8, @intCast(value.len));
-            offset += 1;
-        } else if (value.len <= 255) {
-            buffer[offset] = 0xd9; // str 8
-            offset += 1;
-            buffer[offset] = @intCast(value.len);
-            offset += 1;
-        } else {
-            return error.OutOfMemory;
-        }
-        if (offset + value.len > buffer.len) return error.OutOfMemory;
-        @memcpy(buffer[offset..][0..value.len], value);
-        offset += value.len;
+        try writer.appendPair(name, value);
     }
 
-    return buffer[0..offset];
+    return writer.finish();
 }
+
+const ExtraMsgpackWriter = struct {
+    buffer: []u8,
+    offset: usize,
+    pair_count: u32,
+
+    fn init(buffer: []u8) !ExtraMsgpackWriter {
+        if (buffer.len < 5) return error.BufferOverflow;
+        return .{
+            .buffer = buffer,
+            .offset = 5, // Reserve map32 header; written in finish().
+            .pair_count = 0,
+        };
+    }
+
+    fn appendPair(self: *ExtraMsgpackWriter, name: []const u8, value: []const u8) !void {
+        try self.writeMsgpackString(name);
+        try self.writeMsgpackString(value);
+        self.pair_count += 1;
+    }
+
+    fn finish(self: *ExtraMsgpackWriter) []const u8 {
+        self.buffer[0] = 0xdf; // map 32
+        self.buffer[1] = @intCast((self.pair_count >> 24) & 0xff);
+        self.buffer[2] = @intCast((self.pair_count >> 16) & 0xff);
+        self.buffer[3] = @intCast((self.pair_count >> 8) & 0xff);
+        self.buffer[4] = @intCast(self.pair_count & 0xff);
+        return self.buffer[0..self.offset];
+    }
+
+    fn writeMsgpackString(self: *ExtraMsgpackWriter, value: []const u8) !void {
+        try self.writeStringHeader(value.len);
+        if (self.offset + value.len > self.buffer.len) return error.BufferOverflow;
+        @memcpy(self.buffer[self.offset..][0..value.len], value);
+        self.offset += value.len;
+    }
+
+    fn writeStringHeader(self: *ExtraMsgpackWriter, len: usize) !void {
+        if (len <= 31) {
+            try self.ensureBytes(1);
+            self.buffer[self.offset] = @as(u8, 0xa0) | @as(u8, @intCast(len));
+            self.offset += 1;
+            return;
+        }
+
+        if (len <= std.math.maxInt(u8)) {
+            try self.ensureBytes(2);
+            self.buffer[self.offset] = 0xd9;
+            self.buffer[self.offset + 1] = @intCast(len);
+            self.offset += 2;
+            return;
+        }
+
+        if (len <= std.math.maxInt(u16)) {
+            try self.ensureBytes(3);
+            self.buffer[self.offset] = 0xda;
+            self.buffer[self.offset + 1] = @intCast((len >> 8) & 0xff);
+            self.buffer[self.offset + 2] = @intCast(len & 0xff);
+            self.offset += 3;
+            return;
+        }
+
+        if (len <= std.math.maxInt(u32)) {
+            try self.ensureBytes(5);
+            self.buffer[self.offset] = 0xdb;
+            self.buffer[self.offset + 1] = @intCast((len >> 24) & 0xff);
+            self.buffer[self.offset + 2] = @intCast((len >> 16) & 0xff);
+            self.buffer[self.offset + 3] = @intCast((len >> 8) & 0xff);
+            self.buffer[self.offset + 4] = @intCast(len & 0xff);
+            self.offset += 5;
+            return;
+        }
+
+        return error.OutOfMemory;
+    }
+
+    fn ensureBytes(self: *ExtraMsgpackWriter, n: usize) !void {
+        if (self.offset + n > self.buffer.len) return error.BufferOverflow;
+    }
+};
 
 // =============================================================================
 // Tests
@@ -522,12 +575,70 @@ test "serializeUndeclaredFields" {
 
     const result = try serializeUndeclaredFields(&names, &values, &buffer);
 
-    // Verify fixmap header (0x82 = fixmap with 2 elements)
-    try std.testing.expectEqual(@as(u8, 0x82), result[0]);
+    // Verify map32 header (count=2)
+    try std.testing.expectEqual(@as(u8, 0xdf), result[0]);
+    try std.testing.expectEqual(@as(u8, 0x00), result[1]);
+    try std.testing.expectEqual(@as(u8, 0x00), result[2]);
+    try std.testing.expectEqual(@as(u8, 0x00), result[3]);
+    try std.testing.expectEqual(@as(u8, 0x02), result[4]);
 
     // Verify first key "foo" (0xa3 = fixstr with 3 chars)
-    try std.testing.expectEqual(@as(u8, 0xa3), result[1]);
-    try std.testing.expectEqualStrings("foo", result[2..5]);
+    try std.testing.expectEqual(@as(u8, 0xa3), result[5]);
+    try std.testing.expectEqualStrings("foo", result[6..9]);
+}
+
+test "extractJsonEvents does not silently drop undeclared fields" {
+    const testing = std.testing;
+
+    const fields = [_]dynamic_schema.SignalSchemaField{
+        .{ .arrow_type = .Utf8, .nullable = 0 }, // id
+        .{ .arrow_type = .Utf8, .nullable = 0 }, // type
+        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Binary, .nullable = 1 }, // value.$extra
+    };
+    const names = [_][]const u8{ "id", "type", "timestamp", "value.$extra" };
+
+    var config = try buildExtractionConfig(testing.allocator, &fields, &names);
+    defer freeExtractionConfig(testing.allocator, &config);
+
+    var cols = try columns.DynamicColumns.init(testing.allocator, &fields, 10);
+    defer cols.deinit();
+
+    const json =
+        \\[{"id":"1","type":"order","timestamp":1000,"k01":"v","k02":"v","k03":"v","k04":"v","k05":"v","k06":"v","k07":"v","k08":"v","k09":"v","k10":"v","k11":"v","k12":"v","k13":"v","k14":"v","k15":"v","k16":"v","k17":"v","k18":"v","k19":"v","k20":"v","k21":"v","k22":"v","k23":"v","k24":"v","k25":"v","k26":"v","k27":"v","k28":"v","k29":"v","k30":"v","k31":"v","k32":"v","k33":"v","k34":"v","k35":"v","k36":"v","k37":"v","k38":"v","k39":"v","k40":"v"}]
+    ;
+
+    var work_buffer: [4096]u8 = undefined;
+    const count = try extractJsonEvents(json, &config, &cols, &work_buffer);
+
+    try testing.expectEqual(@as(u32, 1), count);
+    try testing.expectEqual(@as(u32, 1), cols.count);
+    try testing.expect(!cols.isNull(3, 0));
+}
+
+test "extractJsonEvents returns BufferOverflow when workspace is too small" {
+    const testing = std.testing;
+
+    const fields = [_]dynamic_schema.SignalSchemaField{
+        .{ .arrow_type = .Utf8, .nullable = 0 }, // id
+        .{ .arrow_type = .Utf8, .nullable = 0 }, // type
+        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Binary, .nullable = 1 }, // value.$extra
+    };
+    const names = [_][]const u8{ "id", "type", "timestamp", "value.$extra" };
+
+    var config = try buildExtractionConfig(testing.allocator, &fields, &names);
+    defer freeExtractionConfig(testing.allocator, &config);
+
+    var cols = try columns.DynamicColumns.init(testing.allocator, &fields, 1);
+    defer cols.deinit();
+
+    const json =
+        \\[{"id":"1","type":"order","timestamp":1000,"extra":"abcdefghijklmnopqrstuvwxyz"}]
+    ;
+
+    var tiny_work_buffer: [16]u8 = undefined;
+    try testing.expectError(error.BufferOverflow, extractJsonEvents(json, &config, &cols, &tiny_work_buffer));
 }
 
 test "findFieldEntry" {
