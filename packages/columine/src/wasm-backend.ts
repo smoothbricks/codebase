@@ -320,8 +320,11 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
         batchLen,
       );
 
-      // 6. Copy state OUT of WASM memory back to JS ArrayBuffer
-      new Uint8Array(s.buffer).set(wasmU8.subarray(statePtr, statePtr + s.size));
+      // 6. Copy state OUT of WASM memory back to JS ArrayBuffer.
+      // Re-create view because WASM memory may have grown (e.g., dynamic shadow
+      // buffer allocation during undo overflow), which detaches the old ArrayBuffer.
+      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
+      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
 
       return result;
     },

@@ -470,12 +470,17 @@ var g_undo_overflow: bool = false;
 pub var g_undo_enabled: bool = false;
 
 // Shadow buffer for lazy overflow snapshot — only used when undo log exceeds capacity.
-// 2MB covers typical state sizes (each HashMap slot ~32KB, so ~60 slots at 1K capacity).
-const UNDO_SHADOW_CAPACITY: u32 = 2 * 1024 * 1024;
-var g_undo_shadow: [UNDO_SHADOW_CAPACITY]u8 = undefined;
+// WASM: static 4MB buffer (wasm_allocator.alloc grows memory, detaching JS ArrayBuffer views).
+// Native: dynamically allocated via page_allocator for any state size.
+const UNDO_SHADOW_CAPACITY: u32 = 4 * 1024 * 1024;
+var g_undo_shadow_static: if (builtin.cpu.arch == .wasm32) [UNDO_SHADOW_CAPACITY]u8 else [0]u8 = undefined;
+var g_undo_shadow_dynamic: ?[]u8 = null;
+var g_undo_shadow_active: bool = false;
 var g_undo_state_size: u32 = 0;
 // Stored at vm_undo_enable time — WASM is single-threaded so this is safe
 var g_undo_state_base: [*]u8 = undefined;
+
+const native_shadow_allocator = std.heap.page_allocator;
 
 // Saved change flags for rollback (max 256 slots + 1 derived facts flag)
 var g_saved_change_flags: [257]u8 = undefined;
@@ -486,10 +491,22 @@ pub fn undoAppend(entry: FlatUndoEntry) void {
         g_undo_entries[g_undo_count] = entry;
         g_undo_count += 1;
     } else if (!g_undo_overflow) {
-        // First overflow: snapshot current state into shadow buffer so rollback
-        // can restore un-logged mutations that happen after this point
-        if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
-            @memcpy(g_undo_shadow[0..g_undo_state_size], g_undo_state_base[0..g_undo_state_size]);
+        // First overflow: snapshot current state so rollback can restore
+        // un-logged mutations that happen after this point.
+        if (comptime builtin.cpu.arch == .wasm32) {
+            // WASM: static 4MB buffer (avoids memory.grow which detaches JS ArrayBuffer views)
+            if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
+                @memcpy(g_undo_shadow_static[0..g_undo_state_size], g_undo_state_base[0..g_undo_state_size]);
+                g_undo_shadow_active = true;
+            }
+        } else {
+            // Native: dynamically allocate exact-size buffer (no fixed cap)
+            const shadow = native_shadow_allocator.alloc(u8, g_undo_state_size) catch null;
+            if (shadow) |s| {
+                @memcpy(s, g_undo_state_base[0..g_undo_state_size]);
+                g_undo_shadow_dynamic = shadow;
+                g_undo_shadow_active = true;
+            }
         }
         g_undo_overflow = true;
     }
@@ -2443,6 +2460,14 @@ pub export fn vm_undo_enable(state_base: [*]u8, state_size: u32) void {
     g_undo_enabled = true;
     g_undo_count = 0;
     g_undo_overflow = false;
+    g_undo_shadow_active = false;
+    // Free any leftover dynamic shadow from a prior undo session (native only)
+    if (comptime builtin.cpu.arch != .wasm32) {
+        if (g_undo_shadow_dynamic) |s| {
+            native_shadow_allocator.free(s);
+            g_undo_shadow_dynamic = null;
+        }
+    }
     g_undo_state_base = state_base;
     g_undo_state_size = state_size;
     saveChangeFlags(state_base);
@@ -2460,10 +2485,27 @@ pub export fn vm_undo_checkpoint(_state_base: [*]u8) u32 {
 /// overflow), then replay undo log in reverse (undoes logged mutations before overflow).
 /// If no overflow: just replay undo log in reverse.
 pub export fn vm_undo_rollback(state_base: [*]u8, checkpoint_pos: u32) void {
-    if (g_undo_overflow and g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
+    // Validate state identity in native FFI (prevents cross-handle aliasing bugs).
+    // WASM always uses the same stateRegionOffset so the check is redundant there.
+    if (comptime builtin.cpu.arch != .wasm32) {
+        std.debug.assert(state_base == g_undo_state_base);
+    }
+
+    if (g_undo_overflow and g_undo_shadow_active) {
         // Step 1: Restore shadow buffer — undoes all mutations after the overflow point
         // that weren't captured in the undo log
-        @memcpy(state_base[0..g_undo_state_size], g_undo_shadow[0..g_undo_state_size]);
+        if (comptime builtin.cpu.arch == .wasm32) {
+            if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
+                @memcpy(state_base[0..g_undo_state_size], g_undo_shadow_static[0..g_undo_state_size]);
+            }
+        } else {
+            if (g_undo_shadow_dynamic) |shadow| {
+                @memcpy(state_base[0..g_undo_state_size], shadow);
+                native_shadow_allocator.free(shadow);
+                g_undo_shadow_dynamic = null;
+            }
+        }
+        g_undo_shadow_active = false;
     }
     // Step 2: Replay undo log in reverse — undoes logged mutations before overflow
     var i = g_undo_count;
@@ -2477,9 +2519,21 @@ pub export fn vm_undo_rollback(state_base: [*]u8, checkpoint_pos: u32) void {
 
 /// Commit (discard) undo entries and disable undo logging.
 /// Call after speculative execution succeeds.
-pub export fn vm_undo_commit(_state_base: [*]u8, _checkpoint_pos: u32) void {
-    _ = _state_base;
+pub export fn vm_undo_commit(state_base: [*]u8, _checkpoint_pos: u32) void {
     _ = _checkpoint_pos;
+    // Validate state identity in native FFI (WASM always uses same stateRegionOffset)
+    if (comptime builtin.cpu.arch != .wasm32) {
+        std.debug.assert(state_base == g_undo_state_base);
+    }
+
+    // Free dynamic shadow if present (native only)
+    if (comptime builtin.cpu.arch != .wasm32) {
+        if (g_undo_shadow_dynamic) |s| {
+            native_shadow_allocator.free(s);
+            g_undo_shadow_dynamic = null;
+        }
+    }
+    g_undo_shadow_active = false;
     g_undo_count = 0;
     g_undo_overflow = false;
     g_undo_enabled = false;
