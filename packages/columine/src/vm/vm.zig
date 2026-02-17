@@ -476,6 +476,8 @@ const UNDO_SHADOW_CAPACITY: u32 = 4 * 1024 * 1024;
 var g_undo_shadow_static: if (builtin.cpu.arch == .wasm32) [UNDO_SHADOW_CAPACITY]u8 else [0]u8 = undefined;
 var g_undo_shadow_dynamic: ?[]u8 = null;
 var g_undo_shadow_active: bool = false;
+var g_undo_overflow_entry: FlatUndoEntry = undefined;
+var g_undo_has_overflow_entry: bool = false;
 var g_undo_state_size: u32 = 0;
 // Stored at vm_undo_enable time — WASM is single-threaded so this is safe
 var g_undo_state_base: [*]u8 = undefined;
@@ -508,6 +510,8 @@ pub fn undoAppend(entry: FlatUndoEntry) void {
                 g_undo_shadow_active = true;
             }
         }
+        g_undo_overflow_entry = entry;
+        g_undo_has_overflow_entry = true;
         g_undo_overflow = true;
     }
     // If already overflowed, silently drop — shadow buffer covers subsequent mutations
@@ -944,16 +948,21 @@ fn batchMapUpsertLatest(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
-                // Undo: record new insertion so rollback can tombstone it
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .MAP_INSERT,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = 0,
-                    .aux = 0,
-                });
+                // Undo: record new insertion so rollback can tombstone it.
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .MAP_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = 0,
+                        .aux = 0,
+                    });
+                }
                 keys[slot] = key;
                 values[slot] = val;
                 timestamps[slot] = ts;
@@ -963,15 +972,18 @@ fn batchMapUpsertLatest(
             } else if (k == key) {
                 if (ts > timestamps[slot]) {
                     // Undo: save previous value + timestamp before overwrite
-                    if (g_undo_enabled) undoAppend(.{
-                        .op = .MAP_UPDATE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = values[slot],
-                        .aux = @bitCast(timestamps[slot]),
-                    });
+                    if (g_undo_enabled) {
+                        meta.size_ptr.* = size;
+                        undoAppend(.{
+                            .op = .MAP_UPDATE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = values[slot],
+                            .aux = @bitCast(timestamps[slot]),
+                        });
+                    }
                     values[slot] = val;
                     timestamps[slot] = ts;
                     had_update = true;
@@ -1020,16 +1032,21 @@ fn batchMapUpsertFirst(
                     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
                     return .CAPACITY_EXCEEDED;
                 }
-                // Undo: record new insertion (first wins has no update path)
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .MAP_INSERT,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = 0,
-                    .aux = 0,
-                });
+                // Undo: record new insertion (first wins has no update path).
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .MAP_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = 0,
+                        .aux = 0,
+                    });
+                }
                 keys[slot] = key;
                 values[slot] = val;
                 size += 1;
@@ -1082,16 +1099,21 @@ fn batchMapUpsertLast(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
-                // Undo: record new insertion so rollback can tombstone it
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .MAP_INSERT,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = 0,
-                    .aux = 0,
-                });
+                // Undo: record new insertion so rollback can tombstone it.
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .MAP_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = 0,
+                        .aux = 0,
+                    });
+                }
                 keys[slot] = key;
                 values[slot] = val;
                 size += 1;
@@ -1099,15 +1121,18 @@ fn batchMapUpsertLast(
                 break;
             } else if (k == key) {
                 // Undo: save previous value before overwrite (no timestamp for Last)
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .MAP_UPDATE,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = values[slot],
-                    .aux = 0,
-                });
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .MAP_UPDATE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = values[slot],
+                        .aux = 0,
+                    });
+                }
                 // Last wins - always update
                 values[slot] = val;
                 had_update = true;
@@ -1163,16 +1188,21 @@ fn batchMapUpsertMax(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
-                // Undo: record new insertion so rollback can tombstone it
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .MAP_INSERT,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = 0,
-                    .aux = 0,
-                });
+                // Undo: record new insertion so rollback can tombstone it.
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .MAP_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = 0,
+                        .aux = 0,
+                    });
+                }
                 keys[slot] = key;
                 values[slot] = val;
                 cmp_vals[slot] = cmp;
@@ -1183,15 +1213,18 @@ fn batchMapUpsertMax(
                 // MAX: only update if new comparison value is greater
                 if (cmp > cmp_vals[slot]) {
                     // Undo: save previous value + cmp value before overwrite
-                    if (g_undo_enabled) undoAppend(.{
-                        .op = .MAP_UPDATE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = values[slot],
-                        .aux = @bitCast(cmp_vals[slot]),
-                    });
+                    if (g_undo_enabled) {
+                        meta.size_ptr.* = size;
+                        undoAppend(.{
+                            .op = .MAP_UPDATE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = values[slot],
+                            .aux = @bitCast(cmp_vals[slot]),
+                        });
+                    }
                     values[slot] = val;
                     cmp_vals[slot] = cmp;
                     had_update = true;
@@ -1248,16 +1281,21 @@ fn batchMapUpsertMin(
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
                     return .CAPACITY_EXCEEDED;
                 }
-                // Undo: record new insertion so rollback can tombstone it
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .MAP_INSERT,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = 0,
-                    .aux = 0,
-                });
+                // Undo: record new insertion so rollback can tombstone it.
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .MAP_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = 0,
+                        .aux = 0,
+                    });
+                }
                 keys[slot] = key;
                 values[slot] = val;
                 cmp_vals[slot] = cmp;
@@ -1268,15 +1306,18 @@ fn batchMapUpsertMin(
                 // MIN: only update if new comparison value is smaller
                 if (cmp < cmp_vals[slot]) {
                     // Undo: save previous value + cmp value before overwrite
-                    if (g_undo_enabled) undoAppend(.{
-                        .op = .MAP_UPDATE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = values[slot],
-                        .aux = @bitCast(cmp_vals[slot]),
-                    });
+                    if (g_undo_enabled) {
+                        meta.size_ptr.* = size;
+                        undoAppend(.{
+                            .op = .MAP_UPDATE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = values[slot],
+                            .aux = @bitCast(cmp_vals[slot]),
+                        });
+                    }
                     values[slot] = val;
                     cmp_vals[slot] = cmp;
                     had_update = true;
@@ -1318,16 +1359,21 @@ fn batchMapRemove(
             const k = keys[slot];
             if (k == EMPTY_KEY) break;
             if (k == key) {
-                // Undo: save key + value + timestamp so rollback can restore
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .MAP_DELETE,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = values[slot],
-                    .aux = @bitCast(timestamps[slot]),
-                });
+                // Undo: save key + value + timestamp so rollback can restore.
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .MAP_DELETE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = values[slot],
+                        .aux = @bitCast(timestamps[slot]),
+                    });
+                }
                 keys[slot] = TOMBSTONE;
                 size -= 1;
                 had_remove = true;
@@ -1373,16 +1419,21 @@ fn batchSetInsert(
                     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
                     return .CAPACITY_EXCEEDED;
                 }
-                // Undo: record new set insertion so rollback can tombstone it
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .SET_INSERT,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = elem,
-                    .prev_value = 0,
-                    .aux = 0,
-                });
+                // Undo: record new set insertion so rollback can tombstone it.
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .SET_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = elem,
+                        .prev_value = 0,
+                        .aux = 0,
+                    });
+                }
                 keys[slot] = elem;
                 size += 1;
                 had_insert = true;
@@ -1422,16 +1473,21 @@ fn batchSetRemove(
             const k = keys[slot];
             if (k == EMPTY_KEY) break;
             if (k == elem) {
-                // Undo: save element so rollback can restore it
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .SET_DELETE,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = elem,
-                    .prev_value = 0,
-                    .aux = 0,
-                });
+                // Undo: save element so rollback can restore it.
+                // Flush local size to state before undoAppend — overflow may
+                // capture a shadow snapshot and the size field must be current.
+                if (g_undo_enabled) {
+                    meta.size_ptr.* = size;
+                    undoAppend(.{
+                        .op = .SET_DELETE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = elem,
+                        .prev_value = 0,
+                        .aux = 0,
+                    });
+                }
                 keys[slot] = TOMBSTONE;
                 size -= 1;
                 had_remove = true;
@@ -2461,6 +2517,7 @@ pub export fn vm_undo_enable(state_base: [*]u8, state_size: u32) void {
     g_undo_count = 0;
     g_undo_overflow = false;
     g_undo_shadow_active = false;
+    g_undo_has_overflow_entry = false;
     // Free any leftover dynamic shadow from a prior undo session (native only)
     if (comptime builtin.cpu.arch != .wasm32) {
         if (g_undo_shadow_dynamic) |s| {
@@ -2506,6 +2563,12 @@ pub export fn vm_undo_rollback(state_base: [*]u8, checkpoint_pos: u32) void {
             }
         }
         g_undo_shadow_active = false;
+        // Replay the overflow-triggering entry that was dropped from the log.
+        // The shadow includes this mutation's effect, so we must undo it.
+        if (g_undo_has_overflow_entry) {
+            rollbackEntry(state_base, g_undo_overflow_entry);
+            g_undo_has_overflow_entry = false;
+        }
     }
     // Step 2: Replay undo log in reverse — undoes logged mutations before overflow
     var i = g_undo_count;
@@ -2534,6 +2597,7 @@ pub export fn vm_undo_commit(state_base: [*]u8, _checkpoint_pos: u32) void {
         }
     }
     g_undo_shadow_active = false;
+    g_undo_has_overflow_entry = false;
     g_undo_count = 0;
     g_undo_overflow = false;
     g_undo_enabled = false;
@@ -2545,3 +2609,5 @@ pub export fn vm_undo_commit(state_base: [*]u8, _checkpoint_pos: u32) void {
 pub export fn vm_undo_has_overflow() u32 {
     return if (g_undo_overflow) @as(u32, 1) else @as(u32, 0);
 }
+
+

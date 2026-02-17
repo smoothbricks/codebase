@@ -464,7 +464,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     undoHasOverflow(): boolean {
       return wasmInstance.exports.vm_undo_has_overflow() !== 0;
     },
-  };
+  } as ColumineBackend;
 }
 
 // =============================================================================
