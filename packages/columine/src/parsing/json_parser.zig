@@ -51,15 +51,6 @@ pub fn backendName() []const u8 {
     return if (use_simdjzon) "simdjzon" else "std.json.Scanner";
 }
 
-// ============================================================================
-// Scanner compatibility struct for simdjzon backend
-// ============================================================================
-// Provides parser.scanner.cursor for any extractor code that accesses
-// cursor position directly (e.g. raw JSON capture for Binary columns).
-const ScannerCompat = struct {
-    cursor: usize,
-};
-
 /// JSON parser for field extraction
 ///
 /// Wraps either simdjzon DOM parser or std.json.Scanner (selected at comptime)
@@ -69,8 +60,8 @@ const ScannerCompat = struct {
 pub const JsonParser = struct {
     // Backend-specific scanner state.
     // For Scanner: the actual std.json.Scanner.
-    // For simdjzon: a compat struct with cursor field.
-    scanner: if (use_simdjzon) ScannerCompat else std.json.Scanner,
+    // For simdjzon: void (tape walk needs only tape_idx).
+    scanner: if (use_simdjzon) void else std.json.Scanner,
     input: []const u8,
 
     // simdjzon-specific fields (void when not using simdjzon)
@@ -103,7 +94,7 @@ pub const JsonParser = struct {
             // If initialization fails, return a parser in error state
             // nextToken() will return InvalidJson
             return .{
-                .scanner = .{ .cursor = 0 },
+                .scanner = {},
                 .input = input,
                 .simdjzon_parser = undefined,
                 .tape_idx = 0,
@@ -114,7 +105,7 @@ pub const JsonParser = struct {
         parser.parse() catch {
             parser.deinit();
             return .{
-                .scanner = .{ .cursor = 0 },
+                .scanner = {},
                 .input = input,
                 .simdjzon_parser = undefined,
                 .tape_idx = 0,
@@ -123,7 +114,7 @@ pub const JsonParser = struct {
             };
         };
         return .{
-            .scanner = .{ .cursor = 0 },
+            .scanner = {},
             .input = input,
             .simdjzon_parser = parser,
             // Start at tape index 1 (skip ROOT entry)
@@ -175,9 +166,6 @@ pub const JsonParser = struct {
         const entry = tape[self.tape_idx];
         const tape_type = simdjzon.dom.TapeType.from_u64(entry);
 
-        // Advance cursor through input to match current token position.
-        self.advanceCursorToNextToken(tape_type);
-
         switch (tape_type) {
             .START_OBJECT => {
                 self.tape_idx += 1;
@@ -202,7 +190,6 @@ pub const JsonParser = struct {
                 const str_ptr: [*]const u8 = @ptrCast(self.simdjzon_parser.doc.string_buf.items.ptr + str_buf_offset + @sizeOf(u32));
                 const s = str_ptr[0..str_len];
                 self.tape_idx += 1;
-                self.advanceCursorPastString();
                 return Token{ .string = s };
             },
             .INT64 => {
@@ -210,7 +197,6 @@ pub const JsonParser = struct {
                 const slice = std.fmt.bufPrint(&self.num_buf, "{d}", .{val}) catch return error.InvalidNumber;
                 self.num_slice = slice;
                 self.tape_idx += 2;
-                self.advanceCursorPastNumber();
                 return Token{ .number = self.num_slice };
             },
             .UINT64 => {
@@ -218,40 +204,26 @@ pub const JsonParser = struct {
                 const slice = std.fmt.bufPrint(&self.num_buf, "{d}", .{val}) catch return error.InvalidNumber;
                 self.num_slice = slice;
                 self.tape_idx += 2;
-                self.advanceCursorPastNumber();
                 return Token{ .number = self.num_slice };
             },
             .DOUBLE => {
-                // Use raw number bytes from input for precision preservation
-                const num_start = self.scanner.cursor;
-                self.tape_idx += 2;
-                self.advanceCursorPastNumber();
-                const num_end = self.scanner.cursor;
-                if (num_start < num_end and num_end <= self.input.len) {
-                    const raw = std.mem.trimRight(u8, self.input[num_start..num_end], &[_]u8{ ' ', '\t', '\n', '\r', ',', '}', ']', ':' });
-                    if (raw.len > 0) {
-                        return Token{ .number = raw };
-                    }
-                }
-                // Fallback: format the double value
-                const val: f64 = @bitCast(tape[self.tape_idx - 1]);
+                // Format the double value to text for downstream parsing
+                const val: f64 = @bitCast(tape[self.tape_idx + 1]);
                 const slice = std.fmt.bufPrint(&self.num_buf, "{d}", .{val}) catch return error.InvalidNumber;
                 self.num_slice = slice;
+                self.tape_idx += 2;
                 return Token{ .number = self.num_slice };
             },
             .TRUE => {
                 self.tape_idx += 1;
-                self.advanceCursorPastKeyword(4);
                 return .true_;
             },
             .FALSE => {
                 self.tape_idx += 1;
-                self.advanceCursorPastKeyword(5);
                 return .false_;
             },
             .NULL => {
                 self.tape_idx += 1;
-                self.advanceCursorPastKeyword(4);
                 return .null_;
             },
             .ROOT => {
@@ -262,64 +234,12 @@ pub const JsonParser = struct {
         }
     }
 
-    // ========================================================================
-    // Cursor tracking for simdjzon backend
-    // ========================================================================
-
-    fn advanceCursorToNextToken(self: *Self, tape_type: simdjzon.dom.TapeType) void {
-        while (self.scanner.cursor < self.input.len) {
-            const c = self.input[self.scanner.cursor];
-            switch (c) {
-                ' ', '\t', '\n', '\r', ',', ':' => self.scanner.cursor += 1,
-                else => break,
-            }
-        }
-        switch (tape_type) {
-            .START_OBJECT, .END_OBJECT, .START_ARRAY, .END_ARRAY => {
-                if (self.scanner.cursor < self.input.len) {
-                    self.scanner.cursor += 1;
-                }
-            },
-            else => {},
-        }
-    }
-
-    fn advanceCursorPastString(self: *Self) void {
-        if (self.scanner.cursor < self.input.len and self.input[self.scanner.cursor] == '"') {
-            self.scanner.cursor += 1;
-        }
-        while (self.scanner.cursor < self.input.len) {
-            const c = self.input[self.scanner.cursor];
-            self.scanner.cursor += 1;
-            if (c == '"') break;
-            if (c == '\\' and self.scanner.cursor < self.input.len) {
-                self.scanner.cursor += 1;
-            }
-        }
-    }
-
-    fn advanceCursorPastNumber(self: *Self) void {
-        while (self.scanner.cursor < self.input.len) {
-            const c = self.input[self.scanner.cursor];
-            switch (c) {
-                '0'...'9', '.', '-', '+', 'e', 'E' => self.scanner.cursor += 1,
-                else => break,
-            }
-        }
-    }
-
-    fn advanceCursorPastKeyword(self: *Self, len: usize) void {
-        self.scanner.cursor += @min(len, self.input.len - self.scanner.cursor);
-    }
-
     /// Peek at the next token without consuming it
     pub fn peekToken(self: *Self) ParserError!Token {
         if (use_simdjzon) {
             const saved_tape_idx = self.tape_idx;
-            const saved_cursor = self.scanner.cursor;
             const token = self.nextToken() catch |e| return e;
             self.tape_idx = saved_tape_idx;
-            self.scanner.cursor = saved_cursor;
             return token;
         } else {
             const state = self.scanner;
@@ -389,16 +309,7 @@ pub const JsonParser = struct {
     }
 
     /// Skip current value (object, array, or primitive)
-    /// Returns the raw bytes of the skipped value in the input
-    pub fn skipValue(self: *Self) ParserError![]const u8 {
-        const start_cursor = self.scanner.cursor;
-        try self.skipValueInternal();
-        const end_cursor = self.scanner.cursor;
-        return self.input[start_cursor..end_cursor];
-    }
-
-    /// Skip a value without returning the bytes
-    fn skipValueInternal(self: *Self) ParserError!void {
+    pub fn skipValue(self: *Self) ParserError!void {
         const token = try self.nextToken();
         switch (token) {
             .object_begin => {
@@ -428,20 +339,12 @@ pub const JsonParser = struct {
         }
     }
 
-    /// Get raw value bytes from current position
-    /// Captures the JSON substring for complex values
-    pub fn captureRawValue(self: *Self) ParserError![]const u8 {
-        return self.skipValue();
-    }
-
     /// Check if at end of current object
     pub fn isObjectEnd(self: *Self) bool {
         if (use_simdjzon) {
             const saved_tape_idx = self.tape_idx;
-            const saved_cursor = self.scanner.cursor;
             const token = self.nextToken() catch return true;
             self.tape_idx = saved_tape_idx;
-            self.scanner.cursor = saved_cursor;
             return token == .object_end;
         } else {
             const state = self.scanner;
@@ -455,10 +358,8 @@ pub const JsonParser = struct {
     pub fn isArrayEnd(self: *Self) bool {
         if (use_simdjzon) {
             const saved_tape_idx = self.tape_idx;
-            const saved_cursor = self.scanner.cursor;
             const token = self.nextToken() catch return true;
             self.tape_idx = saved_tape_idx;
-            self.scanner.cursor = saved_cursor;
             return token == .array_end;
         } else {
             const state = self.scanner;
@@ -532,7 +433,7 @@ test "JsonParser skipValue for object" {
     // Field 2: complex - skip it
     const field2 = try parser.expectFieldName();
     try std.testing.expectEqualStrings("complex", field2);
-    _ = try parser.skipValue();
+    try parser.skipValue();
 
     // Field 3: after - should be accessible after skip
     const field3 = try parser.expectFieldName();
