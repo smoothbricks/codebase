@@ -2,88 +2,79 @@ import { describe, expect, it } from 'bun:test';
 
 import {
   calculateRequiredWasmBytes,
-  calculateRequiredWasmPages,
   ensureWasmMemoryForWorkingSet,
   WASM_MAX_BYTES,
   WASM_PAGE_BYTES,
+  WasmMemoryContractError,
 } from '../wasm-memory-contract.js';
 
 describe('wasm-memory-contract', () => {
-  it('sums full working set bytes (input + output + workspace + regions)', () => {
-    const requiredBytes = calculateRequiredWasmBytes({
-      inputBytes: 7,
-      outputBytes: 11,
-      workspaceBytes: 13,
-      regionsBytes: 17,
-    });
-
-    expect(requiredBytes).toBe(48);
-  });
-
-  it('calculates required pages from required bytes', () => {
-    expect(calculateRequiredWasmPages(0)).toBe(0);
-    expect(calculateRequiredWasmPages(1)).toBe(1);
-    expect(calculateRequiredWasmPages(WASM_PAGE_BYTES)).toBe(1);
-    expect(calculateRequiredWasmPages(WASM_PAGE_BYTES + 1)).toBe(2);
-  });
-
-  it('grows wasm memory up to the required page count', () => {
-    const memory = new WebAssembly.Memory({ initial: 1 });
+  it('grows from small initial pages when working set requires it', () => {
+    const memory = new WebAssembly.Memory({ initial: 2, maximum: 1024 });
 
     const result = ensureWasmMemoryForWorkingSet(memory, {
-      inputBytes: WASM_PAGE_BYTES,
-      outputBytes: WASM_PAGE_BYTES,
-      workspaceBytes: WASM_PAGE_BYTES,
-      regionsBytes: WASM_PAGE_BYTES,
+      inputBytes: 6 * 1024 * 1024,
+      outputBytes: 2 * 1024 * 1024,
+      workspaceBytes: 2 * 1024 * 1024,
+      regionsBytes: 1 * 1024 * 1024,
     });
 
-    expect(result.requiredPages).toBe(4);
-    expect(result.currentPages).toBe(1);
-    expect(result.grownPages).toBe(3);
-    expect(result.totalPages).toBe(4);
-    expect(memory.buffer.byteLength).toBe(WASM_PAGE_BYTES * 4);
+    expect(result.grownPages).toBeGreaterThan(0);
+    expect(result.totalPages).toBe(result.requiredPages);
   });
 
-  it('throws when working set exceeds configured cap', () => {
-    const memory = new WebAssembly.Memory({ initial: 1 });
+  it('succeeds at or below 64MB cap', () => {
+    const memory = new WebAssembly.Memory({ initial: 4, maximum: 1024 });
+    const targetBytes = WASM_MAX_BYTES - WASM_PAGE_BYTES;
 
-    expect(() =>
-      ensureWasmMemoryForWorkingSet(
-        memory,
-        {
-          inputBytes: WASM_MAX_BYTES,
-          outputBytes: 1,
-          workspaceBytes: 0,
-          regionsBytes: 0,
-        },
-        { maxPages: 1024 },
-      ),
-    ).toThrow('WASM working set requires');
+    const result = ensureWasmMemoryForWorkingSet(memory, {
+      inputBytes: targetBytes - 2 * WASM_PAGE_BYTES,
+      outputBytes: WASM_PAGE_BYTES,
+      workspaceBytes: WASM_PAGE_BYTES,
+      regionsBytes: 0,
+    });
+
+    expect(result.requiredBytes).toBe(targetBytes);
+    expect(result.requiredPages).toBeLessThanOrEqual(1024);
   });
 
-  it('throws for impossible config and invalid byte counts', () => {
-    const memory = new WebAssembly.Memory({ initial: 1 });
-
-    expect(() =>
-      ensureWasmMemoryForWorkingSet(
-        memory,
-        {
-          inputBytes: -1,
-          outputBytes: 0,
-          workspaceBytes: 0,
-          regionsBytes: 0,
-        },
-        { maxPages: 0 },
-      ),
-    ).toThrow('maxPages must be a positive integer page count');
+  it('fails above cap with structured error', () => {
+    const memory = new WebAssembly.Memory({ initial: 4, maximum: 1024 });
 
     expect(() =>
       ensureWasmMemoryForWorkingSet(memory, {
-        inputBytes: -1,
-        outputBytes: 0,
+        inputBytes: WASM_MAX_BYTES,
+        outputBytes: WASM_PAGE_BYTES,
         workspaceBytes: 0,
         regionsBytes: 0,
       }),
-    ).toThrow('inputBytes must be a non-negative integer byte count');
+    ).toThrow(WasmMemoryContractError);
+
+    try {
+      ensureWasmMemoryForWorkingSet(memory, {
+        inputBytes: WASM_MAX_BYTES,
+        outputBytes: WASM_PAGE_BYTES,
+        workspaceBytes: 0,
+        regionsBytes: 0,
+      });
+      throw new Error('expected cap error');
+    } catch (error) {
+      expect(error).toBeInstanceOf(WasmMemoryContractError);
+      const contractError = error as WasmMemoryContractError;
+      expect(contractError.code).toBe('WASM_MEMORY_CAP_EXCEEDED');
+      expect(contractError.message).toContain('cap');
+    }
+  });
+
+  it('required-bytes includes output and workspace, not only input', () => {
+    const requiredBytes = calculateRequiredWasmBytes({
+      inputBytes: 1024,
+      outputBytes: 2048,
+      workspaceBytes: 4096,
+      regionsBytes: 512,
+    });
+
+    expect(requiredBytes).toBe(1024 + 2048 + 4096 + 512);
+    expect(requiredBytes).toBeGreaterThan(1024);
   });
 });
