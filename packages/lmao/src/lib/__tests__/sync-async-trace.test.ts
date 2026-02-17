@@ -5,7 +5,7 @@
  * writing span-ok or span-exception entries at the correct time (immediately for sync,
  * after Promise resolution for async).
  *
- * Per specs/01_trace_logging_system.md and tracer.ts implementation:
+ * Per specs/lmao/01_trace_logging_system.md and tracer.ts implementation:
  * - Sync functions: span-ok/span-exception written immediately after execution
  * - Async functions: span-ok/span-exception written after Promise resolves/rejects
  */

@@ -1,7 +1,7 @@
 /**
  * System schema - base columns that all modules inherit
  *
- * Per specs/01h_entry_types_and_logging_primitives.md and 01f_arrow_table_structure.md:
+ * Per specs/lmao/01h_entry_types_and_logging_primitives.md and 01f_arrow_table_structure.md:
  * - These columns are available in all traces regardless of user schema
  * - The `message` column is UNIFIED for span names, log message templates, exception messages, result messages, and feature flag names
  */
@@ -75,7 +75,7 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
   /**
    * Unified message column - serves different purposes based on entry type.
    *
-   * Per specs/01h_entry_types_and_logging_primitives.md:
+   * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
    * - span-start, span-ok, span-err: Span name (e.g., 'create-user')
    * - span-exception: Exception message (e.g., 'Connection timeout')
    * - info, debug, warn, error, trace: Log message TEMPLATE (e.g., 'User ${userId} created')
@@ -99,7 +99,7 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
   /**
    * Source code line number for this entry.
    *
-   * Per specs/01c_context_flow_and_op_wrappers.md "Line Number System":
+   * Per specs/lmao/01c_context_flow_and_op_wrappers.md "Line Number System":
    * - Uint16 column (max 65535 lines per file)
    * - TypeScript transformer injects line numbers at compile time
    * - No runtime overhead - just a method call with literal number
@@ -122,7 +122,7 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
   /**
    * uint64 value column for metrics and user .uint64() API.
    *
-   * Per specs/01f_arrow_table_structure.md:
+   * Per specs/lmao/01f_arrow_table_structure.md:
    * - Metric values (counts, durations in nanoseconds)
    * - User large integers via .uint64() fluent method
    * - Sparse data (only rows that need uint64)
@@ -196,7 +196,7 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
 // =============================================================================
 // Entry Type Constants
 // =============================================================================
-// Per specs/01h_entry_types_and_logging_primitives.md
+// Per specs/lmao/01h_entry_types_and_logging_primitives.md
 // Stored in Uint8Array for 1-byte storage per entry.
 // Ordered by frequency/importance:
 // 1-4: Span lifecycle (most common - every span has start + end)
@@ -248,7 +248,7 @@ export const ENTRY_TYPE_FF_USAGE = 12;
 export const ENTRY_TYPE_PERIOD_START = 13;
 
 // =============================================================================
-// Op Metrics (per specs/01n_op_and_buffer_metrics.md)
+// Op Metrics (per specs/lmao/01n_op_and_buffer_metrics.md)
 // =============================================================================
 
 /** Op invocations counter - total calls to this operation */

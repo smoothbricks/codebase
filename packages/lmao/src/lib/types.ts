@@ -39,7 +39,7 @@ export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
 /**
  * AnySpanBuffer - Core buffer API for Arrow conversion and generic processing.
  *
- * Per specs/01b5_spanbuffer_memory_layout.md:
+ * Per specs/lmao/01b5_spanbuffer_memory_layout.md:
  * SpanBuffer is the per-span columnar storage that holds all trace data for a single span.
  * It uses cache-aligned TypedArrays for V8 optimization and zero-copy Arrow conversion.
  *
@@ -49,7 +49,7 @@ export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
  * - Tree walking (traverseSpanTree)
  * - Generic buffer processing utilities
  *
- * ## Memory Layout (per specs/01b5)
+ * ## Memory Layout (per specs/lmao/01b5)
  *
  * ```
  * _system ArrayBuffer (64-byte aligned):
@@ -64,7 +64,7 @@ export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
  * └─ parent_span_id: bytes 36-39 (32-bit counter, 0 if root)
  * ```
  *
- * ## Fixed Row Layout (per specs/01h)
+ * ## Fixed Row Layout (per specs/lmao/01h)
  *
  * - Row 0: span-start (written by writeSpanStart)
  * - Row 1: span-end (span-ok, span-err, or span-exception)
@@ -74,7 +74,7 @@ export type { AnyColumnBuffer, ColumnBuffer, ColumnValueType, TypedArray };
  */
 export interface AnySpanBuffer extends AnyColumnBuffer {
   // ===========================================================================
-  // System Memory (cache-aligned, per specs/01b1)
+  // System Memory (cache-aligned, per specs/lmao/01b1)
   // ===========================================================================
 
   /**
@@ -90,13 +90,13 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   readonly _identity: Uint8Array;
 
   // ===========================================================================
-  // System Columns (always eager, never lazy - per specs/01b6)
+  // System Columns (always eager, never lazy - per specs/lmao/01b6)
   // ===========================================================================
 
   /**
    * Nanosecond timestamps for each entry (BigInt64Array).
    *
-   * Per specs/01b3_high_precision_timestamps.md:
+   * Per specs/lmao/01b3_high_precision_timestamps.md:
    * - Uses performance.now() anchored to epoch for nanosecond precision
    * - Row 0: span-start timestamp
    * - Row 1: span-end timestamp (ok/err/exception)
@@ -107,7 +107,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   /**
    * Entry type enum for each row (Uint8Array, 1 byte per entry).
    *
-   * Per specs/01h_entry_types_and_logging_primitives.md:
+   * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
    * Values are ENTRY_TYPE_* constants (span-start=1, span-ok=2, etc.)
    */
   readonly entry_type: Uint8Array;
@@ -124,13 +124,13 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
 
   /**
    * Maximum number of rows this buffer can hold.
-   * Per specs/01b2_buffer_self_tuning.md: Capacity adapts based on workload.
+   * Per specs/lmao/01b2_buffer_self_tuning.md: Capacity adapts based on workload.
    */
   readonly _capacity: number;
 
   /**
    * Next buffer in overflow chain (created when _writeIndex >= _capacity).
-   * Per specs/01b2: Buffers chain rather than resize for predictable allocation.
+   * Per specs/lmao/01b2: Buffers chain rather than resize for predictable allocation.
    */
   _overflow?: AnySpanBuffer;
 
@@ -140,19 +140,19 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
 
   /**
    * Span ID - 32-bit counter unique within this trace.
-   * Per specs/01b4_span_identity.md: Monotonic counter, not globally unique.
+   * Per specs/lmao/01b4_span_identity.md: Monotonic counter, not globally unique.
    */
   readonly span_id: number;
 
   /**
    * Thread ID - 64-bit identifier for this execution thread/context.
-   * Per specs/01b4: Combines worker ID + sequence for uniqueness.
+   * Per specs/lmao/01b4: Combines worker ID + sequence for uniqueness.
    */
   readonly thread_id: bigint;
 
   /**
    * Trace ID - 128-bit UUID identifying the entire trace.
-   * Per specs/01b4: Propagated to all child spans and buffers.
+   * Per specs/lmao/01b4: Propagated to all child spans and buffers.
    */
   readonly trace_id: TraceId;
 
@@ -205,7 +205,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
 
   /**
    * Child spans created via ctx.span().
-   * Per specs/01c: Parent-child relationship for trace tree.
+   * Per specs/lmao/01c: Parent-child relationship for trace tree.
    */
   _children: AnySpanBuffer[];
 
@@ -227,7 +227,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
 
   /**
    * Op metadata for this span - identifies WHICH OP IS EXECUTING.
-   * Per specs/01j and opgroup-refactor.md:
+   * Per specs/lmao/01j and opgroup-refactor.md:
    * - Used for rows 1+ (log entries, tags, span-ok/err) attribution
    * - For Op calls: set to op.metadata
    * - For plain functions: inherited from parent's _opMetadata
@@ -238,14 +238,14 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   /**
    * Callsite metadata - where ctx.span() was called from.
    * Different from _opMetadata when calling into another op.
-   * Per specs/01j: Row 0 gets callsite, rows 1+ get op metadata.
+   * Per specs/lmao/01j: Row 0 gets callsite, rows 1+ get op metadata.
    */
   _callsiteMetadata?: OpMetadata;
 
   /**
    * Scoped attribute values - inherited by child spans.
    *
-   * Per specs/01i_span_scope_attributes.md:
+   * Per specs/lmao/01i_span_scope_attributes.md:
    * - Frozen object (never mutated, replaced on setScope)
    * - Child spans inherit by reference (safe because frozen)
    * - Applied to all rows at Arrow conversion via TypedArray.fill()
@@ -253,7 +253,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   _scopeValues: Readonly<Record<string, unknown>>;
 
   // ===========================================================================
-  // System Column Arrays (per specs/01h - known system schema fields)
+  // System Column Arrays (per specs/lmao/01h - known system schema fields)
   // These are explicitly typed here since they're always present from systemSchema.
   // ===========================================================================
 
@@ -296,7 +296,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   readonly uint64_value_nulls: Uint8Array;
 
   // ===========================================================================
-  // System Column Setters (per specs/01h - always eager)
+  // System Column Setters (per specs/lmao/01h - always eager)
   // ===========================================================================
 
   /**
@@ -307,7 +307,7 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
 
   /**
    * Set source line number for a row.
-   * Per specs/01o: Injected by transformer at compile time.
+   * Per specs/lmao/01o: Injected by transformer at compile time.
    */
   line(pos: number, val: number): AnySpanBuffer;
 

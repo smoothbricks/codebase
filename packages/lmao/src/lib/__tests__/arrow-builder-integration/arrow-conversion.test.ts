@@ -1,7 +1,7 @@
 /**
  * Tests for Arrow table conversion
  *
- * Per specs/01f_arrow_table_structure.md and 01b_columnar_buffer_architecture.md:
+ * Per specs/lmao/01f_arrow_table_structure.md and 01b_columnar_buffer_architecture.md:
  * - Zero-copy conversion from SpanBuffer to Arrow
  * - Null bitmap handling
  * - String type conversion (enum/category/text)

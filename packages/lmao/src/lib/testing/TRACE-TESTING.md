@@ -74,7 +74,7 @@ expect(facts.hasMatch('span:*: err(*)')).toBe(false);
 
 ## Buffer Layout (Why This Works)
 
-Per `specs/01h_entry_types_and_logging_primitives.md`:
+Per `specs/lmao/01h_entry_types_and_logging_primitives.md`:
 
 - **Row 0**: `span-start` + tag writes (`ctx.tag.*` overwrites here)
 - **Row 1**: Completion (`span-ok`/`span-err`/`span-exception`)

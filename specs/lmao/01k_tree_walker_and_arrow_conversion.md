@@ -905,5 +905,5 @@ This specification integrates with:
 
 - **Implementation**: `/packages/lmao/src/lib/convertToArrow.ts`
 - **Buffer types**: `/packages/arrow-builder/src/lib/buffer/types.ts`
-- **Package architecture**: `/specs/00_package_architecture.md`
-- **Arrow table structure**: `/specs/01f_arrow_table_structure.md`
+- **Package architecture**: `/specs/lmao/00_package_architecture.md`
+- **Arrow table structure**: `/specs/lmao/01f_arrow_table_structure.md`

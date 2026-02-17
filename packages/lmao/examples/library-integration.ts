@@ -1,7 +1,7 @@
 /**
  * Example: IDEAL Library Integration Pattern
  *
- * Per specs/01e_library_integration_pattern.md:
+ * Per specs/lmao/01e_library_integration_pattern.md:
  * - Libraries define clean schemas without prefixes
  * - Libraries declare dependencies via `deps: { otherLib: otherModule }`
  * - Dependencies are automatically wired through use()

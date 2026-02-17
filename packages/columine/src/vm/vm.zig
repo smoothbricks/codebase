@@ -166,7 +166,7 @@ pub const ChangeFlag = struct {
 // =============================================================================
 //
 // TTL is a FLAG on any slot type, not a separate type. This avoids explosion
-// of//
+//
 // SlotTypeFlags byte layout:
 // ┌─────────────────────────────────────┐
 // │ 7 │ 6 │ 5 │ 4 │ 3 │ 2 │ 1 │ 0 │

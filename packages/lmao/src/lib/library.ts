@@ -7,7 +7,7 @@
  * HOW: At composition time (cold path), we generate a remapped SpanLogger class
  * that exposes clean method names but writes to prefixed buffer columns.
  *
- * Per specs/01e_library_integration_pattern.md:
+ * Per specs/lmao/01e_library_integration_pattern.md:
  * - Libraries define clean schemas without prefixes (status, method, url)
  * - Prefixing happens at composition time (http_status, http_method, http_url)
  * - Zero hot path overhead - all remapping done via code generation at module creation
@@ -154,7 +154,7 @@ function createSchemaAndMappingCacheKey(schema: LogSchema, mapping: Record<strin
  * - Passes through identity properties (traceId, spanId, etc.)
  * - Remaps getColumnIfAllocated() and getNullsIfAllocated() from prefixed→unprefixed
  *
- * Per specs/01e_library_integration_pattern.md:
+ * Per specs/lmao/01e_library_integration_pattern.md:
  * - Hot path: Library writes directly to unprefixed columns (zero overhead)
  * - Cold path: Arrow conversion uses RemappedBufferView to access via prefixed names
  *

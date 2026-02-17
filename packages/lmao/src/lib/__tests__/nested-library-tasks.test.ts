@@ -1,12 +1,12 @@
 /**
  * Tests for nested library tasks with prefix remapping
  *
- * Per specs/01e_library_integration_pattern.md:
+ * Per specs/lmao/01e_library_integration_pattern.md:
  * - Libraries define clean schemas (status, method)
  * - Prefixes applied at composition time (http_status, http_method)
  * - Library code writes to clean names, stored in prefixed columns
  *
- * Per specs/01k_tree_walker_and_arrow_conversion.md:
+ * Per specs/lmao/01k_tree_walker_and_arrow_conversion.md:
  * - Tree traversal visits all buffers including children
  * - Arrow conversion uses shared dictionaries across all buffers
  *
@@ -256,7 +256,7 @@ describe('Nested Library Tasks', () => {
     /**
      * Test scenario: App -> HTTP lib op -> DB lib op -> Cache lib op -> Auth lib op
      *
-     * Per specs/01e_library_integration_pattern.md:
+     * Per specs/lmao/01e_library_integration_pattern.md:
      * - Each library defines its OWN schema with clean names (status, query, key, userId)
      * - Libraries are composed via deps with .prefix() for namespacing
      * - Effective schema has prefixed columns (http_status, db_query, cache_key, auth_userId)
@@ -554,7 +554,7 @@ describe('Nested Library Tasks', () => {
 
   describe('Column isolation test (same column name with different prefixes)', () => {
     /**
-     * Per specs/01e_library_integration_pattern.md:
+     * Per specs/lmao/01e_library_integration_pattern.md:
      * - Multiple libraries can define the same attribute name
      * - Prefixes resolve to different columns (http_status, db_status)
      * - No collision, correct data in Arrow output
@@ -632,7 +632,7 @@ describe('Nested Library Tasks', () => {
 
   describe('Tree traversal verification (walkSpanTree)', () => {
     /**
-     * Per specs/01k_tree_walker_and_arrow_conversion.md:
+     * Per specs/lmao/01k_tree_walker_and_arrow_conversion.md:
      * - walkSpanTree visits all buffers including children
      * - Visits overflow chains (buffer._overflow)
      * - Depth-first pre-order traversal
@@ -751,7 +751,7 @@ describe('Nested Library Tasks', () => {
       const rows = extractRows(table, ['entry_type', 'message', 'order']);
       const spanStarts = rows.filter((r) => r?.entry_type === 'span-start');
 
-      // Per specs/01k - depth-first pre-order: parent before children
+      // Per specs/lmao/01k - depth-first pre-order: parent before children
       // Order should be: root(1), middle(2), deep(3)
       expect(spanStarts[0]?.order).toBe(1); // root
       expect(spanStarts[0]?.message).toBe('root');
@@ -766,7 +766,7 @@ describe('Nested Library Tasks', () => {
 
   describe('Scope inheritance across nested library tasks', () => {
     /**
-     * Per specs/01i_span_scope_attributes.md:
+     * Per specs/lmao/01i_span_scope_attributes.md:
      * - Scoped attributes propagate to child spans
      * - Child spans inherit parent's scoped attributes
      */

@@ -139,7 +139,7 @@ describe('null bitmap correctness', () => {
 
   describe('log message writes (arbitrary index)', () => {
     it('should NOT set null bitmap during info() - scope filling is deferred to Arrow conversion', () => {
-      // Per specs/01i_span_scope_attributes.md:
+      // Per specs/lmao/01i_span_scope_attributes.md:
       // - Scope values are stored in buffer._scopeValues as a plain object
       // - Scope filling happens at Arrow conversion time, NOT during span execution
       // - This is because scope values are "defaults" that fill null slots

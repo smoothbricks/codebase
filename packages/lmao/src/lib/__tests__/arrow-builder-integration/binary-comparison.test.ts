@@ -6,7 +6,7 @@
  * 2. Deserialized back to identical data
  * 3. Read by any Arrow-compatible tool
  *
- * Per specs/01f_arrow_table_structure.md and 01b_columnar_buffer_architecture.md:
+ * Per specs/lmao/01f_arrow_table_structure.md and 01b_columnar_buffer_architecture.md:
  * - Zero-copy conversion MUST produce correct Arrow format
  * - Dictionary encoding MUST work correctly
  * - Null bitmaps MUST use Arrow format (1=valid, 0=null)

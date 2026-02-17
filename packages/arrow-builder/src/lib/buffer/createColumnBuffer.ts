@@ -1,7 +1,7 @@
 /**
  * Create ColumnBuffer with native TypedArrays
  *
- * Per specs/01b_columnar_buffer_architecture.md and 01b1_buffer_performance_optimizations.md:
+ * Per specs/lmao/01b_columnar_buffer_architecture.md and 01b1_buffer_performance_optimizations.md:
  * - Cache-aligned TypedArrays (64-byte boundaries)
  * - Direct properties for zero-indirection access (no lazy getters)
  * - ${name}_nulls and ${name}_values share ONE ArrayBuffer per column
@@ -23,7 +23,7 @@ import { DEFAULT_BUFFER_CAPACITY } from './types.js';
  * This is the generic buffer creation function that arrow-builder exports.
  * It knows nothing about application-specific concepts.
  *
- * Per specs/01b1_buffer_performance_optimizations.md:
+ * Per specs/lmao/01b1_buffer_performance_optimizations.md:
  * - Uses runtime-generated class with direct properties
  * - Zero indirection: ${name}_nulls and ${name}_values are direct properties
  * - Shared ArrayBuffer: nulls and values use same buffer (cache-aligned)

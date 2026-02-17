@@ -110,7 +110,7 @@ export function generateTraceId(): TraceId {
  * - `span_id`: 32-bit counter unique within the trace
  * - `thread_id`: 64-bit identifier for execution thread/context
  *
- * @see specs/01b4_span_identity.md for full identity design
+ * @see specs/lmao/01b4_span_identity.md for full identity design
  */
 export interface SpanIdentity {
   /** Trace ID - 128-bit UUID identifying the entire trace */

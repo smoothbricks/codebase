@@ -1,7 +1,7 @@
 /**
  * Tests for span scope attributes
  *
- * Per specs/01i_span_scope_attributes.md:
+ * Per specs/lmao/01i_span_scope_attributes.md:
  * - Scope attributes set at span level propagate to all child entries
  * - Child spans inherit parent's scoped attributes
  * - Tasks inherit scoped attributes from calling context

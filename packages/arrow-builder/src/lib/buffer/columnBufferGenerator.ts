@@ -1,7 +1,7 @@
 /**
  * Runtime code generation for ColumnBuffer classes with zero-indirection column access.
  *
- * Per specs/01b1_buffer_performance_optimizations.md:
+ * Per specs/lmao/01b1_buffer_performance_optimizations.md:
  * - Generate concrete class at module initialization time (cold path)
  * - Direct properties for each column (no lazy getters, no wrapper objects)
  * - ${name}_nulls and ${name}_values share ONE ArrayBuffer per column

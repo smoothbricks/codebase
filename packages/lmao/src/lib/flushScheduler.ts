@@ -1,7 +1,7 @@
 /**
  * Background flush scheduler with adaptive flushing
  *
- * Per specs/01b2_buffer_self_tuning.md:
+ * Per specs/lmao/01b2_buffer_self_tuning.md:
  * - Adaptive flush intervals based on capacity, time, memory pressure
  * - Idle detection for opportunistic flushing
  * - Background processing (cold path)

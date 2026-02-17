@@ -77,7 +77,7 @@ inline fn getSystemWriteIndexOffset() u32 {
 }
 
 // =============================================================================
-// Entry Type Constants (per specs/01h and systemSchema.ts)
+// Entry Type Constants (per specs/lmao/01h and systemSchema.ts)
 // =============================================================================
 
 const ENTRY_TYPE_SPAN_START: u8 = 1;

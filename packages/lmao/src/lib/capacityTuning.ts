@@ -1,7 +1,7 @@
 /**
  * Capacity Tuning - Self-tuning buffer capacity based on utilization
  *
- * Per specs/01b2_buffer_self_tuning.md:
+ * Per specs/lmao/01b2_buffer_self_tuning.md:
  * - Track row utilization = totalWrites / (spansCreated * usableRowsPerSpan)
  * - Increase capacity if utilization > 150% (regularly overflowing)
  * - Decrease capacity if utilization < 50% (wasting space)

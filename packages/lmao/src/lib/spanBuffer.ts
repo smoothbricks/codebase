@@ -2,7 +2,7 @@
  * SpanBuffer - Unified memory layout for trace logging
  *
  * This module implements the unified SpanBuffer design from
- * specs/01b_columnar_buffer_architecture.md "Unified SpanBuffer Memory Layout"
+ * specs/lmao/01b_columnar_buffer_architecture.md "Unified SpanBuffer Memory Layout"
  *
  * **Memory Layout**
  *

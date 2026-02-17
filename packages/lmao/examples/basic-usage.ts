@@ -17,7 +17,7 @@
 import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
 
 // 1. Define tag attributes for your domain
-// Using the three string types per specs/01a_trace_schema_system.md:
+// Using the three string types per specs/lmao/01a_trace_schema_system.md:
 // - S.enum: Known values at compile time (Uint8Array, 1 byte)
 // - S.category: Values that often repeat (Uint32Array with string interning)
 // - S.text: Unique values (no dictionary overhead)

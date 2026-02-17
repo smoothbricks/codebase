@@ -1,7 +1,7 @@
 /**
  * Tracer - Abstract base class for trace collection
  *
- * Per specs/01c_context_flow_and_op_wrappers.md:
+ * Per specs/lmao/01c_context_flow_and_op_wrappers.md:
  * - Tracer owns trace() function for creating root spans
  * - Collects SpanBuffers in pendingBuffers array
  * - Subclasses implement flush() to define persistence strategy
@@ -141,7 +141,7 @@ export type TraceOverrides<UserCtx> = [UserCtx] extends [Record<string, never>]
 /**
  * TraceFn - overloaded trace creation function.
  *
- * Per specs/01c_context_flow_and_op_wrappers.md:
+ * Per specs/lmao/01c_context_flow_and_op_wrappers.md:
  * Creates root spans with type-safe Op invocation or inline closures.
  * Mirrors SpanFn but for root traces.
  *

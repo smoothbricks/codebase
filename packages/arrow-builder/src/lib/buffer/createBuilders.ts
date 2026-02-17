@@ -2,7 +2,7 @@
  * Create TypedArray columns for attribute columns based on schema
  *
  * This maps Sury schema types to appropriate storage per
- * specs/01b_columnar_buffer_architecture.md:
+ * specs/lmao/01b_columnar_buffer_architecture.md:
  * - enum → Uint8/Uint16/Uint32Array (size based on enum value count)
  * - category → string[] (raw strings, dictionary built at Arrow conversion)
  * - text → string[] (raw strings, no dictionary)
@@ -38,7 +38,7 @@ export function createAttributeColumns(
 /**
  * Create appropriate TypedArray for a Sury schema
  *
- * STRING TYPE SYSTEM (See specs/01a_trace_schema_system.md):
+ * STRING TYPE SYSTEM (See specs/lmao/01a_trace_schema_system.md):
  * - enum: Uint8/16/32Array (size based on enum value count: <256=8bit, <65536=16bit, else 32bit)
  * - category: string[] (raw strings, dictionary built at Arrow conversion)
  * - text: string[] (raw strings, no dictionary)

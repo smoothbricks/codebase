@@ -1,7 +1,7 @@
 /**
  * Runtime code generation for SpanLogger classes
  *
- * Per specs/01g_trace_context_api_codegen.md and 01j_module_context_and_spanlogger_generation.md:
+ * Per specs/lmao/01g_trace_context_api_codegen.md and 01j_module_context_and_spanlogger_generation.md:
  * - SpanLogger extends ColumnWriter from arrow-builder via codegen extension
  * - Handles log entries (rows 2+) - tag writing is in TagWriter (row 0)
  * - Uses _nextRow() to advance position, then fluent setters write at _writeIndex
@@ -258,7 +258,7 @@ function generateEnumFluentSetters(enumFieldNames: Set<string>): string {
 /**
  * Generate _setScope() method code - IMMUTABLE scope semantics
  *
- * Per specs/01i_span_scope_attributes.md:
+ * Per specs/lmao/01i_span_scope_attributes.md:
  * - Creates NEW frozen object (never mutates existing)
  * - Merge semantics: new values merge with existing
  * - null clears a key, undefined is ignored

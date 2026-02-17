@@ -6,7 +6,7 @@
  * - Business logic ops inherit scoped attributes
  * - Zero repetition of context attributes
  *
- * Per specs/01i_span_scope_attributes.md - Middleware Pattern
+ * Per specs/lmao/01i_span_scope_attributes.md - Middleware Pattern
  */
 
 import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';

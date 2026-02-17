@@ -24,7 +24,7 @@ import {
 // 1. Define Tag Attributes
 // ====================
 
-// Using the three string types per specs/01a_trace_schema_system.md:
+// Using the three string types per specs/lmao/01a_trace_schema_system.md:
 // - S.enum(): Known values at compile time -> Uint8Array (1 byte)
 // - S.category(): Values that repeat -> Uint32Array with string interning
 // - S.text(): Unique values -> Uint32Array without interning
@@ -134,7 +134,7 @@ const createOrder = orderModule.task(
     },
   ) => {
     // Set request-level scoped attributes
-    // Per specs/01i - these propagate to all child operations
+    // Per specs/lmao/01i - these propagate to all child operations
     ctx.setScope({
       userId: orderData.userId,
       requestId: ctx.requestId,

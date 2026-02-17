@@ -72,7 +72,7 @@ function createSchemaWithFlagBuilder<T>(schema: Sury.Schema<T, unknown>): Schema
  * - Full TypeScript inference
  * - Runtime transformations
  *
- * STRING TYPE SYSTEM (See specs/01a_trace_schema_system.md):
+ * STRING TYPE SYSTEM (See specs/lmao/01a_trace_schema_system.md):
  * Three distinct string types, each with different storage strategies:
  * - S.enum(['A', 'B', 'C']) - Known values at compile time (Uint8Array, 1 byte)
  * - S.category() - Repeated values (raw string storage, dictionary built at Arrow conversion)

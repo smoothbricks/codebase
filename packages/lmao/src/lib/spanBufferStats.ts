@@ -4,7 +4,7 @@
  * Mutable stats shared across all SpanBuffer instances from the same defineOpContext.
  * Stored as a static property on the generated SpanBuffer class for optimal memory usage.
  *
- * Per specs/01b2_buffer_self_tuning.md:
+ * Per specs/lmao/01b2_buffer_self_tuning.md:
  * - Track row utilization = totalWrites / (spansCreated * usableRowsPerSpan)
  * - Capacity grows when utilization > 150% (regularly overflowing)
  * - Capacity shrinks when utilization < 50% with enough spans (wasting space)

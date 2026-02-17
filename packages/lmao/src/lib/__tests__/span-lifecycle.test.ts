@@ -1,6 +1,6 @@
 /**
  * Tests for span lifecycle entry types and fluent result API
- * Per specs/01h_entry_types_and_logging_primitives.md
+ * Per specs/lmao/01h_entry_types_and_logging_primitives.md
  */
 
 import { describe, expect, it } from 'bun:test';
@@ -423,7 +423,7 @@ describe('FluentResult Type Compatibility', () => {
 
 /**
  * Tests for fixed row layout in span buffers
- * Per specs/01h_entry_types_and_logging_primitives.md:
+ * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
  * - Row 0: span-start (written at span creation)
  * - Row 1: span-end (pre-initialized as exception, overwritten by ok/err)
  * - Row 2+: events (ctx.log.* appends here)
@@ -525,7 +525,7 @@ describe('Fixed Row Layout', () => {
   });
 
   it('should export entry type constants for use in tests and consumers', () => {
-    // Per specs/01h_entry_types_and_logging_primitives.md
+    // Per specs/lmao/01h_entry_types_and_logging_primitives.md
     // Just verify the constants are exported and are numbers
     expect(typeof ENTRY_TYPE_SPAN_START).toBe('number');
     expect(typeof ENTRY_TYPE_SPAN_OK).toBe('number');

@@ -161,7 +161,7 @@ function walkBuffer<T extends LogSchema>(
     }
   }
 
-  // Buffer layout per specs/01h_entry_types_and_logging_primitives.md:
+  // Buffer layout per specs/lmao/01h_entry_types_and_logging_primitives.md:
   // - Row 0: span-start (tags overwrite this row's attribute columns)
   // - Row 1: span-ok/err/exception (completion status)
   // - Row 2+: log entries (info/debug/warn/error), ff entries

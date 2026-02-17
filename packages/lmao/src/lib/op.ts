@@ -7,7 +7,7 @@
  * Wraps a user function with automatic span tracking.
  * Created by defineOp() from the Op-centric API (defineOpContext).
  *
- * Per specs/01l_op_context_pattern.md and specs/01c_context_flow_and_op_wrappers.md:
+ * Per specs/lmao/01l_op_context_pattern.md and specs/lmao/01c_context_flow_and_op_wrappers.md:
  * - Captures OpMetadata for attribution (package_name, package_file, git_sha, line)
  * - fn is called by span_op() after span_op creates the SpanBuffer/SpanContext
  * - Op name is used for metrics tracking (separate from span names)

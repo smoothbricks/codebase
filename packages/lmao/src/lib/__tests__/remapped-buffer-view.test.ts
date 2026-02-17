@@ -2,7 +2,7 @@
  * Tests for RemappedBufferView - the view that maps prefixed column names
  * to unprefixed column names for tree traversal during Arrow conversion.
  *
- * Per specs/01e_library_integration_pattern.md:
+ * Per specs/lmao/01e_library_integration_pattern.md:
  * - Libraries write to unprefixed columns (status, method)
  * - Arrow conversion accesses via prefixed names (http_status, http_method)
  * - RemappedBufferView bridges this gap for tree traversal

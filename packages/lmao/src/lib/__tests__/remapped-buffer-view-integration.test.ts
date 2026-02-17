@@ -1,7 +1,7 @@
 /**
  * Integration tests for RemappedBufferView registration with prefixed modules
  *
- * Per specs/01e_library_integration_pattern.md and 01c_context_flow_and_op_wrappers.md:
+ * Per specs/lmao/01e_library_integration_pattern.md and 01c_context_flow_and_op_wrappers.md:
  * - RemappedBufferView class is generated once when prefix() is called (cold path)
  * - Op._invoke() creates instances when registering child spans with parent buffers
  * - Root spans don't create RemappedBufferView (no parent to register with)

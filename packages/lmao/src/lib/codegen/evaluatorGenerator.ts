@@ -1,7 +1,7 @@
 /**
  * Runtime code generation for FeatureFlagEvaluator classes
  *
- * Per specs/01g_trace_context_api_codegen.md:
+ * Per specs/lmao/01g_trace_context_api_codegen.md:
  * - Uses new Function() to generate optimized classes at schema definition time (cold path)
  * - Getter properties for each flag enable V8 hidden class optimization
  * - No Proxy overhead - direct property access with inline caching

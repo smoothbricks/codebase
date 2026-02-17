@@ -199,7 +199,7 @@ export interface SchemaBuilder {
   number(): SchemaOrFlagBuilder<number>;
   boolean(): SchemaOrFlagBuilder<boolean>;
 
-  // String types - THREE DISTINCT TYPES per specs/01a_trace_schema_system.md
+  // String types - THREE DISTINCT TYPES per specs/lmao/01a_trace_schema_system.md
   // IMPORTANT: Never use generic "string" - always choose enum/category/text
 
   /**

@@ -1,7 +1,7 @@
 /**
  * Integration tests for Library Integration Pattern and Module Builder Pattern
  *
- * Tests specs/01e_library_integration_pattern.md and specs/01l_module_builder_pattern.md
+ * Tests specs/lmao/01e_library_integration_pattern.md and specs/lmao/01l_op_context_pattern.md
  * - Module definition with defineModule()
  * - Prefix application for library composition
  * - Dependency wiring with .use()

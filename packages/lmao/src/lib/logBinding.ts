@@ -28,7 +28,7 @@ declare type SpanBuffer = any;
  * The constructor takes a raw SpanBuffer and returns a view that remaps column access
  * from prefixed names to unprefixed names for tree traversal during Arrow conversion.
  *
- * Per specs/01e_library_integration_pattern.md:
+ * Per specs/lmao/01e_library_integration_pattern.md:
  * - Hot path: Library writes directly to unprefixed columns (zero overhead)
  * - Cold path: Arrow conversion uses RemappedBufferView to access via prefixed names
  */

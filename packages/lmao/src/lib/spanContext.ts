@@ -1,7 +1,7 @@
 /**
  * SpanContext - Context provided to op functions during span execution
  *
- * Per specs/01c_context_flow_and_op_wrappers.md and specs/01l_module_builder_pattern.md:
+ * Per specs/lmao/01c_context_flow_and_op_wrappers.md and specs/lmao/01l_op_context_pattern.md:
  * - SpanContext combines built-in properties with user-extensible Extra
  * - Uses prototype-based inheritance for V8 hidden class optimization
  * - Child spans inherit scoped attributes from parents
@@ -91,7 +91,7 @@ export type SpanLoggerInternal<T extends LogSchema> = SpanLoggerImpl<T> & {
  * Pre-initialize row 1 as span-exception (will be overwritten by ok/err)
  * Set writeIndex to 2 (events start after reserved rows)
  *
- * Per specs/01h_entry_types_and_logging_primitives.md:
+ * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
  * - Row 0: span-start (written here)
  * - Row 1: span-end (pre-initialized as exception, overwritten by ok/err)
  * - Row 2+: events (ctx.log.* appends here)
@@ -107,7 +107,7 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
 /**
  * Create a SpanLogger for the given buffer.
  *
- * Per specs/01i_span_scope_attributes.md: Scope values are stored directly on buffer._scopeValues.
+ * Per specs/lmao/01i_span_scope_attributes.md: Scope values are stored directly on buffer._scopeValues.
  * The SpanLogger reads/writes scope via buffer._scopeValues - no separate Scope class needed.
  *
  * @param schema - Tag attribute schema with field definitions
@@ -156,7 +156,7 @@ function calculateDelay(policy: RetryPolicy, attempt: number): number {
 /**
  * Write span-retry entry to buffer.
  *
- * Per specs/01h_entry_types_and_logging_primitives.md:
+ * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
  * - span-retry appends to Row 2+ in parent span buffer (like log entries)
  * - Trace-only entry (NOT written to event log)
  * - Contains: attempt number, error message, delay until next attempt
@@ -800,7 +800,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * Complete child span context setup - creates buffer, registers with parent.
      * Called by span0-span8 after _newCtx0/_newCtx1 has created the prototype chain.
      *
-     * Properties are set in HOT→COLD order per specs/01b1_buffer_performance_optimizations.md
+     * Properties are set in HOT→COLD order per specs/lmao/01b1_buffer_performance_optimizations.md
      * to ensure frequently-accessed properties get V8 in-object slots.
      *
      * @param childCtx - Child context created by _newCtx0 or _newCtx1

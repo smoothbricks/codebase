@@ -194,50 +194,52 @@ The agent should:
 
 ### Package Architecture (Read FIRST!)
 
-- **Package Architecture**: specs/00_package_architecture.md - Defines arrow-builder vs lmao responsibilities,
+- **Package Architecture**: specs/lmao/00_package_architecture.md - Defines arrow-builder vs lmao responsibilities,
   dependency direction, what each package OWNS and MUST NOT know about
 
 ### Core System
 
-- **System Overview**: specs/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8 Optimization
-  Patterns** (see also [V8 Optimization References](#v8-optimization-references) below)
-- **Schema System**: specs/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema [**LMAO**]
-- **Feature Flags**: specs/01p_feature_flags.md - Flag schema, evaluator, analytics [**LMAO**]
-- **Context Flow**: specs/01c_context_flow_and_op_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern [**LMAO**]
-- **Buffer Architecture**: specs/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
-  [**ARROW-BUILDER**]
-- **TypeScript Transformer**: specs/01o_typescript_transformer.md - Compile-time V8 optimizations, span_op/span_fn
+- **System Overview**: specs/lmao/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8
+  Optimization Patterns** (see also [V8 Optimization References](#v8-optimization-references) below)
+- **Schema System**: specs/lmao/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema [**LMAO**]
+- **Feature Flags**: specs/lmao/01p_feature_flags.md - Flag schema, evaluator, analytics [**LMAO**]
+- **Context Flow**: specs/lmao/01c_context_flow_and_op_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern
+  [**LMAO**]
+- **Buffer Architecture**: specs/lmao/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow
+  builders!) [**ARROW-BUILDER**]
+- **TypeScript Transformer**: specs/lmao/01o_typescript_transformer.md - Compile-time V8 optimizations, span_op/span_fn
   monomorphic methods [**LMAO-TRANSFORMER**]
 
 ### Buffer System Details (All in @packages/arrow-builder)
 
-- **Performance Opts**: specs/01b1_buffer_performance_optimizations.md - Cache alignment, string interning, enum
+- **Performance Opts**: specs/lmao/01b1_buffer_performance_optimizations.md - Cache alignment, string interning, enum
   optimization
-- **Self-Tuning**: specs/01b2_buffer_self_tuning.md - Zero-config capacity management
-- **High-Precision Timestamps**: specs/01b3_high_precision_timestamps.md - Nanosecond timestamps, BigInt64Array
-- **Span Identity**: specs/01b4_span_identity.md - Span ID design, TraceId, distributed tracing
-- **SpanBuffer Memory Layout**: specs/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization,
+- **Self-Tuning**: specs/lmao/01b2_buffer_self_tuning.md - Zero-config capacity management
+- **High-Precision Timestamps**: specs/lmao/01b3_high_precision_timestamps.md - Nanosecond timestamps, BigInt64Array
+- **Span Identity**: specs/lmao/01b4_span_identity.md - Span ID design, TraceId, distributed tracing
+- **SpanBuffer Memory Layout**: specs/lmao/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization,
   SpanBuffer interface
-- **Buffer Codegen Extension**: specs/01b6_buffer_codegen_extension.md - ColumnBufferExtension, lazy getters,
+- **Buffer Codegen Extension**: specs/lmao/01b6_buffer_codegen_extension.md - ColumnBufferExtension, lazy getters,
   schema-generated buffers
-- **Arrow Table**: specs/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
+- **Arrow Table**: specs/lmao/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
 
 ### API & Code Generation (All in @packages/lmao)
 
-- **Entry Types**: specs/01h_entry_types_and_logging_primitives.md - Unified entry type enum, fluent API
-- **Context API Codegen**: specs/01g_trace_context_api_codegen.md - Runtime code generation for tag methods
-- **Module Context**: specs/01j_module_context_and_spanlogger_generation.md - Op/SpanLogger class generation
-- **Span Scope**: specs/01i_span_scope_attributes.md - Scoped attributes for zero-overhead propagation
+- **Entry Types**: specs/lmao/01h_entry_types_and_logging_primitives.md - Unified entry type enum, fluent API
+- **Context API Codegen**: specs/lmao/01g_trace_context_api_codegen.md - Runtime code generation for tag methods
+- **Module Context**: specs/lmao/01j_module_context_and_spanlogger_generation.md - Op/SpanLogger class generation
+- **Span Scope**: specs/lmao/01i_span_scope_attributes.md - Scoped attributes for zero-overhead propagation
 
 ### Integration & Output
 
-- **Op Context Pattern**: specs/01l_op_context_pattern.md - `defineOpContext()`, `defineOp()`, and Tracer [**LMAO**]
-- **Library Integration**: specs/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
-- **AI Agent Integration**: specs/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
+- **Op Context Pattern**: specs/lmao/01l_op_context_pattern.md - `defineOpContext()`, `defineOp()`, and Tracer
+  [**LMAO**]
+- **Library Integration**: specs/lmao/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
+- **AI Agent Integration**: specs/lmao/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
 
 ## 🏗️ PACKAGE ARCHITECTURE - TWO SIBLING PACKAGES:
 
-> **See specs/00_package_architecture.md for complete details including WHY each decision was made.**
+> **See specs/lmao/00_package_architecture.md for complete details including WHY each decision was made.**
 
 ### @packages/arrow-builder - Low-Level Alternative to apache-arrow
 
@@ -273,16 +275,16 @@ The agent should:
 
 **Owns**:
 
-- Schema DSL (S.enum/category/text/number/boolean) (specs/01a)
+- Schema DSL (S.enum/category/text/number/boolean) (specs/lmao/01a)
 - logSchema definitions with masking
 - **System columns (timestamps, operations) - ALWAYS eager, never lazy**
 - **Scope storage - plain object on buffer, NO codegen needed**
 - SpanBuffer creation (extends ColumnBuffer with span metadata)
-- SpanLogger/ctx API generation (specs/01g, 01j)
-- Fluent logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/01h)
-- Context propagation (traceContext→module→op→span) (specs/01c)
-- Feature flag evaluation (specs/01a)
-- Library integration & prefixing (specs/01e)
+- SpanLogger/ctx API generation (specs/lmao/01g, 01j)
+- Fluent logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/lmao/01h)
+- Context propagation (traceContext→module→op→span) (specs/lmao/01c)
+- Feature flag evaluation (specs/lmao/01a)
+- Library integration & prefixing (specs/lmao/01e)
 
 **Key Architectural Decisions**:
 
@@ -306,7 +308,7 @@ The agent should:
 - **Hot Path**: TypedArray assignments ONLY in arrow-builder. No Arrow builders, no objects!
 - **Package Imports**: lmao can import from `@smoothbricks/arrow-builder`. arrow-builder MUST NOT import from lmao!
 - **DO NOT**: Use Apache Arrow builders in hot path - only TypedArray assignments per
-  specs/01b_columnar_buffer_architecture.md
+  specs/lmao/01b_columnar_buffer_architecture.md
 - **⚠️ SEARCH BEFORE IMPLEMENTING**: Before writing ANY new code, ALWAYS search for existing implementations in BOTH
   packages:
   - Use `grep` or `glob` to find similar functions/types/patterns
@@ -318,7 +320,7 @@ The agent should:
   - **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineLogSchema` and use
     it properly
 
-## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/01a_trace_schema_system.md):
+## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/lmao/01a_trace_schema_system.md):
 
 Three distinct string types, each with different storage strategies:
 
@@ -465,7 +467,7 @@ buffer._children; // Internal tree structure
 buffer._module; // Internal context
 ```
 
-## Implementation Patterns (See specs/01h_entry_types_and_logging_primitives.md)
+## Implementation Patterns (See specs/lmao/01h_entry_types_and_logging_primitives.md)
 
 - **Schema Definition**: ALWAYS use `defineLogSchema()` with `S` builder:
 
@@ -490,7 +492,7 @@ buffer._module; // Internal context
 - **Method Chaining**: Return this from tag methods for fluent API: .userId(id).requestId(req)
 - **Per-Span Buffers**: Each span owns its columnar TypedArrays (Uint8Array, Float64Array, etc.)
 
-## Entry Type System (See specs/01h_entry_types_and_logging_primitives.md)
+## Entry Type System (See specs/lmao/01h_entry_types_and_logging_primitives.md)
 
 Unified enum for ALL trace events:
 
@@ -499,26 +501,26 @@ Unified enum for ALL trace events:
 - **Structured data**: tag
 - **Feature flags**: ff-access, ff-usage Entry types use compile-time enum mapping to Uint8Array for 1-byte storage.
 
-## Critical Performance Rules (See specs/01b1_buffer_performance_optimizations.md)
+## Critical Performance Rules (See specs/lmao/01b1_buffer_performance_optimizations.md)
 
 1. **Hot Path**: TypedArray writes ONLY. No Arrow builders, no objects, no console.log
-2. **Cache Alignment**: 64-byte aligned TypedArrays (specs/01b_columnar_buffer_architecture.md)
+2. **Cache Alignment**: 64-byte aligned TypedArrays (specs/lmao/01b_columnar_buffer_architecture.md)
 3. **String Optimization**:
    - Enums: Compile-time switch-case mapping to Uint8 (1 byte)
    - Categories: Raw strings on hot path, dictionary built on cold path
    - Text: Raw strings without dictionary overhead
 4. **Direct References**: SpanLogger holds buffer ref, no lookups
-   (specs/01j_module_context_and_spanlogger_generation.md)
-5. **Background Conversion**: Arrow Table creation in cold path ONLY (specs/01f_arrow_table_structure.md)
+   (specs/lmao/01j_module_context_and_spanlogger_generation.md)
+5. **Background Conversion**: Arrow Table creation in cold path ONLY (specs/lmao/01f_arrow_table_structure.md)
 
-## Code Generation (See specs/01g_trace_context_api_codegen.md & 01j)
+## Code Generation (See specs/lmao/01g_trace_context_api_codegen.md & 01j)
 
 - **SpanLogger generation**: Runtime class generation with typed methods per schema
 - **Attribute methods**: Each schema field gets a typed method on SpanLogger
 - **Dual API**: Object-based (ctx.tag({ userId: "123" })) and property-based (ctx.tag.userId("123"))
 - **Zero allocation**: Fluent methods return this, no intermediate objects
 
-## Library Integration (See specs/01l_op_context_pattern.md & 01e)
+## Library Integration (See specs/lmao/01l_op_context_pattern.md & 01e)
 
 - Libraries use `defineOpContext({ logSchema, deps, flags, ctx })` to define their op context
 - Ops are defined via
@@ -593,7 +595,7 @@ await trace('my-op', { trace_id: incomingTraceId, env: myEnv }, myOp);
 finally) | | `onSpanStart(childBuffer)` | Before child span fn execution | | `onSpanEnd(childBuffer)` | After child span
 fn completes | | `onStatsWillResetFor(buffer)` | Before capacity tuning stats reset |
 
-## Span Scope Attributes (See specs/01i_span_scope_attributes.md)
+## Span Scope Attributes (See specs/lmao/01i_span_scope_attributes.md)
 
 - Set scoped attributes: `ctx.setScope({ requestId, userId })` - merge semantics, `null` to clear
 - Read scope: `ctx.scope.requestId` - readonly view
@@ -604,21 +606,21 @@ fn completes | | `onStatsWillResetFor(buffer)` | Before capacity tuning stats re
 - **Snapshot semantics**: Child's scope is frozen at creation time (async safe, no race conditions)
 - Columns filled via `TypedArray.fill()` at Arrow conversion (SIMD optimized)
 
-## Self-Tuning Buffers (See specs/01b2_buffer_self_tuning.md)
+## Self-Tuning Buffers (See specs/lmao/01b2_buffer_self_tuning.md)
 
 - Per-module capacity learning
 - Buffer chaining for overflow
 - Zero configuration needed
 - Adapts to workload patterns
 
-## AI Agent Integration (See specs/01d_ai_agent_integration.md)
+## AI Agent Integration (See specs/lmao/01d_ai_agent_integration.md)
 
 - MCP server for structured trace querying
 - Tool-based interface for AI agents
 - Context-efficient (detailed data only loaded on request)
 - Works with Claude Desktop, Cursor, VS Code Copilot
 
-## Arrow Table Output (See specs/01f_arrow_table_structure.md)
+## Arrow Table Output (See specs/lmao/01f_arrow_table_structure.md)
 
 - Enum columns: Dictionary with compile-time values
 - Category columns: Dictionary with runtime-built values
@@ -703,8 +705,8 @@ Module IDs and span names are accessed directly from `buf.module.package_name`, 
 
 When implementing performance-critical code, refer to these V8 optimization resources:
 
-- **Primary Spec**: [V8 Optimization Patterns](specs/01_trace_logging_system.md#v8-optimization-patterns) - Complete
-  guide to V8 optimization patterns used in LMAO
+- **Primary Spec**: [V8 Optimization Patterns](specs/lmao/01_trace_logging_system.md#v8-optimization-patterns) -
+  Complete guide to V8 optimization patterns used in LMAO
 - **External References**:
   - [V8 Fast Properties Blog](https://v8.dev/blog/fast-properties) - Hidden class internals and property access
     optimization

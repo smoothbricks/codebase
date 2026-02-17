@@ -8,7 +8,7 @@
 import { defineFeatureFlags, defineLogSchema, defineModule, InMemoryFlagEvaluator, S } from '../src/index.js';
 
 // Define comprehensive tag attributes
-// Using the three string types per specs/01a_trace_schema_system.md
+// Using the three string types per specs/lmao/01a_trace_schema_system.md
 const orderAttributes = defineLogSchema({
   requestId: S.category(), // Category: request IDs repeat
   userId: S.category(), // Category: user IDs repeat

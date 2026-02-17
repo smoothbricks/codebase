@@ -1,7 +1,7 @@
 /**
  * Zero-copy conversion from SpanBuffer to Flechette tables
  *
- * Per specs/01f_arrow_table_structure.md:
+ * Per specs/lmao/01f_arrow_table_structure.md:
  * - Enum columns: Dictionary with compile-time values
  * - Category columns: Dictionary with runtime-built values
  * - Text columns: Plain strings without dictionary
@@ -933,7 +933,7 @@ export function convertSpanTreeToArrowTable(
 ): Table {
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 0: Collect ALL unique schema fields from ALL buffers in the tree
-  // Per specs/01k_tree_walker_and_arrow_conversion.md - child spans may have different schemas
+  // Per specs/lmao/01k_tree_walker_and_arrow_conversion.md - child spans may have different schemas
   // (e.g., library prefixed schemas like db_query, http_status, etc.)
   // ═══════════════════════════════════════════════════════════════════════════
   const mergedSchemaFields = new Map<string, unknown>();
@@ -1033,7 +1033,7 @@ export function convertSpanTreeToArrowTable(
         }
       }
       // Also add scope values to dictionary (they may not be in columns)
-      // Per specs/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
+      // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
       const scopeValue = buffer._scopeValues?.[fieldName] as string | undefined;
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
@@ -1066,7 +1066,7 @@ export function convertSpanTreeToArrowTable(
         }
       }
       // Also add scope values to dictionary (they may not be in columns)
-      // Per specs/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
+      // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
       const scopeValue = buffer._scopeValues?.[fieldName] as string | undefined;
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
@@ -1403,7 +1403,7 @@ function convertBuffersWithSharedDicts(
   fields.push('entry_type');
 
   // Metadata column: Package name (from task._module.packageName, with callsiteModule for row 0)
-  // Per specs/01c_context_flow_and_op_wrappers.md:
+  // Per specs/lmao/01c_context_flow_and_op_wrappers.md:
   // - Row 0 (span-start): uses callsiteModule for gitSha/packageName/packagePath
   // - Rows 1+ (logs, span-end): uses task._module
   const packageIndices = new packageDict.indexArrayCtor(totalRows);
@@ -1621,7 +1621,7 @@ function convertBuffersWithSharedDicts(
       let nullCount = 0;
       let rowOffset = 0;
 
-      // Per specs/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
+      // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
         // Check if this buffer has a scope value for this field

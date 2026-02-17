@@ -28,7 +28,7 @@ const USER_EXISTS = defineCodeError('USER_EXISTS')<{ email: string }>();
 
 describe('Schema Integration Patterns', () => {
   // Define log schema for DB operations
-  // Using the three string types per specs/01a_trace_schema_system.md:
+  // Using the three string types per specs/lmao/01a_trace_schema_system.md:
   // - S.enum: Known values at compile time
   // - S.category: Values that often repeat
   // - S.text: Unique values
