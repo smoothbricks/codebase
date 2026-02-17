@@ -10,6 +10,7 @@
 
 import type { ParseConfig, ParseResult } from './pipeline.js';
 import type { ColumnInput } from './types.js';
+import { calculateRequiredWasmBytes, ensureWasmMemoryForWorkingSet, WASM_MAX_PAGES } from './wasm-memory-contract.js';
 
 // =============================================================================
 // ParseCompactBackend Interface
@@ -82,14 +83,12 @@ export interface EventProcessorWasmExports {
 // WASM Memory Layout Constants
 // =============================================================================
 
-const WASM_PAGE_SIZE = 64 * 1024;
 const WASM_OUTPUT_HEADER_SIZE = 16;
 
 // Keep dynamic working regions after Zig heap + safety headroom.
 const WASM_HEAP_RESERVE = 9 * 1024 * 1024;
 
 // Parse backend per-call planning limits.
-const MAX_PARSE_WORKING_SET_BYTES = 64 * 1024 * 1024;
 const MIN_INPUT_BYTES = 4 * 1024;
 const MIN_OUTPUT_BYTES = 64 * 1024;
 const MIN_WORKSPACE_BYTES = 256 * 1024;
@@ -108,8 +107,8 @@ interface ParseMemoryLayout {
   readonly schemaOffset: number;
   readonly fieldMetaOffset: number;
   readonly fieldNamesOffset: number;
+  readonly regionsBytes: number;
   readonly requiredWorkingSetBytes: number;
-  readonly requiredTotalMemoryBytes: number;
 }
 
 function align8(n: number): number {
@@ -147,21 +146,13 @@ function planParseMemoryLayout(
   const fieldMetaBytes = align8(fieldMetaLen);
   const fieldNamesBytes = align8(fieldNamesLen);
 
-  const requiredWorkingSetBytes =
-    inputLength +
-    outputLength +
-    workspaceLength +
-    schemaBytes +
-    fieldMetaBytes +
-    fieldNamesBytes +
-    FIXED_LAYOUT_OVERHEAD_BYTES;
-
-  if (requiredWorkingSetBytes > MAX_PARSE_WORKING_SET_BYTES) {
-    throw new Error(
-      `Parse batch requires ${formatBytes(requiredWorkingSetBytes)}, ` +
-        `which exceeds 64MB limit (${MAX_PARSE_WORKING_SET_BYTES} bytes).`,
-    );
-  }
+  const regionsBytes = schemaBytes + fieldMetaBytes + fieldNamesBytes + FIXED_LAYOUT_OVERHEAD_BYTES + WASM_HEAP_RESERVE;
+  const requiredWorkingSetBytes = calculateRequiredWasmBytes({
+    inputBytes: inputLength,
+    outputBytes: outputLength,
+    workspaceBytes: workspaceLength,
+    regionsBytes,
+  });
 
   let offset = WASM_HEAP_RESERVE;
 
@@ -183,8 +174,6 @@ function planParseMemoryLayout(
   const fieldNamesOffset = offset;
   offset += fieldNamesBytes;
 
-  const requiredTotalMemoryBytes = offset + FIXED_LAYOUT_OVERHEAD_BYTES;
-
   return {
     inputOffset,
     inputLength,
@@ -195,19 +184,9 @@ function planParseMemoryLayout(
     schemaOffset,
     fieldMetaOffset,
     fieldNamesOffset,
+    regionsBytes,
     requiredWorkingSetBytes,
-    requiredTotalMemoryBytes,
   };
-}
-
-function ensureWasmMemory(memory: WebAssembly.Memory, requiredBytes: number): void {
-  const currentBytes = memory.buffer.byteLength;
-  if (requiredBytes <= currentBytes) {
-    return;
-  }
-  const missingBytes = requiredBytes - currentBytes;
-  const pagesToGrow = Math.ceil(missingBytes / WASM_PAGE_SIZE);
-  memory.grow(pagesToGrow);
 }
 
 // =============================================================================
@@ -262,7 +241,25 @@ export function createParseCompactWasmBackend(wasm: EventProcessorWasmExports): 
         fieldNamesBuffer?.length ?? 0,
       );
 
-      ensureWasmMemory(wasm.memory, layout.requiredTotalMemoryBytes);
+      try {
+        ensureWasmMemoryForWorkingSet(
+          wasm.memory,
+          {
+            inputBytes: layout.inputLength,
+            outputBytes: layout.outputLength,
+            workspaceBytes: layout.workspaceLength,
+            regionsBytes: layout.regionsBytes,
+          },
+          { maxPages: WASM_MAX_PAGES },
+        );
+      } catch (error) {
+        if (error instanceof Error) {
+          throw new Error(
+            `Failed to size parse WASM memory (${formatBytes(layout.requiredWorkingSetBytes)}): ${error.message}`,
+          );
+        }
+        throw error;
+      }
 
       let memory = new Uint8Array(wasm.memory.buffer);
       memory.set(config.schemaBytes, layout.schemaOffset);
