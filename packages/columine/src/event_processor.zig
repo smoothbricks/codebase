@@ -5,8 +5,6 @@
 //!
 //! This is the generic columine version WITHOUT dedup (bloom filter, checkpoint).
 //!
-//! NOTE: Msgpack support is deferred. JSON is the only supported format.
-
 const std = @import("std");
 const builtin = @import("builtin");
 
@@ -14,13 +12,15 @@ const builtin = @import("builtin");
 // Module imports
 // =============================================================================
 
-// Parsing modules - JSON to columnar format.
+// Parsing modules - JSON and msgpack to columnar format.
 // Named modules (wired in build.zig) so each file belongs to exactly
 pub const parsing = struct {
     pub const columns = @import("columns");
     pub const json_scanner = @import("json_scanner");
     pub const json_parser = @import("json_parser");
     pub const json_extractor = @import("json_extractor");
+    pub const msgpack_scanner = @import("msgpack_scanner");
+    pub const msgpack_extractor = @import("msgpack_extractor");
 };
 
 // Arrow module - IPC encoding for output
@@ -68,8 +68,9 @@ pub const VERSION: u32 = 1;
 /// Input format enum for createLogEntry
 pub const InputFormat = enum(u8) {
     JSON = 0,
-    MSGPACK = 1, // Deferred - returns INVALID_FORMAT if used
+    MSGPACK = 1, // standard msgpack: array of map objects
     ARROW_PASSTHROUGH = 2,
+    MSGPACK_STREAM = 3, // concatenated msgpack maps (no array wrapper)
 };
 
 /// Result codes for WASM exports
@@ -536,9 +537,13 @@ pub export fn ep_create_log_entry(
                 writeResultHeader(output, extraction_error_code, 0, 0, 0, 0);
                 return @intFromEnum(extraction_error_code);
             },
-            .MSGPACK => {
-                writeResultHeader(output, .INVALID_FORMAT, 0, 0, 0, 0);
-                return @intFromEnum(ResultCode.INVALID_FORMAT);
+            .MSGPACK => extractMsgpackEventsWithWorkspaceGrowth(ep, input, dyn_cols, &extraction_error_code, false) catch {
+                writeResultHeader(output, extraction_error_code, 0, 0, 0, 0);
+                return @intFromEnum(extraction_error_code);
+            },
+            .MSGPACK_STREAM => extractMsgpackEventsWithWorkspaceGrowth(ep, input, dyn_cols, &extraction_error_code, true) catch {
+                writeResultHeader(output, extraction_error_code, 0, 0, 0, 0);
+                return @intFromEnum(extraction_error_code);
             },
             .ARROW_PASSTHROUGH => {
                 writeResultHeader(output, .INVALID_FORMAT, 0, 0, 0, 0);
@@ -570,7 +575,8 @@ pub export fn ep_create_log_entry(
         // Parse with json_scanner
         const parse_result: ParseError = switch (input_format) {
             .JSON => parsing.json_scanner.parseJsonEvents(input, &ep.event_columns, allocator),
-            .MSGPACK => .INVALID_MSGPACK,
+            .MSGPACK => parsing.msgpack_scanner.parseMsgpackEvents(input, &ep.event_columns),
+            .MSGPACK_STREAM => parsing.msgpack_scanner.parseMsgpackStream(input, &ep.event_columns),
             .ARROW_PASSTHROUGH => .OK,
         };
 
@@ -686,6 +692,44 @@ fn extractJsonEventsWithWorkspaceGrowth(
     }
 }
 
+fn extractMsgpackEventsWithWorkspaceGrowth(
+    ep: *EventProcessor,
+    input: []const u8,
+    dyn_cols: *DynamicColumns,
+    out_error_code: *ResultCode,
+    is_stream: bool,
+) error{ExtractionFailed}!u32 {
+    const extraction_config = &ep.extraction_config.?;
+
+    while (true) {
+        const extracted = parsing.msgpack_extractor.extractMsgpackEvents(
+            input,
+            extraction_config,
+            dyn_cols,
+            ep.work_buffer,
+            is_stream,
+        ) catch |err| {
+            if (err == error.BufferOverflow) {
+                const min_needed = if (ep.work_buffer.len == 0)
+                    @min(input.len + 64, EventProcessor.WASM_MAX_WORK_BUFFER_BYTES)
+                else
+                    @min(ep.work_buffer.len * 2, EventProcessor.WASM_MAX_WORK_BUFFER_BYTES);
+
+                ep.ensureWorkBufferCapacity(min_needed) catch {
+                    out_error_code.* = .OUT_OF_MEMORY;
+                    return error.ExtractionFailed;
+                };
+                continue;
+            }
+
+            out_error_code.* = mapExtractionError(err);
+            return error.ExtractionFailed;
+        };
+
+        return extracted;
+    }
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -696,6 +740,8 @@ test {
     _ = parsing.json_scanner;
     _ = parsing.json_parser;
     _ = parsing.json_extractor;
+    _ = parsing.msgpack_scanner;
+    _ = parsing.msgpack_extractor;
     _ = arrow.ipc_writer;
     _ = arrow.dynamic_schema;
     _ = arrow.dynamic_record_batch;

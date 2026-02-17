@@ -273,6 +273,23 @@ fn addParsingModules(
     je.addImport("dynamic_schema", ds);
     root.addImport("json_extractor", je);
 
+    // --- msgpack_scanner depends on columns ---
+    const ms = b.createModule(.{
+        .root_source_file = b.path("src/parsing/msgpack_scanner.zig"),
+    });
+    ms.addImport("columns", cols);
+    root.addImport("msgpack_scanner", ms);
+
+    // --- msgpack_extractor depends on json_extractor, columns, dynamic_schema, msgpack_scanner ---
+    const me = b.createModule(.{
+        .root_source_file = b.path("src/parsing/msgpack_extractor.zig"),
+    });
+    me.addImport("json_extractor", je);
+    me.addImport("columns", cols);
+    me.addImport("dynamic_schema", ds);
+    me.addImport("msgpack_scanner", ms);
+    root.addImport("msgpack_extractor", me);
+
     // --- ipc_writer depends on columns, dynamic_schema, dynamic_record_batch ---
     const iw = b.createModule(.{
         .root_source_file = b.path("src/arrow/ipc_writer.zig"),
