@@ -32,11 +32,20 @@
  */
 
 import type { OpContextBinding } from '../opContext/types.js';
-import { ENTRY_TYPE_SPAN_ERR, ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from '../schema/systemSchema.js';
+import {
+  ENTRY_TYPE_DEBUG,
+  ENTRY_TYPE_ERROR,
+  ENTRY_TYPE_INFO,
+  ENTRY_TYPE_SPAN_ERR,
+  ENTRY_TYPE_SPAN_EXCEPTION,
+  ENTRY_TYPE_SPAN_OK,
+  ENTRY_TYPE_TRACE,
+  ENTRY_TYPE_WARN,
+} from '../schema/systemSchema.js';
 import type { TraceId } from '../traceId.js';
 import type { TracerOptions } from '../tracer.js';
 import { Tracer } from '../tracer.js';
-import type { SpanBuffer } from '../types.js';
+import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
 // ============================================================================
 // Formatting Helpers
@@ -122,6 +131,43 @@ function getStatus(entryType: number): string {
     default:
       return 'UNKNOWN';
   }
+}
+
+function getLogLevel(entryType: number): string | null {
+  switch (entryType) {
+    case ENTRY_TYPE_TRACE:
+      return 'TRACE';
+    case ENTRY_TYPE_DEBUG:
+      return 'DEBUG';
+    case ENTRY_TYPE_INFO:
+      return 'INFO';
+    case ENTRY_TYPE_WARN:
+      return 'WARN';
+    case ENTRY_TYPE_ERROR:
+      return 'ERROR';
+    default:
+      return null;
+  }
+}
+
+function formatTemplateMessage(buffer: AnySpanBuffer, row: number, template: string): string {
+  return template.replace(/\$\{([A-Za-z0-9_]+)\}/g, (_full, key: string) => {
+    const values = Reflect.get(buffer, `${key}_values`) as unknown;
+    if (values == null) return `\${${key}}`;
+
+    if (Array.isArray(values)) {
+      const value = values[row];
+      return value === null || value === undefined ? `\${${key}}` : String(value);
+    }
+
+    if (ArrayBuffer.isView(values)) {
+      const typed = values as unknown as { [index: number]: unknown };
+      const value = typed[row];
+      return value === null || value === undefined ? `\${${key}}` : String(value);
+    }
+
+    return `\${${key}}`;
+  });
 }
 
 // ============================================================================
@@ -210,6 +256,38 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     return this.colorEnabled ? RESET : '';
   }
 
+  private printLogRows(buffer: SpanBuffer<B['logBinding']['logSchema']>, indent: number): void {
+    let current: AnySpanBuffer | null = buffer;
+    let isRootSegment = true;
+
+    while (current) {
+      const start = isRootSegment ? 2 : 0;
+      const end = current._writeIndex;
+
+      for (let i = start; i < end; i++) {
+        const level = getLogLevel(current.entry_type[i]);
+        if (!level) continue;
+
+        const template = current.message_values[i] ?? '';
+        const message = formatTemplateMessage(current, i, template);
+        const ts = formatTimestamp(current.timestamp[i]);
+        const traceId = current.trace_id;
+        const line =
+          `[${ts}] ${this.color(traceId)}[${traceId}]${this.reset()} ` +
+          `${'  '.repeat(indent)}· ${level} ${message}\n`;
+
+        if (level === 'ERROR') {
+          this.err.write(line);
+        } else {
+          this.out.write(line);
+        }
+      }
+
+      current = current._overflow ?? null;
+      isRootSegment = false;
+    }
+  }
+
   // --------------------------------------------------------------------------
   // Lifecycle Hooks
   // --------------------------------------------------------------------------
@@ -225,6 +303,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
 
   onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     const traceId = rootBuffer.trace_id;
+    this.printLogRows(rootBuffer, 1);
     this.decrementIndent(traceId);
 
     const name = rootBuffer.message_values[0];
@@ -259,6 +338,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     const traceId = childBuffer.trace_id;
     this.decrementIndent(traceId);
     const indent = this.getIndent(traceId);
+    this.printLogRows(childBuffer, indent + 1);
 
     const name = childBuffer.message_values[0];
     const startTs = childBuffer.timestamp[0];

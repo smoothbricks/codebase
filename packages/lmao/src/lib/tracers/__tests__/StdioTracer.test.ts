@@ -87,6 +87,23 @@ describe('StdioTracer', () => {
       // ISO timestamp format
       expect(output.some((line) => /\d{4}-\d{2}-\d{2}T/.test(line))).toBe(true);
     });
+
+    it('should render log message templates using row values', async () => {
+      const { stream: out, output } = createMockStream();
+      const { stream: err } = createMockStream();
+
+      const tracer = new StdioTracer(ctx, { ...createTestTracerOptions(), out, err, colorEnabled: false });
+      const { trace } = tracer;
+
+      const testOp = defineOp('test', (ctx) => {
+        ctx.log.info('Processing ${userId}').userId('u-123');
+        return ctx.ok('done');
+      });
+
+      await trace('format-test', testOp);
+
+      expect(output.some((line) => line.includes('INFO Processing u-123'))).toBe(true);
+    });
   });
 
   describe('nested spans with indentation', () => {
