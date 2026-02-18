@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 /**
  * TraceRoot - Node.js implementation.
  *

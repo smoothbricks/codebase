@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 /**
  * TraceRoot - Universal implementation with runtime platform detection.
  *
