@@ -95,8 +95,10 @@ export {
 // TRACER RE-EXPORTS
 // =============================================================================
 
-// Re-export createTraceRoot from Node.js for testing (tests run in Node)
-export { createTraceRoot } from '../traceRoot.node.js';
+export { JsBufferStrategy } from '../JsBufferStrategy.js';
+export type { TraceRootFactory } from '../traceRoot.js';
+// Universal createTraceRoot — picks Node (hrtime.bigint) or ES (performance.now) at runtime
+export { createTraceRoot } from '../traceRoot.universal.js';
 export { NoOpTracer } from '../tracers/NoOpTracer.js';
 // Re-export TestTracer for convenience
 export { type StatsSnapshot, TestTracer } from '../tracers/TestTracer.js';
@@ -108,9 +110,8 @@ export { type StatsSnapshot, TestTracer } from '../tracers/TestTracer.js';
 export { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
 
 // =============================================================================
-// TODO: TraceQuery (Higher-level query interface)
+// SPAN QUERY API
 // =============================================================================
 
-// Future additions:
-// - TraceQuery - Query interface for spans/entries without Arrow conversion
-// - TraceAssertions - Bun/Jest/Vitest matcher extensions
+export { type QueryableSpan, querySpan } from './queryable-span.js';
+export { extractFactsFor, findAllSpans, findSpan, spanNames } from './span-query.js';
