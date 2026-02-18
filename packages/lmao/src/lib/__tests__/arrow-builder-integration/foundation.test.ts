@@ -12,7 +12,7 @@ describe('Buffer Foundation', () => {
       userId: S.category(), // Category: user IDs repeat
       count: S.number(),
     });
-    const buf = createSpanBuffer(schema, 'test-span', createTestTraceRoot('trace-123'), DEFAULT_METADATA); // Uses DEFAULT_BUFFER_CAPACITY
+    const buf = createSpanBuffer(schema, createTestTraceRoot('trace-123'), DEFAULT_METADATA); // Uses DEFAULT_BUFFER_CAPACITY
 
     // Span identity assertions (unified memory layout)
     expect(typeof buf.span_id).toBe('number');
@@ -45,7 +45,7 @@ describe('Buffer Foundation', () => {
       count: S.number(),
     });
 
-    const buf = createSpanBuffer(schema, 'test-span', createTestTraceRoot('trace-999'), DEFAULT_METADATA);
+    const buf = createSpanBuffer(schema, createTestTraceRoot('trace-999'), DEFAULT_METADATA);
 
     expect(buf.span_id).toBeGreaterThan(0);
     expect(buf._hasParent).toBe(false);
@@ -61,7 +61,7 @@ describe('Buffer Foundation', () => {
 
     // Get SpanBufferClass to access stats
     const SpanBufferClass = getSpanBufferClass(schema);
-    const buf = createSpanBuffer(schema, 'test-span', createTestTraceRoot('trace-456'), DEFAULT_METADATA, 64);
+    const buf = createSpanBuffer(schema, createTestTraceRoot('trace-456'), DEFAULT_METADATA, 64);
 
     // Stats are accessible from constructor
     const bufferClass = buf.constructor as SpanBufferConstructor;
@@ -79,7 +79,7 @@ describe('Buffer Foundation', () => {
       field5: S.number(),
     });
 
-    const buf = createSpanBuffer(largeSchema, 'test-span', createTestTraceRoot('trace-789'), DEFAULT_METADATA, 64);
+    const buf = createSpanBuffer(largeSchema, createTestTraceRoot('trace-789'), DEFAULT_METADATA, 64);
 
     // Should have TypedArray columns for all 5 attributes (each has _values and _nulls)
     // Note: Columns are lazy-allocated via getters, so Object.keys() won't find them
@@ -102,7 +102,7 @@ describe('Buffer Foundation', () => {
       count: S.number(),
     });
 
-    const buf = createSpanBuffer(schema, 'test-span', createTestTraceRoot('trace-123'), DEFAULT_METADATA);
+    const buf = createSpanBuffer(schema, createTestTraceRoot('trace-123'), DEFAULT_METADATA);
     const SpanBufferClass = buf.constructor as SpanBufferConstructor;
 
     // Schema is accessible via static property

@@ -18,7 +18,7 @@ import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from './t
 function createTestBuffer(): AnySpanBuffer {
   const schema = createTestSchema({});
   const opMetadata = createTestOpMetadata();
-  const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), opMetadata);
+  const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), opMetadata);
   // Write some test data
   buffer._writeIndex = 5;
   for (let i = 0; i < buffer._writeIndex; i++) {

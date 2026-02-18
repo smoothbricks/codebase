@@ -39,25 +39,17 @@ export interface BufferStrategy<T extends LogSchema = LogSchema> {
    * Create a root SpanBuffer for a new trace.
    *
    * @param schema - LogSchema defining column types
-   * @param spanName - Name of the root span
    * @param traceRoot - Platform-specific trace root with timestamp anchors
    * @param opMetadata - Metadata for the executing op
    * @param capacity - Optional capacity override
    * @returns New SpanBuffer for the root span
    */
-  createSpanBuffer(
-    schema: T,
-    spanName: string,
-    traceRoot: ITraceRoot,
-    opMetadata: OpMetadata,
-    capacity?: number,
-  ): SpanBuffer<T>;
+  createSpanBuffer(schema: T, traceRoot: ITraceRoot, opMetadata: OpMetadata, capacity?: number): SpanBuffer<T>;
 
   /**
    * Create a child span buffer linked to a parent.
    *
    * @param parentBuffer - Parent buffer for tree linkage
-   * @param spanName - Name for this span
    * Note: Caller must call writeSpanStart() after this to set span name in message_values[0].
    *
    * @param callsiteMetadata - Metadata for WHERE span() was called (row 0)

@@ -450,6 +450,12 @@ describe('LMAO Op Retry', () => {
   describe('span-retry entries', () => {
     it('should write span-retry entries for each retry attempt', async () => {
       let attempts = 0;
+      const RETRY_OBSERVABILITY = Transient<{ status?: number }>('RETRY_OBSERVABILITY', {
+        backoff: 'fixed',
+        maxAttempts: 3,
+        baseDelayMs: 17,
+        jitter: false,
+      });
 
       const tracer = new TestTracer(testOpContext, createTestTracerOptions());
 
@@ -457,7 +463,7 @@ describe('LMAO Op Retry', () => {
         return ctx.span('retryObservability', async (spanCtx) => {
           attempts++;
           if (attempts < 3) {
-            return spanCtx.err(SERVICE_UNAVAILABLE({ status: 503 }));
+            return spanCtx.err(RETRY_OBSERVABILITY({ status: 503 }));
           }
           return spanCtx.ok({ success: true });
         });
@@ -493,9 +499,16 @@ describe('LMAO Op Retry', () => {
       // Note: For inline functions, the opMetadata name comes from the parent context
       // which in this test is 'root' (the root trace name)
       const messages = spanBuffer.getColumnIfAllocated('message') as string[];
+      const retryAttempts = spanBuffer.getColumnIfAllocated('retry_attempt') as Float64Array;
+      const retryDelays = spanBuffer.getColumnIfAllocated('retry_delay_ms') as Float64Array;
       for (const idx of retryEntries) {
         expect(messages[idx]).toBe('retry:op:root');
       }
+
+      expect(retryAttempts[retryEntries[0]]).toBe(1);
+      expect(retryAttempts[retryEntries[1]]).toBe(2);
+      expect(retryDelays[retryEntries[0]]).toBe(17);
+      expect(retryDelays[retryEntries[1]]).toBe(17);
     });
 
     it('should not write span-retry entries when no retries occur', async () => {

@@ -36,7 +36,7 @@ function createTestBuffer(schema: LogSchema): AnySpanBuffer {
  * Create a test buffer with a specific capacity
  */
 function createTestBufferWithCapacity(schema: LogSchema, capacity: number): AnySpanBuffer {
-  return createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
+  return createSpanBuffer(schema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, capacity);
 }
 
 describe('null bitmap correctness', () => {

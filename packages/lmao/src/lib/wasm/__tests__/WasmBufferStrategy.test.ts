@@ -78,7 +78,7 @@ describe('WasmBufferStrategy', () => {
     it('creates a root span buffer', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+      const buffer = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
       // Caller must set span name via message() - simulating writeSpanStart behavior
       buffer.message(0, 'test-span');
 
@@ -93,7 +93,6 @@ describe('WasmBufferStrategy', () => {
 
       const buffer = strategy.createSpanBuffer(
         testSchema,
-        'test-span',
         traceRoot,
         testMetadata,
         32, // Custom capacity
@@ -106,7 +105,7 @@ describe('WasmBufferStrategy', () => {
       const statsBefore = strategy.getStats();
 
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
-      strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+      strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const statsAfter = strategy.getStats();
       expect(statsAfter.allocCount).toBeGreaterThan(statsBefore.allocCount);
@@ -117,7 +116,7 @@ describe('WasmBufferStrategy', () => {
     it('creates a child span linked to parent', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+      const parent = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const child = strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
       // Caller must set span name via message() - simulating writeSpanStart behavior
@@ -135,7 +134,7 @@ describe('WasmBufferStrategy', () => {
     it('inherits capacity from parent by default', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+      const parent = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const child = strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
 
@@ -145,7 +144,7 @@ describe('WasmBufferStrategy', () => {
     it('allows custom capacity for child', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+      const parent = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const child = strategy.createChildSpanBuffer(
         parent,
@@ -162,7 +161,7 @@ describe('WasmBufferStrategy', () => {
     it('creates overflow buffer linked to parent', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+      const buffer = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const overflow = strategy.createOverflowBuffer(buffer);
 
@@ -179,7 +178,7 @@ describe('WasmBufferStrategy', () => {
     it('frees WASM memory for a single buffer', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+      const buffer = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const statsBefore = strategy.getStats();
       strategy.releaseBuffer(buffer as any);
@@ -191,7 +190,7 @@ describe('WasmBufferStrategy', () => {
     it('frees entire span tree recursively', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const parent = strategy.createSpanBuffer(testSchema, 'parent-span', traceRoot, testMetadata);
+      const parent = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
 
@@ -208,7 +207,7 @@ describe('WasmBufferStrategy', () => {
     it('frees overflow chain', async () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
-      const buffer = strategy.createSpanBuffer(testSchema, 'test-span', traceRoot, testMetadata);
+      const buffer = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       strategy.createOverflowBuffer(buffer);
 
@@ -241,8 +240,8 @@ describe('WasmBufferStrategy', () => {
       const traceRoot = createWasmTraceRoot(strategy.allocator, 'test-trace-id', mockTracer);
 
       // Create some buffers
-      strategy.createSpanBuffer(testSchema, 'test-span-1', traceRoot, testMetadata);
-      strategy.createSpanBuffer(testSchema, 'test-span-2', traceRoot, testMetadata);
+      strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
+      strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const statsBeforeReset = strategy.getStats();
       expect(statsBeforeReset.allocCount).toBeGreaterThan(0);

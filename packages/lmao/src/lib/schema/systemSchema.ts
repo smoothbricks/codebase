@@ -24,6 +24,8 @@ interface SystemSchemaFieldTypes extends Record<string, Schema<unknown>> {
   message: EagerCategorySchema;
   line: LazyNumberSchema;
   error_code: LazyCategorySchema;
+  retry_attempt: LazyNumberSchema;
+  retry_delay_ms: LazyNumberSchema;
   exception_stack: LazyTextSchema;
   ff_value: LazyCategorySchema;
   uint64_value: LazyBigUint64Schema;
@@ -34,6 +36,8 @@ interface SystemSchemaFieldTypes extends Record<string, Schema<unknown>> {
 const messageSchema: EagerCategorySchema = ArrowS.category().eager();
 const lineSchema: LazyNumberSchema = ArrowS.number();
 const errorCodeSchema: LazyCategorySchema = ArrowS.category();
+const retryAttemptSchema: LazyNumberSchema = ArrowS.number();
+const retryDelayMsSchema: LazyNumberSchema = ArrowS.number();
 const exceptionStackSchema: LazyTextSchema = ArrowS.text();
 const ffValueSchema: LazyCategorySchema = ArrowS.category();
 const uint64ValueSchema: LazyBigUint64Schema = ArrowS.bigUint64();
@@ -51,6 +55,8 @@ export const SYSTEM_SCHEMA_FIELD_NAMES = new Set([
   'message',
   'line',
   'error_code',
+  'retry_attempt',
+  'retry_delay_ms',
   'exception_stack',
   'ff_value',
   'uint64_value',
@@ -114,6 +120,8 @@ const systemSchemaFields: SystemSchemaFieldTypes = {
 
   // Error handling
   error_code: errorCodeSchema,
+  retry_attempt: retryAttemptSchema,
+  retry_delay_ms: retryDelayMsSchema,
   exception_stack: exceptionStackSchema,
 
   // Feature flags (ffName is now part of unified `message` column)

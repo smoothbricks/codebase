@@ -339,23 +339,23 @@ this._logBinding = module;     // Accessed for schema/capacity stats
 
 // SLOT 10+: COLD - Only accessed during Arrow conversion or rarely
 this._system = systemBuffer;   // Underlying ArrayBuffer (accessed via views)
-this._spanName = spanName;     // Metadata for Arrow conversion
+this.message_values[0] = spanName; // Span name written to message row 0
 this._scopeValues = ...;       // Scope inheritance
 this._callsiteMetadata = ...;  // Row 0 metadata
 ```
 
 **Access Frequency Analysis:**
 
-| Property                                           | Access Pattern           | Frequency                |
-| -------------------------------------------------- | ------------------------ | ------------------------ |
-| `_writeIndex`                                      | Read + increment         | Every log entry          |
-| `_capacity`                                        | Read (overflow check)    | Every log entry          |
-| `_next`                                            | Read (buffer chain)      | On overflow              |
-| `timestamp` / `entry_type`                         | Array indexing           | Every log entry          |
-| `_children` / `_parent`                            | Tree navigation          | Span creation/completion |
-| `_identity` / `_logBinding`                        | Metadata access          | Span operations          |
-| `_system`                                          | Never after construction | Constructor only         |
-| `_spanName` / `_scopeValues` / `_callsiteMetadata` | Arrow conversion         | Cold path only           |
+| Property                                                   | Access Pattern           | Frequency                |
+| ---------------------------------------------------------- | ------------------------ | ------------------------ |
+| `_writeIndex`                                              | Read + increment         | Every log entry          |
+| `_capacity`                                                | Read (overflow check)    | Every log entry          |
+| `_next`                                                    | Read (buffer chain)      | On overflow              |
+| `timestamp` / `entry_type`                                 | Array indexing           | Every log entry          |
+| `_children` / `_parent`                                    | Tree navigation          | Span creation/completion |
+| `_identity` / `_logBinding`                                | Metadata access          | Span operations          |
+| `_system`                                                  | Never after construction | Constructor only         |
+| `message_values[0]` / `_scopeValues` / `_callsiteMetadata` | Arrow conversion         | Cold path only           |
 
 **Why This Matters:**
 

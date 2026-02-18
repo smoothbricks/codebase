@@ -80,13 +80,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     return new WasmBufferStrategy<T>(allocator);
   }
 
-  createSpanBuffer(
-    schema: T,
-    _spanName: string,
-    traceRoot: ITraceRoot,
-    opMetadata: OpMetadata,
-    capacity?: number,
-  ): SpanBuffer<T> {
+  createSpanBuffer(schema: T, traceRoot: ITraceRoot, opMetadata: OpMetadata, capacity?: number): SpanBuffer<T> {
     const effectiveCapacity = capacity ?? this.allocator.capacity;
 
     // Create WASM buffer

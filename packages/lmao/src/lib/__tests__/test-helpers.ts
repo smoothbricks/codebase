@@ -131,7 +131,6 @@ export function createTestLogBinding<T extends SchemaFields>(schema: SchemaField
 export function createTestSpanBuffer<T extends SchemaFields>(
   schema: SchemaFields | LogSchema<T>,
   options: {
-    spanName?: string;
     trace_id?: TraceId;
     capacity?: number;
   } = {},
@@ -148,7 +147,6 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   // Create SpanBuffer using the Phase 2 API (no LogBinding parameter)
   const spanBuffer = createSpanBuffer(
     logSchema,
-    options.spanName ?? 'test-span',
     traceRoot,
     DEFAULT_METADATA,
     options.capacity ?? DEFAULT_BUFFER_CAPACITY,
@@ -175,7 +173,7 @@ export function createTestLogger<T extends LogSchema>(
 } {
   const logBinding = createTestLogBinding(schema);
   const traceRoot = createTestTraceRoot();
-  const buffer = createSpanBuffer(schema, 'test-span', traceRoot, DEFAULT_METADATA);
+  const buffer = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA);
   const logger = createSpanLogger(schema, buffer);
   return { buffer, logger, logBinding };
 }
@@ -230,9 +228,8 @@ export { createTraceId };
  * createSpanBuffer directly.
  *
  * @param schema - LogSchema to use
- * @param spanName - Span name (default: 'test-span')
  * @param capacity - Buffer capacity (optional, uses default from class stats)
  */
-export function createBuffer<T extends LogSchema>(schema: T, spanName = 'test-span', capacity?: number): SpanBuffer<T> {
-  return createSpanBuffer(schema, spanName, createTestTraceRoot(), DEFAULT_METADATA, capacity);
+export function createBuffer<T extends LogSchema>(schema: T, capacity?: number): SpanBuffer<T> {
+  return createSpanBuffer(schema, createTestTraceRoot(), DEFAULT_METADATA, capacity);
 }

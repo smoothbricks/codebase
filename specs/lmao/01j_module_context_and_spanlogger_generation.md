@@ -34,7 +34,7 @@ ModuleContext (class) - ONE per module definition
 SpanBuffer - ONE per span (internal interface)
 ├── _callsiteModule?: ModuleContext ← caller's module (where span() was invoked) - for row 0 metadata
 ├── _module: ModuleContext          ← op's module (what code is executing) - for rows 1+ metadata
-├── _spanName: string               ← span name for this invocation
+├── message_values[0]: string       ← span name written by writeSpanStart()
 ├── lineNumber_values: Int32Array  ← line numbers per row (written directly, NOT stored as property)
 ├── _parent?: SpanBuffer            ← reference to parent (child spans walk this for trace_id)
 ├── _children: SpanBuffer[]         ← child spans

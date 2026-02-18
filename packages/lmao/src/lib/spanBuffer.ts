@@ -407,7 +407,6 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
  * Root buffers have identity: [threadId(8)][spanId(4)][traceIdLen(1)][traceId(N)]
  *
  * @param schema - Tag attribute schema defining column types (must be LogSchema)
- * @param spanName - Name of the span
  * @param traceRoot - Pre-built ITraceRoot with trace_id, anchors, and tracer
  * @param opMetadata - Op metadata for attribution (package_name, package_file, git_sha, line)
  * @param capacity - Buffer capacity (optional, uses class.stats.capacity if omitted)
@@ -418,7 +417,6 @@ const MIN_CAPACITY = 8;
 
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
-  _spanName: string,
   traceRoot: ITraceRoot,
   opMetadata: OpMetadata,
   capacity?: number,
@@ -462,7 +460,7 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
   const capacity = (stats.capacity + 7) & ~7;
 
-  // Chained buffers inherit callsiteMetadata, opMetadata, and spanName from the original buffer
+  // Chained buffers inherit callsiteMetadata and opMetadata from the original buffer
   // Pass buffer as parent - used for identity sharing; _parent set to buffer._parent in constructor
   const nextBuffer = new SpanBufferClass(
     capacity,

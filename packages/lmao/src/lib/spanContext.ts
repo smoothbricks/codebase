@@ -162,7 +162,7 @@ function calculateDelay(policy: RetryPolicy, attempt: number): number {
  * Per specs/lmao/01h_entry_types_and_logging_primitives.md:
  * - span-retry appends to Row 2+ in parent span buffer (like log entries)
  * - Trace-only entry (NOT written to event log)
- * - Contains: attempt number, error message, delay until next attempt
+ * - Contains: attempt number, error code, and delay until next attempt
  *
  * @param buffer - SpanBuffer to write to (appends at _writeIndex)
  * @param attempt - Attempt number (1-indexed)
@@ -171,9 +171,9 @@ function calculateDelay(policy: RetryPolicy, attempt: number): number {
  */
 function writeRetryEntry<T extends LogSchema>(
   buffer: SpanBuffer<T>,
-  _attempt: number,
+  attempt: number,
   error: TransientError<string, unknown>,
-  _delayMs: number,
+  delayMs: number,
 ): void {
   // Get current write index and advance for next write
   const index = buffer._writeIndex;
@@ -191,11 +191,9 @@ function writeRetryEntry<T extends LogSchema>(
     buffer.error_code(index, error.code);
   }
 
-  // Note: Full retry metadata (attempt, delay, error details) is available via:
-  // - The error code for error classification
-  // - The message for query patterns
-  // - Count of span-retry entries = number of retries that occurred
-  // Additional fields like retry_attempt, retry_delay_ms would require schema extension
+  // Retry metadata fields for direct queryability in Arrow output
+  buffer.retry_attempt(index, attempt);
+  buffer.retry_delay_ms(index, delayMs);
 }
 
 /**

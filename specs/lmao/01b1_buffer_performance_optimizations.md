@@ -97,7 +97,7 @@ slower backing store. **Therefore, assign the HOTTEST properties FIRST** in the 
 class BadBuffer {
   constructor(capacity: number) {
     this._system = new ArrayBuffer(capacity * 9);  // Cold - never accessed after construction
-    this._spanName = 'span';       // Cold - Arrow conversion only
+    this.message_values[0] = 'span'; // Cold write - span name lives in message row 0
     this._parent = undefined;      // Warm - occasionally accessed
     this._children = [];           // Warm - occasionally accessed
     this._scopeValues = undefined; // Cold - Arrow conversion only
@@ -136,7 +136,7 @@ class GoodBuffer {
 
     // SLOT 10+: COLD properties last (only accessed during Arrow conversion)
     this._system = new ArrayBuffer(capacity * 9); // NEVER accessed after construction
-    this._spanName = 'span';       // Arrow conversion only
+    this.message_values[0] = 'span'; // Span name lives in message row 0
     this._scopeValues = undefined; // Arrow conversion only
     this._callsiteMetadata = undefined; // Arrow conversion only
   }
@@ -161,7 +161,7 @@ class GoodBuffer {
     this._logBinding = module;
 
     // Cold properties last (metadata, rarely accessed)
-    this._spanName = 'span';
+    this.message_values[0] = 'span';
     this._scopeValues = undefined;
     this._callsiteMetadata = undefined;
   }

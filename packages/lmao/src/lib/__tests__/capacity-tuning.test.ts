@@ -485,7 +485,6 @@ describe('Capacity Tuning Algorithm', () => {
       for (let span = 0; span < 12; span++) {
         const buffer = createSpanBuffer(
           integrationSchema,
-          'test-span',
           createTestTraceRoot('test-trace'),
           DEFAULT_METADATA,
           undefined,

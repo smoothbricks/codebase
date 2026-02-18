@@ -160,7 +160,7 @@ function generateRemappedBufferViewClass(
     
       // Metadata (pass-through)
       get module() { return this._buffer._module; }
-      get spanName() { return this._buffer._spanName; }
+      get spanName() { return this._buffer.message_values[0]; }
 
       // Remapped column access (for Arrow conversion iteration)
       getColumnIfAllocated(name) {

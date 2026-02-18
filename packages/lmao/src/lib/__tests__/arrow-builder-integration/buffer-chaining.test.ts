@@ -15,7 +15,7 @@ import type { SpanBuffer } from '../../types.js';
 import { createBuffer, createTestSchema, createTestTraceRoot, createTraceId } from '../test-helpers.js';
 
 describe('Buffer Chaining', () => {
-  let schema: LogSchema<any>;
+  let schema: LogSchema;
   let SpanBufferClass: SpanBufferConstructor;
 
   beforeEach(() => {
@@ -122,8 +122,7 @@ describe('Buffer Chaining', () => {
       const nextChildBuffer = createOverflowBuffer(childBuffer);
 
       // Should maintain parent relationship
-      // toBe<any> needed: recursive SpanBuffer intersection types confuse overload resolution
-      expect(nextChildBuffer._parent).toBe<any>(parentBuffer);
+      expect(nextChildBuffer._parent).toBe(parentBuffer as unknown as typeof nextChildBuffer._parent);
 
       // Should NOT be added to parent's children (it's a continuation, not a new span)
       expect(parentBuffer._children).toHaveLength(1);
@@ -146,7 +145,7 @@ describe('Buffer Chaining', () => {
 
   describe('Buffer Chaining Edge Cases', () => {
     it('should handle buffer at exact capacity', () => {
-      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), DEFAULT_METADATA, 10);
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, 10);
       buffer._writeIndex = 10; // At exact capacity
 
       const nextBuffer = createOverflowBuffer(buffer);
@@ -187,7 +186,7 @@ describe('Buffer Chaining', () => {
   describe('Enhanced Buffer Chaining Tests', () => {
     it('should preserve data integrity across multiple buffer overflows', () => {
       const traceId = createTraceId('complex-trace');
-      const rootBuffer = createSpanBuffer(schema, 'root-span', createTestTraceRoot(traceId), DEFAULT_METADATA, 4); // Small capacity
+      const rootBuffer = createSpanBuffer(schema, createTestTraceRoot(traceId), DEFAULT_METADATA, 4); // Small capacity
 
       // Write entries that will cause multiple overflows
       const testEntries = Array.from({ length: 10 }, (_, i) => ({
@@ -242,7 +241,7 @@ describe('Buffer Chaining', () => {
 
     it('should maintain buffer topology with mixed relationships', () => {
       const traceId = createTraceId('topology-test');
-      const rootBuffer = createSpanBuffer(schema, 'root', createTestTraceRoot(traceId), DEFAULT_METADATA, undefined);
+      const rootBuffer = createSpanBuffer(schema, createTestTraceRoot(traceId), DEFAULT_METADATA, undefined);
 
       // Create first chained buffer with children
       const buffer1 = createOverflowBuffer(rootBuffer);
@@ -289,10 +288,9 @@ describe('Buffer Chaining', () => {
       expect(child3.span_id).not.toBe(buffer2.span_id);
 
       // Verify child relationships
-      // toBe<any> needed: recursive SpanBuffer intersection types confuse overload resolution
-      expect(child1._parent).toBe<any>(buffer1);
-      expect(child2._parent).toBe<any>(buffer1);
-      expect(child3._parent).toBe<any>(buffer2);
+      expect(child1._parent).toBe(buffer1 as unknown as typeof child1._parent);
+      expect(child2._parent).toBe(buffer1 as unknown as typeof child2._parent);
+      expect(child3._parent).toBe(buffer2 as unknown as typeof child3._parent);
       expect(child1._overflow).toBeUndefined();
       expect(child2._overflow).toBeUndefined();
       expect(child3._overflow).toBeUndefined();
@@ -300,7 +298,7 @@ describe('Buffer Chaining', () => {
 
     it('should create overflow chain for many entries', () => {
       // Use minimum capacity (8) to force overflow with fewer entries
-      const rootBuffer = createSpanBuffer(schema, 'stats-test', createTestTraceRoot('test-trace'), DEFAULT_METADATA, 8);
+      const rootBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), DEFAULT_METADATA, 8);
 
       // Write 20 entries to force multiple overflows
       let currentBuffer = rootBuffer;
@@ -329,7 +327,7 @@ describe('Buffer Chaining', () => {
     });
 
     it('should preserve schema consistency across chain boundaries', () => {
-      const rootBuffer = createBuffer(schema, 'schema-test');
+      const rootBuffer = createBuffer(schema);
       const buffer1 = createOverflowBuffer(rootBuffer);
       const buffer2 = createOverflowBuffer(buffer1);
       const buffer3 = createOverflowBuffer(buffer2);

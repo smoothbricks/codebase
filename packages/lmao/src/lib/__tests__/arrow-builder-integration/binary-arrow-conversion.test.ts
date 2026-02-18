@@ -20,7 +20,7 @@ describe('Binary Arrow Conversion', () => {
         requestId: S.category(),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
       // Write row with an object payload
@@ -66,7 +66,7 @@ describe('Binary Arrow Conversion', () => {
         request: S.object<HttpRequest>(),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
       const requestData: HttpRequest = {
@@ -96,7 +96,7 @@ describe('Binary Arrow Conversion', () => {
         rawData: S.binary(),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
       const rawBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
@@ -120,7 +120,7 @@ describe('Binary Arrow Conversion', () => {
         requestId: S.category(),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
       // Row 0: payload set
@@ -158,7 +158,7 @@ describe('Binary Arrow Conversion', () => {
         operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
       (writer.nextRow() as any)
@@ -190,12 +190,7 @@ describe('Binary Arrow Conversion', () => {
       });
 
       // Create root buffer
-      const rootBuffer = createSpanBuffer(
-        schema,
-        'root-span',
-        createTestTraceRoot('test-trace'),
-        createTestOpMetadata(),
-      );
+      const rootBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const rootWriter = createColumnWriter(schema, rootBuffer);
 
       (rootWriter.nextRow() as any).payload({ level: 'root', data: [1, 2] }).userId('user-root');
@@ -204,12 +199,7 @@ describe('Binary Arrow Conversion', () => {
       rootBuffer._writeIndex = 1;
 
       // Create child buffer
-      const childBuffer = createSpanBuffer(
-        schema,
-        'child-span',
-        createTestTraceRoot('test-trace'),
-        createTestOpMetadata(),
-      );
+      const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const childWriter = createColumnWriter(schema, childBuffer);
 
       (childWriter.nextRow() as any).payload({ level: 'child', nested: { a: 1 } }).userId('user-child');
@@ -244,7 +234,7 @@ describe('Binary Arrow Conversion', () => {
         payload: S.unknown(),
       });
 
-      const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
       const obj: Record<string, unknown> = { x: 1, y: 2, label: 'original' };
@@ -278,12 +268,7 @@ describe('Binary Arrow Conversion', () => {
       });
 
       // Root buffer with multiple rows to exercise dictionary deduplication
-      const rootBuffer = createSpanBuffer(
-        schema,
-        'root-span',
-        createTestTraceRoot('test-trace'),
-        createTestOpMetadata(),
-      );
+      const rootBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const rootWriter = createColumnWriter(schema, rootBuffer);
 
       (rootWriter.nextRow() as any).payload({ req: 1 }).userId('user-A').action('click');
@@ -301,12 +286,7 @@ describe('Binary Arrow Conversion', () => {
       rootBuffer._writeIndex = 3;
 
       // Child buffer with overlapping category values
-      const childBuffer = createSpanBuffer(
-        schema,
-        'child-span',
-        createTestTraceRoot('test-trace'),
-        createTestOpMetadata(),
-      );
+      const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const childWriter = createColumnWriter(schema, childBuffer);
 
       (childWriter.nextRow() as any).payload({ req: 4 }).userId('user-B').action('submit');
@@ -369,7 +349,7 @@ describe('Binary Arrow Conversion', () => {
       ];
 
       for (const testValue of testValues) {
-        const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+        const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
         const writer = createColumnWriter(schema, buffer);
 
         (writer.nextRow() as any).payload(testValue);

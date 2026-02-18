@@ -550,7 +550,6 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     // Create root SpanBuffer with pre-built TraceRoot via strategy
     const buffer = this.bufferStrategy.createSpanBuffer(
       schema,
-      name, // spanName
       traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
       metadata, // opMetadata (for both callsite and op at root level)
     );

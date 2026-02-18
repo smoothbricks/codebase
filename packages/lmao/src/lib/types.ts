@@ -294,6 +294,18 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
   readonly error_code_nulls: Uint8Array;
 
   /**
+   * Retry attempt column values - number (lazy but always present).
+   */
+  readonly retry_attempt_values: Float64Array;
+  readonly retry_attempt_nulls: Uint8Array;
+
+  /**
+   * Retry delay column values in milliseconds - number (lazy but always present).
+   */
+  readonly retry_delay_ms_values: Float64Array;
+  readonly retry_delay_ms_nulls: Uint8Array;
+
+  /**
    * Exception stack trace column values - text strings (lazy but always present).
    */
   readonly exception_stack_values: string[];
@@ -331,6 +343,16 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Set error code for a row (used by span-err and error log entries).
    */
   error_code(pos: number, val: string): AnySpanBuffer;
+
+  /**
+   * Set retry attempt for a row (used by span-retry entries).
+   */
+  retry_attempt(pos: number, val: number): AnySpanBuffer;
+
+  /**
+   * Set retry delay in ms for a row (used by span-retry entries).
+   */
+  retry_delay_ms(pos: number, val: number): AnySpanBuffer;
 
   /**
    * Set exception stack trace for a row (used by span-exception).

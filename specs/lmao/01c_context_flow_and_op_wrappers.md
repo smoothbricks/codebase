@@ -33,7 +33,7 @@ SpanBuffer - ONE per span (internal)
 ├── _traceRoot: TraceRoot         ← trace_id, anchors, tracer reference
 ├── _callsiteMetadata?: OpMetadata ← CALLER's metadata (for row 0)
 ├── _opMetadata: OpMetadata        ← THIS OP's metadata (for rows 1+)
-├── _spanName: string              ← span name for this invocation
+├── message_values[0]: string      ← span name written by writeSpanStart()
 ├── _parent?: SpanBuffer           ← reference to parent
 ├── _children: SpanBuffer[]        ← child spans
 ├── _scopeValues: Record<string, unknown> ← scope values for this span
@@ -55,6 +55,9 @@ SpanContext (interface) - user-facing, what ops receive
 ```
 
 **Dual Metadata References - Row 0 vs Rows 1+:**
+
+Span names are not stored on an internal `_spanName` property. `writeSpanStart()` writes the span name directly into
+`message_values[0]`, which keeps span naming aligned with the unified `message` column used in Arrow output.
 
 - **Row 0 (span-start)**: Uses `_callsiteMetadata` for `git_sha`, `package_name`, `package_file`
 - **Rows 1+ (span-ok/err/exception, logs)**: Uses `_opMetadata` for `git_sha`, `package_name`, `package_file`
@@ -87,7 +90,7 @@ buffer._opMetadata.package_name; // This op's metadata (for rows 1+)
 buffer._opMetadata.git_sha; // This op's git SHA (for rows 1+)
 buffer._traceRoot.trace_id; // Trace ID (root stores it)
 buffer._traceRoot.tracer; // Tracer reference for lifecycle hooks
-buffer._spanName; // Span name (direct property)
+buffer.message_values[0]; // Span name (row 0, written by writeSpanStart)
 buffer.line_values[0]; // Line number for row 0 (lazy column)
 buffer.trace_id; // Walks parent chain to root if child span
 ```

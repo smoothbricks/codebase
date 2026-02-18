@@ -365,7 +365,8 @@ SpanBuffer public properties correspond exactly to Arrow table column names for 
 
 - **Internal Properties** (`_` prefix for encapsulation):
   - `_system`, `_identity`, `_writeIndex`, `_capacity`, `_next`, `_hasParent`
-  - `_children`, `_parent`, `_module`, `_spanName`, `_callsiteModule`, `_scopeValues`
+  - `_children`, `_parent`, `_module`, `_callsiteModule`, `_scopeValues`
+  - Span name is stored in `message_values[0]` (written by `writeSpanStart()`)
 
 This ensures SpanBuffer properties match Arrow columns 1:1, enabling users to define custom columns with consistent
 naming.

@@ -48,13 +48,7 @@ describe('Buffer Integration', () => {
     });
 
     const capacity = 64;
-    const buf = createSpanBuffer(
-      schema,
-      'test-span',
-      createTestTraceRoot('test-trace'),
-      createTestOpMetadata(),
-      capacity,
-    );
+    const buf = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata(), capacity);
 
     // Core TypedArrays exist
     expect(buf.timestamp).toBeInstanceOf(BigInt64Array);
@@ -79,7 +73,7 @@ describe('Buffer Integration', () => {
     });
 
     // Create buffer with schema
-    const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
     // Verify all attribute columns created with correct types (use _values suffix)
     expect(Array.isArray(buffer.requestId_values)).toBe(true); // category (raw strings)
@@ -96,7 +90,7 @@ describe('Buffer Integration', () => {
       optional: S.optional(S.number()),
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
     // Both should have column storage (use _values suffix)
     expect(Array.isArray(buffer.required_values)).toBe(true); // category (raw strings)
@@ -112,7 +106,7 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // Text: unmasked plain text
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
     // All should have column storage (use _values suffix)
     // Masking is applied during Arrow conversion (cold path), not buffer creation
@@ -128,12 +122,7 @@ describe('Buffer Integration', () => {
       operation: S.enum(['GET', 'POST', 'PUT', 'DELETE']), // 4 values → Uint8Array
     });
 
-    const smallBuffer = createSpanBuffer(
-      smallEnumSchema,
-      'test-span',
-      createTestTraceRoot('test-trace'),
-      createTestOpMetadata(),
-    );
+    const smallBuffer = createSpanBuffer(smallEnumSchema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
     // Should use Uint8Array for enums with ≤255 values (use _values suffix)
     expect(smallBuffer.operation_values).toBeInstanceOf(Uint8Array);
@@ -145,7 +134,7 @@ describe('Buffer Integration', () => {
       plainUserId: S.category(), // No masking
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -185,7 +174,7 @@ describe('Buffer Integration', () => {
       plainText: S.text(), // No masking
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -230,7 +219,7 @@ describe('Buffer Integration', () => {
       secretKey: S.text().mask(customMask),
     });
 
-    const buffer = createSpanBuffer(schema, 'test-span', createTestTraceRoot('test-trace'), createTestOpMetadata());
+    const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
@@ -264,12 +253,7 @@ describe('Buffer Integration', () => {
         optionalField: S.optional(S.number()), // Maps to Uint32Array
       });
 
-      const buffer = createSpanBuffer(
-        schema,
-        'integration-test',
-        createTestTraceRoot('test-trace'),
-        createTestOpMetadata(),
-      );
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
       // Verify arrow-builder created correct column types for each schema type
       expect(buffer.enumField_values).toBeInstanceOf(Uint8Array);
@@ -296,12 +280,7 @@ describe('Buffer Integration', () => {
         error: S.text().mask('email'),
       });
 
-      const buffer = createSpanBuffer(
-        schema,
-        'data-flow-test',
-        createTestTraceRoot('test-trace'),
-        createTestOpMetadata(),
-      );
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
 
       // Use ColumnWriter API to write data (more robust than direct array access)
       const writer = createColumnWriter(schema, buffer);
@@ -330,7 +309,7 @@ describe('Buffer Integration', () => {
     /**
      * Validates that SpanBuffer correctly exposes system properties.
      *
-     * System properties use `_` prefix (e.g., `_logSchema`, `_spanName`, `_capacity`)
+     * System properties use `_` prefix (e.g., `_logSchema`, `_capacity`)
      * to distinguish them from user-defined schema columns which have no prefix.
      * The `_` prefix does NOT mean private - these are readonly public properties.
      */
@@ -339,12 +318,7 @@ describe('Buffer Integration', () => {
         requestId: S.category(),
       });
 
-      const buffer = createSpanBuffer(
-        schema,
-        'context-integration',
-        createTestTraceRoot('test-trace'),
-        createTestOpMetadata(),
-      );
+      const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       // Caller must set span name via message() - simulating writeSpanStart behavior
       buffer.message(0, 'context-integration');
 
@@ -398,12 +372,6 @@ describe('Buffer Integration', () => {
 
       const ts = capturedBuffer.timestamp;
       const writeIndex = capturedBuffer._writeIndex;
-
-      expect(ts).toBeDefined();
-      expect(writeIndex).toBeDefined();
-      if (ts === undefined || writeIndex === undefined) {
-        throw new Error('Expected span buffer to expose timestamp and write index');
-      }
 
       // At minimum, span-start (row 0) should be before span-ok (row 1)
       expect(ts[1]).toBeGreaterThan(ts[0]);

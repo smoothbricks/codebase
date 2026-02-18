@@ -538,7 +538,7 @@ describe('Fixed Row Layout', () => {
   it('should create buffer with proper structure for fixed layout', () => {
     // Create buffer using the new Phase 2 API
     const opMetadata = createTestOpMetadata();
-    const buffer = createSpanBuffer(testSchema, 'test-span', createTestTraceRoot('test-trace'), opMetadata);
+    const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), opMetadata);
 
     // Buffer should have timestamps array for duration calculation
     expect(buffer.timestamp).toBeInstanceOf(BigInt64Array);
@@ -555,7 +555,7 @@ describe('Fixed Row Layout', () => {
 
   it('should expose _spanStartTime from timestamp row 0', () => {
     const opMetadata = createTestOpMetadata();
-    const buffer = createSpanBuffer(testSchema, 'test-span', createTestTraceRoot('test-trace'), opMetadata);
+    const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), opMetadata);
 
     buffer.timestamp[0] = 111n;
     expect(buffer._spanStartTime).toBe(Nanoseconds.unsafe(111n));
@@ -563,7 +563,7 @@ describe('Fixed Row Layout', () => {
 
   it('should expose _lastLoggedTime across overflow chain', () => {
     const opMetadata = createTestOpMetadata();
-    const buffer = createSpanBuffer(testSchema, 'test-span', createTestTraceRoot('test-trace'), opMetadata, 4);
+    const buffer = createSpanBuffer(testSchema, createTestTraceRoot('test-trace'), opMetadata, 4);
 
     buffer._writeIndex = 4;
     buffer.timestamp[0] = 100n;
