@@ -70,7 +70,7 @@ class QueryableSpanImpl<T extends LogSchema> implements QueryableSpan<T> {
   }
 
   get children(): QueryableSpan<T>[] {
-    return this.buffer._children.map((child) => new QueryableSpanImpl(child));
+    return (this.buffer._children as SpanBuffer<T>[]).map((child) => new QueryableSpanImpl(child));
   }
 
   names(): string[] {
