@@ -10,11 +10,9 @@
     "sourceMap": true,
     "lib": [
       "es2022",
-      "dom"
+      "webworker"
     ],
-    "types": [
-      "bun-types"
-    ]
+    "types": []
   },
   "include": [
     "src/**/*.ts"
@@ -24,7 +22,8 @@
     "dist",
     "src/**/*.disabled.ts",
     "src/**/*.test.ts",
-    "src/**/*.bench.ts"
+    "src/**/*.bench.ts",
+    "src/**/__tests__/**"
   ],
   "references": []
 }

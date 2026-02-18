@@ -7,9 +7,10 @@
     "tsBuildInfoFile": "dist/tsconfig.lib.tsbuildinfo",
     "emitDeclarationOnly": false,
     "forceConsistentCasingInFileNames": true,
-    "types": [
-      "node",
-      "bun"
+    "types": [],
+    "lib": [
+      "es2022",
+      "webworker"
     ],
     "skipLibCheck": true,
     "customConditions": []
@@ -21,7 +22,8 @@
     "src/**/__tests__/**",
     "src/**/*.test.ts",
     "src/**/*.spec.ts",
-    "src/lib/testing/vitest-harness.ts"
+    "src/lib/testing/vitest-harness.ts",
+    "src/lib/testing/bun-harness.ts"
   ],
   "references": [
     {
