@@ -324,6 +324,16 @@ export const routeOp = op(async ({ span, tag, log, deps }, event: LambdaEvent): 
 });
 ```
 
+### Direct Invoke Argument Shape
+
+For JSON invoke routers (`{ op: 'name', ...fields }`), use Ops with one of these signatures:
+
+- `(ctx) => Result`
+- `(ctx, argObject) => Result`
+
+Avoid multi-positional Op args for direct JSON invoke paths. Transport adapters have no positional argument ordering, so
+remaining payload fields should map to a single object arg.
+
 **Key Points**:
 
 - `deps: { http: httpModule, auth: authModule }` declares both dependencies
@@ -646,6 +656,7 @@ resolvers, or microservice gateways.
 ## Integration with Other Specs
 
 - **[Op Context Pattern](./01l_op_context_pattern.md)**: Defines `defineOpContext()`, `defineOp()`, and Tracer API
+  contract
 - **[Library Integration Pattern](./01e_library_integration_pattern.md)**: RemappedBufferView for Arrow conversion
 - **[Context Flow](./01c_context_flow_and_op_wrappers.md)**: How context propagates through span() calls
 - **[Trace Schema System](./01a_trace_schema_system.md)**: `S.enum()`, `S.category()`, `S.text()` definitions

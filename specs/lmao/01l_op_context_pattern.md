@@ -680,6 +680,15 @@ const tracer = new TestTracer(opContext, {
 
 ## Common Patterns
 
+### Hybrid Lambda Direct Invoke
+
+When an OpGroup is used as a direct invoke command surface (`{ op: 'name', ...fields }`), map payload fields to a single
+object arg:
+
+- preferred Op signatures: `(ctx)` or `(ctx, argObject)`
+- avoid multi-positional args for JSON invoke transports
+
+
 ### Library Package
 
 ```typescript
