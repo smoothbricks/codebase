@@ -61,5 +61,8 @@ Thumbs.db
 # Jest
 test-output
 
+# Trace test results (SQLite)
+.trace-results.db
+
 # TypeScript build info
 *.tsbuildinfo
