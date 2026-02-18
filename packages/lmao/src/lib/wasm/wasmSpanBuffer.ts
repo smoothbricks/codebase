@@ -217,6 +217,31 @@ function wasmGetTraceId(this: WasmSpanBufferInstance): string {
   return new TextDecoder().decode(new Uint8Array(this._allocator.memory.buffer, traceIdPtr, len));
 }
 
+function wasmGetSpanStartTime(this: WasmSpanBufferInstance): bigint {
+  return this.timestamp[0];
+}
+
+function wasmGetLastLoggedTime(this: WasmSpanBufferInstance): bigint | null {
+  const chain: WasmSpanBufferInstance[] = [];
+  let current: WasmSpanBufferInstance | undefined = this;
+  while (current) {
+    chain.push(current);
+    current = current._overflow;
+  }
+
+  for (let i = chain.length - 1; i >= 0; i--) {
+    const buffer = chain[i];
+    for (let row = buffer._writeIndex - 1; row >= 0; row--) {
+      const ts = buffer.timestamp[row];
+      if (ts !== 0n) {
+        return ts;
+      }
+    }
+  }
+
+  return null;
+}
+
 /**
  * Get thread_id from WASM identity block.
  */
@@ -736,6 +761,17 @@ return WasmSpanBuffer;
     enumerable: true,
     configurable: true,
   });
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_spanStartTime', {
+    get: wasmGetSpanStartTime,
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(WasmSpanBufferClass.prototype, '_lastLoggedTime', {
+    get: wasmGetLastLoggedTime,
+    enumerable: true,
+    configurable: true,
+  });
+
   // Assign compatibility getters for AnySpanBuffer interface
   Object.defineProperty(WasmSpanBufferClass.prototype, '_system', {
     get: wasmGetSystem,

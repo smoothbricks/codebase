@@ -322,6 +322,27 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
       const traceIdBytes = current._identity.subarray(13, 13 + len);
       return textDecoder.decode(traceIdBytes);
     }
+    get _spanStartTime() {
+      return this.timestamp[0];
+    }
+    get _lastLoggedTime() {
+      const chain = [];
+      let current = this;
+      while (current) {
+        chain.push(current);
+        current = current._overflow;
+      }
+      for (let i = chain.length - 1; i >= 0; i--) {
+        const buffer = chain[i];
+        for (let row = buffer._writeIndex - 1; row >= 0; row--) {
+          const ts = buffer.timestamp[row];
+          if (ts !== 0n) {
+            return ts;
+          }
+        }
+      }
+      return null;
+    }
     get _hasParent() { return this._parent !== undefined; }
     get parent_span_id() { return this._parent?.span_id ?? 0; }
     get parent_thread_id() { return this._parent?.thread_id ?? 0n; }

@@ -4,6 +4,7 @@
  */
 
 import { describe, expect, it } from 'bun:test';
+import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { convertSpanTreeToArrowTable } from '../convertToArrow.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { defineCodeError } from '../result.js';
@@ -550,5 +551,31 @@ describe('Fixed Row Layout', () => {
 
     // Fresh buffer starts at writeIndex 0
     expect(buffer._writeIndex).toBe(0);
+  });
+
+  it('should expose _spanStartTime from timestamp row 0', () => {
+    const opMetadata = createTestOpMetadata();
+    const buffer = createSpanBuffer(testSchema, 'test-span', createTestTraceRoot('test-trace'), opMetadata);
+
+    buffer.timestamp[0] = 111n;
+    expect(buffer._spanStartTime).toBe(Nanoseconds.unsafe(111n));
+  });
+
+  it('should expose _lastLoggedTime across overflow chain', () => {
+    const opMetadata = createTestOpMetadata();
+    const buffer = createSpanBuffer(testSchema, 'test-span', createTestTraceRoot('test-trace'), opMetadata, 4);
+
+    buffer._writeIndex = 4;
+    buffer.timestamp[0] = 100n;
+    buffer.timestamp[1] = 200n;
+    buffer.timestamp[2] = 300n;
+    buffer.timestamp[3] = 400n;
+
+    const overflow = buffer.getOrCreateOverflow();
+    overflow._writeIndex = 2;
+    overflow.timestamp[0] = 500n;
+    overflow.timestamp[1] = 600n;
+
+    expect(buffer._lastLoggedTime).toBe(Nanoseconds.unsafe(600n));
   });
 });

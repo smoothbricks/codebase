@@ -1,5 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
-import { S as ArrowS } from '@smoothbricks/arrow-builder';
+import { S as ArrowS, Nanoseconds } from '@smoothbricks/arrow-builder';
 import { createTestOpMetadata, TEST_TRACER } from '../../__tests__/test-helpers.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
@@ -177,6 +177,32 @@ describe('WasmSpanBuffer', () => {
       // Get a new view and verify it sees the same data
       const newView = buffer.timestamp;
       expect(newView[5]).toBe(999n);
+    });
+
+    it('exposes _spanStartTime from row 0', () => {
+      buffer.timestamp[0] = 123n;
+      expect(buffer._spanStartTime).toBe(Nanoseconds.unsafe(123n));
+    });
+
+    it('exposes _lastLoggedTime across overflow chain', () => {
+      buffer._writeIndex = 4;
+      buffer.timestamp[0] = 100n;
+      buffer.timestamp[1] = 200n;
+      buffer.timestamp[2] = 300n;
+      buffer.timestamp[3] = 400n;
+
+      const overflow = createWasmOverflowBuffer(
+        buffer,
+        traceRoot,
+        EMPTY_SCOPE,
+        createTestOpMetadata(),
+        createTestOpMetadata({ name: 'overflow', line: 0 }),
+      );
+      overflow._writeIndex = 2;
+      overflow.timestamp[0] = 500n;
+      overflow.timestamp[1] = 600n;
+
+      expect(buffer._lastLoggedTime).toBe(Nanoseconds.unsafe(600n));
     });
   });
 

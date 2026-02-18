@@ -15,6 +15,7 @@ import type {
   ColumnValueType,
   EagerBinarySchema,
   LazyBinarySchema,
+  Nanoseconds,
   TypedArray,
 } from '@smoothbricks/arrow-builder';
 import type { OpMetadata } from './opContext/opTypes.js';
@@ -111,6 +112,21 @@ export interface AnySpanBuffer extends AnyColumnBuffer {
    * Values are ENTRY_TYPE_* constants (span-start=1, span-ok=2, etc.)
    */
   readonly entry_type: Uint8Array;
+
+  /**
+   * Timestamp of span start (row 0).
+   *
+   * Internal helper getter (underscore-prefixed) to avoid conflicts with schema columns.
+   */
+  readonly _spanStartTime: Nanoseconds;
+
+  /**
+   * Most recent non-zero timestamp in this span's written rows, including overflow buffers.
+   * Returns null if no written row has a timestamp yet.
+   *
+   * Internal helper getter (underscore-prefixed) to avoid conflicts with schema columns.
+   */
+  readonly _lastLoggedTime: Nanoseconds | null;
 
   // ===========================================================================
   // Buffer State
