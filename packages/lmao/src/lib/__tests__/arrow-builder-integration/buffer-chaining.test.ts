@@ -122,7 +122,8 @@ describe('Buffer Chaining', () => {
       const nextChildBuffer = createOverflowBuffer(childBuffer);
 
       // Should maintain parent relationship
-      expect(nextChildBuffer._parent).toBe(parentBuffer);
+      // toBe<any> needed: recursive SpanBuffer intersection types confuse overload resolution
+      expect(nextChildBuffer._parent).toBe<any>(parentBuffer);
 
       // Should NOT be added to parent's children (it's a continuation, not a new span)
       expect(parentBuffer._children).toHaveLength(1);
@@ -288,9 +289,10 @@ describe('Buffer Chaining', () => {
       expect(child3.span_id).not.toBe(buffer2.span_id);
 
       // Verify child relationships
-      expect(child1._parent).toBe(buffer1);
-      expect(child2._parent).toBe(buffer1);
-      expect(child3._parent).toBe(buffer2);
+      // toBe<any> needed: recursive SpanBuffer intersection types confuse overload resolution
+      expect(child1._parent).toBe<any>(buffer1);
+      expect(child2._parent).toBe<any>(buffer1);
+      expect(child3._parent).toBe<any>(buffer2);
       expect(child1._overflow).toBeUndefined();
       expect(child2._overflow).toBeUndefined();
       expect(child3._overflow).toBeUndefined();
