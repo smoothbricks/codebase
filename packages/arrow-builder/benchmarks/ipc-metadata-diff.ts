@@ -59,6 +59,38 @@ function getMessageHeaderName(type: number): string {
   return `Unknown(${type})`;
 }
 
+type DecodedField = {
+  name?: string;
+  nullable?: boolean;
+  type?: {
+    typeId?: number;
+    id?: number;
+    indices?: {
+      typeId?: number;
+    };
+    dictionary?: {
+      typeId?: number;
+    };
+  };
+};
+
+type DecodedContent = {
+  body?: {
+    length?: number;
+  };
+  fields?: DecodedField[];
+  length?: number;
+  nodes?: unknown;
+  regions?: unknown;
+  id?: number;
+  isDelta?: boolean;
+  data?: {
+    length?: number;
+    nodes?: unknown;
+    regions?: unknown;
+  };
+};
+
 function summarizeMessages(buf: Uint8Array) {
   const messages: unknown[] = [];
   let index = 0;
@@ -86,7 +118,7 @@ function summarizeMessages(buf: Uint8Array) {
     }
 
     const typeName = getMessageHeaderName(message.type);
-    const content = message.content as any;
+    const content = message.content as DecodedContent | undefined;
     const bodyLength = content?.body?.length ?? 0;
 
     const summary: Record<string, unknown> = {
@@ -99,7 +131,7 @@ function summarizeMessages(buf: Uint8Array) {
     if (typeName === 'Schema') {
       summary.schema = {
         version: message.version,
-        fields: (content.fields ?? []).map((f: any) => ({
+        fields: (content?.fields ?? []).map((f) => ({
           name: f.name,
           nullable: f.nullable,
           typeId: f.type?.typeId,
@@ -110,17 +142,17 @@ function summarizeMessages(buf: Uint8Array) {
       };
     } else if (typeName === 'RecordBatch') {
       summary.recordBatch = {
-        length: content.length,
-        nodes: content.nodes,
-        regions: content.regions,
+        length: content?.length,
+        nodes: content?.nodes,
+        regions: content?.regions,
       };
     } else if (typeName === 'DictionaryBatch') {
       summary.dictionaryBatch = {
-        id: content.id,
-        isDelta: content.isDelta,
-        dataLength: content.data?.length,
-        nodes: content.data?.nodes,
-        regions: content.data?.regions,
+        id: content?.id,
+        isDelta: content?.isDelta,
+        dataLength: content?.data?.length,
+        nodes: content?.data?.nodes,
+        regions: content?.data?.regions,
       };
     }
 
