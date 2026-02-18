@@ -392,13 +392,24 @@ describe('Buffer Integration', () => {
       // Verify timestamps are strictly increasing
       // Row 0 = span-start, Row 1 = span-ok/span-err, Row 2+ = log entries
       expect(capturedBuffer).toBeDefined();
-      const ts = capturedBuffer!.timestamp;
+      if (capturedBuffer === undefined) {
+        throw new Error('Expected trace callback to capture a span buffer');
+      }
+
+      const ts = capturedBuffer.timestamp;
+      const writeIndex = capturedBuffer._writeIndex;
+
+      expect(ts).toBeDefined();
+      expect(writeIndex).toBeDefined();
+      if (ts === undefined || writeIndex === undefined) {
+        throw new Error('Expected span buffer to expose timestamp and write index');
+      }
 
       // At minimum, span-start (row 0) should be before span-ok (row 1)
       expect(ts[1]).toBeGreaterThan(ts[0]);
 
       // All written timestamps should be > 0
-      for (let i = 0; i < capturedBuffer!._writeIndex; i++) {
+      for (let i = 0; i < writeIndex; i++) {
         expect(ts[i]).toBeGreaterThan(0n);
       }
     });
