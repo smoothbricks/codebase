@@ -504,6 +504,7 @@ describe('Pipeline undo integration', () => {
     );
 
     // Verify overflow occurred (undo log exceeded capacity)
+    // biome-ignore lint/style/noNonNullAssertion: method exists on wasm backend
     expect(backend.undoHasOverflow!()).toBe(true);
 
     // Rollback -- shadow buffer + undo log replay restores logical state

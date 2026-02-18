@@ -441,7 +441,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       wasmInstance.exports.vm_undo_enable(statePtr, s.size);
     },
 
-    undoCheckpoint(state: StateHandle): number {
+    undoCheckpoint(_state: StateHandle): number {
       const statePtr = wasmInstance.stateRegionOffset;
       return wasmInstance.exports.vm_undo_checkpoint(statePtr);
     },
@@ -456,7 +456,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       new Uint8Array(s.buffer).set(wasmU8.subarray(statePtr, statePtr + s.size));
     },
 
-    undoCommit(state: StateHandle, checkpointPos: number): void {
+    undoCommit(_state: StateHandle, checkpointPos: number): void {
       const statePtr = wasmInstance.stateRegionOffset;
       wasmInstance.exports.vm_undo_commit(statePtr, checkpointPos);
     },

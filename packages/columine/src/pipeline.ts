@@ -229,7 +229,9 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     checkpoint(state: StateHandle): UndoToken {
       if (hasNativeUndo) {
         // Enable undo logging, save change flags, store state pointer for lazy overflow
+        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
         backend.undoEnable!(state);
+        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
         const position = backend.undoCheckpoint!(state);
         // No snapshot needed — overflow is handled lazily inside Zig
         return {
@@ -254,7 +256,9 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
         // Native rollback — Zig handles overflow internally via shadow buffer:
         // if overflow occurred, it restores shadow then replays log;
         // if no overflow, it just replays log
+        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
         backend.undoRollback!(state, internal.position);
+        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
         const overflowed = backend.undoHasOverflow!();
         return overflowed ? 'overflow' : 'ok';
       }
@@ -277,6 +281,7 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
       const internal = assertInternalUndoToken(token);
 
       if (hasNativeUndo) {
+        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
         backend.undoCommit!(state, internal.position);
       }
 
