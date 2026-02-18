@@ -73,6 +73,18 @@
       "types": "./dist/testing.d.ts",
       "import": "./dist/testing.js",
       "default": "./dist/testing.js"
+    },
+    "./testing/bun": {
+      "development": "./src/lib/testing/bun-harness.ts",
+      "types": "./dist/lib/testing/bun-harness.d.ts",
+      "import": "./dist/lib/testing/bun-harness.js",
+      "default": "./dist/lib/testing/bun-harness.js"
+    },
+    "./testing/vitest": {
+      "development": "./src/lib/testing/vitest-harness.ts",
+      "types": "./dist/lib/testing/vitest-harness.d.ts",
+      "import": "./dist/lib/testing/vitest-harness.js",
+      "default": "./dist/lib/testing/vitest-harness.js"
     }
   },
   "files": [
