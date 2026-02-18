@@ -11,7 +11,9 @@ describe('Package exports', () => {
 
   it('resolves package metadata export', async () => {
     const pkg = await import('@smoothbricks/arrow-builder/package.json');
-    expect(pkg.name).toBe('@smoothbricks/arrow-builder');
-    expect(pkg.exports).toBeDefined();
+    // nodenext module resolution wraps JSON imports in { default: ... }
+    const meta = pkg.default;
+    expect(meta.name).toBe('@smoothbricks/arrow-builder');
+    expect(meta.exports).toBeDefined();
   });
 });
