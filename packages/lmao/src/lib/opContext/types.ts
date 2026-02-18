@@ -101,9 +101,9 @@ export { opContextType };
  */
 export type OpContext<
   T extends LogSchema = LogSchema,
-  FF extends FeatureFlagSchema = {},
-  Deps extends DepsConfig = {},
-  UserCtx extends Record<string, unknown> = {},
+  FF extends FeatureFlagSchema = FeatureFlagSchema,
+  Deps extends DepsConfig = DepsConfig,
+  UserCtx extends Record<string, unknown> = Record<string, unknown>,
 > = {
   readonly logSchema: T;
   readonly flags: FF;
@@ -236,9 +236,9 @@ export interface OpContextConfig<
  */
 export interface OpContextBinding<
   T extends LogSchema = LogSchema,
-  FF extends FeatureFlagSchema = {},
-  Deps extends DepsConfig = {},
-  UserCtx extends Record<string, unknown> = {},
+  FF extends FeatureFlagSchema = FeatureFlagSchema,
+  Deps extends DepsConfig = DepsConfig,
+  UserCtx extends Record<string, unknown> = Record<string, unknown>,
 > {
   /**
    * Phantom type - extract via OpContextOf<typeof binding>

@@ -60,6 +60,10 @@ let _rootTracePromise: Promise<unknown> | null = null;
 // AsyncLocalStorage for propagating SpanContext to test bodies
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
 
+type TestBody = () => unknown | Promise<unknown>;
+type RootSpanInvoker = (name: string, fn: (ctx: SpanContext<OpContext>) => Promise<unknown>) => Promise<unknown>;
+type DescribeTag = { describe: (path: string) => unknown };
+
 /** Initialize the root tracer for the entire vitest run. Call once in setupFiles. */
 export function initTraceTestRun<B extends OpContextBinding>(
   opContext: B,
@@ -179,11 +183,11 @@ export function createVitestMock(vitestModule: Record<string, unknown>): Record<
     skipIf: origDescribe.skipIf.bind(origDescribe),
   });
 
-  function wrappedIt(name: string, fn: any) {
+  function wrappedIt(name: string, fn: TestBody) {
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
     return origIt(name, () =>
-      (rootCtx.span as Function)(name, async (ctx: SpanContext<OpContext>) => {
-        if (describePath) (ctx.tag as any).describe(describePath);
+      (rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
+        if (describePath) (ctx.tag as unknown as DescribeTag).describe(describePath);
         try {
           await als.run(ctx, fn);
           return ctx.ok(undefined); // pass → span-ok
@@ -234,8 +238,8 @@ export function it(name: string, fn: () => void | Promise<void>): void {
   const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
   _it(name, () => {
     if (!_rootCtx) throw new Error('Call initTraceTestRun() in setupFiles before tests');
-    return (_rootCtx.span as Function)(name, async (ctx: SpanContext<OpContext>) => {
-      if (describePath) (ctx.tag as any).describe(describePath);
+    return (_rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
+      if (describePath) (ctx.tag as unknown as DescribeTag).describe(describePath);
       try {
         await _als.run(ctx, fn);
         return ctx.ok(undefined); // pass → span-ok

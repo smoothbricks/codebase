@@ -53,6 +53,17 @@ interface ExtraContext {
   userId: string;
 }
 
+const defaultExtraContext: ExtraContext = {
+  env: {
+    awsRegion: '',
+    maxConnections: 0,
+    databaseUrl: '',
+    debug: false,
+  },
+  requestId: '',
+  userId: '',
+};
+
 // 5. Create feature flag evaluator (would be LaunchDarkly, database, etc. in production)
 const flagEvaluator = new InMemoryFlagEvaluator({
   advancedValidation: true,
@@ -71,11 +82,7 @@ const userModule = defineModule({
   logSchema: dbAttributes,
   ff: featureFlags,
 })
-  .ctx<ExtraContext>({
-    env: null!, // Required - will be provided at traceContext() time
-    requestId: null!, // Required
-    userId: null!, // Required
-  })
+  .ctx<ExtraContext>(defaultExtraContext)
   .make({ ffEvaluator: flagEvaluator });
 
 // 7. Define ops with typed context

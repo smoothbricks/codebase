@@ -33,14 +33,20 @@ function isBitSet(bitmap: Uint8Array, idx: number): boolean {
  * bit-packed null bitmap.  JS arrays (string[], unknown[]) store `undefined` for
  * unwritten slots, so a plain != null check suffices.
  */
-function readUserValue(buffer: any, fieldName: string, row: number): unknown {
+type DynamicUserColumnBuffer = Record<string, unknown>;
+
+function readUserValue(buffer: DynamicUserColumnBuffer, fieldName: string, row: number): unknown {
   const values = buffer[`${fieldName}_values`];
   if (!values) return undefined;
 
   if (ArrayBuffer.isView(values)) {
     // Typed array — need null bitmap to distinguish zero from unset
     const nulls = buffer[`${fieldName}_nulls`] as Uint8Array | undefined;
-    return nulls && isBitSet(nulls, row) ? (values as any)[row] : undefined;
+    if (!('length' in values)) {
+      return undefined;
+    }
+    const typedValues = values as unknown as { [index: number]: unknown; length: number };
+    return nulls && isBitSet(nulls, row) ? typedValues[row] : undefined;
   }
   // JS array (string[], unknown[]) — undefined means unset
   return (values as unknown[])[row];
@@ -147,7 +153,7 @@ export class TraceSQLiteSink {
 
       const userValues: unknown[] = [];
       for (const fieldName of activeUserFields) {
-        const val = readUserValue(buffer, fieldName, row);
+        const val = readUserValue(buffer as unknown as DynamicUserColumnBuffer, fieldName, row);
         if (val !== undefined) {
           // Convert bigint to number for SQLite compatibility
           userValues.push(typeof val === 'bigint' ? Number(val) : val);
@@ -199,7 +205,7 @@ export class TraceSQLiteSink {
 
       const userValues: unknown[] = [];
       for (const fieldName of activeUserFields) {
-        const val = readUserValue(buffer, fieldName, row);
+        const val = readUserValue(buffer as unknown as DynamicUserColumnBuffer, fieldName, row);
         if (val !== undefined) {
           userValues.push(typeof val === 'bigint' ? Number(val) : val);
         } else {

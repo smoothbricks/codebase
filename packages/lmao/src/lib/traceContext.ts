@@ -90,7 +90,7 @@ export interface TraceContextSystem<
   readonly anchorEpochMicros: number; // Nanoseconds.now() / 1000n at trace root (microsecond precision)
   readonly anchorPerfNow: number; // performance.now() at trace root
   /** Root flag evaluator - use forContext(spanCtx) to get span-bound evaluator */
-  readonly ff: FlagEvaluator<OpContext<T, FF, {}, Env>>;
+  readonly ff: FlagEvaluator<OpContext<T, FF, Record<string, never>, Env>>;
   readonly span: RootSpanFn;
 }
 

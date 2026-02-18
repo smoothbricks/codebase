@@ -186,7 +186,7 @@ export type InferFeatureFlagsWithContext<Ctx extends OpContext> = Ctx['flags'] e
   ? {
       readonly [K in keyof Ctx['flags']]: InferFlagContextType<Ctx, S.Output<Ctx['flags'][K]['schema']>> | undefined;
     }
-  : {};
+  : Record<string, never>;
 
 // ============================================================================
 // Feature Flag Evaluator Class

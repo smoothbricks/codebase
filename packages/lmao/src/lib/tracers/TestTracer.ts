@@ -33,6 +33,10 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import { Tracer } from '../tracer.js';
 import type { SpanBuffer } from '../types.js';
 
+type ResettableBufferStrategy = {
+  reset: () => void;
+};
+
 /**
  * Snapshot of buffer stats captured before reset during capacity tuning.
  */
@@ -131,8 +135,11 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
     this.statsSnapshots.length = 0;
 
     // Reset the buffer strategy if it supports it (e.g., WasmBufferStrategy)
-    if ('reset' in this.bufferStrategy && typeof (this.bufferStrategy as any).reset === 'function') {
-      (this.bufferStrategy as any).reset();
+    if (
+      'reset' in this.bufferStrategy &&
+      typeof (this.bufferStrategy as ResettableBufferStrategy).reset === 'function'
+    ) {
+      (this.bufferStrategy as ResettableBufferStrategy).reset();
     }
   }
 }

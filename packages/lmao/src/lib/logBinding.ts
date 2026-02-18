@@ -14,9 +14,8 @@
 
 import type { LogSchema } from './schema/LogSchema.js';
 
-// Forward declare SpanBuffer type to avoid circular import with types.ts
-// The actual SpanBuffer type is defined in types.ts, which re-exports RemappedViewConstructor
-declare type SpanBuffer = any;
+// Type-only import keeps this file runtime-safe while preserving buffer shape information.
+type SpanBuffer = import('./types.js').AnySpanBuffer;
 
 /**
  * RemappedViewConstructor - Constructor type for RemappedBufferView classes.

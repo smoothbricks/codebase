@@ -201,14 +201,33 @@ interface UserData {
   name: string;
 }
 
+interface WiredLibraryDeps {
+  db: {
+    span: (
+      name: 'db-query',
+      op: typeof dbQuery,
+      sql: string,
+    ) => Promise<{ success: true; value: { rows: UserData[]; rowCount: number } } | { success: false }>;
+  };
+  http: {
+    span: (
+      name: 'http-request',
+      op: typeof httpRequest,
+      opts: { method: string; url: string },
+    ) => Promise<{ success: true; value: unknown } | { success: false }>;
+  };
+}
+
 // Application operation using wired libraries
 const getUserProfile = wiredApp.op('get-user-profile', async (ctx, userId: string) => {
   // Set app-specific attributes
   ctx.tag.userId(userId).requestId('req-123');
 
+  const deps = ctx.deps as unknown as WiredLibraryDeps;
+
   // Use DB to fetch user (current type system requires assertion - should be typed!)
   ctx.log.info('Fetching user from database');
-  const dbResult = await (ctx.deps as any).db.span('db-query', dbQuery, `SELECT * FROM users WHERE id = '${userId}'`);
+  const dbResult = await deps.db.span('db-query', dbQuery, `SELECT * FROM users WHERE id = '${userId}'`);
 
   if (!dbResult.success) {
     return ctx.err('DB_QUERY_FAILED', 'Database error');
@@ -218,7 +237,7 @@ const getUserProfile = wiredApp.op('get-user-profile', async (ctx, userId: strin
 
   // HTTP library uses its internal cache automatically!
   ctx.log.info('Enriching user data via HTTP (with automatic caching)');
-  const enrichResult = await (ctx.deps as any).http.span('http-request', httpRequest, {
+  const enrichResult = await deps.http.span('http-request', httpRequest, {
     method: 'GET',
     url: `https://api.example.com/users/${userId}/profile`,
   });

@@ -145,6 +145,11 @@ export interface SpanBufferConstructor {
   readonly stats: SpanBufferStats;
 }
 
+type MutableSpanBufferConstructor = SpanBufferConstructor & {
+  schema: LogSchema;
+  stats: SpanBufferStats;
+};
+
 /**
  * Cache for generated SpanBuffer classes per schema.
  * Key is the schema object reference (WeakMap for GC).
@@ -378,8 +383,9 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
 
   // Add static properties to the generated class
   // These are shared across all instances from the same defineOpContext
-  (SpanBufferClass as any).schema = schema;
-  (SpanBufferClass as any).stats = {
+  const mutableCtor = SpanBufferClass as MutableSpanBufferConstructor;
+  mutableCtor.schema = schema;
+  mutableCtor.stats = {
     capacity: DEFAULT_BUFFER_CAPACITY,
     totalWrites: 0,
     spansCreated: 0,
@@ -497,7 +503,7 @@ export function createChildSpanBuffer<T extends LogSchema>(
   opMetadata: OpMetadata,
   capacity?: number,
 ): SpanBuffer<T> {
-  const stats = (SpanBufferClass as any).stats as SpanBufferStats;
+  const stats = (SpanBufferClass as MutableSpanBufferConstructor).stats;
   const actualCapacity = capacity ?? stats.capacity;
 
   // Track non-chained buffer creation for capacity tuning

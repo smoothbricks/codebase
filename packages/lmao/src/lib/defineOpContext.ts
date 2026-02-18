@@ -216,7 +216,7 @@ function computeEffectiveSchema(appFields: SchemaFields, deps: DepsConfig | unde
 export function defineOpContext<
   T extends SchemaFields,
   const FF extends FeatureFlagSchema = Record<string, never>,
-  Deps extends DepsConfig = {},
+  Deps extends DepsConfig = Record<string, never>,
   UserCtx extends Record<string, unknown> = Record<string, never>,
 >(config: OpContextConfig<T, FF, Deps, UserCtx>): OpContextFactory<LogSchema<T>, FF, Deps, UserCtx> {
   // Runtime validation: check for reserved property names in user context

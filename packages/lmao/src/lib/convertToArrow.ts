@@ -437,8 +437,9 @@ function buildBinaryColumnFromBuffers(
   let dataLength = 0;
   for (let i = 0; i < allValues.length; i++) {
     offsets[i] = dataLength;
-    if (allValues[i] !== null) {
-      dataLength += allValues[i]!.length;
+    const value = allValues[i];
+    if (value !== null) {
+      dataLength += value.length;
     }
   }
   offsets[allValues.length] = dataLength;

@@ -1,3 +1,5 @@
+/* biome-ignore-all lint/complexity/noArguments: hot-path overload dispatch avoids rest-arg allocations */
+
 /**
  * SpanContext - Context provided to op functions during span execution
  *
@@ -820,7 +822,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       opMetadata: OpMetadata,
     ): SpanContextInstance<Ctx> {
       // Get Op's schema for cross-library calls (child may have different schema than parent)
-      const childSchema = (SpanBufferClass as any).schema as Ctx['logSchema'];
+      const childSchema = (SpanBufferClass as { schema: Ctx['logSchema'] }).schema;
 
       // Use buffer strategy for child span creation (supports both JS and WASM buffers)
       // Pass schema for cross-library calls where child has different schema than parent
