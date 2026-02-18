@@ -18,6 +18,7 @@
 import { getBackend } from './backend.js';
 import type { ParseCompactBackend } from './parse-backend.js';
 import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
+import { isUndoCapableBackend } from './types.js';
 
 // =============================================================================
 // Configuration Types
@@ -221,18 +222,16 @@ function createCompactStage(parseBackend: ParseCompactBackend | null): CompactSt
  */
 function createUndoStage(backend: ColumineBackend): UndoStage {
   // Check once at construction — backend capabilities don't change
-  const hasNativeUndo = typeof backend.undoEnable === 'function';
+  const undoBackend = isUndoCapableBackend(backend) ? backend : null;
 
   return {
     name: 'undo',
 
     checkpoint(state: StateHandle): UndoToken {
-      if (hasNativeUndo) {
+      if (undoBackend) {
         // Enable undo logging, save change flags, store state pointer for lazy overflow
-        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
-        backend.undoEnable!(state);
-        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
-        const position = backend.undoCheckpoint!(state);
+        undoBackend.undoEnable(state);
+        const position = undoBackend.undoCheckpoint(state);
         // No snapshot needed — overflow is handled lazily inside Zig
         return {
           _brand: 'UndoToken',
@@ -252,14 +251,12 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow' {
       const internal = assertInternalUndoToken(token);
 
-      if (hasNativeUndo) {
+      if (undoBackend) {
         // Native rollback — Zig handles overflow internally via shadow buffer:
         // if overflow occurred, it restores shadow then replays log;
         // if no overflow, it just replays log
-        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
-        backend.undoRollback!(state, internal.position);
-        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
-        const overflowed = backend.undoHasOverflow!();
+        undoBackend.undoRollback(state, internal.position);
+        const overflowed = undoBackend.undoHasOverflow();
         return overflowed ? 'overflow' : 'ok';
       }
 
@@ -280,9 +277,8 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
     commit(state: StateHandle, token: UndoToken): void {
       const internal = assertInternalUndoToken(token);
 
-      if (hasNativeUndo) {
-        // biome-ignore lint/style/noNonNullAssertion: guarded by hasNativeUndo check
-        backend.undoCommit!(state, internal.position);
+      if (undoBackend) {
+        undoBackend.undoCommit(state, internal.position);
       }
 
       // Discard snapshot in all cases — mutations are now permanent

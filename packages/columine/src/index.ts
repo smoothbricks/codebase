@@ -30,8 +30,26 @@ export type {
 } from './pipeline.js';
 export { createPipeline } from './pipeline.js';
 // Types and interfaces
-export type { ColumineBackend, ColumnInput, ReducerProgram, SlotDef, StateHandle } from './types.js';
-export { AggType, ErrorCode, HEADER_SIZE, MAGIC, Opcode, PROGRAM_HASH_PREFIX, SlotType, ValueType } from './types.js';
+export type {
+  ColumineBackend,
+  ColumnInput,
+  ReducerProgram,
+  SlotDef,
+  StateHandle,
+  UndoCapableColumineBackend,
+} from './types.js';
+export {
+  AggType,
+  assertUndoCapableBackend,
+  ErrorCode,
+  HEADER_SIZE,
+  isUndoCapableBackend,
+  MAGIC,
+  Opcode,
+  PROGRAM_HASH_PREFIX,
+  SlotType,
+  ValueType,
+} from './types.js';
 // WASM backend (for standalone columine usage)
 export { createColumineWasmBackend, loadColumineWasm } from './wasm-backend.js';
 // Shared WASM memory sizing contract (used by wrappers)

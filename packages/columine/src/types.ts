@@ -239,3 +239,35 @@ export interface ColumineBackend {
    */
   undoHasOverflow?(): boolean;
 }
+
+/**
+ * Backend variant with native undo log support.
+ *
+ * The base interface keeps undo methods optional so non-native backends can
+ * still implement ColumineBackend, while this type captures the capability
+ * contract when native undo is available.
+ */
+export interface UndoCapableColumineBackend extends ColumineBackend {
+  undoEnable(state: StateHandle): void;
+  undoCheckpoint(state: StateHandle): number;
+  undoRollback(state: StateHandle, checkpointPos: number): void;
+  undoCommit(state: StateHandle, checkpointPos: number): void;
+  undoHasOverflow(): boolean;
+}
+
+export function isUndoCapableBackend(backend: ColumineBackend): backend is UndoCapableColumineBackend {
+  return (
+    typeof backend.undoEnable === 'function' &&
+    typeof backend.undoCheckpoint === 'function' &&
+    typeof backend.undoRollback === 'function' &&
+    typeof backend.undoCommit === 'function' &&
+    typeof backend.undoHasOverflow === 'function'
+  );
+}
+
+export function assertUndoCapableBackend(backend: ColumineBackend): UndoCapableColumineBackend {
+  if (!isUndoCapableBackend(backend)) {
+    throw new Error('Backend does not support native undo operations');
+  }
+  return backend;
+}

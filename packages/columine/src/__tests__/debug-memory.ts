@@ -1,6 +1,27 @@
 // Quick debug script to check WASM memory layout
 import { readFileSync } from 'node:fs';
 
+type DebugVmExports = {
+  vm_debug_shadow_addr: () => number;
+  vm_debug_undo_entries_addr: () => number;
+};
+
+function getDebugVmExports(instance: WebAssembly.Instance): DebugVmExports {
+  const exports = instance.exports as {
+    vm_debug_shadow_addr?: unknown;
+    vm_debug_undo_entries_addr?: unknown;
+  };
+  if (typeof exports.vm_debug_shadow_addr !== 'function' || typeof exports.vm_debug_undo_entries_addr !== 'function') {
+    throw new Error('WASM module missing debug memory exports');
+  }
+  const shadowAddr = exports.vm_debug_shadow_addr as () => number;
+  const undoEntriesAddr = exports.vm_debug_undo_entries_addr as () => number;
+  return {
+    vm_debug_shadow_addr: shadowAddr,
+    vm_debug_undo_entries_addr: undoEntriesAddr,
+  };
+}
+
 const wasmPath = new URL('../../dist/columine.wasm', import.meta.url);
 const wasmBytes = readFileSync(wasmPath);
 const wasmModule = await WebAssembly.compile(wasmBytes);
@@ -8,8 +29,7 @@ const instance = await WebAssembly.instantiate(wasmModule, {
   env: { memory: new WebAssembly.Memory({ initial: 96, maximum: 4096 }) },
 });
 
-// biome-ignore lint/suspicious/noExplicitAny: WASM exports are untyped
-const exports = instance.exports as any;
+const exports = getDebugVmExports(instance);
 
 const stateRegionOffset = 64 * 1024; // 64KB, same as wasm-backend.ts
 

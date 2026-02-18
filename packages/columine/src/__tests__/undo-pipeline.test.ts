@@ -13,6 +13,7 @@ import { existsSync } from 'node:fs';
 
 import {
   AggType,
+  assertUndoCapableBackend,
   type ColumineBackend,
   type ColumnInput,
   createPipeline,
@@ -504,8 +505,7 @@ describe('Pipeline undo integration', () => {
     );
 
     // Verify overflow occurred (undo log exceeded capacity)
-    // biome-ignore lint/style/noNonNullAssertion: method exists on wasm backend
-    expect(backend.undoHasOverflow!()).toBe(true);
+    expect(assertUndoCapableBackend(backend).undoHasOverflow()).toBe(true);
 
     // Rollback -- shadow buffer + undo log replay restores logical state
     stages.undo.rollback(state, token);
