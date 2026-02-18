@@ -176,7 +176,7 @@ export class TraceSQLiteSink {
     const status = writeIndex >= 2 ? entryTypeToStatus(buffer.entry_type[1]) : 'running';
 
     // Error code from error_code_values[1] if span errored
-    const errorCode = status === 'err' && buffer.error_code_nulls[1] === 0 ? buffer.error_code_values[1] : null;
+    const errorCode = status === 'err' && buffer.error_code_nulls?.[1] === 0 ? buffer.error_code_values[1] : null;
 
     // Duration from timestamps
     let durationNs: bigint | null = null;
@@ -225,7 +225,7 @@ export class TraceSQLiteSink {
     for (let row = 0; row < writeIndex; row++) {
       const entryType = buffer.entry_type[row];
       const timestampNs = Number(buffer.timestamp[row]);
-      const message = buffer.message_nulls[row] === 0 ? buffer.message_values[row] : null;
+      const message = buffer.message_nulls && buffer.message_nulls[row] === 0 ? buffer.message_values[row] : null;
 
       // Collect user field values
       const userValues: unknown[] = [];
@@ -272,7 +272,7 @@ export class TraceSQLiteSink {
     for (let row = 0; row < writeIndex; row++) {
       const entryType = buffer.entry_type[row];
       const timestampNs = Number(buffer.timestamp[row]);
-      const message = buffer.message_nulls[row] === 0 ? buffer.message_values[row] : null;
+      const message = buffer.message_nulls && buffer.message_nulls[row] === 0 ? buffer.message_values[row] : null;
 
       const userValues: unknown[] = [];
       for (const fieldName of activeUserFields) {

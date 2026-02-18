@@ -1,29 +1,37 @@
 /**
  * bun:test integration for LMAO trace-testing.
  *
- * Provides wrapped describe/it/expect that create traced spans for each test.
- * One root TestTracer is shared across the entire `bun test` run — initialized
- * via `initTraceTestRun()` in a preload file.
+ * Transparently wraps bun:test's it()/test() via mock.module so every test
+ * automatically creates a trace span — no import changes needed in test files.
  *
  * Architecture:
- * - Each it() creates a root trace (tracer.trace(name, fn))
+ * - initTraceTestRun() in preload sets up tracer + SQLite sink
+ * - mock.module('bun:test', ...) in preload patches it()/test() with trace spans
+ * - Each it()/test() creates a root trace (tracer.trace(name, fn))
  * - Operations within tests create child spans via ctx.span()
  * - describe() is pass-through (grouping only, no span)
  * - After all tests: flush span tree to SQLite (if configured)
  *
+ * mock.module MUST be called from the preload file itself — bun only intercepts
+ * subsequent imports when the mock is registered from the entry module context.
+ *
  * @example
  * ```typescript
  * // test-setup.ts (preload)
- * import { initTraceTestRun } from '@smoothbricks/lmao/testing/bun';
- * initTraceTestRun(myOpContext, { sqlite: { dbPath: '.trace-results.db' } });
+ * import { mock } from 'bun:test';
+ * import * as bunTest from 'bun:test';
+ * import { initTraceTestRun, createBunTestMock } from '@smoothbricks/lmao/testing/bun';
+ * import { myOpContext } from './src/opContext.js';
  *
- * // my-test.test.ts
- * import { describe, it, expect, useTestSpan, getTracer } from '@smoothbricks/lmao/testing/bun';
+ * initTraceTestRun(myOpContext, { sqlite: { dbPath: '.trace-results.db' } });
+ * mock.module('bun:test', () => createBunTestMock(bunTest));
+ *
+ * // my-test.test.ts — uses bun:test directly, no import changes needed
+ * import { describe, it, expect } from 'bun:test';
  *
  * describe('Order Processing', () => {
  *   it('validates order', () => {
- *     const ctx = useTestSpan();
- *     // ctx.span(), ctx.tag, ctx.log available
+ *     // This it() is automatically wrapped in a trace span
  *   });
  * });
  * ```
@@ -77,11 +85,53 @@ export function initTraceTestRun<B extends OpContextBinding>(
   // Register global teardown — flush all spans to SQLite after all tests complete
   _afterAll(() => {
     if (_sink && _tracer) {
-      _sink.flushAll(_tracer);
+      try {
+        _sink.flushAll(_tracer);
+        const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
+        console.log(`\n[trace] run_id: ${_sink.runId} → ${dbPath}`);
+      } catch (e) {
+        console.error('[lmao/testing] SQLite flush error:', e);
+      }
       _sink.close();
       _sink = null;
     }
   });
+}
+
+/**
+ * Create a bun:test mock replacement that wraps it()/test() in trace spans.
+ *
+ * Call this from the preload file and pass the result to mock.module:
+ * ```typescript
+ * mock.module('bun:test', () => createBunTestMock(bunTest));
+ * ```
+ *
+ * @param bunTestModule - The original bun:test namespace (`import * as bunTest from 'bun:test'`)
+ */
+export function createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown> {
+  if (!_tracer) throw new Error('Call initTraceTestRun() before createBunTestMock()');
+
+  const origIt = bunTestModule.it as typeof _it;
+  const tracer = _tracer;
+  const als = _als;
+
+  function wrappedIt(name: string, fn: any) {
+    return origIt(name, () => tracer.trace(name, (ctx: SpanContext<OpContext>) => als.run(ctx, fn)) as Promise<void>);
+  }
+  Object.assign(wrappedIt, {
+    skip: origIt.skip,
+    only: origIt.only,
+    todo: origIt.todo,
+    each: origIt.each,
+    skipIf: origIt.skipIf,
+    if: origIt.if,
+  });
+
+  return {
+    ...bunTestModule,
+    it: wrappedIt,
+    test: wrappedIt,
+  };
 }
 
 /** Get the current span context from AsyncLocalStorage (inside an it() block) */

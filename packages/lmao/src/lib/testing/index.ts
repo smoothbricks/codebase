@@ -115,3 +115,10 @@ export { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
 
 export { type QueryableSpan, querySpan } from './queryable-span.js';
 export { extractFactsFor, findAllSpans, findSpan, spanNames } from './span-query.js';
+
+// =============================================================================
+// SQLITE PERSISTENCE
+// =============================================================================
+
+export type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
+export { type TraceSQLiteConfig, TraceSQLiteSink } from './sqlite-sink.js';
