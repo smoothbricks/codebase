@@ -210,7 +210,7 @@ function wasmGetTraceId(this: WasmSpanBufferInstance): string {
   const len = this._allocator.readIdentityTraceIdLen(this._identityPtr);
   if (len === 0) {
     let p = this._parent;
-    while (p && p._parent) p = p._parent;
+    while (p?._parent) p = p._parent;
     return p ? p.trace_id : '';
   }
   const traceIdPtr = this._allocator.getIdentityTraceIdPtr(this._identityPtr);
@@ -334,8 +334,8 @@ function wasmIsColumnAllocated(this: WasmSpanBufferInstance, columnIndex: number
 function wasmGetColumnIfAllocated(this: WasmSpanBufferInstance, columnName: string): ColumnValueType | undefined {
   const idx = this._logSchema._columnNames.indexOf(columnName);
   if (idx === -1) return undefined;
-  const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), columnName + '_values');
-  if (getter && getter.get) {
+  const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), `${columnName}_values`);
+  if (getter?.get) {
     return getter.get.call(this) as ColumnValueType | undefined;
   }
   return undefined;
@@ -345,8 +345,8 @@ function wasmGetColumnIfAllocated(this: WasmSpanBufferInstance, columnName: stri
  * Get column nulls if allocated.
  */
 function wasmGetNullsIfAllocated(this: WasmSpanBufferInstance, columnName: string): Uint8Array | undefined {
-  const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), columnName + '_nulls');
-  if (getter && getter.get) {
+  const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), `${columnName}_nulls`);
+  if (getter?.get) {
     return getter.get.call(this);
   }
   return undefined;

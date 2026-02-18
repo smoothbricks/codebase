@@ -156,10 +156,10 @@ describe('WASM Integration Tests', () => {
 
       // Verify tag values were written (row 0 is span-start)
       // Note: Tags write to row 0 by default for initial span attributes
-      expect(buffer.userId_values![0]).toBe('user-123');
-      expect(buffer.latency_values![0]).toBe(42.5);
+      expect(buffer.userId_values?.[0]).toBe('user-123');
+      expect(buffer.latency_values?.[0]).toBe(42.5);
       // Enum values are stored as uint8 indices
-      expect(buffer.operation_values![0]).toBe(1); // 'READ' is index 1 in ['CREATE', 'READ', 'UPDATE', 'DELETE']
+      expect(buffer.operation_values?.[0]).toBe(1); // 'READ' is index 1 in ['CREATE', 'READ', 'UPDATE', 'DELETE']
     });
 
     it('chains multiple tags fluently', async () => {
@@ -169,9 +169,9 @@ describe('WASM Integration Tests', () => {
       });
 
       const buffer = asWasm(tracer.rootBuffers[0]);
-      expect(buffer.userId_values![0]).toBe('user-456');
-      expect(buffer.latency_values![0]).toBe(100.25);
-      expect(buffer.operation_values![0]).toBe(0); // 'CREATE' is index 0
+      expect(buffer.userId_values?.[0]).toBe('user-456');
+      expect(buffer.latency_values?.[0]).toBe(100.25);
+      expect(buffer.operation_values?.[0]).toBe(0); // 'CREATE' is index 0
     });
   });
 
@@ -270,8 +270,8 @@ describe('WASM Integration Tests', () => {
 
       const buffer = asWasm(tracer.rootBuffers[0]);
       // Stack trace should be written
-      expect(buffer.exception_stack_values![1]).toContain('stack test');
-      expect(buffer.exception_stack_values![1]).toContain('at'); // Stack trace has 'at' for call frames
+      expect(buffer.exception_stack_values?.[1]).toContain('stack test');
+      expect(buffer.exception_stack_values?.[1]).toContain('at'); // Stack trace has 'at' for call frames
     });
   });
 
@@ -294,7 +294,7 @@ describe('WASM Integration Tests', () => {
       const buffer = asWasm(tracer.rootBuffers[0]);
       expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_ERR);
       // Error code should be written to error_code column
-      expect(buffer.error_code_values![1]).toBe('VALIDATION_ERROR');
+      expect(buffer.error_code_values?.[1]).toBe('VALIDATION_ERROR');
     });
   });
 
@@ -472,8 +472,8 @@ describe('WASM Integration Tests', () => {
       expect(buffer2.message_values[0]).toBe('trace-2');
 
       // Different user IDs
-      expect(buffer1.userId_values![0]).toBe('user-1');
-      expect(buffer2.userId_values![0]).toBe('user-2');
+      expect(buffer1.userId_values?.[0]).toBe('user-1');
+      expect(buffer2.userId_values?.[0]).toBe('user-2');
     });
   });
 });

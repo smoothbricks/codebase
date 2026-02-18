@@ -412,7 +412,7 @@ const MIN_CAPACITY = 8;
 
 export function createSpanBuffer<T extends LogSchema>(
   schema: T,
-  spanName: string,
+  _spanName: string,
   traceRoot: ITraceRoot,
   opMetadata: OpMetadata,
   capacity?: number,

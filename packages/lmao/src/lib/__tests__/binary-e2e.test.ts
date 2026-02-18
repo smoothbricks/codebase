@@ -73,8 +73,8 @@ describe('Binary columns E2E through Tracer API', () => {
 
     // Find a row that has a non-null requestBody
     let foundPayload = false;
-    for (let i = 0; i < requestBodyCol!.length; i++) {
-      const bytes = requestBodyCol!.at(i);
+    for (let i = 0; i < requestBodyCol?.length; i++) {
+      const bytes = requestBodyCol?.at(i);
       if (bytes !== null) {
         const decoded = decode(bytes as Uint8Array);
         expect(decoded).toEqual({
@@ -113,8 +113,8 @@ describe('Binary columns E2E through Tracer API', () => {
 
     // Find a non-null response row
     let foundResponse = false;
-    for (let i = 0; i < responseCol!.length; i++) {
-      const bytes = responseCol!.at(i);
+    for (let i = 0; i < responseCol?.length; i++) {
+      const bytes = responseCol?.at(i);
       if (bytes !== null) {
         const decoded = decode(bytes as Uint8Array) as { items: number[]; total: number };
         expect(decoded.items).toEqual([1, 2, 3, 4, 5]);
@@ -160,8 +160,8 @@ describe('Binary columns E2E through Tracer API', () => {
     // Count non-null binary entries (tag row + 2 log rows = at least 3)
     let nonNullCount = 0;
     const decodedPayloads: unknown[] = [];
-    for (let i = 0; i < requestBodyCol!.length; i++) {
-      const bytes = requestBodyCol!.at(i);
+    for (let i = 0; i < requestBodyCol?.length; i++) {
+      const bytes = requestBodyCol?.at(i);
       if (bytes !== null) {
         nonNullCount++;
         decodedPayloads.push(decode(bytes as Uint8Array));

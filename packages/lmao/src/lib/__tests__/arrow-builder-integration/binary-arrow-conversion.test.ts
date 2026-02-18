@@ -40,16 +40,16 @@ describe('Binary Arrow Conversion', () => {
       // Verify the payload column exists and is binary
       const payloadCol = table.getChild('payload');
       expect(payloadCol).toBeDefined();
-      expect(payloadCol!.length).toBe(2);
+      expect(payloadCol?.length).toBe(2);
 
       // Row 0: msgpack-decoded object should match original
-      const row0Bytes = payloadCol!.at(0) as Uint8Array;
+      const row0Bytes = payloadCol?.at(0) as Uint8Array;
       expect(row0Bytes).toBeInstanceOf(Uint8Array);
       const decoded0 = decode(row0Bytes);
       expect(decoded0).toEqual({ action: 'click', x: 100, y: 200 });
 
       // Row 1: msgpack-decoded string should match original
-      const row1Bytes = payloadCol!.at(1) as Uint8Array;
+      const row1Bytes = payloadCol?.at(1) as Uint8Array;
       expect(row1Bytes).toBeInstanceOf(Uint8Array);
       const decoded1 = decode(row1Bytes);
       expect(decoded1).toBe('simple-string');
@@ -83,7 +83,7 @@ describe('Binary Arrow Conversion', () => {
       const requestCol = table.getChild('request');
       expect(requestCol).toBeDefined();
 
-      const bytes = requestCol!.at(0) as Uint8Array;
+      const bytes = requestCol?.at(0) as Uint8Array;
       expect(bytes).toBeInstanceOf(Uint8Array);
       const decoded = decode(bytes) as HttpRequest;
       expect(decoded.method).toBe('POST');
@@ -109,7 +109,7 @@ describe('Binary Arrow Conversion', () => {
       const rawDataCol = table.getChild('rawData');
       expect(rawDataCol).toBeDefined();
 
-      const bytes = rawDataCol!.at(0) as Uint8Array;
+      const bytes = rawDataCol?.at(0) as Uint8Array;
       expect(bytes).toBeInstanceOf(Uint8Array);
       expect(bytes).toEqual(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
     });
@@ -138,15 +138,15 @@ describe('Binary Arrow Conversion', () => {
       const table = convertToArrowTable(buffer);
       const payloadCol = table.getChild('payload');
       expect(payloadCol).toBeDefined();
-      expect(payloadCol!.length).toBe(2);
+      expect(payloadCol?.length).toBe(2);
 
       // Row 0: should have data
-      const row0 = payloadCol!.at(0) as Uint8Array;
+      const row0 = payloadCol?.at(0) as Uint8Array;
       expect(row0).toBeInstanceOf(Uint8Array);
       expect(decode(row0)).toEqual({ key: 'value' });
 
       // Row 1: should be null
-      const row1 = payloadCol!.at(1);
+      const row1 = payloadCol?.at(1);
       expect(row1).toBeNull();
     });
 
@@ -173,11 +173,11 @@ describe('Binary Arrow Conversion', () => {
       const table = convertToArrowTable(buffer);
 
       // Verify all column types work together
-      expect(table.getChild('userId')!.at(0)).toBe('user-1');
-      expect(table.getChild('httpStatus')!.at(0)).toBe(200);
-      expect(table.getChild('operation')!.at(0)).toBe('GET');
+      expect(table.getChild('userId')?.at(0)).toBe('user-1');
+      expect(table.getChild('httpStatus')?.at(0)).toBe(200);
+      expect(table.getChild('operation')?.at(0)).toBe('GET');
 
-      const payloadBytes = table.getChild('payload')!.at(0) as Uint8Array;
+      const payloadBytes = table.getChild('payload')?.at(0) as Uint8Array;
       expect(decode(payloadBytes)).toEqual({ items: [1, 2, 3] });
     });
   });
@@ -224,11 +224,11 @@ describe('Binary Arrow Conversion', () => {
       const table = convertSpanTreeToArrowTable(rootBuffer);
       const payloadCol = table.getChild('payload');
       expect(payloadCol).toBeDefined();
-      expect(payloadCol!.length).toBe(2);
+      expect(payloadCol?.length).toBe(2);
 
       // Both rows should have msgpack-encoded binary data
-      const row0 = decode(payloadCol!.at(0) as Uint8Array);
-      const row1 = decode(payloadCol!.at(1) as Uint8Array);
+      const row0 = decode(payloadCol?.at(0) as Uint8Array);
+      const row1 = decode(payloadCol?.at(1) as Uint8Array);
 
       // Values should match what was written (order may vary due to tree walk)
       const payloads = [row0, row1];
@@ -263,7 +263,7 @@ describe('Binary Arrow Conversion', () => {
       const payloadCol = table.getChild('payload');
       expect(payloadCol).toBeDefined();
 
-      const bytes = payloadCol!.at(0) as Uint8Array;
+      const bytes = payloadCol?.at(0) as Uint8Array;
       const decoded = decode(bytes) as Record<string, unknown>;
       expect(decoded).toEqual({ x: 1, y: 2, label: 'original' });
     });
@@ -324,15 +324,15 @@ describe('Binary Arrow Conversion', () => {
       // Category column should have dictionary-encoded strings (not corrupted by binary column presence)
       const userIdCol = table.getChild('userId');
       expect(userIdCol).toBeDefined();
-      expect(userIdCol!.at(0)).toBe('user-A');
-      expect(userIdCol!.at(1)).toBe('user-A');
-      expect(userIdCol!.at(2)).toBe('user-B');
-      expect(userIdCol!.at(3)).toBe('user-B');
+      expect(userIdCol?.at(0)).toBe('user-A');
+      expect(userIdCol?.at(1)).toBe('user-A');
+      expect(userIdCol?.at(2)).toBe('user-B');
+      expect(userIdCol?.at(3)).toBe('user-B');
 
       // Text column should also work
       const actionCol = table.getChild('action');
       expect(actionCol).toBeDefined();
-      const actions = [actionCol!.at(0), actionCol!.at(1), actionCol!.at(2), actionCol!.at(3)];
+      const actions = [actionCol?.at(0), actionCol?.at(1), actionCol?.at(2), actionCol?.at(3)];
       expect(actions).toContain('click');
       expect(actions).toContain('scroll');
       expect(actions).toContain('submit');
@@ -341,8 +341,8 @@ describe('Binary Arrow Conversion', () => {
       const payloadCol = table.getChild('payload');
       expect(payloadCol).toBeDefined();
       const payloads = [];
-      for (let i = 0; i < payloadCol!.length; i++) {
-        const bytes = payloadCol!.at(i);
+      for (let i = 0; i < payloadCol?.length; i++) {
+        const bytes = payloadCol?.at(i);
         if (bytes !== null) payloads.push(decode(bytes as Uint8Array));
       }
       expect(payloads).toContainEqual({ req: 1 });
@@ -379,7 +379,7 @@ describe('Binary Arrow Conversion', () => {
 
         const table = convertToArrowTable(buffer);
         const payloadCol = table.getChild('payload');
-        const bytes = payloadCol!.at(0) as Uint8Array;
+        const bytes = payloadCol?.at(0) as Uint8Array;
         const decoded = decode(bytes);
 
         if (testValue instanceof Uint8Array) {

@@ -82,7 +82,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
 
   createSpanBuffer(
     schema: T,
-    spanName: string,
+    _spanName: string,
     traceRoot: ITraceRoot,
     opMetadata: OpMetadata,
     capacity?: number,

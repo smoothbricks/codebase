@@ -169,9 +169,9 @@ function calculateDelay(policy: RetryPolicy, attempt: number): number {
  */
 function writeRetryEntry<T extends LogSchema>(
   buffer: SpanBuffer<T>,
-  attempt: number,
+  _attempt: number,
   error: TransientError<string, unknown>,
-  delayMs: number,
+  _delayMs: number,
 ): void {
   // Get current write index and advance for next write
   const index = buffer._writeIndex;

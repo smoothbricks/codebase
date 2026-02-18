@@ -15,7 +15,7 @@ describe('Blocked with BlockedConfig', () => {
       const err = Blocked.service('payment-api', config);
       expect(err.reason).toEqual({ type: 'service', name: 'payment-api' });
       expect(err.blockedConfig).toEqual(config);
-      expect(err.blockedConfig!.nextRetry).toBe(nextRetry);
+      expect(err.blockedConfig?.nextRetry).toBe(nextRetry);
     });
 
     it('should work with BlockedConfig that has only maxAttempts', () => {
@@ -29,7 +29,7 @@ describe('Blocked with BlockedConfig', () => {
       const config: BlockedConfig = { nextRetry };
       const err = Blocked.service('payment-api', config);
       expect(err.blockedConfig).toEqual(config);
-      expect(err.blockedConfig!.nextRetry!(1)).toBe(1000);
+      expect(err.blockedConfig?.nextRetry?.(1)).toBe(1000);
     });
   });
 
@@ -90,7 +90,7 @@ describe('Blocked with BlockedConfig', () => {
       const config: BlockedConfig = { maxAttempts: 3, nextRetry: () => 1000 };
       const err = Blocked.service('api', config);
       const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
-      const inspected = (err as unknown as Record<symbol, () => unknown>)[inspectSymbol]!();
+      const inspected = (err as unknown as Record<symbol, () => unknown>)[inspectSymbol]?.();
       expect(inspected).toEqual({
         _tag: 'Blocked',
         reason: { type: 'service', name: 'api' },

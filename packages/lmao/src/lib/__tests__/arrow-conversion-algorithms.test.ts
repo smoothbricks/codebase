@@ -35,10 +35,10 @@ describe('arrow conversion algorithms', () => {
     const result = buildTextDictionary(buffers, 'field');
 
     expect(result).not.toBeNull();
-    expect(result!.dictionary).toEqual([]);
-    expect(result!.indices.length).toBe(3);
-    expect(result!.nullCount).toBe(3);
-    expect(result!.nullBitmap).toBeDefined();
-    expect(result!.nullBitmap?.[0]).toBe(0);
+    expect(result?.dictionary).toEqual([]);
+    expect(result?.indices.length).toBe(3);
+    expect(result?.nullCount).toBe(3);
+    expect(result?.nullBitmap).toBeDefined();
+    expect(result?.nullBitmap?.[0]).toBe(0);
   });
 });

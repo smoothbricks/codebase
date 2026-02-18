@@ -543,7 +543,7 @@ describe('Buffer Overflow Property Tests', () => {
       }
 
       expect(buffer._overflow).toBeDefined();
-      expect(buffer._overflow!._overflow).toBeDefined();
+      expect(buffer._overflow?._overflow).toBeDefined();
 
       const overflow1 = buffer._overflow!;
       const overflow2 = overflow1._overflow!;
