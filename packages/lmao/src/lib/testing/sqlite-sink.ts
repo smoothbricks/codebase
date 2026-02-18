@@ -82,6 +82,7 @@ export class TraceSQLiteSink {
         run_id TEXT NOT NULL REFERENCES runs(run_id),
         span_name TEXT NOT NULL,
         parent_span_name TEXT,
+        describe TEXT,
         status TEXT NOT NULL,
         error_code TEXT,
         duration_ns INTEGER,
@@ -105,6 +106,7 @@ export class TraceSQLiteSink {
 
       CREATE INDEX IF NOT EXISTS idx_spans_name ON spans(run_id, span_name);
       CREATE INDEX IF NOT EXISTS idx_spans_status ON spans(run_id, status);
+      CREATE INDEX IF NOT EXISTS idx_spans_describe ON spans(run_id, describe);
       CREATE INDEX IF NOT EXISTS idx_log_entries_span ON log_entries(run_id, trace_id, span_id);
     `);
 
@@ -137,19 +139,20 @@ export class TraceSQLiteSink {
   }
 
   /** Write a root SpanBuffer tree to the database */
-  flush<T extends LogSchema>(rootBuffer: SpanBuffer<T>): void {
+  flush<T extends LogSchema>(rootBuffer: SpanBuffer<T>, describePath?: string | null): void {
     this.ensureColumns(rootBuffer._logSchema);
-    this.flushBuffer(rootBuffer, undefined, 0);
+    this.flushBuffer(rootBuffer, undefined, 0, describePath ?? null);
   }
 
   /** Write all rootBuffers from a TestTracer */
-  flushAll(tracer: TestTracer<OpContextBinding>): void {
+  flushAll(tracer: TestTracer<OpContextBinding>, describeMap?: WeakMap<object, string>): void {
     let testCount = 0;
     let passCount = 0;
     let failCount = 0;
 
     for (const rootBuffer of tracer.rootBuffers) {
-      this.flush(rootBuffer as SpanBuffer<LogSchema>);
+      const describePath = describeMap?.get(rootBuffer) ?? null;
+      this.flush(rootBuffer as SpanBuffer<LogSchema>, describePath);
       testCount++;
 
       // Check root buffer completion status
@@ -166,7 +169,12 @@ export class TraceSQLiteSink {
       .run(Date.now(), testCount, passCount, failCount, this.runId);
   }
 
-  private flushBuffer(buffer: AnySpanBuffer, parentSpanName: string | undefined, depth: number): void {
+  private flushBuffer(
+    buffer: AnySpanBuffer,
+    parentSpanName: string | undefined,
+    depth: number,
+    describePath: string | null,
+  ): void {
     const spanName = buffer.message_values[0];
     const traceId = buffer.trace_id;
     const spanId = buffer.span_id;
@@ -192,13 +200,14 @@ export class TraceSQLiteSink {
     this.db
       .prepare(
         `INSERT OR REPLACE INTO spans
-         (run_id, span_name, parent_span_name, status, error_code, duration_ns, started_at, trace_id, span_id, depth)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (run_id, span_name, parent_span_name, describe, status, error_code, duration_ns, started_at, trace_id, span_id, depth)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         this.runId,
         spanName,
         parentSpanName ?? null,
+        describePath,
         status,
         errorCode,
         durationNs !== null ? Number(durationNs) : null,
@@ -250,9 +259,9 @@ export class TraceSQLiteSink {
       this.flushOverflow(buffer._overflow, traceId, spanId, writeIndex);
     }
 
-    // Recurse into children
+    // Recurse into children — describePath propagates to the entire tree
     for (const child of buffer._children) {
-      this.flushBuffer(child, spanName, depth + 1);
+      this.flushBuffer(child, spanName, depth + 1, describePath);
     }
   }
 

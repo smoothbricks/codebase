@@ -9,7 +9,7 @@
  * - mock.module('bun:test', ...) in preload patches it()/test() with trace spans
  * - Each it()/test() creates a root trace (tracer.trace(name, fn))
  * - Operations within tests create child spans via ctx.span()
- * - describe() is pass-through (grouping only, no span)
+ * - describe() is wrapped to track nesting — the describe path is stored on root spans
  * - After all tests: flush span tree to SQLite (if configured)
  *
  * mock.module MUST be called from the preload file itself — bun only intercepts
@@ -65,6 +65,13 @@ let _sink: TraceSQLiteSink | null = null;
 // Each it() runs in its own async context so concurrent tests don't collide.
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
 
+// Maps root SpanBuffers to their describe path at registration time.
+// WeakMap so buffers can be GC'd if the test runner drops them.
+const _describePathMap = new WeakMap<object, string>();
+
+// Describe stack for standalone exports (non-mock-module path)
+const _standaloneDescribeStack: string[] = [];
+
 /** Initialize the root tracer for the entire bun test run. Call once in preload. */
 export function initTraceTestRun<B extends OpContextBinding>(
   opContext: B,
@@ -86,7 +93,7 @@ export function initTraceTestRun<B extends OpContextBinding>(
   _afterAll(() => {
     if (_sink && _tracer) {
       try {
-        _sink.flushAll(_tracer);
+        _sink.flushAll(_tracer, _describePathMap);
         const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
         console.log(`\n[trace] run_id: ${_sink.runId} → ${dbPath}`);
       } catch (e) {
@@ -112,11 +119,42 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
   if (!_tracer) throw new Error('Call initTraceTestRun() before createBunTestMock()');
 
   const origIt = bunTestModule.it as typeof _it;
+  const origDescribe = bunTestModule.describe as typeof _describe;
   const tracer = _tracer;
   const als = _als;
+  const describeStack: string[] = [];
+
+  // describe() callbacks run synchronously (just registering tests)
+  function wrappedDescribe(name: string, fn: () => void) {
+    return origDescribe(name, () => {
+      describeStack.push(name);
+      try {
+        fn();
+      } finally {
+        describeStack.pop();
+      }
+    });
+  }
+  Object.assign(wrappedDescribe, {
+    skip: origDescribe.skip,
+    only: origDescribe.only,
+    todo: origDescribe.todo,
+    each: origDescribe.each,
+    skipIf: origDescribe.skipIf,
+    if: origDescribe.if,
+  });
 
   function wrappedIt(name: string, fn: any) {
-    return origIt(name, () => tracer.trace(name, (ctx: SpanContext<OpContext>) => als.run(ctx, fn)) as Promise<void>);
+    // Capture describe path at registration time (synchronous)
+    const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
+    return origIt(
+      name,
+      () =>
+        tracer.trace(name, (ctx: SpanContext<OpContext>) => {
+          if (describePath) _describePathMap.set(ctx.buffer, describePath);
+          return als.run(ctx, fn);
+        }) as Promise<void>,
+    );
   }
   Object.assign(wrappedIt, {
     skip: origIt.skip,
@@ -129,6 +167,7 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
 
   return {
     ...bunTestModule,
+    describe: wrappedDescribe,
     it: wrappedIt,
     test: wrappedIt,
   };
@@ -148,22 +187,38 @@ export function getTracer(): TestTracer<OpContextBinding> {
 }
 
 /**
- * Wrapped describe — pass-through to bun:test describe.
- * Grouping only, no trace span (spans are created per-test in it()).
+ * Wrapped describe — tracks describe nesting for the standalone export path.
+ * describe() callbacks run synchronously (just registering tests).
  */
-export const describe: typeof _describe = _describe;
+export function describe(name: string, fn: () => void) {
+  return _describe(name, () => {
+    _standaloneDescribeStack.push(name);
+    try {
+      fn();
+    } finally {
+      _standaloneDescribeStack.pop();
+    }
+  });
+}
+describe.skip = _describe.skip;
+describe.only = _describe.only;
+describe.todo = _describe.todo;
+describe.each = _describe.each;
+describe.skipIf = _describe.skipIf;
+describe.if = _describe.if;
 
 /** Wrapped it — creates a root trace span for the test case */
 export function it(name: string, fn: () => void | Promise<void>): void {
+  const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
   _it(name, () => {
     if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');
-    // tracer.trace() creates a root span and calls fn(ctx)
-    // For non-Result returns, it writes SPAN_OK automatically
-    return _tracer.trace(name, (ctx: SpanContext<OpContext>) => _als.run(ctx, fn));
+    return _tracer.trace(name, (ctx: SpanContext<OpContext>) => {
+      if (describePath) _describePathMap.set(ctx.buffer, describePath);
+      return _als.run(ctx, fn);
+    });
   });
 }
 
-// Attach static methods from bun:test
 it.skip = _it.skip;
 it.only = _it.only;
 it.todo = _it.todo;
