@@ -18,7 +18,6 @@ import { existsSync } from 'node:fs';
 import {
   AggType,
   type ColumineBackend,
-  type ColumineStages,
   type ColumnInput,
   createPipeline,
   ErrorCode,
@@ -31,7 +30,6 @@ import {
   type ReducerProgram,
   resetBackend,
   SlotType,
-  type StateHandle,
   setBackend,
   setBackendLoader,
   ValueType,
@@ -44,9 +42,6 @@ import { loadColumineWasm } from '../wasm-backend.js';
 
 const WASM_PATH = new URL('../../dist/columine.wasm', import.meta.url);
 const WASM_EXISTS = existsSync(WASM_PATH.pathname);
-
-// Skip message shown when WASM is unavailable
-const WASM_SKIP_MSG = 'columine.wasm not found. Build with: cd packages/columine && zig build';
 
 // =============================================================================
 // =============================================================================
@@ -403,7 +398,7 @@ describe('SC3: Pipeline composition', () => {
     // Inject a mock backend so createPipeline resolves
     const mockBackend: ColumineBackend = {
       backend: 'mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
       executeBatch: () => 0,
@@ -434,16 +429,14 @@ describe('SC3: Pipeline composition', () => {
 
   it('reduce stage delegates to backend.executeBatch', async () => {
     let executeBatchCalled = false;
-    let executeBatchArgs: unknown[] = [];
 
     const mockBackend: ColumineBackend = {
       backend: 'mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
-      executeBatch: (...args: unknown[]) => {
+      executeBatch: () => {
         executeBatchCalled = true;
-        executeBatchArgs = args;
         return ErrorCode.OK;
       },
       getMapSize: () => 0,
@@ -471,7 +464,7 @@ describe('SC3: Pipeline composition', () => {
   it('parse stage throws helpful error without parse backend', async () => {
     const mockBackend: ColumineBackend = {
       backend: 'mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
       executeBatch: () => 0,
@@ -501,7 +494,7 @@ describe('SC3: Pipeline composition', () => {
 
     const mockBackend: ColumineBackend = {
       backend: 'mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
       executeBatch: () => {
@@ -553,7 +546,7 @@ describe('SC4: DI pattern', () => {
 
     const mockBackend: ColumineBackend = {
       backend: 'mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
       executeBatch: () => 0,
@@ -575,7 +568,7 @@ describe('SC4: DI pattern', () => {
 
     const mockBackend: ColumineBackend = {
       backend: 'test-mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
       executeBatch: () => 0,
@@ -597,7 +590,7 @@ describe('SC4: DI pattern', () => {
   it('resetBackend clears the backend', () => {
     const mockBackend: ColumineBackend = {
       backend: 'mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
       executeBatch: () => 0,
@@ -629,7 +622,7 @@ describe('SC4: DI pattern', () => {
     let loaderCalled = false;
     const mockBackend: ColumineBackend = {
       backend: 'lazy-mock',
-      loadProgram: () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
+      loadProgram: async () => ({ bytecode: new Uint8Array(0), numSlots: 0, numInputs: 0, slotDefs: [] }),
       createState: () => ({ _brand: 'ColumineStateHandle' }),
       resetState: () => {},
       executeBatch: () => 0,

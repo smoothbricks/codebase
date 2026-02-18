@@ -504,7 +504,7 @@ describe('Pipeline undo integration', () => {
     );
 
     // Verify overflow occurred (undo log exceeded capacity)
-    expect(backend.undoHasOverflow()).toBe(true);
+    expect(backend.undoHasOverflow!()).toBe(true);
 
     // Rollback -- shadow buffer + undo log replay restores logical state
     stages.undo.rollback(state, token);
