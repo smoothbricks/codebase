@@ -7,10 +7,10 @@
  * Architecture:
  * - initTraceTestRun() in preload sets up tracer + SQLite sink
  * - mock.module('bun:test', ...) in preload patches it()/test() with trace spans
- * - Each it()/test() creates a root trace (tracer.trace(name, fn))
- * - Operations within tests create child spans via ctx.span()
- * - describe() is wrapped to track nesting — the describe path is stored on root spans
- * - After all tests: flush span tree to SQLite (if configured)
+ * - One root trace per test run (tracer.trace('test-run', ...))
+ * - Each it()/test() creates a child span of the root (rootCtx.span(name, fn))
+ * - describe() is wrapped to track nesting — path written to `describe` schema column
+ * - After all tests: flush root buffer tree to SQLite (if configured)
  *
  * mock.module MUST be called from the preload file itself — bun only intercepts
  * subsequent imports when the mock is registered from the entry module context.
@@ -31,7 +31,7 @@
  *
  * describe('Order Processing', () => {
  *   it('validates order', () => {
- *     // This it() is automatically wrapped in a trace span
+ *     // This it() is automatically wrapped in a child span of the root
  *   });
  * });
  * ```
@@ -53,24 +53,28 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from '../opContext/types.js';
+import { S } from '../schema/builder.js';
+import { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { TestTracer } from '../tracers/TestTracer.js';
-import { type TraceSQLiteConfig, TraceSQLiteSink } from './sqlite-sink.js';
+
+/** bun:test expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
+function isExpectError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('expect(');
+}
 
 // Global singleton — one root tracer for the entire bun test run
 let _tracer: TestTracer<OpContextBinding> | null = null;
 let _sink: TraceSQLiteSink | null = null;
 
+// Root span context, its resolver, and the trace promise — one root per test run
+let _rootCtx: SpanContext<OpContext> | null = null;
+let _resolveTestRun: (() => void) | null = null;
+let _rootTracePromise: Promise<unknown> | null = null;
+
 // AsyncLocalStorage for propagating SpanContext to test bodies.
 // Each it() runs in its own async context so concurrent tests don't collide.
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
-
-// Maps root SpanBuffers to their describe path at registration time.
-// WeakMap so buffers can be GC'd if the test runner drops them.
-const _describePathMap = new WeakMap<object, string>();
-
-// Describe stack for standalone exports (non-mock-module path)
-const _standaloneDescribeStack: string[] = [];
 
 /** Initialize the root tracer for the entire bun test run. Call once in preload. */
 export function initTraceTestRun<B extends OpContextBinding>(
@@ -79,23 +83,50 @@ export function initTraceTestRun<B extends OpContextBinding>(
     sqlite?: TraceSQLiteConfig;
   },
 ): void {
-  _tracer = new TestTracer(opContext, {
+  // Extend user's schema with `describe` column for test grouping
+  const extendedSchema = opContext.logBinding.logSchema.extend({ describe: S.category() });
+  const extendedBinding = {
+    ...opContext,
+    logBinding: { ...opContext.logBinding, logSchema: extendedSchema },
+  };
+
+  _tracer = new TestTracer(extendedBinding, {
     bufferStrategy: new JsBufferStrategy(),
     createTraceRoot,
   }) as TestTracer<OpContextBinding>;
 
   if (options?.sqlite) {
     const db = new Database(options.sqlite.dbPath ?? '.trace-results.db');
-    _sink = new TraceSQLiteSink(db, options.sqlite);
+    _sink = new TraceSQLiteSink(db);
   }
 
-  // Register global teardown — flush all spans to SQLite after all tests complete
-  _afterAll(() => {
-    if (_sink && _tracer) {
+  // Create the single root trace — a long-lived promise keeps it alive
+  const tracer = _tracer;
+  _rootTracePromise = tracer.trace('test-run', (ctx: SpanContext<OpContext>) => {
+    _rootCtx = ctx;
+    return new Promise<void>((resolve) => {
+      _resolveTestRun = resolve;
+    });
+  }) as Promise<unknown>;
+
+  // Register global teardown — resolve root, wait for span-end, then flush to SQLite
+  _afterAll(async () => {
+    // Resolve the root promise — triggers span-end write via _executeWithContext .then()
+    if (_resolveTestRun) {
+      _resolveTestRun();
+      _resolveTestRun = null;
+    }
+    // Await the trace promise so span-end is written to the buffer before flushing
+    if (_rootTracePromise) {
+      await _rootTracePromise;
+      _rootTracePromise = null;
+    }
+    if (_sink && _rootCtx) {
       try {
-        _sink.flushAll(_tracer, _describePathMap);
+        _sink.flush(_rootCtx.buffer);
+        const traceId = _rootCtx.buffer.trace_id;
         const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
-        console.log(`\n[trace] run_id: ${_sink.runId} → ${dbPath}`);
+        console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
       } catch (e) {
         console.error('[lmao/testing] SQLite flush error:', e);
       }
@@ -116,11 +147,11 @@ export function initTraceTestRun<B extends OpContextBinding>(
  * @param bunTestModule - The original bun:test namespace (`import * as bunTest from 'bun:test'`)
  */
 export function createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown> {
-  if (!_tracer) throw new Error('Call initTraceTestRun() before createBunTestMock()');
+  if (!_rootCtx) throw new Error('Call initTraceTestRun() before createBunTestMock()');
 
   const origIt = bunTestModule.it as typeof _it;
   const origDescribe = bunTestModule.describe as typeof _describe;
-  const tracer = _tracer;
+  const rootCtx = _rootCtx;
   const als = _als;
   const describeStack: string[] = [];
 
@@ -135,34 +166,42 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
       }
     });
   }
+  // skipIf/if must return wrappedDescribe (not origDescribe) when the suite should run,
+  // so that describe-path tracking stays active for nested it() calls.
   Object.assign(wrappedDescribe, {
     skip: origDescribe.skip,
     only: origDescribe.only,
     todo: origDescribe.todo,
     each: origDescribe.each,
-    skipIf: origDescribe.skipIf,
-    if: origDescribe.if,
+    skipIf: (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe),
+    if: (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip),
   });
 
   function wrappedIt(name: string, fn: any) {
     // Capture describe path at registration time (synchronous)
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-    return origIt(
-      name,
-      () =>
-        tracer.trace(name, (ctx: SpanContext<OpContext>) => {
-          if (describePath) _describePathMap.set(ctx.buffer, describePath);
-          return als.run(ctx, fn);
-        }) as Promise<void>,
+    return origIt(name, () =>
+      (rootCtx.span as Function)(name, async (ctx: SpanContext<OpContext>) => {
+        if (describePath) (ctx.tag as any).describe(describePath);
+        try {
+          await als.run(ctx, fn);
+          return ctx.ok(undefined); // pass → span-ok
+        } catch (error) {
+          if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
+          throw error; // other throw → span-exception
+        }
+      }),
     );
   }
+  // skipIf/if must return wrappedIt (not origIt) when the test should run,
+  // so the ALS context is set up and useTestSpan() works inside the test body.
   Object.assign(wrappedIt, {
     skip: origIt.skip,
     only: origIt.only,
     todo: origIt.todo,
     each: origIt.each,
-    skipIf: origIt.skipIf,
-    if: origIt.if,
+    skipIf: (condition: boolean) => (condition ? origIt.skip : wrappedIt),
+    if: (condition: boolean) => (condition ? wrappedIt : origIt.skip),
   });
 
   return {
@@ -200,21 +239,31 @@ export function describe(name: string, fn: () => void) {
     }
   });
 }
+
+// Describe stack for standalone exports (non-mock-module path)
+const _standaloneDescribeStack: string[] = [];
+
 describe.skip = _describe.skip;
 describe.only = _describe.only;
 describe.todo = _describe.todo;
 describe.each = _describe.each;
-describe.skipIf = _describe.skipIf;
-describe.if = _describe.if;
+describe.skipIf = _describe.skipIf.bind(_describe);
+describe.if = _describe.if.bind(_describe);
 
-/** Wrapped it — creates a root trace span for the test case */
+/** Wrapped it — creates a child span of the root trace for the test case */
 export function it(name: string, fn: () => void | Promise<void>): void {
   const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
   _it(name, () => {
-    if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');
-    return _tracer.trace(name, (ctx: SpanContext<OpContext>) => {
-      if (describePath) _describePathMap.set(ctx.buffer, describePath);
-      return _als.run(ctx, fn);
+    if (!_rootCtx) throw new Error('Call initTraceTestRun() in preload before tests');
+    return (_rootCtx.span as Function)(name, async (ctx: SpanContext<OpContext>) => {
+      if (describePath) (ctx.tag as any).describe(describePath);
+      try {
+        await _als.run(ctx, fn);
+        return ctx.ok(undefined); // pass → span-ok
+      } catch (error) {
+        if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
+        throw error; // other throw → span-exception
+      }
     });
   });
 }
@@ -223,8 +272,8 @@ it.skip = _it.skip;
 it.only = _it.only;
 it.todo = _it.todo;
 it.each = _it.each;
-it.skipIf = _it.skipIf;
-it.if = _it.if;
+it.skipIf = _it.skipIf.bind(_it);
+it.if = _it.if.bind(_it);
 
 // Re-export everything else unchanged
 export {

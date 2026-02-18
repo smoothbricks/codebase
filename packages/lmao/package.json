@@ -68,6 +68,12 @@
       "import": "./dist/lib/errors/Transient.js",
       "default": "./dist/lib/errors/Transient.js"
     },
+    "./sqlite": {
+      "development": "./src/lib/sqlite/index.ts",
+      "types": "./dist/lib/sqlite/index.d.ts",
+      "import": "./dist/lib/sqlite/index.js",
+      "default": "./dist/lib/sqlite/index.js"
+    },
     "./testing": {
       "development": "./src/testing.ts",
       "types": "./dist/testing.d.ts",
@@ -75,6 +81,7 @@
       "default": "./dist/testing.js"
     },
     "./testing/bun": {
+      "bun": "./src/lib/testing/bun-harness.ts",
       "development": "./src/lib/testing/bun-harness.ts",
       "types": "./dist/lib/testing/bun-harness.d.ts",
       "import": "./dist/lib/testing/bun-harness.js",
