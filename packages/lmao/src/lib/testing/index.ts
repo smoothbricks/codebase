@@ -120,5 +120,5 @@ export { extractFactsFor, findAllSpans, findSpan, spanNames } from './span-query
 // SQLITE PERSISTENCE
 // =============================================================================
 
-export type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
-export { type TraceSQLiteConfig, TraceSQLiteSink } from './sqlite-sink.js';
+export type { SyncSQLiteDatabase, SyncSQLiteStatement } from '../sqlite/sqlite-db.js';
+export { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';

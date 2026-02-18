@@ -1,9 +1,8 @@
 /**
  * vitest integration for LMAO trace-testing.
  *
- * Same architecture as bun-harness: one root TestTracer for the entire vitest
- * run, each it() creates a root trace span, operations create child spans.
- * describe() is wrapped to track nesting — the describe path is stored on root spans.
+ * Same architecture as bun-harness: one root trace per test run,
+ * each it() creates a child span, describe path written to `describe` schema column.
  *
  * Uses better-sqlite3 for SQLite persistence (vitest runs on Node.js).
  *
@@ -38,23 +37,28 @@ import {
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding } from '../opContext/types.js';
+import { S } from '../schema/builder.js';
+import type { SyncSQLiteDatabase } from '../sqlite/sqlite-db.js';
+import { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { TestTracer } from '../tracers/TestTracer.js';
-import type { SyncSQLiteDatabase } from './sqlite-db.js';
-import { type TraceSQLiteConfig, TraceSQLiteSink } from './sqlite-sink.js';
+
+/** vitest expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
+function isExpectError(error: unknown): boolean {
+  return error instanceof Error && error.message.startsWith('expect(');
+}
 
 // Global singleton — one root tracer for the entire vitest run
 let _tracer: TestTracer<OpContextBinding> | null = null;
 let _sink: TraceSQLiteSink | null = null;
 
+// Root span context, its resolver, and the trace promise — one root per test run
+let _rootCtx: SpanContext<OpContext> | null = null;
+let _resolveTestRun: (() => void) | null = null;
+let _rootTracePromise: Promise<unknown> | null = null;
+
 // AsyncLocalStorage for propagating SpanContext to test bodies
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
-
-// Maps root SpanBuffers to their describe path at registration time
-const _describePathMap = new WeakMap<object, string>();
-
-// Describe stack for standalone exports (non-vi.mock path)
-const _standaloneDescribeStack: string[] = [];
 
 /** Initialize the root tracer for the entire vitest run. Call once in setupFiles. */
 export function initTraceTestRun<B extends OpContextBinding>(
@@ -66,20 +70,53 @@ export function initTraceTestRun<B extends OpContextBinding>(
     };
   },
 ): void {
-  _tracer = new TestTracer(opContext, {
+  // Extend user's schema with `describe` column for test grouping
+  const extendedSchema = opContext.logBinding.logSchema.extend({ describe: S.category() });
+  const extendedBinding = {
+    ...opContext,
+    logBinding: { ...opContext.logBinding, logSchema: extendedSchema },
+  };
+
+  _tracer = new TestTracer(extendedBinding, {
     bufferStrategy: new JsBufferStrategy(),
     createTraceRoot,
   }) as TestTracer<OpContextBinding>;
 
   if (options?.sqlite?.createDatabase) {
     const db = options.sqlite.createDatabase(options.sqlite.dbPath ?? '.trace-results.db');
-    _sink = new TraceSQLiteSink(db, options.sqlite);
+    _sink = new TraceSQLiteSink(db);
   }
 
-  // Register global teardown
-  _afterAll(() => {
-    if (_sink && _tracer) {
-      _sink.flushAll(_tracer, _describePathMap);
+  // Create the single root trace — a long-lived promise keeps it alive
+  const tracer = _tracer;
+  _rootTracePromise = tracer.trace('test-run', (ctx: SpanContext<OpContext>) => {
+    _rootCtx = ctx;
+    return new Promise<void>((resolve) => {
+      _resolveTestRun = resolve;
+    });
+  }) as Promise<unknown>;
+
+  // Register global teardown — resolve root, wait for span-end, then flush to SQLite
+  _afterAll(async () => {
+    // Resolve the root promise — triggers span-end write via _executeWithContext .then()
+    if (_resolveTestRun) {
+      _resolveTestRun();
+      _resolveTestRun = null;
+    }
+    // Await the trace promise so span-end is written to the buffer before flushing
+    if (_rootTracePromise) {
+      await _rootTracePromise;
+      _rootTracePromise = null;
+    }
+    if (_sink && _rootCtx) {
+      try {
+        _sink.flush(_rootCtx.buffer);
+        const traceId = _rootCtx.buffer.trace_id;
+        const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
+        console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
+      } catch (e) {
+        console.error('[lmao/testing] SQLite flush error:', e);
+      }
       _sink.close();
       _sink = null;
     }
@@ -116,11 +153,11 @@ export function getTracer(): TestTracer<OpContextBinding> {
  * @param vitestModule - The original vitest namespace from importOriginal()
  */
 export function createVitestMock(vitestModule: Record<string, unknown>): Record<string, unknown> {
-  if (!_tracer) throw new Error('Call initTraceTestRun() before createVitestMock()');
+  if (!_rootCtx) throw new Error('Call initTraceTestRun() before createVitestMock()');
 
   const origIt = vitestModule.it as typeof _it;
   const origDescribe = vitestModule.describe as typeof _describe;
-  const tracer = _tracer;
+  const rootCtx = _rootCtx;
   const als = _als;
   const describeStack: string[] = [];
 
@@ -139,15 +176,21 @@ export function createVitestMock(vitestModule: Record<string, unknown>): Record<
     only: origDescribe.only,
     todo: origDescribe.todo,
     each: origDescribe.each,
-    skipIf: origDescribe.skipIf,
+    skipIf: origDescribe.skipIf.bind(origDescribe),
   });
 
   function wrappedIt(name: string, fn: any) {
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
     return origIt(name, () =>
-      tracer.trace(name, (ctx: SpanContext<OpContext>) => {
-        if (describePath) _describePathMap.set(ctx.buffer, describePath);
-        return als.run(ctx, fn);
+      (rootCtx.span as Function)(name, async (ctx: SpanContext<OpContext>) => {
+        if (describePath) (ctx.tag as any).describe(describePath);
+        try {
+          await als.run(ctx, fn);
+          return ctx.ok(undefined); // pass → span-ok
+        } catch (error) {
+          if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
+          throw error; // other throw → span-exception
+        }
       }),
     );
   }
@@ -156,7 +199,7 @@ export function createVitestMock(vitestModule: Record<string, unknown>): Record<
     only: origIt.only,
     todo: origIt.todo,
     each: origIt.each,
-    skipIf: origIt.skipIf,
+    skipIf: origIt.skipIf.bind(origIt),
   });
 
   return { ...vitestModule, describe: wrappedDescribe, it: wrappedIt, test: wrappedIt };
@@ -176,20 +219,30 @@ export function describe(name: string, fn: () => void) {
     }
   });
 }
+
+// Describe stack for standalone exports (non-vi.mock path)
+const _standaloneDescribeStack: string[] = [];
+
 describe.skip = _describe.skip;
 describe.only = _describe.only;
 describe.todo = _describe.todo;
 describe.each = _describe.each;
-describe.skipIf = _describe.skipIf;
+describe.skipIf = _describe.skipIf.bind(_describe);
 
-/** Wrapped it — creates a root trace span for the test case */
+/** Wrapped it — creates a child span of the root trace for the test case */
 export function it(name: string, fn: () => void | Promise<void>): void {
   const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
   _it(name, () => {
-    if (!_tracer) throw new Error('Call initTraceTestRun() in setupFiles before tests');
-    return _tracer.trace(name, (ctx: SpanContext<OpContext>) => {
-      if (describePath) _describePathMap.set(ctx.buffer, describePath);
-      return _als.run(ctx, fn);
+    if (!_rootCtx) throw new Error('Call initTraceTestRun() in setupFiles before tests');
+    return (_rootCtx.span as Function)(name, async (ctx: SpanContext<OpContext>) => {
+      if (describePath) (ctx.tag as any).describe(describePath);
+      try {
+        await _als.run(ctx, fn);
+        return ctx.ok(undefined); // pass → span-ok
+      } catch (error) {
+        if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
+        throw error; // other throw → span-exception
+      }
     });
   });
 }
@@ -198,7 +251,7 @@ it.skip = _it.skip;
 it.only = _it.only;
 it.todo = _it.todo;
 it.each = _it.each;
-it.skipIf = _it.skipIf;
+it.skipIf = _it.skipIf.bind(_it);
 
 // Re-export everything else unchanged
 export {

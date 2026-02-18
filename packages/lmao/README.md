@@ -153,41 +153,58 @@ preload = ["./test-trace-setup.ts"]
 
 ### Querying Trace Results
 
-After a test run, the trace database is written to the configured path. The `run_id` is printed at the end:
+After a test run, the trace database is written to the configured path. The `trace_id` is printed at the end:
 
 ```
-[trace] run_id: 1718900000000-abc123 → .trace-results.db
+[trace] trace_id: 550e8400-e29b-41d4-a716-446655440000 → .trace-results.db
 ```
+
+The `trace_id` IS the run identifier — one root span per test run, with each `it()` as a child span.
 
 **SQLite CLI queries:**
 
 ```bash
-# All spans for the latest run
-sqlite3 .trace-results.db "SELECT span_name, status, describe FROM spans ORDER BY started_at"
+# All spans for the latest trace (root span name = 'test-run')
+sqlite3 .trace-results.db "SELECT s0.message, s0.describe FROM spans s0 WHERE s0.row_index = 0 ORDER BY s0.timestamp_ns"
 
-# Failed tests with their describe group
-sqlite3 .trace-results.db "SELECT span_name, describe FROM spans WHERE status != 'ok' AND depth = 0"
+# Find root span_id, then query it-level spans
+sqlite3 .trace-results.db "
+  SELECT s0.message AS test_name, s0.describe,
+         CASE WHEN s1.entry_type = 2 THEN 'ok'
+              WHEN s1.entry_type = 3 THEN 'err'
+              WHEN s1.entry_type = 4 THEN 'exception'
+              ELSE 'running' END AS status,
+         s1.timestamp_ns - s0.timestamp_ns AS duration_ns
+  FROM spans s0
+  LEFT JOIN spans s1 ON s1.trace_id = s0.trace_id AND s1.span_id = s0.span_id AND s1.row_index = 1
+  WHERE s0.trace_id = (SELECT trace_id FROM spans WHERE parent_span_id = 0 AND row_index = 0 ORDER BY timestamp_ns DESC LIMIT 1)
+    AND s0.parent_span_id = (SELECT span_id FROM spans WHERE parent_span_id = 0 AND row_index = 0 ORDER BY timestamp_ns DESC LIMIT 1)
+    AND s0.row_index = 0
+  ORDER BY s0.timestamp_ns"
 
 # All tests under a specific describe group
-sqlite3 .trace-results.db "SELECT span_name, status FROM spans WHERE describe = 'Order Processing > validation' AND depth = 0"
+sqlite3 .trace-results.db "SELECT message FROM spans WHERE describe = 'Order Processing > validation' AND row_index = 0"
 
 # Nested describe paths use ' > ' separator
-sqlite3 .trace-results.db "SELECT DISTINCT describe FROM spans WHERE describe IS NOT NULL"
+sqlite3 .trace-results.db "SELECT DISTINCT describe FROM spans WHERE describe IS NOT NULL AND row_index = 0"
 ```
 
-**Key tables:**
+**Schema:**
 
-| Table         | Purpose                                                                         |
-| ------------- | ------------------------------------------------------------------------------- |
-| `runs`        | Test run summary (run_id, started_at, completed_at, pass/fail counts)           |
-| `spans`       | Span tree (span_name, parent_span_name, describe, status, duration_ns, depth)   |
-| `log_entries` | Per-row data within spans (entry_type, timestamp, message, user schema columns) |
+| Column           | Description                                                      |
+| ---------------- | ---------------------------------------------------------------- |
+| `trace_id`       | Run identifier (= root span's trace_id)                          |
+| `span_id`        | Unique span counter within trace                                 |
+| `parent_span_id` | Parent span (0 = root, root's span_id = it-level)                |
+| `row_index`      | Row within span (0 = span-start, 1 = span-end, 2+ = log entries) |
+| `entry_type`     | 1=span-start, 2=span-ok, 3=span-err, 4=span-exception            |
+| `timestamp_ns`   | Nanosecond timestamp                                             |
+| `message`        | Span name (row 0), log message (rows 2+)                         |
+| `describe`       | `' > '`-separated describe path (user schema column)             |
+| `...`            | Additional user schema columns added dynamically via ALTER TABLE |
 
-The `describe` column contains the `' > '`-separated describe path for each root span (depth=0). Child spans inherit the
-same describe path from their root. Tests outside any `describe()` block have `describe = NULL`.
-
-**`run_id`** groups all spans from a single test run. Each `bun test` invocation produces a unique `run_id` (timestamp +
-random suffix). Use it to compare runs or query specific executions.
+Tree structure is encoded via `span_id` / `parent_span_id`. The root span (`parent_span_id = 0`) represents the entire
+test run. Each `it()` is a direct child of the root. User operations create deeper children.
 
 **TraceQuery API (programmatic access):**
 
