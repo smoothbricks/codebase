@@ -14,14 +14,9 @@
   },
   "include": [
     "src/**/*.test.ts",
-    "src/**/__tests__/*.ts",
-    "src/lib/testing/bun-harness.ts",
-    "src/lib/testing/vitest-harness.ts"
+    "src/**/__tests__/*.ts"
   ],
   "references": [
-    {
-      "path": "../arrow-builder/tsconfig.lib.json"
-    },
     {
       "path": "./tsconfig.lib.json"
     }
