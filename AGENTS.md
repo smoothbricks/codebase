@@ -95,6 +95,51 @@ When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
   tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
   ```
 
+### Nx targetDefaults and New Package Checklist
+
+**`targetDefaults` in `nx.json` do NOT auto-create targets.** They only provide default configuration (executor,
+options, dependsOn) for targets that already exist from another source (plugin inference, package.json script, or
+explicit `"nx".targets` config). If a package doesn't declare the target, the targetDefault has no effect.
+
+**When creating a new package**, add these stub entries to `package.json` `"nx".targets`:
+
+```json
+{
+  "nx": {
+    "targets": {
+      "lint": {},
+      "typecheck-tests": {
+        "executor": "nx:run-commands",
+        "options": {
+          "command": "tsc --noEmit -p tsconfig.test.json",
+          "cwd": "packages/<name>"
+        },
+        "dependsOn": ["build"]
+      }
+    }
+  }
+}
+```
+
+- `"lint": {}` — creates the target; `nx.json` targetDefault fills in biome executor + `dependsOn: ["typecheck-tests"]`
+- `"typecheck-tests"` — explicit target because it has package-specific `cwd`; runs `tsc --noEmit` on test tsconfig
+
+Also create `tsconfig.test.json` for the package (see existing packages for the pattern: `types: ["bun"]`,
+`composite: false`, `noEmit: true`, includes test globs, references `tsconfig.lib.json`).
+
+**After any tsconfig or dependency changes**, run `nx sync` to update project references. Verify with `nx sync:check`.
+
+### Platform-Agnostic tsconfig Policy
+
+Platform-agnostic packages use `"types": []` in `tsconfig.lib.json` to prevent accidentally depending on platform
+globals (`Buffer`, `process`, `Bun`). Files that intentionally use platform APIs opt in with per-file triple-slash
+directives:
+
+```typescript
+/// <reference types="node" />  // for node:* imports
+/// <reference types="bun" />   // for Bun.* APIs (use "bun" not "bun-types")
+```
+
 ## ⚠️ GREENFIELD PROJECT - CRITICAL ANALYSIS APPROACH
 
 **THIS IS A GREENFIELD PROJECT.** There is NO legacy code. There are NO existing users.

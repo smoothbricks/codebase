@@ -91,6 +91,12 @@ This is an Nx-based monorepo using Bun as the package manager, with devenv/diren
 - **Code style**: 2 spaces, single quotes, 120 character line width
 - **Nx uses inferred tasks** - don't add build/typecheck scripts to package.json (Nx infers these from tsconfig), but DO
   add test scripts
+- **Nx `targetDefaults` don't create targets** - they only configure targets that already exist. Targets defined in
+  `nx.json` `targetDefaults` (like `lint`, `lint:fix`) must be declared as `"lint": {}` in each package's `"nx".targets`
+  in `package.json` for the target to exist. The targetDefault then fills in the executor, options, and dependencies.
+  When creating a new package, always add these stub entries.
+- **Run `nx sync`** after modifying tsconfig files or adding/removing package dependencies to keep TypeScript project
+  references in sync. Verify with `nx sync:check`.
 
 ### Testing
 
