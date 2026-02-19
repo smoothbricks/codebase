@@ -30,6 +30,11 @@ const EMPTY_VALIDITY = new Uint8Array(0);
 const BOOL_TYPE_ID = (bool() as { typeId?: unknown }).typeId;
 const F64Array = Float64Array;
 
+type Utf8Encoded = {
+  data: Uint8Array;
+  offsets: Int32Array;
+};
+
 function isBoolType(value: unknown): boolean {
   return (value as { typeId?: unknown })?.typeId === BOOL_TYPE_ID;
 }
@@ -93,7 +98,7 @@ function makeColumn(data: {
   return new Column([batch]);
 }
 
-function encodeUtf8(strings: string[]): { data: Uint8Array; offsets: Int32Array } {
+function encodeUtf8(strings: string[]): Utf8Encoded {
   const enc = new TextEncoder();
   const bytes = strings.map((s) => enc.encode(s));
   const total = bytes.reduce((n, b) => n + b.length, 0);

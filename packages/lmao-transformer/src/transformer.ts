@@ -33,6 +33,11 @@ export interface LmaoTransformerOptions {
   projectRoot?: string;
 }
 
+type PackageLocation = {
+  packageName: string;
+  packageDir: string;
+};
+
 /**
  * Get the git repository root directory.
  * Returns undefined if not in a git repository.
@@ -82,7 +87,7 @@ function getLastGitCommit(filePath: string): string {
  * Find the nearest package.json by walking up from a file path.
  * Returns { packageName, packageDir } or undefined if not found.
  */
-function findNearestPackage(filePath: string): { packageName: string; packageDir: string } | undefined {
+function findNearestPackage(filePath: string): PackageLocation | undefined {
   let currentDir = path.dirname(filePath);
   const root = path.parse(currentDir).root;
 
