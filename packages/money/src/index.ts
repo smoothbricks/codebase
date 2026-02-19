@@ -23,12 +23,19 @@
 export { allocateProportional } from './allocate.js';
 // Amount arithmetic
 export { add, divideWithRemainder, multiply, subtract } from './amount.js';
+// Journal assertions
+export { assertBalanced, isBalanced } from './assertions.js';
 // Basis arithmetic
 export { basisAdd, basisMultiply, basisSubtract, toBasis } from './basis.js';
 
 // Currency registry
 export type { CurrencyDef } from './currency-registry.js';
 export { amountScale, basisScale, getCurrency, hasCurrency, registerCurrency } from './currency-registry.js';
+// Formatting (canonical decimal strings)
+export { formatAmount, formatAmountDisplay, formatBasis, parseAmount, parseBasis } from './format.js';
+// FX conversion
+export type { FxAudit, FxResult } from './fx.js';
+export { convertFx } from './fx.js';
 // Rate operations
 export { applyRate } from './rate.js';
 // Rounding
