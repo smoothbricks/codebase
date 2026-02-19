@@ -19,6 +19,14 @@ const eagerSchema = new ColumnSchema({
   userId: S.category(),
 });
 
+function callSetter(buffer: object, setterName: string, pos: number, value: unknown): void {
+  const setter = Reflect.get(buffer, setterName);
+  if (typeof setter !== 'function') {
+    throw new Error(`Missing setter: ${setterName}`);
+  }
+  Reflect.apply(setter, buffer, [pos, value]);
+}
+
 describe('ColumnBuffer setter methods', () => {
   test('should generate setter methods for each column', () => {
     const buffer = createGeneratedColumnBuffer(mockSchema, 10);
@@ -117,8 +125,7 @@ describe('ColumnBuffer setter methods', () => {
   test('_writeIndex should not exist on buffer', () => {
     const buffer = createGeneratedColumnBuffer(mockSchema, 10);
     // _writeIndex is tracked by ColumnWriter, not ColumnBuffer
-    // Note: TypeScript now knows _writeIndex doesn't exist, which is correct
-    expect((buffer as unknown as Record<string, unknown>)._writeIndex).toBeUndefined();
+    expect('_writeIndex' in buffer).toBe(false);
   });
 
   test('null bitmap should mark positions as valid when written', () => {
@@ -267,7 +274,7 @@ describe('Null value support in setters', () => {
     expect(nulls[0] & 1).toBe(1); // bit 0 should be set
 
     // Now write null to mark as null
-    buffer.userId(0, null as unknown as string);
+    callSetter(buffer, 'userId', 0, null);
 
     // Check null bit is cleared (value is null)
     expect(nulls[0] & 1).toBe(0); // bit 0 should be cleared
@@ -289,7 +296,7 @@ describe('Null value support in setters', () => {
     expect(nulls[0] & 0b11).toBe(0b11); // bits 0 and 1 should be set
 
     // Write undefined to position 0
-    buffer.count(0, undefined as unknown as number);
+    callSetter(buffer, 'count', 0, undefined);
 
     // Check bit 0 is cleared, bit 1 still set
     expect(nulls[0] & 0b11).toBe(0b10); // bit 0 cleared, bit 1 set
@@ -307,7 +314,7 @@ describe('Null value support in setters', () => {
     expect(buffer.message_values[0]).toBe('hello');
 
     // Write null - should write empty string (default)
-    buffer.message(0, null as unknown as string);
+    callSetter(buffer, 'message', 0, null);
     expect(buffer.message_values[0]).toBe('');
   });
 
@@ -323,7 +330,7 @@ describe('Null value support in setters', () => {
     expect(buffer.count_values[0]).toBe(42);
 
     // Write null - should write 0 (default)
-    buffer.count(0, null as unknown as number);
+    callSetter(buffer, 'count', 0, null);
     expect(buffer.count_values[0]).toBe(0);
   });
 
@@ -340,7 +347,7 @@ describe('Null value support in setters', () => {
     expect(buffer.status_values[0]).toBe(1);
 
     // Write null
-    buffer.status(0, null as unknown as number);
+    callSetter(buffer, 'status', 0, null);
     expect(buffer.status_nulls[0] & 1).toBe(0); // null bit cleared
   });
 });
@@ -431,12 +438,12 @@ describe('ColumnBuffer comprehensive data type coverage', () => {
     expect(buffer.bigIntCol_nulls[0] & 1).toBe(1);
 
     // Write null/undefined to clear bits
-    buffer.enumCol(0, null as unknown as number);
-    buffer.categoryCol(0, undefined as unknown as string);
-    buffer.textCol(0, null as unknown as string);
-    buffer.numberCol(0, undefined as unknown as number);
-    buffer.booleanCol(0, null as unknown as boolean);
-    buffer.bigIntCol(0, undefined as unknown as bigint);
+    callSetter(buffer, 'enumCol', 0, null);
+    callSetter(buffer, 'categoryCol', 0, undefined);
+    callSetter(buffer, 'textCol', 0, null);
+    callSetter(buffer, 'numberCol', 0, undefined);
+    callSetter(buffer, 'booleanCol', 0, null);
+    callSetter(buffer, 'bigIntCol', 0, undefined);
 
     // Verify all null bits are cleared
     expect(buffer.enumCol_nulls[0] & 1).toBe(0);

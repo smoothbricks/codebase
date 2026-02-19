@@ -44,6 +44,10 @@ const IGNORED_SYSTEM_COLUMNS = new Set([
   'thread_id', // Same thread but can vary
 ]);
 
+function setTagWriterPos<T extends object>(tagWriter: T, pos: number): void {
+  (tagWriter as T & { _pos: number })._pos = pos;
+}
+
 function getTableValue(table: Table, fieldName: string, row: number): unknown {
   const column = table.getChild(fieldName);
   if (!column) {
@@ -547,21 +551,21 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
       const tagWriter1 = createTagWriter(testSchema, buffer1);
 
       // Row 0
-      (tagWriter1 as unknown as { _pos: number })._pos = 0;
+      setTagWriterPos(tagWriter1, 0);
       tagWriter1.value(10).tag_val('first');
 
       // Row 1
-      (tagWriter1 as unknown as { _pos: number })._pos = 1;
+      setTagWriterPos(tagWriter1, 1);
       tagWriter1.value(20).tag_val('second');
 
       // Row 2 - no tags (null)
 
       // Row 3
-      (tagWriter1 as unknown as { _pos: number })._pos = 3;
+      setTagWriterPos(tagWriter1, 3);
       tagWriter1.value(40).tag_val('fourth');
 
       // Row 4
-      (tagWriter1 as unknown as { _pos: number })._pos = 4;
+      setTagWriterPos(tagWriter1, 4);
       tagWriter1.value(50).tag_val('fifth');
 
       // Direct writes for buffer2
