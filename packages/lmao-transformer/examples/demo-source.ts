@@ -31,7 +31,7 @@ const module = defineModule({
 });
 
 // Op that demonstrates transformer line number injections
-const processData = module.op('process-data', async (ctx, userId: string, items: string[]) => {
+const _processData = module.op('process-data', async (ctx, userId: string, items: string[]) => {
   // These log calls will have .line(N) injected by the transformer
   ctx.log.info('Starting data processing');
   ctx.log.debug('Received items to process');
