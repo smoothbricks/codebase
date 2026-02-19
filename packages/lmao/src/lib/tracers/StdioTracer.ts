@@ -110,7 +110,6 @@ function getTraceColor(traceId: TraceId): string {
     const char = str.charCodeAt(i);
     // Simple hash function
     hash = (hash << 5) - hash + char;
-    // biome-ignore lint: Convert to 32bit integer
     hash = hash & hash;
   }
   const index = Math.abs(hash) % COLORS.length;
@@ -151,22 +150,22 @@ function getLogLevel(entryType: number): string | null {
 }
 
 function formatTemplateMessage(buffer: AnySpanBuffer, row: number, template: string): string {
-  return template.replace(/\$\{([A-Za-z0-9_]+)\}/g, (_full, key: string) => {
+  return template.replace(/\{\{([A-Za-z0-9_]+)\}\}/g, (_full, key: string) => {
     const values = Reflect.get(buffer, `${key}_values`) as unknown;
-    if (values == null) return `\${${key}}`;
+    if (values == null) return `{{${key}}}`;
 
     if (Array.isArray(values)) {
       const value = values[row];
-      return value === null || value === undefined ? `\${${key}}` : String(value);
+      return value === null || value === undefined ? `{{${key}}}` : String(value);
     }
 
     if (ArrayBuffer.isView(values)) {
       const typed = values as unknown as { [index: number]: unknown };
       const value = typed[row];
-      return value === null || value === undefined ? `\${${key}}` : String(value);
+      return value === null || value === undefined ? `{{${key}}}` : String(value);
     }
 
-    return `\${${key}}`;
+    return `{{${key}}}`;
   });
 }
 

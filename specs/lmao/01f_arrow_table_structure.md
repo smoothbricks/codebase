@@ -214,18 +214,18 @@ system becomes a row in the final table, enabling rich analytical queries while 
 
 ### Core System Columns (Always Present)
 
-| Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                                 |
-| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------- |
-| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)                                                           | `2024-01-01T10:00:00.000000123Z`                                                                               |
-| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)                                                      | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                           |
-| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread)                                                  | `0x1a2b3c4d5e6f7890`                                                                                           |
-| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                                                             | `1`, `2`, `42`                                                                                                 |
-| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                                 |
-| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                             |
-| `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                       |
-| `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                            |
-| `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                             |
-| `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User ${userId} created'`, `'Processing ${count} items'`, `'TypeError: x is not a function'` |
+| Column Name        | Type                 | Description                                                                                                   | Example Values                                                                                                   |
+| ------------------ | -------------------- | ------------------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------- |
+| `timestamp`        | `timestamp[ns]`      | When event occurred (nanoseconds, BigInt64 storage)                                                           | `2024-01-01T10:00:00.000000123Z`                                                                                 |
+| `trace_id`         | `dictionary<string>` | Request correlation (TraceId branded string, W3C format)                                                      | `'4bf92f3577b34da6a3ce929d0e0e4736'`, `'req-abc123'`                                                             |
+| `thread_id`        | `uint64`             | Thread/worker identifier (crypto-secure random, once/thread)                                                  | `0x1a2b3c4d5e6f7890`                                                                                             |
+| `span_id`          | `uint32`             | Unit of work within thread (incrementing counter)                                                             | `1`, `2`, `42`                                                                                                   |
+| `parent_thread_id` | `uint64` (nullable)  | Parent span's thread (null for root spans)                                                                    | `0x1a2b3c4d5e6f7890` or `null`                                                                                   |
+| `parent_span_id`   | `uint32` (nullable)  | Parent span's ID (null for root spans)                                                                        | `1`, `2` or `null`                                                                                               |
+| `entry_type`       | `dictionary<string>` | Log entry type (see [Entry Types](#entry-type-system))                                                        | `'span-start'`, `'span-ok'`, `'op-invocations'`, `'buffer-writes'`, etc.                                         |
+| `package_name`     | `dictionary<string>` | npm package name (see [Module Identification](#module-identification) section)                                | `'@smoothbricks/lmao'`, `'@mycompany/user-service'`                                                              |
+| `package_file`     | `dictionary<string>` | Path within package, relative to package.json (see [Module Identification](#module-identification) section)   | `'src/services/user.ts'`, `'lib/handlers/auth.ts'`                                                               |
+| `message`          | `dictionary<string>` | Span name, log message template, exception message, result message, OR flag name (see Message Column section) | `'create-user'`, `'User {{userId}} created'`, `'Processing {{count}} items'`, `'TypeError: x is not a function'` |
 
 ### Lazy System Columns (Sparse/Nullable)
 
@@ -665,7 +665,7 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890,
 | ------------ | -------------------- | ------- | -------------------- | -------------- | -------------------------- | ------------ | ------------------------- | ------------------------------ | ----------------------------------------------- | ----------- | ----------- | -------------------------------------- | ------------- | ----------------------------------------------------------------------- | ----------- | ------- | -------- | --------------- | --------------- | -------- |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.000Z` | `span-start` | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.002Z` | `ff-access`  | `@mycompany/user-service` | `src/controllers/user.ts`      | `advancedValidation`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | `true`   |
-| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.005Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Starting registration for ${userId}`           | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.005Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Starting registration for {{userId}}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.010Z` | `span-start` | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.015Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 2       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.045Z` | `tag`        | `@mycompany/user-service` | `src/services/validation.ts`   | `validate-email`                                | 200         | `POST`      | `https://api.*****.com/validate-email` | 30.2          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
@@ -684,7 +684,7 @@ thread_id: 0x1a2b3c4d5e6f7890, span_id: 2, parent_thread_id: 0x1a2b3c4d5e6f7890,
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.245Z` | `tag`        | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | 202         | `POST`      | `https://email.*****.com/send`         | 140.3         | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 5       | `0x1a2b3c4d5e6f7890` | 1              | `2024-01-01T10:00:00.246Z` | `span-ok`    | `@mycompany/user-service` | `src/services/notification.ts` | `send-welcome-email`                            | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.250Z` | `tag`        | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | 1.0             | null     |
-| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for ${userId}`          | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
+| `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.251Z` | `info`       | `@mycompany/user-service` | `src/controllers/user.ts`      | `Registration completed for {{userId}}`         | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 | `req-abc123` | `0x1a2b3c4d5e6f7890` | 1       | null                 | null           | `2024-01-01T10:00:00.252Z` | `span-ok`    | `@mycompany/user-service` | `src/controllers/user.ts`      | `register-user`                                 | null        | null        | null                                   | null          | null                                                                    | null        | null    | null     | `0x8a7b6c5d...` | null            | null     |
 
 ## The `message` System Column
@@ -702,7 +702,7 @@ The `message` column serves different purposes based on entry type:
 | ----------------------------------- | ------------------------------------------------------------ | --------------------------- |
 | `span-start`, `span-ok`, `span-err` | Span name (e.g., `'create-user'`)                            | User `.uint64()` value      |
 | `span-exception`                    | Exception message (e.g., `'TypeError: x is not a function'`) | -                           |
-| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User ${userId} created'`)      | User `.uint64()` value      |
+| `info`, `debug`, `warn`, `error`    | Log message template (e.g., `'User {{userId}} created'`)     | User `.uint64()` value      |
 | `ff-access`, `ff-usage`             | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)       | -                           |
 | `period-start`                      | -                                                            | Period start timestamp (ns) |
 | `op-*` (all 8 op metric types)      | Op name (e.g., `'GET'`, `'createUser'`)                      | Metric value (count or ns)  |
@@ -717,19 +717,19 @@ When you write:
 ```typescript
 // Inside an op function:
 const myOp = op(async ({ log }) => {
-  log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount(5);
+  log.info('User {{userId}} created with {{itemCount}} items').userId(123).itemCount(5);
 });
 ```
 
 The system stores:
 
-| Column      | Value                                              |
-| ----------- | -------------------------------------------------- |
-| `message`   | `'User ${userId} created with ${itemCount} items'` |
-| `userId`    | `123`                                              |
-| `itemCount` | `5`                                                |
+| Column      | Value                                                |
+| ----------- | ---------------------------------------------------- |
+| `message`   | `'User {{userId}} created with {{itemCount}} items'` |
+| `userId`    | `123`                                                |
+| `itemCount` | `5`                                                  |
 
-**The message is NOT interpolated.** The template string `'User ${userId} created...'` is stored verbatim in the
+**The message is NOT interpolated.** The template string `'User {{userId}} created...'` is stored verbatim in the
 `message` column, while the actual values (`123`, `5`) are stored in their respective typed attribute columns.
 
 ### Why This Design?
@@ -753,7 +753,7 @@ Because templates are stored separately from values, you can:
 
 ```sql
 -- Find all occurrences of a specific log pattern
-SELECT * FROM traces WHERE message = 'User ${userId} created with ${itemCount} items';
+SELECT * FROM traces WHERE message = 'User {{userId}} created with {{itemCount}} items';
 
 -- Group by log template to find most frequent messages
 SELECT message, count(*) as occurrences
@@ -765,7 +765,7 @@ ORDER BY occurrences DESC;
 -- Analyze specific template with different values
 SELECT userId, itemCount, timestamp
 FROM traces
-WHERE message = 'User ${userId} created with ${itemCount} items'
+WHERE message = 'User {{userId}} created with {{itemCount}} items'
 ORDER BY timestamp;
 ```
 
@@ -780,12 +780,12 @@ Instead of separate `span_name`, `message`, and `ffName` columns (most always nu
 
 ### Example Data
 
-| entry_type   | message                                            | userId | itemCount |
-| ------------ | -------------------------------------------------- | ------ | --------- |
-| `span-start` | `'create-user'`                                    | `123`  | `null`    |
-| `info`       | `'User ${userId} created with ${itemCount} items'` | `123`  | `5`       |
-| `debug`      | `'Processing batch for ${userId}'`                 | `123`  | `null`    |
-| `span-ok`    | `'create-user'`                                    | `123`  | `null`    |
+| entry_type   | message                                              | userId | itemCount |
+| ------------ | ---------------------------------------------------- | ------ | --------- |
+| `span-start` | `'create-user'`                                      | `123`  | `null`    |
+| `info`       | `'User {{userId}} created with {{itemCount}} items'` | `123`  | `5`       |
+| `debug`      | `'Processing batch for {{userId}}'`                  | `123`  | `null`    |
+| `span-ok`    | `'create-user'`                                      | `123`  | `null`    |
 
 ### Contrast with Traditional Logging
 
@@ -800,7 +800,7 @@ console.log(`User ${userId} created with ${itemCount} items`);
 
 ```typescript
 // Inside an op function:
-log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount(5);
+log.info('User {{userId}} created with {{itemCount}} items').userId(123).itemCount(5);
 // Stores: template in message, values in typed columns - structured, queryable
 ```
 
@@ -815,7 +815,7 @@ log.info('User ${userId} created with ${itemCount} items').userId(123).itemCount
 
 ### 2. Structured Logging via Entry Type Enum
 
-- **Log levels with structure**: `log.info('Template ${var}').var(value)` → `entry_type='info'` with typed attributes
+- **Log levels with structure**: `log.info('Template {{var}}').var(value)` → `entry_type='info'` with typed attributes
 - **Template storage**: Log message TEMPLATES stored in unified `message` column (NOT interpolated strings)
 - **Values in attribute columns**: Actual values stored separately in typed columns for type safety and queryability
 - **Optional attributes**: Structured data can accompany log messages

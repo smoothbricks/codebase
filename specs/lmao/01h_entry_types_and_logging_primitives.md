@@ -282,33 +282,35 @@ levels, but with typed attributes instead of just string concatenation.
 
 **CRITICAL DESIGN DECISION**: Log messages use FORMAT STRINGS stored in the `message` column.
 
+Template placeholders use `{{fieldName}}` syntax (double braces), not `${fieldName}`.
+
 When you write:
 
 ```typescript
 const processUser = op(async ({ log }, userData) => {
-  log.info('User ${userId} processed ${count} items').with({ userId: 'user-123', count: 42 });
+  log.info('User {{userId}} processed {{count}} items').with({ userId: 'user-123', count: 42 });
 });
 ```
 
 The system stores:
 
-| Column    | Value                                       | Type         |
-| --------- | ------------------------------------------- | ------------ |
-| `message` | `'User ${userId} processed ${count} items'` | S.category() |
-| `userId`  | `'user-123'`                                | S.category() |
-| `count`   | `42`                                        | S.number()   |
+| Column    | Value                                         | Type         |
+| --------- | --------------------------------------------- | ------------ |
+| `message` | `'User {{userId}} processed {{count}} items'` | S.category() |
+| `userId`  | `'user-123'`                                  | S.category() |
+| `count`   | `42`                                          | S.number()   |
 
-**The message is NOT interpolated.** The template `'User ${userId} processed ${count} items'` is stored verbatim.
+**The message is NOT interpolated.** The template `'User {{userId}} processed {{count}} items'` is stored verbatim.
 
 **Why Format Strings?**
 
 1. **String Interning**: `message` uses `S.category()` type. Each unique template is interned once. Even if you log
-   `"User ${userId} processed ${count} items"` 10,000 times with different values, the template string is stored ONCE.
+   `"User {{userId}} processed {{count}} items"` 10,000 times with different values, the template string is stored ONCE.
 
 2. **Queryable Templates**: You can find all logs matching a specific template:
 
    ```sql
-   SELECT * FROM traces WHERE message = 'User ${userId} processed ${count} items';
+   SELECT * FROM traces WHERE message = 'User {{userId}} processed {{count}} items';
    ```
 
 3. **Analytics on Values**: Group and aggregate by the actual values:
@@ -316,7 +318,7 @@ The system stores:
    ```sql
    SELECT userId, count(*), avg(count)
    FROM traces
-   WHERE message = 'User ${userId} processed ${count} items'
+   WHERE message = 'User {{userId}} processed {{count}} items'
    GROUP BY userId;
    ```
 
@@ -331,7 +333,7 @@ console.log(`User ${userId} processed ${count} items`);
 
 // LMAO - format string with typed values
 const processUser = op(async ({ log }) => {
-  log.info('User ${userId} processed ${count} items').with({ userId: 'user-123', count: 42 });
+  log.info('User {{userId}} processed {{count}} items').with({ userId: 'user-123', count: 42 });
 });
 // Stores: template once, values in typed columns - structured and efficient!
 ```
@@ -647,17 +649,17 @@ const processUser = op(async ({ tag, log, scope, span, ok, err }, userData) => {
   // FORMAT STRING PATTERN - template stored in message, values in typed columns
   // The message is NOT interpolated - template and values stored separately!
 
-  log.info('Processing user ${userId}').with({ userId: 123 });
-  // Stores: message='Processing user ${userId}', userId=123
+  log.info('Processing user {{userId}}').with({ userId: 123 });
+  // Stores: message='Processing user {{userId}}', userId=123
 
-  log.debug('Query on ${table} took ${duration}ms').with({ table: 'users', duration: 12.5 });
-  // Stores: message='Query on ${table} took ${duration}ms', table='users', duration=12.5
+  log.debug('Query on {{table}} took {{duration}}ms').with({ table: 'users', duration: 12.5 });
+  // Stores: message='Query on {{table}} took {{duration}}ms', table='users', duration=12.5
 
-  log.warn('Rate limit ${current}/${max}').with({ current: 95, max: 100 });
-  // Stores: message='Rate limit ${current}/${max}', current=95, max=100
+  log.warn('Rate limit {{current}}/{{max}}').with({ current: 95, max: 100 });
+  // Stores: message='Rate limit {{current}}/{{max}}', current=95, max=100
 
-  log.error('Connection to ${host} failed').with({ host: 'db.example.com' });
-  // Stores: message='Connection to ${host} failed', host='db.example.com'
+  log.error('Connection to {{host}} failed').with({ host: 'db.example.com' });
+  // Stores: message='Connection to {{host}} failed', host='db.example.com'
 
   // ===== SCOPED ATTRIBUTES (scope) =====
   // Set once, propagates to all entries and child spans
@@ -1097,7 +1099,7 @@ function createSpanCompletion(entryType: 'span-ok' | 'span-err', result?: any, a
 
 ```typescript
 // IMPORTANT: messageTemplate is a FORMAT STRING, not an interpolated message!
-// Example: 'User ${userId} created' - the template is stored verbatim
+// Example: 'User {{userId}} created' - the template is stored verbatim
 // Values like userId are written to their own typed columns (userId_values)
 function createLogEntry(
   level: 'info' | 'debug' | 'warn' | 'error',
@@ -1113,7 +1115,7 @@ function createLogEntry(
   writers.writeMessage(messageTemplate); // message = message TEMPLATE (not interpolated!)
 
   // Attribute VALUES go in their own columns
-  // Template references like ${userId} are NOT replaced - stored verbatim
+  // Template references like {{userId}} are NOT replaced - stored verbatim
   // TODO: Actual column writing API design TBD
   if (attributes) {
     for (const [key, value] of Object.entries(attributes)) {
@@ -1224,13 +1226,13 @@ The system enforces entry type constraints at the API level:
 
 ### The `message` Column by Entry Type
 
-| Entry Type                                            | `message` Contains                                      |
-| ----------------------------------------------------- | ------------------------------------------------------- |
-| `span-start`, `span-ok`, `span-err`, `span-exception` | Span name (e.g., `'create-user'`)                       |
-| `info`, `debug`, `warn`, `error`                      | Log message template (e.g., `'User ${userId} created'`) |
-| `ff-access`, `ff-usage`                               | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)  |
-| `op-*` (all 8 op metric types)                        | Op name (e.g., `'GET'`, `'createUser'`)                 |
-| `period-start`, `buffer-*` (5 types)                  | unused (null)                                           |
+| Entry Type                                            | `message` Contains                                       |
+| ----------------------------------------------------- | -------------------------------------------------------- |
+| `span-start`, `span-ok`, `span-err`, `span-exception` | Span name (e.g., `'create-user'`)                        |
+| `info`, `debug`, `warn`, `error`                      | Log message template (e.g., `'User {{userId}} created'`) |
+| `ff-access`, `ff-usage`                               | Flag name (e.g., `'advancedValidation'`, `'darkMode'`)   |
+| `op-*` (all 8 op metric types)                        | Op name (e.g., `'GET'`, `'createUser'`)                  |
+| `period-start`, `buffer-*` (5 types)                  | unused (null)                                            |
 
 ### Fixed Row Constraints
 

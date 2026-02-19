@@ -96,7 +96,7 @@ describe('StdioTracer', () => {
       const { trace } = tracer;
 
       const testOp = defineOp('test', (ctx) => {
-        ctx.log.info('Processing ${userId}').userId('u-123');
+        ctx.log.info('Processing {{userId}}').userId('u-123');
         return ctx.ok('done');
       });
 
