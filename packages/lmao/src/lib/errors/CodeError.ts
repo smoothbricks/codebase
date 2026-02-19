@@ -32,6 +32,8 @@
 
 import type { TaggedError, TaggedErrorConstructor } from '../result.js';
 
+type CodeErrorJson<C extends string, D> = { code: C; data: D };
+
 /**
  * Error instance created by a Code constructor.
  *
@@ -64,11 +66,11 @@ export class CodeError<C extends string, D = void> extends Error implements Tagg
     return this.code;
   }
 
-  [Symbol.for('nodejs.util.inspect.custom')](): { code: C; data: D } {
+  [Symbol.for('nodejs.util.inspect.custom')](): CodeErrorJson<C, D> {
     return { code: this.code, data: this.data };
   }
 
-  toJSON(): { code: C; data: D } {
+  toJSON(): CodeErrorJson<C, D> {
     return { code: this.code, data: this.data };
   }
 }

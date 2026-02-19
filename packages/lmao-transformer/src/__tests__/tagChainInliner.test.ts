@@ -44,6 +44,13 @@ const IGNORED_SYSTEM_COLUMNS = new Set([
   'thread_id', // Same thread but can vary
 ]);
 
+type TableComparisonResult = { equal: boolean; diff?: string };
+type TestBufferPair<T extends ReturnType<typeof defineLogSchema>> = {
+  buffer1: SpanBuffer<T>;
+  buffer2: SpanBuffer<T>;
+  timestamp: bigint;
+};
+
 function setTagWriterPos<T extends object>(tagWriter: T, pos: number): void {
   (tagWriter as T & { _pos: number })._pos = pos;
 }
@@ -81,7 +88,7 @@ function compareArrowTablesDetailed(
   table1: Table,
   table2: Table,
   options: { ignoreSystemColumns?: boolean } = { ignoreSystemColumns: true },
-): { equal: boolean; diff?: string } {
+): TableComparisonResult {
   // Compare row counts
   if (table1.numRows !== table2.numRows) {
     return {
@@ -157,7 +164,7 @@ function createTestBufferPair<T extends ReturnType<typeof defineLogSchema>>(
   schema: T,
   traceIdSuffix: string,
   capacity?: number,
-): { buffer1: SpanBuffer<T>; buffer2: SpanBuffer<T>; timestamp: bigint } {
+): TestBufferPair<T> {
   const traceRoot = createTestTraceRoot(`trace-${traceIdSuffix}`);
   const buffer1 = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA, capacity);
   const buffer2 = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA, capacity);

@@ -72,6 +72,10 @@ export type DefinedLogSchema<T extends SchemaFields> = LogSchema<T> & {
   readonly [DEFINED_LOG_SCHEMA_BRAND]?: T;
 };
 
+type SafeParseResult<T extends SchemaFields> =
+  | { success: true; value: InferSchema<T> }
+  | { success: false; error: Error };
+
 /**
  * Options for defineLogSchema
  */
@@ -94,7 +98,7 @@ export type ValidatedLogSchema<T extends SchemaFields> = LogSchema<T> & {
   /** Validate data and return null on error */
   parse(data: unknown): InferSchema<T> | null;
   /** Safe parse with detailed error information */
-  safeParse(data: unknown): { success: true; value: InferSchema<T> } | { success: false; error: Error };
+  safeParse(data: unknown): SafeParseResult<T>;
 };
 
 export function defineLogSchema<T extends SchemaFields>(

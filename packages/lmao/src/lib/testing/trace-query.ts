@@ -33,11 +33,14 @@ export interface TraceQueryResult {
   parentSpanId?: number;
 }
 
+type TraceRun = { traceId: string; spanName: string; startedAt: number };
+type LatestTraceRun = { traceId: string };
+
 export class TraceQuery {
   constructor(private db: SyncSQLiteDatabase) {}
 
   /** Get all trace runs (root spans), most recent first */
-  runs(): { traceId: string; spanName: string; startedAt: number }[] {
+  runs(): TraceRun[] {
     return this.db
       .prepare(
         `SELECT trace_id AS traceId, message AS spanName, timestamp_ns AS startedAt
@@ -45,11 +48,11 @@ export class TraceQuery {
          WHERE parent_span_id = 0 AND row_index = 0
          ORDER BY timestamp_ns DESC`,
       )
-      .all() as { traceId: string; spanName: string; startedAt: number }[];
+      .all() as TraceRun[];
   }
 
   /** Get the most recent trace_id (= run_id) */
-  latestRun(): { traceId: string } | undefined {
+  latestRun(): LatestTraceRun | undefined {
     return this.db
       .prepare(
         `SELECT trace_id AS traceId
@@ -57,7 +60,7 @@ export class TraceQuery {
          WHERE parent_span_id = 0 AND row_index = 0
          ORDER BY timestamp_ns DESC LIMIT 1`,
       )
-      .get() as { traceId: string } | undefined;
+      .get() as LatestTraceRun | undefined;
   }
 
   /** Get all failed tests in a run (defaults to latest run) */

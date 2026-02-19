@@ -54,6 +54,17 @@ export const TEST_TRACER = new NoOpTracer(
   createTestTracerOptions(),
 ) as unknown as TracerLifecycleHooks;
 
+type TestSpanBufferBundle<T extends SchemaFields> = {
+  logBinding: LogBinding;
+  spanBuffer: SpanBuffer<LogSchema<T>>;
+};
+
+type TestLoggerBundle<T extends LogSchema> = {
+  buffer: SpanBuffer<T>;
+  logger: SpanLoggerImpl<T>;
+  logBinding: LogBinding;
+};
+
 /**
  * Create a TraceRoot for testing.
  *
@@ -134,7 +145,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
     trace_id?: TraceId;
     capacity?: number;
   } = {},
-): { logBinding: LogBinding; spanBuffer: SpanBuffer<LogSchema<T>> } {
+): TestSpanBufferBundle<T> {
   // Wrap in LogSchema if plain SchemaFields provided
   const logSchema = schema instanceof LogSchema ? (schema as LogSchema<T>) : createTestSchema(schema);
 
@@ -164,13 +175,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
  * @param schema - LogSchema to use
  * @returns Object with buffer and logger, both properly typed
  */
-export function createTestLogger<T extends LogSchema>(
-  schema: T,
-): {
-  buffer: SpanBuffer<T>;
-  logger: SpanLoggerImpl<T>;
-  logBinding: LogBinding;
-} {
+export function createTestLogger<T extends LogSchema>(schema: T): TestLoggerBundle<T> {
   const logBinding = createTestLogBinding(schema);
   const traceRoot = createTestTraceRoot();
   const buffer = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA);

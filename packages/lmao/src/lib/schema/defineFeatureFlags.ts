@@ -8,20 +8,20 @@ export interface FeatureFlagSchema {
   [key: string]: FeatureFlagDefinition<string | number | boolean>;
 }
 
+type DefinedFeatureFlags<T extends FeatureFlagSchema> = {
+  schema: T;
+  syncFlags: SyncFlagKeys<T>[];
+  asyncFlags: AsyncFlagKeys<T>[];
+  type: InferFeatureFlags<T>;
+};
+
 /**
  * Define feature flags with type-safe access patterns
  *
  * @param schema - Object mapping flag names to flag definitions
  * @returns Feature flag definition object for use with evaluator
  */
-export function defineFeatureFlags<T extends FeatureFlagSchema>(
-  schema: T,
-): {
-  schema: T;
-  syncFlags: SyncFlagKeys<T>[];
-  asyncFlags: AsyncFlagKeys<T>[];
-  type: InferFeatureFlags<T>;
-} {
+export function defineFeatureFlags<T extends FeatureFlagSchema>(schema: T): DefinedFeatureFlags<T> {
   const syncFlags: string[] = [];
   const asyncFlags: string[] = [];
 

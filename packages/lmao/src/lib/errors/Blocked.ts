@@ -89,6 +89,18 @@ export interface BlockedConfig {
   readonly nextRetry?: (attempt: number) => number;
 }
 
+type BlockedInspectView = {
+  _tag: 'Blocked';
+  reason: BlockedReason;
+  blockedConfig?: BlockedConfig;
+};
+
+type BlockedJsonView = {
+  _tag: 'Blocked';
+  reason: BlockedReason;
+  blockedConfig?: Omit<BlockedConfig, 'nextRetry'> & { nextRetry?: string };
+};
+
 export class Blocked extends Error implements TaggedError<'Blocked'> {
   static readonly _tag = 'Blocked' as const;
 
@@ -126,11 +138,7 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
   }
 
   /** Clean output for console.log in Node.js */
-  [Symbol.for('nodejs.util.inspect.custom')](): {
-    _tag: 'Blocked';
-    reason: BlockedReason;
-    blockedConfig?: BlockedConfig;
-  } {
+  [Symbol.for('nodejs.util.inspect.custom')](): BlockedInspectView {
     return {
       _tag: this._tag,
       reason: this.reason,
@@ -139,11 +147,7 @@ export class Blocked extends Error implements TaggedError<'Blocked'> {
   }
 
   /** Clean output for JSON.stringify */
-  toJSON(): {
-    _tag: 'Blocked';
-    reason: BlockedReason;
-    blockedConfig?: Omit<BlockedConfig, 'nextRetry'> & { nextRetry?: string };
-  } {
+  toJSON(): BlockedJsonView {
     const config = this.blockedConfig;
     return {
       _tag: this._tag,

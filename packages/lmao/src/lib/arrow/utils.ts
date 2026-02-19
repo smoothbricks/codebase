@@ -7,6 +7,8 @@ import type { AnySpanBuffer } from '../types.js';
 
 const UTF8_ENCODER = new TextEncoder();
 
+type ConcatenatedNullBitmaps = { nullBitmap: Uint8Array | undefined; nullCount: number };
+
 /**
  * Encode an array of strings into a single UTF-8 Uint8Array
  */
@@ -70,10 +72,7 @@ export function concatenateFloat64Arrays(arrays: Float64Array[]): Float64Array {
 /**
  * Concatenate null bitmaps from multiple buffers
  */
-export function concatenateNullBitmaps(
-  buffers: AnySpanBuffer[],
-  columnName: string,
-): { nullBitmap: Uint8Array | undefined; nullCount: number } {
+export function concatenateNullBitmaps(buffers: AnySpanBuffer[], columnName: string): ConcatenatedNullBitmaps {
   const hasAnyNulls = buffers.some((buf) => buf.getNullsIfAllocated(columnName) !== undefined);
 
   if (!hasAnyNulls) return { nullBitmap: undefined, nullCount: 0 };

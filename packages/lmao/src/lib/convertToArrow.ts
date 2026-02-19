@@ -57,11 +57,14 @@ import { globalUtf8Cache } from './utf8Cache.js';
 const DictBuilder = DictionaryBuilder;
 const F64Array = Float64Array;
 
+type BuiltArrowColumn = { column: Column<unknown>; nullCount: number };
+type BuiltMetadataColumns = { fields: string[]; vectors: Column<unknown>[] };
+
 export type SystemColumnBuilder = (
   buffer: AnySpanBuffer,
   buffers: AnySpanBuffer[],
   totalRows: number,
-) => { fields: string[]; vectors: Column<unknown>[] };
+) => BuiltMetadataColumns;
 
 const EMPTY_VALIDITY = new Uint8Array(0);
 const BINARY_TYPE = binary();
@@ -401,7 +404,7 @@ function buildBinaryColumnFromBuffers(
   columnName: string,
   totalRows: number,
   fieldSchema: unknown,
-): { column: Column<unknown>; nullCount: number } {
+): BuiltArrowColumn {
   const encoder = getBinaryEncoder(fieldSchema);
 
   // Collect all values from buffers, encode each if encoder is present
@@ -785,10 +788,7 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
  * This is required for Arrow IPC serialization - Schema validates that
  * fields with same dictionary ID have identical type object references.
  */
-function buildMetadataColumnsWithFields(
-  buffers: AnySpanBuffer[],
-  totalRows: number,
-): { fields: string[]; vectors: Column<unknown>[] } {
+function buildMetadataColumnsWithFields(buffers: AnySpanBuffer[], totalRows: number): BuiltMetadataColumns {
   const fields: string[] = [];
   const vectors: Column<unknown>[] = [];
 

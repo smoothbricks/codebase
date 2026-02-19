@@ -26,6 +26,9 @@ import type { Utf8Encoder } from '@smoothbricks/arrow-builder';
  */
 const DEFAULT_UTF8_CACHE_SIZE = 4096;
 
+type EncodedUtf8Batch = { data: Uint8Array; offsets: Int32Array };
+type Utf8CacheStats = { hits: number; misses: number; hitRate: number; size: number };
+
 /**
  * UTF-8 encoding cache using SIEVE eviction algorithm
  *
@@ -114,7 +117,7 @@ export class Utf8Cache implements Utf8Encoder {
    * @param strings - Array of strings to encode
    * @returns Concatenated UTF-8 bytes and Arrow-format offsets
    */
-  encodeMany(strings: readonly string[]): { data: Uint8Array; offsets: Int32Array } {
+  encodeMany(strings: readonly string[]): EncodedUtf8Batch {
     // First pass: encode all strings and calculate total size
     const encoded: Uint8Array[] = new Array(strings.length);
     let totalSize = 0;
@@ -145,7 +148,7 @@ export class Utf8Cache implements Utf8Encoder {
   /**
    * Get cache statistics
    */
-  get stats(): { hits: number; misses: number; hitRate: number; size: number } {
+  get stats(): Utf8CacheStats {
     const total = this.hits + this.misses;
     return {
       hits: this.hits,

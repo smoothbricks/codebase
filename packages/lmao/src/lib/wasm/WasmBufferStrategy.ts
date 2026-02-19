@@ -37,6 +37,13 @@ export interface WasmBufferStrategyOptions extends WasmAllocatorOptions {
   allocator?: WasmAllocator;
 }
 
+type WasmAllocatorStats = {
+  allocCount: number;
+  freeCount: number;
+  bumpPtr: number;
+  capacity: number;
+};
+
 /**
  * WasmBufferStrategy - Buffer strategy using WASM memory with freelist allocation.
  *
@@ -190,12 +197,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
   /**
    * Get allocator statistics for debugging/monitoring.
    */
-  getStats(): {
-    allocCount: number;
-    freeCount: number;
-    bumpPtr: number;
-    capacity: number;
-  } {
+  getStats(): WasmAllocatorStats {
     return {
       allocCount: this.allocator.getAllocCount(),
       freeCount: this.allocator.getFreeCount(),

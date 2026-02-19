@@ -93,8 +93,8 @@ const httpRequest = httpModule.op('http-request', async (ctx, opts: { method: st
   // Access wired cache dependency (currently requires type assertion due to type system limitation)
   const { cache } = ctx.deps as {
     cache: {
-      get: (key: string) => Promise<{ hit: boolean; value?: unknown }>;
-      set: (key: string, value: unknown, ttl?: number) => Promise<{ success: boolean }>;
+      get: (key: string) => Promise<CacheGetResult>;
+      set: (key: string, value: unknown, ttl?: number) => Promise<CacheSetResult>;
     };
   };
 
@@ -201,20 +201,21 @@ interface UserData {
   name: string;
 }
 
+type CacheGetResult = { hit: boolean; value?: unknown };
+type CacheSetResult = { success: boolean };
+type DbSpanResult = { success: true; value: { rows: UserData[]; rowCount: number } } | { success: false };
+type HttpSpanResult = { success: true; value: unknown } | { success: false };
+
 interface WiredLibraryDeps {
   db: {
-    span: (
-      name: 'db-query',
-      op: typeof dbQuery,
-      sql: string,
-    ) => Promise<{ success: true; value: { rows: UserData[]; rowCount: number } } | { success: false }>;
+    span: (name: 'db-query', op: typeof dbQuery, sql: string) => Promise<DbSpanResult>;
   };
   http: {
     span: (
       name: 'http-request',
       op: typeof httpRequest,
       opts: { method: string; url: string },
-    ) => Promise<{ success: true; value: unknown } | { success: false }>;
+    ) => Promise<HttpSpanResult>;
   };
 }
 

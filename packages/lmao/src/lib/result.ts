@@ -65,6 +65,9 @@ export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> {
  */
 export type ApplyTagsFn<T extends LogSchema> = (buffer: SpanBuffer<T>) => void;
 
+type OkJson<V> = { ok: true; value: V };
+type ErrJson<E> = { ok: false; error: E };
+
 // =============================================================================
 // OK CLASS
 // =============================================================================
@@ -206,11 +209,11 @@ export class Ok<V, T extends LogSchema = LogSchema> {
     return this;
   }
 
-  [Symbol.for('nodejs.util.inspect.custom')](): { ok: true; value: V } {
+  [Symbol.for('nodejs.util.inspect.custom')](): OkJson<V> {
     return { ok: true, value: this.value };
   }
 
-  toJSON(): { ok: true; value: V } {
+  toJSON(): OkJson<V> {
     return { ok: true, value: this.value };
   }
 }
@@ -392,11 +395,11 @@ export class Err<E, T extends LogSchema = LogSchema> {
     return this;
   }
 
-  [Symbol.for('nodejs.util.inspect.custom')](): { ok: false; error: E } {
+  [Symbol.for('nodejs.util.inspect.custom')](): ErrJson<E> {
     return { ok: false, error: this.error };
   }
 
-  toJSON(): { ok: false; error: E } {
+  toJSON(): ErrJson<E> {
     return { ok: false, error: this.error };
   }
 }

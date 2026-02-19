@@ -40,6 +40,13 @@
 import type { TaggedError } from '../result.js';
 import { type BlockedReason, getBlockedReasonName } from './Blocked.js';
 
+type RetriesExhaustedView = {
+  _tag: 'RetriesExhausted';
+  reason: BlockedReason;
+  attempts: number;
+  maxAttempts: number;
+};
+
 export class RetriesExhausted extends Error implements TaggedError<'RetriesExhausted'> {
   static readonly _tag = 'RetriesExhausted' as const;
 
@@ -60,17 +67,12 @@ export class RetriesExhausted extends Error implements TaggedError<'RetriesExhau
   }
 
   /** Clean output for console.log in Node.js */
-  [Symbol.for('nodejs.util.inspect.custom')](): {
-    _tag: 'RetriesExhausted';
-    reason: BlockedReason;
-    attempts: number;
-    maxAttempts: number;
-  } {
+  [Symbol.for('nodejs.util.inspect.custom')](): RetriesExhaustedView {
     return { _tag: this._tag, reason: this.reason, attempts: this.attempts, maxAttempts: this.maxAttempts };
   }
 
   /** Clean output for JSON.stringify */
-  toJSON(): { _tag: 'RetriesExhausted'; reason: BlockedReason; attempts: number; maxAttempts: number } {
+  toJSON(): RetriesExhaustedView {
     return { _tag: this._tag, reason: this.reason, attempts: this.attempts, maxAttempts: this.maxAttempts };
   }
 }

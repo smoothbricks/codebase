@@ -20,8 +20,10 @@ import { StdioTracer } from '../StdioTracer.js';
 // Error code factory for tests
 const TEST_ERROR = defineCodeError('CODE')<{ message: string }>();
 
+type MockStream = { stream: NodeJS.WriteStream; output: string[] };
+
 // Create a mock writable stream that captures output
-function createMockStream(): { stream: NodeJS.WriteStream; output: string[] } {
+function createMockStream(): MockStream {
   const output: string[] = [];
   const stream = new Writable({
     write(chunk, _encoding, callback) {

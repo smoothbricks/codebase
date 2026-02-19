@@ -40,6 +40,12 @@ const testSchema = new LogSchema(
  */
 const RESERVED_ROWS = 2;
 
+type BufferChainAnalysis = {
+  bufferCount: number;
+  totalEntries: number;
+  writeIndices: number[];
+};
+
 /**
  * Helper: Get SpanBufferClass and reset stats for testing
  */
@@ -68,11 +74,7 @@ function countOverflows(buffer: AnySpanBuffer): number {
 /**
  * Helper: Count buffers in chain and collect total entries
  */
-function analyzeBufferChain(rootBuffer: AnySpanBuffer): {
-  bufferCount: number;
-  totalEntries: number;
-  writeIndices: number[];
-} {
+function analyzeBufferChain(rootBuffer: AnySpanBuffer): BufferChainAnalysis {
   const writeIndices: number[] = [];
   let bufferCount = 0;
   let totalEntries = 0;
