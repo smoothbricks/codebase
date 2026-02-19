@@ -155,8 +155,8 @@ function createTestBufferPair<T extends ReturnType<typeof defineLogSchema>>(
   capacity?: number,
 ): { buffer1: SpanBuffer<T>; buffer2: SpanBuffer<T>; timestamp: bigint } {
   const traceRoot = createTestTraceRoot(`trace-${traceIdSuffix}`);
-  const buffer1 = createSpanBuffer(schema, 'test-span', traceRoot, DEFAULT_METADATA, capacity);
-  const buffer2 = createSpanBuffer(schema, 'test-span', traceRoot, DEFAULT_METADATA, capacity);
+  const buffer1 = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA, capacity);
+  const buffer2 = createSpanBuffer(schema, traceRoot, DEFAULT_METADATA, capacity);
 
   // Setup: write system columns identically
   const timestamp = BigInt(Date.now()) * 1000000n;
@@ -524,8 +524,8 @@ describe('Tag Chain Inliner - Arrow Output Equivalence', () => {
 
     it('multiple rows produce identical output', () => {
       const traceRoot = createTestTraceRoot('trace-multirow-test');
-      const buffer1 = createSpanBuffer(testSchema, 'test-span', traceRoot, DEFAULT_METADATA, 16);
-      const buffer2 = createSpanBuffer(testSchema, 'test-span', traceRoot, DEFAULT_METADATA, 16);
+      const buffer1 = createSpanBuffer(testSchema, traceRoot, DEFAULT_METADATA, 16);
+      const buffer2 = createSpanBuffer(testSchema, traceRoot, DEFAULT_METADATA, 16);
 
       const baseTimestamp = BigInt(Date.now()) * 1000000n;
 
