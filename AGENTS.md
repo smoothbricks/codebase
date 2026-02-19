@@ -365,6 +365,26 @@ The agent should:
   - **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineLogSchema` and use
     it properly
 
+## ✅ TYPE-DRIVEN TEST ERGONOMICS WORKFLOW (MANDATORY)
+
+Goal: **zero casts in tests** (`as any`, broad assertion casts, and non-null assertion workarounds) by making library
+APIs naturally inferable for users.
+
+When a test needs casts, follow this exact sequence:
+
+1. **Remove casts in one test file first** and run typecheck/lint to expose real type errors.
+2. **Interpret each error as API feedback** (missing discriminated union, weak generic, unknown boundary, etc.).
+3. **Fix source/runtime/public typings first** (non-test code) so usage is inferred without helper hacks.
+4. **Only after repeated patterns emerge**, add minimal shared helpers/guards in source for boundary decoding.
+5. Re-run package lint/typecheck/tests; then remove now-unneeded test scaffolding.
+
+Rules:
+
+- Do not introduce test-only generic wrappers that hide poor API inference.
+- Prefer runtime validators/type guards at boundary seams (`postMessage`, network payloads, storage reads) over casts.
+- Treat integration tests as user experience tests: if test code must cast to call public APIs, API typing is not ready.
+- Make **atomic commits per fix cluster** (e.g., boundary parser + its call sites, decide context typing upgrade, etc.).
+
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/lmao/01a_trace_schema_system.md):
 
 Three distinct string types, each with different storage strategies:

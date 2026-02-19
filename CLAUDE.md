@@ -105,3 +105,18 @@ Tests use Bun's built-in test runner:
 ```typescript
 import { describe, expect, it } from 'bun:test';
 ```
+
+### Type Inference First (Mandatory)
+
+Integration tests are user-experience tests for public API ergonomics.
+
+- Target outcome: **zero casts in tests** (`as any`, broad assertion casts, non-null workarounds).
+- Workflow:
+  1. Remove casts in a single test file first.
+  2. Run typecheck/lint and read the actual errors.
+  3. Fix source/runtime/public typing contracts first (non-test code).
+  4. Add shared runtime validators/guards only when boundary patterns repeat.
+  5. Re-run checks and keep tests cast-free.
+- Do not add test-only wrappers/generics to hide inference problems.
+- If a test needs casting to call a public API, treat that as a library typing bug to fix.
+- Commit in atomic clusters (e.g., parser/guard + call sites, helper typing upgrades).
