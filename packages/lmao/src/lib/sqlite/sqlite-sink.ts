@@ -18,7 +18,7 @@
 import type { SchemaType } from '@smoothbricks/arrow-builder';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
-import type { SyncSQLiteDatabase } from './sqlite-db.js';
+import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
 
 /** Check if bit at index is set in Arrow null bitmap (1 = valid/present, 0 = null) */
 function isBitSet(bitmap: Uint8Array, idx: number): boolean {
@@ -76,6 +76,7 @@ function schemaTypeToSqlite(schemaType: SchemaType): string {
 
 export class TraceSQLiteSink {
   private knownColumns = new Set<string>();
+  private insertStmtCache = new Map<string, SyncSQLiteStatement>();
 
   constructor(private db: SyncSQLiteDatabase) {
     this.init();
@@ -123,7 +124,31 @@ export class TraceSQLiteSink {
 
   /** Write a root SpanBuffer tree to the database */
   flush(rootBuffer: AnySpanBuffer): void {
-    this.flushBuffer(rootBuffer);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.flushBuffer(rootBuffer);
+      this.db.exec('COMMIT');
+    } catch (error) {
+      this.db.exec('ROLLBACK');
+      throw error;
+    }
+  }
+
+  private getInsertStatement(activeUserFields: readonly string[]): SyncSQLiteStatement {
+    const key = activeUserFields.join(',');
+    const cached = this.insertStmtCache.get(key);
+    if (cached) {
+      return cached;
+    }
+
+    const userColsSql = activeUserFields.length > 0 ? `, ${activeUserFields.join(', ')}` : '';
+    const userPlaceholders = activeUserFields.length > 0 ? `, ${activeUserFields.map(() => '?').join(', ')}` : '';
+    const stmt = this.db.prepare(
+      `INSERT INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message${userColsSql})
+       VALUES (?, ?, ?, ?, ?, ?, ?${userPlaceholders})`,
+    );
+    this.insertStmtCache.set(key, stmt);
+    return stmt;
   }
 
   private flushBuffer(buffer: AnySpanBuffer): void {
@@ -138,13 +163,7 @@ export class TraceSQLiteSink {
     const schema = buffer._logSchema;
     const userFields = schema._columnNames;
     const activeUserFields = userFields.filter((f: string) => this.knownColumns.has(f));
-    const userColsSql = activeUserFields.length > 0 ? `, ${activeUserFields.join(', ')}` : '';
-    const userPlaceholders = activeUserFields.length > 0 ? `, ${activeUserFields.map(() => '?').join(', ')}` : '';
-
-    const insertStmt = this.db.prepare(
-      `INSERT INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message${userColsSql})
-       VALUES (?, ?, ?, ?, ?, ?, ?${userPlaceholders})`,
-    );
+    const insertStmt = this.getInsertStatement(activeUserFields);
 
     for (let row = 0; row < writeIndex; row++) {
       const entryType = buffer.entry_type[row];
@@ -190,13 +209,7 @@ export class TraceSQLiteSink {
     const schema = buffer._logSchema;
     const userFields = schema._columnNames;
     const activeUserFields = userFields.filter((f: string) => this.knownColumns.has(f));
-    const userColsSql = activeUserFields.length > 0 ? `, ${activeUserFields.join(', ')}` : '';
-    const userPlaceholders = activeUserFields.length > 0 ? `, ${activeUserFields.map(() => '?').join(', ')}` : '';
-
-    const insertStmt = this.db.prepare(
-      `INSERT INTO spans (trace_id, span_id, parent_span_id, row_index, entry_type, timestamp_ns, message${userColsSql})
-       VALUES (?, ?, ?, ?, ?, ?, ?${userPlaceholders})`,
-    );
+    const insertStmt = this.getInsertStatement(activeUserFields);
 
     for (let row = 0; row < writeIndex; row++) {
       const entryType = buffer.entry_type[row];
