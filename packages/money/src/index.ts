@@ -19,8 +19,13 @@
  * @packageDocumentation
  */
 
-export type { CurrencyDef } from './currency-registry.js';
+// Amount arithmetic
+export { add, divideWithRemainder, multiply, subtract } from './amount.js';
+// Basis arithmetic
+export { basisAdd, basisMultiply, basisSubtract, toBasis } from './basis.js';
+
 // Currency registry
+export type { CurrencyDef } from './currency-registry.js';
 export { amountScale, basisScale, getCurrency, hasCurrency, registerCurrency } from './currency-registry.js';
 export type { Rate as RateType } from './types.js';
 // Branded types
