@@ -214,7 +214,11 @@ export type SpanLoggerImpl<T extends LogSchema> = ColumnWriter<T> & {
   error(message: string): FluentLogEntry<T>;
   trace(message: string): FluentLogEntry<T>;
   readonly scope: Readonly<Record<string, unknown>>;
-  _setScope(attributes: Partial<InferSchema<T>>): void;
+  _setScope(attributes: ScopeUpdate<T>): void;
+};
+
+export type ScopeUpdate<T extends LogSchema> = {
+  [K in keyof InferSchema<T>]?: InferSchema<T>[K] | null;
 };
 
 /**

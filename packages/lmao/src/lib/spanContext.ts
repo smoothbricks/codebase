@@ -30,6 +30,7 @@ import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import {
   createSpanLogger as createSpanLoggerFromGenerator,
   type FluentLogEntry,
+  type ScopeUpdate,
   type SpanLoggerImpl,
 } from './codegen/spanLoggerGenerator.js';
 import { Blocked } from './errors/Blocked.js';
@@ -528,7 +529,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
     [key: string]: unknown;
 
     // Arrow functions that close over constructor args directly
-    setScope: (attributes: Partial<InferSchema<Ctx['logSchema']>> | null) => void;
+    setScope: (attributes: ScopeUpdate<Ctx['logSchema']> | null) => void;
     ok: <V>(value: V) => Ok<V, Ctx['logSchema']>;
     err: <E>(error: E) => Err<E, Ctx['logSchema']>;
     span: SpanFn<Ctx>;
@@ -547,8 +548,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
       // Regular functions close over constructor args directly - no property lookups
       // Using regular function (not arrow) allows destructuring while closing over args
-      this.setScope = (attributes: Partial<InferSchema<Ctx['logSchema']>> | null): void => {
-        spanLogger._setScope(attributes as Partial<InferSchema<Ctx['logSchema']>>);
+      this.setScope = (attributes: ScopeUpdate<Ctx['logSchema']> | null): void => {
+        spanLogger._setScope(attributes ?? {});
       };
 
       this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value);
@@ -1036,8 +1037,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       ctx.err = function err<E>(error: E): Err<E, Ctx['logSchema']> {
         return new Err<E, Ctx['logSchema']>(error);
       };
-      ctx.setScope = function setScope(attributes: Partial<InferSchema<Ctx['logSchema']>> | null): void {
-        childLogger._setScope(attributes as Partial<InferSchema<Ctx['logSchema']>>);
+      ctx.setScope = function setScope(attributes: ScopeUpdate<Ctx['logSchema']> | null): void {
+        childLogger._setScope(attributes ?? {});
       };
 
       // SLOT 12+: COLD - internal/rarely accessed

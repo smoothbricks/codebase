@@ -27,12 +27,26 @@ interface TestEnv {
   API_KEY: string;
 }
 
+const requiredEnvCtx: { env: TestEnv | null } = {
+  env: null,
+};
+
+const requiredRequestAndEnvCtx: { requestId: string | null; env: TestEnv | null } = {
+  requestId: null,
+  env: null,
+};
+
+const envAndConfigCtx: { env: TestEnv | null; config: { timeout: number } } = {
+  env: null,
+  config: { timeout: 5000 },
+};
+
 describe('Tracer', () => {
   describe('basic functionality', () => {
     it('should create a trace and return the body result', async () => {
       const factory = defineOpContext({
         logSchema: testSchema,
-        ctx: { env: null as unknown as TestEnv },
+        ctx: requiredEnvCtx,
       });
 
       const tracer = new TestTracer(factory, { ...createTestTracerOptions() });
@@ -115,10 +129,7 @@ describe('Tracer', () => {
     it('should accept trace_id combined with userCtx overrides', async () => {
       const factory = defineOpContext({
         logSchema: testSchema,
-        ctx: {
-          requestId: null as unknown as string, // Required
-          env: null as unknown as TestEnv, // Required
-        },
+        ctx: requiredRequestAndEnvCtx,
       });
 
       const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
@@ -129,6 +140,9 @@ describe('Tracer', () => {
         { trace_id: customTraceId, requestId: 'req-123', env: { API_KEY: 'test' } },
         async (ctx) => {
           // Both trace_id and userCtx properties should be available
+          if (ctx.env === null) {
+            throw new Error('env should be provided in trace overrides');
+          }
           expect(ctx.buffer.trace_id).toBe(customTraceId);
           expect(ctx.requestId).toBe('req-123');
           expect(ctx.env.API_KEY).toBe('test');
@@ -140,27 +154,25 @@ describe('Tracer', () => {
     it('should merge ctx defaults with overrides', async () => {
       const factory = defineOpContext({
         logSchema: testSchema,
-        ctx: {
-          env: null as unknown as TestEnv, // Required (null sentinel)
-          config: { timeout: 5000 }, // Has default
-        },
+        ctx: envAndConfigCtx,
       });
 
       const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       await trace('ctx-test', { env: { API_KEY: 'secret' } }, async (ctx) => {
-        const typedCtx = ctx as typeof ctx & { env: TestEnv; config: { timeout: number } };
+        if (ctx.env === null) {
+          throw new Error('env should be provided in trace overrides');
+        }
         // env should be from overrides
-        expect(typedCtx.env.API_KEY).toBe('secret');
+        expect(ctx.env.API_KEY).toBe('secret');
         // config should use default
-        expect(typedCtx.config.timeout).toBe(5000);
+        expect(ctx.config.timeout).toBe(5000);
         return 'done';
       });
 
       // Can override config too
       await trace('ctx-test-2', { env: { API_KEY: 'key2' }, config: { timeout: 10000 } }, async (ctx) => {
-        const typedCtx = ctx as typeof ctx & { config: { timeout: number } };
-        expect(typedCtx.config.timeout).toBe(10000);
+        expect(ctx.config.timeout).toBe(10000);
         return 'done';
       });
     });
@@ -190,8 +202,7 @@ describe('Tracer', () => {
       const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       const result = await trace('with-overrides', { value: 100 }, async (ctx) => {
-        const typedCtx = ctx as typeof ctx & { value: number };
-        return typedCtx.value;
+        return ctx.value;
       });
 
       expect(result).toBe(100);

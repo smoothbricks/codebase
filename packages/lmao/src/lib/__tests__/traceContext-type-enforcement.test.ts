@@ -24,15 +24,21 @@ import { createTestTracerOptions } from './test-helpers.js';
 // =============================================================================
 
 // Factory with required and optional ctx properties
+const testCtxDefaults: {
+  env: { apiTimeout: number; region: string } | null;
+  requestId: string | null;
+  userId: string | undefined;
+} = {
+  env: null,
+  requestId: null,
+  userId: undefined,
+};
+
 const testFactory = defineOpContext({
   logSchema: defineLogSchema({
     userId: S.category(),
   }),
-  ctx: {
-    env: null as unknown as { apiTimeout: number; region: string }, // Required - no default
-    requestId: null as unknown as string, // Required - no default
-    userId: undefined as string | undefined, // Optional - has default
-  },
+  ctx: testCtxDefaults,
 }); // Create a tracer for testing with proper type
 const { trace: testTrace } = new TestTracer(testFactory, { ...createTestTracerOptions() });
 
@@ -52,6 +58,9 @@ describe('Tracer.trace Type Enforcement', () => {
       },
       (ctx) => {
         expect(ctx).toBeDefined();
+        if (ctx.env === null) {
+          throw new Error('env should be populated from trace overrides');
+        }
         expect(ctx.env.region).toBe('us-east-1');
         expect(ctx.requestId).toBe('req-123');
         return 'done';
@@ -110,12 +119,14 @@ describe('Tracer.trace Type Enforcement', () => {
 
 describe('Context Type Flow Through Factory', () => {
   it('should preserve ctx type through defineOpContext', async () => {
+    const defaults: { required: string | null; optional: number | undefined } = {
+      required: null,
+      optional: undefined,
+    };
+
     const factory = defineOpContext({
       logSchema: defineLogSchema({}),
-      ctx: {
-        required: null as unknown as string,
-        optional: undefined as number | undefined,
-      },
+      ctx: defaults,
     });
 
     const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });

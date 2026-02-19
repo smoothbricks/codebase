@@ -109,7 +109,7 @@ describe('null bitmap correctness', () => {
       expect(buffer._scopeValues?.userId).toBe('user-456');
 
       // Pass null to clear requestId, undefined should be ignored
-      logger._setScope({ requestId: null as unknown as string, userId: undefined });
+      logger._setScope({ requestId: null, userId: undefined });
 
       // requestId should be cleared (null), userId should remain (undefined ignored)
       expect(buffer._scopeValues?.requestId).toBeUndefined();

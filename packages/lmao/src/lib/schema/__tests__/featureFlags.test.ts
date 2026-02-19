@@ -8,7 +8,7 @@ import type { AnySpanBuffer } from '../../types.js';
 import { S } from '../builder.js';
 import { defineFeatureFlags } from '../defineFeatureFlags.js';
 import { defineLogSchema } from '../defineLogSchema.js';
-import { type BooleanFlagContext, InMemoryFlagEvaluator, type VariantFlagContext } from '../evaluator.js';
+import { InMemoryFlagEvaluator } from '../evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../systemSchema.js';
 
 /**
@@ -64,11 +64,7 @@ describe('Feature Flags', () => {
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     const result = await trace('test-span', async (ctx) => {
-      // Cast ff to access typed properties (type inference limitation)
-      const ff = ctx.ff as unknown as {
-        debugMode: BooleanFlagContext | undefined;
-        maxRetries: { value: number; track: (context?: { action?: string; outcome?: string }) => unknown } | undefined;
-      };
+      const ff = ctx.ff;
 
       expect(ff.debugMode).toBeDefined();
       expect(ff.debugMode?.value).toBe(true);
@@ -99,7 +95,7 @@ describe('Feature Flags', () => {
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
-      const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
+      const ff = ctx.ff;
       expect(ff.debugMode).toBeUndefined();
       return ctx.ok(null);
     });
@@ -124,16 +120,13 @@ describe('Feature Flags', () => {
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
       // Async flags accessed via get() return FlagContext
-      const limit = (await ctx.ff.get('userSpecificLimit')) as {
-        value: number;
-        track: (context?: { action?: string; outcome?: string }) => unknown;
-      };
+      const limit = await ctx.ff.get('userSpecificLimit');
       expect(limit).toBeDefined();
-      expect(limit.value).toBe(200);
+      expect(limit?.value).toBe(200);
 
-      const provider = (await ctx.ff.get('dynamicProvider')) as VariantFlagContext<string>;
+      const provider = await ctx.ff.get('dynamicProvider');
       expect(provider).toBeDefined();
-      expect(provider.value).toBe('paypal');
+      expect(provider?.value).toBe('paypal');
 
       return ctx.ok(null);
     });
@@ -155,8 +148,7 @@ describe('Feature Flags', () => {
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
-      const ff = ctx.ff as unknown as { advancedValidation: BooleanFlagContext | undefined };
-      const flag = ff.advancedValidation;
+      const flag = ctx.ff.advancedValidation;
 
       // track() returns fluent log entry so additional fields can be tagged
       flag?.track({ action: 'validation_performed', outcome: 'success' }).ff_value('used').line(123);
@@ -183,12 +175,10 @@ describe('Feature Flags', () => {
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
-      const ff = ctx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
-
       // Access the flag multiple times
-      const value1 = ff.debugMode;
-      const value2 = ff.debugMode;
-      const value3 = ff.debugMode;
+      const value1 = ctx.ff.debugMode;
+      const value2 = ctx.ff.debugMode;
+      const value3 = ctx.ff.debugMode;
 
       // All accesses should return same value (flag is truthy)
       expect(value1?.value).toBe(true);
@@ -217,8 +207,8 @@ describe('Feature Flags', () => {
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
-      const value = (await ctx.ff.get('userLimit')) as { value: number };
-      expect(value.value).toBe(200);
+      const value = await ctx.ff.get('userLimit');
+      expect(value?.value).toBe(200);
 
       // Check buffer for ff-access entry
       const accessCount = countEntryType(ctx.buffer, ENTRY_TYPE_FF_ACCESS);
@@ -275,32 +265,23 @@ describe('Feature Flags', () => {
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
-      const ff = ctx.ff as unknown as {
-        enableFeatureX: BooleanFlagContext | undefined;
-        maxConnectionPool:
-          | { value: number; track: (context?: { action?: string; outcome?: string }) => unknown }
-          | undefined;
-        logLevel: VariantFlagContext<string> | undefined;
-        get(flag: string): Promise<unknown>;
-      };
-
       // Test sync flags
-      expect(ff.enableFeatureX?.value).toBe(true);
-      expect(ff.maxConnectionPool?.value).toBe(20);
-      expect(ff.logLevel?.value).toBe('debug');
+      expect(ctx.ff.enableFeatureX?.value).toBe(true);
+      expect(ctx.ff.maxConnectionPool?.value).toBe(20);
+      expect(ctx.ff.logLevel?.value).toBe('debug');
 
       // Test async flags
-      const userTier = (await ff.get('userTier')) as VariantFlagContext<string>;
-      expect(userTier.value).toBe('premium');
+      const userTier = await ctx.ff.get('userTier');
+      expect(userTier?.value).toBe('premium');
 
-      const customLimit = (await ff.get('customLimit')) as { value: number };
-      expect(customLimit.value).toBe(500);
+      const customLimit = await ctx.ff.get('customLimit');
+      expect(customLimit?.value).toBe(500);
 
       return ctx.ok(null);
     });
   });
 
-  test('InMemoryFlagEvaluator setFlag updates values', () => {
+  test('InMemoryFlagEvaluator setFlag updates values', async () => {
     const schema = defineFeatureFlags({
       testFlag: S.category().default('initial').sync(),
     });
@@ -309,11 +290,24 @@ describe('Feature Flags', () => {
     });
 
     // getSync receives ctx as first param (can be empty object for simple evaluator)
-    expect(evaluator.getSync({} as Parameters<typeof evaluator.getSync>[0], 'testFlag')).toBe('initial');
+    const { trace } = new TestTracer(
+      defineOpContext({
+        logSchema: testLogSchema,
+        flags: schema.schema,
+      }),
+      { ...createTestTracerOptions(), flagEvaluator: evaluator },
+    );
+    await trace('sync-read-initial', async (ctx) => {
+      expect(evaluator.getSync(ctx, 'testFlag')).toBe('initial');
+      return ctx.ok(null);
+    });
 
     evaluator.setFlag('testFlag', 'updated');
 
-    expect(evaluator.getSync({} as Parameters<typeof evaluator.getSync>[0], 'testFlag')).toBe('updated');
+    await trace('sync-read-updated', async (ctx) => {
+      expect(evaluator.getSync(ctx, 'testFlag')).toBe('updated');
+      return ctx.ok(null);
+    });
   });
 
   test('InMemoryFlagEvaluator works with async', async () => {
@@ -324,7 +318,17 @@ describe('Feature Flags', () => {
       asyncFlag: 42,
     });
 
-    expect(await evaluator.getAsync({} as Parameters<typeof evaluator.getAsync>[0], 'asyncFlag')).toBe(42);
+    const { trace } = new TestTracer(
+      defineOpContext({
+        logSchema: testLogSchema,
+        flags: schema.schema,
+      }),
+      { ...createTestTracerOptions(), flagEvaluator: evaluator },
+    );
+    await trace('async-read', async (ctx) => {
+      expect(await evaluator.getAsync(ctx, 'asyncFlag')).toBe(42);
+      return ctx.ok(null);
+    });
   });
 
   test('forContext creates child evaluator bound to child SpanContext', async () => {
@@ -341,18 +345,15 @@ describe('Feature Flags', () => {
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('parent-span', async (parentCtx) => {
-      const parentFf = parentCtx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
-
       // Access flag in parent
-      expect(parentFf.debugMode?.value).toBe(true);
+      expect(parentCtx.ff.debugMode?.value).toBe(true);
 
       const parentAccessCount = countEntryType(parentCtx.buffer, ENTRY_TYPE_FF_ACCESS);
       expect(parentAccessCount).toBe(1);
 
       // Create child span - child gets its own ff evaluator via forContext
       await parentCtx.span('child-span', async (childCtx) => {
-        const childFf = childCtx.ff as unknown as { debugMode: BooleanFlagContext | undefined };
-        expect(childFf.debugMode?.value).toBe(true);
+        expect(childCtx.ff.debugMode?.value).toBe(true);
 
         // Access in child should log to child buffer
         const childAccessCount = countEntryType(childCtx.buffer, ENTRY_TYPE_FF_ACCESS);
@@ -384,8 +385,7 @@ describe('Feature Flags', () => {
     });
 
     await enabledTrace('test-enabled', async (ctx) => {
-      const ff = ctx.ff as unknown as { darkMode: BooleanFlagContext | undefined };
-      const darkMode = ff.darkMode;
+      const darkMode = ctx.ff.darkMode;
 
       // Truthy check works naturally with undefined/truthy semantics
       if (darkMode) {
@@ -409,8 +409,7 @@ describe('Feature Flags', () => {
     });
 
     await disabledTrace('test-disabled', async (ctx) => {
-      const ff = ctx.ff as unknown as { darkMode: BooleanFlagContext | undefined };
-      const darkModeDisabled = ff.darkMode;
+      const darkModeDisabled = ctx.ff.darkMode;
 
       // Falsy check works - undefined is falsy
       expect(darkModeDisabled).toBeUndefined();

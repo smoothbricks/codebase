@@ -186,12 +186,15 @@ describe('TestTracer', () => {
 
       const buffer = tracer.rootBuffers[0];
       // Tag values are written to row 0 (span-start row)
-      const typedBuffer = buffer as unknown as {
-        userId_values: string[];
-        count_values: Float64Array;
-      };
-      expect(typedBuffer.userId_values[0]).toBe('user-456');
-      expect(typedBuffer.count_values[0]).toBe(42);
+      const userIdValues = buffer.getColumnIfAllocated('userId');
+      const countValues = buffer.getColumnIfAllocated('count');
+
+      if (!Array.isArray(userIdValues) || !(countValues instanceof Float64Array)) {
+        throw new Error('expected userId/count columns to be allocated');
+      }
+
+      expect(userIdValues[0]).toBe('user-456');
+      expect(countValues[0]).toBe(42);
     });
   });
 });
