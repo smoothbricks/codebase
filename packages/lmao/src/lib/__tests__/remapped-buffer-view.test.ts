@@ -15,10 +15,9 @@ import { createPrefixMapping, generateRemappedBufferViewClass, prefixSchema } fr
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { LogSchema } from '../schema/LogSchema.js';
-import type { TraceId } from '../traceId.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
-import { createTestTracerOptions } from './test-helpers.js';
+import { createBuffer, createTestTracerOptions } from './test-helpers.js';
 
 describe('generateRemappedBufferViewClass', () => {
   describe('class generation', () => {
@@ -36,24 +35,8 @@ describe('generateRemappedBufferViewClass', () => {
       const mapping = { http_status: 'status' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      // Create a mock buffer
-      const mockBuffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 5,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: ['test'],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 123n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: { name: 'test-module' },
-        getColumnIfAllocated: (name: string) => mockBuffer[`${name}_values` as keyof typeof mockBuffer],
-        getNullsIfAllocated: (name: string) => mockBuffer[`${name}_nulls` as keyof typeof mockBuffer],
-      } as unknown as AnySpanBuffer;
+      const mockBuffer = createBuffer(defineLogSchema({}));
+      mockBuffer._writeIndex = 5;
 
       const view = new ViewClass(mockBuffer);
       expect(view).toBeDefined();
@@ -82,35 +65,12 @@ describe('generateRemappedBufferViewClass', () => {
 
   describe('pass-through properties', () => {
     const createMockBuffer = (): AnySpanBuffer => {
-      const buffer = {
-        _children: [{ span_id: 2 }, { span_id: 3 }],
-        _overflow: { span_id: 10 },
-        _writeIndex: 7,
-        timestamp: new BigInt64Array([1n, 2n, 3n, 4n, 5n, 6n, 7n, 8n]),
-        entry_type: new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]),
-        message_values: ['msg1', 'msg2'],
-        message_nulls: new Uint8Array([0b11]),
-        line_values: new Float64Array([10, 20]),
-        line_nulls: new Uint8Array([0b11]),
-        error_code_values: ['ERR001'],
-        error_code_nulls: new Uint8Array([0b01]),
-        exception_stack_values: ['stack trace'],
-        exception_stack_nulls: new Uint8Array([0b01]),
-        ff_value_values: ['true'],
-        ff_value_nulls: new Uint8Array([0b01]),
-        trace_id: 'abc123def456789012345678901234ab' as TraceId,
-        thread_id: 99n,
-        span_id: 42,
-        parent_span_id: 41,
-        _identity: new Uint8Array(32),
-        _logBinding: { name: 'test-module' },
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const schema = defineLogSchema({ userId: S.category() });
+      const buffer = createBuffer(schema);
+      buffer._children = [createBuffer(schema), createBuffer(schema)];
+      buffer._overflow = createBuffer(schema);
+      buffer._writeIndex = 7;
+
       return buffer;
     };
 
@@ -175,7 +135,7 @@ describe('generateRemappedBufferViewClass', () => {
       const view = new ViewClass(buffer);
 
       // The underlying buffer is accessible via _buffer
-      expect((view as unknown as { _buffer: AnySpanBuffer })._buffer).toBe(buffer);
+      expect(Reflect.get(view as object, '_buffer')).toBe(buffer);
     });
   });
 
@@ -185,32 +145,22 @@ describe('generateRemappedBufferViewClass', () => {
       const mapping = { http_status: 'status', http_method: 'method' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      const statusValues = new Float64Array([200, 404, 500]);
-      const methodValues = ['GET', 'POST', 'DELETE'];
+      const buffer = createBuffer(
+        defineLogSchema({
+          status: S.number(),
+          method: S.category(),
+        }),
+      );
+      buffer.status(0, 200);
+      buffer.status(1, 404);
+      buffer.status(2, 500);
+      buffer.method(0, 'GET');
+      buffer.method(1, 'POST');
+      buffer.method(2, 'DELETE');
+      buffer._writeIndex = 3;
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 3,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        status_values: statusValues, // unprefixed column
-        method_values: methodValues, // unprefixed column
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const statusValues = buffer.getColumnIfAllocated('status');
+      const methodValues = buffer.getColumnIfAllocated('method');
 
       const view = new ViewClass(buffer);
 
@@ -223,30 +173,17 @@ describe('generateRemappedBufferViewClass', () => {
       const mapping = { http_status: 'status' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      const statusNulls = new Uint8Array([0b111]);
+      const buffer = createBuffer(
+        defineLogSchema({
+          status: S.number(),
+        }),
+      );
+      buffer.status(0, 200);
+      buffer.status(1, 404);
+      buffer.status(2, 500);
+      buffer._writeIndex = 3;
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 3,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        status_nulls: statusNulls,
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const statusNulls = buffer.getNullsIfAllocated('status');
 
       const view = new ViewClass(buffer);
 
@@ -258,30 +195,16 @@ describe('generateRemappedBufferViewClass', () => {
       const mapping = { http_status: 'status' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      const userIdValues = ['user1', 'user2'];
+      const buffer = createBuffer(
+        defineLogSchema({
+          userId: S.category(),
+        }),
+      );
+      buffer.userId(0, 'user1');
+      buffer.userId(1, 'user2');
+      buffer._writeIndex = 2;
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 2,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        userId_values: userIdValues,
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const userIdValues = buffer.getColumnIfAllocated('userId');
 
       const view = new ViewClass(buffer);
 
@@ -293,27 +216,7 @@ describe('generateRemappedBufferViewClass', () => {
       const mapping = { http_status: 'status' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 0,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        getColumnIfAllocated() {
-          return undefined;
-        },
-        getNullsIfAllocated() {
-          return undefined;
-        },
-      } as unknown as AnySpanBuffer;
+      const buffer = createBuffer(defineLogSchema({}));
 
       const view = new ViewClass(buffer);
 
@@ -349,32 +252,18 @@ describe('generateRemappedBufferViewClass', () => {
 
       const ViewClass = generateRemappedBufferViewClass(invertedMapping);
 
-      const statusValues = new Float64Array([200]);
-      const methodValues = new Uint8Array([0]); // enum index
+      const buffer = createBuffer(
+        defineLogSchema({
+          status: S.number(),
+          method: S.category(),
+        }),
+      );
+      buffer.status(0, 200);
+      buffer.method(0, 'GET');
+      buffer._writeIndex = 1;
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        status_values: statusValues,
-        method_values: methodValues,
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const statusValues = buffer.getColumnIfAllocated('status');
+      const methodValues = buffer.getColumnIfAllocated('method');
 
       const view = new ViewClass(buffer);
 
@@ -605,68 +494,36 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
       // Create child buffer mock
-      const childBuffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: ['child-span'],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 2,
-        parent_span_id: 1,
-        _identity: new Uint8Array(32),
-        _logBinding: { name: 'child-module' },
-        status_values: new Float64Array([404]),
-        status_nulls: new Uint8Array([0b01]),
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const childBuffer = createBuffer(
+        defineLogSchema({
+          status: S.number(),
+        }),
+      );
+      childBuffer.status(0, 404);
+      childBuffer._writeIndex = 1;
 
       // Wrap child in RemappedBufferView
       const childView = new ViewClass(childBuffer);
 
       // Create parent buffer with child as RemappedBufferView
-      const parentBuffer = {
-        _children: [childView], // Parent sees RemappedBufferView, not raw buffer
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: ['parent-span'],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: { name: 'parent-module' },
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const parentBuffer = createBuffer(defineLogSchema({}));
+      (parentBuffer as AnySpanBuffer)._children = [childView];
+      parentBuffer._writeIndex = 1;
 
       // Simulate tree traversal (as Arrow conversion would do)
       expect(parentBuffer._children).toHaveLength(1);
 
-      const child = parentBuffer._children[0] as AnySpanBuffer;
+      const child = parentBuffer._children[0];
 
       // Access via prefixed name through the view
-      expect(child.getColumnIfAllocated('http_status')).toEqual(new Float64Array([404]));
+      const childStatus = child.getColumnIfAllocated('http_status');
+      expect(childStatus).toBeInstanceOf(Float64Array);
+      expect((childStatus as Float64Array)[0]).toBe(404);
 
       // System columns pass through unchanged
-      expect(child.span_id).toBe(2);
-      expect(child.parent_span_id).toBe(1);
-      expect(child.trace_id).toBe('12345678901234567890123456789012' as TraceId);
+      expect(child.span_id).toBe(childBuffer.span_id);
+      expect(child.parent_span_id).toBe(childBuffer.parent_span_id);
+      expect(child.trace_id).toBe(childBuffer.trace_id);
     });
 
     it('should handle nested RemappedBufferView in children array', () => {
@@ -679,75 +536,41 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const DbViewClass = generateRemappedBufferViewClass(dbMapping);
 
       // Grandchild: DB library buffer
-      const grandchildBuffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: ['db-query'],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 3,
-        parent_span_id: 2,
-        _identity: new Uint8Array(32),
-        _logBinding: { name: 'db-module' },
-        query_values: ['SELECT * FROM users'],
-        query_nulls: new Uint8Array([0b01]),
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const grandchildBuffer = createBuffer(
+        defineLogSchema({
+          query: S.text(),
+        }),
+      );
+      grandchildBuffer.query(0, 'SELECT * FROM users');
+      grandchildBuffer._writeIndex = 1;
 
       const grandchildView = new DbViewClass(grandchildBuffer);
 
       // Child: HTTP library buffer with DB grandchild
-      const childBuffer = {
-        _children: [grandchildView],
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: ['http-request'],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 2,
-        parent_span_id: 1,
-        _identity: new Uint8Array(32),
-        _logBinding: { name: 'http-module' },
-        status_values: new Float64Array([200]),
-        status_nulls: new Uint8Array([0b01]),
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const childBuffer = createBuffer(
+        defineLogSchema({
+          status: S.number(),
+        }),
+      );
+      (childBuffer as AnySpanBuffer)._children = [grandchildView];
+      childBuffer.status(0, 200);
+      childBuffer._writeIndex = 1;
 
       const childView = new HttpViewClass(childBuffer);
 
       // Root: App buffer with HTTP child
-      const rootBuffer = {
-        _children: [childView],
-        _writeIndex: 1,
-        span_id: 1,
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-      } as unknown as AnySpanBuffer;
+      const rootBuffer = createBuffer(defineLogSchema({}));
+      (rootBuffer as AnySpanBuffer)._children = [childView];
+      rootBuffer._writeIndex = 1;
 
       // Traverse the tree
-      const httpChild = rootBuffer._children[0] as AnySpanBuffer;
-      const dbGrandchild = httpChild._children[0] as AnySpanBuffer;
+      const httpChild = rootBuffer._children[0];
+      const dbGrandchild = httpChild._children[0];
 
       // Each level returns correct prefixed columns
-      expect(httpChild.getColumnIfAllocated('http_status')).toEqual(new Float64Array([200]));
+      const httpStatus = httpChild.getColumnIfAllocated('http_status');
+      expect(httpStatus).toBeInstanceOf(Float64Array);
+      expect((httpStatus as Float64Array)[0]).toBe(200);
       expect(dbGrandchild.getColumnIfAllocated('db_query')).toEqual(['SELECT * FROM users']);
     });
   });
@@ -756,33 +579,20 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
     it('should handle empty prefix mapping', () => {
       const ViewClass = generateRemappedBufferViewClass({});
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        status_values: new Float64Array([200]),
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const buffer = createBuffer(
+        defineLogSchema({
+          status: S.number(),
+        }),
+      );
+      buffer.status(0, 200);
+      buffer._writeIndex = 1;
 
       const view = new ViewClass(buffer);
 
       // No remapping, pass through directly
-      expect(view.getColumnIfAllocated('status')).toEqual(new Float64Array([200]));
+      const statusCol = view.getColumnIfAllocated('status');
+      expect(statusCol).toBeInstanceOf(Float64Array);
+      expect((statusCol as Float64Array)[0]).toBe(200);
     });
 
     it('should handle special characters in column names', () => {
@@ -790,28 +600,13 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const mapping = { prefix_field_with_underscores: 'field_with_underscores' };
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        field_with_underscores_values: ['test'],
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const buffer = createBuffer(
+        defineLogSchema({
+          field_with_underscores: S.category(),
+        }),
+      );
+      buffer.field_with_underscores(0, 'test');
+      buffer._writeIndex = 1;
 
       const view = new ViewClass(buffer);
 
@@ -827,28 +622,13 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      const buffer = {
-        _children: [],
-        _overflow: undefined,
-        _writeIndex: 1,
-        timestamp: new BigInt64Array(8),
-        entry_type: new Uint8Array(8),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        trace_id: '12345678901234567890123456789012' as TraceId,
-        thread_id: 1n,
-        span_id: 1,
-        parent_span_id: 0,
-        _identity: new Uint8Array(32),
-        _logBinding: {},
-        field50_values: ['value50'],
-        getColumnIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_values`];
-        },
-        getNullsIfAllocated(name: string) {
-          return (this as Record<string, unknown>)[`${name}_nulls`];
-        },
-      } as unknown as AnySpanBuffer;
+      const buffer = createBuffer(
+        defineLogSchema({
+          field50: S.category(),
+        }),
+      );
+      buffer.field50(0, 'value50');
+      buffer._writeIndex = 1;
 
       const view = new ViewClass(buffer);
 

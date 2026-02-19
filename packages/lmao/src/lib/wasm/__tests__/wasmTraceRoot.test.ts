@@ -1,4 +1,6 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
+import { createBuffer } from '../../__tests__/test-helpers.js';
+import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import {
   ENTRY_TYPE_DEBUG,
   ENTRY_TYPE_INFO,
@@ -15,7 +17,7 @@ import { createWasmAllocator, type WasmAllocator } from '../wasmAllocator.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
 
 function createMockSpanBuffer(): AnySpanBuffer {
-  return {} as unknown as AnySpanBuffer;
+  return createBuffer(defineLogSchema({}));
 }
 
 /**

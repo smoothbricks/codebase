@@ -1,10 +1,12 @@
 import { describe, expect, it } from 'bun:test';
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
+import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
+import { createBuffer } from './test-helpers.js';
 
 function createMockSpanBuffer(): AnySpanBuffer {
-  return {} as unknown as AnySpanBuffer;
+  return createBuffer(defineLogSchema({}));
 }
 
 describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
