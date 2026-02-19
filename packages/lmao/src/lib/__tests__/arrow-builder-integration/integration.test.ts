@@ -365,7 +365,10 @@ describe('Buffer Integration', () => {
         await new Promise((r) => setTimeout(r, 5));
         ctx.log.info('third');
         // Access internal buffer for test verification
-        capturedBuffer = (ctx as unknown as { _buffer: SpanBuffer<typeof schema> })._buffer;
+        const internalBuffer = Reflect.get(ctx as object, '_buffer');
+        if (internalBuffer) {
+          capturedBuffer = internalBuffer as SpanBuffer<typeof schema>;
+        }
         return ctx.ok('done');
       });
 

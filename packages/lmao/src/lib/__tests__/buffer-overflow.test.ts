@@ -134,14 +134,19 @@ function collectEntries(
     const start = bufferIndex === 0 ? startRow : 0;
     const end = current._writeIndex;
 
+    const requestIdValues = current.getColumnIfAllocated('requestId');
+    const userIdValues = current.getColumnIfAllocated('userId');
+    const operationValues = current.getColumnIfAllocated('operation');
+    const durationValues = current.getColumnIfAllocated('duration');
+
     for (let row = start; row < end; row++) {
       entries.push({
         bufferIndex,
         rowIndex: row,
-        requestId: (current as unknown as Record<string, unknown[]>).requestId_values?.[row] as string | undefined,
-        userId: (current as unknown as Record<string, unknown[]>).userId_values?.[row] as string | undefined,
-        operation: (current as unknown as Record<string, unknown[]>).operation_values?.[row] as number | undefined,
-        duration: (current as unknown as Record<string, unknown[]>).duration_values?.[row] as number | undefined,
+        requestId: Array.isArray(requestIdValues) ? (requestIdValues[row] as string | undefined) : undefined,
+        userId: Array.isArray(userIdValues) ? (userIdValues[row] as string | undefined) : undefined,
+        operation: operationValues instanceof Uint8Array ? operationValues[row] : undefined,
+        duration: durationValues instanceof Float64Array ? durationValues[row] : undefined,
       });
     }
 

@@ -90,7 +90,8 @@ describe('Blocked with BlockedConfig', () => {
       const config: BlockedConfig = { maxAttempts: 3, nextRetry: () => 1000 };
       const err = Blocked.service('api', config);
       const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
-      const inspected = (err as unknown as Record<symbol, () => unknown>)[inspectSymbol]?.();
+      const inspectFn = Reflect.get(err as object, inspectSymbol) as (() => unknown) | undefined;
+      const inspected = inspectFn?.call(err);
       expect(inspected).toEqual({
         _tag: 'Blocked',
         reason: { type: 'service', name: 'api' },

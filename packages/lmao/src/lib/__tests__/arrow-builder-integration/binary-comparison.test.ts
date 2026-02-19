@@ -75,6 +75,14 @@ function getColumnValue<T>(table: Table, columnName: string, rowIndex: number): 
   return getColumn(table, columnName).get(rowIndex) as T;
 }
 
+function getNumericWriter(buffer: object, columnName: string): (pos: number, value: number) => unknown {
+  const writer = Reflect.get(buffer, columnName);
+  if (typeof writer !== 'function') {
+    throw new Error(`Expected numeric writer for column '${columnName}'`);
+  }
+  return writer.bind(buffer) as (pos: number, value: number) => unknown;
+}
+
 /**
  * Set null bit at position (Arrow format: 1=valid, 0=null)
  */
@@ -159,15 +167,15 @@ describe('Arrow IPC Round-Trip', () => {
       buffer._opMetadata = DEFAULT_METADATA;
 
       // Write enum indices (0=pending, 1=active, 2=completed)
-      // Note: Buffer setters accept numeric indices for enum columns at runtime,
-      // but TypeScript types expect string literals. Use type assertion for low-level tests.
+      // Note: Buffer setters accept numeric indices for enum columns at runtime.
       const testIndices = [0, 2, 1, 0, 2];
       const expectedStrings = ['pending', 'completed', 'active', 'pending', 'completed'];
+      const statusWriter = getNumericWriter(buffer, 'status');
       for (const enumIdx of testIndices) {
         const idx = buffer._writeIndex;
         buffer.timestamp[idx] = 1000n;
         buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
-        (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, enumIdx);
+        statusWriter(idx, enumIdx);
         buffer._writeIndex++;
       }
 
@@ -277,6 +285,7 @@ describe('Arrow IPC Round-Trip', () => {
         { count: 100, active: false, status: 1, userId: 'user-456', userMessage: 'Second message' },
         { count: null, active: true, status: 2, userId: 'user-123', userMessage: 'First message' },
       ];
+      const statusWriter = getNumericWriter(buffer, 'status');
 
       for (const row of testData) {
         const idx = buffer._writeIndex;
@@ -292,7 +301,7 @@ describe('Arrow IPC Round-Trip', () => {
           }
         }
         buffer.active(idx, row.active);
-        (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, row.status);
+        statusWriter(idx, row.status);
         buffer.userId(idx, row.userId);
         buffer.userMessage(idx, row.userMessage);
         buffer._writeIndex++;
@@ -435,7 +444,8 @@ describe('Arrow IPC Round-Trip', () => {
       buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
       buffer.category(idx, 'cat1');
       buffer.text(idx, 'text1');
-      (buffer.status as unknown as (pos: number, val: number) => unknown)(idx, 0);
+      const statusWriter = getNumericWriter(buffer, 'status');
+      statusWriter(idx, 0);
       buffer._writeIndex++;
 
       const table = convertToArrowTable(buffer);

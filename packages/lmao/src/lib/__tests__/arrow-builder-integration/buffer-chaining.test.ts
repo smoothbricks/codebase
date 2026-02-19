@@ -122,7 +122,7 @@ describe('Buffer Chaining', () => {
       const nextChildBuffer = createOverflowBuffer(childBuffer);
 
       // Should maintain parent relationship
-      expect(nextChildBuffer._parent).toBe(parentBuffer as unknown as typeof nextChildBuffer._parent);
+      expect(nextChildBuffer._parent).toBe(parentBuffer);
 
       // Should NOT be added to parent's children (it's a continuation, not a new span)
       expect(parentBuffer._children).toHaveLength(1);
@@ -288,9 +288,9 @@ describe('Buffer Chaining', () => {
       expect(child3.span_id).not.toBe(buffer2.span_id);
 
       // Verify child relationships
-      expect(child1._parent).toBe(buffer1 as unknown as typeof child1._parent);
-      expect(child2._parent).toBe(buffer1 as unknown as typeof child2._parent);
-      expect(child3._parent).toBe(buffer2 as unknown as typeof child3._parent);
+      expect(child1._parent).toBe(buffer1);
+      expect(child2._parent).toBe(buffer1);
+      expect(child3._parent).toBe(buffer2);
       expect(child1._overflow).toBeUndefined();
       expect(child2._overflow).toBeUndefined();
       expect(child3._overflow).toBeUndefined();

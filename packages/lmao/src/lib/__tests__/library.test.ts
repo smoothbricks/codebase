@@ -24,8 +24,7 @@ import {
 } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
-import type { AnySpanBuffer } from '../types.js';
-import { getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
+import { createBuffer, getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
 
 describe('Library Integration Pattern', () => {
   describe('Schema Prefixing', () => {
@@ -171,33 +170,17 @@ describe('Library Integration Pattern', () => {
 
       const ViewClass = generateRemappedBufferViewClass(mapping);
 
-      // Create mock column arrays to test mapping
-      const mockValues = new Float64Array(1);
-      const mockNulls = new Uint8Array(1);
-      const mockBuffer = {
-        getColumnIfAllocated: (name: string) => (name === 'status' ? mockValues : undefined),
-        getNullsIfAllocated: (name: string) => (name === 'status' ? mockNulls : undefined),
-        _children: [],
-        _writeIndex: 0,
-        timestamp: new BigInt64Array(1),
-        entry_type: new Uint8Array(1),
-        message_values: [],
-        message_nulls: new Uint8Array(1),
-        line_values: new Uint32Array(1),
-        line_nulls: new Uint8Array(1),
-        error_code_values: new Uint16Array(1),
-        error_code_nulls: new Uint8Array(1),
-        exception_stack_values: [],
-        exception_stack_nulls: new Uint8Array(1),
-        ff_value_values: [],
-        ff_value_nulls: new Uint8Array(1),
-        trace_id: 'test-trace-id',
-        thread_id: 123n,
-        span_id: 456,
-        parent_span_id: null,
-        _identity: 'test-identity',
-        _logBinding: { package_name: 'test' },
-      } as unknown as AnySpanBuffer;
+      const mockBuffer = createBuffer(
+        defineLogSchema({
+          status: S.number(),
+          method: S.category(),
+        }),
+      );
+      mockBuffer.status(0, 200);
+      mockBuffer._writeIndex = 1;
+
+      const mockValues = mockBuffer.getColumnIfAllocated('status');
+      const mockNulls = mockBuffer.getNullsIfAllocated('status');
 
       const view = new ViewClass(mockBuffer);
 

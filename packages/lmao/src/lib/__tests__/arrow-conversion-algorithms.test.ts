@@ -1,18 +1,28 @@
 import { describe, expect, it } from 'bun:test';
+import type { ColumnValueType } from '@smoothbricks/arrow-builder';
 import { buildTextDictionary } from '../arrow/dictionaries.js';
 import { concatenateNullBitmaps } from '../arrow/utils.js';
+import { S } from '../schema/builder.js';
+import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
+import { createBuffer } from './test-helpers.js';
 
-function mockBuffer(writeIndex: number, column: unknown[] | undefined, nulls: Uint8Array | undefined): AnySpanBuffer {
-  return {
-    _writeIndex: writeIndex,
-    getColumnIfAllocated(columnName: string): unknown {
-      return columnName === 'field' ? column : undefined;
-    },
-    getNullsIfAllocated(columnName: string): Uint8Array | undefined {
-      return columnName === 'field' ? nulls : undefined;
-    },
-  } as unknown as AnySpanBuffer;
+function mockBuffer(
+  writeIndex: number,
+  column: ColumnValueType | undefined,
+  nulls: Uint8Array | undefined,
+): AnySpanBuffer {
+  const buffer = createBuffer(
+    defineLogSchema({
+      field: S.text(),
+    }),
+  );
+  buffer._writeIndex = writeIndex;
+  buffer.getColumnIfAllocated = (columnName: string): ColumnValueType | undefined =>
+    columnName === 'field' ? column : undefined;
+  buffer.getNullsIfAllocated = (columnName: string): Uint8Array | undefined =>
+    columnName === 'field' ? nulls : undefined;
+  return buffer;
 }
 
 describe('arrow conversion algorithms', () => {

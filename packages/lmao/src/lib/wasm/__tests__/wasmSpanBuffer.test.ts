@@ -19,6 +19,18 @@ function testTraceId(value: string) {
   return createTraceId(value);
 }
 
+function getMethod<TArgs extends unknown[], TResult>(target: object, name: string): (...args: TArgs) => TResult {
+  const value = Reflect.get(target, name);
+  if (typeof value !== 'function') {
+    throw new Error(`expected method '${name}' to exist on test buffer`);
+  }
+  return value.bind(target) as (...args: TArgs) => TResult;
+}
+
+function getColumn<T>(target: object, name: string): T {
+  return Reflect.get(target, name) as T;
+}
+
 describe('WasmSpanBuffer', () => {
   let allocator: WasmAllocator;
   const CAPACITY = 64;
@@ -242,58 +254,55 @@ describe('WasmSpanBuffer', () => {
     });
 
     it('allocates userId column on first write', () => {
-      (buffer as unknown as { userId(idx: number, val: string): void }).userId(0, 'user-123');
+      const userId = getMethod<[idx: number, val: string], void>(buffer, 'userId');
+      userId(0, 'user-123');
 
       expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
       expect(buffer.getNullsIfAllocated('userId')).toBeDefined();
     });
 
     it('writes values to category column', () => {
-      const b = buffer as unknown as {
-        userId(idx: number, val: string): WasmSpanBufferInstance;
-        userId_values: string[];
-        userId_nulls: Uint8Array;
-      };
+      const userId = getMethod<[idx: number, val: string], WasmSpanBufferInstance>(buffer, 'userId');
 
-      b.userId(0, 'user-001');
-      b.userId(5, 'user-002');
+      userId(0, 'user-001');
+      userId(5, 'user-002');
 
-      expect(b.userId_values[0]).toBe('user-001');
-      expect(b.userId_values[5]).toBe('user-002');
+      const userIdValues = getColumn<string[]>(buffer, 'userId_values');
+
+      expect(userIdValues[0]).toBe('user-001');
+      expect(userIdValues[5]).toBe('user-002');
     });
 
     it('sets validity bits on write', () => {
-      const b = buffer as unknown as {
-        userId(idx: number, val: string | null): WasmSpanBufferInstance;
-        userId_nulls: Uint8Array;
-      };
+      const userId = getMethod<[idx: number, val: string | null], WasmSpanBufferInstance>(buffer, 'userId');
 
-      b.userId(0, 'user-001');
-      b.userId(5, 'user-002');
+      userId(0, 'user-001');
+      userId(5, 'user-002');
+
+      const userIdNulls = getColumn<Uint8Array>(buffer, 'userId_nulls');
 
       // Check validity bits are set
       // Bit 0 in byte 0 should be 1
-      expect(b.userId_nulls[0] & 0b00000001).toBe(1);
+      expect(userIdNulls[0] & 0b00000001).toBe(1);
       // Bit 5 in byte 0 should be 1
-      expect(b.userId_nulls[0] & 0b00100000).toBe(0b00100000);
+      expect(userIdNulls[0] & 0b00100000).toBe(0b00100000);
     });
 
     it('clears validity bit for null', () => {
-      const b = buffer as unknown as {
-        userId(idx: number, val: string | null): WasmSpanBufferInstance;
-        userId_nulls: Uint8Array;
-      };
+      const userId = getMethod<[idx: number, val: string | null], WasmSpanBufferInstance>(buffer, 'userId');
 
-      b.userId(0, 'user-001');
-      b.userId(0, null);
+      userId(0, 'user-001');
+      userId(0, null);
+
+      const userIdNulls = getColumn<Uint8Array>(buffer, 'userId_nulls');
 
       // Bit 0 should be cleared
-      expect(b.userId_nulls[0] & 0b00000001).toBe(0);
+      expect(userIdNulls[0] & 0b00000001).toBe(0);
     });
 
     it('returns this for chaining', () => {
-      const b = buffer as unknown as { userId(idx: number, val: string): WasmSpanBufferInstance };
-      const result = b.userId(0, 'test');
+      const userId = getMethod<[idx: number, val: string], WasmSpanBufferInstance>(buffer, 'userId');
+      const result = userId(0, 'test');
       expect(result).toBe(buffer);
     });
   });
@@ -310,28 +319,27 @@ describe('WasmSpanBuffer', () => {
     });
 
     it('allocates count column on first write', () => {
-      const b = buffer as unknown as { count(idx: number, val: number): WasmSpanBufferInstance };
-      b.count(0, 42);
+      const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
+      count(0, 42);
 
       expect(buffer.isColumnAllocated(2)).toBe(true);
     });
 
     it('writes to numeric column', () => {
-      const b = buffer as unknown as {
-        count(idx: number, val: number): WasmSpanBufferInstance;
-        count_values: Float64Array | null;
-      };
+      const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
 
-      b.count(0, 42);
-      b.count(5, 100);
+      count(0, 42);
+      count(5, 100);
+
+      const countValues = getColumn<Float64Array | null>(buffer, 'count_values');
 
       // Values should be readable (note: WASM memory layout may vary)
-      expect(b.count_values).toBeDefined();
+      expect(countValues).toBeDefined();
     });
 
     it('returns this for chaining', () => {
-      const b = buffer as unknown as { count(idx: number, val: number): WasmSpanBufferInstance };
-      const result = b.count(0, 42);
+      const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
+      const result = count(0, 42);
       expect(result).toBe(buffer);
     });
   });
@@ -359,12 +367,10 @@ describe('WasmSpanBuffer', () => {
       const buffer = createTestWasmBuffer({ trace_id: 'trace-123', thread_id: 1n, span_id: 1 });
 
       // Write to lazy columns to allocate them
-      const b = buffer as unknown as {
-        count(idx: number, val: number): WasmSpanBufferInstance;
-        isAdmin(idx: number, val: boolean): WasmSpanBufferInstance;
-      };
-      b.count(0, 42);
-      b.isAdmin(0, true);
+      const count = getMethod<[idx: number, val: number], WasmSpanBufferInstance>(buffer, 'count');
+      const isAdmin = getMethod<[idx: number, val: boolean], WasmSpanBufferInstance>(buffer, 'isAdmin');
+      count(0, 42);
+      isAdmin(0, true);
 
       const freesBefore = allocator.getFreeCount();
       buffer.free();
@@ -436,7 +442,10 @@ describe('WasmSpanBuffer', () => {
 
       // Get custom inspect
       const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
-      const inspectFn = (buffer as unknown as Record<symbol, () => string>)[inspectSymbol];
+      const inspectFn = Reflect.get(buffer as object, inspectSymbol) as (() => string) | undefined;
+      if (!inspectFn) {
+        throw new Error('expected custom inspect function on WasmSpanBuffer');
+      }
       const result = inspectFn.call(buffer);
 
       expect(result).toContain('WasmSpanBuffer');
