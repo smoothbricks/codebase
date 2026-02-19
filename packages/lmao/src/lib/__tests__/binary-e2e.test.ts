@@ -16,6 +16,13 @@ import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
+function requireCapturedBuffer(buffer: AnySpanBuffer | undefined): AnySpanBuffer {
+  if (!buffer) {
+    throw new Error('Expected trace to capture a root buffer');
+  }
+  return buffer;
+}
+
 describe('Binary columns E2E through Tracer API', () => {
   // Define schema with binary columns alongside traditional types
   const apiSchema = defineLogSchema({
@@ -37,7 +44,7 @@ describe('Binary columns E2E through Tracer API', () => {
   const { defineOp } = opContext;
 
   it('roundtrips S.unknown() payload through trace -> flush -> Arrow -> decode', async () => {
-    let capturedBuffer: AnySpanBuffer;
+    let capturedBuffer: AnySpanBuffer | undefined;
 
     const testOp = defineOp('getUser', async (ctx) => {
       capturedBuffer = ctx.buffer;
@@ -61,10 +68,10 @@ describe('Binary columns E2E through Tracer API', () => {
     const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
     await trace('test', testOp);
 
-    expect(capturedBuffer!).toBeDefined();
+    const rootBuffer = requireCapturedBuffer(capturedBuffer);
 
     // Convert to Arrow table via the tree path
-    const table = convertSpanTreeToArrowTable(capturedBuffer!);
+    const table = convertSpanTreeToArrowTable(rootBuffer);
     expect(table.numRows).toBeGreaterThan(0);
 
     // Find the requestBody column
@@ -90,7 +97,7 @@ describe('Binary columns E2E through Tracer API', () => {
   });
 
   it('roundtrips S.object<T>() through trace -> flush -> Arrow -> decode', async () => {
-    let capturedBuffer: AnySpanBuffer;
+    let capturedBuffer: AnySpanBuffer | undefined;
 
     const testOp = defineOp('listItems', async (ctx) => {
       capturedBuffer = ctx.buffer;
@@ -105,9 +112,9 @@ describe('Binary columns E2E through Tracer API', () => {
     const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
     await trace('test', testOp);
 
-    expect(capturedBuffer!).toBeDefined();
+    const rootBuffer = requireCapturedBuffer(capturedBuffer);
 
-    const table = convertSpanTreeToArrowTable(capturedBuffer!);
+    const table = convertSpanTreeToArrowTable(rootBuffer);
     const responseCol = table.getChild('responsePayload');
     expect(responseCol).toBeDefined();
 
@@ -127,7 +134,7 @@ describe('Binary columns E2E through Tracer API', () => {
   });
 
   it('handles log entries with binary payloads via ctx.log', async () => {
-    let capturedBuffer: AnySpanBuffer;
+    let capturedBuffer: AnySpanBuffer | undefined;
 
     const testOp = defineOp('processRequest', async (ctx) => {
       capturedBuffer = ctx.buffer;
@@ -151,9 +158,9 @@ describe('Binary columns E2E through Tracer API', () => {
     const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
     await trace('test', testOp);
 
-    expect(capturedBuffer!).toBeDefined();
+    const rootBuffer = requireCapturedBuffer(capturedBuffer);
 
-    const table = convertSpanTreeToArrowTable(capturedBuffer!);
+    const table = convertSpanTreeToArrowTable(rootBuffer);
     const requestBodyCol = table.getChild('requestBody');
     expect(requestBodyCol).toBeDefined();
 

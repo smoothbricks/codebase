@@ -88,6 +88,21 @@ function analyzeBufferChain(rootBuffer: AnySpanBuffer): {
   return { bufferCount, totalEntries, writeIndices };
 }
 
+type LazyColumnProbe = {
+  _requestId_values?: unknown;
+  _userId_values?: unknown;
+  _operation_values?: unknown;
+  _duration_values?: unknown;
+  _success_values?: unknown;
+};
+
+function requireOverflowBuffer(buffer: AnySpanBuffer, label: string): AnySpanBuffer {
+  if (!buffer._overflow) {
+    throw new Error(`Expected overflow buffer for ${label}`);
+  }
+  return buffer._overflow;
+}
+
 /**
  * Helper: Collect all entries from buffer chain
  */
@@ -472,7 +487,8 @@ describe('Buffer Overflow Property Tests', () => {
 
       // Verify overflow happened
       expect(buffer._overflow).toBeDefined();
-      const overflowBuffer = buffer._overflow!;
+      const overflowBuffer = requireOverflowBuffer(buffer, 'prefill-row0');
+      const overflowProbe = overflowBuffer as AnySpanBuffer & LazyColumnProbe;
 
       // CRITICAL: Overflow buffer starts at _writeIndex=0, not 2
       // The bug was that _prefillScopedAttributesOn used startIdx=2, skipping rows 0-1
@@ -481,8 +497,8 @@ describe('Buffer Overflow Property Tests', () => {
       // CRITICAL: Columns in scope but never written to directly are NOT allocated
       // Prefill checks _requestId_values (private) to avoid triggering lazy allocation
       // These columns stay unallocated until Arrow conversion time
-      expect((overflowBuffer as any)._requestId_values).toBeUndefined();
-      expect((overflowBuffer as any)._userId_values).toBeUndefined();
+      expect(overflowProbe._requestId_values).toBeUndefined();
+      expect(overflowProbe._userId_values).toBeUndefined();
 
       // Row 0 has the actual entry (message IS allocated because .info() writes to it)
       expect(overflowBuffer.message_values[0]).toBe('msg-6');
@@ -509,12 +525,14 @@ describe('Buffer Overflow Property Tests', () => {
       expect(buffer._overflow).toBeDefined();
       expect(buffer._overflow?._overflow).toBeDefined();
 
-      const overflow1 = buffer._overflow!;
-      const overflow2 = overflow1._overflow!;
+      const overflow1 = requireOverflowBuffer(buffer, 'multiple-overflow-1');
+      const overflow2 = requireOverflowBuffer(overflow1, 'multiple-overflow-2');
+      const overflow1Probe = overflow1 as AnySpanBuffer & LazyColumnProbe;
+      const overflow2Probe = overflow2 as AnySpanBuffer & LazyColumnProbe;
 
       // Columns in scope but never written directly stay unallocated (lazy)
-      expect((overflow1 as any)._requestId_values).toBeUndefined();
-      expect((overflow2 as any)._requestId_values).toBeUndefined();
+      expect(overflow1Probe._requestId_values).toBeUndefined();
+      expect(overflow2Probe._requestId_values).toBeUndefined();
     });
 
     it('only prefills columns present in _scopeValues, not all schema columns', () => {
@@ -535,16 +553,17 @@ describe('Buffer Overflow Property Tests', () => {
         logger.info(`msg-${i}`);
       }
 
-      const overflowBuffer = buffer._overflow!;
+      const overflowBuffer = requireOverflowBuffer(buffer, 'scope-columns');
+      const overflowProbe = overflowBuffer as AnySpanBuffer & LazyColumnProbe;
 
       // Columns in _scopeValues but NEVER written to directly stay unallocated (lazy)
-      expect((overflowBuffer as any)._userId_values).toBeUndefined();
-      expect((overflowBuffer as any)._requestId_values).toBeUndefined();
+      expect(overflowProbe._userId_values).toBeUndefined();
+      expect(overflowProbe._requestId_values).toBeUndefined();
 
       // Columns NOT in _scopeValues also stay unallocated (lazy)
-      expect((overflowBuffer as any)._operation_values).toBeUndefined();
-      expect((overflowBuffer as any)._duration_values).toBeUndefined();
-      expect((overflowBuffer as any)._success_values).toBeUndefined();
+      expect(overflowProbe._operation_values).toBeUndefined();
+      expect(overflowProbe._duration_values).toBeUndefined();
+      expect(overflowProbe._success_values).toBeUndefined();
     });
 
     it('does not allocate columns that are only in scope (lazy allocation)', () => {
@@ -566,15 +585,17 @@ describe('Buffer Overflow Property Tests', () => {
 
       // Verify overflow happened
       expect(buffer._overflow).toBeDefined();
-      const overflowBuffer = buffer._overflow!;
+      const overflowBuffer = requireOverflowBuffer(buffer, 'lazy-scope-only');
+      const rootProbe = buffer as AnySpanBuffer & LazyColumnProbe;
+      const overflowProbe = overflowBuffer as AnySpanBuffer & LazyColumnProbe;
 
       // CRITICAL: prefill checks the PRIVATE property _userId_values
       // This prevents triggering the lazy getter and allocating memory
       // Since userId was only in scope (never written directly), it stays unallocated
 
       // Verify column was NOT allocated (lazy allocation preserved)
-      expect((buffer as any)._userId_values).toBeUndefined();
-      expect((overflowBuffer as any)._userId_values).toBeUndefined();
+      expect(rootProbe._userId_values).toBeUndefined();
+      expect(overflowProbe._userId_values).toBeUndefined();
 
       // Accessing via the public getter would trigger allocation
       // (but we verify it's undefined before triggering the getter)

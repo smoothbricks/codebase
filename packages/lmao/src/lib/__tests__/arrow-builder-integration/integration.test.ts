@@ -6,7 +6,8 @@ import {
   maskingTransforms,
 } from '@smoothbricks/arrow-builder';
 import type { SpanBuffer } from '@smoothbricks/lmao';
-import { convertToArrowTable, createSpanBuffer, defineOpContext, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
+import { defineOpContext } from '../../defineOpContext.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 
@@ -17,6 +18,14 @@ import {
   createTestTraceRoot,
   createTestTracerOptions,
 } from '../test-helpers.js';
+
+type LooseRowWriter = {
+  [method: string]: (value: unknown) => LooseRowWriter;
+};
+
+function nextLooseRow(writer: { nextRow(): unknown }): LooseRowWriter {
+  return writer.nextRow() as LooseRowWriter;
+}
 
 describe('Buffer Integration', () => {
   it('generates columns with proper names for defined schema', () => {
@@ -139,7 +148,7 @@ describe('Buffer Integration', () => {
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
     // Dynamic fluent API - schema methods are generated at runtime and can't be typed statically
-    (writer.nextRow() as any).userId('user-12345').plainUserId('user-12345');
+    nextLooseRow(writer).userId('user-12345').plainUserId('user-12345');
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
@@ -178,7 +187,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    (writer.nextRow() as any)
+    nextLooseRow(writer)
       .email('john@example.com')
       .sqlQuery("SELECT * FROM users WHERE id = 123 AND name = 'test'")
       .plainText('Plain unmasked text');
@@ -223,7 +232,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    (writer.nextRow() as any).secretKey('sk_live_abcd1234efgh5678');
+    nextLooseRow(writer).secretKey('sk_live_abcd1234efgh5678');
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
@@ -284,7 +293,7 @@ describe('Buffer Integration', () => {
 
       // Use ColumnWriter API to write data (more robust than direct array access)
       const writer = createColumnWriter(schema, buffer);
-      (writer.nextRow() as any)
+      nextLooseRow(writer)
         .userId('user-123')
         .operation('POST') // Use enum value string (ColumnWriter validates against enum values)
         .httpStatus(200)
@@ -296,7 +305,7 @@ describe('Buffer Integration', () => {
       buffer._writeIndex = 1;
 
       // Convert to Arrow using arrow-builder
-      const table = convertToArrowTable(buffer as any);
+      const table = convertToArrowTable(buffer);
 
       // Verify Arrow conversion preserves data and applies masking
       expect(table.numRows).toBe(1);
@@ -345,13 +354,10 @@ describe('Buffer Integration', () => {
           userId: S.category(),
         }),
       });
-      const trace = (new TestTracer(ctx as any, { ...createTestTracerOptions() }) as any).trace as (
-        name: string,
-        fn: (ctx: any) => Promise<any>,
-      ) => Promise<any>;
+      const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
       let capturedBuffer: SpanBuffer<typeof schema> | undefined;
-      await trace('test', async (ctx: any) => {
+      await trace('test', async (ctx) => {
         // Log multiple entries with small delays
         ctx.log.info('first');
         await new Promise((r) => setTimeout(r, 5));

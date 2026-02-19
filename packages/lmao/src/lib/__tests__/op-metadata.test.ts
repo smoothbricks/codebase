@@ -112,14 +112,14 @@ describe('Op Metadata', () => {
       const { defineOp } = ctx;
 
       // Partial metadata without name - simulating transformer that doesn't inject name
-      const partialMetadata = {
+      const partialMetadata: Partial<ReturnType<typeof createOpMetadata>> = {
         package_name: '@my/package',
         package_file: 'src/ops.ts',
         git_sha: 'abc123',
         line: 42,
       };
 
-      const myOp = defineOp('runtime-name', (ctx) => ctx.ok('done'), partialMetadata as any);
+      const myOp = defineOp('runtime-name', (ctx) => ctx.ok('done'), partialMetadata);
 
       // Runtime name should be used since metadata.name wasn't provided
       expect(myOp.metadata.name).toBe('runtime-name');
@@ -132,9 +132,9 @@ describe('Op Metadata', () => {
       const ctx = defineOpContext({ logSchema: testSchema });
       const { defineOp } = ctx;
 
-      let capturedMetadata: any;
+      let capturedMetadata: { name: string } | undefined;
       const myOp = defineOp('traced-op', (ctx) => {
-        capturedMetadata = ctx.buffer._opMetadata;
+        capturedMetadata = ctx.buffer._opMetadata as { name: string };
         return ctx.ok('done');
       });
 
@@ -142,19 +142,19 @@ describe('Op Metadata', () => {
       await tracer.trace('test-trace', myOp);
 
       expect(capturedMetadata).toBeDefined();
-      expect(capturedMetadata.name).toBe('traced-op');
+      expect(capturedMetadata?.name).toBe('traced-op');
     });
 
     it('should distinguish callsite vs op metadata', async () => {
       const ctx = defineOpContext({ logSchema: testSchema });
       const { defineOp } = ctx;
 
-      let innerCallsiteMetadata: any;
-      let innerOpMetadata: any;
+      let innerCallsiteMetadata: { name: string } | undefined;
+      let innerOpMetadata: { name: string } | undefined;
 
       const innerOp = defineOp('inner-op', (ctx) => {
-        innerCallsiteMetadata = ctx.buffer._callsiteMetadata;
-        innerOpMetadata = ctx.buffer._opMetadata;
+        innerCallsiteMetadata = ctx.buffer._callsiteMetadata as { name: string };
+        innerOpMetadata = ctx.buffer._opMetadata as { name: string };
         return ctx.ok('inner-done');
       });
 
@@ -169,8 +169,8 @@ describe('Op Metadata', () => {
       // Inner op should have:
       // - _callsiteMetadata from outer-op (where span() was called)
       // - _opMetadata from inner-op (the op being executed)
-      expect(innerOpMetadata.name).toBe('inner-op');
-      expect(innerCallsiteMetadata.name).toBe('outer-op');
+      expect(innerOpMetadata?.name).toBe('inner-op');
+      expect(innerCallsiteMetadata?.name).toBe('outer-op');
     });
   });
 

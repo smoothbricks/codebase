@@ -12,6 +12,14 @@ import { convertSpanTreeToArrowTable, convertToArrowTable, createSpanBuffer, S }
 import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';
 
+type LooseRowWriter = {
+  [method: string]: (value: unknown) => LooseRowWriter;
+};
+
+function nextLooseRow(writer: { nextRow(): unknown }): LooseRowWriter {
+  return writer.nextRow() as LooseRowWriter;
+}
+
 describe('Binary Arrow Conversion', () => {
   describe('convertToArrowTable (Path 1: single buffer)', () => {
     it('converts S.unknown() column with mixed values to Arrow Binary', () => {
@@ -24,12 +32,12 @@ describe('Binary Arrow Conversion', () => {
       const writer = createColumnWriter(schema, buffer);
 
       // Write row with an object payload
-      (writer.nextRow() as any).payload({ action: 'click', x: 100, y: 200 }).requestId('req-1');
+      nextLooseRow(writer).payload({ action: 'click', x: 100, y: 200 }).requestId('req-1');
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
       // Write row with a string payload
-      (writer.nextRow() as any).payload('simple-string').requestId('req-2');
+      nextLooseRow(writer).payload('simple-string').requestId('req-2');
       buffer.timestamp[1] = 2000n;
       buffer.entry_type[1] = ENTRY_TYPE_INFO;
 
@@ -74,7 +82,7 @@ describe('Binary Arrow Conversion', () => {
         url: '/api/users',
         headers: { 'content-type': 'application/json' },
       };
-      (writer.nextRow() as any).request(requestData);
+      nextLooseRow(writer).request(requestData);
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer._writeIndex = 1;
@@ -100,7 +108,7 @@ describe('Binary Arrow Conversion', () => {
       const writer = createColumnWriter(schema, buffer);
 
       const rawBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-      (writer.nextRow() as any).rawData(rawBytes);
+      nextLooseRow(writer).rawData(rawBytes);
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer._writeIndex = 1;
@@ -124,12 +132,12 @@ describe('Binary Arrow Conversion', () => {
       const writer = createColumnWriter(schema, buffer);
 
       // Row 0: payload set
-      (writer.nextRow() as any).payload({ key: 'value' }).requestId('req-1');
+      nextLooseRow(writer).payload({ key: 'value' }).requestId('req-1');
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
       // Row 1: payload NOT set (null)
-      (writer.nextRow() as any).requestId('req-2');
+      nextLooseRow(writer).requestId('req-2');
       buffer.timestamp[1] = 2000n;
       buffer.entry_type[1] = ENTRY_TYPE_INFO;
 
@@ -161,7 +169,7 @@ describe('Binary Arrow Conversion', () => {
       const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
-      (writer.nextRow() as any)
+      nextLooseRow(writer)
         .userId('user-1')
         .httpStatus(200)
         .payload({ items: [1, 2, 3] })
@@ -193,7 +201,9 @@ describe('Binary Arrow Conversion', () => {
       const rootBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const rootWriter = createColumnWriter(schema, rootBuffer);
 
-      (rootWriter.nextRow() as any).payload({ level: 'root', data: [1, 2] }).userId('user-root');
+      nextLooseRow(rootWriter)
+        .payload({ level: 'root', data: [1, 2] })
+        .userId('user-root');
       rootBuffer.timestamp[0] = 1000n;
       rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       rootBuffer._writeIndex = 1;
@@ -202,7 +212,9 @@ describe('Binary Arrow Conversion', () => {
       const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const childWriter = createColumnWriter(schema, childBuffer);
 
-      (childWriter.nextRow() as any).payload({ level: 'child', nested: { a: 1 } }).userId('user-child');
+      nextLooseRow(childWriter)
+        .payload({ level: 'child', nested: { a: 1 } })
+        .userId('user-child');
       childBuffer.timestamp[0] = 2000n;
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       childBuffer._writeIndex = 1;
@@ -239,7 +251,7 @@ describe('Binary Arrow Conversion', () => {
 
       const obj: Record<string, unknown> = { x: 1, y: 2, label: 'original' };
 
-      (writer.nextRow() as any).payload(obj);
+      nextLooseRow(writer).payload(obj);
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer._writeIndex = 1;
@@ -271,15 +283,15 @@ describe('Binary Arrow Conversion', () => {
       const rootBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const rootWriter = createColumnWriter(schema, rootBuffer);
 
-      (rootWriter.nextRow() as any).payload({ req: 1 }).userId('user-A').action('click');
+      nextLooseRow(rootWriter).payload({ req: 1 }).userId('user-A').action('click');
       rootBuffer.timestamp[0] = 1000n;
       rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
-      (rootWriter.nextRow() as any).payload({ req: 2 }).userId('user-A').action('scroll');
+      nextLooseRow(rootWriter).payload({ req: 2 }).userId('user-A').action('scroll');
       rootBuffer.timestamp[1] = 2000n;
       rootBuffer.entry_type[1] = ENTRY_TYPE_INFO;
 
-      (rootWriter.nextRow() as any).payload({ req: 3 }).userId('user-B').action('click');
+      nextLooseRow(rootWriter).payload({ req: 3 }).userId('user-B').action('click');
       rootBuffer.timestamp[2] = 3000n;
       rootBuffer.entry_type[2] = ENTRY_TYPE_INFO;
 
@@ -289,7 +301,7 @@ describe('Binary Arrow Conversion', () => {
       const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const childWriter = createColumnWriter(schema, childBuffer);
 
-      (childWriter.nextRow() as any).payload({ req: 4 }).userId('user-B').action('submit');
+      nextLooseRow(childWriter).payload({ req: 4 }).userId('user-B').action('submit');
       childBuffer.timestamp[0] = 4000n;
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
@@ -320,7 +332,7 @@ describe('Binary Arrow Conversion', () => {
       // Binary column should have msgpack-encoded objects
       const payloadCol = table.getChild('payload');
       expect(payloadCol).toBeDefined();
-      const payloads = [];
+      const payloads: unknown[] = [];
       for (let i = 0; i < payloadCol?.length; i++) {
         const bytes = payloadCol?.at(i);
         if (bytes !== null) payloads.push(decode(bytes as Uint8Array));
@@ -352,7 +364,7 @@ describe('Binary Arrow Conversion', () => {
         const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
         const writer = createColumnWriter(schema, buffer);
 
-        (writer.nextRow() as any).payload(testValue);
+        nextLooseRow(writer).payload(testValue);
         buffer.timestamp[0] = 1000n;
         buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
         buffer._writeIndex = 1;

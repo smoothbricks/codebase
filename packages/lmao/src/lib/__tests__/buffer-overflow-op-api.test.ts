@@ -27,13 +27,20 @@ import { defineCodeError } from '../result.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import type { AnySpanBuffer } from '../types.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
 // Error code factory for tests
 const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string }>();
 
-// biome-ignore lint/suspicious/noExplicitAny: SpanBuffer generic types are complex, using any for test buffer capture
-type CapturedBuffer = any;
+type CapturedBuffer = AnySpanBuffer | undefined;
+
+function requireCapturedBuffer(buffer: CapturedBuffer, label: string): AnySpanBuffer {
+  if (!buffer) {
+    throw new Error(`Expected captured buffer: ${label}`);
+  }
+  return buffer;
+}
 
 // Test schema with various column types
 const testSchema = defineLogSchema({
@@ -148,7 +155,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
             expect(capturedBuffer).toBeDefined();
 
             // Convert to Arrow and verify
-            const table = convertSpanTreeToArrowTable(capturedBuffer!);
+            const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'entry-preservation'));
             const counts = countRowsByEntryType(table);
 
             // Should have: 1 span-start + numEntries info + 1 span-ok
@@ -189,7 +196,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       expect(capturedBuffer).toBeDefined();
 
       // Convert to Arrow - this walks the entire buffer chain
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'large-volume'));
       const counts = countRowsByEntryType(table);
 
       // All entries should be present
@@ -224,7 +231,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const { trace } = createTestTracer();
       await trace('order', testOp);
 
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'order-test'));
       const rows = extractRows(table);
       const infoRows = rows.filter((r) => r.entry_type === 'info');
 
@@ -261,7 +268,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
           const { trace } = createTestTracer();
           await trace('integrity', testOp);
 
-          const table = convertSpanTreeToArrowTable(capturedBuffer!);
+          const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'data-integrity'));
           const rows = extractRows(table);
           const infoRows = rows.filter((r) => r.entry_type === 'info');
 
@@ -305,7 +312,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const { trace } = createTestTracer();
       await trace('types', testOp);
 
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'enum-types'));
       const rows = extractRows(table);
       const infoRows = rows.filter((r) => r.entry_type === 'info');
 
@@ -367,7 +374,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       expect(childBuffer).toBeDefined();
 
       // Convert entire tree
-      const table = convertSpanTreeToArrowTable(rootBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(rootBuffer, 'nested-root'));
 
       // Count entries
       const counts = countRowsByEntryType(table);
@@ -441,7 +448,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const { trace } = createTestTracer();
       await trace('level1', level1Op);
 
-      const table = convertSpanTreeToArrowTable(level1Buffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(level1Buffer, 'nested-level1'));
       const counts = countRowsByEntryType(table);
 
       // 4 levels * (1 span-start + 15 info + 1 span-ok) = 4 * 17 = 68
@@ -465,7 +472,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const { trace } = createTestTracer();
       await trace('empty', testOp);
 
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'empty-op'));
 
       // Just span-start and span-ok
       expect(table.numRows).toBe(2);
@@ -487,7 +494,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const { trace } = createTestTracer();
       await trace('single', testOp);
 
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'single-log'));
       expect(table.numRows).toBe(3); // span-start + info + span-ok
 
       const rows = extractRows(table);
@@ -508,7 +515,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const { trace } = createTestTracer();
       await trace('error', testOp);
 
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'error-path'));
       const counts = countRowsByEntryType(table);
 
       expect(counts['span-start']).toBe(1);
@@ -533,7 +540,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       // Buffer should still have entries
       expect(capturedBuffer).toBeDefined();
 
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'explicit-assert'));
       const counts = countRowsByEntryType(table);
 
       expect(counts['span-start']).toBe(1);
@@ -574,7 +581,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       const { trace } = createTestTracer();
       await trace('mixed', testOp);
 
-      const table = convertSpanTreeToArrowTable(capturedBuffer!);
+      const table = convertSpanTreeToArrowTable(requireCapturedBuffer(capturedBuffer, 'mixed-entries'));
       const counts = countRowsByEntryType(table);
 
       // 50 entries divided among 4 levels: 13+13+12+12 = 50

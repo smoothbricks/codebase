@@ -10,8 +10,13 @@ import {
 } from '../../schema/systemSchema.js';
 import type { TraceId } from '../../traceId.js';
 import type { TracerLifecycleHooks } from '../../traceRoot.js';
+import type { AnySpanBuffer } from '../../types.js';
 import { createWasmAllocator, type WasmAllocator } from '../wasmAllocator.js';
 import { createWasmTraceRoot } from '../wasmTraceRoot.js';
+
+function createMockSpanBuffer(): AnySpanBuffer {
+  return {} as unknown as AnySpanBuffer;
+}
 
 /**
  * Mock tracer that implements TracerLifecycleHooks for testing.
@@ -23,8 +28,8 @@ const mockTracer: TracerLifecycleHooks = {
   onSpanEnd: () => {},
   onStatsWillResetFor: () => {},
   bufferStrategy: {
-    createChildSpanBuffer: () => ({}) as any,
-    createOverflowBuffer: () => ({}) as any,
+    createChildSpanBuffer: createMockSpanBuffer,
+    createOverflowBuffer: createMockSpanBuffer,
   },
 };
 
