@@ -28,6 +28,8 @@ type DataFactories = {
   createUtf8Data: typeof createUtf8DataFlechette;
 };
 
+type Utf8Fixture = { data: Uint8Array; offsets: Int32Array };
+
 const ROWS = 65_536;
 
 const ROOT_DIR = resolve(dirname(fileURLToPath(import.meta.url)), '../../..');
@@ -45,7 +47,7 @@ function makeNullBitmap(length: number): Uint8Array {
   return bitmap;
 }
 
-function makeUtf8Fixture(length: number): { data: Uint8Array; offsets: Int32Array } {
+function makeUtf8Fixture(length: number): Utf8Fixture {
   const encoder = new TextEncoder();
   const chunks = new Array<Uint8Array>(length);
   const offsets = new Int32Array(length + 1);

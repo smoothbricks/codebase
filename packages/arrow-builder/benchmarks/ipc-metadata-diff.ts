@@ -13,6 +13,8 @@ import {
 const OLD_IPC_SCRIPT = '../../extern/arrow-builder-pre-flechette/packages/arrow-builder/benchmarks/ipc-bytes.ts';
 const ROWS = 4096;
 
+type Utf8Fixture = { data: Uint8Array; offsets: Int32Array };
+
 function makeNullBitmap(length: number): Uint8Array {
   const bytes = Math.ceil(length / 8);
   const bitmap = new Uint8Array(bytes);
@@ -22,7 +24,7 @@ function makeNullBitmap(length: number): Uint8Array {
   return bitmap;
 }
 
-function makeUtf8Fixture(length: number): { data: Uint8Array; offsets: Int32Array } {
+function makeUtf8Fixture(length: number): Utf8Fixture {
   const encoder = new TextEncoder();
   const chunks = new Array<Uint8Array>(length);
   const offsets = new Int32Array(length + 1);
