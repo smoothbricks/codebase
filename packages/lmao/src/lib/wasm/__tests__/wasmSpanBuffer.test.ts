@@ -27,7 +27,7 @@ describe('WasmSpanBuffer', () => {
   beforeEach(async () => {
     allocator = await createWasmAllocator({ capacity: CAPACITY });
     allocator.reset();
-    traceRoot = new WasmTraceRoot(allocator, 'test-trace' as any, TEST_TRACER);
+    traceRoot = new WasmTraceRoot(allocator, testTraceId('test-trace'), TEST_TRACER);
   });
 
   function createTestWasmBuffer(overrides: { trace_id?: string; thread_id?: bigint; span_id?: number } = {}) {

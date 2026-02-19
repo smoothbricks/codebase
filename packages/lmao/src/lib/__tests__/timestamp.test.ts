@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'bun:test';
 
 import { Nanoseconds } from '@smoothbricks/arrow-builder';
+import type { AnySpanBuffer } from '../types.js';
+
+function createMockSpanBuffer(): AnySpanBuffer {
+  return {} as unknown as AnySpanBuffer;
+}
 
 describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
   it('should return a bigint from getTimestampNanos()', async () => {
@@ -12,8 +17,8 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
       bufferStrategy: {
-        createChildSpanBuffer: () => ({}) as any,
-        createOverflowBuffer: () => ({}) as any,
+        createChildSpanBuffer: createMockSpanBuffer,
+        createOverflowBuffer: createMockSpanBuffer,
       },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
@@ -31,8 +36,8 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
       bufferStrategy: {
-        createChildSpanBuffer: () => ({}) as any,
-        createOverflowBuffer: () => ({}) as any,
+        createChildSpanBuffer: createMockSpanBuffer,
+        createOverflowBuffer: createMockSpanBuffer,
       },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
@@ -57,8 +62,8 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
       bufferStrategy: {
-        createChildSpanBuffer: () => ({}) as any,
-        createOverflowBuffer: () => ({}) as any,
+        createChildSpanBuffer: createMockSpanBuffer,
+        createOverflowBuffer: createMockSpanBuffer,
       },
     };
 
@@ -83,8 +88,8 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
       bufferStrategy: {
-        createChildSpanBuffer: () => ({}) as any,
-        createOverflowBuffer: () => ({}) as any,
+        createChildSpanBuffer: createMockSpanBuffer,
+        createOverflowBuffer: createMockSpanBuffer,
       },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
@@ -124,8 +129,8 @@ describe('Node.js TraceRoot Timestamps (process.hrtime.bigint)', () => {
         onSpanEnd: () => {},
         onStatsWillResetFor: () => {},
         bufferStrategy: {
-          createChildSpanBuffer: () => ({}) as any,
-          createOverflowBuffer: () => ({}) as any,
+          createChildSpanBuffer: createMockSpanBuffer,
+          createOverflowBuffer: createMockSpanBuffer,
         },
       };
 
@@ -150,8 +155,8 @@ describe('Browser TraceRoot Timestamps (performance.now)', () => {
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
       bufferStrategy: {
-        createChildSpanBuffer: () => ({}) as any,
-        createOverflowBuffer: () => ({}) as any,
+        createChildSpanBuffer: createMockSpanBuffer,
+        createOverflowBuffer: createMockSpanBuffer,
       },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
@@ -169,8 +174,8 @@ describe('Browser TraceRoot Timestamps (performance.now)', () => {
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
       bufferStrategy: {
-        createChildSpanBuffer: () => ({}) as any,
-        createOverflowBuffer: () => ({}) as any,
+        createChildSpanBuffer: createMockSpanBuffer,
+        createOverflowBuffer: createMockSpanBuffer,
       },
     };
     const traceRoot = createTraceRoot('test-trace', mockTracer);
@@ -195,8 +200,8 @@ describe('Browser TraceRoot Timestamps (performance.now)', () => {
       onSpanEnd: () => {},
       onStatsWillResetFor: () => {},
       bufferStrategy: {
-        createChildSpanBuffer: () => ({}) as any,
-        createOverflowBuffer: () => ({}) as any,
+        createChildSpanBuffer: createMockSpanBuffer,
+        createOverflowBuffer: createMockSpanBuffer,
       },
     };
 
