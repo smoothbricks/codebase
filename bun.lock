@@ -90,6 +90,13 @@
         "typescript": ">=4.7.0",
       },
     },
+    "packages/money": {
+      "name": "@smoothbricks/money",
+      "version": "0.0.1",
+      "dependencies": {
+        "tslib": "^2.3.0",
+      },
+    },
     "packages/statebus": {
       "name": "@smoothbricks/statebus",
       "version": "0.8.0",
@@ -781,6 +788,8 @@
     "@smoothbricks/lmao": ["@smoothbricks/lmao@workspace:packages/lmao"],
 
     "@smoothbricks/lmao-transformer": ["@smoothbricks/lmao-transformer@workspace:packages/lmao-transformer"],
+
+    "@smoothbricks/money": ["@smoothbricks/money@workspace:packages/money"],
 
     "@smoothbricks/statebus": ["@smoothbricks/statebus@workspace:packages/statebus"],
 

@@ -19,6 +19,9 @@
       "path": "./packages/columine"
     },
     {
+      "path": "./packages/money"
+    },
+    {
       "path": "./packages/statebus-core"
     },
     {
