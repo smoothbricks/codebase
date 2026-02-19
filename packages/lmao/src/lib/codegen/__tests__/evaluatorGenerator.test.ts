@@ -1,10 +1,12 @@
 import { describe, expect, test } from 'bun:test';
 import { createBuffer, createTestSchema } from '../../__tests__/test-helpers.js';
+import type { OpContext } from '../../opContext/types.js';
 import { S } from '../../schema/builder.js';
 import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
 import { type BooleanFlagContext, InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { ENTRY_TYPE_FF_ACCESS, ENTRY_TYPE_FF_USAGE } from '../../schema/systemSchema.js';
 import type { LogSchema } from '../../schema/types.js';
+import type { SpanContext } from '../../spanContext.js';
 import type { AnySpanBuffer, SpanBuffer } from '../../types.js';
 import { createEvaluatorClass, generateEvaluatorClass } from '../evaluatorGenerator.js';
 import { createSpanLogger } from '../spanLoggerGenerator.js';
@@ -17,12 +19,10 @@ import { createSpanLogger } from '../spanLoggerGenerator.js';
  * - log with ffAccess, ffUsage, and _writeIndex
  * - buffer getter that returns _buffer
  *
- * Note: Uses explicit 'any' cast since this is a test utility and the actual
- * SpanContext type requires OpContext (not just LogSchema). The runtime
- * structure is what matters for these tests.
+ * Note: This helper intentionally returns a minimal runtime-shaped object,
+ * cast to SpanContext<OpContext> at the boundary for generated evaluator tests.
  */
-// biome-ignore lint/suspicious/noExplicitAny: Test utility - mock context for evaluator testing
-function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): any {
+function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): SpanContext<OpContext> {
   // Get schema from constructor (Phase 2 API)
   const schema = spanBuffer._logSchema as T;
   const logger = createSpanLogger(schema, spanBuffer);
@@ -51,7 +51,7 @@ function createMockSpanContext<T extends LogSchema>(spanBuffer: SpanBuffer<T>): 
     span: () => Promise.resolve(undefined),
     span_op: () => Promise.resolve(undefined),
     span_fn: () => Promise.resolve(undefined),
-  };
+  } as unknown as SpanContext<OpContext>;
 }
 
 describe('EvaluatorGenerator', () => {
