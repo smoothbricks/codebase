@@ -103,8 +103,7 @@ describe('Schema Integration Patterns', () => {
       const result = await trace(
         'check-ctx',
         { requestId: 'req-123', userId: 'user-456', env: environmentConfig },
-        // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties on ctx
-        async (ctx: any) => {
+        async (ctx) => {
           expect(ctx.requestId).toBe('req-123');
           expect(ctx.userId).toBe('user-456');
           // TraceId is W3C format (32 hex chars) via generateTraceId from traceId.ts
@@ -119,17 +118,12 @@ describe('Schema Integration Patterns', () => {
     it('should provide access to environment config as plain properties', async () => {
       const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
 
-      const result = await trace(
-        'check-env',
-        { requestId: 'req-123', env: environmentConfig },
-        // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties on ctx
-        async (ctx: any) => {
-          expect(ctx.env?.awsRegion).toBe('us-east-1');
-          expect(ctx.env?.maxConnections).toBe(100);
-          expect(ctx.env?.databaseUrl).toBe('postgresql://localhost:5432/test');
-          return { checked: true };
-        },
-      );
+      const result = await trace('check-env', { requestId: 'req-123', env: environmentConfig }, async (ctx) => {
+        expect(ctx.env?.awsRegion).toBe('us-east-1');
+        expect(ctx.env?.maxConnections).toBe(100);
+        expect(ctx.env?.databaseUrl).toBe('postgresql://localhost:5432/test');
+        return { checked: true };
+      });
       expect(result.checked).toBe(true);
     });
   });

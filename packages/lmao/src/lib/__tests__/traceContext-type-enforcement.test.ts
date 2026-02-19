@@ -50,8 +50,7 @@ describe('Tracer.trace Type Enforcement', () => {
         requestId: 'req-123',
         // userId is optional, can be omitted
       },
-      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
-      (ctx: any) => {
+      (ctx) => {
         expect(ctx).toBeDefined();
         expect(ctx.env.region).toBe('us-east-1');
         expect(ctx.requestId).toBe('req-123');
@@ -71,8 +70,7 @@ describe('Tracer.trace Type Enforcement', () => {
         requestId: 'req-123',
         userId: 'user-456', // Optional property provided
       },
-      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
-      (ctx: any) => {
+      (ctx) => {
         expect(ctx).toBeDefined();
         expect(ctx.userId).toBe('user-456');
         return 'done';
@@ -94,8 +92,7 @@ describe('Tracer.trace Type Enforcement', () => {
         env: { apiTimeout: 5000, region: 'us-east-1' },
         requestId: 'req-123',
       },
-      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
-      (ctx: any) => {
+      (ctx) => {
         expect(ctx.env).toEqual({ apiTimeout: 5000, region: 'us-east-1' });
         expect(ctx.requestId).toBe('req-123');
         expect(ctx.userId).toBeUndefined();
@@ -130,8 +127,7 @@ describe('Context Type Flow Through Factory', () => {
         required: 'value',
         // optional can be omitted
       },
-      // biome-ignore lint/suspicious/noExplicitAny: Testing user context properties
-      (ctx: any) => {
+      (ctx) => {
         expect(ctx.required).toBe('value');
         return 'done';
       },
