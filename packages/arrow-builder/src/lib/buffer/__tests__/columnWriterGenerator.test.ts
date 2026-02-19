@@ -2,12 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { S } from '../../schema/builder.js';
 import { ColumnSchema } from '../../schema/ColumnSchema.js';
 import { createGeneratedColumnBuffer } from '../columnBufferGenerator.js';
-import {
-  type ColumnWriter,
-  createColumnWriter,
-  generateColumnWriterClass,
-  getColumnWriterClass,
-} from '../columnWriterGenerator.js';
+import { createColumnWriter, generateColumnWriterClass, getColumnWriterClass } from '../columnWriterGenerator.js';
 
 // Test schemas with proper metadata markers
 // Cast to SchemaFields to work around strict type checking in tests
@@ -129,15 +124,13 @@ describe('createColumnWriter', () => {
     const buffer = createGeneratedColumnBuffer(testSchema, 64);
     const writer = createColumnWriter(testSchema, buffer);
 
-    const booleanWriter = writer as typeof writer & { enabled(value: boolean): typeof writer };
-
     // Write multiple booleans to test bit-packing
     for (let i = 0; i < 16; i++) {
       writer.nextRow();
-      booleanWriter.enabled(i % 2 === 0); // alternating true/false
+      writer.enabled(i % 2 === 0); // alternating true/false
     }
 
-    const enabledValues = (buffer as unknown as { enabled_values: Uint8Array }).enabled_values;
+    const enabledValues = buffer.enabled_values;
 
     // First byte should have bits 0, 2, 4, 6 set (even indices = true)
     // Bit pattern: 01010101 = 0x55
@@ -179,7 +172,7 @@ describe('createColumnWriter', () => {
   it('supports extension constructor params', () => {
     const buffer = createGeneratedColumnBuffer(testSchema, 64);
 
-    const writer = createColumnWriter(
+    const writer = createColumnWriter<typeof testSchema, { _custom: string }>(
       testSchema,
       buffer,
       {
@@ -189,14 +182,14 @@ describe('createColumnWriter', () => {
       'test-value',
     );
 
-    expect((writer as ColumnWriter<typeof testSchema> & { _custom: string })._custom).toBe('test-value');
+    expect(writer._custom).toBe('test-value');
   });
 
   it('supports extension dependencies', () => {
     const buffer = createGeneratedColumnBuffer(testSchema, 64);
     const transformFn = (s: string) => s.toUpperCase();
 
-    const writer = createColumnWriter(testSchema, buffer, {
+    const writer = createColumnWriter<typeof testSchema, { transformed(value: string): void }>(testSchema, buffer, {
       classPreamble: '',
       methods: `
 transformed(value) {
@@ -209,10 +202,9 @@ transformed(value) {
     });
 
     writer.nextRow();
-    const transformedWriter = writer as typeof writer & { transformed(value: string): typeof writer };
-    transformedWriter.transformed('hello');
+    writer.transformed('hello');
 
-    expect((buffer as unknown as { message_values: string[] }).message_values[0]).toBe('HELLO');
+    expect(buffer.message_values[0]).toBe('HELLO');
   });
 
   it('writes eager columns without accessing null bitmaps', () => {
@@ -264,24 +256,30 @@ describe('enum O(1) Map lookup', () => {
     const writer = createColumnWriter(testSchema, buffer);
 
     writer.nextRow();
-    expect(() => writer.status('invalid' as 'ok')).toThrow('Invalid enum value');
+    expect(() => {
+      const statusKey = ['status'].join('');
+      const statusSetter = Reflect.get(writer, statusKey);
+      if (typeof statusSetter !== 'function') {
+        throw new Error('Expected status setter to exist');
+      }
+      statusSetter.call(writer, 'invalid');
+    }).toThrow('Invalid enum value');
   });
 
   it('handles high-cardinality enum (64 values) via Map lookup', () => {
     // WHY: Verifies O(1) Map lookup works for high-cardinality enums
     // where indexOf would be measurably slow
-    const values = Array.from({ length: 64 }, (_, i) => `value_${i}`) as [string, ...string[]];
+    const values = ['value_0', ...Array.from({ length: 63 }, (_, i) => `value_${i + 1}`)];
     const highCardSchema = new ColumnSchema({
       status: S.enum(values),
     });
     const buffer = createGeneratedColumnBuffer(highCardSchema, 64);
     const writer = createColumnWriter(highCardSchema, buffer);
-    const statusWriter = writer as typeof writer & { status(value: string): typeof writer };
 
     // Write every value
     for (let i = 0; i < 64; i++) {
       writer.nextRow();
-      statusWriter.status(`value_${i}`);
+      writer.status(`value_${i}`);
     }
 
     // Verify each value got the correct index
@@ -320,10 +318,9 @@ describe('null bitmap handling', () => {
     const writer = createColumnWriter(testSchema, buffer);
 
     writer.nextRow();
-    const userWriter = writer as typeof writer & { userId(value: string): typeof writer };
-    userWriter.userId('test');
+    writer.userId('test');
 
-    const nullBitmap = (buffer as unknown as { userId_nulls: Uint8Array }).userId_nulls;
+    const nullBitmap = buffer.userId_nulls;
     // Bit 0 should be set (first row written)
     expect(nullBitmap[0] & 0x01).toBe(1);
   });
@@ -334,10 +331,9 @@ describe('null bitmap handling', () => {
 
     writer.nextRow();
     // Only write userId, not status
-    const userWriter = writer as typeof writer & { userId(value: string): typeof writer };
-    userWriter.userId('test');
+    writer.userId('test');
 
-    const statusNulls = (buffer as unknown as { status_nulls: Uint8Array }).status_nulls;
+    const statusNulls = buffer.status_nulls;
     // Bit 0 should be unset (status was not written)
     expect(statusNulls[0] & 0x01).toBe(0);
   });

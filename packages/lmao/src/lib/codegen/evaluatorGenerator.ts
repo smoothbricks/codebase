@@ -40,6 +40,9 @@ import type { SpanContext } from '../spanContext.js';
  * Extracts Ctx['flags'] for flag-specific typing.
  */
 export interface GeneratedEvaluatorBase<Ctx extends OpContext> {
+  get<K extends keyof InferFeatureFlagsWithContext<Ctx> & string>(
+    flag: K,
+  ): Promise<InferFeatureFlagsWithContext<Ctx>[K]>;
   get(flag: string): Promise<unknown>;
   forContext(ctx: SpanContext<Ctx>): GeneratedEvaluatorBase<Ctx> & InferFeatureFlagsWithContext<Ctx>;
   readonly evaluator: FlagEvaluator<Ctx>;

@@ -300,6 +300,9 @@ export abstract class FeatureFlagEvaluator<Ctx extends OpContext = OpContext> {
    * Get async flag value
    * Returns undefined when false, FlagContext when truthy
    */
+  abstract get<K extends keyof InferFeatureFlagsWithContext<Ctx> & string>(
+    flag: K,
+  ): Promise<InferFeatureFlagsWithContext<Ctx>[K]>;
   abstract get(flag: string): Promise<unknown>;
 
   /**

@@ -113,13 +113,13 @@ export interface ColumnWriterExtension {
  * writer.nextRow().userId("u123").count(42);
  * ```
  */
-export type ColumnWriter<T extends ColumnSchema = ColumnSchema> = {
-  _buffer: AnyColumnBuffer;
+export type ColumnWriter<T extends ColumnSchema = ColumnSchema, TBuffer extends AnyColumnBuffer = AnyColumnBuffer> = {
+  _buffer: TBuffer;
   _writeIndex: number;
-  nextRow(): ColumnWriter<T>;
-  _getNextBuffer(): AnyColumnBuffer;
+  nextRow(): ColumnWriter<T, TBuffer>;
+  _getNextBuffer(): TBuffer;
 } & {
-  [K in keyof T['fields']]: (value: import('@sury/sury').Output<T['fields'][K]>) => ColumnWriter<T>;
+  [K in keyof T['fields']]: (value: import('@sury/sury').Output<T['fields'][K]>) => ColumnWriter<T, TBuffer>;
 };
 
 /**
@@ -386,7 +386,29 @@ export function getColumnWriterClass<T extends ColumnSchema>(
 ): new (
   buffer: AnyColumnBuffer,
   ...args: unknown[]
-) => ColumnWriter<T> {
+) => ColumnWriter<T>;
+export function getColumnWriterClass<
+  T extends ColumnSchema,
+  TExtension extends object,
+  TBuffer extends AnyColumnBuffer = AnyColumnBuffer,
+>(
+  schema: T,
+  extension?: ColumnWriterExtension,
+): new (
+  buffer: TBuffer,
+  ...args: unknown[]
+) => ColumnWriter<T, TBuffer> & TExtension;
+export function getColumnWriterClass<
+  T extends ColumnSchema,
+  TExtension extends object,
+  TBuffer extends AnyColumnBuffer = AnyColumnBuffer,
+>(
+  schema: T,
+  extension?: ColumnWriterExtension,
+): new (
+  buffer: TBuffer,
+  ...args: unknown[]
+) => ColumnWriter<T, TBuffer> & TExtension {
   const cacheKey = createCacheKey(schema, extension);
 
   let WriterClass = writerClassCache.get(cacheKey);
@@ -420,9 +442,9 @@ export function getColumnWriterClass<T extends ColumnSchema>(
 
   // Cast is safe because the generated class has typed setters matching the schema T
   return WriterClass as unknown as new (
-    buffer: AnyColumnBuffer,
+    buffer: TBuffer,
     ...args: unknown[]
-  ) => ColumnWriter<T>;
+  ) => ColumnWriter<T, TBuffer> & TExtension;
 }
 
 /**
@@ -439,7 +461,27 @@ export function createColumnWriter<T extends ColumnSchema>(
   buffer: AnyColumnBuffer,
   extension?: ColumnWriterExtension,
   ...constructorArgs: unknown[]
-): ColumnWriter<T> {
-  const WriterClass = getColumnWriterClass(schema, extension);
+): ColumnWriter<T>;
+export function createColumnWriter<
+  T extends ColumnSchema,
+  TExtension extends object,
+  TBuffer extends AnyColumnBuffer = AnyColumnBuffer,
+>(
+  schema: T,
+  buffer: TBuffer,
+  extension?: ColumnWriterExtension,
+  ...constructorArgs: unknown[]
+): ColumnWriter<T, TBuffer> & TExtension;
+export function createColumnWriter<
+  T extends ColumnSchema,
+  TExtension extends object,
+  TBuffer extends AnyColumnBuffer = AnyColumnBuffer,
+>(
+  schema: T,
+  buffer: TBuffer,
+  extension?: ColumnWriterExtension,
+  ...constructorArgs: unknown[]
+): ColumnWriter<T, TBuffer> & TExtension {
+  const WriterClass = getColumnWriterClass<T, TExtension, TBuffer>(schema, extension);
   return new WriterClass(buffer, ...constructorArgs);
 }
