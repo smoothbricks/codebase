@@ -105,8 +105,7 @@ describe('Tracer', () => {
 
       const customTraceId = createTraceId('custom-trace-id-12345');
 
-      // biome-ignore lint/suspicious/noExplicitAny: Testing trace_id override
-      await trace('trace-with-id', { trace_id: customTraceId }, async (ctx: any) => {
+      await trace('trace-with-id', { trace_id: customTraceId }, async (ctx) => {
         // Access the trace ID from buffer
         expect(ctx.buffer.trace_id).toBe(customTraceId);
         return 'done';
@@ -125,11 +124,10 @@ describe('Tracer', () => {
       const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
       const customTraceId = createTraceId('combined-override-test');
 
-      // biome-ignore lint/suspicious/noExplicitAny: Testing combined overrides
       await trace(
         'combined-overrides',
         { trace_id: customTraceId, requestId: 'req-123', env: { API_KEY: 'test' } },
-        async (ctx: any) => {
+        async (ctx) => {
           // Both trace_id and userCtx properties should be available
           expect(ctx.buffer.trace_id).toBe(customTraceId);
           expect(ctx.requestId).toBe('req-123');
@@ -151,26 +149,20 @@ describe('Tracer', () => {
       const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       await trace('ctx-test', { env: { API_KEY: 'secret' } }, async (ctx) => {
+        const typedCtx = ctx as typeof ctx & { env: TestEnv; config: { timeout: number } };
         // env should be from overrides
-        // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
-        expect((ctx as any).env.API_KEY).toBe('secret');
+        expect(typedCtx.env.API_KEY).toBe('secret');
         // config should use default
-        // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
-        expect((ctx as any).config.timeout).toBe(5000);
+        expect(typedCtx.config.timeout).toBe(5000);
         return 'done';
       });
 
       // Can override config too
-      await trace(
-        'ctx-test-2',
-        // biome-ignore lint/suspicious/noExplicitAny: Test access with extra override
-        { env: { API_KEY: 'key2' }, config: { timeout: 10000 } } as any,
-        // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
-        async (ctx: any) => {
-          expect(ctx.config.timeout).toBe(10000);
-          return 'done';
-        },
-      );
+      await trace('ctx-test-2', { env: { API_KEY: 'key2' }, config: { timeout: 10000 } }, async (ctx) => {
+        const typedCtx = ctx as typeof ctx & { config: { timeout: number } };
+        expect(typedCtx.config.timeout).toBe(10000);
+        return 'done';
+      });
     });
   });
 
@@ -198,8 +190,8 @@ describe('Tracer', () => {
       const { trace } = new TestTracer(factory, { ...createTestTracerOptions() });
 
       const result = await trace('with-overrides', { value: 100 }, async (ctx) => {
-        // biome-ignore lint/suspicious/noExplicitAny: Test access to dynamic ctx property
-        return (ctx as any).value;
+        const typedCtx = ctx as typeof ctx & { value: number };
+        return typedCtx.value;
       });
 
       expect(result).toBe(100);

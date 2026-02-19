@@ -24,6 +24,7 @@ import {
 } from '../library.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+import type { AnySpanBuffer } from '../types.js';
 import { getMappedOpGroupInternals, getOpGroupInternals } from './test-helpers.js';
 
 describe('Library Integration Pattern', () => {
@@ -196,7 +197,7 @@ describe('Library Integration Pattern', () => {
         parent_span_id: null,
         _identity: 'test-identity',
         _logBinding: { package_name: 'test' },
-      } as any;
+      } as unknown as AnySpanBuffer;
 
       const view = new ViewClass(mockBuffer);
 
@@ -883,28 +884,28 @@ describe('Edge Cases and Error Handling', () => {
 
     it('should handle null and undefined values gracefully', () => {
       // Test with undefined field (edge case)
-      const schemaWithUndefined = new (require('../schema/LogSchema.js') as any).LogSchema({
+      const schemaWithUndefined = defineLogSchema({
         validField: S.text(),
-        undefinedField: undefined,
       });
+      Reflect.apply(Array.prototype.push, schemaWithUndefined._columns, [['undefinedField', undefined]]);
 
       const prefixedWithUndefined = prefixSchema(schemaWithUndefined, 'test');
 
       expect(prefixedWithUndefined).toHaveProperty('test_validField');
       expect(prefixedWithUndefined).toHaveProperty('test_undefinedField');
-      expect((prefixedWithUndefined as any).test_undefinedField).toBeUndefined();
+      expect(Reflect.get(prefixedWithUndefined, 'test_undefinedField')).toBeUndefined();
 
       // Test with null field (edge case)
-      const schemaWithNull = new (require('../schema/LogSchema.js') as any).LogSchema({
+      const schemaWithNull = defineLogSchema({
         validField: S.text(),
-        nullField: null,
       });
+      Reflect.apply(Array.prototype.push, schemaWithNull._columns, [['nullField', null]]);
 
       const prefixedWithNull = prefixSchema(schemaWithNull, 'test');
 
       expect(prefixedWithNull).toHaveProperty('test_validField');
       expect(prefixedWithNull).toHaveProperty('test_nullField');
-      expect((prefixedWithNull as any).test_nullField).toBeNull();
+      expect(Reflect.get(prefixedWithNull, 'test_nullField')).toBeNull();
     });
 
     it('should handle schema with many fields', () => {

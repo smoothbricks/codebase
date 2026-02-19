@@ -245,13 +245,11 @@ describe('EvaluatorGenerator', () => {
       const mockCtx = createMockSpanContext(spanBuffer);
 
       let evalCount = 0;
-      const trackingEvaluator = {
-        getSync: (_ctx: unknown, _flag: string) => {
-          evalCount++;
-          return true;
-        },
-        getAsync: async (_ctx: unknown, _flag: string) => true,
-        forContext: () => trackingEvaluator,
+      const trackingEvaluator = new InMemoryFlagEvaluator(ffSchema.schema, { debugMode: true });
+      const baseGetSync = trackingEvaluator.getSync.bind(trackingEvaluator);
+      trackingEvaluator.getSync = (ctx, flag) => {
+        evalCount++;
+        return baseGetSync(ctx, flag);
       };
 
       const GeneratedClass = createEvaluatorClass(
@@ -260,7 +258,7 @@ describe('EvaluatorGenerator', () => {
         ENTRY_TYPE_FF_ACCESS,
       );
 
-      const instance = new GeneratedClass(mockCtx, trackingEvaluator as any);
+      const instance = new GeneratedClass(mockCtx, trackingEvaluator);
 
       // Access flag multiple times
       (instance as unknown as { debugMode: BooleanFlagContext | undefined }).debugMode;

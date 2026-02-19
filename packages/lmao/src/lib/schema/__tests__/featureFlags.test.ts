@@ -60,7 +60,7 @@ describe('Feature Flags', () => {
     const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
       debugMode: true,
       maxRetries: 5,
-    }) as any;
+    });
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     const result = await trace('test-span', async (ctx) => {
@@ -95,7 +95,7 @@ describe('Feature Flags', () => {
       flags: flags.schema,
     });
 
-    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {}) as any; // No flags set → null values
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {}); // No flags set → null values
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
@@ -119,7 +119,7 @@ describe('Feature Flags', () => {
     const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
       userSpecificLimit: 200,
       dynamicProvider: 'paypal',
-    }) as any;
+    });
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
@@ -151,7 +151,7 @@ describe('Feature Flags', () => {
 
     const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, {
       advancedValidation: true,
-    }) as any;
+    });
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
@@ -179,7 +179,7 @@ describe('Feature Flags', () => {
       flags: flags.schema,
     });
 
-    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true }) as any;
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true });
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
@@ -213,7 +213,7 @@ describe('Feature Flags', () => {
       flags: flags.schema,
     });
 
-    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { userLimit: 200 }) as any;
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { userLimit: 200 });
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
@@ -271,7 +271,7 @@ describe('Feature Flags', () => {
       logLevel: 'debug',
       userTier: 'premium',
       customLimit: 500,
-    }) as any;
+    });
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('test-span', async (ctx) => {
@@ -306,7 +306,7 @@ describe('Feature Flags', () => {
     });
     const evaluator = new InMemoryFlagEvaluator(schema.schema, {
       testFlag: 'initial',
-    }) as any;
+    });
 
     // getSync receives ctx as first param (can be empty object for simple evaluator)
     expect(evaluator.getSync({} as Parameters<typeof evaluator.getSync>[0], 'testFlag')).toBe('initial');
@@ -322,7 +322,7 @@ describe('Feature Flags', () => {
     });
     const evaluator = new InMemoryFlagEvaluator(schema.schema, {
       asyncFlag: 42,
-    }) as any;
+    });
 
     expect(await evaluator.getAsync({} as Parameters<typeof evaluator.getAsync>[0], 'asyncFlag')).toBe(42);
   });
@@ -337,7 +337,7 @@ describe('Feature Flags', () => {
       flags: flags.schema,
     });
 
-    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true }) as any;
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true });
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
     await trace('parent-span', async (parentCtx) => {
@@ -377,7 +377,7 @@ describe('Feature Flags', () => {
       flags: flags.schema,
     });
 
-    const enabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: true }) as any;
+    const enabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: true });
     const { trace: enabledTrace } = new TestTracer(enabledCtx, {
       ...createTestTracerOptions(),
       flagEvaluator: enabledFlagEvaluator,
@@ -402,7 +402,7 @@ describe('Feature Flags', () => {
       flags: flags.schema,
     });
 
-    const disabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: false }) as any;
+    const disabledFlagEvaluator = new InMemoryFlagEvaluator(flags.schema, { darkMode: false });
     const { trace: disabledTrace } = new TestTracer(disabledCtx, {
       ...createTestTracerOptions(),
       flagEvaluator: disabledFlagEvaluator,

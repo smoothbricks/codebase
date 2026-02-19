@@ -78,7 +78,7 @@ describe('WASM Integration Tests', () => {
   afterEach(() => {
     // Release all WASM memory for buffers
     for (const buffer of tracer.rootBuffers) {
-      strategy.releaseBuffer(buffer as any);
+      strategy.releaseBuffer(buffer);
     }
     // Clear tracer state
     tracer.clear();
@@ -87,7 +87,7 @@ describe('WASM Integration Tests', () => {
 
     // Create fresh tracer for next test
     tracer = new TestTracer(opContext, {
-      bufferStrategy: strategy as any,
+      bufferStrategy: strategy,
       createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
     });
   });
@@ -96,7 +96,7 @@ describe('WASM Integration Tests', () => {
   beforeAll(async () => {
     // Wait for strategy to be created (already done in outer beforeAll)
     tracer = new TestTracer(opContext, {
-      bufferStrategy: strategy as any,
+      bufferStrategy: strategy,
       createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
     });
   });
@@ -254,7 +254,7 @@ describe('WASM Integration Tests', () => {
       expect(buffer.entry_type[1]).toBe(ENTRY_TYPE_SPAN_EXCEPTION);
 
       // Verify error message was written - use message_values getter
-      const messageValues = (buffer as any).message_values as string[];
+      const messageValues = buffer.message_values;
       const messages = messageValues.slice(0, buffer._writeIndex).filter((m: string) => m !== undefined);
       expect(messages).toContain('test error');
     });
@@ -326,7 +326,7 @@ describe('WASM Integration Tests', () => {
 
       // Messages are written via message_values getter (SpanLogger uses this)
       // Access via the getter since that's what SpanLogger writes to
-      const messageValues = (buffer as any).message_values as string[];
+      const messageValues = buffer.message_values;
       const messages = messageValues.slice(0, buffer._writeIndex).filter((m: string) => m !== undefined);
       expect(messages).toContain('info message');
       expect(messages).toContain('debug message');
@@ -368,7 +368,7 @@ describe('WASM Integration Tests', () => {
 
       // Release all buffers
       for (const buffer of tracer.rootBuffers) {
-        strategy.releaseBuffer(buffer as any);
+        strategy.releaseBuffer(buffer);
       }
 
       const statsAfterFree = strategy.getStats();
@@ -403,7 +403,7 @@ describe('WASM Integration Tests', () => {
       const freeCountBefore = strategy.getStats().freeCount;
 
       // Release the root buffer (should release entire tree)
-      strategy.releaseBuffer(tracer.rootBuffers[0] as any);
+      strategy.releaseBuffer(tracer.rootBuffers[0]);
 
       const freeCountAfter = strategy.getStats().freeCount;
       // Should have freed memory for all 4 spans (parent + 2 children + 1 grandchild)

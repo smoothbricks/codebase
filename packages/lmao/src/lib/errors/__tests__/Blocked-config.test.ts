@@ -111,7 +111,10 @@ describe('Blocked with BlockedConfig', () => {
       };
 
       const err = Blocked.service('payment-api', config);
-      const nextRetry = err.blockedConfig!.nextRetry!;
+      const nextRetry = err.blockedConfig?.nextRetry;
+      if (!nextRetry) {
+        throw new Error('Expected blockedConfig.nextRetry to be defined');
+      }
 
       expect(nextRetry(1)).toBe(30000);
       expect(nextRetry(2)).toBe(10000);

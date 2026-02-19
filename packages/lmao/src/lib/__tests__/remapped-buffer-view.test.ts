@@ -577,7 +577,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       let opExecuted = false;
 
       // Create an op through the factory
-      const httpOp = defineOp('http-request', async (ctx: any) => {
+      const httpOp = defineOp('http-request', async (ctx) => {
         opExecuted = true;
         // With prefixed schema, we write to prefixed columns directly
         ctx.tag.http_status(200).http_method('GET');
@@ -590,7 +590,7 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
 
       // Create a trace context and run the op via Tracer
       const { trace } = new TestTracer(opContext, { ...createTestTracerOptions() });
-      const result = await trace('http-request', httpOp as any);
+      const result = await trace('http-request', httpOp);
 
       expect(opExecuted).toBe(true);
       expect(result.success).toBe(true);

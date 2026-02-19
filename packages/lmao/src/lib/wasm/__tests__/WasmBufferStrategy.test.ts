@@ -128,7 +128,7 @@ describe('WasmBufferStrategy', () => {
       expect(child.parent_span_id).toBe(parent.span_id);
       // Note: parent._children is NOT populated by the strategy - SpanContext handles that.
       // The strategy only sets up the parent-child relationship via child._parent.
-      expect((child as any)._parent).toBe(parent);
+      expect(child._parent).toBe(parent);
     });
 
     it('inherits capacity from parent by default', async () => {
@@ -170,7 +170,7 @@ describe('WasmBufferStrategy', () => {
       // Note: Currently overflow allocates its own identity block with new span_id
       // TODO: Overflow should share identity with parent buffer
       expect(overflow.trace_id).toBe(buffer.trace_id);
-      expect((buffer as any)._overflow).toBe(overflow);
+      expect(buffer._overflow).toBe(overflow);
     });
   });
 
@@ -181,7 +181,7 @@ describe('WasmBufferStrategy', () => {
       const buffer = strategy.createSpanBuffer(testSchema, traceRoot, testMetadata);
 
       const statsBefore = strategy.getStats();
-      strategy.releaseBuffer(buffer as any);
+      strategy.releaseBuffer(buffer);
       const statsAfter = strategy.getStats();
 
       expect(statsAfter.freeCount).toBeGreaterThan(statsBefore.freeCount);
@@ -197,7 +197,7 @@ describe('WasmBufferStrategy', () => {
       strategy.createChildSpanBuffer(parent, testMetadata, testMetadata);
 
       const statsBefore = strategy.getStats();
-      strategy.releaseBuffer(parent as any);
+      strategy.releaseBuffer(parent);
       const statsAfter = strategy.getStats();
 
       // Should have freed 3 buffers worth of memory
@@ -212,7 +212,7 @@ describe('WasmBufferStrategy', () => {
       strategy.createOverflowBuffer(buffer);
 
       const statsBefore = strategy.getStats();
-      strategy.releaseBuffer(buffer as any);
+      strategy.releaseBuffer(buffer);
       const statsAfter = strategy.getStats();
 
       // Should have freed both buffers
