@@ -186,9 +186,10 @@ describe('TestTracer', () => {
 
       const buffer = tracer.rootBuffers[0];
       // Tag values are written to row 0 (span-start row)
-      // Cast to any to access typed properties since AnySpanBuffer doesn't have index signatures
-      // biome-ignore lint/suspicious/noExplicitAny: Test access to typed buffer properties
-      const typedBuffer = buffer as any;
+      const typedBuffer = buffer as unknown as {
+        userId_values: string[];
+        count_values: Float64Array;
+      };
       expect(typedBuffer.userId_values[0]).toBe('user-456');
       expect(typedBuffer.count_values[0]).toBe(42);
     });

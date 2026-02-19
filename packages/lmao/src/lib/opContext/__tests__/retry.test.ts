@@ -56,6 +56,8 @@ const NETWORK_ERROR = Transient<{ service: string }>('NETWORK_ERROR', {
 });
 // Non-transient error codes
 const VALIDATION_ERROR = Code<{ field: string }>('VALIDATION_ERROR');
+const PLAIN_ERROR = Code<{ detail: string }>('PLAIN_ERROR');
+const CHILD_FAILED = Code<Record<string, never>>('CHILD_FAILED');
 
 describe('LMAO Op Retry', () => {
   // Helper to test retry behavior via child span
@@ -198,8 +200,7 @@ describe('LMAO Op Retry', () => {
 
       const result = await executeWithRetry(tracer, 'testOp', async (ctx) => {
         attempts++;
-        // biome-ignore lint/suspicious/noExplicitAny: Testing plain object errors
-        return ctx.err({ code: 'PLAIN_ERROR', detail: 'something' } as any);
+        return ctx.err(PLAIN_ERROR({ detail: 'something' }));
       });
 
       expect(attempts).toBe(1); // No retries
@@ -690,8 +691,7 @@ describe('LMAO Op Retry', () => {
           });
 
           if (!childResult.success) {
-            // biome-ignore lint/suspicious/noExplicitAny: Testing error propagation
-            return parentCtx.err({ code: 'CHILD_FAILED' } as any);
+            return parentCtx.err(CHILD_FAILED({}));
           }
 
           return parentCtx.ok({ parent: true, childResult: childResult.value });

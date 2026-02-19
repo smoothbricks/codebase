@@ -96,8 +96,7 @@ describe('NoOpTracer', () => {
       });
 
       const result = await trace('parent-trace', async (ctx) => {
-        // biome-ignore lint/suspicious/noExplicitAny: Test setup requires flexible typing
-        const childResult = await (ctx as any).span('child-span', childOp);
+        const childResult = await ctx.span('child-span', childOp);
         expect(childResult.success).toBe(true);
         return 'parent-done';
       });
@@ -147,10 +146,8 @@ describe('NoOpTracer', () => {
       // Should complete without any errors
       const result = await trace('test-trace', async (ctx) => {
         // Create multiple nested spans to trigger all hooks
-        // biome-ignore lint/suspicious/noExplicitAny: Test setup requires flexible typing
-        await (ctx as any).span('child1', childOp1);
-        // biome-ignore lint/suspicious/noExplicitAny: Test setup requires flexible typing
-        await (ctx as any).span('child2', childOp2);
+        await ctx.span('child1', childOp1);
+        await ctx.span('child2', childOp2);
         return 'done';
       });
 
@@ -185,8 +182,7 @@ describe('NoOpTracer', () => {
         return ctx.ok({ status: 'success' });
       });
 
-      // biome-ignore lint/suspicious/noExplicitAny: Test setup requires flexible typing
-      const result = await (trace as any)('ok-test', successOp);
+      const result = await trace('ok-test', successOp);
       expect(result.success).toBe(true);
     });
 
@@ -201,8 +197,7 @@ describe('NoOpTracer', () => {
         return ctx.err(VALIDATION_ERROR({ field: 'email' }));
       });
 
-      // biome-ignore lint/suspicious/noExplicitAny: Test setup requires flexible typing
-      const result = await (trace as any)('err-test', failingOp);
+      const result = await trace('err-test', failingOp);
       expect(result.success).toBe(false);
     });
   });

@@ -346,8 +346,7 @@ describe('Schema Integration Patterns', () => {
       const result = await trace(
         'process-order',
         { requestId: 'req-003', userId: 'user-003', env: environmentConfig },
-        // biome-ignore lint/suspicious/noExplicitAny: Testing op with additional args
-        async (ctx) => (testOp as any).fn(ctx, 'order-789', 149.99),
+        async (ctx) => testOp.fn(ctx, 'order-789', 149.99),
       );
       expect(result.success).toBe(true);
       if (result.success) {
@@ -478,8 +477,7 @@ describe('Schema Integration Patterns', () => {
       const result = await trace(
         'process-order',
         { requestId: 'req-999', userId: 'user-123', env: environmentConfig },
-        // biome-ignore lint/suspicious/noExplicitAny: Testing op with additional args
-        async (ctx) => (processOrder as any).fn(ctx, 'order-456', 99.99),
+        async (ctx) => processOrder.fn(ctx, 'order-456', 99.99),
       );
       expect(result.success).toBe(true);
       if (result.success) {
@@ -537,8 +535,7 @@ describe('Schema Integration Patterns', () => {
         'create-user',
         { requestId: 'req-123', userId: 'user-456', env: environmentConfig },
         async (ctx) =>
-          // biome-ignore lint/suspicious/noExplicitAny: Testing op with additional args
-          (createUser as any).fn(ctx, {
+          createUser.fn(ctx, {
             email: 'test@example.com',
             name: 'Test User',
           }),

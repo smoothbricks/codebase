@@ -129,11 +129,12 @@ describe('createColumnWriter', () => {
     const buffer = createGeneratedColumnBuffer(testSchema, 64);
     const writer = createColumnWriter(testSchema, buffer);
 
+    const booleanWriter = writer as typeof writer & { enabled(value: boolean): typeof writer };
+
     // Write multiple booleans to test bit-packing
     for (let i = 0; i < 16; i++) {
       writer.nextRow();
-      // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-      (writer as any).enabled(i % 2 === 0); // alternating true/false
+      booleanWriter.enabled(i % 2 === 0); // alternating true/false
     }
 
     const enabledValues = (buffer as unknown as { enabled_values: Uint8Array }).enabled_values;
@@ -208,8 +209,8 @@ transformed(value) {
     });
 
     writer.nextRow();
-    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-    (writer as any).transformed('hello');
+    const transformedWriter = writer as typeof writer & { transformed(value: string): typeof writer };
+    transformedWriter.transformed('hello');
 
     expect((buffer as unknown as { message_values: string[] }).message_values[0]).toBe('HELLO');
   });
@@ -263,8 +264,7 @@ describe('enum O(1) Map lookup', () => {
     const writer = createColumnWriter(testSchema, buffer);
 
     writer.nextRow();
-    // biome-ignore lint/suspicious/noExplicitAny: testing invalid value
-    expect(() => writer.status('invalid' as any)).toThrow('Invalid enum value');
+    expect(() => writer.status('invalid' as 'ok')).toThrow('Invalid enum value');
   });
 
   it('handles high-cardinality enum (64 values) via Map lookup', () => {
@@ -276,12 +276,12 @@ describe('enum O(1) Map lookup', () => {
     });
     const buffer = createGeneratedColumnBuffer(highCardSchema, 64);
     const writer = createColumnWriter(highCardSchema, buffer);
+    const statusWriter = writer as typeof writer & { status(value: string): typeof writer };
 
     // Write every value
     for (let i = 0; i < 64; i++) {
       writer.nextRow();
-      // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-      (writer as any).status(`value_${i}`);
+      statusWriter.status(`value_${i}`);
     }
 
     // Verify each value got the correct index
@@ -320,8 +320,8 @@ describe('null bitmap handling', () => {
     const writer = createColumnWriter(testSchema, buffer);
 
     writer.nextRow();
-    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-    (writer as any).userId('test');
+    const userWriter = writer as typeof writer & { userId(value: string): typeof writer };
+    userWriter.userId('test');
 
     const nullBitmap = (buffer as unknown as { userId_nulls: Uint8Array }).userId_nulls;
     // Bit 0 should be set (first row written)
@@ -334,8 +334,8 @@ describe('null bitmap handling', () => {
 
     writer.nextRow();
     // Only write userId, not status
-    // biome-ignore lint/suspicious/noExplicitAny: testing dynamic methods
-    (writer as any).userId('test');
+    const userWriter = writer as typeof writer & { userId(value: string): typeof writer };
+    userWriter.userId('test');
 
     const statusNulls = (buffer as unknown as { status_nulls: Uint8Array }).status_nulls;
     // Bit 0 should be unset (status was not written)
