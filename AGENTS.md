@@ -433,9 +433,15 @@ Three distinct string types, each with different storage strategies:
 - **Test All**: `nx test lmao` (runs all tests for a package)
 - **Note**: Tests no longer depend on typecheck-tests - linting handles that. Tests only depend on build.
 
+(`defineReducer` + `vm.compile(...)`) to prevent JS/VM drift and production-only failures.
 
-- For VM reducers, use `Scenario.createAsync(...).sendAsync(...)` so Scenario can use reducer speculation + checkpoint
-  capabilities while preserving fork isolation.
+**JS reducer/compiler policy:** JS reducer execution is parity-only. Use it only inside Zig reducer/compiler parity
+suites to cross-reference DSL output against VM output. Do NOT use JS reducer execution for domain agent tests or
+integration flows.
+
+
+- VM reducers are the default and required path for Scenario tests (`Scenario.createAsync(...).sendAsync(...)`).
+- JS reducer execution in Scenario is parity-only and reserved for compiler/VM cross-reference tests.
 
 ### Property-Based Testing with fast-check
 
