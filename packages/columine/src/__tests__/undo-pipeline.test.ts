@@ -106,6 +106,14 @@ function buildProgram(opts: {
   return program;
 }
 
+function getUndoPosition(token: unknown): number {
+  const maybe = token as { position?: unknown };
+  if (typeof maybe.position !== 'number') {
+    throw new Error('invariant: undo token missing numeric position');
+  }
+  return maybe.position;
+}
+
 // =============================================================================
 // Pipeline Undo Tests
 // =============================================================================
@@ -520,5 +528,57 @@ describe('Pipeline undo integration', () => {
     expect(backend.mapGet(state, program, 0, 3)).toBe(30);
     // Speculative keys should be gone
     expect(backend.mapGet(state, program, 0, 100)).toBeUndefined();
+  });
+
+  it('delta segments support rollback and rollforward without event replay', async () => {
+    setBackend(backend);
+    const stages = await createPipeline();
+
+    const bytecode = buildProgram({
+      slots: [{ type: 'hashmap', capacity: 64 }],
+      numInputs: 2,
+      reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
+    });
+
+    const program = await backend.loadProgram(bytecode);
+    const state = backend.createState(program);
+
+    if (!backend.executeBatchDelta || !backend.deltaExportSegment || !backend.deltaApplyRollbackSegment) {
+      throw new Error('invariant: backend missing delta segment support');
+    }
+    if (!backend.deltaApplyRollforwardSegment) {
+      throw new Error('invariant: backend missing delta rollforward support');
+    }
+
+    const fromToken = stages.undo.checkpoint(state);
+    const fromPos = getUndoPosition(fromToken);
+
+    backend.executeBatchDelta(
+      state,
+      program,
+      [
+        { data: new Uint32Array([42]), type: ValueType.UINT32 },
+        { data: new Uint32Array([900]), type: ValueType.UINT32 },
+      ],
+      1,
+    );
+
+    expect(backend.getMapSize(state, program, 0)).toBe(1);
+    expect(backend.mapGet(state, program, 0, 42)).toBe(900);
+
+    const toPos = assertUndoCapableBackend(backend).undoCheckpoint(state);
+    const segment = backend.deltaExportSegment(state, fromPos, toPos);
+    expect(segment.undoBytes.byteLength).toBeGreaterThan(0);
+    expect(segment.redoBytes.byteLength).toBe(segment.undoBytes.byteLength);
+    expect(segment.entrySize).toBeGreaterThan(0);
+    expect(segment.overflow).toBeFalse();
+
+    backend.deltaApplyRollbackSegment(state, segment.undoBytes, segment.entrySize);
+    expect(backend.getMapSize(state, program, 0)).toBe(0);
+    expect(backend.mapGet(state, program, 0, 42)).toBeUndefined();
+
+    backend.deltaApplyRollforwardSegment(state, segment.redoBytes, segment.entrySize);
+    expect(backend.getMapSize(state, program, 0)).toBe(1);
+    expect(backend.mapGet(state, program, 0, 42)).toBe(900);
   });
 });
