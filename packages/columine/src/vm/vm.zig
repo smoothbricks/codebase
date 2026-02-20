@@ -472,6 +472,7 @@ const UNDO_CAPACITY: u32 = 16384;
 var g_undo_entries: [UNDO_CAPACITY]FlatUndoEntry = undefined;
 var g_redo_entries: [UNDO_CAPACITY]FlatUndoEntry = undefined;
 var g_undo_count: u32 = 0;
+var g_delta_count: u32 = 0;
 var g_undo_overflow: bool = false;
 pub var g_undo_enabled: bool = false;
 
@@ -533,6 +534,7 @@ pub fn undoAppendPair(undo_entry: FlatUndoEntry, redo_entry: FlatUndoEntry) void
         g_undo_entries[g_undo_count] = undo_entry;
         g_redo_entries[g_undo_count] = redo_entry;
         g_undo_count += 1;
+        g_delta_count = g_undo_count;
     } else if (!g_undo_overflow) {
         // First overflow: snapshot current state so rollback can restore
         // un-logged mutations that happen after this point.
@@ -2797,6 +2799,7 @@ pub export fn vm_set_iter_get(
 pub export fn vm_undo_enable(state_base: [*]u8, state_size: u32) void {
     g_undo_enabled = true;
     g_undo_count = 0;
+    g_delta_count = 0;
     g_undo_overflow = false;
     g_undo_shadow_active = false;
     g_undo_has_overflow_entry = false;
@@ -2859,6 +2862,9 @@ pub export fn vm_undo_rollback(state_base: [*]u8, checkpoint_pos: u32) void {
         rollbackEntry(state_base, g_undo_entries[i]);
     }
     g_undo_count = checkpoint_pos;
+    if (g_delta_count > g_undo_count) {
+        g_delta_count = g_undo_count;
+    }
     restoreChangeFlags(state_base);
 }
 
@@ -2881,6 +2887,7 @@ pub export fn vm_undo_commit(state_base: [*]u8, _checkpoint_pos: u32) void {
     g_undo_shadow_active = false;
     g_undo_has_overflow_entry = false;
     g_undo_count = 0;
+    g_delta_count = 0;
     g_undo_overflow = false;
     g_undo_enabled = false;
 }
@@ -2894,7 +2901,7 @@ pub export fn vm_undo_has_overflow() u32 {
 
 pub export fn vm_delta_export_segment(_state_base: [*]u8, from_pos: u32, to_pos: u32) u32 {
     _ = _state_base;
-    const end = @min(to_pos, g_undo_count);
+    const end = @min(to_pos, g_delta_count);
     const start = @min(from_pos, end);
     g_delta_export_start = start;
     g_delta_export_count = end - start;

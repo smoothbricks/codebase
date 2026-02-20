@@ -581,4 +581,57 @@ describe('Pipeline undo integration', () => {
     expect(backend.getMapSize(state, program, 0)).toBe(1);
     expect(backend.mapGet(state, program, 0, 42)).toBe(900);
   });
+
+  it('without delta recording, export is empty and delta rollback/rollforward cannot restore', async () => {
+    setBackend(backend);
+    const stages = await createPipeline();
+
+    const bytecode = buildProgram({
+      slots: [{ type: 'hashmap', capacity: 64 }],
+      numInputs: 2,
+      reduceOps: [Opcode.BATCH_MAP_UPSERT_LAST, 0, 0, 1],
+    });
+
+    const program = await backend.loadProgram(bytecode);
+    const state = backend.createState(program);
+
+    if (!backend.executeBatchDelta || !backend.deltaExportSegment || !backend.deltaApplyRollbackSegment) {
+      throw new Error('invariant: backend missing delta segment support');
+    }
+    if (!backend.deltaApplyRollforwardSegment) {
+      throw new Error('invariant: backend missing delta rollforward support');
+    }
+
+    const fromPos = getUndoPosition(stages.undo.checkpoint(state));
+
+    // Production profile: executes mutations but does NOT record redo deltas.
+    stages.reduce.executeBatch(
+      state,
+      program,
+      [
+        { data: new Uint32Array([7]), type: ValueType.UINT32 },
+        { data: new Uint32Array([77]), type: ValueType.UINT32 },
+      ],
+      1,
+    );
+
+    expect(backend.getMapSize(state, program, 0)).toBe(1);
+    expect(backend.mapGet(state, program, 0, 7)).toBe(77);
+
+    const toPos = assertUndoCapableBackend(backend).undoCheckpoint(state);
+    const segment = backend.deltaExportSegment(state, fromPos, toPos);
+
+    // Core assertion: same logical flow without executeBatchDelta does not produce usable deltas.
+    expect(segment.undoBytes.byteLength).toBe(0);
+    expect(segment.redoBytes.byteLength).toBe(0);
+
+    // Applying empty segments must NOT restore/reset state.
+    backend.deltaApplyRollbackSegment(state, segment.undoBytes, segment.entrySize);
+    expect(backend.getMapSize(state, program, 0)).toBe(1);
+    expect(backend.mapGet(state, program, 0, 7)).toBe(77);
+
+    backend.deltaApplyRollforwardSegment(state, segment.redoBytes, segment.entrySize);
+    expect(backend.getMapSize(state, program, 0)).toBe(1);
+    expect(backend.mapGet(state, program, 0, 7)).toBe(77);
+  });
 });
