@@ -470,6 +470,26 @@ add_tip_lines: {
 }
 ```
 
+**Extract common field definitions.** Signal schemas are data — `S.*` calls return reusable marker values. Extract
+repeated fields and field groups into constants:
+
+```typescript
+// Common fields shared across signals
+const accountId = S.key('accountId');
+const orderId = S.string();
+const auditInfo = { reason: S.string(), operator_id: S.string() };
+
+export const orderSignals = defineSignals({
+  cancel_order: { value: { ...auditInfo } },
+  hold_order: { value: { ...auditInfo } },
+  order_completed: { value: { account_id: accountId, order_id: orderId } },
+});
+```
+
+**No sender state in signals.** Retry counters, backoff schedules, scheduling timestamps, and config values belong in
+the sender's reducer state, not the signal payload. Use `ctx.time.at()` for scheduling. The receiver should not know or
+care about the sender's internal strategy.
+
 ### Property-Based Testing with fast-check
 
 **Prefer property-based tests by default** for reducer/state-machine behavior, buffer/overflow semantics, fork graphs,

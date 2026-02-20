@@ -24,6 +24,9 @@ domain — a signal says "do X now" and carries only what the **receiver** needs
   `line_type: string` field. If the domain has tips, donations, and adjustments, either define precise signal types for
   each or unify them under one properly named signal with a typed shape. Junk-drawer signals indicate incomplete domain
   analysis.
+- **Extract common fields as constants.** Signal schemas are data — `S.*` returns reusable marker values. Extract
+  repeated fields (e.g., `account_id: S.key(...)`, `order_id: S.string()`) and field groups (e.g.
+  `operator_action = { reason, operator_id }`) into constants, then spread into signal definitions.
 - **Indexes for cross-agent visibility.** If an agent needs to read another agent's state for decoupled coordination,
   use indexes — but only when genuinely needed.
 
