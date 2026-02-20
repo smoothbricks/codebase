@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 import { getCurrency } from '../currency-registry.js';
-import { formatAmount, formatBasis, parseAmount, parseBasis } from '../format.js';
+import { formatAmount, formatAmountDisplay, formatBasis, parseAmount, parseBasis } from '../format.js';
 import { Amount, Basis } from '../types.js';
 
 describe('parseAmount', () => {
@@ -140,5 +140,36 @@ describe('parseBasis/formatBasis round-trip', () => {
     const parsed = parseBasis(original, usd);
     const formatted = formatBasis(parsed, usd);
     expect(formatted).toBe(original);
+  });
+});
+
+describe('formatAmountDisplay', () => {
+  it('formats USD with currency symbol (en-US)', () => {
+    const result = formatAmountDisplay(Amount<'USD'>(150n), getCurrency('USD'), 'en-US');
+    expect(result).toContain('1.50');
+    expect(result).toContain('$');
+  });
+
+  it('formats JPY without decimal places', () => {
+    const result = formatAmountDisplay(Amount<'JPY'>(100n), getCurrency('JPY'), 'en-US');
+    expect(result).toContain('100');
+    expect(result).toContain('¥');
+  });
+
+  it('formats negative amounts', () => {
+    const result = formatAmountDisplay(Amount<'USD'>(-150n), getCurrency('USD'), 'en-US');
+    // Intl.NumberFormat may use minus sign or parentheses depending on locale
+    expect(result).toContain('1.50');
+  });
+
+  it('formats zero correctly', () => {
+    const result = formatAmountDisplay(Amount<'USD'>(0n), getCurrency('USD'), 'en-US');
+    expect(result).toContain('0.00');
+  });
+
+  it('handles large amounts within safe integer range', () => {
+    // $1,000,000,000.00 = 100_000_000_000 cents
+    const result = formatAmountDisplay(Amount<'USD'>(100_000_000_000n), getCurrency('USD'), 'en-US');
+    expect(result).toContain('1,000,000,000.00');
   });
 });

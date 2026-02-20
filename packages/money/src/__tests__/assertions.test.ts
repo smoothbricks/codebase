@@ -12,7 +12,7 @@ describe('assertBalanced', () => {
   });
 
   it('throws for imbalanced legs with descriptive message', () => {
-    expect(() => assertBalanced([Amount<'USD'>(100n), Amount<'USD'>(-99n)])).toThrow('1');
+    expect(() => assertBalanced([Amount<'USD'>(100n), Amount<'USD'>(-99n)])).toThrow(/imbalance of 1\b/);
   });
 
   it('does not throw for empty array', () => {

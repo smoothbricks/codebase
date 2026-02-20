@@ -65,6 +65,14 @@ export function registerCurrency(def: CurrencyDef): void {
   registry.set(def.code, def);
 }
 
+// Precomputed powers of 10 for O(1) scale lookups (covers decimals 0-18)
+const POW10: bigint[] = [];
+for (let i = 0; i <= 18; i++) POW10[i] = 10n ** BigInt(i);
+
+function pow10(n: number): bigint {
+  return POW10[n] ?? 10n ** BigInt(n);
+}
+
 /**
  * Amount scale factor: 10^decimals.
  * For USD (decimals=2): 100n (1 dollar = 100 cents)
@@ -72,7 +80,7 @@ export function registerCurrency(def: CurrencyDef): void {
  * For BTC (decimals=8): 100000000n (1 BTC = 100M satoshi)
  */
 export function amountScale(currency: CurrencyDef): bigint {
-  return 10n ** BigInt(currency.decimals);
+  return pow10(currency.decimals);
 }
 
 /**
@@ -80,5 +88,5 @@ export function amountScale(currency: CurrencyDef): bigint {
  * For USD (basisDecimals=10): 10000000000n
  */
 export function basisScale(currency: CurrencyDef): bigint {
-  return 10n ** BigInt(currency.basisDecimals);
+  return pow10(currency.basisDecimals);
 }

@@ -43,6 +43,6 @@ export function divideWithRemainder<C extends string>(
     throw new Error('Division by zero');
   }
   const quotient = (amount / divisor) as Amount<C>;
-  const remainder = (amount - quotient * divisor) as Amount<C>;
+  const remainder = (amount % divisor) as Amount<C>;
   return { quotient, remainder };
 }

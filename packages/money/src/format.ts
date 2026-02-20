@@ -9,7 +9,6 @@
  */
 
 import type { CurrencyDef } from './currency-registry.js';
-import { amountScale } from './currency-registry.js';
 import type { Amount, Basis } from './types.js';
 
 /**
@@ -64,12 +63,12 @@ export function formatAmountDisplay<C extends string>(
   currency: CurrencyDef,
   locale?: string,
 ): string {
-  const scale = amountScale(currency);
-  const whole = (amount as bigint) / scale;
-  const frac = (amount as bigint) % scale;
-
-  // Reconstruct as a number for Intl.NumberFormat (safe for display, not for round-trip)
-  const numericValue = Number(whole) + Number(frac) / Number(scale);
+  // Convert via canonical decimal string to avoid BigInt->Number precision loss.
+  // Number() on a decimal string like "92000000000.50" loses precision beyond
+  // ~15 significant digits, but that's inherent to Intl.NumberFormat accepting
+  // only number. For amounts > Number.MAX_SAFE_INTEGER minor units, the
+  // trailing digits may be wrong — acceptable for a display-only function.
+  const numericValue = Number(formatAmount(amount, currency));
 
   return new Intl.NumberFormat(locale, {
     style: 'currency',
