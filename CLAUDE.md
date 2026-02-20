@@ -106,6 +106,14 @@ Tests use Bun's built-in test runner:
 import { describe, expect, it } from 'bun:test';
 ```
 
+**Property-based testing (preferred):** For state machines, rollback/undo semantics, fork graphs, and any \"works for N\"
+invariant, default to `fast-check` properties over generated traces rather than only hand-picked examples.
+
+- Prefer property tests for deep fork-of-fork interleavings and reset/rollback correctness.
+- Keep at least one focused example test for readability, then scale coverage with properties.
+- Use explicit invariants (preservation, reversibility, idempotency where expected) and set `numRuns` high enough to
+  stress edge cases.
+
 ### Type Inference First (Mandatory)
 
 Integration tests are user-experience tests for public API ergonomics.

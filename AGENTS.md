@@ -437,8 +437,8 @@ Three distinct string types, each with different storage strategies:
 
 ### Property-Based Testing with fast-check
 
-**Prefer property-based tests** for buffer, overflow, and data integrity scenarios. The `fast-check` library is
-installed.
+**Prefer property-based tests by default** for reducer/state-machine behavior, buffer/overflow semantics, fork graphs,
+and data integrity scenarios. The `fast-check` library is installed.
 
 ```typescript
 import fc from 'fast-check';
@@ -463,6 +463,13 @@ fc.assert(
 - Data integrity across serialization/deserialization
 - Mathematical invariants (e.g., `sb_overflows === bufferCount - 1`)
 - Any scenario where "it works for N" should imply "it works for all N"
+- Deep fork-of-fork interleavings with append/switch/reset operations
+- Rollback/rollforward reversibility across long randomized operation sequences
+
+**Policy:**
+
+- Start with a small example test for readability, then add a property test that stress-tests the same invariant.
+- For fork/undo logic, prefer randomized traces over manually enumerated branch cases.
 
 **Key properties to test:**
 
