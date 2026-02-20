@@ -11,28 +11,27 @@ directly without `bunx`.
 **Error handling policy:** Known operational failures must return `Err`/`Result`; reserve `throw` for invariants or
 impossible programmer/configuration bugs. For full policy and examples, follow `AGENTS.md`.
 
-**Signal design policy:** Signals are minimal cross-agent communication protocols, not data dumps. Each agent owns its
-domain — a signal says "do X now" and carries only what the **receiver** needs to act.
+**Agent design policy:** Agents represent domain entities — if something has its own identity and event history
+(invoice, credit note, subscription, account), it's an agent. Don't conflate a simple current lifecycle with "shouldn't
+be an agent." A credit note that currently processes one event is still a valid agent if credit notes are real domain
+entities with their own audit trail. Agent separation follows entity boundaries, not computational complexity.
 
-- **No sender bookkeeping in signals.** Never put the sender's internal state (retry counters, backoff schedules,
-  scheduling timestamps, config values) into a signal payload. If the sender needs to track retry attempts, backoff, or
-  cadence, that belongs in the sender's reducer state and `ctx.time.at()` for scheduling. The receiver should not know
-  or care about the sender's internal strategy.
-- **Self-contained for deterministic processing.** When correctness requires an exact point-in-time snapshot of another
-  agent's data, embed it in the signal. Signals are immutable — the data is locked at send time. Don't read from an
-  index at processing time for correctness-critical data (e.g. exact invoice amounts for a credit note reversal),
-  because indexes are projections that may lag, change, or be unavailable.
-- **Precise commands, no catch-all buckets.** Each signal type is a specific command with a precise, non-optional
-  payload shape. All signals for an agent share one Arrow RecordBatch schema where the `type` column already
-  discriminates — separate types are free. Don't create vague catch-all signals like `add_other_lines` with an untyped
-  `line_type: string` field. If the domain has tips, donations, and adjustments, either define precise signal types for
-  each or unify them under one properly named signal with a typed shape. Junk-drawer signals indicate incomplete domain
-  analysis.
-- **Extract common fields as constants.** Signal schemas are data — `S.*` returns reusable marker values. Extract
-  repeated fields (e.g., `account_id: S.key(...)`, `order_id: S.string()`) and field groups (e.g.
-  `operator_action = { reason, operator_id }`) into constants, then spread into signal definitions.
-- **Indexes for visibility and querying.** Indexes are projections of agent state — useful for dashboards, lookups, and
-  routing decisions. They are NOT for correctness-critical cross-agent data flows (use signal snapshots for that).
+**Signal design policy:** Signals are minimal cross-agent communication protocols. Each signal is a precise command that
+carries only what the **receiver** needs to act. For the full rules with code examples, see AGENTS.md.
+
+- **No sender bookkeeping.** Retry counters, backoff schedules, scheduling timestamps, and config values stay in the
+  sender's reducer state + `ctx.time.at()`. The receiver should not know or care about the sender's internal strategy.
+- **Self-contained for deterministic processing.** When correctness requires exact cross-agent data, embed a
+  point-in-time snapshot in the signal. Signals are immutable — data is locked at send time. Don't depend on an index
+  read at processing time for correctness-critical operations (e.g. exact invoice amounts for a credit note reversal).
+- **Precise commands, no catch-all buckets.** Each signal type has an exact non-optional payload shape. The Arrow
+  RecordBatch `type` column already discriminates — separate signal types are free. Junk-drawer signals with untyped
+  string discriminators (e.g. `line_type: string`) indicate incomplete domain analysis.
+- **Extract common fields as constants.** `S.*` returns reusable marker values. DRY repeated fields and field groups via
+  constants + spread.
+- **Indexes for visibility and decoupled communication.** Indexes are projections — useful for dashboards, lookups,
+  routing, and cross-agent coordination where eventual consistency is acceptable. Not for correctness-critical data
+  flows where exact point-in-time values are required.
 
 ## Common Development Commands
 

@@ -189,7 +189,11 @@ The agent should:
 1. **REVIEW for INCONSISTENCIES** between spec and implementation
 2. **CRITIQUE the specs themselves** - specs will evolve
 3. **Evaluate if implementation approaches are better than spec requirements**
-4. **Generate tasks for BOTH** implementation fixes AND spec updates
+4. **Generate tasks for BOTH** implementation fixes AND spec updates when inconsistencies are found
+5. **Question assumptions**: Are spec requirements still valid? Do they make sense?
+6. **Check for outdated patterns**: Specs written early may not reflect current best practices
+7. **Validate constraints**: Are spec limitations still necessary or were they premature optimizations?
+8. **Consider real-world usage**: Does the spec match actual developer needs and workflows?
 
 ### When Implementation Diverges from Spec
 
@@ -341,7 +345,7 @@ The agent should:
 **Key Files**:
 
 - `src/lib/schema/` - Schema builders, logSchema, feature flags
-- `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation (tag/log methods)
+- `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation (tag methods)
 - `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer)
 - `src/lib/lmao.ts` - Main integration, context creation
 - `src/lib/types.ts` - SpanBuffer interfaces
@@ -443,24 +447,43 @@ integration flows.
 - VM reducers are the default and required path for Scenario tests (`Scenario.createAsync(...).sendAsync(...)`).
 - JS reducer execution in Scenario is parity-only and reserved for compiler/VM cross-reference tests.
 
-**Signal design:** Signals are minimal cross-agent protocols — each signal says "do X now" and carries only what the **receiver** needs.
+**Signal design:** Signals are minimal cross-agent protocols — each signal is a precise command carrying only what the **receiver** needs.
 
-**Precise commands, not catch-all buckets.** Each signal type is a specific command with a precise, non-optional
-payload. All signals for an agent share one Arrow RecordBatch schema where the `type` column already discriminates —
-separate signal types are free at the storage level. Don't create vague catch-all signals with untyped discriminator
-strings:
+**No sender bookkeeping.** Retry counters, backoff schedules, scheduling timestamps, and config values belong in the
+sender's reducer state, not the signal payload. Use `ctx.time.at()` for scheduling. The receiver should not know or care
+about the sender's internal strategy.
+
+**Self-contained for deterministic processing.** When correctness requires exact cross-agent data, embed a point-in-time
+snapshot in the signal. Signals are immutable — the data is locked at send time. Don't depend on an index read at processing
+time for correctness-critical operations:
 
 ```typescript
-// ❌ Catch-all with untyped line_type — junk drawer signal
+// ✅ Credit note locks in exact invoice data at send time
+create_credit_note: {
+  target_invoice_id: S.string(),
+  original_tax_lines: S.array({ ... }),   // immutable snapshot
+  original_line_items: S.array({ ... }),  // locked at authorization time
+  line_reversals: S.array({ ... }),
+}
+```
+
+An index might lag (hasn't caught up), reflect a changed state (partial payment applied between send and process), or be
+unavailable (write failed). For correctness-critical flows, the signal IS the source of truth.
+
+**Precise commands, no catch-all buckets.** Each signal type has an exact non-optional payload shape. All signals for an
+agent share one Arrow RecordBatch schema where the `type` column already discriminates — separate signal types are free at
+the storage level. Don't create junk-drawer signals with untyped string discriminators:
+
+```typescript
+// ❌ Catch-all with untyped line_type — incomplete domain analysis
 add_other_lines: {
   lines: S.array({
     line_type: '' as string,  // 'tip' | 'donation' | ??? who knows
     amount_micro: 0n as bigint,
-    description: '' as string,
   }),
 }
 
-// ✅ Precise command with exact shape — the type column discriminates for free
+// ✅ Precise command with exact shape
 add_tip_lines: {
   tips: S.array({
     line_item_id: S.string(),
@@ -477,39 +500,18 @@ repeated fields and field groups into constants:
 // Common fields shared across signals
 const accountId = S.key('accountId');
 const orderId = S.string();
-const auditInfo = { reason: S.string(), operator_id: S.string() };
+const operatorAction = { reason: S.string(), operator_id: S.string() };
 
 export const orderSignals = defineSignals({
-  cancel_order: { value: { ...auditInfo } },
-  hold_order: { value: { ...auditInfo } },
+  cancel_order: { value: { ...operatorAction } },
+  hold_order: { value: { ...operatorAction } },
   order_completed: { value: { account_id: accountId, order_id: orderId } },
 });
 ```
 
-**No sender bookkeeping in signals.** Retry counters, backoff schedules, scheduling timestamps, and config values belong
-in the sender's reducer state, not the signal payload. Use `ctx.time.at()` for scheduling. The receiver should not know
-or care about the sender's internal strategy.
-
-**Self-contained for deterministic processing.** When correctness requires an exact point-in-time snapshot of another
-agent's data, embed it in the signal. Signals are immutable — the data is locked at send time. Don't depend on an index
-read at processing time for correctness-critical data:
-
-```typescript
-// ✅ Credit note locks in exact invoice amounts at send time
-create_credit_note: {
-  target_invoice_id: S.string(),
-  original_invoice_total_micro: S.bigint(),  // snapshot, not an index read
-  original_tax_lines: S.array({ ... }),       // immutable at send time
-  line_reversals: S.array({ ... }),
-}
-```
-
-Indexes are projections that may lag, change, or be unavailable. A credit note that reads invoice amounts from an index
-at processing time could get stale data (index hasn't caught up), changed data (partial payment applied between send and
-process), or no data (index write failed).
-
-**Indexes for visibility and querying.** Indexes are useful for dashboards, lookups, and routing decisions — not for
-correctness-critical cross-agent data flows.
+**Indexes for visibility and decoupled communication.** Indexes are projections of agent state — useful for dashboards,
+lookups, routing, and cross-agent coordination where eventual consistency is acceptable. Not for correctness-critical
+data flows where exact point-in-time values are required (use signal snapshots for that).
 
 ### Property-Based Testing with fast-check
 
@@ -539,7 +541,7 @@ fc.assert(
 - Data integrity across serialization/deserialization
 - Mathematical invariants (e.g., `sb_overflows === bufferCount - 1`)
 - Any scenario where "it works for N" should imply "it works for all N"
-- Deep fork-of-fork interleavings with append/switch/reset operations
+- Deep fork of-fork interleavings with append/switch/reset operations
 - Rollback/rollforward reversibility across long randomized operation sequences
 
 **Policy:**
