@@ -443,6 +443,33 @@ integration flows.
 - VM reducers are the default and required path for Scenario tests (`Scenario.createAsync(...).sendAsync(...)`).
 - JS reducer execution in Scenario is parity-only and reserved for compiler/VM cross-reference tests.
 
+**Signal design:** Signals are minimal cross-agent protocols — each signal says "do X now" and carries only what the **receiver** needs.
+
+**Precise commands, not catch-all buckets.** Each signal type is a specific command with a precise, non-optional
+payload. All signals for an agent share one Arrow RecordBatch schema where the `type` column already discriminates —
+separate signal types are free at the storage level. Don't create vague catch-all signals with untyped discriminator
+strings:
+
+```typescript
+// ❌ Catch-all with untyped line_type — junk drawer signal
+add_other_lines: {
+  lines: S.array({
+    line_type: '' as string,  // 'tip' | 'donation' | ??? who knows
+    amount_micro: 0n as bigint,
+    description: '' as string,
+  }),
+}
+
+// ✅ Precise command with exact shape — the type column discriminates for free
+add_tip_lines: {
+  tips: S.array({
+    line_item_id: S.string(),
+    amount_micro: S.bigint(),
+    recipient_id: S.string(),
+  }),
+}
+```
+
 ### Property-Based Testing with fast-check
 
 **Prefer property-based tests by default** for reducer/state-machine behavior, buffer/overflow semantics, fork graphs,

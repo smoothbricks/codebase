@@ -18,10 +18,12 @@ domain — a signal says "do X now" and carries only what the **receiver** needs
   timestamps, config values) into a signal payload. If the sender needs to track retry attempts, backoff, or cadence,
   that belongs in the sender's reducer state and `ctx.time.at()` for scheduling. The receiver should not know or care
   about the sender's internal retry/escalation strategy.
-- **Fewer signal types, use enum discriminators.** Don't create a unique signal type for every variant of the same
-  action. Use a single signal with an `S.enum` discriminator field instead. E.g. one `invoice_closed` signal with
-  `resolution: 'paid' | 'voided' | 'uncollectible'` instead of three separate signal types. This keeps the schema
-  surface area manageable as the system grows.
+- **Precise commands, no catch-all buckets.** Each signal type is a specific command with a precise, non-optional
+  payload shape. All signals for an agent share one Arrow RecordBatch schema where the `type` column already
+  discriminates — separate types are free. Don't create vague catch-all signals like `add_other_lines` with an untyped
+  `line_type: string` field. If the domain has tips, donations, and adjustments, either define precise signal types for
+  each or unify them under one properly named signal with a typed shape. Junk-drawer signals indicate incomplete domain
+  analysis.
 - **Indexes for cross-agent visibility.** If an agent needs to read another agent's state for decoupled coordination,
   use indexes — but only when genuinely needed.
 
