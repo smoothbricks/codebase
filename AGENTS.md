@@ -437,15 +437,6 @@ Three distinct string types, each with different storage strategies:
 - **Test All**: `nx test lmao` (runs all tests for a package)
 - **Note**: Tests no longer depend on typecheck-tests - linting handles that. Tests only depend on build.
 
-(`defineReducer` + `vm.compile(...)`) to prevent JS/VM drift and production-only failures.
-
-**JS reducer/compiler policy:** JS reducer execution is parity-only. Use it only inside Zig reducer/compiler parity
-suites to cross-reference DSL output against VM output. Do NOT use JS reducer execution for domain agent tests or
-integration flows.
-
-
-- VM reducers are the default and required path for Scenario tests (`Scenario.createAsync(...).sendAsync(...)`).
-- JS reducer execution in Scenario is parity-only and reserved for compiler/VM cross-reference tests.
 
 **Signal design:** Signals are minimal cross-agent protocols — each signal is a precise command carrying only what the **receiver** needs.
 
@@ -509,9 +500,18 @@ export const orderSignals = defineSignals({
 });
 ```
 
-**Indexes for visibility and decoupled communication.** Indexes are projections of agent state — useful for dashboards,
-lookups, routing, and cross-agent coordination where eventual consistency is acceptable. Not for correctness-critical
-data flows where exact point-in-time values are required (use signal snapshots for that).
+**Indexes for visibility and decoupled communication.** Indexes are reactive read-optimized projections of agent state —
+write-through SIEVE cache. Defined via `defineIndex()` with key, data, and optional predicates.
+
+- **Same-group:** `ctx.index.{name}.set()`, `.get()`, `.getWhen()` — synchronous, cache-hot reads
+- **Cross-group:** `ctx.peek()`, `ctx.subscribe()` — always stale (different writer)
+- **Reactive:** Watches fire `$keyChanged` (with data included), support predicates for filtered wake-ups
+- **Lifecycle:** TTL with `$keyExpired` notifications, `$keyReplaced` on overwrites, `$keyDeleted` on removal
+- **Custom strategies:** Notification generators (staggered, batched, priority-based) via `onKeyChanged`
+- **Cross-group mutations** route through Signal Threads, not direct index writes
+
+Use for dashboards, lookups, routing, and cross-agent wake-ups where eventual consistency is acceptable. Not for
+correctness-critical flows where exact point-in-time values are required (use signal snapshots for that).
 
 ### Property-Based Testing with fast-check
 

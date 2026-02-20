@@ -29,9 +29,12 @@ carries only what the **receiver** needs to act. For the full rules with code ex
   string discriminators (e.g. `line_type: string`) indicate incomplete domain analysis.
 - **Extract common fields as constants.** `S.*` returns reusable marker values. DRY repeated fields and field groups via
   constants + spread.
-- **Indexes for visibility and decoupled communication.** Indexes are projections — useful for dashboards, lookups,
-  routing, and cross-agent coordination where eventual consistency is acceptable. Not for correctness-critical data
-  flows where exact point-in-time values are required.
+- **Indexes for visibility and decoupled communication.** Indexes are reactive read-optimized projections of agent state
+  (single writer per group, write-through SIEVE cache). Same-group: `ctx.index.{name}.set/get/getWhen`. Cross-group:
+  `ctx.peek()` / `ctx.subscribe()` — always stale. Watches fire `$keyChanged` with data, support predicates, TTL with
+  `$keyExpired`, and custom notification strategies. Use for dashboards, lookups, routing, and cross-agent wake-ups
+  where eventual consistency is acceptable. Not for correctness-critical flows where exact point-in-time values are
+  required (use signal snapshots).
 
 ## Common Development Commands
 
