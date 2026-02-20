@@ -11,6 +11,20 @@ directly without `bunx`.
 **Error handling policy:** Known operational failures must return `Err`/`Result`; reserve `throw` for invariants or
 impossible programmer/configuration bugs. For full policy and examples, follow `AGENTS.md`.
 
+**Signal design policy:** Signals are minimal cross-agent communication protocols, not data dumps. Each agent owns its
+domain — a signal says "do X now" and carries only what the **receiver** needs to act.
+
+- **No sender state in signals.** Never put the sender's internal state (retry counters, backoff schedules, scheduling
+  timestamps, config values) into a signal payload. If the sender needs to track retry attempts, backoff, or cadence,
+  that belongs in the sender's reducer state and `ctx.time.at()` for scheduling. The receiver should not know or care
+  about the sender's internal retry/escalation strategy.
+- **Fewer signal types, use enum discriminators.** Don't create a unique signal type for every variant of the same
+  action. Use a single signal with an `S.enum` discriminator field instead. E.g. one `invoice_closed` signal with
+  `resolution: 'paid' | 'voided' | 'uncollectible'` instead of three separate signal types. This keeps the schema
+  surface area manageable as the system grows.
+- **Indexes for cross-agent visibility.** If an agent needs to read another agent's state for decoupled coordination,
+  use indexes — but only when genuinely needed.
+
 ## Common Development Commands
 
 ### Build and Development
