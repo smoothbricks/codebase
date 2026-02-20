@@ -433,6 +433,8 @@ Three distinct string types, each with different storage strategies:
 - **Test All**: `nx test lmao` (runs all tests for a package)
 - **Note**: Tests no longer depend on typecheck-tests - linting handles that. Tests only depend on build.
 
+`defineReducerJS` for scenario reducers (JS path enables immutable forking).
+
 ### Property-Based Testing with fast-check
 
 **Prefer property-based tests** for buffer, overflow, and data integrity scenarios. The `fast-check` library is
