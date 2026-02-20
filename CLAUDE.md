@@ -153,3 +153,15 @@ Integration tests are user-experience tests for public API ergonomics.
 - Do not add test-only wrappers/generics to hide inference problems.
 - If a test needs casting to call a public API, treat that as a library typing bug to fix.
 - Commit in atomic clusters (e.g., parser/guard + call sites, helper typing upgrades).
+
+### No Type Erasure Policy (Mandatory)
+
+Type inference quality is a primary API quality signal.
+
+- Keep generic type parameters threaded end-to-end (input -> storage -> accessor return type).
+- Do not erase specific generic types into broad singleton storage when values are returned to callers.
+- If a helper accepts a generic context/tracer, exposed getters/handles must preserve that exact generic.
+- Do not patch inference gaps with `as unknown as ...`, `as any`, or broad cast bridges in library code.
+- If a cast seems required, treat it as a typing bug in source API design and fix types first.
+- Back-compat `unknown` defaults may exist in core public generics, but helper/harness APIs must still preserve concrete
+  inferred types at call sites.

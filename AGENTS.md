@@ -389,6 +389,21 @@ Rules:
 - Treat integration tests as user experience tests: if test code must cast to call public APIs, API typing is not ready.
 - Make **atomic commits per fix cluster** (e.g., boundary parser + its call sites, decide context typing upgrade, etc.).
 
+### No Type Erasure Policy (MANDATORY)
+
+These rules are grounded in recent repository direction: typed API inference, generic threading across reducer/runtime
+chains, and sustained cast-removal refactors across tests and runtime helpers.
+
+Policy:
+
+- Keep generic type parameters threaded end-to-end (input -> storage -> accessor return type).
+- Do not erase specific generic types into broad singleton storage when those values are later returned to callers.
+- If a helper accepts a generic context/tracer, exposed getters/handles must preserve that exact generic.
+- Do not patch inference gaps with `as unknown as ...`, `as any`, or broad cast bridges in library code.
+- If a cast seems required, treat it as a typing bug in source API design and fix types first.
+- Back-compat `unknown` defaults may exist in core public generics, but helper/harness APIs must still preserve concrete
+  inferred types at the call site.
+
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/lmao/01a_trace_schema_system.md):
 
 Three distinct string types, each with different storage strategies:
