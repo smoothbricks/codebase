@@ -38,7 +38,7 @@ import type { RetryPolicy } from './errors/retry-policy.js';
 import { TransientError } from './errors/Transient.js';
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
-import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger } from './opContext/types.js';
+import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
 import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import {
@@ -346,6 +346,15 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
 
   // Monomorphic span methods (span0-span8)
   // Transformer emits: ctx.span0(line, name, ctx, SpanBufferClass, remappedViewClass, opMetadata, fn, ...args)
+  spanSync0<S, E>(
+    line: number,
+    name: string,
+    childCtx: SpanContext<Ctx>,
+    SpanBufferClass: SpanBufferConstructor,
+    remappedViewClass: RemappedViewConstructor | undefined,
+    opMetadata: OpMetadata,
+    fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
+  ): Result<S, E>;
   span0<S, E>(
     line: number,
     name: string,
@@ -533,6 +542,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
     ok: <V>(value: V) => Ok<V, Ctx['logSchema']>;
     err: <E>(error: E) => Err<E, Ctx['logSchema']>;
     span: SpanFn<Ctx>;
+    spanSync: SpanSyncFn<Ctx>;
 
     constructor(
       buffer: SpanBuffer<Ctx['logSchema']>,
@@ -734,6 +744,19 @@ export function createSpanContextClass<Ctx extends OpContext>(
             throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
         }
       } as SpanFn<Ctx>;
+
+      this.spanSync = function spanSync(name: string, fn: (ctx: SpanContext<Ctx>) => Result<unknown, unknown>) {
+        const childCtx = self._newCtx0();
+        return self.spanSync0(
+          0,
+          name,
+          childCtx,
+          self._buffer.constructor as SpanBufferConstructor,
+          undefined,
+          self._buffer._opMetadata,
+          fn,
+        );
+      } as SpanSyncFn<Ctx>;
     }
 
     // =========================================================================
@@ -1031,6 +1054,19 @@ export function createSpanContextClass<Ctx extends OpContext>(
         }
       } as SpanFn<Ctx>;
 
+      ctx.spanSync = function spanSync(name: string, fn: (syncCtx: SpanContext<Ctx>) => Result<unknown, unknown>) {
+        const newChildCtx = ctx._newCtx0();
+        return ctx.spanSync0(
+          0,
+          name,
+          newChildCtx,
+          childBuffer.constructor as SpanBufferConstructor,
+          undefined,
+          childBuffer._opMetadata,
+          fn,
+        );
+      } as SpanSyncFn<Ctx>;
+
       ctx.ok = function ok<V>(value: V): Ok<V, Ctx['logSchema']> {
         return new Ok<V, Ctx['logSchema']>(value);
       };
@@ -1069,6 +1105,37 @@ export function createSpanContextClass<Ctx extends OpContext>(
     //                    ctx.span0(line, name, Object.assign(Object.create(ctx), overrides), fn)
     // childCtx inherits from parent via prototype chain, may have user overrides as own properties
     // =========================================================================
+
+    spanSync0<S, E>(
+      line: number,
+      name: string,
+      childCtx: SpanContext<Ctx>,
+      SpanBufferClass: SpanBufferConstructor,
+      remappedViewClass: RemappedViewConstructor | undefined,
+      opMetadata: OpMetadata,
+      fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
+    ): Result<S, E> {
+      const ctx = this._spanPre(
+        childCtx as unknown as SpanContextInstance<Ctx>,
+        line,
+        name,
+        SpanBufferClass,
+        remappedViewClass,
+        opMetadata,
+      );
+      const buffer = ctx._buffer;
+      buffer._traceRoot.tracer.onSpanStart(buffer);
+      try {
+        const result = fn(ctx as unknown as SpanContext<Ctx>);
+        writeSpanEnd(buffer, result);
+        return result;
+      } catch (error) {
+        this._spanException(buffer, error);
+        throw error;
+      } finally {
+        buffer._traceRoot.tracer.onSpanEnd(buffer);
+      }
+    }
 
     async span0<S, E>(
       line: number,

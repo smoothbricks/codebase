@@ -108,6 +108,23 @@ describe('Span Lifecycle', () => {
       }),
     ).rejects.toThrow('Unexpected error');
   });
+
+  it('should support spanSync for synchronous child spans', async () => {
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions() });
+
+    const result = await tracer.trace('root-task', async (rootCtx) => {
+      const childResult = rootCtx.spanSync('sync-child', (childCtx) => {
+        childCtx.tag.spanName('sync-child');
+        return childCtx.ok('child-ok');
+      });
+
+      expect(childResult).not.toBeInstanceOf(Promise);
+      expect(childResult.success).toBe(true);
+      return rootCtx.ok('root-ok');
+    });
+
+    expect(result.success).toBe(true);
+  });
 });
 
 describe('Fluent Result API', () => {

@@ -54,7 +54,7 @@ export type {
 // Op types (metadata, function signature, instance)
 export type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 // SpanContext types (tag writer, logger, span function, full context)
-export type { FluentLogEntry, SpanContext, SpanFn, SpanLogger, TagWriter } from './spanContextTypes.js';
+export type { FluentLogEntry, SpanContext, SpanFn, SpanLogger, SpanSyncFn, TagWriter } from './spanContextTypes.js';
 
 // =============================================================================
 // CONVENIENCE RE-EXPORTS

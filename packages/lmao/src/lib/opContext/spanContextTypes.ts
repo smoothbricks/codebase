@@ -202,6 +202,17 @@ export type SpanFn<Ctx extends OpContext> = {
   <S, E>(name: string, fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>): Promise<Result<S, E>>;
 };
 
+/**
+ * SpanSyncFn - synchronous child span creation.
+ *
+ * Use when the callback is guaranteed sync and should return immediately
+ * with a Result envelope.
+ */
+export type SpanSyncFn<Ctx extends OpContext> = <S, E>(
+  name: string,
+  fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
+) => Result<S, E>;
+
 // =============================================================================
 // SPAN CONTEXT TYPE
 // =============================================================================
@@ -339,6 +350,14 @@ export type SpanContext<Ctx extends OpContext> = {
    * });
    */
   span: SpanFn<Ctx>;
+
+  /**
+   * Create a synchronous child span.
+   *
+   * `spanSync` is for sync callbacks only and returns Result directly.
+   * It does not await or perform async retry/backoff behavior.
+   */
+  spanSync: SpanSyncFn<Ctx>;
 
   /**
    * Set scoped attributes that auto-propagate to all subsequent log entries.

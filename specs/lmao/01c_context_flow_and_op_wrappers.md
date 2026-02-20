@@ -11,6 +11,42 @@ application. It provides:
 4. **Type-safe context destructuring** with automatic span correlation
 5. **User-extensible context** via `ctx` property in `defineOpContext()` for custom properties like env bindings
 
+## What A Span Is (Conceptual Model)
+
+A span is the smallest traced unit of execution in LMAO.
+
+- It models one bounded operation with a start, an end, and structured outcomes.
+- It owns one `SpanBuffer` (row 0 = start attributes/tags, row 1 = completion outcome, rows 2+ = log entries with
+  optional structured fields).
+- It has parent/child relationships to form a causal tree for one trace.
+- It carries scope/context inheritance for consistent correlation across nested operations.
+
+Operationally, `trace(...)` creates the root span and `ctx.span(...)` creates child spans.
+
+## Why `span()` Is Promise-Based
+
+`span()` is Promise-based by design to provide one uniform execution contract for:
+
+- sync op bodies,
+- async op bodies,
+- and retry-aware execution paths (transient failure backoff/retry).
+
+The retry loop is part of span execution and can require asynchronous delay. Keeping `span()` Promise-based ensures one
+consistent API and one lifecycle envelope (`span-start` → retries/logs if needed →
+`span-ok`/`span-err`/`span-exception`) for all operations.
+
+Note: span callbacks may still be synchronous. Promise-based return is the envelope contract, not a requirement that the
+callback itself be async.
+
+### `spanSync()` for Sync-Only Child Spans
+
+When a child span callback is guaranteed synchronous, use `spanSync(name, fn)`.
+
+- Callback type: `(ctx) => Result<S, E>`
+- Return type: `Result<S, E>` (no Promise)
+- Lifecycle semantics: same span-start/span-end/span-exception envelope as `span()`
+- Retry behavior: no async retry/backoff loop
+
 ## Context Hierarchy
 
 ```
