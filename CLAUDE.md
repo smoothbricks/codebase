@@ -14,10 +14,14 @@ impossible programmer/configuration bugs. For full policy and examples, follow `
 **Signal design policy:** Signals are minimal cross-agent communication protocols, not data dumps. Each agent owns its
 domain — a signal says "do X now" and carries only what the **receiver** needs to act.
 
-- **No sender state in signals.** Never put the sender's internal state (retry counters, backoff schedules, scheduling
-  timestamps, config values) into a signal payload. If the sender needs to track retry attempts, backoff, or cadence,
-  that belongs in the sender's reducer state and `ctx.time.at()` for scheduling. The receiver should not know or care
-  about the sender's internal retry/escalation strategy.
+- **No sender bookkeeping in signals.** Never put the sender's internal state (retry counters, backoff schedules,
+  scheduling timestamps, config values) into a signal payload. If the sender needs to track retry attempts, backoff, or
+  cadence, that belongs in the sender's reducer state and `ctx.time.at()` for scheduling. The receiver should not know
+  or care about the sender's internal strategy.
+- **Self-contained for deterministic processing.** When correctness requires an exact point-in-time snapshot of another
+  agent's data, embed it in the signal. Signals are immutable — the data is locked at send time. Don't read from an
+  index at processing time for correctness-critical data (e.g. exact invoice amounts for a credit note reversal),
+  because indexes are projections that may lag, change, or be unavailable.
 - **Precise commands, no catch-all buckets.** Each signal type is a specific command with a precise, non-optional
   payload shape. All signals for an agent share one Arrow RecordBatch schema where the `type` column already
   discriminates — separate types are free. Don't create vague catch-all signals like `add_other_lines` with an untyped
@@ -27,8 +31,8 @@ domain — a signal says "do X now" and carries only what the **receiver** needs
 - **Extract common fields as constants.** Signal schemas are data — `S.*` returns reusable marker values. Extract
   repeated fields (e.g., `account_id: S.key(...)`, `order_id: S.string()`) and field groups (e.g.
   `operator_action = { reason, operator_id }`) into constants, then spread into signal definitions.
-- **Indexes for cross-agent visibility.** If an agent needs to read another agent's state for decoupled coordination,
-  use indexes — but only when genuinely needed.
+- **Indexes for visibility and querying.** Indexes are projections of agent state — useful for dashboards, lookups, and
+  routing decisions. They are NOT for correctness-critical cross-agent data flows (use signal snapshots for that).
 
 ## Common Development Commands
 

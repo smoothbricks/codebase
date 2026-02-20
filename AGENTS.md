@@ -486,9 +486,30 @@ export const orderSignals = defineSignals({
 });
 ```
 
-**No sender state in signals.** Retry counters, backoff schedules, scheduling timestamps, and config values belong in
-the sender's reducer state, not the signal payload. Use `ctx.time.at()` for scheduling. The receiver should not know or
-care about the sender's internal strategy.
+**No sender bookkeeping in signals.** Retry counters, backoff schedules, scheduling timestamps, and config values belong
+in the sender's reducer state, not the signal payload. Use `ctx.time.at()` for scheduling. The receiver should not know
+or care about the sender's internal strategy.
+
+**Self-contained for deterministic processing.** When correctness requires an exact point-in-time snapshot of another
+agent's data, embed it in the signal. Signals are immutable — the data is locked at send time. Don't depend on an index
+read at processing time for correctness-critical data:
+
+```typescript
+// ✅ Credit note locks in exact invoice amounts at send time
+create_credit_note: {
+  target_invoice_id: S.string(),
+  original_invoice_total_micro: S.bigint(),  // snapshot, not an index read
+  original_tax_lines: S.array({ ... }),       // immutable at send time
+  line_reversals: S.array({ ... }),
+}
+```
+
+Indexes are projections that may lag, change, or be unavailable. A credit note that reads invoice amounts from an index
+at processing time could get stale data (index hasn't caught up), changed data (partial payment applied between send and
+process), or no data (index write failed).
+
+**Indexes for visibility and querying.** Indexes are useful for dashboards, lookups, and routing decisions — not for
+correctness-critical cross-agent data flows.
 
 ### Property-Based Testing with fast-check
 
