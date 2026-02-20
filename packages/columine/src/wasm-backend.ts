@@ -60,6 +60,14 @@ interface VmExports {
     numCols: number,
     batchLen: number,
   ): number;
+  vm_execute_batch_delta(
+    stateBase: number,
+    programPtr: number,
+    programLen: number,
+    colPtrsPtr: number,
+    numCols: number,
+    batchLen: number,
+  ): number;
 
   // Lookups
   vm_map_get(stateBase: number, slotOffset: number, capacity: number, key: number): number;
@@ -71,6 +79,25 @@ interface VmExports {
   vm_undo_rollback(stateBase: number, checkpointPos: number): void;
   vm_undo_commit(stateBase: number, checkpointPos: number): void;
   vm_undo_has_overflow(): number;
+
+  vm_delta_export_segment(stateBase: number, fromPos: number, toPos: number): number;
+  vm_delta_export_undo_ptr(): number;
+  vm_delta_export_redo_ptr(): number;
+  vm_delta_export_len_bytes(): number;
+  vm_delta_export_entry_size(): number;
+  vm_delta_export_overflow(): number;
+  vm_delta_apply_rollback_segment(
+    stateBase: number,
+    segmentPtr: number,
+    segmentLenBytes: number,
+    entrySize: number,
+  ): void;
+  vm_delta_apply_rollforward_segment(
+    stateBase: number,
+    segmentPtr: number,
+    segmentLenBytes: number,
+    entrySize: number,
+  ): void;
 }
 
 // =============================================================================
@@ -341,6 +368,52 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       return result;
     },
 
+    executeBatchDelta(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number {
+      const s = state as WasmStateHandle;
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      const wasmU32 = new Uint32Array(wasmInstance.memory.buffer);
+
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+
+      const programPtr = wasmInstance.inputRegionOffset;
+      wasmU8.set(program.bytecode, programPtr);
+
+      let colDataOffset = programPtr + align8(program.bytecode.length);
+
+      if (!scratchColPtrs || scratchColPtrsWidth < columns.length) {
+        scratchColPtrs = new Uint32Array(columns.length);
+        scratchColPtrsWidth = columns.length;
+      }
+
+      for (let i = 0; i < columns.length; i++) {
+        const col = columns[i];
+        const bytes = new Uint8Array(col.data.buffer, col.data.byteOffset, col.data.byteLength);
+        wasmU8.set(bytes, colDataOffset);
+        scratchColPtrs[i] = colDataOffset;
+        colDataOffset += align8(bytes.length);
+      }
+
+      const colPtrsPtr = colDataOffset;
+      for (let i = 0; i < columns.length; i++) {
+        wasmU32[(colPtrsPtr + i * 4) / 4] = scratchColPtrs[i];
+      }
+
+      const result = wasmInstance.exports.vm_execute_batch_delta(
+        statePtr,
+        programPtr,
+        program.bytecode.length,
+        colPtrsPtr,
+        columns.length,
+        batchLen,
+      );
+
+      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
+      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
+
+      return result;
+    },
+
     getMapSize(state: StateHandle, _program: ReducerProgram, slot: number): number {
       const s = state as WasmStateHandle;
       const u32 = new Uint32Array(s.buffer);
@@ -463,6 +536,51 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
 
     undoHasOverflow(): boolean {
       return wasmInstance.exports.vm_undo_has_overflow() !== 0;
+    },
+
+    deltaExportSegment(state: StateHandle, fromPos: number, toPos: number) {
+      const s = state as WasmStateHandle;
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+
+      wasmInstance.exports.vm_delta_export_segment(statePtr, fromPos, toPos);
+      const undoPtr = wasmInstance.exports.vm_delta_export_undo_ptr();
+      const redoPtr = wasmInstance.exports.vm_delta_export_redo_ptr();
+      const len = wasmInstance.exports.vm_delta_export_len_bytes();
+      const entrySize = wasmInstance.exports.vm_delta_export_entry_size();
+      const overflow = wasmInstance.exports.vm_delta_export_overflow() !== 0;
+      const undoBytes = new Uint8Array(wasmInstance.memory.buffer, undoPtr, len).slice();
+      const redoBytes = new Uint8Array(wasmInstance.memory.buffer, redoPtr, len).slice();
+      return { undoBytes, redoBytes, entrySize, overflow };
+    },
+
+    deltaApplyRollbackSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void {
+      const s = state as WasmStateHandle;
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+
+      const segmentPtr = wasmInstance.inputRegionOffset;
+      wasmU8.set(segment, segmentPtr);
+      wasmInstance.exports.vm_delta_apply_rollback_segment(statePtr, segmentPtr, segment.byteLength, entrySize);
+
+      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
+      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
+    },
+
+    deltaApplyRollforwardSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void {
+      const s = state as WasmStateHandle;
+      const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
+      const statePtr = wasmInstance.stateRegionOffset;
+      wasmU8.set(new Uint8Array(s.buffer), statePtr);
+
+      const segmentPtr = wasmInstance.inputRegionOffset;
+      wasmU8.set(segment, segmentPtr);
+      wasmInstance.exports.vm_delta_apply_rollforward_segment(statePtr, segmentPtr, segment.byteLength, entrySize);
+
+      const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
+      new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
     },
   } as ColumineBackend;
 }

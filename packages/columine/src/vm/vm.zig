@@ -463,8 +463,14 @@ pub const FlatUndoEntry = extern struct {
     aux: u64, // Previous timestamp bits (f64), or packed prev values for facts
 };
 
+pub const FlatDeltaEntry = extern struct {
+    undo: FlatUndoEntry,
+    redo: FlatUndoEntry,
+};
+
 const UNDO_CAPACITY: u32 = 16384;
 var g_undo_entries: [UNDO_CAPACITY]FlatUndoEntry = undefined;
+var g_redo_entries: [UNDO_CAPACITY]FlatUndoEntry = undefined;
 var g_undo_count: u32 = 0;
 var g_undo_overflow: bool = false;
 pub var g_undo_enabled: bool = false;
@@ -477,6 +483,7 @@ var g_undo_shadow_static: if (builtin.cpu.arch == .wasm32) [UNDO_SHADOW_CAPACITY
 var g_undo_shadow_dynamic: ?[]u8 = null;
 var g_undo_shadow_active: bool = false;
 var g_undo_overflow_entry: FlatUndoEntry = undefined;
+var g_redo_overflow_entry: FlatUndoEntry = undefined;
 var g_undo_has_overflow_entry: bool = false;
 var g_undo_state_size: u32 = 0;
 // Stored at vm_undo_enable time — WASM is single-threaded so this is safe
@@ -487,6 +494,10 @@ const native_shadow_allocator = std.heap.page_allocator;
 // Saved change flags for rollback (max 256 slots + 1 derived facts flag)
 var g_saved_change_flags: [257]u8 = undefined;
 var g_saved_change_flags_count: u32 = 0;
+
+var g_delta_export_start: u32 = 0;
+var g_delta_export_count: u32 = 0;
+var g_delta_export_overflow: bool = false;
 
 pub fn undoAppend(entry: FlatUndoEntry) void {
     if (g_undo_count < UNDO_CAPACITY) {
@@ -515,6 +526,45 @@ pub fn undoAppend(entry: FlatUndoEntry) void {
         g_undo_overflow = true;
     }
     // If already overflowed, silently drop — shadow buffer covers subsequent mutations
+}
+
+pub fn undoAppendPair(undo_entry: FlatUndoEntry, redo_entry: FlatUndoEntry) void {
+    if (g_undo_count < UNDO_CAPACITY) {
+        g_undo_entries[g_undo_count] = undo_entry;
+        g_redo_entries[g_undo_count] = redo_entry;
+        g_undo_count += 1;
+    } else if (!g_undo_overflow) {
+        // First overflow: snapshot current state so rollback can restore
+        // un-logged mutations that happen after this point.
+        if (comptime builtin.cpu.arch == .wasm32) {
+            // WASM: static 4MB buffer (avoids memory.grow which detaches JS ArrayBuffer views)
+            if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
+                @memcpy(g_undo_shadow_static[0..g_undo_state_size], g_undo_state_base[0..g_undo_state_size]);
+                g_undo_shadow_active = true;
+            }
+        } else {
+            // Native: dynamically allocate exact-size buffer (no fixed cap)
+            const shadow = native_shadow_allocator.alloc(u8, g_undo_state_size) catch null;
+            if (shadow) |s| {
+                @memcpy(s, g_undo_state_base[0..g_undo_state_size]);
+                g_undo_shadow_dynamic = shadow;
+                g_undo_shadow_active = true;
+            }
+        }
+        g_undo_overflow_entry = undo_entry;
+        g_redo_overflow_entry = redo_entry;
+        g_undo_has_overflow_entry = true;
+        g_undo_overflow = true;
+    }
+    // If already overflowed, silently drop — shadow buffer covers subsequent mutations
+}
+
+inline fn appendMutation(comptime delta_mode: bool, undo_entry: FlatUndoEntry, redo_entry: FlatUndoEntry) void {
+    if (delta_mode) {
+        undoAppendPair(undo_entry, redo_entry);
+    } else {
+        undoAppend(undo_entry);
+    }
 }
 
 /// Save all slot change_flags + derived_facts_change_flag at checkpoint time.
@@ -912,6 +962,7 @@ pub export fn vm_evict_all_expired(state_base: [*]u8, now: f64) u32 {
 // =============================================================================
 
 fn batchMapUpsertLatest(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -953,15 +1004,27 @@ fn batchMapUpsertLatest(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .MAP_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = 0,
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .MAP_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .MAP_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = val,
+                            .aux = @bitCast(ts),
+                        },
+                    );
                 }
                 keys[slot] = key;
                 values[slot] = val;
@@ -974,15 +1037,27 @@ fn batchMapUpsertLatest(
                     // Undo: save previous value + timestamp before overwrite
                     if (g_undo_enabled) {
                         meta.size_ptr.* = size;
-                        undoAppend(.{
-                            .op = .MAP_UPDATE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = values[slot],
-                            .aux = @bitCast(timestamps[slot]),
-                        });
+                        appendMutation(
+                            delta_mode,
+                            .{
+                                .op = .MAP_UPDATE,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = key,
+                                .prev_value = values[slot],
+                                .aux = @bitCast(timestamps[slot]),
+                            },
+                            .{
+                                .op = .MAP_UPDATE,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = key,
+                                .prev_value = val,
+                                .aux = @bitCast(ts),
+                            },
+                        );
                     }
                     values[slot] = val;
                     timestamps[slot] = ts;
@@ -1001,6 +1076,7 @@ fn batchMapUpsertLatest(
 }
 
 fn batchMapUpsertFirst(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -1037,15 +1113,27 @@ fn batchMapUpsertFirst(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .MAP_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = 0,
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .MAP_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .MAP_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = val,
+                            .aux = 0,
+                        },
+                    );
                 }
                 keys[slot] = key;
                 values[slot] = val;
@@ -1066,6 +1154,7 @@ fn batchMapUpsertFirst(
 }
 
 fn batchMapUpsertLast(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -1104,15 +1193,27 @@ fn batchMapUpsertLast(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .MAP_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = 0,
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .MAP_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .MAP_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = val,
+                            .aux = 0,
+                        },
+                    );
                 }
                 keys[slot] = key;
                 values[slot] = val;
@@ -1123,15 +1224,27 @@ fn batchMapUpsertLast(
                 // Undo: save previous value before overwrite (no timestamp for Last)
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .MAP_UPDATE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = values[slot],
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .MAP_UPDATE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = values[slot],
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .MAP_UPDATE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = val,
+                            .aux = 0,
+                        },
+                    );
                 }
                 // Last wins - always update
                 values[slot] = val;
@@ -1151,6 +1264,7 @@ fn batchMapUpsertLast(
 /// Batch map upsert with MAX strategy: keep row with highest comparison value.
 /// Uses timestamps array to store comparison values for tracking.
 fn batchMapUpsertMax(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -1193,15 +1307,27 @@ fn batchMapUpsertMax(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .MAP_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = 0,
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .MAP_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .MAP_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = val,
+                            .aux = @bitCast(cmp),
+                        },
+                    );
                 }
                 keys[slot] = key;
                 values[slot] = val;
@@ -1215,15 +1341,27 @@ fn batchMapUpsertMax(
                     // Undo: save previous value + cmp value before overwrite
                     if (g_undo_enabled) {
                         meta.size_ptr.* = size;
-                        undoAppend(.{
-                            .op = .MAP_UPDATE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = values[slot],
-                            .aux = @bitCast(cmp_vals[slot]),
-                        });
+                        appendMutation(
+                            delta_mode,
+                            .{
+                                .op = .MAP_UPDATE,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = key,
+                                .prev_value = values[slot],
+                                .aux = @bitCast(cmp_vals[slot]),
+                            },
+                            .{
+                                .op = .MAP_UPDATE,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = key,
+                                .prev_value = val,
+                                .aux = @bitCast(cmp),
+                            },
+                        );
                     }
                     values[slot] = val;
                     cmp_vals[slot] = cmp;
@@ -1244,6 +1382,7 @@ fn batchMapUpsertMax(
 /// Batch map upsert with MIN strategy: keep row with lowest comparison value.
 /// Uses timestamps array to store comparison values for tracking.
 fn batchMapUpsertMin(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -1286,15 +1425,27 @@ fn batchMapUpsertMin(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .MAP_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = 0,
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .MAP_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .MAP_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = val,
+                            .aux = @bitCast(cmp),
+                        },
+                    );
                 }
                 keys[slot] = key;
                 values[slot] = val;
@@ -1308,15 +1459,27 @@ fn batchMapUpsertMin(
                     // Undo: save previous value + cmp value before overwrite
                     if (g_undo_enabled) {
                         meta.size_ptr.* = size;
-                        undoAppend(.{
-                            .op = .MAP_UPDATE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = values[slot],
-                            .aux = @bitCast(cmp_vals[slot]),
-                        });
+                        appendMutation(
+                            delta_mode,
+                            .{
+                                .op = .MAP_UPDATE,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = key,
+                                .prev_value = values[slot],
+                                .aux = @bitCast(cmp_vals[slot]),
+                            },
+                            .{
+                                .op = .MAP_UPDATE,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = key,
+                                .prev_value = val,
+                                .aux = @bitCast(cmp),
+                            },
+                        );
                     }
                     values[slot] = val;
                     cmp_vals[slot] = cmp;
@@ -1335,6 +1498,7 @@ fn batchMapUpsertMin(
 }
 
 fn batchMapRemove(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -1364,15 +1528,27 @@ fn batchMapRemove(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .MAP_DELETE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = values[slot],
-                        .aux = @bitCast(timestamps[slot]),
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .MAP_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = values[slot],
+                            .aux = @bitCast(timestamps[slot]),
+                        },
+                        .{
+                            .op = .MAP_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = key,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                    );
                 }
                 keys[slot] = TOMBSTONE;
                 size -= 1;
@@ -1392,6 +1568,7 @@ fn batchMapRemove(
 // =============================================================================
 
 fn batchSetInsert(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -1424,15 +1601,27 @@ fn batchSetInsert(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .SET_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = elem,
-                        .prev_value = 0,
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .SET_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = elem,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .SET_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = elem,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                    );
                 }
                 keys[slot] = elem;
                 size += 1;
@@ -1451,6 +1640,7 @@ fn batchSetInsert(
 }
 
 fn batchSetRemove(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
     slot_idx: u8,
@@ -1478,15 +1668,27 @@ fn batchSetRemove(
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
                     meta.size_ptr.* = size;
-                    undoAppend(.{
-                        .op = .SET_DELETE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = elem,
-                        .prev_value = 0,
-                        .aux = 0,
-                    });
+                    appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .SET_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = elem,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                        .{
+                            .op = .SET_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = elem,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                    );
                 }
                 keys[slot] = TOMBSTONE;
                 size -= 1;
@@ -1578,7 +1780,8 @@ fn batchAggMax(val_col: [*]const f64, batch_len: u32, current_max: f64) f64 {
 ///   batch_len: Number of rows in batch
 ///
 /// Returns: ErrorCode
-pub export fn vm_execute_batch(
+fn executeBatchImpl(
+    comptime delta_mode: bool,
     state_base: [*]u8,
     program_ptr: [*]const u8,
     program_len: u32,
@@ -1640,6 +1843,7 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = batchMapUpsertLatest(
+                    delta_mode,
                     state_base,
                     meta,
                     slot,
@@ -1659,6 +1863,7 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = batchMapUpsertFirst(
+                    delta_mode,
                     state_base,
                     meta,
                     slot,
@@ -1677,6 +1882,7 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = batchMapUpsertLast(
+                    delta_mode,
                     state_base,
                     meta,
                     slot,
@@ -1693,7 +1899,7 @@ pub export fn vm_execute_batch(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                batchMapRemove(state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), batch_len);
+                batchMapRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), batch_len);
             },
 
             .BATCH_MAP_UPSERT_MAX => {
@@ -1705,6 +1911,7 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = batchMapUpsertMax(
+                    delta_mode,
                     state_base,
                     meta,
                     slot,
@@ -1725,6 +1932,7 @@ pub export fn vm_execute_batch(
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = batchMapUpsertMin(
+                    delta_mode,
                     state_base,
                     meta,
                     slot,
@@ -1742,7 +1950,7 @@ pub export fn vm_execute_batch(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchSetInsert(state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
+                const result = batchSetInsert(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
                 if (result != .OK) return @intFromEnum(result);
             },
 
@@ -1752,7 +1960,7 @@ pub export fn vm_execute_batch(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                batchSetRemove(state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
+                batchSetRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
             },
 
             .BATCH_AGG_SUM => {
@@ -1764,17 +1972,31 @@ pub export fn vm_execute_batch(
                 const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
                 const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
                 // Undo: save previous f64 value (aux) and count (prev_value) before mutation
-                if (g_undo_enabled) undoAppend(.{
-                    .op = .AGG_UPDATE,
-                    .slot = slot,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = 0,
-                    .prev_value = @truncate(count_ptr.*),
-                    .aux = @bitCast(agg_ptr.*),
-                });
                 const old_val = agg_ptr.*;
-                agg_ptr.* += batchAggSum(getColF64(col_ptrs_ptr, val_col), batch_len);
+                const sum_delta = batchAggSum(getColF64(col_ptrs_ptr, val_col), batch_len);
+                const new_val = old_val + sum_delta;
+                if (g_undo_enabled) appendMutation(
+                    delta_mode,
+                    .{
+                        .op = .AGG_UPDATE,
+                        .slot = slot,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = 0,
+                        .prev_value = @truncate(count_ptr.*),
+                        .aux = @bitCast(old_val),
+                    },
+                    .{
+                        .op = .AGG_UPDATE,
+                        .slot = slot,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = 0,
+                        .prev_value = @truncate(count_ptr.*),
+                        .aux = @bitCast(new_val),
+                    },
+                );
+                agg_ptr.* = new_val;
                 if (agg_ptr.* != old_val) setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
             },
 
@@ -1787,15 +2009,29 @@ pub export fn vm_execute_batch(
                 const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
                 if (batch_len > 0) {
                     // Undo: save previous f64 value (aux) and count (prev_value) before mutation
-                    if (g_undo_enabled) undoAppend(.{
-                        .op = .AGG_UPDATE,
-                        .slot = slot,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = 0,
-                        .prev_value = @truncate(count_ptr.*),
-                        .aux = @bitCast(agg_ptr.*),
-                    });
+                    const prev_count = count_ptr.*;
+                    const next_count = prev_count + batch_len;
+                    if (g_undo_enabled) appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .AGG_UPDATE,
+                            .slot = slot,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = 0,
+                            .prev_value = @truncate(prev_count),
+                            .aux = @bitCast(agg_ptr.*),
+                        },
+                        .{
+                            .op = .AGG_UPDATE,
+                            .slot = slot,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = 0,
+                            .prev_value = @truncate(next_count),
+                            .aux = @bitCast(agg_ptr.*),
+                        },
+                    );
                     count_ptr.* += batch_len;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
                 }
@@ -1813,15 +2049,27 @@ pub export fn vm_execute_batch(
                 const new_val = batchAggMin(getColF64(col_ptrs_ptr, val_col), batch_len, agg_ptr.*);
                 if (new_val != old_val) {
                     // Undo: save previous f64 value (aux) and count (prev_value) before mutation
-                    if (g_undo_enabled) undoAppend(.{
-                        .op = .AGG_UPDATE,
-                        .slot = slot,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = 0,
-                        .prev_value = @truncate(count_ptr.*),
-                        .aux = @bitCast(old_val),
-                    });
+                    if (g_undo_enabled) appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .AGG_UPDATE,
+                            .slot = slot,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = 0,
+                            .prev_value = @truncate(count_ptr.*),
+                            .aux = @bitCast(old_val),
+                        },
+                        .{
+                            .op = .AGG_UPDATE,
+                            .slot = slot,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = 0,
+                            .prev_value = @truncate(count_ptr.*),
+                            .aux = @bitCast(new_val),
+                        },
+                    );
                     agg_ptr.* = new_val;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
                 }
@@ -1839,15 +2087,27 @@ pub export fn vm_execute_batch(
                 const new_val = batchAggMax(getColF64(col_ptrs_ptr, val_col), batch_len, agg_ptr.*);
                 if (new_val != old_val) {
                     // Undo: save previous f64 value (aux) and count (prev_value) before mutation
-                    if (g_undo_enabled) undoAppend(.{
-                        .op = .AGG_UPDATE,
-                        .slot = slot,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = 0,
-                        .prev_value = @truncate(count_ptr.*),
-                        .aux = @bitCast(old_val),
-                    });
+                    if (g_undo_enabled) appendMutation(
+                        delta_mode,
+                        .{
+                            .op = .AGG_UPDATE,
+                            .slot = slot,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = 0,
+                            .prev_value = @truncate(count_ptr.*),
+                            .aux = @bitCast(old_val),
+                        },
+                        .{
+                            .op = .AGG_UPDATE,
+                            .slot = slot,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = 0,
+                            .prev_value = @truncate(count_ptr.*),
+                            .aux = @bitCast(new_val),
+                        },
+                    );
                     agg_ptr.* = new_val;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
                 }
@@ -1858,6 +2118,28 @@ pub export fn vm_execute_batch(
     }
 
     return @intFromEnum(ErrorCode.OK);
+}
+
+pub export fn vm_execute_batch(
+    state_base: [*]u8,
+    program_ptr: [*]const u8,
+    program_len: u32,
+    col_ptrs_ptr: [*]const [*]const u8,
+    num_cols: u32,
+    batch_len: u32,
+) u32 {
+    return executeBatchImpl(false, state_base, program_ptr, program_len, col_ptrs_ptr, num_cols, batch_len);
+}
+
+pub export fn vm_execute_batch_delta(
+    state_base: [*]u8,
+    program_ptr: [*]const u8,
+    program_len: u32,
+    col_ptrs_ptr: [*]const [*]const u8,
+    num_cols: u32,
+    batch_len: u32,
+) u32 {
+    return executeBatchImpl(true, state_base, program_ptr, program_len, col_ptrs_ptr, num_cols, batch_len);
 }
 
 // =============================================================================
@@ -2610,4 +2892,63 @@ pub export fn vm_undo_has_overflow() u32 {
     return if (g_undo_overflow) @as(u32, 1) else @as(u32, 0);
 }
 
+pub export fn vm_delta_export_segment(_state_base: [*]u8, from_pos: u32, to_pos: u32) u32 {
+    _ = _state_base;
+    const end = @min(to_pos, g_undo_count);
+    const start = @min(from_pos, end);
+    g_delta_export_start = start;
+    g_delta_export_count = end - start;
+    g_delta_export_overflow = g_undo_overflow;
+    return g_delta_export_count;
+}
 
+pub export fn vm_delta_export_undo_ptr() u32 {
+    return @truncate(@intFromPtr(&g_undo_entries[g_delta_export_start]));
+}
+
+pub export fn vm_delta_export_redo_ptr() u32 {
+    return @truncate(@intFromPtr(&g_redo_entries[g_delta_export_start]));
+}
+
+pub export fn vm_delta_export_len_bytes() u32 {
+    return g_delta_export_count * @as(u32, @sizeOf(FlatUndoEntry));
+}
+
+pub export fn vm_delta_export_entry_size() u32 {
+    return @sizeOf(FlatUndoEntry);
+}
+
+pub export fn vm_delta_export_overflow() u32 {
+    return if (g_delta_export_overflow) @as(u32, 1) else @as(u32, 0);
+}
+
+pub export fn vm_delta_apply_rollback_segment(
+    state_base: [*]u8,
+    undo_segment_ptr: [*]const u8,
+    segment_len_bytes: u32,
+    entry_size: u32,
+) void {
+    if (entry_size != @sizeOf(FlatUndoEntry) or segment_len_bytes % entry_size != 0) return;
+    const count = segment_len_bytes / entry_size;
+    const entries: [*]align(1) const FlatUndoEntry = @ptrCast(undo_segment_ptr);
+    var i = count;
+    while (i > 0) {
+        i -= 1;
+        rollbackEntry(state_base, entries[i]);
+    }
+}
+
+pub export fn vm_delta_apply_rollforward_segment(
+    state_base: [*]u8,
+    redo_segment_ptr: [*]const u8,
+    segment_len_bytes: u32,
+    entry_size: u32,
+) void {
+    if (entry_size != @sizeOf(FlatUndoEntry) or segment_len_bytes % entry_size != 0) return;
+    const count = segment_len_bytes / entry_size;
+    const entries: [*]align(1) const FlatUndoEntry = @ptrCast(redo_segment_ptr);
+    var i: u32 = 0;
+    while (i < count) : (i += 1) {
+        rollbackEntry(state_base, entries[i]);
+    }
+}

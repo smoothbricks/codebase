@@ -180,6 +180,12 @@ export interface ColumineBackend {
    */
   executeBatch(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
 
+  /**
+   * Delta-enabled execution profile for fork journaling.
+   * Emits mutation deltas for rollback/rollforward navigation.
+   */
+  executeBatchDelta?(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number;
+
   // ===========================================================================
   // State Reading
   // ===========================================================================
@@ -238,6 +244,28 @@ export interface ColumineBackend {
    * Used by UndoStage to report overflow status to callers for perf monitoring.
    */
   undoHasOverflow?(): boolean;
+
+  /**
+   * Export delta segment for mutations in [fromPos, toPos).
+   */
+  deltaExportSegment?(state: StateHandle, fromPos: number, toPos: number): DeltaSegmentExport;
+
+  /**
+   * Apply rollback deltas from a previously exported segment.
+   */
+  deltaApplyRollbackSegment?(state: StateHandle, segment: Uint8Array, entrySize: number): void;
+
+  /**
+   * Apply rollforward deltas from a previously exported segment.
+   */
+  deltaApplyRollforwardSegment?(state: StateHandle, segment: Uint8Array, entrySize: number): void;
+}
+
+export interface DeltaSegmentExport {
+  undoBytes: Uint8Array;
+  redoBytes: Uint8Array;
+  entrySize: number;
+  overflow: boolean;
 }
 
 /**
