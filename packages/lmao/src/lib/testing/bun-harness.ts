@@ -42,6 +42,7 @@
  */
 
 import { Database } from 'bun:sqlite';
+import * as bunTest from 'bun:test';
 import {
   afterAll as _afterAll,
   afterEach as _afterEach,
@@ -50,6 +51,7 @@ import {
   describe as _describe,
   expect as _expect,
   it as _it,
+  mock,
 } from 'bun:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
@@ -57,7 +59,6 @@ import type { SpanContext } from '../opContext/spanContextTypes.js';
 import { type OpContext, type OpContextBinding, type OpContextOf, opContextType } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
 import type { LogSchema } from '../schema/LogSchema.js';
-import type { InferSchema } from '../schema/types.js';
 import { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { TestTracer } from '../tracers/TestTracer.js';
@@ -65,6 +66,24 @@ import { TestTracer } from '../tracers/TestTracer.js';
 /** bun:test expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('expect(');
+}
+
+function writeDescribeTag(tag: unknown, describePath: string | null): void {
+  if (!describePath || typeof tag !== 'object' || tag === null) {
+    return;
+  }
+
+  const record = tag as Record<string, unknown>;
+  const describeWriter = record.describe;
+  if (typeof describeWriter === 'function') {
+    describeWriter(describePath);
+    return;
+  }
+
+  const batchWriter = record.with;
+  if (typeof batchWriter === 'function') {
+    batchWriter({ describe: describePath });
+  }
 }
 
 type TestBody = () => unknown | Promise<unknown>;
@@ -97,6 +116,11 @@ export interface BunTestTracerInstance<B extends OpContextBinding> {
   useTestSpan(): HarnessSpanContext<B>;
   getTracer(): TestTracer<BindingWithDescribe<B>>;
   createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown>;
+}
+
+export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTestTracerInstance<B>): void {
+  tracer.setup();
+  mock.module('bun:test', () => tracer.createBunTestMock(bunTest));
 }
 
 /**
@@ -135,9 +159,7 @@ export function makeTestTracer<B extends OpContextBinding>(
   function runTracedTest(name: string, fn: TestBody, describePath: string | null): Promise<unknown> {
     const currentRoot = assertRootCtx();
     return (currentRoot.span as RootSpanRunner<OpContextOf<ExtendedBinding>>)(name, async (ctx) => {
-      if (describePath) {
-        ctx.tag.with({ describe: describePath } as Partial<InferSchema<OpContextOf<ExtendedBinding>['logSchema']>>);
-      }
+      writeDescribeTag(ctx.tag, describePath);
       try {
         await als.run(ctx, fn);
         return ctx.ok(undefined); // pass -> span-ok
@@ -294,7 +316,6 @@ let _rootTracePromise: Promise<unknown> | null = null;
 // Each it() runs in its own async context so concurrent tests don't collide.
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
 type RootSpanInvoker = (name: string, fn: (ctx: SpanContext<OpContext>) => Promise<unknown>) => Promise<unknown>;
-type DescribeTag = { describe: (path: string) => unknown };
 
 /** Initialize the root tracer for the entire bun test run. Call once in preload. */
 export function initTraceTestRun<B extends OpContextBinding>(
@@ -402,7 +423,7 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
     return origIt(name, () =>
       (rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
-        if (describePath) (ctx.tag as unknown as DescribeTag).describe(describePath);
+        writeDescribeTag(ctx.tag, describePath);
         try {
           await als.run(ctx, fn);
           return ctx.ok(undefined); // pass → span-ok
@@ -476,7 +497,7 @@ export function it(name: string, fn: () => void | Promise<void>): void {
   _it(name, () => {
     if (!_rootCtx) throw new Error('Call initTraceTestRun() in preload before tests');
     return (_rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
-      if (describePath) (ctx.tag as unknown as DescribeTag).describe(describePath);
+      writeDescribeTag(ctx.tag, describePath);
       try {
         await _als.run(ctx, fn);
         return ctx.ok(undefined); // pass → span-ok
