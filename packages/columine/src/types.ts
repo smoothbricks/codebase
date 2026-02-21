@@ -33,6 +33,7 @@ export enum SlotType {
   ARRAY = 3,
   CONDITION_TREE = 4,
   STRUCT_MAP = 5,
+  ORDERED_LIST = 6,
 }
 
 export enum StructFieldType {
@@ -41,6 +42,12 @@ export enum StructFieldType {
   FLOAT64 = 2, // 8 bytes
   BOOL = 3, // 1 byte (stored as u8)
   STRING = 4, // 4 bytes (interned u32)
+  // Array types — in-row: 8 bytes (offset:u32 + length:u32 into per-slot arena)
+  ARRAY_U32 = 5,
+  ARRAY_I64 = 6,
+  ARRAY_F64 = 7,
+  ARRAY_STRING = 8,
+  ARRAY_BOOL = 9,
 }
 
 // =============================================================================
@@ -59,7 +66,13 @@ export type SlotDef =
   | { type: SlotType.HASHSET; capacity: number }
   | { type: SlotType.AGGREGATE; aggType: AggType }
   | { type: SlotType.CONDITION_TREE }
-  | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[] };
+  | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[] }
+  | {
+      type: SlotType.ORDERED_LIST;
+      capacity: number;
+      elemType?: StructFieldType;
+      fieldTypes?: readonly StructFieldType[];
+    };
 
 // =============================================================================
 // State Handle - opaque reference to per-instance state
@@ -138,8 +151,17 @@ export enum Opcode {
 
   // Struct map ops (0x18 init, 0x80 batch)
   SLOT_STRUCT_MAP = 0x18, // slot, type_flags, cap_lo, cap_hi, num_fields, [field_type × num_fields]
-  BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot, key_col, num_vals, [val_col, field_idx] × num_vals
-  // Columine's reducer opcodes end at 0x4F (except struct map batch at 0x80)
+  BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot, key_col, num_vals, [val_col, field_idx] × num_vals, num_array_vals, [(offsets_col, values_col, field_idx) × num_array_vals]
+
+  // Ordered list ops
+  SLOT_ORDERED_LIST = 0x19, // slot, type_flags, cap_lo, cap_hi [, num_fields, field_type × num_fields]
+  LIST_APPEND = 0x84, // slot, val_col
+  LIST_APPEND_STRUCT = 0x85, // slot, num_vals, [(val_col, field_idx) × N]
+
+  // Block-based reduce opcodes (body opcodes use same values as BATCH_* but process one element)
+  FOR_EACH_EVENT = 0xe0, // type_col, type_id (u32 LE: 4 bytes), body_len (u16 LE: 2 bytes)
+  FLAT_MAP = 0xe1, // offsets_col, parent_ts_col, inner_body_len (u16 LE: 2 bytes)
+  // Columine's reducer opcodes end at 0x4F (except struct map at 0x80+, blocks at 0xE0+)
 }
 
 // =============================================================================

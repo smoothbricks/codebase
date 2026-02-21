@@ -178,9 +178,11 @@ This repo uses a strict policy:
 
 ---
 
-## 🔍 CRITICAL ANALYSIS APPROACH - SPECS ARE NOT SACRED
+## 🔍 CRITICAL ANALYSIS APPROACH - SPECS EVOLVE BUT MUST BE IMPLEMENTED
 
-**SPECS EVOLVE AND MAY BE WRONG** - The agent must actively critique and improve specifications:
+**SPECS EVOLVE AND MAY BE WRONG** - The agent must actively critique and improve specifications. But "critique" means
+"build the better version," not "skip building." Every spec'd capability must be implemented or explicitly replaced by a
+superior alternative that is also implemented.
 
 ### Spec Consistency Review Agent Requirements
 
