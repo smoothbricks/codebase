@@ -16,7 +16,7 @@ export { Op } from './lib/op.js';
 
 export { Blocked, type BlockedConfig, type BlockedReason } from './lib/errors/Blocked.js';
 export type { Result, TaggedError, TaggedErrorConstructor } from './lib/result.js';
-export { Err, hasErrorCode, Ok } from './lib/result.js';
+export { defineCodeError, Err, hasErrorCode, Ok } from './lib/result.js';
 
 // Tagged Error Types - tree-shakable subpath exports:
 // import { Blocked } from '@smoothbricks/lmao/errors/Blocked'
