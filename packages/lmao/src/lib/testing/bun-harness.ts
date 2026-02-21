@@ -118,9 +118,29 @@ export interface BunTestTracerInstance<B extends OpContextBinding> {
   createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown>;
 }
 
+export interface BunTestSuiteTracer<B extends OpContextBinding> {
+  useTestTracer: BunTestTracerInstance<B>;
+  useTestSpan(): HarnessSpanContext<B>;
+  setupBunTestSuiteTracing(): void;
+}
+
 export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTestTracerInstance<B>): void {
   tracer.setup();
   mock.module('bun:test', () => tracer.createBunTestMock(bunTest));
+}
+
+export function makeBunTestSuiteTracer<B extends OpContextBinding>(
+  binding: B,
+  options?: {
+    sqlite?: TraceSQLiteConfig;
+  },
+): BunTestSuiteTracer<B> {
+  const useTestTracer = makeTestTracer(binding, options);
+  return {
+    useTestTracer,
+    useTestSpan: () => useTestTracer.useTestSpan(),
+    setupBunTestSuiteTracing: () => installBunTestTracing(useTestTracer),
+  };
 }
 
 /**
