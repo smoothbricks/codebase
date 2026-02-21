@@ -133,6 +133,27 @@ export type VitestTestTracer<B extends OpContextBinding> = {
   it(name: string, fn: () => void | Promise<void>): void;
 };
 
+export type VitestTestSuiteTracer<B extends OpContextBinding> = {
+  useTestTracer: VitestTestTracer<B>;
+  useTestSpan(): SpanCtx<B>;
+  setupVitestTestSuiteTracing(): void;
+};
+
+export function installVitestTestTracing<B extends OpContextBinding>(tracer: VitestTestTracer<B>): void {
+  tracer.initTraceTestRun();
+}
+
+export function makeVitestTestSuiteTracer<B extends OpContextBinding>(
+  config: VitestHarnessConfig<B>,
+): VitestTestSuiteTracer<B> {
+  const useTestTracer = makeVitestTestTracer(config);
+  return {
+    useTestTracer,
+    useTestSpan: () => useTestTracer.useTestSpan(),
+    setupVitestTestSuiteTracing: () => installVitestTestTracing(useTestTracer),
+  };
+}
+
 function tagDescribePath(ctx: { tag: unknown }, describePath: string | null): void {
   if (!describePath) {
     return;
