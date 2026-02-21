@@ -301,7 +301,12 @@ pub const ErrorCode = enum(u32) {
     INVALID_PROGRAM = 2,
     INVALID_SLOT = 3,
     INVALID_STATE = 4,
+    NEEDS_GROWTH = 5,
 };
+
+// Tracks which slot triggered CAPACITY_EXCEEDED so JS can grow it.
+// Set by executeBatchImpl, read by vm_get_needs_growth_slot.
+var g_needs_growth_slot: u8 = 0xFF;
 
 // =============================================================================
 // Hash Function
@@ -1828,6 +1833,17 @@ fn executeBatchImpl(
         }
     }.f;
 
+    // Helper: convert CAPACITY_EXCEEDED to NEEDS_GROWTH, tracking the slot index
+    const signalGrowth = struct {
+        fn check(slot_idx: u8, result: ErrorCode) u32 {
+            if (result == .CAPACITY_EXCEEDED) {
+                g_needs_growth_slot = slot_idx;
+                return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+            }
+            return @intFromEnum(result);
+        }
+    }.check;
+
     var pc: usize = 0;
     while (pc < code.len) {
         const op: Opcode = @enumFromInt(code[pc]);
@@ -1854,7 +1870,7 @@ fn executeBatchImpl(
                     getColF64(col_ptrs_ptr, ts_col),
                     batch_len,
                 );
-                if (result != .OK) return @intFromEnum(result);
+                if (result != .OK) return signalGrowth(slot, result);
             },
 
             .BATCH_MAP_UPSERT_FIRST => {
@@ -1873,7 +1889,7 @@ fn executeBatchImpl(
                     getColU32(col_ptrs_ptr, val_col),
                     batch_len,
                 );
-                if (result != .OK) return @intFromEnum(result);
+                if (result != .OK) return signalGrowth(slot, result);
             },
 
             .BATCH_MAP_UPSERT_LAST => {
@@ -1892,7 +1908,7 @@ fn executeBatchImpl(
                     getColU32(col_ptrs_ptr, val_col),
                     batch_len,
                 );
-                if (result != .OK) return @intFromEnum(result);
+                if (result != .OK) return signalGrowth(slot, result);
             },
 
             .BATCH_MAP_REMOVE => {
@@ -1922,7 +1938,7 @@ fn executeBatchImpl(
                     getColF64(col_ptrs_ptr, cmp_col),
                     batch_len,
                 );
-                if (result != .OK) return @intFromEnum(result);
+                if (result != .OK) return signalGrowth(slot, result);
             },
 
             .BATCH_MAP_UPSERT_MIN => {
@@ -1943,7 +1959,7 @@ fn executeBatchImpl(
                     getColF64(col_ptrs_ptr, cmp_col),
                     batch_len,
                 );
-                if (result != .OK) return @intFromEnum(result);
+                if (result != .OK) return signalGrowth(slot, result);
             },
 
             .BATCH_SET_INSERT => {
@@ -1953,7 +1969,7 @@ fn executeBatchImpl(
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = batchSetInsert(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
-                if (result != .OK) return @intFromEnum(result);
+                if (result != .OK) return signalGrowth(slot, result);
             },
 
             .BATCH_SET_REMOVE => {
