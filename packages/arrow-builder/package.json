@@ -50,16 +50,6 @@
           "{projectRoot}/dist"
         ]
       },
-      "typecheck-tests": {
-        "executor": "nx:run-commands",
-        "options": {
-          "command": "tsc --noEmit -p tsconfig.test.json",
-          "cwd": "packages/arrow-builder"
-        },
-        "dependsOn": [
-          "build"
-        ]
-      },
       "test": {
         "executor": "nx:run-commands",
         "options": {
