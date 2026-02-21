@@ -183,7 +183,8 @@ pub const SlotType = enum(u4) {
     AGGREGATE = 2,
     ARRAY = 3, // For `.within()` without keyBy - stores array of events
     CONDITION_TREE = 4, // Condition router tree (VM handlers: Phase 37)
-    // Room for 11 more types (5-15) without needing TTL variants
+    STRUCT_MAP = 5, // Multi-field hash map with per-row bitset
+    // Room for 10 more types (6-15) without needing TTL variants
 };
 
 pub const SlotTypeFlags = packed struct(u8) {
@@ -206,6 +207,14 @@ pub const AggType = enum(u32) {
     COUNT = 2,
     MIN = 3,
     MAX = 4,
+};
+
+pub const StructFieldType = enum(u8) {
+    UINT32 = 0, // 4 bytes
+    INT64 = 1, // 8 bytes
+    FLOAT64 = 2, // 8 bytes
+    BOOL = 3, // 1 byte (stored as u8)
+    STRING = 4, // 4 bytes (interned u32)
 };
 
 // =============================================================================
@@ -287,6 +296,12 @@ pub const Opcode = enum(u8) {
     BATCH_AGG_COUNT = 0x41, // slot:u8
     BATCH_AGG_MIN = 0x42, // slot:u8, val_col:u8
     BATCH_AGG_MAX = 0x43, // slot:u8, val_col:u8
+
+    // Struct map init (variable-length: base 6 bytes + num_fields)
+    SLOT_STRUCT_MAP = 0x18, // slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8, [field_type:u8 x num_fields]
+
+    // Struct map batch ops
+    BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot:u8, key_col:u8, num_vals:u8, [val_col:u8, field_idx:u8] x num_vals
 
     _,
 };
@@ -898,6 +913,9 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
         },
         .CONDITION_TREE => {
             removeConditionTreeEntry(state_base, meta, key);
+        },
+        .STRUCT_MAP => {
+            // TTL eviction not yet supported for struct maps
         },
     }
 }
@@ -2131,6 +2149,119 @@ fn executeBatchImpl(
                 }
             },
 
+            .BATCH_STRUCT_MAP_UPSERT_LAST => {
+                const slot = code[pc];
+                const key_col = code[pc + 1];
+                const num_vals = code[pc + 2];
+                pc += 3;
+
+                // Read (val_col, field_idx) pairs — max 32 fields
+                var val_cols: [32]u8 = undefined;
+                var field_idxs: [32]u8 = undefined;
+                for (0..num_vals) |vi| {
+                    val_cols[vi] = code[pc];
+                    field_idxs[vi] = code[pc + 1];
+                    pc += 2;
+                }
+
+                const meta_base = STATE_HEADER_SIZE + @as(u32, slot) * SLOT_META_SIZE;
+                const slot_offset = std.mem.readInt(u32, state_base[meta_base..][0..4], .little);
+                const capacity = std.mem.readInt(u32, state_base[meta_base + 4 ..][0..4], .little);
+                var current_size = std.mem.readInt(u32, state_base[meta_base + 8 ..][0..4], .little);
+                const num_fields = state_base[meta_base + 13];
+                const bitset_bytes_val: u32 = state_base[meta_base + 15];
+                const row_size: u32 = std.mem.readInt(u16, state_base[meta_base + 16 ..][0..2], .little);
+
+                // Read field types from slot data prefix
+                const field_types_ptr: [*]u8 = state_base + slot_offset;
+                const descriptor_size = align8(@as(u32, num_fields));
+
+                const keys_offset = slot_offset + descriptor_size;
+                const keys: [*]u32 = @ptrCast(@alignCast(&state_base[keys_offset]));
+                const rows_base = keys_offset + capacity * 4;
+
+                const max_size = (capacity * 7) / 10;
+
+                const key_data = getColU32(col_ptrs_ptr, key_col);
+
+                var i: u32 = 0;
+                while (i < batch_len) : (i += 1) {
+                    const key = key_data[i];
+                    if (key == EMPTY_KEY or key == TOMBSTONE) continue;
+
+                    // Hash probe
+                    var pos = hashKey(key, capacity);
+                    var found = false;
+                    while (true) {
+                        const k = keys[pos];
+                        if (k == EMPTY_KEY) break; // insert at empty
+                        if (k == key) {
+                            found = true;
+                            break;
+                        } // update existing
+                        if (k == TOMBSTONE) break; // reuse tombstone
+                        pos = (pos + 1) & (capacity - 1);
+                    }
+
+                    if (!found) {
+                        if (current_size >= max_size) {
+                            // Commit progress so far
+                            std.mem.writeInt(u32, state_base[meta_base + 8 ..][0..4], current_size, .little);
+                            if (comptime delta_mode) {
+                                state_base[meta_base + 14] |= 0x01;
+                            }
+                            g_needs_growth_slot = slot;
+                            return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                        }
+                        keys[pos] = key;
+                        current_size += 1;
+                    }
+
+                    // Write row data
+                    const row_ptr = state_base + rows_base + pos * row_size;
+
+                    // Clear bitset
+                    @memset(row_ptr[0..bitset_bytes_val], 0);
+
+                    // Write each provided field value
+                    for (0..num_vals) |vi| {
+                        const field_idx = field_idxs[vi];
+                        const field_type: StructFieldType = @enumFromInt(field_types_ptr[field_idx]);
+                        const f_offset = structFieldOffset(num_fields, field_types_ptr, field_idx);
+
+                        // Set bit in bitset
+                        row_ptr[field_idx / 8] |= @as(u8, 1) << @as(u3, @truncate(field_idx % 8));
+
+                        // Write value based on field type
+                        switch (field_type) {
+                            .UINT32, .STRING => {
+                                const col = getColU32(col_ptrs_ptr, val_cols[vi]);
+                                std.mem.writeInt(u32, row_ptr[f_offset..][0..4], col[i], .little);
+                            },
+                            .INT64 => {
+                                const col: [*]const u64 = @ptrCast(@alignCast(col_ptrs_ptr[val_cols[vi]]));
+                                std.mem.writeInt(u64, row_ptr[f_offset..][0..8], col[i], .little);
+                            },
+                            .FLOAT64 => {
+                                const col: [*]const f64 = @ptrCast(@alignCast(col_ptrs_ptr[val_cols[vi]]));
+                                const bits: u64 = @bitCast(col[i]);
+                                std.mem.writeInt(u64, row_ptr[f_offset..][0..8], bits, .little);
+                            },
+                            .BOOL => {
+                                const col = getColU32(col_ptrs_ptr, val_cols[vi]);
+                                row_ptr[f_offset] = if (col[i] != 0) 1 else 0;
+                            },
+                        }
+                    }
+                }
+
+                // Commit size and change flags
+                std.mem.writeInt(u32, state_base[meta_base + 8 ..][0..4], current_size, .little);
+                if (comptime delta_mode) {
+                    state_base[meta_base + 14] |= 0x01; // change_flags
+                }
+            },
+
             else => return @intFromEnum(ErrorCode.INVALID_PROGRAM),
         }
     }
@@ -2319,6 +2450,10 @@ pub export fn vm_calculate_state_size(
                     .CONDITION_TREE => {
                         size += CONDITION_TREE_STATE_BYTES;
                     },
+                    .STRUCT_MAP => {
+                        // STRUCT_MAP uses its own SLOT_STRUCT_MAP opcode, not SLOT_DEF
+                        // This branch should not be reached, but handle gracefully
+                    },
                 }
                 size = align8(size);
 
@@ -2349,6 +2484,37 @@ pub export fn vm_calculate_state_size(
                 // values (u32) + timestamps (f64)
                 size += capacity * 4 + capacity * 8;
                 size = align8(size);
+            },
+
+            .SLOT_STRUCT_MAP => {
+                const type_flags = SlotTypeFlags.fromByte(init_code[pc + 1]);
+                const cap_lo = init_code[pc + 2];
+                const cap_hi = init_code[pc + 3];
+                const num_fields = init_code[pc + 4];
+                pc += 5;
+
+                var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
+                if (capacity == 0) capacity = 1024;
+                capacity = nextPowerOf2(capacity * 2);
+
+                // Read field types from bytecode
+                const field_types_ptr: [*]const u8 = @ptrCast(init_code[pc..].ptr);
+                pc += num_fields;
+
+                const layout = computeStructRowLayout(num_fields, field_types_ptr);
+                size += getStructMapSlotDataSize(layout.descriptor_size, capacity, layout.row_size, false);
+                size = align8(size);
+
+                // TTL eviction storage (if applicable)
+                if (type_flags.has_ttl) {
+                    size += capacity * @sizeOf(EvictionEntry);
+                    size = align8(size);
+                    if (type_flags.has_evict_trigger) {
+                        const evicted_buffer_capacity: u32 = 1024;
+                        size += evicted_buffer_capacity * @sizeOf(EvictionEntry);
+                        size = align8(size);
+                    }
+                }
             },
             .HALT => break,
             else => break,
@@ -2564,6 +2730,9 @@ pub export fn vm_init_state(
 
                         data_offset += capacity * 4 + capacity * 8;
                     },
+                    .STRUCT_MAP => {
+                        // STRUCT_MAP uses its own SLOT_STRUCT_MAP opcode, not SLOT_DEF
+                    },
                 }
                 data_offset = align8(data_offset);
 
@@ -2642,6 +2811,59 @@ pub export fn vm_init_state(
                 data_offset = align8(data_offset);
 
                 writeSlotMeta(state_ptr, slot, primary_offset, capacity, type_flags, .SUM, 0.0, 0.0, 0, .NONE, 0, 0, 0);
+            },
+
+            .SLOT_STRUCT_MAP => {
+                const slot = init_code[pc];
+                const type_flags = SlotTypeFlags.fromByte(init_code[pc + 1]);
+                const cap_lo = init_code[pc + 2];
+                const cap_hi = init_code[pc + 3];
+                const num_fields = init_code[pc + 4];
+                pc += 5;
+
+                var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
+                if (capacity == 0) capacity = 1024;
+                capacity = nextPowerOf2(capacity * 2);
+
+                // Read field types from bytecode
+                const field_types_ptr: [*]const u8 = @ptrCast(init_code[pc..].ptr);
+                pc += num_fields;
+
+                const layout = computeStructRowLayout(num_fields, field_types_ptr);
+
+                const meta_base = STATE_HEADER_SIZE + @as(u32, slot) * SLOT_META_SIZE;
+
+                // Write slot metadata
+                std.mem.writeInt(u32, state_ptr[meta_base..][0..4], data_offset, .little);
+                std.mem.writeInt(u32, state_ptr[meta_base + 4 ..][0..4], capacity, .little);
+                std.mem.writeInt(u32, state_ptr[meta_base + 8 ..][0..4], 0, .little); // size = 0
+                state_ptr[meta_base + 12] = type_flags.toByte();
+                state_ptr[meta_base + 13] = num_fields; // reuse AGG_TYPE byte for num_fields
+                state_ptr[meta_base + 14] = 0; // change_flags
+                state_ptr[meta_base + 15] = @truncate(layout.bitset_bytes); // reuse TIMESTAMP_FIELD_IDX for bitset_bytes
+                std.mem.writeInt(u16, state_ptr[meta_base + 16 ..][0..2], @truncate(layout.row_size), .little); // reuse TTL_SECONDS low bytes for row_size
+                state_ptr[meta_base + 18] = 0; // has_timestamps (0 for UPSERT_LAST)
+                // Clear remaining metadata bytes
+                for (19..SLOT_META_SIZE) |off| {
+                    state_ptr[meta_base + off] = 0;
+                }
+
+                // Write field types as prefix of slot data
+                @memcpy(state_ptr[data_offset .. data_offset + num_fields], field_types_ptr[0..num_fields]);
+
+                // Initialize keys to EMPTY_KEY
+                const keys_offset = data_offset + layout.descriptor_size;
+                const keys: [*]u32 = @ptrCast(@alignCast(&state_ptr[keys_offset]));
+                for (0..capacity) |ki| {
+                    keys[ki] = EMPTY_KEY;
+                }
+
+                // Zero the rows region
+                const rows_offset = keys_offset + capacity * 4;
+                @memset(state_ptr[rows_offset .. rows_offset + capacity * layout.row_size], 0);
+
+                data_offset += getStructMapSlotDataSize(layout.descriptor_size, capacity, layout.row_size, false);
+                data_offset = align8(data_offset);
             },
             .HALT => break,
             else => break,
@@ -2802,6 +3024,89 @@ pub export fn vm_set_iter_get(
 ) u32 {
     const data_ptr = state_base + slot_offset;
     const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
+    return keys[pos];
+}
+
+// =============================================================================
+// Struct Map Read/Iteration Exports
+// =============================================================================
+
+/// Look up a key in a struct map. Returns the absolute byte offset of the row
+/// (from state_base start) or 0xFFFFFFFF if not found.
+/// JS side reads num_fields, row_size from slot metadata and passes them in.
+pub export fn vm_struct_map_get_row_ptr(
+    state_base_ptr: [*]const u8,
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    row_size: u32,
+    key: u32,
+) u32 {
+    const descriptor_size = align8(num_fields);
+    const keys_offset = slot_offset + descriptor_size;
+    const keys: [*]const u32 = @ptrCast(@alignCast(&state_base_ptr[keys_offset]));
+    const rows_base = keys_offset + capacity * 4;
+
+    var pos = hashKey(key, capacity);
+    while (true) {
+        const k = keys[pos];
+        if (k == EMPTY_KEY) return 0xFFFFFFFF;
+        if (k == key) return rows_base + pos * row_size;
+        if (k == TOMBSTONE) {
+            pos = (pos + 1) & (capacity - 1);
+            continue;
+        }
+        pos = (pos + 1) & (capacity - 1);
+    }
+}
+
+/// Struct map iteration — find first occupied slot index.
+/// Returns slot index or capacity (end sentinel).
+pub export fn vm_struct_map_iter_start(
+    state_base_ptr: [*]const u8,
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+) u32 {
+    const descriptor_size = align8(num_fields);
+    const keys_offset = slot_offset + descriptor_size;
+    const keys: [*]const u32 = @ptrCast(@alignCast(&state_base_ptr[keys_offset]));
+    var pos: u32 = 0;
+    while (pos < capacity) : (pos += 1) {
+        if (keys[pos] != EMPTY_KEY and keys[pos] != TOMBSTONE) return pos;
+    }
+    return capacity; // end sentinel
+}
+
+/// Struct map iteration — advance to next occupied slot index.
+/// Returns next slot index or capacity (end sentinel).
+pub export fn vm_struct_map_iter_next(
+    state_base_ptr: [*]const u8,
+    slot_offset: u32,
+    capacity: u32,
+    num_fields: u32,
+    current: u32,
+) u32 {
+    const descriptor_size = align8(num_fields);
+    const keys_offset = slot_offset + descriptor_size;
+    const keys: [*]const u32 = @ptrCast(@alignCast(&state_base_ptr[keys_offset]));
+    var pos = current + 1;
+    while (pos < capacity) : (pos += 1) {
+        if (keys[pos] != EMPTY_KEY and keys[pos] != TOMBSTONE) return pos;
+    }
+    return capacity;
+}
+
+/// Get key at struct map iterator position.
+pub export fn vm_struct_map_iter_key(
+    state_base_ptr: [*]const u8,
+    slot_offset: u32,
+    num_fields: u32,
+    pos: u32,
+) u32 {
+    const descriptor_size = align8(num_fields);
+    const keys_offset = slot_offset + descriptor_size;
+    const keys: [*]const u32 = @ptrCast(@alignCast(&state_base_ptr[keys_offset]));
     return keys[pos];
 }
 
@@ -2994,14 +3299,56 @@ pub export fn vm_get_needs_growth_slot() u32 {
 }
 
 /// Compute data size for a slot given its type and capacity.
+/// NOTE: STRUCT_MAP (type 5) returns 0 here — use getStructMapSlotDataSize instead
+/// (needs row_size from metadata).
 fn getSlotDataSize(slot_type: u4, capacity: u32) u32 {
     return switch (slot_type) {
         0 => capacity * 4 + capacity * 4 + capacity * 8, // HASHMAP: keys + values + timestamps
         1 => capacity * 4, // HASHSET: keys only
         2 => 16, // AGGREGATE: f64 value + u64 count
         4 => 8, // CONDITION_TREE: generation(u32) + last_removed_key(u32)
+        5 => 0, // STRUCT_MAP: use getStructMapSlotDataSize (needs row_size from metadata)
         else => 0,
     };
+}
+
+/// Compute data region size for a STRUCT_MAP slot.
+/// Layout: [field_types x num_fields padded to 4] + [keys u32 x capacity] + [rows x capacity]
+fn getStructMapSlotDataSize(descriptor_size: u32, capacity: u32, row_size: u32, has_timestamps: bool) u32 {
+    return descriptor_size + capacity * 4 + capacity * row_size + if (has_timestamps) capacity * 8 else 0;
+}
+
+fn structFieldSize(ft: StructFieldType) u32 {
+    return switch (ft) {
+        .UINT32, .STRING => 4,
+        .INT64, .FLOAT64 => 8,
+        .BOOL => 1,
+    };
+}
+
+/// Compute row size (bitset + field data) from field types stored in slot data prefix.
+/// Returns: { row_size, bitset_bytes, descriptor_size }
+fn computeStructRowLayout(num_fields: u8, field_types_ptr: [*]const u8) struct { row_size: u32, bitset_bytes: u32, descriptor_size: u32 } {
+    const bitset_bytes: u32 = ((@as(u32, num_fields) + 7) / 8);
+    var row_data: u32 = bitset_bytes;
+    for (0..num_fields) |i| {
+        row_data += structFieldSize(@enumFromInt(field_types_ptr[i]));
+    }
+    // Align row to 4 bytes for clean addressing
+    const row_size = (row_data + 3) & ~@as(u32, 3);
+    // Descriptor: num_fields bytes of field types, aligned to 4
+    const descriptor_size = align8(@as(u32, num_fields));
+    return .{ .row_size = row_size, .bitset_bytes = bitset_bytes, .descriptor_size = descriptor_size };
+}
+
+/// Compute byte offset of a field within a row (after bitset).
+fn structFieldOffset(num_fields: u8, field_types_ptr: [*]const u8, target_field: u8) u32 {
+    const bitset_bytes: u32 = ((@as(u32, num_fields) + 7) / 8);
+    var offset: u32 = bitset_bytes;
+    for (0..target_field) |i| {
+        offset += structFieldSize(@enumFromInt(field_types_ptr[i]));
+    }
+    return offset;
 }
 
 /// Compute state size with 2× capacity for the slot at `grown_slot_idx`.
@@ -3027,7 +3374,16 @@ pub export fn vm_calculate_grown_state_size(
         const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
 
         const cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
-        total_size += getSlotDataSize(slot_type, cap);
+        if (slot_type == 5) {
+            // STRUCT_MAP: read struct-specific metadata
+            const nf: u32 = old_state_ptr[meta_base + 13];
+            const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
+            const has_ts = old_state_ptr[meta_base + 18] != 0;
+            const desc_size = align8(nf);
+            total_size += getStructMapSlotDataSize(desc_size, cap, rs, has_ts);
+        } else {
+            total_size += getSlotDataSize(slot_type, cap);
+        }
         total_size = (total_size + 7) & ~@as(u32, 7);
     }
 
@@ -3065,7 +3421,14 @@ pub export fn vm_grow_state(
 
         const new_cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
         const new_offset = data_cursor;
-        const new_data_size = getSlotDataSize(slot_type, new_cap);
+
+        // Compute data size (STRUCT_MAP needs metadata-based calculation)
+        const new_data_size = if (slot_type == 5) blk: {
+            const nf: u32 = old_state_ptr[meta_base + 13];
+            const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
+            const has_ts = old_state_ptr[meta_base + 18] != 0;
+            break :blk getStructMapSlotDataSize(align8(nf), new_cap, rs, has_ts);
+        } else getSlotDataSize(slot_type, new_cap);
 
         // Write metadata: offset, capacity, size (size updated below for grown)
         std.mem.writeInt(u32, new_state_ptr[meta_base..][0..4], new_offset, .little);
@@ -3125,6 +3488,45 @@ pub export fn vm_grow_state(
                     }
                 }
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
+            } else if (slot_type == 5) {
+                // STRUCT_MAP: copy field type descriptor, init keys to EMPTY_KEY, rehash rows
+                const nf: u32 = old_state_ptr[meta_base + 13];
+                const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
+                const desc_size = align8(nf);
+
+                // Copy field type descriptor prefix
+                @memcpy(new_state_ptr[new_offset .. new_offset + nf], old_state_ptr[old_offset .. old_offset + nf]);
+
+                // Initialize new keys to EMPTY_KEY
+                const new_keys_off = new_offset + desc_size;
+                const new_keys: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_keys_off]));
+                for (0..new_cap) |ki| {
+                    new_keys[ki] = EMPTY_KEY;
+                }
+                const new_rows_base = new_keys_off + new_cap * 4;
+
+                // Rehash from old
+                const old_keys_off = old_offset + desc_size;
+                const old_keys: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_keys_off]));
+                const old_rows_base = old_keys_off + old_cap * 4;
+
+                var rehashed_size: u32 = 0;
+                for (0..old_cap) |oi| {
+                    const key = old_keys[oi];
+                    if (key != EMPTY_KEY and key != TOMBSTONE) {
+                        var pos = hashKey(key, new_cap);
+                        while (new_keys[pos] != EMPTY_KEY) {
+                            pos = (pos + 1) & (new_cap - 1);
+                        }
+                        new_keys[pos] = key;
+                        // Copy row data
+                        const old_row = old_rows_base + @as(u32, @truncate(oi)) * rs;
+                        const new_row = new_rows_base + pos * rs;
+                        @memcpy(new_state_ptr[new_row .. new_row + rs], old_state_ptr[old_row .. old_row + rs]);
+                        rehashed_size += 1;
+                    }
+                }
+                std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
             } else {
                 // Non-hash slot: copy data (aggregates/condition trees shouldn't be grown)
                 const old_data_size = getSlotDataSize(slot_type, old_cap);
@@ -3135,7 +3537,12 @@ pub export fn vm_grow_state(
             }
         } else {
             // Non-grown slot: memcpy data as-is
-            const data_size = getSlotDataSize(slot_type, old_cap);
+            const data_size = if (slot_type == 5) blk: {
+                const nf: u32 = old_state_ptr[meta_base + 13];
+                const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
+                const has_ts = old_state_ptr[meta_base + 18] != 0;
+                break :blk getStructMapSlotDataSize(align8(nf), old_cap, rs, has_ts);
+            } else getSlotDataSize(slot_type, old_cap);
             if (data_size > 0) {
                 @memcpy(new_state_ptr[new_offset .. new_offset + data_size], old_state_ptr[old_offset .. old_offset + data_size]);
             }
@@ -3477,6 +3884,397 @@ test "slot growth - hashset growth preserves elements" {
         prog.len,
         @ptrCast(&col_ptrs_12),
         1,
+        1,
+    );
+    try std.testing.expectEqual(@as(u32, 0), insert_result);
+}
+
+// =============================================================================
+// Tests — Struct Map
+// =============================================================================
+
+/// Build a program with one STRUCT_MAP slot (2 fields: UINT32 + STRING)
+/// and BATCH_STRUCT_MAP_UPSERT_LAST that maps both fields.
+fn buildStructMapTestProgram(comptime cap_lo: u8, comptime cap_hi: u8) [80]u8 {
+    var prog = [_]u8{0} ** 80;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+    // Magic "CLM1"
+    content[0] = 0x41; // 'A'
+    content[1] = 0x58; // 'X'
+    content[2] = 0x45; // 'E'
+    content[3] = 0x31; // '1'
+    // Version: 1.0
+    content[4] = 1;
+    content[5] = 0;
+    // num_slots = 1, num_inputs = 3
+    content[6] = 1;
+    content[7] = 3;
+    // reserved
+    content[8] = 0;
+    content[9] = 0;
+    // Init section: SLOT_STRUCT_MAP opcode(1) + slot(1) + type_flags(1) + cap_lo(1) + cap_hi(1)
+    //               + num_fields(1) + field_types(2) = 8 bytes
+    const init_len: u16 = 8;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+    // Reduce section: BATCH_STRUCT_MAP_UPSERT_LAST opcode(1) + slot(1) + key_col(1) + num_vals(1)
+    //                 + 2x (val_col(1) + field_idx(1)) = 8 bytes
+    const reduce_len: u16 = 8;
+    content[12] = @truncate(reduce_len);
+    content[13] = @truncate(reduce_len >> 8);
+
+    // Init section at content[14]
+    var off: usize = 14;
+    // SLOT_STRUCT_MAP
+    content[off] = 0x18; // SLOT_STRUCT_MAP opcode
+    content[off + 1] = 0; // slot index
+    content[off + 2] = 0x05; // type_flags: STRUCT_MAP=5, no TTL
+    content[off + 3] = cap_lo;
+    content[off + 4] = cap_hi;
+    content[off + 5] = 2; // num_fields = 2
+    content[off + 6] = 0; // field 0: UINT32
+    content[off + 7] = 4; // field 1: STRING (interned u32)
+    off += 8;
+
+    // Reduce section at content[14 + init_len]
+    const reduce_start = 14 + init_len;
+    // BATCH_STRUCT_MAP_UPSERT_LAST slot=0, key_col=0, num_vals=2
+    content[reduce_start] = 0x80;
+    content[reduce_start + 1] = 0; // slot
+    content[reduce_start + 2] = 0; // key_col
+    content[reduce_start + 3] = 2; // num_vals
+    // val_col=1, field_idx=0 (UINT32 field)
+    content[reduce_start + 4] = 1;
+    content[reduce_start + 5] = 0;
+    // val_col=2, field_idx=1 (STRING field)
+    content[reduce_start + 6] = 2;
+    content[reduce_start + 7] = 1;
+
+    return prog;
+}
+
+test "struct map - init, upsert, and read back" {
+    var prog = buildStructMapTestProgram(4, 0);
+
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    try std.testing.expect(state_size > 0);
+
+    var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    std.debug.assert(state_size <= 8192);
+
+    const init_result = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+    try std.testing.expectEqual(@as(u32, 0), init_result);
+
+    // Verify slot metadata
+    const meta_base = STATE_HEADER_SIZE;
+    const capacity = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+    try std.testing.expect(capacity >= 16); // nextPowerOf2(4*2) = 16
+
+    const num_fields = state_buf[meta_base + 13];
+    try std.testing.expectEqual(@as(u8, 2), num_fields);
+
+    const row_size: u32 = std.mem.readInt(u16, state_buf[meta_base + 16 ..][0..2], .little);
+    // 2 fields: bitset=1 byte, UINT32=4 bytes, STRING=4 bytes => 9 bytes, aligned to 4 => 12
+    try std.testing.expectEqual(@as(u32, 12), row_size);
+
+    // Insert 3 entries: key=100 (val=42, str=1001), key=200 (val=99, str=1002), key=300 (val=7, str=1003)
+    var key_col = [3]u32{ 100, 200, 300 };
+    var val_col = [3]u32{ 42, 99, 7 };
+    var str_col = [3]u32{ 1001, 1002, 1003 };
+    const key_ptr: [*]const u8 = @ptrCast(&key_col);
+    const val_ptr: [*]const u8 = @ptrCast(&val_col);
+    const str_ptr: [*]const u8 = @ptrCast(&str_col);
+    const col_ptrs = [3][*]const u8{ key_ptr, val_ptr, str_ptr };
+
+    const exec_result = vm_execute_batch(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs),
+        3,
+        3,
+    );
+    try std.testing.expectEqual(@as(u32, 0), exec_result);
+
+    // Verify size = 3
+    const size_after = std.mem.readInt(u32, state_buf[meta_base + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 3), size_after);
+
+    // Read back via vm_struct_map_get_row_ptr
+    const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
+    const row_off_100 = vm_struct_map_get_row_ptr(
+        @ptrCast(&state_buf),
+        slot_offset,
+        capacity,
+        num_fields,
+        row_size,
+        100,
+    );
+    try std.testing.expect(row_off_100 != 0xFFFFFFFF);
+
+    // Check bitset: both fields set => byte 0 should have bits 0 and 1 set = 0x03
+    try std.testing.expectEqual(@as(u8, 0x03), state_buf[row_off_100]);
+    // Field 0 (UINT32) at offset 1 (after 1-byte bitset) => value 42
+    const f0_val = std.mem.readInt(u32, state_buf[row_off_100 + 1 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 42), f0_val);
+    // Field 1 (STRING) at offset 5 => value 1001
+    const f1_val = std.mem.readInt(u32, state_buf[row_off_100 + 5 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1001), f1_val);
+
+    // Check key=200
+    const row_off_200 = vm_struct_map_get_row_ptr(
+        @ptrCast(&state_buf),
+        slot_offset,
+        capacity,
+        num_fields,
+        row_size,
+        200,
+    );
+    try std.testing.expect(row_off_200 != 0xFFFFFFFF);
+    const f0_val_200 = std.mem.readInt(u32, state_buf[row_off_200 + 1 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 99), f0_val_200);
+
+    // Check non-existent key returns NOT_FOUND
+    const row_off_missing = vm_struct_map_get_row_ptr(
+        @ptrCast(&state_buf),
+        slot_offset,
+        capacity,
+        num_fields,
+        row_size,
+        999,
+    );
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), row_off_missing);
+}
+
+test "struct map - upsert overwrites existing key" {
+    var prog = buildStructMapTestProgram(4, 0);
+
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    _ = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+
+    const meta_base = STATE_HEADER_SIZE;
+    const capacity = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+    const num_fields = state_buf[meta_base + 13];
+    const row_size: u32 = std.mem.readInt(u16, state_buf[meta_base + 16 ..][0..2], .little);
+    const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
+    _ = state_size;
+
+    // Insert key=100, val=42, str=1001
+    {
+        var key_col = [1]u32{100};
+        var val_col = [1]u32{42};
+        var str_col = [1]u32{1001};
+        const col_ptrs = [3][*]const u8{
+            @ptrCast(&key_col),
+            @ptrCast(&val_col),
+            @ptrCast(&str_col),
+        };
+        _ = vm_execute_batch(
+            @ptrCast(&state_buf),
+            @ptrCast(&prog),
+            prog.len,
+            @ptrCast(&col_ptrs),
+            3,
+            1,
+        );
+    }
+
+    // Overwrite key=100 with val=99, str=2002
+    {
+        var key_col = [1]u32{100};
+        var val_col = [1]u32{99};
+        var str_col = [1]u32{2002};
+        const col_ptrs = [3][*]const u8{
+            @ptrCast(&key_col),
+            @ptrCast(&val_col),
+            @ptrCast(&str_col),
+        };
+        _ = vm_execute_batch(
+            @ptrCast(&state_buf),
+            @ptrCast(&prog),
+            prog.len,
+            @ptrCast(&col_ptrs),
+            3,
+            1,
+        );
+    }
+
+    // Size should still be 1 (upsert, not double-insert)
+    const size_after = std.mem.readInt(u32, state_buf[meta_base + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 1), size_after);
+
+    // Values should be overwritten
+    const row_off = vm_struct_map_get_row_ptr(
+        @ptrCast(&state_buf),
+        slot_offset,
+        capacity,
+        num_fields,
+        row_size,
+        100,
+    );
+    try std.testing.expect(row_off != 0xFFFFFFFF);
+    const f0_val = std.mem.readInt(u32, state_buf[row_off + 1 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 99), f0_val);
+    const f1_val = std.mem.readInt(u32, state_buf[row_off + 5 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 2002), f1_val);
+}
+
+test "struct map - iteration" {
+    var prog = buildStructMapTestProgram(4, 0);
+    var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    _ = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+
+    const meta_base = STATE_HEADER_SIZE;
+    const capacity = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+    const num_fields = state_buf[meta_base + 13];
+    const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
+
+    // Insert 3 entries
+    var key_col = [3]u32{ 100, 200, 300 };
+    var val_col = [3]u32{ 10, 20, 30 };
+    var str_col = [3]u32{ 1, 2, 3 };
+    const col_ptrs = [3][*]const u8{
+        @as([*]const u8, @ptrCast(&key_col)),
+        @as([*]const u8, @ptrCast(&val_col)),
+        @as([*]const u8, @ptrCast(&str_col)),
+    };
+    _ = vm_execute_batch(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs),
+        3,
+        3,
+    );
+
+    // Iterate and collect keys
+    var found_keys: [3]u32 = undefined;
+    var count: u32 = 0;
+    var pos = vm_struct_map_iter_start(@ptrCast(&state_buf), slot_offset, capacity, num_fields);
+    while (pos < capacity) {
+        found_keys[count] = vm_struct_map_iter_key(@ptrCast(&state_buf), slot_offset, num_fields, pos);
+        count += 1;
+        pos = vm_struct_map_iter_next(@ptrCast(&state_buf), slot_offset, capacity, num_fields, pos);
+    }
+    try std.testing.expectEqual(@as(u32, 3), count);
+
+    // All 3 keys should be present (order may vary due to hashing)
+    var has_100 = false;
+    var has_200 = false;
+    var has_300 = false;
+    for (0..count) |i| {
+        if (found_keys[i] == 100) has_100 = true;
+        if (found_keys[i] == 200) has_200 = true;
+        if (found_keys[i] == 300) has_300 = true;
+    }
+    try std.testing.expect(has_100);
+    try std.testing.expect(has_200);
+    try std.testing.expect(has_300);
+}
+
+test "struct map - growth preserves entries" {
+    // Use small capacity (cap=4 -> actual=16) to force growth
+    var prog = buildStructMapTestProgram(4, 0);
+    var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    _ = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+
+    const meta_base = STATE_HEADER_SIZE;
+    const num_fields = state_buf[meta_base + 13];
+    const row_size: u32 = std.mem.readInt(u16, state_buf[meta_base + 16 ..][0..2], .little);
+
+    // Insert 11 entries (70% of 16 = 11.2, so 12th should trigger growth)
+    var i: u32 = 0;
+    while (i < 11) : (i += 1) {
+        var key_col = [1]u32{i + 1000};
+        var val_col = [1]u32{i * 10};
+        var str_col = [1]u32{i + 5000};
+        const col_ptrs = [3][*]const u8{
+            @ptrCast(&key_col),
+            @ptrCast(&val_col),
+            @ptrCast(&str_col),
+        };
+        const res = vm_execute_batch(
+            @ptrCast(&state_buf),
+            @ptrCast(&prog),
+            prog.len,
+            @ptrCast(&col_ptrs),
+            3,
+            1,
+        );
+        try std.testing.expectEqual(@as(u32, 0), res);
+    }
+
+    // 12th entry should trigger NEEDS_GROWTH
+    var key_col_12 = [1]u32{2000};
+    var val_col_12 = [1]u32{999};
+    var str_col_12 = [1]u32{9999};
+    const col_ptrs_12 = [3][*]const u8{
+        @ptrCast(&key_col_12),
+        @ptrCast(&val_col_12),
+        @ptrCast(&str_col_12),
+    };
+    const result_12 = vm_execute_batch(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs_12),
+        3,
+        1,
+    );
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.NEEDS_GROWTH)), result_12);
+
+    // Grow
+    const grown_size = vm_calculate_grown_state_size(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        0,
+    );
+    var new_state_buf: [32768]u8 align(8) = [_]u8{0} ** 32768;
+    std.debug.assert(grown_size <= 32768);
+
+    const grow_result = vm_grow_state(
+        @ptrCast(&state_buf),
+        @ptrCast(&new_state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        0,
+    );
+    try std.testing.expectEqual(@as(u32, 0), grow_result);
+
+    // Verify new capacity = 32
+    const new_cap = std.mem.readInt(u32, new_state_buf[meta_base + 4 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 32), new_cap);
+
+    // Verify all 11 entries preserved
+    const new_slot_offset = std.mem.readInt(u32, new_state_buf[meta_base..][0..4], .little);
+    i = 0;
+    while (i < 11) : (i += 1) {
+        const row_off = vm_struct_map_get_row_ptr(
+            @ptrCast(&new_state_buf),
+            new_slot_offset,
+            new_cap,
+            num_fields,
+            row_size,
+            i + 1000,
+        );
+        try std.testing.expect(row_off != 0xFFFFFFFF);
+        // Check UINT32 field value
+        const f0 = std.mem.readInt(u32, new_state_buf[row_off + 1 ..][0..4], .little);
+        try std.testing.expectEqual(i * 10, f0);
+        // Check STRING field value
+        const f1 = std.mem.readInt(u32, new_state_buf[row_off + 5 ..][0..4], .little);
+        try std.testing.expectEqual(i + 5000, f1);
+    }
+
+    // Verify can insert 12th element now
+    const insert_result = vm_execute_batch(
+        @ptrCast(&new_state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs_12),
+        3,
         1,
     );
     try std.testing.expectEqual(@as(u32, 0), insert_result);

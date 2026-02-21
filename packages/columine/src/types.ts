@@ -32,6 +32,15 @@ export enum SlotType {
   AGGREGATE = 2,
   ARRAY = 3,
   CONDITION_TREE = 4,
+  STRUCT_MAP = 5,
+}
+
+export enum StructFieldType {
+  UINT32 = 0, // 4 bytes
+  INT64 = 1, // 8 bytes
+  FLOAT64 = 2, // 8 bytes
+  BOOL = 3, // 1 byte (stored as u8)
+  STRING = 4, // 4 bytes (interned u32)
 }
 
 // =============================================================================
@@ -49,7 +58,8 @@ export type SlotDef =
   | { type: SlotType.HASHMAP; capacity: number }
   | { type: SlotType.HASHSET; capacity: number }
   | { type: SlotType.AGGREGATE; aggType: AggType }
-  | { type: SlotType.CONDITION_TREE };
+  | { type: SlotType.CONDITION_TREE }
+  | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[] };
 
 // =============================================================================
 // State Handle - opaque reference to per-instance state
@@ -125,7 +135,11 @@ export enum Opcode {
   BATCH_AGG_COUNT = 0x41,
   BATCH_AGG_MIN = 0x42,
   BATCH_AGG_MAX = 0x43,
-  // Columine's reducer opcodes end at 0x4F
+
+  // Struct map ops (0x18 init, 0x80 batch)
+  SLOT_STRUCT_MAP = 0x18, // slot, type_flags, cap_lo, cap_hi, num_fields, [field_type × num_fields]
+  BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot, key_col, num_vals, [val_col, field_idx] × num_vals
+  // Columine's reducer opcodes end at 0x4F (except struct map batch at 0x80)
 }
 
 // =============================================================================

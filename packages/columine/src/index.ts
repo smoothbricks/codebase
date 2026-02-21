@@ -48,6 +48,7 @@ export {
   Opcode,
   PROGRAM_HASH_PREFIX,
   SlotType,
+  StructFieldType,
   ValueType,
 } from './types.js';
 // WASM backend (for standalone columine usage)
