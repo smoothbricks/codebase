@@ -1,3 +1,5 @@
+/// <reference types="bun" />
+
 /**
  * bun:test integration for LMAO trace-testing.
  *
@@ -52,8 +54,10 @@ import {
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
-import type { OpContext, OpContextBinding } from '../opContext/types.js';
+import { type OpContext, type OpContextBinding, type OpContextOf, opContextType } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
+import type { LogSchema } from '../schema/LogSchema.js';
+import type { InferSchema } from '../schema/types.js';
 import { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { TestTracer } from '../tracers/TestTracer.js';
@@ -61,6 +65,220 @@ import { TestTracer } from '../tracers/TestTracer.js';
 /** bun:test expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('expect(');
+}
+
+type TestBody = () => unknown | Promise<unknown>;
+
+type DescribeFieldSchema = { describe: ReturnType<typeof S.category> };
+
+type ExtendedLogSchema<T extends LogSchema> =
+  T extends LogSchema<infer Fields> ? LogSchema<Fields & DescribeFieldSchema> : never;
+
+type ExtendedOpContext<Ctx extends OpContext> = Omit<Ctx, 'logSchema'> & {
+  logSchema: ExtendedLogSchema<Ctx['logSchema']>;
+};
+
+type BindingWithDescribe<B extends OpContextBinding> = B & {
+  readonly [opContextType]: ExtendedOpContext<OpContextOf<B>>;
+  readonly logBinding: Omit<B['logBinding'], 'logSchema'> & {
+    readonly logSchema: ExtendedLogSchema<B['logBinding']['logSchema']>;
+  };
+};
+
+type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<BindingWithDescribe<B>>>;
+
+type RootSpanRunner<Ctx extends OpContext> = (
+  name: string,
+  fn: (ctx: SpanContext<Ctx>) => Promise<unknown>,
+) => Promise<unknown>;
+
+export interface BunTestTracerInstance<B extends OpContextBinding> {
+  setup(): void;
+  useTestSpan(): HarnessSpanContext<B>;
+  getTracer(): TestTracer<BindingWithDescribe<B>>;
+  createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown>;
+}
+
+/**
+ * Create an instance-scoped Bun test tracer harness.
+ *
+ * Unlike initTraceTestRun(), this keeps tracer/root/ALS state isolated per instance.
+ */
+export function makeTestTracer<B extends OpContextBinding>(
+  binding: B,
+  options?: {
+    sqlite?: TraceSQLiteConfig;
+  },
+): BunTestTracerInstance<B> {
+  type ExtendedBinding = BindingWithDescribe<B>;
+  type SpanCtx = HarnessSpanContext<B>;
+
+  let tracer: TestTracer<ExtendedBinding> | null = null;
+  let sink: TraceSQLiteSink | null = null;
+  let rootCtx: SpanCtx | null = null;
+  let resolveTestRun: (() => void) | null = null;
+  let rootTracePromise: Promise<unknown> | null = null;
+  let isSetup = false;
+
+  const als = new AsyncLocalStorage<SpanCtx>();
+
+  function assertRootCtx(): SpanCtx {
+    if (!rootCtx) throw new Error('Call setup() before wiring bun:test wrappers');
+    return rootCtx;
+  }
+
+  function assertTracer(): TestTracer<ExtendedBinding> {
+    if (!tracer) throw new Error('Call setup() in preload before tests');
+    return tracer;
+  }
+
+  function runTracedTest(name: string, fn: TestBody, describePath: string | null): Promise<unknown> {
+    const currentRoot = assertRootCtx();
+    return (currentRoot.span as RootSpanRunner<OpContextOf<ExtendedBinding>>)(name, async (ctx) => {
+      if (describePath) {
+        ctx.tag.with({ describe: describePath } as Partial<InferSchema<OpContextOf<ExtendedBinding>['logSchema']>>);
+      }
+      try {
+        await als.run(ctx, fn);
+        return ctx.ok(undefined); // pass -> span-ok
+      } catch (error) {
+        if (isExpectError(error)) {
+          return ctx.err(error); // expect() fail -> span-err
+        }
+        throw error; // other throw -> span-exception
+      }
+    });
+  }
+
+  function createWrappedDescribe(origDescribe: typeof _describe, describeStack: string[]): typeof _describe {
+    const wrappedDescribe = Object.assign(
+      (name: string, fn: () => void) =>
+        origDescribe(name, () => {
+          describeStack.push(name);
+          try {
+            fn();
+          } finally {
+            describeStack.pop();
+          }
+        }),
+      {
+        skip: origDescribe.skip,
+        only: origDescribe.only,
+        todo: origDescribe.todo,
+        each: origDescribe.each,
+        skipIf: (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe),
+        if: (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip),
+      },
+    ) as typeof _describe;
+
+    return wrappedDescribe;
+  }
+
+  function createWrappedIt(origIt: typeof _it, describeStack: string[]): typeof _it {
+    const wrappedIt = Object.assign(
+      (name: string, fn: TestBody) => {
+        const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
+        return origIt(name, () => runTracedTest(name, fn, describePath));
+      },
+      {
+        skip: origIt.skip,
+        only: origIt.only,
+        todo: origIt.todo,
+        each: origIt.each,
+        skipIf: (condition: boolean) => (condition ? origIt.skip : wrappedIt),
+        if: (condition: boolean) => (condition ? wrappedIt : origIt.skip),
+      },
+    ) as typeof _it;
+
+    return wrappedIt;
+  }
+
+  return {
+    setup(): void {
+      if (isSetup) {
+        return;
+      }
+      isSetup = true;
+
+      const extendedSchema = binding.logBinding.logSchema.extend({ describe: S.category() });
+      const extendedBinding = {
+        ...binding,
+        logBinding: {
+          ...binding.logBinding,
+          logSchema: extendedSchema,
+        },
+      } as ExtendedBinding;
+
+      tracer = new TestTracer(extendedBinding, {
+        bufferStrategy: new JsBufferStrategy(),
+        createTraceRoot,
+      });
+
+      if (options?.sqlite) {
+        const db = new Database(options.sqlite.dbPath ?? '.trace-results.db');
+        sink = new TraceSQLiteSink(db);
+      }
+
+      rootTracePromise = tracer.trace('test-run', (ctx) => {
+        rootCtx = ctx;
+        return new Promise<void>((resolve) => {
+          resolveTestRun = resolve;
+        });
+      });
+
+      _afterAll(async () => {
+        if (resolveTestRun) {
+          resolveTestRun();
+          resolveTestRun = null;
+        }
+
+        if (rootTracePromise) {
+          await rootTracePromise;
+          rootTracePromise = null;
+        }
+
+        if (sink && rootCtx) {
+          try {
+            sink.flush(rootCtx.buffer);
+            const traceId = rootCtx.buffer.trace_id;
+            const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
+            console.log(`\n[trace] trace_id: ${traceId} -> ${dbPath}`);
+          } catch (e) {
+            console.error('[lmao/testing] SQLite flush error:', e);
+          }
+
+          sink.close();
+          sink = null;
+        }
+      });
+    },
+
+    useTestSpan(): SpanCtx {
+      const ctx = als.getStore();
+      if (!ctx) throw new Error('useTestSpan() called outside of a traced it()');
+      return ctx;
+    },
+
+    getTracer(): TestTracer<ExtendedBinding> {
+      return assertTracer();
+    },
+
+    createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown> {
+      const origIt = bunTestModule.it as typeof _it;
+      const origDescribe = bunTestModule.describe as typeof _describe;
+      const describeStack: string[] = [];
+
+      const wrappedDescribe = createWrappedDescribe(origDescribe, describeStack);
+      const wrappedIt = createWrappedIt(origIt, describeStack);
+
+      return {
+        ...bunTestModule,
+        describe: wrappedDescribe,
+        it: wrappedIt,
+        test: wrappedIt,
+      };
+    },
+  };
 }
 
 // Global singleton — one root tracer for the entire bun test run
@@ -75,8 +293,6 @@ let _rootTracePromise: Promise<unknown> | null = null;
 // AsyncLocalStorage for propagating SpanContext to test bodies.
 // Each it() runs in its own async context so concurrent tests don't collide.
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
-
-type TestBody = () => unknown | Promise<unknown>;
 type RootSpanInvoker = (name: string, fn: (ctx: SpanContext<OpContext>) => Promise<unknown>) => Promise<unknown>;
 type DescribeTag = { describe: (path: string) => unknown };
 

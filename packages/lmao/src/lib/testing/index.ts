@@ -96,6 +96,7 @@ export {
 // =============================================================================
 
 export { JsBufferStrategy } from '../JsBufferStrategy.js';
+export type { OpContextBinding, OpContextOf } from '../opContext/types.js';
 export type { TraceRootFactory } from '../traceRoot.js';
 // Universal createTraceRoot — picks Node (hrtime.bigint) or ES (performance.now) at runtime
 export { createTraceRoot } from '../traceRoot.universal.js';

@@ -1,3 +1,5 @@
+/// <reference types="node" />
+
 /**
  * vitest integration for LMAO trace-testing.
  *
@@ -24,7 +26,6 @@
  * @module testing/vitest
  */
 
-import { AsyncLocalStorage } from 'node:async_hooks';
 import {
   afterAll as _afterAll,
   afterEach as _afterEach,
@@ -36,7 +37,7 @@ import {
 } from 'vitest';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
-import type { OpContext, OpContextBinding } from '../opContext/types.js';
+import type { OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
 import type { SyncSQLiteDatabase } from '../sqlite/sqlite-db.js';
 import { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
@@ -48,96 +49,314 @@ function isExpectError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('expect(');
 }
 
-// Global singleton — one root tracer for the entire vitest run
-let _tracer: TestTracer<OpContextBinding> | null = null;
-let _sink: TraceSQLiteSink | null = null;
-
-// Root span context, its resolver, and the trace promise — one root per test run
-let _rootCtx: SpanContext<OpContext> | null = null;
-let _resolveTestRun: (() => void) | null = null;
-let _rootTracePromise: Promise<unknown> | null = null;
-
-// AsyncLocalStorage for propagating SpanContext to test bodies
-const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
-
 type TestBody = () => unknown | Promise<unknown>;
-type RootSpanInvoker = (name: string, fn: (ctx: SpanContext<OpContext>) => Promise<unknown>) => Promise<unknown>;
-type DescribeTag = { describe: (path: string) => unknown };
+type SpanCtx<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
+type RootSpanInvoker<B extends OpContextBinding> = (
+  name: string,
+  fn: (ctx: SpanCtx<B>) => Promise<unknown>,
+) => Promise<unknown>;
 
-/** Initialize the root tracer for the entire vitest run. Call once in setupFiles. */
-export function initTraceTestRun<B extends OpContextBinding>(
-  opContext: B,
-  options?: {
-    sqlite?: TraceSQLiteConfig & {
-      /** better-sqlite3 Database constructor. Pass `import('better-sqlite3').default` */
-      createDatabase?: (path: string) => SyncSQLiteDatabase;
-    };
-  },
-): void {
-  // Extend user's schema with `describe` column for test grouping
-  const extendedSchema = opContext.logBinding.logSchema.extend({ describe: S.category() });
-  const extendedBinding = {
-    ...opContext,
-    logBinding: { ...opContext.logBinding, logSchema: extendedSchema },
+type SpanContextStore<Ctx> = {
+  run<R>(ctx: Ctx, fn: () => R): R;
+  getStore(): Ctx | undefined;
+};
+
+type AsyncLocalStorageLike<Ctx> = {
+  run<R>(store: Ctx, callback: () => R): R;
+  getStore(): Ctx | undefined;
+};
+
+type AsyncLocalStorageCtor = new <Ctx>() => AsyncLocalStorageLike<Ctx>;
+
+type InitTraceTestRunOptions = {
+  sqlite?: TraceSQLiteConfig & {
+    /** better-sqlite3 Database constructor. Pass `import('better-sqlite3').default` */
+    createDatabase?: (path: string) => SyncSQLiteDatabase;
   };
+};
 
-  _tracer = new TestTracer(extendedBinding, {
-    bufferStrategy: new JsBufferStrategy(),
-    createTraceRoot,
-  }) as TestTracer<OpContextBinding>;
+class FallbackSpanContextStore<Ctx> implements SpanContextStore<Ctx> {
+  private current: Ctx | undefined;
 
-  if (options?.sqlite?.createDatabase) {
-    const db = options.sqlite.createDatabase(options.sqlite.dbPath ?? '.trace-results.db');
-    _sink = new TraceSQLiteSink(db);
+  run<R>(ctx: Ctx, fn: () => R): R {
+    const prev = this.current;
+    this.current = ctx;
+    try {
+      return fn();
+    } finally {
+      this.current = prev;
+    }
   }
 
-  // Create the single root trace — a long-lived promise keeps it alive
-  const tracer = _tracer;
-  _rootTracePromise = tracer.trace('test-run', (ctx: SpanContext<OpContext>) => {
-    _rootCtx = ctx;
-    return new Promise<void>((resolve) => {
-      _resolveTestRun = resolve;
-    });
-  }) as Promise<unknown>;
+  getStore(): Ctx | undefined {
+    return this.current;
+  }
+}
 
-  // Register global teardown — resolve root, wait for span-end, then flush to SQLite
-  _afterAll(async () => {
-    // Resolve the root promise — triggers span-end write via _executeWithContext .then()
-    if (_resolveTestRun) {
-      _resolveTestRun();
-      _resolveTestRun = null;
+function tryCreateAsyncLocalStorageStore<Ctx>(): SpanContextStore<Ctx> | null {
+  const maybeCtor = (globalThis as { AsyncLocalStorage?: unknown }).AsyncLocalStorage;
+  if (typeof maybeCtor !== 'function') {
+    return null;
+  }
+
+  const ctor = maybeCtor as AsyncLocalStorageCtor;
+  const storage = new ctor<Ctx>();
+  return {
+    run<R>(ctx: Ctx, fn: () => R): R {
+      return storage.run(ctx, fn);
+    },
+    getStore(): Ctx | undefined {
+      return storage.getStore();
+    },
+  };
+}
+
+function createDefaultSpanContextStore<Ctx>(): SpanContextStore<Ctx> {
+  const store = tryCreateAsyncLocalStorageStore<Ctx>();
+  if (store) {
+    return store;
+  }
+
+  // Workers (e.g. Cloudflare Vitest pool) do not expose node:async_hooks.
+  // Fallback is safe for awaited test bodies, but detached async work will not
+  // retain the context automatically.
+  return new FallbackSpanContextStore<Ctx>();
+}
+
+type VitestHarnessConfig<B extends OpContextBinding> = {
+  binding: B;
+  createSpanContextStore?: () => SpanContextStore<SpanCtx<B>>;
+};
+
+export type VitestTestTracer<B extends OpContextBinding> = {
+  initTraceTestRun(options?: InitTraceTestRunOptions): void;
+  useTestSpan(): SpanCtx<B>;
+  getTracer(): TestTracer<B>;
+  createVitestMock(vitestModule: Record<string, unknown>): Record<string, unknown>;
+  describe(name: string, fn: () => void): unknown;
+  it(name: string, fn: () => void | Promise<void>): void;
+};
+
+function tagDescribePath(ctx: { tag: unknown }, describePath: string | null): void {
+  if (!describePath) {
+    return;
+  }
+
+  const maybeDescribe = (ctx.tag as { describe?: (path: string) => unknown }).describe;
+  if (typeof maybeDescribe === 'function') {
+    maybeDescribe(describePath);
+  }
+}
+
+export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestHarnessConfig<B>): VitestTestTracer<B> {
+  const { binding } = config;
+  const spanStore = config.createSpanContextStore?.() ?? createDefaultSpanContextStore<SpanCtx<B>>();
+
+  let initialized = false;
+  let tracer: TestTracer<B> | null = null;
+  let sink: TraceSQLiteSink | null = null;
+  let rootCtx: SpanCtx<B> | null = null;
+  let resolveTestRun: (() => void) | null = null;
+  let rootTracePromise: Promise<unknown> | null = null;
+  const standaloneDescribeStack: string[] = [];
+
+  function getRootCtx(): SpanCtx<B> {
+    if (!rootCtx) {
+      throw new Error('Call initTraceTestRun() in setupFiles before tests');
     }
-    // Await the trace promise so span-end is written to the buffer before flushing
-    if (_rootTracePromise) {
-      await _rootTracePromise;
-      _rootTracePromise = null;
+    return rootCtx;
+  }
+
+  function initTraceTestRun(options?: InitTraceTestRunOptions): void {
+    if (initialized) {
+      throw new Error('initTraceTestRun() already called for this vitest tracer instance');
     }
-    if (_sink && _rootCtx) {
-      try {
-        _sink.flush(_rootCtx.buffer);
-        const traceId = _rootCtx.buffer.trace_id;
-        const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
-        console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
-      } catch (e) {
-        console.error('[lmao/testing] SQLite flush error:', e);
+    initialized = true;
+
+    // Extend user's schema with `describe` column for test grouping.
+    const extendedSchema = binding.logBinding.logSchema.extend({ describe: S.category() });
+    const extendedBinding = {
+      ...binding,
+      logBinding: { ...binding.logBinding, logSchema: extendedSchema },
+    } as B;
+
+    tracer = new TestTracer(extendedBinding, {
+      bufferStrategy: new JsBufferStrategy(),
+      createTraceRoot,
+    });
+
+    if (options?.sqlite?.createDatabase) {
+      const db = options.sqlite.createDatabase(options.sqlite.dbPath ?? '.trace-results.db');
+      sink = new TraceSQLiteSink(db);
+    }
+
+    const activeTracer = tracer;
+    rootTracePromise = activeTracer.trace('test-run', (ctx) => {
+      rootCtx = ctx as SpanCtx<B>;
+      return new Promise<void>((resolve) => {
+        resolveTestRun = resolve;
+      });
+    }) as Promise<unknown>;
+
+    _afterAll(async () => {
+      if (resolveTestRun) {
+        resolveTestRun();
+        resolveTestRun = null;
       }
-      _sink.close();
-      _sink = null;
+
+      if (rootTracePromise) {
+        await rootTracePromise;
+        rootTracePromise = null;
+      }
+
+      if (sink && rootCtx) {
+        try {
+          sink.flush(rootCtx.buffer);
+          const traceId = rootCtx.buffer.trace_id;
+          const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
+          console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
+        } catch (error) {
+          console.error('[lmao/testing] SQLite flush error:', error);
+        }
+        sink.close();
+        sink = null;
+      }
+    });
+  }
+
+  function useTestSpan(): SpanCtx<B> {
+    const ctx = spanStore.getStore();
+    if (!ctx) {
+      throw new Error('useTestSpan() called outside of a traced it()');
     }
-  });
+    return ctx;
+  }
+
+  function getTracer(): TestTracer<B> {
+    if (!tracer) {
+      throw new Error('Call initTraceTestRun() in setupFiles before tests');
+    }
+    return tracer;
+  }
+
+  function createVitestMock(vitestModule: Record<string, unknown>): Record<string, unknown> {
+    const currentRootCtx = getRootCtx();
+    const origIt = vitestModule.it as typeof _it;
+    const origDescribe = vitestModule.describe as typeof _describe;
+    const describeStack: string[] = [];
+
+    function wrappedDescribe(name: string, fn: () => void) {
+      return origDescribe(name, () => {
+        describeStack.push(name);
+        try {
+          fn();
+        } finally {
+          describeStack.pop();
+        }
+      });
+    }
+
+    Object.assign(wrappedDescribe, {
+      skip: origDescribe.skip,
+      only: origDescribe.only,
+      todo: origDescribe.todo,
+      each: origDescribe.each,
+      skipIf: origDescribe.skipIf.bind(origDescribe),
+    });
+
+    function wrappedIt(name: string, fn: TestBody) {
+      const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
+      return origIt(name, () =>
+        (currentRootCtx.span as RootSpanInvoker<B>)(name, async (ctx) => {
+          tagDescribePath(ctx, describePath);
+          try {
+            await spanStore.run(ctx, fn);
+            return ctx.ok(undefined);
+          } catch (error) {
+            if (isExpectError(error)) {
+              return ctx.err(error);
+            }
+            throw error;
+          }
+        }),
+      );
+    }
+
+    Object.assign(wrappedIt, {
+      skip: origIt.skip,
+      only: origIt.only,
+      todo: origIt.todo,
+      each: origIt.each,
+      skipIf: origIt.skipIf.bind(origIt),
+    });
+
+    return { ...vitestModule, describe: wrappedDescribe, it: wrappedIt, test: wrappedIt };
+  }
+
+  function describe(name: string, fn: () => void) {
+    return _describe(name, () => {
+      standaloneDescribeStack.push(name);
+      try {
+        fn();
+      } finally {
+        standaloneDescribeStack.pop();
+      }
+    });
+  }
+
+  function it(name: string, fn: () => void | Promise<void>): void {
+    const describePath = standaloneDescribeStack.length > 0 ? standaloneDescribeStack.join(' > ') : null;
+    _it(name, () => {
+      const currentRootCtx = getRootCtx();
+      return (currentRootCtx.span as RootSpanInvoker<B>)(name, async (ctx) => {
+        tagDescribePath(ctx, describePath);
+        try {
+          await spanStore.run(ctx, fn);
+          return ctx.ok(undefined);
+        } catch (error) {
+          if (isExpectError(error)) {
+            return ctx.err(error);
+          }
+          throw error;
+        }
+      });
+    });
+  }
+
+  return {
+    initTraceTestRun,
+    useTestSpan,
+    getTracer,
+    createVitestMock,
+    describe,
+    it,
+  };
+}
+
+// Global singleton compatibility path (legacy API)
+let _defaultHarness: VitestTestTracer<OpContextBinding> | null = null;
+
+/** Initialize the root tracer for the entire vitest run. Call once in setupFiles. */
+export function initTraceTestRun<B extends OpContextBinding>(opContext: B, options?: InitTraceTestRunOptions): void {
+  const harness = makeVitestTestTracer({ binding: opContext });
+  harness.initTraceTestRun(options);
+  _defaultHarness = harness as VitestTestTracer<OpContextBinding>;
 }
 
 /** Get the current span context from AsyncLocalStorage (inside an it() block) */
-export function useTestSpan(): SpanContext<OpContext> {
-  const ctx = _als.getStore();
-  if (!ctx) throw new Error('useTestSpan() called outside of a traced it()');
-  return ctx;
+export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
+  if (!_defaultHarness) {
+    throw new Error('Call initTraceTestRun() in setupFiles before tests');
+  }
+  return _defaultHarness.useTestSpan();
 }
 
 /** Get the root tracer instance */
 export function getTracer(): TestTracer<OpContextBinding> {
-  if (!_tracer) throw new Error('Call initTraceTestRun() in setupFiles before tests');
-  return _tracer;
+  if (!_defaultHarness) {
+    throw new Error('Call initTraceTestRun() in setupFiles before tests');
+  }
+  return _defaultHarness.getTracer();
 }
 
 /**
@@ -157,56 +376,10 @@ export function getTracer(): TestTracer<OpContextBinding> {
  * @param vitestModule - The original vitest namespace from importOriginal()
  */
 export function createVitestMock(vitestModule: Record<string, unknown>): Record<string, unknown> {
-  if (!_rootCtx) throw new Error('Call initTraceTestRun() before createVitestMock()');
-
-  const origIt = vitestModule.it as typeof _it;
-  const origDescribe = vitestModule.describe as typeof _describe;
-  const rootCtx = _rootCtx;
-  const als = _als;
-  const describeStack: string[] = [];
-
-  function wrappedDescribe(name: string, fn: () => void) {
-    return origDescribe(name, () => {
-      describeStack.push(name);
-      try {
-        fn();
-      } finally {
-        describeStack.pop();
-      }
-    });
+  if (!_defaultHarness) {
+    throw new Error('Call initTraceTestRun() before createVitestMock()');
   }
-  Object.assign(wrappedDescribe, {
-    skip: origDescribe.skip,
-    only: origDescribe.only,
-    todo: origDescribe.todo,
-    each: origDescribe.each,
-    skipIf: origDescribe.skipIf.bind(origDescribe),
-  });
-
-  function wrappedIt(name: string, fn: TestBody) {
-    const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-    return origIt(name, () =>
-      (rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
-        if (describePath) (ctx.tag as unknown as DescribeTag).describe(describePath);
-        try {
-          await als.run(ctx, fn);
-          return ctx.ok(undefined); // pass → span-ok
-        } catch (error) {
-          if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
-          throw error; // other throw → span-exception
-        }
-      }),
-    );
-  }
-  Object.assign(wrappedIt, {
-    skip: origIt.skip,
-    only: origIt.only,
-    todo: origIt.todo,
-    each: origIt.each,
-    skipIf: origIt.skipIf.bind(origIt),
-  });
-
-  return { ...vitestModule, describe: wrappedDescribe, it: wrappedIt, test: wrappedIt };
+  return _defaultHarness.createVitestMock(vitestModule);
 }
 
 /**
@@ -214,18 +387,11 @@ export function createVitestMock(vitestModule: Record<string, unknown>): Record<
  * describe() callbacks run synchronously (just registering tests).
  */
 export function describe(name: string, fn: () => void) {
-  return _describe(name, () => {
-    _standaloneDescribeStack.push(name);
-    try {
-      fn();
-    } finally {
-      _standaloneDescribeStack.pop();
-    }
-  });
+  if (!_defaultHarness) {
+    throw new Error('Call initTraceTestRun() in setupFiles before tests');
+  }
+  return _defaultHarness.describe(name, fn);
 }
-
-// Describe stack for standalone exports (non-vi.mock path)
-const _standaloneDescribeStack: string[] = [];
 
 describe.skip = _describe.skip;
 describe.only = _describe.only;
@@ -235,20 +401,10 @@ describe.skipIf = _describe.skipIf.bind(_describe);
 
 /** Wrapped it — creates a child span of the root trace for the test case */
 export function it(name: string, fn: () => void | Promise<void>): void {
-  const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
-  _it(name, () => {
-    if (!_rootCtx) throw new Error('Call initTraceTestRun() in setupFiles before tests');
-    return (_rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
-      if (describePath) (ctx.tag as unknown as DescribeTag).describe(describePath);
-      try {
-        await _als.run(ctx, fn);
-        return ctx.ok(undefined); // pass → span-ok
-      } catch (error) {
-        if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
-        throw error; // other throw → span-exception
-      }
-    });
-  });
+  if (!_defaultHarness) {
+    throw new Error('Call initTraceTestRun() in setupFiles before tests');
+  }
+  _defaultHarness.it(name, fn);
 }
 
 it.skip = _it.skip;

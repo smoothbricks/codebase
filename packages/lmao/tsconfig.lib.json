@@ -22,8 +22,7 @@
     "src/**/__tests__/**",
     "src/**/*.test.ts",
     "src/**/*.spec.ts",
-    "src/lib/testing/vitest-harness.ts",
-    "src/lib/testing/bun-harness.ts"
+    "src/lib/testing/vitest-harness.ts"
   ],
   "references": [
     {
