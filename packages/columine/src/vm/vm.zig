@@ -2975,3 +2975,509 @@ pub export fn vm_delta_apply_rollforward_segment(
         rollbackEntry(state_base, entries[i]);
     }
 }
+
+// =============================================================================
+// Slot Growth
+// =============================================================================
+//
+// When a HashMap or HashSet exceeds 70% load during executeBatch, the VM returns
+// NEEDS_GROWTH (5). JS then:
+//   1. Calls vm_get_needs_growth_slot() to learn which slot overflowed
+//   2. Calls vm_calculate_grown_state_size() to compute the new buffer size
+//   3. Allocates a new buffer of that size
+//   4. Calls vm_grow_state() to copy data and rehash the grown slot
+//   5. Retries the batch on the new state
+
+/// Returns the slot index that triggered NEEDS_GROWTH, or 0xFF if none.
+pub export fn vm_get_needs_growth_slot() u32 {
+    return @as(u32, g_needs_growth_slot);
+}
+
+/// Compute data size for a slot given its type and capacity.
+fn getSlotDataSize(slot_type: u4, capacity: u32) u32 {
+    return switch (slot_type) {
+        0 => capacity * 4 + capacity * 4 + capacity * 8, // HASHMAP: keys + values + timestamps
+        1 => capacity * 4, // HASHSET: keys only
+        2 => 16, // AGGREGATE: f64 value + u64 count
+        4 => 8, // CONDITION_TREE: generation(u32) + last_removed_key(u32)
+        else => 0,
+    };
+}
+
+/// Compute state size with 2× capacity for the slot at `grown_slot_idx`.
+/// Reads capacity from old state metadata (not program bytecode), so it
+/// handles states that have already been grown.
+pub export fn vm_calculate_grown_state_size(
+    old_state_ptr: [*]const u8,
+    _program_ptr: [*]const u8,
+    _program_len: u32,
+    grown_slot_idx: u32,
+) u32 {
+    _ = _program_ptr;
+    _ = _program_len;
+    const num_slots: u32 = old_state_ptr[9];
+    var total_size: u32 = STATE_HEADER_SIZE + num_slots * SLOT_META_SIZE;
+    total_size = (total_size + 7) & ~@as(u32, 7);
+
+    var slot_i: u32 = 0;
+    while (slot_i < num_slots) : (slot_i += 1) {
+        const meta_base = STATE_HEADER_SIZE + slot_i * SLOT_META_SIZE;
+        const old_cap = std.mem.readInt(u32, old_state_ptr[meta_base + 4 ..][0..4], .little);
+        const type_flags_byte = old_state_ptr[meta_base + 12];
+        const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
+
+        const cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
+        total_size += getSlotDataSize(slot_type, cap);
+        total_size = (total_size + 7) & ~@as(u32, 7);
+    }
+
+    return total_size;
+}
+
+/// Copy state from old buffer to new buffer, rehashing the grown slot.
+/// new_state_ptr must point to a zeroed buffer of vm_calculate_grown_state_size() bytes.
+/// Returns 0 on success.
+pub export fn vm_grow_state(
+    old_state_ptr: [*]const u8,
+    new_state_ptr: [*]u8,
+    _program_ptr: [*]const u8,
+    _program_len: u32,
+    grown_slot_idx: u32,
+) u32 {
+    _ = _program_ptr;
+    _ = _program_len;
+    const num_slots: u32 = old_state_ptr[9];
+
+    // Copy header verbatim
+    @memcpy(new_state_ptr[0..STATE_HEADER_SIZE], old_state_ptr[0..STATE_HEADER_SIZE]);
+
+    // Compute new data offsets and build metadata
+    var data_cursor: u32 = STATE_HEADER_SIZE + num_slots * SLOT_META_SIZE;
+    data_cursor = (data_cursor + 7) & ~@as(u32, 7);
+
+    var slot_i: u32 = 0;
+    while (slot_i < num_slots) : (slot_i += 1) {
+        const meta_base = STATE_HEADER_SIZE + slot_i * SLOT_META_SIZE;
+        const old_offset = std.mem.readInt(u32, old_state_ptr[meta_base..][0..4], .little);
+        const old_cap = std.mem.readInt(u32, old_state_ptr[meta_base + 4 ..][0..4], .little);
+        const type_flags_byte = old_state_ptr[meta_base + 12];
+        const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
+
+        const new_cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
+        const new_offset = data_cursor;
+        const new_data_size = getSlotDataSize(slot_type, new_cap);
+
+        // Write metadata: offset, capacity, size (size updated below for grown)
+        std.mem.writeInt(u32, new_state_ptr[meta_base..][0..4], new_offset, .little);
+        std.mem.writeInt(u32, new_state_ptr[meta_base + 4 ..][0..4], new_cap, .little);
+        // Copy remaining metadata fields (type_flags, agg_type, change_flags, TTL, etc.)
+        @memcpy(new_state_ptr[meta_base + 8 .. meta_base + SLOT_META_SIZE], old_state_ptr[meta_base + 8 .. meta_base + SLOT_META_SIZE]);
+
+        if (slot_i == grown_slot_idx) {
+            if (slot_type == 0) {
+                // HASHMAP: initialize keys to EMPTY_KEY, then rehash
+                const new_keys: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset]));
+                const new_vals: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset + new_cap * 4]));
+                const new_ts: [*]f64 = @ptrCast(@alignCast(&new_state_ptr[new_offset + new_cap * 8]));
+
+                // Fill keys with EMPTY_KEY
+                for (0..new_cap) |i| {
+                    new_keys[i] = EMPTY_KEY;
+                }
+
+                const old_keys: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset]));
+                const old_vals: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset + old_cap * 4]));
+                const old_ts: [*]const f64 = @ptrCast(@alignCast(&old_state_ptr[old_offset + old_cap * 8]));
+
+                var rehashed_size: u32 = 0;
+                for (0..old_cap) |i| {
+                    const key = old_keys[i];
+                    if (key != EMPTY_KEY and key != TOMBSTONE) {
+                        var pos = hashKey(key, new_cap);
+                        while (new_keys[pos] != EMPTY_KEY) {
+                            pos = (pos + 1) & (new_cap - 1);
+                        }
+                        new_keys[pos] = key;
+                        new_vals[pos] = old_vals[i];
+                        new_ts[pos] = old_ts[i];
+                        rehashed_size += 1;
+                    }
+                }
+                std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
+            } else if (slot_type == 1) {
+                // HASHSET: initialize to EMPTY_KEY, then rehash
+                const new_elems: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset]));
+                for (0..new_cap) |i| {
+                    new_elems[i] = EMPTY_KEY;
+                }
+
+                const old_elems: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset]));
+                var rehashed_size: u32 = 0;
+                for (0..old_cap) |i| {
+                    const elem = old_elems[i];
+                    if (elem != EMPTY_KEY and elem != TOMBSTONE) {
+                        var pos = hashKey(elem, new_cap);
+                        while (new_elems[pos] != EMPTY_KEY) {
+                            pos = (pos + 1) & (new_cap - 1);
+                        }
+                        new_elems[pos] = elem;
+                        rehashed_size += 1;
+                    }
+                }
+                std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
+            } else {
+                // Non-hash slot: copy data (aggregates/condition trees shouldn't be grown)
+                const old_data_size = getSlotDataSize(slot_type, old_cap);
+                const copy_len = @min(old_data_size, new_data_size);
+                if (copy_len > 0) {
+                    @memcpy(new_state_ptr[new_offset .. new_offset + copy_len], old_state_ptr[old_offset .. old_offset + copy_len]);
+                }
+            }
+        } else {
+            // Non-grown slot: memcpy data as-is
+            const data_size = getSlotDataSize(slot_type, old_cap);
+            if (data_size > 0) {
+                @memcpy(new_state_ptr[new_offset .. new_offset + data_size], old_state_ptr[old_offset .. old_offset + data_size]);
+            }
+        }
+
+        data_cursor = new_offset + new_data_size;
+        data_cursor = (data_cursor + 7) & ~@as(u32, 7);
+    }
+
+    return @intFromEnum(ErrorCode.OK);
+}
+
+// =============================================================================
+// Tests — Slot Growth
+// =============================================================================
+
+/// Build a minimal program with one HashMap slot (BATCH_MAP_UPSERT_LAST)
+/// and one Aggregate slot (BATCH_AGG_COUNT).
+fn buildTestProgram(comptime cap_lo: u8, comptime cap_hi: u8) [64]u8 {
+    var prog = [_]u8{0} ** 64;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+    // Magic "CLM1" stored as bytes: 'A','X','E','1' → reads as LE u32 = 0x314D4C43
+    content[0] = 0x41; // 'A'
+    content[1] = 0x58; // 'X'
+    content[2] = 0x45; // 'E'
+    content[3] = 0x31; // '1'
+    // Version: 1.0
+    content[4] = 1;
+    content[5] = 0;
+    // num_slots = 2, num_inputs = 2
+    content[6] = 2;
+    content[7] = 2;
+    // reserved
+    content[8] = 0;
+    content[9] = 0;
+    // Init section: SLOT_DEF(5 bytes) × 2 = 10 bytes
+    const init_len: u16 = 10;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+    // Reduce section: BATCH_MAP_UPSERT_LAST(4 bytes) + BATCH_AGG_COUNT(2 bytes) = 6 bytes
+    const reduce_len: u16 = 6;
+    content[12] = @truncate(reduce_len);
+    content[13] = @truncate(reduce_len >> 8);
+
+    // Init section starts at content[14]
+    var off: usize = 14;
+    // SLOT_DEF slot=0, type_flags=0x00 (HASHMAP), cap_lo, cap_hi
+    content[off] = 0x10; // SLOT_DEF opcode
+    content[off + 1] = 0; // slot index
+    content[off + 2] = 0x00; // type_flags: HASHMAP=0, no TTL
+    content[off + 3] = cap_lo;
+    content[off + 4] = cap_hi;
+    off += 5;
+    // SLOT_DEF slot=1, type_flags=0x02 (AGGREGATE), cap_lo=2 (COUNT), cap_hi=0
+    content[off] = 0x10; // SLOT_DEF opcode
+    content[off + 1] = 1; // slot index
+    content[off + 2] = 0x02; // type_flags: AGGREGATE=2
+    content[off + 3] = 2; // AggType.COUNT
+    content[off + 4] = 0;
+
+    // Reduce section starts at content[14 + init_len]
+    const reduce_start = 14 + init_len;
+    // BATCH_MAP_UPSERT_LAST slot=0, key_col=0, val_col=1
+    content[reduce_start] = 0x22;
+    content[reduce_start + 1] = 0;
+    content[reduce_start + 2] = 0;
+    content[reduce_start + 3] = 1;
+    // BATCH_AGG_COUNT slot=1
+    content[reduce_start + 4] = 0x41;
+    content[reduce_start + 5] = 1;
+
+    return prog;
+}
+
+test "slot growth - hashmap capacity exceeded triggers NEEDS_GROWTH" {
+    // Build program with tiny capacity (cap_lo=4, cap_hi=0 → effective capacity = nextPowerOf2(4*2) = 16)
+    const prog = buildTestProgram(4, 0);
+
+    // Calculate state size and allocate
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    std.debug.assert(state_size <= 4096);
+
+    // Init state
+    const init_result = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+    try std.testing.expectEqual(@as(u32, 0), init_result);
+
+    // Verify capacity is 16 (nextPowerOf2(4*2) = 16)
+    const meta_base = STATE_HEADER_SIZE;
+    const cap = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 16), cap);
+
+    // Insert 11 unique keys (max_size = (16*7)/10 = 11, so first 11 fit exactly)
+    var i: u32 = 0;
+    while (i < 11) : (i += 1) {
+        var key_col = [1]u32{i};
+        var val_col = [1]u32{i * 10};
+        const key_ptr: [*]const u8 = @ptrCast(&key_col);
+        const val_ptr: [*]const u8 = @ptrCast(&val_col);
+        const col_ptrs = [2][*]const u8{ key_ptr, val_ptr };
+        const result = vm_execute_batch(
+            @ptrCast(&state_buf),
+            @ptrCast(&prog),
+            prog.len,
+            @ptrCast(&col_ptrs),
+            2,
+            1,
+        );
+        try std.testing.expectEqual(@as(u32, 0), result);
+    }
+
+    // Verify size = 11
+    const size_after_11 = std.mem.readInt(u32, state_buf[meta_base + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 11), size_after_11);
+
+    // 12th unique key should trigger NEEDS_GROWTH (size=11 >= max_size=11)
+    var key_col_12 = [1]u32{100};
+    var val_col_12 = [1]u32{1000};
+    const key_ptr_12: [*]const u8 = @ptrCast(&key_col_12);
+    const val_ptr_12: [*]const u8 = @ptrCast(&val_col_12);
+    const col_ptrs_12 = [2][*]const u8{ key_ptr_12, val_ptr_12 };
+    const result_12 = vm_execute_batch(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs_12),
+        2,
+        1,
+    );
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.NEEDS_GROWTH)), result_12);
+
+    // Verify g_needs_growth_slot is slot 0
+    try std.testing.expectEqual(@as(u32, 0), vm_get_needs_growth_slot());
+}
+
+test "slot growth - grow preserves hashmap entries and aggregate" {
+    const prog = buildTestProgram(4, 0);
+
+    // Init state
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    std.debug.assert(state_size <= 4096);
+
+    const init_result = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+    try std.testing.expectEqual(@as(u32, 0), init_result);
+
+    // Insert 11 unique keys
+    var i: u32 = 0;
+    while (i < 11) : (i += 1) {
+        var key_col = [1]u32{i};
+        var val_col = [1]u32{i * 10};
+        const key_ptr: [*]const u8 = @ptrCast(&key_col);
+        const val_ptr: [*]const u8 = @ptrCast(&val_col);
+        const col_ptrs = [2][*]const u8{ key_ptr, val_ptr };
+        _ = vm_execute_batch(
+            @ptrCast(&state_buf),
+            @ptrCast(&prog),
+            prog.len,
+            @ptrCast(&col_ptrs),
+            2,
+            1,
+        );
+    }
+
+    // Verify aggregate count = 11 (11 batches of 1 row each)
+    const agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE; // slot 1 meta
+    const agg_data_offset = std.mem.readInt(u32, state_buf[agg_meta_base..][0..4], .little);
+    const count_lo = std.mem.readInt(u32, state_buf[agg_data_offset + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 11), count_lo);
+
+    // Grow slot 0
+    const grown_size = vm_calculate_grown_state_size(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        0,
+    );
+    var new_state_buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
+    std.debug.assert(grown_size <= 16384);
+
+    const grow_result = vm_grow_state(
+        @ptrCast(&state_buf),
+        @ptrCast(&new_state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        0,
+    );
+    try std.testing.expectEqual(@as(u32, 0), grow_result);
+
+    // Verify new capacity doubled: 16 → 32
+    const new_meta_base = STATE_HEADER_SIZE;
+    const new_cap = std.mem.readInt(u32, new_state_buf[new_meta_base + 4 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 32), new_cap);
+
+    // Verify size preserved (11 entries rehashed)
+    const new_size = std.mem.readInt(u32, new_state_buf[new_meta_base + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 11), new_size);
+
+    // Verify all entries preserved via vm_map_get
+    const new_data_offset = std.mem.readInt(u32, new_state_buf[new_meta_base..][0..4], .little);
+    i = 0;
+    while (i < 11) : (i += 1) {
+        const result = vm_map_get(@ptrCast(&new_state_buf), new_data_offset, 32, i);
+        try std.testing.expectEqual(i * 10, result);
+    }
+
+    // Verify aggregate count preserved (copied, not re-executed)
+    const new_agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE;
+    const new_agg_data_offset = std.mem.readInt(u32, new_state_buf[new_agg_meta_base..][0..4], .little);
+    const new_count_lo = std.mem.readInt(u32, new_state_buf[new_agg_data_offset + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 11), new_count_lo);
+
+    // Verify we can now insert more entries without NEEDS_GROWTH
+    // (new max_size = (32*7)/10 = 22, currently at 11)
+    var key_col_new = [1]u32{100};
+    var val_col_new = [1]u32{1000};
+    const key_ptr_new: [*]const u8 = @ptrCast(&key_col_new);
+    const val_ptr_new: [*]const u8 = @ptrCast(&val_col_new);
+    const col_ptrs_new = [2][*]const u8{ key_ptr_new, val_ptr_new };
+    const insert_result = vm_execute_batch(
+        @ptrCast(&new_state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs_new),
+        2,
+        1,
+    );
+    try std.testing.expectEqual(@as(u32, 0), insert_result);
+
+    // Verify the new entry is findable
+    const lookup = vm_map_get(@ptrCast(&new_state_buf), new_data_offset, 32, 100);
+    try std.testing.expectEqual(@as(u32, 1000), lookup);
+}
+
+test "slot growth - hashset growth preserves elements" {
+    // Build program with one HashSet slot
+    var prog = [_]u8{0} ** 56;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+    content[0] = 0x41; // 'A'
+    content[1] = 0x58; // 'X'
+    content[2] = 0x45; // 'E'
+    content[3] = 0x31; // '1'
+    content[4] = 1;
+    content[5] = 0;
+    content[6] = 1; // num_slots = 1
+    content[7] = 1; // num_inputs = 1
+    content[8] = 0;
+    content[9] = 0;
+    const init_len: u16 = 5;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+    const reduce_len: u16 = 3;
+    content[12] = @truncate(reduce_len);
+    content[13] = @truncate(reduce_len >> 8);
+
+    // SLOT_DEF slot=0, type_flags=0x01 (HASHSET), cap_lo=4, cap_hi=0 → cap=16
+    content[14] = 0x10;
+    content[15] = 0;
+    content[16] = 0x01; // HASHSET
+    content[17] = 4;
+    content[18] = 0;
+    // BATCH_SET_INSERT slot=0, elem_col=0
+    const reduce_start = 14 + init_len;
+    content[reduce_start] = 0x30;
+    content[reduce_start + 1] = 0;
+    content[reduce_start + 2] = 0;
+
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    std.debug.assert(state_size <= 4096);
+
+    _ = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+
+    // Insert 11 elements
+    var i: u32 = 0;
+    while (i < 11) : (i += 1) {
+        var elem_col = [1]u32{i + 1000}; // avoid EMPTY_KEY/TOMBSTONE
+        const elem_ptr: [*]const u8 = @ptrCast(&elem_col);
+        const col_ptrs = [1][*]const u8{elem_ptr};
+        _ = vm_execute_batch(
+            @ptrCast(&state_buf),
+            @ptrCast(&prog),
+            prog.len,
+            @ptrCast(&col_ptrs),
+            1,
+            1,
+        );
+    }
+
+    // Verify 12th triggers growth
+    var elem_col_12 = [1]u32{2000};
+    const elem_ptr_12: [*]const u8 = @ptrCast(&elem_col_12);
+    const col_ptrs_12 = [1][*]const u8{elem_ptr_12};
+    const result_12 = vm_execute_batch(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs_12),
+        1,
+        1,
+    );
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.NEEDS_GROWTH)), result_12);
+
+    // Grow
+    const grown_size = vm_calculate_grown_state_size(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        0,
+    );
+    var new_state_buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
+    std.debug.assert(grown_size <= 16384);
+
+    _ = vm_grow_state(
+        @ptrCast(&state_buf),
+        @ptrCast(&new_state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        0,
+    );
+
+    // Verify new capacity = 32
+    const meta_base = STATE_HEADER_SIZE;
+    const new_cap = std.mem.readInt(u32, new_state_buf[meta_base + 4 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 32), new_cap);
+
+    // Verify all 11 elements preserved via vm_set_contains
+    const new_data_offset = std.mem.readInt(u32, new_state_buf[meta_base..][0..4], .little);
+    i = 0;
+    while (i < 11) : (i += 1) {
+        const contained = vm_set_contains(@ptrCast(&new_state_buf), new_data_offset, 32, i + 1000);
+        try std.testing.expectEqual(@as(u32, 1), contained);
+    }
+
+    // Verify can insert 12th element now
+    const insert_result = vm_execute_batch(
+        @ptrCast(&new_state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs_12),
+        1,
+        1,
+    );
+    try std.testing.expectEqual(@as(u32, 0), insert_result);
+}

@@ -88,6 +88,8 @@ export enum ErrorCode {
   CAPACITY_EXCEEDED = 1,
   INVALID_PROGRAM = 2,
   INVALID_SLOT = 3,
+  INVALID_STATE = 4,
+  NEEDS_GROWTH = 5,
 }
 
 // =============================================================================
