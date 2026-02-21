@@ -38,6 +38,14 @@ import {
 
 type DynamicRowBuffer = Record<string, unknown>;
 
+function getOptionalArray<T>(buffer: unknown, key: string): T[] | undefined {
+  if (typeof buffer !== 'object' || buffer === null) {
+    return undefined;
+  }
+  const value = (buffer as Record<string, unknown>)[key];
+  return Array.isArray(value) ? (value as T[]) : undefined;
+}
+
 /**
  * Options for fact extraction.
  */
@@ -168,7 +176,7 @@ function walkBuffer<T extends LogSchema>(
   // - Row 1: span-ok/err/exception (completion status)
   // - Row 2+: log entries (info/debug/warn/error), ff entries
   const entryTypes = buffer.entry_type;
-  const messages = (buffer as unknown as { message_values?: (string | undefined)[] }).message_values;
+  const messages = getOptionalArray<string | undefined>(buffer, 'message_values');
 
   // Process log/ff entries from row 2 onwards
   for (let row = 2; row < writeIndex; row++) {
@@ -255,7 +263,7 @@ function extractTagFacts<T extends LogSchema>(
     const nullsKey = `${fieldName}_nulls`;
     const valuesKey = `${fieldName}_values`;
 
-    const dynamicBuffer = buffer as unknown as DynamicRowBuffer;
+    const dynamicBuffer = buffer as DynamicRowBuffer;
     const nulls = dynamicBuffer[nullsKey] as Uint8Array | undefined;
     const values = dynamicBuffer[valuesKey] as unknown[] | undefined;
 
@@ -276,8 +284,8 @@ function extractTagFacts<T extends LogSchema>(
  */
 function extractFFfacts<T extends LogSchema>(buffer: SpanBuffer<T>, row: number, facts: TraceFact[]): void {
   // ff_name and ff_value are system schema fields
-  const ffNameValues = (buffer as unknown as { ff_name_values?: string[] }).ff_name_values;
-  const ffValueValues = (buffer as unknown as { ff_value_values?: string[] }).ff_value_values;
+  const ffNameValues = getOptionalArray<string>(buffer, 'ff_name_values');
+  const ffValueValues = getOptionalArray<string>(buffer, 'ff_value_values');
 
   if (ffNameValues && ffValueValues) {
     const name = ffNameValues[row];
@@ -319,7 +327,7 @@ function entryTypeToLogLevel(entryType: number): LogLevel {
  * Get error code from a span-err row.
  */
 function getErrorCode<T extends LogSchema>(buffer: SpanBuffer<T>, row: number): string {
-  const errorCodes = (buffer as unknown as { error_code_values?: string[] }).error_code_values;
+  const errorCodes = getOptionalArray<string>(buffer, 'error_code_values');
   return errorCodes?.[row] ?? 'UNKNOWN';
 }
 
@@ -327,7 +335,7 @@ function getErrorCode<T extends LogSchema>(buffer: SpanBuffer<T>, row: number): 
  * Get exception message from a span-exception row.
  */
 function getExceptionMessage<T extends LogSchema>(buffer: SpanBuffer<T>, row: number): string {
-  const messages = (buffer as unknown as { message_values?: string[] }).message_values;
+  const messages = getOptionalArray<string>(buffer, 'message_values');
   return messages?.[row] ?? 'Unknown exception';
 }
 
