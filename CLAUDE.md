@@ -16,6 +16,10 @@ impossible programmer/configuration bugs. For full policy and examples, follow `
 be an agent." A credit note that currently processes one event is still a valid agent if credit notes are real domain
 entities with their own audit trail. Agent separation follows entity boundaries, not computational complexity.
 
+**Reducer state policy:** State shape reflects domain structure, not signal structure. Don't mirror signal types into
+parallel arrays — normalize into unified domain collections. The reducer is the boundary where specific signal payloads
+get transformed into canonical state. Use existing discriminators (e.g. `product_type_ord`) for downstream dispatch.
+
 **Signal design policy:** Signals are minimal cross-agent communication protocols. Each signal is a precise command that
 carries only what the **receiver** needs to act. For the full rules with code examples, see AGENTS.md.
 
