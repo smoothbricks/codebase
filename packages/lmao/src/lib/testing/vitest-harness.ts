@@ -128,7 +128,7 @@ export type VitestTestTracer<B extends OpContextBinding> = {
   initTraceTestRun(options?: InitTraceTestRunOptions): void;
   useTestSpan(): SpanCtx<B>;
   getTracer(): TestTracer<B>;
-  createVitestMock(vitestModule: Record<string, unknown>): Record<string, unknown>;
+  createVitestMock<T extends object>(vitestModule: T): T;
   describe(name: string, fn: () => void): unknown;
   it(name: string, fn: () => void | Promise<void>): void;
 };
@@ -256,10 +256,11 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     return tracer;
   }
 
-  function createVitestMock(vitestModule: Record<string, unknown>): Record<string, unknown> {
+  function createVitestMock<T extends object>(vitestModule: T): T {
     const currentRootCtx = getRootCtx();
-    const origIt = vitestModule.it as typeof _it;
-    const origDescribe = vitestModule.describe as typeof _describe;
+    const source = vitestModule as Record<string, unknown>;
+    const origIt = source.it as typeof _it;
+    const origDescribe = source.describe as typeof _describe;
     const describeStack: string[] = [];
 
     function wrappedDescribe(name: string, fn: () => void) {
@@ -307,7 +308,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
       skipIf: origIt.skipIf.bind(origIt),
     });
 
-    return { ...vitestModule, describe: wrappedDescribe, it: wrappedIt, test: wrappedIt };
+    return { ...(source as object), describe: wrappedDescribe, it: wrappedIt, test: wrappedIt } as T;
   }
 
   function describe(name: string, fn: () => void) {
@@ -392,7 +393,7 @@ export function getTracer(): TestTracer<OpContextBinding> {
  *
  * @param vitestModule - The original vitest namespace from importOriginal()
  */
-export function createVitestMock(vitestModule: Record<string, unknown>): Record<string, unknown> {
+export function createVitestMock<T extends object>(vitestModule: T): T {
   if (!_defaultHarness) {
     throw new Error('Call initTraceTestRun() before createVitestMock()');
   }
