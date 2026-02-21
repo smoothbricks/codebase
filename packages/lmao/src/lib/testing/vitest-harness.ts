@@ -51,10 +51,6 @@ function isExpectError(error: unknown): boolean {
 
 type TestBody = () => unknown | Promise<unknown>;
 type SpanCtx<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
-type RootSpanInvoker<B extends OpContextBinding> = (
-  name: string,
-  fn: (ctx: SpanCtx<B>) => Promise<unknown>,
-) => Promise<unknown>;
 
 type SpanContextStore<Ctx> = {
   run<R>(ctx: Ctx, fn: () => R): R;
@@ -191,12 +187,12 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     }
 
     const activeTracer = tracer;
-    rootTracePromise = activeTracer.trace('test-run', (ctx) => {
-      rootCtx = ctx as SpanCtx<B>;
+    rootTracePromise = activeTracer.trace('test-run', (ctx: SpanCtx<B>) => {
+      rootCtx = ctx;
       return new Promise<void>((resolve) => {
         resolveTestRun = resolve;
       });
-    }) as Promise<unknown>;
+    });
 
     _afterAll(async () => {
       if (resolveTestRun) {
@@ -267,7 +263,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     function wrappedIt(name: string, fn: TestBody) {
       const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
       return origIt(name, () =>
-        (currentRootCtx.span as RootSpanInvoker<B>)(name, async (ctx) => {
+        currentRootCtx.span(name, async (ctx) => {
           tagDescribePath(ctx, describePath);
           try {
             await spanStore.run(ctx, fn);
@@ -308,7 +304,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     const describePath = standaloneDescribeStack.length > 0 ? standaloneDescribeStack.join(' > ') : null;
     _it(name, () => {
       const currentRootCtx = getRootCtx();
-      return (currentRootCtx.span as RootSpanInvoker<B>)(name, async (ctx) => {
+      return currentRootCtx.span(name, async (ctx) => {
         tagDescribePath(ctx, describePath);
         try {
           await spanStore.run(ctx, fn);
@@ -340,7 +336,7 @@ let _defaultHarness: VitestTestTracer<OpContextBinding> | null = null;
 export function initTraceTestRun<B extends OpContextBinding>(opContext: B, options?: InitTraceTestRunOptions): void {
   const harness = makeVitestTestTracer({ binding: opContext });
   harness.initTraceTestRun(options);
-  _defaultHarness = harness as VitestTestTracer<OpContextBinding>;
+  _defaultHarness = harness;
 }
 
 /** Get the current span context from AsyncLocalStorage (inside an it() block) */
