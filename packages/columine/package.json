@@ -26,6 +26,14 @@
   },
   "nx": {
     "targets": {
+      "build": {
+        "executor": "nx:noop",
+        "dependsOn": [
+          "^build",
+          "build:ts",
+          "build:zig"
+        ]
+      },
       "typecheck": {
         "dependsOn": [
           "^typecheck"
