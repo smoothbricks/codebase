@@ -22,9 +22,14 @@ export const SPANS_TABLE_INFO_SQL = 'PRAGMA table_info(spans)';
 
 type DynamicUserColumnBuffer = Record<string, unknown>;
 
-interface MissingSchemaColumn {
+export interface SQLiteColumnDefinition {
   name: string;
   sqliteType: string;
+}
+
+interface SQLiteTableInfoColumn {
+  name: string;
+  type: string;
 }
 
 export interface SpanSegment {
@@ -81,6 +86,41 @@ function schemaTypeToSqlite(schemaType: SchemaType): string {
   throw new Error(`Unsupported schema type: ${String(schemaType)}`);
 }
 
+export function normalizeSqliteColumnType(type: string): string {
+  return type.trim() === '' ? 'TEXT' : type;
+}
+
+export function quoteSqlIdentifier(name: string): string {
+  if (!/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error(`Unsafe SQLite identifier: ${name}`);
+  }
+  return `"${name}"`;
+}
+
+export function buildAddColumnSql(column: SQLiteColumnDefinition): string {
+  return `ALTER TABLE spans ADD COLUMN ${quoteSqlIdentifier(column.name)} ${normalizeSqliteColumnType(column.sqliteType)}`;
+}
+
+export function getMissingSqliteColumns(
+  columns: readonly SQLiteColumnDefinition[],
+  knownColumns: ReadonlySet<string>,
+): SQLiteColumnDefinition[] {
+  const missing: SQLiteColumnDefinition[] = [];
+  for (const column of columns) {
+    if (!knownColumns.has(column.name)) {
+      missing.push(column);
+    }
+  }
+  return missing;
+}
+
+export function extractSqliteColumnsFromTableInfo(columns: readonly SQLiteTableInfoColumn[]): SQLiteColumnDefinition[] {
+  return columns.map((column) => ({
+    name: column.name,
+    sqliteType: normalizeSqliteColumnType(column.type),
+  }));
+}
+
 function* walkOverflowSegments(
   buffer: AnySpanBuffer,
   traceId: string,
@@ -113,20 +153,21 @@ export function* walkSpanSegments(rootBuffer: AnySpanBuffer): Generator<SpanSegm
   yield* walkTree(rootBuffer);
 }
 
-export function getMissingSchemaColumns(schema: LogSchema, knownColumns: ReadonlySet<string>): MissingSchemaColumn[] {
+export function getMissingSchemaColumns(
+  schema: LogSchema,
+  knownColumns: ReadonlySet<string>,
+): SQLiteColumnDefinition[] {
   const fields = schema.fields as Record<string, { __schema_type?: SchemaType }>;
-  const missing: MissingSchemaColumn[] = [];
+  const schemaColumns: SQLiteColumnDefinition[] = [];
 
   for (const [name, field] of Object.entries(fields)) {
-    if (knownColumns.has(name)) continue;
-
     const schemaType = field.__schema_type;
     if (!schemaType) continue;
 
-    missing.push({ name, sqliteType: schemaTypeToSqlite(schemaType) });
+    schemaColumns.push({ name, sqliteType: schemaTypeToSqlite(schemaType) });
   }
 
-  return missing;
+  return getMissingSqliteColumns(schemaColumns, knownColumns);
 }
 
 export function getActiveUserFields(schema: LogSchema, knownColumns: ReadonlySet<string>): string[] {

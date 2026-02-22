@@ -18,6 +18,7 @@
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
 import {
+  buildAddColumnSql,
   buildInsertParams,
   buildInsertSql,
   getActiveUserFields,
@@ -56,7 +57,7 @@ export class SQLiteTraceWriter {
   /** Ensure user-defined schema columns exist in the spans table */
   private ensureColumns(schema: LogSchema): void {
     for (const column of getMissingSchemaColumns(schema, this.knownColumns)) {
-      this.db.exec(`ALTER TABLE spans ADD COLUMN ${column.name} ${column.sqliteType}`);
+      this.db.exec(buildAddColumnSql(column));
       this.knownColumns.add(column.name);
     }
   }
