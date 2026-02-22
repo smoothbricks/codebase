@@ -6,7 +6,7 @@
  * Same architecture as bun-harness: one root trace per test run,
  * each it() creates a child span, describe path written to `describe` schema column.
  *
- * Uses better-sqlite3 for SQLite persistence (vitest runs on Node.js).
+ * Supports lifecycle tracer outputs (SQLite, stdio, or both via CompositeTracer).
  *
  * @example
  * ```typescript
@@ -39,11 +39,14 @@ import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
-import { TraceSQLite, TraceSQLiteAsync, type TraceSQLiteConfig } from '../sqlite/index.js';
 import type { AsyncSQLiteDatabase, SyncSQLiteDatabase } from '../sqlite/sqlite-db.js';
+import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
-import { TestTracer } from '../tracers/TestTracer.js';
-import { replayTraceToStdio } from './stdio-replay.js';
+import type { Tracer } from '../tracer.js';
+import { CompositeTracer } from '../tracers/CompositeTracer.js';
+import { NoOpTracer } from '../tracers/NoOpTracer.js';
+import { SQLiteAsyncTracer, SQLiteTracer } from '../tracers/SQLiteTracer.js';
+import { StdioTracer } from '../tracers/StdioTracer.js';
 
 /** vitest expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
@@ -94,15 +97,39 @@ type AsyncLocalStorageLike<Ctx> = {
 
 type AsyncLocalStorageCtor = new <Ctx>() => AsyncLocalStorageLike<Ctx>;
 
+type SQLiteRuntimeConfig = SQLiteWriterConfig &
+  (
+    | {
+        /** Node/bun style synchronous SQLite driver (for example better-sqlite3). */
+        createDatabase: (path: string) => SyncSQLiteDatabase;
+        createAsyncDatabase?: never;
+      }
+    | {
+        /** Async SQLite driver (for example Cloudflare D1 adapter). */
+        createAsyncDatabase: (path: string) => AsyncSQLiteDatabase | Promise<AsyncSQLiteDatabase>;
+        createDatabase?: never;
+      }
+  );
+
 type InitTraceTestRunOptions = {
-  sqlite?: TraceSQLiteConfig & {
-    /** better-sqlite3 Database constructor. Pass `import('better-sqlite3').default` */
-    createDatabase?: (path: string) => SyncSQLiteDatabase;
-    /** async database factory (for worker runtimes such as D1 adapters) */
-    createAsyncDatabase?: (path: string) => AsyncSQLiteDatabase | Promise<AsyncSQLiteDatabase>;
-  };
-  /** force verbose trace printing; defaults to env flag detection */
+  /**
+   * Optional SQLite persistence target.
+   *
+   * Omit this to run traced tests without DB persistence.
+   */
+  sqlite?: SQLiteRuntimeConfig;
+  /** Optional verbose stdout tracing; defaults to env flag detection. */
   verbose?: boolean;
+};
+
+type ClosableTracer = {
+  close?: () => void | Promise<void>;
+};
+
+type TracerFactoryOptions = {
+  binding: OpContextBinding;
+  sqlite: InitTraceTestRunOptions['sqlite'];
+  verbose: boolean;
 };
 
 function isTruthyEnvFlag(value: unknown): boolean {
@@ -178,6 +205,58 @@ function createDefaultSpanContextStore<Ctx>(): SpanContextStore<Ctx> {
   return new FallbackSpanContextStore<Ctx>();
 }
 
+function createRootTracer({ binding, sqlite, verbose }: TracerFactoryOptions): Tracer<OpContextBinding> {
+  const tracerOptions = {
+    bufferStrategy: new JsBufferStrategy(),
+    createTraceRoot,
+  } as const;
+
+  let sqliteTracer: Tracer<OpContextBinding> | null = null;
+  if (sqlite?.createAsyncDatabase) {
+    const dbPath = sqlite.dbPath ?? '.trace-results.db';
+    sqliteTracer = new SQLiteAsyncTracer(binding, {
+      ...tracerOptions,
+      db: sqlite.createAsyncDatabase(dbPath),
+    });
+  } else if (sqlite?.createDatabase) {
+    const db = sqlite.createDatabase(sqlite.dbPath ?? '.trace-results.db');
+    sqliteTracer = new SQLiteTracer(binding, {
+      ...tracerOptions,
+      db,
+    });
+  }
+
+  if (sqliteTracer) {
+    if (verbose) {
+      const stdioTracer = new StdioTracer(binding, {
+        ...tracerOptions,
+      });
+      return new CompositeTracer(binding, {
+        ...tracerOptions,
+        delegates: [stdioTracer, sqliteTracer],
+      });
+    }
+    return sqliteTracer;
+  }
+
+  if (verbose) {
+    return new StdioTracer(binding, {
+      ...tracerOptions,
+    });
+  }
+
+  return new NoOpTracer(binding, {
+    ...tracerOptions,
+  });
+}
+
+async function closeTracer(tracer: Tracer<OpContextBinding>): Promise<void> {
+  const close = (tracer as ClosableTracer).close;
+  if (typeof close === 'function') {
+    await close.call(tracer);
+  }
+}
+
 type VitestHarnessConfig<B extends OpContextBinding> = {
   binding: B;
   createSpanContextStore?: () => SpanContextStore<SpanCtx<B>>;
@@ -186,7 +265,7 @@ type VitestHarnessConfig<B extends OpContextBinding> = {
 export type VitestTestTracer<B extends OpContextBinding> = {
   initTraceTestRun(options?: InitTraceTestRunOptions): void;
   useTestSpan(): SpanCtx<B>;
-  getTracer(): TestTracer<B>;
+  getTracer(): Tracer<B>;
   createVitestMock<T extends object>(vitestModule: T): T;
   describe(name: string, fn: () => void): unknown;
   it(name: string, fn: () => void | Promise<void>): void;
@@ -237,8 +316,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
   vitestHarnessDebug('created vitest test tracer instance');
 
   let initialized = false;
-  let tracer: TestTracer<B> | null = null;
-  let sink: TraceSQLite | TraceSQLiteAsync | null = null;
+  let tracer: Tracer<B> | null = null;
   let verboseTrace = false;
   let rootCtx: SpanCtx<B> | null = null;
   let resolveTestRun: (() => void) | null = null;
@@ -271,11 +349,12 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
       logBinding: { ...binding.logBinding, logSchema: extendedSchema },
     } as B;
 
-    tracer = new TestTracer(extendedBinding, {
-      bufferStrategy: new JsBufferStrategy(),
-      createTraceRoot,
-    });
-    vitestHarnessDebug('created TestTracer for vitest harness');
+    tracer = createRootTracer({
+      binding: extendedBinding,
+      sqlite: options?.sqlite,
+      verbose: verboseTrace,
+    }) as Tracer<B>;
+    vitestHarnessDebug('created root tracer for vitest harness');
 
     const activeTracer = tracer;
     rootTracePromise = activeTracer.trace('test-run', (ctx: SpanCtx<B>) => {
@@ -301,31 +380,20 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
         vitestHarnessDebug('awaited root trace promise');
       }
 
-      if (verboseTrace && rootCtx) {
-        replayTraceToStdio(extendedBinding, rootCtx.buffer);
-      }
-
-      if (!sink && options?.sqlite?.createAsyncDatabase) {
-        const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
-        const db = await options.sqlite.createAsyncDatabase(dbPath);
-        sink = new TraceSQLiteAsync(db);
-      } else if (!sink && options?.sqlite?.createDatabase) {
-        const db = options.sqlite.createDatabase(options.sqlite.dbPath ?? '.trace-results.db');
-        sink = new TraceSQLite(db);
-      }
-
-      if (sink && rootCtx) {
+      if (tracer && rootCtx) {
         try {
-          vitestHarnessDebug('flushing sqlite trace sink');
-          await sink.flush(rootCtx.buffer);
-          const traceId = rootCtx.buffer.trace_id;
-          const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
-          console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
+          vitestHarnessDebug('flushing tracer');
+          await tracer.flush();
+          if (options?.sqlite) {
+            const traceId = rootCtx.buffer.trace_id;
+            const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
+            console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
+          }
         } catch (error) {
           console.error('[lmao/testing] SQLite flush error:', error);
+        } finally {
+          await closeTracer(tracer as unknown as Tracer<OpContextBinding>);
         }
-        await sink.close();
-        sink = null;
       }
       vitestHarnessDebug('afterAll hook complete');
     });
@@ -339,7 +407,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     return ctx;
   }
 
-  function getTracer(): TestTracer<B> {
+  function getTracer(): Tracer<B> {
     if (!tracer) {
       throw new Error('Call initTraceTestRun() in setupFiles before tests');
     }
@@ -466,7 +534,7 @@ export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
 }
 
 /** Get the root tracer instance */
-export function getTracer(): TestTracer<OpContextBinding> {
+export function getTracer(): Tracer<OpContextBinding> {
   if (_activeSuiteTracer) {
     return _activeSuiteTracer.getTracer();
   }

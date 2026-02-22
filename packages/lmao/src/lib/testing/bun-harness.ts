@@ -7,12 +7,12 @@
  * automatically creates a trace span — no import changes needed in test files.
  *
  * Architecture:
- * - initTraceTestRun() in preload sets up tracer + SQLite sink
+ * - initTraceTestRun() in preload sets up a lifecycle tracer pipeline
  * - mock.module('bun:test', ...) in preload patches it()/test() with trace spans
  * - One root trace per test run (tracer.trace('test-run', ...))
  * - Each it()/test() creates a child span of the root (rootCtx.span(name, fn))
  * - describe() is wrapped to track nesting — path written to `describe` schema column
- * - After all tests: flush root buffer tree to SQLite (if configured)
+ * - After all tests: flush tracer outputs (SQLite, stdio, or both)
  *
  * mock.module MUST be called from the preload file itself — bun only intercepts
  * subsequent imports when the mock is registered from the entry module context.
@@ -58,10 +58,13 @@ import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
-import { TraceSQLite, type TraceSQLiteConfig } from '../sqlite/index.js';
+import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
-import { TestTracer } from '../tracers/TestTracer.js';
-import { replayTraceToStdio } from './stdio-replay.js';
+import type { Tracer } from '../tracer.js';
+import { CompositeTracer } from '../tracers/CompositeTracer.js';
+import { NoOpTracer } from '../tracers/NoOpTracer.js';
+import { SQLiteTracer } from '../tracers/SQLiteTracer.js';
+import { StdioTracer } from '../tracers/StdioTracer.js';
 
 /** bun:test expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
@@ -90,7 +93,13 @@ type TestBody = () => unknown | Promise<unknown>;
 type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
 
 type BunTestSetupOptions = {
-  sqlite?: TraceSQLiteConfig;
+  /**
+   * Optional SQLite output path.
+   *
+   * Omit this to run traced tests without DB persistence.
+   */
+  sqlite?: SQLiteWriterConfig;
+  /** Optional verbose stdout tracing; defaults to env flag detection. */
   verbose?: boolean;
 };
 
@@ -117,10 +126,65 @@ type RootSpanRunner<Ctx extends OpContext> = (
   fn: (ctx: SpanContext<Ctx>) => Promise<unknown>,
 ) => Promise<unknown>;
 
+type ClosableTracer = {
+  close?: () => void | Promise<void>;
+};
+
+type TracerFactoryOptions = {
+  binding: OpContextBinding;
+  sqlite: SQLiteWriterConfig | undefined;
+  verbose: boolean;
+};
+
+function createRootTracer({ binding, sqlite, verbose }: TracerFactoryOptions): Tracer<OpContextBinding> {
+  const tracerOptions = {
+    bufferStrategy: new JsBufferStrategy(),
+    createTraceRoot,
+  } as const;
+
+  if (sqlite) {
+    const db = new Database(sqlite.dbPath ?? '.trace-results.db');
+    const sqliteTracer = new SQLiteTracer(binding, {
+      ...tracerOptions,
+      db,
+    });
+
+    if (verbose) {
+      const stdioTracer = new StdioTracer(binding, {
+        ...tracerOptions,
+      });
+
+      return new CompositeTracer(binding, {
+        ...tracerOptions,
+        delegates: [stdioTracer, sqliteTracer],
+      });
+    }
+
+    return sqliteTracer;
+  }
+
+  if (verbose) {
+    return new StdioTracer(binding, {
+      ...tracerOptions,
+    });
+  }
+
+  return new NoOpTracer(binding, {
+    ...tracerOptions,
+  });
+}
+
+async function closeTracer(tracer: Tracer<OpContextBinding>): Promise<void> {
+  const close = (tracer as ClosableTracer).close;
+  if (typeof close === 'function') {
+    await close.call(tracer);
+  }
+}
+
 export interface BunTestTracerInstance<B extends OpContextBinding> {
   setup(): void;
   useTestSpan(): HarnessSpanContext<B>;
-  getTracer(): TestTracer<B>;
+  getTracer(): Tracer<B>;
   createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown>;
 }
 
@@ -161,8 +225,7 @@ export function makeTestTracer<B extends OpContextBinding>(
 ): BunTestTracerInstance<B> {
   type SpanCtx = HarnessSpanContext<B>;
 
-  let tracer: TestTracer<B> | null = null;
-  let sink: TraceSQLite | null = null;
+  let tracer: Tracer<B> | null = null;
   let verboseTrace = false;
   let rootCtx: SpanCtx | null = null;
   let resolveTestRun: (() => void) | null = null;
@@ -176,7 +239,7 @@ export function makeTestTracer<B extends OpContextBinding>(
     return rootCtx;
   }
 
-  function assertTracer(): TestTracer<B> {
+  function assertTracer(): Tracer<B> {
     if (!tracer) throw new Error('Call setup() in preload before tests');
     return tracer;
   }
@@ -256,19 +319,15 @@ export function makeTestTracer<B extends OpContextBinding>(
         },
       } as B;
 
-      tracer = new TestTracer(extendedBinding, {
-        bufferStrategy: new JsBufferStrategy(),
-        createTraceRoot,
-      });
-
       verboseTrace = isVerboseTraceEnabled(options?.verbose);
 
-      if (options?.sqlite) {
-        const db = new Database(options.sqlite.dbPath ?? '.trace-results.db');
-        sink = new TraceSQLite(db);
-      }
+      tracer = createRootTracer({
+        binding: extendedBinding,
+        sqlite: options?.sqlite,
+        verbose: verboseTrace,
+      }) as Tracer<B>;
 
-      rootTracePromise = tracer.trace('test-run', (ctx) => {
+      rootTracePromise = tracer.trace('test-run', (ctx: SpanCtx) => {
         rootCtx = ctx;
         return new Promise<void>((resolve) => {
           resolveTestRun = resolve;
@@ -286,22 +345,19 @@ export function makeTestTracer<B extends OpContextBinding>(
           rootTracePromise = null;
         }
 
-        if (verboseTrace && rootCtx) {
-          replayTraceToStdio(extendedBinding, rootCtx.buffer);
-        }
-
-        if (sink && rootCtx) {
+        if (tracer) {
           try {
-            await sink.flush(rootCtx.buffer);
-            const traceId = rootCtx.buffer.trace_id;
-            const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
-            console.log(`\n[trace] trace_id: ${traceId} -> ${dbPath}`);
+            await tracer.flush();
+            if (options?.sqlite && rootCtx) {
+              const traceId = rootCtx.buffer.trace_id;
+              const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
+              console.log(`\n[trace] trace_id: ${traceId} -> ${dbPath}`);
+            }
           } catch (e) {
             console.error('[lmao/testing] SQLite flush error:', e);
+          } finally {
+            await closeTracer(tracer as unknown as Tracer<OpContextBinding>);
           }
-
-          await sink.close();
-          sink = null;
         }
       });
     },
@@ -312,7 +368,7 @@ export function makeTestTracer<B extends OpContextBinding>(
       return ctx;
     },
 
-    getTracer(): TestTracer<B> {
+    getTracer(): Tracer<B> {
       return assertTracer();
     },
 
@@ -335,8 +391,7 @@ export function makeTestTracer<B extends OpContextBinding>(
 }
 
 // Global singleton — one root tracer for the entire bun test run
-let _tracer: TestTracer<OpContextBinding> | null = null;
-let _sink: TraceSQLite | null = null;
+let _tracer: Tracer<OpContextBinding> | null = null;
 let _verboseTrace = false;
 
 // Root span context, its resolver, and the trace promise — one root per test run
@@ -360,17 +415,13 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
     logBinding: { ...opContext.logBinding, logSchema: extendedSchema },
   };
 
-  _tracer = new TestTracer(extendedBinding, {
-    bufferStrategy: new JsBufferStrategy(),
-    createTraceRoot,
-  }) as TestTracer<OpContextBinding>;
-
   _verboseTrace = isVerboseTraceEnabled(options?.verbose);
 
-  if (options?.sqlite) {
-    const db = new Database(options.sqlite.dbPath ?? '.trace-results.db');
-    _sink = new TraceSQLite(db);
-  }
+  _tracer = createRootTracer({
+    binding: extendedBinding,
+    sqlite: options?.sqlite,
+    verbose: _verboseTrace,
+  });
 
   // Create the single root trace — a long-lived promise keeps it alive
   const tracer = _tracer;
@@ -381,7 +432,7 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
     });
   }) as Promise<unknown>;
 
-  // Register global teardown — resolve root, wait for span-end, then flush to SQLite
+  // Register global teardown — resolve root, wait for span-end, then flush tracer outputs
   _afterAll(async () => {
     // Resolve the root promise — triggers span-end write via _executeWithContext .then()
     if (_resolveTestRun) {
@@ -394,21 +445,19 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
       _rootTracePromise = null;
     }
 
-    if (_verboseTrace && _rootCtx) {
-      replayTraceToStdio(extendedBinding, _rootCtx.buffer);
-    }
-
-    if (_sink && _rootCtx) {
+    if (_tracer) {
       try {
-        await _sink.flush(_rootCtx.buffer);
-        const traceId = _rootCtx.buffer.trace_id;
-        const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
-        console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
+        await _tracer.flush();
+        if (options?.sqlite && _rootCtx) {
+          const traceId = _rootCtx.buffer.trace_id;
+          const dbPath = options.sqlite.dbPath ?? '.trace-results.db';
+          console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
+        }
       } catch (e) {
         console.error('[lmao/testing] SQLite flush error:', e);
+      } finally {
+        await closeTracer(_tracer);
       }
-      await _sink.close();
-      _sink = null;
     }
   });
 }
@@ -506,9 +555,9 @@ export function useTestSpan<Ctx extends SpanContext<OpContext> = SpanContext<OpC
 }
 
 /** Get the root tracer instance */
-export function getTracer(): TestTracer<OpContextBinding> {
+export function getTracer(): Tracer<OpContextBinding> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.getTracer() as TestTracer<OpContextBinding>;
+    return _activeSuiteTracer.getTracer() as Tracer<OpContextBinding>;
   }
 
   if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');
