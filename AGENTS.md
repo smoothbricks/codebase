@@ -455,6 +455,9 @@ Three distinct string types, each with different storage strategies:
 - **Note**: Tests no longer depend on typecheck-tests - linting handles that. Tests only depend on build.
 
 
+- Scenario instances are immutable/fork-safe; create a fresh root per test.
+- JS reducer execution in Scenario is parity-only and reserved for compiler/VM cross-reference tests.
+
 **Signal design:** Signals are minimal cross-agent protocols — each signal is a precise command carrying only what the **receiver** needs.
 
 **No sender bookkeeping.** Retry counters, backoff schedules, scheduling timestamps, and config values belong in the
