@@ -664,6 +664,50 @@ fn findInsertSlot(keys: [*]u32, capacity: u32, key: u32) u32 {
     return capacity; // Full (shouldn't happen with proper load factor)
 }
 
+const UpsertProbe = struct {
+    slot: u32,
+    found_existing: bool,
+};
+
+/// Probe for map/set upsert while honoring tombstones.
+///
+/// If the key already exists, returns `{ found_existing=true, slot=existing_slot }`.
+/// Otherwise returns the best insertion slot:
+/// - first tombstone seen in the probe chain, or
+/// - first EMPTY_KEY slot if no tombstone was seen.
+/// If no insertion slot is available, returns `{ found_existing=false, slot=capacity }`.
+fn probeUpsertSlot(keys: [*]const u32, capacity: u32, key: u32) UpsertProbe {
+    var slot = hashKey(key, capacity);
+    var probes: u32 = 0;
+    var first_tombstone = capacity;
+
+    while (probes < capacity) : (probes += 1) {
+        const k = keys[slot];
+        if (k == key) {
+            return .{ .slot = slot, .found_existing = true };
+        }
+
+        if (k == TOMBSTONE) {
+            if (first_tombstone == capacity) {
+                first_tombstone = slot;
+            }
+        } else if (k == EMPTY_KEY) {
+            return .{
+                .slot = if (first_tombstone != capacity) first_tombstone else slot,
+                .found_existing = false,
+            };
+        }
+
+        slot = (slot + 1) & (capacity - 1);
+    }
+
+    if (first_tombstone != capacity) {
+        return .{ .slot = first_tombstone, .found_existing = false };
+    }
+
+    return .{ .slot = capacity, .found_existing = false };
+}
+
 /// Roll back a single undo entry by reversing its mutation on the flat state buffer.
 fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
     switch (entry.op) {
@@ -1209,103 +1253,100 @@ fn batchMapUpsertLatest(
         const val = val_col[i];
         const ts = ts_col[i];
 
-        var slot = hashKey(key, meta.capacity);
-        var probes: u32 = 0;
+        const probe = probeUpsertSlot(keys, meta.capacity, key);
 
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY or k == TOMBSTONE) {
-                if (size >= max_size) {
+        if (!probe.found_existing) {
+            if (probe.slot == meta.capacity or size >= max_size) {
+                meta.size_ptr.* = size;
+                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                return .CAPACITY_EXCEEDED;
+            }
+
+            // Undo: record new insertion so rollback can tombstone it.
+            // Flush local size to state before undoAppend — overflow may
+            // capture a shadow snapshot and the size field must be current.
+            if (g_undo_enabled) {
+                meta.size_ptr.* = size;
+                appendMutation(
+                    delta_mode,
+                    .{
+                        .op = .MAP_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = 0,
+                        .aux = 0,
+                    },
+                    .{
+                        .op = .MAP_DELETE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = val,
+                        .aux = @bitCast(ts),
+                    },
+                );
+            }
+
+            keys[probe.slot] = key;
+            values[probe.slot] = val;
+            timestamps[probe.slot] = ts;
+            size += 1;
+            had_insert = true;
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                if (ttl_result != .OK) {
                     meta.size_ptr.* = size;
                     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                    return .CAPACITY_EXCEEDED;
+                    return ttl_result;
                 }
-                // Undo: record new insertion so rollback can tombstone it.
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .MAP_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                        .{
-                            .op = .MAP_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = val,
-                            .aux = @bitCast(ts),
-                        },
-                    );
-                }
-                keys[slot] = key;
-                values[slot] = val;
-                timestamps[slot] = ts;
-                size += 1;
-                had_insert = true;
-                if (meta.hasTTL()) {
-                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                    if (ttl_result != .OK) {
-                        meta.size_ptr.* = size;
-                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                        if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                        return ttl_result;
-                    }
-                }
-                break;
-            } else if (k == key) {
-                if (ts > timestamps[slot]) {
-                    // Undo: save previous value + timestamp before overwrite
-                    if (g_undo_enabled) {
-                        meta.size_ptr.* = size;
-                        appendMutation(
-                            delta_mode,
-                            .{
-                                .op = .MAP_UPDATE,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = key,
-                                .prev_value = values[slot],
-                                .aux = @bitCast(timestamps[slot]),
-                            },
-                            .{
-                                .op = .MAP_UPDATE,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = key,
-                                .prev_value = val,
-                                .aux = @bitCast(ts),
-                            },
-                        );
-                    }
-                    values[slot] = val;
-                    timestamps[slot] = ts;
-                    had_update = true;
-                    if (meta.hasTTL()) {
-                        const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                        if (ttl_result != .OK) {
-                            meta.size_ptr.* = size;
-                            if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                            if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                            return ttl_result;
-                        }
-                    }
-                }
-                break;
             }
-            slot = (slot + 1) & (meta.capacity - 1);
+            continue;
+        }
+
+        const slot = probe.slot;
+        if (ts > timestamps[slot]) {
+            // Undo: save previous value + timestamp before overwrite
+            if (g_undo_enabled) {
+                meta.size_ptr.* = size;
+                appendMutation(
+                    delta_mode,
+                    .{
+                        .op = .MAP_UPDATE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = values[slot],
+                        .aux = @bitCast(timestamps[slot]),
+                    },
+                    .{
+                        .op = .MAP_UPDATE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = val,
+                        .aux = @bitCast(ts),
+                    },
+                );
+            }
+            values[slot] = val;
+            timestamps[slot] = ts;
+            had_update = true;
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                if (ttl_result != .OK) {
+                    meta.size_ptr.* = size;
+                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                    return ttl_result;
+                }
+            }
         }
     }
 
@@ -1418,100 +1459,97 @@ fn batchMapUpsertLast(
         const val = val_col[i];
         const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
 
-        var slot = hashKey(key, meta.capacity);
-        var probes: u32 = 0;
+        const probe = probeUpsertSlot(keys, meta.capacity, key);
 
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY or k == TOMBSTONE) {
-                if (size >= max_size) {
+        if (!probe.found_existing) {
+            if (probe.slot == meta.capacity or size >= max_size) {
+                meta.size_ptr.* = size;
+                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                return .CAPACITY_EXCEEDED;
+            }
+
+            // Undo: record new insertion so rollback can tombstone it.
+            // Flush local size to state before undoAppend — overflow may
+            // capture a shadow snapshot and the size field must be current.
+            if (g_undo_enabled) {
+                meta.size_ptr.* = size;
+                appendMutation(
+                    delta_mode,
+                    .{
+                        .op = .MAP_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = 0,
+                        .aux = 0,
+                    },
+                    .{
+                        .op = .MAP_DELETE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = val,
+                        .aux = 0,
+                    },
+                );
+            }
+
+            keys[probe.slot] = key;
+            values[probe.slot] = val;
+            size += 1;
+            had_insert = true;
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                if (ttl_result != .OK) {
                     meta.size_ptr.* = size;
                     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
                     if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                    return .CAPACITY_EXCEEDED;
+                    return ttl_result;
                 }
-                // Undo: record new insertion so rollback can tombstone it.
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .MAP_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                        .{
-                            .op = .MAP_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = val,
-                            .aux = 0,
-                        },
-                    );
-                }
-                keys[slot] = key;
-                values[slot] = val;
-                size += 1;
-                had_insert = true;
-                if (meta.hasTTL()) {
-                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                    if (ttl_result != .OK) {
-                        meta.size_ptr.* = size;
-                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                        if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                        return ttl_result;
-                    }
-                }
-                break;
-            } else if (k == key) {
-                // Undo: save previous value before overwrite (no timestamp for Last)
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .MAP_UPDATE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = values[slot],
-                            .aux = 0,
-                        },
-                        .{
-                            .op = .MAP_UPDATE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = val,
-                            .aux = 0,
-                        },
-                    );
-                }
-                // Last wins - always update
-                values[slot] = val;
-                had_update = true;
-                if (meta.hasTTL()) {
-                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                    if (ttl_result != .OK) {
-                        meta.size_ptr.* = size;
-                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                        if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                        return ttl_result;
-                    }
-                }
-                break;
             }
-            slot = (slot + 1) & (meta.capacity - 1);
+            continue;
+        }
+
+        const slot = probe.slot;
+        // Undo: save previous value before overwrite (no timestamp for Last)
+        if (g_undo_enabled) {
+            meta.size_ptr.* = size;
+            appendMutation(
+                delta_mode,
+                .{
+                    .op = .MAP_UPDATE,
+                    .slot = slot_idx,
+                    ._pad1 = 0,
+                    ._pad2 = 0,
+                    .key = key,
+                    .prev_value = values[slot],
+                    .aux = 0,
+                },
+                .{
+                    .op = .MAP_UPDATE,
+                    .slot = slot_idx,
+                    ._pad1 = 0,
+                    ._pad2 = 0,
+                    .key = key,
+                    .prev_value = val,
+                    .aux = 0,
+                },
+            );
+        }
+        // Last wins - always update
+        values[slot] = val;
+        had_update = true;
+        if (meta.hasTTL()) {
+            const ttl_result = insertWithTTL(state_base, meta, key, ts);
+            if (ttl_result != .OK) {
+                meta.size_ptr.* = size;
+                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                return ttl_result;
+            }
         }
     }
 
@@ -1847,68 +1885,62 @@ fn batchSetInsert(
     while (i < batch_len) : (i += 1) {
         const elem = elem_col[i];
         const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
-        var slot = hashKey(elem, meta.capacity);
-        var probes: u32 = 0;
+        const probe = probeUpsertSlot(keys, meta.capacity, elem);
 
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY or k == TOMBSTONE) {
-                if (size >= max_size) {
+        if (!probe.found_existing) {
+            if (probe.slot == meta.capacity or size >= max_size) {
+                meta.size_ptr.* = size;
+                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                return .CAPACITY_EXCEEDED;
+            }
+            // Undo: record new set insertion so rollback can tombstone it.
+            // Flush local size to state before undoAppend — overflow may
+            // capture a shadow snapshot and the size field must be current.
+            if (g_undo_enabled) {
+                meta.size_ptr.* = size;
+                appendMutation(
+                    delta_mode,
+                    .{
+                        .op = .SET_INSERT,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = elem,
+                        .prev_value = 0,
+                        .aux = 0,
+                    },
+                    .{
+                        .op = .SET_DELETE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = elem,
+                        .prev_value = 0,
+                        .aux = 0,
+                    },
+                );
+            }
+            keys[probe.slot] = elem;
+            size += 1;
+            had_insert = true;
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, elem, ts);
+                if (ttl_result != .OK) {
                     meta.size_ptr.* = size;
                     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    return .CAPACITY_EXCEEDED;
+                    return ttl_result;
                 }
-                // Undo: record new set insertion so rollback can tombstone it.
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .SET_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = elem,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                        .{
-                            .op = .SET_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = elem,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                    );
-                }
-                keys[slot] = elem;
-                size += 1;
-                had_insert = true;
-                if (meta.hasTTL()) {
-                    const ttl_result = insertWithTTL(state_base, meta, elem, ts);
-                    if (ttl_result != .OK) {
-                        meta.size_ptr.* = size;
-                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                        return ttl_result;
-                    }
-                }
-                break;
-            } else if (k == elem) {
-                if (meta.hasTTL()) {
-                    const ttl_result = insertWithTTL(state_base, meta, elem, ts);
-                    if (ttl_result != .OK) {
-                        meta.size_ptr.* = size;
-                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                        return ttl_result;
-                    }
-                }
-                break;
             }
-            slot = (slot + 1) & (meta.capacity - 1);
+            continue;
+        }
+
+        if (meta.hasTTL()) {
+            const ttl_result = insertWithTTL(state_base, meta, elem, ts);
+            if (ttl_result != .OK) {
+                meta.size_ptr.* = size;
+                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                return ttl_result;
+            }
         }
     }
 
@@ -2014,45 +2046,40 @@ fn singleMapUpsertLast(
     const size = meta.size_ptr.*;
     const max_size = (meta.capacity * 7) / 10;
 
-    var pos = hashKey(key, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY or k == TOMBSTONE) {
-            if (size >= max_size) return .CAPACITY_EXCEEDED;
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                    .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = 0 },
-                );
-            }
-            keys[pos] = key;
-            values[pos] = val;
-            meta.size_ptr.* = size + 1;
-            setChangeFlag(meta, ChangeFlag.INSERTED);
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
-                if (ttl_result != .OK) return ttl_result;
-            }
-            return .OK;
-        } else if (k == key) {
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[pos], .aux = 0 },
-                    .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = 0 },
-                );
-            }
-            values[pos] = val;
-            setChangeFlag(meta, ChangeFlag.UPDATED);
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
-                if (ttl_result != .OK) return ttl_result;
-            }
-            return .OK;
+    const probe = probeUpsertSlot(keys, meta.capacity, key);
+    if (!probe.found_existing) {
+        if (probe.slot == meta.capacity or size >= max_size) return .CAPACITY_EXCEEDED;
+        if (g_undo_enabled) {
+            appendMutation(
+                delta_mode,
+                .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
+                .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = 0 },
+            );
         }
-        pos = (pos + 1) & (meta.capacity - 1);
+        keys[probe.slot] = key;
+        values[probe.slot] = val;
+        meta.size_ptr.* = size + 1;
+        setChangeFlag(meta, ChangeFlag.INSERTED);
+        if (meta.hasTTL()) {
+            const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
+            if (ttl_result != .OK) return ttl_result;
+        }
+        return .OK;
+    }
+
+    const slot = probe.slot;
+    if (g_undo_enabled) {
+        appendMutation(
+            delta_mode,
+            .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[slot], .aux = 0 },
+            .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = 0 },
+        );
+    }
+    values[slot] = val;
+    setChangeFlag(meta, ChangeFlag.UPDATED);
+    if (meta.hasTTL()) {
+        const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
+        if (ttl_result != .OK) return ttl_result;
     }
     return .OK;
 }
@@ -2076,49 +2103,44 @@ fn singleMapUpsertLatest(
     const size = meta.size_ptr.*;
     const max_size = (meta.capacity * 7) / 10;
 
-    var pos = hashKey(key, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY or k == TOMBSTONE) {
-            if (size >= max_size) return .CAPACITY_EXCEEDED;
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                    .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(ts) },
-                );
-            }
-            keys[pos] = key;
-            values[pos] = val;
-            timestamps[pos] = ts;
-            meta.size_ptr.* = size + 1;
-            setChangeFlag(meta, ChangeFlag.INSERTED);
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                if (ttl_result != .OK) return ttl_result;
-            }
-            return .OK;
-        } else if (k == key) {
-            if (ts > timestamps[pos]) {
-                if (g_undo_enabled) {
-                    appendMutation(
-                        delta_mode,
-                        .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[pos], .aux = @bitCast(timestamps[pos]) },
-                        .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(ts) },
-                    );
-                }
-                values[pos] = val;
-                timestamps[pos] = ts;
-                setChangeFlag(meta, ChangeFlag.UPDATED);
-                if (meta.hasTTL()) {
-                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                    if (ttl_result != .OK) return ttl_result;
-                }
-            }
-            return .OK;
+    const probe = probeUpsertSlot(keys, meta.capacity, key);
+    if (!probe.found_existing) {
+        if (probe.slot == meta.capacity or size >= max_size) return .CAPACITY_EXCEEDED;
+        if (g_undo_enabled) {
+            appendMutation(
+                delta_mode,
+                .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
+                .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(ts) },
+            );
         }
-        pos = (pos + 1) & (meta.capacity - 1);
+        keys[probe.slot] = key;
+        values[probe.slot] = val;
+        timestamps[probe.slot] = ts;
+        meta.size_ptr.* = size + 1;
+        setChangeFlag(meta, ChangeFlag.INSERTED);
+        if (meta.hasTTL()) {
+            const ttl_result = insertWithTTL(state_base, meta, key, ts);
+            if (ttl_result != .OK) return ttl_result;
+        }
+        return .OK;
+    }
+
+    const slot = probe.slot;
+    if (ts > timestamps[slot]) {
+        if (g_undo_enabled) {
+            appendMutation(
+                delta_mode,
+                .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[slot], .aux = @bitCast(timestamps[slot]) },
+                .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(ts) },
+            );
+        }
+        values[slot] = val;
+        timestamps[slot] = ts;
+        setChangeFlag(meta, ChangeFlag.UPDATED);
+        if (meta.hasTTL()) {
+            const ttl_result = insertWithTTL(state_base, meta, key, ts);
+            if (ttl_result != .OK) return ttl_result;
+        }
     }
     return .OK;
 }
@@ -2338,35 +2360,29 @@ fn singleSetInsert(
     const size = meta.size_ptr.*;
     const max_size = (meta.capacity * 7) / 10;
 
-    var pos = hashKey(elem, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY or k == TOMBSTONE) {
-            if (size >= max_size) return .CAPACITY_EXCEEDED;
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .SET_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
-                    .{ .op = .SET_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
-                );
-            }
-            keys[pos] = elem;
-            meta.size_ptr.* = size + 1;
-            setChangeFlag(meta, ChangeFlag.INSERTED);
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
-                if (ttl_result != .OK) return ttl_result;
-            }
-            return .OK;
-        } else if (k == elem) {
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
-                if (ttl_result != .OK) return ttl_result;
-            }
-            return .OK;
+    const probe = probeUpsertSlot(keys, meta.capacity, elem);
+    if (!probe.found_existing) {
+        if (probe.slot == meta.capacity or size >= max_size) return .CAPACITY_EXCEEDED;
+        if (g_undo_enabled) {
+            appendMutation(
+                delta_mode,
+                .{ .op = .SET_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
+                .{ .op = .SET_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
+            );
         }
-        pos = (pos + 1) & (meta.capacity - 1);
+        keys[probe.slot] = elem;
+        meta.size_ptr.* = size + 1;
+        setChangeFlag(meta, ChangeFlag.INSERTED);
+        if (meta.hasTTL()) {
+            const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
+            if (ttl_result != .OK) return ttl_result;
+        }
+        return .OK;
+    }
+
+    if (meta.hasTTL()) {
+        const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
+        if (ttl_result != .OK) return ttl_result;
     }
     return .OK;
 }
@@ -4457,12 +4473,18 @@ pub export fn vm_init_state(
                 var timestamp_field_idx: u8 = 0;
                 var start_of: DurationUnit = .NONE;
                 if (type_flags.has_ttl) {
-                    const ttl_bytes = init_code[pc .. pc + 4];
-                    const ttl_ptr: *const f32 = @ptrCast(@alignCast(ttl_bytes.ptr));
-                    ttl_seconds = ttl_ptr.*;
-                    const grace_bytes = init_code[pc + 4 .. pc + 8];
-                    const grace_ptr: *const f32 = @ptrCast(@alignCast(grace_bytes.ptr));
-                    grace_seconds = grace_ptr.*;
+                    const ttl_bits: u32 =
+                        @as(u32, init_code[pc]) |
+                        (@as(u32, init_code[pc + 1]) << 8) |
+                        (@as(u32, init_code[pc + 2]) << 16) |
+                        (@as(u32, init_code[pc + 3]) << 24);
+                    ttl_seconds = @bitCast(ttl_bits);
+                    const grace_bits: u32 =
+                        @as(u32, init_code[pc + 4]) |
+                        (@as(u32, init_code[pc + 5]) << 8) |
+                        (@as(u32, init_code[pc + 6]) << 16) |
+                        (@as(u32, init_code[pc + 7]) << 24);
+                    grace_seconds = @bitCast(grace_bits);
                     timestamp_field_idx = init_code[pc + 8];
                     start_of = @enumFromInt(init_code[pc + 9]);
                     pc += 10;
@@ -5843,10 +5865,12 @@ fn buildTTLSetProgram(comptime cap_lo: u8, comptime cap_hi: u8) [96]u8 {
 test "ttl hashmap - insert and evict through live reducer path" {
     const prog = buildTTLMapProgram(4, 0, true);
     const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
-    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
-    std.debug.assert(state_size <= 4096);
+    var state_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(state_size));
+    defer std.testing.allocator.free(state_buf);
+    @memset(state_buf, 0);
+    const state_ptr: [*]u8 = @ptrCast(state_buf.ptr);
 
-    const init_result = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+    const init_result = vm_init_state(state_ptr, @ptrCast(&prog), prog.len);
     try std.testing.expectEqual(@as(u32, 0), init_result);
 
     var key_col = [1]u32{42};
@@ -5854,43 +5878,45 @@ test "ttl hashmap - insert and evict through live reducer path" {
     var ts_col = [1]f64{100.0};
     const col_ptrs = [3][*]const u8{ @ptrCast(&key_col), @ptrCast(&val_col), @ptrCast(&ts_col) };
 
-    const exec_result = vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&col_ptrs), 3, 1);
+    const exec_result = vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&col_ptrs), 3, 1);
     try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.OK)), exec_result);
 
     const meta_base = STATE_HEADER_SIZE;
     const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
     const slot_cap = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
-    const before = vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 42);
+    const before = vm_map_get(state_ptr, slot_offset, slot_cap, 42);
     try std.testing.expectEqual(@as(u32, 7), before);
 
-    const evict_none = vm_evict_all_expired(@ptrCast(&state_buf), 105.0);
+    const evict_none = vm_evict_all_expired(state_ptr, 105.0);
     try std.testing.expectEqual(@as(u32, 0), evict_none);
-    try std.testing.expectEqual(@as(u32, 7), vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 42));
+    try std.testing.expectEqual(@as(u32, 7), vm_map_get(state_ptr, slot_offset, slot_cap, 42));
 
-    const evict_one = vm_evict_all_expired(@ptrCast(&state_buf), 111.0);
+    const evict_one = vm_evict_all_expired(state_ptr, 111.0);
     try std.testing.expectEqual(@as(u32, 1), evict_one);
-    try std.testing.expectEqual(EMPTY_KEY, vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 42));
+    try std.testing.expectEqual(EMPTY_KEY, vm_map_get(state_ptr, slot_offset, slot_cap, 42));
 }
 
 test "ttl hashmap - stale eviction entries do not evict newer values" {
     const prog = buildTTLMapProgram(4, 0, false);
     const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
-    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
-    std.debug.assert(state_size <= 4096);
+    var state_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(state_size));
+    defer std.testing.allocator.free(state_buf);
+    @memset(state_buf, 0);
+    const state_ptr: [*]u8 = @ptrCast(state_buf.ptr);
 
-    try std.testing.expectEqual(@as(u32, 0), vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len));
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(state_ptr, @ptrCast(&prog), prog.len));
 
     var key_col_a = [1]u32{9};
     var val_col_a = [1]u32{100};
     var ts_col_a = [1]f64{100.0};
     const ptrs_a = [3][*]const u8{ @ptrCast(&key_col_a), @ptrCast(&val_col_a), @ptrCast(&ts_col_a) };
-    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_a), 3, 1));
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&ptrs_a), 3, 1));
 
     var key_col_b = [1]u32{9};
     var val_col_b = [1]u32{200};
     var ts_col_b = [1]f64{200.0};
     const ptrs_b = [3][*]const u8{ @ptrCast(&key_col_b), @ptrCast(&val_col_b), @ptrCast(&ts_col_b) };
-    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_b), 3, 1));
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&ptrs_b), 3, 1));
 
     const meta_base = STATE_HEADER_SIZE;
     const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
@@ -5898,51 +5924,55 @@ test "ttl hashmap - stale eviction entries do not evict newer values" {
 
     // cutoff=140, so the stale ts=100 index entry is expired. It must not evict
     // the current key value with ts=200.
-    const evicted = vm_evict_all_expired(@ptrCast(&state_buf), 150.0);
+    const evicted = vm_evict_all_expired(state_ptr, 150.0);
     try std.testing.expectEqual(@as(u32, 0), evicted);
-    try std.testing.expectEqual(@as(u32, 200), vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 9));
+    try std.testing.expectEqual(@as(u32, 200), vm_map_get(state_ptr, slot_offset, slot_cap, 9));
 }
 
 test "ttl hashset - reinsertion refreshes ttl and evicts deterministically" {
     const prog = buildTTLSetProgram(4, 0);
     const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
-    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
-    std.debug.assert(state_size <= 4096);
+    var state_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(state_size));
+    defer std.testing.allocator.free(state_buf);
+    @memset(state_buf, 0);
+    const state_ptr: [*]u8 = @ptrCast(state_buf.ptr);
 
-    try std.testing.expectEqual(@as(u32, 0), vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len));
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(state_ptr, @ptrCast(&prog), prog.len));
 
     var elem_1 = [1]u32{77};
     var ts_1 = [1]f64{100.0};
     const ptrs_1 = [2][*]const u8{ @ptrCast(&elem_1), @ptrCast(&ts_1) };
-    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_1), 2, 1));
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&ptrs_1), 2, 1));
 
     var elem_2 = [1]u32{77};
     var ts_2 = [1]f64{200.0};
     const ptrs_2 = [2][*]const u8{ @ptrCast(&elem_2), @ptrCast(&ts_2) };
-    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_2), 2, 1));
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&ptrs_2), 2, 1));
 
     const meta_base = STATE_HEADER_SIZE;
     const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
     const slot_cap = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
 
-    try std.testing.expect(vm_set_contains(@ptrCast(&state_buf), slot_offset, slot_cap, 77) == 1);
+    try std.testing.expect(vm_set_contains(state_ptr, slot_offset, slot_cap, 77) == 1);
 
     // cutoff=140; refreshed timestamp=200 keeps element alive
-    try std.testing.expectEqual(@as(u32, 0), vm_evict_all_expired(@ptrCast(&state_buf), 150.0));
-    try std.testing.expect(vm_set_contains(@ptrCast(&state_buf), slot_offset, slot_cap, 77) == 1);
+    try std.testing.expectEqual(@as(u32, 0), vm_evict_all_expired(state_ptr, 150.0));
+    try std.testing.expect(vm_set_contains(state_ptr, slot_offset, slot_cap, 77) == 1);
 
     // cutoff=201; refreshed timestamp now expires
-    try std.testing.expectEqual(@as(u32, 1), vm_evict_all_expired(@ptrCast(&state_buf), 211.0));
-    try std.testing.expect(vm_set_contains(@ptrCast(&state_buf), slot_offset, slot_cap, 77) == 0);
+    try std.testing.expectEqual(@as(u32, 1), vm_evict_all_expired(state_ptr, 211.0));
+    try std.testing.expect(vm_set_contains(state_ptr, slot_offset, slot_cap, 77) == 0);
 }
 
 test "ttl eviction index overflow - returns NEEDS_GROWTH instead of dropping" {
     const prog = buildTTLMapProgram(4, 0, false);
     const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
-    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
-    std.debug.assert(state_size <= 4096);
+    var state_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(state_size));
+    defer std.testing.allocator.free(state_buf);
+    @memset(state_buf, 0);
+    const state_ptr: [*]u8 = @ptrCast(state_buf.ptr);
 
-    try std.testing.expectEqual(@as(u32, 0), vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len));
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(state_ptr, @ptrCast(&prog), prog.len));
 
     // Force tiny eviction index capacity to trigger deterministic overflow on
     // the second insert (policy path under test).
@@ -5954,7 +5984,7 @@ test "ttl eviction index overflow - returns NEEDS_GROWTH instead of dropping" {
     var ts_col = [2]f64{ 100.0, 101.0 };
     const ptrs = [3][*]const u8{ @ptrCast(&key_col), @ptrCast(&val_col), @ptrCast(&ts_col) };
 
-    const result = vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs), 3, 2);
+    const result = vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&ptrs), 3, 2);
     try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.NEEDS_GROWTH)), result);
     try std.testing.expectEqual(@as(u32, 0), vm_get_needs_growth_slot());
 }
