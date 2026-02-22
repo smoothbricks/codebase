@@ -234,7 +234,8 @@ pub const StructFieldType = enum(u8) {
 pub const EvictionEntry = packed struct {
     timestamp: f64, // Event timestamp (8 bytes)
     key_or_idx: u32, // Key (for Map/Set) or index (for Array) (4 bytes)
-    // Total: 12 bytes per entry
+    value: u32, // Evicted value snapshot for RETE :evicted bindings (4 bytes)
+    // Total: 16 bytes per entry
 };
 
 const ConditionTreeState = extern struct {
@@ -1205,9 +1206,21 @@ pub fn insertWithTTL(state_base: [*]u8, meta: SlotMeta, key: u32, timestamp: f64
     // Binary search for insert position (sorted by timestamp)
     const pos = binarySearchEvictionPos(eviction_index, eviction_size, timestamp);
 
+    const entry_value: u32 = switch (meta.slotType()) {
+        .HASHMAP => blk: {
+            const data_ptr = state_base + meta.offset;
+            const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
+            const values: [*]const u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
+            const idx = findKeyInMap(@constCast(keys), meta.capacity, key);
+            break :blk if (idx < meta.capacity) values[idx] else 0;
+        },
+        .HASHSET => key,
+        else => 0,
+    };
+
     // Shift right and insert
     shiftEvictionRight(eviction_index, pos, eviction_size);
-    eviction_index[pos] = .{ .timestamp = timestamp, .key_or_idx = key };
+    eviction_index[pos] = .{ .timestamp = timestamp, .key_or_idx = key, .value = entry_value };
     meta.eviction_index_size_ptr.* = eviction_size + 1;
     return .OK;
 }
@@ -4593,7 +4606,7 @@ pub export fn vm_calculate_state_size(
 
                 // Add eviction index and evicted buffer if TTL enabled
                 if (type_flags.has_ttl) {
-                    // EvictionEntry is 12 bytes (f64 timestamp + u32 key_or_idx)
+                    // EvictionEntry is 16 bytes (f64 timestamp + u32 key + u32 value)
                     // Eviction index: same capacity as primary storage
                     size += capacity * @sizeOf(EvictionEntry);
                     size = align8(size);
