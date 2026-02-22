@@ -173,16 +173,27 @@ export enum Opcode {
   // Max/Min pick strategies
   BATCH_MAP_UPSERT_MAX = 0x26,
   BATCH_MAP_UPSERT_MIN = 0x27,
+  BATCH_MAP_UPSERT_LATEST_IF = 0x28,
+  BATCH_MAP_UPSERT_FIRST_IF = 0x29,
+  BATCH_MAP_UPSERT_LAST_IF = 0x2a,
+  BATCH_MAP_REMOVE_IF = 0x2b,
+  BATCH_MAP_UPSERT_MAX_IF = 0x2c,
+  BATCH_MAP_UPSERT_MIN_IF = 0x2d,
 
   // Batch HashSet ops
   BATCH_SET_INSERT = 0x30,
   BATCH_SET_REMOVE = 0x31,
+  BATCH_SET_INSERT_IF = 0x33,
 
   // Batch Aggregate ops
   BATCH_AGG_SUM = 0x40,
   BATCH_AGG_COUNT = 0x41,
   BATCH_AGG_MIN = 0x42,
   BATCH_AGG_MAX = 0x43,
+  BATCH_AGG_SUM_IF = 0x44,
+  BATCH_AGG_COUNT_IF = 0x45,
+  BATCH_AGG_MIN_IF = 0x46,
+  BATCH_AGG_MAX_IF = 0x47,
 
   // Struct map ops (0x18 init, 0x80 batch)
   SLOT_STRUCT_MAP = 0x18, // slot, type_flags, cap_lo, cap_hi, num_fields, [field_type × num_fields]

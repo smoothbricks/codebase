@@ -290,17 +290,28 @@ pub const Opcode = enum(u8) {
     // Max/Min pick strategies (keep row with highest/lowest comparison column value)
     BATCH_MAP_UPSERT_MAX = 0x26, // slot:u8, key_col:u8, val_col:u8, cmp_col:u8
     BATCH_MAP_UPSERT_MIN = 0x27, // slot:u8, key_col:u8, val_col:u8, cmp_col:u8
+    BATCH_MAP_UPSERT_LATEST_IF = 0x28, // slot:u8, key_col:u8, val_col:u8, ts_col:u8, pred_col:u8
+    BATCH_MAP_UPSERT_FIRST_IF = 0x29, // slot:u8, key_col:u8, val_col:u8, pred_col:u8
+    BATCH_MAP_UPSERT_LAST_IF = 0x2A, // slot:u8, key_col:u8, val_col:u8, pred_col:u8
+    BATCH_MAP_REMOVE_IF = 0x2B, // slot:u8, key_col:u8, pred_col:u8
+    BATCH_MAP_UPSERT_MAX_IF = 0x2C, // slot:u8, key_col:u8, val_col:u8, cmp_col:u8, pred_col:u8
+    BATCH_MAP_UPSERT_MIN_IF = 0x2D, // slot:u8, key_col:u8, val_col:u8, cmp_col:u8, pred_col:u8
 
     // HashSet batch ops
     BATCH_SET_INSERT = 0x30, // slot:u8, elem_col:u8
     BATCH_SET_REMOVE = 0x31, // slot:u8, elem_col:u8
     BATCH_SET_INSERT_TTL = 0x32, // slot:u8, elem_col:u8, ts_col:u8
+    BATCH_SET_INSERT_IF = 0x33, // slot:u8, elem_col:u8, pred_col:u8
 
     // Aggregate batch ops (SIMD accelerated)
     BATCH_AGG_SUM = 0x40, // slot:u8, val_col:u8
     BATCH_AGG_COUNT = 0x41, // slot:u8
     BATCH_AGG_MIN = 0x42, // slot:u8, val_col:u8
     BATCH_AGG_MAX = 0x43, // slot:u8, val_col:u8
+    BATCH_AGG_SUM_IF = 0x44, // slot:u8, val_col:u8, pred_col:u8
+    BATCH_AGG_COUNT_IF = 0x45, // slot:u8, pred_col:u8
+    BATCH_AGG_MIN_IF = 0x46, // slot:u8, val_col:u8, pred_col:u8
+    BATCH_AGG_MAX_IF = 0x47, // slot:u8, val_col:u8, pred_col:u8
 
     // Struct map init (variable-length: base 6 bytes + num_fields)
     SLOT_STRUCT_MAP = 0x18, // slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8, [field_type:u8 x num_fields]
@@ -3386,6 +3397,10 @@ inline fn aggOpLen(op_byte: u8) u32 {
         0x41 => 2, // AGG_COUNT: opcode + slot
         0x42 => 3, // AGG_MIN: opcode + slot + val_col
         0x43 => 3, // AGG_MAX: opcode + slot + val_col
+        0x44 => 4, // AGG_SUM_IF: opcode + slot + val_col + pred_col
+        0x45 => 3, // AGG_COUNT_IF: opcode + slot + pred_col
+        0x46 => 4, // AGG_MIN_IF: opcode + slot + val_col + pred_col
+        0x47 => 4, // AGG_MAX_IF: opcode + slot + val_col + pred_col
         else => 2, // conservative fallback
     };
 }
@@ -3404,15 +3419,26 @@ inline fn bodyOpLen(code: []const u8, pc_offset: usize) u32 {
         0x25 => 5, // MAP_UPSERT_LAST_TTL
         0x26 => 5, // MAP_UPSERT_MAX: op + slot + key_col + val_col + cmp_col
         0x27 => 5, // MAP_UPSERT_MIN: op + slot + key_col + val_col + cmp_col
+        0x28 => 6, // MAP_UPSERT_LATEST_IF: op + slot + key_col + val_col + ts_col + pred_col
+        0x29 => 5, // MAP_UPSERT_FIRST_IF: op + slot + key_col + val_col + pred_col
+        0x2A => 5, // MAP_UPSERT_LAST_IF: op + slot + key_col + val_col + pred_col
+        0x2B => 4, // MAP_REMOVE_IF: op + slot + key_col + pred_col
+        0x2C => 6, // MAP_UPSERT_MAX_IF: op + slot + key_col + val_col + cmp_col + pred_col
+        0x2D => 6, // MAP_UPSERT_MIN_IF: op + slot + key_col + val_col + cmp_col + pred_col
         // SET ops
         0x30 => 3, // SET_INSERT: op + slot + elem_col
         0x31 => 3, // SET_REMOVE: op + slot + elem_col
         0x32 => 4, // SET_INSERT_TTL: op + slot + elem_col + ts_col
+        0x33 => 4, // SET_INSERT_IF: op + slot + elem_col + pred_col
         // AGG ops (shouldn't be called here but handle anyway)
         0x40 => 3, // AGG_SUM
         0x41 => 2, // AGG_COUNT
         0x42 => 3, // AGG_MIN
         0x43 => 3, // AGG_MAX
+        0x44 => 4, // AGG_SUM_IF
+        0x45 => 3, // AGG_COUNT_IF
+        0x46 => 4, // AGG_MIN_IF
+        0x47 => 4, // AGG_MAX_IF
         // STRUCT_MAP_UPSERT_LAST: variable length (scalar fields + optional array fields)
         0x80 => blk: {
             // op + slot + key_col + num_vals + (val_col + field_idx) × num_vals
@@ -3544,6 +3570,114 @@ fn executeBatchAggregates(
                         .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(new_val) },
                     );
                     agg_ptr.* = new_val;
+                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                }
+            },
+            0x44 => { // AGG_SUM_IF
+                const slot = body[bpc + 1];
+                const val_col = body[bpc + 2];
+                const pred_col = body[bpc + 3];
+                bpc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                const old_val = agg_ptr.*;
+                const values = getColF64Inner(col_ptrs, val_col);
+                const preds = @as([*]const u32, @ptrCast(@alignCast(col_ptrs[pred_col])));
+                var sum_delta: f64 = 0;
+                var i: u32 = 0;
+                while (i < batch_len) : (i += 1) {
+                    if (type_data[i] == type_id and preds[i] != 0) {
+                        sum_delta += values[i];
+                    }
+                }
+                const new_val = old_val + sum_delta;
+                if (g_undo_enabled) appendMutation(
+                    delta_mode,
+                    .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
+                    .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(new_val) },
+                );
+                agg_ptr.* = new_val;
+                if (agg_ptr.* != old_val) setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+            },
+            0x45 => { // AGG_COUNT_IF
+                const slot = body[bpc + 1];
+                const pred_col = body[bpc + 2];
+                bpc += 3;
+
+                const meta = getSlotMeta(state_base, slot);
+                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                const preds = @as([*]const u32, @ptrCast(@alignCast(col_ptrs[pred_col])));
+                var matched: u64 = 0;
+                var i: u32 = 0;
+                while (i < batch_len) : (i += 1) {
+                    if (type_data[i] == type_id and preds[i] != 0) matched += 1;
+                }
+                if (matched > 0) {
+                    const prev_count = count_ptr.*;
+                    const next_count = prev_count + matched;
+                    if (g_undo_enabled) appendMutation(
+                        delta_mode,
+                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(prev_count), .aux = @bitCast(agg_ptr.*) },
+                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(next_count), .aux = @bitCast(agg_ptr.*) },
+                    );
+                    count_ptr.* = next_count;
+                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                }
+            },
+            0x46 => { // AGG_MIN_IF
+                const slot = body[bpc + 1];
+                const val_col = body[bpc + 2];
+                const pred_col = body[bpc + 3];
+                bpc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                const old_val = agg_ptr.*;
+                const values = getColF64Inner(col_ptrs, val_col);
+                const preds = @as([*]const u32, @ptrCast(@alignCast(col_ptrs[pred_col])));
+                var next = old_val;
+                var i: u32 = 0;
+                while (i < batch_len) : (i += 1) {
+                    if (type_data[i] == type_id and preds[i] != 0 and values[i] < next) next = values[i];
+                }
+                if (next != old_val) {
+                    if (g_undo_enabled) appendMutation(
+                        delta_mode,
+                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
+                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(next) },
+                    );
+                    agg_ptr.* = next;
+                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                }
+            },
+            0x47 => { // AGG_MAX_IF
+                const slot = body[bpc + 1];
+                const val_col = body[bpc + 2];
+                const pred_col = body[bpc + 3];
+                bpc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                const old_val = agg_ptr.*;
+                const values = getColF64Inner(col_ptrs, val_col);
+                const preds = @as([*]const u32, @ptrCast(@alignCast(col_ptrs[pred_col])));
+                var next = old_val;
+                var i: u32 = 0;
+                while (i < batch_len) : (i += 1) {
+                    if (type_data[i] == type_id and preds[i] != 0 and values[i] > next) next = values[i];
+                }
+                if (next != old_val) {
+                    if (g_undo_enabled) appendMutation(
+                        delta_mode,
+                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
+                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(next) },
+                    );
+                    agg_ptr.* = next;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
                 }
             },
@@ -3785,6 +3919,162 @@ fn executeElementOpcodes(
                 }
             },
 
+            // MAP_UPSERT_LATEST_IF (0x28): slot, key_col, val_col, ts_col, pred_col
+            0x28 => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const val_col_idx = body[bpc + 3];
+                const ts_col_idx = body[bpc + 4];
+                const pred_col_idx = body[bpc + 5];
+                bpc += 6;
+
+                if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
+
+                const ts = if (parent_ts_col != 0xFF)
+                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                else
+                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleMapUpsertLatest(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                    getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    ts,
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // MAP_UPSERT_FIRST_IF (0x29): slot, key_col, val_col, pred_col
+            0x29 => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const val_col_idx = body[bpc + 3];
+                const pred_col_idx = body[bpc + 4];
+                bpc += 5;
+
+                if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleMapUpsertFirst(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                    getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // MAP_UPSERT_LAST_IF (0x2A): slot, key_col, val_col, pred_col
+            0x2A => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const val_col_idx = body[bpc + 3];
+                const pred_col_idx = body[bpc + 4];
+                bpc += 5;
+
+                if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleMapUpsertLast(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                    getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // MAP_REMOVE_IF (0x2B): slot, key_col, pred_col
+            0x2B => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const pred_col_idx = body[bpc + 3];
+                bpc += 4;
+
+                if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
+
+                const meta = getSlotMeta(state_base, slot);
+                singleMapRemove(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                );
+            },
+
+            // MAP_UPSERT_MAX_IF (0x2C): slot, key_col, val_col, cmp_col, pred_col
+            0x2C => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const val_col_idx = body[bpc + 3];
+                const cmp_col_idx = body[bpc + 4];
+                const pred_col_idx = body[bpc + 5];
+                bpc += 6;
+
+                if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleMapUpsertMax(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                    getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    getColF64Inner(col_ptrs, cmp_col_idx)[child_idx],
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // MAP_UPSERT_MIN_IF (0x2D): slot, key_col, val_col, cmp_col, pred_col
+            0x2D => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const val_col_idx = body[bpc + 3];
+                const cmp_col_idx = body[bpc + 4];
+                const pred_col_idx = body[bpc + 5];
+                bpc += 6;
+
+                if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleMapUpsertMin(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                    getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    getColF64Inner(col_ptrs, cmp_col_idx)[child_idx],
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
             // SET_INSERT (0x30): slot, elem_col
             0x30 => {
                 const slot = body[bpc + 1];
@@ -3826,6 +4116,30 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
                     ts,
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // SET_INSERT_IF (0x33): slot, elem_col, pred_col
+            0x33 => {
+                const slot = body[bpc + 1];
+                const elem_col_idx = body[bpc + 2];
+                const pred_col_idx = body[bpc + 3];
+                bpc += 4;
+
+                if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleSetInsert(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
