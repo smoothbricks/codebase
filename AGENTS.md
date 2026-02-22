@@ -169,6 +169,40 @@ This repo uses a strict policy:
 - `span-err`: expected operational error represented via `ctx.err(...)` / `Err`.
 - `span-exception`: unexpected thrown exception (bug/invariant break).
 
+### NoOpTracer should not exist — proper tracing policy
+
+**`NoOpTracer` should NOT be used anywhere in this codebase.**
+
+- **Production code**: Requires real tracing. If code needs a span context, require it from the caller
+- **Tests**: MUST use `TestTracer` or suite tracer that flushes to SQLite (per test tracing policy)
+- **If you see NoOpTracer anywhere**: It's legacy debt to remove, not a pattern to follow
+
+**Red flags that indicate broken design:**
+
+```typescript
+// ❌ WRONG - Creating throwaway tracer anywhere
+const tracer = new NoOpTracer();  // NEVER DO THIS
+
+// ❌ WRONG - Optional spanContext
+interface Config {
+  spanContext?: TraceContext;  // Should be REQUIRED
+}
+
+// ✅ CORRECT - Require context, use child spans
+async function dispatchQuery(ctx: TraceContext, ...): Promise<Result> {
+  return ctx.span('query', async (childCtx) => {
+    // childCtx is properly nested in trace tree
+  });
+}
+
+// ✅ CORRECT - Tests use TestTracer or suite tracer
+const tracer = new TestTracer(opContext);  // For test inspection
+// OR use the package's test suite tracer that flushes to SQLite
+```
+
+Runtime code that lacks tracing context indicates a broken call graph. Every entry point (Lambda handler, HTTP handler,
+DO fetch) starts a root trace; all subsequent operations use child spans.
+
 ### Agent implementation requirements
 
 - If code currently throws for a known operational failure, migrate it to a typed `Err` with explicit error code.

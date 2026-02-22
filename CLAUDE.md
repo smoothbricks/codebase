@@ -16,6 +16,21 @@ sink (local `.trace-results.db` or worker D1 binding like `TRACE_RESULTS`). Keep
 move runner-specific behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`,
 `@smoothbricks/lmao/testing/vitest`) plus package-local typed tracer modules.
 
+**Tracing policy — NoOpTracer should not exist in this codebase:** `NoOpTracer` violates our
+test tracing policy (tests MUST flush to SQLite). Do NOT use NoOpTracer anywhere:
+
+- **Production code**: Use real tracers. If code needs a tracer, require spanContext from caller
+- **Tests**: Use `TestTracer` or the test suite tracer harness that flushes to SQLite
+- **If you see NoOpTracer**: It's legacy debt to fix, not a pattern to follow
+
+If code creates a throwaway tracer to satisfy a `spanContext` parameter, the API is wrong — fix it by:
+
+- **Requiring** spanContext (no optional, no fallback) — callers must be in a traced context
+- **Using child spans** (`ctx.span(...)`) not root traces (`tracer.trace(...)`) for nested operations
+- **Propagating context** — pass spanContext through the call chain, never create it ad-hoc
+
+Runtime execution that lacks tracing context indicates a broken call graph.
+
 **Agent design policy:** Agents represent domain entities — if something has its own identity and event history
 (invoice, credit note, subscription, account), it's an agent. Don't conflate a simple current lifecycle with "shouldn't
 be an agent." A credit note that currently processes one event is still a valid agent if credit notes are real domain
