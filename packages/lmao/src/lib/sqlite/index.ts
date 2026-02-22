@@ -15,4 +15,4 @@ export type {
   SyncSQLiteDatabase,
   SyncSQLiteStatement,
 } from './sqlite-db.js';
-export { TraceSQLite, type TraceSQLiteConfig, TraceSQLiteSink } from './sqlite-sink.js';
+export { TraceSQLite, type TraceSQLiteConfig } from './sqlite-sink.js';

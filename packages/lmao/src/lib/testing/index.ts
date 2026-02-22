@@ -122,7 +122,7 @@ export { extractFactsFor, findAllSpans, findSpan, spanNames } from './span-query
 // SQLITE PERSISTENCE
 // =============================================================================
 
-export { TraceSQLite, TraceSQLiteAsync, type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/index.js';
+export { TraceSQLite, TraceSQLiteAsync, type TraceSQLiteConfig } from '../sqlite/index.js';
 export { createD1SQLiteDatabase, type D1LikeDatabase, type D1LikePreparedStatement } from '../sqlite/sqlite-d1.js';
 export type {
   AsyncSQLiteDatabase,
