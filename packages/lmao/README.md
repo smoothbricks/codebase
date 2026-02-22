@@ -126,6 +126,18 @@ describe('Order Processing', () => {
 Both bun:test and vitest use the same transparent interception pattern — tests import from their native test module as
 normal. Only `useTestSpan` (for accessing the it-local trace root) comes from the lmao testing module.
 
+#### Cloudflare Worker + Vitest notes
+
+- Keep the setup file wiring-only: call `setupVitestTestSuiteTracing(...)` and keep the `vi.mock('vitest', ...)` bridge
+  with `createVitestMock(...)`.
+- Debug logging is harness-owned and toggled by `LMAO_VITEST_DEBUG`.
+- In Worker tests, forward the debug env in `vitest.config.ts` via `define`, for example
+  `globalThis.__LMAO_VITEST_DEBUG_ENV__`.
+- Enable debug for Cloudflare tests with:
+
+```bash
+```
+
 ### Setting Up Trace Testing for a New Package
 
 1. Create the preload file (`test-trace-setup.ts`):
