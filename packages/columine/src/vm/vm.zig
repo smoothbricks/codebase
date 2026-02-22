@@ -839,6 +839,40 @@ fn shiftEvictionRight(index: [*]EvictionEntry, pos: u32, size: u32) void {
     }
 }
 
+/// Remove all eviction-index entries for a key.
+/// Returns number of removed entries.
+fn removeEvictionEntriesForKey(index: [*]EvictionEntry, size: u32, key: u32) u32 {
+    var write_idx: u32 = 0;
+    var read_idx: u32 = 0;
+    var removed: u32 = 0;
+
+    while (read_idx < size) : (read_idx += 1) {
+        const entry = index[read_idx];
+        if (entry.key_or_idx == key) {
+            removed += 1;
+            continue;
+        }
+        if (write_idx != read_idx) {
+            index[write_idx] = entry;
+        }
+        write_idx += 1;
+    }
+
+    return removed;
+}
+
+/// Returns true when the eviction index entry still represents the current
+/// value for the key (no newer entry for the same key later in the sorted list).
+fn isEvictionEntryCurrent(index: [*]const EvictionEntry, size: u32, entry_idx: u32, key: u32) bool {
+    var i = entry_idx + 1;
+    while (i < size) : (i += 1) {
+        if (index[i].key_or_idx == key) {
+            return false;
+        }
+    }
+    return true;
+}
+
 /// Evict all entries with timestamp older than cutoff.
 /// Returns number of entries evicted.
 /// If has_evict_trigger is set, evicted entries are copied to evicted buffer for RETE.
@@ -851,44 +885,57 @@ pub fn evictExpired(state_base: [*]u8, meta: SlotMeta, now: f64) u32 {
     const eviction_index = getEvictionIndex(state_base, meta);
     const eviction_size = meta.eviction_index_size_ptr.*;
 
-    var evict_count: u32 = 0;
+    var processed_count: u32 = 0;
+    var removed_count: u32 = 0;
 
     // Scan from front (oldest entries first)
-    while (evict_count < eviction_size) {
-        const entry = eviction_index[evict_count];
+    while (processed_count < eviction_size) {
+        const entry = eviction_index[processed_count];
         if (entry.timestamp >= cutoff) break; // Done - rest are newer
 
-        // Record for RETE rule firing if has_evict_trigger
-        if (meta.hasEvictTrigger()) {
-            const evicted_buffer = getEvictedBuffer(state_base, meta);
-            const evicted_count = meta.evicted_count_ptr.*;
-            evicted_buffer[evicted_count] = entry;
-            meta.evicted_count_ptr.* += 1;
+        // Skip stale index entries (e.g. older timestamp for a key that was
+        // updated later in the same window).
+        if (!isEvictionEntryCurrent(eviction_index, eviction_size, processed_count, entry.key_or_idx)) {
+            processed_count += 1;
+            continue;
         }
 
-        // Remove from primary storage (HashMap/HashSet/Array)
-        removeEntryByKey(state_base, meta, entry.key_or_idx);
+        // Remove from primary storage (HashMap/HashSet/Array). If entry is no
+        // longer present, this was effectively stale and should not be emitted.
+        if (removeEntryByKey(state_base, meta, entry.key_or_idx)) {
+            // Record for RETE rule firing if has_evict_trigger
+            if (meta.hasEvictTrigger()) {
+                const evicted_buffer = getEvictedBuffer(state_base, meta);
+                const evicted_count = meta.evicted_count_ptr.*;
+                evicted_buffer[evicted_count] = entry;
+                meta.evicted_count_ptr.* += 1;
+            }
 
-        evict_count += 1;
+            removed_count += 1;
+        }
+
+        processed_count += 1;
     }
 
     // Shift sorted array to remove processed entries
-    if (evict_count > 0) {
-        shiftEvictionLeft(eviction_index, evict_count, eviction_size);
-        meta.eviction_index_size_ptr.* = eviction_size - evict_count;
+    if (processed_count > 0) {
+        shiftEvictionLeft(eviction_index, processed_count, eviction_size);
+        meta.eviction_index_size_ptr.* = eviction_size - processed_count;
 
-        // Update slot size
-        meta.size_ptr.* -= evict_count;
+        if (removed_count > 0) {
+            // Update slot size only for entries actually removed from storage.
+            meta.size_ptr.* -= removed_count;
 
-        // Set change flag
-        setChangeFlag(meta, ChangeFlag.EVICTED);
+            // Set change flag
+            setChangeFlag(meta, ChangeFlag.EVICTED);
+        }
     }
 
-    return evict_count;
+    return removed_count;
 }
 
 /// Remove entry from primary storage by key (for HashMap/HashSet) or index (for Array)
-fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
+fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) bool {
     switch (meta.slotType()) {
         .HASHMAP => {
             const data_ptr = state_base + meta.offset;
@@ -899,13 +946,14 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
 
             while (probes < meta.capacity) : (probes += 1) {
                 const k = keys[slot];
-                if (k == EMPTY_KEY) return;
+                if (k == EMPTY_KEY) return false;
                 if (k == key) {
                     keys[slot] = TOMBSTONE;
-                    return;
+                    return true;
                 }
                 slot = (slot + 1) & (meta.capacity - 1);
             }
+            return false;
         },
         .HASHSET => {
             const data_ptr = state_base + meta.offset;
@@ -916,13 +964,14 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
 
             while (probes < meta.capacity) : (probes += 1) {
                 const k = keys[slot];
-                if (k == EMPTY_KEY) return;
+                if (k == EMPTY_KEY) return false;
                 if (k == key) {
                     keys[slot] = TOMBSTONE;
-                    return;
+                    return true;
                 }
                 slot = (slot + 1) & (meta.capacity - 1);
             }
+            return false;
         },
         .ARRAY => {
             // For arrays, key_or_idx is the array index
@@ -931,21 +980,28 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
             const data_ptr = state_base + meta.offset;
             const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
             if (key < meta.capacity) {
+                if (keys[key] == EMPTY_KEY or keys[key] == TOMBSTONE) return false;
                 keys[key] = TOMBSTONE;
+                return true;
             }
+            return false;
         },
         .AGGREGATE => {
             // Aggregates don't support individual entry removal
             // TTL for aggregates means the whole aggregate expires
+            return false;
         },
         .CONDITION_TREE => {
             removeConditionTreeEntry(state_base, meta, key);
+            return true;
         },
         .STRUCT_MAP => {
             // TTL eviction not yet supported for struct maps
+            return false;
         },
         .ORDERED_LIST => {
             // TTL eviction not supported for ordered lists
+            return false;
         },
     }
 }
@@ -961,17 +1017,20 @@ fn removeConditionTreeEntry(state_base: [*]u8, meta: SlotMeta, key: u32) void {
 }
 
 /// Insert entry with TTL tracking (maintains sorted eviction index)
-pub fn insertWithTTL(state_base: [*]u8, meta: SlotMeta, key: u32, timestamp: f64) void {
-    if (!meta.hasTTL()) return;
+pub fn insertWithTTL(state_base: [*]u8, meta: SlotMeta, key: u32, timestamp: f64) ErrorCode {
+    if (!meta.hasTTL()) return .OK;
 
     const eviction_index = getEvictionIndex(state_base, meta);
-    const eviction_size = meta.eviction_index_size_ptr.*;
+    const eviction_size_initial = meta.eviction_index_size_ptr.*;
+    const removed_for_key = removeEvictionEntriesForKey(eviction_index, eviction_size_initial, key);
+    const eviction_size = eviction_size_initial - removed_for_key;
+    meta.eviction_index_size_ptr.* = eviction_size;
 
     // Check capacity
     if (eviction_size >= meta.eviction_index_capacity) {
-        // Eviction index full - would need to grow or reject
-        // For now, skip tracking (entry won't be auto-evicted correctly)
-        return;
+        // Deterministic overflow handling: signal growth requirement through the
+        // same CAPACITY_EXCEEDED path used by primary slot storage.
+        return .CAPACITY_EXCEEDED;
     }
 
     // Binary search for insert position (sorted by timestamp)
@@ -981,6 +1040,7 @@ pub fn insertWithTTL(state_base: [*]u8, meta: SlotMeta, key: u32, timestamp: f64
     shiftEvictionRight(eviction_index, pos, eviction_size);
     eviction_index[pos] = .{ .timestamp = timestamp, .key_or_idx = key };
     meta.eviction_index_size_ptr.* = eviction_size + 1;
+    return .OK;
 }
 
 /// Clear evicted buffer (call after RETE rules have processed evictions)
@@ -1086,6 +1146,15 @@ fn batchMapUpsertLatest(
                 timestamps[slot] = ts;
                 size += 1;
                 had_insert = true;
+                if (meta.hasTTL()) {
+                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                    if (ttl_result != .OK) {
+                        meta.size_ptr.* = size;
+                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                        if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                        return ttl_result;
+                    }
+                }
                 break;
             } else if (k == key) {
                 if (ts > timestamps[slot]) {
@@ -1117,6 +1186,15 @@ fn batchMapUpsertLatest(
                     values[slot] = val;
                     timestamps[slot] = ts;
                     had_update = true;
+                    if (meta.hasTTL()) {
+                        const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                        if (ttl_result != .OK) {
+                            meta.size_ptr.* = size;
+                            if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                            if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                            return ttl_result;
+                        }
+                    }
                 }
                 break;
             }
@@ -1215,6 +1293,7 @@ fn batchMapUpsertLast(
     slot_idx: u8,
     key_col: [*]const u32,
     val_col: [*]const u32,
+    ts_col: ?[*]const f64,
     batch_len: u32,
 ) ErrorCode {
     const data_ptr = state_base + meta.offset;
@@ -1230,6 +1309,7 @@ fn batchMapUpsertLast(
     while (i < batch_len) : (i += 1) {
         const key = key_col[i];
         const val = val_col[i];
+        const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
 
         var slot = hashKey(key, meta.capacity);
         var probes: u32 = 0;
@@ -1274,6 +1354,15 @@ fn batchMapUpsertLast(
                 values[slot] = val;
                 size += 1;
                 had_insert = true;
+                if (meta.hasTTL()) {
+                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                    if (ttl_result != .OK) {
+                        meta.size_ptr.* = size;
+                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                        if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                        return ttl_result;
+                    }
+                }
                 break;
             } else if (k == key) {
                 // Undo: save previous value before overwrite (no timestamp for Last)
@@ -1304,6 +1393,15 @@ fn batchMapUpsertLast(
                 // Last wins - always update
                 values[slot] = val;
                 had_update = true;
+                if (meta.hasTTL()) {
+                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                    if (ttl_result != .OK) {
+                        meta.size_ptr.* = size;
+                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                        if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
+                        return ttl_result;
+                    }
+                }
                 break;
             }
             slot = (slot + 1) & (meta.capacity - 1);
@@ -1628,6 +1726,7 @@ fn batchSetInsert(
     meta: SlotMeta,
     slot_idx: u8,
     elem_col: [*]const u32,
+    ts_col: ?[*]const f64,
     batch_len: u32,
 ) ErrorCode {
     const data_ptr = state_base + meta.offset;
@@ -1640,6 +1739,7 @@ fn batchSetInsert(
     var i: u32 = 0;
     while (i < batch_len) : (i += 1) {
         const elem = elem_col[i];
+        const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
         var slot = hashKey(elem, meta.capacity);
         var probes: u32 = 0;
 
@@ -1681,8 +1781,24 @@ fn batchSetInsert(
                 keys[slot] = elem;
                 size += 1;
                 had_insert = true;
+                if (meta.hasTTL()) {
+                    const ttl_result = insertWithTTL(state_base, meta, elem, ts);
+                    if (ttl_result != .OK) {
+                        meta.size_ptr.* = size;
+                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                        return ttl_result;
+                    }
+                }
                 break;
             } else if (k == elem) {
+                if (meta.hasTTL()) {
+                    const ttl_result = insertWithTTL(state_base, meta, elem, ts);
+                    if (ttl_result != .OK) {
+                        meta.size_ptr.* = size;
+                        if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                        return ttl_result;
+                    }
+                }
                 break;
             }
             slot = (slot + 1) & (meta.capacity - 1);
@@ -1772,6 +1888,7 @@ fn singleMapUpsertLast(
     slot_idx: u8,
     key: u32,
     val: u32,
+    ts: ?f64,
 ) ErrorCode {
     if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
 
@@ -1799,6 +1916,10 @@ fn singleMapUpsertLast(
             values[pos] = val;
             meta.size_ptr.* = size + 1;
             setChangeFlag(meta, ChangeFlag.INSERTED);
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
+                if (ttl_result != .OK) return ttl_result;
+            }
             return .OK;
         } else if (k == key) {
             if (g_undo_enabled) {
@@ -1810,6 +1931,10 @@ fn singleMapUpsertLast(
             }
             values[pos] = val;
             setChangeFlag(meta, ChangeFlag.UPDATED);
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
+                if (ttl_result != .OK) return ttl_result;
+            }
             return .OK;
         }
         pos = (pos + 1) & (meta.capacity - 1);
@@ -1854,6 +1979,10 @@ fn singleMapUpsertLatest(
             timestamps[pos] = ts;
             meta.size_ptr.* = size + 1;
             setChangeFlag(meta, ChangeFlag.INSERTED);
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                if (ttl_result != .OK) return ttl_result;
+            }
             return .OK;
         } else if (k == key) {
             if (ts > timestamps[pos]) {
@@ -1867,6 +1996,10 @@ fn singleMapUpsertLatest(
                 values[pos] = val;
                 timestamps[pos] = ts;
                 setChangeFlag(meta, ChangeFlag.UPDATED);
+                if (meta.hasTTL()) {
+                    const ttl_result = insertWithTTL(state_base, meta, key, ts);
+                    if (ttl_result != .OK) return ttl_result;
+                }
             }
             return .OK;
         }
@@ -2080,6 +2213,7 @@ fn singleSetInsert(
     meta: SlotMeta,
     slot_idx: u8,
     elem: u32,
+    ts: ?f64,
 ) ErrorCode {
     if (elem == EMPTY_KEY or elem == TOMBSTONE) return .OK;
 
@@ -2105,8 +2239,16 @@ fn singleSetInsert(
             keys[pos] = elem;
             meta.size_ptr.* = size + 1;
             setChangeFlag(meta, ChangeFlag.INSERTED);
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
+                if (ttl_result != .OK) return ttl_result;
+            }
             return .OK;
         } else if (k == elem) {
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
+                if (ttl_result != .OK) return ttl_result;
+            }
             return .OK;
         }
         pos = (pos + 1) & (meta.capacity - 1);
@@ -2566,6 +2708,27 @@ fn executeBatchImpl(
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
+            .BATCH_MAP_UPSERT_LATEST_TTL => {
+                const slot = code[pc];
+                const key_col = code[pc + 1];
+                const val_col = code[pc + 2];
+                const ts_col = code[pc + 3];
+                pc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = batchMapUpsertLatest(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32(col_ptrs_ptr, key_col),
+                    getColU32(col_ptrs_ptr, val_col),
+                    getColF64(col_ptrs_ptr, ts_col),
+                    batch_len,
+                );
+                if (result != .OK) return signalGrowth(slot, result);
+            },
+
             .BATCH_MAP_UPSERT_FIRST => {
                 const slot = code[pc];
                 const key_col = code[pc + 1];
@@ -2599,6 +2762,28 @@ fn executeBatchImpl(
                     slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
+                    if (meta.hasTTL()) getColF64(col_ptrs_ptr, meta.timestamp_field_idx) else null,
+                    batch_len,
+                );
+                if (result != .OK) return signalGrowth(slot, result);
+            },
+
+            .BATCH_MAP_UPSERT_LAST_TTL => {
+                const slot = code[pc];
+                const key_col = code[pc + 1];
+                const val_col = code[pc + 2];
+                const ts_col = code[pc + 3];
+                pc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = batchMapUpsertLast(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32(col_ptrs_ptr, key_col),
+                    getColU32(col_ptrs_ptr, val_col),
+                    getColF64(col_ptrs_ptr, ts_col),
                     batch_len,
                 );
                 if (result != .OK) return signalGrowth(slot, result);
@@ -2661,7 +2846,34 @@ fn executeBatchImpl(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchSetInsert(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
+                const result = batchSetInsert(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32(col_ptrs_ptr, elem_col),
+                    if (meta.hasTTL()) getColF64(col_ptrs_ptr, meta.timestamp_field_idx) else null,
+                    batch_len,
+                );
+                if (result != .OK) return signalGrowth(slot, result);
+            },
+
+            .BATCH_SET_INSERT_TTL => {
+                const slot = code[pc];
+                const elem_col = code[pc + 1];
+                const ts_col = code[pc + 2];
+                pc += 3;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = batchSetInsert(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32(col_ptrs_ptr, elem_col),
+                    getColF64(col_ptrs_ptr, ts_col),
+                    batch_len,
+                );
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -3031,6 +3243,7 @@ inline fn bodyOpLen(code: []const u8, pc_offset: usize) u32 {
         // SET ops
         0x30 => 3, // SET_INSERT: op + slot + elem_col
         0x31 => 3, // SET_REMOVE: op + slot + elem_col
+        0x32 => 4, // SET_INSERT_TTL: op + slot + elem_col + ts_col
         // AGG ops (shouldn't be called here but handle anyway)
         0x40 => 3, // AGG_SUM
         0x41 => 2, // AGG_COUNT
@@ -3278,6 +3491,65 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // MAP_UPSERT_LATEST_TTL (0x24): slot, key_col, val_col, ts_col
+            0x24 => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const val_col_idx = body[bpc + 3];
+                const ts_col_idx = body[bpc + 4];
+                bpc += 5;
+
+                const ts = if (parent_ts_col != 0xFF)
+                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                else
+                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleMapUpsertLatest(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                    getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    ts,
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // MAP_UPSERT_LAST_TTL (0x25): slot, key_col, val_col, ts_col
+            0x25 => {
+                const slot = body[bpc + 1];
+                const key_col_idx = body[bpc + 2];
+                const val_col_idx = body[bpc + 3];
+                const ts_col_idx = body[bpc + 4];
+                bpc += 5;
+
+                const ts = if (parent_ts_col != 0xFF)
+                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                else
+                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleMapUpsertLast(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, key_col_idx)[child_idx],
+                    getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    ts,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -3362,6 +3634,34 @@ fn executeElementOpcodes(
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // SET_INSERT_TTL (0x32): slot, elem_col, ts_col
+            0x32 => {
+                const slot = body[bpc + 1];
+                const elem_col_idx = body[bpc + 2];
+                const ts_col_idx = body[bpc + 3];
+                bpc += 4;
+
+                const ts = if (parent_ts_col != 0xFF)
+                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                else
+                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleSetInsert(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
+                    ts,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -5266,6 +5566,222 @@ fn buildTestProgram(comptime cap_lo: u8, comptime cap_hi: u8) [64]u8 {
     content[reduce_start + 5] = 1;
 
     return prog;
+}
+
+fn writeF32LE(dst: []u8, value: f32) void {
+    std.mem.writeInt(u32, dst[0..4], @bitCast(value), .little);
+}
+
+/// Build a minimal TTL HashMap program with one slot and one
+/// BATCH_MAP_UPSERT_LATEST reducer opcode.
+fn buildTTLMapProgram(comptime cap_lo: u8, comptime cap_hi: u8, comptime has_evict_trigger: bool) [96]u8 {
+    var prog = [_]u8{0} ** 96;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+
+    content[0] = 0x41;
+    content[1] = 0x58;
+    content[2] = 0x45;
+    content[3] = 0x31;
+    content[4] = 1;
+    content[5] = 0;
+    content[6] = 1; // num_slots
+    content[7] = 3; // num_inputs (key, val, ts)
+    content[8] = 0;
+    content[9] = 0;
+
+    // SLOT_DEF with TTL payload: 1(op)+1(slot)+1(type_flags)+1(cap_lo)+1(cap_hi)+10(ttl payload)
+    const init_len: u16 = 15;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+
+    // BATCH_MAP_UPSERT_LATEST slot,key,val,ts
+    const reduce_len: u16 = 5;
+    content[12] = @truncate(reduce_len);
+    content[13] = @truncate(reduce_len >> 8);
+
+    var off: usize = 14;
+    const ttl_flag: u8 = 0x10;
+    const evict_flag: u8 = if (has_evict_trigger) 0x20 else 0;
+    content[off] = 0x10; // SLOT_DEF
+    content[off + 1] = 0;
+    content[off + 2] = 0x00 | ttl_flag | evict_flag; // HASHMAP + flags
+    content[off + 3] = cap_lo;
+    content[off + 4] = cap_hi;
+    writeF32LE(content[off + 5 .. off + 9], 10.0); // ttl_seconds
+    writeF32LE(content[off + 9 .. off + 13], 0.0); // grace_seconds
+    content[off + 13] = 2; // timestamp_field_idx
+    content[off + 14] = @intFromEnum(DurationUnit.NONE);
+    off += 15;
+
+    content[off] = 0x20; // BATCH_MAP_UPSERT_LATEST
+    content[off + 1] = 0; // slot
+    content[off + 2] = 0; // key col
+    content[off + 3] = 1; // val col
+    content[off + 4] = 2; // ts col
+
+    return prog;
+}
+
+/// Build a minimal TTL HashSet program with one slot and one BATCH_SET_INSERT reducer opcode.
+fn buildTTLSetProgram(comptime cap_lo: u8, comptime cap_hi: u8) [96]u8 {
+    var prog = [_]u8{0} ** 96;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+
+    content[0] = 0x41;
+    content[1] = 0x58;
+    content[2] = 0x45;
+    content[3] = 0x31;
+    content[4] = 1;
+    content[5] = 0;
+    content[6] = 1; // num_slots
+    content[7] = 2; // num_inputs (elem, ts)
+    content[8] = 0;
+    content[9] = 0;
+
+    const init_len: u16 = 15;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+
+    const reduce_len: u16 = 3;
+    content[12] = @truncate(reduce_len);
+    content[13] = @truncate(reduce_len >> 8);
+
+    var off: usize = 14;
+    content[off] = 0x10; // SLOT_DEF
+    content[off + 1] = 0;
+    content[off + 2] = 0x01 | 0x10; // HASHSET + has_ttl
+    content[off + 3] = cap_lo;
+    content[off + 4] = cap_hi;
+    writeF32LE(content[off + 5 .. off + 9], 10.0); // ttl_seconds
+    writeF32LE(content[off + 9 .. off + 13], 0.0); // grace_seconds
+    content[off + 13] = 1; // timestamp_field_idx
+    content[off + 14] = @intFromEnum(DurationUnit.NONE);
+    off += 15;
+
+    content[off] = 0x30; // BATCH_SET_INSERT
+    content[off + 1] = 0; // slot
+    content[off + 2] = 0; // elem col
+
+    return prog;
+}
+
+test "ttl hashmap - insert and evict through live reducer path" {
+    const prog = buildTTLMapProgram(4, 0, true);
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    std.debug.assert(state_size <= 4096);
+
+    const init_result = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+    try std.testing.expectEqual(@as(u32, 0), init_result);
+
+    var key_col = [1]u32{42};
+    var val_col = [1]u32{7};
+    var ts_col = [1]f64{100.0};
+    const col_ptrs = [3][*]const u8{ @ptrCast(&key_col), @ptrCast(&val_col), @ptrCast(&ts_col) };
+
+    const exec_result = vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&col_ptrs), 3, 1);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.OK)), exec_result);
+
+    const meta_base = STATE_HEADER_SIZE;
+    const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
+    const slot_cap = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+    const before = vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 42);
+    try std.testing.expectEqual(@as(u32, 7), before);
+
+    const evict_none = vm_evict_all_expired(@ptrCast(&state_buf), 105.0);
+    try std.testing.expectEqual(@as(u32, 0), evict_none);
+    try std.testing.expectEqual(@as(u32, 7), vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 42));
+
+    const evict_one = vm_evict_all_expired(@ptrCast(&state_buf), 111.0);
+    try std.testing.expectEqual(@as(u32, 1), evict_one);
+    try std.testing.expectEqual(EMPTY_KEY, vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 42));
+}
+
+test "ttl hashmap - stale eviction entries do not evict newer values" {
+    const prog = buildTTLMapProgram(4, 0, false);
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    std.debug.assert(state_size <= 4096);
+
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len));
+
+    var key_col_a = [1]u32{9};
+    var val_col_a = [1]u32{100};
+    var ts_col_a = [1]f64{100.0};
+    const ptrs_a = [3][*]const u8{ @ptrCast(&key_col_a), @ptrCast(&val_col_a), @ptrCast(&ts_col_a) };
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_a), 3, 1));
+
+    var key_col_b = [1]u32{9};
+    var val_col_b = [1]u32{200};
+    var ts_col_b = [1]f64{200.0};
+    const ptrs_b = [3][*]const u8{ @ptrCast(&key_col_b), @ptrCast(&val_col_b), @ptrCast(&ts_col_b) };
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_b), 3, 1));
+
+    const meta_base = STATE_HEADER_SIZE;
+    const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
+    const slot_cap = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+
+    // cutoff=140, so the stale ts=100 index entry is expired. It must not evict
+    // the current key value with ts=200.
+    const evicted = vm_evict_all_expired(@ptrCast(&state_buf), 150.0);
+    try std.testing.expectEqual(@as(u32, 0), evicted);
+    try std.testing.expectEqual(@as(u32, 200), vm_map_get(@ptrCast(&state_buf), slot_offset, slot_cap, 9));
+}
+
+test "ttl hashset - reinsertion refreshes ttl and evicts deterministically" {
+    const prog = buildTTLSetProgram(4, 0);
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    std.debug.assert(state_size <= 4096);
+
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len));
+
+    var elem_1 = [1]u32{77};
+    var ts_1 = [1]f64{100.0};
+    const ptrs_1 = [2][*]const u8{ @ptrCast(&elem_1), @ptrCast(&ts_1) };
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_1), 2, 1));
+
+    var elem_2 = [1]u32{77};
+    var ts_2 = [1]f64{200.0};
+    const ptrs_2 = [2][*]const u8{ @ptrCast(&elem_2), @ptrCast(&ts_2) };
+    try std.testing.expectEqual(@as(u32, 0), vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs_2), 2, 1));
+
+    const meta_base = STATE_HEADER_SIZE;
+    const slot_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
+    const slot_cap = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+
+    try std.testing.expect(vm_set_contains(@ptrCast(&state_buf), slot_offset, slot_cap, 77) == 1);
+
+    // cutoff=140; refreshed timestamp=200 keeps element alive
+    try std.testing.expectEqual(@as(u32, 0), vm_evict_all_expired(@ptrCast(&state_buf), 150.0));
+    try std.testing.expect(vm_set_contains(@ptrCast(&state_buf), slot_offset, slot_cap, 77) == 1);
+
+    // cutoff=201; refreshed timestamp now expires
+    try std.testing.expectEqual(@as(u32, 1), vm_evict_all_expired(@ptrCast(&state_buf), 211.0));
+    try std.testing.expect(vm_set_contains(@ptrCast(&state_buf), slot_offset, slot_cap, 77) == 0);
+}
+
+test "ttl eviction index overflow - returns NEEDS_GROWTH instead of dropping" {
+    const prog = buildTTLMapProgram(4, 0, false);
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    std.debug.assert(state_size <= 4096);
+
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len));
+
+    // Force tiny eviction index capacity to trigger deterministic overflow on
+    // the second insert (policy path under test).
+    const meta_base = STATE_HEADER_SIZE;
+    std.mem.writeInt(u32, state_buf[meta_base + SlotMetaOffset.EVICTION_INDEX_CAPACITY ..][0..4], 1, .little);
+
+    var key_col = [2]u32{ 1, 2 };
+    var val_col = [2]u32{ 10, 20 };
+    var ts_col = [2]f64{ 100.0, 101.0 };
+    const ptrs = [3][*]const u8{ @ptrCast(&key_col), @ptrCast(&val_col), @ptrCast(&ts_col) };
+
+    const result = vm_execute_batch(@ptrCast(&state_buf), @ptrCast(&prog), prog.len, @ptrCast(&ptrs), 3, 2);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.NEEDS_GROWTH)), result);
+    try std.testing.expectEqual(@as(u32, 0), vm_get_needs_growth_slot());
 }
 
 test "slot growth - hashmap capacity exceeded triggers NEEDS_GROWTH" {
