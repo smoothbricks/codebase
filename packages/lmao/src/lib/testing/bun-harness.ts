@@ -56,9 +56,8 @@ import {
 import { AsyncLocalStorage } from 'node:async_hooks';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
-import { type OpContext, type OpContextBinding, type OpContextOf, opContextType } from '../opContext/types.js';
+import type { OpContext, OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
-import type { LogSchema } from '../schema/LogSchema.js';
 import { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { TestTracer } from '../tracers/TestTracer.js';
@@ -87,24 +86,7 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
 }
 
 type TestBody = () => unknown | Promise<unknown>;
-
-type DescribeFieldSchema = { describe: ReturnType<typeof S.category> };
-
-type ExtendedLogSchema<T extends LogSchema> =
-  T extends LogSchema<infer Fields> ? LogSchema<Fields & DescribeFieldSchema> : never;
-
-type ExtendedOpContext<Ctx extends OpContext> = Omit<Ctx, 'logSchema'> & {
-  logSchema: ExtendedLogSchema<Ctx['logSchema']>;
-};
-
-type BindingWithDescribe<B extends OpContextBinding> = B & {
-  readonly [opContextType]: ExtendedOpContext<OpContextOf<B>>;
-  readonly logBinding: Omit<B['logBinding'], 'logSchema'> & {
-    readonly logSchema: ExtendedLogSchema<B['logBinding']['logSchema']>;
-  };
-};
-
-type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<BindingWithDescribe<B>>>;
+type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
 
 type RootSpanRunner<Ctx extends OpContext> = (
   name: string,
@@ -114,7 +96,7 @@ type RootSpanRunner<Ctx extends OpContext> = (
 export interface BunTestTracerInstance<B extends OpContextBinding> {
   setup(): void;
   useTestSpan(): HarnessSpanContext<B>;
-  getTracer(): TestTracer<BindingWithDescribe<B>>;
+  getTracer(): TestTracer<B>;
   createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown>;
 }
 
@@ -124,7 +106,10 @@ export interface BunTestSuiteTracer<B extends OpContextBinding> {
   setupBunTestSuiteTracing(): void;
 }
 
+let _activeSuiteTracer: BunTestTracerInstance<OpContextBinding> | null = null;
+
 export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTestTracerInstance<B>): void {
+  _activeSuiteTracer = tracer as unknown as BunTestTracerInstance<OpContextBinding>;
   tracer.setup();
   mock.module('bun:test', () => tracer.createBunTestMock(bunTest));
 }
@@ -154,10 +139,9 @@ export function makeTestTracer<B extends OpContextBinding>(
     sqlite?: TraceSQLiteConfig;
   },
 ): BunTestTracerInstance<B> {
-  type ExtendedBinding = BindingWithDescribe<B>;
   type SpanCtx = HarnessSpanContext<B>;
 
-  let tracer: TestTracer<ExtendedBinding> | null = null;
+  let tracer: TestTracer<B> | null = null;
   let sink: TraceSQLiteSink | null = null;
   let rootCtx: SpanCtx | null = null;
   let resolveTestRun: (() => void) | null = null;
@@ -171,14 +155,14 @@ export function makeTestTracer<B extends OpContextBinding>(
     return rootCtx;
   }
 
-  function assertTracer(): TestTracer<ExtendedBinding> {
+  function assertTracer(): TestTracer<B> {
     if (!tracer) throw new Error('Call setup() in preload before tests');
     return tracer;
   }
 
   function runTracedTest(name: string, fn: TestBody, describePath: string | null): Promise<unknown> {
     const currentRoot = assertRootCtx();
-    return (currentRoot.span as RootSpanRunner<OpContextOf<ExtendedBinding>>)(name, async (ctx) => {
+    return (currentRoot.span as RootSpanRunner<OpContextOf<B>>)(name, async (ctx) => {
       writeDescribeTag(ctx.tag, describePath);
       try {
         await als.run(ctx, fn);
@@ -249,7 +233,7 @@ export function makeTestTracer<B extends OpContextBinding>(
           ...binding.logBinding,
           logSchema: extendedSchema,
         },
-      } as ExtendedBinding;
+      } as B;
 
       tracer = new TestTracer(extendedBinding, {
         bufferStrategy: new JsBufferStrategy(),
@@ -301,7 +285,7 @@ export function makeTestTracer<B extends OpContextBinding>(
       return ctx;
     },
 
-    getTracer(): TestTracer<ExtendedBinding> {
+    getTracer(): TestTracer<B> {
       return assertTracer();
     },
 
@@ -344,6 +328,8 @@ export function initTraceTestRun<B extends OpContextBinding>(
     sqlite?: TraceSQLiteConfig;
   },
 ): void {
+  _activeSuiteTracer = null;
+
   // Extend user's schema with `describe` column for test grouping
   const extendedSchema = opContext.logBinding.logSchema.extend({ describe: S.category() });
   const extendedBinding = {
@@ -408,7 +394,12 @@ export function initTraceTestRun<B extends OpContextBinding>(
  * @param bunTestModule - The original bun:test namespace (`import * as bunTest from 'bun:test'`)
  */
 export function createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown> {
-  if (!_rootCtx) throw new Error('Call initTraceTestRun() before createBunTestMock()');
+  if (!_rootCtx) {
+    if (_activeSuiteTracer) {
+      return _activeSuiteTracer.createBunTestMock(bunTestModule);
+    }
+    throw new Error('Call initTraceTestRun() before createBunTestMock()');
+  }
 
   const origIt = bunTestModule.it as typeof _it;
   const origDescribe = bunTestModule.describe as typeof _describe;
@@ -474,14 +465,22 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
 }
 
 /** Get the current span context from AsyncLocalStorage (inside an it() block) */
-export function useTestSpan(): SpanContext<OpContext> {
+export function useTestSpan<Ctx extends SpanContext<OpContext> = SpanContext<OpContext>>(): Ctx {
+  if (_activeSuiteTracer) {
+    return _activeSuiteTracer.useTestSpan() as unknown as Ctx;
+  }
+
   const ctx = _als.getStore();
   if (!ctx) throw new Error('useTestSpan() called outside of a traced it()');
-  return ctx;
+  return ctx as unknown as Ctx;
 }
 
 /** Get the root tracer instance */
 export function getTracer(): TestTracer<OpContextBinding> {
+  if (_activeSuiteTracer) {
+    return _activeSuiteTracer.getTracer() as TestTracer<OpContextBinding>;
+  }
+
   if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');
   return _tracer;
 }
