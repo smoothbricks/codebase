@@ -5081,6 +5081,16 @@ fn getSlotDataSize(slot_type: u4, capacity: u32) u32 {
     };
 }
 
+fn getTTLSideBufferSize(has_ttl: bool, has_evict_trigger: bool, capacity: u32) u32 {
+    if (!has_ttl) return 0;
+
+    var size: u32 = align8(capacity * @sizeOf(EvictionEntry));
+    if (has_evict_trigger) {
+        size += align8(1024 * @sizeOf(EvictionEntry));
+    }
+    return size;
+}
+
 /// Compute data region size for a STRUCT_MAP slot.
 /// Layout: [field_types x num_fields padded to 4] + [keys u32 x capacity] + [rows x capacity]
 fn getStructMapSlotDataSize(descriptor_size: u32, capacity: u32, row_size: u32, has_timestamps: bool) u32 {
@@ -5172,21 +5182,24 @@ pub export fn vm_calculate_grown_state_size(
         const old_cap = std.mem.readInt(u32, old_state_ptr[meta_base + 4 ..][0..4], .little);
         const type_flags_byte = old_state_ptr[meta_base + 12];
         const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
+        const has_ttl = (type_flags_byte & 0x10) != 0;
+        const has_evict_trigger = (type_flags_byte & 0x20) != 0;
 
         const cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
+        var slot_size: u32 = 0;
         if (slot_type == 5) {
             // STRUCT_MAP: read struct-specific metadata
             const nf: u32 = old_state_ptr[meta_base + 13];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
             const has_ts = old_state_ptr[meta_base + 18] != 0;
             const desc_size = align8(nf);
-            total_size += getStructMapSlotDataSize(desc_size, cap, rs, has_ts);
+            slot_size += getStructMapSlotDataSize(desc_size, cap, rs, has_ts);
             // Arena: if present, double arena capacity on growth; keep same on non-growth
             const arena_hdr_off = std.mem.readInt(u32, old_state_ptr[meta_base + 20 ..][0..4], .little);
             if (arena_hdr_off != 0) {
                 const old_arena_cap = std.mem.readInt(u32, old_state_ptr[arena_hdr_off..][0..4], .little);
                 const new_arena_cap = if (slot_i == grown_slot_idx) old_arena_cap * 2 else old_arena_cap;
-                total_size += ARENA_HEADER_SIZE + new_arena_cap;
+                slot_size += ARENA_HEADER_SIZE + new_arena_cap;
             }
         } else if (slot_type == 6) {
             // ORDERED_LIST: scalar or struct
@@ -5195,15 +5208,18 @@ pub export fn vm_calculate_grown_state_size(
             if (elem_type_byte == 0xFF) {
                 // Struct list: descriptor + rows
                 const nf: u32 = old_state_ptr[meta_base + 13];
-                total_size += align8(nf) + cap * rs;
+                slot_size += align8(nf) + cap * rs;
             } else {
                 // Scalar list
-                total_size += cap * rs;
+                slot_size += cap * rs;
             }
         } else {
-            total_size += getSlotDataSize(slot_type, cap);
+            slot_size += getSlotDataSize(slot_type, cap);
         }
-        total_size = (total_size + 7) & ~@as(u32, 7);
+
+        slot_size += getTTLSideBufferSize(has_ttl, has_evict_trigger, cap);
+        total_size += slot_size;
+        total_size = align8(total_size);
     }
 
     return total_size;
@@ -5237,12 +5253,14 @@ pub export fn vm_grow_state(
         const old_cap = std.mem.readInt(u32, old_state_ptr[meta_base + 4 ..][0..4], .little);
         const type_flags_byte = old_state_ptr[meta_base + 12];
         const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
+        const has_ttl = (type_flags_byte & 0x10) != 0;
+        const has_evict_trigger = (type_flags_byte & 0x20) != 0;
 
         const new_cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
         const new_offset = data_cursor;
 
-        // Compute data size (STRUCT_MAP and ORDERED_LIST need metadata-based calculation)
-        const new_data_size = if (slot_type == 5) blk: {
+        // Compute primary data size (STRUCT_MAP and ORDERED_LIST need metadata-based calculation)
+        const new_primary_size = if (slot_type == 5) blk: {
             const nf: u32 = old_state_ptr[meta_base + 13];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
             const has_ts = old_state_ptr[meta_base + 18] != 0;
@@ -5258,11 +5276,21 @@ pub export fn vm_grow_state(
             }
         } else getSlotDataSize(slot_type, new_cap);
 
+        const eviction_index_offset = if (has_ttl) align8(new_offset + new_primary_size) else 0;
+        const eviction_index_capacity = if (has_ttl) new_cap else 0;
+        const evicted_buffer_offset = if (has_ttl and has_evict_trigger)
+            align8(eviction_index_offset + eviction_index_capacity * @sizeOf(EvictionEntry))
+        else
+            0;
+
         // Write metadata: offset, capacity, size (size updated below for grown)
         std.mem.writeInt(u32, new_state_ptr[meta_base..][0..4], new_offset, .little);
         std.mem.writeInt(u32, new_state_ptr[meta_base + 4 ..][0..4], new_cap, .little);
         // Copy remaining metadata fields (type_flags, agg_type, change_flags, TTL, etc.)
         @memcpy(new_state_ptr[meta_base + 8 .. meta_base + SLOT_META_SIZE], old_state_ptr[meta_base + 8 .. meta_base + SLOT_META_SIZE]);
+        std.mem.writeInt(u32, new_state_ptr[meta_base + SlotMetaOffset.EVICTION_INDEX_OFFSET ..][0..4], eviction_index_offset, .little);
+        std.mem.writeInt(u32, new_state_ptr[meta_base + SlotMetaOffset.EVICTION_INDEX_CAPACITY ..][0..4], eviction_index_capacity, .little);
+        std.mem.writeInt(u32, new_state_ptr[meta_base + SlotMetaOffset.EVICTED_BUFFER_OFFSET ..][0..4], evicted_buffer_offset, .little);
 
         if (slot_i == grown_slot_idx) {
             if (slot_type == 0) {
@@ -5442,14 +5470,14 @@ pub export fn vm_grow_state(
             } else {
                 // Non-hash slot: copy data (aggregates/condition trees shouldn't be grown)
                 const old_data_size = getSlotDataSize(slot_type, old_cap);
-                const copy_len = @min(old_data_size, new_data_size);
+                const copy_len = @min(old_data_size, new_primary_size);
                 if (copy_len > 0) {
                     @memcpy(new_state_ptr[new_offset .. new_offset + copy_len], old_state_ptr[old_offset .. old_offset + copy_len]);
                 }
             }
         } else {
             // Non-grown slot: memcpy data as-is (struct map data + arena if present)
-            const data_size = if (slot_type == 5) blk: {
+            const primary_size = if (slot_type == 5) blk: {
                 const nf: u32 = old_state_ptr[meta_base + 13];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
                 const has_ts = old_state_ptr[meta_base + 18] != 0;
@@ -5471,8 +5499,8 @@ pub export fn vm_grow_state(
                     break :blk old_cap * rs;
                 }
             } else getSlotDataSize(slot_type, old_cap);
-            if (data_size > 0) {
-                @memcpy(new_state_ptr[new_offset .. new_offset + data_size], old_state_ptr[old_offset .. old_offset + data_size]);
+            if (primary_size > 0) {
+                @memcpy(new_state_ptr[new_offset .. new_offset + primary_size], old_state_ptr[old_offset .. old_offset + primary_size]);
             }
             // Update arena header offset in metadata for non-grown struct maps
             if (slot_type == 5) {
@@ -5489,18 +5517,50 @@ pub export fn vm_grow_state(
             }
         }
 
-        // Advance data_cursor past struct map data + arena (if present)
-        var total_slot_size = new_data_size;
+        if (has_ttl) {
+            const old_eviction_index_offset = std.mem.readInt(u32, old_state_ptr[meta_base + SlotMetaOffset.EVICTION_INDEX_OFFSET ..][0..4], .little);
+            const old_eviction_index_size = std.mem.readInt(u32, old_state_ptr[meta_base + SlotMetaOffset.EVICTION_INDEX_SIZE ..][0..4], .little);
+            var copied_eviction_size: u32 = 0;
+
+            if (old_eviction_index_offset != 0 and eviction_index_offset != 0 and old_eviction_index_size > 0) {
+                copied_eviction_size = @min(old_eviction_index_size, eviction_index_capacity);
+                const copy_bytes = copied_eviction_size * @sizeOf(EvictionEntry);
+                @memcpy(
+                    new_state_ptr[eviction_index_offset .. eviction_index_offset + copy_bytes],
+                    old_state_ptr[old_eviction_index_offset .. old_eviction_index_offset + copy_bytes],
+                );
+            }
+            std.mem.writeInt(u32, new_state_ptr[meta_base + SlotMetaOffset.EVICTION_INDEX_SIZE ..][0..4], copied_eviction_size, .little);
+
+            if (has_evict_trigger) {
+                const old_evicted_offset = std.mem.readInt(u32, old_state_ptr[meta_base + SlotMetaOffset.EVICTED_BUFFER_OFFSET ..][0..4], .little);
+                const old_evicted_count = std.mem.readInt(u32, old_state_ptr[meta_base + SlotMetaOffset.EVICTED_COUNT ..][0..4], .little);
+                var copied_evicted_count: u32 = 0;
+                if (old_evicted_offset != 0 and evicted_buffer_offset != 0 and old_evicted_count > 0) {
+                    copied_evicted_count = @min(old_evicted_count, 1024);
+                    const copy_bytes = copied_evicted_count * @sizeOf(EvictionEntry);
+                    @memcpy(
+                        new_state_ptr[evicted_buffer_offset .. evicted_buffer_offset + copy_bytes],
+                        old_state_ptr[old_evicted_offset .. old_evicted_offset + copy_bytes],
+                    );
+                }
+                std.mem.writeInt(u32, new_state_ptr[meta_base + SlotMetaOffset.EVICTED_COUNT ..][0..4], copied_evicted_count, .little);
+            } else {
+                std.mem.writeInt(u32, new_state_ptr[meta_base + SlotMetaOffset.EVICTED_COUNT ..][0..4], 0, .little);
+            }
+        }
+
+        var slot_total_size = new_primary_size;
         if (slot_type == 5) {
             const arena_hdr_off = std.mem.readInt(u32, old_state_ptr[meta_base + 20 ..][0..4], .little);
             if (arena_hdr_off != 0) {
                 const old_arena_cap = std.mem.readInt(u32, old_state_ptr[arena_hdr_off..][0..4], .little);
                 const new_arena_cap = if (slot_i == grown_slot_idx) old_arena_cap * 2 else old_arena_cap;
-                total_slot_size += ARENA_HEADER_SIZE + new_arena_cap;
+                slot_total_size += ARENA_HEADER_SIZE + new_arena_cap;
             }
         }
-        data_cursor = new_offset + total_slot_size;
-        data_cursor = (data_cursor + 7) & ~@as(u32, 7);
+        slot_total_size += getTTLSideBufferSize(has_ttl, has_evict_trigger, new_cap);
+        data_cursor = align8(new_offset + slot_total_size);
     }
 
     return @intFromEnum(ErrorCode.OK);
