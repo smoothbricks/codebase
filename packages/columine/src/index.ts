@@ -51,6 +51,7 @@ export {
   Opcode,
   PROGRAM_HASH_PREFIX,
   SlotType,
+  SlotTypeFlag,
   StructFieldType,
   TtlStartOf,
   ValueType,

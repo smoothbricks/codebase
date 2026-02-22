@@ -36,6 +36,21 @@ export enum SlotType {
   ORDERED_LIST = 6,
 }
 
+/**
+ * Bit layout for SLOT_DEF/SLOT_STRUCT_MAP/SLOT_ORDERED_LIST `type_flags` byte.
+ *
+ * - bits 0-3: SlotType
+ * - bit 4: has_ttl
+ * - bit 5: has_evict_trigger
+ * - bit 6: no_hashmap_timestamps (HASHMAP only; omit f64 timestamp side-array)
+ * - bit 7: reserved
+ */
+export enum SlotTypeFlag {
+  HAS_TTL = 0x10,
+  HAS_EVICT_TRIGGER = 0x20,
+  NO_HASHMAP_TIMESTAMPS = 0x40,
+}
+
 export enum StructFieldType {
   UINT32 = 0, // 4 bytes
   INT64 = 1, // 8 bytes
@@ -82,7 +97,7 @@ export interface ReducerProgram {
 }
 
 export type SlotDef =
-  | { type: SlotType.HASHMAP; capacity: number; ttl?: SlotTtlMetadata }
+  | { type: SlotType.HASHMAP; capacity: number; storesTimestamps: boolean; ttl?: SlotTtlMetadata }
   | { type: SlotType.HASHSET; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.AGGREGATE; aggType: AggType }
   | { type: SlotType.CONDITION_TREE }

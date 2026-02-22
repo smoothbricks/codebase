@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'bun:test';
 
 import { parseReducerProgram } from '../reducer-bytecode.js';
-import { MAGIC, PROGRAM_HASH_PREFIX, SlotType, StructFieldType, TtlStartOf } from '../types.js';
+import { MAGIC, PROGRAM_HASH_PREFIX, SlotType, SlotTypeFlag, StructFieldType, TtlStartOf } from '../types.js';
 
 function buildProgram(initCode: number[], numSlots: number): Uint8Array {
   const headerSize = 14;
@@ -40,11 +40,12 @@ function ttlBytes(ttlSeconds: number, graceSeconds: number, tsField: number, sta
 
 describe('parseReducerProgram', () => {
   it('decodes SLOT_DEF type nibble while preserving TTL metadata', () => {
-    const typeFlags = SlotType.HASHMAP | 0x10 | 0x20;
+    const typeFlags = SlotType.HASHMAP | SlotTypeFlag.HAS_TTL | SlotTypeFlag.HAS_EVICT_TRIGGER;
     const initCode = [0x10, 0x00, typeFlags, 0x20, 0x00, ...ttlBytes(90, 5, 3, TtlStartOf.MINUTE), 0x00];
     const program = parseReducerProgram(buildProgram(initCode, 1));
 
     expect(program.slotDefs[0].type).toBe(SlotType.HASHMAP);
+    expect('storesTimestamps' in program.slotDefs[0] && program.slotDefs[0].storesTimestamps).toBe(true);
     expect('ttl' in program.slotDefs[0] && program.slotDefs[0].ttl).toEqual({
       ttlSeconds: 90,
       graceSeconds: 5,
@@ -55,7 +56,7 @@ describe('parseReducerProgram', () => {
   });
 
   it('decodes struct-map TTL payload and field types', () => {
-    const typeFlags = SlotType.STRUCT_MAP | 0x10;
+    const typeFlags = SlotType.STRUCT_MAP | SlotTypeFlag.HAS_TTL;
     const initCode = [
       0x18,
       0x00,
@@ -89,5 +90,29 @@ describe('parseReducerProgram', () => {
     const initCode = [0x10, 0x00, SlotType.HASHSET, 0x10, 0x00, 0x00];
     const program = parseReducerProgram(buildProgram(initCode, 1));
     expect(program.slotDefs[0]).toEqual({ type: SlotType.HASHSET, capacity: 16 });
+  });
+
+  it('decodes HASHMAP no-timestamp metadata when no-timestamp bit is set', () => {
+    const typeFlags = SlotType.HASHMAP | SlotTypeFlag.NO_HASHMAP_TIMESTAMPS;
+    const initCode = [0x10, 0x00, typeFlags, 0x20, 0x00, 0x00];
+    const program = parseReducerProgram(buildProgram(initCode, 1));
+
+    expect(program.slotDefs[0]).toEqual({
+      type: SlotType.HASHMAP,
+      capacity: 32,
+      storesTimestamps: false,
+      ttl: undefined,
+    });
+  });
+
+  it('decodes HASHMAP timestamp metadata when no-timestamp bit is unset', () => {
+    const initCode = [0x10, 0x00, SlotType.HASHMAP, 0x20, 0x00, 0x00];
+    const program = parseReducerProgram(buildProgram(initCode, 1));
+    const slot = program.slotDefs[0];
+    expect(slot.type).toBe(SlotType.HASHMAP);
+    if (slot.type !== SlotType.HASHMAP) {
+      throw new Error('invariant: expected hashmap slot');
+    }
+    expect(slot.storesTimestamps).toBe(true);
   });
 });

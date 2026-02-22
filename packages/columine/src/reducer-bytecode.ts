@@ -1,9 +1,19 @@
 import type { ReducerProgram, SlotDef, SlotTtlMetadata, StructFieldType } from './types.js';
-import { AggType, HEADER_SIZE, MAGIC, Opcode, PROGRAM_HASH_PREFIX, SlotType, type TtlStartOf } from './types.js';
+import {
+  AggType,
+  HEADER_SIZE,
+  MAGIC,
+  Opcode,
+  PROGRAM_HASH_PREFIX,
+  SlotType,
+  SlotTypeFlag,
+  type TtlStartOf,
+} from './types.js';
 
 const SLOT_TYPE_MASK = 0x0f;
-const HAS_TTL_FLAG = 0x10;
-const HAS_EVICT_TRIGGER_FLAG = 0x20;
+const HAS_TTL_FLAG = SlotTypeFlag.HAS_TTL;
+const HAS_EVICT_TRIGGER_FLAG = SlotTypeFlag.HAS_EVICT_TRIGGER;
+const NO_HASHMAP_TIMESTAMPS_FLAG = SlotTypeFlag.NO_HASHMAP_TIMESTAMPS;
 
 interface ParsedTtl {
   ttl: SlotTtlMetadata;
@@ -66,7 +76,12 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
 
         switch (slotType) {
           case SlotType.HASHMAP:
-            slotDefs[slot] = { type: SlotType.HASHMAP, capacity, ttl };
+            slotDefs[slot] = {
+              type: SlotType.HASHMAP,
+              capacity,
+              storesTimestamps: (typeFlags & NO_HASHMAP_TIMESTAMPS_FLAG) === 0,
+              ttl,
+            };
             break;
           case SlotType.HASHSET:
             slotDefs[slot] = { type: SlotType.HASHSET, capacity, ttl };

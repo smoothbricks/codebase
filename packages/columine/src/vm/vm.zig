@@ -23,7 +23,7 @@
 //   reserved: u32
 //
 // Slot Data:
-//   HashMap: keys(u32[cap]) + values(u32[cap]) + timestamps(f64[cap])
+//   HashMap: keys(u32[cap]) + values(u32[cap]) [+ timestamps(f64[cap])]
 //   HashSet: keys(u32[cap])
 //   Aggregate: value(f64) + count(u64)
 
@@ -170,12 +170,13 @@ pub const ChangeFlag = struct {
 // SlotTypeFlags byte layout:
 // ┌─────────────────────────────────────┐
 // │ 7 │ 6 │ 5 │ 4 │ 3 │ 2 │ 1 │ 0 │
-// │rsv│rsv│evict│ttl│   slot_type   │
+// │rsv│no_ts│evict│ttl│  slot_type   │
 // └─────────────────────────────────────┘
 // bits 0-3: slot_type (0-15, supports 16 slot types)
 // bit 4:    has_ttl (if 1, TTL params in bytecode)
 // bit 5:    has_evict_trigger (if 1, fire RETE rules on eviction)
-// bits 6-7: reserved
+// bit 6:    no_hashmap_timestamps (if 1, HASHMAP omits f64 side array)
+// bit 7:    reserved
 
 pub const SlotType = enum(u4) {
     HASHMAP = 0,
@@ -191,7 +192,8 @@ pub const SlotTypeFlags = packed struct(u8) {
     slot_type: SlotType, // bits 0-3
     has_ttl: bool, // bit 4: TTL params follow in bytecode
     has_evict_trigger: bool, // bit 5: fire RETE rules on eviction
-    reserved: u2 = 0, // bits 6-7
+    no_hashmap_timestamps: bool = false, // bit 6: HASHMAP storage optimization
+    reserved: u1 = 0, // bit 7
 
     pub fn fromByte(b: u8) SlotTypeFlags {
         return @bitCast(b);
@@ -401,6 +403,11 @@ const SlotMeta = struct {
     /// Helper to check if eviction triggers RETE rules
     pub fn hasEvictTrigger(self: SlotMeta) bool {
         return self.type_flags.has_evict_trigger;
+    }
+
+    /// HASHMAP timestamp/comparison side-array availability.
+    pub fn hasHashMapTimestampStorage(self: SlotMeta) bool {
+        return self.slotType() == .HASHMAP and !self.type_flags.no_hashmap_timestamps;
     }
 
     /// Calculate cutoff time for eviction (called from JS after applying startOf/timezone)
@@ -732,11 +739,13 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             const data_ptr = state_base + meta.offset;
             const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
             const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-            const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
             const idx = findKeyInMap(keys, meta.capacity, entry.key);
             if (idx < meta.capacity) {
                 values[idx] = entry.prev_value;
-                timestamps[idx] = @bitCast(entry.aux);
+                if (meta.hasHashMapTimestampStorage()) {
+                    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
+                    timestamps[idx] = @bitCast(entry.aux);
+                }
                 if (meta.hasTTL()) {
                     removeTTLEntriesForKey(state_base, meta, entry.key);
                     restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
@@ -749,12 +758,14 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             const data_ptr = state_base + meta.offset;
             const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
             const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-            const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
             const idx = findInsertSlot(keys, meta.capacity, entry.key);
             if (idx < meta.capacity) {
                 keys[idx] = entry.key;
                 values[idx] = entry.prev_value;
-                timestamps[idx] = @bitCast(entry.aux);
+                if (meta.hasHashMapTimestampStorage()) {
+                    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
+                    timestamps[idx] = @bitCast(entry.aux);
+                }
                 meta.size_ptr.* += 1;
                 if (meta.hasTTL()) {
                     removeTTLEntriesForKey(state_base, meta, entry.key);
@@ -1237,6 +1248,8 @@ fn batchMapUpsertLatest(
     ts_col: [*]const f64,
     batch_len: u32,
 ) ErrorCode {
+    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
+
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
     const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
@@ -1571,6 +1584,8 @@ fn batchMapUpsertMax(
     cmp_col: [*]const f64,
     batch_len: u32,
 ) ErrorCode {
+    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
+
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
     const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
@@ -1689,6 +1704,8 @@ fn batchMapUpsertMin(
     cmp_col: [*]const f64,
     batch_len: u32,
 ) ErrorCode {
+    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
+
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
     const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
@@ -1806,7 +1823,10 @@ fn batchMapRemove(
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
     const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
+    const timestamps: [*]f64 = if (meta.hasHashMapTimestampStorage())
+        @ptrCast(@alignCast(data_ptr + meta.capacity * 8))
+    else
+        undefined;
 
     var size = meta.size_ptr.*;
     var had_remove = false;
@@ -1835,7 +1855,7 @@ fn batchMapRemove(
                             ._pad2 = 0,
                             .key = key,
                             .prev_value = values[slot],
-                            .aux = @bitCast(timestamps[slot]),
+                            .aux = if (meta.hasHashMapTimestampStorage()) @bitCast(timestamps[slot]) else 0,
                         },
                         .{
                             .op = .MAP_INSERT,
@@ -2093,6 +2113,8 @@ fn singleMapUpsertLatest(
     val: u32,
     ts: f64,
 ) ErrorCode {
+    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
+
     if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
 
     const data_ptr = state_base + meta.offset;
@@ -2201,7 +2223,10 @@ fn singleMapRemove(
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
     const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
+    const timestamps: [*]f64 = if (meta.hasHashMapTimestampStorage())
+        @ptrCast(@alignCast(data_ptr + meta.capacity * 8))
+    else
+        undefined;
 
     var size = meta.size_ptr.*;
 
@@ -2214,7 +2239,15 @@ fn singleMapRemove(
             if (g_undo_enabled) {
                 appendMutation(
                     delta_mode,
-                    .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[pos], .aux = @bitCast(timestamps[pos]) },
+                    .{
+                        .op = .MAP_DELETE,
+                        .slot = slot_idx,
+                        ._pad1 = 0,
+                        ._pad2 = 0,
+                        .key = key,
+                        .prev_value = values[pos],
+                        .aux = if (meta.hasHashMapTimestampStorage()) @bitCast(timestamps[pos]) else 0,
+                    },
                     .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
                 );
             }
@@ -2237,6 +2270,8 @@ fn singleMapUpsertMax(
     val: u32,
     cmp: f64,
 ) ErrorCode {
+    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
+
     if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
 
     const data_ptr = state_base + meta.offset;
@@ -2295,6 +2330,8 @@ fn singleMapUpsertMin(
     val: u32,
     cmp: f64,
 ) ErrorCode {
+    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
+
     if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
 
     const data_ptr = state_base + meta.offset;
@@ -4201,6 +4238,10 @@ pub export fn vm_calculate_state_size(
                 // Skip base bytes
                 pc += 4;
 
+                if (type_flags.slot_type == .HASHMAP and type_flags.has_ttl and type_flags.no_hashmap_timestamps) {
+                    return 0;
+                }
+
                 // Skip TTL params if present (10 bytes: f32 ttl + f32 grace + u8 ts_field + u8 start_of)
                 if (type_flags.has_ttl) {
                     pc += 10;
@@ -4209,8 +4250,11 @@ pub export fn vm_calculate_state_size(
                 // Calculate primary storage size based on slot type
                 switch (type_flags.slot_type) {
                     .HASHMAP => {
-                        // keys (u32) + values (u32) + timestamps (f64)
-                        size += capacity * 4 + capacity * 4 + capacity * 8;
+                        // keys (u32) + values (u32) [+ timestamps (f64)]
+                        size += capacity * 4 + capacity * 4;
+                        if (!type_flags.no_hashmap_timestamps) {
+                            size += capacity * 8;
+                        }
                     },
                     .HASHSET => {
                         // keys (u32)
@@ -4467,6 +4511,10 @@ pub export fn vm_init_state(
                     .SUM;
                 pc += 4;
 
+                if (type_flags.slot_type == .HASHMAP and type_flags.has_ttl and type_flags.no_hashmap_timestamps) {
+                    return @intFromEnum(ErrorCode.INVALID_PROGRAM);
+                }
+
                 // Read TTL params if present (10 bytes: f32 ttl + f32 grace + u8 ts_field + u8 start_of)
                 var ttl_seconds: f32 = 0.0;
                 var grace_seconds: f32 = 0.0;
@@ -4495,19 +4543,20 @@ pub export fn vm_init_state(
                 // Initialize primary storage based on slot type
                 switch (type_flags.slot_type) {
                     .HASHMAP => {
-                        // keys (u32) + values (u32) + timestamps (f64)
+                        // keys (u32) + values (u32) [+ timestamps (f64)]
                         const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
                         for (0..capacity) |i| {
                             keys_ptr[i] = EMPTY_KEY;
                         }
+                        data_offset += capacity * 4 + capacity * 4;
 
-                        const ts_offset = data_offset + capacity * 8;
-                        const ts_ptr: [*]f64 = @ptrCast(@alignCast(state_ptr + ts_offset));
-                        for (0..capacity) |i| {
-                            ts_ptr[i] = -std.math.inf(f64);
+                        if (!type_flags.no_hashmap_timestamps) {
+                            const ts_ptr: [*]f64 = @ptrCast(@alignCast(state_ptr + data_offset));
+                            for (0..capacity) |i| {
+                                ts_ptr[i] = -std.math.inf(f64);
+                            }
+                            data_offset += capacity * 8;
                         }
-
-                        data_offset += capacity * 4 + capacity * 4 + capacity * 8;
                     },
                     .CONDITION_TREE => {
                         const tree_state: *ConditionTreeState = @ptrCast(@alignCast(state_ptr + data_offset));
@@ -5207,9 +5256,9 @@ pub export fn vm_get_needs_growth_slot() u32 {
 /// Compute data size for a slot given its type and capacity.
 /// NOTE: STRUCT_MAP (type 5) returns 0 here — use getStructMapSlotDataSize instead
 /// (needs row_size from metadata).
-fn getSlotDataSize(slot_type: u4, capacity: u32) u32 {
+fn getSlotDataSize(slot_type: u4, capacity: u32, has_hashmap_timestamps: bool) u32 {
     return switch (slot_type) {
-        0 => capacity * 4 + capacity * 4 + capacity * 8, // HASHMAP: keys + values + timestamps
+        0 => capacity * 4 + capacity * 4 + if (has_hashmap_timestamps) capacity * 8 else 0, // HASHMAP: keys + values [+ timestamps]
         1 => capacity * 4, // HASHSET: keys only
         2 => 16, // AGGREGATE: f64 value + u64 count
         4 => 8, // CONDITION_TREE: generation(u32) + last_removed_key(u32)
@@ -5321,6 +5370,7 @@ pub export fn vm_calculate_grown_state_size(
         const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
         const has_ttl = (type_flags_byte & 0x10) != 0;
         const has_evict_trigger = (type_flags_byte & 0x20) != 0;
+        const has_hashmap_timestamps = (slot_type != 0) or ((type_flags_byte & 0x40) == 0);
 
         const cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
         var slot_size: u32 = 0;
@@ -5351,7 +5401,7 @@ pub export fn vm_calculate_grown_state_size(
                 slot_size += cap * rs;
             }
         } else {
-            slot_size += getSlotDataSize(slot_type, cap);
+            slot_size += getSlotDataSize(slot_type, cap, has_hashmap_timestamps);
         }
 
         slot_size += getTTLSideBufferSize(has_ttl, has_evict_trigger, cap);
@@ -5392,6 +5442,7 @@ pub export fn vm_grow_state(
         const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
         const has_ttl = (type_flags_byte & 0x10) != 0;
         const has_evict_trigger = (type_flags_byte & 0x20) != 0;
+        const has_hashmap_timestamps = (slot_type != 0) or ((type_flags_byte & 0x40) == 0);
 
         const new_cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
         const new_offset = data_cursor;
@@ -5411,7 +5462,7 @@ pub export fn vm_grow_state(
             } else {
                 break :blk new_cap * rs;
             }
-        } else getSlotDataSize(slot_type, new_cap);
+        } else getSlotDataSize(slot_type, new_cap, has_hashmap_timestamps);
 
         const eviction_index_offset = if (has_ttl) align8(new_offset + new_primary_size) else 0;
         const eviction_index_capacity = if (has_ttl) new_cap else 0;
@@ -5434,7 +5485,6 @@ pub export fn vm_grow_state(
                 // HASHMAP: initialize keys to EMPTY_KEY, then rehash
                 const new_keys: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset]));
                 const new_vals: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset + new_cap * 4]));
-                const new_ts: [*]f64 = @ptrCast(@alignCast(&new_state_ptr[new_offset + new_cap * 8]));
 
                 // Fill keys with EMPTY_KEY
                 for (0..new_cap) |i| {
@@ -5443,7 +5493,15 @@ pub export fn vm_grow_state(
 
                 const old_keys: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset]));
                 const old_vals: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset + old_cap * 4]));
-                const old_ts: [*]const f64 = @ptrCast(@alignCast(&old_state_ptr[old_offset + old_cap * 8]));
+                const new_has_timestamps = (type_flags_byte & 0x40) == 0;
+                const old_ts: [*]const f64 = if (new_has_timestamps)
+                    @ptrCast(@alignCast(&old_state_ptr[old_offset + old_cap * 8]))
+                else
+                    undefined;
+                const new_ts: [*]f64 = if (new_has_timestamps)
+                    @ptrCast(@alignCast(&new_state_ptr[new_offset + new_cap * 8]))
+                else
+                    undefined;
 
                 var rehashed_size: u32 = 0;
                 for (0..old_cap) |i| {
@@ -5455,7 +5513,9 @@ pub export fn vm_grow_state(
                         }
                         new_keys[pos] = key;
                         new_vals[pos] = old_vals[i];
-                        new_ts[pos] = old_ts[i];
+                        if (new_has_timestamps) {
+                            new_ts[pos] = old_ts[i];
+                        }
                         rehashed_size += 1;
                     }
                 }
@@ -5606,7 +5666,7 @@ pub export fn vm_grow_state(
                 }
             } else {
                 // Non-hash slot: copy data (aggregates/condition trees shouldn't be grown)
-                const old_data_size = getSlotDataSize(slot_type, old_cap);
+                const old_data_size = getSlotDataSize(slot_type, old_cap, has_hashmap_timestamps);
                 const copy_len = @min(old_data_size, new_primary_size);
                 if (copy_len > 0) {
                     @memcpy(new_state_ptr[new_offset .. new_offset + copy_len], old_state_ptr[old_offset .. old_offset + copy_len]);
@@ -5635,7 +5695,7 @@ pub export fn vm_grow_state(
                 } else {
                     break :blk old_cap * rs;
                 }
-            } else getSlotDataSize(slot_type, old_cap);
+            } else getSlotDataSize(slot_type, old_cap, has_hashmap_timestamps);
             if (primary_size > 0) {
                 @memcpy(new_state_ptr[new_offset .. new_offset + primary_size], old_state_ptr[old_offset .. old_offset + primary_size]);
             }
@@ -5765,6 +5825,45 @@ fn buildTestProgram(comptime cap_lo: u8, comptime cap_hi: u8) [64]u8 {
     return prog;
 }
 
+fn buildNoTimestampMapProgram(comptime cap_lo: u8, comptime cap_hi: u8, comptime map_opcode: u8, comptime needs_ts_col: bool) [80]u8 {
+    var prog = [_]u8{0} ** 80;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+    content[0] = 0x41; // 'A'
+    content[1] = 0x58; // 'X'
+    content[2] = 0x45; // 'E'
+    content[3] = 0x31; // '1'
+    content[4] = 1;
+    content[5] = 0;
+    content[6] = 1; // num_slots
+    content[7] = if (needs_ts_col) 3 else 2;
+    content[8] = 0;
+    content[9] = 0;
+
+    const init_len: u16 = 5;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+    const reduce_len: u16 = if (needs_ts_col) 5 else 4;
+    content[12] = @truncate(reduce_len);
+    content[13] = @truncate(reduce_len >> 8);
+
+    var off: usize = 14;
+    content[off] = 0x10; // SLOT_DEF
+    content[off + 1] = 0;
+    content[off + 2] = 0x40; // HASHMAP + NO_HASHMAP_TIMESTAMPS
+    content[off + 3] = cap_lo;
+    content[off + 4] = cap_hi;
+    off += 5;
+
+    content[off] = map_opcode;
+    content[off + 1] = 0;
+    content[off + 2] = 0;
+    content[off + 3] = 1;
+    if (needs_ts_col) {
+        content[off + 4] = 2;
+    }
+    return prog;
+}
+
 fn writeF32LE(dst: []u8, value: f32) void {
     std.mem.writeInt(u32, dst[0..4], @bitCast(value), .little);
 }
@@ -5860,6 +5959,135 @@ fn buildTTLSetProgram(comptime cap_lo: u8, comptime cap_hi: u8) [96]u8 {
     content[off + 2] = 0; // elem col
 
     return prog;
+}
+
+test "hashmap no-timestamp slot reduces state size" {
+    var with_ts = buildNoTimestampMapProgram(4, 0, 0x22, false);
+    const no_ts = buildNoTimestampMapProgram(4, 0, 0x22, false);
+    with_ts[PROGRAM_HASH_PREFIX + 16] &= ~@as(u8, 0x40);
+
+    const with_ts_size = vm_calculate_state_size(@ptrCast(&with_ts), with_ts.len);
+    const no_ts_size = vm_calculate_state_size(@ptrCast(&no_ts), no_ts.len);
+
+    // Effective capacity is nextPowerOf2(4 * 2) = 16, saving one f64 per entry.
+    try std.testing.expectEqual(@as(u32, 16 * 8), with_ts_size - no_ts_size);
+}
+
+test "hashmap no-timestamp supports first and last semantics" {
+    const first_prog = buildNoTimestampMapProgram(4, 0, 0x21, false);
+    const last_prog = buildNoTimestampMapProgram(4, 0, 0x22, false);
+
+    const size_first = vm_calculate_state_size(@ptrCast(&first_prog), first_prog.len);
+    const size_last = vm_calculate_state_size(@ptrCast(&last_prog), last_prog.len);
+
+    var first_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(size_first));
+    defer std.testing.allocator.free(first_buf);
+    @memset(first_buf, 0);
+    var last_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(size_last));
+    defer std.testing.allocator.free(last_buf);
+    @memset(last_buf, 0);
+
+    const first_state: [*]u8 = @ptrCast(first_buf.ptr);
+    const last_state: [*]u8 = @ptrCast(last_buf.ptr);
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(first_state, @ptrCast(&first_prog), first_prog.len));
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(last_state, @ptrCast(&last_prog), last_prog.len));
+
+    var keys = [3]u32{ 7, 7, 7 };
+    var vals = [3]u32{ 10, 20, 30 };
+    const col_ptrs = [2][*]const u8{ @ptrCast(&keys), @ptrCast(&vals) };
+
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.OK)), vm_execute_batch(first_state, @ptrCast(&first_prog), first_prog.len, @ptrCast(&col_ptrs), 2, 3));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.OK)), vm_execute_batch(last_state, @ptrCast(&last_prog), last_prog.len, @ptrCast(&col_ptrs), 2, 3));
+
+    const first_meta = STATE_HEADER_SIZE;
+    const first_offset = std.mem.readInt(u32, first_buf[first_meta..][0..4], .little);
+    const first_cap = std.mem.readInt(u32, first_buf[first_meta + 4 ..][0..4], .little);
+    const last_offset = std.mem.readInt(u32, last_buf[first_meta..][0..4], .little);
+    const last_cap = std.mem.readInt(u32, last_buf[first_meta + 4 ..][0..4], .little);
+
+    try std.testing.expectEqual(@as(u32, 10), vm_map_get(first_state, first_offset, first_cap, 7));
+    try std.testing.expectEqual(@as(u32, 30), vm_map_get(last_state, last_offset, last_cap, 7));
+}
+
+test "hashmap no-timestamp rejects latest/max/min opcodes" {
+    const latest_prog = buildNoTimestampMapProgram(4, 0, 0x20, true);
+    const max_prog = buildNoTimestampMapProgram(4, 0, 0x26, true);
+    const min_prog = buildNoTimestampMapProgram(4, 0, 0x27, true);
+
+    const progs = [_][80]u8{ latest_prog, max_prog, min_prog };
+    for (progs) |prog| {
+        const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+        const state_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(state_size));
+        defer std.testing.allocator.free(state_buf);
+        @memset(state_buf, 0);
+        const state_ptr: [*]u8 = @ptrCast(state_buf.ptr);
+        try std.testing.expectEqual(@as(u32, 0), vm_init_state(state_ptr, @ptrCast(&prog), prog.len));
+
+        var keys = [1]u32{1};
+        var vals = [1]u32{42};
+        var cmp = [1]f64{123};
+        const col_ptrs = [3][*]const u8{ @ptrCast(&keys), @ptrCast(&vals), @ptrCast(&cmp) };
+
+        const result = vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&col_ptrs), 3, 1);
+        try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.INVALID_PROGRAM)), result);
+    }
+}
+
+test "hashmap no-timestamp growth preserves entries" {
+    const prog = buildNoTimestampMapProgram(4, 0, 0x22, false);
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    const state_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(state_size));
+    defer std.testing.allocator.free(state_buf);
+    @memset(state_buf, 0);
+    const state_ptr: [*]u8 = @ptrCast(state_buf.ptr);
+    try std.testing.expectEqual(@as(u32, 0), vm_init_state(state_ptr, @ptrCast(&prog), prog.len));
+
+    var keys = [_]u32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    var vals = [_]u32{ 0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100 };
+    const batch_ptrs = [2][*]const u8{ @ptrCast(&keys), @ptrCast(&vals) };
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.OK)), vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&batch_ptrs), 2, 11));
+
+    var overflow_key = [1]u32{100};
+    var overflow_val = [1]u32{1000};
+    const overflow_ptrs = [2][*]const u8{ @ptrCast(&overflow_key), @ptrCast(&overflow_val) };
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.NEEDS_GROWTH)), vm_execute_batch(state_ptr, @ptrCast(&prog), prog.len, @ptrCast(&overflow_ptrs), 2, 1));
+
+    const grown_size = vm_calculate_grown_state_size(state_ptr, @ptrCast(&prog), prog.len, 0);
+    var grown_buf = try std.testing.allocator.alignedAlloc(u8, std.mem.Alignment.of(u64), @intCast(grown_size));
+    defer std.testing.allocator.free(grown_buf);
+    @memset(grown_buf, 0);
+    const grown_ptr: [*]u8 = @ptrCast(grown_buf.ptr);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.OK)), vm_grow_state(state_ptr, grown_ptr, @ptrCast(&prog), prog.len, 0));
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.OK)), vm_execute_batch(grown_ptr, @ptrCast(&prog), prog.len, @ptrCast(&overflow_ptrs), 2, 1));
+
+    const meta_base = STATE_HEADER_SIZE;
+    const cap = std.mem.readInt(u32, grown_buf[meta_base + 4 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 32), cap);
+    for (0..11) |i| {
+        try std.testing.expectEqual(vals[i], vm_map_get(grown_ptr, std.mem.readInt(u32, grown_buf[meta_base..][0..4], .little), cap, @intCast(i)));
+    }
+    try std.testing.expectEqual(@as(u32, 1000), vm_map_get(grown_ptr, std.mem.readInt(u32, grown_buf[meta_base..][0..4], .little), cap, 100));
+}
+
+test "hashmap invalid no-timestamp+ttl flag combination is rejected" {
+    var prog = buildNoTimestampMapProgram(4, 0, 0x22, false);
+    const content = prog[PROGRAM_HASH_PREFIX..];
+    // Turn on has_ttl while keeping no_hashmap_timestamps.
+    content[16] |= 0x10;
+    // Extend init_len by 10 bytes and provide TTL payload.
+    const init_len: u16 = 15;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+    writeF32LE(content[19..23], 10.0);
+    writeF32LE(content[23..27], 0.0);
+    content[27] = 1;
+    content[28] = @intFromEnum(DurationUnit.NONE);
+
+    try std.testing.expectEqual(@as(u32, 0), vm_calculate_state_size(@ptrCast(&prog), prog.len));
+
+    var state_buf = [_]u8{0} ** 256;
+    const init_result = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+    try std.testing.expectEqual(@as(u32, @intFromEnum(ErrorCode.INVALID_PROGRAM)), init_result);
 }
 
 test "ttl hashmap - insert and evict through live reducer path" {
