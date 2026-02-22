@@ -21,7 +21,7 @@
         "command": "biome check --files-ignore-unknown=true {projectRoot}",
         "cwd": "{workspaceRoot}"
       },
-      "dependsOn": ["typecheck-tests"]
+      "dependsOn": ["typecheck", "typecheck-tests"]
     },
     "typecheck-tests": {
       "executor": "nx:run-commands",
