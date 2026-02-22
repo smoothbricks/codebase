@@ -76,13 +76,13 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
   const record = tag as Record<string, unknown>;
   const describeWriter = record.describe;
   if (typeof describeWriter === 'function') {
-    describeWriter(describePath);
+    describeWriter.call(record, describePath);
     return;
   }
 
   const batchWriter = record.with;
   if (typeof batchWriter === 'function') {
-    batchWriter({ describe: describePath });
+    batchWriter.call(record, { describe: describePath });
   }
 }
 
