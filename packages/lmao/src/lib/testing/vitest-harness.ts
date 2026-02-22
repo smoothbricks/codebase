@@ -49,6 +49,30 @@ function isExpectError(error: unknown): boolean {
   return error instanceof Error && error.message.startsWith('expect(');
 }
 
+function isVitestHarnessDebugEnabled(): boolean {
+  const globalDebug = (globalThis as { __LMAO_VITEST_DEBUG__?: unknown }).__LMAO_VITEST_DEBUG__;
+  if (globalDebug === true) {
+    return true;
+  }
+
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  const envDebug = env?.LMAO_VITEST_DEBUG;
+  return envDebug === '1' || envDebug === 'true';
+}
+
+function vitestHarnessDebug(message: string, data?: unknown): void {
+  if (!isVitestHarnessDebugEnabled()) {
+    return;
+  }
+
+  if (data === undefined) {
+    console.error(`[lmao/vitest-harness] ${message}`);
+    return;
+  }
+
+  console.error(`[lmao/vitest-harness] ${message}`, data);
+}
+
 type TestBody = () => unknown | Promise<unknown>;
 type SpanCtx<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
 
@@ -110,12 +134,14 @@ function tryCreateAsyncLocalStorageStore<Ctx>(): SpanContextStore<Ctx> | null {
 function createDefaultSpanContextStore<Ctx>(): SpanContextStore<Ctx> {
   const store = tryCreateAsyncLocalStorageStore<Ctx>();
   if (store) {
+    vitestHarnessDebug('using AsyncLocalStorage span store');
     return store;
   }
 
   // Workers (e.g. Cloudflare Vitest pool) do not expose node:async_hooks.
   // Fallback is safe for awaited test bodies, but detached async work will not
   // retain the context automatically.
+  vitestHarnessDebug('using fallback span store');
   return new FallbackSpanContextStore<Ctx>();
 }
 
@@ -168,6 +194,7 @@ function tagDescribePath(ctx: { tag: unknown }, describePath: string | null): vo
 export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestHarnessConfig<B>): VitestTestTracer<B> {
   const { binding } = config;
   const spanStore = config.createSpanContextStore?.() ?? createDefaultSpanContextStore<SpanCtx<B>>();
+  vitestHarnessDebug('created vitest test tracer instance');
 
   let initialized = false;
   let tracer: TestTracer<B> | null = null;
@@ -189,6 +216,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
       throw new Error('initTraceTestRun() already called for this vitest tracer instance');
     }
     initialized = true;
+    vitestHarnessDebug('initTraceTestRun start', { sqliteConfigured: options?.sqlite?.createDatabase !== undefined });
 
     // Extend user's schema with `describe` column for test grouping.
     const extendedSchema = binding.logBinding.logSchema.extend({ describe: S.category() });
@@ -201,6 +229,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
       bufferStrategy: new JsBufferStrategy(),
       createTraceRoot,
     });
+    vitestHarnessDebug('created TestTracer for vitest harness');
 
     if (options?.sqlite?.createDatabase) {
       const db = options.sqlite.createDatabase(options.sqlite.dbPath ?? '.trace-results.db');
@@ -210,24 +239,30 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
     const activeTracer = tracer;
     rootTracePromise = activeTracer.trace('test-run', (ctx: SpanCtx<B>) => {
       rootCtx = ctx;
+      vitestHarnessDebug('root test-run span started', { trace_id: ctx.buffer.trace_id });
       return new Promise<void>((resolve) => {
         resolveTestRun = resolve;
       });
     });
+    vitestHarnessDebug('root trace promise created');
 
     _afterAll(async () => {
+      vitestHarnessDebug('afterAll hook start');
       if (resolveTestRun) {
         resolveTestRun();
         resolveTestRun = null;
+        vitestHarnessDebug('resolved root test-run promise');
       }
 
       if (rootTracePromise) {
         await rootTracePromise;
         rootTracePromise = null;
+        vitestHarnessDebug('awaited root trace promise');
       }
 
       if (sink && rootCtx) {
         try {
+          vitestHarnessDebug('flushing sqlite trace sink');
           sink.flush(rootCtx.buffer);
           const traceId = rootCtx.buffer.trace_id;
           const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
@@ -238,6 +273,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
         sink.close();
         sink = null;
       }
+      vitestHarnessDebug('afterAll hook complete');
     });
   }
 
@@ -257,6 +293,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
   }
 
   function createVitestMock<T extends object>(vitestModule: T): T {
+    vitestHarnessDebug('createVitestMock called');
     const currentRootCtx = getRootCtx();
     const source = vitestModule as Record<string, unknown>;
     const origIt = source.it as typeof _it;
