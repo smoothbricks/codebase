@@ -296,10 +296,6 @@ pub const Opcode = enum(u8) {
     BATCH_SET_REMOVE = 0x31, // slot:u8, elem_col:u8
     BATCH_SET_INSERT_TTL = 0x32, // slot:u8, elem_col:u8, ts_col:u8
 
-    // Array batch ops (for .within() without keyBy)
-    BATCH_ARRAY_PUSH = 0x38, // slot:u8, val_col:u8, ts_col:u8
-    BATCH_ARRAY_PUSH_TTL = 0x39, // slot:u8, val_col:u8, ts_col:u8 (tracks in eviction index)
-
     // Aggregate batch ops (SIMD accelerated)
     BATCH_AGG_SUM = 0x40, // slot:u8, val_col:u8
     BATCH_AGG_COUNT = 0x41, // slot:u8
