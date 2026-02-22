@@ -82,7 +82,7 @@ export default defineConfig({
 ```typescript
 // test-setup.ts
 import { vi } from 'vitest';
-import BetterSqlite3 from 'better-sqlite3';
+import { createNodeSQLiteDatabase } from '@smoothbricks/lmao/sqlite/node';
 import { myOpContext } from './src/opContext.js';
 
 vi.mock('vitest', async (importOriginal) => {
@@ -95,7 +95,7 @@ vi.mock('vitest', async (importOriginal) => {
 
 import { initTraceTestRun } from '@smoothbricks/lmao/testing/vitest';
 initTraceTestRun(myOpContext, {
-  sqlite: { dbPath: '.trace-results.db', createDatabase: (p) => new BetterSqlite3(p) },
+  sqlite: { dbPath: '.trace-results.db', createDatabase: createNodeSQLiteDatabase },
 });
 ```
 

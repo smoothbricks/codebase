@@ -74,6 +74,12 @@
       "import": "./dist/lib/sqlite/index.js",
       "default": "./dist/lib/sqlite/index.js"
     },
+    "./sqlite/node": {
+      "development": "./src/lib/sqlite/sqlite-node.ts",
+      "types": "./dist/lib/sqlite/sqlite-node.d.ts",
+      "import": "./dist/lib/sqlite/sqlite-node.js",
+      "default": "./dist/lib/sqlite/sqlite-node.js"
+    },
     "./testing": {
       "development": "./src/testing.ts",
       "types": "./dist/testing.d.ts",
