@@ -61,7 +61,7 @@ export class SQLiteTracer<B extends OpContextBinding = OpContextBinding> extends
 export class SQLiteAsyncTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   private readonly writerPromise: Promise<SQLiteAsyncTraceWriter>;
   private pendingWrites: Promise<void> = Promise.resolve();
-  private pendingError: unknown = null;
+  private pendingErrors: unknown[] = [];
 
   constructor(binding: B, options: SQLiteAsyncTracerOptions<B['logBinding']['logSchema']>) {
     super(binding, options);
@@ -74,15 +74,11 @@ export class SQLiteAsyncTracer<B extends OpContextBinding = OpContextBinding> ex
 
   onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
     this.pendingWrites = this.pendingWrites.then(async () => {
-      if (this.pendingError) {
-        return;
-      }
-
       try {
         const writer = await this.writerPromise;
         await writer.flush(rootBuffer);
       } catch (error) {
-        this.pendingError = error;
+        this.pendingErrors.push(error);
       }
     });
   }
@@ -101,10 +97,13 @@ export class SQLiteAsyncTracer<B extends OpContextBinding = OpContextBinding> ex
 
   override async flush(): Promise<void> {
     await this.pendingWrites;
-    if (this.pendingError) {
-      const error = this.pendingError;
-      this.pendingError = null;
-      throw error;
+    if (this.pendingErrors.length > 0) {
+      const errors = this.pendingErrors;
+      this.pendingErrors = [];
+      if (errors.length === 1) {
+        throw errors[0];
+      }
+      throw new AggregateError(errors, `SQLiteAsyncTracer flush failed for ${errors.length} trace writes`);
     }
   }
 
