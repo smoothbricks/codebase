@@ -29,12 +29,15 @@ export type {
   UndoToken,
 } from './pipeline.js';
 export { createPipeline } from './pipeline.js';
+// Canonical reducer bytecode parser
+export { parseReducerProgram, parseReducerSlotDefs } from './reducer-bytecode.js';
 // Types and interfaces
 export type {
   ColumineBackend,
   ColumnInput,
   ReducerProgram,
   SlotDef,
+  SlotTtlMetadata,
   StateHandle,
   UndoCapableColumineBackend,
 } from './types.js';
@@ -49,6 +52,7 @@ export {
   PROGRAM_HASH_PREFIX,
   SlotType,
   StructFieldType,
+  TtlStartOf,
   ValueType,
 } from './types.js';
 // WASM backend (for standalone columine usage)

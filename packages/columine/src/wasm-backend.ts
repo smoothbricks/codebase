@@ -12,6 +12,7 @@
  *   binary is injected via setBackend() and this loader is never called.
  */
 
+import { parseReducerProgram } from './reducer-bytecode.js';
 import type { ColumineBackend, ColumnInput, ReducerProgram, StateHandle } from './types.js';
 
 // =============================================================================
@@ -118,102 +119,6 @@ function align8(n: number): number {
 }
 
 // =============================================================================
-// Bytecode Parsing (minimal, self-contained)
-// =============================================================================
-
-// Matches columine types.ts constants
-const MAGIC = 0x314D4C43; // "CLM1"
-const HEADER_SIZE = 14;
-
-import type { SlotDef } from './types.js';
-import { AggType, PROGRAM_HASH_PREFIX, SlotType } from './types.js';
-
-// Slot type opcodes (must match vm.zig)
-const SLOT_DEF = 0x10;
-const HALT = 0x00;
-
-function parseProgram(bytecode: Uint8Array, defaultCapacity = 1024): ReducerProgram {
-  const minLen = PROGRAM_HASH_PREFIX + HEADER_SIZE;
-  if (bytecode.length < minLen) {
-    throw new Error('Invalid program: too short');
-  }
-
-  const content = bytecode.subarray(PROGRAM_HASH_PREFIX);
-  const magic = content[0] | (content[1] << 8) | (content[2] << 16) | (content[3] << 24);
-  if (magic !== MAGIC) {
-    throw new Error('Invalid program: bad magic');
-  }
-
-  if (content[4] !== 1 || content[5] !== 0) {
-    throw new Error('Invalid program: unsupported version');
-  }
-
-  const numSlots = content[6];
-  const numInputs = content[7];
-  const initLen = content[10] | (content[11] << 8);
-
-  if (PROGRAM_HASH_PREFIX + HEADER_SIZE + initLen > bytecode.length) {
-    throw new Error('Invalid program: init section overflow');
-  }
-
-  const initCode = content.subarray(HEADER_SIZE, HEADER_SIZE + initLen);
-  const slotDefs = parseSlotDefs(initCode, numSlots, defaultCapacity);
-
-  return { bytecode, numSlots, numInputs, slotDefs };
-}
-
-function parseSlotDefs(initCode: Uint8Array, expectedSlots: number, defaultCapacity: number): SlotDef[] {
-  const slotDefs: SlotDef[] = new Array(expectedSlots);
-  let pc = 0;
-
-  while (pc < initCode.length) {
-    const op = initCode[pc++];
-
-    switch (op) {
-      case SLOT_DEF: {
-        const slot = initCode[pc];
-        const typeFlags = initCode[pc + 1];
-        const capLo = initCode[pc + 2];
-        const capHi = initCode[pc + 3];
-        pc += 4; // slot, type_flags, cap_lo, cap_hi
-
-        switch (typeFlags) {
-          case SlotType.HASHMAP:
-            slotDefs[slot] = { type: SlotType.HASHMAP, capacity: (capHi << 8) | capLo || defaultCapacity };
-            break;
-          case SlotType.HASHSET:
-            slotDefs[slot] = { type: SlotType.HASHSET, capacity: (capHi << 8) | capLo || defaultCapacity };
-            break;
-          case SlotType.AGGREGATE:
-            slotDefs[slot] = { type: SlotType.AGGREGATE, aggType: (capLo || AggType.SUM) as AggType };
-            break;
-          case SlotType.CONDITION_TREE:
-            slotDefs[slot] = { type: SlotType.CONDITION_TREE };
-            break;
-          default:
-            break;
-        }
-        break;
-      }
-      case HALT:
-        pc = initCode.length;
-        break;
-      default:
-        pc = initCode.length;
-    }
-  }
-
-  // Fill any missing slots with default aggregates
-  for (let i = 0; i < expectedSlots; i++) {
-    if (!slotDefs[i]) {
-      slotDefs[i] = { type: SlotType.AGGREGATE, aggType: AggType.SUM };
-    }
-  }
-
-  return slotDefs;
-}
-
-// =============================================================================
 // WASM Backend Factory
 // =============================================================================
 
@@ -262,7 +167,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     backend: 'wasm',
 
     async loadProgram(bytecode: Uint8Array): Promise<ReducerProgram> {
-      return parseProgram(bytecode);
+      return parseReducerProgram(bytecode);
     },
 
     createState(program: ReducerProgram): StateHandle {

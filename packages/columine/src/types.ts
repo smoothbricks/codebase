@@ -50,6 +50,26 @@ export enum StructFieldType {
   ARRAY_BOOL = 9,
 }
 
+export enum TtlStartOf {
+  NONE = 0,
+  SECOND = 1,
+  MINUTE = 2,
+  HOUR = 3,
+  DAY = 4,
+  WEEK = 5,
+  MONTH = 6,
+  QUARTER = 7,
+  YEAR = 8,
+}
+
+export interface SlotTtlMetadata {
+  readonly ttlSeconds: number;
+  readonly graceSeconds: number;
+  readonly timestampFieldIndex: number;
+  readonly startOf: TtlStartOf;
+  readonly hasEvictTrigger: boolean;
+}
+
 // =============================================================================
 // Program - compiled once per agent TYPE, immutable, shared
 // =============================================================================
@@ -62,11 +82,11 @@ export interface ReducerProgram {
 }
 
 export type SlotDef =
-  | { type: SlotType.HASHMAP; capacity: number }
-  | { type: SlotType.HASHSET; capacity: number }
+  | { type: SlotType.HASHMAP; capacity: number; ttl?: SlotTtlMetadata }
+  | { type: SlotType.HASHSET; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.AGGREGATE; aggType: AggType }
   | { type: SlotType.CONDITION_TREE }
-  | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[] }
+  | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[]; ttl?: SlotTtlMetadata }
   | {
       type: SlotType.ORDERED_LIST;
       capacity: number;
