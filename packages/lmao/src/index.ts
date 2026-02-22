@@ -130,8 +130,10 @@ export { JsBufferStrategy } from './lib/JsBufferStrategy.js';
 export type { OpContextBinding } from './lib/opContext/types.js';
 export { type TraceFn, type TraceOverrides, Tracer, type TracerOptions } from './lib/tracer.js';
 export { ArrayQueueTracer } from './lib/tracers/ArrayQueueTracer.js';
+export { CompositeTracer } from './lib/tracers/CompositeTracer.js';
 // Concrete tracer implementations
 export { NoOpTracer } from './lib/tracers/NoOpTracer.js';
+export { SQLiteAsyncTracer, SQLiteTracer } from './lib/tracers/SQLiteTracer.js';
 export { StdioTracer } from './lib/tracers/StdioTracer.js';
 export { type StatsSnapshot, TestTracer } from './lib/tracers/TestTracer.js';
 

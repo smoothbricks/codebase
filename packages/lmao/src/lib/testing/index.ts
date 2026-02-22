@@ -100,7 +100,10 @@ export type { OpContextBinding, OpContextOf } from '../opContext/types.js';
 export type { TraceRootFactory } from '../traceRoot.js';
 // Universal createTraceRoot — picks Node (hrtime.bigint) or ES (performance.now) at runtime
 export { createTraceRoot } from '../traceRoot.universal.js';
+export { CompositeTracer } from '../tracers/CompositeTracer.js';
 export { NoOpTracer } from '../tracers/NoOpTracer.js';
+export { SQLiteAsyncTracer, SQLiteTracer } from '../tracers/SQLiteTracer.js';
+export { StdioTracer } from '../tracers/StdioTracer.js';
 // Re-export TestTracer for convenience
 export { type StatsSnapshot, TestTracer } from '../tracers/TestTracer.js';
 
@@ -122,7 +125,7 @@ export { extractFactsFor, findAllSpans, findSpan, spanNames } from './span-query
 // SQLITE PERSISTENCE
 // =============================================================================
 
-export { TraceSQLite, TraceSQLiteAsync, type TraceSQLiteConfig } from '../sqlite/index.js';
+export { SQLiteAsyncTraceWriter, SQLiteTraceWriter, type SQLiteWriterConfig } from '../sqlite/index.js';
 export { createD1SQLiteDatabase, type D1LikeDatabase, type D1LikePreparedStatement } from '../sqlite/sqlite-d1.js';
 export type {
   AsyncSQLiteDatabase,

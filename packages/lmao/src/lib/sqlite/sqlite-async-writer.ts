@@ -1,10 +1,10 @@
 /**
- * TraceSQLiteAsync - Async SQLite persistence for span buffer trees.
+ * SQLiteAsyncTraceWriter - Async SQLite persistence for span buffer trees.
  *
  * Works with async SQLite drivers (for example Cloudflare D1 adapters) while
- * preserving the same `spans` table shape as the sync TraceSQLite writer.
+ * preserving the same `spans` table shape as the sync SQLiteTraceWriter.
  *
- * @module sqlite-async
+ * @module sqlite-async-writer
  */
 
 import type { LogSchema } from '../schema/LogSchema.js';
@@ -21,7 +21,7 @@ import {
 } from './sqlite-common.js';
 import type { AsyncSQLiteDatabase, AsyncSQLiteStatement } from './sqlite-db.js';
 
-export class TraceSQLiteAsync {
+export class SQLiteAsyncTraceWriter {
   private knownColumns = new Set<string>();
   private insertStmtCache = new Map<string, AsyncSQLiteStatement>();
   private initialized = false;

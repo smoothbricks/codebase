@@ -2,7 +2,7 @@
  * D1 adapter for LMAO async SQLite interfaces.
  *
  * This keeps D1-specific behavior in one place while exposing the generic
- * AsyncSQLiteDatabase contract used by TraceSQLiteAsync.
+ * AsyncSQLiteDatabase contract used by SQLiteAsyncTracer/SQLiteAsyncTraceWriter.
  *
  * @module sqlite-d1
  */

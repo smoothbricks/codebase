@@ -1,5 +1,5 @@
 /**
- * TraceSQLite - General-purpose writer that persists span buffer trees to SQLite.
+ * SQLiteTraceWriter - General-purpose writer that persists span buffer trees to SQLite.
  *
  * Accepts a SyncSQLiteDatabase instance (from bun:sqlite or better-sqlite3)
  * and persists the full span tree as a flat `spans` table with dynamic column
@@ -12,7 +12,7 @@
  * - User schema columns added dynamically via ALTER TABLE
  * - Per-buffer ensureColumns for cross-library schema merging
  *
- * @module sqlite-sink
+ * @module sqlite-writer
  */
 
 import type { LogSchema } from '../schema/LogSchema.js';
@@ -30,12 +30,12 @@ import {
 } from './sqlite-common.js';
 import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
 
-export interface TraceSQLiteConfig {
+export interface SQLiteWriterConfig {
   /** Path to SQLite file. Default: '.trace-results.db' */
   dbPath?: string;
 }
 
-export class TraceSQLite {
+export class SQLiteTraceWriter {
   private knownColumns = new Set<string>();
   private insertStmtCache = new Map<string, SyncSQLiteStatement>();
 
