@@ -1,38 +1,22 @@
 /**
- * TraceSQLite - General-purpose writer that persists span buffer trees to SQLite.
+ * TraceSQLiteAsync - Async SQLite persistence for span buffer trees.
  *
- * Accepts a SyncSQLiteDatabase instance (from bun:sqlite or better-sqlite3)
- * and persists the full span tree as a flat `spans` table with dynamic column
- * evolution based on the LogSchema fields found at flush time.
+ * Works with async SQLite drivers (for example Cloudflare D1 adapters) while
+ * preserving the same `spans` table shape as the sync TraceSQLite writer.
  *
- * Architecture:
- * - Single `spans` table — no runs/log_entries decomposition
- * - trace_id IS the run identifier (one root span per trace)
- * - Tree structure via span_id / parent_span_id (no depth column)
- * - User schema columns added dynamically via ALTER TABLE
- * - Per-buffer ensureColumns for cross-library schema merging
- *
- * @module sqlite-sink
+ * @module sqlite-async
  */
 
 import type { SchemaType } from '@smoothbricks/arrow-builder';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
-import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
+import type { AsyncSQLiteDatabase, AsyncSQLiteStatement } from './sqlite-db.js';
 
 /** Check if bit at index is set in Arrow null bitmap (1 = valid/present, 0 = null) */
 function isBitSet(bitmap: Uint8Array, idx: number): boolean {
   return (bitmap[idx >>> 3] & (1 << (idx & 7))) !== 0;
 }
 
-/**
- * Read a user column value at the given row.
- *
- * Typed arrays (Float64Array, BigUint64Array, Uint8Array) are pre-allocated with
- * zeros — the only way to distinguish "set to 0" from "never written" is the
- * bit-packed null bitmap.  JS arrays (string[], unknown[]) store `undefined` for
- * unwritten slots, so a plain != null check suffices.
- */
 type DynamicUserColumnBuffer = Record<string, unknown>;
 
 function readUserValue(buffer: DynamicUserColumnBuffer, fieldName: string, row: number): unknown {
@@ -40,7 +24,6 @@ function readUserValue(buffer: DynamicUserColumnBuffer, fieldName: string, row: 
   if (!values) return undefined;
 
   if (ArrayBuffer.isView(values)) {
-    // Typed array — need null bitmap to distinguish zero from unset
     const nulls = buffer[`${fieldName}_nulls`] as Uint8Array | undefined;
     if (!('length' in values)) {
       return undefined;
@@ -48,13 +31,8 @@ function readUserValue(buffer: DynamicUserColumnBuffer, fieldName: string, row: 
     const typedValues = values as unknown as { [index: number]: unknown; length: number };
     return nulls && isBitSet(nulls, row) ? typedValues[row] : undefined;
   }
-  // JS array (string[], unknown[]) — undefined means unset
-  return (values as unknown[])[row];
-}
 
-export interface TraceSQLiteConfig {
-  /** Path to SQLite file. Default: '.trace-results.db' */
-  dbPath?: string;
+  return (values as unknown[])[row];
 }
 
 /** Map arrow-builder SchemaType to SQLite column type */
@@ -74,16 +52,19 @@ function schemaTypeToSqlite(schemaType: SchemaType): string {
   }
 }
 
-export class TraceSQLite {
+export class TraceSQLiteAsync {
   private knownColumns = new Set<string>();
-  private insertStmtCache = new Map<string, SyncSQLiteStatement>();
+  private insertStmtCache = new Map<string, AsyncSQLiteStatement>();
+  private initialized = false;
 
-  constructor(private db: SyncSQLiteDatabase) {
-    this.init();
-  }
+  constructor(private db: AsyncSQLiteDatabase) {}
 
-  private init(): void {
-    this.db.exec(`
+  private async init(): Promise<void> {
+    if (this.initialized) {
+      return;
+    }
+
+    await this.db.exec(`
       CREATE TABLE IF NOT EXISTS spans (
         trace_id TEXT NOT NULL,
         span_id INTEGER NOT NULL,
@@ -99,15 +80,15 @@ export class TraceSQLite {
       CREATE INDEX IF NOT EXISTS idx_spans_parent ON spans(trace_id, parent_span_id);
     `);
 
-    // Cache existing user columns from spans table
-    const cols = this.db.prepare('PRAGMA table_info(spans)').all() as { name: string }[];
+    const cols = (await this.db.prepare('PRAGMA table_info(spans)').all()) as { name: string }[];
     for (const col of cols) {
       this.knownColumns.add(col.name);
     }
+
+    this.initialized = true;
   }
 
-  /** Ensure user-defined schema columns exist in the spans table */
-  private ensureColumns(schema: LogSchema): void {
+  private async ensureColumns(schema: LogSchema): Promise<void> {
     const fields = schema.fields as Record<string, { __schema_type?: SchemaType }>;
 
     for (const [name, field] of Object.entries(fields)) {
@@ -117,24 +98,12 @@ export class TraceSQLite {
       if (!schemaType) continue;
 
       const sqliteType = schemaTypeToSqlite(schemaType);
-      this.db.exec(`ALTER TABLE spans ADD COLUMN ${name} ${sqliteType}`);
+      await this.db.exec(`ALTER TABLE spans ADD COLUMN ${name} ${sqliteType}`);
       this.knownColumns.add(name);
     }
   }
 
-  /** Write a root SpanBuffer tree to the database */
-  flush(rootBuffer: AnySpanBuffer): void {
-    this.db.exec('BEGIN IMMEDIATE');
-    try {
-      this.flushBuffer(rootBuffer);
-      this.db.exec('COMMIT');
-    } catch (error) {
-      this.db.exec('ROLLBACK');
-      throw error;
-    }
-  }
-
-  private getInsertStatement(activeUserFields: readonly string[]): SyncSQLiteStatement {
+  private getInsertStatement(activeUserFields: readonly string[]): AsyncSQLiteStatement {
     const key = activeUserFields.join(',');
     const cached = this.insertStmtCache.get(key);
     if (cached) {
@@ -151,9 +120,13 @@ export class TraceSQLite {
     return stmt;
   }
 
-  private flushBuffer(buffer: AnySpanBuffer): void {
-    // Per-buffer schema merging — handles cross-library ops with different schemas
-    this.ensureColumns(buffer._logSchema);
+  async flush(rootBuffer: AnySpanBuffer): Promise<void> {
+    await this.init();
+    await this.flushBuffer(rootBuffer);
+  }
+
+  private async flushBuffer(buffer: AnySpanBuffer): Promise<void> {
+    await this.ensureColumns(buffer._logSchema);
 
     const traceId = buffer.trace_id;
     const spanId = buffer.span_id;
@@ -174,36 +147,32 @@ export class TraceSQLite {
       for (const fieldName of activeUserFields) {
         const val = readUserValue(buffer as unknown as DynamicUserColumnBuffer, fieldName, row);
         if (val !== undefined) {
-          // Convert bigint to number for SQLite compatibility
           userValues.push(typeof val === 'bigint' ? Number(val) : val);
         } else {
           userValues.push(null);
         }
       }
 
-      insertStmt.run(traceId, spanId, parentSpanId, row, entryType, timestampNs, message, ...userValues);
+      await insertStmt.run(traceId, spanId, parentSpanId, row, entryType, timestampNs, message, ...userValues);
     }
 
-    // Overflow: same span, extended rows
     if (buffer._overflow) {
-      this.flushOverflow(buffer._overflow, traceId, spanId, parentSpanId, writeIndex);
+      await this.flushOverflow(buffer._overflow, traceId, spanId, parentSpanId, writeIndex);
     }
 
-    // Children
     for (const child of buffer._children) {
-      this.flushBuffer(child);
+      await this.flushBuffer(child);
     }
   }
 
-  private flushOverflow(
+  private async flushOverflow(
     buffer: AnySpanBuffer,
     traceId: string,
     spanId: number,
     parentSpanId: number,
     rowOffset: number,
-  ): void {
-    // Per-buffer schema merging for overflow too
-    this.ensureColumns(buffer._logSchema);
+  ): Promise<void> {
+    await this.ensureColumns(buffer._logSchema);
 
     const writeIndex = buffer._writeIndex;
     const schema = buffer._logSchema;
@@ -226,19 +195,24 @@ export class TraceSQLite {
         }
       }
 
-      insertStmt.run(traceId, spanId, parentSpanId, rowOffset + row, entryType, timestampNs, message, ...userValues);
+      await insertStmt.run(
+        traceId,
+        spanId,
+        parentSpanId,
+        rowOffset + row,
+        entryType,
+        timestampNs,
+        message,
+        ...userValues,
+      );
     }
 
-    // Continue into chained overflow
     if (buffer._overflow) {
-      this.flushOverflow(buffer._overflow, traceId, spanId, parentSpanId, rowOffset + writeIndex);
+      await this.flushOverflow(buffer._overflow, traceId, spanId, parentSpanId, rowOffset + writeIndex);
     }
   }
 
-  close(): void {
-    this.db.close();
+  async close(): Promise<void> {
+    await this.db.close();
   }
 }
-
-/** @deprecated Use TraceSQLite */
-export const TraceSQLiteSink = TraceSQLite;

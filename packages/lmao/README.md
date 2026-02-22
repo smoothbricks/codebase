@@ -130,9 +130,13 @@ normal. Only `useTestSpan` (for accessing the it-local trace root) comes from th
 
 - Keep the setup file wiring-only: call `setupVitestTestSuiteTracing(...)` and keep the `vi.mock('vitest', ...)` bridge
   with `createVitestMock(...)`.
+- Configure SQLite sink in the package-local vitest tracer module (not in test files) so worker suites flush to a
+  worker-appropriate SQLite target (for example `d1://TRACE_RESULTS`).
 - Debug logging is harness-owned and toggled by `LMAO_VITEST_DEBUG`.
+- Verbose trace replay is toggled by `LMAO_TEST_TRACE_VERBOSE` (prints spans to stdout and still flushes SQLite).
 - In Worker tests, forward the debug env in `vitest.config.ts` via `define`, for example
-  `globalThis.__LMAO_VITEST_DEBUG_ENV__`.
+  `globalThis.__LMAO_VITEST_DEBUG_ENV__`, and do the same for `globalThis.__LMAO_TEST_TRACE_VERBOSE_ENV__` when verbose
+  replay is needed.
 - Enable debug for Cloudflare tests with:
 
 ```bash

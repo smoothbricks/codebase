@@ -458,6 +458,14 @@ Three distinct string types, each with different storage strategies:
 - Scenario instances are immutable/fork-safe; create a fresh root per test.
 - JS reducer execution in Scenario is parity-only and reserved for compiler/VM cross-reference tests.
 
+**Repository requirement:** Every package test suite (except `packages/lmao`) MUST be LMAO-traced and MUST flush
+traces through a SQLite sink (local `.trace-results.db` or worker D1 binding such as `TRACE_RESULTS`).
+- Configure SQLite once in the package-local tracer module (`src/test-suite-tracer.ts` or vitest equivalent), not in
+  individual tests.
+- Preload/setup files must stay wiring-only (one call to setup helper + runner mock bridge when needed).
+- If a runner-specific package needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner harness
+  module, not in setup files.
+
 **Signal design:** Signals are minimal cross-agent protocols — each signal is a precise command carrying only what the **receiver** needs.
 
 **No sender bookkeeping.** Retry counters, backoff schedules, scheduling timestamps, and config values belong in the

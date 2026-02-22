@@ -7,5 +7,12 @@
  * @module sqlite
  */
 
-export type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
-export { type TraceSQLiteConfig, TraceSQLiteSink } from './sqlite-sink.js';
+export { TraceSQLiteAsync } from './sqlite-async.js';
+export { createD1SQLiteDatabase, type D1LikeDatabase, type D1LikePreparedStatement } from './sqlite-d1.js';
+export type {
+  AsyncSQLiteDatabase,
+  AsyncSQLiteStatement,
+  SyncSQLiteDatabase,
+  SyncSQLiteStatement,
+} from './sqlite-db.js';
+export { TraceSQLite, type TraceSQLiteConfig, TraceSQLiteSink } from './sqlite-sink.js';

@@ -58,9 +58,10 @@ import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
-import { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
+import { TraceSQLite, type TraceSQLiteConfig } from '../sqlite/index.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import { TestTracer } from '../tracers/TestTracer.js';
+import { replayTraceToStdio } from './stdio-replay.js';
 
 /** bun:test expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
@@ -87,6 +88,29 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
 
 type TestBody = () => unknown | Promise<unknown>;
 type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
+
+type BunTestSetupOptions = {
+  sqlite?: TraceSQLiteConfig;
+  verbose?: boolean;
+};
+
+function isTruthyEnvFlag(value: unknown): boolean {
+  return value === true || value === '1' || value === 'true';
+}
+
+function isVerboseTraceEnabled(explicitVerbose: boolean | undefined): boolean {
+  if (explicitVerbose !== undefined) {
+    return explicitVerbose;
+  }
+
+  const globalVerbose = (globalThis as { __LMAO_TEST_TRACE_VERBOSE__?: unknown }).__LMAO_TEST_TRACE_VERBOSE__;
+  if (isTruthyEnvFlag(globalVerbose)) {
+    return true;
+  }
+
+  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
+  return isTruthyEnvFlag(env?.LMAO_TEST_TRACE_VERBOSE);
+}
 
 type RootSpanRunner<Ctx extends OpContext> = (
   name: string,
@@ -116,9 +140,7 @@ export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTes
 
 export function makeBunTestSuiteTracer<B extends OpContextBinding>(
   binding: B,
-  options?: {
-    sqlite?: TraceSQLiteConfig;
-  },
+  options?: BunTestSetupOptions,
 ): BunTestSuiteTracer<B> {
   const useTestTracer = makeTestTracer(binding, options);
   return {
@@ -135,14 +157,13 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding>(
  */
 export function makeTestTracer<B extends OpContextBinding>(
   binding: B,
-  options?: {
-    sqlite?: TraceSQLiteConfig;
-  },
+  options?: BunTestSetupOptions,
 ): BunTestTracerInstance<B> {
   type SpanCtx = HarnessSpanContext<B>;
 
   let tracer: TestTracer<B> | null = null;
-  let sink: TraceSQLiteSink | null = null;
+  let sink: TraceSQLite | null = null;
+  let verboseTrace = false;
   let rootCtx: SpanCtx | null = null;
   let resolveTestRun: (() => void) | null = null;
   let rootTracePromise: Promise<unknown> | null = null;
@@ -240,9 +261,11 @@ export function makeTestTracer<B extends OpContextBinding>(
         createTraceRoot,
       });
 
+      verboseTrace = isVerboseTraceEnabled(options?.verbose);
+
       if (options?.sqlite) {
         const db = new Database(options.sqlite.dbPath ?? '.trace-results.db');
-        sink = new TraceSQLiteSink(db);
+        sink = new TraceSQLite(db);
       }
 
       rootTracePromise = tracer.trace('test-run', (ctx) => {
@@ -263,9 +286,13 @@ export function makeTestTracer<B extends OpContextBinding>(
           rootTracePromise = null;
         }
 
+        if (verboseTrace && rootCtx) {
+          replayTraceToStdio(extendedBinding, rootCtx.buffer);
+        }
+
         if (sink && rootCtx) {
           try {
-            sink.flush(rootCtx.buffer);
+            await sink.flush(rootCtx.buffer);
             const traceId = rootCtx.buffer.trace_id;
             const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
             console.log(`\n[trace] trace_id: ${traceId} -> ${dbPath}`);
@@ -273,7 +300,7 @@ export function makeTestTracer<B extends OpContextBinding>(
             console.error('[lmao/testing] SQLite flush error:', e);
           }
 
-          sink.close();
+          await sink.close();
           sink = null;
         }
       });
@@ -309,7 +336,8 @@ export function makeTestTracer<B extends OpContextBinding>(
 
 // Global singleton — one root tracer for the entire bun test run
 let _tracer: TestTracer<OpContextBinding> | null = null;
-let _sink: TraceSQLiteSink | null = null;
+let _sink: TraceSQLite | null = null;
+let _verboseTrace = false;
 
 // Root span context, its resolver, and the trace promise — one root per test run
 let _rootCtx: SpanContext<OpContext> | null = null;
@@ -322,12 +350,7 @@ const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
 type RootSpanInvoker = (name: string, fn: (ctx: SpanContext<OpContext>) => Promise<unknown>) => Promise<unknown>;
 
 /** Initialize the root tracer for the entire bun test run. Call once in preload. */
-export function initTraceTestRun<B extends OpContextBinding>(
-  opContext: B,
-  options?: {
-    sqlite?: TraceSQLiteConfig;
-  },
-): void {
+export function initTraceTestRun<B extends OpContextBinding>(opContext: B, options?: BunTestSetupOptions): void {
   _activeSuiteTracer = null;
 
   // Extend user's schema with `describe` column for test grouping
@@ -342,9 +365,11 @@ export function initTraceTestRun<B extends OpContextBinding>(
     createTraceRoot,
   }) as TestTracer<OpContextBinding>;
 
+  _verboseTrace = isVerboseTraceEnabled(options?.verbose);
+
   if (options?.sqlite) {
     const db = new Database(options.sqlite.dbPath ?? '.trace-results.db');
-    _sink = new TraceSQLiteSink(db);
+    _sink = new TraceSQLite(db);
   }
 
   // Create the single root trace — a long-lived promise keeps it alive
@@ -368,16 +393,21 @@ export function initTraceTestRun<B extends OpContextBinding>(
       await _rootTracePromise;
       _rootTracePromise = null;
     }
+
+    if (_verboseTrace && _rootCtx) {
+      replayTraceToStdio(extendedBinding, _rootCtx.buffer);
+    }
+
     if (_sink && _rootCtx) {
       try {
-        _sink.flush(_rootCtx.buffer);
+        await _sink.flush(_rootCtx.buffer);
         const traceId = _rootCtx.buffer.trace_id;
         const dbPath = options?.sqlite?.dbPath ?? '.trace-results.db';
         console.log(`\n[trace] trace_id: ${traceId} → ${dbPath}`);
       } catch (e) {
         console.error('[lmao/testing] SQLite flush error:', e);
       }
-      _sink.close();
+      await _sink.close();
       _sink = null;
     }
   });

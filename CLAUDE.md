@@ -11,6 +11,11 @@ directly without `bunx`.
 **Error handling policy:** Known operational failures must return `Err`/`Result`; reserve `throw` for invariants or
 impossible programmer/configuration bugs. For full policy and examples, follow `AGENTS.md`.
 
+**Test tracing policy:** Every package test suite (except `packages/lmao`) must be LMAO-traced and flush to a SQLite
+sink (local `.trace-results.db` or worker D1 binding like `TRACE_RESULTS`). Keep preload/setup files wiring-only and
+move runner-specific behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`,
+`@smoothbricks/lmao/testing/vitest`) plus package-local typed tracer modules.
+
 **Agent design policy:** Agents represent domain entities — if something has its own identity and event history
 (invoice, credit note, subscription, account), it's an agent. Don't conflate a simple current lifecycle with "shouldn't
 be an agent." A credit note that currently processes one event is still a valid agent if credit notes are real domain

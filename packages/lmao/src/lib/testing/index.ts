@@ -109,6 +109,7 @@ export { type StatsSnapshot, TestTracer } from '../tracers/TestTracer.js';
 // =============================================================================
 
 export { type ExtractFactsOptions, extractFacts } from './extractFacts.js';
+export { replayTraceToStdio } from './stdio-replay.js';
 
 // =============================================================================
 // SPAN QUERY API
@@ -121,5 +122,11 @@ export { extractFactsFor, findAllSpans, findSpan, spanNames } from './span-query
 // SQLITE PERSISTENCE
 // =============================================================================
 
-export type { SyncSQLiteDatabase, SyncSQLiteStatement } from '../sqlite/sqlite-db.js';
-export { type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/sqlite-sink.js';
+export { TraceSQLite, TraceSQLiteAsync, type TraceSQLiteConfig, TraceSQLiteSink } from '../sqlite/index.js';
+export { createD1SQLiteDatabase, type D1LikeDatabase, type D1LikePreparedStatement } from '../sqlite/sqlite-d1.js';
+export type {
+  AsyncSQLiteDatabase,
+  AsyncSQLiteStatement,
+  SyncSQLiteDatabase,
+  SyncSQLiteStatement,
+} from '../sqlite/sqlite-db.js';

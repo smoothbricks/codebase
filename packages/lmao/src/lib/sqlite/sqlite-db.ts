@@ -1,8 +1,8 @@
 /**
- * Minimal sync SQLite interface — satisfied by both bun:sqlite and better-sqlite3.
+ * Minimal SQLite interfaces used by trace persistence.
  *
- * No runtime dependency — just types. Each harness (bun, vitest) provides
- * the concrete implementation from its platform.
+ * Sync APIs match bun:sqlite / better-sqlite3 style drivers.
+ * Async APIs match worker-style drivers (for example D1 adapters).
  *
  * @module sqlite-db
  */
@@ -17,4 +17,16 @@ export interface SyncSQLiteStatement {
   run(...params: unknown[]): void;
   all(...params: unknown[]): unknown[];
   get(...params: unknown[]): unknown;
+}
+
+export interface AsyncSQLiteDatabase {
+  exec(sql: string): Promise<void>;
+  prepare(sql: string): AsyncSQLiteStatement;
+  close(): Promise<void>;
+}
+
+export interface AsyncSQLiteStatement {
+  run(...params: unknown[]): Promise<void>;
+  all(...params: unknown[]): Promise<unknown[]>;
+  get(...params: unknown[]): Promise<unknown>;
 }
