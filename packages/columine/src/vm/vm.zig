@@ -677,6 +677,9 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             if (idx < meta.capacity) {
                 keys[idx] = TOMBSTONE;
                 meta.size_ptr.* -= 1;
+                if (meta.hasTTL()) {
+                    removeTTLEntriesForKey(state_base, meta, entry.key);
+                }
             }
         },
         .MAP_UPDATE => {
@@ -690,6 +693,10 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             if (idx < meta.capacity) {
                 values[idx] = entry.prev_value;
                 timestamps[idx] = @bitCast(entry.aux);
+                if (meta.hasTTL()) {
+                    removeTTLEntriesForKey(state_base, meta, entry.key);
+                    restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
+                }
             }
         },
         .MAP_DELETE => {
@@ -705,6 +712,10 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
                 values[idx] = entry.prev_value;
                 timestamps[idx] = @bitCast(entry.aux);
                 meta.size_ptr.* += 1;
+                if (meta.hasTTL()) {
+                    removeTTLEntriesForKey(state_base, meta, entry.key);
+                    restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
+                }
             }
         },
         .SET_INSERT => {
@@ -716,6 +727,9 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             if (idx < meta.capacity) {
                 keys[idx] = TOMBSTONE;
                 meta.size_ptr.* -= 1;
+                if (meta.hasTTL()) {
+                    removeTTLEntriesForKey(state_base, meta, entry.key);
+                }
             }
         },
         .SET_DELETE => {
@@ -727,6 +741,10 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             if (idx < meta.capacity) {
                 keys[idx] = entry.key;
                 meta.size_ptr.* += 1;
+                if (meta.hasTTL()) {
+                    removeTTLEntriesForKey(state_base, meta, entry.key);
+                    restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
+                }
             }
         },
         .AGG_UPDATE => {
@@ -861,6 +879,36 @@ fn removeEvictionEntriesForKey(index: [*]EvictionEntry, size: u32, key: u32) u32
     return removed;
 }
 
+fn findLatestEvictionTimestampForKey(index: [*]const EvictionEntry, size: u32, key: u32) ?f64 {
+    if (size == 0) return null;
+    var i: u32 = size;
+    while (i > 0) {
+        i -= 1;
+        const entry = index[i];
+        if (entry.key_or_idx == key) {
+            return entry.timestamp;
+        }
+    }
+    return null;
+}
+
+fn removeTTLEntriesForKey(state_base: [*]u8, meta: SlotMeta, key: u32) void {
+    if (!meta.hasTTL()) return;
+
+    const eviction_index = getEvictionIndex(state_base, meta);
+    const eviction_size = meta.eviction_index_size_ptr.*;
+    const removed = removeEvictionEntriesForKey(eviction_index, eviction_size, key);
+    if (removed > 0) {
+        meta.eviction_index_size_ptr.* = eviction_size - removed;
+    }
+}
+
+fn restoreTTLEntry(state_base: [*]u8, meta: SlotMeta, key: u32, timestamp: f64) void {
+    if (!meta.hasTTL()) return;
+    const insert_result = insertWithTTL(state_base, meta, key, timestamp);
+    std.debug.assert(insert_result == .OK);
+}
+
 /// Returns true when the eviction index entry still represents the current
 /// value for the key (no newer entry for the same key later in the sorted list).
 fn isEvictionEntryCurrent(index: [*]const EvictionEntry, size: u32, entry_idx: u32, key: u32) bool {
@@ -878,7 +926,7 @@ fn isEvictionEntryCurrent(index: [*]const EvictionEntry, size: u32, entry_idx: u
 /// If has_evict_trigger is set, evicted entries are copied to evicted buffer for RETE.
 /// Note: JS layer applies startOf truncation to 'now' before calling this function.
 /// cutoff = now - ttl_seconds - grace_seconds
-pub fn evictExpired(state_base: [*]u8, meta: SlotMeta, now: f64) u32 {
+pub fn evictExpired(state_base: [*]u8, meta: SlotMeta, slot_idx: u8, now: f64) u32 {
     if (!meta.hasTTL()) return 0;
 
     const cutoff = meta.cutoff(now);
@@ -902,6 +950,65 @@ pub fn evictExpired(state_base: [*]u8, meta: SlotMeta, now: f64) u32 {
 
         // Remove from primary storage (HashMap/HashSet/Array). If entry is no
         // longer present, this was effectively stale and should not be emitted.
+        if (g_undo_enabled) {
+            switch (meta.slotType()) {
+                .HASHMAP => {
+                    const data_ptr = state_base + meta.offset;
+                    const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
+                    const values: [*]const u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
+                    const timestamps: [*]const f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
+                    const idx = findKeyInMap(@constCast(keys), meta.capacity, entry.key_or_idx);
+                    if (idx < meta.capacity) {
+                        appendMutation(
+                            false,
+                            .{
+                                .op = .MAP_DELETE,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = entry.key_or_idx,
+                                .prev_value = values[idx],
+                                .aux = @bitCast(timestamps[idx]),
+                            },
+                            .{
+                                .op = .MAP_INSERT,
+                                .slot = slot_idx,
+                                ._pad1 = 0,
+                                ._pad2 = 0,
+                                .key = entry.key_or_idx,
+                                .prev_value = 0,
+                                .aux = 0,
+                            },
+                        );
+                    }
+                },
+                .HASHSET => {
+                    appendMutation(
+                        false,
+                        .{
+                            .op = .SET_DELETE,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = entry.key_or_idx,
+                            .prev_value = 0,
+                            .aux = @bitCast(entry.timestamp),
+                        },
+                        .{
+                            .op = .SET_INSERT,
+                            .slot = slot_idx,
+                            ._pad1 = 0,
+                            ._pad2 = 0,
+                            .key = entry.key_or_idx,
+                            .prev_value = 0,
+                            .aux = 0,
+                        },
+                    );
+                },
+                else => {},
+            }
+        }
+
         if (removeEntryByKey(state_base, meta, entry.key_or_idx)) {
             // Record for RETE rule firing if has_evict_trigger
             if (meta.hasEvictTrigger()) {
@@ -1065,7 +1172,7 @@ pub export fn vm_evict_all_expired(state_base: [*]u8, now: f64) u32 {
             // Clear evicted buffer from previous batch
             clearEvictedBuffer(meta);
             // Evict expired entries
-            total_evicted += evictExpired(state_base, meta, now);
+            total_evicted += evictExpired(state_base, meta, i, now);
         }
     }
 
@@ -1838,6 +1945,14 @@ fn batchSetRemove(
                 // Flush local size to state before undoAppend — overflow may
                 // capture a shadow snapshot and the size field must be current.
                 if (g_undo_enabled) {
+                    var prev_ts_bits: u64 = 0;
+                    if (meta.hasTTL()) {
+                        const eviction_index = getEvictionIndex(state_base, meta);
+                        const eviction_size = meta.eviction_index_size_ptr.*;
+                        if (findLatestEvictionTimestampForKey(eviction_index, eviction_size, elem)) |prev_ts| {
+                            prev_ts_bits = @bitCast(prev_ts);
+                        }
+                    }
                     meta.size_ptr.* = size;
                     appendMutation(
                         delta_mode,
@@ -1848,7 +1963,7 @@ fn batchSetRemove(
                             ._pad2 = 0,
                             .key = elem,
                             .prev_value = 0,
-                            .aux = 0,
+                            .aux = prev_ts_bits,
                         },
                         .{
                             .op = .SET_INSERT,
