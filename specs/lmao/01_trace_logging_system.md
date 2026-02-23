@@ -146,6 +146,13 @@ integration. It consists of these main components:
 - Uses `ctx.waitUntil(...)` for non-blocking trace chunk delivery.
 - Produces durable Arrow chunks for queue/object-storage aggregation.
 
+### 8. [Trace Archive Primitives](./01t_trace_archive_pipeline.md)
+
+**Purpose**: Define library-level archive primitives for chunk identity, split helpers, and compaction.
+
+- Provides deterministic data-plane building blocks callable from archival Ops.
+- Keeps LMAO focused on trace/Arrow mechanics, not agent control-plane policy.
+
 ## Core Architecture Principles
 
 - **Two-Phase Logging**: Separate runtime writes from background processing.

@@ -112,12 +112,13 @@ If none are met during a request, implementation MAY keep best-effort in-memory 
 - Failed enqueue attempts should emit runtime metrics and retry via queue policy/backoff.
 - If queue is unavailable for extended periods, runtime should degrade gracefully and surface health alerts.
 
-## Downstream Aggregation Contract
+## Downstream Archival Contract
 
-Queue consumers should:
+agent:
 
-1. Persist immutable Arrow chunks (for example to R2).
-2. Periodically compact/aggregate into usage windows.
+1. Persists immutable Arrow chunks (for example to R2) with append-only catalog records.
+2. Periodically compacts small chunks into time-windowed Arrow/Parquet files.
+3. Uses mixed-group split helpers before group-targeted routing.
 
 
 ## Example
@@ -156,3 +157,4 @@ async function flushTraceBatch<B extends OpContextBinding>(
 
 - [Trace Logging System](./01_trace_logging_system.md)
 - [Context Flow and Op/Span Pattern](./01c_context_flow_and_op_wrappers.md)
+- [Trace Archive Pipeline](./01t_trace_archive_pipeline.md)
