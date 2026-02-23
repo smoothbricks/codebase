@@ -116,6 +116,8 @@ If none are met during a request, implementation MAY keep best-effort in-memory 
 
 agent:
 
+- LMAO owns data-plane chunk primitives (`chunk_id`, partition inspection/split helpers, compaction helpers).
+
 1. Persists immutable Arrow chunks (for example to R2) with append-only catalog records.
 2. Periodically compacts small chunks into time-windowed Arrow/Parquet files.
 3. Uses mixed-group split helpers before group-targeted routing.

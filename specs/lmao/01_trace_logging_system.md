@@ -152,6 +152,7 @@ integration. It consists of these main components:
 
 - Provides deterministic data-plane building blocks callable from archival Ops.
 - Keeps LMAO focused on trace/Arrow mechanics, not agent control-plane policy.
+  registration, mixed-group routing policy, and fan-out/cursor control-plane behavior.
 
 ## Core Architecture Principles
 
