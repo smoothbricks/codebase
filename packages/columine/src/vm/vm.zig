@@ -186,6 +186,7 @@ pub const SlotType = enum(u4) {
     CONDITION_TREE = 4, // Condition router tree (VM handlers: Phase 37)
     STRUCT_MAP = 5, // Multi-field hash map with per-row bitset
     ORDERED_LIST = 6, // Append-only sequential storage (scalar or struct rows)
+    BITMAP = 7, // Roaring-style reducer membership represented as u32 set semantics
 };
 
 pub const SlotTypeFlags = packed struct(u8) {
@@ -303,6 +304,10 @@ pub const Opcode = enum(u8) {
     BATCH_SET_REMOVE = 0x31, // slot:u8, elem_col:u8
     BATCH_SET_INSERT_TTL = 0x32, // slot:u8, elem_col:u8, ts_col:u8
     BATCH_SET_INSERT_IF = 0x33, // slot:u8, elem_col:u8, pred_col:u8
+
+    // Bitmap batch ops
+    BATCH_BITMAP_ADD = 0x34, // slot:u8, elem_col:u8
+    BATCH_BITMAP_REMOVE = 0x35, // slot:u8, elem_col:u8
 
     // Aggregate batch ops (SIMD accelerated)
     BATCH_AGG_SUM = 0x40, // slot:u8, val_col:u8
@@ -784,29 +789,72 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
         .SET_INSERT => {
             // Undo insert: tombstone the element, decrement size
             const meta = getSlotMeta(state_base, entry.slot);
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-            const idx = findKeyInMap(keys, meta.capacity, entry.key);
-            if (idx < meta.capacity) {
-                keys[idx] = TOMBSTONE;
-                meta.size_ptr.* -= 1;
-                if (meta.hasTTL()) {
-                    removeTTLEntriesForKey(state_base, meta, entry.key);
+            if (meta.slotType() == .BITMAP) {
+                const data_ptr = state_base + meta.offset;
+                const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
+                var size = meta.size_ptr.*;
+                if (size > 0) {
+                    const pos = bitmapLowerBound(values, size, entry.key);
+                    if (pos < size and values[pos] == entry.key) {
+                        var i = pos;
+                        while (i + 1 < size) : (i += 1) {
+                            values[i] = values[i + 1];
+                        }
+                        size -= 1;
+                        values[size] = EMPTY_KEY;
+                        meta.size_ptr.* = size;
+                        if (meta.hasTTL()) {
+                            removeTTLEntriesForKey(state_base, meta, entry.key);
+                        }
+                    }
+                }
+            } else {
+                const data_ptr = state_base + meta.offset;
+                const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+                const idx = findKeyInMap(keys, meta.capacity, entry.key);
+                if (idx < meta.capacity) {
+                    keys[idx] = TOMBSTONE;
+                    meta.size_ptr.* -= 1;
+                    if (meta.hasTTL()) {
+                        removeTTLEntriesForKey(state_base, meta, entry.key);
+                    }
                 }
             }
         },
         .SET_DELETE => {
             // Undo delete: restore element, increment size
             const meta = getSlotMeta(state_base, entry.slot);
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-            const idx = findInsertSlot(keys, meta.capacity, entry.key);
-            if (idx < meta.capacity) {
-                keys[idx] = entry.key;
-                meta.size_ptr.* += 1;
+            if (meta.slotType() == .BITMAP) {
+                const data_ptr = state_base + meta.offset;
+                const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
+                var size = meta.size_ptr.*;
+                if (size < meta.capacity) {
+                    const pos = bitmapLowerBound(values, size, entry.key);
+                    if (pos >= size or values[pos] != entry.key) {
+                        var i = size;
+                        while (i > pos) : (i -= 1) {
+                            values[i] = values[i - 1];
+                        }
+                        values[pos] = entry.key;
+                        size += 1;
+                        meta.size_ptr.* = size;
+                    }
+                }
                 if (meta.hasTTL()) {
                     removeTTLEntriesForKey(state_base, meta, entry.key);
                     restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
+                }
+            } else {
+                const data_ptr = state_base + meta.offset;
+                const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+                const idx = findInsertSlot(keys, meta.capacity, entry.key);
+                if (idx < meta.capacity) {
+                    keys[idx] = entry.key;
+                    meta.size_ptr.* += 1;
+                    if (meta.hasTTL()) {
+                        removeTTLEntriesForKey(state_base, meta, entry.key);
+                        restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
+                    }
                 }
             }
         },
@@ -1045,7 +1093,7 @@ pub fn evictExpired(state_base: [*]u8, meta: SlotMeta, slot_idx: u8, now: f64) u
                         );
                     }
                 },
-                .HASHSET => {
+                .HASHSET, .BITMAP => {
                     appendMutation(
                         false,
                         .{
@@ -1143,6 +1191,24 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) bool {
             }
             return false;
         },
+        .BITMAP => {
+            const data_ptr = state_base + meta.offset;
+            const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
+            var size = meta.size_ptr.*;
+            if (size == 0) return false;
+
+            const pos = bitmapLowerBound(values, size, key);
+            if (pos >= size or values[pos] != key) return false;
+
+            var i = pos;
+            while (i + 1 < size) : (i += 1) {
+                values[i] = values[i + 1];
+            }
+            size -= 1;
+            values[size] = EMPTY_KEY;
+            meta.size_ptr.* = size;
+            return true;
+        },
         .ARRAY => {
             // For arrays, key_or_idx is the array index
             // We mark as tombstone (for sparse arrays) or shift (for dense)
@@ -1214,7 +1280,7 @@ pub fn insertWithTTL(state_base: [*]u8, meta: SlotMeta, key: u32, timestamp: f64
             const idx = findKeyInMap(@constCast(keys), meta.capacity, key);
             break :blk if (idx < meta.capacity) values[idx] else 0;
         },
-        .HASHSET => key,
+        .HASHSET, .BITMAP => key,
         else => 0,
     };
 
@@ -1905,6 +1971,181 @@ fn batchMapRemove(
 // HashSet Operations
 // =============================================================================
 
+inline fn bitmapLowerBound(values: [*]const u32, size: u32, target: u32) u32 {
+    var lo: u32 = 0;
+    var hi: u32 = size;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (values[mid] < target) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
+}
+
+fn batchBitmapAdd(
+    comptime delta_mode: bool,
+    state_base: [*]u8,
+    meta: SlotMeta,
+    slot_idx: u8,
+    elem_col: [*]const u32,
+    ts_col: ?[*]const f64,
+    batch_len: u32,
+) ErrorCode {
+    const data_ptr = state_base + meta.offset;
+    const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
+
+    var size = meta.size_ptr.*;
+    var had_insert = false;
+
+    var i: u32 = 0;
+    while (i < batch_len) : (i += 1) {
+        const elem = elem_col[i];
+        if (elem == EMPTY_KEY or elem == TOMBSTONE) continue;
+        const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
+
+        const pos = bitmapLowerBound(values, size, elem);
+        if (pos < size and values[pos] == elem) {
+            if (meta.hasTTL()) {
+                const ttl_result = insertWithTTL(state_base, meta, elem, ts);
+                if (ttl_result != .OK) {
+                    meta.size_ptr.* = size;
+                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                    return ttl_result;
+                }
+            }
+            continue;
+        }
+
+        if (size >= meta.capacity) {
+            meta.size_ptr.* = size;
+            if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+            return .CAPACITY_EXCEEDED;
+        }
+
+        if (g_undo_enabled) {
+            meta.size_ptr.* = size;
+            appendMutation(
+                delta_mode,
+                .{
+                    .op = .SET_INSERT,
+                    .slot = slot_idx,
+                    ._pad1 = 0,
+                    ._pad2 = 0,
+                    .key = elem,
+                    .prev_value = 0,
+                    .aux = 0,
+                },
+                .{
+                    .op = .SET_DELETE,
+                    .slot = slot_idx,
+                    ._pad1 = 0,
+                    ._pad2 = 0,
+                    .key = elem,
+                    .prev_value = 0,
+                    .aux = 0,
+                },
+            );
+        }
+
+        var j = size;
+        while (j > pos) : (j -= 1) {
+            values[j] = values[j - 1];
+        }
+        values[pos] = elem;
+        size += 1;
+        had_insert = true;
+
+        if (meta.hasTTL()) {
+            const ttl_result = insertWithTTL(state_base, meta, elem, ts);
+            if (ttl_result != .OK) {
+                meta.size_ptr.* = size;
+                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                return ttl_result;
+            }
+        }
+    }
+
+    meta.size_ptr.* = size;
+    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+    return .OK;
+}
+
+fn batchBitmapRemove(
+    comptime delta_mode: bool,
+    state_base: [*]u8,
+    meta: SlotMeta,
+    slot_idx: u8,
+    elem_col: [*]const u32,
+    batch_len: u32,
+) void {
+    const data_ptr = state_base + meta.offset;
+    const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
+
+    var size = meta.size_ptr.*;
+    var had_remove = false;
+
+    var i: u32 = 0;
+    while (i < batch_len) : (i += 1) {
+        const elem = elem_col[i];
+        if (size == 0) break;
+
+        const pos = bitmapLowerBound(values, size, elem);
+        if (pos >= size or values[pos] != elem) {
+            continue;
+        }
+
+        if (g_undo_enabled) {
+            var prev_ts_bits: u64 = 0;
+            if (meta.hasTTL()) {
+                const eviction_index = getEvictionIndex(state_base, meta);
+                const eviction_size = meta.eviction_index_size_ptr.*;
+                if (findLatestEvictionTimestampForKey(eviction_index, eviction_size, elem)) |prev_ts| {
+                    prev_ts_bits = @bitCast(prev_ts);
+                }
+            }
+            meta.size_ptr.* = size;
+            appendMutation(
+                delta_mode,
+                .{
+                    .op = .SET_DELETE,
+                    .slot = slot_idx,
+                    ._pad1 = 0,
+                    ._pad2 = 0,
+                    .key = elem,
+                    .prev_value = 0,
+                    .aux = prev_ts_bits,
+                },
+                .{
+                    .op = .SET_INSERT,
+                    .slot = slot_idx,
+                    ._pad1 = 0,
+                    ._pad2 = 0,
+                    .key = elem,
+                    .prev_value = 0,
+                    .aux = 0,
+                },
+            );
+        }
+
+        var j = pos;
+        while (j + 1 < size) : (j += 1) {
+            values[j] = values[j + 1];
+        }
+        size -= 1;
+        values[size] = EMPTY_KEY;
+        had_remove = true;
+        if (meta.hasTTL()) {
+            removeTTLEntriesForKey(state_base, meta, elem);
+        }
+    }
+
+    meta.size_ptr.* = size;
+    if (had_remove) setChangeFlag(meta, ChangeFlag.REMOVED);
+}
+
 fn batchSetInsert(
     comptime delta_mode: bool,
     state_base: [*]u8,
@@ -1914,6 +2155,10 @@ fn batchSetInsert(
     ts_col: ?[*]const f64,
     batch_len: u32,
 ) ErrorCode {
+    if (meta.slotType() == .BITMAP) {
+        return batchBitmapAdd(delta_mode, state_base, meta, slot_idx, elem_col, ts_col, batch_len);
+    }
+
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
 
@@ -1997,6 +2242,11 @@ fn batchSetRemove(
     elem_col: [*]const u32,
     batch_len: u32,
 ) void {
+    if (meta.slotType() == .BITMAP) {
+        batchBitmapRemove(delta_mode, state_base, meta, slot_idx, elem_col, batch_len);
+        return;
+    }
+
     const data_ptr = state_base + meta.offset;
     const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
 
@@ -2409,6 +2659,14 @@ fn singleSetInsert(
     elem: u32,
     ts: ?f64,
 ) ErrorCode {
+    if (meta.slotType() == .BITMAP) {
+        const ts_col = if (meta.hasTTL()) blk: {
+            var scratch: [1]f64 = .{ts.?};
+            break :blk scratch[0..].ptr;
+        } else null;
+        return batchBitmapAdd(delta_mode, state_base, meta, slot_idx, (&[_]u32{elem})[0..].ptr, ts_col, 1);
+    }
+
     if (elem == EMPTY_KEY or elem == TOMBSTONE) return .OK;
 
     const data_ptr = state_base + meta.offset;
@@ -2451,6 +2709,11 @@ fn singleSetRemove(
     slot_idx: u8,
     elem: u32,
 ) void {
+    if (meta.slotType() == .BITMAP) {
+        batchBitmapRemove(delta_mode, state_base, meta, slot_idx, (&[_]u32{elem})[0..].ptr, 1);
+        return;
+    }
+
     if (elem == EMPTY_KEY or elem == TOMBSTONE) return;
 
     const data_ptr = state_base + meta.offset;
@@ -3072,6 +3335,33 @@ fn executeBatchImpl(
 
                 const meta = getSlotMeta(state_base, slot);
                 batchSetRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
+            },
+
+            .BATCH_BITMAP_ADD => {
+                const slot = code[pc];
+                const elem_col = code[pc + 1];
+                pc += 2;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = batchBitmapAdd(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32(col_ptrs_ptr, elem_col),
+                    if (meta.hasTTL()) getColF64(col_ptrs_ptr, meta.timestamp_field_idx) else null,
+                    batch_len,
+                );
+                if (result != .OK) return signalGrowth(slot, result);
+            },
+
+            .BATCH_BITMAP_REMOVE => {
+                const slot = code[pc];
+                const elem_col = code[pc + 1];
+                pc += 2;
+
+                const meta = getSlotMeta(state_base, slot);
+                batchBitmapRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
             },
 
             .BATCH_AGG_SUM => {
@@ -4176,6 +4466,43 @@ fn executeElementOpcodes(
                 );
             },
 
+            // BITMAP_ADD (0x34): slot, elem_col
+            0x34 => {
+                const slot = body[bpc + 1];
+                const elem_col_idx = body[bpc + 2];
+                bpc += 3;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = singleSetInsert(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // BITMAP_REMOVE (0x35): slot, elem_col
+            0x35 => {
+                const slot = body[bpc + 1];
+                const elem_col_idx = body[bpc + 2];
+                bpc += 3;
+
+                const meta = getSlotMeta(state_base, slot);
+                singleSetRemove(
+                    delta_mode,
+                    state_base,
+                    meta,
+                    slot,
+                    getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
+                );
+            },
+
             // STRUCT_MAP_UPSERT_LAST (0x80): slot, key_col, num_vals, [(val_col, field_idx) × N],
             //   num_array_vals, [(offsets_col, values_col, field_idx) × N]
             0x80 => {
@@ -4579,7 +4906,7 @@ pub export fn vm_calculate_state_size(
                             size += capacity * 8;
                         }
                     },
-                    .HASHSET => {
+                    .HASHSET, .BITMAP => {
                         // keys (u32)
                         size += capacity * 4;
                     },
@@ -4889,7 +5216,7 @@ pub export fn vm_init_state(
                         };
                         data_offset += CONDITION_TREE_STATE_BYTES;
                     },
-                    .HASHSET => {
+                    .HASHSET, .BITMAP => {
                         const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
                         for (0..capacity) |i| {
                             keys_ptr[i] = EMPTY_KEY;
@@ -5583,6 +5910,7 @@ fn getSlotDataSize(slot_type: u4, capacity: u32, has_hashmap_timestamps: bool) u
     return switch (slot_type) {
         0 => capacity * 4 + capacity * 4 + if (has_hashmap_timestamps) capacity * 8 else 0, // HASHMAP: keys + values [+ timestamps]
         1 => capacity * 4, // HASHSET: keys only
+        7 => capacity * 4, // BITMAP: u32 membership keys
         2 => 16, // AGGREGATE: f64 value + u64 count
         4 => 8, // CONDITION_TREE: generation(u32) + last_removed_key(u32)
         5 => 0, // STRUCT_MAP: use getStructMapSlotDataSize (needs row_size from metadata)
@@ -5843,8 +6171,8 @@ pub export fn vm_grow_state(
                     }
                 }
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
-            } else if (slot_type == 1) {
-                // HASHSET: initialize to EMPTY_KEY, then rehash
+            } else if (slot_type == 1 or slot_type == 7) {
+                // HASHSET/BITMAP: initialize to EMPTY_KEY, then rehash
                 const new_elems: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset]));
                 for (0..new_cap) |i| {
                     new_elems[i] = EMPTY_KEY;

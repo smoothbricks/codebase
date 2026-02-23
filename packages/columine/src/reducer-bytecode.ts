@@ -86,6 +86,9 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
           case SlotType.HASHSET:
             slotDefs[slot] = { type: SlotType.HASHSET, capacity, ttl };
             break;
+          case SlotType.BITMAP:
+            slotDefs[slot] = { type: SlotType.BITMAP, capacity, ttl };
+            break;
           case SlotType.AGGREGATE:
             slotDefs[slot] = { type: SlotType.AGGREGATE, aggType: (capLo || AggType.SUM) as AggType };
             break;

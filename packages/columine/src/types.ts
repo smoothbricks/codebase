@@ -34,6 +34,7 @@ export enum SlotType {
   CONDITION_TREE = 4,
   STRUCT_MAP = 5,
   ORDERED_LIST = 6,
+  BITMAP = 7,
 }
 
 /**
@@ -99,6 +100,7 @@ export interface ReducerProgram {
 export type SlotDef =
   | { type: SlotType.HASHMAP; capacity: number; storesTimestamps: boolean; ttl?: SlotTtlMetadata }
   | { type: SlotType.HASHSET; capacity: number; ttl?: SlotTtlMetadata }
+  | { type: SlotType.BITMAP; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.AGGREGATE; aggType: AggType }
   | { type: SlotType.CONDITION_TREE }
   | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[]; ttl?: SlotTtlMetadata }
@@ -184,6 +186,10 @@ export enum Opcode {
   BATCH_SET_INSERT = 0x30,
   BATCH_SET_REMOVE = 0x31,
   BATCH_SET_INSERT_IF = 0x33,
+
+  // Batch bitmap ops (u32 ordinal membership)
+  BATCH_BITMAP_ADD = 0x34,
+  BATCH_BITMAP_REMOVE = 0x35,
 
   // Batch Aggregate ops
   BATCH_AGG_SUM = 0x40,
