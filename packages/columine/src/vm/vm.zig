@@ -29,6 +29,27 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const rawr = @import("rawr");
+const RoaringBitmap = rawr.RoaringBitmap;
+const FrozenBitmap = rawr.FrozenBitmap;
+const bitmap_allocator = if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)
+    std.heap.wasm_allocator
+else
+    std.heap.smp_allocator;
+
+var g_bitmap_scratch_ptr: usize = 0;
+var g_bitmap_scratch_len: u32 = 0;
+var g_bitmap_scratch_fba = std.heap.FixedBufferAllocator.init(&[_]u8{});
+var g_bitmap_last_error: u32 = 0;
+
+inline fn bitmapBackingAllocator() std.mem.Allocator {
+    if (g_bitmap_scratch_ptr != 0 and g_bitmap_scratch_len != 0) {
+        const scratch_ptr: [*]u8 = @ptrFromInt(g_bitmap_scratch_ptr);
+        g_bitmap_scratch_fba = std.heap.FixedBufferAllocator.init(scratch_ptr[0..g_bitmap_scratch_len]);
+        return g_bitmap_scratch_fba.allocator();
+    }
+    return bitmap_allocator;
+}
 
 // NOTE: RETE import removed — columine is the pure reducer VM.
 
@@ -50,6 +71,10 @@ pub const STATE_FORMAT_VERSION: u8 = 2;
 
 const EMPTY_KEY: u32 = 0xFFFFFFFF;
 const TOMBSTONE: u32 = 0xFFFFFFFE;
+
+const BITMAP_SERIALIZED_LEN_BYTES: u32 = 4;
+const BITMAP_BYTES_PER_CAPACITY: u32 = 8;
+const BITMAP_BASE_BYTES: u32 = 256;
 
 // =============================================================================
 // State Header Layout (32 bytes)
@@ -359,6 +384,31 @@ pub const ErrorCode = enum(u32) {
 // Set by executeBatchImpl, read by vm_get_needs_growth_slot.
 var g_needs_growth_slot: u8 = 0xFF;
 
+/// Configure optional bitmap scratch workspace for the next VM call.
+/// When set, bitmap deserialize/mutate allocations use this caller-owned buffer
+/// instead of wasm_allocator, which avoids heap/state overlap.
+pub export fn vm_set_rbmp_scratch(ptr: u32, len: u32) void {
+    g_bitmap_scratch_ptr = @as(usize, ptr);
+    g_bitmap_scratch_len = len;
+}
+
+inline fn clearBitmapScratch() void {
+    g_bitmap_scratch_ptr = 0;
+    g_bitmap_scratch_len = 0;
+}
+
+pub export fn vm_get_rbmp_last_error() u32 {
+    return g_bitmap_last_error;
+}
+
+pub export fn vm_get_rbmp_scratch_len() u32 {
+    return g_bitmap_scratch_len;
+}
+
+pub export fn vm_get_rbmp_scratch_ptr() u32 {
+    return @intCast(g_bitmap_scratch_ptr);
+}
+
 // =============================================================================
 // Hash Function
 // =============================================================================
@@ -539,9 +589,9 @@ var g_undo_overflow: bool = false;
 pub var g_undo_enabled: bool = false;
 
 // Shadow buffer for lazy overflow snapshot — only used when undo log exceeds capacity.
-// WASM: static 4MB buffer (wasm_allocator.alloc grows memory, detaching JS ArrayBuffer views).
+// WASM: static 1MB buffer (wasm_allocator.alloc grows memory, detaching JS ArrayBuffer views).
 // Native: dynamically allocated via page_allocator for any state size.
-const UNDO_SHADOW_CAPACITY: u32 = 4 * 1024 * 1024;
+const UNDO_SHADOW_CAPACITY: u32 = 1 * 1024 * 1024;
 var g_undo_shadow_static: if (builtin.cpu.arch == .wasm32) [UNDO_SHADOW_CAPACITY]u8 else [0]u8 = undefined;
 var g_undo_shadow_dynamic: ?[]u8 = null;
 var g_undo_shadow_active: bool = false;
@@ -570,7 +620,7 @@ pub fn undoAppend(entry: FlatUndoEntry) void {
         // First overflow: snapshot current state so rollback can restore
         // un-logged mutations that happen after this point.
         if (comptime builtin.cpu.arch == .wasm32) {
-            // WASM: static 4MB buffer (avoids memory.grow which detaches JS ArrayBuffer views)
+            // WASM: static shadow buffer (avoids memory.grow which detaches JS ArrayBuffer views)
             if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
                 @memcpy(g_undo_shadow_static[0..g_undo_state_size], g_undo_state_base[0..g_undo_state_size]);
                 g_undo_shadow_active = true;
@@ -601,7 +651,7 @@ pub fn undoAppendPair(undo_entry: FlatUndoEntry, redo_entry: FlatUndoEntry) void
         // First overflow: snapshot current state so rollback can restore
         // un-logged mutations that happen after this point.
         if (comptime builtin.cpu.arch == .wasm32) {
-            // WASM: static 4MB buffer (avoids memory.grow which detaches JS ArrayBuffer views)
+            // WASM: static shadow buffer (avoids memory.grow which detaches JS ArrayBuffer views)
             if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
                 @memcpy(g_undo_shadow_static[0..g_undo_state_size], g_undo_state_base[0..g_undo_state_size]);
                 g_undo_shadow_active = true;
@@ -790,22 +840,17 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             // Undo insert: tombstone the element, decrement size
             const meta = getSlotMeta(state_base, entry.slot);
             if (meta.slotType() == .BITMAP) {
-                const data_ptr = state_base + meta.offset;
-                const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
-                var size = meta.size_ptr.*;
-                if (size > 0) {
-                    const pos = bitmapLowerBound(values, size, entry.key);
-                    if (pos < size and values[pos] == entry.key) {
-                        var i = pos;
-                        while (i + 1 < size) : (i += 1) {
-                            values[i] = values[i + 1];
-                        }
-                        size -= 1;
-                        values[size] = EMPTY_KEY;
-                        meta.size_ptr.* = size;
-                        if (meta.hasTTL()) {
-                            removeTTLEntriesForKey(state_base, meta, entry.key);
-                        }
+                const storage = getBitmapStorage(state_base, meta);
+                var bitmap = bitmapLoad(storage) orelse return;
+                defer bitmap.deinit();
+
+                const removed = bitmap.value.remove(entry.key) catch false;
+                if (removed) {
+                    const cardinality: u32 = @intCast(bitmap.value.cardinality());
+                    if (bitmapStore(storage, &bitmap.value) != .OK) return;
+                    meta.size_ptr.* = cardinality;
+                    if (meta.hasTTL()) {
+                        removeTTLEntriesForKey(state_base, meta, entry.key);
                     }
                 }
             } else {
@@ -825,20 +870,14 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             // Undo delete: restore element, increment size
             const meta = getSlotMeta(state_base, entry.slot);
             if (meta.slotType() == .BITMAP) {
-                const data_ptr = state_base + meta.offset;
-                const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
-                var size = meta.size_ptr.*;
-                if (size < meta.capacity) {
-                    const pos = bitmapLowerBound(values, size, entry.key);
-                    if (pos >= size or values[pos] != entry.key) {
-                        var i = size;
-                        while (i > pos) : (i -= 1) {
-                            values[i] = values[i - 1];
-                        }
-                        values[pos] = entry.key;
-                        size += 1;
-                        meta.size_ptr.* = size;
-                    }
+                const storage = getBitmapStorage(state_base, meta);
+                var bitmap = bitmapLoad(storage) orelse return;
+                defer bitmap.deinit();
+
+                _ = bitmap.value.add(entry.key) catch false;
+                const cardinality: u32 = @intCast(bitmap.value.cardinality());
+                if (cardinality <= meta.capacity and bitmapStore(storage, &bitmap.value) == .OK) {
+                    meta.size_ptr.* = cardinality;
                 }
                 if (meta.hasTTL()) {
                     removeTTLEntriesForKey(state_base, meta, entry.key);
@@ -1192,21 +1231,15 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) bool {
             return false;
         },
         .BITMAP => {
-            const data_ptr = state_base + meta.offset;
-            const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
-            var size = meta.size_ptr.*;
-            if (size == 0) return false;
+            const storage = getBitmapStorage(state_base, meta);
+            var bitmap = bitmapLoad(storage) orelse return false;
+            defer bitmap.deinit();
 
-            const pos = bitmapLowerBound(values, size, key);
-            if (pos >= size or values[pos] != key) return false;
-
-            var i = pos;
-            while (i + 1 < size) : (i += 1) {
-                values[i] = values[i + 1];
-            }
-            size -= 1;
-            values[size] = EMPTY_KEY;
-            meta.size_ptr.* = size;
+            const removed = bitmap.value.remove(key) catch return false;
+            if (!removed) return false;
+            const cardinality: u32 = @intCast(bitmap.value.cardinality());
+            if (bitmapStore(storage, &bitmap.value) != .OK) return false;
+            meta.size_ptr.* = cardinality;
             return true;
         },
         .ARRAY => {
@@ -1971,18 +2004,112 @@ fn batchMapRemove(
 // HashSet Operations
 // =============================================================================
 
-inline fn bitmapLowerBound(values: [*]const u32, size: u32, target: u32) u32 {
-    var lo: u32 = 0;
-    var hi: u32 = size;
-    while (lo < hi) {
-        const mid = lo + (hi - lo) / 2;
-        if (values[mid] < target) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
+const BitmapStorage = struct {
+    serialized_len_ptr: *u32,
+    payload_ptr: [*]u8,
+    payload_capacity: u32,
+};
+
+const BitmapSlot = struct {
+    meta: SlotMeta,
+    storage: BitmapStorage,
+};
+
+const LoadedBitmap = struct {
+    value: RoaringBitmap,
+
+    fn deinit(self: *LoadedBitmap) void {
+        self.value.deinit();
     }
-    return lo;
+};
+
+inline fn bitmapPayloadCapacity(slot_capacity: u32) u32 {
+    return slot_capacity * BITMAP_BYTES_PER_CAPACITY + BITMAP_BASE_BYTES;
+}
+
+inline fn getBitmapStorage(state_base: [*]u8, meta: SlotMeta) BitmapStorage {
+    const data_ptr = state_base + meta.offset;
+    const serialized_len_ptr: *u32 = @ptrCast(@alignCast(data_ptr));
+    return .{
+        .serialized_len_ptr = serialized_len_ptr,
+        .payload_ptr = data_ptr + BITMAP_SERIALIZED_LEN_BYTES,
+        .payload_capacity = bitmapPayloadCapacity(meta.capacity),
+    };
+}
+
+inline fn getBitmapSlotByOffset(state_base: [*]u8, slot_offset: u32) ?BitmapSlot {
+    const meta = findSlotMetaByOffset(state_base, slot_offset) orelse return null;
+    if (meta.slotType() != .BITMAP) return null;
+    return .{ .meta = meta, .storage = getBitmapStorage(state_base, meta) };
+}
+
+inline fn bitmapFrozen(storage: BitmapStorage) ?FrozenBitmap {
+    const serialized_len = storage.serialized_len_ptr.*;
+    if (serialized_len == 0 or serialized_len > storage.payload_capacity) {
+        return null;
+    }
+    return FrozenBitmap.init(storage.payload_ptr[0..serialized_len]) catch return null;
+}
+
+fn bitmapLoad(storage: BitmapStorage) ?LoadedBitmap {
+    const alloc = bitmapBackingAllocator();
+
+    const serialized_len = storage.serialized_len_ptr.*;
+    if (serialized_len == 0) {
+        const empty = RoaringBitmap.init(alloc) catch |err| {
+            if (err == error.OutOfMemory) g_bitmap_last_error = 100 else g_bitmap_last_error = 109;
+            return null;
+        };
+        return .{ .value = empty };
+    }
+    if (serialized_len > storage.payload_capacity) {
+        return null;
+    }
+
+    const data = storage.payload_ptr[0..serialized_len];
+    const restored = RoaringBitmap.deserialize(alloc, data) catch |err| {
+        if (err == error.OutOfMemory)
+            g_bitmap_last_error = 101
+        else if (err == error.InvalidFormat)
+            g_bitmap_last_error = 102
+        else
+            g_bitmap_last_error = 103;
+        return null;
+    };
+    return .{ .value = restored };
+}
+
+fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
+    const serialized_size_usize = bitmap.serializeIntoBuffer(storage.payload_ptr[0..storage.payload_capacity]) catch |err| {
+        if (err == error.NoSpaceLeft) {
+            g_bitmap_last_error = 60;
+            return .CAPACITY_EXCEEDED;
+        }
+        g_bitmap_last_error = 61;
+        return .INVALID_STATE;
+    };
+
+    const serialized_size: u32 = @intCast(serialized_size_usize);
+    if (serialized_size > storage.payload_capacity) {
+        return .CAPACITY_EXCEEDED;
+    }
+
+    storage.serialized_len_ptr.* = serialized_size;
+    if (serialized_size < storage.payload_capacity) {
+        @memset(storage.payload_ptr[serialized_size..storage.payload_capacity], 0);
+    }
+    return .OK;
+}
+
+fn bitmapSelect(storage: BitmapStorage, rank: u32) ?u32 {
+    const frozen = bitmapFrozen(storage) orelse return null;
+    var iterator = frozen.iterator();
+    var idx: u32 = 0;
+    while (iterator.next()) |element| {
+        if (idx == rank) return element;
+        idx += 1;
+    }
+    return null;
 }
 
 fn batchBitmapAdd(
@@ -1994,10 +2121,19 @@ fn batchBitmapAdd(
     ts_col: ?[*]const f64,
     batch_len: u32,
 ) ErrorCode {
-    const data_ptr = state_base + meta.offset;
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
+    g_bitmap_last_error = 0;
+    const storage = getBitmapStorage(state_base, meta);
+    var bitmap = bitmapLoad(storage) orelse {
+        if (g_bitmap_last_error == 0) g_bitmap_last_error = 1;
+        return .INVALID_STATE;
+    };
+    defer bitmap.deinit();
 
-    var size = meta.size_ptr.*;
+    const original_size = meta.size_ptr.*;
+    var cardinality: u32 = @intCast(bitmap.value.cardinality());
+    if (cardinality != original_size) {
+        meta.size_ptr.* = cardinality;
+    }
     var had_insert = false;
 
     var i: u32 = 0;
@@ -2006,27 +2142,62 @@ fn batchBitmapAdd(
         if (elem == EMPTY_KEY or elem == TOMBSTONE) continue;
         const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
 
-        const pos = bitmapLowerBound(values, size, elem);
-        if (pos < size and values[pos] == elem) {
+        const already_present = bitmap.value.contains(elem);
+        if (!already_present and cardinality >= meta.capacity) {
+            if (had_insert) {
+                const flush_result = bitmapStore(storage, &bitmap.value);
+                if (flush_result != .OK) {
+                    g_bitmap_last_error = 2;
+                    meta.size_ptr.* = original_size;
+                    return flush_result;
+                }
+                meta.size_ptr.* = cardinality;
+                setChangeFlag(meta, ChangeFlag.INSERTED);
+            } else {
+                meta.size_ptr.* = original_size;
+            }
+            return .CAPACITY_EXCEEDED;
+        }
+
+        const inserted = if (already_present)
+            false
+        else
+            bitmap.value.add(elem) catch {
+                g_bitmap_last_error = 3;
+                if (had_insert) {
+                    const flush_result = bitmapStore(storage, &bitmap.value);
+                    if (flush_result != .OK) {
+                        g_bitmap_last_error = 4;
+                        meta.size_ptr.* = original_size;
+                        return flush_result;
+                    }
+                    setChangeFlag(meta, ChangeFlag.INSERTED);
+                }
+                meta.size_ptr.* = cardinality;
+                return .INVALID_STATE;
+            };
+
+        if (!inserted) {
             if (meta.hasTTL()) {
                 const ttl_result = insertWithTTL(state_base, meta, elem, ts);
                 if (ttl_result != .OK) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
+                    if (had_insert) {
+                        const flush_result = bitmapStore(storage, &bitmap.value);
+                        if (flush_result != .OK) {
+                            meta.size_ptr.* = original_size;
+                            return flush_result;
+                        }
+                        setChangeFlag(meta, ChangeFlag.INSERTED);
+                    }
+                    meta.size_ptr.* = cardinality;
                     return ttl_result;
                 }
             }
             continue;
         }
 
-        if (size >= meta.capacity) {
-            meta.size_ptr.* = size;
-            if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-            return .CAPACITY_EXCEEDED;
-        }
-
         if (g_undo_enabled) {
-            meta.size_ptr.* = size;
+            meta.size_ptr.* = cardinality;
             appendMutation(
                 delta_mode,
                 .{
@@ -2050,25 +2221,33 @@ fn batchBitmapAdd(
             );
         }
 
-        var j = size;
-        while (j > pos) : (j -= 1) {
-            values[j] = values[j - 1];
-        }
-        values[pos] = elem;
-        size += 1;
+        cardinality += 1;
         had_insert = true;
 
         if (meta.hasTTL()) {
             const ttl_result = insertWithTTL(state_base, meta, elem, ts);
             if (ttl_result != .OK) {
-                meta.size_ptr.* = size;
+                const flush_result = bitmapStore(storage, &bitmap.value);
+                if (flush_result != .OK) {
+                    g_bitmap_last_error = 5;
+                    meta.size_ptr.* = original_size;
+                    return flush_result;
+                }
+                meta.size_ptr.* = cardinality;
                 if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
                 return ttl_result;
             }
         }
     }
 
-    meta.size_ptr.* = size;
+    const store_result = bitmapStore(storage, &bitmap.value);
+    if (store_result != .OK) {
+        g_bitmap_last_error = 6;
+        meta.size_ptr.* = original_size;
+        return store_result;
+    }
+
+    meta.size_ptr.* = cardinality;
     if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
     return .OK;
 }
@@ -2081,19 +2260,20 @@ fn batchBitmapRemove(
     elem_col: [*]const u32,
     batch_len: u32,
 ) void {
-    const data_ptr = state_base + meta.offset;
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr));
+    const storage = getBitmapStorage(state_base, meta);
+    var bitmap = bitmapLoad(storage) orelse return;
+    defer bitmap.deinit();
 
-    var size = meta.size_ptr.*;
+    var cardinality: u32 = @intCast(bitmap.value.cardinality());
     var had_remove = false;
 
     var i: u32 = 0;
     while (i < batch_len) : (i += 1) {
         const elem = elem_col[i];
-        if (size == 0) break;
+        if (cardinality == 0) break;
 
-        const pos = bitmapLowerBound(values, size, elem);
-        if (pos >= size or values[pos] != elem) {
+        const removed = bitmap.value.remove(elem) catch false;
+        if (!removed) {
             continue;
         }
 
@@ -2106,7 +2286,7 @@ fn batchBitmapRemove(
                     prev_ts_bits = @bitCast(prev_ts);
                 }
             }
-            meta.size_ptr.* = size;
+            meta.size_ptr.* = cardinality;
             appendMutation(
                 delta_mode,
                 .{
@@ -2130,19 +2310,23 @@ fn batchBitmapRemove(
             );
         }
 
-        var j = pos;
-        while (j + 1 < size) : (j += 1) {
-            values[j] = values[j + 1];
-        }
-        size -= 1;
-        values[size] = EMPTY_KEY;
+        cardinality -= 1;
         had_remove = true;
         if (meta.hasTTL()) {
             removeTTLEntriesForKey(state_base, meta, elem);
         }
     }
 
-    meta.size_ptr.* = size;
+    if (!had_remove) {
+        meta.size_ptr.* = cardinality;
+        return;
+    }
+
+    if (bitmapStore(storage, &bitmap.value) != .OK) {
+        return;
+    }
+
+    meta.size_ptr.* = cardinality;
     if (had_remove) setChangeFlag(meta, ChangeFlag.REMOVED);
 }
 
@@ -4741,6 +4925,7 @@ pub export fn vm_execute_batch(
     num_cols: u32,
     batch_len: u32,
 ) u32 {
+    defer clearBitmapScratch();
     return executeBatchImpl(false, state_base, program_ptr, program_len, col_ptrs_ptr, num_cols, batch_len);
 }
 
@@ -4752,6 +4937,7 @@ pub export fn vm_execute_batch_delta(
     num_cols: u32,
     batch_len: u32,
 ) u32 {
+    defer clearBitmapScratch();
     return executeBatchImpl(true, state_base, program_ptr, program_len, col_ptrs_ptr, num_cols, batch_len);
 }
 
@@ -4906,9 +5092,12 @@ pub export fn vm_calculate_state_size(
                             size += capacity * 8;
                         }
                     },
-                    .HASHSET, .BITMAP => {
+                    .HASHSET => {
                         // keys (u32)
                         size += capacity * 4;
+                    },
+                    .BITMAP => {
+                        size += BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(capacity);
                     },
                     .AGGREGATE => {
                         // value (f64) + count (u64)
@@ -5216,12 +5405,17 @@ pub export fn vm_init_state(
                         };
                         data_offset += CONDITION_TREE_STATE_BYTES;
                     },
-                    .HASHSET, .BITMAP => {
+                    .HASHSET => {
                         const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
                         for (0..capacity) |i| {
                             keys_ptr[i] = EMPTY_KEY;
                         }
                         data_offset += capacity * 4;
+                    },
+                    .BITMAP => {
+                        const storage_size = BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(capacity);
+                        @memset(state_ptr[data_offset .. data_offset + storage_size], 0);
+                        data_offset += storage_size;
                     },
                     .AGGREGATE => {
                         const agg_ptr: *f64 = @ptrCast(@alignCast(state_ptr + data_offset));
@@ -5522,6 +5716,11 @@ pub export fn vm_set_contains(
     capacity: u32,
     elem: u32,
 ) u32 {
+    if (getBitmapSlotByOffset(state_base, slot_offset)) |slot| {
+        const frozen = bitmapFrozen(slot.storage) orelse return 0;
+        return if (frozen.contains(elem)) 1 else 0;
+    }
+
     const data_ptr = state_base + slot_offset;
     const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
 
@@ -5535,6 +5734,119 @@ pub export fn vm_set_contains(
         slot = (slot + 1) & (capacity - 1);
     }
     return 0;
+}
+
+pub export fn vm_rbmp_export_len(state_base: [*]u8, slot_offset: u32) u32 {
+    const slot = getBitmapSlotByOffset(state_base, slot_offset) orelse return 0;
+    const serialized_len = slot.storage.serialized_len_ptr.*;
+    if (serialized_len > slot.storage.payload_capacity) return 0;
+    return serialized_len;
+}
+
+pub export fn vm_rbmp_export_copy(
+    state_base: [*]u8,
+    slot_offset: u32,
+    out_ptr: [*]u8,
+    out_capacity: u32,
+) u32 {
+    const slot = getBitmapSlotByOffset(state_base, slot_offset) orelse return @intFromEnum(ErrorCode.INVALID_SLOT);
+    const serialized_len = slot.storage.serialized_len_ptr.*;
+    if (serialized_len > slot.storage.payload_capacity) return @intFromEnum(ErrorCode.INVALID_STATE);
+    if (serialized_len > out_capacity) return @intFromEnum(ErrorCode.CAPACITY_EXCEEDED);
+    if (serialized_len > 0) {
+        @memcpy(out_ptr[0..serialized_len], slot.storage.payload_ptr[0..serialized_len]);
+    }
+    return @intFromEnum(ErrorCode.OK);
+}
+
+pub export fn vm_rbmp_import_copy(
+    state_base: [*]u8,
+    slot_offset: u32,
+    in_ptr: [*]const u8,
+    in_len: u32,
+) u32 {
+    const slot = getBitmapSlotByOffset(state_base, slot_offset) orelse return @intFromEnum(ErrorCode.INVALID_SLOT);
+    if (in_len > slot.storage.payload_capacity) {
+        return @intFromEnum(ErrorCode.CAPACITY_EXCEEDED);
+    }
+
+    if (in_len == 0) {
+        slot.storage.serialized_len_ptr.* = 0;
+        @memset(slot.storage.payload_ptr[0..slot.storage.payload_capacity], 0);
+        slot.meta.size_ptr.* = 0;
+        return @intFromEnum(ErrorCode.OK);
+    }
+
+    const frozen = FrozenBitmap.init(in_ptr[0..in_len]) catch return @intFromEnum(ErrorCode.INVALID_STATE);
+    const card = frozen.cardinality();
+    if (card > slot.meta.capacity) {
+        return @intFromEnum(ErrorCode.CAPACITY_EXCEEDED);
+    }
+
+    @memcpy(slot.storage.payload_ptr[0..in_len], in_ptr[0..in_len]);
+    slot.storage.serialized_len_ptr.* = in_len;
+    if (in_len < slot.storage.payload_capacity) {
+        @memset(slot.storage.payload_ptr[in_len..slot.storage.payload_capacity], 0);
+    }
+    slot.meta.size_ptr.* = @intCast(card);
+    return @intFromEnum(ErrorCode.OK);
+}
+
+fn frozenIntersectCount(a: *const FrozenBitmap, b: *const FrozenBitmap) u32 {
+    const card_a = a.cardinality();
+    const card_b = b.cardinality();
+    const small = if (card_a <= card_b) a else b;
+    const large = if (card_a <= card_b) b else a;
+
+    var count: u32 = 0;
+    var iter = small.iterator();
+    while (iter.next()) |v| {
+        if (large.contains(v)) {
+            if (count == std.math.maxInt(u32)) break;
+            count += 1;
+        }
+    }
+    return count;
+}
+
+pub export fn vm_rbmp_intersect_any_slots(state_base: [*]u8, left_slot_offset: u32, right_slot_offset: u32) u32 {
+    const left = getBitmapSlotByOffset(state_base, left_slot_offset) orelse return 0;
+    const right = getBitmapSlotByOffset(state_base, right_slot_offset) orelse return 0;
+    const left_frozen = bitmapFrozen(left.storage) orelse return 0;
+    const right_frozen = bitmapFrozen(right.storage) orelse return 0;
+    return if (frozenIntersectCount(&left_frozen, &right_frozen) > 0) 1 else 0;
+}
+
+pub export fn vm_rbmp_intersect_count_slots(state_base: [*]u8, left_slot_offset: u32, right_slot_offset: u32) u32 {
+    const left = getBitmapSlotByOffset(state_base, left_slot_offset) orelse return 0;
+    const right = getBitmapSlotByOffset(state_base, right_slot_offset) orelse return 0;
+    const left_frozen = bitmapFrozen(left.storage) orelse return 0;
+    const right_frozen = bitmapFrozen(right.storage) orelse return 0;
+    return frozenIntersectCount(&left_frozen, &right_frozen);
+}
+
+pub export fn vm_rbmp_intersect_any_serialized(
+    left_ptr: [*]const u8,
+    left_len: u32,
+    right_ptr: [*]const u8,
+    right_len: u32,
+) u32 {
+    if (left_len == 0 or right_len == 0) return 0;
+    const left = FrozenBitmap.init(left_ptr[0..left_len]) catch return 0;
+    const right = FrozenBitmap.init(right_ptr[0..right_len]) catch return 0;
+    return if (frozenIntersectCount(&left, &right) > 0) 1 else 0;
+}
+
+pub export fn vm_rbmp_intersect_count_serialized(
+    left_ptr: [*]const u8,
+    left_len: u32,
+    right_ptr: [*]const u8,
+    right_len: u32,
+) u32 {
+    if (left_len == 0 or right_len == 0) return 0;
+    const left = FrozenBitmap.init(left_ptr[0..left_len]) catch return 0;
+    const right = FrozenBitmap.init(right_ptr[0..right_len]) catch return 0;
+    return frozenIntersectCount(&left, &right);
 }
 
 // =============================================================================
@@ -5606,6 +5918,12 @@ pub export fn vm_set_iter_start(
     slot_offset: u32,
     capacity: u32,
 ) u32 {
+    if (findSlotMetaByOffset(state_base, slot_offset)) |meta| {
+        if (meta.slotType() == .BITMAP) {
+            return if (meta.size_ptr.* == 0) capacity else 0;
+        }
+    }
+
     // Same as vm_map_iter_start - sets use same key array structure
     return vm_map_iter_start(state_base, slot_offset, capacity);
 }
@@ -5618,6 +5936,13 @@ pub export fn vm_set_iter_next(
     capacity: u32,
     current: u32,
 ) u32 {
+    if (findSlotMetaByOffset(state_base, slot_offset)) |meta| {
+        if (meta.slotType() == .BITMAP) {
+            const next = current + 1;
+            return if (next < meta.size_ptr.*) next else capacity;
+        }
+    }
+
     return vm_map_iter_next(state_base, slot_offset, capacity, current);
 }
 
@@ -5627,9 +5952,26 @@ pub export fn vm_set_iter_get(
     slot_offset: u32,
     pos: u32,
 ) u32 {
+    if (findSlotMetaByOffset(state_base, slot_offset)) |meta| {
+        if (meta.slotType() == .BITMAP) {
+            const storage = getBitmapStorage(state_base, meta);
+            return bitmapSelect(storage, pos) orelse EMPTY_KEY;
+        }
+    }
+
     const data_ptr = state_base + slot_offset;
     const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
     return keys[pos];
+}
+
+fn findSlotMetaByOffset(state_base: [*]u8, slot_offset: u32) ?SlotMeta {
+    const num_slots = state_base[StateHeaderOffset.NUM_SLOTS];
+    var slot: u8 = 0;
+    while (slot < num_slots) : (slot += 1) {
+        const meta = getSlotMeta(state_base, slot);
+        if (meta.offset == slot_offset) return meta;
+    }
+    return null;
 }
 
 // =============================================================================
@@ -5910,7 +6252,7 @@ fn getSlotDataSize(slot_type: u4, capacity: u32, has_hashmap_timestamps: bool) u
     return switch (slot_type) {
         0 => capacity * 4 + capacity * 4 + if (has_hashmap_timestamps) capacity * 8 else 0, // HASHMAP: keys + values [+ timestamps]
         1 => capacity * 4, // HASHSET: keys only
-        7 => capacity * 4, // BITMAP: u32 membership keys
+        7 => BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(capacity), // BITMAP: serialized roaring payload
         2 => 16, // AGGREGATE: f64 value + u64 count
         4 => 8, // CONDITION_TREE: generation(u32) + last_removed_key(u32)
         5 => 0, // STRUCT_MAP: use getStructMapSlotDataSize (needs row_size from metadata)
@@ -6171,8 +6513,8 @@ pub export fn vm_grow_state(
                     }
                 }
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
-            } else if (slot_type == 1 or slot_type == 7) {
-                // HASHSET/BITMAP: initialize to EMPTY_KEY, then rehash
+            } else if (slot_type == 1) {
+                // HASHSET: initialize to EMPTY_KEY, then rehash
                 const new_elems: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset]));
                 for (0..new_cap) |i| {
                     new_elems[i] = EMPTY_KEY;
@@ -6192,6 +6534,15 @@ pub export fn vm_grow_state(
                     }
                 }
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
+            } else if (slot_type == 7) {
+                // BITMAP: copy serialized roaring payload as-is into larger slot.
+                const old_storage_size = BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(old_cap);
+                const new_storage_size = BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(new_cap);
+                @memset(new_state_ptr[new_offset .. new_offset + new_storage_size], 0);
+                @memcpy(
+                    new_state_ptr[new_offset .. new_offset + old_storage_size],
+                    old_state_ptr[old_offset .. old_offset + old_storage_size],
+                );
             } else if (slot_type == 5) {
                 // STRUCT_MAP: copy field type descriptor, init keys to EMPTY_KEY, rehash rows
                 const nf: u32 = old_state_ptr[meta_base + 13];

@@ -17,6 +17,9 @@
             .url = "git+https://github.com/travisstaloch/simdjzon#7c586bada71603a3a28e0f63dbb81cfd5dbb4619",
             .hash = "simdjzon-0.0.1-7uNSgHJ_BQDkK6pvdhXPjeGkqSxQw_hy7TlA1USZ7Ala",
         },
+        .rawr = .{
+            .path = "../../extern/rawr",
+        },
     },
     .paths = .{
         "build.zig",

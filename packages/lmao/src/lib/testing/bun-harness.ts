@@ -58,6 +58,8 @@ import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
+import type { LogSchema } from '../schema/LogSchema.js';
+import type { SchemaFields } from '../schema/types.js';
 import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import type { Tracer } from '../tracer.js';
@@ -91,8 +93,19 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
 
 type TestBody = () => unknown | Promise<unknown>;
 type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
+type BunTestHarnessBuiltins = { describe: ReturnType<typeof S.category> };
+type HarnessSchema<TExt extends SchemaFields> = BunTestHarnessBuiltins & TExt;
 
-type BunTestSetupOptions = {
+type ExtendBindingLogSchema<B extends OpContextBinding, TExt extends SchemaFields> = B extends OpContextBinding<
+  infer T,
+  infer FF,
+  infer Deps,
+  infer UserCtx
+>
+  ? OpContextBinding<T extends LogSchema<infer Fields> ? LogSchema<Fields & TExt> : never, FF, Deps, UserCtx>
+  : never;
+
+export type BunTestSetupOptions<TExt extends SchemaFields = Record<never, never>> = {
   /**
    * Optional SQLite output path.
    *
@@ -101,7 +114,28 @@ type BunTestSetupOptions = {
   sqlite?: SQLiteWriterConfig;
   /** Optional verbose stdout tracing; defaults to env flag detection. */
   verbose?: boolean;
+  /** Optional test-only schema fields merged into span tag/log methods. */
+  testLogSchema?: TExt;
 };
+
+function buildHarnessSchemaExtensions<TExt extends SchemaFields>(
+  binding: OpContextBinding,
+  testLogSchema: TExt | undefined,
+): HarnessSchema<TExt> {
+  const extension = {
+    describe: S.category(),
+    ...(testLogSchema ?? ({} as TExt)),
+  } as HarnessSchema<TExt>;
+
+  const baseColumnNames = new Set(binding.logBinding.logSchema._columnNames);
+  const safeExtension = Object.create(null) as Record<string, unknown>;
+  for (const [fieldName, fieldSchema] of Object.entries(extension)) {
+    if (!baseColumnNames.has(fieldName)) {
+      safeExtension[fieldName] = fieldSchema;
+    }
+  }
+  return safeExtension as HarnessSchema<TExt>;
+}
 
 function isTruthyEnvFlag(value: unknown): boolean {
   return value === true || value === '1' || value === 'true';
@@ -202,10 +236,14 @@ export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTes
   mock.module('bun:test', () => tracer.createBunTestMock(bunTest));
 }
 
-export function makeBunTestSuiteTracer<B extends OpContextBinding>(
+export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
-  options?: BunTestSetupOptions,
-): BunTestSuiteTracer<B> {
+  options?: BunTestSetupOptions<TExt>,
+): BunTestSuiteTracer<ExtendBindingLogSchema<B, HarnessSchema<TExt>>>;
+export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
+  binding: B,
+  options?: BunTestSetupOptions<TExt>,
+): BunTestSuiteTracer<ExtendBindingLogSchema<B, HarnessSchema<TExt>>> {
   const useTestTracer = makeTestTracer(binding, options);
   return {
     useTestTracer,
@@ -219,13 +257,18 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding>(
  *
  * Unlike initTraceTestRun(), this keeps tracer/root/ALS state isolated per instance.
  */
-export function makeTestTracer<B extends OpContextBinding>(
+export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
-  options?: BunTestSetupOptions,
-): BunTestTracerInstance<B> {
-  type SpanCtx = HarnessSpanContext<B>;
+  options?: BunTestSetupOptions<TExt>,
+): BunTestTracerInstance<ExtendBindingLogSchema<B, HarnessSchema<TExt>>>;
+export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
+  binding: B,
+  options?: BunTestSetupOptions<TExt>,
+): BunTestTracerInstance<ExtendBindingLogSchema<B, HarnessSchema<TExt>>> {
+  type ExtendedBinding = ExtendBindingLogSchema<B, HarnessSchema<TExt>>;
+  type SpanCtx = HarnessSpanContext<ExtendedBinding>;
 
-  let tracer: Tracer<B> | null = null;
+  let tracer: Tracer<ExtendedBinding> | null = null;
   let verboseTrace = false;
   let rootCtx: SpanCtx | null = null;
   let resolveTestRun: (() => void) | null = null;
@@ -239,14 +282,14 @@ export function makeTestTracer<B extends OpContextBinding>(
     return rootCtx;
   }
 
-  function assertTracer(): Tracer<B> {
+  function assertTracer(): Tracer<ExtendedBinding> {
     if (!tracer) throw new Error('Call setup() in preload before tests');
     return tracer;
   }
 
   function runTracedTest(name: string, fn: TestBody, describePath: string | null): Promise<unknown> {
     const currentRoot = assertRootCtx();
-    return (currentRoot.span as RootSpanRunner<OpContextOf<B>>)(name, async (ctx) => {
+    return (currentRoot.span as RootSpanRunner<OpContextOf<ExtendedBinding>>)(name, async (ctx) => {
       writeDescribeTag(ctx.tag, describePath);
       try {
         await als.run(ctx, fn);
@@ -310,14 +353,15 @@ export function makeTestTracer<B extends OpContextBinding>(
       }
       isSetup = true;
 
-      const extendedSchema = binding.logBinding.logSchema.extend({ describe: S.category() });
+      const harnessSchema = buildHarnessSchemaExtensions(binding, options?.testLogSchema);
+      const extendedSchema = binding.logBinding.logSchema.extend(harnessSchema);
       const extendedBinding = {
         ...binding,
         logBinding: {
           ...binding.logBinding,
           logSchema: extendedSchema,
         },
-      } as B;
+      } as unknown as ExtendedBinding;
 
       verboseTrace = isVerboseTraceEnabled(options?.verbose);
 
@@ -325,7 +369,7 @@ export function makeTestTracer<B extends OpContextBinding>(
         binding: extendedBinding,
         sqlite: options?.sqlite,
         verbose: verboseTrace,
-      }) as Tracer<B>;
+      }) as Tracer<ExtendedBinding>;
 
       rootTracePromise = tracer.trace('test-run', (ctx: SpanCtx) => {
         rootCtx = ctx;
@@ -368,7 +412,7 @@ export function makeTestTracer<B extends OpContextBinding>(
       return ctx;
     },
 
-    getTracer(): Tracer<B> {
+    getTracer(): Tracer<ExtendedBinding> {
       return assertTracer();
     },
 
@@ -409,7 +453,8 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
   _activeSuiteTracer = null;
 
   // Extend user's schema with `describe` column for test grouping
-  const extendedSchema = opContext.logBinding.logSchema.extend({ describe: S.category() });
+  const harnessSchema = buildHarnessSchemaExtensions(opContext, options?.testLogSchema);
+  const extendedSchema = opContext.logBinding.logSchema.extend(harnessSchema);
   const extendedBinding = {
     ...opContext,
     logBinding: { ...opContext.logBinding, logSchema: extendedSchema },

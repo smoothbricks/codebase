@@ -24,6 +24,15 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSmall,
     });
 
+    const rawr_native_dep = b.dependency("rawr", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const rawr_wasm_dep = b.dependency("rawr", .{
+        .target = wasm_target,
+        .optimize = .ReleaseSmall,
+    });
+
     // ==========================================================================
     // Dependencies - simdjzon (SIMD JSON parser, native targets only)
     // ==========================================================================
@@ -50,9 +59,12 @@ pub fn build(b: *std.Build) void {
     // ==========================================================================
     // and get the reducer VM's public API (vm.zig).
     // ==========================================================================
-    _ = b.addModule("columine", .{
+    const columine_module = b.addModule("columine", .{
         .root_source_file = b.path("src/vm/vm.zig"),
+        .target = target,
+        .optimize = optimize,
     });
+    columine_module.addImport("rawr", rawr_native_dep.module("rawr"));
 
     // ==========================================================================
     // Columine WASM - Reducer-only binary (no RETE)
@@ -71,12 +83,13 @@ pub fn build(b: *std.Build) void {
     columine_wasm.rdynamic = true;
     // Let Zig export memory so wasm_allocator works correctly
     columine_wasm.export_memory = true;
-    // 6MB initial (linker needs ~5.5MB for static data including 4MB undo shadow)
-    columine_wasm.initial_memory = 96 * 64 * 1024;
+    // 3MB initial; grow on demand at runtime.
+    columine_wasm.initial_memory = 48 * 64 * 1024;
     columine_wasm.max_memory = 4096 * 64 * 1024;
 
     // msgpack available for WASM (future Parse/Compact stages)
     columine_wasm.root_module.addImport("msgpack", msgpack_wasm_dep.module("msgpack"));
+    columine_wasm.root_module.addImport("rawr", rawr_wasm_dep.module("rawr"));
 
     b.installArtifact(columine_wasm);
 
@@ -102,6 +115,7 @@ pub fn build(b: *std.Build) void {
 
     // msgpack available for native FFI (future Parse/Compact stages)
     columine_ffi.root_module.addImport("msgpack", msgpack_dep.module("msgpack"));
+    columine_ffi.root_module.addImport("rawr", rawr_native_dep.module("rawr"));
 
     b.installArtifact(columine_ffi);
 
@@ -189,6 +203,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
+    vm_test.root_module.addImport("rawr", rawr_native_dep.module("rawr"));
 
     const run_vm_test = b.addRunArtifact(vm_test);
     test_step.dependOn(&run_vm_test.step);
