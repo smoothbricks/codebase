@@ -191,6 +191,18 @@ export enum Opcode {
   BATCH_BITMAP_ADD = 0x34,
   BATCH_BITMAP_REMOVE = 0x35,
 
+  // Bitmap in-place set algebra (slot × slot)
+  BATCH_BITMAP_AND = 0x36, // target_slot:u8, source_slot:u8
+  BATCH_BITMAP_OR = 0x37,
+  BATCH_BITMAP_ANDNOT = 0x38,
+  BATCH_BITMAP_XOR = 0x39,
+
+  // Bitmap in-place set algebra (slot × scratch)
+  BATCH_BITMAP_AND_SCRATCH = 0x3a,
+  BATCH_BITMAP_OR_SCRATCH = 0x3b,
+  BATCH_BITMAP_ANDNOT_SCRATCH = 0x3c,
+  BATCH_BITMAP_XOR_SCRATCH = 0x3d,
+
   // Batch Aggregate ops
   BATCH_AGG_SUM = 0x40,
   BATCH_AGG_COUNT = 0x41,
