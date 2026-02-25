@@ -2086,6 +2086,13 @@ fn bitmapLoad(storage: BitmapStorage) ?LoadedBitmap {
 fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
     // Optimize container encoding (array → run where beneficial) before serialization
     _ = bitmap.runOptimize() catch {};
+
+    const serialized_size_needed = bitmap.serializedSizeInBytes();
+    if (serialized_size_needed > storage.payload_capacity) {
+        g_bitmap_last_error = 60;
+        return .CAPACITY_EXCEEDED;
+    }
+
     const serialized_size_usize = bitmap.serializeIntoBuffer(storage.payload_ptr[0..storage.payload_capacity]) catch |err| {
         if (err == error.NoSpaceLeft) {
             g_bitmap_last_error = 60;
