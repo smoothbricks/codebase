@@ -333,6 +333,18 @@ pub const Opcode = enum(u8) {
     BATCH_BITMAP_ADD = 0x34, // slot:u8, elem_col:u8
     BATCH_BITMAP_REMOVE = 0x35, // slot:u8, elem_col:u8
 
+    // Bitmap in-place set algebra (slot × slot)
+    BATCH_BITMAP_AND = 0x36, // target_slot:u8, source_slot:u8
+    BATCH_BITMAP_OR = 0x37, // target_slot:u8, source_slot:u8
+    BATCH_BITMAP_ANDNOT = 0x38, // target_slot:u8, source_slot:u8
+    BATCH_BITMAP_XOR = 0x39, // target_slot:u8, source_slot:u8
+
+    // Bitmap in-place set algebra (slot × scratch result)
+    BATCH_BITMAP_AND_SCRATCH = 0x3A, // target_slot:u8
+    BATCH_BITMAP_OR_SCRATCH = 0x3B, // target_slot:u8
+    BATCH_BITMAP_ANDNOT_SCRATCH = 0x3C, // target_slot:u8
+    BATCH_BITMAP_XOR_SCRATCH = 0x3D, // target_slot:u8
+
     // Aggregate batch ops (SIMD accelerated)
     BATCH_AGG_SUM = 0x40, // slot:u8, val_col:u8
     BATCH_AGG_COUNT = 0x41, // slot:u8
@@ -2057,10 +2069,17 @@ inline fn bitmapFrozen(storage: BitmapStorage) ?FrozenBitmap {
 
 fn bitmapLoad(storage: BitmapStorage) ?LoadedBitmap {
     const alloc = bitmapBackingAllocator();
+    const scratch_active = g_bitmap_scratch_ptr != 0 and g_bitmap_scratch_len != 0;
 
     const serialized_len = storage.serialized_len_ptr.*;
     if (serialized_len == 0) {
-        const empty = RoaringBitmap.init(alloc) catch |err| {
+        const empty = RoaringBitmap.init(alloc) catch |err| blk: {
+            if (err == error.OutOfMemory and scratch_active) {
+                break :blk RoaringBitmap.init(bitmap_allocator) catch |fallback_err| {
+                    if (fallback_err == error.OutOfMemory) g_bitmap_last_error = 100 else g_bitmap_last_error = 109;
+                    return null;
+                };
+            }
             if (err == error.OutOfMemory) g_bitmap_last_error = 100 else g_bitmap_last_error = 109;
             return null;
         };
@@ -2071,7 +2090,19 @@ fn bitmapLoad(storage: BitmapStorage) ?LoadedBitmap {
     }
 
     const data = storage.payload_ptr[0..serialized_len];
-    const restored = RoaringBitmap.deserialize(alloc, data) catch |err| {
+    const restored = RoaringBitmap.deserialize(alloc, data) catch |err| blk: {
+        if (err == error.OutOfMemory and scratch_active) {
+            break :blk RoaringBitmap.deserialize(bitmap_allocator, data) catch |fallback_err| {
+                if (fallback_err == error.OutOfMemory)
+                    g_bitmap_last_error = 101
+                else if (fallback_err == error.InvalidFormat)
+                    g_bitmap_last_error = 102
+                else
+                    g_bitmap_last_error = 103;
+                return null;
+            };
+        }
+
         if (err == error.OutOfMemory)
             g_bitmap_last_error = 101
         else if (err == error.InvalidFormat)
@@ -2084,8 +2115,9 @@ fn bitmapLoad(storage: BitmapStorage) ?LoadedBitmap {
 }
 
 fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
-    // Optimize container encoding (array → run where beneficial) before serialization
-    _ = bitmap.runOptimize() catch {};
+    // NOTE: runOptimize disabled temporarily while investigating intermittent INVALID_STATE
+    // during high-volume bitmap mutation in full-suite runs.
+    // _ = bitmap.runOptimize() catch {};
 
     const serialized_size_needed = bitmap.serializedSizeInBytes();
     if (serialized_size_needed > storage.payload_capacity) {
@@ -2094,7 +2126,9 @@ fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
     }
 
     const serialized_size_usize = bitmap.serializeIntoBuffer(storage.payload_ptr[0..storage.payload_capacity]) catch |err| {
-        if (err == error.NoSpaceLeft) {
+        if (err == error.NoSpaceLeft or err == error.OutOfMemory) {
+            // OOM in scratch FBA during serialization temp-buffer alloc → treat as
+            // capacity exceeded so the JS growth loop doubles the slot (and scratch).
             g_bitmap_last_error = 60;
             return .CAPACITY_EXCEEDED;
         }
@@ -2137,6 +2171,8 @@ fn batchBitmapAdd(
     g_bitmap_last_error = 0;
     const storage = getBitmapStorage(state_base, meta);
     var bitmap = bitmapLoad(storage) orelse {
+        // OOM during deserialize (error 100/101) → scratch FBA exhausted, trigger growth
+        if (g_bitmap_last_error == 100 or g_bitmap_last_error == 101) return .CAPACITY_EXCEEDED;
         if (g_bitmap_last_error == 0) g_bitmap_last_error = 1;
         return .INVALID_STATE;
     };
@@ -2176,6 +2212,7 @@ fn batchBitmapAdd(
             false
         else
             bitmap.value.add(elem) catch {
+                // OOM in scratch FBA during container growth → flush and trigger growth
                 g_bitmap_last_error = 3;
                 if (had_insert) {
                     const flush_result = bitmapStore(storage, &bitmap.value);
@@ -2187,7 +2224,7 @@ fn batchBitmapAdd(
                     setChangeFlag(meta, ChangeFlag.INSERTED);
                 }
                 meta.size_ptr.* = cardinality;
-                return .INVALID_STATE;
+                return .CAPACITY_EXCEEDED;
             };
 
         if (!inserted) {
@@ -2255,7 +2292,7 @@ fn batchBitmapAdd(
 
     const store_result = bitmapStore(storage, &bitmap.value);
     if (store_result != .OK) {
-        g_bitmap_last_error = 6;
+        if (g_bitmap_last_error == 0) g_bitmap_last_error = 6;
         meta.size_ptr.* = original_size;
         return store_result;
     }
@@ -2341,6 +2378,112 @@ fn batchBitmapRemove(
 
     meta.size_ptr.* = cardinality;
     if (had_remove) setChangeFlag(meta, ChangeFlag.REMOVED);
+}
+
+// =============================================================================
+// In-place bitmap set algebra
+// =============================================================================
+
+const BitmapAlgebraOp = enum { AND, OR, AND_NOT, XOR };
+
+/// Force an undo snapshot so bulk bitmap mutations are covered by shadow rollback.
+/// Same mechanism as natural overflow — captures full state at this point.
+fn forceUndoSnapshot() void {
+    if (comptime builtin.cpu.arch == .wasm32) {
+        if (g_undo_state_size <= UNDO_SHADOW_CAPACITY) {
+            @memcpy(g_undo_shadow_static[0..g_undo_state_size], g_undo_state_base[0..g_undo_state_size]);
+            g_undo_shadow_active = true;
+        }
+    } else {
+        const shadow = native_shadow_allocator.alloc(u8, g_undo_state_size) catch null;
+        if (shadow) |s| {
+            @memcpy(s, g_undo_state_base[0..g_undo_state_size]);
+            g_undo_shadow_dynamic = shadow;
+            g_undo_shadow_active = true;
+        }
+    }
+    g_undo_overflow = true;
+}
+
+/// In-place set algebra: mutate target slot's bitmap with source bitmap data.
+/// Uses rawr's in-place operations to avoid allocating a new result bitmap.
+/// Undo uses snapshot-based rollback (not per-element tracking).
+fn batchBitmapAlgebra(
+    comptime op: BitmapAlgebraOp,
+    state_base: [*]u8,
+    target_meta: SlotMeta,
+    source_data: []const u8,
+) ErrorCode {
+    const target_storage = getBitmapStorage(state_base, target_meta);
+    const original_size = target_meta.size_ptr.*;
+
+    // Empty-source identities
+    if (source_data.len == 0) {
+        switch (op) {
+            .AND => {
+                // AND with empty = clear target
+                if (g_undo_enabled and !g_undo_overflow) forceUndoSnapshot();
+                target_storage.serialized_len_ptr.* = 0;
+                @memset(target_storage.payload_ptr[0..target_storage.payload_capacity], 0);
+                target_meta.size_ptr.* = 0;
+                if (original_size != 0) setChangeFlag(target_meta, ChangeFlag.SIZE_CHANGED);
+                return .OK;
+            },
+            // OR/ANDNOT/XOR with empty = no change
+            .OR, .AND_NOT, .XOR => return .OK,
+        }
+    }
+
+    // Force undo snapshot before bulk mutation (individual element tracking impractical)
+    if (g_undo_enabled and !g_undo_overflow) forceUndoSnapshot();
+
+    var target = bitmapLoad(target_storage) orelse return .INVALID_STATE;
+    defer target.deinit();
+
+    // Deserialize source into arena (freed on return)
+    var arena = std.heap.ArenaAllocator.init(bitmap_allocator);
+    defer arena.deinit();
+    var source = RoaringBitmap.deserialize(arena.allocator(), source_data) catch {
+        g_bitmap_last_error = 80;
+        return .INVALID_STATE;
+    };
+
+    // In-place operation
+    switch (op) {
+        .AND => target.value.bitwiseAndInPlace(&source) catch {
+            g_bitmap_last_error = 81;
+            target_meta.size_ptr.* = original_size;
+            return .INVALID_STATE;
+        },
+        .OR => target.value.bitwiseOrInPlace(&source) catch {
+            g_bitmap_last_error = 82;
+            target_meta.size_ptr.* = original_size;
+            return .INVALID_STATE;
+        },
+        .AND_NOT => target.value.bitwiseDifferenceInPlace(&source) catch {
+            g_bitmap_last_error = 83;
+            target_meta.size_ptr.* = original_size;
+            return .INVALID_STATE;
+        },
+        .XOR => target.value.bitwiseXorInPlace(&source) catch {
+            g_bitmap_last_error = 84;
+            target_meta.size_ptr.* = original_size;
+            return .INVALID_STATE;
+        },
+    }
+
+    // Store back
+    const store_result = bitmapStore(target_storage, &target.value);
+    if (store_result != .OK) {
+        target_meta.size_ptr.* = original_size;
+        return store_result;
+    }
+
+    const new_card: u32 = @intCast(target.value.cardinality());
+    target_meta.size_ptr.* = new_card;
+    if (new_card != original_size) setChangeFlag(target_meta, ChangeFlag.SIZE_CHANGED);
+
+    return .OK;
 }
 
 fn batchSetInsert(
@@ -3559,6 +3702,50 @@ fn executeBatchImpl(
 
                 const meta = getSlotMeta(state_base, slot);
                 batchBitmapRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
+            },
+
+            // Bitmap in-place set algebra (slot × slot)
+            .BATCH_BITMAP_AND, .BATCH_BITMAP_OR, .BATCH_BITMAP_ANDNOT, .BATCH_BITMAP_XOR => {
+                const target_slot = code[pc];
+                const source_slot = code[pc + 1];
+                pc += 2;
+
+                const target_meta = getSlotMeta(state_base, target_slot);
+                const source_storage = getBitmapStorage(state_base, getSlotMeta(state_base, source_slot));
+                const source_len = source_storage.serialized_len_ptr.*;
+                const source_data: []const u8 = if (source_len > 0) source_storage.payload_ptr[0..source_len] else &[_]u8{};
+
+                const result = switch (op) {
+                    .BATCH_BITMAP_AND => batchBitmapAlgebra(.AND, state_base, target_meta, source_data),
+                    .BATCH_BITMAP_OR => batchBitmapAlgebra(.OR, state_base, target_meta, source_data),
+                    .BATCH_BITMAP_ANDNOT => batchBitmapAlgebra(.AND_NOT, state_base, target_meta, source_data),
+                    .BATCH_BITMAP_XOR => batchBitmapAlgebra(.XOR, state_base, target_meta, source_data),
+                    else => unreachable,
+                };
+                if (result == .CAPACITY_EXCEEDED) return signalGrowth(target_slot, result);
+                if (result != .OK) return @intFromEnum(result);
+            },
+
+            // Bitmap in-place set algebra (slot × scratch)
+            .BATCH_BITMAP_AND_SCRATCH, .BATCH_BITMAP_OR_SCRATCH, .BATCH_BITMAP_ANDNOT_SCRATCH, .BATCH_BITMAP_XOR_SCRATCH => {
+                const target_slot = code[pc];
+                pc += 1;
+
+                const target_meta = getSlotMeta(state_base, target_slot);
+                const source_data: []const u8 = if (g_algebra_result_len > 0)
+                    @as([*]const u8, @ptrFromInt(g_algebra_result_ptr))[0..g_algebra_result_len]
+                else
+                    &[_]u8{};
+
+                const result = switch (op) {
+                    .BATCH_BITMAP_AND_SCRATCH => batchBitmapAlgebra(.AND, state_base, target_meta, source_data),
+                    .BATCH_BITMAP_OR_SCRATCH => batchBitmapAlgebra(.OR, state_base, target_meta, source_data),
+                    .BATCH_BITMAP_ANDNOT_SCRATCH => batchBitmapAlgebra(.AND_NOT, state_base, target_meta, source_data),
+                    .BATCH_BITMAP_XOR_SCRATCH => batchBitmapAlgebra(.XOR, state_base, target_meta, source_data),
+                    else => unreachable,
+                };
+                if (result == .CAPACITY_EXCEEDED) return signalGrowth(target_slot, result);
+                if (result != .OK) return @intFromEnum(result);
             },
 
             .BATCH_AGG_SUM => {
