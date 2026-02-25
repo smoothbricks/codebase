@@ -2115,9 +2115,8 @@ fn bitmapLoad(storage: BitmapStorage) ?LoadedBitmap {
 }
 
 fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
-    // NOTE: runOptimize disabled temporarily while investigating intermittent INVALID_STATE
-    // during high-volume bitmap mutation in full-suite runs.
-    // _ = bitmap.runOptimize() catch {};
+    // Optimize container encoding (array → run where beneficial) before serialization
+    _ = bitmap.runOptimize() catch {};
 
     const serialized_size_needed = bitmap.serializedSizeInBytes();
     if (serialized_size_needed > storage.payload_capacity) {
@@ -2125,7 +2124,21 @@ fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
         return .CAPACITY_EXCEEDED;
     }
 
-    const serialized_size_usize = bitmap.serializeIntoBuffer(storage.payload_ptr[0..storage.payload_capacity]) catch |err| {
+    // Two-phase commit: serialize to temp buffer first, then copy into slot storage.
+    // serializeIntoBuffer may partially write on failure; this keeps slot bytes unmodified
+    // when we need to return CAPACITY_EXCEEDED/INVALID_STATE and retry after growth.
+    const alloc = bitmapBackingAllocator();
+    const temp = alloc.alloc(u8, serialized_size_needed) catch |err| {
+        if (err == error.OutOfMemory) {
+            g_bitmap_last_error = 60;
+            return .CAPACITY_EXCEEDED;
+        }
+        g_bitmap_last_error = 61;
+        return .INVALID_STATE;
+    };
+    defer alloc.free(temp);
+
+    const serialized_size_usize = bitmap.serializeIntoBuffer(temp) catch |err| {
         if (err == error.NoSpaceLeft or err == error.OutOfMemory) {
             // OOM in scratch FBA during serialization temp-buffer alloc → treat as
             // capacity exceeded so the JS growth loop doubles the slot (and scratch).
@@ -2142,6 +2155,7 @@ fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
     }
 
     storage.serialized_len_ptr.* = serialized_size;
+    @memcpy(storage.payload_ptr[0..serialized_size], temp[0..serialized_size]);
     if (serialized_size < storage.payload_capacity) {
         @memset(storage.payload_ptr[serialized_size..storage.payload_capacity], 0);
     }
