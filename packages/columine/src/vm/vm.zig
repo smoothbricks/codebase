@@ -6006,59 +6006,19 @@ pub export fn vm_rbmp_import_copy(
     return @intFromEnum(ErrorCode.OK);
 }
 
-/// Deserialize both bitmaps into a temporary arena and use rawr's SIMD-accelerated
-/// andCardinality — O(n_containers) instead of the old iterate+contains O(min_card × log).
-fn frozenIntersectCount(a: *const FrozenBitmap, b: *const FrozenBitmap) u32 {
-    const card_a = a.cardinality();
-    const card_b = b.cardinality();
-    const small = if (card_a <= card_b) a else b;
-    const large = if (card_a <= card_b) b else a;
-
-    var count: u32 = 0;
-    var iter = small.iterator();
-    while (iter.next()) |v| {
-        if (large.contains(v)) {
-            if (count == std.math.maxInt(u32)) break;
-            count += 1;
-        }
-    }
-    return count;
-}
-
+/// Zero-allocation intersection cardinality using FrozenBitmap's container-level ops.
 fn deserializedIntersectCount(left_data: []const u8, right_data: []const u8) u32 {
     const left_frozen = FrozenBitmap.init(left_data) catch return 0;
     const right_frozen = FrozenBitmap.init(right_data) catch return 0;
-    const small_card = if (left_frozen.cardinality() <= right_frozen.cardinality()) left_frozen.cardinality() else right_frozen.cardinality();
-
-    // Tiny intersections are cheaper with no-allocation frozen iteration.
-    if (small_card <= 64) {
-        return frozenIntersectCount(&left_frozen, &right_frozen);
-    }
-
-    var arena = std.heap.ArenaAllocator.init(bitmap_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var left = RoaringBitmap.deserialize(alloc, left_data) catch return frozenIntersectCount(&left_frozen, &right_frozen);
-    var right = RoaringBitmap.deserialize(alloc, right_data) catch return frozenIntersectCount(&left_frozen, &right_frozen);
-    const card = left.andCardinality(&right);
+    const card = left_frozen.andCardinality(&right_frozen);
     return if (card > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(card);
 }
 
+/// Zero-allocation intersection check using FrozenBitmap's container-level ops.
 fn deserializedIntersects(left_data: []const u8, right_data: []const u8) bool {
     const left_frozen = FrozenBitmap.init(left_data) catch return false;
     const right_frozen = FrozenBitmap.init(right_data) catch return false;
-    const small_card = if (left_frozen.cardinality() <= right_frozen.cardinality()) left_frozen.cardinality() else right_frozen.cardinality();
-
-    if (small_card <= 64) {
-        return frozenIntersectCount(&left_frozen, &right_frozen) > 0;
-    }
-
-    var arena = std.heap.ArenaAllocator.init(bitmap_allocator);
-    defer arena.deinit();
-    const alloc = arena.allocator();
-    var left = RoaringBitmap.deserialize(alloc, left_data) catch return frozenIntersectCount(&left_frozen, &right_frozen) > 0;
-    var right = RoaringBitmap.deserialize(alloc, right_data) catch return frozenIntersectCount(&left_frozen, &right_frozen) > 0;
-    return left.intersects(&right);
+    return left_frozen.intersects(&right_frozen);
 }
 
 /// Get serialized byte slice from a bitmap slot (returns null if empty/invalid).
