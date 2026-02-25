@@ -67,6 +67,11 @@ function readUserValue(buffer: DynamicUserColumnBuffer, fieldName: string, row: 
   return (values as unknown[])[row];
 }
 
+function readScopeValue(buffer: AnySpanBuffer, fieldName: string): unknown {
+  const scopeValues = buffer._scopeValues as Record<string, unknown> | undefined;
+  return scopeValues?.[fieldName];
+}
+
 /** Map arrow-builder SchemaType to SQLite column type */
 function schemaTypeToSqlite(schemaType: SchemaType): string {
   switch (schemaType) {
@@ -192,8 +197,9 @@ export function buildInsertParams(segment: SpanSegment, row: number, activeUserF
   const message = buffer.message_values[row] ?? null;
 
   const userValues = activeUserFields.map((fieldName) => {
-    const val = readUserValue(buffer as unknown as DynamicUserColumnBuffer, fieldName, row);
-    if (val === undefined) {
+    const directValue = readUserValue(buffer as unknown as DynamicUserColumnBuffer, fieldName, row);
+    const val = directValue ?? readScopeValue(buffer, fieldName);
+    if (val === undefined || val === null) {
       return null;
     }
     return typeof val === 'bigint' ? Number(val) : val;

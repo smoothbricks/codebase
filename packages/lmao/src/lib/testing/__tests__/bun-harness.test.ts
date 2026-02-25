@@ -93,10 +93,10 @@ describe('bun harness test log schema extension', () => {
       span.tag.test_metric(123);
       span.log.info('row-1').test_metric(456).test_note('hello');
 
-      const buffer = span.buffer as unknown as Record<string, unknown>;
-      expect((buffer.test_metric_values as number[])[0]).toBe(123);
-      expect((buffer.test_metric_values as number[])[1]).toBe(456);
-      expect((buffer.test_note_values as string[])[1]).toBe('hello');
+      const buffer = span.buffer;
+      expect(buffer.test_metric_values[0]).toBe(123);
+      expect(buffer.test_metric_values[2]).toBe(456);
+      expect(buffer.test_note_values[2]).toBe('hello');
     });
   });
 });
