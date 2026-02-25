@@ -44,8 +44,7 @@ var g_bitmap_last_error: u32 = 0;
 
 inline fn bitmapBackingAllocator() std.mem.Allocator {
     if (g_bitmap_scratch_ptr != 0 and g_bitmap_scratch_len != 0) {
-        const scratch_ptr: [*]u8 = @ptrFromInt(g_bitmap_scratch_ptr);
-        g_bitmap_scratch_fba = std.heap.FixedBufferAllocator.init(scratch_ptr[0..g_bitmap_scratch_len]);
+        // FBA is already initialised by vm_set_rbmp_scratch — just return its allocator
         return g_bitmap_scratch_fba.allocator();
     }
     return bitmap_allocator;
@@ -387,9 +386,14 @@ var g_needs_growth_slot: u8 = 0xFF;
 /// Configure optional bitmap scratch workspace for the next VM call.
 /// When set, bitmap deserialize/mutate allocations use this caller-owned buffer
 /// instead of wasm_allocator, which avoids heap/state overlap.
+/// Also reinitialises the FBA so bitmapBackingAllocator() doesn't have to.
 pub export fn vm_set_rbmp_scratch(ptr: u32, len: u32) void {
     g_bitmap_scratch_ptr = @as(usize, ptr);
     g_bitmap_scratch_len = len;
+    if (ptr != 0 and len != 0) {
+        const scratch_ptr: [*]u8 = @ptrFromInt(@as(usize, ptr));
+        g_bitmap_scratch_fba = std.heap.FixedBufferAllocator.init(scratch_ptr[0..len]);
+    }
 }
 
 inline fn clearBitmapScratch() void {
@@ -2080,6 +2084,8 @@ fn bitmapLoad(storage: BitmapStorage) ?LoadedBitmap {
 }
 
 fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
+    // Optimize container encoding (array → run where beneficial) before serialization
+    _ = bitmap.runOptimize() catch {};
     const serialized_size_usize = bitmap.serializeIntoBuffer(storage.payload_ptr[0..storage.payload_capacity]) catch |err| {
         if (err == error.NoSpaceLeft) {
             g_bitmap_last_error = 60;
@@ -5792,37 +5798,48 @@ pub export fn vm_rbmp_import_copy(
     return @intFromEnum(ErrorCode.OK);
 }
 
-fn frozenIntersectCount(a: *const FrozenBitmap, b: *const FrozenBitmap) u32 {
-    const card_a = a.cardinality();
-    const card_b = b.cardinality();
-    const small = if (card_a <= card_b) a else b;
-    const large = if (card_a <= card_b) b else a;
+/// Deserialize both bitmaps into a temporary arena and use rawr's SIMD-accelerated
+/// andCardinality — O(n_containers) instead of the old iterate+contains O(min_card × log).
+fn deserializedIntersectCount(left_data: []const u8, right_data: []const u8) u32 {
+    var arena = std.heap.ArenaAllocator.init(bitmap_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var left = RoaringBitmap.deserialize(alloc, left_data) catch return 0;
+    var right = RoaringBitmap.deserialize(alloc, right_data) catch return 0;
+    const card = left.andCardinality(&right);
+    return if (card > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(card);
+}
 
-    var count: u32 = 0;
-    var iter = small.iterator();
-    while (iter.next()) |v| {
-        if (large.contains(v)) {
-            if (count == std.math.maxInt(u32)) break;
-            count += 1;
-        }
-    }
-    return count;
+fn deserializedIntersects(left_data: []const u8, right_data: []const u8) bool {
+    var arena = std.heap.ArenaAllocator.init(bitmap_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+    var left = RoaringBitmap.deserialize(alloc, left_data) catch return false;
+    var right = RoaringBitmap.deserialize(alloc, right_data) catch return false;
+    return left.intersects(&right);
+}
+
+/// Get serialized byte slice from a bitmap slot (returns null if empty/invalid).
+inline fn slotSerializedData(storage: BitmapStorage) ?[]const u8 {
+    const serialized_len = storage.serialized_len_ptr.*;
+    if (serialized_len == 0 or serialized_len > storage.payload_capacity) return null;
+    return storage.payload_ptr[0..serialized_len];
 }
 
 pub export fn vm_rbmp_intersect_any_slots(state_base: [*]u8, left_slot_offset: u32, right_slot_offset: u32) u32 {
     const left = getBitmapSlotByOffset(state_base, left_slot_offset) orelse return 0;
     const right = getBitmapSlotByOffset(state_base, right_slot_offset) orelse return 0;
-    const left_frozen = bitmapFrozen(left.storage) orelse return 0;
-    const right_frozen = bitmapFrozen(right.storage) orelse return 0;
-    return if (frozenIntersectCount(&left_frozen, &right_frozen) > 0) 1 else 0;
+    const left_data = slotSerializedData(left.storage) orelse return 0;
+    const right_data = slotSerializedData(right.storage) orelse return 0;
+    return if (deserializedIntersects(left_data, right_data)) 1 else 0;
 }
 
 pub export fn vm_rbmp_intersect_count_slots(state_base: [*]u8, left_slot_offset: u32, right_slot_offset: u32) u32 {
     const left = getBitmapSlotByOffset(state_base, left_slot_offset) orelse return 0;
     const right = getBitmapSlotByOffset(state_base, right_slot_offset) orelse return 0;
-    const left_frozen = bitmapFrozen(left.storage) orelse return 0;
-    const right_frozen = bitmapFrozen(right.storage) orelse return 0;
-    return frozenIntersectCount(&left_frozen, &right_frozen);
+    const left_data = slotSerializedData(left.storage) orelse return 0;
+    const right_data = slotSerializedData(right.storage) orelse return 0;
+    return deserializedIntersectCount(left_data, right_data);
 }
 
 pub export fn vm_rbmp_intersect_any_serialized(
@@ -5832,9 +5849,7 @@ pub export fn vm_rbmp_intersect_any_serialized(
     right_len: u32,
 ) u32 {
     if (left_len == 0 or right_len == 0) return 0;
-    const left = FrozenBitmap.init(left_ptr[0..left_len]) catch return 0;
-    const right = FrozenBitmap.init(right_ptr[0..right_len]) catch return 0;
-    return if (frozenIntersectCount(&left, &right) > 0) 1 else 0;
+    return if (deserializedIntersects(left_ptr[0..left_len], right_ptr[0..right_len])) 1 else 0;
 }
 
 pub export fn vm_rbmp_intersect_count_serialized(
@@ -5844,9 +5859,172 @@ pub export fn vm_rbmp_intersect_count_serialized(
     right_len: u32,
 ) u32 {
     if (left_len == 0 or right_len == 0) return 0;
-    const left = FrozenBitmap.init(left_ptr[0..left_len]) catch return 0;
-    const right = FrozenBitmap.init(right_ptr[0..right_len]) catch return 0;
-    return frozenIntersectCount(&left, &right);
+    return deserializedIntersectCount(left_ptr[0..left_len], right_ptr[0..right_len]);
+}
+
+// =============================================================================
+// Set Algebra Exports (decision-function-side)
+// =============================================================================
+
+/// Global result location for set algebra operations.
+/// Result data lives in bitmap scratch FBA until the next prepareScratch().
+var g_algebra_result_ptr: u32 = 0;
+var g_algebra_result_len: u32 = 0;
+
+pub export fn vm_rbmp_algebra_result_ptr() u32 {
+    return g_algebra_result_ptr;
+}
+
+pub export fn vm_rbmp_algebra_result_len() u32 {
+    return g_algebra_result_len;
+}
+
+/// Get a bitmap slot's serialized data pointer (no copy).
+pub export fn vm_rbmp_slot_data_ptr(state_base: [*]u8, slot_offset: u32) u32 {
+    const slot = getBitmapSlotByOffset(state_base, slot_offset) orelse return 0;
+    return @intCast(@intFromPtr(slot.storage.payload_ptr));
+}
+
+/// Get a bitmap slot's serialized data length (no copy).
+pub export fn vm_rbmp_slot_data_len(state_base: [*]u8, slot_offset: u32) u32 {
+    const slot = getBitmapSlotByOffset(state_base, slot_offset) orelse return 0;
+    const serialized_len = slot.storage.serialized_len_ptr.*;
+    if (serialized_len > slot.storage.payload_capacity) return 0;
+    return serialized_len;
+}
+
+/// Copy raw bytes into bitmap scratch. Used for empty-set identity fast paths.
+fn copyToScratch(src: [*]const u8, len: u32) u32 {
+    const scratch = bitmapBackingAllocator();
+    const out = scratch.alloc(u8, len) catch {
+        g_bitmap_last_error = 70;
+        return @intFromEnum(ErrorCode.CAPACITY_EXCEEDED);
+    };
+    @memcpy(out, src[0..len]);
+    g_algebra_result_ptr = @intCast(@intFromPtr(out.ptr));
+    g_algebra_result_len = len;
+    return @intFromEnum(ErrorCode.OK);
+}
+
+const AlgebraOp = enum { AND, OR, AND_NOT, XOR };
+
+/// Core set algebra: deserialize into arena, compute op, serialize result into scratch.
+fn rbmpSetAlgebra(
+    left_ptr: [*]const u8,
+    left_len: u32,
+    right_ptr: [*]const u8,
+    right_len: u32,
+    comptime op: AlgebraOp,
+) u32 {
+    g_algebra_result_ptr = 0;
+    g_algebra_result_len = 0;
+
+    // Empty-set identities — copy survivor directly into scratch
+    if (left_len == 0 and right_len == 0) return @intFromEnum(ErrorCode.OK);
+    if (left_len == 0) return switch (op) {
+        .AND, .AND_NOT => @intFromEnum(ErrorCode.OK), // empty result
+        .OR, .XOR => copyToScratch(right_ptr, right_len),
+    };
+    if (right_len == 0) return switch (op) {
+        .AND => @intFromEnum(ErrorCode.OK), // empty result
+        .OR, .AND_NOT, .XOR => copyToScratch(left_ptr, left_len),
+    };
+
+    // Arena for deserialization temporaries — bulk freed on return
+    var arena = std.heap.ArenaAllocator.init(bitmap_allocator);
+    defer arena.deinit();
+    const alloc = arena.allocator();
+
+    var left = RoaringBitmap.deserialize(alloc, left_ptr[0..left_len]) catch {
+        g_bitmap_last_error = 71;
+        return @intFromEnum(ErrorCode.INVALID_STATE);
+    };
+    var right = RoaringBitmap.deserialize(alloc, right_ptr[0..right_len]) catch {
+        g_bitmap_last_error = 72;
+        return @intFromEnum(ErrorCode.INVALID_STATE);
+    };
+    var result = switch (op) {
+        .AND => left.bitwiseAnd(alloc, &right),
+        .OR => left.bitwiseOr(alloc, &right),
+        .AND_NOT => left.bitwiseDifference(alloc, &right),
+        .XOR => left.bitwiseXor(alloc, &right),
+    } catch {
+        g_bitmap_last_error = 73;
+        return @intFromEnum(ErrorCode.INVALID_STATE);
+    };
+
+    _ = result.runOptimize() catch {};
+
+    // Serialize result into bitmap scratch (persists until next prepareScratch)
+    const size = result.serializedSizeInBytes();
+    const scratch = bitmapBackingAllocator();
+    const out = scratch.alloc(u8, size) catch {
+        g_bitmap_last_error = 74;
+        return @intFromEnum(ErrorCode.CAPACITY_EXCEEDED);
+    };
+    _ = result.serializeIntoBuffer(out) catch {
+        g_bitmap_last_error = 75;
+        return @intFromEnum(ErrorCode.INVALID_STATE);
+    };
+
+    g_algebra_result_ptr = @intCast(@intFromPtr(out.ptr));
+    g_algebra_result_len = @intCast(size);
+    return @intFromEnum(ErrorCode.OK);
+}
+
+pub export fn vm_rbmp_and(lp: [*]const u8, ll: u32, rp: [*]const u8, rl: u32) u32 {
+    return rbmpSetAlgebra(lp, ll, rp, rl, .AND);
+}
+
+pub export fn vm_rbmp_or(lp: [*]const u8, ll: u32, rp: [*]const u8, rl: u32) u32 {
+    return rbmpSetAlgebra(lp, ll, rp, rl, .OR);
+}
+
+pub export fn vm_rbmp_andnot(lp: [*]const u8, ll: u32, rp: [*]const u8, rl: u32) u32 {
+    return rbmpSetAlgebra(lp, ll, rp, rl, .AND_NOT);
+}
+
+pub export fn vm_rbmp_xor(lp: [*]const u8, ll: u32, rp: [*]const u8, rl: u32) u32 {
+    return rbmpSetAlgebra(lp, ll, rp, rl, .XOR);
+}
+
+// =============================================================================
+// Query Exports for Scratch-Resident or Slot-Resident Serialized Data
+// =============================================================================
+
+/// Check if a serialized bitmap (in scratch or slot storage) contains a value.
+pub export fn vm_rbmp_contains_serialized(ptr: [*]const u8, len: u32, value: u32) u32 {
+    if (len == 0) return 0;
+    const frozen = FrozenBitmap.init(ptr[0..len]) catch return 0;
+    return if (frozen.contains(value)) 1 else 0;
+}
+
+/// Get cardinality of a serialized bitmap (in scratch or slot storage).
+pub export fn vm_rbmp_cardinality_serialized(ptr: [*]const u8, len: u32) u32 {
+    if (len == 0) return 0;
+    const frozen = FrozenBitmap.init(ptr[0..len]) catch return 0;
+    const card = frozen.cardinality();
+    return if (card > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(card);
+}
+
+/// Extract all values from a serialized bitmap into an output buffer.
+/// Returns the number of values written (capped at out_capacity).
+pub export fn vm_rbmp_extract_serialized(
+    data_ptr: [*]const u8,
+    data_len: u32,
+    out_ptr: [*]u32,
+    out_capacity: u32,
+) u32 {
+    if (data_len == 0) return 0;
+    const frozen = FrozenBitmap.init(data_ptr[0..data_len]) catch return 0;
+    var iter = frozen.iterator();
+    var count: u32 = 0;
+    while (iter.next()) |v| {
+        if (count >= out_capacity) break;
+        out_ptr[count] = v;
+        count += 1;
+    }
+    return count;
 }
 
 // =============================================================================
