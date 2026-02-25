@@ -233,6 +233,11 @@ export type BunTestSuiteUseTestTracer<
   TExt extends SchemaFields = Record<never, never>,
 > = ReturnType<typeof makeBunTestSuiteTracer<B, TExt>>['useTestTracer'];
 
+export type TestTracer<
+  B extends OpContextBinding,
+  TExt extends SchemaFields = Record<never, never>,
+> = BunTestSuiteUseTestTracer<B, TExt>;
+
 let _activeSuiteTracer: BunTestTracerInstance<OpContextBinding> | null = null;
 
 export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTestTracerInstance<B>): void {
