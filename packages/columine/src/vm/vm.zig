@@ -41,6 +41,42 @@ var g_bitmap_scratch_ptr: usize = 0;
 var g_bitmap_scratch_len: u32 = 0;
 var g_bitmap_scratch_fba = std.heap.FixedBufferAllocator.init(&[_]u8{});
 var g_bitmap_last_error: u32 = 0;
+var g_bitmap_store_temp: ?[]u8 = null;
+var g_algebra_result_buf: ?[]u8 = null;
+
+fn ensureReusableBuffer(
+    allocator: std.mem.Allocator,
+    buffer: *?[]u8,
+    min_len: usize,
+    oom_error_code: u32,
+    other_error_code: u32,
+) ?[]u8 {
+    if (min_len == 0) return &[_]u8{};
+
+    if (buffer.*) |existing| {
+        if (existing.len >= min_len) return existing[0..min_len];
+
+        const grown = allocator.realloc(existing, min_len) catch |err| {
+            if (err == error.OutOfMemory)
+                g_bitmap_last_error = oom_error_code
+            else
+                g_bitmap_last_error = other_error_code;
+            return null;
+        };
+        buffer.* = grown;
+        return grown[0..min_len];
+    }
+
+    const allocated = allocator.alloc(u8, min_len) catch |err| {
+        if (err == error.OutOfMemory)
+            g_bitmap_last_error = oom_error_code
+        else
+            g_bitmap_last_error = other_error_code;
+        return null;
+    };
+    buffer.* = allocated;
+    return allocated[0..min_len];
+}
 
 inline fn bitmapBackingAllocator() std.mem.Allocator {
     if (g_bitmap_scratch_ptr != 0 and g_bitmap_scratch_len != 0) {
@@ -2127,16 +2163,20 @@ fn bitmapStore(storage: BitmapStorage, bitmap: *RoaringBitmap) ErrorCode {
     // Two-phase commit: serialize to temp buffer first, then copy into slot storage.
     // serializeIntoBuffer may partially write on failure; this keeps slot bytes unmodified
     // when we need to return CAPACITY_EXCEEDED/INVALID_STATE and retry after growth.
-    const alloc = bitmapBackingAllocator();
-    const temp = alloc.alloc(u8, serialized_size_needed) catch |err| {
-        if (err == error.OutOfMemory) {
-            g_bitmap_last_error = 60;
-            return .CAPACITY_EXCEEDED;
+    const scratch_active = g_bitmap_scratch_ptr != 0 and g_bitmap_scratch_len != 0;
+    const temp = if (scratch_active)
+        bitmapBackingAllocator().alloc(u8, serialized_size_needed) catch |err| {
+            if (err == error.OutOfMemory) {
+                g_bitmap_last_error = 60;
+                return .CAPACITY_EXCEEDED;
+            }
+            g_bitmap_last_error = 61;
+            return .INVALID_STATE;
         }
-        g_bitmap_last_error = 61;
-        return .INVALID_STATE;
-    };
-    defer alloc.free(temp);
+    else
+        ensureReusableBuffer(bitmap_allocator, &g_bitmap_store_temp, serialized_size_needed, 60, 61) orelse {
+            return if (g_bitmap_last_error == 61) .INVALID_STATE else .CAPACITY_EXCEEDED;
+        };
 
     const serialized_size_usize = bitmap.serializeIntoBuffer(temp) catch |err| {
         if (err == error.NoSpaceLeft or err == error.OutOfMemory) {
@@ -6069,7 +6109,7 @@ pub export fn vm_rbmp_intersect_count_serialized(
 // =============================================================================
 
 /// Global result location for set algebra operations.
-/// Result data lives in bitmap scratch FBA until the next prepareScratch().
+/// Backed by dedicated VM-owned storage so later scratch allocations cannot clobber it.
 var g_algebra_result_ptr: u32 = 0;
 var g_algebra_result_len: u32 = 0;
 
@@ -6095,22 +6135,25 @@ pub export fn vm_rbmp_slot_data_len(state_base: [*]u8, slot_offset: u32) u32 {
     return serialized_len;
 }
 
-/// Copy raw bytes into bitmap scratch. Used for empty-set identity fast paths.
-fn copyToScratch(src: [*]const u8, len: u32) u32 {
-    const scratch = bitmapBackingAllocator();
-    const out = scratch.alloc(u8, len) catch {
-        g_bitmap_last_error = 70;
+fn setAlgebraResult(src: []const u8, oom_error_code: u32) u32 {
+    if (src.len == 0) {
+        g_algebra_result_ptr = 0;
+        g_algebra_result_len = 0;
+        return @intFromEnum(ErrorCode.OK);
+    }
+
+    const out = ensureReusableBuffer(bitmap_allocator, &g_algebra_result_buf, src.len, oom_error_code, oom_error_code) orelse {
         return @intFromEnum(ErrorCode.CAPACITY_EXCEEDED);
     };
-    @memcpy(out, src[0..len]);
+    @memcpy(out, src);
     g_algebra_result_ptr = @intCast(@intFromPtr(out.ptr));
-    g_algebra_result_len = len;
+    g_algebra_result_len = @intCast(src.len);
     return @intFromEnum(ErrorCode.OK);
 }
 
 const AlgebraOp = enum { AND, OR, AND_NOT, XOR };
 
-/// Core set algebra: deserialize into arena, compute op, serialize result into scratch.
+/// Core set algebra: deserialize into arena, compute op, serialize result into VM-owned buffer.
 fn rbmpSetAlgebra(
     left_ptr: [*]const u8,
     left_len: u32,
@@ -6121,15 +6164,15 @@ fn rbmpSetAlgebra(
     g_algebra_result_ptr = 0;
     g_algebra_result_len = 0;
 
-    // Empty-set identities — copy survivor directly into scratch
+    // Empty-set identities — copy survivor directly into VM-owned algebra storage
     if (left_len == 0 and right_len == 0) return @intFromEnum(ErrorCode.OK);
     if (left_len == 0) return switch (op) {
         .AND, .AND_NOT => @intFromEnum(ErrorCode.OK), // empty result
-        .OR, .XOR => copyToScratch(right_ptr, right_len),
+        .OR, .XOR => setAlgebraResult(right_ptr[0..right_len], 70),
     };
     if (right_len == 0) return switch (op) {
         .AND => @intFromEnum(ErrorCode.OK), // empty result
-        .OR, .AND_NOT, .XOR => copyToScratch(left_ptr, left_len),
+        .OR, .AND_NOT, .XOR => setAlgebraResult(left_ptr[0..left_len], 70),
     };
 
     // Arena for deserialization temporaries — bulk freed on return
@@ -6157,11 +6200,9 @@ fn rbmpSetAlgebra(
 
     _ = result.runOptimize() catch {};
 
-    // Serialize result into bitmap scratch (persists until next prepareScratch)
+    // Serialize result into VM-owned buffer.
     const size = result.serializedSizeInBytes();
-    const scratch = bitmapBackingAllocator();
-    const out = scratch.alloc(u8, size) catch {
-        g_bitmap_last_error = 74;
+    const out = ensureReusableBuffer(bitmap_allocator, &g_algebra_result_buf, size, 74, 74) orelse {
         return @intFromEnum(ErrorCode.CAPACITY_EXCEEDED);
     };
     _ = result.serializeIntoBuffer(out) catch {

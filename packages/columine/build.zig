@@ -14,10 +14,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // Force wasm SIMD for columine/rawr wasm build paths.
+    const wasm_simd_features = std.Target.wasm.featureSet(&.{.simd128});
     // WASM target for msgpack dependency
     const wasm_target = b.resolveTargetQuery(.{
         .cpu_arch = .wasm32,
         .os_tag = .freestanding,
+        .cpu_features_add = wasm_simd_features,
     });
     const msgpack_wasm_dep = b.dependency("zig_msgpack", .{
         .target = wasm_target,
