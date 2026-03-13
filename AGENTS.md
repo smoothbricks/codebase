@@ -153,6 +153,14 @@ directives:
 - **QUESTION ASSUMPTIONS** - implementation may have discovered better approaches than spec requirements
 - When in doubt, ask - don't blindly follow specs if implementation suggests better patterns
 
++ ### VM-Only Reducer Goal (MANDATORY)
++
++- **Reducer runtime of record is VM state only.** Do not keep parallel JS-owned reducer state, hybrid packed snapshots,
++  or JS `applyEvent()` state machines for domain agents.
++- If tests or decisions need a friendlier shape, derive a **read-only projection from VM state at the boundary**. The
++  projection is a view, not another source of truth.
++- If the VM cannot represent needed state yet, implement the VM capability instead of adding a JS fallback.
+
 ## ERROR HANDLING POLICY (RESULT VS THROW)
 
 This repo uses a strict policy:
@@ -326,7 +334,7 @@ The agent should:
 
 > **See specs/lmao/00_package_architecture.md for complete details including WHY each decision was made.**
 
-### @packages/arrow-builder - Low-Level Alternative to apache-arrow
+### @packages/arrow-builder - Low-Level Alternative to Apache Arrow
 
 **Purpose**: Explicit, visible allocations for Arrow table construction (NOT Apache Arrow's hidden resizing!)
 
@@ -439,6 +447,13 @@ Policy:
 - If a cast seems required, treat it as a typing bug in source API design and fix types first.
 - Back-compat `unknown` defaults may exist in core public generics, but helper/harness APIs must still preserve concrete
   inferred types at the call site.
+
++ ### Inference-First API Design (MANDATORY)
++
++  `createTestContext()` over handwritten context/state helper interfaces.
++- Do not manually restate large context shapes when the library can infer them; fix the helper/generic surface instead.
++- A small narrowed local type is acceptable only after inference fails and only to describe a truly smaller surface, not
++  to duplicate the real API contract.
 
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/lmao/01a_trace_schema_system.md):
 
