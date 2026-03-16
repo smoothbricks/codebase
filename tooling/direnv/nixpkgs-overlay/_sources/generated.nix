@@ -7,34 +7,34 @@
 }: {
   bun-aarch64-darwin = {
     pname = "bun-aarch64-darwin";
-    version = "1.3.5";
+    version = "canary";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-darwin-aarch64.zip";
-      sha256 = "sha256-2xdYikrqiASFaCXUvq0/BeHzcnbKYG8342m09y810/s=";
+      url = "https://github.com/oven-sh/bun/releases/download/canary/bun-darwin-aarch64.zip";
+      sha256 = "sha256-x1m2QXUxCN54wnYBabXyUdy6yekLpbxU+i/LfhYg5Xo=";
     };
   };
   bun-aarch64-linux = {
     pname = "bun-aarch64-linux";
-    version = "1.3.5";
+    version = "canary";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-linux-aarch64.zip";
-      sha256 = "sha256-7QEAD4W9l3hSKK0oRdySoYYLgFSFaCbXMXaQrI+O50s=";
+      url = "https://github.com/oven-sh/bun/releases/download/canary/bun-linux-aarch64.zip";
+      sha256 = "sha256-jfreZ2R2Dz2dufeRhT9R7YKsFKWfXZ7tgkcWv2Gayzo=";
     };
   };
   bun-x86_64-darwin = {
     pname = "bun-x86_64-darwin";
-    version = "1.3.5";
+    version = "canary";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-darwin-x64.zip";
-      sha256 = "sha256-9f/AMDD+UnqGKV+1hSuwjF6ZtwdWABHR1QmrAokCvyk=";
+      url = "https://github.com/oven-sh/bun/releases/download/canary/bun-darwin-x64.zip";
+      sha256 = "sha256-zrtzr0U7A24hxVn/X1EsvSV10+44ynxsaV9SsXGOpYA=";
     };
   };
   bun-x86_64-linux = {
     pname = "bun-x86_64-linux";
-    version = "1.3.5";
+    version = "canary";
     src = fetchurl {
-      url = "https://github.com/oven-sh/bun/releases/download/bun-v1.3.5/bun-linux-x64.zip";
-      sha256 = "sha256-cFHYapJK7+o+C5YhO1/Y95wHk/nK5lNCM+Yn5cPbRmk=";
+      url = "https://github.com/oven-sh/bun/releases/download/canary/bun-linux-x64.zip";
+      sha256 = "sha256-K9jnJqFA0FyBK1ZvfBUNZHO/u9emGb2cNClaWUwKmJQ=";
     };
   };
 }
