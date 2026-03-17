@@ -3475,8 +3475,20 @@ fn maskedAggCount(type_data: [*]const u32, type_id: u32, batch_len: u32) u32 {
 }
 
 fn maskedAggMin(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, batch_len: u32, current_min: f64) f64 {
-    var result = current_min;
+    var min_vec: V4f64 = @splat(current_min);
+    const type_id_vec: V4u32 = @splat(type_id);
+    const identity: V4f64 = @splat(std.math.inf(f64)); // non-matching lanes use +inf (neutral for min)
     var i: u32 = 0;
+
+    while (i + 4 <= batch_len) : (i += 4) {
+        const type_vec: V4u32 = .{ type_data[i], type_data[i + 1], type_data[i + 2], type_data[i + 3] };
+        const mask = type_vec == type_id_vec;
+        const val_vec: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
+        const selected = @select(f64, mask, val_vec, identity);
+        min_vec = @min(min_vec, selected);
+    }
+
+    var result = @reduce(.Min, min_vec);
     while (i < batch_len) : (i += 1) {
         if (type_data[i] == type_id) result = @min(result, val_col[i]);
     }
@@ -3484,8 +3496,20 @@ fn maskedAggMin(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, ba
 }
 
 fn maskedAggMax(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, batch_len: u32, current_max: f64) f64 {
-    var result = current_max;
+    var max_vec: V4f64 = @splat(current_max);
+    const type_id_vec: V4u32 = @splat(type_id);
+    const identity: V4f64 = @splat(-std.math.inf(f64)); // non-matching lanes use -inf (neutral for max)
     var i: u32 = 0;
+
+    while (i + 4 <= batch_len) : (i += 4) {
+        const type_vec: V4u32 = .{ type_data[i], type_data[i + 1], type_data[i + 2], type_data[i + 3] };
+        const mask = type_vec == type_id_vec;
+        const val_vec: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
+        const selected = @select(f64, mask, val_vec, identity);
+        max_vec = @max(max_vec, selected);
+    }
+
+    var result = @reduce(.Max, max_vec);
     while (i < batch_len) : (i += 1) {
         if (type_data[i] == type_id) result = @max(result, val_col[i]);
     }
