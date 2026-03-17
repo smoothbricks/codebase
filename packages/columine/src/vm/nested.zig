@@ -99,7 +99,7 @@ pub fn readNestedPrefix(state_base: [*]u8, slot_offset: u32) NestedPrefix {
     };
 }
 
-fn writeNestedPrefix(state_base: [*]u8, slot_offset: u32, prefix: NestedPrefix) void {
+pub fn writeNestedPrefix(state_base: [*]u8, slot_offset: u32, prefix: NestedPrefix) void {
     const base = state_base + slot_offset;
     base[0] = @intFromEnum(prefix.inner_type);
     base[1] = @truncate(prefix.inner_initial_cap);
@@ -117,19 +117,19 @@ fn writeNestedPrefix(state_base: [*]u8, slot_offset: u32, prefix: NestedPrefix) 
 
 /// Outer hash table layout (after NESTED_PREFIX_SIZE prefix):
 ///   [keys: u32 × cap] [inner_ptrs: u32 × cap] [arena_hdr: 8] [arena_data: ...]
-fn outerKeysOffset(slot_offset: u32) u32 {
+pub fn outerKeysOffset(slot_offset: u32) u32 {
     return slot_offset + NESTED_PREFIX_SIZE;
 }
 
-fn outerPtrsOffset(slot_offset: u32, capacity: u32) u32 {
+pub fn outerPtrsOffset(slot_offset: u32, capacity: u32) u32 {
     return outerKeysOffset(slot_offset) + capacity * 4;
 }
 
-fn arenaHeaderOffset(slot_offset: u32, capacity: u32) u32 {
+pub fn arenaHeaderOffset(slot_offset: u32, capacity: u32) u32 {
     return outerPtrsOffset(slot_offset, capacity) + capacity * 4;
 }
 
-fn arenaDataOffset(slot_offset: u32, capacity: u32) u32 {
+pub fn arenaDataOffset(slot_offset: u32, capacity: u32) u32 {
     return arenaHeaderOffset(slot_offset, capacity) + ARENA_HDR_SIZE;
 }
 
@@ -1330,4 +1330,134 @@ test "stress — CAPACITY_EXCEEDED when arena is exhausted" {
     try testing.expect(got_capacity_exceeded);
     // But some inserts should have succeeded
     try testing.expect(meta.size_ptr.* > 0);
+}
+
+// =============================================================================
+// End-to-end test: full VM pipeline (program → state → execute)
+// =============================================================================
+
+const vm = @import("vm.zig");
+
+/// Build a program with one NESTED slot (Map<K, Set<V>>) and a FOR_EACH_EVENT
+/// block containing NESTED_SET_INSERT.
+fn buildNestedSetE2EProgram(type_id: u32) [128]u8 {
+    const PROGRAM_HASH_PREFIX = types.PROGRAM_HASH_PREFIX;
+    var prog = [_]u8{0} ** 128;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+
+    // Magic "CLM1"
+    content[0] = 0x41;
+    content[1] = 0x58;
+    content[2] = 0x45;
+    content[3] = 0x31;
+    // Version 1.0
+    content[4] = 1;
+    content[5] = 0;
+    // num_slots=1, num_inputs=3 (type_col, outer_key_col, elem_col)
+    content[6] = 1;
+    content[7] = 3;
+    content[8] = 0;
+    content[9] = 0;
+
+    // Init section: SLOT_NESTED (9 bytes: opcode + 8 params)
+    const init_len: u16 = 9;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+
+    // Reduce section: FOR_EACH_EVENT header(8) + body(NESTED_SET_INSERT 4 bytes)
+    const body_len: u16 = 4;
+    const reduce_len: u16 = 8 + body_len;
+    content[12] = @truncate(reduce_len);
+    content[13] = @truncate(reduce_len >> 8);
+
+    // Init section at content[14]
+    var off: usize = 14;
+    // SLOT_NESTED: slot=0, type_flags=0x09(NESTED), outer_cap=32, inner_type=HASHSET(1), inner_cap=8, inner_agg=0
+    content[off] = 0x1A; // SLOT_NESTED opcode
+    content[off + 1] = 0; // slot index
+    content[off + 2] = 0x09; // type_flags: NESTED=9
+    content[off + 3] = 32; // outer_cap_lo
+    content[off + 4] = 0; // outer_cap_hi
+    content[off + 5] = 1; // inner_type = HASHSET
+    content[off + 6] = 8; // inner_cap_lo
+    content[off + 7] = 0; // inner_cap_hi
+    content[off + 8] = 0; // inner_agg_type = NONE (not applicable for sets)
+    off += 9;
+
+    // Reduce section at content[14 + init_len]
+    const reduce_start = 14 + init_len;
+    // FOR_EACH_EVENT: type_col=0, type_id=LE32, body_len=LE16
+    content[reduce_start] = 0xE0; // FOR_EACH_EVENT opcode
+    content[reduce_start + 1] = 0; // type_col
+    content[reduce_start + 2] = @truncate(type_id);
+    content[reduce_start + 3] = @truncate(type_id >> 8);
+    content[reduce_start + 4] = @truncate(type_id >> 16);
+    content[reduce_start + 5] = @truncate(type_id >> 24);
+    content[reduce_start + 6] = @truncate(body_len);
+    content[reduce_start + 7] = @truncate(body_len >> 8);
+
+    // Body: NESTED_SET_INSERT slot=0, outer_key_col=1, elem_col=2
+    const body_start = reduce_start + 8;
+    content[body_start] = 0x90; // NESTED_SET_INSERT
+    content[body_start + 1] = 0; // slot
+    content[body_start + 2] = 1; // outer_key_col
+    content[body_start + 3] = 2; // elem_col
+
+    return prog;
+}
+
+test "e2e — NESTED_SET_INSERT through full VM pipeline" {
+    const type_id: u32 = 1;
+    const prog = buildNestedSetE2EProgram(type_id);
+    const prog_len: u32 = @intCast(prog.len);
+
+    // Calculate state size
+    const state_size = vm.vm_calculate_state_size(&prog, prog_len);
+    try testing.expect(state_size > 0);
+
+    // Allocate and initialize state
+    var state_buf: [32768]u8 = [_]u8{0} ** 32768;
+    try testing.expect(state_size <= 32768);
+    const init_result = vm.vm_init_state(&state_buf, &prog, prog_len);
+    try testing.expectEqual(@as(u32, 0), init_result); // ErrorCode.OK
+
+    // Build batch: 4 events
+    // Col 0: type_col (all type_id=1)
+    // Col 1: outer_key_col (keys: 10, 10, 20, 10)
+    // Col 2: elem_col (elems: 100, 101, 100, 100)  ← last is dup for key=10
+    var type_data = [_]u32{ type_id, type_id, type_id, type_id };
+    var outer_keys = [_]u32{ 10, 10, 20, 10 };
+    var elems = [_]u32{ 100, 101, 100, 100 };
+    const col_ptrs = [_][*]const u8{
+        @ptrCast(&type_data),
+        @ptrCast(&outer_keys),
+        @ptrCast(&elems),
+    };
+
+    const exec_result = vm.vm_execute_batch(
+        &state_buf,
+        &prog,
+        prog_len,
+        &col_ptrs,
+        3,
+        4,
+    );
+    try testing.expectEqual(@as(u32, 0), exec_result); // ErrorCode.OK
+
+    // Read results: slot 0 should have 2 outer keys (10, 20)
+    const meta = getSlotMeta(&state_buf, 0);
+    try testing.expectEqual(@as(u32, 2), meta.size_ptr.*);
+
+    // Key 10 should have inner set {100, 101} (dup 100 is idempotent)
+    const inner_10 = getInnerOffset(&state_buf, meta, 10);
+    try testing.expect(inner_10 != 0);
+    try testing.expectEqual(@as(u32, 2), getInnerSetSize(&state_buf, inner_10));
+    try testing.expect(innerSetContains(&state_buf, inner_10, 100));
+    try testing.expect(innerSetContains(&state_buf, inner_10, 101));
+
+    // Key 20 should have inner set {100}
+    const inner_20 = getInnerOffset(&state_buf, meta, 20);
+    try testing.expect(inner_20 != 0);
+    try testing.expectEqual(@as(u32, 1), getInnerSetSize(&state_buf, inner_20));
+    try testing.expect(innerSetContains(&state_buf, inner_20, 100));
 }

@@ -3965,6 +3965,12 @@ inline fn bodyOpLen(code: []const u8, pc_offset: usize) u32 {
             const inner_len = @as(u32, code[pc_offset + 3]) | (@as(u32, code[pc_offset + 4]) << 8);
             break :blk 5 + inner_len;
         },
+        // NESTED_SET_INSERT: op + slot + outer_key_col + elem_col
+        0x90 => 4,
+        // NESTED_MAP_UPSERT_LAST: op + slot + outer_key_col + inner_key_col + val_col
+        0x92 => 5,
+        // NESTED_AGG_UPDATE: op + slot + outer_key_col + val_col
+        0x95 => 4,
         else => 1, // unknown — advance 1 byte to avoid infinite loop
     };
 }
@@ -4891,6 +4897,69 @@ fn executeElementOpcodes(
                 }
             },
 
+            // NESTED_SET_INSERT (0x90): slot, outer_key_col, elem_col
+            0x90 => {
+                const slot = body[bpc + 1];
+                const outer_key_col = body[bpc + 2];
+                const elem_col = body[bpc + 3];
+                bpc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = nested.nestedSetInsert(
+                    state_base,
+                    meta,
+                    getColU32Inner(col_ptrs, outer_key_col)[child_idx],
+                    getColU32Inner(col_ptrs, elem_col)[child_idx],
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // NESTED_MAP_UPSERT_LAST (0x92): slot, outer_key_col, inner_key_col, val_col
+            0x92 => {
+                const slot = body[bpc + 1];
+                const outer_key_col = body[bpc + 2];
+                const inner_key_col = body[bpc + 3];
+                const val_col = body[bpc + 4];
+                bpc += 5;
+
+                const meta = getSlotMeta(state_base, slot);
+                const result = nested.nestedMapUpsertLast(
+                    state_base,
+                    meta,
+                    getColU32Inner(col_ptrs, outer_key_col)[child_idx],
+                    getColU32Inner(col_ptrs, inner_key_col)[child_idx],
+                    getColU32Inner(col_ptrs, val_col)[child_idx],
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
+            // NESTED_AGG_UPDATE (0x95): slot, outer_key_col, val_col
+            0x95 => {
+                const slot = body[bpc + 1];
+                const outer_key_col = body[bpc + 2];
+                const val_col = body[bpc + 3];
+                bpc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const val_data: [*]const f64 = @ptrCast(@alignCast(col_ptrs[val_col]));
+                const result = nested.nestedAggUpdate(
+                    state_base,
+                    meta,
+                    getColU32Inner(col_ptrs, outer_key_col)[child_idx],
+                    @bitCast(val_data[child_idx]),
+                );
+                if (result == .CAPACITY_EXCEEDED) {
+                    g_needs_growth_slot = slot;
+                    return @intFromEnum(ErrorCode.NEEDS_GROWTH);
+                }
+            },
+
             else => {
                 // Unknown body opcode - skip 1 byte to avoid infinite loop
                 bpc += 1;
@@ -5202,6 +5271,34 @@ pub export fn vm_calculate_state_size(
                     const elem_size: u32 = structFieldSize(@enumFromInt(elem_type));
                     size += capacity * elem_size;
                 }
+                size = align8(size);
+            },
+
+            .SLOT_NESTED => {
+                // SLOT_NESTED: slot:u8, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8,
+                //              inner_type:u8, inner_cap_lo:u8, inner_cap_hi:u8, inner_agg_type:u8
+                const outer_cap_lo = init_code[pc + 2];
+                const outer_cap_hi = init_code[pc + 3];
+                const inner_type_byte = init_code[pc + 4];
+                const inner_cap_lo = init_code[pc + 5];
+                const inner_cap_hi = init_code[pc + 6];
+                const inner_agg_type_byte = init_code[pc + 7];
+                pc += 8;
+
+                var outer_cap: u32 = (@as(u32, outer_cap_hi) << 8) | outer_cap_lo;
+                if (outer_cap == 0) outer_cap = 1024;
+                outer_cap = nextPowerOf2(outer_cap * 2);
+
+                var inner_initial_cap: u32 = (@as(u32, inner_cap_hi) << 8) | inner_cap_lo;
+                if (inner_initial_cap == 0) inner_initial_cap = 16;
+                const inner_type: SlotType = @enumFromInt(@as(u4, @truncate(inner_type_byte)));
+                // Only interpret as AggType for AGGREGATE inner containers; default to SUM otherwise
+                const inner_agg_type: AggType = if (inner_type == .AGGREGATE and inner_agg_type_byte >= 1)
+                    @enumFromInt(inner_agg_type_byte)
+                else
+                    .SUM;
+
+                size += nested.nestedSlotDataSize(outer_cap, nextPowerOf2(inner_initial_cap), inner_type, inner_agg_type);
                 size = align8(size);
             },
 
@@ -5687,6 +5784,66 @@ pub export fn vm_init_state(
 
                     data_offset += capacity * elem_size;
                 }
+                data_offset = align8(data_offset);
+            },
+
+            .SLOT_NESTED => {
+                // SLOT_NESTED: slot:u8, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8,
+                //              inner_type:u8, inner_cap_lo:u8, inner_cap_hi:u8, inner_agg_type:u8
+                const slot_idx = init_code[pc];
+                const outer_type_flags_byte = init_code[pc + 1];
+                const outer_cap_lo = init_code[pc + 2];
+                const outer_cap_hi = init_code[pc + 3];
+                const inner_type_byte = init_code[pc + 4];
+                const inner_cap_lo = init_code[pc + 5];
+                const inner_cap_hi = init_code[pc + 6];
+                const inner_agg_type_byte = init_code[pc + 7];
+                pc += 8;
+
+                var outer_cap: u32 = (@as(u32, outer_cap_hi) << 8) | outer_cap_lo;
+                if (outer_cap == 0) outer_cap = 1024;
+                outer_cap = nextPowerOf2(outer_cap * 2);
+
+                var inner_initial_cap: u32 = (@as(u32, inner_cap_hi) << 8) | inner_cap_lo;
+                if (inner_initial_cap == 0) inner_initial_cap = 16;
+                const inner_cap = nextPowerOf2(inner_initial_cap);
+                const inner_type: SlotType = @enumFromInt(@as(u4, @truncate(inner_type_byte)));
+                const inner_agg_type: AggType = if (inner_type == .AGGREGATE and inner_agg_type_byte >= 1)
+                    @enumFromInt(inner_agg_type_byte)
+                else
+                    .SUM;
+
+                // Write slot metadata
+                const meta_base = STATE_HEADER_SIZE + @as(u32, slot_idx) * SLOT_META_SIZE;
+                std.mem.writeInt(u32, state_ptr[meta_base..][0..4], data_offset, .little); // offset
+                std.mem.writeInt(u32, state_ptr[meta_base + 4 ..][0..4], outer_cap, .little); // capacity
+                std.mem.writeInt(u32, state_ptr[meta_base + 8 ..][0..4], 0, .little); // size = 0
+                state_ptr[meta_base + SlotMetaOffset.TYPE_FLAGS] = outer_type_flags_byte;
+                state_ptr[meta_base + SlotMetaOffset.AGG_TYPE] = inner_agg_type_byte;
+                state_ptr[meta_base + SlotMetaOffset.CHANGE_FLAGS] = 0;
+
+                // Write nested prefix at slot data start
+                nested.writeNestedPrefix(state_ptr, data_offset, .{
+                    .inner_type = inner_type,
+                    .inner_initial_cap = @truncate(inner_initial_cap),
+                    .inner_agg_type = inner_agg_type,
+                    .depth = 1,
+                });
+
+                // Initialize outer keys to EMPTY_KEY
+                const keys_off = nested.outerKeysOffset(data_offset);
+                const keys: [*]u32 = @ptrCast(@alignCast(state_ptr + keys_off));
+                for (0..outer_cap) |i| keys[i] = EMPTY_KEY;
+
+                // Initialize arena header
+                const arena_hdr = nested.arenaHeaderOffset(data_offset, outer_cap);
+                const arena_start = nested.arenaDataOffset(data_offset, outer_cap);
+                const slot_data_size = nested.nestedSlotDataSize(outer_cap, inner_cap, inner_type, inner_agg_type);
+                const arena_cap = slot_data_size - (arena_start - data_offset);
+                std.mem.writeInt(u32, state_ptr[arena_hdr..][0..4], arena_cap, .little);
+                std.mem.writeInt(u32, state_ptr[arena_hdr + 4 ..][0..4], 0, .little); // used = 0
+
+                data_offset += slot_data_size;
                 data_offset = align8(data_offset);
             },
 
@@ -6439,16 +6596,18 @@ pub export fn vm_get_needs_growth_slot() u32 {
 }
 
 /// Compute data size for a slot given its type and capacity.
-/// NOTE: STRUCT_MAP (type 5) returns 0 here — use getStructMapSlotDataSize instead
+/// NOTE: STRUCT_MAP (type 6) and ORDERED_LIST (type 7) return 0 — use getStructMapSlotDataSize instead
 /// (needs row_size from metadata).
 fn getSlotDataSize(slot_type: u4, capacity: u32, has_hashmap_timestamps: bool) u32 {
     return switch (slot_type) {
         0 => capacity * 4 + capacity * 4 + if (has_hashmap_timestamps) capacity * 8 else 0, // HASHMAP: keys + values [+ timestamps]
         1 => capacity * 4, // HASHSET: keys only
-        7 => BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(capacity), // BITMAP: serialized roaring payload
         2 => 16, // AGGREGATE: f64 value + u64 count
         4 => 8, // CONDITION_TREE: generation(u32) + last_removed_key(u32)
-        5 => 0, // STRUCT_MAP: use getStructMapSlotDataSize (needs row_size from metadata)
+        5 => 16, // SCALAR: value([8]u8) + cmp_ts(f64)
+        6 => 0, // STRUCT_MAP: use getStructMapSlotDataSize (needs row_size from metadata)
+        7 => 0, // ORDERED_LIST: use separate calculation (needs row_size from metadata)
+        8 => BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(capacity), // BITMAP: serialized roaring payload
         else => 0,
     };
 }
@@ -6560,7 +6719,7 @@ pub export fn vm_calculate_grown_state_size(
 
         const cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
         var slot_size: u32 = 0;
-        if (slot_type == 5) {
+        if (slot_type == 6) {
             // STRUCT_MAP: read struct-specific metadata
             const nf: u32 = old_state_ptr[meta_base + 13];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -6574,7 +6733,7 @@ pub export fn vm_calculate_grown_state_size(
                 const new_arena_cap = if (slot_i == grown_slot_idx) old_arena_cap * 2 else old_arena_cap;
                 slot_size += ARENA_HEADER_SIZE + new_arena_cap;
             }
-        } else if (slot_type == 6) {
+        } else if (slot_type == 7) {
             // ORDERED_LIST: scalar or struct
             const elem_type_byte = old_state_ptr[meta_base + 18];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -6634,12 +6793,14 @@ pub export fn vm_grow_state(
         const new_offset = data_cursor;
 
         // Compute primary data size (STRUCT_MAP and ORDERED_LIST need metadata-based calculation)
-        const new_primary_size = if (slot_type == 5) blk: {
+        const new_primary_size = if (slot_type == 6) blk: {
+            // STRUCT_MAP
             const nf: u32 = old_state_ptr[meta_base + 13];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
             const has_ts = old_state_ptr[meta_base + 18] != 0;
             break :blk getStructMapSlotDataSize(align8(nf), new_cap, rs, has_ts);
-        } else if (slot_type == 6) blk: {
+        } else if (slot_type == 7) blk: {
+            // ORDERED_LIST
             const elem_type_byte = old_state_ptr[meta_base + 18];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
             if (elem_type_byte == 0xFF) {
@@ -6727,7 +6888,7 @@ pub export fn vm_grow_state(
                     }
                 }
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
-            } else if (slot_type == 7) {
+            } else if (slot_type == 8) {
                 // BITMAP: copy serialized roaring payload as-is into larger slot.
                 const old_storage_size = BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(old_cap);
                 const new_storage_size = BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(new_cap);
@@ -6736,7 +6897,7 @@ pub export fn vm_grow_state(
                     new_state_ptr[new_offset .. new_offset + old_storage_size],
                     old_state_ptr[old_offset .. old_offset + old_storage_size],
                 );
-            } else if (slot_type == 5) {
+            } else if (slot_type == 6) {
                 // STRUCT_MAP: copy field type descriptor, init keys to EMPTY_KEY, rehash rows
                 const nf: u32 = old_state_ptr[meta_base + 13];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -6835,7 +6996,7 @@ pub export fn vm_grow_state(
 
                     std.mem.writeInt(u32, new_state_ptr[new_arena_hdr_off + 4 ..][0..4], new_arena_used, .little);
                 }
-            } else if (slot_type == 6) {
+            } else if (slot_type == 7) {
                 // ORDERED_LIST: memcpy existing entries (no rehash needed)
                 const elem_type_byte = old_state_ptr[meta_base + 18];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -6869,7 +7030,8 @@ pub export fn vm_grow_state(
             }
         } else {
             // Non-grown slot: memcpy data as-is (struct map data + arena if present)
-            const primary_size = if (slot_type == 5) blk: {
+            const primary_size = if (slot_type == 6) blk: {
+                // STRUCT_MAP
                 const nf: u32 = old_state_ptr[meta_base + 13];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
                 const has_ts = old_state_ptr[meta_base + 18] != 0;
@@ -6881,7 +7043,8 @@ pub export fn vm_grow_state(
                     sz += ARENA_HEADER_SIZE + arena_cap;
                 }
                 break :blk sz;
-            } else if (slot_type == 6) blk: {
+            } else if (slot_type == 7) blk: {
+                // ORDERED_LIST
                 const etb = old_state_ptr[meta_base + 18];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
                 if (etb == 0xFF) {
@@ -6895,7 +7058,7 @@ pub export fn vm_grow_state(
                 @memcpy(new_state_ptr[new_offset .. new_offset + primary_size], old_state_ptr[old_offset .. old_offset + primary_size]);
             }
             // Update arena header offset in metadata for non-grown struct maps
-            if (slot_type == 5) {
+            if (slot_type == 6) {
                 const old_arena_hdr = std.mem.readInt(u32, old_state_ptr[meta_base + 20 ..][0..4], .little);
                 if (old_arena_hdr != 0) {
                     // Arena moved with the slot data — offset shifted by (new_offset - old_offset)
@@ -6943,7 +7106,7 @@ pub export fn vm_grow_state(
         }
 
         var slot_total_size = new_primary_size;
-        if (slot_type == 5) {
+        if (slot_type == 6) {
             const arena_hdr_off = std.mem.readInt(u32, old_state_ptr[meta_base + 20 ..][0..4], .little);
             if (arena_hdr_off != 0) {
                 const old_arena_cap = std.mem.readInt(u32, old_state_ptr[arena_hdr_off..][0..4], .little);
