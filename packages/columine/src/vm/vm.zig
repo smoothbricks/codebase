@@ -6025,8 +6025,8 @@ test "slot growth - grow preserves hashmap entries and aggregate" {
     // Verify aggregate count = 11 (11 batches of 1 row each)
     const agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE; // slot 1 meta
     const agg_data_offset = std.mem.readInt(u32, state_buf[agg_meta_base..][0..4], .little);
-    const count_lo = std.mem.readInt(u32, state_buf[agg_data_offset + 8 ..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 11), count_lo);
+    const count_val = std.mem.readInt(u64, state_buf[agg_data_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 11), count_val);
 
     // Grow slot 0
     const grown_size = vm_calculate_grown_state_size(
@@ -6067,8 +6067,8 @@ test "slot growth - grow preserves hashmap entries and aggregate" {
     // Verify aggregate count preserved (copied, not re-executed)
     const new_agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE;
     const new_agg_data_offset = std.mem.readInt(u32, new_state_buf[new_agg_meta_base..][0..4], .little);
-    const new_count_lo = std.mem.readInt(u32, new_state_buf[new_agg_data_offset + 8 ..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 11), new_count_lo);
+    const new_count_val = std.mem.readInt(u64, new_state_buf[new_agg_data_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 11), new_count_val);
 
     // Verify we can now insert more entries without NEEDS_GROWTH
     // (new max_size = (32*7)/10 = 22, currently at 11)
@@ -6729,10 +6729,11 @@ test "FOR_EACH_EVENT - basic type filtering" {
     try std.testing.expectEqual(EMPTY_KEY, vm_map_get(@ptrCast(&state_buf), data_offset, cap, 200));
 
     // Aggregate COUNT (slot 1): should be 2 (only TYPE_A events counted)
+    // COUNT is compact 8-byte slot: u64 count at offset 0 (no f64 value prefix)
     const agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE;
     const agg_offset = std.mem.readInt(u32, state_buf[agg_meta_base..][0..4], .little);
-    const agg_count = std.mem.readInt(u32, state_buf[agg_offset + 8 ..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 2), agg_count);
+    const agg_count: u64 = std.mem.readInt(u64, state_buf[agg_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 2), agg_count);
 }
 
 test "FOR_EACH_EVENT - all events match" {
@@ -6770,8 +6771,8 @@ test "FOR_EACH_EVENT - all events match" {
     // Count should be 3
     const agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE;
     const agg_offset = std.mem.readInt(u32, state_buf[agg_meta_base..][0..4], .little);
-    const agg_count = std.mem.readInt(u32, state_buf[agg_offset + 8 ..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 3), agg_count);
+    const agg_count: u64 = std.mem.readInt(u64, state_buf[agg_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 3), agg_count);
 }
 
 test "FOR_EACH_EVENT - no events match" {
@@ -6810,8 +6811,8 @@ test "FOR_EACH_EVENT - no events match" {
     // Count should be 0
     const agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE;
     const agg_offset = std.mem.readInt(u32, state_buf[agg_meta_base..][0..4], .little);
-    const agg_count = std.mem.readInt(u32, state_buf[agg_offset + 8 ..][0..4], .little);
-    try std.testing.expectEqual(@as(u32, 0), agg_count);
+    const agg_count: u64 = std.mem.readInt(u64, state_buf[agg_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 0), agg_count);
 }
 
 // =============================================================================
