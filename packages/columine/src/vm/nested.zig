@@ -721,8 +721,55 @@ pub fn innerAggGetCount(state_base: [*]u8, inner_offset: u32, agg_type: AggType)
 
 const testing = std.testing;
 
-fn makeTestState(comptime size: u32) [size]u8 {
-    return [_]u8{0} ** size;
+/// Test harness: sets up a state buffer with a nested slot at offset 64.
+fn setupNestedTestSlot(
+    state: []u8,
+    outer_cap: u32,
+    inner_type: SlotType,
+    inner_initial_cap: u16,
+    inner_agg_type: AggType,
+) SlotMeta {
+    const slot_offset: u32 = 64;
+
+    writeNestedPrefix(state.ptr, slot_offset, .{
+        .inner_type = inner_type,
+        .inner_initial_cap = inner_initial_cap,
+        .inner_agg_type = inner_agg_type,
+        .depth = 1,
+    });
+
+    // Init outer keys to EMPTY_KEY
+    const keys: [*]u32 = @ptrCast(@alignCast(state.ptr + outerKeysOffset(slot_offset)));
+    for (0..outer_cap) |i| keys[i] = EMPTY_KEY;
+
+    // Init arena header
+    const arena_hdr = arenaHeaderOffset(slot_offset, outer_cap);
+    const arena_start = arenaDataOffset(slot_offset, outer_cap);
+    const arena_cap: u32 = @as(u32, @intCast(state.len)) - arena_start;
+    std.mem.writeInt(u32, state[arena_hdr..][0..4], arena_cap, .little);
+    std.mem.writeInt(u32, state[arena_hdr + 4 ..][0..4], 0, .little);
+
+    // Store outer size at fixed location in metadata area
+    const size_loc: u32 = 32;
+    std.mem.writeInt(u32, state[size_loc..][0..4], 0, .little);
+
+    return SlotMeta{
+        .offset = slot_offset,
+        .capacity = outer_cap,
+        .size_ptr = @ptrCast(@alignCast(&state[size_loc])),
+        .type_flags = .{ .slot_type = .NESTED, .has_ttl = false, .has_evict_trigger = false },
+        .agg_type = inner_agg_type,
+        .change_flags_ptr = @ptrCast(&state[40]),
+        .timestamp_field_idx = 0,
+        .ttl_seconds = 0,
+        .grace_seconds = 0,
+        .start_of = .NONE,
+        .eviction_index_offset = 0,
+        .eviction_index_capacity = 0,
+        .eviction_index_size_ptr = @ptrCast(@alignCast(&state[44])),
+        .evicted_buffer_offset = 0,
+        .evicted_count_ptr = @ptrCast(@alignCast(&state[48])),
+    };
 }
 
 test "nested set — basic insert and contains" {
@@ -1079,4 +1126,208 @@ test "nested aggregate — sum f64 per outer key" {
     try testing.expectEqual(@as(u64, 2), innerAggGetCount(&state, inner_1, .SUM));
     try testing.expectApproxEqAbs(@as(f64, 50.0), innerAggGetF64(&state, inner_2), 0.001);
     try testing.expectEqual(@as(u64, 1), innerAggGetCount(&state, inner_2, .SUM));
+}
+
+// =============================================================================
+// Stress tests — arena accounting, growth, and correctness invariants
+// =============================================================================
+
+/// Verify arena accounting: used bytes match expected allocations.
+fn assertArenaUsed(state: []u8, slot_offset: u32, outer_cap: u32, expected_used: u32) !void {
+    const arena_hdr = arenaHeaderOffset(slot_offset, outer_cap);
+    const actual_used = getArenaUsed(state.ptr, arena_hdr);
+    try testing.expectEqual(expected_used, actual_used);
+}
+
+/// Verify no arena bytes are used beyond arena_used (canary check).
+fn assertArenaCanary(state: []u8, slot_offset: u32, outer_cap: u32) !void {
+    const arena_hdr = arenaHeaderOffset(slot_offset, outer_cap);
+    const used = getArenaUsed(state.ptr, arena_hdr);
+    const cap = getArenaCapacity(state.ptr, arena_hdr);
+    const arena_start = arenaDataOffset(slot_offset, outer_cap);
+
+    // Verify unused arena region is still zero (we zero-init the buffer)
+    if (used < cap) {
+        const unused_start = arena_start + used;
+        const unused_end = arena_start + cap;
+        for (state[unused_start..unused_end]) |b| {
+            if (b != 0) return error.TestExpectedEqual;
+        }
+    }
+}
+
+test "stress — arena accounting: each outer key allocates exactly one inner set" {
+    const outer_cap: u32 = 64;
+    var state: [32768]u8 = [_]u8{0} ** 32768;
+    const meta = setupNestedTestSlot(&state, outer_cap, .HASHSET, 8, .SUM);
+
+    const inner_cap = nextPowerOf2(8); // 16
+    const per_inner = align8(innerContainerSize(.HASHSET, inner_cap, .SUM));
+
+    // Insert one element per outer key for 10 distinct outer keys
+    var k: u32 = 1;
+    while (k <= 10) : (k += 1) {
+        const r = nestedSetInsert(&state, meta, k, 42);
+        try testing.expectEqual(ErrorCode.OK, r);
+    }
+
+    // 10 outer keys → 10 inner containers allocated
+    try assertArenaUsed(&state, meta.offset, outer_cap, 10 * per_inner);
+    try testing.expectEqual(@as(u32, 10), meta.size_ptr.*);
+}
+
+test "stress — arena fragmentation from inner growth is bounded" {
+    const outer_cap: u32 = 16;
+    var state: [65536]u8 = [_]u8{0} ** 65536;
+    const meta = setupNestedTestSlot(&state, outer_cap, .HASHSET, 4, .SUM);
+
+    // Insert many elements into a single outer key to trigger multiple inner growths.
+    // Initial inner cap = nextPowerOf2(4) = 16, 70% load = 11.
+    // Growth: 16 → 32 → 64 → ...
+    // Dead space: 16*4 (old 16-cap set) + 32*4 (old 32-cap set) = 64+128 = 192 bytes header+data
+    var i: u32 = 1;
+    while (i <= 100) : (i += 1) {
+        const r = nestedSetInsert(&state, meta, 1, i);
+        try testing.expectEqual(ErrorCode.OK, r);
+    }
+
+    // Verify all 100 elements are accessible
+    const inner = getInnerOffset(&state, meta, 1);
+    try testing.expectEqual(@as(u32, 100), getInnerSetSize(&state, inner));
+
+    // Verify arena used is reasonable (not unbounded).
+    // After growths from 16→32→64→128→256, total allocated ~= sum of all sizes
+    // 16+32+64+128+256 = 496 entries × 4 bytes + headers = ~2200 bytes
+    // This includes dead space from abandoned smaller allocations.
+    const arena_hdr = arenaHeaderOffset(meta.offset, outer_cap);
+    const used = getArenaUsed(&state, arena_hdr);
+    // Reasonable upper bound: < 16KB for 100 elements
+    try testing.expect(used < 16384);
+    // Lower bound: at least the live container (256 cap × 4 bytes + 8 header = 1032)
+    try testing.expect(used >= 1032);
+}
+
+test "stress — randomized insert/lookup on Map<K, Set<V>>" {
+    const outer_cap: u32 = 64;
+    var state: [262144]u8 = [_]u8{0} ** 262144; // 256KB
+    const meta = setupNestedTestSlot(&state, outer_cap, .HASHSET, 8, .SUM);
+
+    // Use deterministic PRNG for reproducibility
+    var rng = std.Random.DefaultPrng.init(0xDEADBEEF);
+    const random = rng.random();
+
+    // Track ground truth: outer_key → set of inner values
+    var truth: [32]std.ArrayList(u32) = undefined;
+    for (&truth) |*t| t.* = .empty;
+    defer for (&truth) |*t| t.deinit(testing.allocator);
+
+    // Insert 500 random (outer_key, elem) pairs
+    var ops: u32 = 0;
+    while (ops < 500) : (ops += 1) {
+        const outer_key = random.intRangeAtMost(u32, 1, 30);
+        const elem = random.intRangeAtMost(u32, 1, 200);
+
+        const result = nestedSetInsert(&state, meta, outer_key, elem);
+        try testing.expectEqual(ErrorCode.OK, result);
+
+        // Track in ground truth (deduplicated)
+        const idx = outer_key - 1;
+        var found = false;
+        for (truth[idx].items) |v| {
+            if (v == elem) {
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try truth[idx].append(testing.allocator, elem);
+        }
+    }
+
+    // Verify all ground truth entries are in the VM
+    for (0..30) |idx| {
+        const outer_key: u32 = @intCast(idx + 1);
+        const inner = getInnerOffset(&state, meta, outer_key);
+
+        if (truth[idx].items.len == 0) {
+            try testing.expectEqual(@as(u32, 0), inner);
+            continue;
+        }
+
+        try testing.expect(inner != 0);
+        const vm_size = getInnerSetSize(&state, inner);
+        try testing.expectEqual(@as(u32, @intCast(truth[idx].items.len)), vm_size);
+
+        for (truth[idx].items) |elem| {
+            try testing.expect(innerSetContains(&state, inner, elem));
+        }
+    }
+}
+
+test "stress — randomized Map<K, Map<K2, V>> with overwrites" {
+    const outer_cap: u32 = 32;
+    var state: [262144]u8 = [_]u8{0} ** 262144;
+    const meta = setupNestedTestSlot(&state, outer_cap, .HASHMAP, 8, .SUM);
+
+    var rng = std.Random.DefaultPrng.init(0xCAFEBABE);
+    const random = rng.random();
+
+    // Track ground truth: (outer_key, inner_key) → value
+    const Entry = struct { outer: u32, inner: u32, value: u32 };
+    var truth: std.ArrayList(Entry) = .empty;
+    defer truth.deinit(testing.allocator);
+
+    // 300 random upserts — some will overwrite
+    var ops: u32 = 0;
+    while (ops < 300) : (ops += 1) {
+        const outer_key = random.intRangeAtMost(u32, 1, 15);
+        const inner_key = random.intRangeAtMost(u32, 1, 50);
+        const value = random.intRangeAtMost(u32, 1, 10000);
+
+        const result = nestedMapUpsertLast(&state, meta, outer_key, inner_key, value);
+        try testing.expectEqual(ErrorCode.OK, result);
+
+        // Update ground truth (last write wins)
+        var found = false;
+        for (truth.items) |*e| {
+            if (e.outer == outer_key and e.inner == inner_key) {
+                e.value = value;
+                found = true;
+                break;
+            }
+        }
+        if (!found) {
+            try truth.append(testing.allocator, .{ .outer = outer_key, .inner = inner_key, .value = value });
+        }
+    }
+
+    // Verify all entries
+    for (truth.items) |e| {
+        const inner = getInnerOffset(&state, meta, e.outer);
+        try testing.expect(inner != 0);
+        const vm_value = innerMapGet(&state, inner, e.inner);
+        try testing.expectEqual(e.value, vm_value);
+    }
+}
+
+test "stress — CAPACITY_EXCEEDED when arena is exhausted" {
+    const outer_cap: u32 = 16;
+    // Tiny buffer → arena will fill up quickly
+    var state: [1024]u8 = [_]u8{0} ** 1024;
+    const meta = setupNestedTestSlot(&state, outer_cap, .HASHSET, 4, .SUM);
+
+    // Keep inserting until we get CAPACITY_EXCEEDED
+    var got_capacity_exceeded = false;
+    var i: u32 = 1;
+    while (i <= 100) : (i += 1) {
+        const result = nestedSetInsert(&state, meta, i, 42);
+        if (result == .CAPACITY_EXCEEDED) {
+            got_capacity_exceeded = true;
+            break;
+        }
+    }
+    // With a 1KB buffer, arena should exhaust before inserting 100 outer keys
+    try testing.expect(got_capacity_exceeded);
+    // But some inserts should have succeeded
+    try testing.expect(meta.size_ptr.* > 0);
 }

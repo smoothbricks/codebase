@@ -167,6 +167,7 @@ pub const SlotType = enum(u4) {
     STRUCT_MAP = 6, // Multi-field hash map with per-row bitset
     ORDERED_LIST = 7, // Append-only sequential storage (scalar or struct rows)
     BITMAP = 8, // Roaring-style reducer membership represented as u32 set semantics
+    NESTED = 9, // Arena-allocated nested containers: Map<K, Set/Map/Agg/List>
 };
 
 pub const SlotTypeFlags = packed struct(u8) {
@@ -346,14 +347,22 @@ pub const Opcode = enum(u8) {
     // Ordered list init
     SLOT_ORDERED_LIST = 0x19, // slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8 [, num_fields:u8, field_type:u8 × num_fields]
 
+    // Nested container init
+    SLOT_NESTED = 0x1A, // slot:u8, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8, inner_type:u8, inner_cap_lo:u8, inner_cap_hi:u8, inner_agg_type:u8
+
+    // Nested container ops (body opcodes inside FOR_EACH_EVENT blocks)
+    // These operate per-element, dispatched within the FOR_EACH_EVENT loop.
+    NESTED_SET_INSERT = 0x90, // slot:u8, outer_key_col:u8, elem_col:u8
+    NESTED_MAP_UPSERT_LAST = 0x92, // slot:u8, outer_key_col:u8, inner_key_col:u8, val_col:u8
+    NESTED_AGG_UPDATE = 0x95, // slot:u8, outer_key_col:u8, val_col:u8
+
     // Block-based reduce section opcodes (4a)
     // FOR_EACH_EVENT wraps body opcodes that process one element at a time.
     // Body uses the same opcode byte values as BATCH_* but dispatched per-element.
     FOR_EACH_EVENT = 0xE0, // type_col:u8, type_id_lo:u8, type_id_hi_0:u8, type_id_hi_1:u8, type_id_hi_2:u8, body_len_lo:u8, body_len_hi:u8
     FLAT_MAP = 0xE1, // offsets_col:u8, parent_ts_col:u8, inner_body_len_lo:u8, inner_body_len_hi:u8
 
-    // --- Planned opcodes (not yet implemented) ---
-    // See opcodes.zig for the full spec roadmap
+    // --- More planned opcodes in opcodes.zig ---
 
     _,
 };

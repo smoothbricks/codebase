@@ -930,6 +930,10 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) bool {
             // Scalar slots don't support key-based removal
             return false;
         },
+        .NESTED => {
+            // Nested slot TTL eviction not yet supported
+            return false;
+        },
     }
 }
 
@@ -5102,6 +5106,9 @@ pub export fn vm_calculate_state_size(
                     .ORDERED_LIST => {
                         // ORDERED_LIST uses its own SLOT_ORDERED_LIST opcode, not SLOT_DEF
                     },
+                    .NESTED => {
+                        // NESTED uses its own SLOT_NESTED opcode, not SLOT_DEF
+                    },
                 }
                 size = align8(size);
 
@@ -5464,6 +5471,9 @@ pub export fn vm_init_state(
                     },
                     .ORDERED_LIST => {
                         // ORDERED_LIST uses its own SLOT_ORDERED_LIST opcode, not SLOT_DEF
+                    },
+                    .NESTED => {
+                        // NESTED uses its own SLOT_NESTED opcode, not SLOT_DEF
                     },
                 }
                 data_offset = align8(data_offset);
