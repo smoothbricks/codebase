@@ -32,11 +32,13 @@ const builtin = @import("builtin");
 const rawr = @import("rawr");
 const types = @import("types.zig");
 pub const nested = @import("nested.zig");
+pub const hash_table = @import("hash_table.zig");
 
 // Pull in test blocks from sub-modules during test compilation
 comptime {
     if (@import("builtin").is_test) {
         _ = @import("nested.zig");
+        _ = @import("hash_table.zig");
     }
 }
 const RoaringBitmap = rawr.RoaringBitmap;
