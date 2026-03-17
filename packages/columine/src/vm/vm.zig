@@ -36,6 +36,7 @@ pub const hash_table = @import("hash_table.zig");
 pub const hashmap_ops = @import("hashmap_ops.zig");
 pub const hashset_ops = @import("hashset_ops.zig");
 pub const slot_growth = @import("slot_growth.zig");
+pub const aggregates = @import("aggregates.zig");
 
 // Pull in test blocks from sub-modules during test compilation
 comptime {
@@ -45,6 +46,7 @@ comptime {
         _ = @import("hashmap_ops.zig");
         _ = @import("hashset_ops.zig");
         _ = @import("slot_growth.zig");
+        _ = @import("aggregates.zig");
     }
 }
 const RoaringBitmap = rawr.RoaringBitmap;
@@ -1690,253 +1692,30 @@ fn writeStructMapArrayFields(
 // SIMD Aggregate Operations
 // =============================================================================
 
-fn batchAggSum(val_col: [*]const f64, batch_len: u32) f64 {
-    var sum_vec: V4f64 = @splat(0.0);
-    var i: u32 = 0;
 
-    while (i + 4 <= batch_len) : (i += 4) {
-        const v: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
-        sum_vec += v;
-    }
 
-    var result = @reduce(.Add, sum_vec);
-
-    while (i < batch_len) : (i += 1) {
-        result += val_col[i];
-    }
-
-    return result;
-}
-
-fn batchAggMin(val_col: [*]const f64, batch_len: u32, current_min: f64) f64 {
-    if (batch_len == 0) return current_min;
-
-    var min_vec: V4f64 = @splat(current_min);
-    var i: u32 = 0;
-
-    while (i + 4 <= batch_len) : (i += 4) {
-        const v: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
-        min_vec = @min(min_vec, v);
-    }
-
-    var result = @reduce(.Min, min_vec);
-
-    while (i < batch_len) : (i += 1) {
-        result = @min(result, val_col[i]);
-    }
-
-    return result;
-}
-
-fn batchAggMax(val_col: [*]const f64, batch_len: u32, current_max: f64) f64 {
-    if (batch_len == 0) return current_max;
-
-    var max_vec: V4f64 = @splat(current_max);
-    var i: u32 = 0;
-
-    while (i + 4 <= batch_len) : (i += 4) {
-        const v: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
-        max_vec = @max(max_vec, v);
-    }
-
-    var result = @reduce(.Max, max_vec);
-
-    while (i < batch_len) : (i += 1) {
-        result = @max(result, val_col[i]);
-    }
-
-    return result;
-}
 
 // =============================================================================
 // Masked SIMD Aggregates (for FOR_EACH_EVENT type filtering)
 // =============================================================================
 
-const V4u32 = @Vector(4, u32);
 
-fn maskedAggSum(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, batch_len: u32) f64 {
-    if (batch_len == 0) return 0;
 
-    var sum_vec: V4f64 = @splat(0.0);
-    const type_id_vec: V4u32 = @splat(type_id);
-    const zero_f64: V4f64 = @splat(@as(f64, 0.0));
-    var i: u32 = 0;
 
-    while (i + 4 <= batch_len) : (i += 4) {
-        const type_vec: V4u32 = .{ type_data[i], type_data[i + 1], type_data[i + 2], type_data[i + 3] };
-        const mask = type_vec == type_id_vec;
-        const val_vec: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
-        sum_vec += @select(f64, mask, val_vec, zero_f64);
-    }
 
-    var result = @reduce(.Add, sum_vec);
-
-    while (i < batch_len) : (i += 1) {
-        if (type_data[i] == type_id) result += val_col[i];
-    }
-
-    return result;
-}
-
-fn maskedAggCount(type_data: [*]const u32, type_id: u32, batch_len: u32) u32 {
-    var count: u32 = 0;
-    const type_id_vec: V4u32 = @splat(type_id);
-    var i: u32 = 0;
-
-    // SIMD: compare 4 type values at once, count matches via @reduce
-    while (i + 4 <= batch_len) : (i += 4) {
-        const type_vec: V4u32 = .{ type_data[i], type_data[i + 1], type_data[i + 2], type_data[i + 3] };
-        const mask: @Vector(4, bool) = type_vec == type_id_vec;
-        // Convert bool mask to 0/1 integers and sum
-        const ones: V4u32 = @select(u32, mask, @as(V4u32, @splat(@as(u32, 1))), @as(V4u32, @splat(@as(u32, 0))));
-        count += @reduce(.Add, ones);
-    }
-
-    // Scalar tail
-    while (i < batch_len) : (i += 1) {
-        if (type_data[i] == type_id) count += 1;
-    }
-    return count;
-}
-
-fn maskedAggMin(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, batch_len: u32, current_min: f64) f64 {
-    var min_vec: V4f64 = @splat(current_min);
-    const type_id_vec: V4u32 = @splat(type_id);
-    const identity: V4f64 = @splat(std.math.inf(f64)); // non-matching lanes use +inf (neutral for min)
-    var i: u32 = 0;
-
-    while (i + 4 <= batch_len) : (i += 4) {
-        const type_vec: V4u32 = .{ type_data[i], type_data[i + 1], type_data[i + 2], type_data[i + 3] };
-        const mask = type_vec == type_id_vec;
-        const val_vec: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
-        const selected = @select(f64, mask, val_vec, identity);
-        min_vec = @min(min_vec, selected);
-    }
-
-    var result = @reduce(.Min, min_vec);
-    while (i < batch_len) : (i += 1) {
-        if (type_data[i] == type_id) result = @min(result, val_col[i]);
-    }
-    return result;
-}
-
-fn maskedAggMax(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, batch_len: u32, current_max: f64) f64 {
-    var max_vec: V4f64 = @splat(current_max);
-    const type_id_vec: V4u32 = @splat(type_id);
-    const identity: V4f64 = @splat(-std.math.inf(f64)); // non-matching lanes use -inf (neutral for max)
-    var i: u32 = 0;
-
-    while (i + 4 <= batch_len) : (i += 4) {
-        const type_vec: V4u32 = .{ type_data[i], type_data[i + 1], type_data[i + 2], type_data[i + 3] };
-        const mask = type_vec == type_id_vec;
-        const val_vec: V4f64 = .{ val_col[i], val_col[i + 1], val_col[i + 2], val_col[i + 3] };
-        const selected = @select(f64, mask, val_vec, identity);
-        max_vec = @max(max_vec, selected);
-    }
-
-    var result = @reduce(.Max, max_vec);
-    while (i < batch_len) : (i += 1) {
-        if (type_data[i] == type_id) result = @max(result, val_col[i]);
-    }
-    return result;
-}
 
 // =============================================================================
 // Comptime aggregate dispatch — DRY handler for f64/i64 × sum/min/max
 // =============================================================================
 
-const AggKind = enum { sum, min, max };
+// AggKind moved to aggregates.zig
+const AggKind = aggregates.AggKind;
 
-const TypeMask = struct { data: [*]const u32, id: u32 };
+const TypeMask = aggregates.TypeMask;
 
 /// Reduce a column to a single value using SIMD for f64, scalar for i64.
 /// type_mask: only include rows where type_data[i] == type_id (FOR_EACH_EVENT).
 /// pred_col: only include rows where pred[i] != 0 (_IF variants).
-fn reduceCol(
-    comptime T: type,
-    comptime kind: AggKind,
-    vals: [*]const T,
-    batch_len: u32,
-    current: T,
-    type_mask: ?TypeMask,
-    pred_col: ?[*]const u32,
-) T {
-    // f64 SIMD path — no predicate, delegate to vectorized helpers
-    if (T == f64 and pred_col == null) {
-        if (type_mask == null) {
-            return switch (kind) {
-                .sum => current + batchAggSum(vals, batch_len),
-                .min => batchAggMin(vals, batch_len, current),
-                .max => batchAggMax(vals, batch_len, current),
-            };
-        }
-        if (type_mask) |m| {
-            return switch (kind) {
-                .sum => current + maskedAggSum(vals, m.data, m.id, batch_len),
-                .min => maskedAggMin(vals, m.data, m.id, batch_len, current),
-                .max => maskedAggMax(vals, m.data, m.id, batch_len, current),
-            };
-        }
-    }
-
-    // i64 SIMD path for sum — WASM simd128 has i64x2.add (2-wide)
-    if (T == i64 and kind == .sum and pred_col == null) {
-        const V2i64 = @Vector(2, i64);
-        var sum_vec: V2i64 = @splat(@as(i64, 0));
-        var i: u32 = 0;
-
-        if (type_mask) |m| {
-            // Masked i64 sum: check type_data per element, accumulate via i64x2
-            const V2u32 = @Vector(2, u32);
-            const type_id_vec: V2u32 = @splat(m.id);
-            const zero_i64: V2i64 = @splat(@as(i64, 0));
-            while (i + 2 <= batch_len) : (i += 2) {
-                const type_vec: V2u32 = .{ m.data[i], m.data[i + 1] };
-                const mask = type_vec == type_id_vec;
-                const val_vec: V2i64 = .{ vals[i], vals[i + 1] };
-                sum_vec +%= @select(i64, mask, val_vec, zero_i64);
-            }
-        } else {
-            // Unmasked i64 sum
-            while (i + 2 <= batch_len) : (i += 2) {
-                const val_vec: V2i64 = .{ vals[i], vals[i + 1] };
-                sum_vec +%= val_vec;
-            }
-        }
-
-        var acc = current +% @reduce(.Add, sum_vec);
-        // Scalar tail
-        while (i < batch_len) : (i += 1) {
-            if (type_mask) |m| {
-                if (m.data[i] != m.id) continue;
-            }
-            acc +%= vals[i];
-        }
-        return acc;
-    }
-
-    // Scalar path — i64 min/max, or any type with predicate column
-    var acc = current;
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        if (type_mask) |m| {
-            if (m.data[i] != m.id) continue;
-        }
-        if (pred_col) |p| {
-            if (p[i] == 0) continue;
-        }
-        switch (kind) {
-            .sum => acc = if (T == i64) acc +% vals[i] else acc + vals[i],
-            .min => {
-                if (vals[i] < acc) acc = vals[i];
-            },
-            .max => {
-                if (vals[i] > acc) acc = vals[i];
-            },
-        }
-    }
-    return acc;
-}
 
 /// Unified aggregate handler for main dispatch, FOR_EACH_EVENT, and _IF variants.
 /// Uses SIMD for f64 when no predicate column; scalar otherwise.
@@ -1956,7 +1735,7 @@ fn execAgg(
     const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
     const old_val = agg_ptr.*;
 
-    const new_val = reduceCol(T, kind, vals, batch_len, old_val, type_mask, pred_col);
+    const new_val = aggregates.reduceCol(T, kind, vals, batch_len, old_val, type_mask, pred_col);
 
     if (new_val != old_val) {
         if (g_undo_enabled) appendMutation(
@@ -2683,7 +2462,7 @@ fn executeBatchAggregates(
 
                 const meta = getSlotMeta(state_base, slot);
                 const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const matched = maskedAggCount(type_data, type_id, batch_len);
+                const matched = aggregates.maskedAggCount(type_data, type_id, batch_len);
                 if (matched > 0) {
                     const prev_count = count_ptr.*;
                     const next_count = prev_count + matched;
