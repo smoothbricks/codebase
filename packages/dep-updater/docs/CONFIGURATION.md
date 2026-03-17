@@ -84,9 +84,9 @@ export default defineConfig({
     requireTests: true,
   },
 
-  // AI-powered changelog analysis (free by default, no API key needed)
+  // AI-powered changelog analysis (requires ZAI_API_KEY environment variable)
   ai: {
-    provider: 'zai', // Free tier, or: 'anthropic', 'openai', 'google'
+    provider: 'zai', // Only supported provider
   },
 
   // Git configuration
@@ -267,9 +267,9 @@ Controls automatic merging of dependency update PRs.
 
 ### AI (`ai`)
 
-Controls AI-powered changelog analysis. Supports multiple AI providers via the Z.AI GLM-5-Turbo.
+Controls AI-powered changelog analysis. Uses Z.AI GLM-5-Turbo for AI-powered changelog analysis.
 
-**Key Feature:** AI analysis works out of the box with no API key required using the free Z.AI tier.
+**Key Feature:** AI analysis requires `ZAI_API_KEY` environment variable. Without it, the tool falls back to a non-AI structured summary (still useful, just not AI-enhanced).
 
 **Options:**
 
@@ -277,52 +277,34 @@ Controls AI-powered changelog analysis. Supports multiple AI providers via the Z
 - `model` (string) - Model to use (provider-specific defaults apply)
 - `tokenBudget` (number) - Token budget for changelog prompts (optional, provider-specific defaults apply)
 
-**Provider Comparison:**
+**Provider:**
 
-| Provider    | API Key Required | Quality   | Cost | Default Model              |
-| ----------- | ---------------- | --------- | ---- | -------------------------- |
-| `zai`  | ❌ No            | Good      | Free | glm-5-turbo                 |
-| `anthropic` | ✅ Yes           | Excellent | $$   | claude-sonnet-4-5-20250929 |
-| `openai`    | ✅ Yes           | Excellent | $$   | gpt-4o                     |
-| `google`    | ✅ Yes           | Very Good | $    | gemini-1.5-pro             |
+| Provider | API Key Required       | Quality | Cost | Default Model |
+| -------- | ---------------------- | ------- | ---- | ------------- |
+| `zai`    | Yes (`ZAI_API_KEY`)    | Good    | Free | glm-5-turbo   |
 
-**Environment Variables (for premium providers):**
+Set `ZAI_API_KEY` environment variable to enable AI changelog analysis.
 
-| Provider  | Environment Variable |
-| --------- | -------------------- |
-| anthropic | `ANTHROPIC_API_KEY`  |
-| openai    | `OPENAI_API_KEY`     |
-| google    | `GOOGLE_API_KEY`     |
+**Default Token Budget:**
 
-**Default Token Budgets:**
+When changelogs exceed the token budget, they're automatically summarized to fit.
 
-When changelogs exceed the token budget, they're automatically summarized to fit. Provider-specific defaults are:
-
-| Provider    | Default Budget | Rationale                       |
-| ----------- | -------------- | ------------------------------- |
-| `zai`  | 16,000         | Conservative for unknown limits |
-| `anthropic` | 64,000         | Claude handles 200k context     |
-| `openai`    | 64,000         | GPT-4o handles 128k context     |
-| `google`    | 128,000        | Gemini handles 1M context       |
+| Provider | Default Budget | Rationale                       |
+| -------- | -------------- | ------------------------------- |
+| `zai`    | 16,000         | Conservative for unknown limits |
 
 **Examples:**
 
 ```typescript
-// Free tier (default) - works without any API key
+// Z.AI provider (requires ZAI_API_KEY environment variable)
 ai: {
   provider: 'zai',
 }
 
-// Premium provider - requires API key
+// Custom token budget - override default
 ai: {
-  provider: 'anthropic',
-  // Set ANTHROPIC_API_KEY environment variable
-}
-
-// Custom token budget - override provider default
-ai: {
-  provider: 'anthropic',
-  tokenBudget: 32000, // Use 32k instead of default 64k
+  provider: 'zai',
+  tokenBudget: 8000, // Use 8k instead of default 16k
 }
 ```
 
@@ -378,9 +360,9 @@ export default defineConfig({
     devenvPath: './tooling/direnv',
     nixpkgsOverlayPath: './tooling/direnv/nixpkgs-overlay',
   },
-  // Upgrade to premium AI for better quality (requires API key)
+  // AI changelog analysis (requires ZAI_API_KEY)
   ai: {
-    provider: 'anthropic',
+    provider: 'zai',
   },
   prStrategy: {
     stackingEnabled: true,
