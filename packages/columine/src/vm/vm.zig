@@ -371,30 +371,9 @@ fn restoreChangeFlags(state_base: [*]u8) void {
 
 /// Find the array slot for a given key via hash probing.
 /// Returns the slot index, or capacity if not found.
-fn findKeyInMap(keys: [*]u32, capacity: u32, key: u32) u32 {
-    var slot = hashKey(key, capacity);
-    var probes: u32 = 0;
-    while (probes < capacity) : (probes += 1) {
-        if (keys[slot] == key) return slot;
-        if (keys[slot] == EMPTY_KEY) return capacity; // Not found
-        slot = (slot + 1) & (capacity - 1);
-    }
-    return capacity; // Not found
-}
 
 /// Find a TOMBSTONE or EMPTY slot at the hash position for restoring a deleted key.
 /// Used by MAP_DELETE/SET_DELETE rollback to re-insert at the correct probe position.
-fn findInsertSlot(keys: [*]u32, capacity: u32, key: u32) u32 {
-    var slot = hashKey(key, capacity);
-    var probes: u32 = 0;
-    while (probes < capacity) : (probes += 1) {
-        const k = keys[slot];
-        if (k == EMPTY_KEY or k == TOMBSTONE) return slot;
-        if (k == key) return slot; // Key already exists (shouldn't happen, but safe)
-        slot = (slot + 1) & (capacity - 1);
-    }
-    return capacity; // Full (shouldn't happen with proper load factor)
-}
 
 // probeUpsertSlot removed — replaced by FlatHashTable.findInsert() in hash_table.zig
 
@@ -681,32 +660,13 @@ pub fn evictExpired(state_base: [*]u8, meta: SlotMeta, slot_idx: u8, now: f64) u
         if (g_undo_enabled) {
             switch (meta.slotType()) {
                 .HASHMAP => {
-                    const data_ptr = state_base + meta.offset;
-                    const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
-                    const values: [*]const u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-                    const timestamps: [*]const f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-                    const idx = findKeyInMap(@constCast(keys), meta.capacity, entry.key_or_idx);
-                    if (idx < meta.capacity) {
+                    const tbl = hash_table.FlatHashTable(u32).bindSlot(state_base, meta);
+                    if (tbl.find(entry.key_or_idx)) |idx| {
+                        const ts: [*]const f64 = @ptrCast(@alignCast(state_base + meta.offset + meta.capacity * 8));
                         appendMutation(
                             false,
-                            .{
-                                .op = .MAP_DELETE,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = entry.key_or_idx,
-                                .prev_value = values[idx],
-                                .aux = @bitCast(timestamps[idx]),
-                            },
-                            .{
-                                .op = .MAP_INSERT,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = entry.key_or_idx,
-                                .prev_value = 0,
-                                .aux = 0,
-                            },
+                            .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = entry.key_or_idx, .prev_value = tbl.entries[idx], .aux = @bitCast(ts[idx]) },
+                            .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = entry.key_or_idx, .prev_value = 0, .aux = 0 },
                         );
                     }
                 },
@@ -773,40 +733,16 @@ pub fn evictExpired(state_base: [*]u8, meta: SlotMeta, slot_idx: u8, now: f64) u
 fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) bool {
     switch (meta.slotType()) {
         .HASHMAP => {
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-
-            var slot = hashKey(key, meta.capacity);
-            var probes: u32 = 0;
-
-            while (probes < meta.capacity) : (probes += 1) {
-                const k = keys[slot];
-                if (k == EMPTY_KEY) return false;
-                if (k == key) {
-                    keys[slot] = TOMBSTONE;
-                    return true;
-                }
-                slot = (slot + 1) & (meta.capacity - 1);
-            }
-            return false;
+            const tbl = hash_table.FlatHashTable(u32).bindSlot(state_base, meta);
+            const pos = tbl.find(key) orelse return false;
+            tbl.keys[pos] = TOMBSTONE;
+            return true;
         },
         .HASHSET => {
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-
-            var slot = hashKey(key, meta.capacity);
-            var probes: u32 = 0;
-
-            while (probes < meta.capacity) : (probes += 1) {
-                const k = keys[slot];
-                if (k == EMPTY_KEY) return false;
-                if (k == key) {
-                    keys[slot] = TOMBSTONE;
-                    return true;
-                }
-                slot = (slot + 1) & (meta.capacity - 1);
-            }
-            return false;
+            const tbl = hash_table.HashSet.bindSlot(state_base, meta);
+            const pos = tbl.find(key) orelse return false;
+            tbl.keys[pos] = TOMBSTONE;
+            return true;
         },
         .BITMAP => {
             const storage = getBitmapStorage(state_base, meta);
@@ -893,11 +829,8 @@ pub fn insertWithTTL(state_base: [*]u8, meta: SlotMeta, key: u32, timestamp: f64
 
     const entry_value: u32 = switch (meta.slotType()) {
         .HASHMAP => blk: {
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
-            const values: [*]const u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-            const idx = findKeyInMap(@constCast(keys), meta.capacity, key);
-            break :blk if (idx < meta.capacity) values[idx] else 0;
+            const tbl = hash_table.FlatHashTable(u32).bindSlot(state_base, meta);
+            break :blk if (tbl.get(key)) |v| v.* else 0;
         },
         .HASHSET, .BITMAP => key,
         else => 0,
@@ -4507,12 +4440,13 @@ pub export fn vm_map_iter_start(
     slot_offset: u32,
     capacity: u32,
 ) u32 {
-    const data_ptr = state_base + slot_offset;
-    const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
+    // Typed table binding — size_ptr unused for iteration
+    var dummy_size: u32 = 0;
+    const tbl = hash_table.HashMap.bindExternal(state_base + slot_offset, capacity, &dummy_size);
 
     var i: u32 = 0;
-    while (i < capacity) : (i += 1) {
-        const k = keys[i];
+    while (i < tbl.cap) : (i += 1) {
+        const k = tbl.keys[i];
         if (k != EMPTY_KEY and k != TOMBSTONE) {
             return i; // First valid entry
         }
@@ -4528,12 +4462,12 @@ pub export fn vm_map_iter_next(
     capacity: u32,
     current: u32,
 ) u32 {
-    const data_ptr = state_base + slot_offset;
-    const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
+    var dummy_size: u32 = 0;
+    const tbl = hash_table.HashMap.bindExternal(state_base + slot_offset, capacity, &dummy_size);
 
     var i: u32 = current + 1;
-    while (i < capacity) : (i += 1) {
-        const k = keys[i];
+    while (i < tbl.cap) : (i += 1) {
+        const k = tbl.keys[i];
         if (k != EMPTY_KEY and k != TOMBSTONE) {
             return i;
         }
@@ -4549,12 +4483,11 @@ pub export fn vm_map_iter_get(
     capacity: u32,
     pos: u32,
 ) u64 {
-    const data_ptr = state_base + slot_offset;
-    const keys: [*]const u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]const u32 = @ptrCast(@alignCast(data_ptr + capacity * 4));
+    var dummy_size: u32 = 0;
+    const tbl = hash_table.HashMap.bindExternal(state_base + slot_offset, capacity, &dummy_size);
 
-    const key = keys[pos];
-    const val = values[pos];
+    const key = tbl.keys[pos];
+    const val = tbl.entries[pos];
     return (@as(u64, val) << 32) | key;
 }
 
