@@ -19,11 +19,16 @@ export enum ValueType {
   FLOAT64 = 10,
 }
 
+/** Must match Zig AggType enum in opcodes.zig */
 export enum AggType {
   SUM = 1,
   COUNT = 2,
   MIN = 3,
   MAX = 4,
+  AVG = 5,
+  SCALAR_U32 = 8,
+  SCALAR_F64 = 9,
+  SCALAR_I64 = 10,
 }
 
 /** Must match Zig SlotType enum in vm.zig */
@@ -104,6 +109,7 @@ export type SlotDef =
   | { type: SlotType.HASHSET; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.BITMAP; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.AGGREGATE; aggType: AggType }
+  | { type: SlotType.SCALAR; aggType: AggType }
   | { type: SlotType.CONDITION_TREE }
   | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[]; ttl?: SlotTtlMetadata }
   | {
