@@ -38,6 +38,7 @@ pub const hashset_ops = @import("hashset_ops.zig");
 pub const slot_growth = @import("slot_growth.zig");
 pub const aggregates = @import("aggregates.zig");
 pub const undo_log = @import("undo_log.zig");
+pub const struct_map = @import("struct_map.zig");
 
 // Pull in test blocks from sub-modules during test compilation
 comptime {
@@ -49,6 +50,7 @@ comptime {
         _ = @import("slot_growth.zig");
         _ = @import("aggregates.zig");
         _ = @import("undo_log.zig");
+        _ = @import("struct_map.zig");
     }
 }
 const RoaringBitmap = rawr.RoaringBitmap;
@@ -1468,98 +1470,29 @@ fn singleStructMapUpsertLast(
 ) StructUpsertResult {
     if (key == EMPTY_KEY or key == TOMBSTONE) return .{ .err = .OK, .pos = 0 };
 
-    const meta_base = STATE_HEADER_SIZE + @as(u32, slot_idx) * SLOT_META_SIZE;
-    const slot_offset = std.mem.readInt(u32, state_base[meta_base..][0..4], .little);
-    const capacity = std.mem.readInt(u32, state_base[meta_base + 4 ..][0..4], .little);
-    var current_size = std.mem.readInt(u32, state_base[meta_base + 8 ..][0..4], .little);
-    const num_fields = state_base[meta_base + 13];
-    const bitset_bytes_val: u32 = state_base[meta_base + 15];
-    const row_size: u32 = std.mem.readInt(u16, state_base[meta_base + 16 ..][0..2], .little);
-
-    const field_types_ptr: [*]u8 = state_base + slot_offset;
-    const descriptor_size = align8(@as(u32, num_fields));
-    const keys_offset = slot_offset + descriptor_size;
-    const keys: [*]u32 = @ptrCast(@alignCast(&state_base[keys_offset]));
-    const rows_base = keys_offset + capacity * 4;
-    const max_size = (capacity * 7) / 10;
-
-    // Hash probe
-    var pos = hashKey(key, capacity);
-    var found = false;
-    while (true) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY) break;
-        if (k == key) {
-            found = true;
-            break;
+    const smap = struct_map.StructMapSlot.bind(state_base, slot_idx);
+    const result = smap.upsert(key) orelse {
+        if (comptime delta_mode) {
+            const meta_base = STATE_HEADER_SIZE + @as(u32, slot_idx) * SLOT_META_SIZE;
+            state_base[meta_base + 14] |= 0x01;
         }
-        if (k == TOMBSTONE) break;
-        pos = (pos + 1) & (capacity - 1);
-    }
+        g_needs_growth_slot = slot_idx;
+        return .{ .err = .CAPACITY_EXCEEDED, .pos = 0 };
+    };
 
-    if (!found) {
-        if (current_size >= max_size) {
-            // Signal growth needed
-            if (comptime delta_mode) {
-                state_base[meta_base + 14] |= 0x01;
-            }
-            g_needs_growth_slot = slot_idx;
-            return .{ .err = .CAPACITY_EXCEEDED, .pos = 0 };
-        }
-        keys[pos] = key;
-        current_size += 1;
-        std.mem.writeInt(u32, state_base[meta_base + 8 ..][0..4], current_size, .little);
-    }
+    const row = smap.rowPtr(result.pos);
+    smap.clearBitset(row);
 
-    // Write row data
-    const row_ptr = state_base + rows_base + pos * row_size;
-
-    // Clear bitset
-    @memset(row_ptr[0..bitset_bytes_val], 0);
-
-    // Write each provided scalar field value
-    const getColU32Inner = struct {
-        fn f(ptrs: [*]const [*]const u8, idx: u8) [*]const u32 {
-            return @ptrCast(@alignCast(ptrs[idx]));
-        }
-    }.f;
-
+    // Write each provided scalar field value via typed accessor
     for (0..num_vals) |vi| {
-        const field_idx = field_idxs[vi];
-        const field_type: StructFieldType = @enumFromInt(field_types_ptr[field_idx]);
-        const f_offset = structFieldOffset(num_fields, field_types_ptr, field_idx);
-
-        // Set bit in bitset
-        row_ptr[field_idx / 8] |= @as(u8, 1) << @as(u3, @truncate(field_idx % 8));
-
-        // Write value based on field type
-        switch (field_type) {
-            .UINT32, .STRING => {
-                const col = getColU32Inner(col_ptrs, val_cols[vi]);
-                std.mem.writeInt(u32, row_ptr[f_offset..][0..4], col[element_idx], .little);
-            },
-            .INT64 => {
-                const col: [*]const u64 = @ptrCast(@alignCast(col_ptrs[val_cols[vi]]));
-                std.mem.writeInt(u64, row_ptr[f_offset..][0..8], col[element_idx], .little);
-            },
-            .FLOAT64 => {
-                const col: [*]const f64 = @ptrCast(@alignCast(col_ptrs[val_cols[vi]]));
-                const bits: u64 = @bitCast(col[element_idx]);
-                std.mem.writeInt(u64, row_ptr[f_offset..][0..8], bits, .little);
-            },
-            .BOOL => {
-                const col = getColU32Inner(col_ptrs, val_cols[vi]);
-                row_ptr[f_offset] = if (col[element_idx] != 0) 1 else 0;
-            },
-            // Array fields are handled separately via writeStructMapArrayFields
-            .ARRAY_U32, .ARRAY_I64, .ARRAY_F64, .ARRAY_STRING, .ARRAY_BOOL => {},
-        }
+        smap.writeScalarField(result.pos, field_idxs[vi], col_ptrs, val_cols[vi], element_idx);
     }
 
     if (comptime delta_mode) {
+        const meta_base = STATE_HEADER_SIZE + @as(u32, slot_idx) * SLOT_META_SIZE;
         state_base[meta_base + 14] |= 0x01;
     }
-    return .{ .err = .OK, .pos = pos };
+    return .{ .err = .OK, .pos = result.pos };
 }
 
 /// Write array field values into a struct map row's arena.
