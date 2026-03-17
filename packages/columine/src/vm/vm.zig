@@ -3554,7 +3554,43 @@ fn reduceCol(
         }
     }
 
-    // Scalar path — i64, or any type with predicate column
+    // i64 SIMD path for sum — WASM simd128 has i64x2.add (2-wide)
+    if (T == i64 and kind == .sum and pred_col == null) {
+        const V2i64 = @Vector(2, i64);
+        var sum_vec: V2i64 = @splat(@as(i64, 0));
+        var i: u32 = 0;
+
+        if (type_mask) |m| {
+            // Masked i64 sum: check type_data per element, accumulate via i64x2
+            const V2u32 = @Vector(2, u32);
+            const type_id_vec: V2u32 = @splat(m.id);
+            const zero_i64: V2i64 = @splat(@as(i64, 0));
+            while (i + 2 <= batch_len) : (i += 2) {
+                const type_vec: V2u32 = .{ m.data[i], m.data[i + 1] };
+                const mask = type_vec == type_id_vec;
+                const val_vec: V2i64 = .{ vals[i], vals[i + 1] };
+                sum_vec +%= @select(i64, mask, val_vec, zero_i64);
+            }
+        } else {
+            // Unmasked i64 sum
+            while (i + 2 <= batch_len) : (i += 2) {
+                const val_vec: V2i64 = .{ vals[i], vals[i + 1] };
+                sum_vec +%= val_vec;
+            }
+        }
+
+        var acc = current +% @reduce(.Add, sum_vec);
+        // Scalar tail
+        while (i < batch_len) : (i += 1) {
+            if (type_mask) |m| {
+                if (m.data[i] != m.id) continue;
+            }
+            acc +%= vals[i];
+        }
+        return acc;
+    }
+
+    // Scalar path — i64 min/max, or any type with predicate column
     var acc = current;
     var i: u32 = 0;
     while (i < batch_len) : (i += 1) {
