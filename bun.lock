@@ -74,7 +74,6 @@
       },
       "dependencies": {
         "@clack/prompts": "^0.7.0",
-        "@opencode-ai/sdk": "^1.0.0",
         "commander": "^12.1.0",
         "execa": "^9.5.2",
         "fast-glob": "^3.3.2",
