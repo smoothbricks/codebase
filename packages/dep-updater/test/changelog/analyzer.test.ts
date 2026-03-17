@@ -1,5 +1,4 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
-import { countTokens } from '../../src/ai/token-counter.js';
 // Import directly without mocking - we'll test fallback paths
 // This avoids mock persistence issues with Bun's module mocking
 import { analyzeChangelogs, generateCommitMessage } from '../../src/changelog/analyzer.js';
@@ -224,9 +223,7 @@ describe('Changelog Analyzer', () => {
         expect(result).toContain('## Dependency Updates');
         expect(result).toContain('react: 18.0.0 → 19.0.0');
         // Should warn about missing key
-        expect(config.logger?.warn).toHaveBeenCalledWith(
-          expect.stringContaining('No ZAI_API_KEY found'),
-        );
+        expect(config.logger?.warn).toHaveBeenCalledWith(expect.stringContaining('No ZAI_API_KEY found'));
 
         if (originalEnv !== undefined) {
           process.env.ZAI_API_KEY = originalEnv;

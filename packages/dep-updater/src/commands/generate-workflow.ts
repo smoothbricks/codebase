@@ -88,7 +88,8 @@ export async function generateWorkflow(config: DepUpdaterConfig, options: Genera
   const repoRoot = config.repoRoot || (await getRepoRoot());
 
   // AI is enabled by default when API key is configured, or explicitly enabled
-  const useAI = options.enableAI === true || (!options.skipAI && (config.ai?.apiKey !== undefined || !!process.env.ZAI_API_KEY));
+  const useAI =
+    options.enableAI === true || (!options.skipAI && (config.ai?.apiKey !== undefined || !!process.env.ZAI_API_KEY));
 
   const provider = config.ai.provider;
 

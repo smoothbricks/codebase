@@ -2,8 +2,8 @@
  * AI-powered changelog analysis using Z.AI GLM-5-Turbo
  */
 
-import { sendPrompt } from '../ai/zai-client.js';
 import { countTokens } from '../ai/token-counter.js';
+import { sendPrompt } from '../ai/zai-client.js';
 import { type DepUpdaterConfig, sanitizeConfigForLogging } from '../config.js';
 import type { PackageUpdate } from '../types.js';
 
