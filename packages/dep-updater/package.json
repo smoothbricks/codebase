@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/dep-updater",
-  "version": "0.0.1",
+  "version": "0.1.0",
   "description": "Automated dependency update tool with Expo support, stacked PRs, and AI-powered changelogs",
   "type": "module",
   "files": [
@@ -52,7 +52,12 @@
     "ai",
     "stacked-prs"
   ],
-  "private": true,
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/smoothbricks/smoothbricks.git",
+    "directory": "packages/dep-updater"
+  },
   "nx": {
     "targets": {
       "lint": {},
