@@ -31,6 +31,14 @@ const std = @import("std");
 const builtin = @import("builtin");
 const rawr = @import("rawr");
 const types = @import("types.zig");
+pub const nested = @import("nested.zig");
+
+// Pull in test blocks from sub-modules during test compilation
+comptime {
+    if (@import("builtin").is_test) {
+        _ = @import("nested.zig");
+    }
+}
 const RoaringBitmap = rawr.RoaringBitmap;
 const FrozenBitmap = rawr.FrozenBitmap;
 const bitmap_allocator = if (builtin.cpu.arch == .wasm32 or builtin.cpu.arch == .wasm64)
