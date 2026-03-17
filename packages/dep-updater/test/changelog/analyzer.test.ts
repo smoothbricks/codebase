@@ -30,7 +30,7 @@ describe('Changelog Analyzer', () => {
       prTitlePrefix: 'chore: update dependencies',
     },
     autoMerge: { enabled: false, mode: 'none', requireTests: true },
-    ai: { provider: 'anthropic' }, // No API key = fallback mode
+    ai: { provider: 'zai' }, // No API key = fallback mode (ZAI_API_KEY not set)
     git: { remote: 'origin', baseBranch: 'main' },
   };
 
@@ -208,10 +208,13 @@ describe('Changelog Analyzer', () => {
     // fallback scenarios that don't make network calls.
 
     describe('fallback behavior (no API key)', () => {
-      test('falls back to fallback summary when paid provider has no API key', async () => {
+      test('falls back to fallback summary when no ZAI_API_KEY', async () => {
+        const originalEnv = process.env.ZAI_API_KEY;
+        delete process.env.ZAI_API_KEY;
+
         const config: DepUpdaterConfig = {
           ...mockConfig,
-          ai: { provider: 'anthropic' }, // No API key
+          ai: { provider: 'zai' }, // No API key
           logger: createMockLogger(),
         };
 
@@ -222,38 +225,12 @@ describe('Changelog Analyzer', () => {
         expect(result).toContain('react: 18.0.0 → 19.0.0');
         // Should warn about missing key
         expect(config.logger?.warn).toHaveBeenCalledWith(
-          expect.stringContaining("No API key found for provider 'anthropic'"),
+          expect.stringContaining('No ZAI_API_KEY found'),
         );
-      });
 
-      test('falls back when openai provider has no API key', async () => {
-        const config: DepUpdaterConfig = {
-          ...mockConfig,
-          ai: { provider: 'openai' },
-          logger: createMockLogger(),
-        };
-
-        const result = await analyzeChangelogs(updates, changelogs, config);
-
-        expect(result).toContain('## Dependency Updates');
-        expect(config.logger?.warn).toHaveBeenCalledWith(
-          expect.stringContaining("No API key found for provider 'openai'"),
-        );
-      });
-
-      test('falls back when google provider has no API key', async () => {
-        const config: DepUpdaterConfig = {
-          ...mockConfig,
-          ai: { provider: 'google' },
-          logger: createMockLogger(),
-        };
-
-        const result = await analyzeChangelogs(updates, changelogs, config);
-
-        expect(result).toContain('## Dependency Updates');
-        expect(config.logger?.warn).toHaveBeenCalledWith(
-          expect.stringContaining("No API key found for provider 'google'"),
-        );
+        if (originalEnv !== undefined) {
+          process.env.ZAI_API_KEY = originalEnv;
+        }
       });
     });
 
@@ -261,7 +238,7 @@ describe('Changelog Analyzer', () => {
       test('includes changelog URLs in fallback summary', async () => {
         const config: DepUpdaterConfig = {
           ...mockConfig,
-          ai: { provider: 'anthropic' }, // No API key = fallback
+          ai: { provider: 'zai' }, // No API key = fallback
           logger: createMockLogger(),
         };
 
@@ -279,7 +256,7 @@ describe('Changelog Analyzer', () => {
 
         const config: DepUpdaterConfig = {
           ...mockConfig,
-          ai: { provider: 'anthropic' }, // No API key = fallback
+          ai: { provider: 'zai' }, // No API key = fallback
           logger: createMockLogger(),
         };
 
@@ -298,7 +275,7 @@ describe('Changelog Analyzer', () => {
 
         const config: DepUpdaterConfig = {
           ...mockConfig,
-          ai: { provider: 'anthropic' }, // No API key = fallback
+          ai: { provider: 'zai' }, // No API key = fallback
           logger: createMockLogger(),
         };
 
@@ -315,7 +292,7 @@ describe('Changelog Analyzer', () => {
 
         const config: DepUpdaterConfig = {
           ...mockConfig,
-          ai: { provider: 'anthropic' }, // No API key = fallback
+          ai: { provider: 'zai' }, // No API key = fallback
           logger: createMockLogger(),
         };
 

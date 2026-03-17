@@ -95,7 +95,7 @@ export interface DepUpdaterConfig {
     /**
      * Token budget for changelog analysis prompts.
      * When changelogs exceed this limit, they're summarized to fit.
-     * Defaults vary by provider: opencode=16k, anthropic/openai=64k, google=128k
+     * Default: 64k (GLM-5-Turbo has 128k context window)
      */
     tokenBudget?: number;
   };
@@ -149,8 +149,8 @@ export const defaultConfig: DepUpdaterConfig = {
     requireTests: true,
   },
   ai: {
-    provider: 'opencode', // Free tier by default
-    model: 'big-pickle', // Free model via OpenCode
+    provider: 'zai',
+    model: 'glm-5-turbo',
   },
   git: {
     remote: 'origin',

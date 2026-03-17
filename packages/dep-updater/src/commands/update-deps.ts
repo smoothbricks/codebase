@@ -3,7 +3,7 @@
  */
 
 import * as p from '@clack/prompts';
-import { shutdownOpenCodeClient } from '../ai/opencode-client.js';
+import { shutdownAIClient } from '../ai/zai-client.js';
 import { analyzeChangelogs, generateCommitMessage } from '../changelog/analyzer.js';
 import { fetchChangelogs } from '../changelog/fetcher.js';
 import type { DepUpdaterConfig } from '../config.js';
@@ -369,7 +369,6 @@ export async function updateDeps(config: DepUpdaterConfig, options: UpdateOption
 
     p.outro('Dependency update complete!');
   } finally {
-    // Shutdown OpenCode server if it was started (allows process to exit cleanly)
-    await shutdownOpenCodeClient(config.logger);
+    await shutdownAIClient(config.logger);
   }
 }

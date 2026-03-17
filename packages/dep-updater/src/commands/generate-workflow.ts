@@ -10,7 +10,6 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { PROVIDER_ENV_VARS } from '../ai/opencode-client.js';
 import type { DepUpdaterConfig } from '../config.js';
 import { getRepoRoot } from '../git.js';
 import type { GenerateWorkflowOptions, SupportedProvider } from '../types.js';
@@ -38,58 +37,25 @@ function getTemplatesDir(): string {
   throw new Error('Could not find templates directory');
 }
 
-/**
- * Check if provider requires an API key in the workflow
- * OpenCode is free and doesn't require any secrets
- */
-function providerRequiresSecret(provider: SupportedProvider): boolean {
-  return PROVIDER_ENV_VARS[provider] !== '';
-}
-
-/**
- * Get the env var configuration for the workflow based on provider
- * Returns null for providers that don't require secrets (like opencode)
- */
-function getAIEnvVarConfig(provider: SupportedProvider): { envVar: string; secretRef: string } | null {
-  const envVar = PROVIDER_ENV_VARS[provider];
-  if (!envVar) {
-    return null; // No secret needed (e.g., opencode)
-  }
-  return {
-    envVar,
-    secretRef: `\n          ${envVar}: \${{ secrets.${envVar} }}`,
-  };
-}
+/** AI env var name for Z.AI */
+const ZAI_ENV_VAR = 'ZAI_API_KEY';
 
 /**
  * Process unified template placeholders
  * Only handles AI-related placeholders - auth detection is runtime
  */
-function processUnifiedTemplate(template: string, useAI: boolean, provider: SupportedProvider): string {
+function processUnifiedTemplate(template: string, useAI: boolean, _provider: SupportedProvider): string {
   let result = template;
 
   if (useAI) {
-    const aiConfig = getAIEnvVarConfig(provider);
-    const needsSecret = aiConfig !== null;
-
-    if (needsSecret) {
-      // Paid provider - needs API key secret
-      result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
-      result = result.replace(
-        '{{AI_SETUP_NOTE}}',
-        `\n#   - Configured provider: ${provider} (requires ${aiConfig.envVar} secret)`,
-      );
-      result = result.replace('{{AI_STEP_SUFFIX}}', ' with AI changelog analysis');
-      result = result.replace('{{AI_ENV_VAR}}', aiConfig.secretRef);
-    } else {
-      // Free tier (opencode) - no API key needed
-      result = result.replace('{{AI_HEADER_SUFFIX}}', ' + Free AI Changelog Analysis');
-      result = result.replace('{{AI_SETUP_NOTE}}', ''); // No extra note needed for free tier
-      result = result.replace('{{AI_STEP_SUFFIX}}', ' with free AI changelog analysis');
-      result = result.replace('{{AI_ENV_VAR}}', '');
-    }
+    result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
+    result = result.replace(
+      '{{AI_SETUP_NOTE}}',
+      `\n#   - AI provider: Z.AI GLM-5-Turbo (requires ${ZAI_ENV_VAR} secret)`,
+    );
+    result = result.replace('{{AI_STEP_SUFFIX}}', ' with AI changelog analysis');
+    result = result.replace('{{AI_ENV_VAR}}', `\n          ${ZAI_ENV_VAR}: \${{ secrets.${ZAI_ENV_VAR} }}`);
   } else {
-    // Without AI
     result = result.replace('{{AI_HEADER_SUFFIX}}', '');
     result = result.replace('{{AI_SETUP_NOTE}}', '');
     result = result.replace('{{AI_STEP_SUFFIX}}', '');
@@ -121,9 +87,8 @@ async function generateWorkflowContentFromTemplate(options: {
 export async function generateWorkflow(config: DepUpdaterConfig, options: GenerateWorkflowOptions): Promise<void> {
   const repoRoot = config.repoRoot || (await getRepoRoot());
 
-  // AI is enabled by default for free tier (opencode), or when explicitly enabled, or when API key is configured
-  const isFreeProvider = !providerRequiresSecret(config.ai.provider);
-  const useAI = options.enableAI === true || (!options.skipAI && (isFreeProvider || config.ai?.apiKey !== undefined));
+  // AI is enabled by default when API key is configured, or explicitly enabled
+  const useAI = options.enableAI === true || (!options.skipAI && (config.ai?.apiKey !== undefined || !!process.env.ZAI_API_KEY));
 
   const provider = config.ai.provider;
 

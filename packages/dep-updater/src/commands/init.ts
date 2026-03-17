@@ -43,8 +43,8 @@ function generateJSONConfig(options: {
       prTitlePrefix: 'chore: update dependencies',
     },
     ai: {
-      provider: 'opencode',
-      model: 'big-pickle',
+      provider: 'zai',
+      model: 'glm-5-turbo',
     },
   };
 
@@ -84,8 +84,8 @@ export default defineConfig({
     prTitlePrefix: 'chore: update dependencies',
   },
   ai: {
-    provider: 'opencode',
-    model: 'big-pickle',
+    provider: 'zai',
+    model: 'glm-5-turbo',
   },
 });
 `;
@@ -213,11 +213,7 @@ export async function init(config: DepUpdaterConfig, options: InitOptions): Prom
     enableAI = aiPrompt;
 
     if (enableAI) {
-      p.note(
-        'Requires an AI provider API key in GitHub Secrets.\n' +
-          'Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY',
-        'Note',
-      );
+      p.note('Requires ZAI_API_KEY in GitHub Secrets (Z.AI GLM-5-Turbo).', 'Note');
     }
 
     if (enableExpo) {
@@ -358,8 +354,7 @@ export async function init(config: DepUpdaterConfig, options: InitOptions): Prom
 
   // Add API key if AI enabled
   if (enableAI) {
-    nextSteps += `${stepNumber}. Add your AI provider API key to GitHub organization secrets\n`;
-    nextSteps += '   Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY\n\n';
+    nextSteps += `${stepNumber}. Add ZAI_API_KEY to GitHub organization secrets\n\n`;
     stepNumber++;
   }
 

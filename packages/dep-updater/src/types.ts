@@ -222,10 +222,9 @@ export interface GitHubPR {
 
 /**
  * Supported AI providers for changelog analysis
- * - opencode: Free tier via OpenCode (requires `opencode auth login`, default model: big-pickle)
- * - anthropic, openai, google: Premium tiers (require API keys)
+ * - zai: Z.AI GLM-5-Turbo (requires ZAI_API_KEY)
  */
-export const SUPPORTED_PROVIDERS = ['opencode', 'anthropic', 'openai', 'google'] as const;
+export const SUPPORTED_PROVIDERS = ['zai'] as const;
 export type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
 /**

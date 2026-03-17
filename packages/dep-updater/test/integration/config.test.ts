@@ -64,8 +64,8 @@ describe('Config Integration - loadConfig', () => {
     expect(config.git?.baseBranch).toBe('main');
 
     // AI defaults (opencode is free tier with big-pickle model)
-    expect(config.ai.provider).toBe('opencode');
-    expect(config.ai.model).toBe('big-pickle');
+    expect(config.ai.provider).toBe('zai');
+    expect(config.ai.model).toBe('glm-5-turbo');
   });
 });
 
@@ -124,8 +124,8 @@ describe('Config Integration - mergeConfig Deep Merging', () => {
     const merged = mergeConfig(userConfig);
 
     expect(merged.ai.apiKey).toBe('sk-test-key');
-    expect(merged.ai.provider).toBe('opencode'); // Keeps default (free tier)
-    expect(merged.ai.model).toBe('big-pickle'); // Keeps default
+    expect(merged.ai.provider).toBe('zai'); // Keeps default (free tier)
+    expect(merged.ai.model).toBe('glm-5-turbo'); // Keeps default
   });
 
   test('should deep merge expo section when enabled', () => {

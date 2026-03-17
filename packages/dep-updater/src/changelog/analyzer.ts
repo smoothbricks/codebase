@@ -1,63 +1,20 @@
 /**
- * AI-powered changelog analysis using OpenCode SDK
- *
- * Supports multiple AI providers via SST's OpenCode SDK:
- * - OpenCode (free tier, no API key required)
- * - Anthropic (Claude)
- * - OpenAI (GPT-4)
- * - Google (Gemini)
+ * AI-powered changelog analysis using Z.AI GLM-5-Turbo
  */
 
-import { PROVIDER_ENV_VARS, sendPrompt } from '../ai/opencode-client.js';
+import { sendPrompt } from '../ai/zai-client.js';
 import { countTokens } from '../ai/token-counter.js';
 import { type DepUpdaterConfig, sanitizeConfigForLogging } from '../config.js';
-import type { PackageUpdate, SupportedProvider } from '../types.js';
+import type { PackageUpdate } from '../types.js';
 
-/**
- * Provider-specific default token budgets
- * These are conservative defaults based on each provider's context window
- */
-const DEFAULT_TOKEN_BUDGETS: Record<string, number> = {
-  opencode: 16000, // Conservative for unknown limits
-  anthropic: 64000, // Claude handles 200k context
-  openai: 64000, // GPT-4o handles 128k context
-  google: 128000, // Gemini handles 1M context
-};
-
-/** Default model for summarization (cheaper/faster) - provider-specific */
-const SUMMARIZATION_MODELS: Record<string, string> = {
-  opencode: 'big-pickle', // Free model via OpenCode
-  anthropic: 'claude-3-5-haiku-latest',
-  openai: 'gpt-4o-mini',
-  google: 'gemini-1.5-flash',
-};
-
-/**
- * Check if provider requires an API key
- * OpenCode (big-pickle model) is free and doesn't require authentication
- */
-function requiresApiKey(provider: string): boolean {
-  return provider !== 'opencode';
-}
-
-/**
- * Get the summarization model for a provider (cheaper/faster model)
- */
-function getSummarizationModel(provider: string): string {
-  return SUMMARIZATION_MODELS[provider] || SUMMARIZATION_MODELS.anthropic;
-}
+/** Default token budget for GLM-5-Turbo (128k context window) */
+const DEFAULT_TOKEN_BUDGET = 64000;
 
 /**
  * Get the token budget for changelog analysis
- * User config override takes priority, then falls back to provider default
  */
 function getTokenBudget(config: DepUpdaterConfig): number {
-  // User override takes priority
-  if (config.ai.tokenBudget) {
-    return config.ai.tokenBudget;
-  }
-  // Fall back to provider default
-  return DEFAULT_TOKEN_BUDGETS[config.ai.provider] || 16000;
+  return config.ai.tokenBudget || DEFAULT_TOKEN_BUDGET;
 }
 
 /**
@@ -67,9 +24,7 @@ async function summarizeChangelog(changelog: string, packageName: string, config
   try {
     const prompt = `Summarize this changelog for ${packageName} in 2-3 bullet points. Focus on breaking changes, security fixes, and important new features. Be concise.\n\n${changelog}`;
 
-    const response = await sendPrompt(config, prompt, {
-      model: getSummarizationModel(config.ai.provider),
-    });
+    const response = await sendPrompt(config, prompt);
 
     return response || changelog.substring(0, 1000);
   } catch (error) {
@@ -82,7 +37,7 @@ async function summarizeChangelog(changelog: string, packageName: string, config
 }
 
 /**
- * Analyze changelogs using OpenCode SDK (multi-provider AI)
+ * Analyze changelogs using Z.AI GLM-5-Turbo
  */
 export async function analyzeChangelogs(
   updates: PackageUpdate[],
@@ -90,22 +45,18 @@ export async function analyzeChangelogs(
   config: DepUpdaterConfig,
   downgrades: PackageUpdate[] = [],
 ): Promise<string> {
-  // Check for API key based on provider (opencode doesn't need one)
-  if (requiresApiKey(config.ai.provider)) {
-    const apiKey = config.ai.apiKey || getProviderApiKey(config.ai.provider);
-
-    if (!apiKey) {
-      config.logger?.warn(`No API key found for provider '${config.ai.provider}', skipping AI analysis`);
-      config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
-      return generateFallbackSummary(updates, downgrades);
-    }
+  // Check for API key
+  const apiKey = config.ai.apiKey || process.env.ZAI_API_KEY;
+  if (!apiKey) {
+    config.logger?.warn('No ZAI_API_KEY found, skipping AI analysis');
+    config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
+    return generateFallbackSummary(updates, downgrades);
   }
 
   try {
     // Build prompt and check token count, summarizing large changelogs if needed
     const prompt = await buildPromptWithinBudget(updates, changelogs, config);
 
-    // Send prompt via OpenCode SDK
     const response = await sendPrompt(config, prompt);
 
     if (response) {
@@ -133,14 +84,6 @@ export async function analyzeChangelogs(
     }
     return generateFallbackSummary(updates, downgrades);
   }
-}
-
-/**
- * Get the API key environment variable for a provider
- */
-function getProviderApiKey(provider: SupportedProvider): string | undefined {
-  const envVar = PROVIDER_ENV_VARS[provider];
-  return process.env[envVar];
 }
 
 /**
