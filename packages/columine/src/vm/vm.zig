@@ -6243,7 +6243,7 @@ fn buildStructMapTestProgram(comptime cap_lo: u8, comptime cap_hi: u8) [80]u8 {
     // SLOT_STRUCT_MAP
     content[off] = 0x18; // SLOT_STRUCT_MAP opcode
     content[off + 1] = 0; // slot index
-    content[off + 2] = 0x05; // type_flags: STRUCT_MAP=5, no TTL
+    content[off + 2] = @intFromEnum(SlotType.STRUCT_MAP); // type_flags: STRUCT_MAP, no TTL
     content[off + 3] = cap_lo;
     content[off + 4] = cap_hi;
     content[off + 5] = 2; // num_fields = 2
@@ -6852,7 +6852,7 @@ fn buildBlockStructMapTestProgram(type_id: u32) [96]u8 {
     var off: usize = 14;
     content[off] = 0x18; // SLOT_STRUCT_MAP
     content[off + 1] = 0;
-    content[off + 2] = 0x05; // STRUCT_MAP
+    content[off + 2] = @intFromEnum(SlotType.STRUCT_MAP); // STRUCT_MAP
     content[off + 3] = 4; // cap_lo
     content[off + 4] = 0;
     content[off + 5] = 2; // num_fields
@@ -7323,7 +7323,7 @@ fn buildMixedBlockTestProgram(type_id: u32) [160]u8 {
     // Slot 0: SLOT_STRUCT_MAP
     content[off] = 0x18;
     content[off + 1] = 0; // slot
-    content[off + 2] = 0x05; // STRUCT_MAP
+    content[off + 2] = @intFromEnum(SlotType.STRUCT_MAP); // STRUCT_MAP
     content[off + 3] = 4; // cap_lo
     content[off + 4] = 0;
     content[off + 5] = 2; // num_fields
@@ -7938,7 +7938,7 @@ fn buildStructListTestProgram(type_id: u32) [96]u8 {
     var off: usize = 14;
     content[off] = 0x19; // SLOT_ORDERED_LIST
     content[off + 1] = 0; // slot
-    content[off + 2] = 6; // type_flags: ORDERED_LIST(6)
+    content[off + 2] = @intFromEnum(SlotType.ORDERED_LIST); // type_flags: ORDERED_LIST
     content[off + 3] = 8; // cap_lo
     content[off + 4] = 0; // cap_hi
     content[off + 5] = 0xFF; // elem_type: STRUCT
@@ -8124,7 +8124,7 @@ test "ORDERED_LIST - inside FLAT_MAP" {
     var off: usize = 14;
     content[off] = 0x19; // SLOT_ORDERED_LIST
     content[off + 1] = 0; // slot
-    content[off + 2] = 6; // type_flags: ORDERED_LIST
+    content[off + 2] = @intFromEnum(SlotType.ORDERED_LIST); // type_flags: ORDERED_LIST
     content[off + 3] = 8; // cap_lo
     content[off + 4] = 0;
     content[off + 5] = 0; // UINT32
@@ -8232,7 +8232,7 @@ fn buildArrayFieldTestProgram(type_id: u32) [128]u8 {
     var off: usize = 14;
     content[off] = 0x18; // SLOT_STRUCT_MAP
     content[off + 1] = 0; // slot index
-    content[off + 2] = 0x05; // type_flags: STRUCT_MAP=5
+    content[off + 2] = @intFromEnum(SlotType.STRUCT_MAP); // type_flags: STRUCT_MAP
     content[off + 3] = 4; // cap_lo
     content[off + 4] = 0; // cap_hi
     content[off + 5] = 2; // num_fields
