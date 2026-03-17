@@ -290,7 +290,7 @@ fn extractTypedValue(
                 else => return error.InvalidFieldType,
             }
         },
-        .Int => {
+        .Int, .Int64 => {
             // Expect number or ISO-8601 string, coerce to i64
             switch (token) {
                 .number => |n| {

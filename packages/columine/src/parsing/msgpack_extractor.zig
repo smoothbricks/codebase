@@ -181,7 +181,7 @@ fn extractTypedValue(
             const result = dynamic_cols.appendUtf8(col_idx, s);
             if (result != .OK) return error.BufferOverflow;
         },
-        .Int => {
+        .Int, .Int64 => {
             // Integer, float (truncated), or string (ISO-8601 timestamp)
             if (b == 0xc0) {
                 pos.* += 1;
