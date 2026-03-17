@@ -660,7 +660,7 @@ gh variable set DEP_UPDATER_SKIP_AI --body "true" --org YOUR_ORG
 
 1. Generate PAT: https://github.com/settings/tokens/new (scope: `repo`)
 2. Add organization secret: `DEP_UPDATER_TOKEN`
-3. Optional: Add AI provider API key (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY`)
+3. Optional: Add AI provider API key (`ZAI_API_KEY`)
 
 **For GitHub App:**
 
@@ -672,8 +672,7 @@ gh variable set DEP_UPDATER_SKIP_AI --body "true" --org YOUR_ORG
 3. Add organization variables and secrets:
    - Variable: `DEP_UPDATER_APP_ID` (App ID from GitHub App settings)
    - Secret: `DEP_UPDATER_APP_PRIVATE_KEY` (Private key PEM file content)
-   - Secret (optional): AI provider API key for changelog analysis (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or
-     `GOOGLE_API_KEY`)
+   - Secret (optional): AI provider API key for changelog analysis (`ZAI_API_KEY`)
 
 ### Init Command (`src/commands/init.ts`)
 
@@ -908,7 +907,7 @@ const safePath = safeResolve(baseDir, userProvidedPath);
 
 ## Code Coverage Status
 
-### ✅ Tested (415 tests total)
+### ✅ Tested (486 tests total)
 
 - **GitHub Client** - GitHubCLIClient class (20 tests)
   - listUpdatePRs: JSON parsing, empty results, command verification, error handling (5 tests)
