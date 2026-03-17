@@ -112,7 +112,7 @@ pub const DynamicColumn = struct {
     ) DynamicColumn {
         return .{
             .field_idx = field_idx,
-            .arrow_type = .Int,
+            .arrow_type = .Int32,
             .nullable = nullable,
             .validity = validity,
             .data = data,
@@ -129,7 +129,7 @@ pub const DynamicColumn = struct {
     ) DynamicColumn {
         return .{
             .field_idx = field_idx,
-            .arrow_type = .FloatingPoint,
+            .arrow_type = .Float64,
             .nullable = nullable,
             .validity = validity,
             .data = data,
@@ -217,7 +217,7 @@ pub const DynamicBodyBuilder = struct {
                 // Data buffer
                 if (!self.addBuffer(column.data)) return false;
             },
-            .Int, .Int64, .FloatingPoint, .Bool => {
+            .Int32, .Int64, .Float64, .Bool => {
                 // Just data buffer
                 if (!self.addBuffer(column.data)) return false;
             },
@@ -301,7 +301,7 @@ test "computeBufferCount for 4-field schema" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id: validity + offsets + data = 3
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type: validity + offsets + data = 3
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp: validity + data = 2
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp: validity + data = 2
         .{ .arrow_type = .Binary, .nullable = 1 }, // value: validity + offsets + data = 3
     };
 
@@ -314,9 +314,9 @@ test "computeBufferCount for extended schema" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id: 3
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type: 3
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp: 2
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp: 2
         .{ .arrow_type = .Utf8, .nullable = 1 }, // value.orderId: 3
-        .{ .arrow_type = .FloatingPoint, .nullable = 1 }, // value.amount: 2
+        .{ .arrow_type = .Float64, .nullable = 1 }, // value.amount: 2
         .{ .arrow_type = .Bool, .nullable = 1 }, // value.confirmed: 2
     };
 
@@ -332,7 +332,7 @@ test "DynamicColumn constructors" {
     try std.testing.expect(!col.nullable);
 
     const int_col = DynamicColumn.int64(2, false, null, &[_]u8{});
-    try std.testing.expectEqual(dynamic_schema.ArrowType.Int, int_col.arrow_type);
+    try std.testing.expectEqual(dynamic_schema.ArrowType.Int32, int_col.arrow_type);
     try std.testing.expect(int_col.offsets == null);
 }
 

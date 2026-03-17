@@ -17,11 +17,14 @@ const std = @import("std");
 /// Arrow type identifiers matching TypeScript ArrowType enum in ArrowSchemaDescriptor.ts.
 pub const ArrowType = enum(u8) {
     Null = 0,
-    Int = 1,
-    FloatingPoint = 2,
+    /// 32-bit signed integer (enum ordinals, S.i32(), S.u32())
+    Int32 = 1,
+    /// 64-bit IEEE 754 float (S.number(), S.f64())
+    Float64 = 2,
     Binary = 3,
     Utf8 = 4,
     Bool = 5,
+    /// 64-bit signed integer (S.bigint(), S.i64(), S.timestamp(), timestamps)
     Int64 = 6,
 };
 
@@ -56,7 +59,7 @@ pub const SignalSchemaField = extern struct {
                 // Variable-length: offsets buffer + data buffer
                 count += 2;
             },
-            .Int, .Int64, .FloatingPoint, .Bool => {
+            .Int32, .Int64, .Float64, .Bool => {
                 // Fixed-length: just data buffer
                 count += 1;
             },
@@ -273,11 +276,11 @@ test "SignalSchemaField bufferCount" {
     try std.testing.expectEqual(@as(u32, 3), binary_field.bufferCount());
 
     // Int (fixed-length): validity + data = 2
-    const int_field = SignalSchemaField{ .arrow_type = .Int, .nullable = 0 };
+    const int_field = SignalSchemaField{ .arrow_type = .Int32, .nullable = 0 };
     try std.testing.expectEqual(@as(u32, 2), int_field.bufferCount());
 
-    // FloatingPoint (fixed-length): validity + data = 2
-    const float_field = SignalSchemaField{ .arrow_type = .FloatingPoint, .nullable = 1 };
+    // Float64 (fixed-length): validity + data = 2
+    const float_field = SignalSchemaField{ .arrow_type = .Float64, .nullable = 1 };
     try std.testing.expectEqual(@as(u32, 2), float_field.bufferCount());
 
     // Bool (fixed-length): validity + data = 2
@@ -299,7 +302,7 @@ test "DynamicSchemaConfig init and deinit" {
     const fields = [_]SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Binary, .nullable = 1 }, // value
     };
 
@@ -319,7 +322,7 @@ test "DynamicSchemaConfig computeBufferCount for 4-field schema" {
     const fields = [_]SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id: 3 buffers
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type: 3 buffers
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp: 2 buffers
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp: 2 buffers
         .{ .arrow_type = .Binary, .nullable = 1 }, // value: 3 buffers
     };
 
@@ -340,9 +343,9 @@ test "DynamicSchemaConfig computeBufferCount for 5-field schema" {
     const fields = [_]SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id: 3 buffers
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type: 3 buffers
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp: 2 buffers
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp: 2 buffers
         .{ .arrow_type = .Utf8, .nullable = 1 }, // value.orderId: 3 buffers
-        .{ .arrow_type = .FloatingPoint, .nullable = 1 }, // value.amount: 2 buffers
+        .{ .arrow_type = .Float64, .nullable = 1 }, // value.amount: 2 buffers
     };
 
     var config = try DynamicSchemaConfig.init(allocator, &schema_bytes, &fields, 5);

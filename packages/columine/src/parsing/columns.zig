@@ -465,8 +465,8 @@ pub const DynamicColumns = struct {
             const col_type: ColumnType = switch (field.arrow_type) {
                 .Utf8 => .utf8,
                 .Binary => .binary,
-                .Int, .Int64 => .int64,
-                .FloatingPoint => .float64,
+                .Int32, .Int64 => .int64,
+                .Float64 => .float64,
                 .Bool => .bool_,
                 .Null => .utf8, // Treat null type as empty strings
             };
@@ -633,7 +633,7 @@ test "DynamicColumns - init and deinit" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Binary, .nullable = 1 }, // value
     };
 
@@ -647,8 +647,8 @@ test "DynamicColumns - init and deinit" {
 test "DynamicColumns - append values" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
-        .{ .arrow_type = .Int, .nullable = 0 }, // count
-        .{ .arrow_type = .FloatingPoint, .nullable = 1 }, // amount
+        .{ .arrow_type = .Int32, .nullable = 0 }, // count
+        .{ .arrow_type = .Float64, .nullable = 1 }, // amount
         .{ .arrow_type = .Bool, .nullable = 1 }, // active
     };
 
@@ -675,7 +675,7 @@ test "DynamicColumns - append values" {
 test "DynamicColumns - null values" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
-        .{ .arrow_type = .FloatingPoint, .nullable = 1 }, // optional_amount
+        .{ .arrow_type = .Float64, .nullable = 1 }, // optional_amount
     };
 
     var cols = try DynamicColumns.init(std.testing.allocator, &fields, 10);
@@ -695,7 +695,7 @@ test "DynamicColumns - null values" {
 test "DynamicColumns - multiple rows" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // name
-        .{ .arrow_type = .Int, .nullable = 0 }, // count
+        .{ .arrow_type = .Int32, .nullable = 0 }, // count
     };
 
     var cols = try DynamicColumns.init(std.testing.allocator, &fields, 10);
@@ -747,7 +747,7 @@ test "DynamicColumns - reset for reuse" {
 
 test "DynamicColumns - invalid column type error" {
     const fields = [_]dynamic_schema.SignalSchemaField{
-        .{ .arrow_type = .Int, .nullable = 0 }, // int column
+        .{ .arrow_type = .Int32, .nullable = 0 }, // int column
     };
 
     var cols = try DynamicColumns.init(std.testing.allocator, &fields, 10);

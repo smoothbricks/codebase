@@ -304,7 +304,9 @@ const EventProcessor = struct {
                     total += (cap + 1) * @sizeOf(u32);
                     total += cap * 128;
                 },
-                .Int, .Int64, .FloatingPoint => {
+                .Int32, .Int64, .Float64 => {
+                    // Int32 also uses 8 bytes: JSON parser stores all integers as i64,
+                    // then the IPC writer narrows to i32 at serialization time.
                     total += cap * 8;
                 },
                 .Bool => {
@@ -759,7 +761,7 @@ test "ep_create_log_entry with schema" {
     const fields = [_]arrow.dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Binary, .nullable = 1 }, // value
     };
 

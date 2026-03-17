@@ -290,7 +290,7 @@ fn extractTypedValue(
                 else => return error.InvalidFieldType,
             }
         },
-        .Int, .Int64 => {
+        .Int32, .Int64 => {
             // Expect number or ISO-8601 string, coerce to i64
             switch (token) {
                 .number => |n| {
@@ -310,7 +310,7 @@ fn extractTypedValue(
                 else => return error.InvalidFieldType,
             }
         },
-        .FloatingPoint => {
+        .Float64 => {
             // Expect number, keep as f64
             switch (token) {
                 .number => |n| {
@@ -751,7 +751,7 @@ test "extractTypedValue - string" {
 
 test "extractTypedValue - number to int64" {
     const fields = [_]dynamic_schema.SignalSchemaField{
-        .{ .arrow_type = .Int, .nullable = 0 },
+        .{ .arrow_type = .Int32, .nullable = 0 },
     };
 
     var cols = try columns.DynamicColumns.init(std.testing.allocator, &fields, 10);
@@ -763,7 +763,7 @@ test "extractTypedValue - number to int64" {
 
     var scratch: [4096]u8 = undefined;
     try std.testing.expect(cols.beginRow());
-    try extractTypedValue(&parser, .Int, &cols, 0, &scratch);
+    try extractTypedValue(&parser, .Int32, &cols, 0, &scratch);
     cols.endRow();
 
     try std.testing.expectEqual(@as(u32, 1), cols.count);
@@ -772,7 +772,7 @@ test "extractTypedValue - number to int64" {
 
 test "extractTypedValue - number to float64" {
     const fields = [_]dynamic_schema.SignalSchemaField{
-        .{ .arrow_type = .FloatingPoint, .nullable = 0 },
+        .{ .arrow_type = .Float64, .nullable = 0 },
     };
 
     var cols = try columns.DynamicColumns.init(std.testing.allocator, &fields, 10);
@@ -784,7 +784,7 @@ test "extractTypedValue - number to float64" {
 
     var scratch: [4096]u8 = undefined;
     try std.testing.expect(cols.beginRow());
-    try extractTypedValue(&parser, .FloatingPoint, &cols, 0, &scratch);
+    try extractTypedValue(&parser, .Float64, &cols, 0, &scratch);
     cols.endRow();
 
     try std.testing.expectEqual(@as(u32, 1), cols.count);
@@ -970,7 +970,7 @@ test "extractJsonEvents does not silently drop undeclared fields" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Binary, .nullable = 1 }, // value.$extra
     };
     const names = [_][]const u8{ "id", "type", "timestamp", "value.$extra" };
@@ -999,7 +999,7 @@ test "extractJsonEvents returns BufferOverflow when workspace is too small" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Binary, .nullable = 1 }, // value.$extra
     };
     const names = [_][]const u8{ "id", "type", "timestamp", "value.$extra" };
@@ -1024,7 +1024,7 @@ test "extractJsonEvents - multiple events" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Utf8, .nullable = 1 }, // value.orderId
         .{ .arrow_type = .Binary, .nullable = 1 }, // value.$extra
     };
@@ -1054,7 +1054,7 @@ test "extractJsonEvents - with undeclared fields" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Utf8, .nullable = 1 }, // orderId
         .{ .arrow_type = .Binary, .nullable = 1 }, // value.$extra
     };

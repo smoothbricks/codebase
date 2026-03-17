@@ -181,7 +181,7 @@ fn extractTypedValue(
             const result = dynamic_cols.appendUtf8(col_idx, s);
             if (result != .OK) return error.BufferOverflow;
         },
-        .Int, .Int64 => {
+        .Int32, .Int64 => {
             // Integer, float (truncated), or string (ISO-8601 timestamp)
             if (b == 0xc0) {
                 pos.* += 1;
@@ -213,7 +213,7 @@ fn extractTypedValue(
             }
             return error.InvalidFieldType;
         },
-        .FloatingPoint => {
+        .Float64 => {
             if (b == 0xc0) {
                 pos.* += 1;
                 _ = dynamic_cols.appendNull(col_idx);
@@ -453,8 +453,8 @@ test "extractMsgpackEvents - stream format with typed extraction" {
     const field_meta = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0, .reserved = [_]u8{ 0, 0 } },
         .{ .arrow_type = .Utf8, .nullable = 0, .reserved = [_]u8{ 0, 0 } },
-        .{ .arrow_type = .Int, .nullable = 0, .reserved = [_]u8{ 0, 0 } },
-        .{ .arrow_type = .Int, .nullable = 1, .reserved = [_]u8{ 0, 0 } },
+        .{ .arrow_type = .Int32, .nullable = 0, .reserved = [_]u8{ 0, 0 } },
+        .{ .arrow_type = .Int32, .nullable = 1, .reserved = [_]u8{ 0, 0 } },
     };
     const field_names = [_][]const u8{ "id", "type", "timestamp", "value.qty" };
 

@@ -333,7 +333,7 @@ pub fn writeArrowIpcFromDynamicColumns(
                 );
                 if (!body_builder.addColumn(dc, row_count, null_count)) return error.BufferTooSmall;
             },
-            .Int, .Int64 => {
+            .Int32, .Int64 => {
                 const values_bytes = std.mem.sliceAsBytes(col_storage.fixed_i64.?[0..dyn_cols.count]);
 
                 const dc = dynamic_record_batch.DynamicColumn.int64(
@@ -344,7 +344,7 @@ pub fn writeArrowIpcFromDynamicColumns(
                 );
                 if (!body_builder.addColumn(dc, row_count, null_count)) return error.BufferTooSmall;
             },
-            .FloatingPoint => {
+            .Float64 => {
                 const values_bytes = std.mem.sliceAsBytes(col_storage.fixed_f64.?[0..dyn_cols.count]);
 
                 const dc = dynamic_record_batch.DynamicColumn.float64(
@@ -472,7 +472,7 @@ test "writeArrowIpcFromColumnsWithSchema basic" {
     const fields = [_]dynamic_schema.SignalSchemaField{
         .{ .arrow_type = .Utf8, .nullable = 0 }, // id
         .{ .arrow_type = .Utf8, .nullable = 0 }, // type
-        .{ .arrow_type = .Int, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
         .{ .arrow_type = .Binary, .nullable = 1 }, // value
     };
     var config = try dynamic_schema.DynamicSchemaConfig.init(std.testing.allocator, &schema_bytes, &fields, 4);
@@ -511,10 +511,10 @@ test "writeArrowIpcFromColumnsWithSchema multiple events" {
         0x00, 0x00, 0x00, 0x00,
     };
     const fields = [_]dynamic_schema.SignalSchemaField{
-        .{ .arrow_type = .Utf8, .nullable = 0 },
-        .{ .arrow_type = .Utf8, .nullable = 0 },
-        .{ .arrow_type = .Int, .nullable = 0 },
-        .{ .arrow_type = .Binary, .nullable = 1 },
+        .{ .arrow_type = .Utf8, .nullable = 0 }, // id
+        .{ .arrow_type = .Utf8, .nullable = 0 }, // type
+        .{ .arrow_type = .Int64, .nullable = 0 }, // timestamp
+        .{ .arrow_type = .Binary, .nullable = 1 }, // value
     };
     var config = try dynamic_schema.DynamicSchemaConfig.init(std.testing.allocator, &schema_bytes, &fields, 4);
     defer config.deinit();
