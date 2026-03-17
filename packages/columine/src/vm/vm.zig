@@ -634,7 +634,8 @@ pub const FlatUndoOp = enum(u8) {
     MAP_DELETE = 3, // Rollback: restore key + value + timestamp, increment size
     SET_INSERT = 4, // Rollback: tombstone elem, decrement size
     SET_DELETE = 5, // Rollback: restore elem, increment size
-    AGG_UPDATE = 6, // Rollback: restore prev value + count
+    AGG_UPDATE = 6, // Rollback: restore prev value (f64/i64) + count (u64) — 16-byte slots
+    COUNT_UPDATE = 11, // Rollback: restore prev count (u64) — 8-byte COUNT slot
     FACT_INSERT_NEW = 7, // Rollback: tombstone derived fact key
     FACT_INSERT_UPDATE = 8, // Rollback: restore prev derived fact values
     FACT_RETRACT = 9, // Rollback: restore derived fact key + values
@@ -974,12 +975,18 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             }
         },
         .AGG_UPDATE => {
-            // Undo aggregate update: restore prev f64 value and prev u64 count
-            // aux stores the previous f64 value bits, prev_value stores previous count (truncated to u32)
+            // Undo aggregate update: restore prev value (f64/i64) and prev count (u64)
+            // aux stores the previous value bits, prev_value stores previous count (truncated to u32)
             const meta = getSlotMeta(state_base, entry.slot);
-            const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
+            const val_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
             const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-            agg_ptr.* = @bitCast(entry.aux);
+            val_ptr.* = entry.aux;
+            count_ptr.* = entry.prev_value;
+        },
+        .COUNT_UPDATE => {
+            // Undo count update: restore prev count — COUNT slot is 8 bytes (u64 only)
+            const meta = getSlotMeta(state_base, entry.slot);
+            const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
             count_ptr.* = entry.prev_value;
         },
         .FACT_INSERT_NEW => {
@@ -4017,34 +4024,17 @@ fn executeBatchImpl(
                 pc += 1;
 
                 const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                // COUNT slot is 8 bytes: u64 count at meta.offset directly
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
                 if (batch_len > 0) {
-                    // Undo: save previous f64 value (aux) and count (prev_value) before mutation
                     const prev_count = count_ptr.*;
                     const next_count = prev_count + batch_len;
                     if (g_undo_enabled) appendMutation(
                         delta_mode,
-                        .{
-                            .op = .AGG_UPDATE,
-                            .slot = slot,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = 0,
-                            .prev_value = @truncate(prev_count),
-                            .aux = @bitCast(agg_ptr.*),
-                        },
-                        .{
-                            .op = .AGG_UPDATE,
-                            .slot = slot,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = 0,
-                            .prev_value = @truncate(next_count),
-                            .aux = @bitCast(agg_ptr.*),
-                        },
+                        .{ .op = .COUNT_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(prev_count), .aux = 0 },
+                        .{ .op = .COUNT_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(next_count), .aux = 0 },
                     );
-                    count_ptr.* += batch_len;
+                    count_ptr.* = next_count;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
                 }
             },
@@ -4438,23 +4428,22 @@ fn executeBatchAggregates(
                 bpc += 3;
                 execAgg(f64, .sum, delta_mode, state_base, slot, getColAs(f64, col_ptrs, val_col), batch_len, .{ .data = type_data, .id = type_id }, null);
             },
-            0x41 => { // AGG_COUNT
+            0x41 => { // AGG_COUNT — 8-byte slot (u64 at meta.offset)
                 const slot = body[bpc + 1];
                 bpc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
                 const matched = maskedAggCount(type_data, type_id, batch_len);
                 if (matched > 0) {
                     const prev_count = count_ptr.*;
                     const next_count = prev_count + matched;
                     if (g_undo_enabled) appendMutation(
                         delta_mode,
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(prev_count), .aux = @bitCast(agg_ptr.*) },
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(next_count), .aux = @bitCast(agg_ptr.*) },
+                        .{ .op = .COUNT_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(prev_count), .aux = 0 },
+                        .{ .op = .COUNT_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(next_count), .aux = 0 },
                     );
-                    count_ptr.* += matched;
+                    count_ptr.* = next_count;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
                 }
             },
@@ -4477,14 +4466,13 @@ fn executeBatchAggregates(
                 bpc += 4;
                 execAgg(f64, .sum, delta_mode, state_base, slot, getColAs(f64, col_ptrs, val_col), batch_len, .{ .data = type_data, .id = type_id }, getColAs(u32, col_ptrs, pred_col));
             },
-            0x45 => { // AGG_COUNT_IF — keeps its own handler (COUNT uses u64 field, not value)
+            0x45 => { // AGG_COUNT_IF — 8-byte slot (u64 at meta.offset)
                 const slot = body[bpc + 1];
                 const pred_col = body[bpc + 2];
                 bpc += 3;
 
                 const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *f64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
                 const preds = @as([*]const u32, @ptrCast(@alignCast(col_ptrs[pred_col])));
                 var matched: u64 = 0;
                 var i: u32 = 0;
@@ -4496,8 +4484,8 @@ fn executeBatchAggregates(
                     const next_count = prev_count + matched;
                     if (g_undo_enabled) appendMutation(
                         delta_mode,
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(prev_count), .aux = @bitCast(agg_ptr.*) },
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(next_count), .aux = @bitCast(agg_ptr.*) },
+                        .{ .op = .COUNT_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(prev_count), .aux = 0 },
+                        .{ .op = .COUNT_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(next_count), .aux = 0 },
                     );
                     count_ptr.* = next_count;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
@@ -5521,8 +5509,9 @@ pub export fn vm_calculate_state_size(
                         size += BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(capacity);
                     },
                     .AGGREGATE => {
-                        // value (f64) + count (u64)
-                        size += 16;
+                        // COUNT: u64 only (8 bytes). Others: value + count = 16 bytes.
+                        // cap_lo holds AggType for AGGREGATE/SCALAR slots.
+                        size += if (cap_lo == @intFromEnum(AggType.COUNT)) 8 else 16;
                     },
                     .SCALAR => {
                         // value ([8]u8) + cmp_ts (f64) = 16 bytes
@@ -5843,32 +5832,39 @@ pub export fn vm_init_state(
                         data_offset += storage_size;
                     },
                     .AGGREGATE => {
-                        switch (agg_type) {
-                            .SUM_I64 => {
-                                const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                ptr.* = 0;
-                            },
-                            .MIN_I64 => {
-                                const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                ptr.* = std.math.maxInt(i64);
-                            },
-                            .MAX_I64 => {
-                                const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                ptr.* = std.math.minInt(i64);
-                            },
-                            else => {
-                                // f64 aggregates (SUM, COUNT, MIN, MAX, AVG)
-                                const agg_ptr: *f64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                agg_ptr.* = switch (agg_type) {
-                                    .MIN => std.math.inf(f64),
-                                    .MAX => -std.math.inf(f64),
-                                    else => 0.0,
-                                };
-                            },
+                        if (agg_type == .COUNT) {
+                            // COUNT: just a u64 counter, 8 bytes
+                            const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset));
+                            count_ptr.* = 0;
+                            data_offset += 8;
+                        } else {
+                            // SUM/MIN/MAX/AVG: value (8 bytes) + count (8 bytes) = 16 bytes
+                            switch (agg_type) {
+                                .SUM_I64 => {
+                                    const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
+                                    ptr.* = 0;
+                                },
+                                .MIN_I64 => {
+                                    const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
+                                    ptr.* = std.math.maxInt(i64);
+                                },
+                                .MAX_I64 => {
+                                    const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
+                                    ptr.* = std.math.minInt(i64);
+                                },
+                                else => {
+                                    const agg_ptr: *f64 = @ptrCast(@alignCast(state_ptr + data_offset));
+                                    agg_ptr.* = switch (agg_type) {
+                                        .MIN => std.math.inf(f64),
+                                        .MAX => -std.math.inf(f64),
+                                        else => 0.0,
+                                    };
+                                },
+                            }
+                            const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset + 8));
+                            count_ptr.* = 0;
+                            data_offset += 16;
                         }
-                        const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset + 8));
-                        count_ptr.* = 0;
-                        data_offset += 16;
                     },
                     .SCALAR => {
                         // value ([8]u8) + cmp_ts (f64) = 16 bytes
