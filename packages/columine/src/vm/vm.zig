@@ -3807,34 +3807,27 @@ pub export fn vm_init_state(
                 // Initialize primary storage based on slot type
                 switch (type_flags.slot_type) {
                     .HASHMAP => {
-                        // keys (u32) + values (u32) [+ timestamps (f64)]
-                        const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
-                        for (0..capacity) |i| {
-                            keys_ptr[i] = EMPTY_KEY;
-                        }
+                        // Init keys to EMPTY_KEY via typed FlatHashTable, skip values (zero-init)
+                        const slot_meta_off = STATE_HEADER_SIZE + @as(u32, slot) * SLOT_META_SIZE;
+                        const size_ptr: *align(1) u32 = @ptrCast(state_ptr + slot_meta_off + 8);
+                        _ = hash_table.FlatHashTable(u32).initExternal(state_ptr + data_offset, capacity, size_ptr);
                         data_offset += capacity * 4 + capacity * 4;
 
                         if (!type_flags.no_hashmap_timestamps) {
                             const ts_ptr: [*]f64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                            for (0..capacity) |i| {
-                                ts_ptr[i] = -std.math.inf(f64);
-                            }
+                            for (0..capacity) |i| ts_ptr[i] = -std.math.inf(f64);
                             data_offset += capacity * 8;
                         }
                     },
                     .CONDITION_TREE => {
                         const tree_state: *ConditionTreeState = @ptrCast(@alignCast(state_ptr + data_offset));
-                        tree_state.* = .{
-                            .lifecycle_generation = 1,
-                            .last_removed_key = EMPTY_KEY,
-                        };
+                        tree_state.* = .{ .lifecycle_generation = 1, .last_removed_key = EMPTY_KEY };
                         data_offset += CONDITION_TREE_STATE_BYTES;
                     },
                     .HASHSET => {
-                        const keys_ptr: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
-                        for (0..capacity) |i| {
-                            keys_ptr[i] = EMPTY_KEY;
-                        }
+                        const slot_meta_off = STATE_HEADER_SIZE + @as(u32, slot) * SLOT_META_SIZE;
+                        const size_ptr: *align(1) u32 = @ptrCast(state_ptr + slot_meta_off + 8);
+                        _ = hash_table.HashSet.initExternal(state_ptr + data_offset, capacity, size_ptr);
                         data_offset += capacity * 4;
                     },
                     .BITMAP => {
@@ -3843,39 +3836,7 @@ pub export fn vm_init_state(
                         data_offset += storage_size;
                     },
                     .AGGREGATE => {
-                        if (agg_type == .COUNT) {
-                            // COUNT: just a u64 counter, 8 bytes
-                            const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                            count_ptr.* = 0;
-                            data_offset += 8;
-                        } else {
-                            // SUM/MIN/MAX/AVG: value (8 bytes) + count (8 bytes) = 16 bytes
-                            switch (agg_type) {
-                                .SUM_I64 => {
-                                    const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                    ptr.* = 0;
-                                },
-                                .MIN_I64 => {
-                                    const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                    ptr.* = std.math.maxInt(i64);
-                                },
-                                .MAX_I64 => {
-                                    const ptr: *i64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                    ptr.* = std.math.minInt(i64);
-                                },
-                                else => {
-                                    const agg_ptr: *f64 = @ptrCast(@alignCast(state_ptr + data_offset));
-                                    agg_ptr.* = switch (agg_type) {
-                                        .MIN => std.math.inf(f64),
-                                        .MAX => -std.math.inf(f64),
-                                        else => 0.0,
-                                    };
-                                },
-                            }
-                            const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset + 8));
-                            count_ptr.* = 0;
-                            data_offset += 16;
-                        }
+                        data_offset += aggregates.initAggSlot(state_ptr, data_offset, agg_type);
                     },
                     .SCALAR => {
                         // value ([8]u8) + cmp_ts (f64) = 16 bytes

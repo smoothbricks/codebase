@@ -82,6 +82,20 @@ pub fn FlatHashTable(comptime Entry: type) type {
             return bindExternal(state_base + meta.offset, meta.capacity, meta.size_ptr);
         }
 
+        /// Initialize a headerless table (for top-level VM slots where cap/size are in metadata).
+        /// Fills keys with EMPTY_KEY. Returns the initialized table handle.
+        pub fn initExternal(data_ptr: [*]u8, cap: u32, size_ptr: *align(1) u32) Self {
+            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
+            for (0..cap) |i| keys[i] = EMPTY_KEY;
+            size_ptr.* = 0;
+            return .{
+                .cap = cap,
+                .size_ptr = size_ptr,
+                .keys = keys,
+                .entries = if (has_entries) @ptrCast(@alignCast(data_ptr + cap * 4)) else {},
+            };
+        }
+
         /// Initialize a new table at `state_base + offset`.
         pub fn init(state_base: [*]u8, offset: u32, capacity: u32) Self {
             const base = state_base + offset;

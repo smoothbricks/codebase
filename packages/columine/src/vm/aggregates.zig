@@ -231,6 +231,67 @@ pub fn reduceCol(
 
 const types = @import("types.zig");
 
+/// Initialize an aggregate slot at the given offset in state_base.
+/// Handles all AggType variants: COUNT(8b, zero), SUM/AVG(16b, 0+0),
+/// MIN(16b, +inf+0), MAX(16b, -inf+0), i64 variants similarly.
+/// Returns the byte size consumed.
+pub fn initAggSlot(state_base: [*]u8, offset: u32, agg_type: types.AggType) u32 {
+    switch (agg_type) {
+        .COUNT => {
+            const s = AggSlot(.COUNT).bind(state_base, offset);
+            s.setCount(0);
+            return AggSlot(.COUNT).byte_size;
+        },
+        .SUM => {
+            const s = AggSlot(.SUM).bind(state_base, offset);
+            s.setValue(0.0);
+            s.setCount(0);
+            return AggSlot(.SUM).byte_size;
+        },
+        .MIN => {
+            const s = AggSlot(.MIN).bind(state_base, offset);
+            s.setValue(std.math.inf(f64));
+            s.setCount(0);
+            return AggSlot(.MIN).byte_size;
+        },
+        .MAX => {
+            const s = AggSlot(.MAX).bind(state_base, offset);
+            s.setValue(-std.math.inf(f64));
+            s.setCount(0);
+            return AggSlot(.MAX).byte_size;
+        },
+        .AVG => {
+            const s = AggSlot(.AVG).bind(state_base, offset);
+            s.setValue(0.0);
+            s.setCount(0);
+            return AggSlot(.AVG).byte_size;
+        },
+        .SUM_I64 => {
+            const s = AggSlot(.SUM_I64).bind(state_base, offset);
+            s.setValue(0);
+            s.setCount(0);
+            return AggSlot(.SUM_I64).byte_size;
+        },
+        .MIN_I64 => {
+            const s = AggSlot(.MIN_I64).bind(state_base, offset);
+            s.setValue(std.math.maxInt(i64));
+            s.setCount(0);
+            return AggSlot(.MIN_I64).byte_size;
+        },
+        .MAX_I64 => {
+            const s = AggSlot(.MAX_I64).bind(state_base, offset);
+            s.setValue(std.math.minInt(i64));
+            s.setCount(0);
+            return AggSlot(.MAX_I64).byte_size;
+        },
+        else => {
+            // SCALAR subtypes or unknown — zero-fill 16 bytes
+            @memset((state_base + offset)[0..16], 0);
+            return 16;
+        },
+    }
+}
+
 /// Typed accessor for aggregate slot data. Encodes the layout difference
 /// between compact COUNT (8 bytes: u64 count at offset 0) and standard
 /// SUM/MIN/MAX (16 bytes: value at 0, count at 8).
