@@ -353,6 +353,19 @@ export async function updateDevenv(
       logger?.info('✓ Nix inputs updated but no package version changes detected');
     }
 
+    // In normal mode, restore lock file if no meaningful changes detected
+    // This prevents dirty lock files from nixpkgs rolling branch hash changes
+    // that don't result in actual package version changes
+    if (!dryRun && updates.length === 0 && (!downgrades || downgrades.length === 0)) {
+      try {
+        await execa('git', ['restore', lockPath], { cwd: devenvPath })
+        logger?.info('Restored devenv.lock (no meaningful package changes)')
+      } catch {
+        // If git restore fails (e.g., not a git repo), lock file stays dirty
+        logger?.debug?.('Could not restore devenv.lock via git, lock file changes will persist')
+      }
+    }
+
     // In dry-run mode, restore the lock file to its original state
     if (dryRun) {
       try {
