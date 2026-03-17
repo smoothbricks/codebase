@@ -35,6 +35,7 @@ pub const nested = @import("nested.zig");
 pub const hash_table = @import("hash_table.zig");
 pub const hashmap_ops = @import("hashmap_ops.zig");
 pub const hashset_ops = @import("hashset_ops.zig");
+pub const slot_growth = @import("slot_growth.zig");
 
 // Pull in test blocks from sub-modules during test compilation
 comptime {
@@ -43,6 +44,7 @@ comptime {
         _ = @import("hash_table.zig");
         _ = @import("hashmap_ops.zig");
         _ = @import("hashset_ops.zig");
+        _ = @import("slot_growth.zig");
     }
 }
 const RoaringBitmap = rawr.RoaringBitmap;
@@ -5263,24 +5265,7 @@ pub export fn vm_get_needs_growth_slot() u32 {
     return @as(u32, g_needs_growth_slot);
 }
 
-/// Compute data size for a slot given its type and capacity.
-/// NOTE: STRUCT_MAP (type 6) and ORDERED_LIST (type 7) return 0 — use getStructMapSlotDataSize instead
-/// (needs row_size from metadata).
-/// Compute data size for a slot given its type, capacity, and agg_type.
-/// For STRUCT_MAP/ORDERED_LIST/NESTED, returns 0 (use dedicated size functions).
-fn getSlotDataSize(slot_type: u4, capacity: u32, has_hashmap_timestamps: bool, agg_type_byte: u8) u32 {
-    return switch (slot_type) {
-        0 => capacity * 4 + capacity * 4 + if (has_hashmap_timestamps) capacity * 8 else 0, // HASHMAP: keys + values [+ timestamps]
-        1 => capacity * 4, // HASHSET: keys only
-        2 => if (agg_type_byte == 2) 8 else 16, // AGGREGATE: COUNT=8 bytes, others=16
-        4 => 8, // CONDITION_TREE: generation(u32) + last_removed_key(u32)
-        5 => 16, // SCALAR: value([8]u8) + cmp_ts(f64)
-        6 => 0, // STRUCT_MAP: use getStructMapSlotDataSize (needs row_size from metadata)
-        7 => 0, // ORDERED_LIST: use separate calculation (needs row_size from metadata)
-        8 => BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(capacity), // BITMAP: serialized roaring payload
-        else => 0,
-    };
-}
+// getSlotDataSize removed — replaced by slot_growth.slotDataSize (typed SlotType enum)
 
 fn getTTLSideBufferSize(has_ttl: bool, has_evict_trigger: bool, capacity: u32) u32 {
     if (!has_ttl) return 0;
@@ -5385,12 +5370,12 @@ pub export fn vm_calculate_grown_state_size(
         const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
         const has_ttl = (type_flags_byte & 0x10) != 0;
         const has_evict_trigger = (type_flags_byte & 0x20) != 0;
-        const has_hashmap_timestamps = (slot_type != 0) or ((type_flags_byte & 0x40) == 0);
+        const has_hashmap_timestamps = (slot_type != @intFromEnum(SlotType.HASHMAP)) or ((type_flags_byte & 0x40) == 0);
         const agg_type_byte = old_state_ptr[meta_base + 13]; // dual-purpose: AggType for agg/scalar, num_fields for struct_map
 
         const cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
         var slot_size: u32 = 0;
-        if (slot_type == 6) {
+        if (slot_type == @intFromEnum(SlotType.STRUCT_MAP)) {
             // STRUCT_MAP: byte 13 = num_fields
             const nf: u32 = agg_type_byte;
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -5404,7 +5389,7 @@ pub export fn vm_calculate_grown_state_size(
                 const new_arena_cap = if (slot_i == grown_slot_idx) old_arena_cap * 2 else old_arena_cap;
                 slot_size += ARENA_HEADER_SIZE + new_arena_cap;
             }
-        } else if (slot_type == 7) {
+        } else if (slot_type == @intFromEnum(SlotType.ORDERED_LIST)) {
             // ORDERED_LIST: scalar or struct
             const elem_type_byte = old_state_ptr[meta_base + 18];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -5417,7 +5402,7 @@ pub export fn vm_calculate_grown_state_size(
                 slot_size += cap * rs;
             }
         } else {
-            slot_size += getSlotDataSize(slot_type, cap, has_hashmap_timestamps, agg_type_byte);
+            slot_size += slot_growth.slotDataSize(SlotTypeFlags.fromByte(type_flags_byte).slot_type, cap, has_hashmap_timestamps, agg_type_byte);
         }
 
         slot_size += getTTLSideBufferSize(has_ttl, has_evict_trigger, cap);
@@ -5458,20 +5443,20 @@ pub export fn vm_grow_state(
         const slot_type: u4 = @truncate(type_flags_byte & 0x0F);
         const has_ttl = (type_flags_byte & 0x10) != 0;
         const has_evict_trigger = (type_flags_byte & 0x20) != 0;
-        const has_hashmap_timestamps = (slot_type != 0) or ((type_flags_byte & 0x40) == 0);
+        const has_hashmap_timestamps = (slot_type != @intFromEnum(SlotType.HASHMAP)) or ((type_flags_byte & 0x40) == 0);
         const agg_type_byte2 = old_state_ptr[meta_base + 13];
 
         const new_cap = if (slot_i == grown_slot_idx) nextPowerOf2(old_cap * 2) else old_cap;
         const new_offset = data_cursor;
 
         // Compute primary data size (STRUCT_MAP and ORDERED_LIST need metadata-based calculation)
-        const new_primary_size = if (slot_type == 6) blk: {
+        const new_primary_size = if (slot_type == @intFromEnum(SlotType.STRUCT_MAP)) blk: {
             // STRUCT_MAP
             const nf: u32 = old_state_ptr[meta_base + 13];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
             const has_ts = old_state_ptr[meta_base + 18] != 0;
             break :blk getStructMapSlotDataSize(align8(nf), new_cap, rs, has_ts);
-        } else if (slot_type == 7) blk: {
+        } else if (slot_type == @intFromEnum(SlotType.ORDERED_LIST)) blk: {
             // ORDERED_LIST
             const elem_type_byte = old_state_ptr[meta_base + 18];
             const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -5481,7 +5466,7 @@ pub export fn vm_grow_state(
             } else {
                 break :blk new_cap * rs;
             }
-        } else getSlotDataSize(slot_type, new_cap, has_hashmap_timestamps, agg_type_byte2);
+        } else slot_growth.slotDataSize(SlotTypeFlags.fromByte(type_flags_byte).slot_type, new_cap, has_hashmap_timestamps, agg_type_byte2);
 
         const eviction_index_offset = if (has_ttl) align8(new_offset + new_primary_size) else 0;
         const eviction_index_capacity = if (has_ttl) new_cap else 0;
@@ -5500,67 +5485,16 @@ pub export fn vm_grow_state(
         std.mem.writeInt(u32, new_state_ptr[meta_base + SlotMetaOffset.EVICTED_BUFFER_OFFSET ..][0..4], evicted_buffer_offset, .little);
 
         if (slot_i == grown_slot_idx) {
-            if (slot_type == 0) {
-                // HASHMAP: initialize keys to EMPTY_KEY, then rehash
-                const new_keys: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset]));
-                const new_vals: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset + new_cap * 4]));
-
-                // Fill keys with EMPTY_KEY
-                for (0..new_cap) |i| {
-                    new_keys[i] = EMPTY_KEY;
-                }
-
-                const old_keys: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset]));
-                const old_vals: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset + old_cap * 4]));
-                const new_has_timestamps = (type_flags_byte & 0x40) == 0;
-                const old_ts: [*]const f64 = if (new_has_timestamps)
-                    @ptrCast(@alignCast(&old_state_ptr[old_offset + old_cap * 8]))
-                else
-                    undefined;
-                const new_ts: [*]f64 = if (new_has_timestamps)
-                    @ptrCast(@alignCast(&new_state_ptr[new_offset + new_cap * 8]))
-                else
-                    undefined;
-
-                var rehashed_size: u32 = 0;
-                for (0..old_cap) |i| {
-                    const key = old_keys[i];
-                    if (key != EMPTY_KEY and key != TOMBSTONE) {
-                        var pos = hashKey(key, new_cap);
-                        while (new_keys[pos] != EMPTY_KEY) {
-                            pos = (pos + 1) & (new_cap - 1);
-                        }
-                        new_keys[pos] = key;
-                        new_vals[pos] = old_vals[i];
-                        if (new_has_timestamps) {
-                            new_ts[pos] = old_ts[i];
-                        }
-                        rehashed_size += 1;
-                    }
-                }
+            if (slot_type == @intFromEnum(SlotType.HASHMAP)) {
+                // HASHMAP: rehash keys + values + optional timestamps via typed helper
+                const has_ts = (type_flags_byte & 0x40) == 0;
+                const rehashed_size = slot_growth.growHashMap(old_state_ptr, new_state_ptr, old_offset, new_offset, old_cap, new_cap, has_ts);
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
-            } else if (slot_type == 1) {
-                // HASHSET: initialize to EMPTY_KEY, then rehash
-                const new_elems: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_offset]));
-                for (0..new_cap) |i| {
-                    new_elems[i] = EMPTY_KEY;
-                }
-
-                const old_elems: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_offset]));
-                var rehashed_size: u32 = 0;
-                for (0..old_cap) |i| {
-                    const elem = old_elems[i];
-                    if (elem != EMPTY_KEY and elem != TOMBSTONE) {
-                        var pos = hashKey(elem, new_cap);
-                        while (new_elems[pos] != EMPTY_KEY) {
-                            pos = (pos + 1) & (new_cap - 1);
-                        }
-                        new_elems[pos] = elem;
-                        rehashed_size += 1;
-                    }
-                }
+            } else if (slot_type == @intFromEnum(SlotType.HASHSET)) {
+                // HASHSET: rehash keys via typed helper
+                const rehashed_size = slot_growth.growHashSet(old_state_ptr, new_state_ptr, old_offset, new_offset, old_cap, new_cap);
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
-            } else if (slot_type == 8) {
+            } else if (slot_type == @intFromEnum(SlotType.BITMAP)) {
                 // BITMAP: copy serialized roaring payload as-is into larger slot.
                 const old_storage_size = BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(old_cap);
                 const new_storage_size = BITMAP_SERIALIZED_LEN_BYTES + bitmapPayloadCapacity(new_cap);
@@ -5569,44 +5503,16 @@ pub export fn vm_grow_state(
                     new_state_ptr[new_offset .. new_offset + old_storage_size],
                     old_state_ptr[old_offset .. old_offset + old_storage_size],
                 );
-            } else if (slot_type == 6) {
-                // STRUCT_MAP: copy field type descriptor, init keys to EMPTY_KEY, rehash rows
+            } else if (slot_type == @intFromEnum(SlotType.STRUCT_MAP)) {
+                // STRUCT_MAP: rehash keys + rows via typed helper
                 const nf: u32 = old_state_ptr[meta_base + 13];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
                 const desc_size = align8(nf);
-
-                // Copy field type descriptor prefix
-                @memcpy(new_state_ptr[new_offset .. new_offset + nf], old_state_ptr[old_offset .. old_offset + nf]);
-
-                // Initialize new keys to EMPTY_KEY
                 const new_keys_off = new_offset + desc_size;
                 const new_keys: [*]u32 = @ptrCast(@alignCast(&new_state_ptr[new_keys_off]));
-                for (0..new_cap) |ki| {
-                    new_keys[ki] = EMPTY_KEY;
-                }
                 const new_rows_base = new_keys_off + new_cap * 4;
 
-                // Rehash from old
-                const old_keys_off = old_offset + desc_size;
-                const old_keys: [*]const u32 = @ptrCast(@alignCast(&old_state_ptr[old_keys_off]));
-                const old_rows_base = old_keys_off + old_cap * 4;
-
-                var rehashed_size: u32 = 0;
-                for (0..old_cap) |oi| {
-                    const key = old_keys[oi];
-                    if (key != EMPTY_KEY and key != TOMBSTONE) {
-                        var pos = hashKey(key, new_cap);
-                        while (new_keys[pos] != EMPTY_KEY) {
-                            pos = (pos + 1) & (new_cap - 1);
-                        }
-                        new_keys[pos] = key;
-                        // Copy row data
-                        const old_row = old_rows_base + @as(u32, @truncate(oi)) * rs;
-                        const new_row = new_rows_base + pos * rs;
-                        @memcpy(new_state_ptr[new_row .. new_row + rs], old_state_ptr[old_row .. old_row + rs]);
-                        rehashed_size += 1;
-                    }
-                }
+                const rehashed_size = slot_growth.growStructMap(old_state_ptr, new_state_ptr, old_offset, new_offset, old_cap, new_cap, nf, rs);
                 std.mem.writeInt(u32, new_state_ptr[meta_base + 8 ..][0..4], rehashed_size, .little);
 
                 // Arena compaction: compact live array data into new arena
@@ -5668,7 +5574,7 @@ pub export fn vm_grow_state(
 
                     std.mem.writeInt(u32, new_state_ptr[new_arena_hdr_off + 4 ..][0..4], new_arena_used, .little);
                 }
-            } else if (slot_type == 7) {
+            } else if (slot_type == @intFromEnum(SlotType.ORDERED_LIST)) {
                 // ORDERED_LIST: memcpy existing entries (no rehash needed)
                 const elem_type_byte = old_state_ptr[meta_base + 18];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -5694,7 +5600,7 @@ pub export fn vm_grow_state(
                 }
             } else {
                 // Non-hash slot: copy data (aggregates/condition trees shouldn't be grown)
-                const old_data_size = getSlotDataSize(slot_type, old_cap, has_hashmap_timestamps, agg_type_byte2);
+                const old_data_size = slot_growth.slotDataSize(SlotTypeFlags.fromByte(type_flags_byte).slot_type, old_cap, has_hashmap_timestamps, agg_type_byte2);
                 const copy_len = @min(old_data_size, new_primary_size);
                 if (copy_len > 0) {
                     @memcpy(new_state_ptr[new_offset .. new_offset + copy_len], old_state_ptr[old_offset .. old_offset + copy_len]);
@@ -5702,7 +5608,7 @@ pub export fn vm_grow_state(
             }
         } else {
             // Non-grown slot: memcpy data as-is (struct map data + arena if present)
-            const primary_size = if (slot_type == 6) blk: {
+            const primary_size = if (slot_type == @intFromEnum(SlotType.STRUCT_MAP)) blk: {
                 // STRUCT_MAP
                 const nf: u32 = old_state_ptr[meta_base + 13];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -5715,7 +5621,7 @@ pub export fn vm_grow_state(
                     sz += ARENA_HEADER_SIZE + arena_cap;
                 }
                 break :blk sz;
-            } else if (slot_type == 7) blk: {
+            } else if (slot_type == @intFromEnum(SlotType.ORDERED_LIST)) blk: {
                 // ORDERED_LIST
                 const etb = old_state_ptr[meta_base + 18];
                 const rs: u32 = std.mem.readInt(u16, old_state_ptr[meta_base + 16 ..][0..2], .little);
@@ -5725,12 +5631,12 @@ pub export fn vm_grow_state(
                 } else {
                     break :blk old_cap * rs;
                 }
-            } else getSlotDataSize(slot_type, old_cap, has_hashmap_timestamps, agg_type_byte2);
+            } else slot_growth.slotDataSize(SlotTypeFlags.fromByte(type_flags_byte).slot_type, old_cap, has_hashmap_timestamps, agg_type_byte2);
             if (primary_size > 0) {
                 @memcpy(new_state_ptr[new_offset .. new_offset + primary_size], old_state_ptr[old_offset .. old_offset + primary_size]);
             }
             // Update arena header offset in metadata for non-grown struct maps
-            if (slot_type == 6) {
+            if (slot_type == @intFromEnum(SlotType.STRUCT_MAP)) {
                 const old_arena_hdr = std.mem.readInt(u32, old_state_ptr[meta_base + 20 ..][0..4], .little);
                 if (old_arena_hdr != 0) {
                     // Arena moved with the slot data — offset shifted by (new_offset - old_offset)
@@ -5778,7 +5684,7 @@ pub export fn vm_grow_state(
         }
 
         var slot_total_size = new_primary_size;
-        if (slot_type == 6) {
+        if (slot_type == @intFromEnum(SlotType.STRUCT_MAP)) {
             const arena_hdr_off = std.mem.readInt(u32, old_state_ptr[meta_base + 20 ..][0..4], .little);
             if (arena_hdr_off != 0) {
                 const old_arena_cap = std.mem.readInt(u32, old_state_ptr[arena_hdr_off..][0..4], .little);
