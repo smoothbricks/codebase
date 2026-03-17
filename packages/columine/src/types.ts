@@ -19,7 +19,7 @@ export enum ValueType {
   FLOAT64 = 10,
 }
 
-/** Must match Zig AggType enum in opcodes.zig */
+/** Must match Zig AggType enum in vm.zig */
 export enum AggType {
   SUM = 1,
   COUNT = 2,
@@ -29,6 +29,12 @@ export enum AggType {
   SCALAR_U32 = 8,
   SCALAR_F64 = 9,
   SCALAR_I64 = 10,
+  /** Lossless i64 sum for S.bigint()/S.i64()/S.timestamp() */
+  SUM_I64 = 11,
+  /** Lossless i64 min */
+  MIN_I64 = 12,
+  /** Lossless i64 max */
+  MAX_I64 = 13,
 }
 
 /** Must match Zig SlotType enum in vm.zig */
@@ -220,6 +226,11 @@ export enum Opcode {
   BATCH_AGG_COUNT_IF = 0x45,
   BATCH_AGG_MIN_IF = 0x46,
   BATCH_AGG_MAX_IF = 0x47,
+
+  // i64 aggregate ops — lossless integer accumulation for S.bigint()/S.i64()/S.timestamp()
+  BATCH_AGG_SUM_I64 = 0x49,
+  BATCH_AGG_MIN_I64 = 0x4a,
+  BATCH_AGG_MAX_I64 = 0x4b,
 
   // Struct map ops (0x18 init, 0x80 batch)
   SLOT_STRUCT_MAP = 0x18, // slot, type_flags, cap_lo, cap_hi, num_fields, [field_type × num_fields]
