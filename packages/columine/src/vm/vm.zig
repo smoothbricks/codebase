@@ -34,6 +34,7 @@ const types = @import("types.zig");
 pub const nested = @import("nested.zig");
 pub const hash_table = @import("hash_table.zig");
 pub const hashmap_ops = @import("hashmap_ops.zig");
+pub const hashset_ops = @import("hashset_ops.zig");
 
 // Pull in test blocks from sub-modules during test compilation
 comptime {
@@ -41,6 +42,7 @@ comptime {
         _ = @import("nested.zig");
         _ = @import("hash_table.zig");
         _ = @import("hashmap_ops.zig");
+        _ = @import("hashset_ops.zig");
     }
 }
 const RoaringBitmap = rawr.RoaringBitmap;
@@ -620,7 +622,7 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
 // =============================================================================
 
 /// Get pointer to eviction index array for a TTL slot
-inline fn getEvictionIndex(state_base: [*]u8, meta: SlotMeta) [*]EvictionEntry {
+pub inline fn getEvictionIndex(state_base: [*]u8, meta: SlotMeta) [*]EvictionEntry {
     return @ptrCast(@alignCast(state_base + meta.eviction_index_offset));
 }
 
@@ -687,7 +689,7 @@ fn removeEvictionEntriesForKey(index: [*]EvictionEntry, size: u32, key: u32) u32
     return removed;
 }
 
-fn findLatestEvictionTimestampForKey(index: [*]const EvictionEntry, size: u32, key: u32) ?f64 {
+pub fn findLatestEvictionTimestampForKey(index: [*]const EvictionEntry, size: u32, key: u32) ?f64 {
     if (size == 0) return null;
     var i: u32 = size;
     while (i > 0) {
@@ -1185,7 +1187,7 @@ fn bitmapSelect(storage: BitmapStorage, rank: u32) ?u32 {
     return null;
 }
 
-fn batchBitmapAdd(
+pub fn batchBitmapAdd(
     comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
@@ -1328,7 +1330,7 @@ fn batchBitmapAdd(
     return .OK;
 }
 
-fn batchBitmapRemove(
+pub fn batchBitmapRemove(
     comptime delta_mode: bool,
     state_base: [*]u8,
     meta: SlotMeta,
@@ -1512,170 +1514,7 @@ fn batchBitmapAlgebra(
     return .OK;
 }
 
-fn batchSetInsert(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    elem_col: [*]const u32,
-    ts_col: ?[*]const f64,
-    batch_len: u32,
-) ErrorCode {
-    if (meta.slotType() == .BITMAP) {
-        return batchBitmapAdd(delta_mode, state_base, meta, slot_idx, elem_col, ts_col, batch_len);
-    }
 
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-
-    var size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-    var had_insert = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const elem = elem_col[i];
-        const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
-        const probe = probeUpsertSlot(keys, meta.capacity, elem);
-
-        if (!probe.found_existing) {
-            if (probe.slot == meta.capacity or size >= max_size) {
-                meta.size_ptr.* = size;
-                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                return .CAPACITY_EXCEEDED;
-            }
-            // Undo: record new set insertion so rollback can tombstone it.
-            // Flush local size to state before undoAppend — overflow may
-            // capture a shadow snapshot and the size field must be current.
-            if (g_undo_enabled) {
-                meta.size_ptr.* = size;
-                appendMutation(
-                    delta_mode,
-                    .{
-                        .op = .SET_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = elem,
-                        .prev_value = 0,
-                        .aux = 0,
-                    },
-                    .{
-                        .op = .SET_DELETE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = elem,
-                        .prev_value = 0,
-                        .aux = 0,
-                    },
-                );
-            }
-            keys[probe.slot] = elem;
-            size += 1;
-            had_insert = true;
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, elem, ts);
-                if (ttl_result != .OK) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    return ttl_result;
-                }
-            }
-            continue;
-        }
-
-        if (meta.hasTTL()) {
-            const ttl_result = insertWithTTL(state_base, meta, elem, ts);
-            if (ttl_result != .OK) {
-                meta.size_ptr.* = size;
-                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                return ttl_result;
-            }
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-    return .OK;
-}
-
-fn batchSetRemove(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    elem_col: [*]const u32,
-    batch_len: u32,
-) void {
-    if (meta.slotType() == .BITMAP) {
-        batchBitmapRemove(delta_mode, state_base, meta, slot_idx, elem_col, batch_len);
-        return;
-    }
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-
-    var size = meta.size_ptr.*;
-    var had_remove = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const elem = elem_col[i];
-        var slot = hashKey(elem, meta.capacity);
-        var probes: u32 = 0;
-
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY) break;
-            if (k == elem) {
-                // Undo: save element so rollback can restore it.
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    var prev_ts_bits: u64 = 0;
-                    if (meta.hasTTL()) {
-                        const eviction_index = getEvictionIndex(state_base, meta);
-                        const eviction_size = meta.eviction_index_size_ptr.*;
-                        if (findLatestEvictionTimestampForKey(eviction_index, eviction_size, elem)) |prev_ts| {
-                            prev_ts_bits = @bitCast(prev_ts);
-                        }
-                    }
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .SET_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = elem,
-                            .prev_value = 0,
-                            .aux = prev_ts_bits,
-                        },
-                        .{
-                            .op = .SET_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = elem,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                    );
-                }
-                keys[slot] = TOMBSTONE;
-                size -= 1;
-                had_remove = true;
-                break;
-            }
-            slot = (slot + 1) & (meta.capacity - 1);
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_remove) setChangeFlag(meta, ChangeFlag.REMOVED);
-}
 
 // =============================================================================
 // Single-Element Operations (for block-based dispatch in FOR_EACH_EVENT)
@@ -1690,98 +1529,7 @@ fn batchSetRemove(
 
 
 
-fn singleSetInsert(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    elem: u32,
-    ts: ?f64,
-) ErrorCode {
-    if (meta.slotType() == .BITMAP) {
-        const ts_col = if (meta.hasTTL()) blk: {
-            var scratch: [1]f64 = .{ts.?};
-            break :blk scratch[0..].ptr;
-        } else null;
-        return batchBitmapAdd(delta_mode, state_base, meta, slot_idx, (&[_]u32{elem})[0..].ptr, ts_col, 1);
-    }
 
-    if (elem == EMPTY_KEY or elem == TOMBSTONE) return .OK;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-
-    const size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-
-    const probe = probeUpsertSlot(keys, meta.capacity, elem);
-    if (!probe.found_existing) {
-        if (probe.slot == meta.capacity or size >= max_size) return .CAPACITY_EXCEEDED;
-        if (g_undo_enabled) {
-            appendMutation(
-                delta_mode,
-                .{ .op = .SET_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
-                .{ .op = .SET_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
-            );
-        }
-        keys[probe.slot] = elem;
-        meta.size_ptr.* = size + 1;
-        setChangeFlag(meta, ChangeFlag.INSERTED);
-        if (meta.hasTTL()) {
-            const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
-            if (ttl_result != .OK) return ttl_result;
-        }
-        return .OK;
-    }
-
-    if (meta.hasTTL()) {
-        const ttl_result = insertWithTTL(state_base, meta, elem, ts.?);
-        if (ttl_result != .OK) return ttl_result;
-    }
-    return .OK;
-}
-
-fn singleSetRemove(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    elem: u32,
-) void {
-    if (meta.slotType() == .BITMAP) {
-        batchBitmapRemove(delta_mode, state_base, meta, slot_idx, (&[_]u32{elem})[0..].ptr, 1);
-        return;
-    }
-
-    if (elem == EMPTY_KEY or elem == TOMBSTONE) return;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-
-    var size = meta.size_ptr.*;
-
-    var pos = hashKey(elem, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY) break;
-        if (k == elem) {
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .SET_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
-                    .{ .op = .SET_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = elem, .prev_value = 0, .aux = 0 },
-                );
-            }
-            keys[pos] = TOMBSTONE;
-            size -= 1;
-            meta.size_ptr.* = size;
-            setChangeFlag(meta, ChangeFlag.REMOVED);
-            break;
-        }
-        pos = (pos + 1) & (meta.capacity - 1);
-    }
-}
 
 const StructUpsertResult = struct {
     err: ErrorCode,
@@ -2436,7 +2184,7 @@ fn executeBatchImpl(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchSetInsert(
+                const result = hashset_ops.batchSetInsert(
                     delta_mode,
                     state_base,
                     meta,
@@ -2455,7 +2203,7 @@ fn executeBatchImpl(
                 pc += 3;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchSetInsert(
+                const result = hashset_ops.batchSetInsert(
                     delta_mode,
                     state_base,
                     meta,
@@ -2473,7 +2221,7 @@ fn executeBatchImpl(
                 pc += 2;
 
                 const meta = getSlotMeta(state_base, slot);
-                batchSetRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
+                hashset_ops.batchSetRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, elem_col), batch_len);
             },
 
             .BATCH_BITMAP_ADD => {
@@ -3520,7 +3268,7 @@ fn executeElementOpcodes(
                 bpc += 3;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleSetInsert(
+                const result = hashset_ops.singleSetInsert(
                     delta_mode,
                     state_base,
                     meta,
@@ -3547,7 +3295,7 @@ fn executeElementOpcodes(
                     getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleSetInsert(
+                const result = hashset_ops.singleSetInsert(
                     delta_mode,
                     state_base,
                     meta,
@@ -3571,7 +3319,7 @@ fn executeElementOpcodes(
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleSetInsert(
+                const result = hashset_ops.singleSetInsert(
                     delta_mode,
                     state_base,
                     meta,
@@ -3592,7 +3340,7 @@ fn executeElementOpcodes(
                 bpc += 3;
 
                 const meta = getSlotMeta(state_base, slot);
-                singleSetRemove(
+                hashset_ops.singleSetRemove(
                     delta_mode,
                     state_base,
                     meta,
@@ -3608,7 +3356,7 @@ fn executeElementOpcodes(
                 bpc += 3;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleSetInsert(
+                const result = hashset_ops.singleSetInsert(
                     delta_mode,
                     state_base,
                     meta,
@@ -3629,7 +3377,7 @@ fn executeElementOpcodes(
                 bpc += 3;
 
                 const meta = getSlotMeta(state_base, slot);
-                singleSetRemove(
+                hashset_ops.singleSetRemove(
                     delta_mode,
                     state_base,
                     meta,
