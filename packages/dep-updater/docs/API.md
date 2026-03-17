@@ -131,7 +131,7 @@ export default defineConfig({
     autoDetect: true,
   },
   ai: {
-    provider: 'anthropic',
+    provider: 'zai',
   },
 });
 ```
@@ -253,14 +253,16 @@ Validate GitHub App setup and configuration.
 **Signature:**
 
 ```typescript
-async function validateSetup(config: DepUpdaterConfig): Promise<boolean>;
+async function validateSetup(logger: Logger, repoRoot?: string, executor?: CommandExecutor): Promise<number>;
 ```
 
 **Parameters:**
 
-- `config` - Full configuration object
+- `logger` - Logger instance for output
+- `repoRoot` (string, optional) - Repository root path
+- `executor` (CommandExecutor, optional) - Command executor for testing
 
-**Returns:** `true` if all checks pass, `false` otherwise
+**Returns:** `0` if all checks pass, `1` if any check fails (exit code).
 
 **Checks:**
 
@@ -273,10 +275,11 @@ async function validateSetup(config: DepUpdaterConfig): Promise<boolean>;
 **Example:**
 
 ```typescript
-const isValid = await validateSetup(config);
-if (!isValid) {
-  console.error('Setup validation failed');
-  process.exit(1);
+import { createConsoleLogger } from '@smoothbricks/dep-updater';
+const logger = createConsoleLogger();
+const exitCode = await validateSetup(logger);
+if (exitCode !== 0) {
+  process.exit(exitCode);
 }
 ```
 
@@ -318,7 +321,7 @@ interface DepUpdaterConfig {
     requireTests: boolean;
   };
   ai?: {
-    provider: 'anthropic';
+    provider: 'zai';
     apiKey?: string;
     model?: string;
   };
@@ -402,8 +405,8 @@ const shouldUseAI = process.env.NODE_ENV === 'production';
 const config = mergeConfig({
   ai: shouldUseAI
     ? {
-        provider: 'anthropic',
-        apiKey: process.env.ANTHROPIC_API_KEY,
+        provider: 'zai',
+        apiKey: process.env.ZAI_API_KEY,
       }
     : undefined,
 });
