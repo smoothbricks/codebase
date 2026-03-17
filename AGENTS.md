@@ -450,7 +450,7 @@ Policy:
 
 + ### Inference-First API Design (MANDATORY)
 +
-+  `createTestContext()` over handwritten context/state helper interfaces.
+-  handwritten context/state helper interfaces.
 +- Do not manually restate large context shapes when the library can infer them; fix the helper/generic surface instead.
 +- A small narrowed local type is acceptable only after inference fails and only to describe a truly smaller surface, not
 +  to duplicate the real API contract.
