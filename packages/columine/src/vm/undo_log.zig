@@ -1,11 +1,18 @@
 // =============================================================================
-// Undo Log for Speculation Rollback
+// Undo Log — Byte-level Checkpoint/Rollback for VM State
 // =============================================================================
 //
-// Records every mutation for rollback during speculative execution.
+// Provides checkpoint and rollback over the VM's in-memory state buffer.
+// by Scenario for fork navigation (efficient branch switching without replay).
 //
-// When speculation is rejected, we replay the undo log in reverse order
-// to restore state to pre-speculation state.
+// knowledge of slot layouts — it undoes hash map inserts, aggregate updates,
+// struct map mutations, etc. at the byte level. The *mechanism* is generic;
+// the *decision* to speculate comes from the executor layer above.
+//
+// When not enabled (g_undo_enabled == false), zero overhead — all mutation
+// recording is gated behind the flag. Standalone columine users that never
+// call vm_undo_enable pay nothing.
+//
 //
 // Undo entries are stored in pre-allocated TypedArrays for efficiency.
 
