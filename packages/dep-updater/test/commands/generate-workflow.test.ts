@@ -132,8 +132,7 @@ describe('Unified Workflow Template Generation', () => {
       let parsed: any;
 
       beforeEach(async () => {
-        // Default provider is zai, so AI is enabled by default
-        workflow = await generateWorkflow([]);
+        workflow = await generateWorkflow(['--enable-ai']);
         parsed = parseYaml(workflow);
       });
 
@@ -146,15 +145,15 @@ describe('Unified Workflow Template Generation', () => {
         expect(workflow).not.toMatch(/{{STEP_/);
       });
 
-      it('should have correct header with Free AI on first line', () => {
+      it('should have correct header with AI on first line', () => {
         const firstLine = workflow.split('\n')[0];
-        expect(firstLine).toContain('+ Free AI Changelog Analysis');
+        expect(firstLine).toContain('+ AI Changelog Analysis');
       });
 
-      it('should have free AI suffix in step name', () => {
+      it('should have AI suffix in step name', () => {
         const steps = parsed.jobs['update-deps'].steps;
         const runStep = steps.find((s: WorkflowStep) => s.name?.startsWith('Run dep-updater'));
-        expect(runStep.name).toBe('Run dep-updater with free AI changelog analysis');
+        expect(runStep.name).toBe('Run dep-updater with AI changelog analysis');
       });
 
       it('should not have paid API key env vars in run step (free tier)', () => {
