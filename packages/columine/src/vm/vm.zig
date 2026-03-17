@@ -5819,7 +5819,7 @@ pub export fn vm_init_state(
                 std.mem.writeInt(u32, state_ptr[meta_base + 4 ..][0..4], outer_cap, .little); // capacity
                 std.mem.writeInt(u32, state_ptr[meta_base + 8 ..][0..4], 0, .little); // size = 0
                 state_ptr[meta_base + SlotMetaOffset.TYPE_FLAGS] = outer_type_flags_byte;
-                state_ptr[meta_base + SlotMetaOffset.AGG_TYPE] = inner_agg_type_byte;
+                state_ptr[meta_base + SlotMetaOffset.AGG_TYPE] = @intFromEnum(inner_agg_type);
                 state_ptr[meta_base + SlotMetaOffset.CHANGE_FLAGS] = 0;
 
                 // Write nested prefix at slot data start

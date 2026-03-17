@@ -461,7 +461,10 @@ pub fn getSlotMeta(state_base: [*]u8, slot: u8) SlotMeta {
 
     // Read byte-sized fields
     const type_flags = SlotTypeFlags.fromByte(meta_bytes[SlotMetaOffset.TYPE_FLAGS]);
-    const agg_type: AggType = @enumFromInt(meta_bytes[SlotMetaOffset.AGG_TYPE]);
+    // Byte 13 is dual-purpose: AggType for AGGREGATE/SCALAR, num_fields for STRUCT_MAP, 0 for others.
+    // Only interpret as AggType if the raw value is in range [1..13].
+    const agg_byte = meta_bytes[SlotMetaOffset.AGG_TYPE];
+    const agg_type: AggType = if (agg_byte >= 1 and agg_byte <= 13) @enumFromInt(agg_byte) else .SUM;
     const change_flags_ptr: *u8 = @ptrCast(meta_bytes + SlotMetaOffset.CHANGE_FLAGS);
     const timestamp_field_idx = meta_bytes[SlotMetaOffset.TIMESTAMP_FIELD_IDX];
     const start_of: DurationUnit = @enumFromInt(meta_bytes[SlotMetaOffset.START_OF]);

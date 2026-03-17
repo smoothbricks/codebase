@@ -1406,6 +1406,31 @@ fn buildNestedSetE2EProgram(type_id: u32) [128]u8 {
     return prog;
 }
 
+test "e2e — SLOT_NESTED state init roundtrip" {
+    const type_id: u32 = 1;
+    const prog = buildNestedSetE2EProgram(type_id);
+    const prog_len: u32 = @intCast(prog.len);
+
+    const state_size = vm.vm_calculate_state_size(&prog, prog_len);
+    try testing.expect(state_size > 0);
+    try testing.expect(state_size < 32768);
+
+    var state_buf: [32768]u8 align(8) = [_]u8{0} ** 32768;
+    const init_result = vm.vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog_len);
+    try testing.expectEqual(@as(u32, 0), init_result);
+
+    // Read back metadata
+    const state_ptr: [*]u8 = @ptrCast(&state_buf);
+    const m = getSlotMeta(state_ptr, 0);
+    try testing.expect(m.offset > 0);
+    try testing.expect(m.capacity >= 32); // We requested 32 outer cap
+
+    // Read nested prefix from slot data
+    const prefix = readNestedPrefix(state_ptr, m.offset);
+    try testing.expectEqual(SlotType.HASHSET, prefix.inner_type);
+    try testing.expectEqual(@as(u8, 1), prefix.depth);
+}
+
 test "e2e — NESTED_SET_INSERT through full VM pipeline" {
     const type_id: u32 = 1;
     const prog = buildNestedSetE2EProgram(type_id);
@@ -1414,12 +1439,19 @@ test "e2e — NESTED_SET_INSERT through full VM pipeline" {
     // Calculate state size
     const state_size = vm.vm_calculate_state_size(&prog, prog_len);
     try testing.expect(state_size > 0);
+    try testing.expect(state_size < 32768); // Must fit in our buffer
 
     // Allocate and initialize state
-    var state_buf: [32768]u8 = [_]u8{0} ** 32768;
-    try testing.expect(state_size <= 32768);
-    const init_result = vm.vm_init_state(&state_buf, &prog, prog_len);
+    var state_buf: [32768]u8 align(8) = [_]u8{0} ** 32768;
+    const init_result = vm.vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog_len);
     try testing.expectEqual(@as(u32, 0), init_result); // ErrorCode.OK
+
+    // Verify slot metadata was written correctly
+    {
+        const m = getSlotMeta(@ptrCast(&state_buf), 0);
+        try testing.expect(m.offset > 0); // Data region should be after header
+        try testing.expect(m.capacity > 0); // Outer capacity should be set
+    }
 
     // Build batch: 4 events
     // Col 0: type_col (all type_id=1)
@@ -1435,17 +1467,17 @@ test "e2e — NESTED_SET_INSERT through full VM pipeline" {
     };
 
     const exec_result = vm.vm_execute_batch(
-        &state_buf,
-        &prog,
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
         prog_len,
-        &col_ptrs,
+        @ptrCast(&col_ptrs),
         3,
         4,
     );
     try testing.expectEqual(@as(u32, 0), exec_result); // ErrorCode.OK
 
     // Read results: slot 0 should have 2 outer keys (10, 20)
-    const meta = getSlotMeta(&state_buf, 0);
+    const meta = getSlotMeta(@ptrCast(&state_buf), 0);
     try testing.expectEqual(@as(u32, 2), meta.size_ptr.*);
 
     // Key 10 should have inner set {100, 101} (dup 100 is idempotent)
