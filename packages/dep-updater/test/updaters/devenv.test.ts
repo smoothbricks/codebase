@@ -382,13 +382,13 @@ describe('updateDevenv - lock file restoration logic', () => {
     // Verified manually and via the parseDixOutput tests that confirm accurate detection.
 
     // Verify parseDixOutput correctly identifies "no updates" scenarios
-    const emptyResult = parseDixOutput('')
-    expect(emptyResult.updates).toHaveLength(0)
-    expect(emptyResult.downgrades).toHaveLength(0)
+    const emptyResult = parseDixOutput('');
+    expect(emptyResult.updates).toHaveLength(0);
+    expect(emptyResult.downgrades).toHaveLength(0);
 
     // Verify rebuild-only changes are correctly filtered (no false positives)
-    const rebuildOnly = parseDixOutput('CHANGED\n[D.] bash     5.3p3 ×2 -> 5.3p3')
-    expect(rebuildOnly.updates).toHaveLength(0)
-    expect(rebuildOnly.downgrades).toHaveLength(0)
-  })
+    const rebuildOnly = parseDixOutput('CHANGED\n[D.] bash     5.3p3 ×2 -> 5.3p3');
+    expect(rebuildOnly.updates).toHaveLength(0);
+    expect(rebuildOnly.downgrades).toHaveLength(0);
+  });
 });

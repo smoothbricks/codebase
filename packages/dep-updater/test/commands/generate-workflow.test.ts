@@ -21,6 +21,13 @@ interface WorkflowStep {
   run?: string;
 }
 
+interface ParsedWorkflow {
+  name: string;
+  on: Record<string, unknown>;
+  permissions: Record<string, string>;
+  jobs: Record<string, { 'runs-on': string; steps: WorkflowStep[] }>;
+}
+
 describe('Unified Workflow Template Generation', () => {
   const packageRoot = join(__dirname, '../..');
   const templatesDir = join(packageRoot, 'templates/workflows');
@@ -57,11 +64,14 @@ describe('Unified Workflow Template Generation', () => {
       const template = await readFile(join(templatesDir, 'unified.yml'), 'utf-8');
 
       // GitHub App conditional step
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions template syntax
       expect(template).toContain("if: ${{ vars.DEP_UPDATER_APP_ID != '' }}");
       expect(template).toContain('actions/create-github-app-token@v2');
 
       // Token fallback expression
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions template syntax
       expect(template).toContain('${{ steps.app-token.outputs.token || secrets.DEP_UPDATER_TOKEN }}');
+      // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions template syntax
       expect(template).toContain('${{ steps.app-token.outputs.token || github.token }}');
     });
 
@@ -87,7 +97,7 @@ describe('Unified Workflow Template Generation', () => {
 
     describe('Without AI (--skip-ai)', () => {
       let workflow: string;
-      let parsed: any;
+      let parsed: ParsedWorkflow;
 
       beforeEach(async () => {
         workflow = await generateWorkflow(['--skip-ai']);
@@ -129,7 +139,7 @@ describe('Unified Workflow Template Generation', () => {
 
     describe('With AI (zai)', () => {
       let workflow: string;
-      let parsed: any;
+      let parsed: ParsedWorkflow;
 
       beforeEach(async () => {
         workflow = await generateWorkflow(['--enable-ai']);
@@ -168,7 +178,7 @@ describe('Unified Workflow Template Generation', () => {
 
     describe('Runtime Auth Detection', () => {
       let workflow: string;
-      let parsed: any;
+      let parsed: ParsedWorkflow;
 
       beforeEach(async () => {
         workflow = await generateWorkflow([]);

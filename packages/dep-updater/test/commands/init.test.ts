@@ -8,7 +8,7 @@ import type { DepUpdaterConfig } from '../../src/config.js';
 import type { InitOptions, ProjectSetup } from '../../src/types.js';
 
 describe('init command', () => {
-  const defaultConfig: DepUpdaterConfig = {
+  const _defaultConfig: DepUpdaterConfig = {
     repoRoot: '/test-repo',
     prStrategy: {
       stackingEnabled: true,
@@ -454,7 +454,7 @@ export default defineConfig({
     });
 
     test('should allow overwrite with --yes flag', () => {
-      const existingConfig = '/test-repo/tooling/dep-updater.json';
+      const _existingConfig = '/test-repo/tooling/dep-updater.json';
       const options: InitOptions = {
         yes: true,
         dryRun: false,
@@ -467,7 +467,7 @@ export default defineConfig({
     });
 
     test('should skip overwrite in dry-run mode', () => {
-      const existingConfig = '/test-repo/tooling/dep-updater.json';
+      const _existingConfig = '/test-repo/tooling/dep-updater.json';
       const options: InitOptions = {
         yes: false,
         dryRun: true,

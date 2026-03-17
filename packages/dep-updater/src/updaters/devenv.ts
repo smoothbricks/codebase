@@ -358,11 +358,11 @@ export async function updateDevenv(
     // that don't result in actual package version changes
     if (!dryRun && updates.length === 0 && (!downgrades || downgrades.length === 0)) {
       try {
-        await execa('git', ['restore', lockPath], { cwd: devenvPath })
-        logger?.info('Restored devenv.lock (no meaningful package changes)')
+        await execa('git', ['restore', lockPath], { cwd: devenvPath });
+        logger?.info('Restored devenv.lock (no meaningful package changes)');
       } catch {
         // If git restore fails (e.g., not a git repo), lock file stays dirty
-        logger?.debug?.('Could not restore devenv.lock via git, lock file changes will persist')
+        logger?.debug?.('Could not restore devenv.lock via git, lock file changes will persist');
       }
     }
 
