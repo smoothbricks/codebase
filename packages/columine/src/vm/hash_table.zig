@@ -49,7 +49,12 @@ pub fn FlatHashTable(comptime Entry: type) type {
             return HDR_BYTES + capacity * 4 + capacity * entry_size;
         }
 
-        /// Bind to an existing table at `state_base + offset`.
+        /// Total byte size WITHOUT header (for top-level slots where cap/size live in metadata).
+        pub fn dataSizeNoHeader(capacity: u32) u32 {
+            return capacity * 4 + capacity * entry_size;
+        }
+
+        /// Bind to an existing table at `state_base + offset` (with inline header).
         pub fn bind(state_base: [*]u8, offset: u32) Self {
             const base = state_base + offset;
             const cap = std.mem.readInt(u32, base[HDR_CAP..][0..4], .little);
@@ -59,6 +64,22 @@ pub fn FlatHashTable(comptime Entry: type) type {
                 .keys = @ptrCast(@alignCast(base + HDR_BYTES)),
                 .entries = if (has_entries) @ptrCast(@alignCast(base + HDR_BYTES + cap * 4)) else {},
             };
+        }
+
+        /// Bind to a headerless table where cap/size live externally (e.g., in slot metadata).
+        /// `data_ptr` points to the start of the keys array (no header prefix).
+        pub fn bindExternal(data_ptr: [*]u8, cap: u32, size_ptr: *align(1) u32) Self {
+            return .{
+                .cap = cap,
+                .size_ptr = size_ptr,
+                .keys = @ptrCast(@alignCast(data_ptr)),
+                .entries = if (has_entries) @ptrCast(@alignCast(data_ptr + cap * 4)) else {},
+            };
+        }
+
+        /// Bind to a top-level VM slot using SlotMeta.
+        pub fn bindSlot(state_base: [*]u8, meta: types.SlotMeta) Self {
+            return bindExternal(state_base + meta.offset, meta.capacity, meta.size_ptr);
         }
 
         /// Initialize a new table at `state_base + offset`.
@@ -80,7 +101,7 @@ pub fn FlatHashTable(comptime Entry: type) type {
             return self.size_ptr.*;
         }
 
-        fn maxLoad(self: Self) u32 {
+        pub fn maxLoad(self: Self) u32 {
             return (self.cap * 7) / 10;
         }
 

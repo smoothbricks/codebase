@@ -33,12 +33,14 @@ const rawr = @import("rawr");
 const types = @import("types.zig");
 pub const nested = @import("nested.zig");
 pub const hash_table = @import("hash_table.zig");
+pub const hashmap_ops = @import("hashmap_ops.zig");
 
 // Pull in test blocks from sub-modules during test compilation
 comptime {
     if (@import("builtin").is_test) {
         _ = @import("nested.zig");
         _ = @import("hash_table.zig");
+        _ = @import("hashmap_ops.zig");
     }
 }
 const RoaringBitmap = rawr.RoaringBitmap;
@@ -323,7 +325,7 @@ pub fn undoAppendPair(undo_entry: FlatUndoEntry, redo_entry: FlatUndoEntry) void
     // If already overflowed, silently drop — shadow buffer covers subsequent mutations
 }
 
-inline fn appendMutation(comptime delta_mode: bool, undo_entry: FlatUndoEntry, redo_entry: FlatUndoEntry) void {
+pub inline fn appendMutation(comptime delta_mode: bool, undo_entry: FlatUndoEntry, redo_entry: FlatUndoEntry) void {
     if (delta_mode) {
         undoAppendPair(undo_entry, redo_entry);
     } else {
