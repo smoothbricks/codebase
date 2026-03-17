@@ -253,7 +253,11 @@ async function createPRWorkflow(
   const prTitle = generatePRTitle(config, hasBreaking);
 
   try {
-    const { createPR } = await import('../pr/stacking.js');
+    const { autoCloseOldPRs, createPR } = await import('../pr/stacking.js');
+
+    // Auto-close old PRs beyond maxStackDepth before creating new one
+    await autoCloseOldPRs(config, repoRoot);
+
     const pr = await createPR(config, repoRoot, {
       title: prTitle,
       body: prBody,
