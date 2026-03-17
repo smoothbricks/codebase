@@ -55,11 +55,12 @@ import type { Op } from '../op.js';
  * Convert a single definition (Op or OpFn) to an Op type.
  * Uses ExtractSuccess/ExtractError from result.ts to infer types from return value.
  */
-type DefToOp<Ctx extends OpContext, Def> = Def extends Op<Ctx, infer Args, infer S, infer E>
-  ? Op<Ctx, Args, S, E>
-  : Def extends (ctx: SpanContext<Ctx>, ...args: infer Args) => infer R
-    ? Op<Ctx, Args, ExtractSuccess<R>, ExtractError<R>>
-    : never;
+type DefToOp<Ctx extends OpContext, Def> =
+  Def extends Op<Ctx, infer Args, infer S, infer E>
+    ? Op<Ctx, Args, S, E>
+    : Def extends (ctx: SpanContext<Ctx>, ...args: infer Args) => infer R
+      ? Op<Ctx, Args, ExtractSuccess<R>, ExtractError<R>>
+      : never;
 
 /**
  * Transform a record of Op functions into Ops

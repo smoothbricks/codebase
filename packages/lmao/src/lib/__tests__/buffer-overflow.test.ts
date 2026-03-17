@@ -442,9 +442,7 @@ describe('Buffer Overflow Property Tests', () => {
       fc.assert(
         fc.property(
           fc.integer({ min: 1, max: 100 }), // entries
-          fc
-            .integer({ min: 8, max: 64 })
-            .map((n) => (n + 7) & ~7), // capacity aligned to 8
+          fc.integer({ min: 8, max: 64 }).map((n) => (n + 7) & ~7), // capacity aligned to 8
           (numEntries, capacity) => {
             // Reset all stats to prevent capacity tuning from modifying them mid-test
             SpanBufferClass.stats.capacity = capacity; // Set for chained buffers

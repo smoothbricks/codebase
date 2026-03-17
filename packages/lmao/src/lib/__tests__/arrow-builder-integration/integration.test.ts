@@ -348,6 +348,7 @@ describe('Buffer Integration', () => {
     it('should write increasing timestamps for each entry', async () => {
       // SpanBuffer is just storage - SpanLogger writes timestamps.
       // Use the full system (Tracer + SpanLogger) to verify entries have increasing timestamps.
+      // biome-ignore lint/correctness/noUnusedVariables: used via typeof for SpanBuffer type parameter
       const schema = createTestSchema({ userId: S.category() });
       const ctx = defineOpContext({
         logSchema: defineLogSchema({

@@ -96,14 +96,10 @@ type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>
 type BunTestHarnessBuiltins = { describe: ReturnType<typeof S.category> };
 type HarnessSchema<TExt extends SchemaFields> = BunTestHarnessBuiltins & TExt;
 
-type ExtendBindingLogSchema<B extends OpContextBinding, TExt extends SchemaFields> = B extends OpContextBinding<
-  infer T,
-  infer FF,
-  infer Deps,
-  infer UserCtx
->
-  ? OpContextBinding<T extends LogSchema<infer Fields> ? LogSchema<Fields & TExt> : never, FF, Deps, UserCtx>
-  : never;
+type ExtendBindingLogSchema<B extends OpContextBinding, TExt extends SchemaFields> =
+  B extends OpContextBinding<infer T, infer FF, infer Deps, infer UserCtx>
+    ? OpContextBinding<T extends LogSchema<infer Fields> ? LogSchema<Fields & TExt> : never, FF, Deps, UserCtx>
+    : never;
 
 export type BunTestSetupOptions<TExt extends SchemaFields = Record<never, never>> = {
   /**
