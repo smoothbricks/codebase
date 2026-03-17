@@ -41,12 +41,7 @@ const libResult = await build({
   format: 'esm',
   minify: false,
   sourcemap: 'none',
-  external: [
-    'commander',
-    'execa',
-    'fast-glob',
-    'yaml',
-  ],
+  external: ['commander', 'execa', 'fast-glob', 'yaml'],
   naming: {
     entry: 'index.js',
   },
