@@ -32,11 +32,10 @@ import { type ColumnSchema, isColumnSchema, type SchemaType, type SchemaWithMeta
 import { bufferHelpers } from './bufferHelpers.js';
 import { type AnyColumnBuffer, type ColumnBuffer, DEFAULT_BUFFER_CAPACITY } from './types.js';
 
-// Re-export types for consumers
-export type { AnyColumnBuffer, ColumnBuffer };
-
 // Re-export for consumers
 export { getAlignedCapacity } from './bufferHelpers.js';
+// Re-export types for consumers
+export type { AnyColumnBuffer, ColumnBuffer };
 
 /**
  * Extension options for injecting custom code into generated ColumnBuffer classes.
