@@ -388,49 +388,7 @@ fn findInsertSlot(keys: [*]u32, capacity: u32, key: u32) u32 {
     return capacity; // Full (shouldn't happen with proper load factor)
 }
 
-const UpsertProbe = struct {
-    slot: u32,
-    found_existing: bool,
-};
-
-/// Probe for map/set upsert while honoring tombstones.
-///
-/// If the key already exists, returns `{ found_existing=true, slot=existing_slot }`.
-/// Otherwise returns the best insertion slot:
-/// - first tombstone seen in the probe chain, or
-/// - first EMPTY_KEY slot if no tombstone was seen.
-/// If no insertion slot is available, returns `{ found_existing=false, slot=capacity }`.
-fn probeUpsertSlot(keys: [*]const u32, capacity: u32, key: u32) UpsertProbe {
-    var slot = hashKey(key, capacity);
-    var probes: u32 = 0;
-    var first_tombstone = capacity;
-
-    while (probes < capacity) : (probes += 1) {
-        const k = keys[slot];
-        if (k == key) {
-            return .{ .slot = slot, .found_existing = true };
-        }
-
-        if (k == TOMBSTONE) {
-            if (first_tombstone == capacity) {
-                first_tombstone = slot;
-            }
-        } else if (k == EMPTY_KEY) {
-            return .{
-                .slot = if (first_tombstone != capacity) first_tombstone else slot,
-                .found_existing = false,
-            };
-        }
-
-        slot = (slot + 1) & (capacity - 1);
-    }
-
-    if (first_tombstone != capacity) {
-        return .{ .slot = first_tombstone, .found_existing = false };
-    }
-
-    return .{ .slot = capacity, .found_existing = false };
-}
+// probeUpsertSlot removed — replaced by FlatHashTable.findInsert() in hash_table.zig
 
 /// Roll back a single undo entry by reversing its mutation on the flat state buffer.
 fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
