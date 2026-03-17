@@ -37,6 +37,7 @@ pub const hashmap_ops = @import("hashmap_ops.zig");
 pub const hashset_ops = @import("hashset_ops.zig");
 pub const slot_growth = @import("slot_growth.zig");
 pub const aggregates = @import("aggregates.zig");
+pub const undo_log = @import("undo_log.zig");
 
 // Pull in test blocks from sub-modules during test compilation
 comptime {
@@ -47,6 +48,7 @@ comptime {
         _ = @import("hashset_ops.zig");
         _ = @import("slot_growth.zig");
         _ = @import("aggregates.zig");
+        _ = @import("undo_log.zig");
     }
 }
 const RoaringBitmap = rawr.RoaringBitmap;
@@ -398,33 +400,14 @@ fn findInsertSlot(keys: [*]u32, capacity: u32, key: u32) u32 {
 fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
     switch (entry.op) {
         .MAP_INSERT => {
-            // Undo insert: tombstone the key, decrement size
-            // Use TOMBSTONE (not EMPTY_KEY) to preserve probe chains
             const meta = getSlotMeta(state_base, entry.slot);
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-            const idx = findKeyInMap(keys, meta.capacity, entry.key);
-            if (idx < meta.capacity) {
-                keys[idx] = TOMBSTONE;
-                meta.size_ptr.* -= 1;
-                if (meta.hasTTL()) {
-                    removeTTLEntriesForKey(state_base, meta, entry.key);
-                }
+            if (undo_log.rollbackMapInsert(state_base, meta, entry.key)) {
+                if (meta.hasTTL()) removeTTLEntriesForKey(state_base, meta, entry.key);
             }
         },
         .MAP_UPDATE => {
-            // Undo update: restore previous value and timestamp
             const meta = getSlotMeta(state_base, entry.slot);
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-            const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-            const idx = findKeyInMap(keys, meta.capacity, entry.key);
-            if (idx < meta.capacity) {
-                values[idx] = entry.prev_value;
-                if (meta.hasHashMapTimestampStorage()) {
-                    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-                    timestamps[idx] = @bitCast(entry.aux);
-                }
+            if (undo_log.rollbackMapUpdate(state_base, meta, entry.key, entry.prev_value, entry.aux)) {
                 if (meta.hasTTL()) {
                     removeTTLEntriesForKey(state_base, meta, entry.key);
                     restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
@@ -432,20 +415,8 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             }
         },
         .MAP_DELETE => {
-            // Undo delete: restore key + value + timestamp, increment size
             const meta = getSlotMeta(state_base, entry.slot);
-            const data_ptr = state_base + meta.offset;
-            const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-            const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-            const idx = findInsertSlot(keys, meta.capacity, entry.key);
-            if (idx < meta.capacity) {
-                keys[idx] = entry.key;
-                values[idx] = entry.prev_value;
-                if (meta.hasHashMapTimestampStorage()) {
-                    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-                    timestamps[idx] = @bitCast(entry.aux);
-                }
-                meta.size_ptr.* += 1;
+            if (undo_log.rollbackMapDelete(state_base, meta, entry.key, entry.prev_value, entry.aux)) {
                 if (meta.hasTTL()) {
                     removeTTLEntriesForKey(state_base, meta, entry.key);
                     restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
@@ -453,43 +424,31 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             }
         },
         .SET_INSERT => {
-            // Undo insert: tombstone the element, decrement size
             const meta = getSlotMeta(state_base, entry.slot);
             if (meta.slotType() == .BITMAP) {
+                // Bitmap rollback stays inline (uses roaring library)
                 const storage = getBitmapStorage(state_base, meta);
                 var bitmap = bitmapLoad(storage) orelse return;
                 defer bitmap.deinit();
-
                 const removed = bitmap.value.remove(entry.key) catch false;
                 if (removed) {
                     const cardinality: u32 = @intCast(bitmap.value.cardinality());
                     if (bitmapStore(storage, &bitmap.value) != .OK) return;
                     meta.size_ptr.* = cardinality;
-                    if (meta.hasTTL()) {
-                        removeTTLEntriesForKey(state_base, meta, entry.key);
-                    }
+                    if (meta.hasTTL()) removeTTLEntriesForKey(state_base, meta, entry.key);
                 }
             } else {
-                const data_ptr = state_base + meta.offset;
-                const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-                const idx = findKeyInMap(keys, meta.capacity, entry.key);
-                if (idx < meta.capacity) {
-                    keys[idx] = TOMBSTONE;
-                    meta.size_ptr.* -= 1;
-                    if (meta.hasTTL()) {
-                        removeTTLEntriesForKey(state_base, meta, entry.key);
-                    }
+                if (undo_log.rollbackSetInsert(state_base, meta, entry.key)) {
+                    if (meta.hasTTL()) removeTTLEntriesForKey(state_base, meta, entry.key);
                 }
             }
         },
         .SET_DELETE => {
-            // Undo delete: restore element, increment size
             const meta = getSlotMeta(state_base, entry.slot);
             if (meta.slotType() == .BITMAP) {
                 const storage = getBitmapStorage(state_base, meta);
                 var bitmap = bitmapLoad(storage) orelse return;
                 defer bitmap.deinit();
-
                 _ = bitmap.value.add(entry.key) catch false;
                 const cardinality: u32 = @intCast(bitmap.value.cardinality());
                 if (cardinality <= meta.capacity and bitmapStore(storage, &bitmap.value) == .OK) {
@@ -500,12 +459,7 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
                     restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
                 }
             } else {
-                const data_ptr = state_base + meta.offset;
-                const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-                const idx = findInsertSlot(keys, meta.capacity, entry.key);
-                if (idx < meta.capacity) {
-                    keys[idx] = entry.key;
-                    meta.size_ptr.* += 1;
+                if (undo_log.rollbackSetDelete(state_base, meta, entry.key)) {
                     if (meta.hasTTL()) {
                         removeTTLEntriesForKey(state_base, meta, entry.key);
                         restoreTTLEntry(state_base, meta, entry.key, @bitCast(entry.aux));
