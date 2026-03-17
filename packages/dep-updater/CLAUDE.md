@@ -11,7 +11,7 @@ AI-powered changelog summaries.
 
 - Expo SDK version management with syncpack integration
 - Stacked PR workflow (base new PRs on previous update PRs)
-- AI-powered changelog analysis (free by default via OpenCode, or premium with Anthropic/OpenAI/Google)
+- AI-powered changelog analysis (Z.AI GLM-5-Turbo (requires ZAI_API_KEY))
 - Multi-ecosystem support (npm, Expo, Nix/devenv)
 - Dry-run mode for safe testing
 
@@ -54,7 +54,7 @@ src/
 ├── pr/
 │   └── stacking.ts        # PR stacking algorithm (all functions accept executor param for testing)
 ├── ai/                    # AI integration
-│   ├── opencode-client.ts # OpenCode SDK client for multi-provider AI
+│   ├── zai-client.ts # Z.AI GLM-5-Turbo client
 │   └── token-counter.ts   # Token counting with gpt-tokenizer
 ├── changelog/
 │   ├── fetcher.ts         # Fetch changelogs from npm/GitHub
@@ -88,7 +88,7 @@ test/                      # Mirrors src/ structure
 │   ├── pr-stacking-workflow.test.ts   # End-to-end PR stacking workflows (14 tests)
 │   └── config.test.ts                 # Config loading, merging, sanitization (32 tests)
 ├── ai/                    # AI integration tests (30 tests)
-│   ├── opencode-client.test.ts        # OpenCode SDK client tests (16 tests)
+│   ├── zai-client.test.ts               # Z.AI client tests
 │   └── token-counter.test.ts          # Token counting tests (14 tests)
 ├── changelog/             # Changelog tests (25 tests)
 │   ├── analyzer.test.ts               # Commit message generation (8 tests)
@@ -489,9 +489,9 @@ fundamental issues:
 
 **Decision Needed:** Validate if `@expo/cli` is a better indicator of Expo projects than `expo-constants`
 
-### 3. OpenCode SDK Integration
+### 3. Z.AI Integration (Implemented)
 
-**Context:** OpenCode SDK provides a programmatic API for fetching package changelogs, release notes, and dependency
+**Context:** Z.AI SDK provides a programmatic API for fetching package changelogs, release notes, and dependency
 information. It could potentially replace or supplement the current changelog fetching logic.
 
 **Current Implementation:**
@@ -501,7 +501,7 @@ information. It could potentially replace or supplement the current changelog fe
 - Manual parsing of changelog formats
 - No structured API, relies on convention
 
-**Potential Benefits of OpenCode SDK:**
+**Potential Benefits of Z.AI SDK:**
 
 - Structured API for changelog/release data
 - Better reliability than scraping
@@ -517,7 +517,7 @@ information. It could potentially replace or supplement the current changelog fe
 
 **Decision Needed:**
 
-1. Evaluate OpenCode SDK capabilities and coverage
+1. Evaluate Z.AI SDK capabilities and coverage
 2. Compare reliability vs current implementation
 3. Assess if benefits justify additional dependency
 4. Determine if it should replace or supplement current fetcher
@@ -583,7 +583,7 @@ dep-updater generate-workflow
 # Disable AI changelog analysis
 dep-updater generate-workflow --skip-ai
 
-# Enable AI explicitly (default with opencode free tier)
+# Enable AI explicitly (default with Z.AI)
 dep-updater generate-workflow --enable-ai
 
 # Custom schedule
@@ -593,7 +593,7 @@ dep-updater generate-workflow --schedule "0 3 * * 1"
 **AI Configuration:**
 
 ```typescript
-// AI is enabled by default with free tier (opencode)
+// AI is enabled by default with free tier (zai)
 // Priority: explicit flag > skipAI flag > auto-detection (free tier enabled by default)
 const isFreeProvider = !providerRequiresSecret(config.ai.provider);
 const useAI = options.enableAI === true || (!options.skipAI && (isFreeProvider || config.ai?.apiKey !== undefined));
@@ -813,7 +813,7 @@ interface DepUpdaterConfig {
   nix?: { enabled: boolean; devenvPath: string; nixpkgsOverlayPath: string };
   prStrategy: { stackingEnabled: boolean; maxStackDepth: number; ... };
   autoMerge: { enabled: boolean; mode: 'none' | 'patch' | 'minor'; ... };
-  ai: { provider: SupportedProvider; apiKey?: string; model?: string }; // SupportedProvider = 'opencode' | 'anthropic' | 'openai' | 'google'
+  ai: { provider: SupportedProvider; apiKey?: string; model?: string }; // SupportedProvider = 'zai'
   git?: { remote: string; baseBranch: string };
   repoRoot?: string;
 }

@@ -74,7 +74,7 @@ Before using dep-updater, ensure you have the following installed:
 - [nvfetcher](https://github.com/berberman/nvfetcher) - For nixpkgs overlay updates
 - [Nix](https://nixos.org) - Fallback for nixpkgs updates
 - **AI Provider API Key** - Optional, for premium AI analysis (free tier works without any key)
-  - Default: OpenCode (free, no API key required)
+  - Default: Z.AI GLM-5-Turbo (requires ZAI_API_KEY)
   - Premium: Set `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, or `GOOGLE_API_KEY` for higher quality analysis
 
 > **Note:** The generated GitHub Actions workflow automatically installs Nix, devenv, and nvfetcher when `devenv.yaml`
@@ -163,11 +163,11 @@ dep-updater generate-workflow --schedule "0 3 * * 1" --workflow-name "Weekly Upd
 
 **Upgrading to Premium AI:**
 
-The default free tier (OpenCode) works out of the box. To upgrade to premium AI:
+The default free tier (Z.AI) works out of the box. To upgrade to premium AI:
 
 ```bash
 # 1. Add your AI provider API key to organization secrets
-# Supported: ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY
+# Supported: ZAI_API_KEY
 gh secret set ANTHROPIC_API_KEY --org YOUR_ORG
 
 # 2. That's it! The workflow automatically uses premium AI when API key is available
@@ -273,7 +273,7 @@ Key configuration sections:
 
 ### Optional (Premium AI Analysis)
 
-AI changelog analysis works out of the box with no API key (using OpenCode free tier). For higher quality analysis, add
+AI changelog analysis works out of the box with no API key (using Z.AI). For higher quality analysis, add
 one of:
 
 - `ANTHROPIC_API_KEY`: For Anthropic/Claude (excellent quality)

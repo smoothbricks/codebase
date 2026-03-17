@@ -16,9 +16,8 @@
 #     3. Add organization variable: DEP_UPDATER_APP_ID
 #     4. Add organization secret: DEP_UPDATER_APP_PRIVATE_KEY
 #
-# Optional: AI Changelog Analysis
-#   - Free: Works out of the box with OpenCode (no API key needed)
-#   - Premium: Add ANTHROPIC_API_KEY, OPENAI_API_KEY, or GOOGLE_API_KEY secret{{AI_SETUP_NOTE}}
+# Optional: AI Changelog Analysis (Z.AI GLM-5-Turbo)
+#   - Add ZAI_API_KEY secret for AI-powered changelog summaries{{AI_SETUP_NOTE}}
 #   - Disable: Set repository variable DEP_UPDATER_SKIP_AI=true
 #
 # 📖 Full guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/dep-updater/docs/GETTING-STARTED.md
@@ -77,10 +76,6 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email 'github-actions[bot]@users.noreply.github.com'
-
-      - name: Install OpenCode CLI
-        if: ${{ vars.DEP_UPDATER_SKIP_AI != 'true' }}
-        run: bun add -g opencode-ai@latest
 
       - name: Run dep-updater{{AI_STEP_SUFFIX}}
         env:

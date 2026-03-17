@@ -86,7 +86,7 @@ export default defineConfig({
 
   // AI-powered changelog analysis (free by default, no API key needed)
   ai: {
-    provider: 'opencode', // Free tier, or: 'anthropic', 'openai', 'google'
+    provider: 'zai', // Free tier, or: 'anthropic', 'openai', 'google'
   },
 
   // Git configuration
@@ -123,7 +123,7 @@ Create `tooling/dep-updater.json`:
     "prTitlePrefix": "chore: update dependencies"
   },
   "ai": {
-    "provider": "opencode"
+    "provider": "zai"
   }
 }
 ```
@@ -267,13 +267,13 @@ Controls automatic merging of dependency update PRs.
 
 ### AI (`ai`)
 
-Controls AI-powered changelog analysis. Supports multiple AI providers via the OpenCode SDK.
+Controls AI-powered changelog analysis. Supports multiple AI providers via the Z.AI GLM-5-Turbo.
 
-**Key Feature:** AI analysis works out of the box with no API key required using the free OpenCode tier.
+**Key Feature:** AI analysis works out of the box with no API key required using the free Z.AI tier.
 
 **Options:**
 
-- `provider` (string) - AI provider (default: `'opencode'`)
+- `provider` (string) - AI provider (default: `'zai'`)
 - `model` (string) - Model to use (provider-specific defaults apply)
 - `tokenBudget` (number) - Token budget for changelog prompts (optional, provider-specific defaults apply)
 
@@ -281,7 +281,7 @@ Controls AI-powered changelog analysis. Supports multiple AI providers via the O
 
 | Provider    | API Key Required | Quality   | Cost | Default Model              |
 | ----------- | ---------------- | --------- | ---- | -------------------------- |
-| `opencode`  | ❌ No            | Good      | Free | big-pickle                 |
+| `zai`  | ❌ No            | Good      | Free | glm-5-turbo                 |
 | `anthropic` | ✅ Yes           | Excellent | $$   | claude-sonnet-4-5-20250929 |
 | `openai`    | ✅ Yes           | Excellent | $$   | gpt-4o                     |
 | `google`    | ✅ Yes           | Very Good | $    | gemini-1.5-pro             |
@@ -300,7 +300,7 @@ When changelogs exceed the token budget, they're automatically summarized to fit
 
 | Provider    | Default Budget | Rationale                       |
 | ----------- | -------------- | ------------------------------- |
-| `opencode`  | 16,000         | Conservative for unknown limits |
+| `zai`  | 16,000         | Conservative for unknown limits |
 | `anthropic` | 64,000         | Claude handles 200k context     |
 | `openai`    | 64,000         | GPT-4o handles 128k context     |
 | `google`    | 128,000        | Gemini handles 1M context       |
@@ -310,7 +310,7 @@ When changelogs exceed the token budget, they're automatically summarized to fit
 ```typescript
 // Free tier (default) - works without any API key
 ai: {
-  provider: 'opencode',
+  provider: 'zai',
 }
 
 // Premium provider - requires API key

@@ -63,7 +63,7 @@ describe('Config Integration - loadConfig', () => {
     expect(config.git?.remote).toBe('origin');
     expect(config.git?.baseBranch).toBe('main');
 
-    // AI defaults (opencode is free tier with big-pickle model)
+    // AI defaults (zai with glm-5-turbo model)
     expect(config.ai.provider).toBe('zai');
     expect(config.ai.model).toBe('glm-5-turbo');
   });

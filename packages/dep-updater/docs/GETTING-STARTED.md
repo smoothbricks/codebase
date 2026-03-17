@@ -95,7 +95,7 @@ npx @smoothbricks/dep-updater generate-workflow
 This creates `.github/workflows/update-deps.yml` with runtime auth detection. The workflow will automatically use PAT
 authentication since you have `DEP_UPDATER_TOKEN` configured.
 
-**AI Changelog Analysis** is enabled by default using the free OpenCode provider. To disable AI:
+**AI Changelog Analysis** is enabled by default using the Z.AI provider. To disable AI:
 
 - Set repository variable `DEP_UPDATER_SKIP_AI=true`, or
 - Regenerate with `--skip-ai` flag
@@ -312,7 +312,7 @@ npx @smoothbricks/dep-updater generate-workflow
 This creates `.github/workflows/update-deps.yml` with runtime auth detection. The workflow will automatically use GitHub
 App authentication since you have `DEP_UPDATER_APP_ID` configured.
 
-**AI Changelog Analysis** is enabled by default using the free OpenCode provider. To disable:
+**AI Changelog Analysis** is enabled by default using the Z.AI provider. To disable:
 
 - Set repository variable `DEP_UPDATER_SKIP_AI=true`
 

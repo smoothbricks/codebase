@@ -68,8 +68,7 @@ describe('Unified Workflow Template Generation', () => {
     it('should have conditional AI skip logic', async () => {
       const template = await readFile(join(templatesDir, 'unified.yml'), 'utf-8');
 
-      // OpenCode CLI installation conditional on skip flag
-      expect(template).toContain("if: ${{ vars.DEP_UPDATER_SKIP_AI != 'true' }}");
+      // Runtime skip-ai flag via DEP_UPDATER_SKIP_AI variable
       expect(template).toContain('DEP_UPDATER_SKIP_AI');
       expect(template).toContain('--skip-ai');
     });
@@ -128,12 +127,12 @@ describe('Unified Workflow Template Generation', () => {
       });
     });
 
-    describe('With Free AI (default: opencode)', () => {
+    describe('With AI (zai)', () => {
       let workflow: string;
       let parsed: any;
 
       beforeEach(async () => {
-        // Default provider is opencode (free), so AI is enabled by default
+        // Default provider is zai, so AI is enabled by default
         workflow = await generateWorkflow([]);
         parsed = parseYaml(workflow);
       });
@@ -202,14 +201,6 @@ describe('Unified Workflow Template Generation', () => {
         expect(runStep.env.GH_TOKEN).toContain('secrets.DEP_UPDATER_TOKEN');
       });
 
-      it('should have conditional OpenCode CLI installation', () => {
-        const steps = parsed.jobs['update-deps'].steps;
-        const openCodeStep = steps.find((s: WorkflowStep) => s.name === 'Install OpenCode CLI');
-
-        expect(openCodeStep).toBeDefined();
-        expect(openCodeStep.if).toContain("vars.DEP_UPDATER_SKIP_AI != 'true'");
-      });
-
       it('should have runtime skip-ai flag handling', () => {
         const steps = parsed.jobs['update-deps'].steps;
         const runStep = steps.find((s: WorkflowStep) => s.name?.includes('Run dep-updater'));
@@ -248,7 +239,6 @@ describe('Unified Workflow Template Generation', () => {
         expect(stepNames).toContain('Checkout repository');
         expect(stepNames).toContain('Setup Bun');
         expect(stepNames).toContain('Configure git');
-        expect(stepNames).toContain('Install OpenCode CLI');
         expect(stepNames.some((n: string) => n.includes('Run dep-updater'))).toBe(true);
       });
 

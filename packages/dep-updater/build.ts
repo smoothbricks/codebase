@@ -17,7 +17,6 @@ const bundleResult = await build({
   sourcemap: 'none',
   external: [
     // Keep external dependencies
-    '@opencode-ai/sdk',
     'commander',
     'execa',
     'fast-glob',

@@ -25,7 +25,7 @@ describe('init command', () => {
       requireTests: true,
     },
     ai: {
-      provider: 'opencode',
+      provider: 'zai',
     },
     git: {
       remote: 'origin',
@@ -144,8 +144,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'opencode',
-          model: 'big-pickle',
+          provider: 'zai',
+          model: 'glm-5-turbo',
         },
       };
 
@@ -191,8 +191,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'opencode',
-          model: 'big-pickle',
+          provider: 'zai',
+          model: 'glm-5-turbo',
         },
       };
 
@@ -231,8 +231,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'opencode',
-          model: 'big-pickle',
+          provider: 'zai',
+          model: 'glm-5-turbo',
         },
       };
 
@@ -271,8 +271,8 @@ describe('init command', () => {
           prTitlePrefix: 'chore: update dependencies',
         },
         ai: {
-          provider: 'opencode',
-          model: 'big-pickle',
+          provider: 'zai',
+          model: 'glm-5-turbo',
         },
       };
 
@@ -316,8 +316,8 @@ export default defineConfig({
     prTitlePrefix: 'chore: update dependencies',
   },
   ai: {
-    provider: 'opencode',
-    model: 'big-pickle',
+    provider: 'zai',
+    model: 'glm-5-turbo',
   },
 });
 `;
@@ -544,16 +544,16 @@ export default defineConfig({
   });
 
   describe('AI configuration', () => {
-    test('should use OpenCode provider by default (free tier)', () => {
-      const aiProvider = 'opencode';
+    test('should use Z.AI provider by default', () => {
+      const aiProvider = 'zai';
 
-      expect(aiProvider).toBe('opencode');
+      expect(aiProvider).toBe('zai');
     });
 
     test('should use correct default model', () => {
-      const model = 'big-pickle';
+      const model = 'glm-5-turbo';
 
-      expect(model).toBe('big-pickle');
+      expect(model).toBe('glm-5-turbo');
     });
   });
 
