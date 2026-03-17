@@ -1023,648 +1023,6 @@ pub export fn vm_evict_all_expired(state_base: [*]u8, now: f64) u32 {
 // HashMap Operations
 // =============================================================================
 
-fn batchMapUpsertLatest(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key_col: [*]const u32,
-    val_col: [*]const u32,
-    ts_col: [*]const f64,
-    batch_len: u32,
-) ErrorCode {
-    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-
-    var size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-    var had_insert = false;
-    var had_update = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const key = key_col[i];
-        const val = val_col[i];
-        const ts = ts_col[i];
-
-        const probe = probeUpsertSlot(keys, meta.capacity, key);
-
-        if (!probe.found_existing) {
-            if (probe.slot == meta.capacity or size >= max_size) {
-                meta.size_ptr.* = size;
-                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                return .CAPACITY_EXCEEDED;
-            }
-
-            // Undo: record new insertion so rollback can tombstone it.
-            // Flush local size to state before undoAppend — overflow may
-            // capture a shadow snapshot and the size field must be current.
-            if (g_undo_enabled) {
-                meta.size_ptr.* = size;
-                appendMutation(
-                    delta_mode,
-                    .{
-                        .op = .MAP_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = 0,
-                        .aux = 0,
-                    },
-                    .{
-                        .op = .MAP_DELETE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = val,
-                        .aux = @bitCast(ts),
-                    },
-                );
-            }
-
-            keys[probe.slot] = key;
-            values[probe.slot] = val;
-            timestamps[probe.slot] = ts;
-            size += 1;
-            had_insert = true;
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                if (ttl_result != .OK) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                    return ttl_result;
-                }
-            }
-            continue;
-        }
-
-        const slot = probe.slot;
-        if (ts > timestamps[slot]) {
-            // Undo: save previous value + timestamp before overwrite
-            if (g_undo_enabled) {
-                meta.size_ptr.* = size;
-                appendMutation(
-                    delta_mode,
-                    .{
-                        .op = .MAP_UPDATE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = values[slot],
-                        .aux = @bitCast(timestamps[slot]),
-                    },
-                    .{
-                        .op = .MAP_UPDATE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = val,
-                        .aux = @bitCast(ts),
-                    },
-                );
-            }
-            values[slot] = val;
-            timestamps[slot] = ts;
-            had_update = true;
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                if (ttl_result != .OK) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                    return ttl_result;
-                }
-            }
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-    return .OK;
-}
-
-fn batchMapUpsertFirst(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key_col: [*]const u32,
-    val_col: [*]const u32,
-    batch_len: u32,
-) ErrorCode {
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-
-    var size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-    var had_insert = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const key = key_col[i];
-        const val = val_col[i];
-
-        var slot = hashKey(key, meta.capacity);
-        var probes: u32 = 0;
-
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY or k == TOMBSTONE) {
-                if (size >= max_size) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    return .CAPACITY_EXCEEDED;
-                }
-                // Undo: record new insertion (first wins has no update path).
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .MAP_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                        .{
-                            .op = .MAP_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = val,
-                            .aux = 0,
-                        },
-                    );
-                }
-                keys[slot] = key;
-                values[slot] = val;
-                size += 1;
-                had_insert = true;
-                break;
-            } else if (k == key) {
-                // First wins - don't update
-                break;
-            }
-            slot = (slot + 1) & (meta.capacity - 1);
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-    return .OK;
-}
-
-fn batchMapUpsertLast(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key_col: [*]const u32,
-    val_col: [*]const u32,
-    ts_col: ?[*]const f64,
-    batch_len: u32,
-) ErrorCode {
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-
-    var size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-    var had_insert = false;
-    var had_update = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const key = key_col[i];
-        const val = val_col[i];
-        const ts = if (meta.hasTTL()) ts_col.?[i] else 0;
-
-        const probe = probeUpsertSlot(keys, meta.capacity, key);
-
-        if (!probe.found_existing) {
-            if (probe.slot == meta.capacity or size >= max_size) {
-                meta.size_ptr.* = size;
-                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                return .CAPACITY_EXCEEDED;
-            }
-
-            // Undo: record new insertion so rollback can tombstone it.
-            // Flush local size to state before undoAppend — overflow may
-            // capture a shadow snapshot and the size field must be current.
-            if (g_undo_enabled) {
-                meta.size_ptr.* = size;
-                appendMutation(
-                    delta_mode,
-                    .{
-                        .op = .MAP_INSERT,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = 0,
-                        .aux = 0,
-                    },
-                    .{
-                        .op = .MAP_DELETE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = val,
-                        .aux = 0,
-                    },
-                );
-            }
-
-            keys[probe.slot] = key;
-            values[probe.slot] = val;
-            size += 1;
-            had_insert = true;
-            if (meta.hasTTL()) {
-                const ttl_result = insertWithTTL(state_base, meta, key, ts);
-                if (ttl_result != .OK) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                    return ttl_result;
-                }
-            }
-            continue;
-        }
-
-        const slot = probe.slot;
-        // Undo: save previous value before overwrite (no timestamp for Last)
-        if (g_undo_enabled) {
-            meta.size_ptr.* = size;
-            appendMutation(
-                delta_mode,
-                .{
-                    .op = .MAP_UPDATE,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = values[slot],
-                    .aux = 0,
-                },
-                .{
-                    .op = .MAP_UPDATE,
-                    .slot = slot_idx,
-                    ._pad1 = 0,
-                    ._pad2 = 0,
-                    .key = key,
-                    .prev_value = val,
-                    .aux = 0,
-                },
-            );
-        }
-        // Last wins - always update
-        values[slot] = val;
-        had_update = true;
-        if (meta.hasTTL()) {
-            const ttl_result = insertWithTTL(state_base, meta, key, ts);
-            if (ttl_result != .OK) {
-                meta.size_ptr.* = size;
-                if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                return ttl_result;
-            }
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-    return .OK;
-}
-
-/// Batch map upsert with MAX strategy: keep row with highest comparison value.
-/// Uses timestamps array to store comparison values for tracking.
-fn batchMapUpsertMax(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key_col: [*]const u32,
-    val_col: [*]const u32,
-    cmp_col: [*]const f64,
-    batch_len: u32,
-) ErrorCode {
-    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    // Repurpose timestamps array to store comparison values
-    const cmp_vals: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-
-    var size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-    var had_insert = false;
-    var had_update = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const key = key_col[i];
-        const val = val_col[i];
-        const cmp = cmp_col[i];
-
-        var slot = hashKey(key, meta.capacity);
-        var probes: u32 = 0;
-
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY or k == TOMBSTONE) {
-                if (size >= max_size) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                    return .CAPACITY_EXCEEDED;
-                }
-                // Undo: record new insertion so rollback can tombstone it.
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .MAP_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                        .{
-                            .op = .MAP_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = val,
-                            .aux = @bitCast(cmp),
-                        },
-                    );
-                }
-                keys[slot] = key;
-                values[slot] = val;
-                cmp_vals[slot] = cmp;
-                size += 1;
-                had_insert = true;
-                break;
-            } else if (k == key) {
-                // MAX: only update if new comparison value is greater
-                if (cmp > cmp_vals[slot]) {
-                    // Undo: save previous value + cmp value before overwrite
-                    if (g_undo_enabled) {
-                        meta.size_ptr.* = size;
-                        appendMutation(
-                            delta_mode,
-                            .{
-                                .op = .MAP_UPDATE,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = key,
-                                .prev_value = values[slot],
-                                .aux = @bitCast(cmp_vals[slot]),
-                            },
-                            .{
-                                .op = .MAP_UPDATE,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = key,
-                                .prev_value = val,
-                                .aux = @bitCast(cmp),
-                            },
-                        );
-                    }
-                    values[slot] = val;
-                    cmp_vals[slot] = cmp;
-                    had_update = true;
-                }
-                break;
-            }
-            slot = (slot + 1) & (meta.capacity - 1);
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-    return .OK;
-}
-
-/// Batch map upsert with MIN strategy: keep row with lowest comparison value.
-/// Uses timestamps array to store comparison values for tracking.
-fn batchMapUpsertMin(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key_col: [*]const u32,
-    val_col: [*]const u32,
-    cmp_col: [*]const f64,
-    batch_len: u32,
-) ErrorCode {
-    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    // Repurpose timestamps array to store comparison values
-    const cmp_vals: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-
-    var size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-    var had_insert = false;
-    var had_update = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const key = key_col[i];
-        const val = val_col[i];
-        const cmp = cmp_col[i];
-
-        var slot = hashKey(key, meta.capacity);
-        var probes: u32 = 0;
-
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY or k == TOMBSTONE) {
-                if (size >= max_size) {
-                    meta.size_ptr.* = size;
-                    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-                    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-                    return .CAPACITY_EXCEEDED;
-                }
-                // Undo: record new insertion so rollback can tombstone it.
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .MAP_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                        .{
-                            .op = .MAP_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = val,
-                            .aux = @bitCast(cmp),
-                        },
-                    );
-                }
-                keys[slot] = key;
-                values[slot] = val;
-                cmp_vals[slot] = cmp;
-                size += 1;
-                had_insert = true;
-                break;
-            } else if (k == key) {
-                // MIN: only update if new comparison value is smaller
-                if (cmp < cmp_vals[slot]) {
-                    // Undo: save previous value + cmp value before overwrite
-                    if (g_undo_enabled) {
-                        meta.size_ptr.* = size;
-                        appendMutation(
-                            delta_mode,
-                            .{
-                                .op = .MAP_UPDATE,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = key,
-                                .prev_value = values[slot],
-                                .aux = @bitCast(cmp_vals[slot]),
-                            },
-                            .{
-                                .op = .MAP_UPDATE,
-                                .slot = slot_idx,
-                                ._pad1 = 0,
-                                ._pad2 = 0,
-                                .key = key,
-                                .prev_value = val,
-                                .aux = @bitCast(cmp),
-                            },
-                        );
-                    }
-                    values[slot] = val;
-                    cmp_vals[slot] = cmp;
-                    had_update = true;
-                }
-                break;
-            }
-            slot = (slot + 1) & (meta.capacity - 1);
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_insert) setChangeFlag(meta, ChangeFlag.INSERTED);
-    if (had_update) setChangeFlag(meta, ChangeFlag.UPDATED);
-    return .OK;
-}
-
-fn batchMapRemove(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key_col: [*]const u32,
-    batch_len: u32,
-) void {
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const timestamps: [*]f64 = if (meta.hasHashMapTimestampStorage())
-        @ptrCast(@alignCast(data_ptr + meta.capacity * 8))
-    else
-        undefined;
-
-    var size = meta.size_ptr.*;
-    var had_remove = false;
-
-    var i: u32 = 0;
-    while (i < batch_len) : (i += 1) {
-        const key = key_col[i];
-        var slot = hashKey(key, meta.capacity);
-        var probes: u32 = 0;
-
-        while (probes < meta.capacity) : (probes += 1) {
-            const k = keys[slot];
-            if (k == EMPTY_KEY) break;
-            if (k == key) {
-                // Undo: save key + value + timestamp so rollback can restore.
-                // Flush local size to state before undoAppend — overflow may
-                // capture a shadow snapshot and the size field must be current.
-                if (g_undo_enabled) {
-                    meta.size_ptr.* = size;
-                    appendMutation(
-                        delta_mode,
-                        .{
-                            .op = .MAP_DELETE,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = values[slot],
-                            .aux = if (meta.hasHashMapTimestampStorage()) @bitCast(timestamps[slot]) else 0,
-                        },
-                        .{
-                            .op = .MAP_INSERT,
-                            .slot = slot_idx,
-                            ._pad1 = 0,
-                            ._pad2 = 0,
-                            .key = key,
-                            .prev_value = 0,
-                            .aux = 0,
-                        },
-                    );
-                }
-                keys[slot] = TOMBSTONE;
-                size -= 1;
-                had_remove = true;
-                break;
-            }
-            slot = (slot + 1) & (meta.capacity - 1);
-        }
-    }
-
-    meta.size_ptr.* = size;
-    if (had_remove) setChangeFlag(meta, ChangeFlag.REMOVED);
-}
 
 // =============================================================================
 // HashSet Operations
@@ -2326,338 +1684,11 @@ fn batchSetRemove(
 // FOR_EACH_EVENT; these are the loop bodies.  Existing BATCH_* handlers are
 // preserved unchanged for backward compat with pre-block bytecode.
 
-fn singleMapUpsertLast(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key: u32,
-    val: u32,
-    ts: ?f64,
-) ErrorCode {
-    if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
 
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
 
-    const size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
 
-    const probe = probeUpsertSlot(keys, meta.capacity, key);
-    if (!probe.found_existing) {
-        if (probe.slot == meta.capacity or size >= max_size) return .CAPACITY_EXCEEDED;
-        if (g_undo_enabled) {
-            appendMutation(
-                delta_mode,
-                .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = 0 },
-            );
-        }
-        keys[probe.slot] = key;
-        values[probe.slot] = val;
-        meta.size_ptr.* = size + 1;
-        setChangeFlag(meta, ChangeFlag.INSERTED);
-        if (meta.hasTTL()) {
-            const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
-            if (ttl_result != .OK) return ttl_result;
-        }
-        return .OK;
-    }
 
-    const slot = probe.slot;
-    if (g_undo_enabled) {
-        appendMutation(
-            delta_mode,
-            .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[slot], .aux = 0 },
-            .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = 0 },
-        );
-    }
-    values[slot] = val;
-    setChangeFlag(meta, ChangeFlag.UPDATED);
-    if (meta.hasTTL()) {
-        const ttl_result = insertWithTTL(state_base, meta, key, ts.?);
-        if (ttl_result != .OK) return ttl_result;
-    }
-    return .OK;
-}
 
-fn singleMapUpsertLatest(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key: u32,
-    val: u32,
-    ts: f64,
-) ErrorCode {
-    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
-
-    if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const timestamps: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-
-    const size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-
-    const probe = probeUpsertSlot(keys, meta.capacity, key);
-    if (!probe.found_existing) {
-        if (probe.slot == meta.capacity or size >= max_size) return .CAPACITY_EXCEEDED;
-        if (g_undo_enabled) {
-            appendMutation(
-                delta_mode,
-                .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(ts) },
-            );
-        }
-        keys[probe.slot] = key;
-        values[probe.slot] = val;
-        timestamps[probe.slot] = ts;
-        meta.size_ptr.* = size + 1;
-        setChangeFlag(meta, ChangeFlag.INSERTED);
-        if (meta.hasTTL()) {
-            const ttl_result = insertWithTTL(state_base, meta, key, ts);
-            if (ttl_result != .OK) return ttl_result;
-        }
-        return .OK;
-    }
-
-    const slot = probe.slot;
-    if (ts > timestamps[slot]) {
-        if (g_undo_enabled) {
-            appendMutation(
-                delta_mode,
-                .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[slot], .aux = @bitCast(timestamps[slot]) },
-                .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(ts) },
-            );
-        }
-        values[slot] = val;
-        timestamps[slot] = ts;
-        setChangeFlag(meta, ChangeFlag.UPDATED);
-        if (meta.hasTTL()) {
-            const ttl_result = insertWithTTL(state_base, meta, key, ts);
-            if (ttl_result != .OK) return ttl_result;
-        }
-    }
-    return .OK;
-}
-
-fn singleMapUpsertFirst(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key: u32,
-    val: u32,
-) ErrorCode {
-    if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-
-    const size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-
-    var pos = hashKey(key, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY or k == TOMBSTONE) {
-            if (size >= max_size) return .CAPACITY_EXCEEDED;
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                    .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = 0 },
-                );
-            }
-            keys[pos] = key;
-            values[pos] = val;
-            meta.size_ptr.* = size + 1;
-            setChangeFlag(meta, ChangeFlag.INSERTED);
-            return .OK;
-        } else if (k == key) {
-            // First wins - don't update
-            return .OK;
-        }
-        pos = (pos + 1) & (meta.capacity - 1);
-    }
-    return .OK;
-}
-
-fn singleMapRemove(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key: u32,
-) void {
-    if (key == EMPTY_KEY or key == TOMBSTONE) return;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const timestamps: [*]f64 = if (meta.hasHashMapTimestampStorage())
-        @ptrCast(@alignCast(data_ptr + meta.capacity * 8))
-    else
-        undefined;
-
-    var size = meta.size_ptr.*;
-
-    var pos = hashKey(key, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY) break;
-        if (k == key) {
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{
-                        .op = .MAP_DELETE,
-                        .slot = slot_idx,
-                        ._pad1 = 0,
-                        ._pad2 = 0,
-                        .key = key,
-                        .prev_value = values[pos],
-                        .aux = if (meta.hasHashMapTimestampStorage()) @bitCast(timestamps[pos]) else 0,
-                    },
-                    .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                );
-            }
-            keys[pos] = TOMBSTONE;
-            size -= 1;
-            meta.size_ptr.* = size;
-            setChangeFlag(meta, ChangeFlag.REMOVED);
-            break;
-        }
-        pos = (pos + 1) & (meta.capacity - 1);
-    }
-}
-
-fn singleMapUpsertMax(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key: u32,
-    val: u32,
-    cmp: f64,
-) ErrorCode {
-    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
-
-    if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const cmp_vals: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-
-    const size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-
-    var pos = hashKey(key, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY or k == TOMBSTONE) {
-            if (size >= max_size) return .CAPACITY_EXCEEDED;
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                    .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(cmp) },
-                );
-            }
-            keys[pos] = key;
-            values[pos] = val;
-            cmp_vals[pos] = cmp;
-            meta.size_ptr.* = size + 1;
-            setChangeFlag(meta, ChangeFlag.INSERTED);
-            return .OK;
-        } else if (k == key) {
-            if (cmp > cmp_vals[pos]) {
-                if (g_undo_enabled) {
-                    appendMutation(
-                        delta_mode,
-                        .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[pos], .aux = @bitCast(cmp_vals[pos]) },
-                        .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(cmp) },
-                    );
-                }
-                values[pos] = val;
-                cmp_vals[pos] = cmp;
-                setChangeFlag(meta, ChangeFlag.UPDATED);
-            }
-            return .OK;
-        }
-        pos = (pos + 1) & (meta.capacity - 1);
-    }
-    return .OK;
-}
-
-fn singleMapUpsertMin(
-    comptime delta_mode: bool,
-    state_base: [*]u8,
-    meta: SlotMeta,
-    slot_idx: u8,
-    key: u32,
-    val: u32,
-    cmp: f64,
-) ErrorCode {
-    if (!meta.hasHashMapTimestampStorage()) return .INVALID_PROGRAM;
-
-    if (key == EMPTY_KEY or key == TOMBSTONE) return .OK;
-
-    const data_ptr = state_base + meta.offset;
-    const keys: [*]u32 = @ptrCast(@alignCast(data_ptr));
-    const values: [*]u32 = @ptrCast(@alignCast(data_ptr + meta.capacity * 4));
-    const cmp_vals: [*]f64 = @ptrCast(@alignCast(data_ptr + meta.capacity * 8));
-
-    const size = meta.size_ptr.*;
-    const max_size = (meta.capacity * 7) / 10;
-
-    var pos = hashKey(key, meta.capacity);
-    var probes: u32 = 0;
-    while (probes < meta.capacity) : (probes += 1) {
-        const k = keys[pos];
-        if (k == EMPTY_KEY or k == TOMBSTONE) {
-            if (size >= max_size) return .CAPACITY_EXCEEDED;
-            if (g_undo_enabled) {
-                appendMutation(
-                    delta_mode,
-                    .{ .op = .MAP_INSERT, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = 0, .aux = 0 },
-                    .{ .op = .MAP_DELETE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(cmp) },
-                );
-            }
-            keys[pos] = key;
-            values[pos] = val;
-            cmp_vals[pos] = cmp;
-            meta.size_ptr.* = size + 1;
-            setChangeFlag(meta, ChangeFlag.INSERTED);
-            return .OK;
-        } else if (k == key) {
-            if (cmp < cmp_vals[pos]) {
-                if (g_undo_enabled) {
-                    appendMutation(
-                        delta_mode,
-                        .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = values[pos], .aux = @bitCast(cmp_vals[pos]) },
-                        .{ .op = .MAP_UPDATE, .slot = slot_idx, ._pad1 = 0, ._pad2 = 0, .key = key, .prev_value = val, .aux = @bitCast(cmp) },
-                    );
-                }
-                values[pos] = val;
-                cmp_vals[pos] = cmp;
-                setChangeFlag(meta, ChangeFlag.UPDATED);
-            }
-            return .OK;
-        }
-        pos = (pos + 1) & (meta.capacity - 1);
-    }
-    return .OK;
-}
 
 fn singleSetInsert(
     comptime delta_mode: bool,
@@ -3321,45 +2352,14 @@ fn executeBatchImpl(
         switch (op) {
             .HALT => break,
 
-            .BATCH_MAP_UPSERT_LATEST => {
+            .BATCH_MAP_UPSERT_LATEST, .BATCH_MAP_UPSERT_LATEST_TTL => {
                 const slot = code[pc];
                 const key_col = code[pc + 1];
                 const val_col = code[pc + 2];
                 const ts_col = code[pc + 3];
                 pc += 4;
-
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchMapUpsertLatest(
-                    delta_mode,
-                    state_base,
-                    meta,
-                    slot,
-                    getColU32(col_ptrs_ptr, key_col),
-                    getColU32(col_ptrs_ptr, val_col),
-                    getColF64(col_ptrs_ptr, ts_col),
-                    batch_len,
-                );
-                if (result != .OK) return signalGrowth(slot, result);
-            },
-
-            .BATCH_MAP_UPSERT_LATEST_TTL => {
-                const slot = code[pc];
-                const key_col = code[pc + 1];
-                const val_col = code[pc + 2];
-                const ts_col = code[pc + 3];
-                pc += 4;
-
-                const meta = getSlotMeta(state_base, slot);
-                const result = batchMapUpsertLatest(
-                    delta_mode,
-                    state_base,
-                    meta,
-                    slot,
-                    getColU32(col_ptrs_ptr, key_col),
-                    getColU32(col_ptrs_ptr, val_col),
-                    getColF64(col_ptrs_ptr, ts_col),
-                    batch_len,
-                );
+                const result = hashmap_ops.batchMapUpsert(.latest, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColF64(col_ptrs_ptr, ts_col), batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -3368,17 +2368,8 @@ fn executeBatchImpl(
                 const key_col = code[pc + 1];
                 const val_col = code[pc + 2];
                 pc += 3;
-
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchMapUpsertFirst(
-                    delta_mode,
-                    state_base,
-                    meta,
-                    slot,
-                    getColU32(col_ptrs_ptr, key_col),
-                    getColU32(col_ptrs_ptr, val_col),
-                    batch_len,
-                );
+                const result = hashmap_ops.batchMapUpsert(.first, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), null, batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -3387,18 +2378,8 @@ fn executeBatchImpl(
                 const key_col = code[pc + 1];
                 const val_col = code[pc + 2];
                 pc += 3;
-
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchMapUpsertLast(
-                    delta_mode,
-                    state_base,
-                    meta,
-                    slot,
-                    getColU32(col_ptrs_ptr, key_col),
-                    getColU32(col_ptrs_ptr, val_col),
-                    if (meta.hasTTL()) getColF64(col_ptrs_ptr, meta.timestamp_field_idx) else null,
-                    batch_len,
-                );
+                const result = hashmap_ops.batchMapUpsert(.last, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), if (meta.hasTTL()) getColF64(col_ptrs_ptr, meta.timestamp_field_idx) else null, batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -3408,18 +2389,8 @@ fn executeBatchImpl(
                 const val_col = code[pc + 2];
                 const ts_col = code[pc + 3];
                 pc += 4;
-
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchMapUpsertLast(
-                    delta_mode,
-                    state_base,
-                    meta,
-                    slot,
-                    getColU32(col_ptrs_ptr, key_col),
-                    getColU32(col_ptrs_ptr, val_col),
-                    getColF64(col_ptrs_ptr, ts_col),
-                    batch_len,
-                );
+                const result = hashmap_ops.batchMapUpsert(.last, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColF64(col_ptrs_ptr, ts_col), batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -3427,9 +2398,8 @@ fn executeBatchImpl(
                 const slot = code[pc];
                 const key_col = code[pc + 1];
                 pc += 2;
-
                 const meta = getSlotMeta(state_base, slot);
-                batchMapRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), batch_len);
+                hashmap_ops.batchMapRemove(delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), batch_len);
             },
 
             .BATCH_MAP_UPSERT_MAX => {
@@ -3438,18 +2408,8 @@ fn executeBatchImpl(
                 const val_col = code[pc + 2];
                 const cmp_col = code[pc + 3];
                 pc += 4;
-
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchMapUpsertMax(
-                    delta_mode,
-                    state_base,
-                    meta,
-                    slot,
-                    getColU32(col_ptrs_ptr, key_col),
-                    getColU32(col_ptrs_ptr, val_col),
-                    getColF64(col_ptrs_ptr, cmp_col),
-                    batch_len,
-                );
+                const result = hashmap_ops.batchMapUpsert(.max, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColF64(col_ptrs_ptr, cmp_col), batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -3459,12 +2419,8 @@ fn executeBatchImpl(
                 const val_col = code[pc + 2];
                 const cmp_col = code[pc + 3];
                 pc += 4;
-
                 const meta = getSlotMeta(state_base, slot);
-                const result = batchMapUpsertMin(
-                    delta_mode,
-                    state_base,
-                    meta,
+                const result = hashmap_ops.batchMapUpsert(.min, delta_mode, state_base, meta,
                     slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
@@ -4217,7 +3173,7 @@ fn executeElementOpcodes(
                     getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertLatest(
+                const result = hashmap_ops.singleMapUpsert(.latest,
                     delta_mode,
                     state_base,
                     meta,
@@ -4240,13 +3196,14 @@ fn executeElementOpcodes(
                 bpc += 4;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertFirst(
+                const result = hashmap_ops.singleMapUpsert(.first,
                     delta_mode,
                     state_base,
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    0,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -4262,14 +3219,14 @@ fn executeElementOpcodes(
                 bpc += 4;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertLast(
+                const result = hashmap_ops.singleMapUpsert(.last,
                     delta_mode,
                     state_base,
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else 0,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -4291,7 +3248,7 @@ fn executeElementOpcodes(
                     getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertLatest(
+                const result = hashmap_ops.singleMapUpsert(.latest,
                     delta_mode,
                     state_base,
                     meta,
@@ -4320,7 +3277,7 @@ fn executeElementOpcodes(
                     getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertLast(
+                const result = hashmap_ops.singleMapUpsert(.last,
                     delta_mode,
                     state_base,
                     meta,
@@ -4342,7 +3299,7 @@ fn executeElementOpcodes(
                 bpc += 3;
 
                 const meta = getSlotMeta(state_base, slot);
-                singleMapRemove(
+                hashmap_ops.singleMapRemove(
                     delta_mode,
                     state_base,
                     meta,
@@ -4360,7 +3317,7 @@ fn executeElementOpcodes(
                 bpc += 5;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertMax(
+                const result = hashmap_ops.singleMapUpsert(.max,
                     delta_mode,
                     state_base,
                     meta,
@@ -4384,7 +3341,7 @@ fn executeElementOpcodes(
                 bpc += 5;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertMin(
+                const result = hashmap_ops.singleMapUpsert(.min,
                     delta_mode,
                     state_base,
                     meta,
@@ -4416,7 +3373,7 @@ fn executeElementOpcodes(
                     getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertLatest(
+                const result = hashmap_ops.singleMapUpsert(.latest,
                     delta_mode,
                     state_base,
                     meta,
@@ -4442,13 +3399,14 @@ fn executeElementOpcodes(
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertFirst(
+                const result = hashmap_ops.singleMapUpsert(.first,
                     delta_mode,
                     state_base,
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
+                    0,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -4467,14 +3425,14 @@ fn executeElementOpcodes(
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertLast(
+                const result = hashmap_ops.singleMapUpsert(.last,
                     delta_mode,
                     state_base,
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else 0,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -4492,7 +3450,7 @@ fn executeElementOpcodes(
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
-                singleMapRemove(
+                hashmap_ops.singleMapRemove(
                     delta_mode,
                     state_base,
                     meta,
@@ -4513,7 +3471,7 @@ fn executeElementOpcodes(
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertMax(
+                const result = hashmap_ops.singleMapUpsert(.max,
                     delta_mode,
                     state_base,
                     meta,
@@ -4540,7 +3498,7 @@ fn executeElementOpcodes(
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
-                const result = singleMapUpsertMin(
+                const result = hashmap_ops.singleMapUpsert(.min,
                     delta_mode,
                     state_base,
                     meta,
@@ -4568,7 +3526,7 @@ fn executeElementOpcodes(
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
-                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else 0,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -4619,7 +3577,7 @@ fn executeElementOpcodes(
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
-                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else 0,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -4656,7 +3614,7 @@ fn executeElementOpcodes(
                     meta,
                     slot,
                     getColU32Inner(col_ptrs, elem_col_idx)[child_idx],
-                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else null,
+                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else 0,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
