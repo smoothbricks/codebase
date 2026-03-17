@@ -304,7 +304,7 @@ const EventProcessor = struct {
                     total += (cap + 1) * @sizeOf(u32);
                     total += cap * 128;
                 },
-                .Int, .FloatingPoint => {
+                .Int, .Int64, .FloatingPoint => {
                     total += cap * 8;
                 },
                 .Bool => {

@@ -4223,6 +4223,7 @@ inline fn aggOpLen(op_byte: u8) u32 {
         0x45 => 3, // AGG_COUNT_IF: opcode + slot + pred_col
         0x46 => 4, // AGG_MIN_IF: opcode + slot + val_col + pred_col
         0x47 => 4, // AGG_MAX_IF: opcode + slot + val_col + pred_col
+        0x48 => 4, // BATCH_SCALAR_LATEST: opcode + slot + val_col + cmp_col
         else => 2, // conservative fallback
     };
 }
@@ -4501,6 +4502,58 @@ fn executeBatchAggregates(
                     );
                     agg_ptr.* = next;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                }
+            },
+            0x48 => { // BATCH_SCALAR_LATEST — store value from event with highest comparison timestamp
+                const slot = body[bpc + 1];
+                const val_col = body[bpc + 2];
+                const cmp_col = body[bpc + 3];
+                bpc += 4;
+
+                const meta = getSlotMeta(state_base, slot);
+                const data_base = state_base + meta.offset;
+                const cmp_ptr: *f64 = @ptrCast(@alignCast(data_base + 8));
+                const cmp_vals = getColF64Inner(col_ptrs, cmp_col);
+
+                const scalar_type = meta.agg_type;
+                switch (scalar_type) {
+                    .SCALAR_U32 => {
+                        const val_ptr: *u32 = @ptrCast(@alignCast(data_base));
+                        const val_vals: [*]const u32 = @ptrCast(@alignCast(col_ptrs[val_col]));
+                        var i: u32 = 0;
+                        while (i < batch_len) : (i += 1) {
+                            if (type_data[i] == type_id and cmp_vals[i] > cmp_ptr.* and val_vals[i] != EMPTY_KEY) {
+                                val_ptr.* = val_vals[i];
+                                cmp_ptr.* = cmp_vals[i];
+                                setChangeFlag(meta, ChangeFlag.UPDATED);
+                            }
+                        }
+                    },
+                    .SCALAR_F64 => {
+                        const val_ptr: *f64 = @ptrCast(@alignCast(data_base));
+                        const val_vals = getColF64Inner(col_ptrs, val_col);
+                        var i: u32 = 0;
+                        while (i < batch_len) : (i += 1) {
+                            if (type_data[i] == type_id and cmp_vals[i] > cmp_ptr.*) {
+                                val_ptr.* = val_vals[i];
+                                cmp_ptr.* = cmp_vals[i];
+                                setChangeFlag(meta, ChangeFlag.UPDATED);
+                            }
+                        }
+                    },
+                    .SCALAR_I64 => {
+                        const val_ptr: *i64 = @ptrCast(@alignCast(data_base));
+                        const val_vals: [*]const i64 = @ptrCast(@alignCast(col_ptrs[val_col]));
+                        var i: u32 = 0;
+                        while (i < batch_len) : (i += 1) {
+                            if (type_data[i] == type_id and cmp_vals[i] > cmp_ptr.*) {
+                                val_ptr.* = val_vals[i];
+                                cmp_ptr.* = cmp_vals[i];
+                                setChangeFlag(meta, ChangeFlag.UPDATED);
+                            }
+                        }
+                    },
+                    else => {},
                 }
             },
             else => {
@@ -5678,10 +5731,11 @@ pub export fn vm_init_state(
                 const cap_lo = init_code[pc + 2];
                 const cap_hi = init_code[pc + 3];
                 var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (type_flags.slot_type != .AGGREGATE and type_flags.slot_type != .CONDITION_TREE and capacity == 0) {
+                const is_fixed_size = type_flags.slot_type == .AGGREGATE or type_flags.slot_type == .SCALAR or type_flags.slot_type == .CONDITION_TREE;
+                if (!is_fixed_size and capacity == 0) {
                     capacity = 1024;
                 }
-                if (type_flags.slot_type != .AGGREGATE and type_flags.slot_type != .CONDITION_TREE) {
+                if (!is_fixed_size) {
                     capacity = nextPowerOf2(capacity * 2);
                 }
                 // For AGGREGATE/SCALAR: cap_lo encodes the AggType subtype
