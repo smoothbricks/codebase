@@ -333,7 +333,7 @@ pub fn writeArrowIpcFromDynamicColumns(
                 );
                 if (!body_builder.addColumn(dc, row_count, null_count)) return error.BufferTooSmall;
             },
-            .Int => {
+            .Int, .Int64 => {
                 const values_bytes = std.mem.sliceAsBytes(col_storage.fixed_i64.?[0..dyn_cols.count]);
 
                 const dc = dynamic_record_batch.DynamicColumn.int64(

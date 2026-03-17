@@ -26,15 +26,17 @@ export enum AggType {
   MAX = 4,
 }
 
+/** Must match Zig SlotType enum in vm.zig */
 export enum SlotType {
   HASHMAP = 0,
   HASHSET = 1,
   AGGREGATE = 2,
   ARRAY = 3,
   CONDITION_TREE = 4,
-  STRUCT_MAP = 5,
-  ORDERED_LIST = 6,
-  BITMAP = 7,
+  SCALAR = 5,
+  STRUCT_MAP = 6,
+  ORDERED_LIST = 7,
+  BITMAP = 8,
 }
 
 /**

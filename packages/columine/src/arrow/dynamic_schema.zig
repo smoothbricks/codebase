@@ -14,6 +14,7 @@ const std = @import("std");
 
 /// Arrow type identifiers matching TypeScript ArrowType enum.
 /// These values must match ArrowSchemaDescriptor.ts for correct FFI.
+/// Arrow type identifiers matching TypeScript ArrowType enum in ArrowSchemaDescriptor.ts.
 pub const ArrowType = enum(u8) {
     Null = 0,
     Int = 1,
@@ -21,6 +22,7 @@ pub const ArrowType = enum(u8) {
     Binary = 3,
     Utf8 = 4,
     Bool = 5,
+    Int64 = 6,
 };
 
 /// Field metadata passed from TypeScript for buffer computation.
@@ -54,7 +56,7 @@ pub const SignalSchemaField = extern struct {
                 // Variable-length: offsets buffer + data buffer
                 count += 2;
             },
-            .Int, .FloatingPoint, .Bool => {
+            .Int, .Int64, .FloatingPoint, .Bool => {
                 // Fixed-length: just data buffer
                 count += 1;
             },

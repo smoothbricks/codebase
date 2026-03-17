@@ -217,7 +217,7 @@ pub const DynamicBodyBuilder = struct {
                 // Data buffer
                 if (!self.addBuffer(column.data)) return false;
             },
-            .Int, .FloatingPoint, .Bool => {
+            .Int, .Int64, .FloatingPoint, .Bool => {
                 // Just data buffer
                 if (!self.addBuffer(column.data)) return false;
             },

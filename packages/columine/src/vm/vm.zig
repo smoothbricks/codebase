@@ -244,9 +244,10 @@ pub const SlotType = enum(u4) {
     AGGREGATE = 2,
     ARRAY = 3, // For `.within()` without keyBy - stores array of events
     CONDITION_TREE = 4, // Condition router tree (VM handlers: Phase 37)
-    STRUCT_MAP = 5, // Multi-field hash map with per-row bitset
-    ORDERED_LIST = 6, // Append-only sequential storage (scalar or struct rows)
-    BITMAP = 7, // Roaring-style reducer membership represented as u32 set semantics
+    SCALAR = 5, // Single typed value + comparison timestamp for latest()
+    STRUCT_MAP = 6, // Multi-field hash map with per-row bitset
+    ORDERED_LIST = 7, // Append-only sequential storage (scalar or struct rows)
+    BITMAP = 8, // Roaring-style reducer membership represented as u32 set semantics
 };
 
 pub const SlotTypeFlags = packed struct(u8) {
@@ -265,11 +266,19 @@ pub const SlotTypeFlags = packed struct(u8) {
     }
 };
 
-pub const AggType = enum(u32) {
+/// Subtype for AGGREGATE and SCALAR slots. Stored in metadata byte 13.
+/// Values 1-5: aggregate operations (for AGGREGATE slots)
+/// Values 8-10: scalar value types (for SCALAR slots)
+pub const AggType = enum(u8) {
     SUM = 1,
     COUNT = 2,
     MIN = 3,
     MAX = 4,
+    AVG = 5,
+    // 6-7: reserved for future aggregate types
+    SCALAR_U32 = 8, // Interned string ID
+    SCALAR_F64 = 9, // 64-bit float
+    SCALAR_I64 = 10, // 64-bit signed integer (bigint, timestamps)
 };
 
 pub const StructFieldType = enum(u8) {
@@ -390,6 +399,10 @@ pub const Opcode = enum(u8) {
     BATCH_AGG_COUNT_IF = 0x45, // slot:u8, pred_col:u8
     BATCH_AGG_MIN_IF = 0x46, // slot:u8, val_col:u8, pred_col:u8
     BATCH_AGG_MAX_IF = 0x47, // slot:u8, val_col:u8, pred_col:u8
+
+    // Scalar batch ops — store latest value (highest comparison timestamp wins)
+    // AggType subtype (SCALAR_U32/SCALAR_F64/SCALAR_I64) is in slot metadata.
+    BATCH_SCALAR_LATEST = 0x48, // slot:u8, val_col:u8, cmp_col:u8
 
     // Struct map init (variable-length: base 6 bytes + num_fields)
     SLOT_STRUCT_MAP = 0x18, // slot:u8, type_flags:u8, cap_lo:u8, cap_hi:u8, num_fields:u8, [field_type:u8 x num_fields]
@@ -1322,6 +1335,10 @@ fn removeEntryByKey(state_base: [*]u8, meta: SlotMeta, key: u32) bool {
         },
         .ORDERED_LIST => {
             // TTL eviction not supported for ordered lists
+            return false;
+        },
+        .SCALAR => {
+            // Scalar slots don't support key-based removal
             return false;
         },
     }
@@ -3513,6 +3530,12 @@ fn executeBatchImpl(
         }
     }.f;
 
+    const getColI64 = struct {
+        fn f(ptrs: [*]const [*]const u8, idx: u8) [*]const i64 {
+            return @ptrCast(@alignCast(ptrs[idx]));
+        }
+    }.f;
+
     // Helper: convert CAPACITY_EXCEEDED to NEEDS_GROWTH, tracking the slot index
     const signalGrowth = struct {
         fn check(slot_idx: u8, result: ErrorCode) u32 {
@@ -3949,6 +3972,64 @@ fn executeBatchImpl(
                     );
                     agg_ptr.* = new_val;
                     setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                }
+            },
+
+            .BATCH_SCALAR_LATEST => {
+                // Store value from event with highest comparison timestamp.
+                // AggType subtype determines how the 8-byte value field is interpreted.
+                const slot = code[pc];
+                const val_col = code[pc + 1];
+                const cmp_col = code[pc + 2];
+                pc += 3;
+
+                const meta = getSlotMeta(state_base, slot);
+                const data_base = state_base + meta.offset;
+                const cmp_ptr: *f64 = @ptrCast(@alignCast(data_base + 8));
+                const cmp_vals = getColF64(col_ptrs_ptr, cmp_col);
+
+                const scalar_type = meta.agg_type;
+                switch (scalar_type) {
+                    .SCALAR_U32 => {
+                        const val_ptr: *u32 = @ptrCast(@alignCast(data_base));
+                        const val_vals = getColU32(col_ptrs_ptr, val_col);
+                        var i: u32 = 0;
+                        while (i < batch_len) : (i += 1) {
+                            const ts = cmp_vals[i];
+                            if (ts > cmp_ptr.* and val_vals[i] != EMPTY_KEY) {
+                                val_ptr.* = val_vals[i];
+                                cmp_ptr.* = ts;
+                                setChangeFlag(meta, ChangeFlag.UPDATED);
+                            }
+                        }
+                    },
+                    .SCALAR_F64 => {
+                        const val_ptr: *f64 = @ptrCast(@alignCast(data_base));
+                        const val_vals = getColF64(col_ptrs_ptr, val_col);
+                        var i: u32 = 0;
+                        while (i < batch_len) : (i += 1) {
+                            const ts = cmp_vals[i];
+                            if (ts > cmp_ptr.*) {
+                                val_ptr.* = val_vals[i];
+                                cmp_ptr.* = ts;
+                                setChangeFlag(meta, ChangeFlag.UPDATED);
+                            }
+                        }
+                    },
+                    .SCALAR_I64 => {
+                        const val_ptr: *i64 = @ptrCast(@alignCast(data_base));
+                        const val_vals = getColI64(col_ptrs_ptr, val_col);
+                        var i: u32 = 0;
+                        while (i < batch_len) : (i += 1) {
+                            const ts = cmp_vals[i];
+                            if (ts > cmp_ptr.*) {
+                                val_ptr.* = val_vals[i];
+                                cmp_ptr.* = ts;
+                                setChangeFlag(meta, ChangeFlag.UPDATED);
+                            }
+                        }
+                    },
+                    else => return @intFromEnum(ErrorCode.INVALID_PROGRAM),
                 }
             },
 
@@ -5318,10 +5399,11 @@ pub export fn vm_calculate_state_size(
                 const cap_lo = init_code[pc + 2];
                 const cap_hi = init_code[pc + 3];
                 var capacity: u32 = (@as(u32, cap_hi) << 8) | cap_lo;
-                if (type_flags.slot_type != .AGGREGATE and type_flags.slot_type != .CONDITION_TREE and capacity == 0) {
+                const is_fixed_size = type_flags.slot_type == .AGGREGATE or type_flags.slot_type == .SCALAR or type_flags.slot_type == .CONDITION_TREE;
+                if (!is_fixed_size and capacity == 0) {
                     capacity = 1024;
                 }
-                if (type_flags.slot_type != .AGGREGATE and type_flags.slot_type != .CONDITION_TREE) {
+                if (!is_fixed_size) {
                     capacity = nextPowerOf2(capacity * 2); // 2x for load factor
                 }
 
@@ -5355,6 +5437,10 @@ pub export fn vm_calculate_state_size(
                     },
                     .AGGREGATE => {
                         // value (f64) + count (u64)
+                        size += 16;
+                    },
+                    .SCALAR => {
+                        // value ([8]u8) + cmp_ts (f64) = 16 bytes
                         size += 16;
                     },
                     .ARRAY => {
@@ -5598,10 +5684,9 @@ pub export fn vm_init_state(
                 if (type_flags.slot_type != .AGGREGATE and type_flags.slot_type != .CONDITION_TREE) {
                     capacity = nextPowerOf2(capacity * 2);
                 }
-                const agg_type: AggType = if (type_flags.slot_type == .AGGREGATE)
-                    (if (cap_lo > 0) @enumFromInt(cap_lo) else .SUM)
-                else
-                    .SUM;
+                // For AGGREGATE/SCALAR: cap_lo encodes the AggType subtype
+                const is_subtyped = type_flags.slot_type == .AGGREGATE or type_flags.slot_type == .SCALAR;
+                const agg_type: AggType = if (is_subtyped and cap_lo > 0) @enumFromInt(cap_lo) else .SUM;
                 pc += 4;
 
                 if (type_flags.slot_type == .HASHMAP and type_flags.has_ttl and type_flags.no_hashmap_timestamps) {
@@ -5680,6 +5765,13 @@ pub export fn vm_init_state(
                         };
                         const count_ptr: *u64 = @ptrCast(@alignCast(state_ptr + data_offset + 8));
                         count_ptr.* = 0;
+                        data_offset += 16;
+                    },
+                    .SCALAR => {
+                        // value ([8]u8) + cmp_ts (f64) = 16 bytes
+                        @memset(state_ptr[data_offset .. data_offset + 8], 0);
+                        const cmp_ptr: *f64 = @ptrCast(@alignCast(state_ptr + data_offset + 8));
+                        cmp_ptr.* = -std.math.inf(f64);
                         data_offset += 16;
                     },
                     .ARRAY => {
