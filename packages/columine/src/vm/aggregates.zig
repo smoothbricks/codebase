@@ -226,6 +226,75 @@ pub fn reduceCol(
 }
 
 // =============================================================================
+// Typed Aggregate Slot — comptime layout for COUNT (8 bytes) vs standard (16)
+// =============================================================================
+
+const types = @import("types.zig");
+
+/// Typed accessor for aggregate slot data. Encodes the layout difference
+/// between compact COUNT (8 bytes: u64 count at offset 0) and standard
+/// SUM/MIN/MAX (16 bytes: value at 0, count at 8).
+pub fn AggSlot(comptime agg: types.AggType) type {
+    const is_count = agg == .COUNT;
+    const is_i64 = agg == .SUM_I64 or agg == .MIN_I64 or agg == .MAX_I64;
+    const ValType = if (is_count) void else if (is_i64) i64 else f64;
+
+    return struct {
+        const Self = @This();
+        base: [*]u8,
+
+        /// Byte size of this aggregate slot.
+        pub const byte_size: u32 = if (is_count) 8 else 16;
+
+        pub fn bind(state_base: [*]u8, offset: u32) Self {
+            return .{ .base = state_base + offset };
+        }
+
+        pub fn bindMeta(state_base: [*]u8, meta: types.SlotMeta) Self {
+            return bind(state_base, meta.offset);
+        }
+
+        /// Read the count value (u64).
+        pub fn count(self: Self) u64 {
+            if (is_count) {
+                // COUNT: u64 at offset 0
+                const ptr: *align(1) const u64 = @ptrCast(self.base);
+                return ptr.*;
+            } else {
+                // SUM/MIN/MAX: u64 at offset 8
+                const ptr: *align(1) const u64 = @ptrCast(self.base + 8);
+                return ptr.*;
+            }
+        }
+
+        /// Read the accumulated value (f64 or i64). Not available for COUNT.
+        pub fn value(self: Self) ValType {
+            if (is_count) @compileError("COUNT slots have no value field");
+            const ptr: *align(1) const ValType = @ptrCast(self.base);
+            return ptr.*;
+        }
+
+        /// Write the count.
+        pub fn setCount(self: Self, c: u64) void {
+            if (is_count) {
+                const ptr: *align(1) u64 = @ptrCast(self.base);
+                ptr.* = c;
+            } else {
+                const ptr: *align(1) u64 = @ptrCast(self.base + 8);
+                ptr.* = c;
+            }
+        }
+
+        /// Write the accumulated value.
+        pub fn setValue(self: Self, v: ValType) void {
+            if (is_count) @compileError("COUNT slots have no value field");
+            const ptr: *align(1) ValType = @ptrCast(self.base);
+            ptr.* = v;
+        }
+    };
+}
+
+// =============================================================================
 // Tests
 // =============================================================================
 
@@ -267,4 +336,34 @@ test "reduceCol — f64 with predicate column" {
     var pred = [_]u32{ 1, 0, 1, 0 }; // only indices 0 and 2
     const result = reduceCol(f64, .sum, &vals, 4, 0, null, &pred);
     try testing.expectApproxEqAbs(@as(f64, 40.0), result, 0.001);
+}
+
+test "AggSlot — COUNT layout (8 bytes, count at offset 0)" {
+    var buf: [16]u8 align(8) = [_]u8{0} ** 16;
+    const slot = AggSlot(.COUNT).bind(&buf, 0);
+    try testing.expectEqual(@as(u64, 0), slot.count());
+    slot.setCount(42);
+    try testing.expectEqual(@as(u64, 42), slot.count());
+    try testing.expectEqual(@as(u32, 8), AggSlot(.COUNT).byte_size);
+}
+
+test "AggSlot — SUM layout (16 bytes, value at 0, count at 8)" {
+    var buf: [16]u8 align(8) = [_]u8{0} ** 16;
+    const slot = AggSlot(.SUM).bind(&buf, 0);
+    try testing.expectApproxEqAbs(@as(f64, 0.0), slot.value(), 0.001);
+    try testing.expectEqual(@as(u64, 0), slot.count());
+    slot.setValue(123.456);
+    slot.setCount(5);
+    try testing.expectApproxEqAbs(@as(f64, 123.456), slot.value(), 0.001);
+    try testing.expectEqual(@as(u64, 5), slot.count());
+    try testing.expectEqual(@as(u32, 16), AggSlot(.SUM).byte_size);
+}
+
+test "AggSlot — SUM_I64 layout (16 bytes, i64 value)" {
+    var buf: [16]u8 align(8) = [_]u8{0} ** 16;
+    const slot = AggSlot(.SUM_I64).bind(&buf, 0);
+    slot.setValue(999_999_999_999);
+    slot.setCount(1);
+    try testing.expectEqual(@as(i64, 999_999_999_999), slot.value());
+    try testing.expectEqual(@as(u64, 1), slot.count());
 }
