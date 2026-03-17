@@ -3481,6 +3481,91 @@ fn maskedAggMax(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, ba
 }
 
 // =============================================================================
+// Comptime aggregate dispatch — DRY handler for f64/i64 × sum/min/max
+// =============================================================================
+
+const AggKind = enum { sum, min, max };
+
+/// Unified aggregate handler for both main dispatch and FOR_EACH_EVENT.
+/// Comptime-parameterized on value type (f64/i64), operation (sum/min/max),
+/// and masking (null = all rows, non-null = type-filtered rows).
+fn execAgg(
+    comptime T: type,
+    comptime kind: AggKind,
+    comptime delta_mode: bool,
+    state_base: [*]u8,
+    slot: u8,
+    vals: [*]const T,
+    batch_len: u32,
+    type_mask: ?struct { data: [*]const u32, id: u32 },
+) void {
+    const meta = getSlotMeta(state_base, slot);
+    const agg_ptr: *T = @ptrCast(@alignCast(state_base + meta.offset));
+    const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
+    const old_val = agg_ptr.*;
+
+    const new_val: T = switch (kind) {
+        .sum => blk: {
+            var acc: T = 0;
+            var i: u32 = 0;
+            while (i < batch_len) : (i += 1) {
+                if (type_mask) |m| {
+                    if (m.data[i] != m.id) continue;
+                }
+                if (T == i64) {
+                    acc +%= vals[i];
+                } else {
+                    acc += vals[i];
+                }
+            }
+            break :blk if (T == i64) old_val +% acc else old_val + acc;
+        },
+        .min => blk: {
+            var current = old_val;
+            var i: u32 = 0;
+            while (i < batch_len) : (i += 1) {
+                if (type_mask) |m| {
+                    if (m.data[i] != m.id) continue;
+                }
+                if (vals[i] < current) current = vals[i];
+            }
+            break :blk current;
+        },
+        .max => blk: {
+            var current = old_val;
+            var i: u32 = 0;
+            while (i < batch_len) : (i += 1) {
+                if (type_mask) |m| {
+                    if (m.data[i] != m.id) continue;
+                }
+                if (vals[i] > current) current = vals[i];
+            }
+            break :blk current;
+        },
+    };
+
+    const changed = switch (kind) {
+        .sum => new_val != old_val,
+        .min, .max => new_val != old_val,
+    };
+
+    if (changed) {
+        if (g_undo_enabled) appendMutation(
+            delta_mode,
+            .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
+            .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(new_val) },
+        );
+        agg_ptr.* = new_val;
+        setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+    }
+}
+
+/// Read a column as [*]const T from the column pointer array.
+fn getColAs(comptime T: type, col_ptrs: anytype, col: u8) [*]const T {
+    return @ptrCast(@alignCast(col_ptrs[col]));
+}
+
+// =============================================================================
 // Main Execution - NEW SIMPLIFIED API
 // =============================================================================
 
@@ -3986,80 +4071,24 @@ fn executeBatchImpl(
                 }
             },
 
-            // i64 aggregate ops — lossless integer accumulation
+            // i64 aggregate ops — delegate to comptime-generic execAgg
             .BATCH_AGG_SUM_I64 => {
                 const slot = code[pc];
                 const val_col = code[pc + 1];
                 pc += 2;
-
-                const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *i64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-                const old_val = agg_ptr.*;
-                const vals = getColI64(col_ptrs_ptr, val_col);
-                var sum: i64 = 0;
-                var i: u32 = 0;
-                while (i < batch_len) : (i += 1) {
-                    sum +%= vals[i];
-                }
-                const new_val = old_val +% sum;
-                if (g_undo_enabled) appendMutation(
-                    delta_mode,
-                    .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
-                    .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(new_val) },
-                );
-                agg_ptr.* = new_val;
-                if (new_val != old_val) setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                execAgg(i64, .sum, delta_mode, state_base, slot, getColAs(i64, col_ptrs_ptr, val_col), batch_len, null);
             },
             .BATCH_AGG_MIN_I64 => {
                 const slot = code[pc];
                 const val_col = code[pc + 1];
                 pc += 2;
-
-                const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *i64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-                const old_val = agg_ptr.*;
-                const vals = getColI64(col_ptrs_ptr, val_col);
-                var current = old_val;
-                var i: u32 = 0;
-                while (i < batch_len) : (i += 1) {
-                    if (vals[i] < current) current = vals[i];
-                }
-                if (current != old_val) {
-                    if (g_undo_enabled) appendMutation(
-                        delta_mode,
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(current) },
-                    );
-                    agg_ptr.* = current;
-                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
-                }
+                execAgg(i64, .min, delta_mode, state_base, slot, getColAs(i64, col_ptrs_ptr, val_col), batch_len, null);
             },
             .BATCH_AGG_MAX_I64 => {
                 const slot = code[pc];
                 const val_col = code[pc + 1];
                 pc += 2;
-
-                const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *i64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-                const old_val = agg_ptr.*;
-                const vals = getColI64(col_ptrs_ptr, val_col);
-                var current = old_val;
-                var i: u32 = 0;
-                while (i < batch_len) : (i += 1) {
-                    if (vals[i] > current) current = vals[i];
-                }
-                if (current != old_val) {
-                    if (g_undo_enabled) appendMutation(
-                        delta_mode,
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(current) },
-                    );
-                    agg_ptr.* = current;
-                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
-                }
+                execAgg(i64, .max, delta_mode, state_base, slot, getColAs(i64, col_ptrs_ptr, val_col), batch_len, null);
             },
 
             .BATCH_SCALAR_LATEST => {
@@ -4650,79 +4679,24 @@ fn executeBatchAggregates(
                     else => {},
                 }
             },
-            0x49 => { // BATCH_AGG_SUM_I64 — lossless i64 sum with type mask
+            // i64 aggregate ops — delegate to comptime-generic execAgg with type mask
+            0x49 => { // BATCH_AGG_SUM_I64
                 const slot = body[bpc + 1];
                 const val_col = body[bpc + 2];
                 bpc += 3;
-
-                const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *i64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-                const old_val = agg_ptr.*;
-                const vals: [*]const i64 = @ptrCast(@alignCast(col_ptrs[val_col]));
-                var sum: i64 = 0;
-                var i: u32 = 0;
-                while (i < batch_len) : (i += 1) {
-                    if (type_data[i] == type_id) sum +%= vals[i];
-                }
-                const new_val = old_val +% sum;
-                if (g_undo_enabled) appendMutation(
-                    delta_mode,
-                    .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
-                    .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(new_val) },
-                );
-                agg_ptr.* = new_val;
-                if (new_val != old_val) setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
+                execAgg(i64, .sum, delta_mode, state_base, slot, getColAs(i64, col_ptrs, val_col), batch_len, .{ .data = type_data, .id = type_id });
             },
             0x4a => { // BATCH_AGG_MIN_I64
                 const slot = body[bpc + 1];
                 const val_col = body[bpc + 2];
                 bpc += 3;
-
-                const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *i64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-                const old_val = agg_ptr.*;
-                const vals: [*]const i64 = @ptrCast(@alignCast(col_ptrs[val_col]));
-                var current = old_val;
-                var i: u32 = 0;
-                while (i < batch_len) : (i += 1) {
-                    if (type_data[i] == type_id and vals[i] < current) current = vals[i];
-                }
-                if (current != old_val) {
-                    if (g_undo_enabled) appendMutation(
-                        delta_mode,
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(current) },
-                    );
-                    agg_ptr.* = current;
-                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
-                }
+                execAgg(i64, .min, delta_mode, state_base, slot, getColAs(i64, col_ptrs, val_col), batch_len, .{ .data = type_data, .id = type_id });
             },
             0x4b => { // BATCH_AGG_MAX_I64
                 const slot = body[bpc + 1];
                 const val_col = body[bpc + 2];
                 bpc += 3;
-
-                const meta = getSlotMeta(state_base, slot);
-                const agg_ptr: *i64 = @ptrCast(@alignCast(state_base + meta.offset));
-                const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-                const old_val = agg_ptr.*;
-                const vals: [*]const i64 = @ptrCast(@alignCast(col_ptrs[val_col]));
-                var current = old_val;
-                var i: u32 = 0;
-                while (i < batch_len) : (i += 1) {
-                    if (type_data[i] == type_id and vals[i] > current) current = vals[i];
-                }
-                if (current != old_val) {
-                    if (g_undo_enabled) appendMutation(
-                        delta_mode,
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(old_val) },
-                        .{ .op = .AGG_UPDATE, .slot = slot, ._pad1 = 0, ._pad2 = 0, .key = 0, .prev_value = @truncate(count_ptr.*), .aux = @bitCast(current) },
-                    );
-                    agg_ptr.* = current;
-                    setChangeFlag(meta, ChangeFlag.SIZE_CHANGED);
-                }
+                execAgg(i64, .max, delta_mode, state_base, slot, getColAs(i64, col_ptrs, val_col), batch_len, .{ .data = type_data, .id = type_id });
             },
             else => {
                 bpc += aggOpLen(op_byte);
