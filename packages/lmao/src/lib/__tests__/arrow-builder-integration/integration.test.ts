@@ -5,13 +5,12 @@ import {
   DEFAULT_BUFFER_CAPACITY,
   maskingTransforms,
 } from '@smoothbricks/arrow-builder';
-import type { SpanBuffer } from '@smoothbricks/lmao';
 import { convertToArrowTable, createSpanBuffer, ENTRY_TYPE_SPAN_START, S } from '@smoothbricks/lmao';
 import { defineOpContext } from '../../defineOpContext.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
-
 import { TestTracer } from '../../tracers/TestTracer.js';
+import type { AnySpanBuffer } from '../../types.js';
 import {
   createTestOpMetadata,
   createTestSchema,
@@ -348,8 +347,6 @@ describe('Buffer Integration', () => {
     it('should write increasing timestamps for each entry', async () => {
       // SpanBuffer is just storage - SpanLogger writes timestamps.
       // Use the full system (Tracer + SpanLogger) to verify entries have increasing timestamps.
-      // biome-ignore lint/correctness/noUnusedVariables: used via typeof for SpanBuffer type parameter
-      const schema = createTestSchema({ userId: S.category() });
       const ctx = defineOpContext({
         logSchema: defineLogSchema({
           userId: S.category(),
@@ -357,7 +354,7 @@ describe('Buffer Integration', () => {
       });
       const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
 
-      let capturedBuffer: SpanBuffer<typeof schema> | undefined;
+      let capturedBuffer: AnySpanBuffer | undefined;
       await trace('test', async (ctx) => {
         // Log multiple entries with small delays
         ctx.log.info('first');
@@ -368,7 +365,7 @@ describe('Buffer Integration', () => {
         // Access internal buffer for test verification
         const internalBuffer = Reflect.get(ctx as object, '_buffer');
         if (internalBuffer) {
-          capturedBuffer = internalBuffer as SpanBuffer<typeof schema>;
+          capturedBuffer = internalBuffer as AnySpanBuffer;
         }
         return ctx.ok('done');
       });
