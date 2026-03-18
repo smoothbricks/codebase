@@ -256,3 +256,78 @@ test "growHashMap — preserves timestamps side-array" {
     try testing.expect(found_pos < new_cap);
     try testing.expectApproxEqAbs(@as(f64, 999.5), new_ts[found_pos], 0.001);
 }
+
+// =============================================================================
+// Stress tests — sequential growth cascade
+// =============================================================================
+
+test "stress — sequential HashMap growth 16→32→64→128" {
+    // Uses FlatHashTable with inline headers (init/bind) so size is tracked
+    // automatically in the header. Each growth step rehashes via the typed API
+    // into a new region within the same buffer, then re-binds.
+    const HT = ht.FlatHashTable(u32);
+
+    var buf: [65536]u8 align(8) = [_]u8{0} ** 65536;
+
+    // Track all inserted keys and their values for verification
+    var all_keys: [256]u32 = [_]u32{0} ** 256;
+    var all_vals: [256]u32 = [_]u32{0} ** 256;
+    var total_inserted: u32 = 0;
+    var next_key: u32 = 1;
+
+    // Start: cap=16 at offset 0
+    var current_cap: u32 = 16;
+    var current_offset: u32 = 0;
+    var tbl = HT.init(&buf, current_offset, current_cap);
+
+    // Growth targets: 16 → 32 → 64 → 128
+    const target_caps = [_]u32{ 32, 64, 128 };
+
+    for (target_caps) |new_cap| {
+        // Insert keys until load factor exceeded (null = needs growth)
+        while (true) {
+            const result = tbl.upsert(next_key, next_key * 7);
+            if (result == null) break;
+            all_keys[total_inserted] = next_key;
+            all_vals[total_inserted] = next_key * 7;
+            total_inserted += 1;
+            next_key += 1;
+        }
+
+        // Grow: rehash into a new region using the typed rehashInto API
+        const new_offset = current_offset + HT.byteSize(current_cap) + 64; // gap to avoid overlap
+        tbl = tbl.rehashInto(&buf, new_offset, new_cap);
+
+        // Verify all entries present after growth
+        try testing.expectEqual(total_inserted, tbl.size());
+        var v: u32 = 0;
+        while (v < total_inserted) : (v += 1) {
+            const entry = tbl.get(all_keys[v]);
+            try testing.expect(entry != null);
+            try testing.expectEqual(all_vals[v], entry.?.*);
+        }
+
+        current_offset = new_offset;
+        current_cap = new_cap;
+
+        // Insert the key that triggered growth (was rejected above)
+        const retry = tbl.upsert(next_key, next_key * 7);
+        try testing.expect(retry != null);
+        all_keys[total_inserted] = next_key;
+        all_vals[total_inserted] = next_key * 7;
+        total_inserted += 1;
+        next_key += 1;
+    }
+
+    // Final verification: all keys still have correct values
+    var f: u32 = 0;
+    while (f < total_inserted) : (f += 1) {
+        const entry = tbl.get(all_keys[f]);
+        try testing.expect(entry != null);
+        try testing.expectEqual(all_vals[f], entry.?.*);
+    }
+
+    // Verify final size matches total inserted
+    try testing.expectEqual(total_inserted, tbl.size());
+    try testing.expect(total_inserted > 0);
+}

@@ -710,3 +710,130 @@ test "e2e — NESTED_SET_INSERT through full VM pipeline" {
     try testing.expectEqual(@as(u32, 1), getInnerSetSize(state_ptr, inner_20));
     try testing.expect(innerSetContains(state_ptr, inner_20, 100));
 }
+
+// =============================================================================
+// Stress tests — arena fragmentation, multi-seed randomization, capacity limits
+// =============================================================================
+
+test "stress — inner growth cascade tracks arena fragmentation" {
+    var state: [131072]u8 align(8) = [_]u8{0} ** 131072;
+    const meta = setupNestedTestSlot(&state, 16, .HASHSET, 4, .SUM);
+
+    // Insert 100 elements into ONE outer key, forcing inner set growth: 4->8->16->32->64->128
+    var i: u32 = 1;
+    while (i <= 100) : (i += 1) {
+        try testing.expectEqual(ErrorCode.OK, nestedSetInsert(&state, meta, 1, i));
+    }
+
+    // All 100 elements must be present
+    const inner = getInnerOffset(&state, meta, 1);
+    try testing.expect(inner != 0);
+    i = 1;
+    while (i <= 100) : (i += 1) {
+        try testing.expect(innerSetContains(&state, inner, i));
+    }
+
+    // Arena must have allocated something
+    const arena = Arena.bind(&state, arenaHeaderOffset(meta.offset, meta.capacity));
+    try testing.expect(arena.used() > 0);
+
+    // Dead space: old capacities 4, 8, 16, 32, 64 are abandoned in the arena.
+    // The live inner set has cap=128 (byteSize(128)). Everything else is fragmentation.
+    const dead_space = HashSet.byteSize(4) + HashSet.byteSize(8) + HashSet.byteSize(16) + HashSet.byteSize(32) + HashSet.byteSize(64);
+    const live_size = HashSet.byteSize(128);
+
+    // Arena used must exceed the live data size, proving fragmentation exists
+    try testing.expect(arena.used() >= live_size + dead_space);
+}
+
+test "stress — multi-seed randomized Map<K, Set<V>>" {
+    const seeds = [_]u64{ 0xDEADBEEF, 0xCAFEBABE, 0x12345678, 0xFEEDFACE };
+
+    inline for (seeds) |seed| {
+        var state: [262144]u8 align(8) = [_]u8{0} ** 262144;
+        const meta = setupNestedTestSlot(&state, 64, .HASHSET, 8, .SUM);
+
+        var rng = std.Random.DefaultPrng.init(seed);
+        const random = rng.random();
+
+        var truth: [32]std.ArrayList(u32) = undefined;
+        for (&truth) |*t| t.* = .empty;
+        defer for (&truth) |*t| t.deinit(testing.allocator);
+
+        var ops: u32 = 0;
+        while (ops < 500) : (ops += 1) {
+            const outer_key = random.intRangeAtMost(u32, 1, 30);
+            const elem = random.intRangeAtMost(u32, 1, 200);
+            try testing.expectEqual(ErrorCode.OK, nestedSetInsert(&state, meta, outer_key, elem));
+
+            const idx = outer_key - 1;
+            var found = false;
+            for (truth[idx].items) |v| {
+                if (v == elem) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) try truth[idx].append(testing.allocator, elem);
+        }
+
+        for (0..30) |idx| {
+            const outer_key: u32 = @intCast(idx + 1);
+            const inner = getInnerOffset(&state, meta, outer_key);
+            if (truth[idx].items.len == 0) {
+                try testing.expectEqual(@as(u32, 0), inner);
+                continue;
+            }
+            try testing.expect(inner != 0);
+            try testing.expectEqual(@as(u32, @intCast(truth[idx].items.len)), getInnerSetSize(&state, inner));
+            for (truth[idx].items) |elem| {
+                try testing.expect(innerSetContains(&state, inner, elem));
+            }
+        }
+    }
+}
+
+test "stress — many outer keys fill arena to capacity" {
+    var state: [65536]u8 align(8) = [_]u8{0} ** 65536;
+    const meta = setupNestedTestSlot(&state, 128, .HASHSET, 4, .SUM);
+
+    var successful_keys: u32 = 0;
+    var k: u32 = 1;
+    while (k <= 128) : (k += 1) {
+        if (nestedSetInsert(&state, meta, k, k * 10) == .OK) {
+            successful_keys += 1;
+        } else {
+            break;
+        }
+    }
+
+    // Some keys succeeded, but not all (arena exhausted before outer table full)
+    try testing.expect(successful_keys > 0);
+    try testing.expect(successful_keys < 128);
+
+    // Every successful key's inner set must contain its element
+    var v: u32 = 1;
+    while (v <= successful_keys) : (v += 1) {
+        try testing.expect(innerSetContains(&state, getInnerOffset(&state, meta, v), v * 10));
+    }
+}
+
+test "stress — inner map growth preserves all entries" {
+    var state: [131072]u8 align(8) = [_]u8{0} ** 131072;
+    const meta = setupNestedTestSlot(&state, 16, .HASHMAP, 4, .SUM);
+
+    // Insert 50 key-value pairs into inner map under outer key=1. Values = key * 10.
+    // Forces growth: 4->8->16->32->64
+    var i: u32 = 1;
+    while (i <= 50) : (i += 1) {
+        try testing.expectEqual(ErrorCode.OK, nestedMapUpsertLast(&state, meta, 1, i, i * 10));
+    }
+
+    // Verify all 50 entries present with correct values
+    const inner = getInnerOffset(&state, meta, 1);
+    try testing.expect(inner != 0);
+    i = 1;
+    while (i <= 50) : (i += 1) {
+        try testing.expectEqual(i * 10, innerMapGet(&state, inner, i));
+    }
+}

@@ -355,3 +355,114 @@ test "EMPTY_KEY and TOMBSTONE are rejected" {
     try testing.expect(tbl.insertKey(TOMBSTONE) == null);
     try testing.expectEqual(@as(u32, 0), tbl.size());
 }
+
+// =============================================================================
+// Stress / property tests
+// =============================================================================
+
+test "stress — randomized insert 1000 keys, verify all found" {
+    var buf: [32768]u8 align(8) = [_]u8{0} ** 32768;
+    const tbl = HashSet.init(&buf, 0, 2048);
+
+    var rng = std.Random.DefaultPrng.init(0xDEADBEEF);
+    const random = rng.random();
+
+    var inserted: [1024]u32 = undefined;
+    var inserted_len: u32 = 0;
+    var i: u32 = 0;
+    while (i < 1000) : (i += 1) {
+        const key = random.intRangeAtMost(u32, 1, 100000);
+        if (tbl.insertKey(key)) |was_new| {
+            if (was_new) {
+                inserted[inserted_len] = key;
+                inserted_len += 1;
+            }
+        }
+    }
+
+    // Verify all inserted keys found
+    for (inserted[0..inserted_len]) |key| {
+        try testing.expect(tbl.contains(key));
+    }
+
+    // Verify size matches
+    try testing.expectEqual(inserted_len, tbl.size());
+}
+
+test "stress — fill to load factor then rehash preserves all" {
+    var buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    const src = HashSet.init(&buf, 0, 32);
+
+    // Insert 22 keys (just under 70% of 32 = 22.4)
+    var i: u32 = 1;
+    while (i <= 22) : (i += 1) {
+        const result = src.insertKey(i);
+        try testing.expect(result != null);
+        try testing.expectEqual(true, result.?);
+    }
+    try testing.expectEqual(@as(u32, 22), src.size());
+
+    // Rehash into cap=64 table at offset 1024
+    const dst = src.rehashInto(&buf, 1024, 64);
+    try testing.expectEqual(@as(u32, 22), dst.size());
+
+    // Verify all 22 keys present in new table
+    i = 1;
+    while (i <= 22) : (i += 1) {
+        try testing.expect(dst.contains(i));
+    }
+}
+
+test "property — size always equals count of live keys" {
+    var buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    const tbl = HashMap.init(&buf, 0, 128);
+
+    var count: u32 = 0;
+    var i: u32 = 1;
+    while (i <= 80) : (i += 1) {
+        if (tbl.upsert(i, i * 10)) |was_new| {
+            if (was_new) count += 1;
+        } else break;
+    }
+
+    // Invariant: size == manually tracked count
+    try testing.expectEqual(count, tbl.size());
+
+    // Invariant: count of non-sentinel slots == size
+    var slot_count: u32 = 0;
+    for (0..tbl.cap) |si| {
+        if (tbl.keys[si] != EMPTY_KEY and tbl.keys[si] != TOMBSTONE) slot_count += 1;
+    }
+    try testing.expectEqual(tbl.size(), slot_count);
+}
+
+test "stress — HashMap upsert overwrites preserve size" {
+    var buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    const tbl = HashMap.init(&buf, 0, 128);
+
+    // Insert 50 keys with initial values
+    var i: u32 = 1;
+    while (i <= 50) : (i += 1) {
+        const result = tbl.upsert(i, i * 100);
+        try testing.expect(result != null);
+        try testing.expectEqual(true, result.?);
+    }
+    try testing.expectEqual(@as(u32, 50), tbl.size());
+
+    // Upsert same 50 keys with different values
+    i = 1;
+    while (i <= 50) : (i += 1) {
+        const result = tbl.upsert(i, i * 200);
+        try testing.expect(result != null);
+        try testing.expectEqual(false, result.?); // not new
+    }
+
+    // Size must still be 50 (not 100)
+    try testing.expectEqual(@as(u32, 50), tbl.size());
+
+    // Each key must have the NEW value
+    i = 1;
+    while (i <= 50) : (i += 1) {
+        try testing.expectEqual(i * 200, tbl.get(i).?.*);
+    }
+}
