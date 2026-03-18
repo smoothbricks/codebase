@@ -8,12 +8,12 @@ import { existsSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import {
-  type PatchnoteConfig,
   defaultConfig,
   executeConfigScript,
   isConfigScript,
   loadConfig,
   mergeConfig,
+  type PatchnoteConfig,
   sanitizeConfigForLogging,
 } from '../../src/config.js';
 import type { DeepPartial } from '../../src/types.js';

@@ -7,10 +7,10 @@ import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
-  type PatchnoteConfig,
   defaultConfig,
   loadConfig,
   mergeConfig,
+  type PatchnoteConfig,
   sanitizeConfigForLogging,
 } from '../src/config.js';
 import type { DeepPartial } from '../src/types.js';
