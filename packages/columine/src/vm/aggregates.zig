@@ -428,3 +428,116 @@ test "AggSlot — SUM_I64 layout (16 bytes, i64 value)" {
     try testing.expectEqual(@as(i64, 999_999_999_999), slot.value());
     try testing.expectEqual(@as(u64, 1), slot.count());
 }
+
+// =============================================================================
+// Parametric SIMD batch-size tests
+// =============================================================================
+// Exercise SIMD paths across tail-only, exact-multiple, mixed, and large sizes
+// to ensure the 4-wide V4f64 / 2-wide V2i64 loops + scalar tails are correct.
+
+const parametric_f64_sizes = [_]u32{ 1, 2, 3, 4, 5, 7, 8, 15, 16, 31, 32, 100, 256 };
+const parametric_masked_sizes = [_]u32{ 1, 4, 8, 32, 100 };
+const parametric_i64_sizes = [_]u32{ 1, 3, 7, 8, 16, 100 };
+
+/// Precomputed f64 buffer: vals[i] = @as(f64, @floatFromInt(i + 1))
+const max_param_len = 256;
+const param_f64_vals: [max_param_len]f64 = blk: {
+    var arr: [max_param_len]f64 = undefined;
+    for (0..max_param_len) |i| {
+        arr[i] = @as(f64, @floatFromInt(i + 1));
+    }
+    break :blk arr;
+};
+
+/// Precomputed i64 buffer: vals[i] = @as(i64, @intCast(i + 1))
+const param_i64_vals: [max_param_len]i64 = blk: {
+    var arr: [max_param_len]i64 = undefined;
+    for (0..max_param_len) |i| {
+        arr[i] = @as(i64, @intCast(i + 1));
+    }
+    break :blk arr;
+};
+
+/// Alternating type_ids: even indices = 1, odd indices = 2
+const param_type_ids: [max_param_len]u32 = blk: {
+    var arr: [max_param_len]u32 = undefined;
+    for (0..max_param_len) |i| {
+        arr[i] = if (i % 2 == 0) 1 else 2;
+    }
+    break :blk arr;
+};
+
+/// Predicate column: every 3rd element (i % 3 == 0) is 1, rest 0
+const param_pred_col: [max_param_len]u32 = blk: {
+    var arr: [max_param_len]u32 = undefined;
+    for (0..max_param_len) |i| {
+        arr[i] = if (i % 3 == 0) 1 else 0;
+    }
+    break :blk arr;
+};
+
+test "batchAggSum — parametric batch sizes" {
+    for (parametric_f64_sizes) |n| {
+        const expected = @as(f64, @floatFromInt(n)) * @as(f64, @floatFromInt(n + 1)) / 2.0;
+        const result = batchAggSum(&param_f64_vals, n);
+        try testing.expectApproxEqAbs(expected, result, 0.001);
+    }
+}
+
+test "batchAggMin — parametric batch sizes" {
+    for (parametric_f64_sizes) |n| {
+        const result = batchAggMin(&param_f64_vals, n, std.math.inf(f64));
+        try testing.expectApproxEqAbs(@as(f64, 1.0), result, 0.001);
+    }
+}
+
+test "batchAggMax — parametric batch sizes" {
+    for (parametric_f64_sizes) |n| {
+        const expected = @as(f64, @floatFromInt(n));
+        const result = batchAggMax(&param_f64_vals, n, -std.math.inf(f64));
+        try testing.expectApproxEqAbs(expected, result, 0.001);
+    }
+}
+
+test "maskedAggSum — parametric batch sizes" {
+    for (parametric_masked_sizes) |n| {
+        // Even-indexed elements (type_id=1): vals[0], vals[2], vals[4], ...
+        // These are 1, 3, 5, ... — sum of first ceil(n/2) odd naturals
+        var expected: f64 = 0.0;
+        var i: u32 = 0;
+        while (i < n) : (i += 1) {
+            if (i % 2 == 0) expected += param_f64_vals[i];
+        }
+        const result = maskedAggSum(&param_f64_vals, &param_type_ids, 1, n);
+        try testing.expectApproxEqAbs(expected, result, 0.001);
+    }
+}
+
+test "maskedAggCount — parametric batch sizes" {
+    for (parametric_masked_sizes) |n| {
+        // Count of even-indexed elements (type_id=1) = ceil(n/2)
+        const expected = (n + 1) / 2;
+        const result = maskedAggCount(&param_type_ids, 1, n);
+        try testing.expectEqual(expected, result);
+    }
+}
+
+test "reduceCol i64 sum — parametric batch sizes" {
+    for (parametric_i64_sizes) |n| {
+        const n_i64 = @as(i64, @intCast(n));
+        const expected = @divExact(n_i64 * (n_i64 + 1), 2);
+        const result = reduceCol(i64, .sum, &param_i64_vals, n, 0, null, null);
+        try testing.expectEqual(expected, result);
+    }
+}
+
+test "reduceCol f64 sum with predicate — batch_len=32" {
+    // pred[i] = 1 when i % 3 == 0, so indices 0,3,6,9,...,30
+    var expected: f64 = 0.0;
+    var i: u32 = 0;
+    while (i < 32) : (i += 1) {
+        if (i % 3 == 0) expected += param_f64_vals[i];
+    }
+    const result = reduceCol(f64, .sum, &param_f64_vals, 32, 0, null, &param_pred_col);
+    try testing.expectApproxEqAbs(expected, result, 0.001);
+}
