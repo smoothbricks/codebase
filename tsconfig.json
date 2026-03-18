@@ -46,7 +46,7 @@
       "path": "./packages/cli"
     },
     {
-      "path": "./packages/dep-updater"
+      "path": "./packages/patchnote"
     }
   ]
 }
