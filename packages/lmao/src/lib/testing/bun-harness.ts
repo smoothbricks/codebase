@@ -302,7 +302,8 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
         return ctx.ok(undefined); // pass -> span-ok
       } catch (error) {
         if (isExpectError(error)) {
-          return ctx.err(error); // expect() fail -> span-err
+          ctx.err(error); // record assertion failure in span
+          throw error; // re-throw so bun:test sees the failure
         }
         throw error; // other throw -> span-exception
       }
@@ -569,7 +570,10 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
           await als.run(ctx, fn);
           return ctx.ok(undefined); // pass → span-ok
         } catch (error) {
-          if (isExpectError(error)) return ctx.err(error); // expect() fail → span-err
+          if (isExpectError(error)) {
+            ctx.err(error); // record assertion failure in span
+            throw error; // re-throw so bun:test sees the failure
+          }
           throw error; // other throw → span-exception
         }
       }),
