@@ -86,4 +86,4 @@ jobs:
           if [[ "${{ vars.PATCHNOTE_SKIP_AI }}" == "true" ]]; then
             FLAGS="--skip-ai"
           fi
-          npx @smoothbricks/patchnote update-deps --verbose $FLAGS
+          bunx @smoothbricks/patchnote update-deps --verbose $FLAGS
