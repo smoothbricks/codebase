@@ -1261,3 +1261,307 @@ pub export fn vm_grow_state(
 
     return @intFromEnum(ErrorCode.OK);
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+const testing = std.testing;
+
+// ---------------------------------------------------------------------------
+// Helper: build a minimal program with a single slot defined by SLOT_DEF
+// ---------------------------------------------------------------------------
+fn buildSingleSlotProgram(type_flags_byte: u8, cap_lo: u8, cap_hi: u8) [64]u8 {
+    var prog = [_]u8{0} ** 64;
+    const content = prog[PROGRAM_HASH_PREFIX..];
+    // Magic "CLM1" little-endian
+    content[0] = 0x41;
+    content[1] = 0x58;
+    content[2] = 0x45;
+    content[3] = 0x31;
+    content[4] = 1; // version lo
+    content[5] = 0; // version hi
+    content[6] = 1; // num_slots
+    content[7] = 0; // body_len_lo (unused for init-only)
+    content[8] = 0;
+    content[9] = 0;
+    // init_len = 6 (1 opcode + 1 slot + 1 flags + 1 cap_lo + 1 cap_hi + 1 HALT)
+    const init_len: u16 = 6;
+    content[10] = @truncate(init_len);
+    content[11] = @truncate(init_len >> 8);
+    content[12] = 0; // reduce_len lo
+    content[13] = 0; // reduce_len hi
+    // Init section at content[14]
+    content[14] = @intFromEnum(Opcode.SLOT_DEF);
+    content[15] = 0; // slot index
+    content[16] = type_flags_byte;
+    content[17] = cap_lo;
+    content[18] = cap_hi;
+    content[19] = @intFromEnum(Opcode.HALT);
+    return prog;
+}
+
+// ---------------------------------------------------------------------------
+// 1. computeStructRowLayout
+// ---------------------------------------------------------------------------
+
+test "computeStructRowLayout — 2 fields (UINT32, STRING)" {
+    var fields = [_]u8{ @intFromEnum(StructFieldType.UINT32), @intFromEnum(StructFieldType.STRING) };
+    const layout = computeStructRowLayout(2, &fields);
+    // bitset = (2+7)/8 = 1, row_data = 1+4+4 = 9, padded to 4 = 12
+    try testing.expectEqual(@as(u32, 1), layout.bitset_bytes);
+    try testing.expectEqual(@as(u32, 12), layout.row_size);
+    try testing.expectEqual(@as(u32, 8), layout.descriptor_size);
+}
+
+test "computeStructRowLayout — 3 fields (FLOAT64, BOOL, INT64)" {
+    var fields = [_]u8{ @intFromEnum(StructFieldType.FLOAT64), @intFromEnum(StructFieldType.BOOL), @intFromEnum(StructFieldType.INT64) };
+    const layout = computeStructRowLayout(3, &fields);
+    // bitset = 1, row_data = 1+8+1+8 = 18, padded to 4 = 20
+    try testing.expectEqual(@as(u32, 1), layout.bitset_bytes);
+    try testing.expectEqual(@as(u32, 20), layout.row_size);
+    try testing.expectEqual(@as(u32, 8), layout.descriptor_size);
+}
+
+test "computeStructRowLayout — 8 fields (all UINT32)" {
+    var fields = [_]u8{@intFromEnum(StructFieldType.UINT32)} ** 8;
+    const layout = computeStructRowLayout(8, &fields);
+    // bitset = (8+7)/8 = 1, row_data = 1+8*4 = 33, padded to 4 = 36
+    try testing.expectEqual(@as(u32, 1), layout.bitset_bytes);
+    try testing.expectEqual(@as(u32, 36), layout.row_size);
+    try testing.expectEqual(@as(u32, 8), layout.descriptor_size);
+}
+
+// ---------------------------------------------------------------------------
+// 2. structFieldOffset
+// ---------------------------------------------------------------------------
+
+test "structFieldOffset — 3 fields (UINT32=4, FLOAT64=8, STRING=4)" {
+    var fields = [_]u8{ @intFromEnum(StructFieldType.UINT32), @intFromEnum(StructFieldType.FLOAT64), @intFromEnum(StructFieldType.STRING) };
+    const bitset_bytes: u32 = 1; // (3+7)/8
+    // field 0: starts at bitset_bytes
+    try testing.expectEqual(bitset_bytes, structFieldOffset(3, &fields, 0));
+    // field 1: bitset + UINT32(4) = 1+4 = 5
+    try testing.expectEqual(bitset_bytes + 4, structFieldOffset(3, &fields, 1));
+    // field 2: bitset + UINT32(4) + FLOAT64(8) = 1+4+8 = 13
+    try testing.expectEqual(bitset_bytes + 4 + 8, structFieldOffset(3, &fields, 2));
+}
+
+// ---------------------------------------------------------------------------
+// 3. structFieldSize
+// ---------------------------------------------------------------------------
+
+test "structFieldSize — all types" {
+    try testing.expectEqual(@as(u32, 4), structFieldSize(.UINT32));
+    try testing.expectEqual(@as(u32, 8), structFieldSize(.INT64));
+    try testing.expectEqual(@as(u32, 8), structFieldSize(.FLOAT64));
+    try testing.expectEqual(@as(u32, 1), structFieldSize(.BOOL));
+    try testing.expectEqual(@as(u32, 4), structFieldSize(.STRING));
+    // Array types: in-row (offset:u32 + length:u32) = 8
+    try testing.expectEqual(@as(u32, 8), structFieldSize(.ARRAY_U32));
+    try testing.expectEqual(@as(u32, 8), structFieldSize(.ARRAY_I64));
+    try testing.expectEqual(@as(u32, 8), structFieldSize(.ARRAY_F64));
+    try testing.expectEqual(@as(u32, 8), structFieldSize(.ARRAY_STRING));
+    try testing.expectEqual(@as(u32, 8), structFieldSize(.ARRAY_BOOL));
+}
+
+// ---------------------------------------------------------------------------
+// 4. arenaInitialCapacity
+// ---------------------------------------------------------------------------
+
+test "arenaInitialCapacity — equals hash_capacity * 64" {
+    try testing.expectEqual(@as(u32, 64 * 64), arenaInitialCapacity(64));
+    try testing.expectEqual(@as(u32, 16 * 64), arenaInitialCapacity(16));
+    try testing.expectEqual(@as(u32, 256 * 64), arenaInitialCapacity(256));
+}
+
+// ---------------------------------------------------------------------------
+// 5. getStructMapSlotDataSize
+// ---------------------------------------------------------------------------
+
+test "getStructMapSlotDataSize — without timestamps" {
+    // descriptor=8, cap=32, row_size=12 → 8 + 32*4 + 32*12 = 8+128+384 = 520
+    try testing.expectEqual(@as(u32, 520), getStructMapSlotDataSize(8, 32, 12, false));
+}
+
+test "getStructMapSlotDataSize — with timestamps" {
+    // descriptor=8, cap=32, row_size=12 → 8 + 32*4 + 32*12 + 32*8 = 8+128+384+256 = 776
+    try testing.expectEqual(@as(u32, 776), getStructMapSlotDataSize(8, 32, 12, true));
+}
+
+// ---------------------------------------------------------------------------
+// 6. getTTLSideBufferSize
+// ---------------------------------------------------------------------------
+
+test "getTTLSideBufferSize — no TTL returns 0" {
+    try testing.expectEqual(@as(u32, 0), getTTLSideBufferSize(false, false, 32));
+}
+
+test "getTTLSideBufferSize — TTL only (no evict trigger)" {
+    // cap=32, EvictionEntry=16 bytes → align8(32*16) = align8(512) = 512
+    try testing.expectEqual(align8(32 * @sizeOf(EvictionEntry)), getTTLSideBufferSize(true, false, 32));
+}
+
+test "getTTLSideBufferSize — TTL + evict trigger" {
+    const cap: u32 = 32;
+    const expected = align8(cap * @sizeOf(EvictionEntry)) + align8(1024 * @sizeOf(EvictionEntry));
+    try testing.expectEqual(expected, getTTLSideBufferSize(true, true, cap));
+}
+
+// ---------------------------------------------------------------------------
+// 7. vm_calculate_state_size — HASHMAP slot
+// ---------------------------------------------------------------------------
+
+test "vm_calculate_state_size — HASHMAP" {
+    // type_flags = HASHMAP (0x00), cap_lo=8, cap_hi=0 → requested=8, effective=nextPowerOf2(8*2)=16
+    const prog = buildSingleSlotProgram(0x00, 8, 0);
+    const size = vm_calculate_state_size(&prog, prog.len);
+    try testing.expect(size > 0);
+
+    const cap: u32 = 16; // nextPowerOf2(8*2)
+    // header(32) + 1 slot meta(48) = 80, align8 = 80
+    var expected: u32 = align8(STATE_HEADER_SIZE + 1 * SLOT_META_SIZE);
+    // HASHMAP: keys(cap*4) + values(cap*4) + timestamps(cap*8)
+    expected += cap * 4 + cap * 4 + cap * 8;
+    expected = align8(expected);
+    try testing.expectEqual(expected, size);
+}
+
+// ---------------------------------------------------------------------------
+// 8. vm_calculate_state_size — AGGREGATE (COUNT)
+// ---------------------------------------------------------------------------
+
+test "vm_calculate_state_size — AGGREGATE COUNT" {
+    // type_flags = AGGREGATE (0x02), cap_lo = AggType.COUNT (2), cap_hi = 0
+    const prog = buildSingleSlotProgram(0x02, @intFromEnum(AggType.COUNT), 0);
+    const size = vm_calculate_state_size(&prog, prog.len);
+    try testing.expect(size > 0);
+
+    var expected: u32 = align8(STATE_HEADER_SIZE + 1 * SLOT_META_SIZE);
+    // COUNT aggregate: 8 bytes (not 16)
+    expected += 8;
+    expected = align8(expected);
+    try testing.expectEqual(expected, size);
+}
+
+// ---------------------------------------------------------------------------
+// 9. vm_init_state — HASHMAP (magic, keys, size, timestamps)
+// ---------------------------------------------------------------------------
+
+test "vm_init_state — HASHMAP keys=EMPTY_KEY, size=0, timestamps=-inf" {
+    const prog = buildSingleSlotProgram(0x00, 8, 0);
+    const size = vm_calculate_state_size(&prog, prog.len);
+    try testing.expect(size > 0);
+
+    var state_buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
+    const rc = vm_init_state(&state_buf, &prog, prog.len);
+    try testing.expectEqual(@as(u32, 0), rc); // OK
+
+    // Check magic
+    const magic = std.mem.readInt(u32, state_buf[0..4], .little);
+    try testing.expectEqual(STATE_MAGIC, magic);
+
+    // Read slot meta
+    const meta = types.getSlotMeta(&state_buf, 0);
+    try testing.expectEqual(@as(u32, 0), meta.size_ptr.*); // size == 0
+
+    const cap: u32 = 16; // nextPowerOf2(8*2)
+    try testing.expectEqual(cap, meta.capacity);
+
+    // Keys should be EMPTY_KEY
+    const keys: [*]const u32 = @ptrCast(@alignCast(state_buf[meta.offset..]));
+    for (0..cap) |i| {
+        try testing.expectEqual(EMPTY_KEY, keys[i]);
+    }
+
+    // Timestamps should be -inf
+    const ts_offset = meta.offset + cap * 4 + cap * 4;
+    const ts: [*]const f64 = @ptrCast(@alignCast(state_buf[ts_offset..]));
+    for (0..cap) |i| {
+        try testing.expect(ts[i] == -std.math.inf(f64));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 10. vm_init_state — AGGREGATE (SUM → value=0.0, count=0; MIN → value=+inf)
+// ---------------------------------------------------------------------------
+
+test "vm_init_state — AGGREGATE SUM value=0, count=0" {
+    const prog = buildSingleSlotProgram(0x02, @intFromEnum(AggType.SUM), 0);
+    const size = vm_calculate_state_size(&prog, prog.len);
+    try testing.expect(size > 0);
+
+    var state_buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
+    const rc = vm_init_state(&state_buf, &prog, prog.len);
+    try testing.expectEqual(@as(u32, 0), rc);
+
+    const meta = types.getSlotMeta(&state_buf, 0);
+    const slot = aggregates.AggSlot(.SUM).bind(&state_buf, meta.offset);
+    try testing.expectApproxEqAbs(@as(f64, 0.0), slot.value(), 0.001);
+    try testing.expectEqual(@as(u64, 0), slot.count());
+}
+
+test "vm_init_state — AGGREGATE MIN value=+inf" {
+    const prog = buildSingleSlotProgram(0x02, @intFromEnum(AggType.MIN), 0);
+    const size = vm_calculate_state_size(&prog, prog.len);
+    try testing.expect(size > 0);
+
+    var state_buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
+    const rc = vm_init_state(&state_buf, &prog, prog.len);
+    try testing.expectEqual(@as(u32, 0), rc);
+
+    const meta = types.getSlotMeta(&state_buf, 0);
+    const slot = aggregates.AggSlot(.MIN).bind(&state_buf, meta.offset);
+    try testing.expect(slot.value() == std.math.inf(f64));
+    try testing.expectEqual(@as(u64, 0), slot.count());
+}
+
+// ---------------------------------------------------------------------------
+// 11. vm_init_state — HASHSET (keys=EMPTY_KEY)
+// ---------------------------------------------------------------------------
+
+test "vm_init_state — HASHSET keys=EMPTY_KEY" {
+    // HASHSET = 1
+    const type_flags = SlotTypeFlags{ .slot_type = .HASHSET, .has_ttl = false, .has_evict_trigger = false };
+    const prog = buildSingleSlotProgram(type_flags.toByte(), 8, 0);
+    const size = vm_calculate_state_size(&prog, prog.len);
+    try testing.expect(size > 0);
+
+    var state_buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
+    const rc = vm_init_state(&state_buf, &prog, prog.len);
+    try testing.expectEqual(@as(u32, 0), rc);
+
+    const meta = types.getSlotMeta(&state_buf, 0);
+    const cap: u32 = 16; // nextPowerOf2(8*2)
+    try testing.expectEqual(cap, meta.capacity);
+
+    const keys: [*]const u32 = @ptrCast(@alignCast(state_buf[meta.offset..]));
+    for (0..cap) |i| {
+        try testing.expectEqual(EMPTY_KEY, keys[i]);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 12. vm_calculate_grown_state_size — HASHMAP cap doubles
+// ---------------------------------------------------------------------------
+
+test "vm_calculate_grown_state_size — HASHMAP slot cap doubles" {
+    const prog = buildSingleSlotProgram(0x00, 8, 0);
+    const size = vm_calculate_state_size(&prog, prog.len);
+    try testing.expect(size > 0);
+
+    var state_buf: [16384]u8 align(8) = [_]u8{0} ** 16384;
+    const rc = vm_init_state(&state_buf, &prog, prog.len);
+    try testing.expectEqual(@as(u32, 0), rc);
+
+    // Grow slot 0: old_cap=16 → new_cap=nextPowerOf2(16*2)=32
+    const grown_size = vm_calculate_grown_state_size(&state_buf, &prog, prog.len, 0);
+    try testing.expect(grown_size > size);
+
+    const new_cap: u32 = 32; // nextPowerOf2(16*2)
+    var expected: u32 = align8(STATE_HEADER_SIZE + 1 * SLOT_META_SIZE);
+    // HASHMAP with timestamps: keys(cap*4) + values(cap*4) + timestamps(cap*8)
+    expected += new_cap * 4 + new_cap * 4 + new_cap * 8;
+    expected = align8(expected);
+    try testing.expectEqual(expected, grown_size);
+}

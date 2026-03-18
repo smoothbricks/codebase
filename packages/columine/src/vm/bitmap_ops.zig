@@ -889,3 +889,395 @@ pub export fn vm_rbmp_extract_serialized(
     }
     return count;
 }
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+const testing = std.testing;
+
+// ---------------------------------------------------------------------------
+// Helpers: create a BitmapStorage pointing into a local buffer
+// ---------------------------------------------------------------------------
+
+fn makeStorage(buf: []align(8) u8) BitmapStorage {
+    return .{
+        .serialized_len_ptr = @ptrCast(@alignCast(buf.ptr)),
+        .payload_ptr = buf.ptr + BITMAP_SERIALIZED_LEN_BYTES,
+        .payload_capacity = @intCast(buf.len - BITMAP_SERIALIZED_LEN_BYTES),
+    };
+}
+
+/// Build a minimal state buffer with one BITMAP slot and return the SlotMeta.
+/// Layout: [STATE_HEADER (32)] [SLOT_META (48)] [bitmap data area ...]
+fn initBitmapSlotState(state: []align(8) u8, capacity: u32) SlotMeta {
+    @memset(state, 0);
+
+    // State header
+    const hdr: [*]u8 = state.ptr;
+    std.mem.writeInt(u32, hdr[StateHeaderOffset.MAGIC..][0..4], 0x53544154, .little);
+    hdr[StateHeaderOffset.FORMAT_VERSION] = 2;
+    hdr[StateHeaderOffset.NUM_SLOTS] = 1;
+
+    // Slot metadata at STATE_HEADER_SIZE
+    const meta_base = STATE_HEADER_SIZE;
+    const slot_data_offset = STATE_HEADER_SIZE + SLOT_META_SIZE;
+    std.mem.writeInt(u32, state[meta_base + SlotMetaOffset.OFFSET ..][0..4], slot_data_offset, .little);
+    std.mem.writeInt(u32, state[meta_base + SlotMetaOffset.CAPACITY ..][0..4], capacity, .little);
+    std.mem.writeInt(u32, state[meta_base + SlotMetaOffset.SIZE ..][0..4], 0, .little);
+    // type_flags: BITMAP (8), no TTL, no eviction
+    state[meta_base + SlotMetaOffset.TYPE_FLAGS] = @intFromEnum(types.SlotType.BITMAP);
+
+    return getSlotMeta(state.ptr, 0);
+}
+
+// ---------------------------------------------------------------------------
+// 1. Empty bitmap load
+// ---------------------------------------------------------------------------
+test "bitmapLoad — empty (serialized_len=0) returns bitmap with cardinality 0" {
+    var buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    const storage = makeStorage(&buf);
+    // serialized_len is already 0
+
+    var loaded = bitmapLoad(storage) orelse return error.SkipZigTest;
+    defer loaded.deinit();
+
+    try testing.expectEqual(@as(u64, 0), loaded.value.cardinality());
+}
+
+// ---------------------------------------------------------------------------
+// 2. Serialize round-trip (10 elements)
+// ---------------------------------------------------------------------------
+test "bitmapStore/bitmapLoad — round-trip preserves 10 elements" {
+    var buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    const storage = makeStorage(&buf);
+
+    // Create, add 10 elements, store
+    var bmp = bitmapLoad(storage) orelse return error.SkipZigTest;
+    const elems = [_]u32{ 5, 10, 15, 20, 25, 30, 35, 40, 45, 50 };
+    for (elems) |e| {
+        _ = try bmp.value.add(e);
+    }
+    try testing.expectEqual(ErrorCode.OK, bitmapStore(storage, &bmp.value));
+    bmp.deinit();
+
+    // Reload and verify
+    var reloaded = bitmapLoad(storage) orelse return error.SkipZigTest;
+    defer reloaded.deinit();
+
+    try testing.expectEqual(@as(u64, 10), reloaded.value.cardinality());
+    for (elems) |e| {
+        try testing.expect(reloaded.value.contains(e));
+    }
+    // Element not added should be absent
+    try testing.expect(!reloaded.value.contains(99));
+}
+
+// ---------------------------------------------------------------------------
+// 3. Large bitmap (500 elements)
+// ---------------------------------------------------------------------------
+test "bitmapStore/bitmapLoad — 500 elements round-trip" {
+    var buf: [65536]u8 align(8) = [_]u8{0} ** 65536;
+    const storage = makeStorage(&buf);
+
+    var bmp = bitmapLoad(storage) orelse return error.SkipZigTest;
+    var i: u32 = 1;
+    while (i <= 500) : (i += 1) {
+        _ = try bmp.value.add(i);
+    }
+    try testing.expectEqual(ErrorCode.OK, bitmapStore(storage, &bmp.value));
+    bmp.deinit();
+
+    var reloaded = bitmapLoad(storage) orelse return error.SkipZigTest;
+    defer reloaded.deinit();
+
+    try testing.expectEqual(@as(u64, 500), reloaded.value.cardinality());
+    try testing.expect(reloaded.value.contains(1)); // first
+    try testing.expect(reloaded.value.contains(250)); // middle
+    try testing.expect(reloaded.value.contains(500)); // last
+    try testing.expect(!reloaded.value.contains(0)); // absent
+    try testing.expect(!reloaded.value.contains(501)); // absent
+}
+
+// ---------------------------------------------------------------------------
+// 4. bitmapFrozen on empty
+// ---------------------------------------------------------------------------
+test "bitmapFrozen — returns null when serialized_len=0" {
+    var buf: [4096]u8 align(8) = [_]u8{0} ** 4096;
+    const storage = makeStorage(&buf);
+    // serialized_len = 0
+    try testing.expect(bitmapFrozen(storage) == null);
+}
+
+// ---------------------------------------------------------------------------
+// 5. bitmapFrozen on valid data
+// ---------------------------------------------------------------------------
+test "bitmapFrozen — iterates stored elements" {
+    var buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    const storage = makeStorage(&buf);
+
+    var bmp = bitmapLoad(storage) orelse return error.SkipZigTest;
+    _ = try bmp.value.add(7);
+    _ = try bmp.value.add(42);
+    _ = try bmp.value.add(100);
+    try testing.expectEqual(ErrorCode.OK, bitmapStore(storage, &bmp.value));
+    bmp.deinit();
+
+    const frozen = bitmapFrozen(storage) orelse return error.SkipZigTest;
+    var iter = frozen.iterator();
+    var collected: [16]u32 = undefined;
+    var count: u32 = 0;
+    while (iter.next()) |v| {
+        collected[count] = v;
+        count += 1;
+    }
+    try testing.expectEqual(@as(u32, 3), count);
+    try testing.expectEqual(@as(u32, 7), collected[0]);
+    try testing.expectEqual(@as(u32, 42), collected[1]);
+    try testing.expectEqual(@as(u32, 100), collected[2]);
+}
+
+// ---------------------------------------------------------------------------
+// 6. bitmapSelect
+// ---------------------------------------------------------------------------
+test "bitmapSelect — returns element at given rank" {
+    var buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    const storage = makeStorage(&buf);
+
+    var bmp = bitmapLoad(storage) orelse return error.SkipZigTest;
+    const elems = [_]u32{ 10, 20, 30, 40, 50 };
+    for (elems) |e| {
+        _ = try bmp.value.add(e);
+    }
+    try testing.expectEqual(ErrorCode.OK, bitmapStore(storage, &bmp.value));
+    bmp.deinit();
+
+    try testing.expectEqual(@as(?u32, 10), bitmapSelect(storage, 0));
+    try testing.expectEqual(@as(?u32, 30), bitmapSelect(storage, 2));
+    try testing.expectEqual(@as(?u32, 50), bitmapSelect(storage, 4));
+    // Out of range
+    try testing.expect(bitmapSelect(storage, 5) == null);
+}
+
+// ---------------------------------------------------------------------------
+// 7. bitmapPayloadCapacity formula
+// ---------------------------------------------------------------------------
+test "bitmapPayloadCapacity — formula cap*BYTES_PER_CAP + BASE" {
+    // cap=0
+    try testing.expectEqual(BITMAP_BASE_BYTES, bitmapPayloadCapacity(0));
+    // cap=1 → 1*8 + 256 = 264
+    try testing.expectEqual(1 * BITMAP_BYTES_PER_CAPACITY + BITMAP_BASE_BYTES, bitmapPayloadCapacity(1));
+    // cap=16 → 16*8 + 256 = 384
+    try testing.expectEqual(16 * BITMAP_BYTES_PER_CAPACITY + BITMAP_BASE_BYTES, bitmapPayloadCapacity(16));
+    // cap=1000 → 1000*8 + 256 = 8256
+    try testing.expectEqual(1000 * BITMAP_BYTES_PER_CAPACITY + BITMAP_BASE_BYTES, bitmapPayloadCapacity(1000));
+}
+
+// ---------------------------------------------------------------------------
+// 8. getBitmapStorage layout
+// ---------------------------------------------------------------------------
+test "getBitmapStorage — returns correct pointers and capacity" {
+    var state: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    const capacity: u32 = 64;
+    const meta = initBitmapSlotState(&state, capacity);
+
+    const storage = getBitmapStorage(&state, meta);
+
+    // serialized_len_ptr should point to state[slot_data_offset]
+    const slot_data_offset = STATE_HEADER_SIZE + SLOT_META_SIZE;
+    const expected_len_ptr: *u32 = @ptrCast(@alignCast(&state[slot_data_offset]));
+    try testing.expectEqual(expected_len_ptr, storage.serialized_len_ptr);
+
+    // payload_ptr should be 4 bytes after slot_data_offset
+    const expected_payload: [*]u8 = @as([*]u8, &state) + slot_data_offset + BITMAP_SERIALIZED_LEN_BYTES;
+    try testing.expectEqual(expected_payload, storage.payload_ptr);
+
+    // payload_capacity matches formula
+    try testing.expectEqual(bitmapPayloadCapacity(capacity), storage.payload_capacity);
+}
+
+// ---------------------------------------------------------------------------
+// 9. batchBitmapAdd — basic 5-element insert
+// ---------------------------------------------------------------------------
+test "batchBitmapAdd — inserts 5 elements" {
+    var state: [65536]u8 align(8) = [_]u8{0} ** 65536;
+    const capacity: u32 = 128;
+    const meta = initBitmapSlotState(&state, capacity);
+    const storage = getBitmapStorage(&state, meta);
+
+    var elems = [_]u32{ 100, 200, 300, 400, 500 };
+    const result = batchBitmapAdd(false, &state, meta, 0, &elems, null, 5);
+    try testing.expectEqual(ErrorCode.OK, result);
+    try testing.expectEqual(@as(u32, 5), meta.size_ptr.*);
+
+    // Verify via frozen bitmap
+    const frozen = bitmapFrozen(storage) orelse return error.SkipZigTest;
+    try testing.expectEqual(@as(u64, 5), frozen.cardinality());
+    try testing.expect(frozen.contains(100));
+    try testing.expect(frozen.contains(300));
+    try testing.expect(frozen.contains(500));
+}
+
+// ---------------------------------------------------------------------------
+// 10. batchBitmapAdd — dedup (same element twice)
+// ---------------------------------------------------------------------------
+test "batchBitmapAdd — dedup same element" {
+    var state: [65536]u8 align(8) = [_]u8{0} ** 65536;
+    const capacity: u32 = 128;
+    const meta = initBitmapSlotState(&state, capacity);
+
+    var elems = [_]u32{ 42, 42 };
+    const result = batchBitmapAdd(false, &state, meta, 0, &elems, null, 2);
+    try testing.expectEqual(ErrorCode.OK, result);
+    try testing.expectEqual(@as(u32, 1), meta.size_ptr.*);
+}
+
+// ---------------------------------------------------------------------------
+// 11. batchBitmapRemove — add 5, remove 2
+// ---------------------------------------------------------------------------
+test "batchBitmapRemove — removes elements correctly" {
+    var state: [65536]u8 align(8) = [_]u8{0} ** 65536;
+    const capacity: u32 = 128;
+    const meta = initBitmapSlotState(&state, capacity);
+    const storage = getBitmapStorage(&state, meta);
+
+    // Add 5
+    var add_elems = [_]u32{ 10, 20, 30, 40, 50 };
+    _ = batchBitmapAdd(false, &state, meta, 0, &add_elems, null, 5);
+    try testing.expectEqual(@as(u32, 5), meta.size_ptr.*);
+
+    // Remove 2
+    var rm_elems = [_]u32{ 20, 40 };
+    batchBitmapRemove(false, &state, meta, 0, &rm_elems, 2);
+    try testing.expectEqual(@as(u32, 3), meta.size_ptr.*);
+
+    // Verify survivors
+    const frozen = bitmapFrozen(storage) orelse return error.SkipZigTest;
+    try testing.expect(frozen.contains(10));
+    try testing.expect(!frozen.contains(20));
+    try testing.expect(frozen.contains(30));
+    try testing.expect(!frozen.contains(40));
+    try testing.expect(frozen.contains(50));
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for set algebra tests: serialize a bitmap with given elements
+// ---------------------------------------------------------------------------
+
+fn serializeBitmapElements(elems: []const u32, out: []u8) !u32 {
+    var bmp = try RoaringBitmap.init(bitmap_allocator);
+    defer bmp.deinit();
+    for (elems) |e| {
+        _ = try bmp.add(e);
+    }
+    _ = bmp.runOptimize() catch {};
+    const size = bmp.serializedSizeInBytes();
+    if (size > out.len) return error.NoSpaceLeft;
+    const written = try bmp.serializeIntoBuffer(out[0..size]);
+    return @intCast(written);
+}
+
+fn deserializeBitmapToSortedArray(data: [*]const u8, len: u32, out: []u32) u32 {
+    const frozen = FrozenBitmap.init(data[0..len]) catch return 0;
+    var iter = frozen.iterator();
+    var count: u32 = 0;
+    while (iter.next()) |v| {
+        if (count >= out.len) break;
+        out[count] = v;
+        count += 1;
+    }
+    return count;
+}
+
+// ---------------------------------------------------------------------------
+// 12. Set algebra AND — uses rawr directly (WASM exports use u32 ptrs, N/A native)
+// ---------------------------------------------------------------------------
+test "set algebra AND — intersection of two bitmaps" {
+    const alloc = bitmap_allocator;
+    var a = try RoaringBitmap.init(alloc);
+    defer a.deinit();
+    var b = try RoaringBitmap.init(alloc);
+    defer b.deinit();
+
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |e| _ = try a.add(e);
+    for ([_]u32{ 3, 4, 5, 6, 7 }) |e| _ = try b.add(e);
+
+    var result = try a.bitwiseAnd(alloc, &b);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(u64, 3), result.cardinality());
+    try testing.expect(result.contains(3));
+    try testing.expect(result.contains(4));
+    try testing.expect(result.contains(5));
+    try testing.expect(!result.contains(1));
+    try testing.expect(!result.contains(7));
+}
+
+// ---------------------------------------------------------------------------
+// 13. Set algebra OR
+// ---------------------------------------------------------------------------
+test "set algebra OR — union of two bitmaps" {
+    const alloc = bitmap_allocator;
+    var a = try RoaringBitmap.init(alloc);
+    defer a.deinit();
+    var b = try RoaringBitmap.init(alloc);
+    defer b.deinit();
+
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |e| _ = try a.add(e);
+    for ([_]u32{ 3, 4, 5, 6, 7 }) |e| _ = try b.add(e);
+
+    var result = try a.bitwiseOr(alloc, &b);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(u64, 7), result.cardinality());
+    var i: u32 = 1;
+    while (i <= 7) : (i += 1) {
+        try testing.expect(result.contains(i));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 14. Set algebra ANDNOT
+// ---------------------------------------------------------------------------
+test "set algebra ANDNOT — difference A \\ B" {
+    const alloc = bitmap_allocator;
+    var a = try RoaringBitmap.init(alloc);
+    defer a.deinit();
+    var b = try RoaringBitmap.init(alloc);
+    defer b.deinit();
+
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |e| _ = try a.add(e);
+    for ([_]u32{ 3, 4, 5, 6, 7 }) |e| _ = try b.add(e);
+
+    var result = try a.bitwiseDifference(alloc, &b);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(u64, 2), result.cardinality());
+    try testing.expect(result.contains(1));
+    try testing.expect(result.contains(2));
+    try testing.expect(!result.contains(3));
+}
+
+// ---------------------------------------------------------------------------
+// 15. Set algebra XOR
+// ---------------------------------------------------------------------------
+test "set algebra XOR — symmetric difference" {
+    const alloc = bitmap_allocator;
+    var a = try RoaringBitmap.init(alloc);
+    defer a.deinit();
+    var b = try RoaringBitmap.init(alloc);
+    defer b.deinit();
+
+    for ([_]u32{ 1, 2, 3, 4, 5 }) |e| _ = try a.add(e);
+    for ([_]u32{ 3, 4, 5, 6, 7 }) |e| _ = try b.add(e);
+
+    var result = try a.bitwiseXor(alloc, &b);
+    defer result.deinit();
+
+    try testing.expectEqual(@as(u64, 4), result.cardinality());
+    try testing.expect(result.contains(1));
+    try testing.expect(result.contains(2));
+    try testing.expect(result.contains(6));
+    try testing.expect(result.contains(7));
+    try testing.expect(!result.contains(3));
+}
