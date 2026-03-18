@@ -466,3 +466,30 @@ test "stress — HashMap upsert overwrites preserve size" {
         try testing.expectEqual(i * 200, tbl.get(i).?.*);
     }
 }
+
+test "edge — max valid key (0xFFFFFFFD) works correctly" {
+    var buf: [512]u8 align(8) = [_]u8{0} ** 512;
+    const tbl = HashSet.init(&buf, 0, 16);
+
+    // 0xFFFFFFFD is the max valid key (one below TOMBSTONE=0xFFFFFFFE)
+    try testing.expectEqual(true, tbl.insertKey(0xFFFFFFFD).?);
+    try testing.expect(tbl.contains(0xFFFFFFFD));
+    try testing.expectEqual(@as(u32, 1), tbl.size());
+
+    // EMPTY_KEY (0xFFFFFFFF) and TOMBSTONE (0xFFFFFFFE) must be rejected
+    try testing.expect(!tbl.contains(EMPTY_KEY)); // 0xFFFFFFFF
+    try testing.expect(!tbl.contains(TOMBSTONE)); // 0xFFFFFFFE
+}
+
+test "edge — HashMap upsert with key near sentinels" {
+    var buf: [1024]u8 align(8) = [_]u8{0} ** 1024;
+    const tbl = HashMap.init(&buf, 0, 16);
+
+    // 0xFFFFFFFD is valid — upsert should work
+    try testing.expectEqual(true, tbl.upsert(0xFFFFFFFD, 42).?);
+    try testing.expectEqual(@as(u32, 42), tbl.get(0xFFFFFFFD).?.*);
+
+    // Sentinel keys must return null (rejected by find/findInsert)
+    try testing.expect(tbl.get(EMPTY_KEY) == null); // 0xFFFFFFFF
+    try testing.expect(tbl.get(TOMBSTONE) == null); // 0xFFFFFFFE
+}

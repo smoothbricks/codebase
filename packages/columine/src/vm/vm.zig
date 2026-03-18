@@ -373,19 +373,12 @@ fn rollbackEntry(state_base: [*]u8, entry: FlatUndoEntry) void {
             }
         },
         .AGG_UPDATE => {
-            // Undo aggregate update: restore prev value (f64/i64) and prev count (u64)
-            // aux stores the previous value bits, prev_value stores previous count (truncated to u32)
             const meta = getSlotMeta(state_base, entry.slot);
-            const val_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
-            const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset + 8));
-            val_ptr.* = entry.aux;
-            count_ptr.* = entry.prev_value;
+            undo_log.rollbackAggUpdate(state_base, meta, entry.prev_value, entry.aux);
         },
         .COUNT_UPDATE => {
-            // Undo count update: restore prev count — COUNT slot is 8 bytes (u64 only)
             const meta = getSlotMeta(state_base, entry.slot);
-            const count_ptr: *u64 = @ptrCast(@alignCast(state_base + meta.offset));
-            count_ptr.* = entry.prev_value;
+            undo_log.rollbackCountUpdate(state_base, meta, entry.prev_value);
         },
         .FACT_INSERT_NEW => {
             // Undo derived fact new insertion: tombstone the key
