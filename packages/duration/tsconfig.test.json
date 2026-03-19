@@ -6,11 +6,11 @@
     "types": [
       "bun"
     ],
-    "composite": false,
-    "noEmit": true,
-    "emitDeclarationOnly": false,
-    "declaration": false,
-    "declarationMap": false
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist-test",
+    "tsBuildInfoFile": "dist-test/tsconfig.test.tsbuildinfo"
   },
   "include": [
     "src/**/*.test.ts",

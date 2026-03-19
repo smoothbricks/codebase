@@ -81,17 +81,7 @@
         "command": "biome check --files-ignore-unknown=true {projectRoot}",
         "cwd": "{workspaceRoot}"
       },
-      "dependsOn": ["typecheck", "typecheck-tests"]
-    },
-    "typecheck-tests": {
-      "executor": "nx:run-commands",
-      "cache": true,
-      "inputs": ["default", { "dependentTasksOutputFiles": "**/*.d.ts" }],
-      "options": {
-        "command": "tsc --noEmit -p {projectRoot}/tsconfig.test.json",
-        "cwd": "{workspaceRoot}"
-      },
-      "dependsOn": ["build", "^build"]
+      "dependsOn": ["typecheck"]
     },
     "lint:fix": {
       "executor": "nx:run-commands",

@@ -3,14 +3,20 @@
   "compilerOptions": {
     "baseUrl": "../..",
     "rootDir": "src",
-    "types": ["bun", "node"],
-    "noEmit": true,
-    "composite": false,
-    "declaration": false,
-    "declarationMap": false,
-    "emitDeclarationOnly": false
+    "types": [
+      "bun",
+      "node"
+    ],
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist-test",
+    "tsBuildInfoFile": "dist-test/tsconfig.test.tsbuildinfo"
   },
-  "include": ["src/**/*.test.ts", "src/**/__tests__/*.ts"],
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/__tests__/*.ts"
+  ],
   "references": [
     {
       "path": "./tsconfig.lib.json"

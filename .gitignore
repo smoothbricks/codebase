@@ -66,3 +66,6 @@ test-output
 
 # TypeScript build info
 *.tsbuildinfo
+dist-test/
+
+# Vitest worker-generated wasm copies
