@@ -242,7 +242,9 @@ export enum Opcode {
   LIST_APPEND_STRUCT = 0x85, // slot, num_vals, [(val_col, field_idx) × N]
 
   // Block-based reduce opcodes (body opcodes use same values as BATCH_* but process one element)
-  FOR_EACH_EVENT = 0xe0, // type_col, type_id (u32 LE: 4 bytes), body_len (u16 LE: 2 bytes)
+  FOR_EACH = 0xe0, // col, match_count, match_ids (u32 LE × match_count), body_len (u16 LE)
+  /** @deprecated Use FOR_EACH */
+  FOR_EACH_EVENT = 0xe0, // alias for backward compat
   FLAT_MAP = 0xe1, // offsets_col, parent_ts_col, inner_body_len (u16 LE: 2 bytes)
   // Columine's reducer opcodes end at 0x4F (except struct map at 0x80+, blocks at 0xE0+)
 }
