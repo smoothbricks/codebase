@@ -7,7 +7,7 @@
  */
 
 import type { CurrencyDef } from './currency-registry.js';
-import type { Amount, Basis } from './types.js';
+import { Amount, type Basis } from './types.js';
 
 /**
  * Explicit rounding modes for Basis -> Amount conversion.
@@ -48,7 +48,7 @@ export function roundBasisToAmount<C extends string>(
 
   if (divisor === 1n) {
     // No rounding needed when scales are identical
-    return basis as unknown as Amount<C>;
+    return Amount<C>(basis as bigint);
   }
 
   // BigInt division truncates toward zero
@@ -57,7 +57,7 @@ export function roundBasisToAmount<C extends string>(
 
   // Exact division -- no rounding needed
   if (remainder === 0n) {
-    return truncated as unknown as Amount<C>;
+    return Amount<C>(truncated);
   }
 
   const absRemainder = bigAbs(remainder);
@@ -70,29 +70,29 @@ export function roundBasisToAmount<C extends string>(
     case RoundingMode.Floor: {
       // Floor: toward negative infinity
       if (isNegative && remainder !== 0n) {
-        return (truncated - 1n) as unknown as Amount<C>;
+        return Amount<C>(truncated - 1n);
       }
-      return truncated as unknown as Amount<C>;
+      return Amount<C>(truncated);
     }
 
     case RoundingMode.Ceil: {
       // Ceil: toward positive infinity
       if (!isNegative && remainder !== 0n) {
-        return (truncated + 1n) as unknown as Amount<C>;
+        return Amount<C>(truncated + 1n);
       }
-      return truncated as unknown as Amount<C>;
+      return Amount<C>(truncated);
     }
 
     case RoundingMode.HalfUp: {
       // HalfUp: round away from zero on 0.5
       if (divisorIsEven && absRemainder === halfDivisor) {
         // Exactly half -- round away from zero
-        return (isNegative ? truncated - 1n : truncated + 1n) as unknown as Amount<C>;
+        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
       }
       if (absRemainder > halfDivisor) {
-        return (isNegative ? truncated - 1n : truncated + 1n) as unknown as Amount<C>;
+        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
       }
-      return truncated as unknown as Amount<C>;
+      return Amount<C>(truncated);
     }
 
     case RoundingMode.HalfEven: {
@@ -102,16 +102,16 @@ export function roundBasisToAmount<C extends string>(
         const absTruncated = bigAbs(truncated);
         if (absTruncated % 2n === 0n) {
           // Already even -- stay
-          return truncated as unknown as Amount<C>;
+          return Amount<C>(truncated);
         }
         // Odd -- round away from zero to make even
-        return (isNegative ? truncated - 1n : truncated + 1n) as unknown as Amount<C>;
+        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
       }
       // Not exactly half -- round to nearest
       if (absRemainder > halfDivisor) {
-        return (isNegative ? truncated - 1n : truncated + 1n) as unknown as Amount<C>;
+        return Amount<C>(isNegative ? truncated - 1n : truncated + 1n);
       }
-      return truncated as unknown as Amount<C>;
+      return Amount<C>(truncated);
     }
 
     default: {
