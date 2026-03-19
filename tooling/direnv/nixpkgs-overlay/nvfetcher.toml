@@ -1,19 +1,21 @@
 # Run: nix shell nixpkgs#nvfetcher -c nvfetcher -o _sources
-# Using src.manual = "canary" to track pre-built binaries from bun's canary tag (main branch)
-# Re-run nvfetcher to refresh hashes when you need a newer canary build
 
 [bun-x86_64-linux]
-src.manual = "canary"
-fetch.url = "https://github.com/oven-sh/bun/releases/download/canary/bun-linux-x64.zip"
+src.github = "oven-sh/bun"
+src.prefix = "bun-v"
+fetch.url = "https://github.com/oven-sh/bun/releases/download/bun-v$ver/bun-linux-x64.zip"
 
 [bun-aarch64-linux]
-src.manual = "canary"
-fetch.url = "https://github.com/oven-sh/bun/releases/download/canary/bun-linux-aarch64.zip"
+src.github = "oven-sh/bun"
+src.prefix = "bun-v"
+fetch.url = "https://github.com/oven-sh/bun/releases/download/bun-v$ver/bun-linux-aarch64.zip"
 
 [bun-x86_64-darwin]
-src.manual = "canary"
-fetch.url = "https://github.com/oven-sh/bun/releases/download/canary/bun-darwin-x64.zip"
+src.github = "oven-sh/bun"
+src.prefix = "bun-v"
+fetch.url = "https://github.com/oven-sh/bun/releases/download/bun-v$ver/bun-darwin-x64.zip"
 
 [bun-aarch64-darwin]
-src.manual = "canary"
-fetch.url = "https://github.com/oven-sh/bun/releases/download/canary/bun-darwin-aarch64.zip"
+src.github = "oven-sh/bun"
+src.prefix = "bun-v"
+fetch.url = "https://github.com/oven-sh/bun/releases/download/bun-v$ver/bun-darwin-aarch64.zip"
