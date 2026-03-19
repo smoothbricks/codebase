@@ -831,10 +831,10 @@ const hasArrayFields = state_init.hasArrayFields;
 const getTTLSideBufferSize = state_init.getTTLSideBufferSize;
 
 // =============================================================================
-// Single-Element Operations (for block-based dispatch in FOR_EACH_EVENT)
+// Single-Element Operations (for block-based dispatch in FOR_EACH)
 // =============================================================================
 // Each function processes ONE key/value at a time. The batch loop lives in
-// FOR_EACH_EVENT; these are the loop bodies.  Existing BATCH_* handlers are
+// FOR_EACH; these are the loop bodies.  Existing BATCH_* handlers are
 // preserved unchanged for backward compat with pre-block bytecode.
 
 
@@ -979,7 +979,7 @@ fn writeStructMapArrayFields(
 
 
 // =============================================================================
-// Masked SIMD Aggregates (for FOR_EACH_EVENT type filtering)
+// Masked SIMD Aggregates (for FOR_EACH type filtering)
 // =============================================================================
 
 
@@ -997,10 +997,10 @@ const AggKind = aggregates.AggKind;
 const TypeMask = aggregates.TypeMask;
 
 /// Reduce a column to a single value using SIMD for f64, scalar for i64.
-/// type_mask: only include rows where type_data[i] == type_id (FOR_EACH_EVENT).
+/// type_mask: only include rows where type_data[i] == type_id (FOR_EACH).
 /// pred_col: only include rows where pred[i] != 0 (_IF variants).
 
-/// Unified aggregate handler for main dispatch, FOR_EACH_EVENT, and _IF variants.
+/// Unified aggregate handler for main dispatch, FOR_EACH, and _IF variants.
 /// Uses SIMD for f64 when no predicate column; scalar otherwise.
 fn execAgg(
     comptime T: type,
@@ -1542,7 +1542,7 @@ fn executeBatchImpl(
                                 const col = getColU32(col_ptrs_ptr, val_cols[vi]);
                                 row_ptr[f_offset] = if (col[i] != 0) 1 else 0;
                             },
-                            // Array fields handled via block-based path (FOR_EACH_EVENT + writeStructMapArrayFields)
+                            // Array fields handled via block-based path (FOR_EACH + writeStructMapArrayFields)
                             .ARRAY_U32, .ARRAY_I64, .ARRAY_F64, .ARRAY_STRING, .ARRAY_BOOL => {},
                         }
                     }
@@ -1555,37 +1555,59 @@ fn executeBatchImpl(
                 }
             },
 
-            .FOR_EACH_EVENT => {
-                // Header: type_col:u8, type_id:u32(LE), body_len:u16(LE)
-                const type_col = code[pc];
-                const type_id = @as(u32, code[pc + 1]) |
-                    (@as(u32, code[pc + 2]) << 8) |
-                    (@as(u32, code[pc + 3]) << 16) |
-                    (@as(u32, code[pc + 4]) << 24);
-                const body_len = @as(u16, code[pc + 5]) | (@as(u16, code[pc + 6]) << 8);
-                pc += 7;
+            .FOR_EACH => {
+                // Header: col:u8, match_count:u8, match_ids:u32le[match_count], body_len:u16le
+                const col_idx = code[pc];
+                const match_count = code[pc + 1];
+                const match_ids_start = pc + 2;
+                const body_len_offset = match_ids_start + @as(usize, match_count) * 4;
+                const body_len = @as(u16, code[body_len_offset]) | (@as(u16, code[body_len_offset + 1]) << 8);
+                const body_start = body_len_offset + 2;
+                pc = body_start + body_len;
 
-                const body = code[pc .. pc + body_len];
-                pc += body_len;
-
-                const type_data = getColU32(col_ptrs_ptr, type_col);
+                const body = code[body_start .. body_start + body_len];
+                const type_data = getColU32(col_ptrs_ptr, col_idx);
 
                 // Pass 1: batch-level aggregates with type mask (SIMD)
-                const agg_result = executeBatchAggregates(
-                    delta_mode,
-                    state_base,
-                    body,
-                    col_ptrs_ptr,
-                    batch_len,
-                    type_data,
-                    type_id,
-                );
-                if (agg_result != @intFromEnum(ErrorCode.OK)) return agg_result;
+                // Run once per match_id — aggregates accumulate correctly across calls
+                var mi: usize = 0;
+                while (mi < match_count) : (mi += 1) {
+                    const id_off = match_ids_start + mi * 4;
+                    const match_id = @as(u32, code[id_off]) |
+                        (@as(u32, code[id_off + 1]) << 8) |
+                        (@as(u32, code[id_off + 2]) << 16) |
+                        (@as(u32, code[id_off + 3]) << 24);
+                    const agg_result = executeBatchAggregates(
+                        delta_mode,
+                        state_base,
+                        body,
+                        col_ptrs_ptr,
+                        batch_len,
+                        type_data,
+                        match_id,
+                    );
+                    if (agg_result != @intFromEnum(ErrorCode.OK)) return agg_result;
+                }
 
                 // Pass 2: per-element scalar operations (hash/struct/set)
                 var ei: u32 = 0;
                 while (ei < batch_len) : (ei += 1) {
-                    if (type_data[ei] != type_id) continue;
+                    const val = type_data[ei];
+                    // Check if val matches any of the match_ids
+                    var matched = false;
+                    var mj: usize = 0;
+                    while (mj < match_count) : (mj += 1) {
+                        const id_off = match_ids_start + mj * 4;
+                        const match_id = @as(u32, code[id_off]) |
+                            (@as(u32, code[id_off + 1]) << 8) |
+                            (@as(u32, code[id_off + 2]) << 16) |
+                            (@as(u32, code[id_off + 3]) << 24);
+                        if (val == match_id) {
+                            matched = true;
+                            break;
+                        }
+                    }
+                    if (!matched) continue;
                     const elem_result = executeElementOpcodes(
                         delta_mode,
                         state_base,
@@ -1607,7 +1629,7 @@ fn executeBatchImpl(
 }
 
 // =============================================================================
-// Block-based execution helpers (FOR_EACH_EVENT / FLAT_MAP)
+// Block-based execution helpers (FOR_EACH / FLAT_MAP)
 // =============================================================================
 
 /// Returns true if the opcode byte is an aggregate op (0x40-0x4F).

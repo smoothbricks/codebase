@@ -148,7 +148,7 @@ pub fn batchSetRemove(
 }
 
 // =============================================================================
-// Single-element operations (FOR_EACH_EVENT body dispatch)
+// Single-element operations (FOR_EACH body dispatch)
 // =============================================================================
 
 pub fn singleSetInsert(

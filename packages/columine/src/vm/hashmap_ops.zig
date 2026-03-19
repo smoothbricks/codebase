@@ -201,7 +201,7 @@ pub fn batchMapRemove(
 }
 
 // =============================================================================
-// Single-element operations (for FOR_EACH_EVENT body dispatch)
+// Single-element operations (for FOR_EACH body dispatch)
 // =============================================================================
 
 /// Single-element upsert — same as batch with batch_len=1 but takes element index.

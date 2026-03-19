@@ -1193,14 +1193,19 @@ test "struct map - growth preserves entries" {
 }
 
 // =============================================================================
-// Tests — FOR_EACH_EVENT block-based execution
+// Tests — FOR_EACH block-based execution
 // =============================================================================
 
 /// Build a program with one HashMap slot (HASHMAP, LAST strategy) and a
-/// FOR_EACH_EVENT block wrapping MAP_UPSERT_LAST + AGG_COUNT.
+/// FOR_EACH block wrapping MAP_UPSERT_LAST + AGG_COUNT.
 /// Columns: 0=type_col(u32), 1=key_col(u32), 2=val_col(u32)
 /// Slot 0: HashMap (cap_lo=4 → cap=16), Slot 1: Aggregate COUNT
-fn buildForEachEventTestProgram(type_id: u32) [96]u8 {
+fn buildForEachTestProgram(type_id: u32) [96]u8 {
+    return buildForEachTestProgramMulti(&[_]u32{type_id});
+}
+
+/// Multi-match variant: match any of the given type IDs.
+fn buildForEachTestProgramMulti(type_ids: []const u32) [96]u8 {
     var prog = [_]u8{0} ** 96;
     const content = prog[PROGRAM_HASH_PREFIX..];
     // Magic "CLM1"
@@ -1223,9 +1228,12 @@ fn buildForEachEventTestProgram(type_id: u32) [96]u8 {
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
 
-    // Reduce section: FOR_EACH_EVENT header(8) + body: MAP_UPSERT_LAST(4) + AGG_COUNT(2) = 14
+    // Reduce section: FOR_EACH header + body
+    // Header: opcode(1) + col(1) + match_count(1) + match_ids(4*N) + body_len(2) = 5 + 4*N
+    const match_count: u8 = @intCast(type_ids.len);
+    const header_len: u16 = 5 + @as(u16, match_count) * 4;
     const body_len: u16 = 6; // MAP_UPSERT_LAST(4) + AGG_COUNT(2)
-    const reduce_len: u16 = 8 + body_len; // FOR_EACH_EVENT header(8) + body
+    const reduce_len: u16 = header_len + body_len;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -1248,21 +1256,27 @@ fn buildForEachEventTestProgram(type_id: u32) [96]u8 {
 
     // Reduce section
     const rs = 14 + init_len;
-    // FOR_EACH_EVENT opcode
+    // FOR_EACH opcode
     content[rs] = 0xE0;
-    // type_col=0
+    // col=0 (type_col)
     content[rs + 1] = 0;
-    // type_id as u32 LE
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
+    // match_count
+    content[rs + 2] = match_count;
+    // match_ids as u32 LE
+    var ids_off = rs + 3;
+    for (type_ids) |tid| {
+        content[ids_off] = @truncate(tid);
+        content[ids_off + 1] = @truncate(tid >> 8);
+        content[ids_off + 2] = @truncate(tid >> 16);
+        content[ids_off + 3] = @truncate(tid >> 24);
+        ids_off += 4;
+    }
     // body_len as u16 LE
-    content[rs + 6] = @truncate(body_len);
-    content[rs + 7] = @truncate(body_len >> 8);
+    content[ids_off] = @truncate(body_len);
+    content[ids_off + 1] = @truncate(body_len >> 8);
 
     // Body: MAP_UPSERT_LAST(0x22) slot=0 key_col=1 val_col=2
-    const body_start = rs + 8;
+    const body_start = ids_off + 2;
     content[body_start] = 0x22;
     content[body_start + 1] = 0; // slot
     content[body_start + 2] = 1; // key_col
@@ -1275,11 +1289,11 @@ fn buildForEachEventTestProgram(type_id: u32) [96]u8 {
     return prog;
 }
 
-test "FOR_EACH_EVENT - basic type filtering" {
+test "FOR_EACH - basic type filtering" {
     const TYPE_A: u32 = 1001;
     const TYPE_B: u32 = 1002;
 
-    var prog = buildForEachEventTestProgram(TYPE_A);
+    var prog = buildForEachTestProgram(TYPE_A);
 
     const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
     var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
@@ -1331,9 +1345,9 @@ test "FOR_EACH_EVENT - basic type filtering" {
     try std.testing.expectEqual(@as(u64, 2), agg_count);
 }
 
-test "FOR_EACH_EVENT - all events match" {
+test "FOR_EACH - all events match" {
     const TYPE_A: u32 = 1001;
-    var prog = buildForEachEventTestProgram(TYPE_A);
+    var prog = buildForEachTestProgram(TYPE_A);
 
     var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
     _ = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
@@ -1370,10 +1384,10 @@ test "FOR_EACH_EVENT - all events match" {
     try std.testing.expectEqual(@as(u64, 3), agg_count);
 }
 
-test "FOR_EACH_EVENT - no events match" {
+test "FOR_EACH - no events match" {
     const TYPE_A: u32 = 1001;
     const TYPE_B: u32 = 1002;
-    var prog = buildForEachEventTestProgram(TYPE_A);
+    var prog = buildForEachTestProgram(TYPE_A);
 
     var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
     _ = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
@@ -1410,13 +1424,109 @@ test "FOR_EACH_EVENT - no events match" {
     try std.testing.expectEqual(@as(u64, 0), agg_count);
 }
 
+test "FOR_EACH - multi-match (match_count=2)" {
+    const TYPE_A: u32 = 1001;
+    const TYPE_B: u32 = 1002;
+    const TYPE_C: u32 = 1003;
+
+    // Match both TYPE_A and TYPE_B, exclude TYPE_C
+    var prog = buildForEachTestProgramMulti(&[_]u32{ TYPE_A, TYPE_B });
+
+    const state_size = vm_calculate_state_size(@ptrCast(&prog), prog.len);
+    var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    std.debug.assert(state_size <= 8192);
+
+    const init_result = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+    try std.testing.expectEqual(@as(u32, 0), init_result);
+
+    // 4 events: TYPE_A, TYPE_B, TYPE_C, TYPE_A
+    // Only TYPE_A and TYPE_B should be processed (3 out of 4)
+    var type_col = [4]u32{ TYPE_A, TYPE_B, TYPE_C, TYPE_A };
+    var key_col = [4]u32{ 100, 200, 300, 400 };
+    var val_col = [4]u32{ 10, 20, 30, 40 };
+    const col_ptrs = [3][*]const u8{
+        @as([*]const u8, @ptrCast(&type_col)),
+        @as([*]const u8, @ptrCast(&key_col)),
+        @as([*]const u8, @ptrCast(&val_col)),
+    };
+
+    const exec_result = vm_execute_batch(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs),
+        3,
+        4,
+    );
+    try std.testing.expectEqual(@as(u32, 0), exec_result);
+
+    // HashMap (slot 0): should have 3 entries (keys 100, 200, 400) — key 300 was TYPE_C
+    const meta_base = STATE_HEADER_SIZE;
+    const map_size = std.mem.readInt(u32, state_buf[meta_base + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 3), map_size);
+
+    const data_offset = std.mem.readInt(u32, state_buf[meta_base..][0..4], .little);
+    const cap = std.mem.readInt(u32, state_buf[meta_base + 4 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 10), vm_map_get(@ptrCast(&state_buf), data_offset, cap, 100));
+    try std.testing.expectEqual(@as(u32, 20), vm_map_get(@ptrCast(&state_buf), data_offset, cap, 200));
+    try std.testing.expectEqual(@as(u32, 40), vm_map_get(@ptrCast(&state_buf), data_offset, cap, 400));
+    try std.testing.expectEqual(EMPTY_KEY, vm_map_get(@ptrCast(&state_buf), data_offset, cap, 300));
+
+    // Aggregate COUNT (slot 1): should be 3 (TYPE_A×2 + TYPE_B×1)
+    const agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE;
+    const agg_offset = std.mem.readInt(u32, state_buf[agg_meta_base..][0..4], .little);
+    const agg_count: u64 = std.mem.readInt(u64, state_buf[agg_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 3), agg_count);
+}
+
+test "FOR_EACH - multi-match (match_count=3) all types match" {
+    const TYPE_A: u32 = 10;
+    const TYPE_B: u32 = 20;
+    const TYPE_C: u32 = 30;
+
+    var prog = buildForEachTestProgramMulti(&[_]u32{ TYPE_A, TYPE_B, TYPE_C });
+
+    var state_buf: [8192]u8 align(8) = [_]u8{0} ** 8192;
+    _ = vm_init_state(@ptrCast(&state_buf), @ptrCast(&prog), prog.len);
+
+    var type_col = [3]u32{ TYPE_A, TYPE_B, TYPE_C };
+    var key_col = [3]u32{ 1, 2, 3 };
+    var val_col = [3]u32{ 111, 222, 333 };
+    const col_ptrs = [3][*]const u8{
+        @as([*]const u8, @ptrCast(&type_col)),
+        @as([*]const u8, @ptrCast(&key_col)),
+        @as([*]const u8, @ptrCast(&val_col)),
+    };
+
+    const exec_result = vm_execute_batch(
+        @ptrCast(&state_buf),
+        @ptrCast(&prog),
+        prog.len,
+        @ptrCast(&col_ptrs),
+        3,
+        3,
+    );
+    try std.testing.expectEqual(@as(u32, 0), exec_result);
+
+    // All 3 should be in the map
+    const meta_base = STATE_HEADER_SIZE;
+    const map_size = std.mem.readInt(u32, state_buf[meta_base + 8 ..][0..4], .little);
+    try std.testing.expectEqual(@as(u32, 3), map_size);
+
+    // Count should be 3
+    const agg_meta_base = STATE_HEADER_SIZE + SLOT_META_SIZE;
+    const agg_offset = std.mem.readInt(u32, state_buf[agg_meta_base..][0..4], .little);
+    const agg_count: u64 = std.mem.readInt(u64, state_buf[agg_offset..][0..8], .little);
+    try std.testing.expectEqual(@as(u64, 3), agg_count);
+}
+
 // =============================================================================
-// Tests — FOR_EACH_EVENT with STRUCT_MAP
+// Tests — FOR_EACH with STRUCT_MAP
 // =============================================================================
 
 /// Build a program with:
 ///   Slot 0: STRUCT_MAP (2 fields: UINT32 + STRING, cap=16)
-/// Reduce: FOR_EACH_EVENT(type_col=0, type_id) { STRUCT_MAP_UPSERT_LAST }
+/// Reduce: FOR_EACH(type_col=0, type_id) { STRUCT_MAP_UPSERT_LAST }
 /// Columns: 0=type, 1=key, 2=uint32_val, 3=string_val
 fn buildBlockStructMapTestProgram(type_id: u32) [96]u8 {
     var prog = [_]u8{0} ** 96;
@@ -1437,9 +1547,9 @@ fn buildBlockStructMapTestProgram(type_id: u32) [96]u8 {
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
 
-    // Reduce: FOR_EACH_EVENT(8) + body: STRUCT_MAP_UPSERT_LAST(9) = 17
+    // Reduce: FOR_EACH(9) + body: STRUCT_MAP_UPSERT_LAST(9) = 18
     const body_len: u16 = 9; // op(1)+slot(1)+key_col(1)+num_vals(1)+2*(val_col+field_idx)+num_array_vals(1)
-    const reduce_len: u16 = 8 + body_len;
+    const reduce_len: u16 = 9 + body_len;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -1457,17 +1567,18 @@ fn buildBlockStructMapTestProgram(type_id: u32) [96]u8 {
 
     // Reduce section
     const rs = 14 + init_len;
-    content[rs] = 0xE0; // FOR_EACH_EVENT
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
-    content[rs + 6] = @truncate(body_len);
-    content[rs + 7] = @truncate(body_len >> 8);
+    content[rs] = 0xE0; // FOR_EACH
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
+    content[rs + 7] = @truncate(body_len);
+    content[rs + 8] = @truncate(body_len >> 8);
 
     // Body: STRUCT_MAP_UPSERT_LAST
-    const bs = rs + 8;
+    const bs = rs + 9;
     content[bs] = 0x80;
     content[bs + 1] = 0; // slot
     content[bs + 2] = 1; // key_col
@@ -1481,7 +1592,7 @@ fn buildBlockStructMapTestProgram(type_id: u32) [96]u8 {
     return prog;
 }
 
-test "FOR_EACH_EVENT - struct map upsert with type filtering" {
+test "FOR_EACH - struct map upsert with type filtering" {
     const TYPE_A: u32 = 1001;
     const TYPE_B: u32 = 1002;
     var prog = buildBlockStructMapTestProgram(TYPE_A);
@@ -1554,7 +1665,7 @@ test "FOR_EACH_EVENT - struct map upsert with type filtering" {
 
 /// Build a program with:
 ///   Slot 0: STRUCT_MAP (2 fields: UINT32 + STRING, cap=16)
-/// Reduce: FOR_EACH_EVENT(type_col=0, type_id) {
+/// Reduce: FOR_EACH(type_col=0, type_id) {
 ///            FLAT_MAP(offsets_col=1, parent_ts_col=0xFF) {
 ///              STRUCT_MAP_UPSERT_LAST(key_col=2, ...)
 ///            }
@@ -1582,8 +1693,8 @@ fn buildFlatMapTestProgram(type_id: u32) [112]u8 {
     const inner_body_len: u16 = 9;
     // FLAT_MAP header: op(1)+offsets_col(1)+parent_ts_col(1)+inner_body_len(2) = 5
     const flat_map_total: u16 = 5 + inner_body_len;
-    // FOR_EACH_EVENT header: 8 bytes, body = flat_map_total
-    const reduce_len: u16 = 8 + flat_map_total;
+    // FOR_EACH header: 9 bytes (match_count=1), body = flat_map_total
+    const reduce_len: u16 = 9 + flat_map_total;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -1601,18 +1712,19 @@ fn buildFlatMapTestProgram(type_id: u32) [112]u8 {
 
     // Reduce section
     const rs = 14 + init_len;
-    // FOR_EACH_EVENT
+    // FOR_EACH
     content[rs] = 0xE0;
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
-    content[rs + 6] = @truncate(flat_map_total);
-    content[rs + 7] = @truncate(flat_map_total >> 8);
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
+    content[rs + 7] = @truncate(flat_map_total);
+    content[rs + 8] = @truncate(flat_map_total >> 8);
 
     // FLAT_MAP
-    const fm = rs + 8;
+    const fm = rs + 9;
     content[fm] = 0xE1; // FLAT_MAP
     content[fm + 1] = 1; // offsets_col
     content[fm + 2] = 0xFF; // parent_ts_col (unused)
@@ -1878,13 +1990,13 @@ test "FLAT_MAP - growth: small capacity triggers NEEDS_GROWTH" {
 }
 
 // =============================================================================
-// Tests — FLAT_MAP + event-level ops in same FOR_EACH_EVENT block
+// Tests — FLAT_MAP + event-level ops in same FOR_EACH block
 // =============================================================================
 
 /// Build a program with:
 ///   Slot 0: STRUCT_MAP (2 fields: UINT32 + STRING, cap=16) — updated via FLAT_MAP
 ///   Slot 1: AGGREGATE SUM — updated at event level (non-flat)
-/// FOR_EACH_EVENT block body: AGG_SUM(slot=1, val_col=2) + FLAT_MAP { STRUCT_MAP_UPSERT_LAST }
+/// FOR_EACH block body: AGG_SUM(slot=1, val_col=2) + FLAT_MAP { STRUCT_MAP_UPSERT_LAST }
 /// Columns: 0=type, 1=offsets(u32), 2=parent_amount(f64), 3=child_key(u32), 4=child_val0(u32), 5=child_val1(u32)
 fn buildMixedBlockTestProgram(type_id: u32) [160]u8 {
     var prog = [_]u8{0} ** 160;
@@ -1909,7 +2021,7 @@ fn buildMixedBlockTestProgram(type_id: u32) [160]u8 {
     const inner_body_len: u16 = 9; // STRUCT_MAP_UPSERT_LAST (8 + num_array_vals)
     const flat_map_total: u16 = 5 + inner_body_len;
     const agg_op_len: u16 = 3; // AGG_SUM: op + slot + val_col
-    const reduce_len: u16 = 8 + agg_op_len + flat_map_total; // FOR_EACH_EVENT header + body
+    const reduce_len: u16 = 9 + agg_op_len + flat_map_total; // FOR_EACH header(9) + body
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -1936,19 +2048,20 @@ fn buildMixedBlockTestProgram(type_id: u32) [160]u8 {
 
     // Reduce section
     const rs = 14 + init_len;
-    // FOR_EACH_EVENT header
+    // FOR_EACH header
     content[rs] = 0xE0;
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
     const body_total = agg_op_len + flat_map_total;
-    content[rs + 6] = @truncate(body_total);
-    content[rs + 7] = @truncate(body_total >> 8);
+    content[rs + 7] = @truncate(body_total);
+    content[rs + 8] = @truncate(body_total >> 8);
 
-    // Body starts after FOR_EACH_EVENT header
-    const body_start = rs + 8;
+    // Body starts after FOR_EACH header
+    const body_start = rs + 9;
 
     // AGG_SUM: op(0x40) + slot(1) + val_col(2, parent_amount as f64)
     content[body_start] = 0x40; // AGG_SUM
@@ -1978,7 +2091,7 @@ fn buildMixedBlockTestProgram(type_id: u32) [160]u8 {
     return prog;
 }
 
-test "FLAT_MAP + event-level AGG_SUM in same FOR_EACH_EVENT block" {
+test "FLAT_MAP + event-level AGG_SUM in same FOR_EACH block" {
     const TYPE_A: u32 = 1001;
     var prog = buildMixedBlockTestProgram(TYPE_A);
 
@@ -2033,7 +2146,7 @@ test "FLAT_MAP + event-level AGG_SUM in same FOR_EACH_EVENT block" {
 // =============================================================================
 
 /// Build a program with nested FLAT_MAP (depth-2):
-///   FOR_EACH_EVENT { FLAT_MAP(outer) { FLAT_MAP(inner) { STRUCT_MAP_UPSERT_LAST } } }
+///   FOR_EACH { FLAT_MAP(outer) { FLAT_MAP(inner) { STRUCT_MAP_UPSERT_LAST } } }
 ///
 ///   Slot 0: STRUCT_MAP (2 fields: UINT32 + STRING, cap=16)
 ///   Columns: 0=type, 1=outer_offsets, 2=inner_offsets, 3=leaf_key, 4=leaf_val0, 5=leaf_val1
@@ -2061,8 +2174,8 @@ fn buildNestedFlatMapTestProgram(type_id: u32) [128]u8 {
     const inner_flat_map_total: u16 = 5 + inner_body_len;
     // Outer FLAT_MAP: op(1)+offsets_col(1)+parent_ts_col(1)+inner_body_len(2) = 5 + inner_flat_map_total
     const outer_flat_map_total: u16 = 5 + inner_flat_map_total;
-    // FOR_EACH_EVENT: header(8) + outer_flat_map_total
-    const reduce_len: u16 = 8 + outer_flat_map_total;
+    // FOR_EACH: header(9) + outer_flat_map_total
+    const reduce_len: u16 = 9 + outer_flat_map_total;
 
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
@@ -2083,18 +2196,19 @@ fn buildNestedFlatMapTestProgram(type_id: u32) [128]u8 {
 
     // Reduce section
     const rs: usize = 14 + init_len;
-    // FOR_EACH_EVENT
+    // FOR_EACH
     content[rs] = 0xE0;
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
-    content[rs + 6] = @truncate(outer_flat_map_total);
-    content[rs + 7] = @truncate(outer_flat_map_total >> 8);
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
+    content[rs + 7] = @truncate(outer_flat_map_total);
+    content[rs + 8] = @truncate(outer_flat_map_total >> 8);
 
     // Outer FLAT_MAP
-    const ofm = rs + 8;
+    const ofm = rs + 9;
     content[ofm] = 0xE1;
     content[ofm + 1] = 1; // outer offsets_col
     content[ofm + 2] = 0xFF; // parent_ts_col (unused)
@@ -2202,7 +2316,7 @@ test "Nested FLAT_MAP - depth-2 (groups → items → struct map)" {
 
 /// Build a program with MAP_UPSERT_LATEST inside FLAT_MAP, using parent_ts_col:
 ///   Slot 0: HASHMAP (cap=16, with timestamps)
-///   FOR_EACH_EVENT { FLAT_MAP(offsets_col=1, parent_ts_col=2) { MAP_UPSERT_LATEST(slot=0, key_col=3, val_col=4, ts_col=5) } }
+///   FOR_EACH { FLAT_MAP(offsets_col=1, parent_ts_col=2) { MAP_UPSERT_LATEST(slot=0, key_col=3, val_col=4, ts_col=5) } }
 ///
 /// The ts_col=5 is the "fallback" ts column, but parent_ts_col=2 overrides it inside FLAT_MAP.
 /// Columns: 0=type, 1=offsets, 2=parent_ts(f64), 3=child_key, 4=child_val, 5=child_ts(f64, ignored)
@@ -2228,7 +2342,7 @@ fn buildFlatMapLatestTestProgram(type_id: u32) [112]u8 {
     // Body: MAP_UPSERT_LATEST = 5 bytes (op + slot + key_col + val_col + ts_col)
     const inner_body_len: u16 = 5;
     const flat_map_total: u16 = 5 + inner_body_len; // FLAT_MAP header + body
-    const reduce_len: u16 = 8 + flat_map_total; // FOR_EACH_EVENT + body
+    const reduce_len: u16 = 9 + flat_map_total; // FOR_EACH(9) + body
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -2243,17 +2357,18 @@ fn buildFlatMapLatestTestProgram(type_id: u32) [112]u8 {
 
     // Reduce section
     const rs = 14 + init_len;
-    content[rs] = 0xE0; // FOR_EACH_EVENT
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
-    content[rs + 6] = @truncate(flat_map_total);
-    content[rs + 7] = @truncate(flat_map_total >> 8);
+    content[rs] = 0xE0; // FOR_EACH
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
+    content[rs + 7] = @truncate(flat_map_total);
+    content[rs + 8] = @truncate(flat_map_total >> 8);
 
     // FLAT_MAP with parent_ts_col = 2 (uses parent event's timestamp)
-    const fm = rs + 8;
+    const fm = rs + 9;
     content[fm] = 0xE1; // FLAT_MAP
     content[fm + 1] = 1; // offsets_col
     content[fm + 2] = 2; // parent_ts_col = col 2 (parent timestamp!)
@@ -2341,7 +2456,7 @@ test "FLAT_MAP with LATEST strategy - parent timestamp overrides child ts_col" {
 
 /// Build a program with:
 ///   Slot 0: ORDERED_LIST (scalar UINT32, capacity hint=8)
-///   FOR_EACH_EVENT { LIST_APPEND(slot=0, val_col=1) }
+///   FOR_EACH { LIST_APPEND(slot=0, val_col=1) }
 /// Columns: 0=type, 1=value(u32)
 fn buildScalarListTestProgram(type_id: u32) [80]u8 {
     var prog = [_]u8{0} ** 80;
@@ -2362,9 +2477,9 @@ fn buildScalarListTestProgram(type_id: u32) [80]u8 {
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
 
-    // Reduce: FOR_EACH_EVENT(8) + LIST_APPEND(3) = 11
+    // Reduce: FOR_EACH(9) + LIST_APPEND(3) = 12
     const body_len: u16 = 3;
-    const reduce_len: u16 = 8 + body_len;
+    const reduce_len: u16 = 9 + body_len;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -2380,17 +2495,18 @@ fn buildScalarListTestProgram(type_id: u32) [80]u8 {
 
     // Reduce section
     const rs: usize = 14 + init_len;
-    content[rs] = 0xE0; // FOR_EACH_EVENT
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
-    content[rs + 6] = @truncate(body_len);
-    content[rs + 7] = @truncate(body_len >> 8);
+    content[rs] = 0xE0; // FOR_EACH
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
+    content[rs + 7] = @truncate(body_len);
+    content[rs + 8] = @truncate(body_len >> 8);
 
     // Body: LIST_APPEND
-    const bo = rs + 8;
+    const bo = rs + 9;
     content[bo] = 0x84; // LIST_APPEND
     content[bo + 1] = 0; // slot
     content[bo + 2] = 1; // val_col
@@ -2501,7 +2617,7 @@ test "ORDERED_LIST - scalar growth triggers NEEDS_GROWTH" {
 
 /// Build a program with:
 ///   Slot 0: ORDERED_LIST (struct, 2 fields: UINT32 + STRING, capacity hint=8)
-///   FOR_EACH_EVENT { LIST_APPEND_STRUCT(slot=0, vals from cols 1,2) }
+///   FOR_EACH { LIST_APPEND_STRUCT(slot=0, vals from cols 1,2) }
 /// Columns: 0=type, 1=val0(u32), 2=val1(u32)
 fn buildStructListTestProgram(type_id: u32) [96]u8 {
     var prog = [_]u8{0} ** 96;
@@ -2523,9 +2639,9 @@ fn buildStructListTestProgram(type_id: u32) [96]u8 {
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
 
-    // Reduce: FOR_EACH_EVENT(8) + LIST_APPEND_STRUCT(3 + 2*2 = 7) = 15
+    // Reduce: FOR_EACH(9) + LIST_APPEND_STRUCT(3 + 2*2 = 7) = 16
     const body_len: u16 = 7;
-    const reduce_len: u16 = 8 + body_len;
+    const reduce_len: u16 = 9 + body_len;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -2544,17 +2660,18 @@ fn buildStructListTestProgram(type_id: u32) [96]u8 {
 
     // Reduce section
     const rs: usize = 14 + init_len;
-    content[rs] = 0xE0; // FOR_EACH_EVENT
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
-    content[rs + 6] = @truncate(body_len);
-    content[rs + 7] = @truncate(body_len >> 8);
+    content[rs] = 0xE0; // FOR_EACH
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
+    content[rs + 7] = @truncate(body_len);
+    content[rs + 8] = @truncate(body_len >> 8);
 
     // Body: LIST_APPEND_STRUCT
-    const bo = rs + 8;
+    const bo = rs + 9;
     content[bo] = 0x85; // LIST_APPEND_STRUCT
     content[bo + 1] = 0; // slot
     content[bo + 2] = 2; // num_vals
@@ -2689,7 +2806,7 @@ test "ORDERED_LIST - undo restores count" {
 
 test "ORDERED_LIST - inside FLAT_MAP" {
     const TYPE_A: u32 = 1001;
-    // Build a program: FOR_EACH_EVENT { FLAT_MAP { LIST_APPEND(slot=0, val_col=2) } }
+    // Build a program: FOR_EACH { FLAT_MAP { LIST_APPEND(slot=0, val_col=2) } }
     // Slot 0: ORDERED_LIST (scalar UINT32, cap=8)
     // Columns: 0=type, 1=offsets, 2=child_val(u32)
     var prog = [_]u8{0} ** 96;
@@ -2711,7 +2828,7 @@ test "ORDERED_LIST - inside FLAT_MAP" {
 
     const inner_body_len: u16 = 3; // LIST_APPEND
     const flat_map_total: u16 = 5 + inner_body_len;
-    const reduce_len: u16 = 8 + flat_map_total;
+    const reduce_len: u16 = 9 + flat_map_total;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -2728,15 +2845,16 @@ test "ORDERED_LIST - inside FLAT_MAP" {
     // Reduce
     const rs = 14 + init_len;
     content[rs] = 0xE0;
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(TYPE_A);
-    content[rs + 3] = @truncate(TYPE_A >> 8);
-    content[rs + 4] = @truncate(TYPE_A >> 16);
-    content[rs + 5] = @truncate(TYPE_A >> 24);
-    content[rs + 6] = @truncate(flat_map_total);
-    content[rs + 7] = @truncate(flat_map_total >> 8);
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(TYPE_A);
+    content[rs + 4] = @truncate(TYPE_A >> 8);
+    content[rs + 5] = @truncate(TYPE_A >> 16);
+    content[rs + 6] = @truncate(TYPE_A >> 24);
+    content[rs + 7] = @truncate(flat_map_total);
+    content[rs + 8] = @truncate(flat_map_total >> 8);
 
-    const fm = rs + 8;
+    const fm = rs + 9;
     content[fm] = 0xE1; // FLAT_MAP
     content[fm + 1] = 1; // offsets_col
     content[fm + 2] = 0xFF; // parent_ts_col
@@ -2814,12 +2932,12 @@ fn buildArrayFieldTestProgram(type_id: u32) [128]u8 {
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
 
-    // Reduce: FOR_EACH_EVENT(8) + body: STRUCT_MAP_UPSERT_LAST
+    // Reduce: FOR_EACH(9) + body: STRUCT_MAP_UPSERT_LAST
     //   Scalar: op(1)+slot(1)+key_col(1)+num_vals(1)+1*(val_col+field_idx) = 6
     //   Array: num_array_vals(1)+1*(offsets_col+values_col+field_idx) = 4
     //   Total body = 6 + 4 = 10
     const body_len: u16 = 10;
-    const reduce_len: u16 = 8 + body_len;
+    const reduce_len: u16 = 9 + body_len;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -2837,17 +2955,18 @@ fn buildArrayFieldTestProgram(type_id: u32) [128]u8 {
 
     // Reduce section
     const rs = 14 + init_len;
-    content[rs] = 0xE0; // FOR_EACH_EVENT
-    content[rs + 1] = 0; // type_col
-    content[rs + 2] = @truncate(type_id);
-    content[rs + 3] = @truncate(type_id >> 8);
-    content[rs + 4] = @truncate(type_id >> 16);
-    content[rs + 5] = @truncate(type_id >> 24);
-    content[rs + 6] = @truncate(body_len);
-    content[rs + 7] = @truncate(body_len >> 8);
+    content[rs] = 0xE0; // FOR_EACH
+    content[rs + 1] = 0; // col (type_col)
+    content[rs + 2] = 1; // match_count
+    content[rs + 3] = @truncate(type_id);
+    content[rs + 4] = @truncate(type_id >> 8);
+    content[rs + 5] = @truncate(type_id >> 16);
+    content[rs + 6] = @truncate(type_id >> 24);
+    content[rs + 7] = @truncate(body_len);
+    content[rs + 8] = @truncate(body_len >> 8);
 
     // Body: STRUCT_MAP_UPSERT_LAST with 1 scalar + 1 array field
-    const bs = rs + 8;
+    const bs = rs + 9;
     content[bs] = 0x80; // STRUCT_MAP_UPSERT_LAST
     content[bs + 1] = 0; // slot
     content[bs + 2] = 1; // key_col

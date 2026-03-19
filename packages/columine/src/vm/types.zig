@@ -340,7 +340,7 @@ pub const Opcode = enum(u8) {
     // Struct map batch ops
     BATCH_STRUCT_MAP_UPSERT_LAST = 0x80, // slot:u8, key_col:u8, num_vals:u8, [val_col:u8, field_idx:u8] x num_vals
 
-    // Ordered list ops (body opcodes inside FOR_EACH_EVENT/FLAT_MAP blocks)
+    // Ordered list ops (body opcodes inside FOR_EACH/FLAT_MAP blocks)
     LIST_APPEND = 0x84, // slot:u8, val_col:u8
     LIST_APPEND_STRUCT = 0x85, // slot:u8, num_vals:u8, [(val_col:u8, field_idx:u8) × N]
 
@@ -350,16 +350,16 @@ pub const Opcode = enum(u8) {
     // Nested container init
     SLOT_NESTED = 0x1A, // slot:u8, outer_type_flags:u8, outer_cap_lo:u8, outer_cap_hi:u8, inner_type:u8, inner_cap_lo:u8, inner_cap_hi:u8, inner_agg_type:u8
 
-    // Nested container ops (body opcodes inside FOR_EACH_EVENT blocks)
-    // These operate per-element, dispatched within the FOR_EACH_EVENT loop.
+    // Nested container ops (body opcodes inside FOR_EACH blocks)
+    // These operate per-element, dispatched within the FOR_EACH loop.
     NESTED_SET_INSERT = 0x90, // slot:u8, outer_key_col:u8, elem_col:u8
     NESTED_MAP_UPSERT_LAST = 0x92, // slot:u8, outer_key_col:u8, inner_key_col:u8, val_col:u8
     NESTED_AGG_UPDATE = 0x95, // slot:u8, outer_key_col:u8, val_col:u8
 
     // Block-based reduce section opcodes (4a)
-    // FOR_EACH_EVENT wraps body opcodes that process one element at a time.
+    // FOR_EACH wraps body opcodes that process one element at a time.
     // Body uses the same opcode byte values as BATCH_* but dispatched per-element.
-    FOR_EACH_EVENT = 0xE0, // type_col:u8, type_id_lo:u8, type_id_hi_0:u8, type_id_hi_1:u8, type_id_hi_2:u8, body_len_lo:u8, body_len_hi:u8
+    FOR_EACH = 0xE0, // col:u8, match_count:u8, match_ids:u32le[match_count], body_len:u16le
     FLAT_MAP = 0xE1, // offsets_col:u8, parent_ts_col:u8, inner_body_len_lo:u8, inner_body_len_hi:u8
 
     // --- More planned opcodes in opcodes.zig ---

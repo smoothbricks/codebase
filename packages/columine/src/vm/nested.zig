@@ -613,7 +613,7 @@ fn buildNestedSetE2EProgram(type_id: u32) [128]u8 {
     const init_len: u16 = 9; // SLOT_NESTED: 1 opcode + 8 params
     c[10] = @truncate(init_len); c[11] = @truncate(init_len >> 8);
     const body_len: u16 = 4; // NESTED_SET_INSERT: 4 bytes
-    const reduce_len: u16 = 8 + body_len; // FOR_EACH_EVENT header(8) + body
+    const reduce_len: u16 = 9 + body_len; // FOR_EACH header(9: op+col+match_count+1*u32+u16) + body
     c[12] = @truncate(reduce_len); c[13] = @truncate(reduce_len >> 8);
 
     // Init: SLOT_NESTED
@@ -626,15 +626,16 @@ fn buildNestedSetE2EProgram(type_id: u32) [128]u8 {
     c[off+6] = 8; c[off+7] = 0; // inner_cap = 8
     c[off+8] = 1; // inner_agg = SUM (unused for set, but must be valid)
 
-    // Reduce: FOR_EACH_EVENT { NESTED_SET_INSERT }
+    // Reduce: FOR_EACH { NESTED_SET_INSERT }
     const rs = 14 + init_len;
-    c[rs] = 0xE0; // FOR_EACH_EVENT
-    c[rs+1] = 0; // type_col
-    c[rs+2] = @truncate(type_id); c[rs+3] = @truncate(type_id >> 8);
-    c[rs+4] = @truncate(type_id >> 16); c[rs+5] = @truncate(type_id >> 24);
-    c[rs+6] = @truncate(body_len); c[rs+7] = @truncate(body_len >> 8);
+    c[rs] = 0xE0; // FOR_EACH
+    c[rs+1] = 0; // col (type_col)
+    c[rs+2] = 1; // match_count
+    c[rs+3] = @truncate(type_id); c[rs+4] = @truncate(type_id >> 8);
+    c[rs+5] = @truncate(type_id >> 16); c[rs+6] = @truncate(type_id >> 24);
+    c[rs+7] = @truncate(body_len); c[rs+8] = @truncate(body_len >> 8);
 
-    const bs = rs + 8;
+    const bs = rs + 9;
     c[bs] = 0x90; // NESTED_SET_INSERT
     c[bs+1] = 0; // slot
     c[bs+2] = 1; // outer_key_col

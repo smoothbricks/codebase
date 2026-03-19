@@ -64,7 +64,7 @@ pub fn batchAggMax(val_col: [*]const f64, batch_len: u32, current_max: f64) f64 
 }
 
 // =============================================================================
-// Type-masked SIMD reductions (FOR_EACH_EVENT: only rows matching type_id)
+// Type-masked SIMD reductions (FOR_EACH: only rows matching type_id)
 // =============================================================================
 
 pub fn maskedAggSum(val_col: [*]const f64, type_data: [*]const u32, type_id: u32, batch_len: u32) f64 {
@@ -143,7 +143,7 @@ pub fn maskedAggMax(val_col: [*]const f64, type_data: [*]const u32, type_id: u32
 // =============================================================================
 
 /// Reduce a column to a single value. Dispatches to SIMD for f64 and i64 sum.
-/// type_mask: only include rows matching type_id (FOR_EACH_EVENT).
+/// type_mask: only include rows matching type_id (FOR_EACH).
 /// pred_col: only include rows where pred[i] != 0 (_IF variants).
 pub fn reduceCol(
     comptime T: type,

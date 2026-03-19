@@ -211,13 +211,15 @@ pub const Opcode = enum(u8) {
     // Block-Based Reduce Opcodes (0xE0+ range)
     // ═══════════════════════════════════════════════════════════════════
     //
-    // FOR_EACH_EVENT wraps body opcodes that process one element at a
-    // time, dispatched only for rows matching a type discriminator.
+    // FOR_EACH wraps body opcodes that process one element at a time,
+    // dispatched only for rows matching one or more type discriminators.
     // Body opcodes reuse the same byte values as BATCH_* but are
     // dispatched per-element within the block.
 
-    /// Type-discriminated event loop. Only processes rows where type_col == type_id.
-    FOR_EACH_EVENT = 0xE0, // ✓ implemented — type_col:u8, type_id:u32le(4 bytes), body_len:u16le(2 bytes)
+    /// Type-discriminated event loop with multi-match support.
+    /// When match_count == 1, processes rows where col == match_id (backward compat).
+    /// When match_count > 1, processes rows matching ANY of the match_ids.
+    FOR_EACH = 0xE0, // ✓ implemented — col:u8, match_count:u8, match_ids:u32le[match_count], body_len:u16le
     /// Flat-map expansion: iterates nested array offsets, running inner body per element.
     FLAT_MAP = 0xE1, // ✓ implemented — offsets_col:u8, parent_ts_col:u8, inner_body_len:u16le(2 bytes)
 
