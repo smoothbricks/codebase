@@ -28,6 +28,7 @@
   "scripts": {
     "build:all": "nx run-many -t build",
     "build:watch": "nx run-many -t build --watch",
+    "clean:trace-db": "find * -name .trace-results.db -delete -print",
     "link:all": "bun run build:all && for pkg in packages/*; do (cd $pkg && bun link); done",
     "unlink:all": "for pkg in packages/*; do (cd $pkg && bun unlink); done",
     "list:nx-build-targets": "nx show projects | xargs -n1 nx show project --json | jq -r  '.name as $name | .targets | to_entries[] | \"\\($name):\\(.key)\"'",
