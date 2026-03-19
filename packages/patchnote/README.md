@@ -14,6 +14,114 @@ Automated dependency update tool with Expo SDK support, stacked PRs, and AI-powe
 - 📦 **Syncpack Integration**: Respects version constraints and regenerates config from Expo
 - ⚙️ **Highly Configurable**: Works with any project structure through flexible configuration
 
+## Quick Start (Zero Config)
+
+Copy this file to `.github/workflows/update-deps.yml` and push. That's it -- works with zero configuration using the
+built-in `GITHUB_TOKEN`.
+
+```yaml
+# Automated dependency updates with patchnote
+#
+# Authentication: Auto-detected at runtime
+#   - If PATCHNOTE_APP_ID is set -> GitHub App mode (recommended)
+#   - Otherwise -> PAT mode (uses PATCHNOTE_TOKEN secret)
+#
+# Setup options:
+#
+#   Zero config: Works out of the box using the built-in GITHUB_TOKEN.
+#     Note: PRs created this way won't trigger other workflows (GitHub limitation).
+#
+#   Option A: Personal Access Token (5 minutes)
+#     1. Generate PAT: https://github.com/settings/tokens/new (scope: repo)
+#     2. Add organization secret: PATCHNOTE_TOKEN
+#
+#   Option B: GitHub App (15 minutes, recommended for organizations)
+#     1. Create GitHub App with permissions: contents:write, pull-requests:write
+#     2. Install app to repository
+#     3. Add organization variable: PATCHNOTE_APP_ID
+#     4. Add organization secret: PATCHNOTE_APP_PRIVATE_KEY
+#
+# Optional: AI Changelog Analysis (Z.AI GLM-5-Turbo)
+#   - Add ZAI_API_KEY secret for AI-powered changelog summaries
+#   - Disable: Set repository variable PATCHNOTE_SKIP_AI=true
+
+name: Update Dependencies
+
+on:
+  schedule:
+    # Run daily at 2 AM UTC
+    - cron: '0 2 * * *'
+  workflow_dispatch: # Allow manual triggers
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  update-deps:
+    runs-on: ubuntu-latest
+
+    steps:
+      # GitHub App token generation (skipped if PATCHNOTE_APP_ID not set)
+      - name: Generate GitHub App token
+        if: ${{ vars.PATCHNOTE_APP_ID != '' }}
+        id: app-token
+        uses: actions/create-github-app-token@v2
+        with:
+          app-id: ${{ vars.PATCHNOTE_APP_ID }}
+          private-key: ${{ secrets.PATCHNOTE_APP_PRIVATE_KEY }}
+
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # Full history for git operations
+          # Uses App token if available, otherwise default token
+          token: ${{ steps.app-token.outputs.token || github.token }}
+
+      - name: Install Nix
+        if: hashFiles('**/devenv.yaml') != ''
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Nix cache
+        if: hashFiles('**/devenv.yaml') != ''
+        uses: DeterminateSystems/magic-nix-cache-action@main
+
+      - name: Install devenv and nvfetcher
+        if: hashFiles('**/devenv.yaml') != ''
+        run: nix profile install nixpkgs#devenv nixpkgs#nvfetcher
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Configure git
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email 'github-actions[bot]@users.noreply.github.com'
+
+      - name: Run patchnote
+        env:
+          # Token priority: GitHub App token > PAT (PATCHNOTE_TOKEN) > built-in GITHUB_TOKEN
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
+        run: |
+          FLAGS=""
+          if [[ "${{ vars.PATCHNOTE_SKIP_AI }}" == "true" ]]; then
+            FLAGS="--skip-ai"
+          fi
+          bunx @smoothbricks/patchnote update-deps --verbose $FLAGS
+```
+
+> **Note:** PRs created with the built-in `GITHUB_TOKEN` will NOT trigger other workflows (e.g., CI checks). This is a
+> GitHub security limitation. For production use, set up a PAT or GitHub App -- see
+> [Getting Started Guide](docs/GETTING-STARTED.md).
+
+> **Note:** Nix-related steps (Install Nix, Setup Nix cache, Install devenv) are automatically skipped if
+> `devenv.yaml` is not present in your repository. No manual configuration needed.
+
+For AI-powered changelog summaries, add `ZAI_API_KEY` as a repository secret. Without it, the tool falls back to a
+structured (non-AI) summary that is still useful for PR review.
+
 ## Getting Started
 
 **👉 New to patchnote?** Start with the getting started guide:
