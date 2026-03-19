@@ -60,6 +60,8 @@ carries only what the **receiver** needs to act. For the full rules with code ex
   where eventual consistency is acceptable. Not for correctness-critical flows where exact point-in-time values are
   required (use signal snapshots).
 
+  Scenario paths write facts to VM state via the RETE bridge. Do not use JS RETE evaluation in domain tests.
+
 ## Common Development Commands
 
 ### Build and Development

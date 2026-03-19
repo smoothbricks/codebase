@@ -476,6 +476,14 @@ Policy:
  Back-compat `unknown` defaults may exist in core public generics, but helper/harness APIs must still preserve concrete
   inferred types at the call site.
 
+Scenario paths write facts to VM state via the RETE bridge (`vm-rete-bridge.ts` runs JS `:then` callbacks, writes
+results to VM state via `vm_rete_insert_fact`). The VM facts reader (`vm-facts-reader.ts`) reads directly from WASM
+memory with zero-copy Uint32Array views.
+
+- **Domain/agent tests:** Use Scenario with `defineRuleset` — rules fire automatically after reduce, facts are stored in
+  VM state, `scenario.facts` returns a snapshot-backed reader.
+  pattern as reducer parity: run both paths, compare with fast-check. See `rete-parity.test.ts`.
+
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/lmao/01a_trace_schema_system.md):
 
 Three distinct string types, each with different storage strategies:
