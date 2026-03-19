@@ -130,7 +130,7 @@ export type SlotDef =
   | { type: SlotType.BITMAP; capacity: number; ttl?: SlotTtlMetadata }
   | { type: SlotType.AGGREGATE; aggType: AggType }
   | { type: SlotType.SCALAR; aggType: AggType }
-  | { type: SlotType.CONDITION_TREE }
+  | { type: SlotType.CONDITION_TREE; capacity?: number }
   | { type: SlotType.STRUCT_MAP; capacity: number; fieldTypes: readonly StructFieldType[]; ttl?: SlotTtlMetadata }
   | {
       type: SlotType.ORDERED_LIST;
