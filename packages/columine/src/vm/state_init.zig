@@ -231,6 +231,12 @@ pub export fn vm_calculate_state_size(
                     },
                     .CONDITION_TREE => {
                         size += CONDITION_TREE_STATE_BYTES;
+                        // Derived facts HashMap: keys[cap]*4 + values_lo[cap]*4 + values_hi[cap]*4
+                        // capacity from bytecode is the derived facts HashMap capacity
+                        if (capacity > 0) {
+                            size = align8(size);
+                            size += capacity * 12;
+                        }
                     },
                     .STRUCT_MAP => {
                         // STRUCT_MAP uses its own SLOT_STRUCT_MAP opcode, not SLOT_DEF
@@ -554,6 +560,30 @@ pub export fn vm_init_state(
                         const tree_state: *ConditionTreeState = @ptrCast(@alignCast(state_ptr + data_offset));
                         tree_state.* = .{ .lifecycle_generation = 1, .last_removed_key = EMPTY_KEY };
                         data_offset += CONDITION_TREE_STATE_BYTES;
+
+                        // Allocate and initialize derived facts HashMap region
+                        // capacity from bytecode = derived facts HashMap capacity
+                        if (capacity > 0) {
+                            data_offset = align8(data_offset);
+                            const derived_facts_offset = data_offset;
+
+                            // Initialize keys to EMPTY_KEY sentinel
+                            const keys: [*]u32 = @ptrCast(@alignCast(state_ptr + data_offset));
+                            for (0..capacity) |i| keys[i] = EMPTY_KEY;
+                            data_offset += capacity * 4;
+
+                            // Zero-init values_lo and values_hi
+                            @memset(state_ptr[data_offset .. data_offset + capacity * 4], 0);
+                            data_offset += capacity * 4;
+                            @memset(state_ptr[data_offset .. data_offset + capacity * 4], 0);
+                            data_offset += capacity * 4;
+
+                            // Write derived facts layout into state header
+                            std.mem.writeInt(u32, state_ptr[StateHeaderOffset.DERIVED_FACTS_OFFSET..][0..4], derived_facts_offset, .little);
+                            std.mem.writeInt(u16, state_ptr[StateHeaderOffset.DERIVED_FACTS_CAPACITY..][0..2], @intCast(capacity), .little);
+                            // Set HAS_RETE flag
+                            state_ptr[StateHeaderOffset.FLAGS] |= types.StateFlags.HAS_RETE;
+                        }
                     },
                     .HASHSET => {
                         const slot_meta_off = STATE_HEADER_SIZE + @as(u32, slot) * SLOT_META_SIZE;
@@ -1257,6 +1287,12 @@ pub export fn vm_grow_state(
         }
         slot_total_size += getTTLSideBufferSize(has_ttl, has_evict_trigger, new_cap);
         data_cursor = align8(new_offset + slot_total_size);
+
+        // Update derived facts offset in state header when CONDITION_TREE slot moves
+        if (slot_type == @intFromEnum(SlotType.CONDITION_TREE) and new_cap > 0) {
+            const new_derived_offset = align8(new_offset + CONDITION_TREE_STATE_BYTES);
+            std.mem.writeInt(u32, new_state_ptr[StateHeaderOffset.DERIVED_FACTS_OFFSET..][0..4], new_derived_offset, .little);
+        }
     }
 
     return @intFromEnum(ErrorCode.OK);

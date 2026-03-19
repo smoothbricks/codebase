@@ -32,7 +32,8 @@ pub fn slotDataSize(slot_type: SlotType, capacity: u32, has_timestamps: bool, ag
         .HASHMAP => capacity * 4 + capacity * 4 + if (has_timestamps) capacity * 8 else 0,
         .HASHSET => capacity * 4,
         .AGGREGATE => if (agg_type_byte == 2) 8 else 16, // COUNT=8, others=16
-        .CONDITION_TREE => types.CONDITION_TREE_STATE_BYTES,
+        // CONDITION_TREE: 8 bytes state + derived facts HashMap (keys + values_lo + values_hi)
+        .CONDITION_TREE => types.CONDITION_TREE_STATE_BYTES + if (capacity > 0) capacity * 12 else 0,
         .SCALAR => 16,
         .BITMAP => 4 + bitmapPayloadCapacity(capacity), // serialized_len(4) + payload
         .STRUCT_MAP, .ORDERED_LIST, .NESTED => 0, // use dedicated functions
