@@ -38,8 +38,7 @@
         "inputs": [
           "{projectRoot}/src/**/*.zig",
           "{projectRoot}/build.zig",
-          "{projectRoot}/build.zig.zon",
-          "{workspaceRoot}/extern/rawr/src/**/*.zig"
+          "{projectRoot}/build.zig.zon"
         ],
         "outputs": [
           "{projectRoot}/dist/*.wasm"

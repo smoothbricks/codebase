@@ -18,7 +18,8 @@
             .hash = "simdjzon-0.0.1-7uNSgHJ_BQDkK6pvdhXPjeGkqSxQw_hy7TlA1USZ7Ala",
         },
         .rawr = .{
-            .path = "../../extern/rawr",
+            .url = "git+https://github.com/smoothbricks/rawr#5166e12cac5c6da6a03f2c70b9a3f716fd80bb57",
+            .hash = "rawr-0.0.1-qsnO1N2TBQCubp8dKbK97A60Wm--IjWadsnXwgiWVDmw",
         },
     },
     .paths = .{
