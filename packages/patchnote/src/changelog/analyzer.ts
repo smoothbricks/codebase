@@ -73,16 +73,22 @@ export async function analyzeChangelogs(
         result = `${result}\n\n${formatDowngradesSection(downgrades)}`;
       }
 
+      // Append raw release notes after AI summary for reviewer reference
+      const releaseNotes = renderReleaseNotesSection(updates, changelogs, 60000 - result.length);
+      if (releaseNotes) {
+        result = `${result}\n\n${releaseNotes}`;
+      }
+
       return result;
     }
 
-    return generateFallbackSummary(updates, downgrades);
+    return generateFallbackSummary(updates, downgrades, changelogs);
   } catch (error) {
     config.logger?.warn('AI analysis failed:', error instanceof Error ? error.message : String(error));
     if (process.env.VERBOSE) {
       config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
     }
-    return generateFallbackSummary(updates, downgrades);
+    return generateFallbackSummary(updates, downgrades, changelogs);
   }
 }
 
@@ -235,10 +241,75 @@ function formatNixUpdatesSection(updates: PackageUpdate[]): string {
   return parts.join('\n');
 }
 
+/** Maximum characters for individual changelog content within a details block */
+const MAX_INDIVIDUAL_CHANGELOG_CHARS = 2000;
+
+/** Default character budget for total PR body */
+const DEFAULT_CHAR_BUDGET = 55000;
+
+/**
+ * Render collapsible release notes section from changelogs
+ * Each package with actual content (not just a URL) gets a <details> block.
+ */
+export function renderReleaseNotesSection(
+  updates: PackageUpdate[],
+  changelogs: Map<string, string>,
+  charBudget: number = DEFAULT_CHAR_BUDGET,
+): string {
+  const blocks: string[] = [];
+  let totalChars = 0;
+  let omitted = false;
+
+  for (const update of updates) {
+    const content = changelogs.get(update.name);
+    if (!content) continue;
+
+    // Skip URL-only entries (not actual release notes)
+    if (content.startsWith('http')) continue;
+
+    // Check if we have room in the budget
+    if (totalChars >= charBudget) {
+      omitted = true;
+      break;
+    }
+
+    // Truncate individual content if too large
+    let displayContent = content;
+    if (content.length > MAX_INDIVIDUAL_CHANGELOG_CHARS) {
+      displayContent = `${content.substring(0, MAX_INDIVIDUAL_CHANGELOG_CHARS)}\n\n...(truncated)`;
+    }
+
+    const block = `<details><summary>${update.name} ${update.fromVersion} -> ${update.toVersion}</summary>\n\n${displayContent}\n\n</details>`;
+
+    // Check if adding this block would exceed budget
+    if (totalChars + block.length > charBudget) {
+      omitted = true;
+      break;
+    }
+
+    blocks.push(block);
+    totalChars += block.length;
+  }
+
+  if (blocks.length === 0) return '';
+
+  let result = `### Release Notes\n\n${blocks.join('\n\n')}`;
+
+  if (omitted) {
+    result += '\n\nAdditional release notes omitted for size.';
+  }
+
+  return result;
+}
+
 /**
  * Generate fallback summary without AI
  */
-function generateFallbackSummary(updates: PackageUpdate[], downgrades: PackageUpdate[] = []): string {
+function generateFallbackSummary(
+  updates: PackageUpdate[],
+  downgrades: PackageUpdate[] = [],
+  changelogs?: Map<string, string>,
+): string {
   const sections = {
     major: [] as PackageUpdate[],
     minor: [] as PackageUpdate[],
@@ -300,6 +371,16 @@ function generateFallbackSummary(updates: PackageUpdate[], downgrades: PackageUp
     parts.push('');
   }
 
+  // Add release notes section if changelogs are available
+  if (changelogs && changelogs.size > 0) {
+    const currentLength = parts.join('\n').length;
+    const releaseNotes = renderReleaseNotesSection(updates, changelogs, 60000 - currentLength);
+    if (releaseNotes) {
+      parts.push('');
+      parts.push(releaseNotes);
+    }
+  }
+
   parts.push(`\nTotal updates: ${updates.length}`);
 
   return parts.join('\n');
@@ -312,6 +393,7 @@ export async function generateCommitMessage(
   updates: PackageUpdate[],
   _config: PatchnoteConfig,
   downgrades: PackageUpdate[] = [],
+  changelogs?: Map<string, string>,
 ): Promise<{ title: string; body: string }> {
   const ecosystems = [...new Set(updates.map((u) => u.ecosystem))];
   const hasBreaking = updates.some((u) => u.updateType === 'major');
@@ -321,7 +403,7 @@ export async function generateCommitMessage(
 
   const body = `Updated ${updates.length} packages across ${ecosystems.join(', ')} ecosystems.
 
-${generateFallbackSummary(updates, downgrades)}`;
+${generateFallbackSummary(updates, downgrades, changelogs)}`;
 
   return { title, body };
 }

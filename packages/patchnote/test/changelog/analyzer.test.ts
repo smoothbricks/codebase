@@ -1,11 +1,7 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 // Import directly without mocking - we'll test fallback paths
 // This avoids mock persistence issues with Bun's module mocking
-import {
-  analyzeChangelogs,
-  generateCommitMessage,
-  renderReleaseNotesSection,
-} from '../../src/changelog/analyzer.js';
+import { analyzeChangelogs, generateCommitMessage, renderReleaseNotesSection } from '../../src/changelog/analyzer.js';
 import type { PatchnoteConfig } from '../../src/config.js';
 import type { Logger } from '../../src/logger.js';
 import type { PackageUpdate } from '../../src/types.js';

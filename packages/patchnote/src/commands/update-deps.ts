@@ -195,7 +195,7 @@ async function generateCommitData(
   let prBody: string;
 
   if (options.skipAI || changelogs.size === 0) {
-    const { body } = await generateCommitMessage(allUpdates, config, allDowngrades);
+    const { body } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs);
     prBody = body;
   } else {
     const aiSpinner = p.spinner();
@@ -204,7 +204,7 @@ async function generateCommitData(
     aiSpinner.stop('AI analysis complete');
   }
 
-  const { title } = await generateCommitMessage(allUpdates, config, allDowngrades);
+  const { title } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs);
 
   return {
     commitTitle: title,
