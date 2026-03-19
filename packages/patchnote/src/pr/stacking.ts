@@ -214,6 +214,10 @@ export async function createPR(
       body,
       head: headBranch,
       base: baseBranch,
+      labels: config.prStrategy.labels,
+      assignees: config.prStrategy.assignees,
+      reviewers: config.prStrategy.reviewers,
+      draft: config.prStrategy.draft,
     });
 
     config.logger?.info(`✓ Created PR #${result.number}: ${result.url}`);

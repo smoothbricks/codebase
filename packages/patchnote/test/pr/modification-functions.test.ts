@@ -145,6 +145,107 @@ describe('createPR', () => {
   });
 });
 
+describe('createPR with metadata pass-through', () => {
+  const basePRUrl = 'https://github.com/owner/repo/pull/200';
+
+  function createMetadataSpy() {
+    const calls: Array<[string | URL, readonly string[] | undefined, Record<string, unknown> | undefined]> = [];
+    const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, unknown>) => {
+      calls.push([cmd, args, opts]);
+      return { stdout: basePRUrl, stderr: '', exitCode: 0 };
+    };
+    return { mock, calls };
+  }
+
+  test('should pass labels from config to GitHub client', async () => {
+    const spy = createMetadataSpy();
+    const config: PatchnoteConfig = {
+      prStrategy: {
+        stackingEnabled: true,
+        maxStackDepth: 5,
+        autoCloseOldPRs: true,
+        resetOnMerge: true,
+        stopOnConflicts: true,
+        branchPrefix: 'chore/update-deps',
+        prTitlePrefix: 'chore: update dependencies',
+        labels: ['deps'],
+      },
+      autoMerge: { enabled: false, mode: 'none', requireTests: true },
+      ai: { provider: 'zai' },
+    };
+
+    await createPR(config, '/repo', {
+      title: 'Test PR',
+      body: 'body',
+      baseBranch: 'main',
+      headBranch: 'feature',
+    }, spy.mock);
+
+    const args = spy.calls[0]![1]!;
+    expect(args).toContain('--label');
+    const idx = args.indexOf('--label');
+    expect(args[idx + 1]).toBe('deps');
+  });
+
+  test('should pass draft from config to GitHub client', async () => {
+    const spy = createMetadataSpy();
+    const config: PatchnoteConfig = {
+      prStrategy: {
+        stackingEnabled: true,
+        maxStackDepth: 5,
+        autoCloseOldPRs: true,
+        resetOnMerge: true,
+        stopOnConflicts: true,
+        branchPrefix: 'chore/update-deps',
+        prTitlePrefix: 'chore: update dependencies',
+        draft: true,
+      },
+      autoMerge: { enabled: false, mode: 'none', requireTests: true },
+      ai: { provider: 'zai' },
+    };
+
+    await createPR(config, '/repo', {
+      title: 'Test PR',
+      body: 'body',
+      baseBranch: 'main',
+      headBranch: 'feature',
+    }, spy.mock);
+
+    const args = spy.calls[0]![1]!;
+    expect(args).toContain('--draft');
+  });
+
+  test('should not add metadata flags when config has no metadata', async () => {
+    const spy = createMetadataSpy();
+    const config: PatchnoteConfig = {
+      prStrategy: {
+        stackingEnabled: true,
+        maxStackDepth: 5,
+        autoCloseOldPRs: true,
+        resetOnMerge: true,
+        stopOnConflicts: true,
+        branchPrefix: 'chore/update-deps',
+        prTitlePrefix: 'chore: update dependencies',
+      },
+      autoMerge: { enabled: false, mode: 'none', requireTests: true },
+      ai: { provider: 'zai' },
+    };
+
+    await createPR(config, '/repo', {
+      title: 'Test PR',
+      body: 'body',
+      baseBranch: 'main',
+      headBranch: 'feature',
+    }, spy.mock);
+
+    const args = spy.calls[0]![1]!;
+    expect(args).not.toContain('--label');
+    expect(args).not.toContain('--assignee');
+    expect(args).not.toContain('--reviewer');
+    expect(args).not.toContain('--draft');
+  });
+});
+
 describe('autoCloseOldPRs', () => {
   const baseConfig: PatchnoteConfig = {
     prStrategy: {

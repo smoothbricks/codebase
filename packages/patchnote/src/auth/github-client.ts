@@ -61,25 +61,51 @@ export class GitHubCLIClient implements IGitHubClient {
 
   async createPR(
     repoRoot: string,
-    options: { title: string; body: string; head: string; base: string },
+    options: {
+      title: string
+      body: string
+      head: string
+      base: string
+      labels?: string[]
+      assignees?: string[]
+      reviewers?: string[]
+      draft?: boolean
+    },
   ): Promise<{ number: number; url: string }> {
     try {
-      const { stdout } = await this.executor(
-        'gh',
-        [
-          'pr',
-          'create',
-          '--title',
-          options.title,
-          '--body',
-          options.body,
-          '--base',
-          options.base,
-          '--head',
-          options.head,
-        ],
-        { cwd: repoRoot },
-      );
+      const args: string[] = [
+        'pr',
+        'create',
+        '--title',
+        options.title,
+        '--body',
+        options.body,
+        '--base',
+        options.base,
+        '--head',
+        options.head,
+      ];
+
+      if (options.labels) {
+        for (const label of options.labels) {
+          args.push('--label', label);
+        }
+      }
+      if (options.assignees) {
+        for (const assignee of options.assignees) {
+          args.push('--assignee', assignee);
+        }
+      }
+      if (options.reviewers) {
+        for (const reviewer of options.reviewers) {
+          args.push('--reviewer', reviewer);
+        }
+      }
+      if (options.draft) {
+        args.push('--draft');
+      }
+
+      const { stdout } = await this.executor('gh', args, { cwd: repoRoot });
 
       // Extract PR URL from output (format: https://github.com/owner/repo/pull/123)
       const url = stdout.trim();

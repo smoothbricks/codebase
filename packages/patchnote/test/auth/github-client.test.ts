@@ -241,6 +241,130 @@ describe('GitHubCLIClient', () => {
     });
   });
 
+  describe('createPR with metadata', () => {
+    const basePRUrl = 'https://github.com/owner/repo/pull/100\n';
+
+    function createGhSpy() {
+      const calls: Array<[string | URL, readonly string[] | undefined, Record<string, unknown> | undefined]> = [];
+      const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, unknown>) => {
+        calls.push([cmd, args, opts]);
+        return { stdout: basePRUrl, stderr: '', exitCode: 0 };
+      };
+      return { mock, calls };
+    }
+
+    test('should add --label flags for each label', async () => {
+      const spy = createGhSpy();
+      const client = new GitHubCLIClient(spy.mock);
+      await client.createPR('/repo', {
+        title: 'Test',
+        body: 'Body',
+        base: 'main',
+        head: 'feature',
+        labels: ['deps', 'automated'],
+      });
+
+      const args = spy.calls[0]![1]!;
+      expect(args).toContain('--label');
+      // Check labels appear in order
+      const labelIndices = args.reduce<number[]>((acc, arg, i) => (arg === '--label' ? [...acc, i] : acc), []);
+      expect(labelIndices).toHaveLength(2);
+      expect(args[labelIndices[0]! + 1]).toBe('deps');
+      expect(args[labelIndices[1]! + 1]).toBe('automated');
+    });
+
+    test('should add --assignee flags for each assignee', async () => {
+      const spy = createGhSpy();
+      const client = new GitHubCLIClient(spy.mock);
+      await client.createPR('/repo', {
+        title: 'Test',
+        body: 'Body',
+        base: 'main',
+        head: 'feature',
+        assignees: ['alice'],
+      });
+
+      const args = spy.calls[0]![1]!;
+      expect(args).toContain('--assignee');
+      const idx = args.indexOf('--assignee');
+      expect(args[idx + 1]).toBe('alice');
+    });
+
+    test('should add --reviewer flags for each reviewer', async () => {
+      const spy = createGhSpy();
+      const client = new GitHubCLIClient(spy.mock);
+      await client.createPR('/repo', {
+        title: 'Test',
+        body: 'Body',
+        base: 'main',
+        head: 'feature',
+        reviewers: ['bob', 'carol'],
+      });
+
+      const args = spy.calls[0]![1]!;
+      const reviewerIndices = args.reduce<number[]>((acc, arg, i) => (arg === '--reviewer' ? [...acc, i] : acc), []);
+      expect(reviewerIndices).toHaveLength(2);
+      expect(args[reviewerIndices[0]! + 1]).toBe('bob');
+      expect(args[reviewerIndices[1]! + 1]).toBe('carol');
+    });
+
+    test('should add --draft flag when draft is true', async () => {
+      const spy = createGhSpy();
+      const client = new GitHubCLIClient(spy.mock);
+      await client.createPR('/repo', {
+        title: 'Test',
+        body: 'Body',
+        base: 'main',
+        head: 'feature',
+        draft: true,
+      });
+
+      const args = spy.calls[0]![1]!;
+      expect(args).toContain('--draft');
+    });
+
+    test('should not add metadata flags when not provided', async () => {
+      const spy = createGhSpy();
+      const client = new GitHubCLIClient(spy.mock);
+      await client.createPR('/repo', {
+        title: 'Test',
+        body: 'Body',
+        base: 'main',
+        head: 'feature',
+      });
+
+      const args = spy.calls[0]![1]!;
+      expect(args).not.toContain('--label');
+      expect(args).not.toContain('--assignee');
+      expect(args).not.toContain('--reviewer');
+      expect(args).not.toContain('--draft');
+    });
+
+    test('should add all metadata flags together in correct order', async () => {
+      const spy = createGhSpy();
+      const client = new GitHubCLIClient(spy.mock);
+      await client.createPR('/repo', {
+        title: 'Test',
+        body: 'Body',
+        base: 'main',
+        head: 'feature',
+        labels: ['deps'],
+        assignees: ['alice'],
+        reviewers: ['bob'],
+        draft: true,
+      });
+
+      const args = spy.calls[0]![1]!;
+      // Base args come first
+      expect(args.slice(0, 10)).toEqual([
+        'pr', 'create', '--title', 'Test', '--body', 'Body', '--base', 'main', '--head', 'feature',
+      ]);
+      // Metadata flags after base args
+      const metadataArgs = args.slice(10);
+      expect(metadataArgs).toEqual(['--label', 'deps', '--assignee', 'alice', '--reviewer', 'bob', '--draft']);
+    });
+  });
+
   describe('closePR', () => {
     test('should call gh pr close with correct arguments', async () => {
       const spy = createExecaSpy({

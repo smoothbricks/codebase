@@ -274,10 +274,14 @@ export interface IGitHubClient {
   createPR(
     repoRoot: string,
     options: {
-      title: string;
-      body: string;
-      head: string;
-      base: string;
+      title: string
+      body: string
+      head: string
+      base: string
+      labels?: string[]
+      assignees?: string[]
+      reviewers?: string[]
+      draft?: boolean
     },
   ): Promise<{ number: number; url: string }>;
   /** Close a pull request with a comment */

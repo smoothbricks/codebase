@@ -67,6 +67,14 @@ export interface PatchnoteConfig {
     branchPrefix: string;
     /** PR title prefix */
     prTitlePrefix: string;
+    /** Labels to add to created PRs */
+    labels?: string[];
+    /** Users to assign to created PRs */
+    assignees?: string[];
+    /** Users to request review from */
+    reviewers?: string[];
+    /** Create PRs as draft */
+    draft?: boolean;
   };
 
   /**
