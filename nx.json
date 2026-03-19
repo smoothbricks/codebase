@@ -86,6 +86,7 @@
     "typecheck-tests": {
       "executor": "nx:run-commands",
       "cache": true,
+      "inputs": ["default", { "dependentTasksOutputFiles": "**/*.d.ts" }],
       "options": {
         "command": "tsc --noEmit -p {projectRoot}/tsconfig.test.json",
         "cwd": "{workspaceRoot}"

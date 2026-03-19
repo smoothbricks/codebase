@@ -344,9 +344,9 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       const aggType = u8[metaStart + 13];
 
       if (aggType === 2) {
-        // COUNT - return count (u64 at dataOffset + 8)
-        const countLo = u32[(dataOffset + 8) / 4];
-        const countHi = u32[(dataOffset + 12) / 4];
+        // COUNT layout: u64 at offset 0 (8 bytes total, no value field)
+        const countLo = u32[dataOffset / 4];
+        const countHi = u32[dataOffset / 4 + 1];
         return countLo + countHi * 0x100000000;
       }
       return f64[dataOffset / 8];
