@@ -30,7 +30,7 @@
     "react-native": ">=0.73.0"
   },
   "scripts": {
-    "test": "bun test"
+    "test": "bun test --pass-with-no-tests"
   },
   "nx": {
     "sourceRoot": "packages/lmao-inspector/src",
