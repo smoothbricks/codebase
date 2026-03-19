@@ -77,6 +77,10 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 
 - **Run tests**: `bun test`
 - **Run specific test file**: `bun test <file-path>`
+- **Nx cache is expected to work.** If a task only passes with `--skip-nx-cache`, treat that as a broken
+  target/input/output/dependency configuration and fix the Nx config instead of normalizing cache bypasses.
+- **Do not rely on `--skip-nx-cache` as routine workflow.** Use it only to diagnose cache issues, then repair the
+  underlying Nx configuration so cached and uncached runs agree.
 
 ### Linting and Formatting
 

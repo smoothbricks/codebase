@@ -28,6 +28,9 @@
 - **No `NoOpTracer`.** `NoOpTracer` should not appear in this repo. Require tracing context from callers, use child
   spans, and use suite/test tracers in tests.
 - **Lint before tests.** Use `nx lint <project>` before `bun test` or `nx test <project>`.
+- **Nx cache is not flaky; config is.** If a task only passes with `--skip-nx-cache`, fix the target's inputs, outputs,
+  dependency graph, or task wiring so cached and uncached runs agree.
+- **Do not normalize cache bypasses.** `--skip-nx-cache` is for diagnosis only, not routine development or validation.
 
 ## Type Inference Rules
 
@@ -165,6 +168,16 @@ Also create `tsconfig.test.json` for the package (see existing packages for the 
 `composite: false`, `noEmit: true`, includes test globs, references `tsconfig.lib.json`).
 
 **After any tsconfig or dependency changes**, run `nx sync` to update project references. Verify with `nx sync:check`.
+
+### Nx Cache Reliability Policy
+
+If agents keep reaching for `--skip-nx-cache`, assume the workspace configuration is wrong until proven otherwise.
+
+- Verify target `inputs`, `outputs`, `dependsOn`, and project graph edges rather than bypassing cache.
+- Fix nondeterministic generators, missing output declarations, stale build artifacts, or implicit dependency gaps.
+- When a cached run diverges from a fresh run, capture the exact target and repair the Nx config so both paths behave
+  the same.
+- Do not leave docs, scripts, or plans teaching `--skip-nx-cache` as a normal fix.
 
 ### Platform-Agnostic tsconfig Policy
 
