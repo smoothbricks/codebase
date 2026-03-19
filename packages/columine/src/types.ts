@@ -79,6 +79,20 @@ export enum StructFieldType {
   ARRAY_BOOL = 9,
 }
 
+/**
+ * Comparison type for HashMap pick strategies (latest/max/min).
+ * Determines how the 8-byte comparison column is interpreted in the VM.
+ * Must match Zig CmpType enum in hashmap_ops.zig.
+ */
+export enum ComparisonType {
+  /** Compare as unsigned 32-bit integers (string intern IDs, ordinals) */
+  U32 = 0,
+  /** Compare as 64-bit IEEE 754 floats (numeric fields, timestamps-as-f64) */
+  F64 = 1,
+  /** Compare as signed 64-bit integers (bigint timestamps) */
+  I64 = 2,
+}
+
 export enum TtlStartOf {
   NONE = 0,
   SECOND = 1,

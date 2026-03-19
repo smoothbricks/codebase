@@ -63,7 +63,8 @@ pub const Opcode = enum(u8) {
     // ═══════════════════════════════════════════════════════════════════
 
     /// keyBy(field).keepValue(latest('timestamp'))
-    BATCH_MAP_UPSERT_LATEST = 0x20, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, ts_col:u8
+    /// cmp_type: 0=u32, 1=f64, 2=i64 — typed comparison for the ts_col column
+    BATCH_MAP_UPSERT_LATEST = 0x20, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, ts_col:u8, cmp_type:u8
     /// keyBy(field).keepValue(first)
     BATCH_MAP_UPSERT_FIRST = 0x21, // ✓ implemented — slot:u8, key_col:u8, val_col:u8
     /// keyBy(field).keepValue(last)
@@ -72,19 +73,21 @@ pub const Opcode = enum(u8) {
     BATCH_MAP_REMOVE = 0x23, // ✓ implemented — slot:u8, key_col:u8
 
     /// TTL-aware latest upsert (tracks insertion in eviction index)
-    BATCH_MAP_UPSERT_LATEST_TTL = 0x24, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, ts_col:u8
+    BATCH_MAP_UPSERT_LATEST_TTL = 0x24, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, ts_col:u8, cmp_type:u8
     /// TTL-aware last upsert (tracks insertion in eviction index)
     BATCH_MAP_UPSERT_LAST_TTL = 0x25, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, ts_col:u8
 
     /// keyBy(field).keepValue(max('field'))
-    BATCH_MAP_UPSERT_MAX = 0x26, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8
+    /// cmp_type: 0=u32, 1=f64, 2=i64 — typed comparison for the cmp_col column
+    BATCH_MAP_UPSERT_MAX = 0x26, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8
     /// keyBy(field).keepValue(min('field'))
-    BATCH_MAP_UPSERT_MIN = 0x27, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8
+    /// cmp_type: 0=u32, 1=f64, 2=i64 — typed comparison for the cmp_col column
+    BATCH_MAP_UPSERT_MIN = 0x27, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8
 
     // ─── Conditional variants (_IF suffix = predicate-filtered) ────────
 
     /// Conditional latest upsert — only process rows where pred_col is truthy
-    BATCH_MAP_UPSERT_LATEST_IF = 0x28, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, ts_col:u8, pred_col:u8
+    BATCH_MAP_UPSERT_LATEST_IF = 0x28, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, ts_col:u8, cmp_type:u8, pred_col:u8
     /// Conditional first upsert
     BATCH_MAP_UPSERT_FIRST_IF = 0x29, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, pred_col:u8
     /// Conditional last upsert
@@ -92,9 +95,9 @@ pub const Opcode = enum(u8) {
     /// Conditional remove
     BATCH_MAP_REMOVE_IF = 0x2B, // ✓ implemented — slot:u8, key_col:u8, pred_col:u8
     /// Conditional max upsert
-    BATCH_MAP_UPSERT_MAX_IF = 0x2C, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8, pred_col:u8
+    BATCH_MAP_UPSERT_MAX_IF = 0x2C, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8, pred_col:u8
     /// Conditional min upsert
-    BATCH_MAP_UPSERT_MIN_IF = 0x2D, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8, pred_col:u8
+    BATCH_MAP_UPSERT_MIN_IF = 0x2D, // ✓ implemented — slot:u8, key_col:u8, val_col:u8, cmp_col:u8, cmp_type:u8, pred_col:u8
 
     // ═══════════════════════════════════════════════════════════════════
     // Batch HashSet Operations

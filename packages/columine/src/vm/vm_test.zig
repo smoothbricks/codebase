@@ -152,7 +152,8 @@ fn buildNoTimestampMapProgram(comptime cap_lo: u8, comptime cap_hi: u8, comptime
     const init_len: u16 = 5;
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
-    const reduce_len: u16 = if (needs_ts_col) 5 else 4;
+    // LATEST/MAX/MIN opcodes now have an extra cmp_type byte
+    const reduce_len: u16 = if (needs_ts_col) 6 else 4;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -169,7 +170,8 @@ fn buildNoTimestampMapProgram(comptime cap_lo: u8, comptime cap_hi: u8, comptime
     content[off + 2] = 0;
     content[off + 3] = 1;
     if (needs_ts_col) {
-        content[off + 4] = 2;
+        content[off + 4] = 2; // ts_col / cmp_col
+        content[off + 5] = 1; // cmp_type = f64
     }
     return prog;
 }
@@ -200,8 +202,8 @@ fn buildTTLMapProgram(comptime cap_lo: u8, comptime cap_hi: u8, comptime has_evi
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
 
-    // BATCH_MAP_UPSERT_LATEST slot,key,val,ts
-    const reduce_len: u16 = 5;
+    // BATCH_MAP_UPSERT_LATEST slot,key,val,ts,cmp_type
+    const reduce_len: u16 = 6;
     content[12] = @truncate(reduce_len);
     content[13] = @truncate(reduce_len >> 8);
 
@@ -224,6 +226,7 @@ fn buildTTLMapProgram(comptime cap_lo: u8, comptime cap_hi: u8, comptime has_evi
     content[off + 2] = 0; // key col
     content[off + 3] = 1; // val col
     content[off + 4] = 2; // ts col
+    content[off + 5] = 1; // cmp_type = f64
 
     return prog;
 }
@@ -2339,8 +2342,8 @@ fn buildFlatMapLatestTestProgram(type_id: u32) [112]u8 {
     content[10] = @truncate(init_len);
     content[11] = @truncate(init_len >> 8);
 
-    // Body: MAP_UPSERT_LATEST = 5 bytes (op + slot + key_col + val_col + ts_col)
-    const inner_body_len: u16 = 5;
+    // Body: MAP_UPSERT_LATEST = 6 bytes (op + slot + key_col + val_col + ts_col + cmp_type)
+    const inner_body_len: u16 = 6;
     const flat_map_total: u16 = 5 + inner_body_len; // FLAT_MAP header + body
     const reduce_len: u16 = 9 + flat_map_total; // FOR_EACH(9) + body
     content[12] = @truncate(reduce_len);
@@ -2382,6 +2385,7 @@ fn buildFlatMapLatestTestProgram(type_id: u32) [112]u8 {
     content[ib + 2] = 3; // key_col (child)
     content[ib + 3] = 4; // val_col (child)
     content[ib + 4] = 5; // ts_col (child — will be OVERRIDDEN by parent_ts_col)
+    content[ib + 5] = 1; // cmp_type = f64
 
     return prog;
 }

@@ -1103,6 +1103,13 @@ fn executeBatchImpl(
         }
     }.f;
 
+    // Helper to get column as raw bytes (for typed comparison dispatch)
+    const getColRaw = struct {
+        fn f(ptrs: [*]const [*]const u8, idx: u8) [*]const u8 {
+            return ptrs[idx];
+        }
+    }.f;
+
     // Helper: convert CAPACITY_EXCEEDED to NEEDS_GROWTH, tracking the slot index
     const signalGrowth = struct {
         fn check(slot_idx: u8, result: ErrorCode) u32 {
@@ -1127,9 +1134,10 @@ fn executeBatchImpl(
                 const key_col = code[pc + 1];
                 const val_col = code[pc + 2];
                 const ts_col = code[pc + 3];
-                pc += 4;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(code[pc + 4]);
+                pc += 5;
                 const meta = getSlotMeta(state_base, slot);
-                const result = hashmap_ops.batchMapUpsert(.latest, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColF64(col_ptrs_ptr, ts_col), batch_len);
+                const result = hashmap_ops.batchMapUpsert(.latest, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColRaw(col_ptrs_ptr, ts_col), cmp_type, batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -1139,7 +1147,7 @@ fn executeBatchImpl(
                 const val_col = code[pc + 2];
                 pc += 3;
                 const meta = getSlotMeta(state_base, slot);
-                const result = hashmap_ops.batchMapUpsert(.first, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), null, batch_len);
+                const result = hashmap_ops.batchMapUpsert(.first, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), null, .f64, batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -1149,7 +1157,7 @@ fn executeBatchImpl(
                 const val_col = code[pc + 2];
                 pc += 3;
                 const meta = getSlotMeta(state_base, slot);
-                const result = hashmap_ops.batchMapUpsert(.last, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), if (meta.hasTTL()) getColF64(col_ptrs_ptr, meta.timestamp_field_idx) else null, batch_len);
+                const result = hashmap_ops.batchMapUpsert(.last, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), if (meta.hasTTL()) getColRaw(col_ptrs_ptr, meta.timestamp_field_idx) else null, .f64, batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -1160,7 +1168,7 @@ fn executeBatchImpl(
                 const ts_col = code[pc + 3];
                 pc += 4;
                 const meta = getSlotMeta(state_base, slot);
-                const result = hashmap_ops.batchMapUpsert(.last, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColF64(col_ptrs_ptr, ts_col), batch_len);
+                const result = hashmap_ops.batchMapUpsert(.last, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColRaw(col_ptrs_ptr, ts_col), .f64, batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -1177,9 +1185,10 @@ fn executeBatchImpl(
                 const key_col = code[pc + 1];
                 const val_col = code[pc + 2];
                 const cmp_col = code[pc + 3];
-                pc += 4;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(code[pc + 4]);
+                pc += 5;
                 const meta = getSlotMeta(state_base, slot);
-                const result = hashmap_ops.batchMapUpsert(.max, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColF64(col_ptrs_ptr, cmp_col), batch_len);
+                const result = hashmap_ops.batchMapUpsert(.max, delta_mode, state_base, meta, slot, getColU32(col_ptrs_ptr, key_col), getColU32(col_ptrs_ptr, val_col), getColRaw(col_ptrs_ptr, cmp_col), cmp_type, batch_len);
                 if (result != .OK) return signalGrowth(slot, result);
             },
 
@@ -1188,13 +1197,15 @@ fn executeBatchImpl(
                 const key_col = code[pc + 1];
                 const val_col = code[pc + 2];
                 const cmp_col = code[pc + 3];
-                pc += 4;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(code[pc + 4]);
+                pc += 5;
                 const meta = getSlotMeta(state_base, slot);
                 const result = hashmap_ops.batchMapUpsert(.min, delta_mode, state_base, meta,
                     slot,
                     getColU32(col_ptrs_ptr, key_col),
                     getColU32(col_ptrs_ptr, val_col),
-                    getColF64(col_ptrs_ptr, cmp_col),
+                    getColRaw(col_ptrs_ptr, cmp_col),
+                    cmp_type,
                     batch_len,
                 );
                 if (result != .OK) return signalGrowth(slot, result);
@@ -1662,20 +1673,20 @@ inline fn bodyOpLen(code: []const u8, pc_offset: usize) u32 {
     const op_byte = code[pc_offset];
     return switch (op_byte) {
         // MAP ops
-        0x20 => 5, // MAP_UPSERT_LATEST: op + slot + key_col + val_col + ts_col
+        0x20 => 6, // MAP_UPSERT_LATEST: op + slot + key_col + val_col + ts_col + cmp_type
         0x21 => 4, // MAP_UPSERT_FIRST: op + slot + key_col + val_col
         0x22 => 4, // MAP_UPSERT_LAST: op + slot + key_col + val_col
         0x23 => 3, // MAP_REMOVE: op + slot + key_col
-        0x24 => 5, // MAP_UPSERT_LATEST_TTL
+        0x24 => 6, // MAP_UPSERT_LATEST_TTL: op + slot + key_col + val_col + ts_col + cmp_type
         0x25 => 5, // MAP_UPSERT_LAST_TTL
-        0x26 => 5, // MAP_UPSERT_MAX: op + slot + key_col + val_col + cmp_col
-        0x27 => 5, // MAP_UPSERT_MIN: op + slot + key_col + val_col + cmp_col
-        0x28 => 6, // MAP_UPSERT_LATEST_IF: op + slot + key_col + val_col + ts_col + pred_col
+        0x26 => 6, // MAP_UPSERT_MAX: op + slot + key_col + val_col + cmp_col + cmp_type
+        0x27 => 6, // MAP_UPSERT_MIN: op + slot + key_col + val_col + cmp_col + cmp_type
+        0x28 => 7, // MAP_UPSERT_LATEST_IF: op + slot + key_col + val_col + ts_col + cmp_type + pred_col
         0x29 => 5, // MAP_UPSERT_FIRST_IF: op + slot + key_col + val_col + pred_col
         0x2A => 5, // MAP_UPSERT_LAST_IF: op + slot + key_col + val_col + pred_col
         0x2B => 4, // MAP_REMOVE_IF: op + slot + key_col + pred_col
-        0x2C => 6, // MAP_UPSERT_MAX_IF: op + slot + key_col + val_col + cmp_col + pred_col
-        0x2D => 6, // MAP_UPSERT_MIN_IF: op + slot + key_col + val_col + cmp_col + pred_col
+        0x2C => 7, // MAP_UPSERT_MAX_IF: op + slot + key_col + val_col + cmp_col + cmp_type + pred_col
+        0x2D => 7, // MAP_UPSERT_MIN_IF: op + slot + key_col + val_col + cmp_col + cmp_type + pred_col
         // SET ops
         0x30 => 3, // SET_INSERT: op + slot + elem_col
         0x31 => 3, // SET_REMOVE: op + slot + elem_col
@@ -1938,6 +1949,11 @@ fn executeElementOpcodes(
             return @ptrCast(@alignCast(ptrs[idx]));
         }
     }.f;
+    const getColRawInner = struct {
+        fn f(ptrs: [*]const [*]const u8, idx: u8) [*]const u8 {
+            return ptrs[idx];
+        }
+    }.f;
 
     var bpc: usize = 0;
     while (bpc < body.len) {
@@ -1950,19 +1966,22 @@ fn executeElementOpcodes(
         }
 
         switch (op_byte) {
-            // MAP_UPSERT_LATEST (0x20): slot, key_col, val_col, ts_col
+            // MAP_UPSERT_LATEST (0x20): slot, key_col, val_col, ts_col, cmp_type
             0x20 => {
                 const slot = body[bpc + 1];
                 const key_col_idx = body[bpc + 2];
                 const val_col_idx = body[bpc + 3];
                 const ts_col_idx = body[bpc + 4];
-                bpc += 5;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(body[bpc + 5]);
+                bpc += 6;
 
-                // Inside FLAT_MAP with parent_ts_col set: use parent event's timestamp
-                const ts = if (parent_ts_col != 0xFF)
-                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                // Read comparison value with proper type from column
+                const cmp_raw = if (parent_ts_col != 0xFF)
+                    getColRawInner(col_ptrs, parent_ts_col)
                 else
-                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+                    getColRawInner(col_ptrs, ts_col_idx);
+                const cmp_idx = if (parent_ts_col != 0xFF) parent_idx else child_idx;
+                const cmp_val = hashmap_ops.readCmpValue(cmp_raw, cmp_idx, cmp_type);
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = hashmap_ops.singleMapUpsert(.latest,
@@ -1972,7 +1991,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    ts,
+                    cmp_val,
+                    cmp_type,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -1996,6 +2016,7 @@ fn executeElementOpcodes(
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
                     0,
+                    .f64,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2011,6 +2032,7 @@ fn executeElementOpcodes(
                 bpc += 4;
 
                 const meta = getSlotMeta(state_base, slot);
+                const ttl_cmp: u64 = if (meta.hasTTL()) @bitCast(getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx]) else 0;
                 const result = hashmap_ops.singleMapUpsert(.last,
                     delta_mode,
                     state_base,
@@ -2018,7 +2040,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else 0,
+                    ttl_cmp,
+                    .f64,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2026,18 +2049,21 @@ fn executeElementOpcodes(
                 }
             },
 
-            // MAP_UPSERT_LATEST_TTL (0x24): slot, key_col, val_col, ts_col
+            // MAP_UPSERT_LATEST_TTL (0x24): slot, key_col, val_col, ts_col, cmp_type
             0x24 => {
                 const slot = body[bpc + 1];
                 const key_col_idx = body[bpc + 2];
                 const val_col_idx = body[bpc + 3];
                 const ts_col_idx = body[bpc + 4];
-                bpc += 5;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(body[bpc + 5]);
+                bpc += 6;
 
-                const ts = if (parent_ts_col != 0xFF)
-                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                const cmp_raw = if (parent_ts_col != 0xFF)
+                    getColRawInner(col_ptrs, parent_ts_col)
                 else
-                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+                    getColRawInner(col_ptrs, ts_col_idx);
+                const cmp_idx = if (parent_ts_col != 0xFF) parent_idx else child_idx;
+                const cmp_val = hashmap_ops.readCmpValue(cmp_raw, cmp_idx, cmp_type);
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = hashmap_ops.singleMapUpsert(.latest,
@@ -2047,7 +2073,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    ts,
+                    cmp_val,
+                    cmp_type,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2063,10 +2090,13 @@ fn executeElementOpcodes(
                 const ts_col_idx = body[bpc + 4];
                 bpc += 5;
 
-                const ts = if (parent_ts_col != 0xFF)
-                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                const ts_raw = if (parent_ts_col != 0xFF)
+                    getColRawInner(col_ptrs, parent_ts_col)
                 else
-                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+                    getColRawInner(col_ptrs, ts_col_idx);
+                const ts_idx = if (parent_ts_col != 0xFF) parent_idx else child_idx;
+                // TTL last always uses f64 timestamps
+                const ts_val = hashmap_ops.readCmpValue(ts_raw, ts_idx, .f64);
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = hashmap_ops.singleMapUpsert(.last,
@@ -2076,7 +2106,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    ts,
+                    ts_val,
+                    .f64,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2100,15 +2131,17 @@ fn executeElementOpcodes(
                 );
             },
 
-            // MAP_UPSERT_MAX (0x26): slot, key_col, val_col, cmp_col
+            // MAP_UPSERT_MAX (0x26): slot, key_col, val_col, cmp_col, cmp_type
             0x26 => {
                 const slot = body[bpc + 1];
                 const key_col_idx = body[bpc + 2];
                 const val_col_idx = body[bpc + 3];
                 const cmp_col_idx = body[bpc + 4];
-                bpc += 5;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(body[bpc + 5]);
+                bpc += 6;
 
                 const meta = getSlotMeta(state_base, slot);
+                const cmp_val = hashmap_ops.readCmpValue(getColRawInner(col_ptrs, cmp_col_idx), child_idx, cmp_type);
                 const result = hashmap_ops.singleMapUpsert(.max,
                     delta_mode,
                     state_base,
@@ -2116,7 +2149,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    getColF64Inner(col_ptrs, cmp_col_idx)[child_idx],
+                    cmp_val,
+                    cmp_type,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2124,15 +2158,17 @@ fn executeElementOpcodes(
                 }
             },
 
-            // MAP_UPSERT_MIN (0x27): slot, key_col, val_col, cmp_col
+            // MAP_UPSERT_MIN (0x27): slot, key_col, val_col, cmp_col, cmp_type
             0x27 => {
                 const slot = body[bpc + 1];
                 const key_col_idx = body[bpc + 2];
                 const val_col_idx = body[bpc + 3];
                 const cmp_col_idx = body[bpc + 4];
-                bpc += 5;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(body[bpc + 5]);
+                bpc += 6;
 
                 const meta = getSlotMeta(state_base, slot);
+                const cmp_val = hashmap_ops.readCmpValue(getColRawInner(col_ptrs, cmp_col_idx), child_idx, cmp_type);
                 const result = hashmap_ops.singleMapUpsert(.min,
                     delta_mode,
                     state_base,
@@ -2140,7 +2176,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    getColF64Inner(col_ptrs, cmp_col_idx)[child_idx],
+                    cmp_val,
+                    cmp_type,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2148,21 +2185,24 @@ fn executeElementOpcodes(
                 }
             },
 
-            // MAP_UPSERT_LATEST_IF (0x28): slot, key_col, val_col, ts_col, pred_col
+            // MAP_UPSERT_LATEST_IF (0x28): slot, key_col, val_col, ts_col, cmp_type, pred_col
             0x28 => {
                 const slot = body[bpc + 1];
                 const key_col_idx = body[bpc + 2];
                 const val_col_idx = body[bpc + 3];
                 const ts_col_idx = body[bpc + 4];
-                const pred_col_idx = body[bpc + 5];
-                bpc += 6;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(body[bpc + 5]);
+                const pred_col_idx = body[bpc + 6];
+                bpc += 7;
 
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
-                const ts = if (parent_ts_col != 0xFF)
-                    getColF64Inner(col_ptrs, parent_ts_col)[parent_idx]
+                const cmp_raw = if (parent_ts_col != 0xFF)
+                    getColRawInner(col_ptrs, parent_ts_col)
                 else
-                    getColF64Inner(col_ptrs, ts_col_idx)[child_idx];
+                    getColRawInner(col_ptrs, ts_col_idx);
+                const cmp_idx = if (parent_ts_col != 0xFF) parent_idx else child_idx;
+                const cmp_val = hashmap_ops.readCmpValue(cmp_raw, cmp_idx, cmp_type);
 
                 const meta = getSlotMeta(state_base, slot);
                 const result = hashmap_ops.singleMapUpsert(.latest,
@@ -2172,7 +2212,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    ts,
+                    cmp_val,
+                    cmp_type,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2199,6 +2240,7 @@ fn executeElementOpcodes(
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
                     0,
+                    .f64,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2217,6 +2259,7 @@ fn executeElementOpcodes(
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
+                const ttl_cmp: u64 = if (meta.hasTTL()) @bitCast(getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx]) else 0;
                 const result = hashmap_ops.singleMapUpsert(.last,
                     delta_mode,
                     state_base,
@@ -2224,7 +2267,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    if (meta.hasTTL()) getColF64Inner(col_ptrs, meta.timestamp_field_idx)[child_idx] else 0,
+                    ttl_cmp,
+                    .f64,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2251,18 +2295,20 @@ fn executeElementOpcodes(
                 );
             },
 
-            // MAP_UPSERT_MAX_IF (0x2C): slot, key_col, val_col, cmp_col, pred_col
+            // MAP_UPSERT_MAX_IF (0x2C): slot, key_col, val_col, cmp_col, cmp_type, pred_col
             0x2C => {
                 const slot = body[bpc + 1];
                 const key_col_idx = body[bpc + 2];
                 const val_col_idx = body[bpc + 3];
                 const cmp_col_idx = body[bpc + 4];
-                const pred_col_idx = body[bpc + 5];
-                bpc += 6;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(body[bpc + 5]);
+                const pred_col_idx = body[bpc + 6];
+                bpc += 7;
 
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
+                const cmp_val = hashmap_ops.readCmpValue(getColRawInner(col_ptrs, cmp_col_idx), child_idx, cmp_type);
                 const result = hashmap_ops.singleMapUpsert(.max,
                     delta_mode,
                     state_base,
@@ -2270,7 +2316,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    getColF64Inner(col_ptrs, cmp_col_idx)[child_idx],
+                    cmp_val,
+                    cmp_type,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;
@@ -2278,18 +2325,20 @@ fn executeElementOpcodes(
                 }
             },
 
-            // MAP_UPSERT_MIN_IF (0x2D): slot, key_col, val_col, cmp_col, pred_col
+            // MAP_UPSERT_MIN_IF (0x2D): slot, key_col, val_col, cmp_col, cmp_type, pred_col
             0x2D => {
                 const slot = body[bpc + 1];
                 const key_col_idx = body[bpc + 2];
                 const val_col_idx = body[bpc + 3];
                 const cmp_col_idx = body[bpc + 4];
-                const pred_col_idx = body[bpc + 5];
-                bpc += 6;
+                const cmp_type: hashmap_ops.CmpType = @enumFromInt(body[bpc + 5]);
+                const pred_col_idx = body[bpc + 6];
+                bpc += 7;
 
                 if (getColU32Inner(col_ptrs, pred_col_idx)[child_idx] == 0) continue;
 
                 const meta = getSlotMeta(state_base, slot);
+                const cmp_val = hashmap_ops.readCmpValue(getColRawInner(col_ptrs, cmp_col_idx), child_idx, cmp_type);
                 const result = hashmap_ops.singleMapUpsert(.min,
                     delta_mode,
                     state_base,
@@ -2297,7 +2346,8 @@ fn executeElementOpcodes(
                     slot,
                     getColU32Inner(col_ptrs, key_col_idx)[child_idx],
                     getColU32Inner(col_ptrs, val_col_idx)[child_idx],
-                    getColF64Inner(col_ptrs, cmp_col_idx)[child_idx],
+                    cmp_val,
+                    cmp_type,
                 );
                 if (result == .CAPACITY_EXCEEDED) {
                     g_needs_growth_slot = slot;

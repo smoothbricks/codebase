@@ -44,6 +44,7 @@ export type {
 export {
   AggType,
   assertUndoCapableBackend,
+  ComparisonType,
   ErrorCode,
   HEADER_SIZE,
   isUndoCapableBackend,
