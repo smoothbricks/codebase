@@ -133,16 +133,23 @@ pub fn FlatHashTable(comptime Entry: type) type {
         }
 
         /// Find insertion position for key.
+        /// Probes past tombstones to find the key if it exists further in the
+        /// chain, reusing the first tombstone slot for insertion when the key
+        /// is truly absent.
         pub fn findInsert(self: Self, key: u32) ?struct { pos: u32, found: bool } {
             if (key == EMPTY_KEY or key == TOMBSTONE) return null;
             var pos = hashKey(key, self.cap);
             var probes: u32 = 0;
+            var first_tombstone: ?u32 = null;
             while (probes < self.cap) : (probes += 1) {
                 const k = self.keys[pos];
                 if (k == key) return .{ .pos = pos, .found = true };
-                if (k == EMPTY_KEY or k == TOMBSTONE) return .{ .pos = pos, .found = false };
+                if (k == EMPTY_KEY) return .{ .pos = first_tombstone orelse pos, .found = false };
+                if (k == TOMBSTONE and first_tombstone == null) first_tombstone = pos;
                 pos = (pos + 1) & (self.cap - 1);
             }
+            // Table full — use first tombstone if available
+            if (first_tombstone) |ft| return .{ .pos = ft, .found = false };
             return null;
         }
 
