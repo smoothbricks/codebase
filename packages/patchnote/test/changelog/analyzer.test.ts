@@ -1,7 +1,11 @@
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test';
 // Import directly without mocking - we'll test fallback paths
 // This avoids mock persistence issues with Bun's module mocking
-import { analyzeChangelogs, generateCommitMessage } from '../../src/changelog/analyzer.js';
+import {
+  analyzeChangelogs,
+  generateCommitMessage,
+  renderReleaseNotesSection,
+} from '../../src/changelog/analyzer.js';
 import type { PatchnoteConfig } from '../../src/config.js';
 import type { Logger } from '../../src/logger.js';
 import type { PackageUpdate } from '../../src/types.js';
@@ -297,6 +301,158 @@ describe('Changelog Analyzer', () => {
 
         expect(result).toContain('(nix)');
       });
+    });
+  });
+
+  describe('renderReleaseNotesSection', () => {
+    test('renders collapsible details blocks for packages with changelog content', () => {
+      const updates: PackageUpdate[] = [
+        { name: 'react', fromVersion: '18.0.0', toVersion: '19.0.0', updateType: 'major', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map([['react', '## 19.0.0\n- Breaking: New rendering model']]);
+
+      const result = renderReleaseNotesSection(updates, changelogs);
+
+      expect(result).toContain('### Release Notes');
+      expect(result).toContain('<details>');
+      expect(result).toContain('<summary>react 18.0.0 -> 19.0.0</summary>');
+      expect(result).toContain('## 19.0.0\n- Breaking: New rendering model');
+      expect(result).toContain('</details>');
+    });
+
+    test('skips entries where changelog content starts with http (URL-only)', () => {
+      const updates: PackageUpdate[] = [
+        { name: 'vite', fromVersion: '5.0.0', toVersion: '5.1.0', updateType: 'minor', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map([['vite', 'https://github.com/vitejs/vite/releases/tag/v5.1.0']]);
+
+      const result = renderReleaseNotesSection(updates, changelogs);
+
+      expect(result).toBe('');
+    });
+
+    test('truncates individual changelog content exceeding 2000 chars', () => {
+      const longContent = 'A'.repeat(2500);
+      const updates: PackageUpdate[] = [
+        { name: 'big-lib', fromVersion: '1.0.0', toVersion: '2.0.0', updateType: 'major', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map([['big-lib', longContent]]);
+
+      const result = renderReleaseNotesSection(updates, changelogs);
+
+      expect(result).toContain('<details>');
+      expect(result).toContain('...(truncated)');
+      // Should not contain full 2500 chars of content
+      expect(result).not.toContain('A'.repeat(2500));
+    });
+
+    test('returns empty string when changelogs map is empty', () => {
+      const updates: PackageUpdate[] = [
+        { name: 'react', fromVersion: '18.0.0', toVersion: '19.0.0', updateType: 'major', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map<string, string>();
+
+      const result = renderReleaseNotesSection(updates, changelogs);
+
+      expect(result).toBe('');
+    });
+
+    test('stops adding entries when approaching character budget', () => {
+      const updates: PackageUpdate[] = [
+        { name: 'pkg-a', fromVersion: '1.0.0', toVersion: '2.0.0', updateType: 'major', ecosystem: 'npm' },
+        { name: 'pkg-b', fromVersion: '1.0.0', toVersion: '2.0.0', updateType: 'major', ecosystem: 'npm' },
+        { name: 'pkg-c', fromVersion: '1.0.0', toVersion: '2.0.0', updateType: 'major', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map([
+        ['pkg-a', 'A'.repeat(500)],
+        ['pkg-b', 'B'.repeat(500)],
+        ['pkg-c', 'C'.repeat(500)],
+      ]);
+
+      // Use a very small budget that won't fit all three
+      const result = renderReleaseNotesSection(updates, changelogs, 700);
+
+      expect(result).toContain('pkg-a');
+      expect(result).toContain('omitted for size');
+    });
+
+    test('renders multiple packages each with their own details block', () => {
+      const updates: PackageUpdate[] = [
+        { name: 'react', fromVersion: '18.0.0', toVersion: '19.0.0', updateType: 'major', ecosystem: 'npm' },
+        { name: 'vite', fromVersion: '5.0.0', toVersion: '5.1.0', updateType: 'minor', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map([
+        ['react', '## React 19\n- New features'],
+        ['vite', '## Vite 5.1\n- Performance improvements'],
+      ]);
+
+      const result = renderReleaseNotesSection(updates, changelogs);
+
+      expect(result).toContain('<summary>react 18.0.0 -> 19.0.0</summary>');
+      expect(result).toContain('<summary>vite 5.0.0 -> 5.1.0</summary>');
+      // Ensure proper blank lines for GitHub markdown rendering
+      expect(result).toContain('\n\n## React 19');
+      expect(result).toContain('\n\n</details>');
+    });
+  });
+
+  describe('generateCommitMessage with changelogs', () => {
+    test('includes details blocks when changelogs map has content', async () => {
+      const updates: PackageUpdate[] = [
+        { name: 'react', fromVersion: '18.0.0', toVersion: '19.0.0', updateType: 'major', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map([['react', '## 19.0.0\n- Breaking change']]);
+
+      const { body } = await generateCommitMessage(updates, mockConfig, [], changelogs);
+
+      expect(body).toContain('<details>');
+      expect(body).toContain('<summary>react 18.0.0 -> 19.0.0</summary>');
+      expect(body).toContain('## 19.0.0\n- Breaking change');
+    });
+
+    test('does not include details block for URL-only changelogs', async () => {
+      const updates: PackageUpdate[] = [
+        { name: 'vite', fromVersion: '5.0.0', toVersion: '5.1.0', updateType: 'minor', ecosystem: 'npm' },
+      ];
+      const changelogs = new Map([['vite', 'https://github.com/vitejs/vite/releases']]);
+
+      const { body } = await generateCommitMessage(updates, mockConfig, [], changelogs);
+
+      expect(body).not.toContain('<details>');
+    });
+  });
+
+  describe('analyzeChangelogs with release notes embedding', () => {
+    test('fallback mode (no API key) includes details blocks when changelogs have content', async () => {
+      const originalEnv = process.env.ZAI_API_KEY;
+      delete process.env.ZAI_API_KEY;
+
+      const updates: PackageUpdate[] = [
+        {
+          name: 'react',
+          fromVersion: '18.0.0',
+          toVersion: '19.0.0',
+          updateType: 'major',
+          ecosystem: 'npm',
+        },
+      ];
+      const changelogs = new Map([['react', '## 19.0.0\n- Breaking: New JSX transform']]);
+
+      const config: PatchnoteConfig = {
+        ...mockConfig,
+        ai: { provider: 'zai' },
+        logger: createMockLogger(),
+      };
+
+      const result = await analyzeChangelogs(updates, changelogs, config);
+
+      // The no-API-key fallback at line 53 doesn't have access to changelogs
+      // so it should NOT include details blocks in this specific path
+      expect(result).toContain('## Dependency Updates');
+
+      if (originalEnv !== undefined) {
+        process.env.ZAI_API_KEY = originalEnv;
+      }
     });
   });
 });
