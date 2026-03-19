@@ -68,9 +68,10 @@ describe('Unified Workflow Template Generation', () => {
       expect(template).toContain("if: ${{ vars.PATCHNOTE_APP_ID != '' }}");
       expect(template).toContain('actions/create-github-app-token@v2');
 
-      // Token fallback expression
+      // Token fallback expression (three-tier: app-token > PAT > GITHUB_TOKEN)
       // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions template syntax
-      expect(template).toContain('${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN }}');
+      expect(template).toContain('${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}');
+      // Checkout uses two-tier fallback (app-token > GITHUB_TOKEN)
       // biome-ignore lint/suspicious/noTemplateCurlyInString: GitHub Actions template syntax
       expect(template).toContain('${{ steps.app-token.outputs.token || github.token }}');
     });
@@ -208,6 +209,26 @@ describe('Unified Workflow Template Generation', () => {
 
         expect(runStep.env.GH_TOKEN).toContain('steps.app-token.outputs.token');
         expect(runStep.env.GH_TOKEN).toContain('secrets.PATCHNOTE_TOKEN');
+        expect(runStep.env.GH_TOKEN).toContain('github.token');
+      });
+
+      it('should have three-tier token fallback in priority order: app-token, PATCHNOTE_TOKEN, github.token', () => {
+        const steps = parsed.jobs['update-deps'].steps;
+        const runStep = steps.find((s: WorkflowStep) => s.name?.includes('Run patchnote'));
+        const ghToken = runStep.env.GH_TOKEN;
+
+        // All three fallback levels must be present
+        expect(ghToken).toContain('steps.app-token.outputs.token');
+        expect(ghToken).toContain('secrets.PATCHNOTE_TOKEN');
+        expect(ghToken).toContain('github.token');
+
+        // Verify priority order: app-token first, then PATCHNOTE_TOKEN, then github.token
+        const appTokenIdx = ghToken.indexOf('steps.app-token.outputs.token');
+        const patIdx = ghToken.indexOf('secrets.PATCHNOTE_TOKEN');
+        const githubTokenIdx = ghToken.indexOf('github.token');
+
+        expect(appTokenIdx).toBeLessThan(patIdx);
+        expect(patIdx).toBeLessThan(githubTokenIdx);
       });
 
       it('should have runtime skip-ai flag handling', () => {

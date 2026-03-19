@@ -6,6 +6,9 @@
 #
 # Setup options:
 #
+#   Zero config: Works out of the box using the built-in GITHUB_TOKEN.
+#     Note: PRs created this way won't trigger other workflows (GitHub limitation).
+#
 #   Option A: Personal Access Token (5 minutes)
 #     1. Generate PAT: https://github.com/settings/tokens/new (scope: repo)
 #     2. Add organization secret: PATCHNOTE_TOKEN
@@ -79,8 +82,8 @@ jobs:
 
       - name: Run patchnote{{AI_STEP_SUFFIX}}
         env:
-          # Uses App token if available (priority), otherwise falls back to PAT
-          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN }}{{AI_ENV_VAR}}
+          # Token priority: GitHub App token > PAT (PATCHNOTE_TOKEN) > built-in GITHUB_TOKEN
+          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}{{AI_ENV_VAR}}
         run: |
           FLAGS=""
           if [[ "${{ vars.PATCHNOTE_SKIP_AI }}" == "true" ]]; then
