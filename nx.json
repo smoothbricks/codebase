@@ -77,6 +77,13 @@
     "lint": {
       "executor": "nx:run-commands",
       "cache": true,
+      "inputs": [
+        "{projectRoot}/src/**/*",
+        "{projectRoot}/package.json",
+        "{projectRoot}/tsconfig*.json",
+        "{workspaceRoot}/biome.json",
+        "{workspaceRoot}/tooling/checks/**/*"
+      ],
       "options": {
         "command": "biome check --files-ignore-unknown=true {projectRoot}",
         "cwd": "{workspaceRoot}"
