@@ -372,3 +372,27 @@ export interface ResolvedPackagePolicy {
   group?: string;
   allowedVersions?: string;
 }
+
+/**
+ * Options for the setup command
+ */
+export interface SetupOptions extends UpdateOptions {
+  /** Create a new GitHub App via manifest flow */
+  createApp?: boolean;
+  /** GitHub organization name */
+  org?: string;
+}
+
+/**
+ * GitHub App credentials returned from the manifest flow
+ */
+export interface GitHubAppCredentials {
+  /** GitHub App ID */
+  id: number;
+  /** PEM-encoded private key */
+  pem: string;
+  /** Webhook secret */
+  webhookSecret: string;
+  /** App slug (URL-friendly name) */
+  slug: string;
+}
