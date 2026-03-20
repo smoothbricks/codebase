@@ -106,6 +106,14 @@ export function buildAddColumnSql(column: SQLiteColumnDefinition): string {
   return `ALTER TABLE spans ADD COLUMN ${quoteSqlIdentifier(column.name)} ${normalizeSqliteColumnType(column.sqliteType)}`;
 }
 
+export function isSqliteDuplicateColumnError(error: unknown, columnName: string): boolean {
+  if (!(error instanceof Error)) {
+    return false;
+  }
+
+  return error.message.toLowerCase().includes(`duplicate column name: ${columnName.toLowerCase()}`);
+}
+
 export function getMissingSqliteColumns(
   columns: readonly SQLiteColumnDefinition[],
   knownColumns: ReadonlySet<string>,

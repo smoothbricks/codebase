@@ -16,6 +16,7 @@ import {
   getActiveUserFields,
   getInsertStatementCacheKey,
   getMissingSchemaColumns,
+  isSqliteDuplicateColumnError,
   SPANS_TABLE_INFO_SQL,
   SPANS_TABLE_INIT_SQL,
   walkSpanSegments,
@@ -36,17 +37,30 @@ export class SQLiteAsyncTraceWriter {
 
     await this.db.exec(SPANS_TABLE_INIT_SQL);
 
-    const cols = (await this.db.prepare(SPANS_TABLE_INFO_SQL).all()) as { name: string }[];
-    for (const col of cols) {
-      this.knownColumns.add(col.name);
-    }
+    await this.refreshKnownColumns();
 
     this.initialized = true;
   }
 
+  private async refreshKnownColumns(): Promise<void> {
+    this.knownColumns.clear();
+    const cols = (await this.db.prepare(SPANS_TABLE_INFO_SQL).all()) as { name: string }[];
+    for (const col of cols) {
+      this.knownColumns.add(col.name);
+    }
+  }
+
   private async ensureColumns(schema: LogSchema): Promise<void> {
     for (const column of getMissingSchemaColumns(schema, this.knownColumns)) {
-      await this.db.exec(buildAddColumnSql(column));
+      try {
+        await this.db.exec(buildAddColumnSql(column));
+      } catch (error) {
+        if (!isSqliteDuplicateColumnError(error, column.name)) {
+          throw error;
+        }
+      }
+
+      await this.refreshKnownColumns();
       this.knownColumns.add(column.name);
     }
   }

@@ -24,6 +24,7 @@ import {
   getActiveUserFields,
   getInsertStatementCacheKey,
   getMissingSchemaColumns,
+  isSqliteDuplicateColumnError,
   SPANS_TABLE_INFO_SQL,
   SPANS_TABLE_INIT_SQL,
   type SpanSegment,
@@ -47,6 +48,11 @@ export class SQLiteTraceWriter {
   private init(): void {
     this.db.exec(SPANS_TABLE_INIT_SQL);
 
+    this.refreshKnownColumns();
+  }
+
+  private refreshKnownColumns(): void {
+    this.knownColumns.clear();
     // Cache existing user columns from spans table
     const cols = this.db.prepare(SPANS_TABLE_INFO_SQL).all() as { name: string }[];
     for (const col of cols) {
@@ -57,7 +63,15 @@ export class SQLiteTraceWriter {
   /** Ensure user-defined schema columns exist in the spans table */
   private ensureColumns(schema: LogSchema): void {
     for (const column of getMissingSchemaColumns(schema, this.knownColumns)) {
-      this.db.exec(buildAddColumnSql(column));
+      try {
+        this.db.exec(buildAddColumnSql(column));
+      } catch (error) {
+        if (!isSqliteDuplicateColumnError(error, column.name)) {
+          throw error;
+        }
+      }
+
+      this.refreshKnownColumns();
       this.knownColumns.add(column.name);
     }
   }
