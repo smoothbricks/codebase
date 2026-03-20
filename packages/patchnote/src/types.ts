@@ -33,6 +33,11 @@ export type DeepPartial<T> = T extends object
 export type UpdateType = 'major' | 'minor' | 'patch' | 'unknown';
 
 /**
+ * Merge strategy for auto-merging pull requests
+ */
+export type MergeStrategy = 'squash' | 'rebase' | 'merge';
+
+/**
  * Dependency ecosystem
  */
 export type DependencyEcosystem = 'npm' | 'nix' | 'nixpkgs' | 'expo';
@@ -288,6 +293,8 @@ export interface IGitHubClient {
   ): Promise<{ number: number; url: string }>;
   /** Close a pull request with a comment */
   closePR(repoRoot: string, prNumber: number, comment: string): Promise<void>;
+  /** Enable GitHub auto-merge on a pull request */
+  enableAutoMerge(repoRoot: string, prNumber: number, strategy: MergeStrategy): Promise<void>;
 }
 
 /**

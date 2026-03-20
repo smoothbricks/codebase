@@ -4,7 +4,7 @@
  */
 
 import { execa } from 'execa';
-import type { CommandExecutor, GitHubPR, IGitHubClient } from '../types.js';
+import type { CommandExecutor, GitHubPR, IGitHubClient, MergeStrategy } from '../types.js';
 
 /**
  * GitHub CLI client implementation
@@ -129,6 +129,14 @@ export class GitHubCLIClient implements IGitHubClient {
       await this.executor('gh', ['pr', 'close', prNumber.toString(), '--comment', comment], { cwd: repoRoot });
     } catch (error: unknown) {
       throw this.enhanceError(error, `close PR #${prNumber}`);
+    }
+  }
+
+  async enableAutoMerge(repoRoot: string, prNumber: number, strategy: MergeStrategy): Promise<void> {
+    try {
+      await this.executor('gh', ['pr', 'merge', prNumber.toString(), '--auto', `--${strategy}`], { cwd: repoRoot })
+    } catch (error: unknown) {
+      throw this.enhanceError(error, `enable auto-merge on PR #${prNumber}`)
     }
   }
 

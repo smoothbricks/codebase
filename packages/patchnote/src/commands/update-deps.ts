@@ -11,7 +11,7 @@ import { executeConfigScript, findConfigFile, isConfigScript } from '../config.j
 import { createUpdateCommit, fetch, getRepoRoot, switchBranch } from '../git.js';
 import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/stacking.js';
 import { resolveSemanticPrefix } from '../semantic.js';
-import type { PackageUpdate, UpdateOptions, UpdateResult } from '../types.js';
+import type { PackageUpdate, UpdateOptions, UpdateResult, UpdateType } from '../types.js';
 import { updateBunDependencies } from '../updaters/bun.js';
 import { updateDevenv } from '../updaters/devenv.js';
 import { updateNixpkgsOverlay } from '../updaters/nixpkgs.js';
@@ -215,6 +215,77 @@ async function generateCommitData(
   };
 }
 
+const SEVERITY_LEVELS: Record<UpdateType, number> = {
+  patch: 0,
+  minor: 1,
+  major: 2,
+  unknown: 3,
+}
+
+/**
+ * Get the maximum update severity from a list of updates.
+ * Returns the most severe update type. Returns 'patch' for empty arrays.
+ */
+export function getMaxUpdateSeverity(updates: PackageUpdate[]): UpdateType {
+  if (updates.length === 0) return 'patch'
+
+  let maxLevel = 0
+  let maxType: UpdateType = 'patch'
+
+  for (const update of updates) {
+    const level = SEVERITY_LEVELS[update.updateType]
+    if (level > maxLevel) {
+      maxLevel = level
+      maxType = update.updateType
+    }
+  }
+
+  return maxType
+}
+
+/**
+ * Determine if auto-merge should be enabled for a set of updates.
+ * Returns true only if all updates are within the configured mode threshold.
+ */
+export function shouldAutoMerge(mode: 'none' | 'patch' | 'minor', updates: PackageUpdate[]): boolean {
+  if (mode === 'none') return false
+
+  const maxSeverity = getMaxUpdateSeverity(updates)
+
+  if (maxSeverity === 'unknown') return false
+
+  if (mode === 'patch') return maxSeverity === 'patch'
+  if (mode === 'minor') return maxSeverity === 'patch' || maxSeverity === 'minor'
+
+  return false
+}
+
+/**
+ * Enable auto-merge on a PR if the config and update types qualify.
+ * Failures are logged as warnings and do not throw.
+ */
+async function enableAutoMergeIfEligible(
+  config: PatchnoteConfig,
+  repoRoot: string,
+  prNumber: number,
+  allUpdates: PackageUpdate[],
+): Promise<void> {
+  if (!config.autoMerge.enabled || config.autoMerge.mode === 'none') return
+  if (!shouldAutoMerge(config.autoMerge.mode, allUpdates)) return
+
+  try {
+    const { GitHubCLIClient } = await import('../auth/github-client.js')
+    const client = new GitHubCLIClient()
+    await client.enableAutoMerge(repoRoot, prNumber, config.autoMerge.strategy)
+    config.logger?.info(`Auto-merge enabled for PR #${prNumber} (${config.autoMerge.strategy})`)
+  } catch (error) {
+    config.logger?.warn(
+      `Could not enable auto-merge for PR #${prNumber}: ${error instanceof Error ? error.message : String(error)}`,
+    )
+    config.logger?.warn('Common causes: branch protection not configured, auto-merge not enabled in repo settings')
+  }
+}
+
 /**
  * Create branch, commit, push, and PR for updates
  */
@@ -270,6 +341,10 @@ async function createPRWorkflow(
     });
 
     prSpinner.stop(`Created PR #${pr.number}`);
+
+    // Enable auto-merge if configured and update types qualify
+    await enableAutoMergeIfEligible(config, repoRoot, pr.number, allUpdates);
+
     p.note(`${pr.url}\nBase: ${stackBase}`, 'Pull Request');
   } catch (error) {
     prSpinner.stop('PR creation failed');

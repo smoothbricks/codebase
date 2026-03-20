@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
-import type { DeepPartial, ExpoProject, SupportedProvider } from './types.js';
+import type { DeepPartial, ExpoProject, MergeStrategy, SupportedProvider } from './types.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
 export interface PatchnoteConfig {
@@ -79,13 +79,16 @@ export interface PatchnoteConfig {
 
   /**
    * Auto-merge configuration
-   * TODO: Auto-merge feature not yet implemented. Configuration exists for future use.
+   * When enabled, uses `gh pr merge --auto` to let GitHub merge PRs
+   * once branch protection requirements (status checks, reviews) are met.
    */
   autoMerge: {
     /** Enable auto-merge functionality */
     enabled: boolean;
     /** Auto-merge mode: none, patch only, or minor+patch */
     mode: 'none' | 'patch' | 'minor';
+    /** Merge strategy to use (squash, rebase, or merge commit) */
+    strategy: MergeStrategy;
     /** Require all tests to pass before auto-merge */
     requireTests: boolean;
     /** Minimum test coverage percentage (future use) */
@@ -164,6 +167,7 @@ export const defaultConfig: PatchnoteConfig = {
   autoMerge: {
     enabled: false,
     mode: 'none',
+    strategy: 'squash',
     requireTests: true,
   },
   ai: {
