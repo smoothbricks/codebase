@@ -183,6 +183,23 @@ async function runAllUpdaters(
       summaryLines.push(`  ${error}`);
     }
   }
+
+  // Check npm provenance downgrades (unless disabled)
+  const provenanceMode = config.provenanceCheck?.mode ?? 'block';
+  if (provenanceMode !== 'skip') {
+    const provenanceSpinner = p.spinner();
+    provenanceSpinner.start('Checking npm provenance');
+    const { checkProvenanceDowngrades } = await import('../provenance/checker.js');
+    await checkProvenanceDowngrades(allUpdates, 5, config.logger);
+    const downgradedCount = allUpdates.filter((u) => u.provenanceDowngraded).length;
+    provenanceSpinner.stop(
+      downgradedCount > 0 ? `Provenance: ${downgradedCount} downgrade(s) detected` : 'Provenance: OK',
+    );
+    if (downgradedCount > 0) {
+      summaryLines.push(`  provenance downgrades: ${downgradedCount}`);
+    }
+  }
+
   p.note(summaryLines.join('\n'), 'Summary');
 
   return {
@@ -243,6 +260,13 @@ async function generateCommitData(
   }
 
   const { title } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs, semanticPrefix);
+
+  // Prepend provenance warnings to PR body if any downgrades detected
+  const { formatProvenanceWarnings } = await import('../provenance/formatter.js');
+  const provenanceWarning = formatProvenanceWarnings(allUpdates);
+  if (provenanceWarning) {
+    prBody = `${provenanceWarning}\n\n${prBody}`;
+  }
 
   return {
     commitTitle: title,
@@ -308,6 +332,13 @@ async function enableAutoMergeIfEligible(
 ): Promise<void> {
   if (!config.autoMerge.enabled || config.autoMerge.mode === 'none') return;
   if (!resolveAutoMerge(policies, config.autoMerge.mode, allUpdates)) return;
+
+  // Block auto-merge if any package has provenance downgrade and mode is 'block'
+  const provenanceMode = config.provenanceCheck?.mode ?? 'block';
+  if (provenanceMode === 'block' && allUpdates.some((u) => u.provenanceDowngraded)) {
+    config.logger?.warn('Auto-merge disabled: provenance downgrade detected in one or more packages');
+    return;
+  }
 
   try {
     const { GitHubCLIClient } = await import('../auth/github-client.js');
