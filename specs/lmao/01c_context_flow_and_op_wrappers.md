@@ -258,7 +258,8 @@ abstract class Tracer<T extends LogSchema> {
 **Concrete implementations** (from `packages/lmao/src/lib/tracer/`):
 
 - `TestTracer` - Accumulates root buffers in `rootBuffers` array for inspection
-- `NoOpTracer` - Legacy no-op tracer; repo policy prefers observable tracers even in tests
+- `NoOpTracer` - Supported no-op implementation; useful for API/overhead comparison, but repo policy prefers observable
+  tracers even in tests
 - `StdioTracer` - Prints colored trace output to console
 - `ArrayQueueTracer` - Batches buffers, drained via `drain()` method
 

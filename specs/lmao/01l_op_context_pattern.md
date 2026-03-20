@@ -484,12 +484,12 @@ All hooks receive the `SpanBuffer` as their argument, providing access to:
 
 ### Concrete Implementations
 
-| Tracer             | Purpose                                   | Key Features                                           |
-| ------------------ | ----------------------------------------- | ------------------------------------------------------ |
-| `TestTracer`       | Test inspection and Arrow conversion      | `rootBuffers[]`, `statsSnapshots[]`, `clear()`         |
-| `NoOpTracer`       | Legacy escape hatch (not repo-default)    | All hooks are no-ops, zero overhead                    |
-| `StdioTracer`      | Development debugging with console output | Color-coded trace IDs, indented tree output, durations |
-| `ArrayQueueTracer` | Production batching before backend send   | `queue[]`, `drain()` method for batch processing       |
+| Tracer             | Purpose                                           | Key Features                                           |
+| ------------------ | ------------------------------------------------- | ------------------------------------------------------ |
+| `TestTracer`       | Test inspection and Arrow conversion              | `rootBuffers[]`, `statsSnapshots[]`, `clear()`         |
+| `NoOpTracer`       | Supported no-op implementation (not repo-default) | All hooks are no-ops, zero overhead                    |
+| `StdioTracer`      | Development debugging with console output         | Color-coded trace IDs, indented tree output, durations |
+| `ArrayQueueTracer` | Production batching before backend send           | `queue[]`, `drain()` method for batch processing       |
 
 **TestTracer:**
 
@@ -504,10 +504,11 @@ expect(tracer.rootBuffers).toHaveLength(1);
 const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
 ```
 
-**NoOpTracer (legacy):**
+**NoOpTracer:**
 
-`NoOpTracer` still exists in `@smoothbricks/lmao`, but this repo's default policy is to use `TestTracer`,
-`ArrayQueueTracer`, or `StdioTracer` so tracing stays observable during tests and runtime debugging.
+`NoOpTracer` still exists in `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but this repo's
+default policy is to use `TestTracer`, `ArrayQueueTracer`, or `StdioTracer` so tracing stays observable during tests and
+runtime debugging.
 
 **StdioTracer:**
 
