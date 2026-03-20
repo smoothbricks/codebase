@@ -29,6 +29,8 @@ export * from './git.js';
 export * from './logger.js';
 // Export PR utilities
 export * from './pr/stacking.js';
+// Export package rules
+export * from './rules.js';
 // Export syncpack utilities
 export * from './syncpack/generator.js';
 // Export types

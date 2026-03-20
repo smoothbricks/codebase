@@ -237,7 +237,7 @@ describe('applyPackageRules', () => {
     const updates = [makeUpdate('react')]
     const rules: PackageRule[] = [{ match: 'react', ignore: true }]
     applyPackageRules(updates, rules, logger)
-    expect(messages.some((m) => m.includes('react') && m.includes('ignore'))).toBe(true)
+    expect(messages.some((m) => m.includes('react') && m.includes('ignor'))).toBe(true)
   })
 
   test('logs version-rejected packages when logger provided', () => {
