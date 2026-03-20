@@ -73,8 +73,8 @@ src/
     └── project-detection.ts    # Project setup detection (package manager, Expo, Nix, syncpack)
 
 test/                      # Mirrors src/ structure
-├── auth/                  # GitHub client tests (20 tests - COMPLETE)
-│   └── github-client.test.ts          # GitHubCLIClient unit tests (20 tests)
+├── auth/                  # GitHub client tests (25 tests - COMPLETE)
+│   └── github-client.test.ts          # GitHubCLIClient unit tests (25 tests)
 ├── git/                   # Git operation tests (86 tests - COMPLETE)
 │   ├── query-functions.test.ts        # Read-only operations (41 tests)
 │   ├── modification-functions.test.ts # State-changing operations (31 tests)
@@ -96,6 +96,8 @@ test/                      # Mirrors src/ structure
 ├── updaters/              # Updater tests (19 tests)
 │   ├── devenv.test.ts                 # Devenv (Nix) updater (10 tests)
 │   └── nixpkgs.test.ts                # Nixpkgs overlay updater (9 tests)
+├── commands/              # Command unit tests
+│   └── automerge.test.ts              # shouldAutoMerge + getMaxUpdateSeverity (18 tests)
 ├── utils/                 # Utility tests (14 tests)
 │   └── project-detection.test.ts      # Project setup detection (14 tests)
 └── helpers/
@@ -229,6 +231,7 @@ export interface IGitHubClient {
   checkPRConflicts(repoRoot: string, prNumber: number): Promise<boolean>;
   createPR(repoRoot: string, options: {...}): Promise<{number, url}>;
   closePR(repoRoot: string, prNumber: number, comment: string): Promise<void>;
+  enableAutoMerge(repoRoot: string, prNumber: number, strategy: MergeStrategy): Promise<void>;
 }
 ```
 
@@ -401,7 +404,23 @@ Located in `src/pr/stacking.ts` (274 lines, **FULLY TESTED** - 47 tests):
 - PR creation with stacking workflow (`createStackedPR`)
 - All functions accept `executor` parameter for testability
 
-### 6. Command Refactoring for Maintainability
+### 6. Auto-Merge via GitHub
+
+Auto-merge uses `gh pr merge <number> --auto --<strategy>` to enable GitHub's server-side auto-merge feature.
+
+**Key design choices:**
+
+- **GitHub-side feature:** The `--auto` flag tells GitHub to merge once branch protection requirements are met. Patchnote
+  does not poll or wait for merge completion.
+- **Non-fatal:** Auto-merge failures are logged as warnings, not errors. The PR is already created; the user can enable
+  auto-merge manually if needed.
+- **Mode-based filtering:** `shouldAutoMerge()` checks the maximum update severity against the configured mode
+  (`patch` or `minor`). Unknown update types are never auto-merged (safe default).
+- **Requires branch protection:** GitHub requires branch protection rules on the target branch for `--auto` to work.
+  Without them, the command will fail (handled gracefully).
+- **Strategy selection:** Supports `squash` (default), `rebase`, and `merge` strategies via `MergeStrategy` type.
+
+### 7. Command Refactoring for Maintainability
 
 **update-deps.ts** - Refactored from 246-line monolithic function into 5 focused functions (301 lines total):
 
@@ -811,7 +830,7 @@ interface PatchnoteConfig {
   syncpack?: { configPath: string; preserveCustomRules: boolean };
   nix?: { enabled: boolean; devenvPath: string; nixpkgsOverlayPath: string };
   prStrategy: { stackingEnabled: boolean; maxStackDepth: number; ... };
-  autoMerge: { enabled: boolean; mode: 'none' | 'patch' | 'minor'; ... };
+  autoMerge: { enabled: boolean; mode: 'none' | 'patch' | 'minor'; strategy: MergeStrategy; ... };
   ai: { provider: SupportedProvider; apiKey?: string; model?: string }; // SupportedProvider = 'zai'
   git?: { remote: string; baseBranch: string };
   repoRoot?: string;
@@ -907,13 +926,14 @@ const safePath = safeResolve(baseDir, userProvidedPath);
 
 ## Code Coverage Status
 
-### ✅ Tested (486 tests total)
+### ✅ Tested (572 tests total)
 
-- **GitHub Client** - GitHubCLIClient class (20 tests)
+- **GitHub Client** - GitHubCLIClient class (25 tests)
   - listUpdatePRs: JSON parsing, empty results, command verification, error handling (5 tests)
   - checkPRConflicts: All mergeable statuses, JSON validation, error handling (6 tests)
   - createPR: URL parsing, PR number extraction, invalid format handling (4 tests)
   - closePR: Comment inclusion, argument handling (3 tests)
+  - enableAutoMerge: Strategy flags, cwd passing, error enhancement (5 tests)
   - Constructor: Custom and default executors (2 tests)
 - **Git operations** - All 19 functions (86 tests)
 - **PR Stacking** - All 8 functions (47 tests)
@@ -987,7 +1007,6 @@ await createUpdateCommit({}, 'message');
 
 ### Planned Features
 
-- Auto-merge functionality (config exists, implementation TODO)
 - Exclude patterns for dependencies
 
 ### Known Limitations
