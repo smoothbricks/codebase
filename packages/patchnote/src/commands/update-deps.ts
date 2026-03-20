@@ -10,9 +10,10 @@ import type { PatchnoteConfig } from '../config.js';
 import { executeConfigScript, findConfigFile, isConfigScript } from '../config.js';
 import { filterUpdates } from '../filters.js';
 import { createUpdateCommit, fetch, getRepoRoot, switchBranch } from '../git.js';
+import { applyPackageRules, resolveAutoMerge } from '../rules.js';
 import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/stacking.js';
 import { resolveSemanticPrefix } from '../semantic.js';
-import type { PackageUpdate, UpdateOptions, UpdateResult, UpdateType } from '../types.js';
+import type { PackageUpdate, ResolvedPackagePolicy, UpdateOptions, UpdateResult, UpdateType } from '../types.js';
 import { updateBunDependencies } from '../updaters/bun.js';
 import { updateDevenv } from '../updaters/devenv.js';
 import { updateNixpkgsOverlay } from '../updaters/nixpkgs.js';
@@ -58,6 +59,7 @@ async function runAllUpdaters(
   allUpdates: PackageUpdate[];
   allDowngrades: PackageUpdate[];
   errors: string[];
+  policies: Map<string, ResolvedPackagePolicy>;
   results: {
     bun: UpdateResult;
     devenv: UpdateResult;
@@ -146,11 +148,21 @@ async function runAllUpdaters(
     p.log.info(`Filtered out ${filteredCount} package(s) by exclude/include rules`);
   }
 
-  // Replace arrays with filtered versions
+  // Apply package rules (per-package policies)
+  const { updates: ruledUpdates, policies } = applyPackageRules(filteredUpdates, config.packageRules, config.logger);
+  const ruledCount = filteredUpdates.length - ruledUpdates.length;
+  if (ruledCount > 0) {
+    p.log.info(`Removed ${ruledCount} package(s) by package rules (ignored/version-constrained)`);
+  }
+
+  // Also apply package rules to downgrades for consistency
+  const { updates: ruledDowngrades } = applyPackageRules(filteredDowngrades, config.packageRules, config.logger);
+
+  // Replace arrays with filtered+ruled versions
   allUpdates.length = 0;
-  allUpdates.push(...filteredUpdates);
+  allUpdates.push(...ruledUpdates);
   allDowngrades.length = 0;
-  allDowngrades.push(...filteredDowngrades);
+  allDowngrades.push(...ruledDowngrades);
 
   // Report summary using p.note()
   const summaryLines = [`Total: ${allUpdates.length} updates`, `  npm: ${bunResult.updates.length}`];
@@ -160,6 +172,9 @@ async function runAllUpdaters(
   }
   if (filteredCount > 0) {
     summaryLines.push(`  filtered: -${filteredCount}`);
+  }
+  if (ruledCount > 0) {
+    summaryLines.push(`  rules: -${ruledCount}`);
   }
   if (errors.length > 0) {
     summaryLines.push('');
@@ -174,6 +189,7 @@ async function runAllUpdaters(
     allUpdates,
     allDowngrades,
     errors,
+    policies,
     results: {
       bun: bunResult,
       devenv: devenvResult,
@@ -288,9 +304,10 @@ async function enableAutoMergeIfEligible(
   repoRoot: string,
   prNumber: number,
   allUpdates: PackageUpdate[],
+  policies: Map<string, ResolvedPackagePolicy> = new Map(),
 ): Promise<void> {
   if (!config.autoMerge.enabled || config.autoMerge.mode === 'none') return;
-  if (!shouldAutoMerge(config.autoMerge.mode, allUpdates)) return;
+  if (!resolveAutoMerge(policies, config.autoMerge.mode, allUpdates)) return;
 
   try {
     const { GitHubCLIClient } = await import('../auth/github-client.js');
@@ -315,6 +332,7 @@ async function createPRWorkflow(
   prBody: string,
   stackBase: string,
   allUpdates: PackageUpdate[],
+  policies: Map<string, ResolvedPackagePolicy> = new Map(),
   semanticPrefix?: string | null,
 ): Promise<void> {
   const branchName = generateBranchName(config);
@@ -362,7 +380,7 @@ async function createPRWorkflow(
     prSpinner.stop(`Created PR #${pr.number}`);
 
     // Enable auto-merge if configured and update types qualify
-    await enableAutoMergeIfEligible(config, repoRoot, pr.number, allUpdates);
+    await enableAutoMergeIfEligible(config, repoRoot, pr.number, allUpdates, policies);
 
     p.note(`${pr.url}\nBase: ${stackBase}`, 'Pull Request');
   } catch (error) {
@@ -404,7 +422,7 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     const { stackBase, mainBranch } = await setupBranchForStacking(config, repoRoot);
 
     // Run all updaters
-    const { allUpdates, allDowngrades } = await runAllUpdaters(config, repoRoot, options);
+    const { allUpdates, allDowngrades, policies } = await runAllUpdaters(config, repoRoot, options);
 
     // Resolve semantic prefix after updates are known (needs isDev info)
     const semanticPrefix = await resolveSemanticPrefix(config, repoRoot, allUpdates);
@@ -478,7 +496,7 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
 
     // Create PR workflow
     if (!options.skipGit) {
-      await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates, semanticPrefix);
+      await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates, policies, semanticPrefix);
     }
 
     p.outro('Dependency update complete!');

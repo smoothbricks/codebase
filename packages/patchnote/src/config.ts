@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
-import type { DeepPartial, ExpoProject, FilterConfig, MergeStrategy, SupportedProvider } from './types.js';
+import type { DeepPartial, ExpoProject, FilterConfig, MergeStrategy, PackageRule, SupportedProvider } from './types.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
 export interface PatchnoteConfig {
@@ -134,6 +134,18 @@ export interface PatchnoteConfig {
    * Exclude takes precedence over include when both match a package.
    */
   filters?: FilterConfig;
+
+  /**
+   * Per-package update rules. Evaluated in order; later rules override earlier ones.
+   * Runs after exclude/include filters for fine-grained per-package control.
+   * @example
+   * packageRules: [
+   *   { match: '@types/*', automerge: true },
+   *   { match: 'react', allowedVersions: '^18' },
+   *   { match: '*', updateTypes: ['patch'], automerge: true },
+   * ]
+   */
+  packageRules?: PackageRule[];
 
   /** Repository root path */
   repoRoot?: string;
@@ -317,6 +329,7 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
       ? { ...defaultConfig.semanticCommits, ...userConfig.semanticCommits }
       : defaultConfig.semanticCommits,
     filters: userConfig.filters ? { ...defaultConfig.filters, ...userConfig.filters } : defaultConfig.filters,
+    packageRules: userConfig.packageRules ?? defaultConfig.packageRules,
     // Logger is runtime-only, always use default logger (can be overridden later)
     logger: defaultConfig.logger,
   } as PatchnoteConfig;
