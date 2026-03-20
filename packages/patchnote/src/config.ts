@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
-import type { DeepPartial, ExpoProject, MergeStrategy, SupportedProvider } from './types.js';
+import type { DeepPartial, ExpoProject, FilterConfig, MergeStrategy, SupportedProvider } from './types.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
 export interface PatchnoteConfig {
@@ -129,6 +129,12 @@ export interface PatchnoteConfig {
     devPrefix: string;
   };
 
+  /**
+   * Dependency filtering configuration.
+   * Exclude takes precedence over include when both match a package.
+   */
+  filters?: FilterConfig;
+
   /** Repository root path */
   repoRoot?: string;
 
@@ -182,6 +188,10 @@ export const defaultConfig: PatchnoteConfig = {
     enabled: 'auto',
     prefix: 'chore(deps)',
     devPrefix: 'chore(dev-deps)',
+  },
+  filters: {
+    exclude: [],
+    include: [],
   },
   logger: new ConsoleLogger(LogLevel.INFO),
 };
@@ -306,6 +316,7 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
     semanticCommits: userConfig.semanticCommits
       ? { ...defaultConfig.semanticCommits, ...userConfig.semanticCommits }
       : defaultConfig.semanticCommits,
+    filters: userConfig.filters ? { ...defaultConfig.filters, ...userConfig.filters } : defaultConfig.filters,
     // Logger is runtime-only, always use default logger (can be overridden later)
     logger: defaultConfig.logger,
   } as PatchnoteConfig;

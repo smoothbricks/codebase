@@ -77,8 +77,20 @@ program
 program
   .command('update-deps')
   .description('Update all dependencies respecting syncpack constraints')
-  .action(async () => {
+  .option('--exclude <patterns...>', 'Exclude packages matching patterns (glob)')
+  .option('--include <patterns...>', 'Only update packages matching patterns (allowlist)')
+  .action(async (options) => {
     const config = await setupConfig();
+
+    // Merge CLI filter patterns into config
+    if (options.exclude) {
+      config.filters = config.filters || { exclude: [], include: [] }
+      config.filters.exclude = [...(config.filters.exclude || []), ...options.exclude]
+    }
+    if (options.include) {
+      config.filters = config.filters || { exclude: [], include: [] }
+      config.filters.include = [...(config.filters.include || []), ...options.include]
+    }
 
     const { updateDeps } = await import('./commands/update-deps.js');
 

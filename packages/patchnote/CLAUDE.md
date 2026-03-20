@@ -39,6 +39,7 @@ AI-powered changelog summaries.
 src/
 ├── git.ts                  # Git operations (all functions accept executor param for testing)
 ├── config.ts              # Configuration loading and defaults
+├── filters.ts             # Dependency filtering (exclude/include with micromatch globs)
 ├── logger.ts              # Logger interface and implementations (Console, Silent)
 ├── types.ts               # Shared TypeScript types
 ├── cli.ts                 # CLI entry point with commander.js
@@ -73,6 +74,7 @@ src/
     └── project-detection.ts    # Project setup detection (package manager, Expo, Nix, syncpack)
 
 test/                      # Mirrors src/ structure
+├── filters.test.ts        # Dependency filtering tests (14 tests - COMPLETE)
 ├── auth/                  # GitHub client tests (25 tests - COMPLETE)
 │   └── github-client.test.ts          # GitHubCLIClient unit tests (25 tests)
 ├── git/                   # Git operation tests (86 tests - COMPLETE)
@@ -833,6 +835,7 @@ interface PatchnoteConfig {
   autoMerge: { enabled: boolean; mode: 'none' | 'patch' | 'minor'; strategy: MergeStrategy; ... };
   ai: { provider: SupportedProvider; apiKey?: string; model?: string }; // SupportedProvider = 'zai'
   git?: { remote: string; baseBranch: string };
+  filters?: { exclude?: string[]; include?: string[] }; // Exclude takes precedence over include
   repoRoot?: string;
 }
 ```
@@ -926,8 +929,9 @@ const safePath = safeResolve(baseDir, userProvidedPath);
 
 ## Code Coverage Status
 
-### ✅ Tested (572 tests total)
+### ✅ Tested (590 tests total)
 
+- **Filters** - filterUpdates exclude/include/precedence (14 tests)
 - **GitHub Client** - GitHubCLIClient class (25 tests)
   - listUpdatePRs: JSON parsing, empty results, command verification, error handling (5 tests)
   - checkPRConflicts: All mergeable statuses, JSON validation, error handling (6 tests)
@@ -1004,10 +1008,6 @@ await createUpdateCommit({}, 'message');
 ```
 
 ## Future Development
-
-### Planned Features
-
-- Exclude patterns for dependencies
 
 ### Known Limitations
 

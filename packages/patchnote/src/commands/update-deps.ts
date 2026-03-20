@@ -8,6 +8,7 @@ import { analyzeChangelogs, generateCommitMessage } from '../changelog/analyzer.
 import { fetchChangelogs } from '../changelog/fetcher.js';
 import type { PatchnoteConfig } from '../config.js';
 import { executeConfigScript, findConfigFile, isConfigScript } from '../config.js';
+import { filterUpdates } from '../filters.js';
 import { createUpdateCommit, fetch, getRepoRoot, switchBranch } from '../git.js';
 import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/stacking.js';
 import { resolveSemanticPrefix } from '../semantic.js';
@@ -136,11 +137,29 @@ async function runAllUpdaters(
     }
   }
 
+  // Apply dependency filters (exclude/include)
+  const preFilterCount = allUpdates.length
+  const filteredUpdates = filterUpdates(allUpdates, config.filters, config.logger)
+  const filteredDowngrades = filterUpdates(allDowngrades, config.filters, config.logger)
+  const filteredCount = preFilterCount - filteredUpdates.length
+  if (filteredCount > 0) {
+    p.log.info(`Filtered out ${filteredCount} package(s) by exclude/include rules`)
+  }
+
+  // Replace arrays with filtered versions
+  allUpdates.length = 0
+  allUpdates.push(...filteredUpdates)
+  allDowngrades.length = 0
+  allDowngrades.push(...filteredDowngrades)
+
   // Report summary using p.note()
   const summaryLines = [`Total: ${allUpdates.length} updates`, `  npm: ${bunResult.updates.length}`];
   if (config.nix?.enabled) {
     summaryLines.push(`  devenv: ${devenvResult.updates.length}`);
     summaryLines.push(`  nixpkgs: ${nixpkgsResult.updates.length}`);
+  }
+  if (filteredCount > 0) {
+    summaryLines.push(`  filtered: -${filteredCount}`);
   }
   if (errors.length > 0) {
     summaryLines.push('');
