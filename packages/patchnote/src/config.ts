@@ -95,6 +95,16 @@ export interface PatchnoteConfig {
     minCoverage?: number;
   };
 
+  /** npm provenance downgrade detection */
+  provenanceCheck?: {
+    /** Behavior when provenance downgrade is detected.
+     * - 'block': Add PR warning AND block auto-merge (default)
+     * - 'warn': Add PR warning only, do not block auto-merge
+     * - 'skip': Disable provenance checking entirely
+     */
+    mode: 'block' | 'warn' | 'skip';
+  };
+
   /** AI-powered changelog analysis */
   ai: {
     /** AI provider for changelog analysis */
@@ -187,6 +197,9 @@ export const defaultConfig: PatchnoteConfig = {
     mode: 'none',
     strategy: 'squash',
     requireTests: true,
+  },
+  provenanceCheck: {
+    mode: 'block',
   },
   ai: {
     provider: 'zai',
@@ -323,6 +336,9 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
     nix: userConfig.nix ? { ...defaultConfig.nix, ...userConfig.nix } : defaultConfig.nix,
     prStrategy: { ...defaultConfig.prStrategy, ...(userConfig.prStrategy || {}) },
     autoMerge: { ...defaultConfig.autoMerge, ...(userConfig.autoMerge || {}) },
+    provenanceCheck: userConfig.provenanceCheck
+      ? { ...defaultConfig.provenanceCheck, ...userConfig.provenanceCheck }
+      : defaultConfig.provenanceCheck,
     ai: { ...defaultConfig.ai, ...(userConfig.ai || {}) },
     git: userConfig.git ? { ...defaultConfig.git, ...userConfig.git } : defaultConfig.git,
     semanticCommits: userConfig.semanticCommits

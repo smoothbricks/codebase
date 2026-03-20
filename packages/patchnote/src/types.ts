@@ -64,6 +64,8 @@ export interface PackageUpdate {
   breakingChanges?: string[];
   /** Whether this is a dev dependency */
   isDev?: boolean;
+  /** Whether provenance was downgraded (had -> lost) */
+  provenanceDowngraded?: boolean;
 }
 
 /**
