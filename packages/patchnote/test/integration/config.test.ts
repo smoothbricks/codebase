@@ -341,30 +341,30 @@ describe('Config Integration - Realistic Scenarios', () => {
 
 describe('Config Integration - Filter Config Merging', () => {
   test('mergeConfig with no filters uses defaults (empty arrays)', () => {
-    const merged = mergeConfig({})
-    expect(merged.filters).toEqual({ exclude: [], include: [] })
-  })
+    const merged = mergeConfig({});
+    expect(merged.filters).toEqual({ exclude: [], include: [] });
+  });
 
   test('mergeConfig with exclude only keeps default include', () => {
-    const merged = mergeConfig({ filters: { exclude: ['react'] } })
-    expect(merged.filters?.exclude).toEqual(['react'])
-    expect(merged.filters?.include).toEqual([])
-  })
+    const merged = mergeConfig({ filters: { exclude: ['react'] } });
+    expect(merged.filters?.exclude).toEqual(['react']);
+    expect(merged.filters?.include).toEqual([]);
+  });
 
   test('mergeConfig with include only keeps default exclude', () => {
-    const merged = mergeConfig({ filters: { include: ['vite'] } })
-    expect(merged.filters?.include).toEqual(['vite'])
-    expect(merged.filters?.exclude).toEqual([])
-  })
+    const merged = mergeConfig({ filters: { include: ['vite'] } });
+    expect(merged.filters?.include).toEqual(['vite']);
+    expect(merged.filters?.exclude).toEqual([]);
+  });
 
   test('mergeConfig with both exclude and include preserves both', () => {
     const merged = mergeConfig({
       filters: { exclude: ['react', '@types/*'], include: ['vite', 'vitest'] },
-    })
-    expect(merged.filters?.exclude).toEqual(['react', '@types/*'])
-    expect(merged.filters?.include).toEqual(['vite', 'vitest'])
-  })
-})
+    });
+    expect(merged.filters?.exclude).toEqual(['react', '@types/*']);
+    expect(merged.filters?.include).toEqual(['vite', 'vitest']);
+  });
+});
 
 describe('Config Integration - sanitizeConfigForLogging', () => {
   test('should redact API key', () => {

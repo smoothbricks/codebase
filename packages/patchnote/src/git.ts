@@ -220,7 +220,7 @@ export async function getRecentCommitMessages(
   branch?: string,
   executor: CommandExecutor = defaultExecutor,
 ): Promise<string[]> {
-  const args = ['log', '--format=%s', `-n`, `${count}`];
+  const args = ['log', '--format=%s', '-n', `${count}`];
   if (branch) {
     args.push(branch);
   }
@@ -229,9 +229,7 @@ export async function getRecentCommitMessages(
     cwd: repoRoot,
   });
 
-  return stdout
-    .split('\n')
-    .filter((line: string) => line.trim().length > 0);
+  return stdout.split('\n').filter((line: string) => line.trim().length > 0);
 }
 
 /**

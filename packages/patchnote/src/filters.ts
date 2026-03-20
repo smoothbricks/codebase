@@ -1,6 +1,6 @@
-import micromatch from 'micromatch'
-import type { Logger } from './logger.js'
-import type { FilterConfig, PackageUpdate } from './types.js'
+import micromatch from 'micromatch';
+import type { Logger } from './logger.js';
+import type { FilterConfig, PackageUpdate } from './types.js';
 
 /**
  * Filter package updates based on exclude/include patterns.
@@ -13,19 +13,19 @@ export function filterUpdates(
   filters: FilterConfig | undefined,
   logger?: Logger,
 ): PackageUpdate[] {
-  if (!filters) return updates
-  const { exclude = [], include = [] } = filters
-  if (exclude.length === 0 && include.length === 0) return updates
+  if (!filters) return updates;
+  const { exclude = [], include = [] } = filters;
+  if (exclude.length === 0 && include.length === 0) return updates;
 
   return updates.filter((update) => {
     if (exclude.length > 0 && micromatch.isMatch(update.name, exclude)) {
-      logger?.info(`Filtered out (excluded): ${update.name}`)
-      return false
+      logger?.info(`Filtered out (excluded): ${update.name}`);
+      return false;
     }
     if (include.length > 0 && !micromatch.isMatch(update.name, include)) {
-      logger?.info(`Filtered out (not in include list): ${update.name}`)
-      return false
+      logger?.info(`Filtered out (not in include list): ${update.name}`);
+      return false;
     }
-    return true
-  })
+    return true;
+  });
 }

@@ -138,19 +138,19 @@ async function runAllUpdaters(
   }
 
   // Apply dependency filters (exclude/include)
-  const preFilterCount = allUpdates.length
-  const filteredUpdates = filterUpdates(allUpdates, config.filters, config.logger)
-  const filteredDowngrades = filterUpdates(allDowngrades, config.filters, config.logger)
-  const filteredCount = preFilterCount - filteredUpdates.length
+  const preFilterCount = allUpdates.length;
+  const filteredUpdates = filterUpdates(allUpdates, config.filters, config.logger);
+  const filteredDowngrades = filterUpdates(allDowngrades, config.filters, config.logger);
+  const filteredCount = preFilterCount - filteredUpdates.length;
   if (filteredCount > 0) {
-    p.log.info(`Filtered out ${filteredCount} package(s) by exclude/include rules`)
+    p.log.info(`Filtered out ${filteredCount} package(s) by exclude/include rules`);
   }
 
   // Replace arrays with filtered versions
-  allUpdates.length = 0
-  allUpdates.push(...filteredUpdates)
-  allDowngrades.length = 0
-  allDowngrades.push(...filteredDowngrades)
+  allUpdates.length = 0;
+  allUpdates.push(...filteredUpdates);
+  allDowngrades.length = 0;
+  allDowngrades.push(...filteredDowngrades);
 
   // Report summary using p.note()
   const summaryLines = [`Total: ${allUpdates.length} updates`, `  npm: ${bunResult.updates.length}`];
@@ -239,27 +239,27 @@ const SEVERITY_LEVELS: Record<UpdateType, number> = {
   minor: 1,
   major: 2,
   unknown: 3,
-}
+};
 
 /**
  * Get the maximum update severity from a list of updates.
  * Returns the most severe update type. Returns 'patch' for empty arrays.
  */
 export function getMaxUpdateSeverity(updates: PackageUpdate[]): UpdateType {
-  if (updates.length === 0) return 'patch'
+  if (updates.length === 0) return 'patch';
 
-  let maxLevel = 0
-  let maxType: UpdateType = 'patch'
+  let maxLevel = 0;
+  let maxType: UpdateType = 'patch';
 
   for (const update of updates) {
-    const level = SEVERITY_LEVELS[update.updateType]
+    const level = SEVERITY_LEVELS[update.updateType];
     if (level > maxLevel) {
-      maxLevel = level
-      maxType = update.updateType
+      maxLevel = level;
+      maxType = update.updateType;
     }
   }
 
-  return maxType
+  return maxType;
 }
 
 /**
@@ -267,16 +267,16 @@ export function getMaxUpdateSeverity(updates: PackageUpdate[]): UpdateType {
  * Returns true only if all updates are within the configured mode threshold.
  */
 export function shouldAutoMerge(mode: 'none' | 'patch' | 'minor', updates: PackageUpdate[]): boolean {
-  if (mode === 'none') return false
+  if (mode === 'none') return false;
 
-  const maxSeverity = getMaxUpdateSeverity(updates)
+  const maxSeverity = getMaxUpdateSeverity(updates);
 
-  if (maxSeverity === 'unknown') return false
+  if (maxSeverity === 'unknown') return false;
 
-  if (mode === 'patch') return maxSeverity === 'patch'
-  if (mode === 'minor') return maxSeverity === 'patch' || maxSeverity === 'minor'
+  if (mode === 'patch') return maxSeverity === 'patch';
+  if (mode === 'minor') return maxSeverity === 'patch' || maxSeverity === 'minor';
 
-  return false
+  return false;
 }
 
 /**
@@ -289,19 +289,19 @@ async function enableAutoMergeIfEligible(
   prNumber: number,
   allUpdates: PackageUpdate[],
 ): Promise<void> {
-  if (!config.autoMerge.enabled || config.autoMerge.mode === 'none') return
-  if (!shouldAutoMerge(config.autoMerge.mode, allUpdates)) return
+  if (!config.autoMerge.enabled || config.autoMerge.mode === 'none') return;
+  if (!shouldAutoMerge(config.autoMerge.mode, allUpdates)) return;
 
   try {
-    const { GitHubCLIClient } = await import('../auth/github-client.js')
-    const client = new GitHubCLIClient()
-    await client.enableAutoMerge(repoRoot, prNumber, config.autoMerge.strategy)
-    config.logger?.info(`Auto-merge enabled for PR #${prNumber} (${config.autoMerge.strategy})`)
+    const { GitHubCLIClient } = await import('../auth/github-client.js');
+    const client = new GitHubCLIClient();
+    await client.enableAutoMerge(repoRoot, prNumber, config.autoMerge.strategy);
+    config.logger?.info(`Auto-merge enabled for PR #${prNumber} (${config.autoMerge.strategy})`);
   } catch (error) {
     config.logger?.warn(
       `Could not enable auto-merge for PR #${prNumber}: ${error instanceof Error ? error.message : String(error)}`,
-    )
-    config.logger?.warn('Common causes: branch protection not configured, auto-merge not enabled in repo settings')
+    );
+    config.logger?.warn('Common causes: branch protection not configured, auto-merge not enabled in repo settings');
   }
 }
 
@@ -452,7 +452,13 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     // Dry run exit - show what would be created
     if (options.dryRun) {
       const branchName = generateBranchName(config);
-      const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades, semanticPrefix);
+      const { commitTitle, prBody } = await generateCommitData(
+        allUpdates,
+        config,
+        options,
+        allDowngrades,
+        semanticPrefix,
+      );
 
       const dryRunInfo = [`Branch: ${branchName}`, `Commit: ${commitTitle}`, `PR base: ${stackBase}`].join('\n');
       p.note(dryRunInfo, 'Dry Run - Would Create');
@@ -462,7 +468,13 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     }
 
     // Generate commit data
-    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades, semanticPrefix);
+    const { commitTitle, prBody } = await generateCommitData(
+      allUpdates,
+      config,
+      options,
+      allDowngrades,
+      semanticPrefix,
+    );
 
     // Create PR workflow
     if (!options.skipGit) {

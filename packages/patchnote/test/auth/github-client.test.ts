@@ -418,59 +418,59 @@ describe('GitHubCLIClient', () => {
     test('should call gh pr merge with --auto and --squash for squash strategy', async () => {
       const spy = createExecaSpy({
         'gh pr merge 42 --auto --squash': '',
-      })
+      });
 
-      const client = new GitHubCLIClient(spy.mock)
-      await client.enableAutoMerge('/repo', 42, 'squash')
+      const client = new GitHubCLIClient(spy.mock);
+      await client.enableAutoMerge('/repo', 42, 'squash');
 
-      expect(spy.calls).toHaveLength(1)
-      expect(spy.calls[0]?.[0]).toBe('gh')
-      expect(spy.calls[0]?.[1]).toEqual(['pr', 'merge', '42', '--auto', '--squash'])
-    })
+      expect(spy.calls).toHaveLength(1);
+      expect(spy.calls[0]?.[0]).toBe('gh');
+      expect(spy.calls[0]?.[1]).toEqual(['pr', 'merge', '42', '--auto', '--squash']);
+    });
 
     test('should call gh pr merge with --auto and --rebase for rebase strategy', async () => {
       const spy = createExecaSpy({
         'gh pr merge 99 --auto --rebase': '',
-      })
+      });
 
-      const client = new GitHubCLIClient(spy.mock)
-      await client.enableAutoMerge('/repo', 99, 'rebase')
+      const client = new GitHubCLIClient(spy.mock);
+      await client.enableAutoMerge('/repo', 99, 'rebase');
 
-      expect(spy.calls).toHaveLength(1)
-      expect(spy.calls[0]?.[1]).toEqual(['pr', 'merge', '99', '--auto', '--rebase'])
-    })
+      expect(spy.calls).toHaveLength(1);
+      expect(spy.calls[0]?.[1]).toEqual(['pr', 'merge', '99', '--auto', '--rebase']);
+    });
 
     test('should call gh pr merge with --auto and --merge for merge strategy', async () => {
       const spy = createExecaSpy({
         'gh pr merge 7 --auto --merge': '',
-      })
+      });
 
-      const client = new GitHubCLIClient(spy.mock)
-      await client.enableAutoMerge('/repo', 7, 'merge')
+      const client = new GitHubCLIClient(spy.mock);
+      await client.enableAutoMerge('/repo', 7, 'merge');
 
-      expect(spy.calls).toHaveLength(1)
-      expect(spy.calls[0]?.[1]).toEqual(['pr', 'merge', '7', '--auto', '--merge'])
-    })
+      expect(spy.calls).toHaveLength(1);
+      expect(spy.calls[0]?.[1]).toEqual(['pr', 'merge', '7', '--auto', '--merge']);
+    });
 
     test('should use correct cwd', async () => {
       const spy = createExecaSpy({
         'gh pr merge 10 --auto --squash': '',
-      })
+      });
 
-      const client = new GitHubCLIClient(spy.mock)
-      await client.enableAutoMerge('/my/custom/repo', 10, 'squash')
+      const client = new GitHubCLIClient(spy.mock);
+      await client.enableAutoMerge('/my/custom/repo', 10, 'squash');
 
-      expect(spy.calls[0]?.[2]).toEqual({ cwd: '/my/custom/repo' })
-    })
+      expect(spy.calls[0]?.[2]).toEqual({ cwd: '/my/custom/repo' });
+    });
 
     test('should throw enhanced error on failure', async () => {
-      const mockExeca = createErrorExeca('Something went wrong')
+      const mockExeca = createErrorExeca('Something went wrong');
 
-      const client = new GitHubCLIClient(mockExeca)
+      const client = new GitHubCLIClient(mockExeca);
 
-      await expect(client.enableAutoMerge('/repo', 42, 'squash')).rejects.toThrow('enable auto-merge on PR #42')
-    })
-  })
+      await expect(client.enableAutoMerge('/repo', 42, 'squash')).rejects.toThrow('enable auto-merge on PR #42');
+    });
+  });
 
   describe('constructor', () => {
     test('should use provided executor', async () => {

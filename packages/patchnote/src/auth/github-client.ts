@@ -134,9 +134,9 @@ export class GitHubCLIClient implements IGitHubClient {
 
   async enableAutoMerge(repoRoot: string, prNumber: number, strategy: MergeStrategy): Promise<void> {
     try {
-      await this.executor('gh', ['pr', 'merge', prNumber.toString(), '--auto', `--${strategy}`], { cwd: repoRoot })
+      await this.executor('gh', ['pr', 'merge', prNumber.toString(), '--auto', `--${strategy}`], { cwd: repoRoot });
     } catch (error: unknown) {
-      throw this.enhanceError(error, `enable auto-merge on PR #${prNumber}`)
+      throw this.enhanceError(error, `enable auto-merge on PR #${prNumber}`);
     }
   }
 

@@ -6,16 +6,17 @@
  * commit messages and PR titles.
  */
 
-import type { PatchnoteConfig } from './config.js'
-import { defaultConfig } from './config.js'
-import { getRecentCommitMessages } from './git.js'
-import type { CommandExecutor, PackageUpdate } from './types.js'
+import type { PatchnoteConfig } from './config.js';
+import { defaultConfig } from './config.js';
+import { getRecentCommitMessages } from './git.js';
+import type { CommandExecutor, PackageUpdate } from './types.js';
 
 /**
  * Regex matching conventional commit format
  * Matches: type[(scope)][!]: description
  */
-export const CONVENTIONAL_COMMIT_REGEX = /^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)(\(.+\))?!?:\s/
+export const CONVENTIONAL_COMMIT_REGEX =
+  /^(feat|fix|chore|docs|style|refactor|perf|test|build|ci|revert)(\(.+\))?!?:\s/;
 
 /**
  * Detect whether commit messages follow conventional commit format
@@ -24,10 +25,10 @@ export const CONVENTIONAL_COMMIT_REGEX = /^(feat|fix|chore|docs|style|refactor|p
  * @returns true if strictly more than 50% match conventional format
  */
 export function detectSemanticCommits(commitMessages: string[]): boolean {
-  if (commitMessages.length === 0) return false
+  if (commitMessages.length === 0) return false;
 
-  const conventionalCount = commitMessages.filter((msg) => CONVENTIONAL_COMMIT_REGEX.test(msg)).length
-  return conventionalCount / commitMessages.length > 0.5
+  const conventionalCount = commitMessages.filter((msg) => CONVENTIONAL_COMMIT_REGEX.test(msg)).length;
+  return conventionalCount / commitMessages.length > 0.5;
 }
 
 /**
@@ -45,32 +46,32 @@ export async function resolveSemanticPrefix(
   updates: PackageUpdate[],
   executor?: CommandExecutor,
 ): Promise<string | null> {
-  const semanticConfig = config.semanticCommits ?? defaultConfig.semanticCommits!
-  const { enabled, prefix, devPrefix } = semanticConfig
+  const semanticConfig = config.semanticCommits ?? defaultConfig.semanticCommits!;
+  const { enabled, prefix, devPrefix } = semanticConfig;
 
   // Explicitly disabled
   if (enabled === false) {
-    return null
+    return null;
   }
 
   // Auto-detect from repository history
   if (enabled === 'auto') {
-    const baseBranch = config.git?.baseBranch ?? 'main'
-    const args: [string, number, string | undefined] = [repoRoot, 10, baseBranch]
+    const baseBranch = config.git?.baseBranch ?? 'main';
+    const args: [string, number, string | undefined] = [repoRoot, 10, baseBranch];
     const messages = executor
       ? await getRecentCommitMessages(...args, executor)
-      : await getRecentCommitMessages(...args)
+      : await getRecentCommitMessages(...args);
 
     if (!detectSemanticCommits(messages)) {
-      return null
+      return null;
     }
   }
 
   // Determine dev vs prod prefix
   // Use devPrefix only when ALL updates are dev dependencies
   if (updates.length > 0 && updates.every((u) => u.isDev === true)) {
-    return devPrefix
+    return devPrefix;
   }
 
-  return prefix
+  return prefix;
 }

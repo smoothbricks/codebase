@@ -84,12 +84,12 @@ program
 
     // Merge CLI filter patterns into config
     if (options.exclude) {
-      config.filters = config.filters || { exclude: [], include: [] }
-      config.filters.exclude = [...(config.filters.exclude || []), ...options.exclude]
+      config.filters = config.filters || { exclude: [], include: [] };
+      config.filters.exclude = [...(config.filters.exclude || []), ...options.exclude];
     }
     if (options.include) {
-      config.filters = config.filters || { exclude: [], include: [] }
-      config.filters.include = [...(config.filters.include || []), ...options.include]
+      config.filters = config.filters || { exclude: [], include: [] };
+      config.filters.include = [...(config.filters.include || []), ...options.include];
     }
 
     const { updateDeps } = await import('./commands/update-deps.js');

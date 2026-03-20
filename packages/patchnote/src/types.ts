@@ -300,9 +300,9 @@ export interface IGitHubClient {
 /** Dependency filtering configuration */
 export interface FilterConfig {
   /** Exclude packages matching these patterns (glob, exact name). Takes precedence over include. */
-  exclude?: string[]
+  exclude?: string[];
   /** Only update packages matching these patterns (allowlist mode). If empty/undefined, all packages are included. */
-  include?: string[]
+  include?: string[];
 }
 
 /**
