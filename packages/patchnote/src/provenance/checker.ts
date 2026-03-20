@@ -9,8 +9,8 @@
  * (packages that never had provenance are not flagged).
  */
 
-import type { Logger } from '../logger.js'
-import type { PackageUpdate } from '../types.js'
+import type { Logger } from '../logger.js';
+import type { PackageUpdate } from '../types.js';
 
 /**
  * Check if a specific package version has npm provenance attestation.
@@ -24,21 +24,21 @@ import type { PackageUpdate } from '../types.js'
  */
 export async function getProvenanceStatus(packageName: string, version: string): Promise<boolean> {
   try {
-    const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}/${version}`
-    const response = await fetch(url)
-    if (!response.ok) return false
+    const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}/${version}`;
+    const response = await fetch(url);
+    if (!response.ok) return false;
 
     const data = (await response.json()) as {
       dist?: {
         attestations?: {
-          provenance?: { predicateType: string }
-        }
-      }
-    }
+          provenance?: { predicateType: string };
+        };
+      };
+    };
 
-    return !!data.dist?.attestations?.provenance
+    return !!data.dist?.attestations?.provenance;
   } catch {
-    return false // Fail open: treat fetch errors as "unknown" (not a downgrade)
+    return false; // Fail open: treat fetch errors as "unknown" (not a downgrade)
   }
 }
 
@@ -62,25 +62,25 @@ export async function checkProvenanceDowngrades(
   logger?: Logger,
 ): Promise<void> {
   // Only check npm packages
-  const npmUpdates = updates.filter((u) => u.ecosystem === 'npm')
-  if (npmUpdates.length === 0) return
+  const npmUpdates = updates.filter((u) => u.ecosystem === 'npm');
+  if (npmUpdates.length === 0) return;
 
   // Process in batches
   for (let i = 0; i < npmUpdates.length; i += maxConcurrent) {
-    const batch = npmUpdates.slice(i, i + maxConcurrent)
+    const batch = npmUpdates.slice(i, i + maxConcurrent);
     await Promise.all(
       batch.map(async (update) => {
         // Check current version first (short-circuit optimization)
-        const currentHasProvenance = await getProvenanceStatus(update.name, update.fromVersion)
-        if (!currentHasProvenance) return // No downgrade possible
+        const currentHasProvenance = await getProvenanceStatus(update.name, update.fromVersion);
+        if (!currentHasProvenance) return; // No downgrade possible
 
         // Current has provenance -- check if target also has it
-        const targetHasProvenance = await getProvenanceStatus(update.name, update.toVersion)
+        const targetHasProvenance = await getProvenanceStatus(update.name, update.toVersion);
         if (!targetHasProvenance) {
-          update.provenanceDowngraded = true
-          logger?.warn(`Provenance downgrade detected: ${update.name} ${update.fromVersion} -> ${update.toVersion}`)
+          update.provenanceDowngraded = true;
+          logger?.warn(`Provenance downgrade detected: ${update.name} ${update.fromVersion} -> ${update.toVersion}`);
         }
       }),
-    )
+    );
   }
 }
