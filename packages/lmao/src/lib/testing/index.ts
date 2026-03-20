@@ -133,3 +133,9 @@ export type {
   SyncSQLiteDatabase,
   SyncSQLiteStatement,
 } from '../sqlite/sqlite-db.js';
+
+// =============================================================================
+// TEST HARNESS WIRING
+// =============================================================================
+
+export { makeBunTestSuiteTracer, type TestTracer as BunHarnessTestTracer } from './bun-harness.js';
