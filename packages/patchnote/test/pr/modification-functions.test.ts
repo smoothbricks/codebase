@@ -174,12 +174,17 @@ describe('createPR with metadata pass-through', () => {
       ai: { provider: 'zai' },
     };
 
-    await createPR(config, '/repo', {
-      title: 'Test PR',
-      body: 'body',
-      baseBranch: 'main',
-      headBranch: 'feature',
-    }, spy.mock);
+    await createPR(
+      config,
+      '/repo',
+      {
+        title: 'Test PR',
+        body: 'body',
+        baseBranch: 'main',
+        headBranch: 'feature',
+      },
+      spy.mock,
+    );
 
     const args = spy.calls[0]![1]!;
     expect(args).toContain('--label');
@@ -204,12 +209,17 @@ describe('createPR with metadata pass-through', () => {
       ai: { provider: 'zai' },
     };
 
-    await createPR(config, '/repo', {
-      title: 'Test PR',
-      body: 'body',
-      baseBranch: 'main',
-      headBranch: 'feature',
-    }, spy.mock);
+    await createPR(
+      config,
+      '/repo',
+      {
+        title: 'Test PR',
+        body: 'body',
+        baseBranch: 'main',
+        headBranch: 'feature',
+      },
+      spy.mock,
+    );
 
     const args = spy.calls[0]![1]!;
     expect(args).toContain('--draft');
@@ -231,12 +241,17 @@ describe('createPR with metadata pass-through', () => {
       ai: { provider: 'zai' },
     };
 
-    await createPR(config, '/repo', {
-      title: 'Test PR',
-      body: 'body',
-      baseBranch: 'main',
-      headBranch: 'feature',
-    }, spy.mock);
+    await createPR(
+      config,
+      '/repo',
+      {
+        title: 'Test PR',
+        body: 'body',
+        baseBranch: 'main',
+        headBranch: 'feature',
+      },
+      spy.mock,
+    );
 
     const args = spy.calls[0]![1]!;
     expect(args).not.toContain('--label');

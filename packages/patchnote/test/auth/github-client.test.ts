@@ -267,7 +267,7 @@ describe('GitHubCLIClient', () => {
       const args = spy.calls[0]![1]!;
       expect(args).toContain('--label');
       // Check labels appear in order
-      const labelIndices = args.reduce<number[]>((acc, arg, i) => (arg === '--label' ? [...acc, i] : acc), []);
+      const labelIndices = args.flatMap((arg, i) => (arg === '--label' ? [i] : []));
       expect(labelIndices).toHaveLength(2);
       expect(args[labelIndices[0]! + 1]).toBe('deps');
       expect(args[labelIndices[1]! + 1]).toBe('automated');
@@ -302,7 +302,7 @@ describe('GitHubCLIClient', () => {
       });
 
       const args = spy.calls[0]![1]!;
-      const reviewerIndices = args.reduce<number[]>((acc, arg, i) => (arg === '--reviewer' ? [...acc, i] : acc), []);
+      const reviewerIndices = args.flatMap((arg, i) => (arg === '--reviewer' ? [i] : []));
       expect(reviewerIndices).toHaveLength(2);
       expect(args[reviewerIndices[0]! + 1]).toBe('bob');
       expect(args[reviewerIndices[1]! + 1]).toBe('carol');
@@ -357,7 +357,16 @@ describe('GitHubCLIClient', () => {
       const args = spy.calls[0]![1]!;
       // Base args come first
       expect(args.slice(0, 10)).toEqual([
-        'pr', 'create', '--title', 'Test', '--body', 'Body', '--base', 'main', '--head', 'feature',
+        'pr',
+        'create',
+        '--title',
+        'Test',
+        '--body',
+        'Body',
+        '--base',
+        'main',
+        '--head',
+        'feature',
       ]);
       // Metadata flags after base args
       const metadataArgs = args.slice(10);

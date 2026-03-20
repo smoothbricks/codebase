@@ -62,14 +62,14 @@ export class GitHubCLIClient implements IGitHubClient {
   async createPR(
     repoRoot: string,
     options: {
-      title: string
-      body: string
-      head: string
-      base: string
-      labels?: string[]
-      assignees?: string[]
-      reviewers?: string[]
-      draft?: boolean
+      title: string;
+      body: string;
+      head: string;
+      base: string;
+      labels?: string[];
+      assignees?: string[];
+      reviewers?: string[];
+      draft?: boolean;
     },
   ): Promise<{ number: number; url: string }> {
     try {
