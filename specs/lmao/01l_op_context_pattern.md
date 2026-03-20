@@ -487,7 +487,7 @@ All hooks receive the `SpanBuffer` as their argument, providing access to:
 | Tracer             | Purpose                                   | Key Features                                           |
 | ------------------ | ----------------------------------------- | ------------------------------------------------------ |
 | `TestTracer`       | Test inspection and Arrow conversion      | `rootBuffers[]`, `statsSnapshots[]`, `clear()`         |
-| `NoOpTracer`       | Disable tracing / performance baseline    | All hooks are no-ops, zero overhead                    |
+| `NoOpTracer`       | Legacy escape hatch (not repo-default)    | All hooks are no-ops, zero overhead                    |
 | `StdioTracer`      | Development debugging with console output | Color-coded trace IDs, indented tree output, durations |
 | `ArrayQueueTracer` | Production batching before backend send   | `queue[]`, `drain()` method for batch processing       |
 
@@ -504,14 +504,10 @@ expect(tracer.rootBuffers).toHaveLength(1);
 const table = convertSpanTreeToArrowTable(tracer.rootBuffers[0]);
 ```
 
-**NoOpTracer:**
+**NoOpTracer (legacy):**
 
-Executes ops normally but discards all trace data. Useful for tests that don't need output or for disabling tracing.
-
-```typescript
-const { trace } = new NoOpTracer(opContext);
-await trace('fetch', fetchOp); // Executes, no side effects
-```
+`NoOpTracer` still exists in `@smoothbricks/lmao`, but this repo's default policy is to use `TestTracer`,
+`ArrayQueueTracer`, or `StdioTracer` so tracing stays observable during tests and runtime debugging.
 
 **StdioTracer:**
 
