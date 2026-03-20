@@ -46,6 +46,7 @@
       },
       "typecheck": {
         "dependsOn": [
+          "build",
           "^typecheck"
         ]
       }
