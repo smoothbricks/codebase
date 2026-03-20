@@ -297,6 +297,14 @@ export interface IGitHubClient {
   enableAutoMerge(repoRoot: string, prNumber: number, strategy: MergeStrategy): Promise<void>;
 }
 
+/** Dependency filtering configuration */
+export interface FilterConfig {
+  /** Exclude packages matching these patterns (glob, exact name). Takes precedence over include. */
+  exclude?: string[]
+  /** Only update packages matching these patterns (allowlist mode). If empty/undefined, all packages are included. */
+  include?: string[]
+}
+
 /**
  * Options for generate-syncpack command
  */
