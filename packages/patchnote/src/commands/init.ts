@@ -46,6 +46,11 @@ function generateJSONConfig(options: {
       provider: 'zai',
       model: 'glm-5-turbo',
     },
+    semanticCommits: {
+      enabled: 'auto',
+      prefix: 'chore(deps)',
+      devPrefix: 'chore(dev-deps)',
+    },
   };
 
   return `${JSON.stringify(config, null, 2)}\n`;
@@ -86,6 +91,11 @@ export default defineConfig({
   ai: {
     provider: 'zai',
     model: 'glm-5-turbo',
+  },
+  semanticCommits: {
+    enabled: 'auto',
+    prefix: 'chore(deps)',
+    devPrefix: 'chore(dev-deps)',
   },
 });
 `;

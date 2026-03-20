@@ -187,6 +187,70 @@ describe('Changelog Analyzer', () => {
       // Should still generate valid output
       expect(body).toContain('Total updates: 1');
     });
+
+    test('uses semantic prefix in title when provided', async () => {
+      const updates: PackageUpdate[] = [
+        {
+          name: 'vite',
+          fromVersion: '7.2.0',
+          toVersion: '7.2.1',
+          updateType: 'patch',
+          ecosystem: 'npm',
+        },
+      ];
+
+      const { title } = await generateCommitMessage(updates, mockConfig, [], undefined, 'chore(deps)');
+
+      expect(title).toBe('chore(deps): update dependencies');
+    });
+
+    test('uses semantic prefix with breaking changes', async () => {
+      const updates: PackageUpdate[] = [
+        {
+          name: 'react',
+          fromVersion: '19.1.0',
+          toVersion: '20.0.0',
+          updateType: 'major',
+          ecosystem: 'npm',
+        },
+      ];
+
+      const { title } = await generateCommitMessage(updates, mockConfig, [], undefined, 'chore(deps)');
+
+      expect(title).toBe('chore(deps): update dependencies (includes breaking changes)');
+    });
+
+    test('uses default chore prefix when semantic prefix is null', async () => {
+      const updates: PackageUpdate[] = [
+        {
+          name: 'vite',
+          fromVersion: '7.2.0',
+          toVersion: '7.2.1',
+          updateType: 'patch',
+          ecosystem: 'npm',
+        },
+      ];
+
+      const { title } = await generateCommitMessage(updates, mockConfig, [], undefined, null);
+
+      expect(title).toBe('chore: update dependencies');
+    });
+
+    test('uses default chore prefix when semantic prefix is undefined', async () => {
+      const updates: PackageUpdate[] = [
+        {
+          name: 'vite',
+          fromVersion: '7.2.0',
+          toVersion: '7.2.1',
+          updateType: 'patch',
+          ecosystem: 'npm',
+        },
+      ];
+
+      const { title } = await generateCommitMessage(updates, mockConfig);
+
+      expect(title).toBe('chore: update dependencies');
+    });
   });
 
   describe('analyzeChangelogs', () => {

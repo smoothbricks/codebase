@@ -10,6 +10,7 @@ import type { PatchnoteConfig } from '../config.js';
 import { executeConfigScript, findConfigFile, isConfigScript } from '../config.js';
 import { createUpdateCommit, fetch, getRepoRoot, switchBranch } from '../git.js';
 import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/stacking.js';
+import { resolveSemanticPrefix } from '../semantic.js';
 import type { PackageUpdate, UpdateOptions, UpdateResult } from '../types.js';
 import { updateBunDependencies } from '../updaters/bun.js';
 import { updateDevenv } from '../updaters/devenv.js';
@@ -171,11 +172,13 @@ async function generateCommitData(
   config: PatchnoteConfig,
   options: UpdateOptions,
   allDowngrades: PackageUpdate[] = [],
+  semanticPrefix?: string | null,
 ): Promise<{ commitTitle: string; prBody: string }> {
   if (allUpdates.length === 0) {
     // Lock file only update
+    const lockFileTitle = semanticPrefix ? `${semanticPrefix}: update lock file` : 'chore: update lock file';
     return {
-      commitTitle: 'chore: update lock file',
+      commitTitle: lockFileTitle,
       prBody: 'Updated lock file to resolve dependencies within existing semver ranges.',
     };
   }
@@ -195,7 +198,7 @@ async function generateCommitData(
   let prBody: string;
 
   if (options.skipAI || changelogs.size === 0) {
-    const { body } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs);
+    const { body } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs, semanticPrefix);
     prBody = body;
   } else {
     const aiSpinner = p.spinner();
@@ -204,7 +207,7 @@ async function generateCommitData(
     aiSpinner.stop('AI analysis complete');
   }
 
-  const { title } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs);
+  const { title } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs, semanticPrefix);
 
   return {
     commitTitle: title,
@@ -222,6 +225,7 @@ async function createPRWorkflow(
   prBody: string,
   stackBase: string,
   allUpdates: PackageUpdate[],
+  semanticPrefix?: string | null,
 ): Promise<void> {
   const branchName = generateBranchName(config);
   const remote = config.git?.remote || 'origin';
@@ -250,7 +254,7 @@ async function createPRWorkflow(
   const prSpinner = p.spinner();
   prSpinner.start('Creating pull request');
   const hasBreaking = allUpdates.some((u) => u.updateType === 'major');
-  const prTitle = generatePRTitle(config, hasBreaking);
+  const prTitle = generatePRTitle(config, hasBreaking, semanticPrefix);
 
   try {
     const { autoCloseOldPRs, createPR } = await import('../pr/stacking.js');
@@ -308,6 +312,9 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     // Run all updaters
     const { allUpdates, allDowngrades } = await runAllUpdaters(config, repoRoot, options);
 
+    // Resolve semantic prefix after updates are known (needs isDev info)
+    const semanticPrefix = await resolveSemanticPrefix(config, repoRoot, allUpdates);
+
     // Check if there are any uncommitted changes (including lock files)
     const { isWorkingDirectoryClean } = await import('../git.js');
     const isClean = await isWorkingDirectoryClean(repoRoot);
@@ -330,9 +337,10 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
           const lockSpinner = p.spinner();
           lockSpinner.start('Committing lock file updates to existing PR branch');
           // Commit lock file changes to existing PR branch
+          const lockFileTitle = semanticPrefix ? `${semanticPrefix}: update lock file` : 'chore: update lock file';
           await createUpdateCommit(
             config,
-            'chore: update lock file',
+            lockFileTitle,
             'Updated lock file to resolve dependencies within existing semver ranges.',
           );
 
@@ -350,7 +358,7 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     // Dry run exit - show what would be created
     if (options.dryRun) {
       const branchName = generateBranchName(config);
-      const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
+      const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades, semanticPrefix);
 
       const dryRunInfo = [`Branch: ${branchName}`, `Commit: ${commitTitle}`, `PR base: ${stackBase}`].join('\n');
       p.note(dryRunInfo, 'Dry Run - Would Create');
@@ -360,11 +368,11 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     }
 
     // Generate commit data
-    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades);
+    const { commitTitle, prBody } = await generateCommitData(allUpdates, config, options, allDowngrades, semanticPrefix);
 
     // Create PR workflow
     if (!options.skipGit) {
-      await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates);
+      await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates, semanticPrefix);
     }
 
     p.outro('Dependency update complete!');

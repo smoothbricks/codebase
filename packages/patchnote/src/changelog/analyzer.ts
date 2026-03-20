@@ -394,12 +394,15 @@ export async function generateCommitMessage(
   _config: PatchnoteConfig,
   downgrades: PackageUpdate[] = [],
   changelogs?: Map<string, string>,
+  semanticPrefix?: string | null,
 ): Promise<{ title: string; body: string }> {
   const ecosystems = [...new Set(updates.map((u) => u.ecosystem))];
   const hasBreaking = updates.some((u) => u.updateType === 'major');
 
-  // Simple commit message without AI for now
-  const title = hasBreaking ? 'chore: update dependencies (includes breaking changes)' : 'chore: update dependencies';
+  // Use semantic prefix if provided, otherwise fall back to default 'chore'
+  const titlePrefix = semanticPrefix ?? 'chore';
+  const breakingSuffix = hasBreaking ? ' (includes breaking changes)' : '';
+  const title = `${titlePrefix}: update dependencies${breakingSuffix}`;
 
   const body = `Updated ${updates.length} packages across ${ecosystems.join(', ')} ecosystems.
 

@@ -244,9 +244,22 @@ export function generateBranchName(config: PatchnoteConfig, date?: Date): string
 
 /**
  * Generate PR title
+ *
+ * If a semanticPrefix is provided and the user has NOT customized prTitlePrefix
+ * (i.e., it's still at the default value), the semantic prefix will be used
+ * for the PR title. If the user has customized prTitlePrefix, their value is respected.
  */
-export function generatePRTitle(config: PatchnoteConfig, hasBreaking = false): string {
+export function generatePRTitle(config: PatchnoteConfig, hasBreaking = false, semanticPrefix?: string | null): string {
   const { prStrategy } = config;
+
+  // Only apply semantic prefix if prTitlePrefix is at its default value
+  const DEFAULT_PR_TITLE_PREFIX = 'chore: update dependencies';
+  const useSemanticForPR = semanticPrefix && prStrategy.prTitlePrefix === DEFAULT_PR_TITLE_PREFIX;
+
+  if (useSemanticForPR) {
+    const breakingSuffix = hasBreaking ? ' (includes breaking changes)' : '';
+    return `${semanticPrefix}: update dependencies${breakingSuffix}`;
+  }
 
   if (hasBreaking) {
     return `${prStrategy.prTitlePrefix} (includes breaking changes)`;
