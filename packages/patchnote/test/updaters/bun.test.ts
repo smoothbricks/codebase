@@ -1,5 +1,5 @@
-import { describe, expect, test } from 'bun:test';
-import { parseBunUpdateOutput, parsePackageJsonDiff } from '../../src/updaters/bun.js';
+import { describe, expect, test } from 'bun:test'
+import { parseBunOutdated, parseBunUpdateOutput, parsePackageJsonDiff } from '../../src/updaters/bun.js'
 
 describe('Bun Updater', () => {
   describe('parsePackageJsonDiff', () => {
@@ -17,7 +17,8 @@ describe('Bun Updater', () => {
         toVersion: '7.2.2',
         updateType: 'minor',
         ecosystem: 'npm',
-      });
+        isDev: false,
+      })
     });
 
     test('parses multiple package changes', () => {
@@ -105,7 +106,8 @@ describe('Bun Updater', () => {
         toVersion: '2.3.5',
         updateType: 'patch',
         ecosystem: 'npm',
-      });
+        isDev: false,
+      })
     });
 
     test('parses multiple package updates', () => {
@@ -189,11 +191,132 @@ Checked 2057 installs across 2251 packages (no changes)`;
     });
 
     test('handles add symbol for new packages', () => {
-      const output = '+ lodash 4.17.21 → 4.17.21';
-      const updates = parseBunUpdateOutput(output);
+      const output = '+ lodash 4.17.21 → 4.17.21'
+      const updates = parseBunUpdateOutput(output)
 
-      expect(updates).toHaveLength(1);
-      expect(updates[0].name).toBe('lodash');
-    });
-  });
-});
+      expect(updates).toHaveLength(1)
+      expect(updates[0].name).toBe('lodash')
+    })
+
+    test('sets isDev to false for all entries (unknown from stdout)', () => {
+      const output = '↑ vite 7.2.0 → 7.2.2'
+      const updates = parseBunUpdateOutput(output)
+
+      expect(updates).toHaveLength(1)
+      expect(updates[0].isDev).toBe(false)
+    })
+  })
+
+  describe('parseBunOutdated', () => {
+    test('parses basic outdated output', () => {
+      const output = `| Package | Current | Update | Latest |
+|---------|---------|--------|--------|
+| axios   | 1.6.0   | 1.7.0  | 1.7.0  |`
+
+      const updates = parseBunOutdated(output)
+
+      expect(updates).toHaveLength(1)
+      expect(updates[0].name).toBe('axios')
+      expect(updates[0].fromVersion).toBe('1.6.0')
+      expect(updates[0].toVersion).toBe('1.7.0')
+    })
+
+    test('sets isDev=true for packages with (dev) suffix', () => {
+      const output = `| Package | Current | Update | Latest |
+|---------|---------|--------|--------|
+| vitest (dev) | 1.0.0 | 2.0.0 | 2.0.0 |`
+
+      const updates = parseBunOutdated(output)
+
+      expect(updates).toHaveLength(1)
+      expect(updates[0].name).toBe('vitest')
+      expect(updates[0].isDev).toBe(true)
+    })
+
+    test('sets isDev=false for packages without (dev) suffix', () => {
+      const output = `| Package | Current | Update | Latest |
+|---------|---------|--------|--------|
+| react   | 18.0.0  | 19.0.0 | 19.0.0 |`
+
+      const updates = parseBunOutdated(output)
+
+      expect(updates).toHaveLength(1)
+      expect(updates[0].name).toBe('react')
+      expect(updates[0].isDev).toBe(false)
+    })
+
+    test('correctly sets isDev for mixed packages', () => {
+      const output = `| Package | Current | Update | Latest |
+|---------|---------|--------|--------|
+| react   | 18.0.0  | 19.0.0 | 19.0.0 |
+| vitest (dev) | 1.0.0 | 2.0.0 | 2.0.0 |
+| lodash  | 4.17.20 | 4.17.21 | 4.17.21 |`
+
+      const updates = parseBunOutdated(output)
+
+      expect(updates).toHaveLength(3)
+      expect(updates[0].isDev).toBe(false)
+      expect(updates[1].isDev).toBe(true)
+      expect(updates[2].isDev).toBe(false)
+    })
+  })
+
+  describe('parsePackageJsonDiff isDev tracking', () => {
+    test('sets isDev=false for dependencies section', () => {
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -10,3 +10,3 @@
+   "dependencies": {
+-    "react": "^18.0.0",
++    "react": "^19.0.0",
+   },`
+
+      const updates = parsePackageJsonDiff(diff)
+
+      expect(updates).toHaveLength(1)
+      expect(updates[0].name).toBe('react')
+      expect(updates[0].isDev).toBe(false)
+    })
+
+    test('sets isDev=true for devDependencies section', () => {
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -10,3 +10,3 @@
+   "devDependencies": {
+-    "vitest": "^1.0.0",
++    "vitest": "^2.0.0",
+   },`
+
+      const updates = parsePackageJsonDiff(diff)
+
+      expect(updates).toHaveLength(1)
+      expect(updates[0].name).toBe('vitest')
+      expect(updates[0].isDev).toBe(true)
+    })
+
+    test('tracks section transitions correctly', () => {
+      const diff = `diff --git a/package.json b/package.json
+--- a/package.json
++++ b/package.json
+@@ -10,6 +10,6 @@
+   "dependencies": {
+-    "react": "^18.0.0",
++    "react": "^19.0.0",
+   },
+   "devDependencies": {
+-    "vitest": "^1.0.0",
++    "vitest": "^2.0.0",
+   },`
+
+      const updates = parsePackageJsonDiff(diff)
+
+      expect(updates).toHaveLength(2)
+      const react = updates.find(u => u.name === 'react')
+      const vitest = updates.find(u => u.name === 'vitest')
+      expect(react?.isDev).toBe(false)
+      expect(vitest?.isDev).toBe(true)
+    })
+  })
+})

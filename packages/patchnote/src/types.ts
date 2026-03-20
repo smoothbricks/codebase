@@ -57,6 +57,8 @@ export interface PackageUpdate {
   changelogUrl?: string;
   /** Breaking changes detected */
   breakingChanges?: string[];
+  /** Whether this is a dev dependency */
+  isDev?: boolean;
 }
 
 /**

@@ -206,6 +206,35 @@ export async function deleteRemoteBranch(
 }
 
 /**
+ * Get recent commit messages (subject lines) from git log
+ *
+ * @param repoRoot - Repository root directory
+ * @param count - Number of commits to retrieve
+ * @param branch - Optional branch to read from (defaults to HEAD)
+ * @param executor - Command executor for testing
+ * @returns Array of commit subject lines
+ */
+export async function getRecentCommitMessages(
+  repoRoot: string,
+  count: number,
+  branch?: string,
+  executor: CommandExecutor = defaultExecutor,
+): Promise<string[]> {
+  const args = ['log', '--format=%s', `-n`, `${count}`];
+  if (branch) {
+    args.push(branch);
+  }
+
+  const { stdout } = await executor('git', args, {
+    cwd: repoRoot,
+  });
+
+  return stdout
+    .split('\n')
+    .filter((line: string) => line.trim().length > 0);
+}
+
+/**
  * Get the last commit message
  */
 export async function getLastCommitMessage(

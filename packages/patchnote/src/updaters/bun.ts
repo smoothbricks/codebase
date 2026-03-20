@@ -33,7 +33,8 @@ export function parseBunOutdated(output: string): PackageUpdate[] {
     if (parts.length < 4) continue;
 
     const [nameWithDev, current, update] = parts;
-    // Remove "(dev)" suffix if present
+    // Detect and remove "(dev)" suffix
+    const isDev = /\s*\(dev\)\s*$/.test(nameWithDev);
     const name = nameWithDev.replace(/\s*\(dev\)\s*$/, '');
 
     // Only include if there's an actual update (current !== update)
@@ -44,6 +45,7 @@ export function parseBunOutdated(output: string): PackageUpdate[] {
         toVersion: update,
         updateType: classifyUpdateType(current, update),
         ecosystem: 'npm',
+        isDev,
       });
     }
   }
@@ -65,35 +67,50 @@ export function parsePackageJsonDiff(diff: string): PackageUpdate[] {
   // Pattern: "package-name": "version"
   const versionPattern = /^\s*[+-]\s*"(@?[^"]+)":\s*"([~^]?[\d.]+(?:-[\w.]+)?)"/;
 
-  // Collect all removals and additions
-  const removals = new Map<string, string>();
-  const additions = new Map<string, string>();
+  // Section header pattern to detect dependencies vs devDependencies
+  const sectionPattern = /^\s*[+-]?\s*"(dependencies|devDependencies)":/;
+
+  // Track current section and isDev status per package
+  let currentSection: 'dependencies' | 'devDependencies' | null = null;
+
+  // Collect all removals and additions with their section info
+  const removals = new Map<string, { version: string; isDev: boolean }>();
+  const additions = new Map<string, { version: string; isDev: boolean }>();
 
   for (const line of lines) {
+    // Check for section headers
+    const sectionMatch = line.match(sectionPattern);
+    if (sectionMatch) {
+      currentSection = sectionMatch[1] as 'dependencies' | 'devDependencies';
+      continue;
+    }
+
     const match = line.match(versionPattern);
     if (!match) continue;
 
     const [, packageName, version] = match;
     const cleanVersion = version.replace(/^[~^]/, ''); // Strip semver prefix
+    const isDev = currentSection === 'devDependencies';
 
     if (line.trim()[0] === '-') {
-      removals.set(packageName, cleanVersion);
+      removals.set(packageName, { version: cleanVersion, isDev });
     } else if (line.trim()[0] === '+') {
-      additions.set(packageName, cleanVersion);
+      additions.set(packageName, { version: cleanVersion, isDev });
     }
   }
 
   // Match removals with additions
-  for (const [packageName, fromVersion] of removals) {
-    const toVersion = additions.get(packageName);
+  for (const [packageName, removal] of removals) {
+    const addition = additions.get(packageName);
 
-    if (toVersion && fromVersion !== toVersion) {
+    if (addition && removal.version !== addition.version) {
       updates.push({
         name: packageName,
-        fromVersion,
-        toVersion,
-        updateType: classifyUpdateType(fromVersion, toVersion),
+        fromVersion: removal.version,
+        toVersion: addition.version,
+        updateType: classifyUpdateType(removal.version, addition.version),
         ecosystem: 'npm',
+        isDev: addition.isDev,
       });
     }
   }
@@ -127,6 +144,7 @@ export function parseBunUpdateOutput(output: string): PackageUpdate[] {
       toVersion,
       updateType: classifyUpdateType(fromVersion, toVersion),
       ecosystem: 'npm',
+      isDev: false,
     });
   }
 

@@ -116,6 +116,16 @@ export interface PatchnoteConfig {
     baseBranch: string;
   };
 
+  /** Semantic commit message configuration */
+  semanticCommits?: {
+    /** Enable semantic commit prefixes: true, false, or 'auto' (detect from repo history) */
+    enabled: boolean | 'auto';
+    /** Commit type for production dependency updates (default: 'chore(deps)') */
+    prefix: string;
+    /** Commit type for dev dependency updates (default: 'chore(dev-deps)') */
+    devPrefix: string;
+  };
+
   /** Repository root path */
   repoRoot?: string;
 
@@ -163,6 +173,11 @@ export const defaultConfig: PatchnoteConfig = {
   git: {
     remote: 'origin',
     baseBranch: 'main',
+  },
+  semanticCommits: {
+    enabled: 'auto',
+    prefix: 'chore(deps)',
+    devPrefix: 'chore(dev-deps)',
   },
   logger: new ConsoleLogger(LogLevel.INFO),
 };
@@ -284,6 +299,9 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
     autoMerge: { ...defaultConfig.autoMerge, ...(userConfig.autoMerge || {}) },
     ai: { ...defaultConfig.ai, ...(userConfig.ai || {}) },
     git: userConfig.git ? { ...defaultConfig.git, ...userConfig.git } : defaultConfig.git,
+    semanticCommits: userConfig.semanticCommits
+      ? { ...defaultConfig.semanticCommits, ...userConfig.semanticCommits }
+      : defaultConfig.semanticCommits,
     // Logger is runtime-only, always use default logger (can be overridden later)
     logger: defaultConfig.logger,
   } as PatchnoteConfig;
