@@ -8,10 +8,10 @@
  * Rules are evaluated in order with last-match-wins override semantics.
  */
 
-import micromatch from 'micromatch'
-import type { Logger } from './logger.js'
-import type { DepType, PackageRule, PackageUpdate, ResolvedPackagePolicy } from './types.js'
-import { shouldAutoMerge } from './commands/update-deps.js'
+import micromatch from 'micromatch';
+import { shouldAutoMerge } from './commands/update-deps.js';
+import type { Logger } from './logger.js';
+import type { DepType, PackageRule, PackageUpdate, ResolvedPackagePolicy } from './types.js';
 
 /**
  * Test whether a package name matches a single pattern.
@@ -23,14 +23,14 @@ export function matchesPattern(packageName: string, pattern: string): boolean {
   // Detect regex: starts and ends with `/` and has length > 2
   if (pattern.length > 2 && pattern.startsWith('/') && pattern.endsWith('/')) {
     try {
-      const re = new RegExp(pattern.slice(1, -1))
-      return re.test(packageName)
+      const re = new RegExp(pattern.slice(1, -1));
+      return re.test(packageName);
     } catch {
-      return false
+      return false;
     }
   }
 
-  return micromatch.isMatch(packageName, pattern)
+  return micromatch.isMatch(packageName, pattern);
 }
 
 /**
@@ -41,22 +41,22 @@ export function matchesPattern(packageName: string, pattern: string): boolean {
  */
 function matchesRule(update: PackageUpdate, rule: PackageRule): boolean {
   // Check match patterns
-  const patterns = Array.isArray(rule.match) ? rule.match : [rule.match]
-  const nameMatch = patterns.some((p) => matchesPattern(update.name, p))
-  if (!nameMatch) return false
+  const patterns = Array.isArray(rule.match) ? rule.match : [rule.match];
+  const nameMatch = patterns.some((p) => matchesPattern(update.name, p));
+  if (!nameMatch) return false;
 
   // Check updateTypes constraint
   if (rule.updateTypes && rule.updateTypes.length > 0) {
-    if (!rule.updateTypes.includes(update.updateType)) return false
+    if (!rule.updateTypes.includes(update.updateType)) return false;
   }
 
   // Check depTypes constraint
   if (rule.depTypes && rule.depTypes.length > 0) {
-    const depType: DepType = update.isDev ? 'devDependencies' : 'dependencies'
-    if (!rule.depTypes.includes(depType)) return false
+    const depType: DepType = update.isDev ? 'devDependencies' : 'dependencies';
+    if (!rule.depTypes.includes(depType)) return false;
   }
 
-  return true
+  return true;
 }
 
 /**
@@ -65,19 +65,19 @@ function matchesRule(update: PackageUpdate, rule: PackageRule): boolean {
  * Only explicitly defined fields are merged; undefined fields are skipped.
  */
 export function resolvePolicy(update: PackageUpdate, rules: PackageRule[]): ResolvedPackagePolicy {
-  const policy: ResolvedPackagePolicy = {}
+  const policy: ResolvedPackagePolicy = {};
 
   for (const rule of rules) {
-    if (!matchesRule(update, rule)) continue
+    if (!matchesRule(update, rule)) continue;
 
-    if (rule.automerge !== undefined) policy.automerge = rule.automerge
-    if (rule.pin !== undefined) policy.pin = rule.pin
-    if (rule.ignore !== undefined) policy.ignore = rule.ignore
-    if (rule.group !== undefined) policy.group = rule.group
-    if (rule.allowedVersions !== undefined) policy.allowedVersions = rule.allowedVersions
+    if (rule.automerge !== undefined) policy.automerge = rule.automerge;
+    if (rule.pin !== undefined) policy.pin = rule.pin;
+    if (rule.ignore !== undefined) policy.ignore = rule.ignore;
+    if (rule.group !== undefined) policy.group = rule.group;
+    if (rule.allowedVersions !== undefined) policy.allowedVersions = rule.allowedVersions;
   }
 
-  return policy
+  return policy;
 }
 
 /**
@@ -96,28 +96,28 @@ export function applyPackageRules(
   logger?: Logger,
 ): { updates: PackageUpdate[]; policies: Map<string, ResolvedPackagePolicy> } {
   if (!rules || rules.length === 0) {
-    return { updates, policies: new Map() }
+    return { updates, policies: new Map() };
   }
 
-  const policies = new Map<string, ResolvedPackagePolicy>()
-  const filtered: PackageUpdate[] = []
+  const policies = new Map<string, ResolvedPackagePolicy>();
+  const filtered: PackageUpdate[] = [];
 
   for (const update of updates) {
-    const policy = resolvePolicy(update, rules)
-    policies.set(update.name, policy)
+    const policy = resolvePolicy(update, rules);
+    policies.set(update.name, policy);
 
     // Handle ignore action
     if (policy.ignore) {
-      logger?.info(`Package rule: ignoring ${update.name}`)
-      continue
+      logger?.info(`Package rule: ignoring ${update.name}`);
+      continue;
     }
 
     // Handle pin action: compute allowedVersions from fromVersion
     if (policy.pin) {
-      const parts = update.fromVersion.split('.')
-      const major = parts[0] ?? '0'
-      const minor = parts[1] ?? '0'
-      policy.allowedVersions = `~${major}.${minor}`
+      const parts = update.fromVersion.split('.');
+      const major = parts[0] ?? '0';
+      const minor = parts[1] ?? '0';
+      policy.allowedVersions = `~${major}.${minor}`;
     }
 
     // Handle allowedVersions action
@@ -125,15 +125,15 @@ export function applyPackageRules(
       if (!Bun.semver.satisfies(update.toVersion, policy.allowedVersions)) {
         logger?.info(
           `Package rule: version ${update.toVersion} of ${update.name} does not satisfy ${policy.allowedVersions}`,
-        )
-        continue
+        );
+        continue;
       }
     }
 
-    filtered.push(update)
+    filtered.push(update);
   }
 
-  return { updates: filtered, policies }
+  return { updates: filtered, policies };
 }
 
 /**
@@ -150,32 +150,32 @@ export function resolveAutoMerge(
   updates: PackageUpdate[],
 ): boolean {
   // Collect all policies that explicitly set automerge
-  const explicitPolicies: boolean[] = []
+  const explicitPolicies: boolean[] = [];
   for (const [, policy] of policies) {
     if (policy.automerge !== undefined) {
-      explicitPolicies.push(policy.automerge)
+      explicitPolicies.push(policy.automerge);
     }
   }
 
   // No policies explicitly set automerge => fall back to global
   if (explicitPolicies.length === 0) {
-    return shouldAutoMerge(globalMode, updates)
+    return shouldAutoMerge(globalMode, updates);
   }
 
   // Any explicit false => false
   if (explicitPolicies.some((v) => v === false)) {
-    return false
+    return false;
   }
 
   // All explicit values are true
   if (explicitPolicies.every((v) => v === true)) {
     // If all policies have automerge explicitly set (same count as total policies), override global
     if (explicitPolicies.length === policies.size) {
-      return true
+      return true;
     }
     // Mixed: some explicit true, some without => fall back to global
-    return shouldAutoMerge(globalMode, updates)
+    return shouldAutoMerge(globalMode, updates);
   }
 
-  return shouldAutoMerge(globalMode, updates)
+  return shouldAutoMerge(globalMode, updates);
 }
