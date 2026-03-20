@@ -312,3 +312,63 @@ export interface GenerateSyncpackOptions extends UpdateOptions {
   /** Target Expo SDK version */
   expoSdkVersion?: string;
 }
+
+/**
+ * Dependency section type for package rule constraints.
+ * Used to limit rules to specific dependency categories.
+ */
+export type DepType = 'dependencies' | 'devDependencies' | 'peerDependencies';
+
+/**
+ * Per-package update rule for fine-grained control over dependency updates.
+ * Rules are evaluated in order with last-match-wins override semantics.
+ *
+ * @example
+ * ```typescript
+ * // Auto-merge all @types/* packages
+ * { match: '@types/*', automerge: true }
+ *
+ * // Pin React to 18.x
+ * { match: 'react', allowedVersions: '^18' }
+ *
+ * // Ignore a specific package
+ * { match: 'legacy-pkg', ignore: true }
+ *
+ * // Auto-merge patch updates for all packages
+ * { match: '*', updateTypes: ['patch'], automerge: true }
+ *
+ * // Later rules override earlier ones for matching packages:
+ * // [{ match: '*', automerge: true }, { match: 'react', automerge: false }]
+ * // => react gets automerge: false, everything else gets automerge: true
+ * ```
+ */
+export interface PackageRule {
+  /** Pattern(s) to match package names. Supports exact names, globs, brace expansion, and `/regex/` patterns. */
+  match: string | string[];
+  /** Limit this rule to specific update severity levels. */
+  updateTypes?: UpdateType[];
+  /** Limit this rule to specific dependency section types. */
+  depTypes?: DepType[];
+  /** Override the global autoMerge setting for matched packages. */
+  automerge?: boolean;
+  /** Pin matched packages to their current major.minor range (~major.minor). */
+  pin?: boolean;
+  /** Remove matched packages from the update list entirely. */
+  ignore?: boolean;
+  /** Group name for batching matched packages into the same PR (stored in policy, no filtering effect). */
+  group?: string;
+  /** Semver range constraint -- reject updates whose toVersion does not satisfy this range. */
+  allowedVersions?: string;
+}
+
+/**
+ * Resolved policy for a single package after evaluating all matching rules.
+ * Fields are only present if explicitly set by at least one matching rule.
+ */
+export interface ResolvedPackagePolicy {
+  automerge?: boolean;
+  pin?: boolean;
+  ignore?: boolean;
+  group?: string;
+  allowedVersions?: string;
+}
