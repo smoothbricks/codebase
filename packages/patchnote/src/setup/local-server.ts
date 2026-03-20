@@ -19,6 +19,8 @@ interface CallbackServerResult {
   waitForCode: () => Promise<string>
   /** Manually close the server */
   close: () => void
+  /** Update the manifest page HTML (useful when port is needed to build the manifest) */
+  setManifestPage: (html: string) => void
 }
 
 const DEFAULT_TIMEOUT_MS = 300_000 // 5 minutes
@@ -38,6 +40,7 @@ export function startCallbackServer(options: CallbackServerOptions): Promise<Cal
     let resolveCode: (code: string) => void
     let rejectCode: (error: Error) => void
     let settled = false
+    let currentManifestPage = options.manifestPage
 
     const codePromise = new Promise<string>((resolve, reject) => {
       resolveCode = resolve
@@ -65,7 +68,7 @@ export function startCallbackServer(options: CallbackServerOptions): Promise<Cal
 
       if (pathname === '/' && req.method === 'GET') {
         res.writeHead(200, { 'Content-Type': 'text/html' })
-        res.end(options.manifestPage)
+        res.end(currentManifestPage)
         return
       }
 
@@ -111,6 +114,9 @@ export function startCallbackServer(options: CallbackServerOptions): Promise<Cal
           return codePromise
         },
         close: cleanup,
+        setManifestPage: (html: string) => {
+          currentManifestPage = html
+        },
       })
     })
   })

@@ -174,5 +174,29 @@ program
     process.exit(exitCode);
   });
 
+/**
+ * Command: setup
+ * Setup patchnote GitHub App authentication via manifest flow
+ */
+program
+  .command('setup')
+  .description('Setup patchnote GitHub App authentication')
+  .option('--create-app', 'Create a new GitHub App via manifest flow')
+  .option('--org <org>', 'GitHub organization name')
+  .action(async (options) => {
+    if (!options.createApp) {
+      console.error('Please specify --create-app to create a new GitHub App');
+      console.error('Usage: patchnote setup --create-app [--org <org>]');
+      process.exit(1);
+    }
+    const config = await setupConfig();
+    const { setup } = await import('./commands/setup.js');
+    await setup(config, {
+      ...getUpdateOptions(),
+      createApp: options.createApp,
+      org: options.org,
+    });
+  });
+
 // Parse arguments and run
 program.parse(process.argv);
