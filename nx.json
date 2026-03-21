@@ -42,7 +42,13 @@
     },
     "build:zig": {
       "cache": true,
-      "inputs": ["default", { "dependentTasksOutputFiles": "**/*.wasm", "transitive": true }],
+      "inputs": [
+        "default",
+        {
+          "dependentTasksOutputFiles": "**/*.wasm",
+          "transitive": true
+        }
+      ],
       "outputs": [
         "{projectRoot}/dist/**/*.wasm",
         "{projectRoot}/dist/**/*.node",
