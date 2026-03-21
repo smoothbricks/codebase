@@ -5,6 +5,12 @@ export function assertDefined<T>(value: T | null | undefined, message?: string):
   }
 }
 
+/** Return a defined value or throw with message on failure. */
+export function expectDefined<T>(value: T | null | undefined, message?: string): T {
+  assertDefined(value, message);
+  return value;
+}
+
 /** Assert value is a Record. Throws with message on failure. */
 export function assertRecord(value: unknown, message?: string): asserts value is Record<string, unknown> {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {

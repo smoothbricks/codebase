@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { assertDefined, assertNever, assertRecord } from '../assert.js';
+import { assertDefined, assertNever, assertRecord, expectDefined } from '../assert.js';
 
 // ---------------------------------------------------------------------------
 // assertDefined
@@ -28,11 +28,10 @@ describe('assertDefined', () => {
     expect(() => assertDefined(null, 'User must exist')).toThrow('User must exist');
   });
 
-  it('narrows the type after assertion', () => {
+  it('returns the defined value with a narrowed type', () => {
     const value: string | null | undefined = 'hello';
-    assertDefined(value);
-    // If the assertion didn't narrow, this line would be a type error
-    const _check: string = value;
+    const narrowed = expectDefined(value);
+    const _check: string = narrowed;
     expect(_check).toBe('hello');
   });
 });

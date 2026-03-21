@@ -24,7 +24,7 @@
  * @packageDocumentation
  */
 
-export { assertDefined, assertNever, assertRecord } from './assert.js';
+export { assertDefined, assertNever, assertRecord, expectDefined } from './assert.js';
 export {
   hasOwn,
   hasOwnBigInt,
