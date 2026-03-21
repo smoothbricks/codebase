@@ -5,6 +5,10 @@
  * No runtime overhead -- branding is purely a TypeScript construct.
  */
 
+// Inline Brand to avoid circular dependencies.
+// Phantom brand pattern for compile-time safety.
+declare const __brand: unique symbol;
+type Brand<T, B> = T & { readonly [__brand]: B };
 
 /** Bigint microseconds since epoch -- canonical timestamp */
 export type EpochMicros = Brand<bigint, 'EpochMicros'>;
