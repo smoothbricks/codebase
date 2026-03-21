@@ -16,12 +16,10 @@ sink (local `.trace-results.db` or worker D1 binding like `TRACE_RESULTS`). Keep
 move runner-specific behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`,
 `@smoothbricks/lmao/testing/vitest`) plus package-local typed tracer modules.
 
-**Tracing policy — NoOpTracer should not exist in this codebase:** `NoOpTracer` violates our
-test tracing policy (tests MUST flush to SQLite). Do NOT use NoOpTracer anywhere:
-
-- **Production code**: Use real tracers. If code needs a tracer, require spanContext from caller
-- **Tests**: Use `TestTracer` or the test suite tracer harness that flushes to SQLite
-- **If you see NoOpTracer**: It's legacy debt to fix, not a pattern to follow
+**Tracing policy — No default `NoOpTracer`:** `createAxeNoOpTracer()` is banned/removed.
+`NoOpTracer` may still exist in `@smoothbricks/lmao` for API proof, comparison, and overhead
+benchmarking, but it is not the normal repo pattern. Require tracing context from callers,
+use child spans, and use observable suite/test tracers in tests.
 
 If code creates a throwaway tracer to satisfy a `spanContext` parameter, the API is wrong — fix it by:
 

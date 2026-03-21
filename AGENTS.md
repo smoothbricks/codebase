@@ -25,8 +25,9 @@
 
 - **Known operational failures return `Err`/`Result`.** `throw` is only for invariants, impossible states, or programmer
   bugs.
-- **No `NoOpTracer`.** `NoOpTracer` should not appear in this repo. Require tracing context from callers, use child
-  spans, and use suite/test tracers in tests.
+- **No default `NoOpTracer`.** `createAxeNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
+  `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
+  Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
 - **Lint before tests.** Use `nx lint <project>` before `bun test` or `nx test <project>`.
 - **Nx cache is not flaky; config is.** If a task only passes with `--skip-nx-cache`, fix the target's inputs, outputs,
   dependency graph, or task wiring so cached and uncached runs agree.
@@ -219,13 +220,15 @@ This repo uses a strict policy:
  `span-err`: expected operational error represented via `ctx.err(...)` / `Err`.
  `span-exception`: unexpected thrown exception (bug/invariant break).
 
-### NoOpTracer should not exist — proper tracing policy
+### NoOpTracer policy
 
-**`NoOpTracer` should NOT be used anywhere in this codebase.**
+**`createAxeNoOpTracer()` is banned/removed, and `NoOpTracer` is not an approved default wiring pattern in this
+codebase.**
 
- **Production code**: Requires real tracing. If code seems to need it, the tracing API/call graph is wrong
- **Tests**: MUST use `TestTracer` or suite tracer that flushes to SQLite (per test tracing policy)
- **If you see NoOpTracer anywhere**: It's legacy debt to remove, not a pattern to follow
+ **Production code**: Requires real tracing. If code needs a spanContext, require it from the caller
+ **Tests**: MUST use `TestTracer` or suite tracer that flushes to SQLite (per CLAUDE.md test tracing policy)
+- **Benchmarking / comparison**: `NoOpTracer` may still exist in `@smoothbricks/lmao` for API proof or overhead
+  measurement, but ordinary app/test wiring in this repo should not use it as the default pattern
 
 **Red flags that indicate broken design:**
 
@@ -727,8 +730,9 @@ Unified enum for ALL trace events:
 
 ## Tracer Usage Pattern
 
-`Tracer` is an **abstract base class** with 5 lifecycle hooks. Use concrete implementations. `NoOpTracer` is banned in
-this repo; require real tracing in production and suite/test tracers in tests.
+`Tracer` is an **abstract base class** with 5 lifecycle hooks. Use concrete implementations. `NoOpTracer` may exist for
+API/benchmark comparison, but this repo's normal runtime/test wiring should use real tracing in production and
+suite/test tracers in tests.
 
 ```typescript
 import { TestTracer, StdioTracer, ArrayQueueTracer } from '@smoothbricks/lmao';
@@ -777,7 +781,8 @@ await trace('my-op', { trace_id: incomingTraceId, env: myEnv }, myOp);
 **Key Points:**
 
  **Tracer is abstract** - use `TestTracer`, `StdioTracer`, or `ArrayQueueTracer` here
- **Do not use `NoOpTracer`** - if code seems to need it, the tracing API/call graph is wrong
+ **Do not default to `NoOpTracer` in repo code** - if ordinary code seems to need it, the tracing API/call graph is
+  wrong
  **Pass full opContext** - `new TestTracer(opContext)` not just logBinding
  **Always destructure** `{ trace, flush }` from concrete tracer instance
  `TestTracer.rootBuffers` - accumulated root buffers for inspection
