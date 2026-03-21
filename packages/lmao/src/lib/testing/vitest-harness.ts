@@ -572,6 +572,13 @@ export function createVitestMock<T extends object>(vitestModule: T): T {
   return _defaultHarness.createVitestMock(vitestModule);
 }
 
+function assignOptionalBoundFunctionProperty(target: object, key: string, source: object, thisArg: unknown): void {
+  const value = Reflect.get(source, key);
+  if (typeof value === 'function') {
+    Reflect.set(target, key, value.bind(thisArg));
+  }
+}
+
 /**
  * Wrapped describe — tracks describe nesting for the standalone export path.
  * describe() callbacks run synchronously (just registering tests).
@@ -591,7 +598,7 @@ describe.skip = _describe.skip;
 describe.only = _describe.only;
 describe.todo = _describe.todo;
 describe.each = _describe.each;
-describe.skipIf = _describe.skipIf.bind(_describe);
+assignOptionalBoundFunctionProperty(describe, 'skipIf', _describe, _describe);
 
 /** Wrapped it — creates a child span of the root trace for the test case */
 export function it(name: string, fn: () => void | Promise<void>): void {
@@ -610,7 +617,7 @@ it.skip = _it.skip;
 it.only = _it.only;
 it.todo = _it.todo;
 it.each = _it.each;
-it.skipIf = _it.skipIf.bind(_it);
+assignOptionalBoundFunctionProperty(it, 'skipIf', _it, _it);
 
 // Re-export everything else unchanged
 export {
