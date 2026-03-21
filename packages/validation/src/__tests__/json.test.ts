@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { parseJsonArray, parseJsonRecord, safeJsonParse } from '../json.js';
+import { parseJsonArray, parseJsonRecord, parseJsonValue, safeJsonParse } from '../json.js';
 
 // ---------------------------------------------------------------------------
 // safeJsonParse
@@ -131,6 +131,32 @@ describe('parseJsonRecord', () => {
   it('returns error for invalid JSON', () => {
     const result = parseJsonRecord('not json');
     expect(result.ok).toBe(false);
+  });
+});
+
+describe('parseJsonValue', () => {
+  it('returns typed values when the guard matches', () => {
+    const result = parseJsonValue(
+      '{"kind":"signal"}',
+      (value): value is { kind: string } => {
+        return typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string';
+      },
+      'signal envelope',
+    );
+
+    expect(result).toEqual({ ok: true, value: { kind: 'signal' } });
+  });
+
+  it('returns a structured error when the guard fails', () => {
+    const result = parseJsonValue(
+      '{"kind":1}',
+      (value): value is { kind: string } => {
+        return typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string';
+      },
+      'signal envelope',
+    );
+
+    expect(result).toEqual({ ok: false, error: 'Expected signal envelope' });
   });
 });
 

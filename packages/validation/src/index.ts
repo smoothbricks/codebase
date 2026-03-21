@@ -38,5 +38,5 @@ export {
   isRecord,
   isString,
 } from './guards.js';
-export type { JsonParseResult } from './json.js';
-export { parseJsonArray, parseJsonRecord, safeJsonParse } from './json.js';
+export type { JsonGuard, JsonParseResult } from './json.js';
+export { parseJsonArray, parseJsonRecord, parseJsonValue, safeJsonParse } from './json.js';
