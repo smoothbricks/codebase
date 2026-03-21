@@ -25,6 +25,12 @@
       "path": "./packages/lmao-inspector"
     },
     {
+      "path": "./packages/nx-plugin"
+    },
+    {
+      "path": "./packages/time"
+    },
+    {
       "path": "./packages/statebus-core"
     },
     {

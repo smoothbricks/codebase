@@ -1,0 +1,24 @@
+{
+  "extends": "../../tsconfig.base.json",
+  "compilerOptions": {
+    "baseUrl": ".",
+    "rootDir": "src",
+    "types": [
+      "bun"
+    ],
+    "composite": true,
+    "declaration": true,
+    "declarationMap": true,
+    "outDir": "dist-test",
+    "tsBuildInfoFile": "dist-test/tsconfig.test.tsbuildinfo"
+  },
+  "include": [
+    "src/**/*.test.ts",
+    "src/**/__tests__/*.ts"
+  ],
+  "references": [
+    {
+      "path": "./tsconfig.lib.json"
+    }
+  ]
+}
