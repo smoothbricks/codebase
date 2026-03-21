@@ -57,17 +57,18 @@ import { AsyncLocalStorage } from 'node:async_hooks';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
-import type { OpContext, OpContextBinding, OpContextOf } from '../opContext/types.js';
+import type { DepsConfig, FeatureFlagSchema, OpContext, OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
 import { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
+import { isSpanContext } from '../spanContext.js';
 import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import type { Tracer } from '../tracer.js';
 import { CompositeTracer } from '../tracers/CompositeTracer.js';
-import { NoOpTracer } from '../tracers/NoOpTracer.js';
 import { SQLiteTracer } from '../tracers/SQLiteTracer.js';
 import { StdioTracer } from '../tracers/StdioTracer.js';
+import { TestTracer as InMemoryTestTracer } from '../tracers/TestTracer.js';
 
 /** bun:test expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
@@ -130,21 +131,45 @@ export type BunTestSetupOptions<TExt extends SchemaFields = Record<never, never>
   extraTestColumns?: TExt;
 };
 
+function buildHarnessSchemaExtensions(binding: OpContextBinding, extraTestColumns: undefined): BunTestHarnessBuiltins;
+function buildHarnessSchemaExtensions<TExt extends SchemaFields>(
+  binding: OpContextBinding,
+  extraTestColumns: TExt,
+): HarnessSchema<TExt>;
 function buildHarnessSchemaExtensions<TExt extends SchemaFields>(
   binding: OpContextBinding,
   extraTestColumns: TExt | undefined,
-): SchemaFields {
+): BunTestHarnessBuiltins | HarnessSchema<TExt> {
   const extensionBase: BunTestHarnessBuiltins = { describe: S.category() };
-  const extension = extraTestColumns ? { ...extensionBase, ...extraTestColumns } : extensionBase;
-
   const baseColumnNames = new Set(binding.logBinding.logSchema._columnNames);
-  const safeExtension: SchemaFields = {};
-  for (const [fieldName, fieldSchema] of Object.entries(extension)) {
-    if (!baseColumnNames.has(fieldName)) {
-      safeExtension[fieldName] = fieldSchema;
+  for (const fieldName of Object.keys(extraTestColumns ?? {})) {
+    if (baseColumnNames.has(fieldName)) {
+      throw new Error(`Test harness schema column '${fieldName}' already exists in the bound log schema`);
     }
   }
-  return safeExtension;
+
+  return extraTestColumns ? { ...extensionBase, ...extraTestColumns } : extensionBase;
+}
+
+function extendBindingLogSchema<
+  B extends OpContextBinding<LogSchema<TFields>, FF, Deps, UserCtx>,
+  TFields extends SchemaFields,
+  FF extends FeatureFlagSchema,
+  Deps extends DepsConfig,
+  UserCtx extends Record<string, unknown>,
+  TExt extends SchemaFields,
+>(binding: B, extension: TExt): OpContextBinding<LogSchema<TFields & TExt>, FF, Deps, UserCtx> {
+  const extendedBinding: OpContextBinding<LogSchema<TFields & TExt>, FF, Deps, UserCtx> = {
+    logBinding: {
+      ...binding.logBinding,
+      logSchema: binding.logBinding.logSchema.extend(extension),
+    },
+    flags: binding.flags,
+    ctxDefaults: binding.ctxDefaults,
+    deps: binding.deps,
+  };
+
+  return extendedBinding;
 }
 
 function isTruthyEnvFlag(value: unknown): boolean {
@@ -157,6 +182,22 @@ function isSchemaFieldsRecord(value: unknown): value is SchemaFields {
 
 function isOpContextBindingLike(value: unknown): value is OpContextBinding {
   return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'logBinding') === 'object';
+}
+
+function isSpanContextForBinding<B extends OpContextBinding>(
+  value: unknown,
+  binding: B,
+): value is SpanContext<OpContextOf<B>> {
+  return isSpanContext<OpContextOf<B>>(value) && Reflect.get(value, '_schema') === binding.logBinding.logSchema;
+}
+
+function isTracerForBinding<B extends OpContextBinding>(value: unknown, binding: B): value is Tracer<B> {
+  const logBinding = typeof value === 'object' && value !== null ? Reflect.get(value, 'logBinding') : null;
+  return (
+    typeof logBinding === 'object' &&
+    logBinding !== null &&
+    Reflect.get(logBinding, 'logSchema') === binding.logBinding.logSchema
+  );
 }
 
 function isVerboseTraceEnabled(explicitVerbose: boolean | undefined): boolean {
@@ -172,15 +213,19 @@ function isVerboseTraceEnabled(explicitVerbose: boolean | undefined): boolean {
   return isTruthyEnvFlag(process.env.LMAO_TEST_TRACE_VERBOSE);
 }
 
-type TracerFactoryOptions = {
-  binding: OpContextBinding;
+type TracerFactoryOptions<B extends OpContextBinding> = {
+  binding: B;
   sqlite: SQLiteWriterConfig | undefined;
   verbose: boolean;
 };
 
-function createRootTracer({ binding, sqlite, verbose }: TracerFactoryOptions): Tracer<OpContextBinding> {
+function createRootTracer<B extends OpContextBinding>({
+  binding,
+  sqlite,
+  verbose,
+}: TracerFactoryOptions<B>): Tracer<B> {
   const tracerOptions = {
-    bufferStrategy: new JsBufferStrategy(),
+    bufferStrategy: new JsBufferStrategy<B['logBinding']['logSchema']>(),
     createTraceRoot,
   } as const;
 
@@ -211,12 +256,12 @@ function createRootTracer({ binding, sqlite, verbose }: TracerFactoryOptions): T
     });
   }
 
-  return new NoOpTracer(binding, {
+  return new InMemoryTestTracer(binding, {
     ...tracerOptions,
   });
 }
 
-async function closeTracer(tracer: Tracer<OpContextBinding>): Promise<void> {
+async function closeTracer<B extends OpContextBinding>(tracer: Tracer<B>): Promise<void> {
   const close = Reflect.get(tracer, 'close');
   if (typeof close === 'function') {
     await close.call(tracer);
@@ -261,6 +306,10 @@ export function installBunTestTracing(tracer: ActiveBunTestTracer): void {
   mock.module('bun:test', () => tracer.createBunTestMock(bunTest));
 }
 
+export function makeBunTestSuiteTracer<B extends OpContextBinding>(
+  binding: B,
+  options?: Omit<BunTestSetupOptions, 'extraTestColumns'>,
+): BunTestSuiteTracer<ExtendBindingLogSchema<B, BunTestHarnessBuiltins>>;
 export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
   options?: BunTestSetupOptions<TExt>,
@@ -268,8 +317,8 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends 
 export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
   options?: BunTestSetupOptions<TExt>,
-): BunTestSuiteTracer<ExtendBindingLogSchema<B, HarnessSchema<TExt>>> {
-  const useTestTracer = makeTestTracer(binding, options);
+): BunTestSuiteTracer<OpContextBinding> {
+  const useTestTracer = createTestTracerInstance(binding, options);
   return {
     useTestTracer,
     useTestSpan: () => useTestTracer.useTestSpan(),
@@ -281,12 +330,12 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends 
  * Define a per-package test tracer — metadata for preload discovery + typed span accessor.
  *
  * Returns plain data that `autoSetupBunTestTracing` reads at discovery time, plus a
- * `useTestSpan()` that delegates to the global `_activeSuiteTracer` with the correct
- * binding type restored.
+ * `useTestSpan()` that threads the package-local binding through the generic
+ * `useTestSpan<B>()` helper.
  *
- * WHY cast: The global `useTestSpan()` erases the binding to `OpContextBinding`. The cast
- * is safe because `autoSetupBunTestTracing` creates the active tracer FROM the same
- * `opContext` binding that was passed here — so the runtime type matches `B`.
+ * WHY generic threading: `autoSetupBunTestTracing` creates the active tracer from the
+ * same `opContext` binding passed here, so the exported helper can preserve the real
+ * span type without a local assertion bridge.
  */
 export function defineTestTracer<B extends OpContextBinding>(
   binding: B,
@@ -299,6 +348,11 @@ export function defineTestTracer<B extends OpContextBinding>(
   return {
     opContext: binding,
     extraTestColumns: options?.extraTestColumns,
+    // WHY no re-validation: the global useTestSpan() already validates against
+    // the active suite tracer's (extended) binding. Re-checking against the
+    // original binding fails when extraTestColumns extend the schema, because
+    // the span's _schema is the extended LogSchema, not the original.
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: useTestSpan() returns SpanContext typed to the suite binding; narrowing to OpContextOf<B> is safe because initTraceTestRun validates the binding matches
     useTestSpan: () => useTestSpan() as SpanContext<OpContextOf<B>>,
   };
 }
@@ -308,6 +362,10 @@ export function defineTestTracer<B extends OpContextBinding>(
  *
  * Unlike initTraceTestRun(), this keeps tracer/root/ALS state isolated per instance.
  */
+export function makeTestTracer<B extends OpContextBinding>(
+  binding: B,
+  options?: Omit<BunTestSetupOptions, 'extraTestColumns'>,
+): BunTestTracerInstance<ExtendBindingLogSchema<B, BunTestHarnessBuiltins>>;
 export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
   options?: BunTestSetupOptions<TExt>,
@@ -315,26 +373,34 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
 export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
   binding: B,
   options?: BunTestSetupOptions<TExt>,
-): BunTestTracerInstance<ExtendBindingLogSchema<B, HarnessSchema<TExt>>> {
-  type ExtendedBinding = ExtendBindingLogSchema<B, HarnessSchema<TExt>>;
-  type SpanCtx = HarnessSpanContext<ExtendedBinding>;
-
-  let tracer: Tracer<ExtendedBinding> | null = null;
+): BunTestTracerInstance<OpContextBinding> {
+  return createTestTracerInstance(binding, options);
+}
+function createTestTracerInstance<B extends OpContextBinding, TExt extends SchemaFields = Record<never, never>>(
+  binding: B,
+  options?: BunTestSetupOptions<TExt>,
+): BunTestTracerInstance<OpContextBinding> {
+  let activeBinding: OpContextBinding | null = null;
+  let tracer: Tracer<OpContextBinding> | null = null;
   let verboseTrace = false;
-  let rootCtx: SpanCtx | null = null;
+  let rootCtx: SpanContext<OpContext> | null = null;
   let resolveTestRun: (() => void) | null = null;
   let rootTracePromise: Promise<unknown> | null = null;
   let isSetup = false;
 
-  const als = new AsyncLocalStorage<SpanCtx>();
+  const als = new AsyncLocalStorage<SpanContext<OpContext>>();
 
-  function assertRootCtx(): SpanCtx {
-    if (!rootCtx) throw new Error('Call setup() before wiring bun:test wrappers');
+  function assertRootCtx(): SpanContext<OpContext> {
+    if (!rootCtx || !activeBinding || !isSpanContextForBinding(rootCtx, activeBinding)) {
+      throw new Error('Call setup() before wiring bun:test wrappers');
+    }
     return rootCtx;
   }
 
-  function assertTracer(): Tracer<ExtendedBinding> {
-    if (!tracer) throw new Error('Call setup() in preload before tests');
+  function assertTracer(): Tracer<OpContextBinding> {
+    if (!tracer || !activeBinding || !isTracerForBinding(tracer, activeBinding)) {
+      throw new Error('Call setup() in preload before tests');
+    }
     return tracer;
   }
 
@@ -382,6 +448,7 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
 
     const wrappedIt: typeof _it = Object.assign(wrappedItBase, origIt);
     wrappedIt.each = origIt.each.bind(origIt);
+    wrappedIt.todo = origIt.todo?.bind(origIt);
     wrappedIt.skipIf = (condition: boolean) => (condition ? origIt.skip : wrappedIt);
     wrappedIt.if = (condition: boolean) => (condition ? wrappedIt : origIt.skip);
 
@@ -395,27 +462,23 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
       }
       isSetup = true;
 
-      const harnessSchema = buildHarnessSchemaExtensions(binding, options?.extraTestColumns);
-      const extendedSchema = binding.logBinding.logSchema.extend(harnessSchema);
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- logSchema.extend preserves the runtime binding shape but TS loses the merged schema parameter.
-      const extendedBinding = {
-        ...binding,
-        logBinding: {
-          ...binding.logBinding,
-          logSchema: extendedSchema,
-        },
-      } as unknown as ExtendedBinding;
+      const harnessSchema =
+        options?.extraTestColumns === undefined
+          ? buildHarnessSchemaExtensions(binding, undefined)
+          : buildHarnessSchemaExtensions(binding, options.extraTestColumns);
+      const extendedBinding = extendBindingLogSchema(binding, harnessSchema);
+      activeBinding = extendedBinding;
 
       verboseTrace = isVerboseTraceEnabled(options?.verbose);
 
-      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- the harness installs the schema-extended binding above, so the resulting tracer matches ExtendedBinding at runtime.
-      tracer = createRootTracer({
+      const activeTracer = createRootTracer({
         binding: extendedBinding,
         sqlite: options?.sqlite,
         verbose: verboseTrace,
-      }) as Tracer<ExtendedBinding>;
+      });
 
-      rootTracePromise = tracer.trace('test-run', (ctx: SpanCtx) => {
+      tracer = activeTracer;
+      rootTracePromise = activeTracer.trace('test-run', (ctx: SpanContext<OpContext>) => {
         rootCtx = ctx;
         return new Promise<void>((resolve) => {
           resolveTestRun = resolve;
@@ -444,20 +507,21 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
           } catch (e) {
             console.error('[lmao/testing] SQLite flush error:', e);
           } finally {
-            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- closeTracer only reads the optional close() hook from the base tracer interface.
-            await closeTracer(tracer as unknown as Tracer<OpContextBinding>);
+            await closeTracer(tracer);
           }
         }
       });
     },
 
-    useTestSpan(): SpanCtx {
+    useTestSpan(): SpanContext<OpContext> {
       const ctx = als.getStore();
-      if (!ctx) throw new Error('useTestSpan() called outside of a traced it()');
+      if (!ctx || !activeBinding || !isSpanContextForBinding(ctx, activeBinding)) {
+        throw new Error('useTestSpan() called outside of a traced it()');
+      }
       return ctx;
     },
 
-    getTracer(): Tracer<ExtendedBinding> {
+    getTracer(): Tracer<OpContextBinding> {
       return assertTracer();
     },
 
@@ -497,7 +561,10 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
   _activeSuiteTracer = null;
 
   // Extend user's schema with `describe` column for test grouping
-  const harnessSchema = buildHarnessSchemaExtensions(opContext, options?.extraTestColumns);
+  const harnessSchema =
+    options?.extraTestColumns === undefined
+      ? buildHarnessSchemaExtensions(opContext, undefined)
+      : buildHarnessSchemaExtensions(opContext, options.extraTestColumns);
   const extendedSchema = opContext.logBinding.logSchema.extend(harnessSchema);
   const extendedBinding = {
     ...opContext,

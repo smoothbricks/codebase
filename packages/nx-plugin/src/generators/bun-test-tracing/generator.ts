@@ -131,47 +131,33 @@ function updatePackageJson(tree: Tree, packageJsonPath: string): void {
 
 function writeBunfig(tree: Tree, projectRoot: string): void {
   const bunfigPath = joinPathFragments(projectRoot, 'bunfig.toml');
-  // Relative path from package to root test-trace-preload.ts
-  const preloadEntry = normalizePath(path.relative(projectRoot, 'test-trace-preload.ts'));
+  const preloadEntries = '"@smoothbricks/lmao/bun/preload", "@smoothbricks/lmao/bun/trace-preload"';
 
   if (!tree.exists(bunfigPath)) {
-    tree.write(bunfigPath, `[test]\npreload = ["${preloadEntry}"]\n`);
+    tree.write(bunfigPath, `[test]\npreload = [${preloadEntries}]\n`);
     return;
   }
 
   const current = tree.read(bunfigPath, 'utf-8') ?? '';
-  // Replace old ./test-trace-setup.ts with the root preload path
-  if (current.includes('./test-trace-setup.ts')) {
-    tree.write(bunfigPath, current.replace('./test-trace-setup.ts', preloadEntry));
+
+  // Already has the package specifier preloads
+  if (current.includes('@smoothbricks/lmao/bun/preload')) {
     return;
   }
 
-  if (current.includes(preloadEntry)) {
-    return;
-  }
-
+  // Replace old patterns with the package specifier preloads
   if (current.includes('preload = [')) {
-    tree.write(
-      bunfigPath,
-      current.replace(/preload\s*=\s*\[(.*?)\]/s, (_match: string, inner: string) => {
-        const trimmed = inner.trim();
-        if (trimmed.length === 0) {
-          return `preload = ["${preloadEntry}"]`;
-        }
-
-        return `preload = [${trimmed}, "${preloadEntry}"]`;
-      }),
-    );
+    tree.write(bunfigPath, current.replace(/preload\s*=\s*\[.*?\]/s, `preload = [${preloadEntries}]`));
     return;
   }
 
   if (current.includes('[test]')) {
-    tree.write(bunfigPath, current.replace('[test]', `[test]\npreload = ["${preloadEntry}"]`));
+    tree.write(bunfigPath, current.replace('[test]', `[test]\npreload = [${preloadEntries}]`));
     return;
   }
 
   const suffix = current.endsWith('\n') ? '' : '\n';
-  tree.write(bunfigPath, `${current}${suffix}[test]\npreload = ["${preloadEntry}"]\n`);
+  tree.write(bunfigPath, `${current}${suffix}[test]\npreload = [${preloadEntries}]\n`);
 }
 
 function renderSuiteTracer(options: Required<BunTestTracingGeneratorSchema>): string {
