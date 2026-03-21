@@ -3,16 +3,16 @@
  * All functions follow the CommandExecutor dependency injection pattern.
  */
 
-import { execa } from 'execa'
-import type { CommandExecutor, GitHubAppCredentials } from '../types.js'
+import { execa } from 'execa';
+import type { CommandExecutor, GitHubAppCredentials } from '../types.js';
 
 /**
  * Detect the GitHub organization from the current repository.
  * Uses `gh repo view` to get the repo owner.
  */
 export async function detectOrg(executor: CommandExecutor = execa as unknown as CommandExecutor): Promise<string> {
-  const { stdout } = await executor('gh', ['repo', 'view', '--json', 'owner', '--jq', '.owner.login'])
-  return stdout.trim()
+  const { stdout } = await executor('gh', ['repo', 'view', '--json', 'owner', '--jq', '.owner.login']);
+  return stdout.trim();
 }
 
 /**
@@ -23,10 +23,10 @@ export async function checkAuthScopes(
   executor: CommandExecutor = execa as unknown as CommandExecutor,
 ): Promise<boolean> {
   try {
-    await executor('gh', ['auth', 'status'])
-    return true
+    await executor('gh', ['auth', 'status']);
+    return true;
   } catch {
-    return false
+    return false;
   }
 }
 
@@ -38,14 +38,14 @@ export async function exchangeCode(
   code: string,
   executor: CommandExecutor = execa as unknown as CommandExecutor,
 ): Promise<GitHubAppCredentials> {
-  const { stdout } = await executor('gh', ['api', 'POST', `/app-manifests/${code}/conversions`])
-  const data = JSON.parse(stdout)
+  const { stdout } = await executor('gh', ['api', 'POST', `/app-manifests/${code}/conversions`]);
+  const data = JSON.parse(stdout);
   return {
     id: data.id,
     pem: data.pem,
     webhookSecret: data.webhook_secret,
     slug: data.slug,
-  }
+  };
 }
 
 /**
@@ -69,14 +69,12 @@ export async function storeCredentials(
     'all',
     '--body',
     options.appId.toString(),
-  ])
+  ]);
 
   // Set PEM as org secret via stdin (handles multiline correctly)
-  await executor(
-    'gh',
-    ['secret', 'set', 'PATCHNOTE_APP_PRIVATE_KEY', '--org', options.org, '--visibility', 'all'],
-    { input: options.pem },
-  )
+  await executor('gh', ['secret', 'set', 'PATCHNOTE_APP_PRIVATE_KEY', '--org', options.org, '--visibility', 'all'], {
+    input: options.pem,
+  });
 }
 
 /**
@@ -88,7 +86,7 @@ export async function deleteApp(
   executor: CommandExecutor = execa as unknown as CommandExecutor,
 ): Promise<void> {
   try {
-    await executor('gh', ['api', '-X', 'DELETE', `/apps/${slug}`])
+    await executor('gh', ['api', '-X', 'DELETE', `/apps/${slug}`]);
   } catch {
     // Best-effort: silently ignore errors during rollback
   }

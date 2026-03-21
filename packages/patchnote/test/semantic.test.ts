@@ -4,7 +4,7 @@ import { defaultConfig } from '../src/config.js';
 import { getRecentCommitMessages } from '../src/git.js';
 import { CONVENTIONAL_COMMIT_REGEX, detectSemanticCommits, resolveSemanticPrefix } from '../src/semantic.js';
 import type { PackageUpdate } from '../src/types.js';
-import { createExecaSpy, createMockExeca } from './helpers/mock-execa.js';
+import { createMockExeca } from './helpers/mock-execa.js';
 
 describe('Semantic Commits', () => {
   describe('CONVENTIONAL_COMMIT_REGEX', () => {

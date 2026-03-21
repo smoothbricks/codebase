@@ -4,20 +4,20 @@
  */
 
 interface ManifestOptions {
-  org: string
-  appName: string
-  port: number
+  org: string;
+  appName: string;
+  port: number;
 }
 
 interface AppManifest {
-  name: string
-  description: string
-  url: string
-  hook_attributes: { url: string; active: boolean }
-  redirect_url: string
-  public: boolean
-  default_permissions: Record<string, string>
-  default_events: string[]
+  name: string;
+  description: string;
+  url: string;
+  hook_attributes: { url: string; active: boolean };
+  redirect_url: string;
+  public: boolean;
+  default_permissions: Record<string, string>;
+  default_events: string[];
 }
 
 /**
@@ -41,7 +41,7 @@ export function buildManifest(options: ManifestOptions): AppManifest {
       metadata: 'read',
     },
     default_events: [],
-  }
+  };
 }
 
 /**
@@ -53,7 +53,7 @@ function escapeHtml(str: string): string {
     .replace(/</g, '&lt;')
     .replace(/>/g, '&gt;')
     .replace(/'/g, '&#39;')
-    .replace(/"/g, '&quot;')
+    .replace(/"/g, '&quot;');
 }
 
 /**
@@ -63,8 +63,8 @@ function escapeHtml(str: string): string {
  * The page auto-submits on load, so the user is immediately redirected to GitHub.
  */
 export function generateManifestPage(org: string, manifest: object): string {
-  const url = `https://github.com/organizations/${org}/settings/apps/new`
-  const escapedManifest = escapeHtml(JSON.stringify(manifest))
+  const url = `https://github.com/organizations/${org}/settings/apps/new`;
+  const escapedManifest = escapeHtml(JSON.stringify(manifest));
 
   return `<!DOCTYPE html>
 <html>
@@ -76,5 +76,5 @@ export function generateManifestPage(org: string, manifest: object): string {
   </form>
   <script>document.getElementById('manifest-form').submit()</script>
 </body>
-</html>`
+</html>`;
 }

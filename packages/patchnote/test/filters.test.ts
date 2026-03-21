@@ -6,7 +6,7 @@
 import { describe, expect, test } from 'bun:test';
 import { filterUpdates } from '../src/filters.js';
 import type { Logger } from '../src/logger.js';
-import type { FilterConfig, PackageUpdate } from '../src/types.js';
+import type { PackageUpdate } from '../src/types.js';
 
 /** Helper: create a minimal PackageUpdate fixture */
 function makeUpdate(name: string, overrides?: Partial<PackageUpdate>): PackageUpdate {
