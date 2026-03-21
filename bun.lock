@@ -107,6 +107,17 @@
         "tslib": "^2.3.0",
       },
     },
+    "packages/nx-plugin": {
+      "name": "@smoothbricks/nx-plugin",
+      "version": "0.0.1",
+      "dependencies": {
+        "nx": "22.5.4",
+        "tslib": "^2.3.0",
+      },
+      "devDependencies": {
+        "@smoothbricks/lmao": "workspace:*",
+      },
+    },
     "packages/statebus": {
       "name": "@smoothbricks/statebus",
       "version": "0.8.0",
@@ -800,6 +811,8 @@
     "@smoothbricks/lmao-transformer": ["@smoothbricks/lmao-transformer@workspace:packages/lmao-transformer"],
 
     "@smoothbricks/money": ["@smoothbricks/money@workspace:packages/money"],
+
+    "@smoothbricks/nx-plugin": ["@smoothbricks/nx-plugin@workspace:packages/nx-plugin"],
 
     "@smoothbricks/statebus": ["@smoothbricks/statebus@workspace:packages/statebus"],
 

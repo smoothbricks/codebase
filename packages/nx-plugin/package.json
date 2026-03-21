@@ -1,0 +1,31 @@
+{
+  "name": "@smoothbricks/nx-plugin",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "sideEffects": false,
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "generators": "./generators.json",
+  "scripts": {
+    "test": "bun test"
+  },
+  "nx": {
+    "targets": {
+      "lint": {}
+    }
+  },
+  "files": [
+    "dist",
+    "generators.json",
+    "!**/*.tsbuildinfo"
+  ],
+  "dependencies": {
+    "nx": "22.5.4",
+    "tslib": "^2.3.0"
+  },
+  "devDependencies": {
+    "@smoothbricks/lmao": "workspace:*"
+  }
+}
