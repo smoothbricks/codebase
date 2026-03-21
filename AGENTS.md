@@ -28,6 +28,10 @@
 - **No default `NoOpTracer`.** `createAxeNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
   `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
   Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
+- **Run `bun test` from the package directory, not the monorepo root.** Each package has a `bunfig.toml` that preloads
+  test tracing (`test-trace-setup.ts`). Running `bun test packages/foo/src/...` from the monorepo root skips the
+  preload, causing `useTestSpan()` errors and missing trace output. Use `cd packages/foo && bun test src/...` or
+  `nx test <project>` (which runs from the correct directory automatically).
 - **Lint before tests.** Use `nx lint <project>` before `bun test` or `nx test <project>`.
 - **Nx cache is not flaky; config is.** If a task only passes with `--skip-nx-cache`, fix the target's inputs, outputs,
   dependency graph, or task wiring so cached and uncached runs agree.
@@ -222,7 +226,7 @@ This repo uses a strict policy:
 
 ### NoOpTracer policy
 
-**`createAxeNoOpTracer()` is banned/removed, and `NoOpTracer` is not an approved default wiring pattern in this
+**`NoOpTracer` is not an approved default wiring pattern in this
 codebase.**
 
  **Production code**: Requires real tracing. If code needs a spanContext, require it from the caller

@@ -16,10 +16,10 @@ sink (local `.trace-results.db` or worker D1 binding like `TRACE_RESULTS`). Keep
 move runner-specific behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`,
 `@smoothbricks/lmao/testing/vitest`) plus package-local typed tracer modules.
 
-**Tracing policy — No default `NoOpTracer`:** `createAxeNoOpTracer()` is banned/removed.
-`NoOpTracer` may still exist in `@smoothbricks/lmao` for API proof, comparison, and overhead
-benchmarking, but it is not the normal repo pattern. Require tracing context from callers,
-use child spans, and use observable suite/test tracers in tests.
+**Tracing policy — No default `NoOpTracer`:** `NoOpTracer` may exist in `@smoothbricks/lmao` for
+API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
+Require tracing context from callers, use child spans, and use observable suite/test tracers
+in tests.
 
 If code creates a throwaway tracer to satisfy a `spanContext` parameter, the API is wrong — fix it by:
 
@@ -74,7 +74,9 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 ### Testing
 
 - **Run tests**: `bun test`
-- **Run specific test file**: `bun test <file-path>`
+- **Run specific test file**: run from the package directory, e.g. `cd packages/<name> && bun test src/path/to/file.test.ts`.
+  Running `bun test` from the monorepo root skips the package's `bunfig.toml` preload (test tracing, etc.).
+- **Full project test suite:** `nx test <project>` (Nx runs from the correct directory automatically)
 - **Nx cache is expected to work.** If a task only passes with `--skip-nx-cache`, treat that as a broken
   target/input/output/dependency configuration and fix the Nx config instead of normalizing cache bypasses.
 - **Do not rely on `--skip-nx-cache` as routine workflow.** Use it only to diagnose cache issues, then repair the
