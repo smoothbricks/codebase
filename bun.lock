@@ -50,6 +50,9 @@
       "dependencies": {
         "tslib": "^2.3.0",
       },
+      "devDependencies": {
+        "@smoothbricks/validation": "workspace:*",
+      },
     },
     "packages/eslint-stdout": {
       "name": "eslint-stdout",
@@ -113,6 +116,9 @@
       "version": "0.0.1",
       "dependencies": {
         "tslib": "^2.3.0",
+      },
+      "devDependencies": {
+        "@smoothbricks/validation": "workspace:*",
       },
     },
     "packages/nx-plugin": {
