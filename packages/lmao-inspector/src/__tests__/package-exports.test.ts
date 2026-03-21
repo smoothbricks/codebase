@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { isRecord } from '@smoothbricks/validation';
 
 type ExportConditions = {
   development?: string;
@@ -13,10 +14,6 @@ type PackageManifest = {
 };
 
 const packageUrl = new URL('../../package.json', import.meta.url);
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
 
 function assertPackageManifest(value: unknown): asserts value is PackageManifest {
   if (!isRecord(value) || typeof value.name !== 'string' || !isRecord(value.exports)) {

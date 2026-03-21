@@ -32,6 +32,9 @@
   "scripts": {
     "test": "bun test --pass-with-no-tests"
   },
+  "devDependencies": {
+    "@smoothbricks/validation": "workspace:*"
+  },
   "nx": {
     "sourceRoot": "packages/lmao-inspector/src",
     "projectType": "library",

@@ -53,6 +53,7 @@
     }
   },
   "devDependencies": {
+    "@smoothbricks/validation": "workspace:*",
     "typescript": "^5.3.0"
   }
 }

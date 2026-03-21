@@ -16,5 +16,13 @@
   "exclude": [
     "node_modules",
     "dist"
+  ],
+  "references": [
+    {
+      "path": "../validation/tsconfig.lib.json"
+    },
+    {
+      "path": "./tsconfig.lib.json"
+    }
   ]
 }
