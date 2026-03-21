@@ -50,6 +50,9 @@ describe('bun-test-tracing generator', () => {
     const tracerFile = tree.read('packages/example/src/test-suite-tracer.ts', 'utf-8');
     expect(tracerFile).toContain("import { type TraceContext, opContext } from '@smoothbricks/lmao';");
     expect(tracerFile).toContain('makeBunTestSuiteTracer(opContext');
+    expect(tracerFile).toContain(
+      "import { makeBunTestSuiteTracer, type TestTracer, useTestSpan as globalUseTestSpan } from '@smoothbricks/lmao/testing/bun';",
+    );
 
     const packageJson = readJson(tree, 'packages/example/package.json');
     expect(packageJson.scripts?.test).toBe('bun test');

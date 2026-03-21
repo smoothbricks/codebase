@@ -179,7 +179,7 @@ function writeBunfig(tree: Tree, projectRoot: string): void {
 }
 
 function renderSuiteTracer(options: Required<BunTestTracingGeneratorSchema>): string {
-  const tracerImport = `import { makeBunTestSuiteTracer, type TestTracer } from '${options.tracerModule}';`;
+  const tracerImport = `import { makeBunTestSuiteTracer, type TestTracer, useTestSpan as globalUseTestSpan } from '${options.tracerModule}';`;
   const contextImport =
     options.opContextModule === options.spanContextModule
       ? `import { type ${options.spanContextExport}, ${options.opContextExport} } from '${options.opContextModule}';`
@@ -194,6 +194,12 @@ function renderSuiteTracer(options: Required<BunTestTracingGeneratorSchema>): st
     contextImport,
     tracerImport,
     '',
+    '/** No custom schema columns — exported for root preload auto-discovery. */',
+    'export const testLogSchema = undefined;',
+    '',
+    '/** Exported for root preload auto-discovery to pick up the shared opContext. */',
+    `export { ${options.opContextExport} as opContext };`,
+    '',
     `const suite = makeBunTestSuiteTracer(${options.opContextExport}, {`,
     `  sqlite: { dbPath: '.trace-results.db' },`,
     '});',
@@ -204,7 +210,8 @@ function renderSuiteTracer(options: Required<BunTestTracingGeneratorSchema>): st
     '  suite.setupBunTestSuiteTracing();',
     '}',
     '',
-    `export const useTestSpan = (): ${options.spanContextExport} => suite.useTestSpan();`,
+    '// Delegate to the global useTestSpan which checks _activeSuiteTracer (set by root preload)',
+    `export const useTestSpan = (): ${options.spanContextExport} => globalUseTestSpan();`,
     '',
   ].join('\n');
 }

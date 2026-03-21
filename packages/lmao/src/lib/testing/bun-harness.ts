@@ -236,6 +236,11 @@ export type TestTracer<
 
 let _activeSuiteTracer: BunTestTracerInstance<OpContextBinding> | null = null;
 
+/** Returns the active suite tracer set by installBunTestTracing(), or null if none is active. */
+export function getActiveSuiteTracer(): BunTestTracerInstance<OpContextBinding> | null {
+  return _activeSuiteTracer;
+}
+
 export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTestTracerInstance<B>): void {
   _activeSuiteTracer = tracer as unknown as BunTestTracerInstance<OpContextBinding>;
   tracer.setup();
@@ -609,14 +614,20 @@ export function useTestSpan<Ctx extends SpanContext<OpContext> = SpanContext<OpC
   return ctx as unknown as Ctx;
 }
 
-/** Get the root tracer instance */
-export function getTracer(): Tracer<OpContextBinding> {
+/**
+ * Get the root tracer instance.
+ *
+ * The optional type parameter narrows the return type for consumers that know
+ * the concrete binding (e.g. `getTracer<typeof opContext>()`). The underlying
+ * tracer is always the one created by `installBunTestTracing()` or `initTraceTestRun()`.
+ */
+export function getTracer<B extends OpContextBinding = OpContextBinding>(): Tracer<B> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.getTracer() as Tracer<OpContextBinding>;
+    return _activeSuiteTracer.getTracer() as Tracer<B>;
   }
 
   if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');
-  return _tracer;
+  return _tracer as Tracer<B>;
 }
 
 /**
@@ -682,60 +693,66 @@ export {
 // Auto-discovery preload
 // =============================================================================
 
+export type AutoSetupOptions = {
+  /** Absolute path to the packages directory to scan for test-suite-tracer.ts files. */
+  packagesDir: string;
+};
+
 /**
- * Auto-discover and load the nearest package's test-suite-tracer from a root preload.
+ * Auto-discover ALL package test-suite-tracers, merge their schemas, and create
+ * one unified root tracer for the entire bun test run.
  *
- * Bun only loads `bunfig.toml` from the directory where `bun test` is invoked.
- * When running `bun test packages/foo/src/bar.test.ts` from the monorepo root,
- * the package-level `bunfig.toml` (and its preload) is skipped.
+ * Scans `packagesDir` for `<pkg>/src/test-suite-tracer.ts` files, collects each
+ * package's `testLogSchema` export (if any), merges them into a superset schema,
+ * picks the first available `opContext`, and calls `installBunTestTracing()`.
  *
- * This function solves that: call it from a root-level preload and it will:
- * 1. Find the test file path from `process.argv`
- * 2. Walk up to the nearest `package.json` (the package root)
- * 3. Dynamically import `src/test-suite-tracer.ts` if it exists
- * 4. Call `setupBunTestSuiteTracing()` to wire up traced `it()`
- *
- * Packages with custom `bunfig.toml` still take precedence (Bun uses the nearest config).
+ * Per-package `useTestSpan()` delegates to the global `useTestSpan()` from this
+ * module which checks `_activeSuiteTracer` — set by the root preload via
+ * `installBunTestTracing()`.
  *
  * @example
  * ```ts
- * // bunfig.toml (monorepo root)
- * // [test]
- * // preload = ["./test-trace-preload.ts"]
- *
  * // test-trace-preload.ts (monorepo root)
- * import { autoSetupBunTestTracing } from '@smoothbricks/lmao/testing/bun';
- * await autoSetupBunTestTracing();
+ * import { autoSetupBunTestTracing } from './packages/lmao/src/lib/testing/bun-harness.js';
+ * await autoSetupBunTestTracing({ packagesDir: './packages' });
  * ```
  */
-export async function autoSetupBunTestTracing(): Promise<boolean> {
-  const testFile = process.argv[1];
-  if (!testFile || testFile.endsWith('/bun')) return false;
+export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promise<boolean> {
+  const { join, resolve } = await import('node:path');
+  const { existsSync, readdirSync } = await import('node:fs');
 
-  const { dirname, join, resolve } = await import('node:path');
-  const { existsSync } = await import('node:fs');
+  const packagesDir = resolve(options.packagesDir);
+  if (!existsSync(packagesDir)) return false;
 
-  // Walk up from the test file to find the nearest package.json
-  let dir = dirname(resolve(testFile));
-  const root = dirname(dir); // stop before filesystem root
-  let pkgRoot: string | null = null;
-  while (dir !== dirname(dir)) {
-    if (existsSync(join(dir, 'package.json'))) {
-      pkgRoot = dir;
-      break;
+  const mergedSchema: Record<string, unknown> = {};
+  let opContext: OpContextBinding | null = null;
+
+  for (const entry of readdirSync(packagesDir, { withFileTypes: true })) {
+    if (!entry.isDirectory()) continue;
+    const tracerPath = join(packagesDir, entry.name, 'src', 'test-suite-tracer.ts');
+    if (!existsSync(tracerPath)) continue;
+
+    const mod = await import(tracerPath);
+
+    // Collect custom schema columns from each package
+    if (mod.testLogSchema && typeof mod.testLogSchema === 'object') {
+      Object.assign(mergedSchema, mod.testLogSchema);
     }
-    dir = dirname(dir);
-  }
-  if (!pkgRoot) return false;
 
-  // Look for the package's test-suite-tracer
-  const tracerPath = join(pkgRoot, 'src', 'test-suite-tracer.ts');
-  if (!existsSync(tracerPath)) return false;
-
-  const mod = await import(tracerPath);
-  if (typeof mod.setupBunTestSuiteTracing === 'function') {
-    mod.setupBunTestSuiteTracing();
-    return true;
+    // Use the first available opContext (they all bind the same opContext)
+    if (!opContext && mod.opContext) {
+      opContext = mod.opContext as OpContextBinding;
+    }
   }
-  return false;
+
+  if (!opContext) return false;
+
+  const hasCustomSchema = Object.keys(mergedSchema).length > 0;
+  const suite = makeBunTestSuiteTracer(opContext, {
+    sqlite: { dbPath: '.trace-results.db' },
+    testLogSchema: hasCustomSchema ? (mergedSchema as SchemaFields) : undefined,
+  });
+
+  suite.setupBunTestSuiteTracing();
+  return true;
 }
