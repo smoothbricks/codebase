@@ -44,7 +44,6 @@ const DEFAULT_TEST_INCLUDES = [
   'src/**/__tests__/**/*.ts',
   'src/**/__tests__/**/*.tsx',
   'src/test-suite-tracer.ts',
-  'test-trace-setup.ts',
 ];
 
 const COPIED_COMPILER_OPTIONS = ['baseUrl', 'rootDir', 'module', 'moduleResolution', 'jsx', 'lib'];
@@ -70,7 +69,6 @@ export default async function generator(tree: Tree, schema: BunTestTracingGenera
 
   updatePackageJson(tree, packageJsonPath);
   writeBunfig(tree, resolved.root);
-  tree.write(joinPathFragments(resolved.root, 'test-trace-setup.ts'), renderTestTraceSetup());
   tree.write(joinPathFragments(resolved.root, 'src/test-suite-tracer.ts'), renderSuiteTracer(options));
   updateTsconfigTest(tree, resolved.root, packageJsonPath, tsconfigPath, libTsconfigPath);
   updateProjectTsconfig(tree, tsconfigPath);
@@ -137,7 +135,8 @@ function updatePackageJson(tree: Tree, packageJsonPath: string): void {
 
 function writeBunfig(tree: Tree, projectRoot: string): void {
   const bunfigPath = joinPathFragments(projectRoot, 'bunfig.toml');
-  const preloadEntry = './test-trace-setup.ts';
+  // Relative path from package to root test-trace-preload.ts
+  const preloadEntry = normalizePath(path.relative(projectRoot, 'test-trace-preload.ts'));
 
   if (!tree.exists(bunfigPath)) {
     tree.write(bunfigPath, `[test]\npreload = ["${preloadEntry}"]\n`);
@@ -145,6 +144,12 @@ function writeBunfig(tree: Tree, projectRoot: string): void {
   }
 
   const current = tree.read(bunfigPath, 'utf-8') ?? '';
+  // Replace old ./test-trace-setup.ts with the root preload path
+  if (current.includes('./test-trace-setup.ts')) {
+    tree.write(bunfigPath, current.replace('./test-trace-setup.ts', preloadEntry));
+    return;
+  }
+
   if (current.includes(preloadEntry)) {
     return;
   }
@@ -171,10 +176,6 @@ function writeBunfig(tree: Tree, projectRoot: string): void {
 
   const suffix = current.endsWith('\n') ? '' : '\n';
   tree.write(bunfigPath, `${current}${suffix}[test]\npreload = ["${preloadEntry}"]\n`);
-}
-
-function renderTestTraceSetup(): string {
-  return "import { setupBunTestSuiteTracing } from './src/test-suite-tracer.js';\n\nsetupBunTestSuiteTracing();\n";
 }
 
 function renderSuiteTracer(options: Required<BunTestTracingGeneratorSchema>): string {
