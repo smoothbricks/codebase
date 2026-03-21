@@ -677,3 +677,65 @@ export {
   _beforeEach as beforeEach,
   _expect as expect,
 };
+
+// =============================================================================
+// Auto-discovery preload
+// =============================================================================
+
+/**
+ * Auto-discover and load the nearest package's test-suite-tracer from a root preload.
+ *
+ * Bun only loads `bunfig.toml` from the directory where `bun test` is invoked.
+ * When running `bun test packages/foo/src/bar.test.ts` from the monorepo root,
+ * the package-level `bunfig.toml` (and its preload) is skipped.
+ *
+ * This function solves that: call it from a root-level preload and it will:
+ * 1. Find the test file path from `process.argv`
+ * 2. Walk up to the nearest `package.json` (the package root)
+ * 3. Dynamically import `src/test-suite-tracer.ts` if it exists
+ * 4. Call `setupBunTestSuiteTracing()` to wire up traced `it()`
+ *
+ * Packages with custom `bunfig.toml` still take precedence (Bun uses the nearest config).
+ *
+ * @example
+ * ```ts
+ * // bunfig.toml (monorepo root)
+ * // [test]
+ * // preload = ["./test-trace-preload.ts"]
+ *
+ * // test-trace-preload.ts (monorepo root)
+ * import { autoSetupBunTestTracing } from '@smoothbricks/lmao/testing/bun';
+ * await autoSetupBunTestTracing();
+ * ```
+ */
+export async function autoSetupBunTestTracing(): Promise<boolean> {
+  const testFile = process.argv[1];
+  if (!testFile || testFile.endsWith('/bun')) return false;
+
+  const { dirname, join, resolve } = await import('node:path');
+  const { existsSync } = await import('node:fs');
+
+  // Walk up from the test file to find the nearest package.json
+  let dir = dirname(resolve(testFile));
+  const root = dirname(dir); // stop before filesystem root
+  let pkgRoot: string | null = null;
+  while (dir !== dirname(dir)) {
+    if (existsSync(join(dir, 'package.json'))) {
+      pkgRoot = dir;
+      break;
+    }
+    dir = dirname(dir);
+  }
+  if (!pkgRoot) return false;
+
+  // Look for the package's test-suite-tracer
+  const tracerPath = join(pkgRoot, 'src', 'test-suite-tracer.ts');
+  if (!existsSync(tracerPath)) return false;
+
+  const mod = await import(tracerPath);
+  if (typeof mod.setupBunTestSuiteTracing === 'function') {
+    mod.setupBunTestSuiteTracing();
+    return true;
+  }
+  return false;
+}
