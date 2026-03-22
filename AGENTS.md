@@ -14,6 +14,9 @@
 - **Fix everything you see.** Never wave off a failure as "pre-existing". If you touch casts, hacks, dead code, or
   broken tests, clean them up.
 - **Search before implementing.** Reuse existing code and patterns before adding new helpers, APIs, or schema objects.
+- **Avoid stupid allocations on hot paths.** If a success/failure wrapper can be an immutable singleton or eliminated
+    entirely, do that instead of allocating fresh `{ ok: true }` / tiny throwaway objects in runtime-heavy code. Cold-path
+    boundary parsing can still use small result objects when they are the right contract.
 - **This is greenfield.** No backwards-compat layers, deprecated APIs, or dead code retention.
 
 ## Specs Rules
@@ -25,7 +28,7 @@
 
 - **Known operational failures return `Err`/`Result`.** `throw` is only for invariants, impossible states, or programmer
   bugs.
-- **No default `NoOpTracer`.** `createAxeNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
+- **No default `NoOpTracer`.** `createNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
   `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
   Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
 - **Run `bun test` from the package directory, not the monorepo root.** Each package has a `bunfig.toml` that preloads
