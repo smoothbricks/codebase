@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'bun:test';
 
-import { parseJsonArray, parseJsonRecord, parseJsonValue, safeJsonParse } from '../json.js';
+import { parseJsonArray, parseJsonRecord, parseJsonValue, safeJsonParse, validateJsonValue } from '../json.js';
 
 // ---------------------------------------------------------------------------
 // safeJsonParse
@@ -135,11 +135,15 @@ describe('parseJsonRecord', () => {
 });
 
 describe('parseJsonValue', () => {
-  it('returns typed values when the guard matches', () => {
+  it('returns typed values when the parser succeeds', () => {
     const result = parseJsonValue(
       '{"kind":"signal"}',
-      (value): value is { kind: string } => {
-        return typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string';
+      (value): { kind: string } => {
+        if (typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string') {
+          return { kind: value.kind };
+        }
+
+        throw new Error('Expected signal envelope');
       },
       'signal envelope',
     );
@@ -147,14 +151,56 @@ describe('parseJsonValue', () => {
     expect(result).toEqual({ ok: true, value: { kind: 'signal' } });
   });
 
-  it('returns a structured error when the guard fails', () => {
+  it('returns a structured error when the parser rejects the value', () => {
     const result = parseJsonValue(
       '{"kind":1}',
-      (value): value is { kind: string } => {
-        return typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string';
+      (value): { kind: string } => {
+        if (typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string') {
+          return { kind: value.kind };
+        }
+
+        throw new Error('Expected signal envelope');
       },
       'signal envelope',
     );
+
+    expect(result).toEqual({ ok: false, error: 'Expected signal envelope' });
+  });
+
+  it('uses the fallback expected message when the parser throws a non-error value', () => {
+    const result = parseJsonValue(
+      '{"kind":1}',
+      (): { kind: string } => {
+        throw 'bad parser';
+      },
+      'signal envelope',
+    );
+
+    expect(result).toEqual({ ok: false, error: 'Expected signal envelope' });
+  });
+});
+
+describe('validateJsonValue', () => {
+  it('returns typed values when the validator succeeds', () => {
+    const result = validateJsonValue('{"kind":"signal"}', (value) => {
+      if (typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string') {
+        return { ok: true, value: { kind: value.kind } };
+      }
+
+      return { ok: false, error: 'Expected signal envelope' };
+    });
+
+    expect(result).toEqual({ ok: true, value: { kind: 'signal' } });
+  });
+
+  it('returns the validator error when validation fails', () => {
+    const result = validateJsonValue('{"kind":1}', (value) => {
+      if (typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string') {
+        return { ok: true, value: { kind: value.kind } };
+      }
+
+      return { ok: false, error: 'Expected signal envelope' };
+    });
 
     expect(result).toEqual({ ok: false, error: 'Expected signal envelope' });
   });
