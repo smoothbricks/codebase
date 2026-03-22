@@ -1,5 +1,10 @@
 import type { Schema, SchemaWithMetadata } from '@smoothbricks/arrow-builder';
-import { createEvaluatorClass } from '../codegen/evaluatorGenerator.js';
+import {
+  createEvaluatorClass,
+  type GeneratedEvaluatorBase,
+  type GeneratedEvaluatorInstance,
+  typeGeneratedEvaluator,
+} from '../codegen/evaluatorGenerator.js';
 import type { FluentLogEntry } from '../codegen/spanLoggerGenerator.js';
 import type { OpContext } from '../opContext/types.js';
 import type { SpanContext } from '../spanContext.js';
@@ -241,44 +246,17 @@ export type InferFeatureFlagsWithContext<Ctx extends OpContext> = Ctx['flags'] e
 // ============================================================================
 
 /**
- * Cache for generated evaluator classes by schema reference
- * Using WeakMap so schemas can be garbage collected
- */
-const evaluatorClassCache = new WeakMap<
-  FeatureFlagSchema,
-  new (
-    spanContext: SpanContext<OpContext>,
-    evaluator: FlagEvaluator,
-  ) => FeatureFlagEvaluator<OpContext>
->();
-
-/**
- * Get or create a generated evaluator class for a schema
+ * Get or create a generated evaluator class for a schema.
+ *
+ * The worker-safe constructor cache lives in `evaluatorGenerator.ts`.
  */
 function getOrCreateEvaluatorClass<Ctx extends OpContext>(
   schema: Ctx['flags'],
 ): new (
   spanContext: SpanContext<Ctx>,
   evaluator: FlagEvaluator<Ctx>,
-) => FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx> {
-  // Check cache first
-  let GeneratedClass = evaluatorClassCache.get(schema);
-
-  if (!GeneratedClass) {
-    // Generate the class using new Function()
-    GeneratedClass = createEvaluatorClass(schema, validateFlagValue, ENTRY_TYPE_FF_ACCESS) as unknown as new (
-      spanContext: SpanContext<OpContext>,
-      evaluator: FlagEvaluator,
-    ) => FeatureFlagEvaluator<OpContext>;
-
-    // Cache the generated class
-    evaluatorClassCache.set(schema, GeneratedClass);
-  }
-
-  return GeneratedClass as unknown as new (
-    spanContext: SpanContext<Ctx>,
-    evaluator: FlagEvaluator<Ctx>,
-  ) => FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx>;
+) => GeneratedEvaluatorBase<Ctx> {
+  return createEvaluatorClass(schema, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
 }
 
 /**
@@ -372,7 +350,8 @@ export function createFeatureFlagEvaluator<Ctx extends OpContext>(
   evaluator: FlagEvaluator<Ctx>,
 ): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx> {
   const GeneratedClass = getOrCreateEvaluatorClass<Ctx>(schema);
-  return new GeneratedClass(spanContext, evaluator);
+  const instance: GeneratedEvaluatorInstance<Ctx> = typeGeneratedEvaluator(new GeneratedClass(spanContext, evaluator));
+  return instance;
 }
 
 /**

@@ -80,6 +80,26 @@ describe('Feature Flags', () => {
     expect(result.success).toBe(true);
   });
 
+  test('feature-flag runtime stays worker-safe', async () => {
+    const flags = defineFeatureFlags({
+      debugMode: S.boolean().default(false).sync(),
+    });
+
+    const ctx = defineOpContext({
+      logSchema: testLogSchema,
+      flags: flags.schema,
+    });
+
+    const flagEvaluator = new InMemoryFlagEvaluator(flags.schema, { debugMode: true });
+    const tracer = new TestTracer(ctx, { ...createTestTracerOptions(), flagEvaluator });
+
+    await tracer.trace('worker-safe-evaluator', async (spanCtx) => {
+      expect(spanCtx.ff.debugMode?.value).toBe(true);
+      expect(spanCtx.ff.constructor.toString()).not.toContain('new Function');
+      return spanCtx.ok(null);
+    });
+  });
+
   test('evaluator returns undefined for falsy flags', async () => {
     const flags = defineFeatureFlags({
       debugMode: S.boolean().default(false).sync(),

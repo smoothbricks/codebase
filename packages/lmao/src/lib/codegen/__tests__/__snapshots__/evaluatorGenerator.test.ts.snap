@@ -1,664 +1,160 @@
 // Bun Snapshot v1, https://bun.sh/docs/test/snapshots
 
 exports[`generateEvaluatorClass snapshots snapshot: single boolean flag 1`] = `
-"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
-  'use strict';
-
-  class GeneratedEvaluator {
-    #spanContext;
-    #evaluator;
-    #schema;
-
-    constructor(spanContext, evaluator) {
-      this.#spanContext = spanContext;
-      this.#evaluator = evaluator;
-      // Schema passed as closure parameter at codegen time
-      this.#schema = SCHEMA;
-    }
-
-    get evaluator() { return this.#evaluator; }
-
-    #hasLoggedAccess(flagName) {
-      let buf = this.#spanContext._buffer;
-      
-      while (buf) {
-        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
-        // This ensures we check all written entries including the most recent
-        const limit = buf._writeIndex;
-        for (let i = limit - 1; i >= 0; i--) {
-          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
-              buf.message_values && buf.message_values[i] === flagName) {
-            return true;
-          }
-        }
-        buf = buf._overflow;
-      }
-      return false;
-    }
-
-    #getFlag(flagName) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flagName];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = this.#evaluator.getSync(ctx, flagName);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flagName)) {
-        const log = ctx.log;
-        log.ffAccess(flagName, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flagName, value);
-      return wrapped;
-    }
-
-    #wrapValue(flagName, value) {
-      const self = this;
-      if (typeof value === 'boolean') {
-        return {
-          value: true,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'string') {
-        return {
-          value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'object' && value !== null) {
-        return {
-          ...value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      return {
-        value,
-        track(context) { return self.#logUsage(flagName, context); }
-      };
-    }
-
-    #logUsage(flagName, context) {
-      const log = this.#spanContext.log;
-      return log.ffUsage(flagName, context);
-    }
-
-    async get(flag) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flag];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = await this.#evaluator.getAsync(ctx, flag);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flag)) {
-        const log = ctx.log;
-        log.ffAccess(flag, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flag, value);
-      return wrapped;
-    }
-
-    forContext(ctx) {
-      return new GeneratedEvaluator(ctx, this.#evaluator);
-    }
-
-    get debugMode() {
-      return this.#getFlag('debugMode');
-    }
+"class GeneratedEvaluator extends WorkerSafeGeneratedEvaluator {
+  constructor(spanContext, evaluator) {
+    super(spanContext, evaluator, SCHEMA, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
   }
 
-  return GeneratedEvaluator;
-})
-"
+  forContext(ctx) {
+    return new GeneratedEvaluator(ctx, this.evaluator);
+  }
+}
+
+Object.defineProperties(GeneratedEvaluator.prototype, {
+  debugMode: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('debugMode');
+    },
+  }
+});"
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: multiple flags of different types 1`] = `
-"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
-  'use strict';
-
-  class GeneratedEvaluator {
-    #spanContext;
-    #evaluator;
-    #schema;
-
-    constructor(spanContext, evaluator) {
-      this.#spanContext = spanContext;
-      this.#evaluator = evaluator;
-      // Schema passed as closure parameter at codegen time
-      this.#schema = SCHEMA;
-    }
-
-    get evaluator() { return this.#evaluator; }
-
-    #hasLoggedAccess(flagName) {
-      let buf = this.#spanContext._buffer;
-      
-      while (buf) {
-        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
-        // This ensures we check all written entries including the most recent
-        const limit = buf._writeIndex;
-        for (let i = limit - 1; i >= 0; i--) {
-          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
-              buf.message_values && buf.message_values[i] === flagName) {
-            return true;
-          }
-        }
-        buf = buf._overflow;
-      }
-      return false;
-    }
-
-    #getFlag(flagName) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flagName];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = this.#evaluator.getSync(ctx, flagName);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flagName)) {
-        const log = ctx.log;
-        log.ffAccess(flagName, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flagName, value);
-      return wrapped;
-    }
-
-    #wrapValue(flagName, value) {
-      const self = this;
-      if (typeof value === 'boolean') {
-        return {
-          value: true,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'string') {
-        return {
-          value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'object' && value !== null) {
-        return {
-          ...value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      return {
-        value,
-        track(context) { return self.#logUsage(flagName, context); }
-      };
-    }
-
-    #logUsage(flagName, context) {
-      const log = this.#spanContext.log;
-      return log.ffUsage(flagName, context);
-    }
-
-    async get(flag) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flag];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = await this.#evaluator.getAsync(ctx, flag);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flag)) {
-        const log = ctx.log;
-        log.ffAccess(flag, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flag, value);
-      return wrapped;
-    }
-
-    forContext(ctx) {
-      return new GeneratedEvaluator(ctx, this.#evaluator);
-    }
-
-    get debugMode() {
-      return this.#getFlag('debugMode');
-    }
-
-    get maxRetries() {
-      return this.#getFlag('maxRetries');
-    }
-
-    get logLevel() {
-      return this.#getFlag('logLevel');
-    }
+"class GeneratedEvaluator extends WorkerSafeGeneratedEvaluator {
+  constructor(spanContext, evaluator) {
+    super(spanContext, evaluator, SCHEMA, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
   }
 
-  return GeneratedEvaluator;
-})
-"
+  forContext(ctx) {
+    return new GeneratedEvaluator(ctx, this.evaluator);
+  }
+}
+
+Object.defineProperties(GeneratedEvaluator.prototype, {
+  debugMode: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('debugMode');
+    },
+  },
+  maxRetries: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('maxRetries');
+    },
+  },
+  logLevel: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('logLevel');
+    },
+  }
+});"
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: async flags 1`] = `
-"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
-  'use strict';
-
-  class GeneratedEvaluator {
-    #spanContext;
-    #evaluator;
-    #schema;
-
-    constructor(spanContext, evaluator) {
-      this.#spanContext = spanContext;
-      this.#evaluator = evaluator;
-      // Schema passed as closure parameter at codegen time
-      this.#schema = SCHEMA;
-    }
-
-    get evaluator() { return this.#evaluator; }
-
-    #hasLoggedAccess(flagName) {
-      let buf = this.#spanContext._buffer;
-      
-      while (buf) {
-        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
-        // This ensures we check all written entries including the most recent
-        const limit = buf._writeIndex;
-        for (let i = limit - 1; i >= 0; i--) {
-          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
-              buf.message_values && buf.message_values[i] === flagName) {
-            return true;
-          }
-        }
-        buf = buf._overflow;
-      }
-      return false;
-    }
-
-    #getFlag(flagName) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flagName];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = this.#evaluator.getSync(ctx, flagName);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flagName)) {
-        const log = ctx.log;
-        log.ffAccess(flagName, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flagName, value);
-      return wrapped;
-    }
-
-    #wrapValue(flagName, value) {
-      const self = this;
-      if (typeof value === 'boolean') {
-        return {
-          value: true,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'string') {
-        return {
-          value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'object' && value !== null) {
-        return {
-          ...value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      return {
-        value,
-        track(context) { return self.#logUsage(flagName, context); }
-      };
-    }
-
-    #logUsage(flagName, context) {
-      const log = this.#spanContext.log;
-      return log.ffUsage(flagName, context);
-    }
-
-    async get(flag) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flag];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = await this.#evaluator.getAsync(ctx, flag);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flag)) {
-        const log = ctx.log;
-        log.ffAccess(flag, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flag, value);
-      return wrapped;
-    }
-
-    forContext(ctx) {
-      return new GeneratedEvaluator(ctx, this.#evaluator);
-    }
-
-    get asyncFeature() {
-      return this.#getFlag('asyncFeature');
-    }
-
-    get asyncLimit() {
-      return this.#getFlag('asyncLimit');
-    }
+"class GeneratedEvaluator extends WorkerSafeGeneratedEvaluator {
+  constructor(spanContext, evaluator) {
+    super(spanContext, evaluator, SCHEMA, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
   }
 
-  return GeneratedEvaluator;
-})
-"
+  forContext(ctx) {
+    return new GeneratedEvaluator(ctx, this.evaluator);
+  }
+}
+
+Object.defineProperties(GeneratedEvaluator.prototype, {
+  asyncFeature: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('asyncFeature');
+    },
+  },
+  asyncLimit: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('asyncLimit');
+    },
+  }
+});"
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: custom class name 1`] = `
-"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
-  'use strict';
-
-  class CustomFeatureFlagEvaluator {
-    #spanContext;
-    #evaluator;
-    #schema;
-
-    constructor(spanContext, evaluator) {
-      this.#spanContext = spanContext;
-      this.#evaluator = evaluator;
-      // Schema passed as closure parameter at codegen time
-      this.#schema = SCHEMA;
-    }
-
-    get evaluator() { return this.#evaluator; }
-
-    #hasLoggedAccess(flagName) {
-      let buf = this.#spanContext._buffer;
-      
-      while (buf) {
-        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
-        // This ensures we check all written entries including the most recent
-        const limit = buf._writeIndex;
-        for (let i = limit - 1; i >= 0; i--) {
-          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
-              buf.message_values && buf.message_values[i] === flagName) {
-            return true;
-          }
-        }
-        buf = buf._overflow;
-      }
-      return false;
-    }
-
-    #getFlag(flagName) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flagName];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = this.#evaluator.getSync(ctx, flagName);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flagName)) {
-        const log = ctx.log;
-        log.ffAccess(flagName, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flagName, value);
-      return wrapped;
-    }
-
-    #wrapValue(flagName, value) {
-      const self = this;
-      if (typeof value === 'boolean') {
-        return {
-          value: true,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'string') {
-        return {
-          value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'object' && value !== null) {
-        return {
-          ...value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      return {
-        value,
-        track(context) { return self.#logUsage(flagName, context); }
-      };
-    }
-
-    #logUsage(flagName, context) {
-      const log = this.#spanContext.log;
-      return log.ffUsage(flagName, context);
-    }
-
-    async get(flag) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flag];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = await this.#evaluator.getAsync(ctx, flag);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flag)) {
-        const log = ctx.log;
-        log.ffAccess(flag, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flag, value);
-      return wrapped;
-    }
-
-    forContext(ctx) {
-      return new CustomFeatureFlagEvaluator(ctx, this.#evaluator);
-    }
-
-    get testFlag() {
-      return this.#getFlag('testFlag');
-    }
+"class CustomFeatureFlagEvaluator extends WorkerSafeGeneratedEvaluator {
+  constructor(spanContext, evaluator) {
+    super(spanContext, evaluator, SCHEMA, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
   }
 
-  return CustomFeatureFlagEvaluator;
-})
-"
+  forContext(ctx) {
+    return new CustomFeatureFlagEvaluator(ctx, this.evaluator);
+  }
+}
+
+Object.defineProperties(CustomFeatureFlagEvaluator.prototype, {
+  testFlag: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('testFlag');
+    },
+  }
+});"
 `;
 
 exports[`generateEvaluatorClass snapshots snapshot: many flags 1`] = `
-"(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA) {
-  'use strict';
-
-  class GeneratedEvaluator {
-    #spanContext;
-    #evaluator;
-    #schema;
-
-    constructor(spanContext, evaluator) {
-      this.#spanContext = spanContext;
-      this.#evaluator = evaluator;
-      // Schema passed as closure parameter at codegen time
-      this.#schema = SCHEMA;
-    }
-
-    get evaluator() { return this.#evaluator; }
-
-    #hasLoggedAccess(flagName) {
-      let buf = this.#spanContext._buffer;
-      
-      while (buf) {
-        // Use buffer._writeIndex which is _writeIndex + 1 (points past last written index)
-        // This ensures we check all written entries including the most recent
-        const limit = buf._writeIndex;
-        for (let i = limit - 1; i >= 0; i--) {
-          if (buf.entry_type[i] === ENTRY_TYPE_FF_ACCESS && 
-              buf.message_values && buf.message_values[i] === flagName) {
-            return true;
-          }
-        }
-        buf = buf._overflow;
-      }
-      return false;
-    }
-
-    #getFlag(flagName) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flagName];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = this.#evaluator.getSync(ctx, flagName);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flagName)) {
-        const log = ctx.log;
-        log.ffAccess(flagName, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flagName, value);
-      return wrapped;
-    }
-
-    #wrapValue(flagName, value) {
-      const self = this;
-      if (typeof value === 'boolean') {
-        return {
-          value: true,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'string') {
-        return {
-          value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      if (typeof value === 'object' && value !== null) {
-        return {
-          ...value,
-          track(context) { return self.#logUsage(flagName, context); }
-        };
-      }
-      return {
-        value,
-        track(context) { return self.#logUsage(flagName, context); }
-      };
-    }
-
-    #logUsage(flagName, context) {
-      const log = this.#spanContext.log;
-      return log.ffUsage(flagName, context);
-    }
-
-    async get(flag) {
-      const ctx = this.#spanContext;
-      const definition = this.#schema[flag];
-      
-      // Pass ctx first (consistency), then flag name
-      // Evaluator receives Omit<SpanContext, 'ff'> to prevent infinite recursion
-      const rawValue = await this.#evaluator.getAsync(ctx, flag);
-      const value = validateFlagValue(rawValue, definition.schema, definition.defaultValue);
-      
-      // Deduplicate: only log first access per span
-      if (!this.#hasLoggedAccess(flag)) {
-        const log = ctx.log;
-        log.ffAccess(flag, rawValue);
-      }
-      
-      if (!value) {
-        return undefined;
-      }
-      
-      const wrapped = this.#wrapValue(flag, value);
-      return wrapped;
-    }
-
-    forContext(ctx) {
-      return new GeneratedEvaluator(ctx, this.#evaluator);
-    }
-
-    get flag1() {
-      return this.#getFlag('flag1');
-    }
-
-    get flag2() {
-      return this.#getFlag('flag2');
-    }
-
-    get flag3() {
-      return this.#getFlag('flag3');
-    }
-
-    get flag4() {
-      return this.#getFlag('flag4');
-    }
-
-    get flag5() {
-      return this.#getFlag('flag5');
-    }
+"class GeneratedEvaluator extends WorkerSafeGeneratedEvaluator {
+  constructor(spanContext, evaluator) {
+    super(spanContext, evaluator, SCHEMA, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
   }
 
-  return GeneratedEvaluator;
-})
-"
+  forContext(ctx) {
+    return new GeneratedEvaluator(ctx, this.evaluator);
+  }
+}
+
+Object.defineProperties(GeneratedEvaluator.prototype, {
+  flag1: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('flag1');
+    },
+  },
+  flag2: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('flag2');
+    },
+  },
+  flag3: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('flag3');
+    },
+  },
+  flag4: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('flag4');
+    },
+  },
+  flag5: {
+    configurable: true,
+    enumerable: false,
+    get() {
+      return this.getFlag('flag5');
+    },
+  }
+});"
 `;

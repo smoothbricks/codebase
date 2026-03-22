@@ -54,23 +54,21 @@ describe('EvaluatorGenerator', () => {
 
       const code = generateEvaluatorClass(schema.schema);
 
-      // Should be a valid IIFE wrapper
-      expect(code).toContain('(function(validateFlagValue, ENTRY_TYPE_FF_ACCESS, SCHEMA)');
-      expect(code).toContain("'use strict'");
-      expect(code).toContain('class GeneratedEvaluator');
+      expect(code).toContain('class GeneratedEvaluator extends WorkerSafeGeneratedEvaluator');
+      expect(code).toContain('Object.defineProperties(GeneratedEvaluator.prototype');
 
-      // Should have getters for each flag
-      expect(code).toContain('get debugMode()');
-      expect(code).toContain('get maxRetries()');
+      // Should describe the generated getters for each flag
+      expect(code).toContain("return this.getFlag('debugMode')");
+      expect(code).toContain("return this.getFlag('maxRetries')");
 
       // Should have new API methods (not old ones)
       expect(code).toContain('forContext(ctx)');
-      expect(code).toContain('async get(flag)');
-      expect(code).toContain('track(context) { return self.#logUsage(flagName, context); }');
+      expect(code).toContain('super(spanContext, evaluator, SCHEMA, validateFlagValue, ENTRY_TYPE_FF_ACCESS);');
 
       // Should NOT have old API methods
       expect(code).not.toContain('withBuffer(');
       expect(code).not.toContain('getContext()');
+      expect(code).not.toContain('new Function');
     });
 
     test('generates unique getter for each flag', () => {
@@ -85,16 +83,16 @@ describe('EvaluatorGenerator', () => {
 
       const code = generateEvaluatorClass(schema.schema);
 
-      expect(code).toContain('get featureA()');
-      expect(code).toContain('get featureB()');
-      expect(code).toContain('get featureC()');
-      expect(code).toContain('get featureD()');
+      expect(code).toContain('featureA: {');
+      expect(code).toContain('featureB: {');
+      expect(code).toContain('featureC: {');
+      expect(code).toContain('featureD: {');
 
-      // Each getter should call #getFlag with the flag name
-      expect(code).toContain("this.#getFlag('featureA')");
-      expect(code).toContain("this.#getFlag('featureB')");
-      expect(code).toContain("this.#getFlag('featureC')");
-      expect(code).toContain("this.#getFlag('featureD')");
+      // Each getter should call getFlag with the flag name
+      expect(code).toContain("this.getFlag('featureA')");
+      expect(code).toContain("this.getFlag('featureB')");
+      expect(code).toContain("this.getFlag('featureC')");
+      expect(code).toContain("this.getFlag('featureD')");
     });
   });
 
@@ -172,7 +170,7 @@ describe('EvaluatorGenerator', () => {
       const instance = new GeneratedClass(mockCtx, evaluator);
 
       // Access the flag via generated getter
-      const flag = instance.debugMode;
+      const flag = Reflect.get(instance, 'debugMode');
 
       expect(flag).toBeDefined();
       expect(flag?.value).toBe(true);
@@ -197,7 +195,7 @@ describe('EvaluatorGenerator', () => {
       const evaluator = new InMemoryFlagEvaluator<Ctx>(ffSchema.schema, { debugMode: false });
       const instance = new GeneratedClass(mockCtx, evaluator);
 
-      const flag = instance.debugMode;
+      const flag = Reflect.get(instance, 'debugMode');
       expect(flag).toBeUndefined();
     });
 
@@ -226,7 +224,7 @@ describe('EvaluatorGenerator', () => {
       const childInstance = instance.forContext(childCtx);
 
       // Child should have flag accessible
-      const childFlag = childInstance.debugMode;
+      const childFlag = Reflect.get(childInstance, 'debugMode');
       expect(childFlag?.value).toBe(true);
     });
 
@@ -256,9 +254,9 @@ describe('EvaluatorGenerator', () => {
       const instance = new GeneratedClass(mockCtx, trackingEvaluator);
 
       // Access flag multiple times
-      instance.debugMode;
-      instance.debugMode;
-      instance.debugMode;
+      Reflect.get(instance, 'debugMode');
+      Reflect.get(instance, 'debugMode');
+      Reflect.get(instance, 'debugMode');
 
       // Evaluator should be called each time (no local cache)
       expect(evalCount).toBe(3);
@@ -315,7 +313,7 @@ describe('EvaluatorGenerator', () => {
       const evaluator = new InMemoryFlagEvaluator<Ctx>(ffSchema.schema, { debugMode: true });
       const instance = new GeneratedClass(mockCtx, evaluator);
 
-      const flag = instance.debugMode;
+      const flag = Reflect.get(instance, 'debugMode');
       flag?.track({ action: 'test_action', outcome: 'success' });
 
       // Check buffer for ff-usage entry
@@ -404,6 +402,21 @@ describe('EvaluatorGenerator', () => {
       // Generated code should not contain Proxy
       expect(code).not.toContain('new Proxy');
       expect(code).not.toContain('Proxy(');
+    });
+
+    test('runtime path stays worker-safe', () => {
+      const schema = defineFeatureFlags({
+        testFlag: S.boolean().default(false).sync(),
+      });
+
+      const GeneratedClass = createEvaluatorClass(
+        schema.schema,
+        (value, _schema, def) => value ?? def,
+        ENTRY_TYPE_FF_ACCESS,
+      );
+
+      expect(() => GeneratedClass).not.toThrow();
+      expect(GeneratedClass.toString()).not.toContain('new Function');
     });
   });
 });
