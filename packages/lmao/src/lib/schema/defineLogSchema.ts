@@ -88,15 +88,74 @@ export type ValidatedLogSchema<T extends SchemaFields> = LogSchema<T> & {
 };
 
 /**
+ * Extended schema shape covering optional, refine, union, and key wrappers.
+ * Avoids repetitive inline casts throughout validateField.
+ *
+ * define additional schema types (e.g. 'key') beyond the columnar SchemaType union.
+ */
+interface ExtendedSchema extends Omit<SchemaWithMetadata, '__schema_type'> {
+  __schema_type?: string;
+  __optional?: boolean;
+  __inner?: SchemaWithMetadata;
+  __refiner?: (value: unknown, fail: { fail(msg: string): never }) => unknown;
+  __union?: SchemaWithMetadata[];
+  __key_name?: string;
+  __key_validator?: (value: string) => string;
+}
+
+/**
  * Validate a single field value against its schema metadata.
  * Uses __schema_type for type dispatch — no Sury dependency.
+ *
+ * Handles all schema compositions: optional, refine, union, key.
+ * Throws on unknown __schema_type to prevent silent acceptance of invalid data.
  */
 function validateField(key: string, value: unknown, schema: SchemaWithMetadata): unknown {
+  const s = schema as ExtendedSchema;
+
   // Handle optional schemas (created via S.optional())
-  const s = schema as SchemaWithMetadata & { __optional?: boolean };
+  if (s.__optional) {
+    if (value === undefined || value === null) return undefined;
+    // Value is present — recursively validate against the inner schema
+    if (s.__inner) {
+      return validateField(key, value, s.__inner);
+    }
+    // Optional with no inner schema — accept the value as-is
+    // (shouldn't happen with well-formed schemas, but defensive)
+    return value;
+  }
+
   if (value === undefined || value === null) {
-    if (s.__optional) return undefined;
     throw new Error(`Field "${key}": expected a value, got ${value === null ? 'null' : 'undefined'}`);
+  }
+
+  // Handle refine() schemas — invoke the stored refiner function
+  if (s.__refiner) {
+    try {
+      return s.__refiner(value, {
+        fail(msg: string): never {
+          throw new Error(`Field "${key}": refinement failed — ${msg}`);
+        },
+      });
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith(`Field "${key}":`)) throw err;
+      throw new Error(`Field "${key}": refinement failed — ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
+  // Handle union() schemas — try each member, accept if any matches
+  if (s.__union) {
+    const errors: string[] = [];
+    for (const member of s.__union) {
+      try {
+        return validateField(key, value, member);
+      } catch (err) {
+        errors.push(err instanceof Error ? err.message : String(err));
+      }
+    }
+    throw new Error(
+      `Field "${key}": value does not match any union member. Tried ${s.__union.length}: ${errors.join('; ')}`,
+    );
   }
 
   switch (s.__schema_type) {
@@ -122,9 +181,18 @@ function validateField(key: string, value: unknown, schema: SchemaWithMetadata):
     case 'binary':
       // Binary accepts any value (raw bytes or encoder-wrapped)
       return value;
-    default:
-      // Unknown schema type — accept as-is
+    case 'key':
+      // Key schema — validate the runtime value using the stored validator
+      if (typeof value !== 'string') throw new Error(`Field "${key}": expected string key value, got ${typeof value}`);
+      if (s.__key_validator) {
+        return s.__key_validator(value);
+      }
       return value;
+    default:
+      throw new Error(
+        `Field "${key}": unknown schema type "${s.__schema_type ?? '<none>'}". ` +
+          'All schema types must be explicitly handled in validateField.',
+      );
   }
 }
 

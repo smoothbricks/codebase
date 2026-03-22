@@ -269,4 +269,74 @@ describe('defineLogSchema with Sury', () => {
     expect(result.operation).toBe('CREATE');
     expect(result.metadata).toBeUndefined();
   });
+
+  // =========================================================================
+  // Regression tests for Sury removal (eb6fbce2)
+  // Validates that schema validation semantics were not weakened
+  // =========================================================================
+
+  test('rejects unknown __schema_type instead of silently accepting', () => {
+    // Craft a schema object with an unknown __schema_type to verify
+    // validateField throws instead of falling through to a default: return value.
+    // We create a valid number schema then corrupt its __schema_type at runtime
+    // to simulate an unrecognized schema variant.
+    const numberSchema = S.number();
+    // Runtime mutation to inject an unrecognized schema type — this is
+    // testing defensive validation, not normal usage
+    Object.assign(numberSchema, { __schema_type: 'nonexistent' });
+    const weirdSchema = defineLogSchema({ field: numberSchema });
+
+    expect(() => {
+      weirdSchema.validate({ field: 42 });
+    }).toThrow(/unknown schema type/i);
+  });
+
+  test('optional(enum(...)) rejects invalid inner values', () => {
+    const schema = defineLogSchema({
+      status: S.optional(S.enum(['active', 'inactive'])),
+    });
+
+    // Valid: undefined
+    expect(schema.validate({}).status).toBeUndefined();
+
+    // Valid: correct enum value
+    expect(schema.validate({ status: 'active' }).status).toBe('active');
+
+    // Invalid: wrong enum value — must throw, not silently accept
+    expect(() => {
+      schema.validate({ status: 'bogus' });
+    }).toThrow(/expected one of/);
+  });
+
+  test('optional(number()) rejects wrong type when present', () => {
+    const schema = defineLogSchema({
+      count: S.optional(S.number()),
+    });
+
+    // Valid: undefined
+    expect(schema.validate({}).count).toBeUndefined();
+
+    // Valid: number
+    expect(schema.validate({ count: 5 }).count).toBe(5);
+
+    // Invalid: string when number expected
+    expect(() => {
+      schema.validate({ count: 'five' });
+    }).toThrow(/expected number/);
+  });
+
+  test('union rejects when no member matches', () => {
+    const schema = defineLogSchema({
+      value: S.union([S.category(), S.number()]),
+    });
+
+    // Valid members
+    expect(schema.validate({ value: 'hello' }).value).toBe('hello');
+    expect(schema.validate({ value: 42 }).value).toBe(42);
+
+    // Invalid: boolean is not in the union
+    expect(() => {
+      schema.validate({ value: true });
+    }).toThrow(/does not match any union member/);
+  });
 });

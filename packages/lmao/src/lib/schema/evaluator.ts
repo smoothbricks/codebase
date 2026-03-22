@@ -8,11 +8,38 @@ import type { LogSchema } from './LogSchema.js';
 import { ENTRY_TYPE_FF_ACCESS } from './systemSchema.js';
 
 /**
+ * Extended schema shape for flag validation — covers refine(), enum membership,
+ * SchemaType union.
+ */
+interface ExtendedFlagSchema extends Omit<SchemaWithMetadata, '__schema_type'> {
+  __schema_type?: string;
+  __refiner?: (value: unknown, fail: { fail(msg: string): never }) => unknown;
+}
+
+/**
  * Type guard to validate flag value matches schema.
  * Uses __schema_type metadata for type-based validation instead of Sury.
+ *
+ * For feature flags the types are limited (string, number, boolean, enum, bigint).
+ * Schemas with __refiner (from refine()) invoke the refiner — on failure, return default.
+ * Schemas with __enum_values check membership.
  */
 function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T): T {
-  const meta = schema as SchemaWithMetadata;
+  const meta = schema as ExtendedFlagSchema;
+
+  // Handle refine() schemas — invoke the stored refiner, fall back to default on failure
+  if (meta.__refiner) {
+    try {
+      return meta.__refiner(value, {
+        fail(msg: string): never {
+          throw new Error(msg);
+        },
+      }) as T;
+    } catch {
+      return defaultValue;
+    }
+  }
+
   switch (meta.__schema_type) {
     case 'number':
       return typeof value === 'number' ? (value as T) : defaultValue;
@@ -27,9 +54,13 @@ function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T
       return value as T;
     case 'bigUint64':
       return typeof value === 'bigint' ? (value as T) : defaultValue;
+    case 'key':
+      // Key schema in feature flags — validate it's a string
+      return typeof value === 'string' ? (value as T) : defaultValue;
     default:
-      // Unknown schema type — accept if same typeof as default, else use default
-      return typeof value === typeof defaultValue ? (value as T) : defaultValue;
+      // Unknown schema type — reject by returning the default value.
+      // This prevents silently accepting invalid data for unhandled schema types.
+      return defaultValue;
   }
 }
 

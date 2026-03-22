@@ -14,8 +14,11 @@ declare const phantomInput: unique symbol;
  * Phantom schema type for compile-time type inference.
  * Replaces Sury.Schema<Output, Input>.
  *
- * At runtime, schema objects are plain objects with __schema_type metadata.
- * The Output/Input type parameters exist only for TypeScript inference.
+ * Base singletons (string, number, etc.) below are phantom type carriers only —
+ * they carry no runtime metadata. Builder functions (S.number(), S.enum(), etc.
+ * in builder.ts) create schema objects with __schema_type metadata for columnar
+ * storage dispatch. The Output/Input type parameters exist only for TypeScript
+ * inference and are never set at runtime.
  */
 export interface Schema<Output = unknown, Input = Output> {
   readonly [phantomOutput]?: Output;

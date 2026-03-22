@@ -18,6 +18,7 @@ import type {
   EagerBigUint64Schema,
   EagerBinarySchema,
   EagerBooleanSchema,
+  EagerBrand,
   EagerCategorySchema,
   EagerEnumSchema,
   EagerNumberSchema,
@@ -26,6 +27,7 @@ import type {
   LazyBigUint64Schema,
   LazyBinarySchema,
   LazyBooleanSchema,
+  LazyBrand,
   LazyCategorySchema,
   LazyEnumSchema,
   LazyNumberSchema,
@@ -33,6 +35,25 @@ import type {
   MaskPreset,
   MaskTransform,
 } from './types.js';
+
+/**
+ * Convert a lazy schema to its eager variant by adding __eager: true.
+ *
+ * The Lazy types carry LazyBrand (__eager?: never) while Eager types carry
+ * EagerBrand (__eager: true). A plain spread would produce a contradictory
+ * intersection. This helper strips the conflicting __eager via Omit and adds
+ * EagerBrand, using a structural chain cast (not `as unknown as`).
+ *
+ * The E parameter is intentionally unconstrained against L because Eager types
+ * may widen some of L's generic properties (e.g. EagerEnumSchema widens
+ * __enum_values from the specific tuple T to readonly string[]).
+ */
+function toEager<L extends { __schema_type: string }, E>(schema: L): E {
+  const eager = { ...schema, __eager: true as const };
+  // Two-step structural cast: first to the intermediate intersection (which is
+  // sound — we're just adding __eager to the same metadata), then to E.
+  return eager as Omit<L, keyof LazyBrand> & EagerBrand as E;
+}
 
 /**
  * Masking preset implementations
@@ -135,10 +156,9 @@ function precomputeEnumUtf8(values: readonly string[]): EnumUtf8Precomputed {
  * objects with __schema_type metadata; no Sury prototype needed.
  */
 function withEager<L extends { __schema_type: string }, E>(schema: L): L & { eager(): E } {
-  (schema as L & { eager(): E }).eager = (): E => {
-    return { ...schema, __eager: true as const } as unknown as E;
-  };
-  return schema as L & { eager(): E };
+  const lazyWithEager = schema as L & { eager(): E };
+  lazyWithEager.eager = (): E => toEager<L, E>(schema);
+  return lazyWithEager;
 }
 
 /**
@@ -276,16 +296,12 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
       const maskedSchema = { ...schema, __mask_transform: resolveMaskTransform(preset) } as LazyCategorySchema;
       // Preserve mask/eager chainability
       maskedSchema.mask = schema.mask;
-      maskedSchema.eager = (): EagerCategorySchema => {
-        return { ...maskedSchema, __eager: true as const } as unknown as EagerCategorySchema;
-      };
+      maskedSchema.eager = (): EagerCategorySchema => toEager(maskedSchema);
       return maskedSchema;
     };
 
     // Add chainable .eager() method
-    schema.eager = (): EagerCategorySchema => {
-      return { ...schema, __eager: true as const } as unknown as EagerCategorySchema;
-    };
+    schema.eager = (): EagerCategorySchema => toEager(schema);
 
     return schema;
   },
@@ -297,9 +313,7 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
       (schema as LazyBinarySchema & { __binary_encoder: BinaryEncoder }).__binary_encoder = options.encoder;
     }
 
-    schema.eager = (): EagerBinarySchema => {
-      return { ...schema, __eager: true as const } as unknown as EagerBinarySchema;
-    };
+    schema.eager = (): EagerBinarySchema => toEager(schema);
 
     return schema;
   },
@@ -311,16 +325,12 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     schema.mask = (preset: MaskPreset | MaskTransform): LazyTextSchema => {
       const maskedSchema = { ...schema, __mask_transform: resolveMaskTransform(preset) } as LazyTextSchema;
       maskedSchema.mask = schema.mask;
-      maskedSchema.eager = (): EagerTextSchema => {
-        return { ...maskedSchema, __eager: true as const } as unknown as EagerTextSchema;
-      };
+      maskedSchema.eager = (): EagerTextSchema => toEager(maskedSchema);
       return maskedSchema;
     };
 
     // Add chainable .eager() method
-    schema.eager = (): EagerTextSchema => {
-      return { ...schema, __eager: true as const } as unknown as EagerTextSchema;
-    };
+    schema.eager = (): EagerTextSchema => toEager(schema);
 
     return schema;
   },
