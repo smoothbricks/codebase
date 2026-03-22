@@ -1,6 +1,15 @@
 import { describe, expect, it } from 'bun:test';
 
-import { parseJsonArray, parseJsonRecord, parseJsonValue, safeJsonParse, validateJsonValue } from '../json.js';
+import {
+  expectJsonBoundary,
+  parseJsonArray,
+  parseJsonBoundary,
+  parseJsonBoundaryValue,
+  parseJsonRecord,
+  parseJsonValue,
+  safeJsonParse,
+  validateJsonValue,
+} from '../json.js';
 
 // ---------------------------------------------------------------------------
 // safeJsonParse
@@ -177,6 +186,88 @@ describe('parseJsonValue', () => {
     );
 
     expect(result).toEqual({ ok: false, error: 'Expected signal envelope' });
+  });
+});
+
+describe('parseJsonBoundaryValue', () => {
+  it('returns the parsed value when the boundary parser succeeds', () => {
+    const result = parseJsonBoundaryValue(
+      { kind: 'signal' },
+      {
+        parse: (value): { kind: string } => {
+          if (typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string') {
+            return { kind: value.kind };
+          }
+
+          throw new Error('Expected signal envelope');
+        },
+        expected: 'signal envelope',
+      },
+    );
+
+    expect(result).toEqual({ ok: true, value: { kind: 'signal' } });
+  });
+
+  it('returns the expected fallback when the parser throws a non-error value', () => {
+    const result = parseJsonBoundaryValue(
+      { kind: 1 },
+      {
+        parse: (): { kind: string } => {
+          throw 'bad parser';
+        },
+        expected: 'signal envelope',
+      },
+    );
+
+    expect(result).toEqual({ ok: false, error: 'Expected signal envelope' });
+  });
+});
+
+describe('parseJsonBoundary', () => {
+  it('parses JSON without a boundary parser', () => {
+    const result = parseJsonBoundary('{"kind":"signal"}');
+
+    expect(result).toEqual({ ok: true, value: { kind: 'signal' } });
+  });
+
+  it('returns the boundary parser error for malformed payloads', () => {
+    const result = parseJsonBoundary('{"kind":1}', {
+      parse: (value): { kind: string } => {
+        if (typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string') {
+          return { kind: value.kind };
+        }
+
+        throw new Error('Expected signal envelope');
+      },
+      expected: 'signal envelope',
+    });
+
+    expect(result).toEqual({ ok: false, error: 'Expected signal envelope' });
+  });
+});
+
+describe('expectJsonBoundary', () => {
+  it('returns parsed JSON without a boundary parser', () => {
+    expect(expectJsonBoundary('{"kind":"signal"}', undefined, 'signal payload')).toEqual({ kind: 'signal' });
+  });
+
+  it('throws a contextual parse error when the boundary parser rejects the payload', () => {
+    expect(() =>
+      expectJsonBoundary(
+        '{"kind":1}',
+        {
+          parse: (value): { kind: string } => {
+            if (typeof value === 'object' && value !== null && 'kind' in value && typeof value.kind === 'string') {
+              return { kind: value.kind };
+            }
+
+            throw new Error('Expected signal envelope');
+          },
+          expected: 'signal envelope',
+        },
+        'signal payload',
+      ),
+    ).toThrow('Failed to parse signal envelope: Expected signal envelope');
   });
 });
 

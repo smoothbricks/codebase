@@ -38,5 +38,14 @@ export {
   isRecord,
   isString,
 } from './guards.js';
-export type { JsonBoundaryParser, JsonBoundaryValidator, JsonParseResult } from './json.js';
-export { parseJsonArray, parseJsonRecord, parseJsonValue, safeJsonParse, validateJsonValue } from './json.js';
+export type { JsonBoundaryParseOptions, JsonBoundaryParser, JsonBoundaryValidator, JsonParseResult } from './json.js';
+export {
+  expectJsonBoundary,
+  parseJsonArray,
+  parseJsonBoundary,
+  parseJsonBoundaryValue,
+  parseJsonRecord,
+  parseJsonValue,
+  safeJsonParse,
+  validateJsonValue,
+} from './json.js';
