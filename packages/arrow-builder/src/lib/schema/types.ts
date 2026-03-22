@@ -1,12 +1,12 @@
 /**
  * Schema metadata types for arrow-builder
  *
- * These types define the metadata attached to Sury schemas for columnar storage.
+ * These types define the metadata attached to schema objects for columnar storage.
  * They enable arrow-builder to determine which TypedArray to create for each schema field.
  */
 
-import type * as Sury from '@sury/sury';
 import type { IntType } from '@uwdata/flechette';
+import type { Schema } from './core.js';
 
 /**
  * Schema type marker for columnar storage
@@ -63,7 +63,7 @@ export interface EnumUtf8Precomputed {
  * Base schema with metadata
  * Using intersection type since we can't extend Sury.Schema directly
  */
-export type SchemaWithMetadata<T = unknown> = Sury.Schema<T, unknown> & {
+export type SchemaWithMetadata<T = unknown> = Schema<T> & {
   __schema_type?: SchemaType;
   __enum_values?: readonly string[];
   __enum_utf8?: EnumUtf8Precomputed;
@@ -93,14 +93,14 @@ interface EnumMetadataBase {
  * Storage: Uint8Array (1 byte) with compile-time mapping
  * Arrow: Dictionary with pre-defined values (UTF-8 pre-computed at definition time)
  */
-export type EagerEnumSchema<T extends string = string> = Sury.Schema<T, unknown> & EnumMetadataBase & EagerBrand;
+export type EagerEnumSchema<T extends string = string> = Schema<T> & EnumMetadataBase & EagerBrand;
 
 /**
  * Lazy enum schema with chainable eager method
  * Storage: Uint8Array (1 byte) with compile-time mapping
  * Arrow: Dictionary with pre-defined values (UTF-8 pre-computed at definition time)
  */
-export type LazyEnumSchema<T extends string = string> = Sury.Schema<T, unknown> &
+export type LazyEnumSchema<T extends string = string> = Schema<T> &
   EnumMetadataBase &
   LazyBrand & {
     /**
@@ -127,14 +127,14 @@ interface CategoryMetadataBase {
  * Storage: Uint32Array indices with string interning
  * Arrow: Dictionary built dynamically from interned strings
  */
-export type EagerCategorySchema = Sury.Schema<string, unknown> & CategoryMetadataBase & EagerBrand;
+export type EagerCategorySchema = Schema<string> & CategoryMetadataBase & EagerBrand;
 
 /**
  * Lazy category schema with chainable mask and eager methods
  * Storage: Uint32Array indices with string interning
  * Arrow: Dictionary built dynamically from interned strings
  */
-export type LazyCategorySchema = Sury.Schema<string, unknown> &
+export type LazyCategorySchema = Schema<string> &
   CategoryMetadataBase &
   LazyBrand & {
     /**
@@ -166,14 +166,14 @@ interface TextMetadataBase {
  * Storage: Raw strings without interning
  * Arrow: Plain string column (no dictionary overhead)
  */
-export type EagerTextSchema = Sury.Schema<string, unknown> & TextMetadataBase & EagerBrand;
+export type EagerTextSchema = Schema<string> & TextMetadataBase & EagerBrand;
 
 /**
  * Lazy text schema with chainable mask and eager methods
  * Storage: Raw strings without interning
  * Arrow: Plain string column (no dictionary overhead)
  */
-export type LazyTextSchema = Sury.Schema<string, unknown> &
+export type LazyTextSchema = Schema<string> &
   TextMetadataBase &
   LazyBrand & {
     /**
@@ -203,13 +203,13 @@ interface NumberMetadataBase {
  * Eager number schema - allocated immediately, no null bitmap
  * Storage: Float64Array
  */
-export type EagerNumberSchema = Sury.Schema<number, unknown> & NumberMetadataBase & EagerBrand;
+export type EagerNumberSchema = Schema<number> & NumberMetadataBase & EagerBrand;
 
 /**
  * Lazy number schema with chainable eager method
  * Storage: Float64Array
  */
-export type LazyNumberSchema = Sury.Schema<number, unknown> &
+export type LazyNumberSchema = Schema<number> &
   NumberMetadataBase &
   LazyBrand & {
     /**
@@ -234,13 +234,13 @@ interface BooleanMetadataBase {
  * Eager boolean schema - allocated immediately, no null bitmap
  * Storage: Uint8Array (0/1)
  */
-export type EagerBooleanSchema = Sury.Schema<boolean, unknown> & BooleanMetadataBase & EagerBrand;
+export type EagerBooleanSchema = Schema<boolean> & BooleanMetadataBase & EagerBrand;
 
 /**
  * Lazy boolean schema with chainable eager method
  * Storage: Uint8Array (0/1)
  */
-export type LazyBooleanSchema = Sury.Schema<boolean, unknown> &
+export type LazyBooleanSchema = Schema<boolean> &
   BooleanMetadataBase &
   LazyBrand & {
     /**
@@ -265,13 +265,13 @@ interface BigUint64MetadataBase {
  * Eager bigUint64 schema - allocated immediately, no null bitmap
  * Storage: BigUint64Array
  */
-export type EagerBigUint64Schema = Sury.Schema<bigint, unknown> & BigUint64MetadataBase & EagerBrand;
+export type EagerBigUint64Schema = Schema<bigint> & BigUint64MetadataBase & EagerBrand;
 
 /**
  * Lazy bigUint64 schema with chainable eager method
  * Storage: BigUint64Array
  */
-export type LazyBigUint64Schema = Sury.Schema<bigint, unknown> &
+export type LazyBigUint64Schema = Schema<bigint> &
   BigUint64MetadataBase &
   LazyBrand & {
     /**
@@ -310,7 +310,7 @@ interface BinaryMetadataBase {
  * Storage: Array (object references, frozen at tag time)
  * Arrow: Binary column (encoded at flush time via BinaryEncoder if present)
  */
-export type EagerBinarySchema<T = Uint8Array> = Sury.Schema<T, unknown> & BinaryMetadataBase & EagerBrand;
+export type EagerBinarySchema<T = Uint8Array> = Schema<T> & BinaryMetadataBase & EagerBrand;
 
 /**
  * Lazy binary schema with chainable eager method
@@ -320,7 +320,7 @@ export type EagerBinarySchema<T = Uint8Array> = Sury.Schema<T, unknown> & Binary
  * T defaults to Uint8Array (raw binary). When an encoder is provided,
  * T will be unknown (the consumer controls the type).
  */
-export type LazyBinarySchema<T = Uint8Array> = Sury.Schema<T, unknown> &
+export type LazyBinarySchema<T = Uint8Array> = Schema<T> &
   BinaryMetadataBase &
   LazyBrand & {
     /**

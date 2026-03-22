@@ -1,14 +1,14 @@
 /**
  * Define log schema with runtime validation and type inference
  *
- * This module leverages Sury for:
- * - Ultra-fast runtime validation (94,828 ops/ms)
+ * This module leverages __schema_type metadata on schema objects for:
+ * - Runtime validation via schema-type dispatch
  * - Automatic TypeScript inference
  * - Schema transformations (masking)
  * - Extension composition
  */
 
-import * as S from '@sury/sury';
+import type { SchemaWithMetadata } from '@smoothbricks/arrow-builder';
 import { LogSchema } from './LogSchema.js';
 import type { InferSchema, SchemaFields } from './types.js';
 
@@ -20,12 +20,6 @@ export declare const DEFINED_LOG_SCHEMA_BRAND: unique symbol;
 
 /**
  * Define log schema with runtime validation and type inference
- *
- * This wraps Sury's object schema to provide:
- * - Runtime validation via Sury
- * - Type inference from schema
- * - Extension capabilities
- * - Reserved name validation
  *
  * Example:
  * ```typescript
@@ -43,14 +37,9 @@ export declare const DEFINED_LOG_SCHEMA_BRAND: unique symbol;
  *   httpStatus: 200,
  *   operation: 'SELECT'
  * });
- *
- * // Extend schema
- * const extended = schema.extend({
- *   duration: S.number()
- * });
  * ```
  *
- * @param schema - Object mapping field names to Sury schemas
+ * @param schema - Object mapping field names to schema objects
  * @returns Extended schema with validation and extension methods
  */
 
@@ -63,9 +52,6 @@ export declare const DEFINED_LOG_SCHEMA_BRAND: unique symbol;
  * - Validation methods (validate, parse, safeParse)
  * - LogSchema methods (fieldEntries, fieldCount, fieldNames, fields)
  * - Brand marker for type detection in InferSchema
- *
- * The brand marker allows InferSchema to detect when it receives a
- * DefinedLogSchema and extract the original schema type T for inference.
  */
 export type DefinedLogSchema<T extends SchemaFields> = LogSchema<T> & {
   /** Brand marker - never actually set, only for type discrimination */
@@ -101,6 +87,65 @@ export type ValidatedLogSchema<T extends SchemaFields> = LogSchema<T> & {
   safeParse(data: unknown): SafeParseResult<T>;
 };
 
+/**
+ * Validate a single field value against its schema metadata.
+ * Uses __schema_type for type dispatch — no Sury dependency.
+ */
+function validateField(key: string, value: unknown, schema: SchemaWithMetadata): unknown {
+  // Handle optional schemas (created via S.optional())
+  const s = schema as SchemaWithMetadata & { __optional?: boolean };
+  if (value === undefined || value === null) {
+    if (s.__optional) return undefined;
+    throw new Error(`Field "${key}": expected a value, got ${value === null ? 'null' : 'undefined'}`);
+  }
+
+  switch (s.__schema_type) {
+    case 'number':
+      if (typeof value !== 'number') throw new Error(`Field "${key}": expected number, got ${typeof value}`);
+      return value;
+    case 'boolean':
+      if (typeof value !== 'boolean') throw new Error(`Field "${key}": expected boolean, got ${typeof value}`);
+      return value;
+    case 'text':
+    case 'category':
+      if (typeof value !== 'string') throw new Error(`Field "${key}": expected string, got ${typeof value}`);
+      return value;
+    case 'enum':
+      if (typeof value !== 'string') throw new Error(`Field "${key}": expected string, got ${typeof value}`);
+      if (s.__enum_values && !s.__enum_values.includes(value)) {
+        throw new Error(`Field "${key}": expected one of [${s.__enum_values.join(', ')}], got "${value}"`);
+      }
+      return value;
+    case 'bigUint64':
+      if (typeof value !== 'bigint') throw new Error(`Field "${key}": expected bigint, got ${typeof value}`);
+      return value;
+    case 'binary':
+      // Binary accepts any value (raw bytes or encoder-wrapped)
+      return value;
+    default:
+      // Unknown schema type — accept as-is
+      return value;
+  }
+}
+
+/**
+ * Validate an object against a set of schema columns.
+ */
+function validateObject<T extends SchemaFields>(
+  data: unknown,
+  columns: Iterable<readonly [string, SchemaWithMetadata]>,
+): InferSchema<T> {
+  if (typeof data !== 'object' || data === null) {
+    throw new Error(`Expected object, got ${data === null ? 'null' : typeof data}`);
+  }
+  const obj = data as Record<string, unknown>;
+  const result: Record<string, unknown> = {};
+  for (const [key, schema] of columns) {
+    result[key] = validateField(key, obj[key], schema);
+  }
+  return result as InferSchema<T>;
+}
+
 export function defineLogSchema<T extends SchemaFields>(
   schema: T,
   options?: DefineLogSchemaOptions,
@@ -113,16 +158,6 @@ export function defineLogSchema<T extends SchemaFields>(
     LogSchema.assertUserFieldNames(logSchema._columnNames);
   }
 
-  // Convert to Sury object schema for validation using builder pattern
-  // Use LogSchema.fieldEntries() directly
-  const objectSchema = S.object((s) => {
-    const output: Record<string, unknown> = {};
-    for (const [key, surySchema] of logSchema._columns) {
-      output[key] = s.field(key, surySchema);
-    }
-    return output as InferSchema<T>;
-  });
-
   // Add validation methods directly to logSchema (preserves LogSchema instance)
   // Use Object.assign to mutate logSchema in place, preserving prototype chain
   const result = Object.assign(logSchema, {
@@ -132,7 +167,7 @@ export function defineLogSchema<T extends SchemaFields>(
      * @throws Error if validation fails
      */
     validate: (data: unknown): InferSchema<T> => {
-      return S.parseOrThrow(data, objectSchema);
+      return validateObject<T>(data, logSchema._columns);
     },
 
     /**
@@ -141,8 +176,11 @@ export function defineLogSchema<T extends SchemaFields>(
      * @returns Validated data or null if invalid
      */
     parse: (data: unknown): InferSchema<T> | null => {
-      const result = S.safe(() => S.parseOrThrow(data, objectSchema));
-      return result.success ? result.value : null;
+      try {
+        return validateObject<T>(data, logSchema._columns);
+      } catch {
+        return null;
+      }
     },
 
     /**
@@ -151,13 +189,12 @@ export function defineLogSchema<T extends SchemaFields>(
      * @returns Result object with success flag
      */
     safeParse: (data: unknown) => {
-      const result = S.safe(() => S.parseOrThrow(data, objectSchema));
-      if (result.success) {
-        return { success: true as const, value: result.value };
+      try {
+        return { success: true as const, value: validateObject<T>(data, logSchema._columns) };
+      } catch (err) {
+        const error = err instanceof Error ? err : new Error(String(err));
+        return { success: false as const, error };
       }
-      // Convert Sury error to standard Error
-      const error = result.error instanceof Error ? result.error : new Error(String(result.error));
-      return { success: false as const, error };
     },
   });
 

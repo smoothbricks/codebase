@@ -2,13 +2,13 @@
  * Schema type definitions for arrow-builder
  *
  * Arrow-builder is a low-level columnar buffer engine that works with
- * Sury schemas that have __schema_type metadata attached.
+ * schema objects that have __schema_type metadata attached.
  */
 
-import type * as Sury from '@sury/sury';
+import type { Schema } from './schema/core.js';
 
 // Type alias for schema objects (Record<string, Schema>)
-export type SchemaFields = Record<string, Sury.Schema<unknown, unknown>>;
+export type SchemaFields = Record<string, Schema>;
 
 // Re-export ColumnSchema for external use (class is both value and type)
 export { ColumnSchema, isColumnSchema } from './schema/ColumnSchema.js';

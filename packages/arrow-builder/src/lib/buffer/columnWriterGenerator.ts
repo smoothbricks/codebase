@@ -119,7 +119,7 @@ export type ColumnWriter<T extends ColumnSchema = ColumnSchema, TBuffer extends 
   nextRow(): ColumnWriter<T, TBuffer>;
   _getNextBuffer(): TBuffer;
 } & {
-  [K in keyof T['fields']]: (value: import('@sury/sury').Output<T['fields'][K]>) => ColumnWriter<T, TBuffer>;
+  [K in keyof T['fields']]: (value: import('../schema/core.js').Output<T['fields'][K]>) => ColumnWriter<T, TBuffer>;
 };
 
 /**

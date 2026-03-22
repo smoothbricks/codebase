@@ -85,6 +85,12 @@ export {
 } from './lib/schema/systemSchema.js';
 
 // =============================================================================
+// Schema Core Types (re-exported from arrow-builder)
+// =============================================================================
+
+export type { Input, Output, Schema, SchemaFields, SchemaType, SchemaWithMetadata } from '@smoothbricks/arrow-builder';
+
+// =============================================================================
 // Schema System (additional exports not in defineOpContext)
 // Note: defineOpContext already re-exports S, defineFeatureFlags, defineLogSchema, LogSchema
 // =============================================================================

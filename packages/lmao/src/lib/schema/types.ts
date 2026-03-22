@@ -5,9 +5,10 @@
  * for feature flags and type inference.
  */
 
-import type * as Sury from '@sury/sury';
+import type { Input, Output, Schema } from '@smoothbricks/arrow-builder';
 
 // Re-export schema metadata types from arrow-builder (single source of truth)
+// Re-export schema core types from arrow-builder for external use
 export type {
   // Binary encoder interface
   BinaryEncoder,
@@ -20,6 +21,7 @@ export type {
   EagerTextSchema,
   // Metadata and utility types
   EnumUtf8Precomputed,
+  Input,
   // Binary schemas
   LazyBinarySchema,
   // Lazy schema types (default - allocated on first write)
@@ -30,15 +32,14 @@ export type {
   LazyTextSchema,
   MaskPreset,
   MaskTransform,
+  Output,
+  Schema,
   SchemaFields,
   SchemaType,
   SchemaWithMetadata,
 } from '@smoothbricks/arrow-builder';
-
 // Re-export ColumnSchema and SchemaFields from arrow-builder for external use
 export { ColumnSchema, isColumnSchema } from '@smoothbricks/arrow-builder';
-// Re-export Sury's core types for external use
-export type { Input, Output, Schema } from '@sury/sury';
 
 // Re-export LogSchema for external use
 export { isLogSchema, LogSchema } from './LogSchema.js';
@@ -103,9 +104,6 @@ type SchemaFieldKeys<T> =
 
 /**
  * Extract TypeScript output types from log schema
- * This enables full type inference from Sury schemas
- *
- * IMPORTANT: This type must properly infer from schemas with __schema_type metadata
  *
  * Works with LogSchema instances or plain schema objects.
  *
@@ -115,7 +113,7 @@ type SchemaFieldKeys<T> =
  * 3. Check if it's a text schema -> string
  * 4. Check if it's a number schema -> number
  * 5. Check if it's a boolean schema -> boolean
- * 6. Fall back to Sury.Output<T[K]>
+ * 6. Fall back to Schema Output<T[K]>
  *
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
@@ -132,7 +130,7 @@ export type InferSchema<T extends LogSchema | SchemaFields> = {
             ? number
             : ExtractSchemaFields<T>[K] extends LazyBooleanSchema | EagerBooleanSchema
               ? boolean
-              : ExtractSchemaFields<T>[K] extends Sury.Schema<infer Out, unknown>
+              : ExtractSchemaFields<T>[K] extends Schema<infer Out>
                 ? Out
                 : never;
 };
@@ -144,7 +142,7 @@ export type InferSchema<T extends LogSchema | SchemaFields> = {
  * NOTE: Function properties (validate, parse, etc.) are filtered out.
  */
 export type InferSchemaInput<T extends LogSchema | SchemaFields> = {
-  [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends Sury.Schema<unknown, infer In> ? In : never;
+  [K in SchemaFieldKeys<T>]: ExtractSchemaFields<T>[K] extends Schema<unknown, infer In> ? In : never;
 };
 
 /**
@@ -167,7 +165,7 @@ export interface FlagBuilderWithDefault<T> {
  * Feature flag definition with default value and evaluation type
  */
 export interface FeatureFlagDefinition<T, EvalType extends 'sync' | 'async' = 'sync' | 'async'> {
-  schema: Sury.Schema<T, unknown>;
+  schema: Schema<T>;
   defaultValue: T;
   evaluationType: EvalType;
 }
@@ -176,7 +174,7 @@ export interface FeatureFlagDefinition<T, EvalType extends 'sync' | 'async' = 's
  * Schema that can be used for both tag attributes and feature flags
  * This type is returned by S.string(), S.number(), etc.
  */
-export type SchemaOrFlagBuilder<T> = Sury.Schema<T, unknown> & FlagBuilder<T>;
+export type SchemaOrFlagBuilder<T> = Schema<T> & FlagBuilder<T>;
 
 /**
  * Category schema with flag builder, mask method, and eager method.
@@ -191,7 +189,7 @@ export type CategorySchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & LazyCate
 export type TextSchemaOrFlagBuilder = SchemaOrFlagBuilder<string> & LazyTextSchema;
 
 /**
- * Schema builder interface that wraps Sury with custom API
+ * Schema builder interface that wraps arrow-builder with custom API
  * Supports both tag attributes and feature flags
  */
 export interface SchemaBuilder {
@@ -260,10 +258,8 @@ export interface SchemaBuilder {
   object<T extends object>(): LazyBinarySchema<T>;
 
   // Optional wrapper
-  optional<T>(schema: Sury.Schema<T, unknown>): Sury.Schema<T | undefined, T | undefined>;
+  optional<T>(schema: Schema<T>): Schema<T | undefined, T | undefined>;
 
   // Union types - for multiple schemas
-  union<T extends readonly [Sury.Schema<unknown, unknown>, ...Sury.Schema<unknown, unknown>[]]>(
-    schemas: T,
-  ): Sury.Schema<Sury.Output<T[number]>, Sury.Input<T[number]>>;
+  union<T extends readonly [Schema, ...Schema[]]>(schemas: T): Schema<Output<T[number]>, Input<T[number]>>;
 }

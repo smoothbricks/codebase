@@ -34,7 +34,6 @@
       "name": "@smoothbricks/arrow-builder",
       "version": "0.0.1",
       "dependencies": {
-        "@sury/sury": "npm:@jsr/sury__sury",
         "@uwdata/flechette": "^2.3.0",
         "tslib": "^2.3.0",
       },
@@ -77,7 +76,6 @@
         "@msgpack/msgpack": "^3.1.3",
         "@neophi/sieve-cache": "^1.5.0",
         "@smoothbricks/arrow-builder": "workspace:*",
-        "@sury/sury": "npm:@jsr/sury__sury",
         "@uwdata/flechette": "^2.3.0",
         "tslib": "^2.3.0",
       },
@@ -860,8 +858,6 @@
     "@so-ric/colorspace": ["@so-ric/colorspace@1.1.6", "", { "dependencies": { "color": "^5.0.2", "text-hex": "1.0.x" } }, "sha512-/KiKkpHNOBgkFJwu9sh48LkHSMYGyuTcSFK/qMBdnOAlrRJzRSXAOFB5qwzaVQuDl8wAvHVMkaASQDReTahxuw=="],
 
     "@standard-schema/spec": ["@standard-schema/spec@1.1.0", "", {}, "sha512-l2aFy5jALhniG5HgqrD6jXLi/rUWrKvqN/qJx6yoJsgKhblVd+iqqU4RCXavm/jPityDo5TCvKMnpjKnOriy0w=="],
-
-    "@sury/sury": ["@jsr/sury__sury@10.0.3", "https://npm.jsr.io/~/11/@jsr/sury__sury/10.0.3.tgz", {}, "sha512-1Y2r9NghGOP6nsfqaHSAoFkh56DbOB+GuyZ7Mn91LVSWm44offpvLsaAW7QK92QgVxhPwciAAqdvmhbdfHPrxg=="],
 
     "@svgr/babel-plugin-add-jsx-attribute": ["@svgr/babel-plugin-add-jsx-attribute@8.0.0", "", { "peerDependencies": { "@babel/core": "^7.0.0-0" } }, "sha512-b9MIk7yhdS1pMCZM8VeNfUlSKVRhsHZNMl5O9SfaX0l0t5wjdgu4IDzGB8bpnGBBOjGST3rRFVsaaEtI4W6f7g=="],
 

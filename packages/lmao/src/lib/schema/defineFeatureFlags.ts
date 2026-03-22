@@ -1,4 +1,4 @@
-import type * as Sury from '@sury/sury';
+import type { Output } from '@smoothbricks/arrow-builder';
 import type { FeatureFlagDefinition } from './types.js';
 
 /**
@@ -59,7 +59,7 @@ export type AsyncFlagKeys<T extends FeatureFlagSchema> = {
  * Infer TypeScript types from feature flag schema
  */
 export type InferFeatureFlags<T extends FeatureFlagSchema> = {
-  [K in keyof T]: Sury.Output<T[K]['schema']>;
+  [K in keyof T]: Output<T[K]['schema']>;
 };
 
 /**

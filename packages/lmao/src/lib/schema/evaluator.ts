@@ -1,4 +1,4 @@
-import * as S from '@sury/sury';
+import type { Schema, SchemaWithMetadata } from '@smoothbricks/arrow-builder';
 import { createEvaluatorClass } from '../codegen/evaluatorGenerator.js';
 import type { FluentLogEntry } from '../codegen/spanLoggerGenerator.js';
 import type { OpContext } from '../opContext/types.js';
@@ -8,13 +8,28 @@ import type { LogSchema } from './LogSchema.js';
 import { ENTRY_TYPE_FF_ACCESS } from './systemSchema.js';
 
 /**
- * Type guard to validate flag value matches schema
+ * Type guard to validate flag value matches schema.
+ * Uses __schema_type metadata for type-based validation instead of Sury.
  */
-function validateFlagValue<T>(value: unknown, schema: S.Schema<T, unknown>, defaultValue: T): T {
-  try {
-    return S.parseOrThrow(value, schema);
-  } catch {
-    return defaultValue;
+function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T): T {
+  const meta = schema as SchemaWithMetadata;
+  switch (meta.__schema_type) {
+    case 'number':
+      return typeof value === 'number' ? (value as T) : defaultValue;
+    case 'boolean':
+      return typeof value === 'boolean' ? (value as T) : defaultValue;
+    case 'text':
+    case 'category':
+      return typeof value === 'string' ? (value as T) : defaultValue;
+    case 'enum':
+      if (typeof value !== 'string') return defaultValue;
+      if (meta.__enum_values && !meta.__enum_values.includes(value)) return defaultValue;
+      return value as T;
+    case 'bigUint64':
+      return typeof value === 'bigint' ? (value as T) : defaultValue;
+    default:
+      // Unknown schema type — accept if same typeof as default, else use default
+      return typeof value === typeof defaultValue ? (value as T) : defaultValue;
   }
 }
 
@@ -184,7 +199,9 @@ type InferFlagContextType<Ctx extends OpContext, T> = T extends boolean
  */
 export type InferFeatureFlagsWithContext<Ctx extends OpContext> = Ctx['flags'] extends FeatureFlagSchema
   ? {
-      readonly [K in keyof Ctx['flags']]: InferFlagContextType<Ctx, S.Output<Ctx['flags'][K]['schema']>> | undefined;
+      readonly [K in keyof Ctx['flags']]:
+        | InferFlagContextType<Ctx, import('@smoothbricks/arrow-builder').Output<Ctx['flags'][K]['schema']>>
+        | undefined;
     }
   : Record<string, never>;
 

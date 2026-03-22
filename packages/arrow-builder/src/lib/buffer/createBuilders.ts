@@ -10,7 +10,7 @@
  * - boolean → Uint8Array
  */
 
-import type * as Sury from '@sury/sury';
+import type { Schema } from '../schema/core.js';
 import type { ColumnSchema, SchemaWithMetadata } from '../schema-types.js';
 import { type ColumnValueType, DEFAULT_BUFFER_CAPACITY, type TypedArrayConstructor } from './types.js';
 
@@ -49,7 +49,7 @@ export function createAttributeColumns(
  *
  * We attach metadata to schemas in builder.ts to identify the type.
  */
-function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capacity: number): ColumnValueType {
+function createTypedArrayForSchema(schema: Schema, capacity: number): ColumnValueType {
   const schemaWithMetadata = schema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata.__schema_type;
 
@@ -103,9 +103,9 @@ function createTypedArrayForSchema(schema: Sury.Schema<unknown, unknown>, capaci
 /**
  * Get TypedArray constructor for a schema type
  *
- * This examines the Sury schema to determine the appropriate TypedArray constructor.
+ * This examines the schema to determine the appropriate TypedArray constructor.
  */
-export function getTypedArrayConstructor(schema: Sury.Schema<unknown, unknown>): TypedArrayConstructor {
+export function getTypedArrayConstructor(schema: Schema): TypedArrayConstructor {
   const schemaWithMetadata = schema as SchemaWithMetadata;
   const schemaType = schemaWithMetadata.__schema_type;
 
