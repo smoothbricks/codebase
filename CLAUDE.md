@@ -62,9 +62,11 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 
 - **Search before implementing.** Reuse existing code and patterns before adding new helpers, APIs, or schema objects.
 
-- **Avoid stupid allocations on hot paths.** If a success/failure wrapper can be an immutable singleton or eliminated
-  entirely, do that instead of allocating fresh `{ ok: true }` / tiny throwaway objects in runtime-heavy code. Cold-path
-  boundary parsing can still use small result objects when they are the right contract.
+- **Avoid stupid allocations, especially on hot or frequently hit paths.** Do not excuse needless allocations just
+  because a path is "cold" — startup, boundary, serverless, and browser initialization paths still matter. If a
+  success/failure wrapper can be an immutable singleton or eliminated entirely, do that instead of allocating fresh
+  `{ ok: true }` / tiny throwaway objects. Keep small result objects only when they are truly the right contract and not
+  an avoidable churn point.
 
 ## Common Development Commands
 
