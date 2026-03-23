@@ -67,10 +67,13 @@ describe('Action Wrapper Workflow Generation', () => {
 
     it('should have runtime auth detection and action usage in template', async () => {
       const template = await readFile(join(templatesDir, 'unified.yml'), 'utf-8');
+      const ghaExpr = '${' + '{';
 
-      expect(template).toContain("if: ${{ vars.PATCHNOTE_APP_ID != '' }}");
+      expect(template).toContain(`if: ${ghaExpr} vars.PATCHNOTE_APP_ID != '' }}`);
       expect(template).toContain('actions/create-github-app-token@v2');
-      expect(template).toContain('${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}');
+      expect(template).toContain(
+        `${ghaExpr} steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}`,
+      );
       expect(template).toContain('uses: smoothbricks/smoothbricks/packages/patchnote-action@v1');
     });
 

@@ -63,7 +63,7 @@ export function startCallbackServer(options: CallbackServerOptions): Promise<Cal
     };
 
     server = createServer((req, res) => {
-      const url = new URL(req.url!, 'http://localhost');
+      const url = new URL(req.url ?? '/', 'http://localhost');
       const pathname = url.pathname;
 
       if (pathname === '/' && req.method === 'GET') {

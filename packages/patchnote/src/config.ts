@@ -8,8 +8,8 @@ import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
-import { safeResolve, validatePathWithinBase } from './utils/path-validation.js';
 import type { DeepPartial, ExpoProject, FilterConfig, MergeStrategy, PackageRule, SupportedProvider } from './types.js';
+import { safeResolve, validatePathWithinBase } from './utils/path-validation.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
 export interface PatchnoteConfig {

@@ -46,7 +46,12 @@ export async function resolveSemanticPrefix(
   updates: PackageUpdate[],
   executor?: CommandExecutor,
 ): Promise<string | null> {
-  const semanticConfig = config.semanticCommits ?? defaultConfig.semanticCommits!;
+  const semanticConfig = config.semanticCommits ??
+    defaultConfig.semanticCommits ?? {
+      enabled: 'auto',
+      prefix: 'chore(deps)',
+      devPrefix: 'chore(dev-deps)',
+    };
   const { enabled, prefix, devPrefix } = semanticConfig;
 
   // Explicitly disabled

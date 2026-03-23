@@ -66,8 +66,11 @@ function processUnifiedTemplate(
     result = result.replace('{{AI_ENV_VAR}}', '');
     result = result.replace('{{SKIP_AI_INPUT}}', 'true');
   } else {
-    result = result.replace('{{AI_ENV_VAR}}', `\n        env:\n          ${ZAI_ENV_VAR}: \${{ secrets.${ZAI_ENV_VAR} }}`);
-    result = result.replace('{{SKIP_AI_INPUT}}', "${{ vars.PATCHNOTE_SKIP_AI == 'true' }}");
+    result = result.replace(
+      '{{AI_ENV_VAR}}',
+      `\n        env:\n          ${ZAI_ENV_VAR}: \${{ secrets.${ZAI_ENV_VAR} }}`,
+    );
+    result = result.replace('{{SKIP_AI_INPUT}}', `\${{ vars.PATCHNOTE_SKIP_AI == 'true' }}`);
 
     if (useAI) {
       result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
