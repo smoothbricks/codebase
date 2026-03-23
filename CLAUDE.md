@@ -82,8 +82,13 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 ### Testing
 
 - **Run tests**: `bun test`
-- **Run specific test file**: run from the package directory, e.g. `cd packages/<name> && bun test src/path/to/file.test.ts`.
-  Running `bun test` from the monorepo root skips the package's `bunfig.toml` preload (test tracing, etc.).
+- **Run specific test file**: direct `bun test` works from the repo root or a package directory for the shared Typia + trace
+  preloads because both the root `bunfig.toml` and the package `bunfig.toml` files preload `test-trace-preload.ts`. Use
+  whichever path is clearest: e.g. `bun test packages/<name>/src/path/to/file.test.ts` from the repo root or
+  `bun test src/path/to/file.test.ts` from `packages/<name>`.
+- **Package-local extra preloads still matter.** If a package adds its own extra preload beyond the shared root ones
+  (for example for package-specific test setup), run from that package directory when that extra setup is part
+  of the proof obligation.
 - **Full project test suite:** `nx test <project>` (Nx runs from the correct directory automatically)
 - **Nx cache is expected to work.** If a task only passes with `--skip-nx-cache`, treat that as a broken
   target/input/output/dependency configuration and fix the Nx config instead of normalizing cache bypasses.

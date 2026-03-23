@@ -33,10 +33,13 @@
 - **No default `NoOpTracer`.** `createNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
   `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
   Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
-- **Run `bun test` from the package directory, not the monorepo root.** Each package has a `bunfig.toml` that preloads
-  test tracing (`test-trace-setup.ts`). Running `bun test packages/foo/src/...` from the monorepo root skips the
-  preload, causing `useTestSpan()` errors and missing trace output. Use `cd packages/foo && bun test src/...` or
-  `nx test <project>` (which runs from the correct directory automatically).
+- **Direct `bun test` now loads the shared tracing preload from either the repo root or a package directory.** The root
+  `bunfig.toml` and the package-level `bunfig.toml` files preload `test-trace-preload.ts`, so traced single-file runs no
+  longer fail just because they start at the monorepo root. Use whichever invocation is clearest:
+  `bun test packages/foo/src/...` from the repo root or `bun test src/...` inside `packages/foo`.
+  `nx test <project>` remains valid because Nx runs from the package directory.
+- **Package-local extra preloads still require the package `bunfig.toml`.** Example: `packages/lmao-expo/bunfig.toml`
+  also preloads `src/test-preload.ts`, so run Expo proofs from `packages/lmao-expo` when that extra setup matters.
 - **Lint before tests.** Use `nx lint <project>` before `bun test` or `nx test <project>`.
 - **Nx cache is not flaky; config is.** If a task only passes with `--skip-nx-cache`, fix the target's inputs, outputs,
   dependency graph, or task wiring so cached and uncached runs agree.
