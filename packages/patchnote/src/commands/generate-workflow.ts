@@ -39,28 +39,54 @@ function getTemplatesDir(): string {
 
 /** AI env var name for Z.AI */
 const ZAI_ENV_VAR = 'ZAI_API_KEY';
+const DEFAULT_SCHEDULE = '0 2 * * *';
+const DEFAULT_WORKFLOW_NAME = 'Update Dependencies';
 
 /**
  * Process unified template placeholders
  * Only handles AI-related placeholders - auth detection is runtime
  */
-function processUnifiedTemplate(template: string, useAI: boolean, _provider: SupportedProvider): string {
+function processUnifiedTemplate(
+  template: string,
+  options: {
+    useAI: boolean;
+    provider: SupportedProvider;
+    schedule?: string;
+    workflowName?: string;
+    configPath?: string;
+    forceSkipAI?: boolean;
+  },
+): string {
+  const { useAI, schedule, workflowName, configPath, forceSkipAI } = options;
   let result = template;
 
-  if (useAI) {
-    result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
-    result = result.replace(
-      '{{AI_SETUP_NOTE}}',
-      `\n#   - AI provider: Z.AI GLM-5-Turbo (requires ${ZAI_ENV_VAR} secret)`,
-    );
-    result = result.replace('{{AI_STEP_SUFFIX}}', ' with AI changelog analysis');
-    result = result.replace('{{AI_ENV_VAR}}', `\n          ${ZAI_ENV_VAR}: \${{ secrets.${ZAI_ENV_VAR} }}`);
-  } else {
+  if (forceSkipAI) {
     result = result.replace('{{AI_HEADER_SUFFIX}}', '');
     result = result.replace('{{AI_SETUP_NOTE}}', '');
-    result = result.replace('{{AI_STEP_SUFFIX}}', '');
     result = result.replace('{{AI_ENV_VAR}}', '');
+    result = result.replace('{{SKIP_AI_INPUT}}', 'true');
+  } else {
+    result = result.replace('{{AI_ENV_VAR}}', `\n        env:\n          ${ZAI_ENV_VAR}: \${{ secrets.${ZAI_ENV_VAR} }}`);
+    result = result.replace('{{SKIP_AI_INPUT}}', "${{ vars.PATCHNOTE_SKIP_AI == 'true' }}");
+
+    if (useAI) {
+      result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
+      result = result.replace(
+        '{{AI_SETUP_NOTE}}',
+        `\n#   - AI provider: Z.AI GLM-5-Turbo (requires ${ZAI_ENV_VAR} secret)`,
+      );
+    } else {
+      result = result.replace('{{AI_HEADER_SUFFIX}}', '');
+      result = result.replace('{{AI_SETUP_NOTE}}', '');
+    }
   }
+
+  result = result.replace('{{WORKFLOW_NAME}}', JSON.stringify(workflowName || DEFAULT_WORKFLOW_NAME));
+  result = result.replace('{{SCHEDULE}}', schedule || DEFAULT_SCHEDULE);
+  result = result.replace(
+    '{{CONFIG_PATH_BLOCK}}',
+    configPath ? `\n          config-path: ${JSON.stringify(configPath)}` : '',
+  );
 
   return result;
 }
@@ -71,14 +97,16 @@ function processUnifiedTemplate(template: string, useAI: boolean, _provider: Sup
 async function generateWorkflowContentFromTemplate(options: {
   useAI: boolean;
   provider: SupportedProvider;
+  schedule?: string;
+  workflowName?: string;
+  configPath?: string;
+  forceSkipAI?: boolean;
 }): Promise<string> {
-  const { useAI, provider } = options;
-
   const templatesDir = getTemplatesDir();
   const templatePath = join(templatesDir, 'unified.yml');
 
   const template = await readFile(templatePath, 'utf-8');
-  return processUnifiedTemplate(template, useAI, provider);
+  return processUnifiedTemplate(template, options);
 }
 
 /**
@@ -97,7 +125,14 @@ export async function generateWorkflow(config: PatchnoteConfig, options: Generat
   config.logger?.info('  Auth type: auto-detected at runtime (GitHub App > PAT)');
   config.logger?.info(`  AI analysis: ${useAI ? `enabled (${provider})` : 'disabled'}\n`);
 
-  const workflowContent = await generateWorkflowContentFromTemplate({ useAI, provider });
+  const workflowContent = await generateWorkflowContentFromTemplate({
+    useAI,
+    provider,
+    schedule: options.schedule,
+    workflowName: options.workflowName,
+    configPath: options.configPath,
+    forceSkipAI: options.skipAI,
+  });
 
   // Compute paths first so we can show them in dry-run
   const workflowDir = safeResolve(repoRoot, '.github/workflows');

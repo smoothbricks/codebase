@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/patchnote",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Automated dependency update tool with Expo support, stacked PRs, and AI-powered changelogs",
   "type": "module",
   "files": [

@@ -410,4 +410,20 @@ describe('loadConfig', () => {
 
     expect(config.prStrategy.maxStackDepth).toBe(7);
   });
+
+  test('should load config from an explicit config path', async () => {
+    const tmpDir = mkdtempSync(join(tmpdir(), 'patchnote-test-'));
+    const configDir = join(tmpDir, 'custom');
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(
+      join(configDir, 'patchnote.json'),
+      JSON.stringify({ prStrategy: { maxStackDepth: 12 }, git: { baseBranch: 'develop' } }),
+    );
+
+    const config = await loadConfig(tmpDir, './custom/patchnote.json');
+
+    expect(config.prStrategy.maxStackDepth).toBe(12);
+    expect(config.git?.baseBranch).toBe('develop');
+  });
 });

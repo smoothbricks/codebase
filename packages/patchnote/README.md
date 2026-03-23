@@ -16,11 +16,14 @@ Automated dependency update tool with Expo SDK support, stacked PRs, and AI-powe
 
 ## Quick Start (Zero Config)
 
-Copy this file to `.github/workflows/update-deps.yml` and push. That's it -- works with zero configuration using the
-built-in `GITHUB_TOKEN`.
+Create `.github/workflows/update-deps.yml` with this thin wrapper and push. The runtime logic lives in the published
+same-repo subpath action.
 
 ```yaml
 # Automated dependency updates with patchnote
+#
+# This workflow is intentionally thin. The runtime logic lives in the
+# published patchnote action at `smoothbricks/smoothbricks/packages/patchnote-action@v1`.
 #
 # Authentication: Auto-detected at runtime
 #   - If PATCHNOTE_APP_ID is set -> GitHub App mode (recommended)
@@ -71,53 +74,21 @@ jobs:
           app-id: ${{ vars.PATCHNOTE_APP_ID }}
           private-key: ${{ secrets.PATCHNOTE_APP_PRIVATE_KEY }}
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Run patchnote action
+        uses: smoothbricks/smoothbricks/packages/patchnote-action@v1
         with:
-          fetch-depth: 0 # Full history for git operations
-          # Uses App token if available, otherwise default token
-          token: ${{ steps.app-token.outputs.token || github.token }}
-
-      - name: Install Nix
-        if: hashFiles('**/devenv.yaml') != ''
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        if: hashFiles('**/devenv.yaml') != ''
-        uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Install devenv and nvfetcher
-        if: hashFiles('**/devenv.yaml') != ''
-        run: nix profile install nixpkgs#devenv nixpkgs#nvfetcher
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Configure git
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-
-      - name: Run patchnote
+          token: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
+          skip-ai: ${{ vars.PATCHNOTE_SKIP_AI == 'true' }}
         env:
-          # Token priority: GitHub App token > PAT (PATCHNOTE_TOKEN) > built-in GITHUB_TOKEN
-          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
-        run: |
-          FLAGS=""
-          if [[ "${{ vars.PATCHNOTE_SKIP_AI }}" == "true" ]]; then
-            FLAGS="--skip-ai"
-          fi
-          bunx @smoothbricks/patchnote update-deps --verbose $FLAGS
+          ZAI_API_KEY: ${{ secrets.ZAI_API_KEY }}
 ```
 
 > **Note:** PRs created with the built-in `GITHUB_TOKEN` will NOT trigger other workflows (e.g., CI checks). This is a
 > GitHub security limitation. For production use, set up a PAT or GitHub App -- see
 > [Getting Started Guide](docs/GETTING-STARTED.md).
 
-> **Note:** Nix-related steps (Install Nix, Setup Nix cache, Install devenv) are automatically skipped if
-> `devenv.yaml` is not present in your repository. No manual configuration needed.
+> **Note:** The action automatically installs Nix, configures cache, and installs `devenv`/`nvfetcher` when
+> `devenv.yaml` is present in your repository.
 
 For AI-powered changelog summaries, add `ZAI_API_KEY` as a repository secret. Without it, the tool falls back to a
 structured (non-AI) summary that is still useful for PR review.
@@ -135,7 +106,7 @@ structured (non-AI) summary that is still useful for PR review.
 
 ```bash
 # Interactive wizard guides you through setup
-npx @smoothbricks/patchnote init
+bunx @smoothbricks/patchnote init
 
 # Choose PAT (simple) or GitHub App (advanced)
 # Generates config and workflow automatically
@@ -144,11 +115,11 @@ npx @smoothbricks/patchnote init
 **Manual workflow generation:**
 
 ```bash
-# Generate workflow (auth is auto-detected at runtime)
-npx @smoothbricks/patchnote generate-workflow
+# Generate the thin action wrapper workflow
+bunx @smoothbricks/patchnote generate-workflow
 
 # Validate setup
-npx @smoothbricks/patchnote validate-setup
+bunx @smoothbricks/patchnote validate-setup
 ```
 
 ## Documentation

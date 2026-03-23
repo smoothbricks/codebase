@@ -438,7 +438,9 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
   const repoRoot = config.repoRoot || (await getRepoRoot());
 
   // Check if config file is an executable script (script mode)
-  const configPath = await findConfigFile(repoRoot);
+  const configPath = options.configPath
+    ? safeResolve(repoRoot, options.configPath)
+    : await findConfigFile(repoRoot);
   if (configPath && (await isConfigScript(configPath))) {
     p.intro('🔧 Running config script');
     await executeConfigScript(configPath);

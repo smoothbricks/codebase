@@ -175,6 +175,8 @@ export interface UpdateOptions {
   skipGit: boolean;
   /** Skip AI changelog analysis */
   skipAI: boolean;
+  /** Explicit path to patchnote config file */
+  configPath?: string;
 }
 
 /**

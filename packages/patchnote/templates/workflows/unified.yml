@@ -1,8 +1,11 @@
 # Automated dependency updates with patchnote{{AI_HEADER_SUFFIX}}
 #
+# This workflow is intentionally thin. The runtime logic lives in the
+# published patchnote action at `smoothbricks/smoothbricks/packages/patchnote-action@v1`.
+#
 # Authentication: Auto-detected at runtime
-#   - If PATCHNOTE_APP_ID is set → GitHub App mode (recommended)
-#   - Otherwise → PAT mode (uses PATCHNOTE_TOKEN secret)
+#   - If PATCHNOTE_APP_ID is set -> GitHub App mode (recommended)
+#   - Otherwise -> PAT mode (uses PATCHNOTE_TOKEN secret)
 #
 # Setup options:
 #
@@ -25,12 +28,12 @@
 #
 # 📖 Full guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/patchnote/docs/GETTING-STARTED.md
 
-name: Update Dependencies
+name: {{WORKFLOW_NAME}}
 
 on:
   schedule:
     # Run daily at 2 AM UTC
-    - cron: '0 2 * * *'
+    - cron: '{{SCHEDULE}}'
   workflow_dispatch: # Allow manual triggers
 
 permissions:
@@ -51,42 +54,8 @@ jobs:
           app-id: ${{ vars.PATCHNOTE_APP_ID }}
           private-key: ${{ secrets.PATCHNOTE_APP_PRIVATE_KEY }}
 
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - name: Run patchnote action
+        uses: smoothbricks/smoothbricks/packages/patchnote-action@v1
         with:
-          fetch-depth: 0 # Full history for git operations
-          # Uses App token if available, otherwise default token (PAT in GH_TOKEN handles API calls)
-          token: ${{ steps.app-token.outputs.token || github.token }}
-
-      - name: Install Nix
-        if: hashFiles('**/devenv.yaml') != ''
-        uses: DeterminateSystems/nix-installer-action@main
-
-      - name: Setup Nix cache
-        if: hashFiles('**/devenv.yaml') != ''
-        uses: DeterminateSystems/magic-nix-cache-action@main
-
-      - name: Install devenv and nvfetcher
-        if: hashFiles('**/devenv.yaml') != ''
-        run: nix profile install nixpkgs#devenv nixpkgs#nvfetcher
-
-      - name: Setup Bun
-        uses: oven-sh/setup-bun@v2
-        with:
-          bun-version: latest
-
-      - name: Configure git
-        run: |
-          git config user.name 'github-actions[bot]'
-          git config user.email 'github-actions[bot]@users.noreply.github.com'
-
-      - name: Run patchnote{{AI_STEP_SUFFIX}}
-        env:
-          # Token priority: GitHub App token > PAT (PATCHNOTE_TOKEN) > built-in GITHUB_TOKEN
-          GH_TOKEN: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}{{AI_ENV_VAR}}
-        run: |
-          FLAGS=""
-          if [[ "${{ vars.PATCHNOTE_SKIP_AI }}" == "true" ]]; then
-            FLAGS="--skip-ai"
-          fi
-          bunx @smoothbricks/patchnote update-deps --verbose $FLAGS
+          token: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
+          skip-ai: "{{SKIP_AI_INPUT}}"{{CONFIG_PATH_BLOCK}}{{AI_ENV_VAR}}

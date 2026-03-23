@@ -2,9 +2,13 @@
 
 This guide will help you set up patchnote for automated dependency updates in your organization.
 
-## Unified Workflow with Runtime Auth Detection
+## Thin Workflow + Same-Repo Action
 
-patchnote uses a **single workflow file** that automatically detects your authentication method at runtime:
+patchnote uses a **thin workflow wrapper** that delegates runtime work to the published same-repo subpath action:
+
+- `smoothbricks/smoothbricks/packages/patchnote-action@v1`
+
+The wrapper automatically detects your authentication method at runtime:
 
 - **If `PATCHNOTE_APP_ID` is set** → Uses GitHub App (priority)
 - **Otherwise** → Falls back to PAT using `PATCHNOTE_TOKEN`
@@ -89,11 +93,12 @@ gh secret set PATCHNOTE_TOKEN --org YOUR_ORG
 ### Step 3: Generate Workflow File (1 minute)
 
 ```bash
-npx @smoothbricks/patchnote generate-workflow
+bunx @smoothbricks/patchnote generate-workflow
 ```
 
-This creates `.github/workflows/update-deps.yml` with runtime auth detection. The workflow will automatically use PAT
-authentication since you have `PATCHNOTE_TOKEN` configured.
+This creates `.github/workflows/update-deps.yml` as a thin wrapper around
+`smoothbricks/smoothbricks/packages/patchnote-action@v1`. The workflow will automatically use PAT authentication since
+you have `PATCHNOTE_TOKEN` configured.
 
 **AI Changelog Analysis** is enabled by default using the Z.AI provider. To disable AI:
 
@@ -306,11 +311,12 @@ In each repository where you want to run patchnote:
 
 ```bash
 cd /path/to/your/repository
-npx @smoothbricks/patchnote generate-workflow
+bunx @smoothbricks/patchnote generate-workflow
 ```
 
-This creates `.github/workflows/update-deps.yml` with runtime auth detection. The workflow will automatically use GitHub
-App authentication since you have `PATCHNOTE_APP_ID` configured.
+This creates `.github/workflows/update-deps.yml` as a thin wrapper around
+`smoothbricks/smoothbricks/packages/patchnote-action@v1`. The workflow will automatically use GitHub App
+authentication since you have `PATCHNOTE_APP_ID` configured.
 
 **AI Changelog Analysis** is enabled by default using the Z.AI provider. To disable:
 
@@ -329,7 +335,7 @@ git push
 Run the validation command to verify everything is configured correctly:
 
 ```bash
-npx @smoothbricks/patchnote validate-setup
+bunx @smoothbricks/patchnote validate-setup
 ```
 
 This will check:

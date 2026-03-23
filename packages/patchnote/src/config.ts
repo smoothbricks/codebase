@@ -4,10 +4,11 @@
 
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
+import { safeResolve, validatePathWithinBase } from './utils/path-validation.js';
 import type { DeepPartial, ExpoProject, FilterConfig, MergeStrategy, PackageRule, SupportedProvider } from './types.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
@@ -242,11 +243,27 @@ const CONFIG_FILE_NAMES = ['tooling/patchnote.ts', 'tooling/patchnote.json'];
  * console.log('Max stack depth:', config.prStrategy.maxStackDepth);
  * ```
  */
-export async function loadConfig(searchPath?: string): Promise<PatchnoteConfig> {
+export async function loadConfig(searchPath?: string, explicitConfigPath?: string): Promise<PatchnoteConfig> {
   const startPath = searchPath || process.cwd();
 
-  // Try to find config file
-  const configPath = await findConfigFile(startPath);
+  const configPath = explicitConfigPath
+    ? await (async () => {
+        let repoRoot = startPath;
+
+        try {
+          repoRoot = await getRepoRoot(startPath);
+        } catch {
+          // Fallback for non-git contexts such as isolated config tests.
+        }
+
+        if (isAbsolute(explicitConfigPath)) {
+          validatePathWithinBase(repoRoot, explicitConfigPath);
+          return explicitConfigPath;
+        }
+
+        return safeResolve(repoRoot, explicitConfigPath);
+      })()
+    : await findConfigFile(startPath);
 
   if (!configPath) {
     // No config file found, return defaults

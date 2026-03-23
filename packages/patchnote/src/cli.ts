@@ -10,17 +10,19 @@ program
   .option('--dry-run', 'Run without making changes')
   .option('--skip-git', 'Skip git operations')
   .option('--skip-ai', 'Skip AI-powered changelog analysis')
+  .option('--config-path <path>', 'Path to patchnote config file')
   .option('-v, --verbose', 'Enable verbose logging');
 
 /**
  * Helper to setup config with logger based on CLI flags
  */
 async function setupConfig() {
-  const config = await loadConfig();
-  const logger = new ConsoleLogger(program.opts().verbose ? LogLevel.DEBUG : LogLevel.INFO);
+  const opts = program.opts();
+  const config = await loadConfig(process.cwd(), opts.configPath);
+  const logger = new ConsoleLogger(opts.verbose ? LogLevel.DEBUG : LogLevel.INFO);
   config.logger = logger;
 
-  if (program.opts().verbose) {
+  if (opts.verbose) {
     logger.debug('Configuration:', JSON.stringify(sanitizeConfigForLogging(config), null, 2));
     logger.debug('');
   }
@@ -37,6 +39,7 @@ function getUpdateOptions(): UpdateOptions {
     dryRun: opts.dryRun ?? false,
     skipGit: opts.skipGit ?? false,
     skipAI: opts.skipAi ?? false,
+    configPath: opts.configPath,
   };
 }
 
