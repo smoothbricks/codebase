@@ -6,7 +6,7 @@ This guide will help you set up patchnote for automated dependency updates in yo
 
 patchnote uses a **thin workflow wrapper** that delegates runtime work to the published same-repo subpath action:
 
-- `smoothbricks/smoothbricks/packages/patchnote-action@v1`
+- `smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package`
 
 The wrapper automatically detects your authentication method at runtime:
 
@@ -97,7 +97,7 @@ bunx @smoothbricks/patchnote generate-workflow
 ```
 
 This creates `.github/workflows/update-deps.yml` as a thin wrapper around
-`smoothbricks/smoothbricks/packages/patchnote-action@v1`. The workflow will automatically use PAT authentication since
+`smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package`. The workflow will automatically use PAT authentication since
 you have `PATCHNOTE_TOKEN` configured.
 
 **AI Changelog Analysis** is enabled by default using the Z.AI provider. To disable AI:
@@ -315,7 +315,7 @@ bunx @smoothbricks/patchnote generate-workflow
 ```
 
 This creates `.github/workflows/update-deps.yml` as a thin wrapper around
-`smoothbricks/smoothbricks/packages/patchnote-action@v1`. The workflow will automatically use GitHub App
+`smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package`. The workflow will automatically use GitHub App
 authentication since you have `PATCHNOTE_APP_ID` configured.
 
 **AI Changelog Analysis** is enabled by default using the Z.AI provider. To disable:

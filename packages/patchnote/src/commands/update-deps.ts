@@ -416,6 +416,7 @@ async function createPRWorkflow(
     p.note(`${pr.url}\nBase: ${stackBase}`, 'Pull Request');
   } catch (error) {
     prSpinner.stop('PR creation failed');
+    config.logger?.error(error instanceof Error ? error.message : String(error));
     // Clean up orphan branch on remote if PR creation fails
     config.logger?.error('Cleaning up remote branch...');
     try {

@@ -202,4 +202,7 @@ program
   });
 
 // Parse arguments and run
-program.parse(process.argv);
+program.parseAsync(process.argv).catch((error) => {
+  console.error(error instanceof Error ? error.message : String(error));
+  process.exit(1);
+});

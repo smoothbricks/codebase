@@ -23,7 +23,7 @@ same-repo subpath action.
 # Automated dependency updates with patchnote
 #
 # This workflow is intentionally thin. The runtime logic lives in the
-# published patchnote action at `smoothbricks/smoothbricks/packages/patchnote-action@v1`.
+# published patchnote action at `smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package`.
 #
 # Authentication: Auto-detected at runtime
 #   - If PATCHNOTE_APP_ID is set -> GitHub App mode (recommended)
@@ -75,7 +75,7 @@ jobs:
           private-key: ${{ secrets.PATCHNOTE_APP_PRIVATE_KEY }}
 
       - name: Run patchnote action
-        uses: smoothbricks/smoothbricks/packages/patchnote-action@v1
+        uses: smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package
         with:
           token: ${{ steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}
           skip-ai: ${{ vars.PATCHNOTE_SKIP_AI == 'true' }}

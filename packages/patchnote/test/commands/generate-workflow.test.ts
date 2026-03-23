@@ -74,7 +74,7 @@ describe('Action Wrapper Workflow Generation', () => {
       expect(template).toContain(
         `${ghaExpr} steps.app-token.outputs.token || secrets.PATCHNOTE_TOKEN || github.token }}`,
       );
-      expect(template).toContain('uses: smoothbricks/smoothbricks/packages/patchnote-action@v1');
+      expect(template).toContain('uses: smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package');
     });
 
     it('should have conditional AI skip logic', async () => {
@@ -115,7 +115,7 @@ describe('Action Wrapper Workflow Generation', () => {
         const runStep = steps.find((s: WorkflowStep) => s.name === 'Run patchnote action');
 
         expect(runStep).toBeDefined();
-        expect(runStep!.uses).toBe('smoothbricks/smoothbricks/packages/patchnote-action@v1');
+        expect(runStep!.uses).toBe('smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package');
       });
 
       it('should set skip-ai input to true', () => {
@@ -156,7 +156,7 @@ describe('Action Wrapper Workflow Generation', () => {
         const runStep = steps.find((s: WorkflowStep) => s.name === 'Run patchnote action');
 
         expect(runStep).toBeDefined();
-        expect(runStep!.uses).toBe('smoothbricks/smoothbricks/packages/patchnote-action@v1');
+        expect(runStep!.uses).toBe('smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package');
       });
 
       it('should pass runtime skip-ai expression and ZAI secret env', () => {

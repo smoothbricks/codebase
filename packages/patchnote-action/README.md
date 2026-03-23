@@ -5,7 +5,7 @@ GitHub Action wrapper for patchnote, published from the `smoothbricks` monorepo 
 ## Usage
 
 ```yaml
-- uses: smoothbricks/smoothbricks/packages/patchnote-action@v1
+- uses: smoothbricks/codebase/packages/patchnote-action@feat/add-dep-updater-package
   with:
     token: ${{ secrets.PATCHNOTE_TOKEN }}
 ```
@@ -13,4 +13,4 @@ GitHub Action wrapper for patchnote, published from the `smoothbricks` monorepo 
 ## Maintainer Notes
 
 - The action runs the co-located `packages/patchnote` source from the same git ref as the action itself.
-- Keep the major tag (`v1`) updated to a released commit so the documented action reference resolves for users.
+- While the action is still under test, point consumers at the branch ref `feat/add-dep-updater-package`.
