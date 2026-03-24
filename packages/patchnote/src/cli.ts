@@ -101,6 +101,19 @@ program
   });
 
 /**
+ * Command: lock-file-maintenance
+ * Refresh lock file without changing package.json
+ */
+program
+  .command('lock-file-maintenance')
+  .description('Refresh lock file without changing package.json (updates transitive dependencies)')
+  .action(async () => {
+    const config = await setupConfig();
+    const { lockFileMaintenance } = await import('./commands/lock-file-maintenance.js');
+    await lockFileMaintenance(config, getUpdateOptions());
+  });
+
+/**
  * Command: generate-syncpack
  * Generate syncpack configuration from Expo SDK version
  */
