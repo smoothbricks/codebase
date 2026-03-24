@@ -1,7 +1,8 @@
 /**
- * Auto-detect workspace scopes from package.json and find Expo projects
+ * Auto-detect workspace scopes from package.json, pnpm-workspace.yaml, and find Expo projects
  */
 
+import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { relative, resolve } from 'node:path';
 import glob from 'fast-glob';
@@ -16,21 +17,70 @@ interface PackageJson {
 }
 
 /**
- * Read package.json and extract workspace package names
+ * Get workspace glob patterns from pnpm-workspace.yaml or package.json workspaces field.
+ *
+ * Priority:
+ * 1. pnpm-workspace.yaml (pnpm ignores package.json workspaces)
+ * 2. package.json workspaces (array or object format)
+ *
+ * @param repoRoot - Repository root directory
+ * @returns Array of workspace glob patterns (e.g. ['packages/*', 'apps/*'])
  */
-async function getWorkspacePackageNames(repoRoot: string, logger?: Logger): Promise<string[]> {
+export async function getWorkspacePatterns(repoRoot: string): Promise<string[]> {
+  // 1. Check for pnpm-workspace.yaml first
+  const pnpmWorkspacePath = resolve(repoRoot, 'pnpm-workspace.yaml');
+  if (existsSync(pnpmWorkspacePath)) {
+    try {
+      const content = await readFile(pnpmWorkspacePath, 'utf-8');
+      const patterns: string[] = [];
+      let inPackages = false;
+
+      for (const line of content.split('\n')) {
+        if (line.match(/^packages:/)) {
+          inPackages = true;
+          continue;
+        }
+        if (inPackages && line.match(/^\s+-\s+/)) {
+          const pattern = line.replace(/^\s+-\s+['"]?/, '').replace(/['"]?\s*$/, '');
+          if (!pattern.startsWith('!')) {
+            patterns.push(pattern);
+          }
+        } else if (inPackages && line.trim().length > 0 && !line.match(/^\s/)) {
+          break; // End of packages section
+        }
+      }
+
+      return patterns;
+    } catch {
+      // Fall through to package.json
+    }
+  }
+
+  // 2. Fall back to package.json workspaces field
   try {
     const packageJsonPath = resolve(repoRoot, 'package.json');
     const content = await readFile(packageJsonPath, 'utf-8');
     const packageJson: PackageJson = JSON.parse(content);
 
-    // Get workspace patterns
-    let workspacePatterns: string[] = [];
     if (Array.isArray(packageJson.workspaces)) {
-      workspacePatterns = packageJson.workspaces;
-    } else if (packageJson.workspaces?.packages) {
-      workspacePatterns = packageJson.workspaces.packages;
+      return packageJson.workspaces;
     }
+    if (packageJson.workspaces?.packages) {
+      return packageJson.workspaces.packages;
+    }
+  } catch {
+    // No package.json or parse error
+  }
+
+  return [];
+}
+
+/**
+ * Read package.json and extract workspace package names
+ */
+async function getWorkspacePackageNames(repoRoot: string, logger?: Logger): Promise<string[]> {
+  try {
+    const workspacePatterns = await getWorkspacePatterns(repoRoot);
 
     if (workspacePatterns.length === 0) {
       return [];
@@ -127,13 +177,8 @@ export async function detectExpoProjects(repoRoot: string, logger?: Logger): Pro
     const content = await readFile(packageJsonPath, 'utf-8');
     const packageJson: PackageJson = JSON.parse(content);
 
-    // Get workspace patterns
-    let workspacePatterns: string[] = [];
-    if (Array.isArray(packageJson.workspaces)) {
-      workspacePatterns = packageJson.workspaces;
-    } else if (packageJson.workspaces?.packages) {
-      workspacePatterns = packageJson.workspaces.packages;
-    }
+    // Get workspace patterns using the shared utility
+    const workspacePatterns = await getWorkspacePatterns(repoRoot);
 
     // If no workspaces, check root package.json
     if (workspacePatterns.length === 0) {
