@@ -5,12 +5,12 @@
  * resolution logic for npm-published preset packages.
  */
 
-import { createRequire } from 'node:module'
-import { pathToFileURL } from 'node:url'
-import type { PatchnoteConfig } from './config.js'
-import type { DeepPartial } from './types.js'
+import { createRequire } from 'node:module';
+import { pathToFileURL } from 'node:url';
+import type { PatchnoteConfig } from './config.js';
+import type { DeepPartial } from './types.js';
 
-type PartialConfig = DeepPartial<PatchnoteConfig>
+type PartialConfig = DeepPartial<PatchnoteConfig>;
 
 /** Sections that use shallow-merge (base + override spread) */
 const SHALLOW_MERGE_SECTIONS = [
@@ -24,10 +24,10 @@ const SHALLOW_MERGE_SECTIONS = [
   'git',
   'semanticCommits',
   'filters',
-] as const
+] as const;
 
 /** Sections where override completely replaces base (last wins) */
-const REPLACE_SECTIONS = ['packageRules', 'grouping'] as const
+const REPLACE_SECTIONS = ['packageRules', 'grouping'] as const;
 
 /**
  * Built-in preset definitions.
@@ -66,7 +66,7 @@ export const BUILT_IN_PRESETS: Record<string, PartialConfig> = {
     grouping: { separateMajor: true, separateMinorPatch: true },
     packageRules: [{ match: '*', updateTypes: ['patch'] }],
   },
-}
+};
 
 /**
  * Merge two DeepPartial<PatchnoteConfig> objects with section-aware shallow merge.
@@ -77,18 +77,16 @@ export const BUILT_IN_PRESETS: Record<string, PartialConfig> = {
  * - Top-level scalars are spread normally
  */
 export function mergePartials(base: PartialConfig, override: PartialConfig): PartialConfig {
-  const result: PartialConfig = { ...base }
+  const result: PartialConfig = { ...base };
 
   // Shallow-merge each config section
   // Type assertion needed: TS can't narrow union of section types when iterating
-  const res = result as Record<string, unknown>
+  const res = result as Record<string, unknown>;
   for (const section of SHALLOW_MERGE_SECTIONS) {
-    const baseSection = base[section] as Record<string, unknown> | undefined
-    const overrideSection = override[section] as Record<string, unknown> | undefined
+    const baseSection = base[section] as Record<string, unknown> | undefined;
+    const overrideSection = override[section] as Record<string, unknown> | undefined;
     if (overrideSection !== undefined) {
-      res[section] = baseSection
-        ? { ...baseSection, ...overrideSection }
-        : { ...overrideSection }
+      res[section] = baseSection ? { ...baseSection, ...overrideSection } : { ...overrideSection };
     }
     // If override doesn't have this section, base's value is already in result via spread
   }
@@ -96,16 +94,16 @@ export function mergePartials(base: PartialConfig, override: PartialConfig): Par
   // Replace sections: override completely replaces base
   for (const section of REPLACE_SECTIONS) {
     if (override[section] !== undefined) {
-      res[section] = override[section]
+      res[section] = override[section];
     }
   }
 
   // Top-level scalars (repoRoot, etc.)
   if (override.repoRoot !== undefined) {
-    result.repoRoot = override.repoRoot
+    result.repoRoot = override.repoRoot;
   }
 
-  return result
+  return result;
 }
 
 /**
@@ -121,42 +119,44 @@ export function mergePartials(base: PartialConfig, override: PartialConfig): Par
  */
 export async function resolvePreset(ref: string, visited?: Set<string>): Promise<PartialConfig> {
   // Cycle detection
-  const seen = visited ?? new Set<string>()
+  const seen = visited ?? new Set<string>();
   if (seen.has(ref)) {
-    throw new Error(`Circular preset reference detected: ${ref}`)
+    throw new Error(`Circular preset reference detected: ${ref}`);
   }
-  seen.add(ref)
+  seen.add(ref);
 
   // Built-in preset
   if (ref.startsWith('patchnote:')) {
-    const name = ref.slice('patchnote:'.length)
-    const preset = BUILT_IN_PRESETS[name]
+    const name = ref.slice('patchnote:'.length);
+    const preset = BUILT_IN_PRESETS[name];
     if (!preset) {
-      throw new Error(`Unknown built-in preset: ${ref}. Available presets: ${Object.keys(BUILT_IN_PRESETS).join(', ')}`)
+      throw new Error(
+        `Unknown built-in preset: ${ref}. Available presets: ${Object.keys(BUILT_IN_PRESETS).join(', ')}`,
+      );
     }
-    return preset
+    return preset;
   }
 
   // npm preset resolution
-  const require = createRequire(import.meta.url)
-  const candidates = [ref]
+  const require = createRequire(import.meta.url);
+  const candidates = [ref];
 
   // If ref doesn't look like a scoped package or already prefixed, try with prefix
   if (!ref.startsWith('@') && !ref.startsWith('patchnote-config-')) {
-    candidates.push(`patchnote-config-${ref}`)
+    candidates.push(`patchnote-config-${ref}`);
   }
 
   for (const candidate of candidates) {
     try {
-      const resolved = require.resolve(candidate)
-      const module = await import(pathToFileURL(resolved).href)
-      return module.default || module
+      const resolved = require.resolve(candidate);
+      const module = await import(pathToFileURL(resolved).href);
+      return module.default || module;
     } catch {
       // Try next candidate
     }
   }
 
-  throw new Error(`Cannot resolve preset '${ref}'. Install it with: bun add -d ${ref}`)
+  throw new Error(`Cannot resolve preset '${ref}'. Install it with: bun add -d ${ref}`);
 }
 
 /**
@@ -168,16 +168,16 @@ export async function resolvePreset(ref: string, visited?: Set<string>): Promise
  */
 export async function resolvePresets(refs: string[], visited?: Set<string>): Promise<PartialConfig> {
   if (refs.length === 0) {
-    return {}
+    return {};
   }
 
-  const seen = visited ?? new Set<string>()
-  let merged: PartialConfig = {}
+  const seen = visited ?? new Set<string>();
+  let merged: PartialConfig = {};
 
   for (const ref of refs) {
-    const preset = await resolvePreset(ref, seen)
-    merged = mergePartials(merged, preset)
+    const preset = await resolvePreset(ref, seen);
+    merged = mergePartials(merged, preset);
   }
 
-  return merged
+  return merged;
 }

@@ -827,7 +827,8 @@ describe('Config Integration - extends presets', () => {
     );
 
     const config = await loadConfig(undefined, configPath);
-    expect((config as any).extends).toBeUndefined();
+    // biome-ignore lint/suspicious/noExplicitAny: testing that extends is stripped from resolved config
+    expect((config as Record<string, any>).extends).toBeUndefined();
   });
 
   test('script mode configs are unaffected by extends', async () => {

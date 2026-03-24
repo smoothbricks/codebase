@@ -8,6 +8,7 @@ import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
+import { mergePartials, resolvePresets } from './presets.js';
 import type {
   DeepPartial,
   ExpoProject,
@@ -17,7 +18,6 @@ import type {
   PackageRule,
   SupportedProvider,
 } from './types.js';
-import { mergePartials, resolvePresets } from './presets.js';
 import { safeResolve, validatePathWithinBase } from './utils/path-validation.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
