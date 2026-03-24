@@ -174,6 +174,14 @@ export interface PatchnoteConfig {
    */
   grouping?: GroupingConfig;
 
+  /** Lock file maintenance configuration */
+  lockFileMaintenance?: {
+    /** Enable lock file maintenance mode */
+    enabled: boolean;
+    /** Branch prefix for lock file maintenance PRs */
+    branchPrefix: string;
+  };
+
   /** Repository root path */
   repoRoot?: string;
 
@@ -247,6 +255,10 @@ export const defaultConfig: PatchnoteConfig = {
   filters: {
     exclude: [],
     include: [],
+  },
+  lockFileMaintenance: {
+    enabled: false,
+    branchPrefix: 'chore/lock-file-maintenance',
   },
   logger: new ConsoleLogger(LogLevel.INFO),
 };
@@ -401,6 +413,9 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
     filters: userConfig.filters ? { ...defaultConfig.filters, ...userConfig.filters } : defaultConfig.filters,
     grouping: userConfig.grouping ?? defaultConfig.grouping,
     packageRules: userConfig.packageRules ?? defaultConfig.packageRules,
+    lockFileMaintenance: userConfig.lockFileMaintenance
+      ? { ...defaultConfig.lockFileMaintenance, ...userConfig.lockFileMaintenance }
+      : defaultConfig.lockFileMaintenance,
     // Logger is runtime-only, always use default logger (can be overridden later)
     logger: defaultConfig.logger,
   } as PatchnoteConfig;

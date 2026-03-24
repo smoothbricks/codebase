@@ -4,7 +4,7 @@
 
 import { execa } from 'execa';
 import type { Logger } from '../logger.js';
-import type { PackageUpdate, UpdateResult } from '../types.js';
+import type { CommandExecutor, PackageUpdate, UpdateResult } from '../types.js';
 
 /**
  * Parse bun outdated output to detect available updates
@@ -279,5 +279,46 @@ export async function updateBunDependencies(
       error: String(error),
       ecosystem: 'npm',
     };
+  }
+}
+
+/**
+ * Refresh the lock file by running `bun install --force`
+ * This re-resolves all transitive dependencies from the registry
+ * without modifying package.json files.
+ *
+ * @param repoRoot - Repository root directory
+ * @param options - Options including dryRun, logger, and executor for testing
+ * @returns Whether bun.lock changed and any error that occurred
+ */
+export async function refreshLockFile(
+  repoRoot: string,
+  options: {
+    dryRun?: boolean
+    logger?: Logger
+    executor?: CommandExecutor
+  } = {},
+): Promise<{ changed: boolean; error?: string }> {
+  const { dryRun = false, logger, executor = execa as unknown as CommandExecutor } = options
+
+  if (dryRun) {
+    logger?.info('Dry run: would run bun install --force to refresh lock file')
+    return { changed: false }
+  }
+
+  try {
+    logger?.info('Running bun install --force to refresh transitive dependencies...')
+    await executor('bun', ['install', '--force'], { cwd: repoRoot })
+    logger?.info('Lock file refresh complete')
+
+    // Check if bun.lock actually changed
+    const { stdout } = await executor('git', ['diff', '--name-only'], { cwd: repoRoot })
+    const changed = stdout.split('\n').some((f: string) => f.trim() === 'bun.lock' || f.trim() === 'bun.lockb')
+
+    return { changed }
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error)
+    logger?.error('Lock file refresh failed:', message)
+    return { changed: false, error: message }
   }
 }
