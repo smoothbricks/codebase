@@ -115,6 +115,12 @@ export interface PatchnoteConfig {
     mode: 'block' | 'warn' | 'skip';
   };
 
+  /** Deprecated package detection */
+  deprecationCheck?: {
+    /** Behavior: 'warn' (PR warning), 'skip' (disable). Default: 'warn'. */
+    mode: 'warn' | 'skip';
+  };
+
   /** AI-powered changelog analysis */
   ai: {
     /** AI provider for changelog analysis */
@@ -238,6 +244,9 @@ export const defaultConfig: PatchnoteConfig = {
   },
   provenanceCheck: {
     mode: 'block',
+  },
+  deprecationCheck: {
+    mode: 'warn',
   },
   ai: {
     provider: 'zai',
@@ -413,6 +422,9 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
     provenanceCheck: userConfig.provenanceCheck
       ? { ...defaultConfig.provenanceCheck, ...userConfig.provenanceCheck }
       : defaultConfig.provenanceCheck,
+    deprecationCheck: userConfig.deprecationCheck
+      ? { ...defaultConfig.deprecationCheck, ...userConfig.deprecationCheck }
+      : defaultConfig.deprecationCheck,
     ai: { ...defaultConfig.ai, ...(userConfig.ai || {}) },
     git: userConfig.git ? { ...defaultConfig.git, ...userConfig.git } : defaultConfig.git,
     semanticCommits: userConfig.semanticCommits

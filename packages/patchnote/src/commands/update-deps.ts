@@ -207,6 +207,20 @@ export async function runAllUpdaters(
     }
   }
 
+  // Check deprecated packages (unless disabled)
+  const deprecationMode = config.deprecationCheck?.mode ?? 'warn';
+  if (deprecationMode !== 'skip') {
+    const deprecationSpinner = p.spinner();
+    deprecationSpinner.start('Checking for deprecated packages');
+    const { checkDeprecations } = await import('../deprecated/checker.js');
+    await checkDeprecations(allUpdates, 5, config.logger);
+    const deprecatedCount = allUpdates.filter((u) => u.deprecatedMessage).length;
+    deprecationSpinner.stop(deprecatedCount > 0 ? `Deprecated: ${deprecatedCount} package(s)` : 'Deprecated: none');
+    if (deprecatedCount > 0) {
+      summaryLines.push(`  deprecated: ${deprecatedCount}`);
+    }
+  }
+
   p.note(summaryLines.join('\n'), 'Summary');
 
   return {
@@ -274,6 +288,13 @@ async function generateCommitData(
   const provenanceWarning = formatProvenanceWarnings(allUpdates);
   if (provenanceWarning) {
     prBody = `${provenanceWarning}\n\n${prBody}`;
+  }
+
+  // Append deprecation warnings (informational, after main content)
+  const { formatDeprecationWarnings } = await import('../deprecated/formatter.js');
+  const deprecationWarning = formatDeprecationWarnings(allUpdates);
+  if (deprecationWarning) {
+    prBody = `${prBody}\n\n${deprecationWarning}`;
   }
 
   return {
