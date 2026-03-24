@@ -30,8 +30,10 @@ in {
   ];
 
   # Use system Xcode for iOS simulator, signing, and instruments.
-  # Nix Apple SDK is build-only — no simctl/simulator runtimes.
+  # Nix Apple SDK is build-only — no simctl/simulator runtimes, and nix's
+  # clang doesn't support -index-store-path which xcodebuild passes.
   # https://devenv.sh/recipes/macos/
+  # https://github.com/cachix/devenv/issues/1674
   apple.sdk = null;
 
   # https://devenv.sh/languages/
@@ -71,6 +73,11 @@ in {
     cd "$DEVENV_ROOT/../.."
     export PATH="$PWD/tooling:$PWD/node_modules/.bin:$PATH"
     bun ${./setup-environment.ts}
+
+    # Unset nix CC/CXX so xcodebuild finds Xcode's clang (supports -index-store-path)
+    # Zig has its own toolchain and doesn't use CC; bun/node native addons use node-gyp
+    # which finds compilers via its own logic.
+    unset CC CXX
 
     # S3 integration tests (BunS3Archive) - MinIO runs when devenv up
     export S3_TEST_ENDPOINT="http://127.0.0.1:9000"
