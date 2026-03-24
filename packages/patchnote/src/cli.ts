@@ -101,6 +101,19 @@ program
   });
 
 /**
+ * Command: onboard
+ * Create onboarding PR with default configuration (for CI use)
+ */
+program
+  .command('onboard')
+  .description('Create onboarding PR with default configuration (for CI use)')
+  .action(async () => {
+    const config = await setupConfig();
+    const { onboard } = await import('./commands/onboard.js');
+    await onboard(config, getUpdateOptions());
+  });
+
+/**
  * Command: lock-file-maintenance
  * Refresh lock file without changing package.json
  */
