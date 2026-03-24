@@ -2,7 +2,7 @@
  * Configuration for the patchnote tool
  */
 
-import { existsSync } from 'node:fs';
+import { existsSync, realpathSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
@@ -298,7 +298,10 @@ export async function loadConfig(searchPath?: string, explicitConfigPath?: strin
         }
 
         if (isAbsolute(explicitConfigPath)) {
-          validatePathWithinBase(repoRoot, explicitConfigPath);
+          // Resolve symlinks so git's realpath-resolved root matches the config path
+          const realRoot = existsSync(repoRoot) ? realpathSync(repoRoot) : repoRoot;
+          const realConfig = existsSync(explicitConfigPath) ? realpathSync(explicitConfigPath) : explicitConfigPath;
+          validatePathWithinBase(realRoot, realConfig);
           return explicitConfigPath;
         }
 
