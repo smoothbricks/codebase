@@ -85,6 +85,8 @@ export interface PatchnoteConfig {
     reviewers?: string[];
     /** Create PRs as draft */
     draft?: boolean;
+    /** Custom PR body template. Uses {{variable}} placeholders. Undefined = use built-in default. */
+    prBodyTemplate?: string;
   };
 
   /**

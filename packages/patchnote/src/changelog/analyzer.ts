@@ -44,12 +44,15 @@ export async function analyzeChangelogs(
   changelogs: Map<string, string>,
   config: PatchnoteConfig,
   downgrades: PackageUpdate[] = [],
+  rawMode = false,
 ): Promise<string> {
   // Check for API key
   const apiKey = config.ai.apiKey || process.env.ZAI_API_KEY;
   if (!apiKey) {
     config.logger?.warn('No ZAI_API_KEY found, skipping AI analysis');
     config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
+    // In raw mode, return just the update table (no embedded downgrades/releaseNotes)
+    if (rawMode) return generateUpdateTable(updates);
     return generateFallbackSummary(updates, downgrades);
   }
 
@@ -60,7 +63,10 @@ export async function analyzeChangelogs(
     const response = await sendPrompt(config, prompt);
 
     if (response) {
-      // Append nix updates and downgrades sections
+      // In raw mode, return ONLY the AI response (template handles section placement)
+      if (rawMode) return response;
+
+      // Legacy mode: append nix updates and downgrades sections
       // AI may omit nix packages since they don't have changelogs
       let result = response;
 
@@ -82,12 +88,14 @@ export async function analyzeChangelogs(
       return result;
     }
 
+    if (rawMode) return generateUpdateTable(updates);
     return generateFallbackSummary(updates, downgrades, changelogs);
   } catch (error) {
     config.logger?.warn('AI analysis failed:', error instanceof Error ? error.message : String(error));
     if (process.env.VERBOSE) {
       config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
     }
+    if (rawMode) return generateUpdateTable(updates);
     return generateFallbackSummary(updates, downgrades, changelogs);
   }
 }
@@ -210,7 +218,7 @@ function formatUpdate(update: PackageUpdate): string {
 /**
  * Format downgrades/removals section for PR description
  */
-function formatDowngradesSection(downgrades: PackageUpdate[]): string {
+export function formatDowngradesSection(downgrades: PackageUpdate[]): string {
   if (downgrades.length === 0) return '';
 
   const parts: string[] = ['### i Downgrades & Removals (Informational)\n'];
@@ -228,7 +236,7 @@ function formatDowngradesSection(downgrades: PackageUpdate[]): string {
  * Format nix updates section for PR description
  * Nix packages don't have changelogs fetched from npm, so ensure they're listed
  */
-function formatNixUpdatesSection(updates: PackageUpdate[]): string {
+export function formatNixUpdatesSection(updates: PackageUpdate[]): string {
   const nixUpdates = updates.filter((u) => u.ecosystem === 'nix' || u.ecosystem === 'nixpkgs');
   if (nixUpdates.length === 0) return '';
 
@@ -303,13 +311,10 @@ export function renderReleaseNotesSection(
 }
 
 /**
- * Generate fallback summary without AI
+ * Generate the grouped update table (major/minor/patch/other sections + total count).
+ * Does NOT include downgrades or release notes -- those are separate template variables.
  */
-function generateFallbackSummary(
-  updates: PackageUpdate[],
-  downgrades: PackageUpdate[] = [],
-  changelogs?: Map<string, string>,
-): string {
+export function generateUpdateTable(updates: PackageUpdate[]): string {
   const sections = {
     major: [] as PackageUpdate[],
     minor: [] as PackageUpdate[],
@@ -365,25 +370,37 @@ function generateFallbackSummary(
     parts.push('');
   }
 
-  // Add downgrades section if any
+  parts.push(`\nTotal updates: ${updates.length}`);
+
+  return parts.join('\n');
+}
+
+/**
+ * Generate fallback summary without AI.
+ * Delegates to generateUpdateTable() for the core list, then appends
+ * downgrades and release notes for backward compatibility.
+ */
+function generateFallbackSummary(
+  updates: PackageUpdate[],
+  downgrades: PackageUpdate[] = [],
+  changelogs?: Map<string, string>,
+): string {
+  const table = generateUpdateTable(updates);
+  const parts: string[] = [table];
+
   if (downgrades.length > 0) {
     parts.push(formatDowngradesSection(downgrades));
-    parts.push('');
   }
 
-  // Add release notes section if changelogs are available
   if (changelogs && changelogs.size > 0) {
-    const currentLength = parts.join('\n').length;
+    const currentLength = parts.join('\n\n').length;
     const releaseNotes = renderReleaseNotesSection(updates, changelogs, 60000 - currentLength);
     if (releaseNotes) {
-      parts.push('');
       parts.push(releaseNotes);
     }
   }
 
-  parts.push(`\nTotal updates: ${updates.length}`);
-
-  return parts.join('\n');
+  return parts.join('\n\n');
 }
 
 /**

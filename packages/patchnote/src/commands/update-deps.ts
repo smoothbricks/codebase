@@ -4,7 +4,7 @@
 
 import * as p from '@clack/prompts';
 import { shutdownAIClient } from '../ai/zai-client.js';
-import { analyzeChangelogs, generateCommitMessage } from '../changelog/analyzer.js';
+import { generateCommitMessage } from '../changelog/analyzer.js';
 import { fetchChangelogs } from '../changelog/fetcher.js';
 import type { PatchnoteConfig } from '../config.js';
 import { executeConfigScript, findConfigFile, isConfigScript } from '../config.js';
@@ -14,6 +14,9 @@ import { partitionUpdates } from '../grouping.js';
 import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/stacking.js';
 import { applyPackageRules, resolveAutoMerge } from '../rules.js';
 import { resolveSemanticPrefix } from '../semantic.js';
+import { DEFAULT_PR_BODY_TEMPLATE } from '../template/defaults.js';
+import { collapseBlankLines, renderTemplate } from '../template/renderer.js';
+import { buildTemplateVariables } from '../template/variables.js';
 import type { PackageUpdate, ResolvedPackagePolicy, UpdateOptions, UpdateResult, UpdateType } from '../types.js';
 import { updateNpmDependencies } from '../updaters/bun.js';
 import { updateDevenv } from '../updaters/devenv.js';
@@ -268,39 +271,30 @@ async function generateCommitData(
     changelogSpinner.stop(`Fetched ${changelogs.size} changelogs`);
   }
 
-  // Generate commit message
-  let prBody: string;
-
-  if (options.skipAI || changelogs.size === 0) {
-    const { body } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs, semanticPrefix);
-    prBody = body;
-  } else {
-    const aiSpinner = p.spinner();
-    aiSpinner.start('Analyzing changelogs with AI');
-    prBody = await analyzeChangelogs(allUpdates, changelogs, config, allDowngrades);
-    aiSpinner.stop('AI analysis complete');
-  }
-
+  // Generate commit title
   const { title } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs, semanticPrefix);
 
-  // Prepend provenance warnings to PR body if any downgrades detected
-  const { formatProvenanceWarnings } = await import('../provenance/formatter.js');
-  const provenanceWarning = formatProvenanceWarnings(allUpdates);
-  if (provenanceWarning) {
-    prBody = `${provenanceWarning}\n\n${prBody}`;
-  }
+  // Build template variables (decomposed sections)
+  const aiSpinner = !options.skipAI && changelogs.size > 0 ? p.spinner() : null;
+  if (aiSpinner) aiSpinner.start('Analyzing changelogs with AI');
 
-  // Append deprecation warnings (informational, after main content)
-  const { formatDeprecationWarnings } = await import('../deprecated/formatter.js');
-  const deprecationWarning = formatDeprecationWarnings(allUpdates);
-  if (deprecationWarning) {
-    prBody = `${prBody}\n\n${deprecationWarning}`;
-  }
-
-  return {
+  const variables = await buildTemplateVariables({
+    updates: allUpdates,
+    downgrades: allDowngrades,
+    changelogs,
+    config,
+    skipAI: options.skipAI,
     commitTitle: title,
-    prBody,
-  };
+  });
+
+  if (aiSpinner) aiSpinner.stop('AI analysis complete');
+
+  // Render template
+  const template = config.prStrategy.prBodyTemplate ?? DEFAULT_PR_BODY_TEMPLATE;
+  const rendered = renderTemplate(template, variables);
+  const prBody = collapseBlankLines(rendered);
+
+  return { commitTitle: title, prBody };
 }
 
 const SEVERITY_LEVELS: Record<UpdateType, number> = {
