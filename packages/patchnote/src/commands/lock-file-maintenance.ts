@@ -8,11 +8,36 @@
 
 import * as p from '@clack/prompts';
 import type { PatchnoteConfig } from '../config.js';
-import { commit, createBranch, deleteRemoteBranch, getRepoRoot, pushWithUpstream, stageFiles } from '../git.js';
-import { createPR } from '../pr/stacking.js';
-import { resolveSemanticPrefix } from '../semantic.js';
+import * as gitModule from '../git.js';
+import * as stackingModule from '../pr/stacking.js';
+import * as semanticModule from '../semantic.js';
 import type { UpdateOptions } from '../types.js';
-import { refreshLockFile } from '../updaters/bun.js';
+import * as bunModule from '../updaters/bun.js';
+
+/** Injectable dependencies for testing */
+export interface LockFileMaintenanceDeps {
+  getRepoRoot: typeof gitModule.getRepoRoot;
+  createBranch: typeof gitModule.createBranch;
+  stageFiles: typeof gitModule.stageFiles;
+  commit: typeof gitModule.commit;
+  pushWithUpstream: typeof gitModule.pushWithUpstream;
+  deleteRemoteBranch: typeof gitModule.deleteRemoteBranch;
+  createPR: typeof stackingModule.createPR;
+  resolveSemanticPrefix: typeof semanticModule.resolveSemanticPrefix;
+  refreshLockFile: typeof bunModule.refreshLockFile;
+}
+
+const defaultDeps: LockFileMaintenanceDeps = {
+  getRepoRoot: gitModule.getRepoRoot,
+  createBranch: gitModule.createBranch,
+  stageFiles: gitModule.stageFiles,
+  commit: gitModule.commit,
+  pushWithUpstream: gitModule.pushWithUpstream,
+  deleteRemoteBranch: gitModule.deleteRemoteBranch,
+  createPR: stackingModule.createPR,
+  resolveSemanticPrefix: semanticModule.resolveSemanticPrefix,
+  refreshLockFile: bunModule.refreshLockFile,
+};
 
 /**
  * Generate a timestamped branch name for lock file maintenance
@@ -30,15 +55,19 @@ function generateLockMaintenanceBranchName(prefix: string): string {
  * Refreshes bun.lock by running `bun install --force` and creates
  * a standalone PR targeting the base branch directly (no stacking).
  */
-export async function lockFileMaintenance(config: PatchnoteConfig, options: UpdateOptions): Promise<void> {
+export async function lockFileMaintenance(
+  config: PatchnoteConfig,
+  options: UpdateOptions,
+  deps: LockFileMaintenanceDeps = defaultDeps,
+): Promise<void> {
   p.intro('Lock file maintenance');
 
-  const repoRoot = config.repoRoot || (await getRepoRoot());
+  const repoRoot = config.repoRoot || (await deps.getRepoRoot());
 
   // Refresh lock file
   const refreshSpinner = p.spinner();
   refreshSpinner.start('Refreshing lock file');
-  const result = await refreshLockFile(repoRoot, {
+  const result = await deps.refreshLockFile(repoRoot, {
     dryRun: options.dryRun,
     logger: config.logger,
   });
@@ -74,7 +103,7 @@ export async function lockFileMaintenance(config: PatchnoteConfig, options: Upda
   const remote = config.git?.remote || 'origin';
 
   // Resolve semantic prefix
-  const semanticPrefix = await resolveSemanticPrefix(config, repoRoot, []);
+  const semanticPrefix = await deps.resolveSemanticPrefix(config, repoRoot, []);
   const commitTitle = semanticPrefix ? `${semanticPrefix}: lock file maintenance` : 'chore: lock file maintenance';
   const commitBody =
     'Refreshed lock file to update transitive dependency resolutions.\n\nRan `bun install --force` to re-resolve all dependencies from the registry.';
@@ -82,20 +111,20 @@ export async function lockFileMaintenance(config: PatchnoteConfig, options: Upda
   // Create branch
   const branchSpinner = p.spinner();
   branchSpinner.start('Creating maintenance branch');
-  await createBranch(repoRoot, branchName);
+  await deps.createBranch(repoRoot, branchName);
   branchSpinner.stop(`Created branch: ${branchName}`);
 
   // Stage only lock files (not all changes — avoids sweeping unrelated local changes)
   const commitSpinner = p.spinner();
   commitSpinner.start('Committing lock file changes');
-  await stageFiles(repoRoot, ['bun.lock', 'bun.lockb']);
-  await commit(repoRoot, commitTitle, commitBody);
+  await deps.stageFiles(repoRoot, ['bun.lock', 'bun.lockb']);
+  await deps.commit(repoRoot, commitTitle, commitBody);
   commitSpinner.stop('Commit created');
 
   // Push
   const pushSpinner = p.spinner();
   pushSpinner.start('Pushing to remote');
-  await pushWithUpstream(repoRoot, remote, branchName);
+  await deps.pushWithUpstream(repoRoot, remote, branchName);
   pushSpinner.stop(`Pushed to ${remote}/${branchName}`);
 
   // Create PR (standalone, targeting base branch directly -- no stacking)
@@ -103,7 +132,7 @@ export async function lockFileMaintenance(config: PatchnoteConfig, options: Upda
   prSpinner.start('Creating pull request');
 
   try {
-    const pr = await createPR(config, repoRoot, {
+    const pr = await deps.createPR(config, repoRoot, {
       title: commitTitle,
       body: commitBody,
       baseBranch,
@@ -135,7 +164,7 @@ export async function lockFileMaintenance(config: PatchnoteConfig, options: Upda
     // Clean up orphan branch on remote
     config.logger?.error('Cleaning up remote branch...');
     try {
-      await deleteRemoteBranch(repoRoot, remote, branchName);
+      await deps.deleteRemoteBranch(repoRoot, remote, branchName);
       config.logger?.info(`Deleted orphan branch: ${remote}/${branchName}`);
     } catch (cleanupError) {
       config.logger?.warn(
