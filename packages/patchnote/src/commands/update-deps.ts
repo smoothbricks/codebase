@@ -328,15 +328,15 @@ async function enableAutoMergeIfEligible(
   config: PatchnoteConfig,
   repoRoot: string,
   prNumber: number,
-  allUpdates: PackageUpdate[],
+  updates: PackageUpdate[],
   policies: Map<string, ResolvedPackagePolicy> = new Map(),
 ): Promise<void> {
   if (!config.autoMerge.enabled || config.autoMerge.mode === 'none') return;
-  if (!resolveAutoMerge(policies, config.autoMerge.mode, allUpdates)) return;
+  if (!resolveAutoMerge(policies, config.autoMerge.mode, updates)) return;
 
   // Block auto-merge if any package has provenance downgrade and mode is 'block'
   const provenanceMode = config.provenanceCheck?.mode ?? 'block';
-  if (provenanceMode === 'block' && allUpdates.some((u) => u.provenanceDowngraded)) {
+  if (provenanceMode === 'block' && updates.some((u) => u.provenanceDowngraded)) {
     config.logger?.warn('Auto-merge disabled: provenance downgrade detected in one or more packages');
     return;
   }
@@ -401,10 +401,7 @@ async function createPRWorkflow(
   const prTitle = generatePRTitle(config, hasBreaking, semanticPrefix, groupName);
 
   try {
-    const { autoCloseOldPRs, createPR } = await import('../pr/stacking.js');
-
-    // Auto-close old PRs beyond maxStackDepth before creating new one
-    await autoCloseOldPRs(config, repoRoot);
+    const { createPR } = await import('../pr/stacking.js');
 
     const pr = await createPR(config, repoRoot, {
       title: prTitle,
@@ -544,11 +541,16 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
 
     // Create PR workflow for each group
     if (!options.skipGit) {
+      // Auto-close old PRs beyond maxStackDepth once before creating any new PRs
+      // (not per-group, to avoid closing our own just-created group PRs)
+      const { autoCloseOldPRs } = await import('../pr/stacking.js');
+      await autoCloseOldPRs(config, repoRoot);
+
       // For multi-group: reset working tree and re-run targeted updates per group
       // so each PR gets only its own package changes and a clean lockfile
       if (isMultiGroup) {
-        const { execa } = await import('execa');
         // Reset working tree from the initial full update run
+        const { execa } = await import('execa');
         await execa('git', ['checkout', '.'], { cwd: repoRoot });
       }
 
@@ -602,6 +604,9 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
         // Each group creates an INDEPENDENT PR against the same stackBase
         if (isMultiGroup) {
           await switchBranch(repoRoot, stackBase);
+          // Reset any leftover working tree changes from this group's bun update
+          const { execa: execaReset } = await import('execa');
+          await execaReset('git', ['checkout', '.'], { cwd: repoRoot });
         }
       }
     }
