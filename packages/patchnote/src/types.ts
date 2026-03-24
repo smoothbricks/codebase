@@ -166,6 +166,19 @@ export interface ExpoProject {
 }
 
 /**
+ * Configuration for grouping/batching dependency updates into separate PRs.
+ * Groups are evaluated in priority order: semver level first, then name patterns, then default.
+ */
+export interface GroupingConfig {
+  /** Separate major updates into their own PR group */
+  separateMajor?: boolean
+  /** Separate minor and patch updates into their own PR groups */
+  separateMinorPatch?: boolean
+  /** Name-pattern groups: packages matching the pattern are grouped together */
+  groups?: Array<{ name: string; match: string | string[] }>
+}
+
+/**
  * Options for update commands
  */
 export interface UpdateOptions {

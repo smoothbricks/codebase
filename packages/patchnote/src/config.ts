@@ -8,7 +8,15 @@ import { isAbsolute, join } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import { getRepoRoot } from './git.js';
 import { ConsoleLogger, type Logger, LogLevel } from './logger.js';
-import type { DeepPartial, ExpoProject, FilterConfig, MergeStrategy, PackageRule, SupportedProvider } from './types.js';
+import type {
+  DeepPartial,
+  ExpoProject,
+  FilterConfig,
+  GroupingConfig,
+  MergeStrategy,
+  PackageRule,
+  SupportedProvider,
+} from './types.js';
 import { safeResolve, validatePathWithinBase } from './utils/path-validation.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
@@ -157,6 +165,13 @@ export interface PatchnoteConfig {
    * ]
    */
   packageRules?: PackageRule[];
+
+  /**
+   * Update grouping/batching configuration.
+   * When set, dependency updates are partitioned into separate PRs by semver level
+   * and/or package name pattern. When undefined, all updates go into a single PR.
+   */
+  grouping?: GroupingConfig;
 
   /** Repository root path */
   repoRoot?: string;
@@ -362,6 +377,7 @@ export function mergeConfig(userConfig: DeepPartial<PatchnoteConfig>): Patchnote
       ? { ...defaultConfig.semanticCommits, ...userConfig.semanticCommits }
       : defaultConfig.semanticCommits,
     filters: userConfig.filters ? { ...defaultConfig.filters, ...userConfig.filters } : defaultConfig.filters,
+    grouping: userConfig.grouping ?? defaultConfig.grouping,
     packageRules: userConfig.packageRules ?? defaultConfig.packageRules,
     // Logger is runtime-only, always use default logger (can be overridden later)
     logger: defaultConfig.logger,
