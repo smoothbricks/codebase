@@ -294,31 +294,31 @@ export async function updateBunDependencies(
 export async function refreshLockFile(
   repoRoot: string,
   options: {
-    dryRun?: boolean
-    logger?: Logger
-    executor?: CommandExecutor
+    dryRun?: boolean;
+    logger?: Logger;
+    executor?: CommandExecutor;
   } = {},
 ): Promise<{ changed: boolean; error?: string }> {
-  const { dryRun = false, logger, executor = execa as unknown as CommandExecutor } = options
+  const { dryRun = false, logger, executor = execa as unknown as CommandExecutor } = options;
 
   if (dryRun) {
-    logger?.info('Dry run: would run bun install --force to refresh lock file')
-    return { changed: false }
+    logger?.info('Dry run: would run bun install --force to refresh lock file');
+    return { changed: false };
   }
 
   try {
-    logger?.info('Running bun install --force to refresh transitive dependencies...')
-    await executor('bun', ['install', '--force'], { cwd: repoRoot })
-    logger?.info('Lock file refresh complete')
+    logger?.info('Running bun install --force to refresh transitive dependencies...');
+    await executor('bun', ['install', '--force'], { cwd: repoRoot });
+    logger?.info('Lock file refresh complete');
 
-    // Check if bun.lock actually changed
-    const { stdout } = await executor('git', ['diff', '--name-only'], { cwd: repoRoot })
-    const changed = stdout.split('\n').some((f: string) => f.trim() === 'bun.lock' || f.trim() === 'bun.lockb')
+    // Check if bun.lock actually changed (scoped to lock files only to avoid false positives from unrelated changes)
+    const { stdout } = await executor('git', ['diff', '--name-only', '--', 'bun.lock', 'bun.lockb'], { cwd: repoRoot });
+    const changed = stdout.trim().length > 0;
 
-    return { changed }
+    return { changed };
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error)
-    logger?.error('Lock file refresh failed:', message)
-    return { changed: false, error: message }
+    const message = error instanceof Error ? error.message : String(error);
+    logger?.error('Lock file refresh failed:', message);
+    return { changed: false, error: message };
   }
 }
