@@ -6,7 +6,7 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test';
 import { existsSync } from 'node:fs';
 import { mkdir, rm, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { dirname, join, relative } from 'node:path';
 import {
   defaultConfig,
   executeConfigScript,
@@ -723,7 +723,11 @@ describe('Config Integration - Script Mode', () => {
 });
 
 describe('Config Integration - extends presets', () => {
-  const testDir = join(process.cwd(), 'test-temp-extends-presets');
+  // Use the package's own directory for temp files (works regardless of cwd)
+  const pkgDir = dirname(dirname(import.meta.dir));
+  const testDir = join(pkgDir, 'test-temp-extends-presets');
+  // Compute relative import path from testDir to src/config.js
+  const configImport = relative(testDir, join(pkgDir, 'src/config.js'));
 
   beforeEach(async () => {
     if (!existsSync(testDir)) {
@@ -741,7 +745,7 @@ describe('Config Integration - extends presets', () => {
     const configPath = join(testDir, 'config-extends.ts');
     await writeFile(
       configPath,
-      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      `import { defineConfig } from '${configImport}';
       export default defineConfig({
         extends: ['patchnote:recommended'],
       });`,
@@ -761,7 +765,7 @@ describe('Config Integration - extends presets', () => {
     const configPath = join(testDir, 'config-local-override.ts');
     await writeFile(
       configPath,
-      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      `import { defineConfig } from '${configImport}';
       export default defineConfig({
         extends: ['patchnote:recommended'],
         prStrategy: { maxStackDepth: 3 },
@@ -781,7 +785,7 @@ describe('Config Integration - extends presets', () => {
     const configPath = join(testDir, 'config-multi-preset.ts');
     await writeFile(
       configPath,
-      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      `import { defineConfig } from '${configImport}';
       export default defineConfig({
         extends: ['patchnote:recommended', 'patchnote:aggressive'],
         prStrategy: { branchPrefix: 'custom/prefix' },
@@ -805,7 +809,7 @@ describe('Config Integration - extends presets', () => {
     const configPath = join(testDir, 'config-bad-preset.ts');
     await writeFile(
       configPath,
-      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      `import { defineConfig } from '${configImport}';
       export default defineConfig({
         extends: ['patchnote:does-not-exist'],
       });`,
@@ -820,7 +824,7 @@ describe('Config Integration - extends presets', () => {
     const configPath = join(testDir, 'config-no-extends.ts');
     await writeFile(
       configPath,
-      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      `import { defineConfig } from '${configImport}';
       export default defineConfig({
         extends: ['patchnote:recommended'],
       });`,
