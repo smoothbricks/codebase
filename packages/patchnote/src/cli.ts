@@ -227,6 +227,20 @@ program
     });
   });
 
+/**
+ * Command: rebase-open-prs
+ * Rebase open patchnote PRs onto updated base branch
+ */
+program
+  .command('rebase-open-prs')
+  .description('Rebase open patchnote PRs onto updated base branch')
+  .option('--max-age <days>', 'Skip PRs older than N days', '30')
+  .action(async (options) => {
+    const config = await setupConfig();
+    const { rebaseOpenPRs } = await import('./commands/rebase-open-prs.js');
+    await rebaseOpenPRs(config, { ...getUpdateOptions(), maxAgeDays: Number.parseInt(options.maxAge) });
+  });
+
 // Parse arguments and run
 program.parseAsync(process.argv).catch((error) => {
   console.error(error instanceof Error ? error.message : String(error));
