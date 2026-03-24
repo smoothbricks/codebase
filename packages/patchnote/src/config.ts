@@ -292,16 +292,21 @@ export async function loadConfig(searchPath?: string, explicitConfigPath?: strin
         let repoRoot = startPath;
 
         try {
-          repoRoot = await getRepoRoot(startPath);
+          const gitRoot = await getRepoRoot(startPath);
+          // Sanity check: startPath must be within gitRoot, otherwise the result
+          // is unreliable (e.g. mocked in tests or stale git state)
+          const realStart = existsSync(startPath) ? realpathSync(startPath) : startPath;
+          const realGitRoot = existsSync(gitRoot) ? realpathSync(gitRoot) : gitRoot;
+          if (realStart.startsWith(realGitRoot)) {
+            repoRoot = realGitRoot;
+          }
         } catch {
           // Fallback for non-git contexts such as isolated config tests.
         }
 
         if (isAbsolute(explicitConfigPath)) {
-          // Resolve symlinks so git's realpath-resolved root matches the config path
-          const realRoot = existsSync(repoRoot) ? realpathSync(repoRoot) : repoRoot;
           const realConfig = existsSync(explicitConfigPath) ? realpathSync(explicitConfigPath) : explicitConfigPath;
-          validatePathWithinBase(realRoot, realConfig);
+          validatePathWithinBase(repoRoot, realConfig);
           return explicitConfigPath;
         }
 
