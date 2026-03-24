@@ -505,9 +505,7 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     }
 
     // Partition updates into groups (or single default group)
-    const groups = config.grouping
-      ? partitionUpdates(allUpdates, config.grouping)
-      : new Map([['default', allUpdates]]);
+    const groups = config.grouping ? partitionUpdates(allUpdates, config.grouping) : new Map([['default', allUpdates]]);
 
     const groupEntries = [...groups.entries()];
     const isMultiGroup = groupEntries.length > 1;

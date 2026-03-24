@@ -171,11 +171,11 @@ export interface ExpoProject {
  */
 export interface GroupingConfig {
   /** Separate major updates into their own PR group */
-  separateMajor?: boolean
+  separateMajor?: boolean;
   /** Separate minor and patch updates into their own PR groups */
-  separateMinorPatch?: boolean
+  separateMinorPatch?: boolean;
   /** Name-pattern groups: packages matching the pattern are grouped together */
-  groups?: Array<{ name: string; match: string | string[] }>
+  groups?: Array<{ name: string; match: string | string[] }>;
 }
 
 /**
