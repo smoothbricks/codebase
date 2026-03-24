@@ -29,6 +29,11 @@ in {
     awscli2 # For DynamoDB Local CLI testing/debugging
   ];
 
+  # Use system Xcode for iOS simulator, signing, and instruments.
+  # Nix Apple SDK is build-only — no simctl/simulator runtimes.
+  # https://devenv.sh/recipes/macos/
+  apple.sdk = null;
+
   # https://devenv.sh/languages/
   # Python with pyarrow for Arrow IPC verification tests.
   # Must use languages.python instead of adding pythonEnv to packages because:
