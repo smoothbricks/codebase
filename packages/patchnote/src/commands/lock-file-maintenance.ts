@@ -1,7 +1,7 @@
 /**
  * Lock file maintenance command
  *
- * Regenerates bun.lock without modifying package.json files,
+ * Regenerates the lock file without modifying package.json files,
  * refreshing transitive dependency resolutions to their latest
  * compatible versions.
  */
@@ -13,6 +13,8 @@ import * as stackingModule from '../pr/stacking.js';
 import * as semanticModule from '../semantic.js';
 import type { UpdateOptions } from '../types.js';
 import * as bunModule from '../updaters/bun.js';
+import { getPackageManagerCommands } from '../updaters/package-manager.js';
+import { detectProjectSetup } from '../utils/project-detection.js';
 
 /** Injectable dependencies for testing */
 export interface LockFileMaintenanceDeps {
@@ -52,7 +54,7 @@ function generateLockMaintenanceBranchName(prefix: string): string {
 /**
  * Lock file maintenance command
  *
- * Refreshes bun.lock by running `bun install --force` and creates
+ * Refreshes the lock file by running a force install and creates
  * a standalone PR targeting the base branch directly (no stacking).
  */
 export async function lockFileMaintenance(
@@ -64,12 +66,17 @@ export async function lockFileMaintenance(
 
   const repoRoot = config.repoRoot || (await deps.getRepoRoot());
 
+  // Detect package manager and get PM-specific commands
+  const setup = await detectProjectSetup(repoRoot);
+  const pmCommands = getPackageManagerCommands(setup.packageManager);
+
   // Refresh lock file
   const refreshSpinner = p.spinner();
   refreshSpinner.start('Refreshing lock file');
   const result = await deps.refreshLockFile(repoRoot, {
     dryRun: options.dryRun,
     logger: config.logger,
+    packageManager: setup.packageManager,
   });
   refreshSpinner.stop(result.changed ? 'Lock file has changes' : 'Lock file is up to date');
 
@@ -83,7 +90,10 @@ export async function lockFileMaintenance(
   // Handle no changes
   if (!result.changed) {
     if (options.dryRun) {
-      p.note('Lock file would be refreshed by running bun install --force', 'Dry Run');
+      p.note(
+        `Lock file would be refreshed by running ${pmCommands.cmd} ${pmCommands.forceRefreshArgs.join(' ')}`,
+        'Dry Run',
+      );
     }
     p.outro('Lock file is already up to date');
     return;
@@ -105,8 +115,7 @@ export async function lockFileMaintenance(
   // Resolve semantic prefix
   const semanticPrefix = await deps.resolveSemanticPrefix(config, repoRoot, []);
   const commitTitle = semanticPrefix ? `${semanticPrefix}: lock file maintenance` : 'chore: lock file maintenance';
-  const commitBody =
-    'Refreshed lock file to update transitive dependency resolutions.\n\nRan `bun install --force` to re-resolve all dependencies from the registry.';
+  const commitBody = `Refreshed lock file to update transitive dependency resolutions.\n\nRan \`${pmCommands.cmd} ${pmCommands.forceRefreshArgs.join(' ')}\` to re-resolve all dependencies from the registry.`;
 
   // Create branch
   const branchSpinner = p.spinner();
@@ -114,10 +123,10 @@ export async function lockFileMaintenance(
   await deps.createBranch(repoRoot, branchName);
   branchSpinner.stop(`Created branch: ${branchName}`);
 
-  // Stage only lock files (not all changes — avoids sweeping unrelated local changes)
+  // Stage only lock files (not all changes -- avoids sweeping unrelated local changes)
   const commitSpinner = p.spinner();
   commitSpinner.start('Committing lock file changes');
-  await deps.stageFiles(repoRoot, ['bun.lock', 'bun.lockb']);
+  await deps.stageFiles(repoRoot, pmCommands.lockFileNames);
   await deps.commit(repoRoot, commitTitle, commitBody);
   commitSpinner.stop('Commit created');
 

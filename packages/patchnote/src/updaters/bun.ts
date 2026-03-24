@@ -1,10 +1,11 @@
 /**
- * Bun dependency updater
+ * Dependency updater (supports bun, npm, pnpm, yarn)
  */
 
 import { execa } from 'execa';
 import type { Logger } from '../logger.js';
-import type { CommandExecutor, PackageUpdate, UpdateResult } from '../types.js';
+import type { CommandExecutor, PackageUpdate, ProjectSetup, UpdateResult } from '../types.js';
+import { getPackageManagerCommands } from './package-manager.js';
 
 /**
  * Parse bun outdated output to detect available updates
@@ -175,9 +176,9 @@ function classifyUpdateType(from: string, to: string): 'major' | 'minor' | 'patc
 }
 
 /**
- * Update Bun dependencies
+ * Update npm ecosystem dependencies using the detected package manager
  */
-export async function updateBunDependencies(
+export async function updateNpmDependencies(
   repoRoot: string,
   options: {
     dryRun?: boolean;
@@ -186,48 +187,50 @@ export async function updateBunDependencies(
     logger?: Logger;
     /** When set, only update these specific packages (for per-group updates) */
     packages?: string[];
+    /** Package manager to use (defaults to 'bun' for backward compatibility) */
+    packageManager?: ProjectSetup['packageManager'];
   } = {},
 ): Promise<UpdateResult> {
   const { dryRun = false, recursive = true, syncpackFixCommand = 'syncpack:fix', logger, packages } = options;
+  const pm = getPackageManagerCommands(options.packageManager ?? 'bun');
 
   try {
-    logger?.info('Updating Bun dependencies...');
+    logger?.info(`Updating ${pm.cmd} dependencies...`);
 
     let updates: PackageUpdate[] = [];
 
     if (!dryRun) {
-      // Run bun update and capture output
-      const args = ['update'];
-      if (recursive) {
-        args.push('--recursive');
+      // Run update and capture output
+      const args = [...pm.updateArgs];
+      if (recursive && pm.recursiveFlag) {
+        args.push(pm.recursiveFlag);
       }
       // When packages are specified, only update those (for per-group runs)
       if (packages && packages.length > 0) {
         args.push(...packages);
       }
 
-      const result = await execa('bun', args, {
+      const result = await execa(pm.cmd, args, {
         cwd: repoRoot,
       });
 
       // Show the output to user
       logger?.info(result.stdout);
-      logger?.info('✓ Bun update completed');
+      logger?.info(`✓ ${pm.cmd} update completed`);
 
-      // Run bun install to sync lock file with package.json changes
-      // This ensures bun.lock workspaces section matches updated package.json
+      // Run install to sync lock file with package.json changes
       try {
-        await execa('bun', ['install'], {
+        await execa(pm.cmd, pm.installArgs, {
           cwd: repoRoot,
         });
         logger?.info('✓ Lock file synced');
       } catch (_error) {
-        logger?.warn('Warning: bun install failed, lock file may be out of sync');
+        logger?.warn(`Warning: ${pm.cmd} install failed, lock file may be out of sync`);
       }
 
       // Run syncpack to fix any version mismatches
       try {
-        const syncpackResult = await execa('bun', ['run', syncpackFixCommand], {
+        const syncpackResult = await execa(pm.cmd, [...pm.runScriptArgs(syncpackFixCommand)], {
           cwd: repoRoot,
         });
         logger?.info(syncpackResult.stdout);
@@ -248,20 +251,25 @@ export async function updateBunDependencies(
         }
       } catch (_error) {
         logger?.warn('Warning: Could not get git diff, falling back to stdout parsing');
-        // Fallback to stdout parsing
+        // Fallback to stdout parsing (only works for bun output format)
         updates = parseBunUpdateOutput(result.stdout);
       }
     } else {
-      // Dry run: use bun outdated to detect available updates
-      logger?.info('Checking for available updates...');
-      try {
-        const outdatedResult = await execa('bun', ['outdated'], {
-          cwd: repoRoot,
-        });
-        updates = parseBunOutdated(outdatedResult.stdout);
-      } catch (_error) {
-        // bun outdated may fail if no updates available
-        logger?.info('No updates detected');
+      // Dry run: check for outdated packages
+      if (pm.cmd === 'bun') {
+        // bun outdated has a parseable markdown table format
+        logger?.info('Checking for available updates...');
+        try {
+          const outdatedResult = await execa(pm.cmd, pm.outdatedArgs, {
+            cwd: repoRoot,
+          });
+          updates = parseBunOutdated(outdatedResult.stdout);
+        } catch (_error) {
+          // bun outdated may fail if no updates available
+          logger?.info('No updates detected');
+        }
+      } else {
+        logger?.info(`Dry run: checking outdated not yet supported for ${pm.cmd}`);
       }
     }
 
@@ -282,14 +290,17 @@ export async function updateBunDependencies(
   }
 }
 
+/** @deprecated Use updateNpmDependencies instead */
+export const updateBunDependencies = updateNpmDependencies;
+
 /**
- * Refresh the lock file by running `bun install --force`
+ * Refresh the lock file by running a force install command
  * This re-resolves all transitive dependencies from the registry
  * without modifying package.json files.
  *
  * @param repoRoot - Repository root directory
- * @param options - Options including dryRun, logger, and executor for testing
- * @returns Whether bun.lock changed and any error that occurred
+ * @param options - Options including dryRun, logger, executor, and packageManager
+ * @returns Whether the lock file changed and any error that occurred
  */
 export async function refreshLockFile(
   repoRoot: string,
@@ -297,22 +308,25 @@ export async function refreshLockFile(
     dryRun?: boolean;
     logger?: Logger;
     executor?: CommandExecutor;
+    /** Package manager to use (defaults to 'bun' for backward compatibility) */
+    packageManager?: ProjectSetup['packageManager'];
   } = {},
 ): Promise<{ changed: boolean; error?: string }> {
   const { dryRun = false, logger, executor = execa as unknown as CommandExecutor } = options;
+  const pm = getPackageManagerCommands(options.packageManager ?? 'bun');
 
   if (dryRun) {
-    logger?.info('Dry run: would run bun install --force to refresh lock file');
+    logger?.info(`Dry run: would run ${pm.cmd} ${pm.forceRefreshArgs.join(' ')} to refresh lock file`);
     return { changed: false };
   }
 
   try {
-    logger?.info('Running bun install --force to refresh transitive dependencies...');
-    await executor('bun', ['install', '--force'], { cwd: repoRoot });
+    logger?.info(`Running ${pm.cmd} ${pm.forceRefreshArgs.join(' ')} to refresh transitive dependencies...`);
+    await executor(pm.cmd, pm.forceRefreshArgs, { cwd: repoRoot });
     logger?.info('Lock file refresh complete');
 
-    // Check if bun.lock actually changed (scoped to lock files only to avoid false positives from unrelated changes)
-    const { stdout } = await executor('git', ['diff', '--name-only', '--', 'bun.lock', 'bun.lockb'], { cwd: repoRoot });
+    // Check if lock file actually changed (scoped to lock files only to avoid false positives from unrelated changes)
+    const { stdout } = await executor('git', ['diff', '--name-only', '--', ...pm.lockFileNames], { cwd: repoRoot });
     const changed = stdout.trim().length > 0;
 
     return { changed };

@@ -69,4 +69,48 @@ describe('refreshLockFile', () => {
     expect(result.error).toBeDefined();
     expect(result.error).toContain('bun install failed: network error');
   });
+
+  test('with packageManager: pnpm runs pnpm install --force and checks pnpm-lock.yaml', async () => {
+    const spy = createExecaSpy({
+      'pnpm install --force': '',
+      'git diff --name-only -- pnpm-lock.yaml': 'pnpm-lock.yaml\n',
+    });
+
+    const result = await refreshLockFile('/repo', { executor: spy.mock, packageManager: 'pnpm' });
+
+    expect(result).toEqual({ changed: true });
+    expect(spy.calls).toHaveLength(2);
+    expect(spy.calls[0]![0]).toBe('pnpm');
+    expect(spy.calls[0]![1]).toEqual(['install', '--force']);
+    expect(spy.calls[1]![1]).toEqual(['diff', '--name-only', '--', 'pnpm-lock.yaml']);
+  });
+
+  test('with packageManager: npm runs npm install and checks package-lock.json', async () => {
+    const spy = createExecaSpy({
+      'npm install': '',
+      'git diff --name-only -- package-lock.json': 'package-lock.json\n',
+    });
+
+    const result = await refreshLockFile('/repo', { executor: spy.mock, packageManager: 'npm' });
+
+    expect(result).toEqual({ changed: true });
+    expect(spy.calls).toHaveLength(2);
+    expect(spy.calls[0]![0]).toBe('npm');
+    expect(spy.calls[0]![1]).toEqual(['install']);
+    expect(spy.calls[1]![1]).toEqual(['diff', '--name-only', '--', 'package-lock.json']);
+  });
+
+  test('with packageManager: yarn runs yarn install --force and checks yarn.lock', async () => {
+    const spy = createExecaSpy({
+      'yarn install --force': '',
+      'git diff --name-only -- yarn.lock': '',
+    });
+
+    const result = await refreshLockFile('/repo', { executor: spy.mock, packageManager: 'yarn' });
+
+    expect(result).toEqual({ changed: false });
+    expect(spy.calls[0]![0]).toBe('yarn');
+    expect(spy.calls[0]![1]).toEqual(['install', '--force']);
+    expect(spy.calls[1]![1]).toEqual(['diff', '--name-only', '--', 'yarn.lock']);
+  });
 });

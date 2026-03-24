@@ -15,10 +15,11 @@ import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/
 import { applyPackageRules, resolveAutoMerge } from '../rules.js';
 import { resolveSemanticPrefix } from '../semantic.js';
 import type { PackageUpdate, ResolvedPackagePolicy, UpdateOptions, UpdateResult, UpdateType } from '../types.js';
-import { updateBunDependencies } from '../updaters/bun.js';
+import { updateNpmDependencies } from '../updaters/bun.js';
 import { updateDevenv } from '../updaters/devenv.js';
 import { updateNixpkgsOverlay } from '../updaters/nixpkgs.js';
 import { safeResolve } from '../utils/path-validation.js';
+import { detectProjectSetup } from '../utils/project-detection.js';
 
 /**
  * Setup branch for stacked PR workflow
@@ -61,6 +62,7 @@ async function runAllUpdaters(
   allDowngrades: PackageUpdate[];
   errors: string[];
   policies: Map<string, ResolvedPackagePolicy>;
+  setup: import('../types.js').ProjectSetup;
   results: {
     bun: UpdateResult;
     devenv: UpdateResult;
@@ -71,21 +73,25 @@ async function runAllUpdaters(
   const allDowngrades: PackageUpdate[] = [];
   const errors: string[] = [];
 
-  // Update Bun dependencies (will only find updates beyond what's in current branch)
+  // Detect package manager
+  const setup = await detectProjectSetup(repoRoot);
+
+  // Update npm ecosystem dependencies using detected package manager
   const bunSpinner = p.spinner();
-  bunSpinner.start('Updating npm dependencies');
-  const bunResult = await updateBunDependencies(repoRoot, {
+  bunSpinner.start(`Updating ${setup.packageManager} dependencies`);
+  const bunResult = await updateNpmDependencies(repoRoot, {
     dryRun: options.dryRun,
     recursive: true,
     syncpackFixCommand: config.syncpack?.fixScriptName,
     logger: config.logger,
+    packageManager: setup.packageManager,
   });
 
   if (bunResult.success) {
     allUpdates.push(...bunResult.updates);
     bunSpinner.stop(`npm: ${bunResult.updates.length} updates`);
   } else {
-    errors.push(`Bun update failed: ${bunResult.error}`);
+    errors.push(`${setup.packageManager} update failed: ${bunResult.error}`);
     bunSpinner.stop('npm: failed');
   }
 
@@ -208,6 +214,7 @@ async function runAllUpdaters(
     allDowngrades,
     errors,
     policies,
+    setup,
     results: {
       bun: bunResult,
       devenv: devenvResult,
@@ -456,7 +463,7 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
     const { stackBase, mainBranch } = await setupBranchForStacking(config, repoRoot);
 
     // Run all updaters
-    const { allUpdates, allDowngrades, policies } = await runAllUpdaters(config, repoRoot, options);
+    const { allUpdates, allDowngrades, policies, setup } = await runAllUpdaters(config, repoRoot, options);
 
     // Resolve semantic prefix after updates are known (needs isDev info)
     const semanticPrefix = await resolveSemanticPrefix(config, repoRoot, allUpdates);
@@ -565,11 +572,12 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
           if (npmPackages.length > 0) {
             const groupSpinner = p.spinner();
             groupSpinner.start(`Running targeted update for group: ${groupName}`);
-            await updateBunDependencies(repoRoot, {
+            await updateNpmDependencies(repoRoot, {
               recursive: true,
               syncpackFixCommand: config.syncpack?.fixScriptName,
               logger: config.logger,
               packages: npmPackages,
+              packageManager: setup.packageManager,
             });
             groupSpinner.stop(`Updated ${npmPackages.length} packages for group: ${groupName}`);
           }

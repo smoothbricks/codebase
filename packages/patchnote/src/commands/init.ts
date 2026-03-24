@@ -7,10 +7,26 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import * as p from '@clack/prompts';
 import type { PatchnoteConfig } from '../config.js';
 import { getRepoRoot } from '../git.js';
-import type { InitOptions } from '../types.js';
+import type { InitOptions, ProjectSetup } from '../types.js';
 import { safeResolve } from '../utils/path-validation.js';
 import { detectProjectSetup } from '../utils/project-detection.js';
 import { generateWorkflow } from './generate-workflow.js';
+
+/**
+ * Get the correct dlx (download and execute) command for the package manager
+ */
+function getDlxCommand(pm: ProjectSetup['packageManager']): string {
+  switch (pm) {
+    case 'bun':
+      return 'bunx';
+    case 'npm':
+      return 'npx';
+    case 'pnpm':
+      return 'pnpm dlx';
+    case 'yarn':
+      return 'yarn dlx';
+  }
+}
 
 /**
  * Generate JSON config file content
@@ -141,13 +157,6 @@ export async function init(config: PatchnoteConfig, options: InitOptions): Promi
   config.logger?.info(`  Nix detected: ${detected.hasNix ? 'yes' : 'no'}`);
   config.logger?.info(`  Syncpack detected: ${detected.hasSyncpack ? 'yes' : 'no'}`);
   config.logger?.info('');
-
-  if (detected.packageManager !== 'bun') {
-    p.note(
-      `Your project uses ${detected.packageManager}. Support for other package managers is coming soon.`,
-      'Warning',
-    );
-  }
 
   let enableExpo = detected.hasExpo;
   let enableNix = detected.hasNix;
@@ -381,12 +390,13 @@ export async function init(config: PatchnoteConfig, options: InitOptions): Promi
   }
 
   // Test or wait for scheduled run
+  const dlxCmd = getDlxCommand(detected.packageManager);
   if (generateWorkflowFile) {
     nextSteps += `${stepNumber}. Test manually: gh workflow run update-deps.yml\n`;
     nextSteps += '   Or wait for scheduled run (daily at 2 AM UTC)';
   } else {
     nextSteps += `${stepNumber}. Test it now:\n`;
-    nextSteps += '   bunx @smoothbricks/patchnote update-deps --dry-run';
+    nextSteps += `   ${dlxCmd} @smoothbricks/patchnote update-deps --dry-run`;
   }
 
   nextSteps +=
