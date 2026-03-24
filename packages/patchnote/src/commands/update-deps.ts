@@ -357,6 +357,7 @@ async function enableAutoMergeIfEligible(
 /**
  * Create branch, commit, push, and PR for updates
  *
+ * @param updates - The updates for this specific PR (may be a group subset or all updates)
  * @param groupName - Optional group name for multi-group PRs (affects branch name and PR title)
  */
 async function createPRWorkflow(
@@ -365,7 +366,7 @@ async function createPRWorkflow(
   commitTitle: string,
   prBody: string,
   stackBase: string,
-  allUpdates: PackageUpdate[],
+  updates: PackageUpdate[],
   policies: Map<string, ResolvedPackagePolicy> = new Map(),
   semanticPrefix?: string | null,
   groupName?: string,
@@ -396,7 +397,7 @@ async function createPRWorkflow(
   // If PR creation fails, clean up the orphan branch on remote
   const prSpinner = p.spinner();
   prSpinner.start(`Creating pull request${groupName ? ` (${groupName})` : ''}`);
-  const hasBreaking = allUpdates.some((u) => u.updateType === 'major');
+  const hasBreaking = updates.some((u) => u.updateType === 'major');
   const prTitle = generatePRTitle(config, hasBreaking, semanticPrefix, groupName);
 
   try {
@@ -415,7 +416,7 @@ async function createPRWorkflow(
     prSpinner.stop(`Created PR #${pr.number}${groupName ? ` (${groupName})` : ''}`);
 
     // Enable auto-merge if configured and update types qualify
-    await enableAutoMergeIfEligible(config, repoRoot, pr.number, allUpdates, policies);
+    await enableAutoMergeIfEligible(config, repoRoot, pr.number, updates, policies);
 
     p.note(`${pr.url}\nBase: ${stackBase}`, `Pull Request${groupName ? ` (${groupName})` : ''}`);
   } catch (error) {
@@ -545,9 +546,36 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
 
     // Create PR workflow for each group
     if (!options.skipGit) {
+      // For multi-group: reset working tree and re-run targeted updates per group
+      // so each PR gets only its own package changes and a clean lockfile
+      if (isMultiGroup) {
+        const { execa } = await import('execa');
+        // Reset working tree from the initial full update run
+        await execa('git', ['checkout', '.'], { cwd: repoRoot });
+      }
+
       for (const [groupName, groupUpdates] of groupEntries) {
         // For single group (no grouping or only default), don't add group suffix
         const effectiveGroupName = isMultiGroup ? groupName : undefined;
+
+        if (isMultiGroup) {
+          // Re-run bun update with only this group's packages so each PR gets
+          // its own package.json changes and a consistent lockfile
+          const npmPackages = groupUpdates.filter((u) => u.ecosystem === 'npm').map((u) => u.name);
+          if (npmPackages.length > 0) {
+            const groupSpinner = p.spinner();
+            groupSpinner.start(`Running targeted update for group: ${groupName}`);
+            await updateBunDependencies(repoRoot, {
+              recursive: true,
+              syncpackFixCommand: config.syncpack?.fixScriptName,
+              logger: config.logger,
+              packages: npmPackages,
+            });
+            groupSpinner.stop(`Updated ${npmPackages.length} packages for group: ${groupName}`);
+          }
+
+          // TODO: handle non-npm ecosystems (devenv/nixpkgs) per group if needed
+        }
 
         // Generate commit data scoped to this group's updates
         const groupDowngrades = allDowngrades.filter((d) => groupUpdates.some((u) => u.name === d.name));
@@ -572,12 +600,10 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
           effectiveGroupName,
         );
 
-        // Switch back to stack base before creating next group's branch
+        // Switch back to stack base and reset working tree before next group
         // Each group creates an INDEPENDENT PR against the same stackBase
         if (isMultiGroup) {
           await switchBranch(repoRoot, stackBase);
-          // Brief pause between group PRs to ensure unique branch timestamps
-          await new Promise((resolve) => setTimeout(resolve, 100));
         }
       }
     }

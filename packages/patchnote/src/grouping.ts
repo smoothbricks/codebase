@@ -11,7 +11,6 @@
 import micromatch from 'micromatch'
 import type { GroupingConfig, PackageUpdate } from './types.js'
 
-export type { GroupingConfig } from './types.js'
 
 /**
  * Partition a list of updates into named groups based on the grouping config.

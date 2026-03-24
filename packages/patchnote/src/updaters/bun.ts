@@ -184,9 +184,11 @@ export async function updateBunDependencies(
     recursive?: boolean;
     syncpackFixCommand?: string;
     logger?: Logger;
+    /** When set, only update these specific packages (for per-group updates) */
+    packages?: string[];
   } = {},
 ): Promise<UpdateResult> {
-  const { dryRun = false, recursive = true, syncpackFixCommand = 'syncpack:fix', logger } = options;
+  const { dryRun = false, recursive = true, syncpackFixCommand = 'syncpack:fix', logger, packages } = options;
 
   try {
     logger?.info('Updating Bun dependencies...');
@@ -198,6 +200,10 @@ export async function updateBunDependencies(
       const args = ['update'];
       if (recursive) {
         args.push('--recursive');
+      }
+      // When packages are specified, only update those (for per-group runs)
+      if (packages && packages.length > 0) {
+        args.push(...packages);
       }
 
       const result = await execa('bun', args, {
