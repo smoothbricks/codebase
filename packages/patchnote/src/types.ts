@@ -66,6 +66,12 @@ export interface PackageUpdate {
   isDev?: boolean;
   /** Whether provenance was downgraded (had -> lost) */
   provenanceDowngraded?: boolean;
+  /** Deprecation message from npm registry (toVersion) */
+  deprecatedMessage?: string;
+  /** Suggested replacement package name (from Renovate mapping) */
+  replacementName?: string;
+  /** Suggested replacement package version (from Renovate mapping) */
+  replacementVersion?: string;
 }
 
 /**
