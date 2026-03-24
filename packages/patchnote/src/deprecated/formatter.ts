@@ -23,7 +23,8 @@ export function formatDeprecationWarnings(updates: PackageUpdate[]): string {
   ];
 
   for (const pkg of deprecated) {
-    const replacement = pkg.replacementName ? ` -> **${pkg.replacementName}**@${pkg.replacementVersion}` : '';
+    const versionSuffix = pkg.replacementVersion ? `@${pkg.replacementVersion}` : '';
+    const replacement = pkg.replacementName ? ` -> **${pkg.replacementName}**${versionSuffix}` : '';
     lines.push(`- **${pkg.name}** ${pkg.fromVersion} -> ${pkg.toVersion}: ${pkg.deprecatedMessage}${replacement}`);
   }
 

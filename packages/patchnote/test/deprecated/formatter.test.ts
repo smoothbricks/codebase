@@ -81,6 +81,23 @@ describe('formatDeprecationWarnings', () => {
     );
   });
 
+  test('omits version suffix when replacementVersion is empty string', () => {
+    const updates = [
+      makeUpdate('framer-motion', {
+        fromVersion: '10.0.0',
+        toVersion: '11.0.0',
+        deprecatedMessage: 'Use motion instead',
+        replacementName: 'motion',
+        replacementVersion: '',
+      }),
+    ];
+
+    const result = formatDeprecationWarnings(updates);
+
+    expect(result).toContain('-> **motion**');
+    expect(result).not.toContain('**motion**@');
+  });
+
   test('returns empty string for empty array', () => {
     expect(formatDeprecationWarnings([])).toBe('');
   });
