@@ -21,7 +21,7 @@ export class GitHubCLIClient implements IGitHubClient {
     try {
       const { stdout } = await this.executor(
         'gh',
-        ['pr', 'list', '--json', 'number,title,headRefName,createdAt,url', '--state', 'open'],
+        ['pr', 'list', '--json', 'number,title,headRefName,baseRefName,createdAt,url', '--state', 'open'],
         { cwd: repoRoot },
       );
 
@@ -152,7 +152,7 @@ export class GitHubCLIClient implements IGitHubClient {
           '--state',
           'open',
           '--json',
-          'number,title,headRefName,createdAt,url',
+          'number,title,headRefName,baseRefName,createdAt,url',
           '--limit',
           '1',
         ],
@@ -174,6 +174,14 @@ export class GitHubCLIClient implements IGitHubClient {
       await this.executor('gh', ['pr', 'edit', prNumber.toString(), '--body', options.body], { cwd: repoRoot });
     } catch (error: unknown) {
       throw this.enhanceError(error, `edit PR #${prNumber}`);
+    }
+  }
+
+  async commentOnPR(repoRoot: string, prNumber: number, body: string): Promise<void> {
+    try {
+      await this.executor('gh', ['pr', 'comment', prNumber.toString(), '--body', body], { cwd: repoRoot });
+    } catch (error: unknown) {
+      throw this.enhanceError(error, `comment on PR #${prNumber}`);
     }
   }
 

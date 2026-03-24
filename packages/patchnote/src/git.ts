@@ -302,6 +302,37 @@ export async function fetch(
 }
 
 /**
+ * Rebase current branch onto a target ref
+ * Returns true if rebase succeeded, false if it failed (conflict).
+ * On failure, automatically aborts the rebase to restore working state.
+ */
+export async function rebase(
+  repoRoot: string,
+  onto: string,
+  executor: CommandExecutor = defaultExecutor,
+): Promise<boolean> {
+  try {
+    await executor('git', ['rebase', onto], { cwd: repoRoot });
+    return true;
+  } catch {
+    // Rebase failed (conflict) -- abort to restore clean state
+    try {
+      await executor('git', ['rebase', '--abort'], { cwd: repoRoot });
+    } catch {
+      // Abort may fail if not in rebase state -- ignore
+    }
+    return false;
+  }
+}
+
+/**
+ * Abort an in-progress rebase
+ */
+export async function abortRebase(repoRoot: string, executor: CommandExecutor = defaultExecutor): Promise<void> {
+  await executor('git', ['rebase', '--abort'], { cwd: repoRoot });
+}
+
+/**
  * Get diff between two branches/commits
  */
 export async function getDiff(

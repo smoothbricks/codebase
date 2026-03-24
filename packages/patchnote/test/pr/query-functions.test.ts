@@ -63,7 +63,7 @@ describe('checkPRConflicts', () => {
 describe('getOpenUpdatePRs', () => {
   test('should return empty array when no PRs exist', async () => {
     const mockExeca = createMockExeca({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify([]),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify([]),
     });
 
     const prs = await getOpenUpdatePRs('/repo', 'chore/update-deps', mockExeca);
@@ -100,7 +100,7 @@ describe('getOpenUpdatePRs', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify(allPRs), stderr: '', exitCode: 0 };
       }
       if (key === 'gh pr view 1 --json mergeable') {
@@ -148,7 +148,7 @@ describe('getOpenUpdatePRs', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify(allPRs), stderr: '', exitCode: 0 };
       }
       if (key.startsWith('gh pr view')) {
@@ -187,7 +187,7 @@ describe('getOpenUpdatePRs', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify(allPRs), stderr: '', exitCode: 0 };
       }
       if (key === 'gh pr view 1 --json mergeable') {
@@ -221,7 +221,7 @@ describe('getOpenUpdatePRs', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify(allPRs), stderr: '', exitCode: 0 };
       }
       if (key.startsWith('gh pr view')) {
@@ -246,7 +246,7 @@ describe('getOpenUpdatePRs', () => {
 
   test('should throw for non-array response', async () => {
     const mockExeca = createMockExeca({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify({
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify({
         error: 'invalid',
       }),
     });
@@ -270,7 +270,7 @@ describe('getOpenUpdatePRs', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify(allPRs), stderr: '', exitCode: 0 };
       }
       if (key.startsWith('gh pr view')) {

@@ -244,12 +244,38 @@ export interface GitHubPR {
   title: string;
   /** Head branch name */
   headRefName: string;
+  /** Base branch name (the branch this PR targets) */
+  baseRefName?: string;
   /** PR creation date */
   createdAt: string;
   /** PR URL */
   url: string;
   /** Whether the PR is mergeable (no conflicts) */
   mergeable?: 'MERGEABLE' | 'CONFLICTING' | 'UNKNOWN';
+}
+
+/**
+ * Result of rebasing a single PR
+ */
+export interface RebaseResult {
+  /** PR number */
+  prNumber: number;
+  /** Branch name */
+  branch: string;
+  /** Whether the rebase succeeded */
+  success: boolean;
+  /** Whether the PR was skipped */
+  skipped: boolean;
+  /** Reason for skipping */
+  skipReason?: 'stale' | 'conflict' | 'parent-conflict' | 'branch-missing';
+}
+
+/**
+ * Options for rebase-open-prs command
+ */
+export interface RebaseOpenPRsOptions extends UpdateOptions {
+  /** Skip PRs older than this many days */
+  maxAgeDays: number;
 }
 
 /**
@@ -324,6 +350,8 @@ export interface IGitHubClient {
   findPRByHead(repoRoot: string, headBranch: string): Promise<GitHubPR | null>;
   /** Update a PR body */
   editPR(repoRoot: string, prNumber: number, options: { body: string }): Promise<void>;
+  /** Post a comment on a PR */
+  commentOnPR(repoRoot: string, prNumber: number, body: string): Promise<void>;
 }
 
 /** Dependency filtering configuration */

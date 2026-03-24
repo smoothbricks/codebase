@@ -24,7 +24,7 @@ function createPRWorkflowMock(scenario: {
     const key = [command, ...(args || [])].join(' ');
 
     // List all PRs
-    if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+    if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
       const openPRs = existingPRs
         .filter((pr) => !closedSet.has(pr.number))
         .map((pr) => ({
@@ -190,7 +190,7 @@ describe('PR Stacking Workflow - Sequential PR Creation', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         const allPRs = [
           {
             number: 1,
@@ -483,7 +483,7 @@ describe('PR Stacking Workflow - Stacking Disabled', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify([]), stderr: '', exitCode: 0 };
       }
 
@@ -598,7 +598,7 @@ describe('PR Stacking Workflow - getOpenUpdatePRs Integration', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return {
           stdout: JSON.stringify([
             {
@@ -679,7 +679,7 @@ describe('PR Stacking Workflow - autoCloseOldPRs Integration', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         const allPRs = [
           {
             number: 1,

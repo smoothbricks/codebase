@@ -292,7 +292,7 @@ describe('autoCloseOldPRs', () => {
     };
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify([]),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify([]),
     });
 
     await autoCloseOldPRs(config, '/repo', spy.mock);
@@ -323,7 +323,7 @@ describe('autoCloseOldPRs', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify(prs), stderr: '', exitCode: 0 };
       }
       if (key.startsWith('gh pr view')) {
@@ -363,7 +363,7 @@ describe('autoCloseOldPRs', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 3 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
@@ -418,7 +418,7 @@ describe('autoCloseOldPRs', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 3 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
@@ -468,7 +468,7 @@ describe('autoCloseOldPRs', () => {
       const command = typeof cmd === 'string' ? cmd : cmd.toString();
       const key = [command, ...(args || [])].join(' ');
 
-      if (key === 'gh pr list --json number,title,headRefName,createdAt,url --state open') {
+      if (key === 'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open') {
         return { stdout: JSON.stringify(prs), stderr: '', exitCode: 0 };
       }
       if (key.startsWith('gh pr view')) {

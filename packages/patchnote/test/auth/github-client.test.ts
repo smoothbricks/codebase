@@ -23,7 +23,7 @@ describe('GitHubCLIClient', () => {
       ];
 
       const mockExeca = createMockExeca({
-        'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(mockPRs),
+        'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(mockPRs),
       });
 
       const client = new GitHubCLIClient(mockExeca);
@@ -37,7 +37,7 @@ describe('GitHubCLIClient', () => {
 
     test('should return empty array when no PRs exist', async () => {
       const mockExeca = createMockExeca({
-        'gh pr list --json number,title,headRefName,createdAt,url --state open': '[]',
+        'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': '[]',
       });
 
       const client = new GitHubCLIClient(mockExeca);
@@ -48,7 +48,7 @@ describe('GitHubCLIClient', () => {
 
     test('should use correct gh CLI command', async () => {
       const spy = createExecaSpy({
-        'gh pr list --json number,title,headRefName,createdAt,url --state open': '[]',
+        'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': '[]',
       });
 
       const client = new GitHubCLIClient(spy.mock);
@@ -60,7 +60,7 @@ describe('GitHubCLIClient', () => {
         'pr',
         'list',
         '--json',
-        'number,title,headRefName,createdAt,url',
+        'number,title,headRefName,baseRefName,createdAt,url',
         '--state',
         'open',
       ]);
@@ -69,7 +69,7 @@ describe('GitHubCLIClient', () => {
 
     test('should throw on malformed JSON', async () => {
       const mockExeca = createMockExeca({
-        'gh pr list --json number,title,headRefName,createdAt,url --state open': 'not valid json{',
+        'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': 'not valid json{',
       });
 
       const client = new GitHubCLIClient(mockExeca);
@@ -78,7 +78,7 @@ describe('GitHubCLIClient', () => {
 
     test('should throw on non-array JSON response', async () => {
       const mockExeca = createMockExeca({
-        'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify({
+        'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify({
           error: 'authentication required',
         }),
       });
@@ -483,7 +483,7 @@ describe('GitHubCLIClient', () => {
       };
 
       const mockExeca = createMockExeca({
-        'gh pr list --head chore/configure-patchnote --state open --json number,title,headRefName,createdAt,url --limit 1':
+        'gh pr list --head chore/configure-patchnote --state open --json number,title,headRefName,baseRefName,createdAt,url --limit 1':
           JSON.stringify([mockPR]),
       });
 
@@ -495,7 +495,7 @@ describe('GitHubCLIClient', () => {
 
     test('should return null when no matching PR exists', async () => {
       const mockExeca = createMockExeca({
-        'gh pr list --head chore/configure-patchnote --state open --json number,title,headRefName,createdAt,url --limit 1':
+        'gh pr list --head chore/configure-patchnote --state open --json number,title,headRefName,baseRefName,createdAt,url --limit 1':
           '[]',
       });
 
@@ -507,7 +507,8 @@ describe('GitHubCLIClient', () => {
 
     test('should use correct gh CLI args and cwd', async () => {
       const spy = createExecaSpy({
-        'gh pr list --head my-branch --state open --json number,title,headRefName,createdAt,url --limit 1': '[]',
+        'gh pr list --head my-branch --state open --json number,title,headRefName,baseRefName,createdAt,url --limit 1':
+          '[]',
       });
 
       const client = new GitHubCLIClient(spy.mock);
@@ -523,7 +524,7 @@ describe('GitHubCLIClient', () => {
         '--state',
         'open',
         '--json',
-        'number,title,headRefName,createdAt,url',
+        'number,title,headRefName,baseRefName,createdAt,url',
         '--limit',
         '1',
       ]);
@@ -573,10 +574,45 @@ describe('GitHubCLIClient', () => {
     });
   });
 
+  describe('commentOnPR', () => {
+    test('should call gh pr comment with correct arguments', async () => {
+      const spy = createExecaSpy({
+        'gh pr comment 42 --body Rebase failed due to conflicts': '',
+      });
+
+      const client = new GitHubCLIClient(spy.mock);
+      await client.commentOnPR('/repo', 42, 'Rebase failed due to conflicts');
+
+      expect(spy.calls).toHaveLength(1);
+      expect(spy.calls[0]?.[0]).toBe('gh');
+      expect(spy.calls[0]?.[1]).toEqual(['pr', 'comment', '42', '--body', 'Rebase failed due to conflicts']);
+      expect(spy.calls[0]?.[2]).toEqual({ cwd: '/repo' });
+    });
+
+    test('should use correct cwd', async () => {
+      const spy = createExecaSpy({
+        'gh pr comment 99 --body Test comment': '',
+      });
+
+      const client = new GitHubCLIClient(spy.mock);
+      await client.commentOnPR('/my/custom/repo', 99, 'Test comment');
+
+      expect(spy.calls[0]?.[2]).toEqual({ cwd: '/my/custom/repo' });
+    });
+
+    test('should throw enhanced error on failure', async () => {
+      const mockExeca = createErrorExeca('Something went wrong');
+
+      const client = new GitHubCLIClient(mockExeca);
+
+      await expect(client.commentOnPR('/repo', 42, 'test')).rejects.toThrow('comment on PR #42');
+    });
+  });
+
   describe('constructor', () => {
     test('should use provided executor', async () => {
       const spy = createExecaSpy({
-        'gh pr list --json number,title,headRefName,createdAt,url --state open': '[]',
+        'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': '[]',
       });
 
       const client = new GitHubCLIClient(spy.mock);

@@ -52,7 +52,7 @@ describe('determineBaseBranch', () => {
 
   test('should return main when no open PRs exist', async () => {
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify([]),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify([]),
     });
 
     const result = await determineBaseBranch(baseConfig, '/repo', spy.mock);
@@ -73,7 +73,7 @@ describe('determineBaseBranch', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
     });
 
@@ -109,7 +109,7 @@ describe('determineBaseBranch', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 3 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
@@ -140,7 +140,7 @@ describe('determineBaseBranch', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'CONFLICTING' }),
     });
@@ -171,7 +171,7 @@ describe('determineBaseBranch', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'CONFLICTING' }),
     });
 
@@ -244,7 +244,7 @@ describe('determineBaseBranch', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(allPRs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(allPRs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 3 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
     });
@@ -282,7 +282,7 @@ describe('determineBaseBranch', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'CONFLICTING' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'CONFLICTING' }),
       'gh pr view 3 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
@@ -341,7 +341,7 @@ describe('createStackedPR', () => {
 
     const spy = createExecaSpy({
       // Called twice: once in determineBaseBranch, once in autoCloseOldPRs
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr create --title Update deps --body Changelog --base chore/update-deps-2025-01-02 --head chore/update-deps-2025-01-03':
@@ -390,7 +390,7 @@ describe('createStackedPR', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 3 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
@@ -422,7 +422,7 @@ describe('createStackedPR', () => {
 
   test('should base on main when no existing PRs', async () => {
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify([]),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify([]),
       'gh pr create --title Update deps --body Changelog --base main --head chore/update-deps-2025-01-01':
         'https://github.com/owner/repo/pull/1',
     });
@@ -454,7 +454,7 @@ describe('createStackedPR', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'CONFLICTING' }),
       'gh pr create --title Update deps --body Changelog --base main --head chore/update-deps-2025-01-02':
         'https://github.com/owner/repo/pull/2',
@@ -509,7 +509,7 @@ describe('createStackedPR', () => {
     ];
 
     const spy = createExecaSpy({
-      'gh pr list --json number,title,headRefName,createdAt,url --state open': JSON.stringify(prs),
+      'gh pr list --json number,title,headRefName,baseRefName,createdAt,url --state open': JSON.stringify(prs),
       'gh pr view 1 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 2 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),
       'gh pr view 3 --json mergeable': JSON.stringify({ mergeable: 'MERGEABLE' }),

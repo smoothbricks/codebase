@@ -4,11 +4,13 @@
 
 import { describe, expect, test } from 'bun:test';
 import {
+  abortRebase,
   commit,
   createBranch,
   fetch,
   push,
   pushWithUpstream,
+  rebase,
   stageAll,
   stageFiles,
   switchBranch,
@@ -311,5 +313,85 @@ describe('fetch', () => {
     const mockExeca = createErrorExeca("fatal: 'nonexistent' does not appear to be a git repository");
 
     await expect(fetch('/repo', 'nonexistent', mockExeca)).rejects.toThrow();
+  });
+});
+
+describe('rebase', () => {
+  test('should return true on successful rebase', async () => {
+    const spy = createExecaSpy({
+      'git rebase origin/main': '',
+    });
+
+    const result = await rebase('/repo', 'origin/main', spy.mock);
+
+    expect(result).toBe(true);
+    expect(spy.calls).toHaveLength(1);
+    expect(spy.calls[0]).toEqual(['git', ['rebase', 'origin/main'], { cwd: '/repo' }]);
+  });
+
+  test('should return false on conflict and auto-abort', async () => {
+    let callCount = 0;
+    const mock = async (cmd: string | URL, args?: readonly string[], opts?: Record<string, unknown>) => {
+      callCount++;
+      const command = typeof cmd === 'string' ? cmd : cmd.toString();
+      const key = [command, ...(args || [])].join(' ');
+
+      if (key === 'git rebase origin/main') {
+        throw new Error('CONFLICT');
+      }
+      if (key === 'git rebase --abort') {
+        return { stdout: '', stderr: '', exitCode: 0 };
+      }
+      throw new Error(`Unexpected command: ${key}`);
+    };
+
+    const result = await rebase('/repo', 'origin/main', mock);
+
+    expect(result).toBe(false);
+    expect(callCount).toBe(2); // rebase + abort
+  });
+
+  test('should handle abort failure gracefully', async () => {
+    const mock = async (cmd: string | URL, args?: readonly string[]) => {
+      const command = typeof cmd === 'string' ? cmd : cmd.toString();
+      const key = [command, ...(args || [])].join(' ');
+
+      // Both rebase and abort fail
+      throw new Error(`Failed: ${key}`);
+    };
+
+    const result = await rebase('/repo', 'origin/main', mock);
+
+    // Should still return false even if abort fails
+    expect(result).toBe(false);
+  });
+
+  test('should use correct cwd', async () => {
+    const spy = createExecaSpy({
+      'git rebase origin/develop': '',
+    });
+
+    await rebase('/my/custom/repo', 'origin/develop', spy.mock);
+
+    expect(spy.calls[0]?.[2]).toEqual({ cwd: '/my/custom/repo' });
+  });
+});
+
+describe('abortRebase', () => {
+  test('should call git rebase --abort', async () => {
+    const spy = createExecaSpy({
+      'git rebase --abort': '',
+    });
+
+    await abortRebase('/repo', spy.mock);
+
+    expect(spy.calls).toHaveLength(1);
+    expect(spy.calls[0]).toEqual(['git', ['rebase', '--abort'], { cwd: '/repo' }]);
+  });
+
+  test('should throw when not in rebase state', async () => {
+    const mockExeca = createErrorExeca('fatal: No rebase in progress?');
+
+    await expect(abortRebase('/repo', mockExeca)).rejects.toThrow();
   });
 });
