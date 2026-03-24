@@ -10,6 +10,7 @@ import type { PatchnoteConfig } from '../config.js';
 import { executeConfigScript, findConfigFile, isConfigScript } from '../config.js';
 import { filterUpdates } from '../filters.js';
 import { createUpdateCommit, fetch, getRepoRoot, switchBranch } from '../git.js';
+import { partitionUpdates } from '../grouping.js';
 import { determineBaseBranch, generateBranchName, generatePRTitle } from '../pr/stacking.js';
 import { applyPackageRules, resolveAutoMerge } from '../rules.js';
 import { resolveSemanticPrefix } from '../semantic.js';
@@ -355,6 +356,8 @@ async function enableAutoMergeIfEligible(
 
 /**
  * Create branch, commit, push, and PR for updates
+ *
+ * @param groupName - Optional group name for multi-group PRs (affects branch name and PR title)
  */
 async function createPRWorkflow(
   config: PatchnoteConfig,
@@ -365,13 +368,14 @@ async function createPRWorkflow(
   allUpdates: PackageUpdate[],
   policies: Map<string, ResolvedPackagePolicy> = new Map(),
   semanticPrefix?: string | null,
+  groupName?: string,
 ): Promise<void> {
-  const branchName = generateBranchName(config);
+  const branchName = generateBranchName(config, undefined, groupName);
   const remote = config.git?.remote || 'origin';
 
   // Create new branch from current position (already checked out correct base)
   const branchSpinner = p.spinner();
-  branchSpinner.start('Creating update branch');
+  branchSpinner.start(`Creating update branch${groupName ? ` (${groupName})` : ''}`);
   const { createBranch, pushWithUpstream, deleteRemoteBranch } = await import('../git.js');
   await createBranch(repoRoot, branchName);
   branchSpinner.stop(`Created branch: ${branchName}`);
@@ -391,9 +395,9 @@ async function createPRWorkflow(
   // Create PR (uses stackBase determined at the beginning)
   // If PR creation fails, clean up the orphan branch on remote
   const prSpinner = p.spinner();
-  prSpinner.start('Creating pull request');
+  prSpinner.start(`Creating pull request${groupName ? ` (${groupName})` : ''}`);
   const hasBreaking = allUpdates.some((u) => u.updateType === 'major');
-  const prTitle = generatePRTitle(config, hasBreaking, semanticPrefix);
+  const prTitle = generatePRTitle(config, hasBreaking, semanticPrefix, groupName);
 
   try {
     const { autoCloseOldPRs, createPR } = await import('../pr/stacking.js');
@@ -408,12 +412,12 @@ async function createPRWorkflow(
       headBranch: branchName,
     });
 
-    prSpinner.stop(`Created PR #${pr.number}`);
+    prSpinner.stop(`Created PR #${pr.number}${groupName ? ` (${groupName})` : ''}`);
 
     // Enable auto-merge if configured and update types qualify
     await enableAutoMergeIfEligible(config, repoRoot, pr.number, allUpdates, policies);
 
-    p.note(`${pr.url}\nBase: ${stackBase}`, 'Pull Request');
+    p.note(`${pr.url}\nBase: ${stackBase}`, `Pull Request${groupName ? ` (${groupName})` : ''}`);
   } catch (error) {
     prSpinner.stop('PR creation failed');
     config.logger?.error(error instanceof Error ? error.message : String(error));
@@ -499,36 +503,83 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
       }
     }
 
+    // Partition updates into groups (or single default group)
+    const groups = config.grouping
+      ? partitionUpdates(allUpdates, config.grouping)
+      : new Map([['default', allUpdates]]);
+
+    const groupEntries = [...groups.entries()];
+    const isMultiGroup = groupEntries.length > 1;
+
+    if (isMultiGroup) {
+      p.log.info(`Grouped into ${groupEntries.length} groups: ${groupEntries.map(([name]) => name).join(', ')}`);
+    }
+
     // Dry run exit - show what would be created
     if (options.dryRun) {
-      const branchName = generateBranchName(config);
-      const { commitTitle, prBody } = await generateCommitData(
-        allUpdates,
-        config,
-        options,
-        allDowngrades,
-        semanticPrefix,
-      );
+      for (const [groupName, groupUpdates] of groupEntries) {
+        const effectiveGroupName = isMultiGroup ? groupName : undefined;
+        const branchName = generateBranchName(config, undefined, effectiveGroupName);
+        const groupDowngrades = allDowngrades.filter((d) => groupUpdates.some((u) => u.name === d.name));
+        const { commitTitle, prBody } = await generateCommitData(
+          groupUpdates,
+          config,
+          options,
+          groupDowngrades,
+          semanticPrefix,
+        );
 
-      const dryRunInfo = [`Branch: ${branchName}`, `Commit: ${commitTitle}`, `PR base: ${stackBase}`].join('\n');
-      p.note(dryRunInfo, 'Dry Run - Would Create');
-      p.note(prBody, 'PR Description');
+        const groupLabel = effectiveGroupName ? ` (${effectiveGroupName})` : '';
+        const dryRunInfo = [
+          `Branch: ${branchName}`,
+          `Commit: ${commitTitle}`,
+          `PR base: ${stackBase}`,
+          `Updates: ${groupUpdates.length}`,
+        ].join('\n');
+        p.note(dryRunInfo, `Dry Run - Would Create${groupLabel}`);
+        p.note(prBody, `PR Description${groupLabel}`);
+      }
       p.outro('Dry run complete');
       return;
     }
 
-    // Generate commit data
-    const { commitTitle, prBody } = await generateCommitData(
-      allUpdates,
-      config,
-      options,
-      allDowngrades,
-      semanticPrefix,
-    );
-
-    // Create PR workflow
+    // Create PR workflow for each group
     if (!options.skipGit) {
-      await createPRWorkflow(config, repoRoot, commitTitle, prBody, stackBase, allUpdates, policies, semanticPrefix);
+      for (const [groupName, groupUpdates] of groupEntries) {
+        // For single group (no grouping or only default), don't add group suffix
+        const effectiveGroupName = isMultiGroup ? groupName : undefined;
+
+        // Generate commit data scoped to this group's updates
+        const groupDowngrades = allDowngrades.filter((d) => groupUpdates.some((u) => u.name === d.name));
+        const { commitTitle, prBody } = await generateCommitData(
+          groupUpdates,
+          config,
+          options,
+          groupDowngrades,
+          semanticPrefix,
+        );
+
+        // Create PR for this group
+        await createPRWorkflow(
+          config,
+          repoRoot,
+          commitTitle,
+          prBody,
+          stackBase,
+          groupUpdates,
+          policies,
+          semanticPrefix,
+          effectiveGroupName,
+        );
+
+        // Switch back to stack base before creating next group's branch
+        // Each group creates an INDEPENDENT PR against the same stackBase
+        if (isMultiGroup) {
+          await switchBranch(repoRoot, stackBase);
+          // Brief pause between group PRs to ensure unique branch timestamps
+          await new Promise((resolve) => setTimeout(resolve, 100));
+        }
+      }
     }
 
     p.outro('Dependency update complete!');

@@ -231,13 +231,21 @@ export async function createPR(
 /**
  * Generate branch name for update PR
  * Includes timestamp to ensure uniqueness when multiple PRs created same day
+ *
+ * @param config - Patchnote configuration
+ * @param date - Date to use for branch name (defaults to now)
+ * @param groupName - Optional group name to include in branch name for multi-group PRs
  */
-export function generateBranchName(config: PatchnoteConfig, date?: Date): string {
+export function generateBranchName(config: PatchnoteConfig, date?: Date, groupName?: string): string {
   const { prStrategy } = config;
   const now = date || new Date();
   const dateStr = now.toISOString().split('T')[0];
   // Add hour-minute for uniqueness (multiple PRs same day)
   const timeStr = now.toISOString().split('T')[1]?.substring(0, 5).replace(':', '');
+
+  if (groupName) {
+    return `${prStrategy.branchPrefix}-${groupName}-${dateStr}-${timeStr}`;
+  }
 
   return `${prStrategy.branchPrefix}-${dateStr}-${timeStr}`;
 }
@@ -248,24 +256,41 @@ export function generateBranchName(config: PatchnoteConfig, date?: Date): string
  * If a semanticPrefix is provided and the user has NOT customized prTitlePrefix
  * (i.e., it's still at the default value), the semantic prefix will be used
  * for the PR title. If the user has customized prTitlePrefix, their value is respected.
+ *
+ * @param config - Patchnote configuration
+ * @param hasBreaking - Whether the updates include breaking changes
+ * @param semanticPrefix - Optional semantic commit prefix (e.g. "chore(deps)")
+ * @param groupName - Optional group name to append to the title for multi-group PRs
  */
-export function generatePRTitle(config: PatchnoteConfig, hasBreaking = false, semanticPrefix?: string | null): string {
+export function generatePRTitle(
+  config: PatchnoteConfig,
+  hasBreaking = false,
+  semanticPrefix?: string | null,
+  groupName?: string,
+): string {
   const { prStrategy } = config;
 
   // Only apply semantic prefix if prTitlePrefix is at its default value
   const DEFAULT_PR_TITLE_PREFIX = 'chore: update dependencies';
   const useSemanticForPR = semanticPrefix && prStrategy.prTitlePrefix === DEFAULT_PR_TITLE_PREFIX;
 
+  let title: string;
+
   if (useSemanticForPR) {
-    const breakingSuffix = hasBreaking ? ' (includes breaking changes)' : '';
-    return `${semanticPrefix}: update dependencies${breakingSuffix}`;
+    title = `${semanticPrefix}: update dependencies`;
+  } else {
+    title = prStrategy.prTitlePrefix;
+  }
+
+  if (groupName) {
+    title += ` (${groupName})`;
   }
 
   if (hasBreaking) {
-    return `${prStrategy.prTitlePrefix} (includes breaking changes)`;
+    title += ' (includes breaking changes)';
   }
 
-  return prStrategy.prTitlePrefix;
+  return title;
 }
 
 /**
