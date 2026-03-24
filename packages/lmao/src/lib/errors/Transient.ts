@@ -161,9 +161,10 @@ export function Transient<D = void, C extends string = string>(
  */
 function isRetryPolicyLike(value: unknown): value is Partial<RetryPolicy> {
   if (typeof value !== 'object' || value === null) return false;
-  const obj = value as Record<string, unknown>;
-  // Check for RetryPolicy-specific keys
-  return 'backoff' in obj || 'maxAttempts' in obj || 'baseDelayMs' in obj || 'maxDelayMs' in obj || 'jitter' in obj;
+  // Check for RetryPolicy-specific keys — `in` accepts `object`, no cast needed
+  return (
+    'backoff' in value || 'maxAttempts' in value || 'baseDelayMs' in value || 'maxDelayMs' in value || 'jitter' in value
+  );
 }
 
 // Re-export policy helpers for convenience

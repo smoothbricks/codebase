@@ -333,7 +333,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
 
   // Internal methods
   _newCtx0(): SpanContextInstance<Ctx>;
-  _newCtx1(overrides: Record<string, unknown>): SpanContextInstance<Ctx>;
+  _newCtx1(overrides: object): SpanContextInstance<Ctx>;
   _spanPre(
     childCtx: SpanContextInstance<Ctx>,
     line: number,
@@ -617,7 +617,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
           : (fnOrOp as (ctx: SpanContext<Ctx>, ...args: unknown[]) => Promise<Result<unknown, unknown>>);
 
         // Create child context - use _newCtx0 or _newCtx1 based on overrides
-        const childCtx = hasOverrides ? self._newCtx1(maybeOverrides as Record<string, unknown>) : self._newCtx0();
+        const childCtx = hasOverrides ? self._newCtx1(maybeOverrides) : self._newCtx0();
 
         // Dispatch to monomorphic methods with all Op properties extracted
         const argCount = len - fnIdx - 1;
@@ -817,7 +817,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      *
      * Transformer emits: ctx.span0(line, name, ctx._newCtx1({ requestId }), fn)
      */
-    _newCtx1(overrides: Record<string, unknown>): SpanContextInstance<Ctx> {
+    _newCtx1(overrides: object): SpanContextInstance<Ctx> {
       return Object.assign(Object.create(this), overrides) as SpanContextInstance<Ctx>;
     }
 
@@ -928,7 +928,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
           : (fnOrOp as (ctx: SpanContext<Ctx>, ...args: unknown[]) => Promise<Result<unknown, unknown>>);
 
         // Create child context - use _newCtx0 or _newCtx1 based on overrides
-        const newChildCtx = hasOverrides ? ctx._newCtx1(maybeOverrides as Record<string, unknown>) : ctx._newCtx0();
+        const newChildCtx = hasOverrides ? ctx._newCtx1(maybeOverrides) : ctx._newCtx0();
         const argCount = len - fnIdx - 1;
         switch (argCount) {
           case 0:
