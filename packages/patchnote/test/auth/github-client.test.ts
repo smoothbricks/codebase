@@ -472,6 +472,107 @@ describe('GitHubCLIClient', () => {
     });
   });
 
+  describe('findPRByHead', () => {
+    test('should return PR when matching open PR exists', async () => {
+      const mockPR = {
+        number: 42,
+        title: 'Configure Patchnote',
+        headRefName: 'chore/configure-patchnote',
+        createdAt: '2024-03-01T10:00:00Z',
+        url: 'https://github.com/owner/repo/pull/42',
+      };
+
+      const mockExeca = createMockExeca({
+        'gh pr list --head chore/configure-patchnote --state open --json number,title,headRefName,createdAt,url --limit 1':
+          JSON.stringify([mockPR]),
+      });
+
+      const client = new GitHubCLIClient(mockExeca);
+      const result = await client.findPRByHead('/repo', 'chore/configure-patchnote');
+
+      expect(result).toEqual(mockPR);
+    });
+
+    test('should return null when no matching PR exists', async () => {
+      const mockExeca = createMockExeca({
+        'gh pr list --head chore/configure-patchnote --state open --json number,title,headRefName,createdAt,url --limit 1':
+          '[]',
+      });
+
+      const client = new GitHubCLIClient(mockExeca);
+      const result = await client.findPRByHead('/repo', 'chore/configure-patchnote');
+
+      expect(result).toBeNull();
+    });
+
+    test('should use correct gh CLI args and cwd', async () => {
+      const spy = createExecaSpy({
+        'gh pr list --head my-branch --state open --json number,title,headRefName,createdAt,url --limit 1': '[]',
+      });
+
+      const client = new GitHubCLIClient(spy.mock);
+      await client.findPRByHead('/test-repo', 'my-branch');
+
+      expect(spy.calls).toHaveLength(1);
+      expect(spy.calls[0]?.[0]).toBe('gh');
+      expect(spy.calls[0]?.[1]).toEqual([
+        'pr',
+        'list',
+        '--head',
+        'my-branch',
+        '--state',
+        'open',
+        '--json',
+        'number,title,headRefName,createdAt,url',
+        '--limit',
+        '1',
+      ]);
+      expect(spy.calls[0]?.[2]).toEqual({ cwd: '/test-repo' });
+    });
+
+    test('should throw enhanced error on failure', async () => {
+      const mockExeca = createErrorExeca('Something went wrong');
+
+      const client = new GitHubCLIClient(mockExeca);
+
+      await expect(client.findPRByHead('/repo', 'some-branch')).rejects.toThrow('find PR by head branch');
+    });
+  });
+
+  describe('editPR', () => {
+    test('should call gh pr edit with correct args', async () => {
+      const spy = createExecaSpy({
+        'gh pr edit 42 --body Updated body content': '',
+      });
+
+      const client = new GitHubCLIClient(spy.mock);
+      await client.editPR('/repo', 42, { body: 'Updated body content' });
+
+      expect(spy.calls).toHaveLength(1);
+      expect(spy.calls[0]?.[0]).toBe('gh');
+      expect(spy.calls[0]?.[1]).toEqual(['pr', 'edit', '42', '--body', 'Updated body content']);
+    });
+
+    test('should use correct cwd', async () => {
+      const spy = createExecaSpy({
+        'gh pr edit 99 --body Test body': '',
+      });
+
+      const client = new GitHubCLIClient(spy.mock);
+      await client.editPR('/my/custom/repo', 99, { body: 'Test body' });
+
+      expect(spy.calls[0]?.[2]).toEqual({ cwd: '/my/custom/repo' });
+    });
+
+    test('should throw enhanced error on failure', async () => {
+      const mockExeca = createErrorExeca('Something went wrong');
+
+      const client = new GitHubCLIClient(mockExeca);
+
+      await expect(client.editPR('/repo', 42, { body: 'test' })).rejects.toThrow('edit PR #42');
+    });
+  });
+
   describe('constructor', () => {
     test('should use provided executor', async () => {
       const spy = createExecaSpy({

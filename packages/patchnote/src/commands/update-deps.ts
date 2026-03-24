@@ -53,7 +53,7 @@ async function setupBranchForStacking(
  * Run all dependency updaters (npm, devenv, nixpkgs)
  * Returns collected updates and errors
  */
-async function runAllUpdaters(
+export async function runAllUpdaters(
   config: PatchnoteConfig,
   repoRoot: string,
   options: UpdateOptions,

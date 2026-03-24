@@ -140,6 +140,43 @@ export class GitHubCLIClient implements IGitHubClient {
     }
   }
 
+  async findPRByHead(repoRoot: string, headBranch: string): Promise<GitHubPR | null> {
+    try {
+      const { stdout } = await this.executor(
+        'gh',
+        [
+          'pr',
+          'list',
+          '--head',
+          headBranch,
+          '--state',
+          'open',
+          '--json',
+          'number,title,headRefName,createdAt,url',
+          '--limit',
+          '1',
+        ],
+        { cwd: repoRoot },
+      );
+
+      const parsed = JSON.parse(stdout);
+      if (!Array.isArray(parsed)) {
+        throw new Error(`Expected array from gh pr list, got ${typeof parsed}`);
+      }
+      return parsed.length > 0 ? (parsed[0] as GitHubPR) : null;
+    } catch (error: unknown) {
+      throw this.enhanceError(error, 'find PR by head branch');
+    }
+  }
+
+  async editPR(repoRoot: string, prNumber: number, options: { body: string }): Promise<void> {
+    try {
+      await this.executor('gh', ['pr', 'edit', prNumber.toString(), '--body', options.body], { cwd: repoRoot });
+    } catch (error: unknown) {
+      throw this.enhanceError(error, `edit PR #${prNumber}`);
+    }
+  }
+
   /**
    * Enhance GitHub CLI errors with helpful troubleshooting information
    */

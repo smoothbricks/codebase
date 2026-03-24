@@ -35,7 +35,7 @@ function getDlxCommand(pm: ProjectSetup['packageManager']): string {
 /**
  * Generate JSON config file content
  */
-function generateJSONConfig(options: {
+export function generateJSONConfig(options: {
   enableExpo: boolean;
   enableNix: boolean;
   enableAI: boolean;

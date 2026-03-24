@@ -213,6 +213,14 @@ export interface InitOptions extends UpdateOptions {
 }
 
 /**
+ * Options for onboard command (CI onboarding PR creation)
+ */
+export interface OnboardOptions extends UpdateOptions {
+  /** Verbose output */
+  verbose?: boolean;
+}
+
+/**
  * Type for command executor (for testing git operations)
  * Matches the array-long form: execa(file, args, options)
  *
@@ -312,6 +320,10 @@ export interface IGitHubClient {
   closePR(repoRoot: string, prNumber: number, comment: string): Promise<void>;
   /** Enable GitHub auto-merge on a pull request */
   enableAutoMerge(repoRoot: string, prNumber: number, strategy: MergeStrategy): Promise<void>;
+  /** Find an open PR by head branch name */
+  findPRByHead(repoRoot: string, headBranch: string): Promise<GitHubPR | null>;
+  /** Update a PR body */
+  editPR(repoRoot: string, prNumber: number, options: { body: string }): Promise<void>;
 }
 
 /** Dependency filtering configuration */
