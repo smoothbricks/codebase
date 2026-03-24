@@ -69,6 +69,27 @@ describe('generateBranchName', () => {
 
     expect(branchName).toBe('update-deps-2025-03-01-1000');
   });
+
+  test('should insert groupName between prefix and date', () => {
+    const date = new Date('2025-01-15T10:00:00Z');
+    const branchName = generateBranchName(config, date, 'types');
+
+    expect(branchName).toBe('chore/update-deps-types-2025-01-15-1000');
+  });
+
+  test('should insert "major" groupName into branch name', () => {
+    const date = new Date('2025-01-15T10:00:00Z');
+    const branchName = generateBranchName(config, date, 'major');
+
+    expect(branchName).toBe('chore/update-deps-major-2025-01-15-1000');
+  });
+
+  test('should produce current format when groupName is undefined', () => {
+    const date = new Date('2025-01-15T10:00:00Z');
+    const branchName = generateBranchName(config, date, undefined);
+
+    expect(branchName).toBe('chore/update-deps-2025-01-15-1000');
+  });
 });
 
 describe('generatePRTitle', () => {
@@ -136,5 +157,35 @@ describe('generatePRTitle', () => {
     const title = generatePRTitle(customConfig, true);
 
     expect(title).toBe('feat: upgrade packages (includes breaking changes)');
+  });
+
+  test('should append group name when groupName is provided', () => {
+    const title = generatePRTitle(config, false, undefined, 'types');
+
+    expect(title).toBe('chore: update dependencies (types)');
+  });
+
+  test('should append "major" group name to title', () => {
+    const title = generatePRTitle(config, false, undefined, 'major');
+
+    expect(title).toBe('chore: update dependencies (major)');
+  });
+
+  test('should include both group name and breaking changes', () => {
+    const title = generatePRTitle(config, true, undefined, 'major');
+
+    expect(title).toBe('chore: update dependencies (major) (includes breaking changes)');
+  });
+
+  test('should produce current format when groupName is undefined', () => {
+    const title = generatePRTitle(config, false, undefined, undefined);
+
+    expect(title).toBe('chore: update dependencies');
+  });
+
+  test('should append group name with semantic prefix', () => {
+    const title = generatePRTitle(config, false, 'chore(deps)', 'types');
+
+    expect(title).toBe('chore(deps): update dependencies (types)');
   });
 });
