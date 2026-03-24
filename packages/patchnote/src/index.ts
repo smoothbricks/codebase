@@ -20,6 +20,8 @@ export * from './commands/update-expo.js';
 export * from './commands/validate-setup.js';
 // Export configuration
 export * from './config.js';
+// Export preset utilities
+export * from './presets.js';
 // Export Expo utilities
 export * from './expo/sdk-checker.js';
 export * from './expo/versions-fetcher.js';

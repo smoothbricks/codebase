@@ -17,6 +17,7 @@ import type {
   PackageRule,
   SupportedProvider,
 } from './types.js';
+import { mergePartials, resolvePresets } from './presets.js';
 import { safeResolve, validatePathWithinBase } from './utils/path-validation.js';
 import { detectExpoProjects } from './utils/workspace-detector.js';
 
@@ -181,6 +182,19 @@ export interface PatchnoteConfig {
 }
 
 /**
+ * Input type for defineConfig and config files.
+ * Extends DeepPartial<PatchnoteConfig> with an optional `extends` field
+ * for referencing shareable preset configurations.
+ *
+ * The `extends` field is consumed at load time and does NOT appear
+ * on the resolved PatchnoteConfig.
+ */
+export interface PatchnoteConfigInput extends DeepPartial<PatchnoteConfig> {
+  /** Array of preset references to extend from (e.g., 'patchnote:recommended', '@myorg/patchnote-config') */
+  extends?: string[];
+}
+
+/**
  * Default configuration
  */
 export const defaultConfig: PatchnoteConfig = {
@@ -306,8 +320,16 @@ export async function loadConfig(searchPath?: string, explicitConfigPath?: strin
       return { ...defaultConfig };
     }
 
-    // Merge with defaults
-    return mergeConfig(userConfig);
+    // Extract extends field (not part of PatchnoteConfig)
+    const { extends: presetRefs, ...localConfig } = userConfig as PatchnoteConfigInput;
+
+    if (presetRefs && presetRefs.length > 0) {
+      const resolvedPresets = await resolvePresets(presetRefs);
+      const mergedWithPresets = mergePartials(resolvedPresets, localConfig);
+      return mergeConfig(mergedWithPresets);
+    }
+
+    return mergeConfig(localConfig);
   } catch (error) {
     if (error instanceof SyntaxError) {
       console.warn(`Failed to parse config file at ${configPath}: ${error.message}`);
@@ -470,7 +492,7 @@ export async function resolveExpoProjects(config: PatchnoteConfig): Promise<Expo
  * });
  * ```
  */
-export function defineConfig(config: DeepPartial<PatchnoteConfig>): DeepPartial<PatchnoteConfig> {
+export function defineConfig(config: PatchnoteConfigInput): PatchnoteConfigInput {
   return config;
 }
 

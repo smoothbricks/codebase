@@ -80,11 +80,13 @@ export function mergePartials(base: PartialConfig, override: PartialConfig): Par
   const result: PartialConfig = { ...base }
 
   // Shallow-merge each config section
+  // Type assertion needed: TS can't narrow union of section types when iterating
+  const res = result as Record<string, unknown>
   for (const section of SHALLOW_MERGE_SECTIONS) {
-    const baseSection = base[section]
-    const overrideSection = override[section]
+    const baseSection = base[section] as Record<string, unknown> | undefined
+    const overrideSection = override[section] as Record<string, unknown> | undefined
     if (overrideSection !== undefined) {
-      result[section] = baseSection
+      res[section] = baseSection
         ? { ...baseSection, ...overrideSection }
         : { ...overrideSection }
     }
@@ -94,7 +96,7 @@ export function mergePartials(base: PartialConfig, override: PartialConfig): Par
   // Replace sections: override completely replaces base
   for (const section of REPLACE_SECTIONS) {
     if (override[section] !== undefined) {
-      ;(result as Record<string, unknown>)[section] = override[section]
+      res[section] = override[section]
     }
   }
 
