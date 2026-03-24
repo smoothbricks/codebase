@@ -51,8 +51,8 @@ export async function analyzeChangelogs(
   if (!apiKey) {
     config.logger?.warn('No ZAI_API_KEY found, skipping AI analysis');
     config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
-    // In raw mode, return just the update table (no embedded downgrades/releaseNotes)
-    if (rawMode) return generateUpdateTable(updates);
+    // In raw mode, return empty -- the template's {{table}} variable handles the fallback
+    if (rawMode) return '';
     return generateFallbackSummary(updates, downgrades);
   }
 
@@ -88,14 +88,14 @@ export async function analyzeChangelogs(
       return result;
     }
 
-    if (rawMode) return generateUpdateTable(updates);
+    if (rawMode) return '';
     return generateFallbackSummary(updates, downgrades, changelogs);
   } catch (error) {
     config.logger?.warn('AI analysis failed:', error instanceof Error ? error.message : String(error));
     if (process.env.VERBOSE) {
       config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
     }
-    if (rawMode) return generateUpdateTable(updates);
+    if (rawMode) return '';
     return generateFallbackSummary(updates, downgrades, changelogs);
   }
 }

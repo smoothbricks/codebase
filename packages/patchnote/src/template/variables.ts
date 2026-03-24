@@ -52,8 +52,9 @@ export async function buildTemplateVariables(opts: {
   }
 
   // Get structured table (no downgrades/release notes embedded)
-  // When AI is active and returns content, table is empty (aiSummary replaces it)
-  const table = skipAI || changelogs.size === 0 ? generateUpdateTable(updates) : '';
+  // When AI produced content, table is empty (aiSummary replaces it).
+  // When AI failed or was skipped, table shows the fallback update list.
+  const table = aiSummary ? '' : generateUpdateTable(updates);
 
   const provenanceWarnings = formatProvenanceWarnings(updates);
   const deprecationWarnings = formatDeprecationWarnings(updates);

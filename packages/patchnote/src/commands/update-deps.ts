@@ -271,8 +271,8 @@ async function generateCommitData(
     changelogSpinner.stop(`Fetched ${changelogs.size} changelogs`);
   }
 
-  // Generate commit title
-  const { title } = await generateCommitMessage(allUpdates, config, allDowngrades, changelogs, semanticPrefix);
+  // Generate commit title (body is unused -- template handles body rendering)
+  const { title } = await generateCommitMessage(allUpdates, config, allDowngrades, undefined, semanticPrefix);
 
   // Build template variables (decomposed sections)
   const aiSpinner = !options.skipAI && changelogs.size > 0 ? p.spinner() : null;
