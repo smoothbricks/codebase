@@ -5,6 +5,7 @@
 import { execa } from 'execa';
 import type { Logger } from '../logger.js';
 import type { CommandExecutor, PackageUpdate, ProjectSetup, UpdateResult } from '../types.js';
+import { isExecutableAvailable } from '../utils/project-detection.js';
 import { getPackageManagerCommands } from './package-manager.js';
 
 /**
@@ -192,7 +193,17 @@ export async function updateNpmDependencies(
   } = {},
 ): Promise<UpdateResult> {
   const { dryRun = false, recursive = true, syncpackFixCommand = 'syncpack:fix', logger, packages } = options;
-  const pm = getPackageManagerCommands(options.packageManager ?? 'bun');
+  const pmName = options.packageManager ?? 'bun';
+  const pm = getPackageManagerCommands(pmName);
+
+  if (!isExecutableAvailable(pm.cmd)) {
+    return {
+      success: false,
+      updates: [],
+      error: `Package manager '${pm.cmd}' is not installed. Please install ${pm.cmd} or check your PATH.`,
+      ecosystem: 'npm',
+    };
+  }
 
   try {
     logger?.info(`Updating ${pm.cmd} dependencies...`);

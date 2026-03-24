@@ -51,7 +51,7 @@ export function getPackageManagerCommands(pm: ProjectSetup['packageManager']): P
         updateArgs: ['update'],
         recursiveFlag: undefined,
         installArgs: ['install'],
-        forceRefreshArgs: ['install'],
+        forceRefreshArgs: ['install', '--package-lock-only'],
         lockFileNames: ['package-lock.json'],
         runScriptArgs: (name) => ['run', name],
         outdatedArgs: ['outdated', '--json'],
@@ -78,5 +78,9 @@ export function getPackageManagerCommands(pm: ProjectSetup['packageManager']): P
         runScriptArgs: (name) => ['run', name],
         outdatedArgs: ['outdated', '--json'],
       };
+    default: {
+      const _exhaustive: never = pm;
+      throw new Error(`Unsupported package manager: ${_exhaustive}`);
+    }
   }
 }

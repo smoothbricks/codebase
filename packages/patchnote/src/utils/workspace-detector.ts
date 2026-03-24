@@ -17,6 +17,81 @@ interface PackageJson {
 }
 
 /**
+ * Strip surrounding quotes (single or double) and trim whitespace from a YAML value.
+ */
+function unquote(value: string): string {
+  const trimmed = value.trim();
+  if ((trimmed.startsWith("'") && trimmed.endsWith("'")) || (trimmed.startsWith('"') && trimmed.endsWith('"'))) {
+    return trimmed.slice(1, -1);
+  }
+  return trimmed;
+}
+
+/**
+ * Parse pnpm-workspace.yaml to extract workspace patterns.
+ *
+ * Handles both block format:
+ *   packages:
+ *     - 'packages/*'
+ *
+ * And inline format:
+ *   packages: ['packages/*', 'apps/*']
+ *
+ * Strips comments and exclusion patterns (prefixed with !).
+ */
+export function parsePnpmWorkspaceYaml(content: string): string[] {
+  const lines = content.split('\n');
+
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    const match = line.match(/^packages\s*:\s*(.*)/);
+    if (!match) continue;
+
+    const rest = match[1].replace(/#.*$/, '').trim();
+
+    // Inline array: packages: ['packages/*', 'apps/*']
+    if (rest.startsWith('[')) {
+      const items = rest
+        .replace(/^\[/, '')
+        .replace(/\]\s*$/, '')
+        .split(',')
+        .map((item) => unquote(item))
+        .filter((item) => item.length > 0 && !item.startsWith('!'));
+      return items;
+    }
+
+    // Non-empty rest that isn't a list — single inline value (rare but valid)
+    if (rest.length > 0) {
+      const val = unquote(rest);
+      return val.length > 0 && !val.startsWith('!') ? [val] : [];
+    }
+
+    // Block list: read indented - items
+    const patterns: string[] = [];
+    for (let j = i + 1; j < lines.length; j++) {
+      const itemLine = lines[j];
+      // Strip comments
+      const stripped = itemLine.replace(/#.*$/, '');
+      // End of block: non-indented, non-empty line
+      if (stripped.trim().length > 0 && !stripped.match(/^\s/)) {
+        break;
+      }
+      // List item
+      const itemMatch = stripped.match(/^\s+-\s+(.*)/);
+      if (itemMatch) {
+        const pattern = unquote(itemMatch[1]);
+        if (pattern.length > 0 && !pattern.startsWith('!')) {
+          patterns.push(pattern);
+        }
+      }
+    }
+    return patterns;
+  }
+
+  return [];
+}
+
+/**
  * Get workspace glob patterns from pnpm-workspace.yaml or package.json workspaces field.
  *
  * Priority:
@@ -32,25 +107,10 @@ export async function getWorkspacePatterns(repoRoot: string): Promise<string[]> 
   if (existsSync(pnpmWorkspacePath)) {
     try {
       const content = await readFile(pnpmWorkspacePath, 'utf-8');
-      const patterns: string[] = [];
-      let inPackages = false;
-
-      for (const line of content.split('\n')) {
-        if (line.match(/^packages:/)) {
-          inPackages = true;
-          continue;
-        }
-        if (inPackages && line.match(/^\s+-\s+/)) {
-          const pattern = line.replace(/^\s+-\s+['"]?/, '').replace(/['"]?\s*$/, '');
-          if (!pattern.startsWith('!')) {
-            patterns.push(pattern);
-          }
-        } else if (inPackages && line.trim().length > 0 && !line.match(/^\s/)) {
-          break; // End of packages section
-        }
+      const patterns = parsePnpmWorkspaceYaml(content);
+      if (patterns.length > 0) {
+        return patterns;
       }
-
-      return patterns;
     } catch {
       // Fall through to package.json
     }

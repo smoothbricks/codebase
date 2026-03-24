@@ -2,11 +2,26 @@
  * Project setup detection utilities
  */
 
+import { execFileSync } from 'node:child_process';
 import { existsSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import fg from 'fast-glob';
 import type { ProjectSetup } from '../types.js';
+
+/**
+ * Check if a command executable is available on PATH.
+ * Useful for validating that the detected package manager is actually installed
+ * before attempting to run commands.
+ */
+export function isExecutableAvailable(cmd: string): boolean {
+  try {
+    execFileSync(process.platform === 'win32' ? 'where' : 'which', [cmd], { stdio: 'ignore' });
+    return true;
+  } catch {
+    return false;
+  }
+}
 
 /**
  * Detect project setup by checking for specific files/config

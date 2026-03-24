@@ -25,6 +25,10 @@ function getDlxCommand(pm: ProjectSetup['packageManager']): string {
       return 'pnpm dlx';
     case 'yarn':
       return 'yarn dlx';
+    default: {
+      const _exhaustive: never = pm;
+      throw new Error(`Unsupported package manager: ${_exhaustive}`);
+    }
   }
 }
 

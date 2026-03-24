@@ -6,6 +6,7 @@ import {
   detectWorkspaceScopes,
   generateWorkspacePrefixes,
   getWorkspacePatterns,
+  parsePnpmWorkspaceYaml,
 } from '../../src/utils/workspace-detector.js';
 
 describe('Workspace Detector', () => {
@@ -137,6 +138,125 @@ describe('Workspace Detector', () => {
       const patterns = await getWorkspacePatterns(tmpDir);
 
       expect(patterns).toEqual([]);
+    });
+
+    test('reads pnpm-workspace.yaml with inline array format', async () => {
+      tmpDir = await mkdtemp(join(tmpdir(), 'ws-test-'));
+      await writeFile(join(tmpDir, 'pnpm-workspace.yaml'), "packages: ['packages/*', 'apps/*']\n");
+      await writeFile(join(tmpDir, 'package.json'), '{}');
+
+      const patterns = await getWorkspacePatterns(tmpDir);
+
+      expect(patterns).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('reads pnpm-workspace.yaml with comments on lines', async () => {
+      tmpDir = await mkdtemp(join(tmpdir(), 'ws-test-'));
+      await writeFile(
+        join(tmpDir, 'pnpm-workspace.yaml'),
+        `packages:
+  - 'packages/*' # main packages
+  - 'apps/*' # application packages
+`,
+      );
+      await writeFile(join(tmpDir, 'package.json'), '{}');
+
+      const patterns = await getWorkspacePatterns(tmpDir);
+
+      expect(patterns).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('reads pnpm-workspace.yaml with unquoted patterns', async () => {
+      tmpDir = await mkdtemp(join(tmpdir(), 'ws-test-'));
+      await writeFile(
+        join(tmpDir, 'pnpm-workspace.yaml'),
+        `packages:
+  - packages/*
+  - apps/*
+`,
+      );
+      await writeFile(join(tmpDir, 'package.json'), '{}');
+
+      const patterns = await getWorkspacePatterns(tmpDir);
+
+      expect(patterns).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('reads pnpm-workspace.yaml with double-quoted patterns', async () => {
+      tmpDir = await mkdtemp(join(tmpdir(), 'ws-test-'));
+      await writeFile(
+        join(tmpDir, 'pnpm-workspace.yaml'),
+        `packages:
+  - "packages/*"
+  - "apps/*"
+`,
+      );
+      await writeFile(join(tmpDir, 'package.json'), '{}');
+
+      const patterns = await getWorkspacePatterns(tmpDir);
+
+      expect(patterns).toEqual(['packages/*', 'apps/*']);
+    });
+  });
+
+  describe('parsePnpmWorkspaceYaml', () => {
+    test('parses block list format', () => {
+      const result = parsePnpmWorkspaceYaml(`packages:
+  - 'packages/*'
+  - 'apps/*'
+`);
+      expect(result).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('parses inline array format', () => {
+      const result = parsePnpmWorkspaceYaml("packages: ['packages/*', 'apps/*']");
+      expect(result).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('parses inline array with double quotes', () => {
+      const result = parsePnpmWorkspaceYaml('packages: ["packages/*", "apps/*"]');
+      expect(result).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('strips inline comments', () => {
+      const result = parsePnpmWorkspaceYaml(`packages:
+  - 'packages/*' # main packages
+  - 'apps/*' # app packages
+`);
+      expect(result).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('filters exclusion patterns', () => {
+      const result = parsePnpmWorkspaceYaml(`packages:
+  - 'packages/*'
+  - '!**/test/**'
+  - 'apps/*'
+`);
+      expect(result).toEqual(['packages/*', 'apps/*']);
+    });
+
+    test('handles empty packages key', () => {
+      const result = parsePnpmWorkspaceYaml('packages:\n');
+      expect(result).toEqual([]);
+    });
+
+    test('handles no packages key', () => {
+      const result = parsePnpmWorkspaceYaml('catalog:\n  foo: 1.0.0\n');
+      expect(result).toEqual([]);
+    });
+
+    test('stops block list at next top-level key', () => {
+      const result = parsePnpmWorkspaceYaml(`packages:
+  - 'packages/*'
+catalog:
+  foo: 1.0.0
+`);
+      expect(result).toEqual(['packages/*']);
+    });
+
+    test('handles inline array exclusion patterns', () => {
+      const result = parsePnpmWorkspaceYaml("packages: ['packages/*', '!**/test/**', 'apps/*']");
+      expect(result).toEqual(['packages/*', 'apps/*']);
     });
   });
 });

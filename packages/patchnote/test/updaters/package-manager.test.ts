@@ -21,7 +21,7 @@ describe('getPackageManagerCommands', () => {
     expect(pm.updateArgs).toEqual(['update']);
     expect(pm.recursiveFlag).toBeUndefined();
     expect(pm.installArgs).toEqual(['install']);
-    expect(pm.forceRefreshArgs).toEqual(['install']);
+    expect(pm.forceRefreshArgs).toEqual(['install', '--package-lock-only']);
     expect(pm.lockFileNames).toEqual(['package-lock.json']);
     expect(pm.outdatedArgs).toEqual(['outdated', '--json']);
   });

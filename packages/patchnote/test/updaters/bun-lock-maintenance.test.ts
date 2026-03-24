@@ -85,9 +85,9 @@ describe('refreshLockFile', () => {
     expect(spy.calls[1]![1]).toEqual(['diff', '--name-only', '--', 'pnpm-lock.yaml']);
   });
 
-  test('with packageManager: npm runs npm install and checks package-lock.json', async () => {
+  test('with packageManager: npm runs npm install --package-lock-only and checks package-lock.json', async () => {
     const spy = createExecaSpy({
-      'npm install': '',
+      'npm install --package-lock-only': '',
       'git diff --name-only -- package-lock.json': 'package-lock.json\n',
     });
 
@@ -96,7 +96,7 @@ describe('refreshLockFile', () => {
     expect(result).toEqual({ changed: true });
     expect(spy.calls).toHaveLength(2);
     expect(spy.calls[0]![0]).toBe('npm');
-    expect(spy.calls[0]![1]).toEqual(['install']);
+    expect(spy.calls[0]![1]).toEqual(['install', '--package-lock-only']);
     expect(spy.calls[1]![1]).toEqual(['diff', '--name-only', '--', 'package-lock.json']);
   });
 
