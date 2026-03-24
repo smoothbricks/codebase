@@ -721,3 +721,129 @@ describe('Config Integration - Script Mode', () => {
     });
   });
 });
+
+describe('Config Integration - extends presets', () => {
+  const testDir = join(process.cwd(), 'test-temp-extends-presets');
+
+  beforeEach(async () => {
+    if (!existsSync(testDir)) {
+      await mkdir(testDir, { recursive: true });
+    }
+  });
+
+  afterEach(async () => {
+    if (existsSync(testDir)) {
+      await rm(testDir, { recursive: true, force: true });
+    }
+  });
+
+  test('loadConfig with extends: ["patchnote:recommended"] applies preset values', async () => {
+    const configPath = join(testDir, 'config-extends.ts');
+    await writeFile(
+      configPath,
+      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      export default defineConfig({
+        extends: ['patchnote:recommended'],
+      });`,
+    );
+
+    const config = await loadConfig(undefined, configPath);
+
+    // recommended preset: grouping.separateMajor = true
+    expect(config.grouping?.separateMajor).toBe(true);
+    // recommended preset: autoMerge.enabled = false (same as default, but comes from preset)
+    expect(config.autoMerge.enabled).toBe(false);
+    // recommended preset: prStrategy.stopOnConflicts = true
+    expect(config.prStrategy.stopOnConflicts).toBe(true);
+  });
+
+  test('local config overrides preset values', async () => {
+    const configPath = join(testDir, 'config-local-override.ts');
+    await writeFile(
+      configPath,
+      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      export default defineConfig({
+        extends: ['patchnote:recommended'],
+        prStrategy: { maxStackDepth: 3 },
+      });`,
+    );
+
+    const config = await loadConfig(undefined, configPath);
+
+    // Local override wins
+    expect(config.prStrategy.maxStackDepth).toBe(3);
+    // Other recommended preset values still applied (via defaults merge)
+    expect(config.prStrategy.stackingEnabled).toBe(true);
+    expect(config.grouping?.separateMajor).toBe(true);
+  });
+
+  test('multiple presets merge in order, then local config wins', async () => {
+    const configPath = join(testDir, 'config-multi-preset.ts');
+    await writeFile(
+      configPath,
+      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      export default defineConfig({
+        extends: ['patchnote:recommended', 'patchnote:aggressive'],
+        prStrategy: { branchPrefix: 'custom/prefix' },
+      });`,
+    );
+
+    const config = await loadConfig(undefined, configPath);
+
+    // aggressive wins over recommended on autoMerge.enabled (true vs false)
+    expect(config.autoMerge.enabled).toBe(true);
+    expect(config.autoMerge.mode).toBe('minor');
+    // aggressive wins on maxStackDepth (10 vs 5)
+    expect(config.prStrategy.maxStackDepth).toBe(10);
+    // recommended's grouping.separateMajor persists (aggressive has no grouping)
+    expect(config.grouping?.separateMajor).toBe(true);
+    // local config wins on branchPrefix
+    expect(config.prStrategy.branchPrefix).toBe('custom/prefix');
+  });
+
+  test('extends with unknown preset returns defaults (error handled)', async () => {
+    const configPath = join(testDir, 'config-bad-preset.ts');
+    await writeFile(
+      configPath,
+      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      export default defineConfig({
+        extends: ['patchnote:does-not-exist'],
+      });`,
+    );
+
+    // loadConfig should catch and warn, returning defaults
+    const config = await loadConfig(undefined, configPath);
+    expect(config.prStrategy.maxStackDepth).toBe(defaultConfig.prStrategy.maxStackDepth);
+  });
+
+  test('resolved config has no extends property', async () => {
+    const configPath = join(testDir, 'config-no-extends.ts');
+    await writeFile(
+      configPath,
+      `import { defineConfig } from '../packages/patchnote/src/config.js';
+      export default defineConfig({
+        extends: ['patchnote:recommended'],
+      });`,
+    );
+
+    const config = await loadConfig(undefined, configPath);
+    expect((config as any).extends).toBeUndefined();
+  });
+
+  test('script mode configs are unaffected by extends', async () => {
+    const outputPath = join(testDir, 'script-output.txt');
+    const configPath = join(testDir, 'config-script.ts');
+    await writeFile(
+      configPath,
+      `import { writeFileSync } from 'node:fs';
+      export default async function() {
+        writeFileSync('${outputPath}', 'script ran');
+      }`,
+    );
+
+    // Script mode returns a function, not an object -- loadConfig should detect this
+    // and return defaults (script mode handled elsewhere by isConfigScript/executeConfigScript)
+    const isScript = await isConfigScript(configPath);
+    expect(isScript).toBe(true);
+  });
+});
