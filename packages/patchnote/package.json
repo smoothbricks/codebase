@@ -28,6 +28,7 @@
     "build": "bun run build.ts",
     "typecheck": "tsc --build --emitDeclarationOnly",
     "test": "bun test",
+    "test:integration": "bun test test/integration-real/ --timeout 60000",
     "test:watch": "bun test --watch"
   },
   "dependencies": {
