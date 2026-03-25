@@ -1,2 +1,2 @@
 [test]
-preload = ["../../test-trace-preload.ts"]
+preload = ["@smoothbricks/lmao/bun/test-preload"]

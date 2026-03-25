@@ -98,6 +98,16 @@
       "types": "./dist/lib/testing/vitest-harness.d.ts",
       "import": "./dist/lib/testing/vitest-harness.js",
       "default": "./dist/lib/testing/vitest-harness.js"
+    },
+    "./bun/preload": {
+      "bun": "./src/bun/preload.ts",
+      "development": "./src/bun/preload.ts",
+      "default": "./dist/bun/preload.js"
+    },
+    "./bun/test-preload": {
+      "bun": "./src/bun/test-preload.ts",
+      "development": "./src/bun/test-preload.ts",
+      "default": "./dist/bun/test-preload.js"
     }
   },
   "files": [
