@@ -81,17 +81,31 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 
 ### Testing
 
-- **Run tests**: `bun test`
+- **Lint (all rules):** `nx lint <project>` — runs biome + eslint (type-checked) + custom checks, cached
+- **Lint before tests:** always `nx lint <project>` first
+- **Test:** `nx test <project>` — ALWAYS through Nx, never bare `bun test`
+- **Test with filter:** `nx test <project> -- --filter \"test name pattern\"`
+- **Typecheck / build:** `nx typecheck <project>`, `nx build <project>`
+- **After tsconfig or dependency changes:** `nx sync` and `nx sync:check`
+- **Query test results:** Use `.trace-results.db` SQLite databases:
+  ```bash
+  bun -e \"
+    const { Database } = require('bun:sqlite');
+    const db = new Database('packages/<project>/.trace-results.db');
+    const latest = db.query(\\\"SELECT trace_id FROM spans WHERE parent_span_id = 0 AND row_index = 0 ORDER BY timestamp_ns DESC LIMIT 1\\\").get();
+    const failures = db.query(\\\"SELECT s0.message AS name, s1.message AS err FROM spans s0 JOIN spans s1 ON s1.trace_id=s0.trace_id AND s1.span_id=s0.span_id AND s1.row_index=1 WHERE s0.trace_id=? AND s0.row_index=0 AND s1.entry_type IN (3,4)\\\").all(latest.trace_id);
+    if (!failures.length) { console.log('All passed'); process.exit(0); }
+    for (const f of failures) console.log('[FAIL]', f.name);
+  \"
+  ```
 - **ALWAYS run tests through Nx:** `nx test <project>` — this builds dependencies first, ensuring `.d.ts` files are
   fresh. Direct `bun test` from a package directory uses whatever declarations are on disk, which causes false
   passes/failures when a dependency changed but wasn't rebuilt. The ONLY exception: `bun test <file>` from the repo root
   for a quick single-file check when you are certain the build is fresh (e.g. immediately after `nx typecheck`).
 - **Package-local extra preloads still matter.** If a package adds its own extra preload beyond the shared root ones
   (for example for package-specific test setup), `nx test` handles this automatically.
-- **Nx cache is expected to work.** If a task only passes with `--skip-nx-cache`, treat that as a broken
-  target/input/output/dependency configuration and fix the Nx config instead of normalizing cache bypasses.
-- **Do not rely on `--skip-nx-cache` as routine workflow.** Use it only to diagnose cache issues, then repair the
-  underlying Nx configuration so cached and uncached runs agree.
+- **Never skip Nx cache** unless diagnosing cache issues — fix the config instead. If a task only passes with
+  `--skip-nx-cache`, treat that as a broken target/input/output/dependency configuration.
 
 ### Linting and Formatting
 

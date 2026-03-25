@@ -84,18 +84,24 @@
     "lint": {
       "executor": "nx:run-commands",
       "cache": true,
+      "dependsOn": ["typecheck"],
       "inputs": [
         "{projectRoot}/src/**/*",
         "{projectRoot}/package.json",
         "{projectRoot}/tsconfig*.json",
         "{workspaceRoot}/biome.json",
+        "{workspaceRoot}/eslint.config.ts",
+        "{workspaceRoot}/tsconfig.base.json",
         "{workspaceRoot}/tooling/checks/**/*"
       ],
       "options": {
-        "command": "biome check --files-ignore-unknown=true {projectRoot}",
-        "cwd": "{workspaceRoot}"
-      },
-      "dependsOn": ["typecheck"]
+        "commands": [
+          "biome check --files-ignore-unknown=true {projectRoot}",
+          "eslint {projectRoot}/src"
+        ],
+        "cwd": "{workspaceRoot}",
+        "parallel": false
+      }
     },
     "lint:fix": {
       "executor": "nx:run-commands",
