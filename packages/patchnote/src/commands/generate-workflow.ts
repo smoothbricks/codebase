@@ -10,6 +10,7 @@ import { existsSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { PROVIDER_CONFIGS } from '../ai/providers.js';
 import type { PatchnoteConfig } from '../config.js';
 import { getRepoRoot } from '../git.js';
 import type { GenerateWorkflowOptions, SupportedProvider } from '../types.js';
@@ -37,8 +38,6 @@ function getTemplatesDir(): string {
   throw new Error('Could not find templates directory');
 }
 
-/** AI env var name for Z.AI */
-const ZAI_ENV_VAR = 'ZAI_API_KEY';
 const DEFAULT_SCHEDULE = '0 2 * * *';
 const DEFAULT_WORKFLOW_NAME = 'Update Dependencies';
 
@@ -61,23 +60,25 @@ function processUnifiedTemplate(
   const { useAI, schedule, workflowName, configPath, forceSkipAI, baseBranch } = options;
   let result = template;
 
+  // Build env block with all provider env vars
+  const envLines = Object.values(PROVIDER_CONFIGS)
+    .map((cfg) => `          ${cfg.envVar}: \${{ secrets.${cfg.envVar} }}`)
+    .join('\n');
+
   if (forceSkipAI) {
     result = result.replace('{{AI_HEADER_SUFFIX}}', '');
     result = result.replace('{{AI_SETUP_NOTE}}', '');
     result = result.replace('{{AI_ENV_VAR}}', '');
     result = result.replace('{{SKIP_AI_INPUT}}', 'true');
   } else {
-    result = result.replace(
-      '{{AI_ENV_VAR}}',
-      `\n        env:\n          ${ZAI_ENV_VAR}: \${{ secrets.${ZAI_ENV_VAR} }}`,
-    );
+    result = result.replace('{{AI_ENV_VAR}}', `\n        env:\n${envLines}`);
     result = result.replace('{{SKIP_AI_INPUT}}', `\${{ vars.PATCHNOTE_SKIP_AI == 'true' }}`);
 
     if (useAI) {
       result = result.replace('{{AI_HEADER_SUFFIX}}', ' + AI Changelog Analysis');
       result = result.replace(
         '{{AI_SETUP_NOTE}}',
-        `\n#   - AI provider: Z.AI GLM-5-Turbo (requires ${ZAI_ENV_VAR} secret)`,
+        '\n#   - AI providers: Z.AI GLM-5-Turbo (ZAI_API_KEY) or Google Gemini (GEMINI_API_KEY, free)',
       );
     } else {
       result = result.replace('{{AI_HEADER_SUFFIX}}', '');
@@ -121,9 +122,9 @@ async function generateWorkflowContentFromTemplate(options: {
 export async function generateWorkflow(config: PatchnoteConfig, options: GenerateWorkflowOptions): Promise<void> {
   const repoRoot = config.repoRoot || (await getRepoRoot());
 
-  // AI is enabled by default when API key is configured, or explicitly enabled
-  const useAI =
-    options.enableAI === true || (!options.skipAI && (config.ai?.apiKey !== undefined || !!process.env.ZAI_API_KEY));
+  // AI is enabled by default when any API key is configured, or explicitly enabled
+  const hasAnyKey = Object.values(PROVIDER_CONFIGS).some((cfg) => !!process.env[cfg.envVar]);
+  const useAI = options.enableAI === true || (!options.skipAI && (config.ai?.apiKey !== undefined || hasAnyKey));
 
   const provider = config.ai.provider;
 

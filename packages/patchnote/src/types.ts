@@ -287,8 +287,9 @@ export interface RebaseOpenPRsOptions extends UpdateOptions {
 /**
  * Supported AI providers for changelog analysis
  * - zai: Z.AI GLM-5-Turbo (requires ZAI_API_KEY)
+ * - gemini: Google Gemini (requires GEMINI_API_KEY, free tier available at aistudio.google.com/apikey)
  */
-export const SUPPORTED_PROVIDERS = ['zai'] as const;
+export const SUPPORTED_PROVIDERS = ['zai', 'gemini'] as const;
 export type SupportedProvider = (typeof SUPPORTED_PROVIDERS)[number];
 
 /**

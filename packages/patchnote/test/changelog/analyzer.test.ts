@@ -38,12 +38,16 @@ describe('Changelog Analyzer', () => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENAI_API_KEY;
     delete process.env.GOOGLE_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.ZAI_API_KEY;
   });
 
   afterEach(() => {
     delete process.env.ANTHROPIC_API_KEY;
     delete process.env.OPENAI_API_KEY;
     delete process.env.GOOGLE_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+    delete process.env.ZAI_API_KEY;
   });
 
   describe('generateCommitMessage', () => {
@@ -271,10 +275,7 @@ describe('Changelog Analyzer', () => {
     // fallback scenarios that don't make network calls.
 
     describe('fallback behavior (no API key)', () => {
-      test('falls back to fallback summary when no ZAI_API_KEY', async () => {
-        const originalEnv = process.env.ZAI_API_KEY;
-        delete process.env.ZAI_API_KEY;
-
+      test('falls back to fallback summary when no API key available', async () => {
         const config: PatchnoteConfig = {
           ...mockConfig,
           ai: { provider: 'zai' }, // No API key
@@ -286,12 +287,8 @@ describe('Changelog Analyzer', () => {
         // Should return fallback summary (not make AI call)
         expect(result).toContain('## Dependency Updates');
         expect(result).toContain('react: 18.0.0 → 19.0.0');
-        // Should warn about missing key
-        expect(config.logger?.warn).toHaveBeenCalledWith(expect.stringContaining('No ZAI_API_KEY found'));
-
-        if (originalEnv !== undefined) {
-          process.env.ZAI_API_KEY = originalEnv;
-        }
+        // Should warn about missing key with provider-aware message
+        expect(config.logger?.warn).toHaveBeenCalledWith(expect.stringContaining('No AI API key found'));
       });
     });
 
@@ -484,9 +481,6 @@ describe('Changelog Analyzer', () => {
 
   describe('analyzeChangelogs with release notes embedding', () => {
     test('fallback mode (no API key) includes details blocks when changelogs have content', async () => {
-      const originalEnv = process.env.ZAI_API_KEY;
-      delete process.env.ZAI_API_KEY;
-
       const updates: PackageUpdate[] = [
         {
           name: 'react',
@@ -506,13 +500,9 @@ describe('Changelog Analyzer', () => {
 
       const result = await analyzeChangelogs(updates, changelogs, config);
 
-      // The no-API-key fallback at line 53 doesn't have access to changelogs
+      // The no-API-key fallback doesn't have access to changelogs
       // so it should NOT include details blocks in this specific path
       expect(result).toContain('## Dependency Updates');
-
-      if (originalEnv !== undefined) {
-        process.env.ZAI_API_KEY = originalEnv;
-      }
     });
   });
 });

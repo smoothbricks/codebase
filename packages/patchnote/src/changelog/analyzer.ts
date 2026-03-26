@@ -1,21 +1,11 @@
 /**
- * AI-powered changelog analysis using Z.AI GLM-5-Turbo
+ * AI-powered changelog analysis with multi-provider support
  */
 
+import { getProviderTokenBudget, resolveProvider, sendPrompt } from '../ai/ai-client.js';
 import { countTokens } from '../ai/token-counter.js';
-import { sendPrompt } from '../ai/zai-client.js';
 import { type PatchnoteConfig, sanitizeConfigForLogging } from '../config.js';
 import type { PackageUpdate } from '../types.js';
-
-/** Default token budget for GLM-5-Turbo (128k context window) */
-const DEFAULT_TOKEN_BUDGET = 64000;
-
-/**
- * Get the token budget for changelog analysis
- */
-function getTokenBudget(config: PatchnoteConfig): number {
-  return config.ai.tokenBudget || DEFAULT_TOKEN_BUDGET;
-}
 
 /**
  * Summarize a large changelog using a faster model
@@ -46,10 +36,10 @@ export async function analyzeChangelogs(
   downgrades: PackageUpdate[] = [],
   rawMode = false,
 ): Promise<string> {
-  // Check for API key
-  const apiKey = config.ai.apiKey || process.env.ZAI_API_KEY;
-  if (!apiKey) {
-    config.logger?.warn('No ZAI_API_KEY found, skipping AI analysis');
+  // Check for API key using multi-provider resolution
+  const resolved = resolveProvider(config);
+  if (!resolved) {
+    config.logger?.warn('No AI API key found. Set GEMINI_API_KEY (free) or ZAI_API_KEY for AI analysis');
     config.logger?.warn('AI config:', JSON.stringify(sanitizeConfigForLogging(config).ai));
     // In raw mode, return empty -- the template's {{table}} variable handles the fallback
     if (rawMode) return '';
@@ -109,7 +99,7 @@ async function buildPromptWithinBudget(
   config: PatchnoteConfig,
 ): Promise<string> {
   // Get token budget (user override or provider default)
-  const tokenBudget = getTokenBudget(config);
+  const tokenBudget = getProviderTokenBudget(config);
 
   // Start with original changelogs (copy to avoid mutating input)
   const workingChangelogs = new Map(changelogs);

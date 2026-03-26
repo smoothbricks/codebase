@@ -12,11 +12,18 @@ function createMockLogger(): Logger {
   };
 }
 
-describe('zai-client', () => {
+describe('zai-client (backward compat re-export)', () => {
   let mockConfig: PatchnoteConfig;
   const originalFetch = globalThis.fetch;
+  let savedZaiKey: string | undefined;
+  let savedGeminiKey: string | undefined;
 
   beforeEach(() => {
+    savedZaiKey = process.env.ZAI_API_KEY;
+    savedGeminiKey = process.env.GEMINI_API_KEY;
+    delete process.env.ZAI_API_KEY;
+    delete process.env.GEMINI_API_KEY;
+
     mockConfig = {
       ai: {
         provider: 'zai',
@@ -29,6 +36,16 @@ describe('zai-client', () => {
 
   afterEach(() => {
     globalThis.fetch = originalFetch;
+    if (savedZaiKey !== undefined) {
+      process.env.ZAI_API_KEY = savedZaiKey;
+    } else {
+      delete process.env.ZAI_API_KEY;
+    }
+    if (savedGeminiKey !== undefined) {
+      process.env.GEMINI_API_KEY = savedGeminiKey;
+    } else {
+      delete process.env.GEMINI_API_KEY;
+    }
   });
 
   describe('sendPrompt', () => {
@@ -100,7 +117,6 @@ describe('zai-client', () => {
 
     it('should fall back to ZAI_API_KEY env var', async () => {
       mockConfig.ai.apiKey = undefined;
-      const originalEnv = process.env.ZAI_API_KEY;
       process.env.ZAI_API_KEY = 'env-key';
 
       let capturedHeaders: HeadersInit | undefined;
@@ -118,30 +134,18 @@ describe('zai-client', () => {
           Authorization: 'Bearer env-key',
         }),
       );
-
-      if (originalEnv !== undefined) {
-        process.env.ZAI_API_KEY = originalEnv;
-      } else {
-        delete process.env.ZAI_API_KEY;
-      }
     });
 
     it('should throw when no API key', async () => {
       mockConfig.ai.apiKey = undefined;
-      const originalEnv = process.env.ZAI_API_KEY;
-      delete process.env.ZAI_API_KEY;
 
-      await expect(sendPrompt(mockConfig, 'Test')).rejects.toThrow('No Z.AI API key found');
-
-      if (originalEnv !== undefined) {
-        process.env.ZAI_API_KEY = originalEnv;
-      }
+      await expect(sendPrompt(mockConfig, 'Test')).rejects.toThrow('No AI API key found');
     });
 
     it('should throw on HTTP error', async () => {
       globalThis.fetch = mock(() => Promise.resolve(new Response('Unauthorized', { status: 401 }))) as typeof fetch;
 
-      await expect(sendPrompt(mockConfig, 'Test')).rejects.toThrow('Z.AI API error 401');
+      await expect(sendPrompt(mockConfig, 'Test')).rejects.toThrow('zai API error 401');
     });
 
     it('should throw when no content in response', async () => {
@@ -149,7 +153,7 @@ describe('zai-client', () => {
         Promise.resolve(new Response(JSON.stringify({ choices: [] }), { status: 200 })),
       ) as typeof fetch;
 
-      await expect(sendPrompt(mockConfig, 'Test')).rejects.toThrow('No content in Z.AI response');
+      await expect(sendPrompt(mockConfig, 'Test')).rejects.toThrow('No content in zai response');
     });
 
     it('should trim response text', async () => {

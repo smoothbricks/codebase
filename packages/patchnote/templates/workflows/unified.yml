@@ -22,8 +22,9 @@
 #     3. Add organization variable: PATCHNOTE_APP_ID
 #     4. Add organization secret: PATCHNOTE_APP_PRIVATE_KEY
 #
-# Optional: AI Changelog Analysis (Z.AI GLM-5-Turbo)
-#   - Add ZAI_API_KEY secret for AI-powered changelog summaries{{AI_SETUP_NOTE}}
+# Optional: AI Changelog Analysis
+#   - Free: Add GEMINI_API_KEY secret (get free key at aistudio.google.com/apikey)
+#   - Paid: Add ZAI_API_KEY secret for Z.AI GLM-5-Turbo{{AI_SETUP_NOTE}}
 #   - Disable: Set repository variable PATCHNOTE_SKIP_AI=true
 #
 # 📖 Full guide: https://github.com/smoothbricks/smoothbricks/blob/main/packages/patchnote/docs/GETTING-STARTED.md
