@@ -572,8 +572,12 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
       // so each PR gets only its own package changes and a clean lockfile
       if (isMultiGroup) {
         // Reset working tree from the initial full update run
-        const { execa } = await import('execa');
-        await execa('git', ['checkout', '.'], { cwd: repoRoot });
+        // Preserve Nix-related file changes when nix is enabled
+        const { restoreWorkingTree } = await import('../git.js');
+        const nixExcludePatterns = config.nix?.enabled
+          ? ['devenv.lock', 'devenv.yaml', 'devenv.nix', '_sources/generated.json']
+          : undefined;
+        await restoreWorkingTree(repoRoot, nixExcludePatterns);
       }
 
       for (const [groupName, groupUpdates] of groupEntries) {
@@ -628,8 +632,12 @@ export async function updateDeps(config: PatchnoteConfig, options: UpdateOptions
         if (isMultiGroup) {
           await switchBranch(repoRoot, stackBase);
           // Reset any leftover working tree changes from this group's bun update
-          const { execa: execaReset } = await import('execa');
-          await execaReset('git', ['checkout', '.'], { cwd: repoRoot });
+          // Preserve Nix-related file changes when nix is enabled
+          const { restoreWorkingTree: restoreWorkingTreeReset } = await import('../git.js');
+          const nixExcludePatternsReset = config.nix?.enabled
+            ? ['devenv.lock', 'devenv.yaml', 'devenv.nix', '_sources/generated.json']
+            : undefined;
+          await restoreWorkingTreeReset(repoRoot, nixExcludePatternsReset);
         }
       }
     }

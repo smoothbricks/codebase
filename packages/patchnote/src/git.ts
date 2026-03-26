@@ -89,6 +89,28 @@ export async function switchBranch(
 }
 
 /**
+ * Restore working tree files to HEAD state.
+ * When excludePatterns is provided, only restores files whose paths
+ * do NOT match any pattern (substring match). This preserves changes
+ * from other ecosystems (e.g., Nix files) during multi-group resets.
+ */
+export async function restoreWorkingTree(
+  repoRoot: string,
+  excludePatterns?: string[],
+  executor: CommandExecutor = defaultExecutor,
+): Promise<void> {
+  if (!excludePatterns || excludePatterns.length === 0) {
+    await executor('git', ['checkout', '.'], { cwd: repoRoot });
+    return;
+  }
+  const changedFiles = await getChangedFiles(repoRoot, executor);
+  const filesToRestore = changedFiles.filter((f) => !excludePatterns.some((p) => f.includes(p)));
+  if (filesToRestore.length > 0) {
+    await executor('git', ['checkout', '--', ...filesToRestore], { cwd: repoRoot });
+  }
+}
+
+/**
  * Check if a branch exists (locally or remotely)
  */
 export async function branchExists(

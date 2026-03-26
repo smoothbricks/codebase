@@ -11,6 +11,7 @@ import {
   push,
   pushWithUpstream,
   rebase,
+  restoreWorkingTree,
   stageAll,
   stageFiles,
   switchBranch,
@@ -393,5 +394,44 @@ describe('abortRebase', () => {
     const mockExeca = createErrorExeca('fatal: No rebase in progress?');
 
     await expect(abortRebase('/repo', mockExeca)).rejects.toThrow();
+  });
+});
+
+describe('restoreWorkingTree', () => {
+  test('restores all files when no excludePatterns', async () => {
+    const spy = createExecaSpy({
+      'git checkout .': '',
+    });
+    await restoreWorkingTree('/repo', undefined, spy.mock);
+    expect(spy.calls).toHaveLength(1);
+    expect(spy.calls[0]![1]).toEqual(['checkout', '.']);
+  });
+
+  test('restores all files when excludePatterns is empty', async () => {
+    const spy = createExecaSpy({
+      'git checkout .': '',
+    });
+    await restoreWorkingTree('/repo', [], spy.mock);
+    expect(spy.calls).toHaveLength(1);
+    expect(spy.calls[0]![1]).toEqual(['checkout', '.']);
+  });
+
+  test('excludes files matching patterns', async () => {
+    const spy = createExecaSpy({
+      'git status --porcelain': ' M package.json\n M bun.lockb\n M devenv.lock\n M _sources/generated.json',
+      'git checkout -- package.json bun.lockb': '',
+    });
+    await restoreWorkingTree('/repo', ['devenv', '_sources/generated.json'], spy.mock);
+    expect(spy.calls).toHaveLength(2);
+    expect(spy.calls[1]![1]).toEqual(['checkout', '--', 'package.json', 'bun.lockb']);
+  });
+
+  test('does nothing when all files are excluded', async () => {
+    const spy = createExecaSpy({
+      'git status --porcelain': ' M devenv.lock\n M devenv.yaml',
+    });
+    await restoreWorkingTree('/repo', ['devenv'], spy.mock);
+    expect(spy.calls).toHaveLength(1); // only the status call
+    expect(spy.calls[0]![1]).toEqual(['status', '--porcelain']);
   });
 });
