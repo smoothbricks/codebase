@@ -38,7 +38,7 @@ export async function getCurrentExpoSDK(packageJsonPath: string): Promise<string
  */
 export async function getLatestExpoSDK(): Promise<ExpoSDKVersion> {
   try {
-    const response = await fetch('https://registry.npmjs.org/expo/latest');
+    const response = await fetch('https://registry.npmjs.org/expo/latest', { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) {
       throw new Error(`Failed to fetch Expo version: ${response.statusText}`);
     }

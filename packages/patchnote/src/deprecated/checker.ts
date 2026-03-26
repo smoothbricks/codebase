@@ -24,7 +24,7 @@ import { findReplacement } from './replacements.js';
 export async function getDeprecationStatus(packageName: string, version: string): Promise<string | null> {
   try {
     const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}/${version}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) return null;
 
     const data = (await response.json()) as { deprecated?: string };

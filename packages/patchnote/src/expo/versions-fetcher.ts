@@ -16,7 +16,7 @@ export async function fetchExpoVersions(sdkVersion: string): Promise<ExpoPackage
     const majorVersion = sdkVersion.split('.')[0];
     const url = `https://raw.githubusercontent.com/expo/expo/sdk-${majorVersion}/packages/expo/bundledNativeModules.json`;
 
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) {
       throw new Error(`Failed to fetch Expo versions: ${response.statusText}`);
     }
@@ -25,7 +25,7 @@ export async function fetchExpoVersions(sdkVersion: string): Promise<ExpoPackage
 
     // Also fetch React/React Native versions from the SDK
     const packageJsonUrl = `https://raw.githubusercontent.com/expo/expo/sdk-${majorVersion}/packages/expo/package.json`;
-    const packageJsonResponse = await fetch(packageJsonUrl);
+    const packageJsonResponse = await fetch(packageJsonUrl, { signal: AbortSignal.timeout(30_000) });
 
     let reactVersion = '19.0.0'; // fallback
     let reactNativeVersion = '0.76.0'; // fallback

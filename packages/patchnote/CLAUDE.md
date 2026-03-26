@@ -412,12 +412,12 @@ Auto-merge uses `gh pr merge <number> --auto --<strategy>` to enable GitHub's se
 
 **Key design choices:**
 
-- **GitHub-side feature:** The `--auto` flag tells GitHub to merge once branch protection requirements are met. Patchnote
-  does not poll or wait for merge completion.
+- **GitHub-side feature:** The `--auto` flag tells GitHub to merge once branch protection requirements are met.
+  Patchnote does not poll or wait for merge completion.
 - **Non-fatal:** Auto-merge failures are logged as warnings, not errors. The PR is already created; the user can enable
   auto-merge manually if needed.
-- **Mode-based filtering:** `shouldAutoMerge()` checks the maximum update severity against the configured mode
-  (`patch` or `minor`). Unknown update types are never auto-merged (safe default).
+- **Mode-based filtering:** `shouldAutoMerge()` checks the maximum update severity against the configured mode (`patch`
+  or `minor`). Unknown update types are never auto-merged (safe default).
 - **Requires branch protection:** GitHub requires branch protection rules on the target branch for `--auto` to work.
   Without them, the command will fail (handled gracefully).
 - **Strategy selection:** Supports `squash` (default), `rebase`, and `merge` strategies via `MergeStrategy` type.
@@ -926,6 +926,13 @@ const safePath = safeResolve(baseDir, userProvidedPath);
 - Must be absolute path (starts with `/` or Windows drive letter)
 - Prevents command injection via malicious repo paths
 - Throws on empty or relative paths
+
+### Dynamic TypeScript Config Execution
+
+`loadConfig()` dynamically imports `.ts` config files via `import(pathToFileURL())`. This is by design -- TypeScript
+configs support `defineConfig()` with full type safety and custom logic (e.g., conditional config, hooks). Path
+validation ensures configs are within the repo root. This is the same trust model as tools like Vite, ESLint, and
+Prettier that execute user config files.
 
 ## Code Coverage Status
 

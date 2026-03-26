@@ -17,7 +17,15 @@ export interface ReplacementSuggestion {
 type ReplacementsData = Record<string, ReplacementSuggestion>;
 
 const dataPath = join(import.meta.dirname, '..', 'data', 'npm-replacements.json');
-const replacements: ReplacementsData = JSON.parse(readFileSync(dataPath, 'utf-8')) as ReplacementsData;
+
+let _replacements: ReplacementsData | null = null;
+
+function getReplacements(): ReplacementsData {
+  if (!_replacements) {
+    _replacements = JSON.parse(readFileSync(dataPath, 'utf-8')) as ReplacementsData;
+  }
+  return _replacements;
+}
 
 /**
  * Look up a replacement suggestion for a deprecated package.
@@ -29,5 +37,5 @@ const replacements: ReplacementsData = JSON.parse(readFileSync(dataPath, 'utf-8'
  * @returns Replacement suggestion if found, null otherwise
  */
 export function findReplacement(packageName: string): ReplacementSuggestion | null {
-  return replacements[packageName] ?? null;
+  return getReplacements()[packageName] ?? null;
 }

@@ -44,6 +44,7 @@ export async function sendPrompt(
       Authorization: `Bearer ${apiKey}`,
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(60_000),
   });
 
   if (!response.ok) {

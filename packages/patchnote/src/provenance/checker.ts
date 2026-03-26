@@ -25,7 +25,7 @@ import type { PackageUpdate } from '../types.js';
 export async function getProvenanceStatus(packageName: string, version: string): Promise<boolean> {
   try {
     const url = `https://registry.npmjs.org/${encodeURIComponent(packageName)}/${version}`;
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) return false;
 
     const data = (await response.json()) as {

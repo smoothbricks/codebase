@@ -10,7 +10,7 @@ import type { PackageUpdate } from '../types.js';
 async function fetchNpmChangelog(packageName: string, version: string): Promise<string | null> {
   try {
     // Try to get changelog from npm registry metadata
-    const response = await fetch(`https://registry.npmjs.org/${packageName}`);
+    const response = await fetch(`https://registry.npmjs.org/${packageName}`, { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) return null;
 
     const rawData = await response.json();
@@ -56,7 +56,7 @@ async function fetchGitHubChangelog(packageName: string, version: string): Promi
 
     for (const repo of possibleRepos) {
       const url = `https://api.github.com/repos/${repo}/releases/tags/v${version}`;
-      const response = await fetch(url);
+      const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
 
       if (response.ok) {
         const data = (await response.json()) as { body?: string; html_url?: string };
@@ -79,7 +79,7 @@ async function fetchGitHubChangelog(packageName: string, version: string): Promi
  */
 async function fetchChangelogContent(url: string): Promise<string | null> {
   try {
-    const response = await fetch(url);
+    const response = await fetch(url, { signal: AbortSignal.timeout(30_000) });
     if (!response.ok) return null;
 
     const contentType = response.headers.get('content-type');

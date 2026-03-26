@@ -9,6 +9,7 @@
  */
 
 import micromatch from 'micromatch';
+import { satisfies } from 'semver';
 import { shouldAutoMerge } from './commands/update-deps.js';
 import type { Logger } from './logger.js';
 import type { DepType, PackageRule, PackageUpdate, ResolvedPackagePolicy } from './types.js';
@@ -122,7 +123,7 @@ export function applyPackageRules(
 
     // Handle allowedVersions action
     if (policy.allowedVersions) {
-      if (!Bun.semver.satisfies(update.toVersion, policy.allowedVersions)) {
+      if (!satisfies(update.toVersion, policy.allowedVersions)) {
         logger?.info(
           `Package rule: version ${update.toVersion} of ${update.name} does not satisfy ${policy.allowedVersions}`,
         );
