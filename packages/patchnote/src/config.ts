@@ -129,7 +129,7 @@ export interface PatchnoteConfig {
     provider: SupportedProvider;
     /** Provider-specific model ID */
     model?: string;
-    /** API key (falls back to env vars: ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) */
+    /** API key (falls back to env vars: ZAI_API_KEY, GEMINI_API_KEY based on provider) */
     apiKey?: string;
     /**
      * Token budget for changelog analysis prompts.

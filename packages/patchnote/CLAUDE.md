@@ -11,7 +11,7 @@ AI-powered changelog summaries.
 
 - Expo SDK version management with syncpack integration
 - Stacked PR workflow (base new PRs on previous update PRs)
-- AI-powered changelog analysis (Z.AI GLM-5-Turbo (requires ZAI_API_KEY))
+- AI-powered changelog analysis (Google Gemini free tier, or Z.AI GLM-5-Turbo)
 - Multi-ecosystem support (npm, Expo, Nix/devenv)
 - Dry-run mode for safe testing
 
@@ -55,7 +55,9 @@ src/
 ├── pr/
 │   └── stacking.ts        # PR stacking algorithm (all functions accept executor param for testing)
 ├── ai/                    # AI integration
-│   ├── zai-client.ts # Z.AI GLM-5-Turbo client
+│   ├── providers.ts       # Provider config registry (Z.AI, Gemini)
+│   ├── ai-client.ts       # Multi-provider AI client with auto-fallback
+│   ├── zai-client.ts      # Backward-compat re-export of ai-client
 │   └── token-counter.ts   # Token counting with gpt-tokenizer
 ├── changelog/
 │   ├── fetcher.ts         # Fetch changelogs from npm/GitHub
@@ -89,9 +91,10 @@ test/                      # Mirrors src/ structure
 ├── integration/           # Integration tests (46 tests - COMPLETE)
 │   ├── pr-stacking-workflow.test.ts   # End-to-end PR stacking workflows (14 tests)
 │   └── config.test.ts                 # Config loading, merging, sanitization (32 tests)
-├── ai/                    # AI integration tests (30 tests)
-│   ├── zai-client.test.ts               # Z.AI client tests
-│   └── token-counter.test.ts          # Token counting tests (14 tests)
+├── ai/                    # AI integration tests (51 tests)
+│   ├── ai-client.test.ts             # Multi-provider AI client tests (27 tests)
+│   ├── zai-client.test.ts            # Backward-compat re-export tests (10 tests)
+│   └── token-counter.test.ts         # Token counting tests (14 tests)
 ├── changelog/             # Changelog tests (25 tests)
 │   ├── analyzer.test.ts               # Commit message generation (8 tests)
 │   └── fetcher.test.ts                # Changelog fetching and parsing (17 tests)
@@ -614,10 +617,10 @@ patchnote generate-workflow --schedule "0 3 * * 1"
 **AI Configuration:**
 
 ```typescript
-// AI is enabled by default with free tier (zai)
-// Priority: explicit flag > skipAI flag > auto-detection (free tier enabled by default)
-const isFreeProvider = !providerRequiresSecret(config.ai.provider);
-const useAI = options.enableAI === true || (!options.skipAI && (isFreeProvider || config.ai?.apiKey !== undefined));
+// AI is enabled when any provider API key is available (via env var or config)
+// Provider resolution: configured provider env var → fallback to any provider with a key
+const hasAnyKey = Object.values(PROVIDER_CONFIGS).some((cfg) => !!process.env[cfg.envVar]);
+const useAI = options.enableAI === true || (!options.skipAI && (config.ai?.apiKey !== undefined || hasAnyKey));
 ```
 
 **Switching Auth Methods (No Regeneration Needed):**
@@ -833,7 +836,7 @@ interface PatchnoteConfig {
   nix?: { enabled: boolean; devenvPath: string; nixpkgsOverlayPath: string };
   prStrategy: { stackingEnabled: boolean; maxStackDepth: number; ... };
   autoMerge: { enabled: boolean; mode: 'none' | 'patch' | 'minor'; strategy: MergeStrategy; ... };
-  ai: { provider: SupportedProvider; apiKey?: string; model?: string }; // SupportedProvider = 'zai'
+  ai: { provider: SupportedProvider; apiKey?: string; model?: string }; // SupportedProvider = 'zai' | 'gemini'
   git?: { remote: string; baseBranch: string };
   filters?: { exclude?: string[]; include?: string[] }; // Exclude takes precedence over include
   repoRoot?: string;
