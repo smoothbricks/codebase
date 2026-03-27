@@ -291,20 +291,33 @@ fn extractTypedValue(
             }
         },
         .Int32, .Int64 => {
-            // Expect number or ISO-8601 string, coerce to i64
+            // Expect number or string, coerce to i64.
+            // Try direct integer parse first (lossless for all i64 values),
+            // fall back to float parse for decimal JSON numbers.
             switch (token) {
                 .number => |n| {
-                    // Parse as float first (JSON numbers can have decimals)
-                    const f = std.fmt.parseFloat(f64, n) catch return error.InvalidFieldType;
-                    const i: i64 = @intFromFloat(f);
-                    const result = dynamic_cols.appendInt64(col_idx, i);
-                    if (result != .OK) return error.BufferOverflow;
+                    if (std.fmt.parseInt(i64, n, 10)) |i| {
+                        const result = dynamic_cols.appendInt64(col_idx, i);
+                        if (result != .OK) return error.BufferOverflow;
+                    } else |_| {
+                        // Decimal number — parse as float, truncate to i64
+                        const f = std.fmt.parseFloat(f64, n) catch return error.InvalidFieldType;
+                        const i: i64 = @intFromFloat(f);
+                        const result = dynamic_cols.appendInt64(col_idx, i);
+                        if (result != .OK) return error.BufferOverflow;
+                    }
                 },
                 .string => |s| {
-                    // ISO-8601 timestamp string → microseconds since epoch
-                    const micros = parseTimestampToMicros(s) orelse return error.InvalidFieldType;
-                    const result = dynamic_cols.appendInt64(col_idx, micros);
-                    if (result != .OK) return error.BufferOverflow;
+                    // Try direct integer parse first (supports bigint-as-string)
+                    if (std.fmt.parseInt(i64, s, 10)) |i| {
+                        const result = dynamic_cols.appendInt64(col_idx, i);
+                        if (result != .OK) return error.BufferOverflow;
+                    } else |_| {
+                        // Fall back to ISO-8601 timestamp string → microseconds
+                        const micros = parseTimestampToMicros(s) orelse return error.InvalidFieldType;
+                        const result = dynamic_cols.appendInt64(col_idx, micros);
+                        if (result != .OK) return error.BufferOverflow;
+                    }
                 },
                 .null_ => _ = dynamic_cols.appendNull(col_idx),
                 else => return error.InvalidFieldType,
