@@ -1,6 +1,6 @@
 # Typia validation codegen — needed for ALL bun execution (runtime + dev server).
-preload = ["@smoothbricks/lmao/bun/preload"]
+preload = ["./packages/lmao/src/bun/preload.ts"]
 
 [test]
 # Typia codegen + LMAO test tracing (flushes spans to .trace-results.db).
-preload = ["@smoothbricks/lmao/bun/test-preload"]
+preload = ["./packages/lmao/src/bun/test-preload"]
