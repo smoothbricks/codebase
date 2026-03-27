@@ -206,6 +206,7 @@ function validateObject<T extends SchemaFields>(
   if (typeof data !== 'object' || data === null) {
     throw new Error(`Expected object, got ${data === null ? 'null' : typeof data}`);
   }
+  // WHY: After null/typeof guard, data is a non-null object; cast enables string-indexed field access
   const obj = data as Record<string, unknown>;
   const result: Record<string, unknown> = {};
   for (const [key, schema] of columns) {

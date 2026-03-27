@@ -937,7 +937,7 @@ export function convertSpanTreeToArrowTable(
   const schemaFields: Array<[string, unknown]> = Array.from(mergedSchemaFields.entries());
 
   // Create merged schema object from collected fields (for capacity stats and other uses)
-  const mergedSchema = Object.fromEntries(mergedSchemaFields) as Record<string, unknown>;
+  const mergedSchema: Record<string, unknown> = Object.fromEntries(mergedSchemaFields);
 
   // ═══════════════════════════════════════════════════════════════════════════
   // PASS 1: Build dictionaries using DictionaryBuilder from arrow-builder

@@ -143,7 +143,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
 
   // Use exported memory if the module provides one,
   // otherwise fall back to the imported memory we created above
-  const exportedMemory = (instance.exports as Record<string, unknown>).memory as WebAssembly.Memory | undefined;
+  const exportedMemory = instance.exports.memory as WebAssembly.Memory | undefined;
   const memory = exportedMemory ?? importedMemory;
 
   // Ensure memory is large enough for the layout

@@ -192,7 +192,7 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
     // Spread ops onto this instance as own properties
     // Why spread: Enables direct access (ctx.deps.http.request)
     for (const [name, op] of Object.entries(ops)) {
-      (this as Record<string, unknown>)[name] = op;
+      this[name] = op;
     }
   }
 
@@ -224,10 +224,10 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
     // Copy ops, creating new Op instances with remappedViewClass
     // Why same SpanBufferClass: All ops from same defineOpContext share schema + stats
     for (const key of Object.keys(this)) {
-      const value = (this as Record<string, unknown>)[key];
+      const value = this[key];
       if (value instanceof Op) {
         const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        (newGroup as Record<string, unknown>)[key] = new Op(
+        newGroup[key] = new Op(
           oldOp.metadata,
           oldOp.SpanBufferClass, // SAME class - shared schema + stats
           oldOp.fn,
@@ -263,15 +263,10 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
 
     // Copy ops with remappedViewClass
     for (const key of Object.keys(this)) {
-      const value = (this as Record<string, unknown>)[key];
+      const value = this[key];
       if (value instanceof Op) {
         const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        (newGroup as Record<string, unknown>)[key] = new Op(
-          oldOp.metadata,
-          oldOp.SpanBufferClass,
-          oldOp.fn,
-          remappedViewClass,
-        );
+        newGroup[key] = new Op(oldOp.metadata, oldOp.SpanBufferClass, oldOp.fn, remappedViewClass);
       }
     }
 
@@ -313,7 +308,7 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
 
     // Spread ops onto this instance
     for (const [name, op] of Object.entries(ops)) {
-      (this as Record<string, unknown>)[name] = op;
+      this[name] = op;
     }
   }
 
@@ -342,15 +337,10 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
 
     // Copy ops with new remappedViewClass
     for (const key of Object.keys(this)) {
-      const value = (this as Record<string, unknown>)[key];
+      const value = this[key];
       if (value instanceof Op) {
         const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        (newGroup as Record<string, unknown>)[key] = new Op(
-          oldOp.metadata,
-          oldOp.SpanBufferClass,
-          oldOp.fn,
-          remappedViewClass,
-        );
+        newGroup[key] = new Op(oldOp.metadata, oldOp.SpanBufferClass, oldOp.fn, remappedViewClass);
       }
     }
 
@@ -384,15 +374,10 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
 
     // Copy ops with new remappedViewClass
     for (const key of Object.keys(this)) {
-      const value = (this as Record<string, unknown>)[key];
+      const value = this[key];
       if (value instanceof Op) {
         const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        (newGroup as Record<string, unknown>)[key] = new Op(
-          oldOp.metadata,
-          oldOp.SpanBufferClass,
-          oldOp.fn,
-          remappedViewClass,
-        );
+        newGroup[key] = new Op(oldOp.metadata, oldOp.SpanBufferClass, oldOp.fn, remappedViewClass);
       }
     }
 

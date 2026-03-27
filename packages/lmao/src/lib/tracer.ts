@@ -593,7 +593,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
    * - undefined is allowed for optional fields
    */
   private _resolveUserContext(overrides: Record<string, unknown>): Record<string, unknown> {
-    const ctxDefaults = this.ctxDefaults as Record<string, unknown>;
+    const ctxDefaults = this.ctxDefaults;
 
     // Check that all null-sentinel keys are provided in overrides
     for (const key of Object.keys(ctxDefaults)) {

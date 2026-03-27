@@ -25,12 +25,17 @@ const SCHEMA_TYPES: readonly SchemaType[] = ['enum', 'category', 'text', 'number
  * Type guard to check if a value is a SchemaWithMetadata
  * This is used to safely access __schema_type metadata on schemas
  */
+/** Narrow unknown to Record<string, unknown> — non-null object with string-keyed access. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadata {
-  if (value === null || typeof value !== 'object') {
+  if (!isRecord(value)) {
     return false;
   }
 
-  const obj = value as Record<string, unknown>;
+  const obj = value;
 
   // __schema_type is optional, but if present must be a valid type
   if ('__schema_type' in obj) {

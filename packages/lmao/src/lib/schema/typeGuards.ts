@@ -17,21 +17,24 @@ export {
 import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
 import type { FeatureFlagDefinition } from './types.js';
 
+/** Narrow unknown to Record<string, unknown> — non-null object with string-keyed access. */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
 /**
  * Type guard to check if a value is a FeatureFlagDefinition
  */
 export function isFeatureFlagDefinition(value: unknown): value is FeatureFlagDefinition<string | number | boolean> {
-  if (value === null || typeof value !== 'object') {
+  if (!isRecord(value)) {
     return false;
   }
 
-  const obj = value as Record<string, unknown>;
-
   return (
-    'schema' in obj &&
-    'defaultValue' in obj &&
-    'evaluationType' in obj &&
-    (obj.evaluationType === 'sync' || obj.evaluationType === 'async')
+    'schema' in value &&
+    'defaultValue' in value &&
+    'evaluationType' in value &&
+    (value.evaluationType === 'sync' || value.evaluationType === 'async')
   );
 }
 
@@ -39,16 +42,14 @@ export function isFeatureFlagDefinition(value: unknown): value is FeatureFlagDef
  * Type guard to check if a value is a valid EvaluationContext
  */
 export function isEvaluationContext(value: unknown): value is EvaluationContext {
-  if (value === null || typeof value !== 'object') {
+  if (!isRecord(value)) {
     return false;
   }
 
-  const obj = value as Record<string, unknown>;
-
   // EvaluationContext can have various string/number/boolean properties
   // Check that all values are of valid types
-  for (const key in obj) {
-    const val = obj[key];
+  for (const key in value) {
+    const val = value[key];
     if (val !== undefined && typeof val !== 'string' && typeof val !== 'number' && typeof val !== 'boolean') {
       return false;
     }
@@ -61,35 +62,33 @@ export function isEvaluationContext(value: unknown): value is EvaluationContext 
  * Type guard to check if a value is a valid UsageContext
  */
 export function isUsageContext(value: unknown): value is UsageContext {
-  if (value === null || typeof value !== 'object') {
+  if (!isRecord(value)) {
     return false;
   }
 
-  const obj = value as Record<string, unknown>;
-
   // Check action property if present
-  if ('action' in obj && typeof obj.action !== 'string' && obj.action !== undefined) {
+  if ('action' in value && typeof value.action !== 'string' && value.action !== undefined) {
     return false;
   }
 
   // Check outcome property if present
-  if ('outcome' in obj && obj.outcome !== undefined && obj.outcome !== 'success' && obj.outcome !== 'failure') {
+  if ('outcome' in value && value.outcome !== undefined && value.outcome !== 'success' && value.outcome !== 'failure') {
     return false;
   }
 
   // Check value property if present
-  if ('value' in obj && typeof obj.value !== 'number' && obj.value !== undefined) {
+  if ('value' in value && typeof value.value !== 'number' && value.value !== undefined) {
     return false;
   }
 
   // Check metadata property if present
-  if ('metadata' in obj && obj.metadata !== undefined) {
-    if (typeof obj.metadata !== 'object' || obj.metadata === null) {
+  if ('metadata' in value && value.metadata !== undefined) {
+    if (!isRecord(value.metadata)) {
       return false;
     }
 
     // Validate metadata values
-    const metadata = obj.metadata as Record<string, unknown>;
+    const metadata = value.metadata;
     for (const key in metadata) {
       const val = metadata[key];
       if (typeof val !== 'string' && typeof val !== 'number' && typeof val !== 'boolean') {
