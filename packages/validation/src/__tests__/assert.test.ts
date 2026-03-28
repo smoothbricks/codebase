@@ -80,12 +80,12 @@ describe('assertRecord', () => {
 
 describe('assertNever', () => {
   it('always throws', () => {
-    // We cast to never in test-only context to exercise the runtime path
-    expect(() => assertNever('unexpected' as never)).toThrow('Unexpected value: unexpected');
+    // WHY: Reflect.apply exercises the runtime throw path without a narrowing cast.
+    expect(() => Reflect.apply(assertNever, undefined, ['unexpected'])).toThrow('Unexpected value: unexpected');
   });
 
   it('uses custom message when provided', () => {
-    expect(() => assertNever(42 as never, 'Unhandled case: 42')).toThrow('Unhandled case: 42');
+    expect(() => Reflect.apply(assertNever, undefined, [42, 'Unhandled case: 42'])).toThrow('Unhandled case: 42');
   });
 
   it('works in an exhaustive switch pattern', () => {

@@ -1,0 +1,5 @@
+# WHY: Nx runs `bun test` from `packages/validation`, so this package needs its
+# own Bun test preloads. The root bunfig is not enough to register Typia before
+# the smoke suite imports `typia` from this package directory.
+[test]
+preload = ["../lmao/src/bun/preload.ts", "../lmao/src/bun/trace-preload.ts"]

@@ -54,11 +54,12 @@ import {
   mock,
 } from 'bun:test';
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContext, OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
-import type { LogSchema } from '../schema/LogSchema.js';
+import { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
@@ -95,6 +96,13 @@ type TestBody = () => unknown | Promise<unknown>;
 type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
 type BunTestHarnessBuiltins = { describe: ReturnType<typeof S.category> };
 type HarnessSchema<TExt extends SchemaFields> = BunTestHarnessBuiltins & TExt;
+
+// WHY: Package-local `nx test` runs Bun from that package directory, so the
+// shared preload must not eagerly import unrelated packages' tracer modules just
+// to find one opContext. A tiny fallback binding keeps tracing active for
+// packages that only need SQLite-backed test spans and do not define their own
+// `src/test-suite-tracer.ts`.
+const defaultAutoSetupOpContext = defineOpContext({ logSchema: new LogSchema({}) });
 
 type ExtendBindingLogSchema<B extends OpContextBinding, TExt extends SchemaFields> =
   B extends OpContextBinding<infer T, infer FF, infer Deps, infer UserCtx>
@@ -706,12 +714,13 @@ export type AutoSetupOptions = {
 };
 
 /**
- * Auto-discover ALL package test-suite-tracers, merge their schemas, and create
- * one unified root tracer for the entire bun test run.
+ * Auto-discover package test-suite-tracers and create the root tracer for the
+ * current bun test run.
  *
- * Scans `packagesDir` for `<pkg>/src/test-suite-tracer.ts` files, collects each
- * package's `testLogSchema` export (if any), merges them into a superset schema,
- * picks the first available `opContext`, and calls `installBunTestTracing()`.
+ * When Bun is running from inside `packages/<name>`, prefer that package's own
+ * `src/test-suite-tracer.ts` and avoid importing unrelated packages. Repo-root
+ * runs still fall back to the full scan so cross-package test runs keep the
+ * merged-schema behavior.
  *
  * Per-package `useTestSpan()` delegates to the global `useTestSpan()` from this
  * module which checks `_activeSuiteTracer` — set by the root preload via
@@ -725,11 +734,48 @@ export type AutoSetupOptions = {
  * ```
  */
 export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promise<boolean> {
-  const { join, resolve } = await import('node:path');
+  const { join, relative, resolve, sep } = await import('node:path');
   const { existsSync, readdirSync } = await import('node:fs');
 
   const packagesDir = resolve(options.packagesDir);
   if (!existsSync(packagesDir)) return false;
+
+  const installSuite = (opContext: OpContextBinding, mergedSchema: Record<string, unknown>): boolean => {
+    const hasCustomSchema = Object.keys(mergedSchema).length > 0;
+    const suite = makeBunTestSuiteTracer(opContext, {
+      sqlite: { dbPath: '.trace-results.db' },
+      testLogSchema: hasCustomSchema ? (mergedSchema as SchemaFields) : undefined,
+    });
+
+    suite.setupBunTestSuiteTracing();
+    return true;
+  };
+
+  const cwd = resolve(process.cwd());
+  const relativeToPackagesDir = relative(packagesDir, cwd);
+  const isPackageLocalRun =
+    relativeToPackagesDir !== '' &&
+    !relativeToPackagesDir.startsWith('..') &&
+    !relativeToPackagesDir.startsWith(`.${sep}`);
+
+  if (isPackageLocalRun) {
+    const [packageName] = relativeToPackagesDir.split(sep);
+    const tracerPath = join(packagesDir, packageName, 'src', 'test-suite-tracer.ts');
+
+    if (!existsSync(tracerPath)) {
+      return installSuite(defaultAutoSetupOpContext, {});
+    }
+
+    const mod = await import(tracerPath);
+    const mergedSchema =
+      mod.testLogSchema && typeof mod.testLogSchema === 'object' ? (mod.testLogSchema as Record<string, unknown>) : {};
+    const opContext =
+      mod.opContext && typeof mod.opContext === 'object'
+        ? (mod.opContext as OpContextBinding)
+        : defaultAutoSetupOpContext;
+
+    return installSuite(opContext, mergedSchema);
+  }
 
   const mergedSchema: Record<string, unknown> = {};
   let opContext: OpContextBinding | null = null;
@@ -752,14 +798,5 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     }
   }
 
-  if (!opContext) return false;
-
-  const hasCustomSchema = Object.keys(mergedSchema).length > 0;
-  const suite = makeBunTestSuiteTracer(opContext, {
-    sqlite: { dbPath: '.trace-results.db' },
-    testLogSchema: hasCustomSchema ? (mergedSchema as SchemaFields) : undefined,
-  });
-
-  suite.setupBunTestSuiteTracing();
-  return true;
+  return installSuite(opContext ?? defaultAutoSetupOpContext, mergedSchema);
 }
