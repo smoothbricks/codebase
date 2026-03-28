@@ -25,7 +25,12 @@ let _enginePromise: Promise<ArrowQueryEngine> | null = null;
  */
 export function createQueryEngine(): Promise<ArrowQueryEngine> {
   if (_enginePromise) return _enginePromise;
-  _enginePromise = initEngine();
+  // Reset the singleton on init failure so callers can retry after a broken
+  // worker bundle selection or transient network fetch problem.
+  _enginePromise = initEngine().catch((error: unknown) => {
+    _enginePromise = null;
+    throw error;
+  });
   return _enginePromise;
 }
 
@@ -36,8 +41,13 @@ async function initEngine(): Promise<ArrowQueryEngine> {
   // CDN-hosted WASM bundles avoid Metro/Vite bundling issues
   const bundles = duckdbModule.getJsDelivrBundles();
   const bundle = await duckdbModule.selectBundle(bundles);
+  const { mainWorker } = bundle;
 
-  const worker = new Worker(bundle.mainWorker!);
+  if (!mainWorker) {
+    throw new Error('DuckDB-WASM bundle selection did not provide a main worker entry');
+  }
+
+  const worker = new Worker(mainWorker);
   const logger = new duckdbModule.ConsoleLogger();
   const db = new duckdbModule.AsyncDuckDB(logger, worker);
   await db.instantiate(bundle.mainModule, bundle.pthreadWorker);

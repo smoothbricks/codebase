@@ -26,8 +26,7 @@
   "exclude": [
     "src/**/__tests__/**",
     "src/**/*.test.ts",
-    "src/**/*.spec.ts",
-    "src/lib/testing/vitest-harness.ts"
+    "src/**/*.spec.ts"
   ],
   "references": [
     {

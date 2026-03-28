@@ -74,6 +74,11 @@ describe('WASM Integration Tests', () => {
       initialPages: 16,
       maxPages: 16,
     });
+
+    tracer = new TestTracer(opContext, {
+      bufferStrategy: strategy,
+      createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
+    });
   });
 
   afterEach(() => {
@@ -87,15 +92,6 @@ describe('WASM Integration Tests', () => {
     strategy.reset();
 
     // Create fresh tracer for next test
-    tracer = new TestTracer(opContext, {
-      bufferStrategy: strategy,
-      createTraceRoot: createWasmTraceRootFactory(strategy.allocator),
-    });
-  });
-
-  // Initialize tracer before first test
-  beforeAll(async () => {
-    // Wait for strategy to be created (already done in outer beforeAll)
     tracer = new TestTracer(opContext, {
       bufferStrategy: strategy,
       createTraceRoot: createWasmTraceRootFactory(strategy.allocator),

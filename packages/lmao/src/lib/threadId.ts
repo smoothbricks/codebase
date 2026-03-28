@@ -48,7 +48,6 @@ function ensureInitialized(): void {
 
   // For Node.js < 19, try to use node:crypto
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
     const nodeCrypto = require('node:crypto');
     if (nodeCrypto && typeof nodeCrypto.randomFillSync === 'function') {
       nodeCrypto.randomFillSync(threadIdBytes);

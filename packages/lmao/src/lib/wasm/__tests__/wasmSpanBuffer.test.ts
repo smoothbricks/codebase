@@ -39,6 +39,7 @@ describe('WasmSpanBuffer', () => {
   beforeEach(async () => {
     allocator = await createWasmAllocator({ capacity: CAPACITY });
     allocator.reset();
+    allocator.setThreadId(0, 42); // high=0, low=42 -> thread_id = 42n
     traceRoot = new WasmTraceRoot(allocator, testTraceId('test-trace'), TEST_TRACER);
   });
 
@@ -70,14 +71,6 @@ describe('WasmSpanBuffer', () => {
     operation: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']),
     duration: ArrowS.bigUint64(),
     errorMessage: S.text(),
-  });
-
-  beforeEach(async () => {
-    allocator = await createWasmAllocator({ capacity: CAPACITY });
-    allocator.reset();
-    // Set thread_id in WASM header (global for all buffers in this allocator)
-    // thread_id = 42n for most tests
-    allocator.setThreadId(0, 42); // high=0, low=42 -> thread_id = 42n
   });
 
   describe('getWasmSpanBufferClass', () => {

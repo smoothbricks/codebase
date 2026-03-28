@@ -4,7 +4,15 @@ import tseslint from 'typescript-eslint';
 // This config exists solely to catch unsafe type assertions that biome cannot detect.
 export default tseslint.config(
   {
-    ignores: ['**/dist/**', '**/dist-*/**', '**/node_modules/**', '**/*.js', '**/*.cjs', '**/*.mjs'],
+    ignores: [
+      '**/dist/**',
+      '**/dist-*/**',
+      '**/node_modules/**',
+      '**/*.disabled.ts',
+      '**/*.js',
+      '**/*.cjs',
+      '**/*.mjs',
+    ],
   },
   {
     files: ['packages/*/src/**/*.ts', 'packages/*/src/**/*.tsx'],
