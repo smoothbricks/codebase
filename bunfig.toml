@@ -1,6 +1,3 @@
-# Typia validation codegen — needed for ALL bun execution (runtime + dev server).
-preload = ["./packages/lmao/src/bun/preload.ts"]
-
 [test]
 # Keep Typia and test tracing as separate preloads so Typia is registered before
 # the tracing preload imports any source files that call typia.createValidate*().
