@@ -7,9 +7,14 @@
 
 import type { OpContext } from '../opContext/types.js';
 import type { FeatureFlagSchema } from '../schema/defineFeatureFlags.js';
-import type { FlagEvaluator, FlagTrackContext, InferFeatureFlagsWithContext } from '../schema/evaluator.js';
+import type {
+  FlagEvaluator,
+  FlagTrackContext,
+  InferFeatureFlagsWithContext,
+  SpanContextWithoutFf,
+} from '../schema/evaluator.js';
 import type { Schema } from '../schema/types.js';
-import type { SpanContext, SpanLoggerInternal } from '../spanContext.js';
+import type { SpanLoggerInternal } from '../spanContext.js';
 import type { AnySpanBuffer } from '../types.js';
 
 /**
@@ -20,7 +25,7 @@ export interface GeneratedEvaluatorBase<Ctx extends OpContext> {
     flag: K,
   ): Promise<InferFeatureFlagsWithContext<Ctx>[K]>;
   get(flag: string): Promise<unknown>;
-  forContext(ctx: SpanContext<Ctx>): GeneratedEvaluatorInstance<Ctx>;
+  forContext(ctx: SpanContextWithoutFf<Ctx>): GeneratedEvaluatorInstance<Ctx>;
   readonly evaluator: FlagEvaluator<Ctx>;
 }
 
@@ -28,11 +33,9 @@ export type GeneratedEvaluatorInstance<Ctx extends OpContext> = GeneratedEvaluat
   InferFeatureFlagsWithContext<Ctx>;
 
 type GeneratedEvaluatorConstructor<Ctx extends OpContext> = new (
-  spanContext: SpanContext<Ctx>,
+  spanContext: SpanContextWithoutFf<Ctx>,
   evaluator: FlagEvaluator<Ctx>,
-) => GeneratedEvaluatorBase<Ctx>;
-
-type CachedConstructor = abstract new (...args: never[]) => object;
+) => GeneratedEvaluatorInstance<Ctx>;
 
 type ValidateFlagValue = (value: unknown, schema: Schema<unknown, unknown>, defaultValue: unknown) => unknown;
 
@@ -40,10 +43,51 @@ type FeatureFlagDefinition = FeatureFlagSchema[string];
 
 type WorkerSafeEvaluatorInstance = WorkerSafeGeneratedEvaluator<OpContext>;
 
+type EvaluatorRuntimeContext<Ctx extends OpContext> = SpanContextWithoutFf<Ctx> & {
+  _buffer: AnySpanBuffer;
+  log: SpanLoggerInternal<Ctx['logSchema']>;
+};
+
 /**
  * Cache for generated evaluator classes by schema reference.
  */
-const evaluatorClassCache = new WeakMap<FeatureFlagSchema, CachedConstructor>();
+const evaluatorClassCache = new WeakMap<FeatureFlagSchema, unknown>();
+
+function isGeneratedEvaluatorConstructor<Ctx extends OpContext>(
+  value: unknown,
+): value is GeneratedEvaluatorConstructor<Ctx> {
+  return typeof value === 'function';
+}
+
+function isGeneratedEvaluatorInstance<Ctx extends OpContext>(value: unknown): value is GeneratedEvaluatorInstance<Ctx> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isAnySpanBuffer(value: unknown): value is AnySpanBuffer {
+  return typeof value === 'object' && value !== null && '_writeIndex' in value && 'entry_type' in value;
+}
+
+function isInternalSpanLogger<T extends OpContext['logSchema']>(value: unknown): value is SpanLoggerInternal<T> {
+  return typeof value === 'object' && value !== null && 'ffAccess' in value && 'ffUsage' in value;
+}
+
+function getEvaluatorRuntimeContext<Ctx extends OpContext>(
+  ctx: SpanContextWithoutFf<Ctx>,
+): EvaluatorRuntimeContext<Ctx> {
+  if (typeof ctx !== 'object' || ctx === null || !('_buffer' in ctx) || !('log' in ctx)) {
+    throw new Error('Feature-flag evaluator requires an internal span context');
+  }
+
+  if (!isAnySpanBuffer(ctx._buffer) || !isInternalSpanLogger<Ctx['logSchema']>(ctx.log)) {
+    throw new Error('Feature-flag evaluator requires runtime span buffer and logger internals');
+  }
+
+  return {
+    ...ctx,
+    _buffer: ctx._buffer,
+    log: ctx.log,
+  };
+}
 
 function createFlagGetter(flagName: string) {
   return function generatedFlagGetter(this: WorkerSafeEvaluatorInstance) {
@@ -67,12 +111,6 @@ function buildGetterDescriptors(flagNames: readonly string[]): PropertyDescripto
   }
 
   return descriptors;
-}
-
-export function typeGeneratedEvaluator<Ctx extends OpContext>(
-  evaluator: GeneratedEvaluatorBase<Ctx>,
-): GeneratedEvaluatorInstance<Ctx> {
-  return evaluator as GeneratedEvaluatorInstance<Ctx>;
 }
 
 /**
@@ -113,20 +151,20 @@ ${getterEntries}
 }
 
 class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEvaluatorBase<Ctx> {
-  readonly #spanContext: SpanContext<Ctx>;
+  readonly #spanContext: EvaluatorRuntimeContext<Ctx>;
   readonly #evaluator: FlagEvaluator<Ctx>;
   readonly #schema: Ctx['flags'];
   readonly #validateFlagValue: ValidateFlagValue;
   readonly #entryTypeFfAccess: number;
 
   constructor(
-    spanContext: SpanContext<Ctx>,
+    spanContext: SpanContextWithoutFf<Ctx>,
     evaluator: FlagEvaluator<Ctx>,
     schema: Ctx['flags'],
     validateFlagValue: ValidateFlagValue,
     entryTypeFfAccess: number,
   ) {
-    this.#spanContext = spanContext;
+    this.#spanContext = getEvaluatorRuntimeContext(spanContext);
     this.#evaluator = evaluator;
     this.#schema = schema;
     this.#validateFlagValue = validateFlagValue;
@@ -138,7 +176,7 @@ class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEv
   }
 
   protected hasLoggedAccess(flagName: string): boolean {
-    let buf: AnySpanBuffer | undefined = this.#spanContext._buffer as AnySpanBuffer;
+    let buf: AnySpanBuffer | undefined = this.#spanContext._buffer;
 
     while (buf) {
       const limit = buf._writeIndex;
@@ -147,7 +185,7 @@ class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEv
           return true;
         }
       }
-      buf = buf._overflow as AnySpanBuffer | undefined;
+      buf = buf._overflow;
     }
 
     return false;
@@ -191,7 +229,7 @@ class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEv
     return this.wrapValue(flag, value);
   }
 
-  forContext(_ctx: SpanContext<Ctx>): GeneratedEvaluatorInstance<Ctx> {
+  forContext(_ctx: SpanContextWithoutFf<Ctx>): GeneratedEvaluatorInstance<Ctx> {
     throw new Error('forContext() must be implemented by the schema-specific evaluator class');
   }
 
@@ -222,7 +260,7 @@ class WorkerSafeGeneratedEvaluator<Ctx extends OpContext> implements GeneratedEv
   }
 
   private getLogger(): SpanLoggerInternal<Ctx['logSchema']> {
-    return this.#spanContext.log as SpanLoggerInternal<Ctx['logSchema']>;
+    return this.#spanContext.log;
   }
 
   private logUsage(flagName: string, context?: FlagTrackContext) {
@@ -240,22 +278,31 @@ export function createEvaluatorClass<Ctx extends OpContext>(
   ENTRY_TYPE_FF_ACCESS: number,
 ): GeneratedEvaluatorConstructor<Ctx> {
   const cached = evaluatorClassCache.get(schema);
-  if (cached) {
-    return cached as GeneratedEvaluatorConstructor<Ctx>;
+  if (isGeneratedEvaluatorConstructor<Ctx>(cached)) {
+    return cached;
   }
 
   class GeneratedEvaluator extends WorkerSafeGeneratedEvaluator<Ctx> {
-    constructor(spanContext: SpanContext<Ctx>, evaluator: FlagEvaluator<Ctx>) {
+    constructor(spanContext: SpanContextWithoutFf<Ctx>, evaluator: FlagEvaluator<Ctx>) {
       super(spanContext, evaluator, schema, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
     }
 
-    override forContext(ctx: SpanContext<Ctx>): GeneratedEvaluatorInstance<Ctx> {
-      return typeGeneratedEvaluator(new GeneratedEvaluator(ctx, this.evaluator));
+    override forContext(ctx: SpanContextWithoutFf<Ctx>): GeneratedEvaluatorInstance<Ctx> {
+      const nextEvaluator: unknown = new GeneratedEvaluator(ctx, this.evaluator);
+      if (!isGeneratedEvaluatorInstance<Ctx>(nextEvaluator)) {
+        throw new Error('Failed to create feature-flag evaluator instance');
+      }
+      return nextEvaluator;
     }
   }
 
   Object.defineProperties(GeneratedEvaluator.prototype, buildGetterDescriptors(Object.keys(schema)));
-  evaluatorClassCache.set(schema, GeneratedEvaluator);
+  const generatedEvaluatorClass: unknown = GeneratedEvaluator;
+  evaluatorClassCache.set(schema, generatedEvaluatorClass);
 
-  return GeneratedEvaluator;
+  if (!isGeneratedEvaluatorConstructor<Ctx>(generatedEvaluatorClass)) {
+    throw new Error('Failed to generate feature-flag evaluator constructor');
+  }
+
+  return generatedEvaluatorClass;
 }

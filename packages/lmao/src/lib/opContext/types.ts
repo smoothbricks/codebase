@@ -80,7 +80,7 @@ const opContextType: unique symbol = Symbol('opContextType');
  * const { defineOp } = defineOpContext({ ... });
  * type MyCtx = OpContextOf<typeof factory>; // OpContext<T, FF, Deps, UserCtx>
  */
-export type OpContextOf<F> = F extends { readonly [opContextType]: infer Ctx } ? Ctx : never;
+export type OpContextOf<F> = F extends { readonly [opContextType]?: infer Ctx } ? Ctx : never;
 
 export { opContextType };
 
@@ -119,7 +119,7 @@ import type { LogSchema } from '../schema/LogSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import type { ValidateUserContext } from './contextTypes.js';
 import type { FeatureFlagSchema } from './featureFlagTypes.js';
-import type { DepsConfig, EffectiveSchema, OpGroup, SchemaFieldsOf } from './opGroupTypes.js';
+import type { DepsConfig, OpGroup } from './opGroupTypes.js';
 import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 
 /**
@@ -248,7 +248,7 @@ export interface OpContextBinding<
    *
    * @internal
    */
-  readonly [opContextType]: OpContext<T, FF, Deps, UserCtx>;
+  readonly [opContextType]?: OpContext<T, FF, Deps, UserCtx>;
 
   /**
    * LogBinding for this context (schema, capacity stats, optional prefix view).
@@ -311,7 +311,7 @@ export interface OpContextFactory<
    *
    * External consumers can use this to see the full schema shape.
    */
-  readonly logSchema: LogSchema<EffectiveSchema<SchemaFieldsOf<T>, Deps>>;
+  readonly logSchema: T;
 
   /**
    * The feature flag schema (for external consumers)

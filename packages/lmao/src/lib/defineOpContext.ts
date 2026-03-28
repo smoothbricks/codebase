@@ -22,6 +22,7 @@
 
 import {
   type AnyOpGroup,
+  type AnyOpGroupPublic,
   createDefineOp,
   createDefineOps,
   createOpGroup,
@@ -32,14 +33,16 @@ import {
   type OpContext,
   type OpContextConfig,
   type OpContextFactory,
-  opContextType,
   RESERVED_CONTEXT_PROPS,
+  type ValidateUserContext,
 } from './opContext/index.js';
 import { LogSchema } from './schema/LogSchema.js';
 import { mergeWithSystemSchema, SYSTEM_SCHEMA_FIELD_NAMES } from './schema/systemSchema.js';
 import type { SchemaFields } from './schema/types.js';
-import { EMPTY_SCOPE } from './spanBuffer.js';
-import type { LogBinding } from './types.js';
+
+const EMPTY_FLAGS = Object.freeze({}) satisfies Record<string, never>;
+const EMPTY_DEPS = Object.freeze({}) satisfies Record<string, never>;
+const EMPTY_USER_CTX = Object.freeze({}) satisfies Record<string, never>;
 
 // =============================================================================
 // EFFECTIVE SCHEMA COMPUTATION
@@ -86,13 +89,17 @@ function isSystemField(fieldName: string): boolean {
  * @returns Schema fields without system fields
  */
 function filterOutSystemFields(fields: SchemaFields): SchemaFields {
-  const result: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(fields)) {
+  const result: SchemaFields = {};
+  for (const key of Object.keys(fields)) {
     if (!isSystemField(key)) {
-      result[key] = value;
+      result[key] = fields[key];
     }
   }
-  return result as SchemaFields;
+  return result;
+}
+
+function isInternalOpGroup(dep: AnyOpGroupPublic): dep is AnyOpGroupPublic & AnyOpGroup {
+  return '_logSchema' in dep;
 }
 
 /**
@@ -110,7 +117,11 @@ function filterOutSystemFields(fields: SchemaFields): SchemaFields {
  * @param dep - An OpGroup or MappedOpGroup (with internal properties _logSchema, _contributedSchema)
  * @returns The schema fields this dep contributes (user fields only, no system fields)
  */
-function getContributedSchemaFromDep(dep: AnyOpGroup): SchemaFields {
+function getContributedSchemaFromDep(dep: AnyOpGroupPublic): SchemaFields {
+  if (!isInternalOpGroup(dep)) {
+    throw new Error('Invalid op dependency: expected an OpGroup created by defineOps()');
+  }
+
   if (isMappedOpGroup(dep)) {
     // MappedOpGroup has _contributedSchema with mapped field names
     // This already excludes null-mapped columns (they were dropped in buildContributedSchema)
@@ -135,13 +146,18 @@ function getContributedSchemaFromDep(dep: AnyOpGroup): SchemaFields {
  * @returns Combined schema fields for the effective schema
  * @throws Error if deps contribute conflicting field names
  */
-function computeEffectiveSchema(appFields: SchemaFields, deps: DepsConfig | undefined): SchemaFields {
+function computeEffectiveSchema<T extends SchemaFields>(appFields: T): T;
+function computeEffectiveSchema<T extends SchemaFields, Deps extends DepsConfig>(
+  appFields: T,
+  deps: Deps,
+): EffectiveSchema<T, Deps>;
+function computeEffectiveSchema(appFields: SchemaFields, deps?: DepsConfig): SchemaFields {
   if (!deps || Object.keys(deps).length === 0) {
     return appFields;
   }
 
   // Start with app fields
-  const effective: Record<string, unknown> = { ...appFields };
+  const effective: SchemaFields = { ...appFields };
 
   // Track which dep contributed each field for conflict detection
   const fieldSource: Record<string, string> = {};
@@ -153,7 +169,7 @@ function computeEffectiveSchema(appFields: SchemaFields, deps: DepsConfig | unde
   for (const [depName, dep] of Object.entries(deps)) {
     // Cast to AnyOpGroup to access internal properties (_logSchema, _contributedSchema)
     // These exist at runtime but are hidden from public TypeScript interfaces
-    const contributed = getContributedSchemaFromDep(dep as unknown as AnyOpGroup);
+    const contributed = getContributedSchemaFromDep(dep);
 
     for (const [fieldName, fieldDef] of Object.entries(contributed)) {
       // Check for conflict
@@ -171,7 +187,62 @@ function computeEffectiveSchema(appFields: SchemaFields, deps: DepsConfig | unde
     }
   }
 
-  return effective as SchemaFields;
+  return effective;
+}
+
+function buildOpContextFactory<
+  EffectiveFields extends SchemaFields,
+  FF extends FeatureFlagSchema,
+  Deps extends DepsConfig,
+  UserCtx extends Record<string, unknown>,
+>(
+  effectiveFields: EffectiveFields,
+  flags: FF,
+  deps: Deps,
+  ctxDefaults: UserCtx,
+): OpContextFactory<LogSchema<EffectiveFields>, FF, Deps, UserCtx> {
+  // Merge effective schema with system schema (message, line, error_code, etc.)
+  // System columns are always available on SpanBuffer regardless of user schema.
+  // Type parameter stays on the effective user/dependency schema because callers should infer
+  // only the public columns, while the runtime object still carries the merged system fields.
+  const mergedSchema = new LogSchema<EffectiveFields>(mergeWithSystemSchema(effectiveFields));
+
+  // Create a LogBinding for ops to use.
+  // NOTE: Stats are NO LONGER on LogBinding - they are on SpanBufferClass.stats (static property).
+  // This avoids sync bugs from having two stat objects and reduces per-instance memory.
+  // See agent-todo/opgroup-refactor.md lines 58-70, 525-547 for rationale.
+  const logBinding = {
+    logSchema: mergedSchema,
+    remappedViewClass: undefined,
+  };
+
+  // Create the defineOp and defineOps functions bound to this config.
+  // CRITICAL: Use mergedSchema (with system columns), not just the app schema, because
+  // runtime SpanBuffer generation needs the full row shape even though public factory.logSchema
+  // intentionally exposes only user/dependency columns.
+  const defineOp = createDefineOp<OpContext<typeof mergedSchema, FF, Deps, UserCtx>>({
+    logSchema: mergedSchema,
+    flags,
+  });
+
+  const defineOps = createDefineOps<OpContext<typeof mergedSchema, FF, Deps, UserCtx>>(
+    { logSchema: mergedSchema, flags },
+    createOpGroup,
+  );
+
+  // Create effective schema LogSchema instance for factory.logSchema.
+  // This contains app fields + all dep contributed fields (user fields only, no system).
+  const effectiveLogSchema = new LogSchema(effectiveFields);
+
+  return {
+    logSchema: effectiveLogSchema,
+    flags,
+    logBinding,
+    ctxDefaults,
+    deps,
+    defineOp,
+    defineOps,
+  };
 }
 
 /**
@@ -213,17 +284,56 @@ function computeEffectiveSchema(appFields: SchemaFields, deps: DepsConfig | unde
  * });
  * ```
  */
+export function defineOpContext<T extends SchemaFields>(
+  config: OpContextConfig<T, Record<string, never>, Record<string, never>, Record<string, never>>,
+): OpContextFactory<LogSchema<T>, Record<string, never>, Record<string, never>, Record<string, never>>;
+export function defineOpContext<T extends SchemaFields, const FF extends FeatureFlagSchema>(
+  config: OpContextConfig<T, FF, Record<string, never>, Record<string, never>> & { flags: FF },
+): OpContextFactory<LogSchema<T>, FF, Record<string, never>, Record<string, never>>;
+export function defineOpContext<T extends SchemaFields, UserCtx extends Record<string, unknown>>(
+  config: OpContextConfig<T, Record<string, never>, Record<string, never>, UserCtx> & {
+    ctx: ValidateUserContext<UserCtx>;
+  },
+): OpContextFactory<LogSchema<T>, Record<string, never>, Record<string, never>, UserCtx>;
+export function defineOpContext<
+  T extends SchemaFields,
+  const FF extends FeatureFlagSchema,
+  UserCtx extends Record<string, unknown>,
+>(
+  config: OpContextConfig<T, FF, Record<string, never>, UserCtx> & { flags: FF; ctx: ValidateUserContext<UserCtx> },
+): OpContextFactory<LogSchema<T>, FF, Record<string, never>, UserCtx>;
+export function defineOpContext<T extends SchemaFields, Deps extends DepsConfig>(
+  config: OpContextConfig<T, Record<string, never>, Deps, Record<string, never>> & { deps: Deps },
+): OpContextFactory<LogSchema<EffectiveSchema<T, Deps>>, Record<string, never>, Deps, Record<string, never>>;
+export function defineOpContext<T extends SchemaFields, const FF extends FeatureFlagSchema, Deps extends DepsConfig>(
+  config: OpContextConfig<T, FF, Deps, Record<string, never>> & { flags: FF; deps: Deps },
+): OpContextFactory<LogSchema<EffectiveSchema<T, Deps>>, FF, Deps, Record<string, never>>;
+export function defineOpContext<
+  T extends SchemaFields,
+  Deps extends DepsConfig,
+  UserCtx extends Record<string, unknown>,
+>(
+  config: OpContextConfig<T, Record<string, never>, Deps, UserCtx> & { deps: Deps; ctx: ValidateUserContext<UserCtx> },
+): OpContextFactory<LogSchema<EffectiveSchema<T, Deps>>, Record<string, never>, Deps, UserCtx>;
+export function defineOpContext<
+  T extends SchemaFields,
+  const FF extends FeatureFlagSchema,
+  Deps extends DepsConfig,
+  UserCtx extends Record<string, unknown>,
+>(
+  config: OpContextConfig<T, FF, Deps, UserCtx> & { flags: FF; deps: Deps; ctx: ValidateUserContext<UserCtx> },
+): OpContextFactory<LogSchema<EffectiveSchema<T, Deps>>, FF, Deps, UserCtx>;
 export function defineOpContext<
   T extends SchemaFields,
   const FF extends FeatureFlagSchema = Record<string, never>,
   Deps extends DepsConfig = Record<string, never>,
   UserCtx extends Record<string, unknown> = Record<string, never>,
->(config: OpContextConfig<T, FF, Deps, UserCtx>): OpContextFactory<LogSchema<T>, FF, Deps, UserCtx> {
+>(config: OpContextConfig<T, FF, Deps, UserCtx>) {
   // Runtime validation: check for reserved property names in user context
   if (config.ctx) {
     const userKeys = Object.keys(config.ctx);
     for (const key of userKeys) {
-      if ((RESERVED_CONTEXT_PROPS as readonly string[]).includes(key)) {
+      if (RESERVED_CONTEXT_PROPS.some((reservedProp) => reservedProp === key)) {
         throw new Error(
           `Cannot use '${key}' in ctx - it is a reserved SpanContext property. ` +
             `Reserved: ${RESERVED_CONTEXT_PROPS.join(', ')}`,
@@ -236,56 +346,41 @@ export function defineOpContext<
     }
   }
 
-  // Compute effective schema by combining app schema with dep contributions
-  // This merges app fields + all dep contributed fields (after prefix/mapping)
+  // Compute effective schema by combining app schema with dep contributions.
+  // This merges app fields + all dep contributed fields (after prefix/mapping).
+  if (config.deps === undefined) {
+    const effectiveFields = computeEffectiveSchema(config.logSchema.fields);
+
+    if (config.flags === undefined) {
+      if (config.ctx === undefined) {
+        return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, EMPTY_DEPS, EMPTY_USER_CTX);
+      }
+
+      return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, EMPTY_DEPS, config.ctx);
+    }
+
+    if (config.ctx === undefined) {
+      return buildOpContextFactory(effectiveFields, config.flags, EMPTY_DEPS, EMPTY_USER_CTX);
+    }
+
+    return buildOpContextFactory(effectiveFields, config.flags, EMPTY_DEPS, config.ctx);
+  }
+
   const effectiveFields = computeEffectiveSchema(config.logSchema.fields, config.deps);
 
-  // Merge effective schema with system schema (message, line, error_code, etc.)
-  // System columns are always available on SpanBuffer regardless of user schema
-  const mergedFields = mergeWithSystemSchema(effectiveFields);
-  const mergedSchema = new LogSchema(mergedFields);
+  if (config.flags === undefined) {
+    if (config.ctx === undefined) {
+      return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, config.deps, EMPTY_USER_CTX);
+    }
 
-  // Create a LogBinding for ops to use.
-  // NOTE: Stats are NO LONGER on LogBinding - they are on SpanBufferClass.stats (static property).
-  // This avoids sync bugs from having two stat objects and reduces per-instance memory.
-  // See agent-todo/opgroup-refactor.md lines 58-70, 525-547 for rationale.
-  const logBinding: LogBinding<LogSchema<T>> = {
-    logSchema: mergedSchema as unknown as LogSchema<T>,
-    remappedViewClass: undefined, // Will be set if prefixing is applied
-  };
+    return buildOpContextFactory(effectiveFields, EMPTY_FLAGS, config.deps, config.ctx);
+  }
 
-  // Create the defineOp and defineOps functions bound to this config
-  // CRITICAL: Use mergedSchema (with system columns), not config.logSchema
-  // Cast via unknown because mergedSchema includes SystemSchemaFieldTypes which
-  // doesn't overlap with T directly, but is correct at runtime.
-  const defineOp = createDefineOp<OpContext<LogSchema<T>, FF, Deps, UserCtx>>({
-    logSchema: mergedSchema as unknown as LogSchema<T>,
-    flags: config.flags as FF,
-  });
+  if (config.ctx === undefined) {
+    return buildOpContextFactory(effectiveFields, config.flags, config.deps, EMPTY_USER_CTX);
+  }
 
-  const defineOps = createDefineOps<OpContext<LogSchema<T>, FF, Deps, UserCtx>>(
-    { logSchema: mergedSchema as unknown as LogSchema<T>, flags: config.flags as FF },
-    createOpGroup,
-  );
-
-  // Create effective schema LogSchema instance for factory.logSchema
-  // This contains app fields + all dep contributed fields (user fields only, no system)
-  const effectiveLogSchema = new LogSchema(effectiveFields);
-
-  // Return the factory with phantom type property
-  // Note: logSchema is the effective schema (app + deps), not just app's schema
-  // OpContextFactory expects LogSchema<EffectiveSchema<T, Deps>>,
-  // which is computed at runtime above.
-  return {
-    [opContextType]: undefined as unknown as OpContext<LogSchema<T>, FF, Deps, UserCtx>,
-    logSchema: effectiveLogSchema as unknown as LogSchema<EffectiveSchema<T, Deps>>,
-    flags: config.flags as FF,
-    logBinding,
-    ctxDefaults: (config.ctx ?? EMPTY_SCOPE) as UserCtx,
-    deps: (config.deps ?? EMPTY_SCOPE) as Deps,
-    defineOp,
-    defineOps,
-  };
+  return buildOpContextFactory(effectiveFields, config.flags, config.deps, config.ctx);
 }
 
 // Re-export everything from opContext for convenience

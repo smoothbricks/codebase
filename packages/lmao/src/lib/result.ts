@@ -50,9 +50,8 @@ export interface TaggedError<Tag extends string = string> {
  * Constructor type for tagged errors.
  * Used with Result.isErr(Tag) to check error type via instanceof.
  */
-export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> {
+export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> extends Function {
   readonly _tag: T['_tag'];
-  new (...args: never[]): T;
 }
 
 // =============================================================================
@@ -67,6 +66,47 @@ export type ApplyTagsFn<T extends LogSchema> = (buffer: SpanBuffer<T>) => void;
 
 type OkJson<V> = { ok: true; value: V };
 type ErrJson<E> = { ok: false; error: E };
+
+type BufferRowWriter = (row: number, value: unknown) => void;
+type ErrPredicate<E> = (error: E) => boolean;
+type ErrClassMatcher = abstract new (...args: never[]) => unknown;
+type ErrMatcher<E> = TaggedErrorConstructor<TaggedError> | ErrClassMatcher | ErrPredicate<E>;
+
+function isBufferRowWriter(value: unknown): value is BufferRowWriter {
+  return typeof value === 'function';
+}
+
+function applyDeferredAttributes<T extends LogSchema>(
+  buffer: SpanBuffer<T>,
+  attributes: Partial<InferSchema<T>>,
+): void {
+  for (const [key, value] of Object.entries(attributes)) {
+    if (value == null) {
+      continue;
+    }
+
+    const writer = Reflect.get(buffer, key);
+    if (isBufferRowWriter(writer)) {
+      Reflect.apply(writer, buffer, [1, value]);
+    }
+  }
+}
+
+function isErrPredicate<E>(value: ErrMatcher<E>): value is ErrPredicate<E> {
+  const prototype = Reflect.get(value, 'prototype');
+  return prototype === undefined || prototype === Function.prototype;
+}
+
+function isInstanceofMatcher<E>(value: ErrMatcher<E>): value is TaggedErrorConstructor<TaggedError> | ErrClassMatcher {
+  return typeof value === 'function' && !isErrPredicate(value);
+}
+
+function createCodeErrorValue<Code extends string, Fields extends object>(
+  prototype: object,
+  fields: Fields,
+): CodeErrorInstance<Code, Fields> & Fields {
+  return Object.assign(Object.create(prototype), fields);
+}
 
 // =============================================================================
 // OK CLASS
@@ -175,11 +215,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
     const prev = this.applyTags;
     this.applyTags = (buffer) => {
       if (prev) prev(buffer);
-      for (const [key, value] of Object.entries(attributes)) {
-        if (value != null && typeof (buffer as Record<string, unknown>)[key] === 'function') {
-          (buffer as Record<string, (pos: number, val: unknown) => void>)[key](1, value);
-        }
-      }
+      applyDeferredAttributes(buffer, attributes);
     };
     return this;
   }
@@ -292,23 +328,17 @@ export class Err<E, T extends LogSchema = LogSchema> {
   isErr<C extends abstract new (...args: never[]) => unknown>(Class: C): this is Err<InstanceType<C>, T>;
   isErr(predicate: (error: E) => boolean): boolean;
   isErr<Tag extends TaggedError>(
-    tagOrPredicate?:
-      | TaggedErrorConstructor<Tag>
-      | (abstract new (
-          ...args: never[]
-        ) => unknown)
-      | ((error: E) => boolean),
+    tagOrPredicate?: TaggedErrorConstructor<Tag> | ErrClassMatcher | ErrPredicate<E>,
   ): boolean {
     if (tagOrPredicate === undefined) return true;
 
     // instanceof check for classes (including TaggedError and CodeError)
-    if (typeof tagOrPredicate === 'function') {
-      // Check if it's a predicate function (not a constructor)
-      if (tagOrPredicate.prototype === undefined || tagOrPredicate.prototype === Function.prototype) {
-        return (tagOrPredicate as (error: E) => boolean)(this.error);
-      }
-      // It's a constructor - use instanceof
-      return this.error instanceof (tagOrPredicate as abstract new (...args: never[]) => unknown);
+    if (isErrPredicate(tagOrPredicate)) {
+      return tagOrPredicate(this.error);
+    }
+
+    if (isInstanceofMatcher(tagOrPredicate)) {
+      return this.error instanceof tagOrPredicate;
     }
 
     return false;
@@ -366,11 +396,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
     const prev = this.applyTags;
     this.applyTags = (buffer) => {
       if (prev) prev(buffer);
-      for (const [key, value] of Object.entries(attributes)) {
-        if (value != null && typeof (buffer as Record<string, unknown>)[key] === 'function') {
-          (buffer as Record<string, (pos: number, val: unknown) => void>)[key](1, value);
-        }
-      }
+      applyDeferredAttributes(buffer, attributes);
     };
     return this;
   }
@@ -438,7 +464,6 @@ export interface CodeErrorInstance<Code extends string, _Fields extends object> 
  */
 export interface CodeErrorClass<Code extends string, Fields extends object> {
   (fields: Fields): CodeErrorInstance<Code, Fields> & Fields;
-  new (fields: Fields): CodeErrorInstance<Code, Fields> & Fields;
   readonly prototype: { readonly code: Code };
 }
 
@@ -475,21 +500,26 @@ export interface CodeErrorClass<Code extends string, Fields extends object> {
 export function defineCodeError<Code extends string>(code: Code) {
   return <Fields extends object = Record<string, never>>(): CodeErrorClass<Code, Fields> => {
     // Constructor function that works with or without 'new'
-    const CodeError = function (
+    const CodeError: CodeErrorClass<Code, Fields> = function (
       this: (CodeErrorInstance<Code, Fields> & Fields) | undefined,
       fields: Fields,
     ): CodeErrorInstance<Code, Fields> & Fields {
       // Allow calling without 'new'
       if (!(this instanceof CodeError)) {
-        return new CodeError(fields);
+        return createCodeErrorValue<Code, Fields>(CodeError.prototype, fields);
       }
       // Assign fields as own properties
       Object.assign(this, fields);
       return this;
-    } as unknown as CodeErrorClass<Code, Fields>;
+    };
 
     // Put code on prototype so all instances share it
-    (CodeError.prototype as { code: Code }).code = code;
+    Object.defineProperty(CodeError.prototype, 'code', {
+      value: code,
+      writable: false,
+      enumerable: true,
+      configurable: false,
+    });
 
     return CodeError;
   };

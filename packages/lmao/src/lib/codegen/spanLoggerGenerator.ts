@@ -652,7 +652,15 @@ function buildSpanLoggerExtension(schema: LogSchema): ColumnWriterExtension {
 /**
  * Cache for generated SpanLogger classes per schema.
  */
-const spanLoggerClassCache = new WeakMap<LogSchema, new (buffer: AnySpanBuffer) => SpanLoggerImpl<LogSchema>>();
+const spanLoggerClassCache = new WeakMap<LogSchema, unknown>();
+
+function isSpanLoggerConstructor<T extends LogSchema>(
+  value: unknown,
+): value is new (
+  buffer: AnySpanBuffer,
+) => SpanLoggerImpl<T> {
+  return typeof value === 'function';
+}
 
 /**
  * Create SpanLogger class constructor from schema.
@@ -679,14 +687,20 @@ export function createSpanLoggerClass<T extends LogSchema>(
     // Use arrow-builder's getColumnWriterClass with our extension
     const WriterClass = getColumnWriterClass(schema, extension);
 
-    SpanLoggerClass = WriterClass as unknown as new (buffer: AnySpanBuffer) => SpanLoggerImpl<LogSchema>;
+    SpanLoggerClass = WriterClass;
+
+    if (!isSpanLoggerConstructor<LogSchema>(SpanLoggerClass)) {
+      throw new Error('Failed to generate SpanLogger constructor');
+    }
 
     spanLoggerClassCache.set(schema, SpanLoggerClass);
   }
 
-  return SpanLoggerClass as new (
-    buffer: AnySpanBuffer,
-  ) => SpanLoggerImpl<T>;
+  if (!isSpanLoggerConstructor<T>(SpanLoggerClass)) {
+    throw new Error('Invalid cached SpanLogger constructor');
+  }
+
+  return SpanLoggerClass;
 }
 
 /**

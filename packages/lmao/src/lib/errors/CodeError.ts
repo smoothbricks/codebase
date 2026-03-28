@@ -114,11 +114,14 @@ export interface CodeConstructorVoid<C extends string> extends TaggedErrorConstr
  * }
  * ```
  */
-export function Code<D = void, C extends string = string>(
-  code: C,
-): D extends void ? CodeConstructorVoid<C> : CodeConstructor<C, D> {
-  const fn = (data: D) => new CodeError(code, data);
-  Object.defineProperty(fn, '_tag', { value: code, writable: false, enumerable: true });
-  // For void data, we still need to call with undefined
-  return fn as D extends void ? CodeConstructorVoid<C> : CodeConstructor<C, D>;
+export function Code<C extends string>(code: C): CodeConstructorVoid<C>;
+export function Code<_D extends void, C extends string = string>(code: C): CodeConstructorVoid<C>;
+export function Code<D, C extends string = string>(code: C): CodeConstructor<C, D>;
+export function Code(code: string) {
+  function createCodeError(data?: unknown) {
+    return new CodeError(code, data);
+  }
+
+  Object.defineProperty(createCodeError, '_tag', { value: code, writable: false, enumerable: true });
+  return createCodeError;
 }

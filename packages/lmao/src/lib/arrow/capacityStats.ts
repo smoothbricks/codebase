@@ -2,6 +2,7 @@ import {
   batchType,
   bool,
   Column,
+  type DataType,
   dictionary,
   float64,
   type IntType,
@@ -35,38 +36,57 @@ type Utf8Encoded = {
   offsets: Int32Array;
 };
 
-function isBoolType(value: unknown): boolean {
-  return (value as { typeId?: unknown })?.typeId === BOOL_TYPE_ID;
-}
+type BoolType = ReturnType<typeof bool>;
+type DictionaryType = ReturnType<typeof dictionary>;
+type Utf8Type = ReturnType<typeof utf8>;
 
-function makeColumn(data: {
-  type: unknown;
+type ColumnDataBase<TType, TValues = unknown> = {
+  type: TType;
   length: number;
   nullCount: number;
-  values?: unknown;
+  values?: TValues;
   validity?: Uint8Array;
-  offsets?: Int32Array;
-  dict?: Column<unknown>;
-}): Column<unknown> {
+};
+
+type DictionaryColumnData = ColumnDataBase<DictionaryType> & { dict: Column<unknown> };
+type Utf8ColumnData = ColumnDataBase<Utf8Type, Uint8Array> & { offsets: Int32Array };
+type BoolColumnData = ColumnDataBase<BoolType, Uint8Array>;
+type GenericColumnData = ColumnDataBase<DataType>;
+
+function hasTypeId(value: unknown): value is { readonly typeId: unknown } {
+  return typeof value === 'object' && value !== null && 'typeId' in value;
+}
+
+function isBoolType(value: unknown): value is BoolType {
+  return hasTypeId(value) && value.typeId === BOOL_TYPE_ID;
+}
+
+function hasArrowIndexType(value: unknown): value is { readonly __arrow_index_type: IntType } {
+  return typeof value === 'object' && value !== null && '__arrow_index_type' in value;
+}
+
+function makeColumn(data: DictionaryColumnData): Column<unknown>;
+function makeColumn(data: Utf8ColumnData): Column<unknown>;
+function makeColumn(data: BoolColumnData): Column<unknown>;
+function makeColumn(data: GenericColumnData): Column<unknown>;
+function makeColumn(data: DictionaryColumnData | Utf8ColumnData | BoolColumnData | GenericColumnData): Column<unknown> {
   const validity = data.validity ?? EMPTY_VALIDITY;
 
-  if (data.dict) {
-    const dictType = data.type as ReturnType<typeof dictionary>;
-    const batch = new (batchType(dictType))({
-      type: dictType,
+  if ('dict' in data) {
+    const batch = new (batchType(data.type))({
+      type: data.type,
       length: data.length,
       nullCount: data.nullCount,
       validity,
       values: data.values,
-    }) as { setDictionary(col: Column<unknown>): void };
+    });
     batch.setDictionary(data.dict);
-    return new Column([batch as never]);
+    return new Column([batch]);
   }
 
-  if (data.offsets) {
-    const utf8Type = data.type as ReturnType<typeof utf8>;
-    const batch = new (batchType(utf8Type))({
-      type: utf8Type,
+  if ('offsets' in data) {
+    const batch = new (batchType(data.type))({
+      type: data.type,
       length: data.length,
       nullCount: data.nullCount,
       validity,
@@ -77,9 +97,8 @@ function makeColumn(data: {
   }
 
   if (isBoolType(data.type)) {
-    const boolType = data.type as ReturnType<typeof bool>;
-    const batch = new (batchType(boolType))({
-      type: boolType,
+    const batch = new (batchType(data.type))({
+      type: data.type,
       length: data.length,
       nullCount: data.nullCount,
       validity,
@@ -88,7 +107,7 @@ function makeColumn(data: {
     return new Column([batch]);
   }
 
-  const batch = new (batchType(data.type as never))({
+  const batch = new (batchType(data.type))({
     type: data.type,
     length: data.length,
     nullCount: data.nullCount,
@@ -374,8 +393,7 @@ export function createCapacityStatsTable(
 
     let idxType: IntType = uint8();
     if (lmaoType === 'enum') {
-      const meta = fieldSchema as { __arrow_index_type?: unknown };
-      idxType = (meta.__arrow_index_type as IntType) ?? uint8();
+      idxType = hasArrowIndexType(fieldSchema) ? fieldSchema.__arrow_index_type : uint8();
     }
     const dictType = dictionary(utf8(), idxType);
     append(

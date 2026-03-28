@@ -45,12 +45,12 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
    * Cache of SpanBuffer classes per schema.
    * Populated lazily on first buffer creation.
    */
-  private spanBufferClassCache = new WeakMap<T, SpanBufferConstructor>();
+  private spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
 
   /**
    * Get or create SpanBuffer class for a schema.
    */
-  private getSpanBufferClassForSchema(schema: T): SpanBufferConstructor {
+  private getSpanBufferClassForSchema(schema: LogSchema): SpanBufferConstructor {
     let cached = this.spanBufferClassCache.get(schema);
     if (!cached) {
       cached = getSpanBufferClass(schema);
@@ -71,7 +71,7 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
     schema?: T,
   ): SpanBuffer<T> {
     // Use provided schema (for cross-library calls) or parent's schema
-    const childSchema = schema ?? (parentBuffer._logSchema as T);
+    const childSchema = schema ?? parentBuffer._logSchema;
     const SpanBufferClass = this.getSpanBufferClassForSchema(childSchema);
     return createChildSpanBufferImpl(parentBuffer, SpanBufferClass, callsiteMetadata, opMetadata, capacity);
   }
@@ -82,7 +82,7 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
 
   toArrowTable(buffer: AnySpanBuffer): Table {
     // Uses existing tree conversion with shared dictionaries
-    return convertSpanTreeToArrowTable(buffer) as unknown as Table;
+    return convertSpanTreeToArrowTable(buffer);
   }
 
   releaseBuffer(_buffer: AnySpanBuffer): void {

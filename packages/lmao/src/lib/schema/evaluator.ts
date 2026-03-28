@@ -1,10 +1,5 @@
 import type { Schema, SchemaWithMetadata } from '@smoothbricks/arrow-builder';
-import {
-  createEvaluatorClass,
-  type GeneratedEvaluatorBase,
-  type GeneratedEvaluatorInstance,
-  typeGeneratedEvaluator,
-} from '../codegen/evaluatorGenerator.js';
+import { createEvaluatorClass, type GeneratedEvaluatorInstance } from '../codegen/evaluatorGenerator.js';
 import type { FluentLogEntry } from '../codegen/spanLoggerGenerator.js';
 import type { OpContext } from '../opContext/types.js';
 import type { SpanContext } from '../spanContext.js';
@@ -28,8 +23,12 @@ interface ExtendedFlagSchema extends Omit<SchemaWithMetadata, '__schema_type'> {
  * For feature flags the types are limited (string, number, boolean, enum, bigint).
  * Schemas with __refiner (from refine()) invoke the refiner — on failure, return default.
  * Schemas with __enum_values check membership.
+ *
+ * The runtime guard only knows the schema metadata, so the implementation returns
+ * `unknown` and lets the overloads carry the caller's concrete schema type.
  */
-function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T): T {
+function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T): T;
+function validateFlagValue(value: unknown, schema: Schema<unknown>, defaultValue: unknown): unknown {
   const meta = schema as ExtendedFlagSchema;
 
   // Handle refine() schemas — invoke the stored refiner, fall back to default on failure
@@ -39,7 +38,7 @@ function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T
         fail(msg: string): never {
           throw new Error(msg);
         },
-      }) as T;
+      });
     } catch {
       return defaultValue;
     }
@@ -47,21 +46,21 @@ function validateFlagValue<T>(value: unknown, schema: Schema<T>, defaultValue: T
 
   switch (meta.__schema_type) {
     case 'number':
-      return typeof value === 'number' ? (value as T) : defaultValue;
+      return typeof value === 'number' ? value : defaultValue;
     case 'boolean':
-      return typeof value === 'boolean' ? (value as T) : defaultValue;
+      return typeof value === 'boolean' ? value : defaultValue;
     case 'text':
     case 'category':
-      return typeof value === 'string' ? (value as T) : defaultValue;
+      return typeof value === 'string' ? value : defaultValue;
     case 'enum':
       if (typeof value !== 'string') return defaultValue;
       if (meta.__enum_values && !meta.__enum_values.includes(value)) return defaultValue;
-      return value as T;
+      return value;
     case 'bigUint64':
-      return typeof value === 'bigint' ? (value as T) : defaultValue;
+      return typeof value === 'bigint' ? value : defaultValue;
     case 'key':
       // Key schema in feature flags — validate it's a string
-      return typeof value === 'string' ? (value as T) : defaultValue;
+      return typeof value === 'string' ? value : defaultValue;
     default:
       // Unknown schema type — reject by returning the default value.
       // This prevents silently accepting invalid data for unhandled schema types.
@@ -253,9 +252,9 @@ export type InferFeatureFlagsWithContext<Ctx extends OpContext> = Ctx['flags'] e
 function getOrCreateEvaluatorClass<Ctx extends OpContext>(
   schema: Ctx['flags'],
 ): new (
-  spanContext: SpanContext<Ctx>,
+  spanContext: SpanContextWithoutFf<Ctx>,
   evaluator: FlagEvaluator<Ctx>,
-) => GeneratedEvaluatorBase<Ctx> {
+) => GeneratedEvaluatorInstance<Ctx> {
   return createEvaluatorClass(schema, validateFlagValue, ENTRY_TYPE_FF_ACCESS);
 }
 
@@ -346,11 +345,11 @@ export abstract class FeatureFlagEvaluator<Ctx extends OpContext = OpContext> {
  */
 export function createFeatureFlagEvaluator<Ctx extends OpContext>(
   schema: Ctx['flags'],
-  spanContext: SpanContext<Ctx>,
+  spanContext: SpanContextWithoutFf<Ctx>,
   evaluator: FlagEvaluator<Ctx>,
 ): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx> {
   const GeneratedClass = getOrCreateEvaluatorClass<Ctx>(schema);
-  const instance: GeneratedEvaluatorInstance<Ctx> = typeGeneratedEvaluator(new GeneratedClass(spanContext, evaluator));
+  const instance: GeneratedEvaluatorInstance<Ctx> = new GeneratedClass(spanContext, evaluator);
   return instance;
 }
 
@@ -400,6 +399,6 @@ export class InMemoryFlagEvaluator<Ctx extends OpContext = OpContext> implements
    * The generated class has typed getters (ff.darkMode) and calls this.getSync(ctx, flag).
    */
   forContext(ctx: SpanContextWithoutFf<Ctx>): FeatureFlagEvaluator<Ctx> & InferFeatureFlagsWithContext<Ctx> {
-    return createFeatureFlagEvaluator(this.ffSchema, ctx as SpanContext<Ctx>, this);
+    return createFeatureFlagEvaluator(this.ffSchema, ctx, this);
   }
 }

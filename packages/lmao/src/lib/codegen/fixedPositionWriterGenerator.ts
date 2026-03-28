@@ -94,6 +94,22 @@ export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
   [K in keyof InferSchema<T>]: (value: InferSchema<T>[K]) => ResultWriter<T, R, E>;
 };
 
+type TagWriterConstructor<T extends LogSchema> = new (buffer: AnySpanBuffer) => TagWriter<T>;
+
+type ResultWriterConstructor<T extends LogSchema> = new <R = unknown, E = unknown>(
+  buffer: AnySpanBuffer,
+  resultOrError: unknown,
+  isError: boolean,
+) => ResultWriter<T, R, E>;
+
+function isTagWriterConstructor<T extends LogSchema>(value: unknown): value is TagWriterConstructor<T> {
+  return typeof value === 'function';
+}
+
+function isResultWriterConstructor<T extends LogSchema>(value: unknown): value is ResultWriterConstructor<T> {
+  return typeof value === 'function';
+}
+
 /**
  * Generate enum value mapping code.
  * Creates a switch-case statement for compile-time enum mapping.
@@ -258,19 +274,12 @@ ${extensionMethods}
  * Cache for TagWriter classes (position 0).
  * WeakMap allows garbage collection when schema is no longer referenced.
  */
-const tagWriterClassCache = new WeakMap<LogSchema, new (buffer: AnySpanBuffer) => TagWriter<LogSchema>>();
+const tagWriterClassCache = new WeakMap<LogSchema, unknown>();
 
 /**
  * Cache for ResultWriter classes (position 1).
  */
-const resultWriterClassCache = new WeakMap<
-  LogSchema,
-  new (
-    buffer: AnySpanBuffer,
-    result: unknown,
-    isError: boolean,
-  ) => ResultWriter<LogSchema>
->();
+const resultWriterClassCache = new WeakMap<LogSchema, unknown>();
 
 // ============================================================================
 // TagWriter API
@@ -297,20 +306,21 @@ export function getTagWriterClass<T extends LogSchema>(schema: T): new (buffer: 
     const classCode = generateTagWriterClass(schema).trim();
 
     // Compile with new Function()
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-    const factory = new Function('helpers', classCode) as (
-      helpers: typeof bufferHelpers,
-    ) => new (
-      buffer: AnySpanBuffer,
-    ) => TagWriter<LogSchema>;
-
+    const factory = new Function('helpers', classCode);
     WriterClass = factory(bufferHelpers);
+
+    if (!isTagWriterConstructor<LogSchema>(WriterClass)) {
+      throw new Error('Failed to generate TagWriter constructor');
+    }
+
     tagWriterClassCache.set(schema, WriterClass);
   }
 
-  return WriterClass as new (
-    buffer: AnySpanBuffer,
-  ) => TagWriter<T>;
+  if (!isTagWriterConstructor<T>(WriterClass)) {
+    throw new Error('Invalid cached TagWriter constructor');
+  }
+
+  return WriterClass;
 }
 
 /**
@@ -365,35 +375,32 @@ export function generateResultWriterClass(schema: LogSchema): string {
  */
 export function getResultWriterClass<T extends LogSchema>(
   schema: T,
-): new (
+): new <R = unknown, E = unknown>(
   buffer: AnySpanBuffer,
   resultOrError: unknown,
   isError: boolean,
-) => ResultWriter<T> {
+) => ResultWriter<T, R, E> {
   let WriterClass = resultWriterClassCache.get(schema);
 
   if (!WriterClass) {
     const classCode = generateResultWriterClass(schema).trim();
 
     // Compile with new Function()
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-    const factory = new Function('helpers', classCode) as (
-      helpers: typeof bufferHelpers,
-    ) => new (
-      buffer: AnySpanBuffer,
-      resultOrError: unknown,
-      isError: boolean,
-    ) => ResultWriter<LogSchema>;
-
+    const factory = new Function('helpers', classCode);
     WriterClass = factory(bufferHelpers);
+
+    if (!isResultWriterConstructor<LogSchema>(WriterClass)) {
+      throw new Error('Failed to generate ResultWriter constructor');
+    }
+
     resultWriterClassCache.set(schema, WriterClass);
   }
 
-  return WriterClass as new (
-    buffer: AnySpanBuffer,
-    resultOrError: unknown,
-    isError: boolean,
-  ) => ResultWriter<T>;
+  if (!isResultWriterConstructor<T>(WriterClass)) {
+    throw new Error('Invalid cached ResultWriter constructor');
+  }
+
+  return WriterClass;
 }
 
 /**
@@ -412,5 +419,5 @@ export function createResultWriter<T extends LogSchema, R = unknown, E = unknown
   isError: boolean,
 ): ResultWriter<T, R, E> {
   const WriterClass = getResultWriterClass(schema);
-  return new WriterClass(buffer, resultOrError, isError) as ResultWriter<T, R, E>;
+  return new WriterClass(buffer, resultOrError, isError);
 }

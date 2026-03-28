@@ -120,39 +120,34 @@ export interface TransientConstructorVoid<C extends string> extends TaggedErrorC
  * }
  * ```
  */
-export function Transient<D = void, C extends string = string>(
+export function Transient<C extends string>(code: C, defaultPolicy: RetryPolicy): TransientConstructorVoid<C>;
+export function Transient<_D extends void, C extends string = string>(
   code: C,
   defaultPolicy: RetryPolicy,
-): D extends void ? TransientConstructorVoid<C> : TransientConstructor<C, D> {
-  // Constructor function - handles both void and data cases
-  const fn = (dataOrOverride?: D | Partial<RetryPolicy>, maybeOverride?: Partial<RetryPolicy>) => {
-    // Determine if first arg is data or policy override (for void case)
-    let data: D;
-    let override: Partial<RetryPolicy> | undefined;
+): TransientConstructorVoid<C>;
+export function Transient<D, C extends string = string>(
+  code: C,
+  defaultPolicy: RetryPolicy,
+): TransientConstructor<C, D>;
+export function Transient(
+  code: string,
+  defaultPolicy: RetryPolicy,
+): TransientConstructorVoid<string> | TransientConstructor<string, unknown> {
+  function createTransientError(policyOverride?: Partial<RetryPolicy>): TransientError<string, void>;
+  function createTransientError(data: unknown, policyOverride?: Partial<RetryPolicy>): TransientError<string, unknown>;
+  function createTransientError(dataOrOverride?: unknown, maybeOverride?: Partial<RetryPolicy>) {
+    const override =
+      maybeOverride !== undefined ? maybeOverride : isRetryPolicyLike(dataOrOverride) ? dataOrOverride : undefined;
 
-    if (maybeOverride !== undefined) {
-      // Two args: data and override
-      data = dataOrOverride as D;
-      override = maybeOverride;
-    } else if (dataOrOverride !== undefined && isRetryPolicyLike(dataOrOverride)) {
-      // Single arg that looks like policy override (void data case)
-      data = undefined as D;
-      override = dataOrOverride as Partial<RetryPolicy>;
-    } else {
-      // Single arg is data (or undefined for void)
-      data = dataOrOverride as D;
-      override = undefined;
-    }
-
+    const data = maybeOverride !== undefined || override !== undefined ? undefined : dataOrOverride;
     const mergedPolicy = mergePolicy(defaultPolicy, override);
     return new TransientError(code, data, mergedPolicy);
-  };
+  }
 
-  // Static properties
-  Object.defineProperty(fn, '_tag', { value: code, writable: false, enumerable: true });
-  Object.defineProperty(fn, 'defaultPolicy', { value: defaultPolicy, writable: false, enumerable: true });
-
-  return fn as D extends void ? TransientConstructorVoid<C> : TransientConstructor<C, D>;
+  return Object.assign(createTransientError, {
+    _tag: code,
+    defaultPolicy,
+  });
 }
 
 /**
