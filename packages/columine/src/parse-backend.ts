@@ -79,6 +79,39 @@ export interface EventProcessorWasmExports {
   ): number;
 }
 
+function isWasmFunction<T extends (...args: never[]) => unknown>(value: unknown): value is T {
+  return typeof value === 'function';
+}
+
+function parseEventProcessorWasmExports(exports: WebAssembly.Instance['exports']): EventProcessorWasmExports {
+  const memory = exports.memory;
+  const epVersion = exports.ep_version;
+  const epCreateWithSchema = exports.ep_create_with_schema;
+  const epCreateWithSchemaAndNames = exports.ep_create_with_schema_and_names;
+  const epDestroy = exports.ep_destroy;
+  const epCreateLogEntry = exports.ep_create_log_entry;
+
+  if (
+    !(memory instanceof WebAssembly.Memory) ||
+    !isWasmFunction<EventProcessorWasmExports['ep_version']>(epVersion) ||
+    !isWasmFunction<EventProcessorWasmExports['ep_create_with_schema']>(epCreateWithSchema) ||
+    !isWasmFunction<EventProcessorWasmExports['ep_create_with_schema_and_names']>(epCreateWithSchemaAndNames) ||
+    !isWasmFunction<EventProcessorWasmExports['ep_destroy']>(epDestroy) ||
+    !isWasmFunction<EventProcessorWasmExports['ep_create_log_entry']>(epCreateLogEntry)
+  ) {
+    throw new Error('event_processor.wasm missing expected exports');
+  }
+
+  return {
+    memory,
+    ep_version: epVersion,
+    ep_create_with_schema: epCreateWithSchema,
+    ep_create_with_schema_and_names: epCreateWithSchemaAndNames,
+    ep_destroy: epDestroy,
+    ep_create_log_entry: epCreateLogEntry,
+  };
+}
+
 // =============================================================================
 // WASM Memory Layout Constants
 // =============================================================================
@@ -422,7 +455,7 @@ export async function loadParseBackend(wasmPath?: string | URL): Promise<ParseCo
   const wasmModule = await WebAssembly.compile(wasmBytes);
   // event_processor exports its own memory — no imports needed
   const instance = await WebAssembly.instantiate(wasmModule, {});
-  const exports = instance.exports as unknown as EventProcessorWasmExports;
+  const exports = parseEventProcessorWasmExports(instance.exports);
 
   return createParseCompactWasmBackend(exports);
 }

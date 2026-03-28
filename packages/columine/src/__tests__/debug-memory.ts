@@ -6,19 +6,24 @@ type DebugVmExports = {
   vm_debug_undo_entries_addr: () => number;
 };
 
+function isWasmFunction<T extends (...args: never[]) => unknown>(value: unknown): value is T {
+  return typeof value === 'function';
+}
+
 function getDebugVmExports(instance: WebAssembly.Instance): DebugVmExports {
   const exports = instance.exports as {
     vm_debug_shadow_addr?: unknown;
     vm_debug_undo_entries_addr?: unknown;
   };
-  if (typeof exports.vm_debug_shadow_addr !== 'function' || typeof exports.vm_debug_undo_entries_addr !== 'function') {
+  if (
+    !isWasmFunction<DebugVmExports['vm_debug_shadow_addr']>(exports.vm_debug_shadow_addr) ||
+    !isWasmFunction<DebugVmExports['vm_debug_undo_entries_addr']>(exports.vm_debug_undo_entries_addr)
+  ) {
     throw new Error('WASM module missing debug memory exports');
   }
-  const shadowAddr = exports.vm_debug_shadow_addr as () => number;
-  const undoEntriesAddr = exports.vm_debug_undo_entries_addr as () => number;
   return {
-    vm_debug_shadow_addr: shadowAddr,
-    vm_debug_undo_entries_addr: undoEntriesAddr,
+    vm_debug_shadow_addr: exports.vm_debug_shadow_addr,
+    vm_debug_undo_entries_addr: exports.vm_debug_undo_entries_addr,
   };
 }
 

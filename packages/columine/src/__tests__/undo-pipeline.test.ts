@@ -107,11 +107,10 @@ function buildProgram(opts: {
 }
 
 function getUndoPosition(token: unknown): number {
-  const maybe = token as { position?: unknown };
-  if (typeof maybe.position !== 'number') {
+  if (typeof token !== 'object' || token === null || !('position' in token) || typeof token.position !== 'number') {
     throw new Error('invariant: undo token missing numeric position');
   }
-  return maybe.position;
+  return token.position;
 }
 
 // =============================================================================

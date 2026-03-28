@@ -114,6 +114,114 @@ interface WasmInstance {
   inputRegionOffset: number;
 }
 
+function isWasmFunction<T extends (...args: never[]) => unknown>(value: unknown): value is T {
+  return typeof value === 'function';
+}
+
+function parseVmExports(exports: WebAssembly.Instance['exports']): VmExports {
+  const calculateStateSize = exports.vm_calculate_state_size;
+  const initState = exports.vm_init_state;
+  const resetState = exports.vm_reset_state;
+  const executeBatch = exports.vm_execute_batch;
+  const executeBatchDelta = exports.vm_execute_batch_delta;
+  const mapGet = exports.vm_map_get;
+  const setContains = exports.vm_set_contains;
+  const undoEnable = exports.vm_undo_enable;
+  const undoCheckpoint = exports.vm_undo_checkpoint;
+  const undoRollback = exports.vm_undo_rollback;
+  const undoCommit = exports.vm_undo_commit;
+  const undoHasOverflow = exports.vm_undo_has_overflow;
+  const deltaExportSegment = exports.vm_delta_export_segment;
+  const deltaExportUndoPtr = exports.vm_delta_export_undo_ptr;
+  const deltaExportRedoPtr = exports.vm_delta_export_redo_ptr;
+  const deltaExportLenBytes = exports.vm_delta_export_len_bytes;
+  const deltaExportEntrySize = exports.vm_delta_export_entry_size;
+  const deltaExportOverflow = exports.vm_delta_export_overflow;
+  const deltaApplyRollbackSegment = exports.vm_delta_apply_rollback_segment;
+  const deltaApplyRollforwardSegment = exports.vm_delta_apply_rollforward_segment;
+
+  if (
+    !isWasmFunction<VmExports['vm_calculate_state_size']>(calculateStateSize) ||
+    !isWasmFunction<VmExports['vm_init_state']>(initState) ||
+    !isWasmFunction<VmExports['vm_reset_state']>(resetState) ||
+    !isWasmFunction<VmExports['vm_execute_batch']>(executeBatch) ||
+    !isWasmFunction<VmExports['vm_execute_batch_delta']>(executeBatchDelta) ||
+    !isWasmFunction<VmExports['vm_map_get']>(mapGet) ||
+    !isWasmFunction<VmExports['vm_set_contains']>(setContains) ||
+    !isWasmFunction<VmExports['vm_undo_enable']>(undoEnable) ||
+    !isWasmFunction<VmExports['vm_undo_checkpoint']>(undoCheckpoint) ||
+    !isWasmFunction<VmExports['vm_undo_rollback']>(undoRollback) ||
+    !isWasmFunction<VmExports['vm_undo_commit']>(undoCommit) ||
+    !isWasmFunction<VmExports['vm_undo_has_overflow']>(undoHasOverflow) ||
+    !isWasmFunction<VmExports['vm_delta_export_segment']>(deltaExportSegment) ||
+    !isWasmFunction<VmExports['vm_delta_export_undo_ptr']>(deltaExportUndoPtr) ||
+    !isWasmFunction<VmExports['vm_delta_export_redo_ptr']>(deltaExportRedoPtr) ||
+    !isWasmFunction<VmExports['vm_delta_export_len_bytes']>(deltaExportLenBytes) ||
+    !isWasmFunction<VmExports['vm_delta_export_entry_size']>(deltaExportEntrySize) ||
+    !isWasmFunction<VmExports['vm_delta_export_overflow']>(deltaExportOverflow) ||
+    !isWasmFunction<VmExports['vm_delta_apply_rollback_segment']>(deltaApplyRollbackSegment) ||
+    !isWasmFunction<VmExports['vm_delta_apply_rollforward_segment']>(deltaApplyRollforwardSegment)
+  ) {
+    throw new Error('WASM module missing VM exports');
+  }
+
+  return {
+    vm_calculate_state_size: calculateStateSize,
+    vm_init_state: initState,
+    vm_reset_state: resetState,
+    vm_execute_batch: executeBatch,
+    vm_execute_batch_delta: executeBatchDelta,
+    vm_map_get: mapGet,
+    vm_set_contains: setContains,
+    vm_undo_enable: undoEnable,
+    vm_undo_checkpoint: undoCheckpoint,
+    vm_undo_rollback: undoRollback,
+    vm_undo_commit: undoCommit,
+    vm_undo_has_overflow: undoHasOverflow,
+    vm_delta_export_segment: deltaExportSegment,
+    vm_delta_export_undo_ptr: deltaExportUndoPtr,
+    vm_delta_export_redo_ptr: deltaExportRedoPtr,
+    vm_delta_export_len_bytes: deltaExportLenBytes,
+    vm_delta_export_entry_size: deltaExportEntrySize,
+    vm_delta_export_overflow: deltaExportOverflow,
+    vm_delta_apply_rollback_segment: deltaApplyRollbackSegment,
+    vm_delta_apply_rollforward_segment: deltaApplyRollforwardSegment,
+  };
+}
+
+function getExportedMemory(exports: WebAssembly.Instance['exports']): WebAssembly.Memory | null {
+  return exports.memory instanceof WebAssembly.Memory ? exports.memory : null;
+}
+
+function createWasmStateHandle(buffer: ArrayBuffer, size: number): WasmStateHandle {
+  return {
+    _brand: 'ColumineStateHandle',
+    buffer,
+    size,
+  };
+}
+
+function assertWasmStateHandle(state: StateHandle): WasmStateHandle {
+  if (!isWasmStateHandle(state)) {
+    // invariant throw: backend received a foreign or corrupted state handle
+    throw new Error('Invalid Columine state handle for WASM backend');
+  }
+  return state;
+}
+
+function isWasmStateHandle(state: StateHandle): state is WasmStateHandle {
+  return (
+    typeof state === 'object' &&
+    state !== null &&
+    'buffer' in state &&
+    state.buffer instanceof ArrayBuffer &&
+    'size' in state &&
+    typeof state.size === 'number' &&
+    Number.isInteger(state.size) &&
+    state.size >= 0
+  );
+}
+
 function align8(n: number): number {
   return (n + 7) & ~7;
 }
@@ -139,11 +247,11 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     env: { memory: importedMemory },
   });
 
-  const exports = instance.exports as unknown as VmExports;
+  const exports = parseVmExports(instance.exports);
 
   // Use exported memory if the module provides one,
   // otherwise fall back to the imported memory we created above
-  const exportedMemory = instance.exports.memory as WebAssembly.Memory | undefined;
+  const exportedMemory = getExportedMemory(instance.exports);
   const memory = exportedMemory ?? importedMemory;
 
   // Ensure memory is large enough for the layout
@@ -163,7 +271,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     inputRegionOffset: 8 * 1024 * 1024, // 8MB
   };
 
-  return {
+  const backend: ColumineBackend = {
     backend: 'wasm',
 
     async loadProgram(bytecode: Uint8Array): Promise<ReducerProgram> {
@@ -194,15 +302,11 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       const buffer = new ArrayBuffer(stateSize);
       new Uint8Array(buffer).set(wasmU8.subarray(statePtr, statePtr + stateSize));
 
-      return {
-        _brand: 'ColumineStateHandle',
-        buffer,
-        size: stateSize,
-      } as WasmStateHandle;
+      return createWasmStateHandle(buffer, stateSize);
     },
 
     resetState(state: StateHandle, program: ReducerProgram): void {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
 
       // Copy program to WASM memory
@@ -218,7 +322,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     executeBatch(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
       const wasmU32 = new Uint32Array(wasmInstance.memory.buffer);
 
@@ -274,7 +378,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     executeBatchDelta(state: StateHandle, program: ReducerProgram, columns: ColumnInput[], batchLen: number): number {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
       const wasmU32 = new Uint32Array(wasmInstance.memory.buffer);
 
@@ -320,21 +424,21 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     getMapSize(state: StateHandle, _program: ReducerProgram, slot: number): number {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const u32 = new Uint32Array(s.buffer);
       const metaIdx = (STATE_HEADER_SIZE + slot * SLOT_META_SIZE) / 4;
       return u32[metaIdx + 2]; // size field
     },
 
     getSetSize(state: StateHandle, _program: ReducerProgram, slot: number): number {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const u32 = new Uint32Array(s.buffer);
       const metaIdx = (STATE_HEADER_SIZE + slot * SLOT_META_SIZE) / 4;
       return u32[metaIdx + 2];
     },
 
     getAggregateValue(state: StateHandle, _program: ReducerProgram, slot: number): number {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const u8 = new Uint8Array(s.buffer);
       const u32 = new Uint32Array(s.buffer);
       const f64 = new Float64Array(s.buffer);
@@ -353,7 +457,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     mapGet(state: StateHandle, _program: ReducerProgram, slot: number, key: number): number | undefined {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
 
       // Copy state to WASM for lookup
@@ -371,7 +475,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     setContains(state: StateHandle, _program: ReducerProgram, slot: number, elem: number): boolean {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
 
       // Copy state to WASM for lookup
@@ -388,7 +492,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     serialize(state: StateHandle, _program: ReducerProgram): Uint8Array {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       // Return a copy of the JS ArrayBuffer
       return new Uint8Array(s.buffer).slice();
     },
@@ -398,11 +502,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       const buffer = new ArrayBuffer(data.length);
       new Uint8Array(buffer).set(data);
 
-      return {
-        _brand: 'ColumineStateHandle',
-        buffer,
-        size: data.length,
-      } as WasmStateHandle;
+      return createWasmStateHandle(buffer, data.length);
     },
 
     // =========================================================================
@@ -410,7 +510,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     // =========================================================================
 
     undoEnable(state: StateHandle): void {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
       // Copy state INTO WASM so enable can save change flags
       const statePtr = wasmInstance.stateRegionOffset;
@@ -425,7 +525,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     undoRollback(state: StateHandle, checkpointPos: number): void {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const statePtr = wasmInstance.stateRegionOffset;
       // State is already in WASM memory from the last executeBatch
       wasmInstance.exports.vm_undo_rollback(statePtr, checkpointPos);
@@ -444,7 +544,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     deltaExportSegment(state: StateHandle, fromPos: number, toPos: number) {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
       const statePtr = wasmInstance.stateRegionOffset;
       wasmU8.set(new Uint8Array(s.buffer), statePtr);
@@ -461,7 +561,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     deltaApplyRollbackSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
       const statePtr = wasmInstance.stateRegionOffset;
       wasmU8.set(new Uint8Array(s.buffer), statePtr);
@@ -475,7 +575,7 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
     },
 
     deltaApplyRollforwardSegment(state: StateHandle, segment: Uint8Array, entrySize: number): void {
-      const s = state as WasmStateHandle;
+      const s = assertWasmStateHandle(state);
       const wasmU8 = new Uint8Array(wasmInstance.memory.buffer);
       const statePtr = wasmInstance.stateRegionOffset;
       wasmU8.set(new Uint8Array(s.buffer), statePtr);
@@ -487,7 +587,9 @@ export async function createColumineWasmBackend(wasmBytes: BufferSource, memoryP
       const freshU8 = new Uint8Array(wasmInstance.memory.buffer);
       new Uint8Array(s.buffer).set(freshU8.subarray(statePtr, statePtr + s.size));
     },
-  } as ColumineBackend;
+  };
+
+  return backend;
 }
 
 // =============================================================================

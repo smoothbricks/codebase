@@ -152,21 +152,56 @@ interface InternalUndoToken extends UndoToken {
   snapshot: Uint8Array | null;
 }
 
+interface SnapshotStateHandle extends StateHandle {
+  readonly buffer: ArrayBuffer;
+}
+
+function isSnapshotStateHandle(state: StateHandle): state is SnapshotStateHandle {
+  return 'buffer' in state && state.buffer instanceof ArrayBuffer;
+}
+
+function cloneStateSnapshot(state: StateHandle): Uint8Array {
+  if (!isSnapshotStateHandle(state)) {
+    // invariant throw: snapshot fallback only works for raw-buffer state handles
+    throw new Error('Undo fallback requires a state handle backed by an ArrayBuffer');
+  }
+  return new Uint8Array(state.buffer).slice();
+}
+
+function restoreStateSnapshot(state: StateHandle, snapshot: Uint8Array): void {
+  if (!isSnapshotStateHandle(state)) {
+    // invariant throw: snapshot/token does not belong to a raw-buffer state handle
+    throw new Error('Undo fallback requires a state handle backed by an ArrayBuffer');
+  }
+  if (snapshot.length > state.buffer.byteLength) {
+    // invariant throw: snapshot/token does not belong to this state handle
+    throw new Error('Invalid UndoToken: snapshot size exceeds target state buffer');
+  }
+  new Uint8Array(state.buffer).set(snapshot);
+}
+
 function assertInternalUndoToken(token: UndoToken): InternalUndoToken {
-  const internal = token as Partial<InternalUndoToken>;
-  const position = internal.position;
-  if (!Number.isInteger(position) || (position as number) < 0) {
+  if (typeof token !== 'object' || token === null) {
+    // invariant throw: caller passed a non-pipeline token or corrupted token
+    throw new Error('Invalid UndoToken: expected object token');
+  }
+
+  const position = 'position' in token ? token.position : undefined;
+  if (typeof position !== 'number' || !Number.isInteger(position) || position < 0) {
     // invariant throw: caller passed a non-pipeline token or corrupted token
     throw new Error('Invalid UndoToken: missing or invalid checkpoint position');
   }
-  if (internal.snapshot !== null && !(internal.snapshot instanceof Uint8Array) && internal.snapshot !== undefined) {
+
+  const snapshot = 'snapshot' in token ? token.snapshot : undefined;
+  if (snapshot !== null && !(snapshot instanceof Uint8Array) && snapshot !== undefined) {
     // invariant throw: caller passed a non-pipeline token or corrupted token
     throw new Error('Invalid UndoToken: snapshot must be Uint8Array | null');
   }
+
   return {
     _brand: 'UndoToken',
-    position: position as number,
-    snapshot: internal.snapshot ?? null,
+    position,
+    snapshot: snapshot ?? null,
   };
 }
 
@@ -233,19 +268,21 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
         undoBackend.undoEnable(state);
         const position = undoBackend.undoCheckpoint(state);
         // No snapshot needed — overflow is handled lazily inside Zig
-        return {
+        const token: InternalUndoToken = {
           _brand: 'UndoToken',
           position,
           snapshot: null,
-        } as InternalUndoToken;
+        };
+        return token;
       }
       // Fallback path: full snapshot only (no native undo available)
-      const snapshot = backend.serialize(state, {} as ReducerProgram);
-      return {
+      const snapshot = cloneStateSnapshot(state);
+      const token: InternalUndoToken = {
         _brand: 'UndoToken',
         position: 0,
         snapshot,
-      } as InternalUndoToken;
+      };
+      return token;
     },
 
     rollback(state: StateHandle, token: UndoToken): 'ok' | 'overflow' {
@@ -262,13 +299,8 @@ function createUndoStage(backend: ColumineBackend): UndoStage {
 
       // Fallback: restore from snapshot (no native undo)
       if (internal.snapshot) {
-        const stateAny = state as StateHandle & { buffer?: ArrayBuffer; size?: number };
-        if (stateAny.buffer && internal.snapshot.length > 0) {
-          if (internal.snapshot.length > stateAny.buffer.byteLength) {
-            // invariant throw: snapshot/token does not belong to this state handle
-            throw new Error('Invalid UndoToken: snapshot size exceeds target state buffer');
-          }
-          new Uint8Array(stateAny.buffer).set(internal.snapshot);
+        if (internal.snapshot.length > 0) {
+          restoreStateSnapshot(state, internal.snapshot);
         }
       }
       return 'ok';

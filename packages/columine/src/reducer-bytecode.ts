@@ -20,6 +20,60 @@ interface ParsedTtl {
   nextPc: number;
 }
 
+function parseAggType(value: number): AggType {
+  switch (value) {
+    case AggType.SUM:
+    case AggType.COUNT:
+    case AggType.MIN:
+    case AggType.MAX:
+    case AggType.AVG:
+    case AggType.SCALAR_U32:
+    case AggType.SCALAR_F64:
+    case AggType.SCALAR_I64:
+    case AggType.SUM_I64:
+    case AggType.MIN_I64:
+    case AggType.MAX_I64:
+      return value;
+    default:
+      throw new Error(`Invalid program: unknown aggregate type ${value}`);
+  }
+}
+
+function parseStructFieldType(value: number): StructFieldType {
+  switch (value) {
+    case 0:
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+    case 9:
+      return value;
+    default:
+      throw new Error(`Invalid program: unknown struct field type ${value}`);
+  }
+}
+
+function parseTtlStartOf(value: number): TtlStartOf {
+  switch (value) {
+    case 0:
+    case 1:
+    case 2:
+    case 3:
+    case 4:
+    case 5:
+    case 6:
+    case 7:
+    case 8:
+      return value;
+    default:
+      throw new Error(`Invalid program: unknown TTL startOf ${value}`);
+  }
+}
+
 export function parseReducerProgram(bytecode: Uint8Array, defaultCapacity = 1024): ReducerProgram {
   const minLen = PROGRAM_HASH_PREFIX + HEADER_SIZE;
   if (bytecode.length < minLen) {
@@ -90,7 +144,7 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
             slotDefs[slot] = { type: SlotType.BITMAP, capacity, ttl };
             break;
           case SlotType.AGGREGATE:
-            slotDefs[slot] = { type: SlotType.AGGREGATE, aggType: (capLo || AggType.SUM) as AggType };
+            slotDefs[slot] = { type: SlotType.AGGREGATE, aggType: parseAggType(capLo || AggType.SUM) };
             break;
           case SlotType.CONDITION_TREE:
             slotDefs[slot] = { type: SlotType.CONDITION_TREE };
@@ -111,7 +165,7 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
 
         const fieldTypes: StructFieldType[] = [];
         for (let i = 0; i < numFields; i++) {
-          fieldTypes.push(initCode[pc++] as StructFieldType);
+          fieldTypes.push(parseStructFieldType(initCode[pc++]));
         }
 
         const ttlParsed = parseTtlIfPresent(initCode, pc, typeFlags);
@@ -140,11 +194,11 @@ export function parseReducerSlotDefs(initCode: Uint8Array, expectedSlots: number
           const numFields = initCode[pc++];
           const fieldTypes: StructFieldType[] = [];
           for (let i = 0; i < numFields; i++) {
-            fieldTypes.push(initCode[pc++] as StructFieldType);
+            fieldTypes.push(parseStructFieldType(initCode[pc++]));
           }
           slotDefs[slot] = { type: SlotType.ORDERED_LIST, capacity, fieldTypes };
         } else {
-          slotDefs[slot] = { type: SlotType.ORDERED_LIST, capacity, elemType: elemTypeByte as StructFieldType };
+          slotDefs[slot] = { type: SlotType.ORDERED_LIST, capacity, elemType: parseStructFieldType(elemTypeByte) };
         }
         break;
       }
@@ -182,7 +236,7 @@ function parseTtlIfPresent(initCode: Uint8Array, pc: number, typeFlags: number):
       ttlSeconds: view.getFloat32(0, true),
       graceSeconds: view.getFloat32(4, true),
       timestampFieldIndex: view.getUint8(8),
-      startOf: view.getUint8(9) as TtlStartOf,
+      startOf: parseTtlStartOf(view.getUint8(9)),
       hasEvictTrigger: (typeFlags & HAS_EVICT_TRIGGER_FLAG) !== 0,
     },
     nextPc: pc + 10,

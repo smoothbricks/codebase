@@ -9,6 +9,13 @@ import {
   WasmMemoryContractError,
 } from '../wasm-memory-contract.js';
 
+function assertWasmMemoryContractError(error: unknown): WasmMemoryContractError {
+  if (!(error instanceof WasmMemoryContractError)) {
+    throw new Error('expected WasmMemoryContractError');
+  }
+  return error;
+}
+
 describe('wasm-memory-contract', () => {
   it('grows from small initial pages when working set requires it', () => {
     const memory = new WebAssembly.Memory({ initial: 2, maximum: 1024 });
@@ -61,7 +68,7 @@ describe('wasm-memory-contract', () => {
       throw new Error('expected cap error');
     } catch (error) {
       expect(error).toBeInstanceOf(WasmMemoryContractError);
-      const contractError = error as WasmMemoryContractError;
+      const contractError = assertWasmMemoryContractError(error);
       expect(contractError.code).toBe('WASM_MEMORY_CAP_EXCEEDED');
       expect(contractError.message).toContain('cap');
     }
