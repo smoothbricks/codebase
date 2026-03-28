@@ -5,8 +5,15 @@
  * Used for Arrow dictionary columns that require sorted values (enum, category).
  */
 
+declare const sortedArrayBrand: unique symbol;
+
 /** Branded type for arrays that have been sorted */
-export type SortedArray<T> = readonly T[] & { readonly __sorted: true };
+export type SortedArray<T> = readonly T[] & { readonly [sortedArrayBrand]: true };
+
+function brandSortedArray<T>(arr: T[]): SortedArray<T>;
+function brandSortedArray<T>(arr: T[]): readonly T[] {
+  return arr;
+}
 
 /**
  * Sort an array in-place and return it as a branded SortedArray.
@@ -15,7 +22,7 @@ export type SortedArray<T> = readonly T[] & { readonly __sorted: true };
  */
 export function sortInPlace<T>(arr: T[], compare: (a: T, b: T) => number): SortedArray<T> {
   arr.sort(compare);
-  return arr as unknown as SortedArray<T>;
+  return brandSortedArray(arr);
 }
 
 /**

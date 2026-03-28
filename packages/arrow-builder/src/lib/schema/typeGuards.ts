@@ -16,10 +16,42 @@ import type {
   SchemaWithMetadata,
 } from './types.js';
 
-/**
- * Valid schema types
- */
-const SCHEMA_TYPES: readonly SchemaType[] = ['enum', 'category', 'text', 'number', 'boolean', 'bigUint64', 'binary'];
+function isSchemaType(value: unknown): value is SchemaType {
+  return (
+    value === 'enum' ||
+    value === 'category' ||
+    value === 'text' ||
+    value === 'number' ||
+    value === 'boolean' ||
+    value === 'bigUint64' ||
+    value === 'binary'
+  );
+}
+
+function hasReadonlyStringArray<T extends string>(
+  value: { [K in T]?: unknown },
+  key: T,
+): value is { [K in T]: readonly string[] } {
+  return Array.isArray(value[key]) && value[key].every((entry) => typeof entry === 'string');
+}
+
+function hasMaskTransformProperty(
+  value: SchemaWithMetadata & { __mask_transform?: unknown },
+): value is SchemaWithMetadata & { __mask_transform: MaskTransform } {
+  return typeof value.__mask_transform === 'function';
+}
+
+function hasBinaryEncoderProperty(
+  value: SchemaWithMetadata & { __binary_encoder?: unknown },
+): value is SchemaWithMetadata & { __binary_encoder: BinaryEncoder } {
+  return (
+    typeof value.__binary_encoder === 'object' && value.__binary_encoder !== null && 'encode' in value.__binary_encoder
+  );
+}
+
+function hasEnumUtf8(value: { __enum_utf8?: EnumUtf8Precomputed }): value is { __enum_utf8: EnumUtf8Precomputed } {
+  return value.__enum_utf8 !== undefined;
+}
 
 /**
  * Type guard to check if a value is a SchemaWithMetadata
@@ -39,7 +71,7 @@ export function isSchemaWithMetadata(value: unknown): value is SchemaWithMetadat
 
   // __schema_type is optional, but if present must be a valid type
   if ('__schema_type' in obj) {
-    return SCHEMA_TYPES.includes(obj.__schema_type as SchemaType);
+    return isSchemaType(obj.__schema_type);
   }
 
   // If __schema_type is not present, it's still valid (just unknown type)
@@ -55,13 +87,7 @@ export function isEnumSchema(value: unknown): value is LazyEnumSchema | EagerEnu
     return false;
   }
 
-  const obj = value as SchemaWithMetadata;
-
-  return (
-    obj.__schema_type === 'enum' &&
-    '__enum_values' in obj &&
-    Array.isArray((obj as LazyEnumSchema | EagerEnumSchema).__enum_values)
-  );
+  return value.__schema_type === 'enum' && hasReadonlyStringArray(value, '__enum_values');
 }
 
 /**
@@ -94,8 +120,8 @@ export function getEnumValues(value: unknown): readonly string[] | undefined {
  * time (cold path) so Arrow conversion just copies the pre-built dictionary data.
  */
 export function getEnumUtf8(value: unknown): EnumUtf8Precomputed | undefined {
-  if (isEnumSchema(value) && '__enum_utf8' in value) {
-    return (value as LazyEnumSchema | EagerEnumSchema).__enum_utf8;
+  if (isEnumSchema(value) && hasEnumUtf8(value)) {
+    return value.__enum_utf8;
   }
   return undefined;
 }
@@ -109,9 +135,7 @@ export function hasMaskTransform(value: unknown): value is LazyCategorySchema | 
     return false;
   }
 
-  return (
-    '__mask_transform' in value && typeof (value as { __mask_transform?: unknown }).__mask_transform === 'function'
-  );
+  return hasMaskTransformProperty(value);
 }
 
 /**
@@ -120,7 +144,7 @@ export function hasMaskTransform(value: unknown): value is LazyCategorySchema | 
  */
 export function getMaskTransform(value: unknown): MaskTransform | undefined {
   if (hasMaskTransform(value)) {
-    return (value as LazyCategorySchema | LazyTextSchema).__mask_transform;
+    return value.__mask_transform;
   }
   return undefined;
 }
@@ -130,8 +154,8 @@ export function getMaskTransform(value: unknown): MaskTransform | undefined {
  * or if no encoder was provided (raw Uint8Array mode).
  */
 export function getBinaryEncoder(value: unknown): BinaryEncoder | undefined {
-  if (isSchemaWithMetadata(value) && value.__schema_type === 'binary') {
-    return (value as { __binary_encoder?: BinaryEncoder }).__binary_encoder;
+  if (isSchemaWithMetadata(value) && value.__schema_type === 'binary' && hasBinaryEncoderProperty(value)) {
+    return value.__binary_encoder;
   }
   return undefined;
 }

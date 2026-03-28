@@ -358,6 +358,13 @@ ${extensionMethods}
  */
 const writerClassCache = new Map<string, new (buffer: AnyColumnBuffer, ...args: unknown[]) => ColumnWriter>();
 
+function compileColumnWriterFactory(
+  ...args: string[]
+): (...factoryArgs: unknown[]) => new (buffer: AnyColumnBuffer, ...ctorArgs: unknown[]) => ColumnWriter;
+function compileColumnWriterFactory(...args: string[]): Function {
+  return new Function(...args);
+}
+
 /**
  * Create a stable cache key from schema and extension options.
  */
@@ -408,7 +415,14 @@ export function getColumnWriterClass<
 ): new (
   buffer: TBuffer,
   ...args: unknown[]
-) => ColumnWriter<T, TBuffer> & TExtension {
+) => ColumnWriter<T, TBuffer> & TExtension;
+export function getColumnWriterClass(
+  schema: ColumnSchema,
+  extension?: ColumnWriterExtension,
+): new (
+  buffer: AnyColumnBuffer,
+  ...args: unknown[]
+) => ColumnWriter {
   const cacheKey = createCacheKey(schema, extension);
 
   let WriterClass = writerClassCache.get(cacheKey);
@@ -428,23 +442,13 @@ export function getColumnWriterClass<
     }
 
     // Create function that takes dependencies as parameters and returns the class
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-    const factory = new Function(...depNames, classCode) as (
-      ...args: unknown[]
-    ) => new (
-      buffer: AnyColumnBuffer,
-      ...args: unknown[]
-    ) => ColumnWriter;
+    const factory = compileColumnWriterFactory(...depNames, classCode);
     WriterClass = factory(...depValues);
 
     writerClassCache.set(cacheKey, WriterClass);
   }
 
-  // Cast is safe because the generated class has typed setters matching the schema T
-  return WriterClass as unknown as new (
-    buffer: TBuffer,
-    ...args: unknown[]
-  ) => ColumnWriter<T, TBuffer> & TExtension;
+  return WriterClass;
 }
 
 /**
@@ -481,7 +485,13 @@ export function createColumnWriter<
   buffer: TBuffer,
   extension?: ColumnWriterExtension,
   ...constructorArgs: unknown[]
-): ColumnWriter<T, TBuffer> & TExtension {
-  const WriterClass = getColumnWriterClass<T, TExtension, TBuffer>(schema, extension);
+): ColumnWriter<T, TBuffer> & TExtension;
+export function createColumnWriter(
+  schema: ColumnSchema,
+  buffer: AnyColumnBuffer,
+  extension?: ColumnWriterExtension,
+  ...constructorArgs: unknown[]
+): ColumnWriter {
+  const WriterClass = getColumnWriterClass(schema, extension);
   return new WriterClass(buffer, ...constructorArgs);
 }

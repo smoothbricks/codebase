@@ -181,14 +181,14 @@ function createDictionaryDataGeneric(
   const dictColumn = new Column([utf8Batch]) as Column<string>;
 
   const dictionaryType = dictionary(dictionaryValueType, indexType);
-  const dictBatch = new DictBatchCtor({
+  const dictBatch: DictionaryBatchLike = new DictBatchCtor({
     type: dictionaryType,
     length,
     nullCount: nullBitmap ? countNulls(nullBitmap, length) : 0,
     values: indices.subarray(0, length),
     validity: createValidity(length, nullBitmap),
   });
-  attachDictionaryWithoutEagerCache(dictBatch as DictionaryBatchLike, dictColumn);
+  attachDictionaryWithoutEagerCache(dictBatch, dictColumn);
 
   return dictBatch;
 }

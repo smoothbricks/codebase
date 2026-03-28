@@ -430,6 +430,13 @@ return ${className};
  */
 const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => AnyColumnBuffer>();
 
+function compileColumnBufferFactory(
+  ...args: string[]
+): (...factoryArgs: unknown[]) => new (capacity: number, ...ctorArgs: unknown[]) => AnyColumnBuffer;
+function compileColumnBufferFactory(...args: string[]): Function {
+  return new Function(...args);
+}
+
 function createCacheKey(schema: ColumnSchema, extension?: ColumnBufferExtension): string {
   if (!extension) return JSON.stringify(schema.fields);
   const { dependencies: _, ...extensionWithoutDeps } = extension;
@@ -445,7 +452,14 @@ export function getColumnBufferClass<S extends ColumnSchema>(
 ): new (
   capacity: number,
   ...args: unknown[]
-) => ColumnBuffer<S> {
+) => ColumnBuffer<S>;
+export function getColumnBufferClass(
+  schema: ColumnSchema,
+  extension?: ColumnBufferExtension,
+): new (
+  capacity: number,
+  ...args: unknown[]
+) => AnyColumnBuffer {
   const cacheKey = createCacheKey(schema, extension);
   let BufferClass = classCache.get(cacheKey);
 
@@ -462,21 +476,12 @@ export function getColumnBufferClass<S extends ColumnSchema>(
       }
     }
 
-    // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-    const factory = new Function(...depNames, classCode) as (
-      ...args: unknown[]
-    ) => new (
-      capacity: number,
-      ...args: unknown[]
-    ) => AnyColumnBuffer;
+    const factory = compileColumnBufferFactory(...depNames, classCode);
     BufferClass = factory(...depValues);
     classCache.set(cacheKey, BufferClass);
   }
 
-  return BufferClass as unknown as new (
-    capacity: number,
-    ...args: unknown[]
-  ) => ColumnBuffer<S>;
+  return BufferClass;
 }
 
 /**
@@ -484,10 +489,16 @@ export function getColumnBufferClass<S extends ColumnSchema>(
  */
 export function createGeneratedColumnBuffer<S extends ColumnSchema>(
   schema: S,
+  requestedCapacity?: number,
+  extension?: ColumnBufferExtension,
+  ...constructorArgs: unknown[]
+): ColumnBuffer<S>;
+export function createGeneratedColumnBuffer(
+  schema: ColumnSchema,
   requestedCapacity = DEFAULT_BUFFER_CAPACITY,
   extension?: ColumnBufferExtension,
   ...constructorArgs: unknown[]
-): ColumnBuffer<S> {
+): AnyColumnBuffer {
   const BufferClass = getColumnBufferClass(schema, extension);
   return new BufferClass(requestedCapacity, ...constructorArgs);
 }

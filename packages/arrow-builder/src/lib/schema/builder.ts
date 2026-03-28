@@ -18,7 +18,6 @@ import type {
   EagerBigUint64Schema,
   EagerBinarySchema,
   EagerBooleanSchema,
-  EagerBrand,
   EagerCategorySchema,
   EagerEnumSchema,
   EagerNumberSchema,
@@ -27,7 +26,6 @@ import type {
   LazyBigUint64Schema,
   LazyBinarySchema,
   LazyBooleanSchema,
-  LazyBrand,
   LazyCategorySchema,
   LazyEnumSchema,
   LazyNumberSchema,
@@ -35,25 +33,6 @@ import type {
   MaskPreset,
   MaskTransform,
 } from './types.js';
-
-/**
- * Convert a lazy schema to its eager variant by adding __eager: true.
- *
- * The Lazy types carry LazyBrand (__eager?: never) while Eager types carry
- * EagerBrand (__eager: true). A plain spread would produce a contradictory
- * intersection. This helper strips the conflicting __eager via Omit and adds
- * EagerBrand, using a structural chain cast (not `as unknown as`).
- *
- * The E parameter is intentionally unconstrained against L because Eager types
- * may widen some of L's generic properties (e.g. EagerEnumSchema widens
- * __enum_values from the specific tuple T to readonly string[]).
- */
-function toEager<L extends { __schema_type: string }, E>(schema: L): E {
-  const eager = { ...schema, __eager: true as const };
-  // Two-step structural cast: first to the intermediate intersection (which is
-  // sound — we're just adding __eager to the same metadata), then to E.
-  return eager as Omit<L, keyof LazyBrand> & EagerBrand as E;
-}
 
 /**
  * Masking preset implementations
@@ -150,15 +129,104 @@ function precomputeEnumUtf8(values: readonly string[]): EnumUtf8Precomputed {
   return { bytes, concatenated, offsets };
 }
 
-/**
- * Create a fresh schema object with an .eager() chain method.
- * Replaces Object.create(Sury.X) cloning — schema objects are now plain
- * objects with __schema_type metadata; no Sury prototype needed.
- */
-function withEager<L extends { __schema_type: string }, E>(schema: L): L & { eager(): E } {
-  const lazyWithEager = schema as L & { eager(): E };
-  lazyWithEager.eager = (): E => toEager<L, E>(schema);
-  return lazyWithEager;
+function createLazyNumberSchema(): LazyNumberSchema {
+  return {
+    __schema_type: 'number',
+    eager(): EagerNumberSchema {
+      return { __schema_type: 'number', __eager: true };
+    },
+  };
+}
+
+function createLazyBigUint64Schema(): LazyBigUint64Schema {
+  return {
+    __schema_type: 'bigUint64',
+    eager(): EagerBigUint64Schema {
+      return { __schema_type: 'bigUint64', __eager: true };
+    },
+  };
+}
+
+function createLazyBooleanSchema(): LazyBooleanSchema {
+  return {
+    __schema_type: 'boolean',
+    eager(): EagerBooleanSchema {
+      return { __schema_type: 'boolean', __eager: true };
+    },
+  };
+}
+
+function createLazyEnumSchema<T extends string>(
+  values: readonly T[],
+  enumUtf8: EnumUtf8Precomputed,
+  indexArrayCtor: Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor,
+  arrowIndexType: ReturnType<typeof uint8> | ReturnType<typeof uint16> | ReturnType<typeof uint32>,
+): LazyEnumSchema<T> {
+  return {
+    __schema_type: 'enum',
+    __enum_values: values,
+    __enum_utf8: enumUtf8,
+    __index_array_ctor: indexArrayCtor,
+    __arrow_index_type: arrowIndexType,
+    eager(): EagerEnumSchema<T> {
+      return {
+        __schema_type: 'enum',
+        __enum_values: values,
+        __enum_utf8: enumUtf8,
+        __index_array_ctor: indexArrayCtor,
+        __arrow_index_type: arrowIndexType,
+        __eager: true,
+      };
+    },
+  };
+}
+
+function createLazyCategorySchema(maskTransform?: MaskTransform): LazyCategorySchema {
+  return {
+    __schema_type: 'category',
+    __mask_transform: maskTransform,
+    mask(preset: MaskPreset | MaskTransform): LazyCategorySchema {
+      return createLazyCategorySchema(resolveMaskTransform(preset));
+    },
+    eager(): EagerCategorySchema {
+      return {
+        __schema_type: 'category',
+        __mask_transform: maskTransform,
+        __eager: true,
+      };
+    },
+  };
+}
+
+function createLazyBinarySchema<T = Uint8Array>(encoder?: BinaryEncoder): LazyBinarySchema<T> {
+  return {
+    __schema_type: 'binary',
+    __binary_encoder: encoder,
+    eager(): EagerBinarySchema<T> {
+      return {
+        __schema_type: 'binary',
+        __binary_encoder: encoder,
+        __eager: true,
+      };
+    },
+  };
+}
+
+function createLazyTextSchema(maskTransform?: MaskTransform): LazyTextSchema {
+  return {
+    __schema_type: 'text',
+    __mask_transform: maskTransform,
+    mask(preset: MaskPreset | MaskTransform): LazyTextSchema {
+      return createLazyTextSchema(resolveMaskTransform(preset));
+    },
+    eager(): EagerTextSchema {
+      return {
+        __schema_type: 'text',
+        __mask_transform: maskTransform,
+        __eager: true,
+      };
+    },
+  };
 }
 
 /**
@@ -250,21 +318,15 @@ export interface ArrowSchemaBuilder {
  */
 const schemaBuilderImpl: ArrowSchemaBuilder = {
   number: (): LazyNumberSchema => {
-    return withEager<{ __schema_type: 'number' }, EagerNumberSchema>({
-      __schema_type: 'number',
-    }) as LazyNumberSchema;
+    return createLazyNumberSchema();
   },
 
   bigUint64: (): LazyBigUint64Schema => {
-    return withEager<{ __schema_type: 'bigUint64' }, EagerBigUint64Schema>({
-      __schema_type: 'bigUint64',
-    }) as LazyBigUint64Schema;
+    return createLazyBigUint64Schema();
   },
 
   boolean: (): LazyBooleanSchema => {
-    return withEager<{ __schema_type: 'boolean' }, EagerBooleanSchema>({
-      __schema_type: 'boolean',
-    }) as LazyBooleanSchema;
+    return createLazyBooleanSchema();
   },
 
   enum: <T extends readonly string[]>(values: T): LazyEnumSchema<T[number]> => {
@@ -277,62 +339,19 @@ const schemaBuilderImpl: ArrowSchemaBuilder = {
     const indexArrayCtor = uniqueCount <= 255 ? Uint8Array : uniqueCount <= 65535 ? Uint16Array : Uint32Array;
     const arrowIndexType = uniqueCount <= 255 ? uint8() : uniqueCount <= 65535 ? uint16() : uint32();
 
-    const schema = {
-      __schema_type: 'enum' as const,
-      __enum_values: values,
-      __enum_utf8: precomputeEnumUtf8(values),
-      __index_array_ctor: indexArrayCtor,
-      __arrow_index_type: arrowIndexType,
-    };
-
-    return withEager<typeof schema, EagerEnumSchema<T[number]>>(schema) as LazyEnumSchema<T[number]>;
+    return createLazyEnumSchema(values, precomputeEnumUtf8(values), indexArrayCtor, arrowIndexType);
   },
 
   category: (): LazyCategorySchema => {
-    const schema = { __schema_type: 'category' as const } as LazyCategorySchema;
-
-    // Add chainable .mask() method
-    schema.mask = (preset: MaskPreset | MaskTransform): LazyCategorySchema => {
-      const maskedSchema = { ...schema, __mask_transform: resolveMaskTransform(preset) } as LazyCategorySchema;
-      // Preserve mask/eager chainability
-      maskedSchema.mask = schema.mask;
-      maskedSchema.eager = (): EagerCategorySchema => toEager(maskedSchema);
-      return maskedSchema;
-    };
-
-    // Add chainable .eager() method
-    schema.eager = (): EagerCategorySchema => toEager(schema);
-
-    return schema;
+    return createLazyCategorySchema();
   },
 
   binary: (options?: { encoder: BinaryEncoder }): LazyBinarySchema => {
-    const schema = { __schema_type: 'binary' as const } as LazyBinarySchema;
-
-    if (options?.encoder) {
-      (schema as LazyBinarySchema & { __binary_encoder: BinaryEncoder }).__binary_encoder = options.encoder;
-    }
-
-    schema.eager = (): EagerBinarySchema => toEager(schema);
-
-    return schema;
+    return createLazyBinarySchema(options?.encoder);
   },
 
   text: (): LazyTextSchema => {
-    const schema = { __schema_type: 'text' as const } as LazyTextSchema;
-
-    // Add chainable .mask() method
-    schema.mask = (preset: MaskPreset | MaskTransform): LazyTextSchema => {
-      const maskedSchema = { ...schema, __mask_transform: resolveMaskTransform(preset) } as LazyTextSchema;
-      maskedSchema.mask = schema.mask;
-      maskedSchema.eager = (): EagerTextSchema => toEager(maskedSchema);
-      return maskedSchema;
-    };
-
-    // Add chainable .eager() method
-    schema.eager = (): EagerTextSchema => toEager(schema);
-
-    return schema;
+    return createLazyTextSchema();
   },
 
   optional: <T>(schema: Schema<T>): Schema<T | undefined, T | undefined> => {

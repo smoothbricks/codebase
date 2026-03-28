@@ -35,11 +35,11 @@ export type Input<S> = S extends Schema<unknown, infer I> ? I : unknown;
 // Base singleton schemas — plain objects with phantom types, no validation
 // ---------------------------------------------------------------------------
 
-export const string: Schema<string, string> = {} as Schema<string, string>;
-export const number: Schema<number, number> = {} as Schema<number, number>;
-export const boolean: Schema<boolean, boolean> = {} as Schema<boolean, boolean>;
-export const bigint: Schema<bigint, bigint> = {} as Schema<bigint, bigint>;
-export const unknown: Schema<unknown, unknown> = {} as Schema<unknown, unknown>;
+export const string: Schema<string, string> = {};
+export const number: Schema<number, number> = {};
+export const boolean: Schema<boolean, boolean> = {};
+export const bigint: Schema<bigint, bigint> = {};
+export const unknown: Schema<unknown, unknown> = {};
 
 // ---------------------------------------------------------------------------
 // Composition functions — type-level wrappers for schema construction
@@ -53,19 +53,27 @@ export function refine<I, O>(
   _base: Schema<I>,
   refiner: (value: I, fail: { fail(msg: string): never }) => O,
 ): Schema<O, I> {
-  return { __refiner: refiner } as Schema<O, I> & {
+  const refined: Schema<O, I> & {
     __refiner: typeof refiner;
-  };
+  } = { __refiner: refiner };
+  return refined;
 }
 
 /** Create an optional schema wrapper */
 export function optional<T>(schema: Schema<T>): Schema<T | undefined, T | undefined> {
-  return { __optional: true, __inner: schema } as Schema<T | undefined, T | undefined>;
+  const optionalSchema: Schema<T | undefined, T | undefined> & {
+    __optional: true;
+    __inner: Schema<T>;
+  } = { __optional: true, __inner: schema };
+  return optionalSchema;
 }
 
 /** Create a union schema wrapper */
 export function union<T extends readonly [Schema, ...Schema[]]>(
   schemas: T,
 ): Schema<Output<T[number]>, Input<T[number]>> {
-  return { __union: [...schemas] } as Schema<Output<T[number]>, Input<T[number]>>;
+  const unionSchema: Schema<Output<T[number]>, Input<T[number]>> & {
+    __union: [...T];
+  } = { __union: [...schemas] };
+  return unionSchema;
 }

@@ -42,7 +42,14 @@
  * A `number` with a compile-time brand that prevents accidental mixing of time units.
  * The brand is erased at runtime, so there is zero overhead.
  */
-export type Microseconds = number & { readonly _brand: 'Microseconds' };
+declare const microsecondsBrand: unique symbol;
+
+export type Microseconds = number & { readonly [microsecondsBrand]: 'Microseconds' };
+
+function toMicroseconds(value: number): Microseconds;
+function toMicroseconds(value: number): number {
+  return value;
+}
 
 /**
  * Utility functions for working with Microseconds
@@ -63,7 +70,7 @@ export namespace Microseconds {
    * ```
    */
   export function fromMillis(millis: number): Microseconds {
-    return (millis * 1000) as Microseconds;
+    return toMicroseconds(millis * 1000);
   }
 
   /**
@@ -84,7 +91,7 @@ export namespace Microseconds {
    * ```
    */
   export function fromNanos(nanos: bigint): Microseconds {
-    return Number(nanos / 1000n) as Microseconds;
+    return toMicroseconds(Number(nanos / 1000n));
   }
 
   /**
@@ -106,7 +113,7 @@ export namespace Microseconds {
    * ```
    */
   export function unsafe(value: number): Microseconds {
-    return value as Microseconds;
+    return toMicroseconds(value);
   }
 
   /**

@@ -17,8 +17,29 @@
  * @param startIndex - Start index (inclusive)
  * @param endIndex - End index (exclusive)
  */
+type NumericFillValues = Float64Array | Uint8Array | Uint16Array | Uint32Array | Int8Array;
+type FillValues = NumericFillValues | string[];
+
+function isStringValues(values: FillValues): values is string[] {
+  return Array.isArray(values);
+}
+
 export function fillNullSlots(
-  values: Float64Array | Uint8Array | Uint16Array | Uint32Array | Int8Array | string[],
+  values: string[],
+  nullBitmap: Uint8Array,
+  value: string,
+  startIndex: number,
+  endIndex: number,
+): void;
+export function fillNullSlots(
+  values: NumericFillValues,
+  nullBitmap: Uint8Array,
+  value: number,
+  startIndex: number,
+  endIndex: number,
+): void;
+export function fillNullSlots(
+  values: FillValues,
   nullBitmap: Uint8Array,
   value: number | string,
   startIndex: number,
@@ -33,7 +54,17 @@ export function fillNullSlots(
     const bitIdx = i & 7;
     const isNull = (nullBitmap[byteIdx] & (1 << bitIdx)) === 0;
     if (isNull) {
-      (values as (number | string)[])[i] = value;
+      if (isStringValues(values)) {
+        if (typeof value !== 'string') {
+          throw new TypeError('String columns must be filled with string values');
+        }
+        values[i] = value;
+      } else {
+        if (typeof value !== 'number') {
+          throw new TypeError('Numeric columns must be filled with number values');
+        }
+        values[i] = value;
+      }
       nullBitmap[byteIdx] |= 1 << bitIdx; // Mark as valid
     }
   }
@@ -50,7 +81,21 @@ export function fillNullSlots(
  * @param endIndex - End index (exclusive)
  */
 export function fillRangeWithValue(
-  values: Float64Array | Uint8Array | Uint16Array | Uint32Array | Int8Array | string[],
+  values: string[],
+  nullBitmap: Uint8Array,
+  value: string,
+  startIndex: number,
+  endIndex: number,
+): void;
+export function fillRangeWithValue(
+  values: NumericFillValues,
+  nullBitmap: Uint8Array,
+  value: number,
+  startIndex: number,
+  endIndex: number,
+): void;
+export function fillRangeWithValue(
+  values: FillValues,
   nullBitmap: Uint8Array,
   value: number | string,
   startIndex: number,
@@ -58,16 +103,18 @@ export function fillRangeWithValue(
 ): void {
   // For TypedArrays: use fill()
   // For string arrays: loop
-  if (Array.isArray(values)) {
+  if (isStringValues(values)) {
+    if (typeof value !== 'string') {
+      throw new TypeError('String columns must be filled with string values');
+    }
     for (let i = startIndex; i < endIndex; i++) {
-      values[i] = value as string;
+      values[i] = value;
     }
   } else {
-    (values as Float64Array | Uint8Array | Uint16Array | Uint32Array | Int8Array).fill(
-      value as number,
-      startIndex,
-      endIndex,
-    );
+    if (typeof value !== 'number') {
+      throw new TypeError('Numeric columns must be filled with number values');
+    }
+    values.fill(value, startIndex, endIndex);
   }
 
   // Mark range as valid in nullBitmap

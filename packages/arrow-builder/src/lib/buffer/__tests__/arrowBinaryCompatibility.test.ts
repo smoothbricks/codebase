@@ -393,7 +393,12 @@ describe('Arrow IPC Compatibility - Large Datasets', () => {
   });
 
   it('handles large enum dictionary', () => {
-    const enumValues = Array.from({ length: 100 }, (_, i) => `status_${i}`) as [string, ...string[]];
+    const generatedEnumValues = Array.from({ length: 100 }, (_, i) => `status_${i}`);
+    const firstEnumValue = generatedEnumValues[0];
+    if (firstEnumValue === undefined) {
+      throw new Error('Expected non-empty enum values');
+    }
+    const enumValues: [string, ...string[]] = [firstEnumValue, ...generatedEnumValues.slice(1)];
     const schema = new ColumnSchema({ status: S.enum(enumValues) });
     const buffer = createGeneratedColumnBuffer(schema, 256);
 

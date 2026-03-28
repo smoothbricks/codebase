@@ -220,6 +220,7 @@ export type ExposedColumnBuffer<Schema> = ColumnBuffer<Schema> & {
 /**
  * Expose internal column arrays for testing/inspection.
  */
-export function expose<S>(buffer: ColumnBuffer<S>): ExposedColumnBuffer<S> {
-  return buffer as ExposedColumnBuffer<S>;
+export function expose<S>(buffer: ColumnBuffer<S>): ExposedColumnBuffer<S>;
+export function expose<S>(buffer: ColumnBuffer<S>): ColumnBuffer<S> {
+  return buffer;
 }
