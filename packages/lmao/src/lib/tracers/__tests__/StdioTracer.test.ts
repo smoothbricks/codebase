@@ -15,24 +15,27 @@ import { defineOpContext } from '../../defineOpContext.js';
 import { defineCodeError } from '../../result.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
-import { StdioTracer } from '../StdioTracer.js';
+import { StdioTracer, type StdioWritable } from '../StdioTracer.js';
 
 // Error code factory for tests
 const TEST_ERROR = defineCodeError('CODE')<{ message: string }>();
 
-type MockStream = { stream: NodeJS.WriteStream; output: string[] };
+type MockStream = { stream: StdioWritable; output: string[] };
 
 // Create a mock writable stream that captures output
 function createMockStream(): MockStream {
   const output: string[] = [];
-  const stream = new Writable({
+  const writable = new Writable({
     write(chunk, _encoding, callback) {
       output.push(chunk.toString());
       callback();
     },
-  }) as NodeJS.WriteStream;
-  // Add required properties
-  (stream as NodeJS.WriteStream).isTTY = false;
+  });
+  const stream: StdioWritable = {
+    write(chunk: string): boolean {
+      return writable.write(chunk);
+    },
+  };
   return { stream, output };
 }
 

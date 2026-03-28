@@ -4,10 +4,13 @@ import type { SpanBuffer } from '../types.js';
 
 type MaybeClose = { close?: () => void | Promise<void> };
 
-export interface CompositeTracerOptions<
-  T extends import('../schema/LogSchema.js').LogSchema = import('../schema/LogSchema.js').LogSchema,
-> extends TracerOptions<T> {
-  delegates: Tracer[];
+function hasClose(value: unknown): value is MaybeClose {
+  return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'close') === 'function';
+}
+
+export interface CompositeTracerOptions<B extends OpContextBinding = OpContextBinding>
+  extends TracerOptions<B['logBinding']['logSchema']> {
+  delegates: Tracer<B>[];
 }
 
 /**
@@ -19,9 +22,9 @@ export interface CompositeTracerOptions<
 export class CompositeTracer<B extends OpContextBinding = OpContextBinding> extends Tracer<B> {
   private readonly delegates: Tracer<B>[];
 
-  constructor(binding: B, options: CompositeTracerOptions<B['logBinding']['logSchema']>) {
+  constructor(binding: B, options: CompositeTracerOptions<B>) {
     super(binding, options);
-    this.delegates = options.delegates as Tracer<B>[];
+    this.delegates = options.delegates;
   }
 
   onTraceStart(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
@@ -62,9 +65,11 @@ export class CompositeTracer<B extends OpContextBinding = OpContextBinding> exte
 
   async close(): Promise<void> {
     for (const tracer of this.delegates) {
-      const close = (tracer as MaybeClose).close;
-      if (typeof close === 'function') {
-        await close.call(tracer);
+      if (hasClose(tracer)) {
+        const { close } = tracer;
+        if (close) {
+          await close.call(tracer);
+        }
       }
     }
   }

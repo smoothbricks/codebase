@@ -9,9 +9,9 @@
  * @module traceRoot.es
  */
 
-import type { Nanoseconds } from '@smoothbricks/arrow-builder';
+import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
-import type { TraceId } from './traceId.js';
+import { createTraceId, type TraceId } from './traceId.js';
 import {
   type ITraceRoot,
   TRACE_ROOT_ANCHOR_EPOCH_OFFSET,
@@ -91,7 +91,7 @@ export class TraceRoot implements ITraceRoot {
    */
   get trace_id(): TraceId {
     const len = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_LEN_OFFSET, 1)[0];
-    return textDecoder.decode(new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, len)) as TraceId;
+    return createTraceId(textDecoder.decode(new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, len)));
   }
 
   /**
@@ -102,7 +102,7 @@ export class TraceRoot implements ITraceRoot {
     const elapsedMs = performance.now() - this._perfView[0];
     // Convert to nanoseconds (last 3 digits = 000 due to microsecond precision)
     const elapsedNanos = BigInt(Math.floor(elapsedMs * 1000)) * 1000n;
-    return (this._epochView[0] + elapsedNanos) as Nanoseconds;
+    return Nanoseconds.unsafe(this._epochView[0] + elapsedNanos);
   }
 
   /**
@@ -153,5 +153,5 @@ export class TraceRoot implements ITraceRoot {
 export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks): TraceRoot {
   const anchorEpochNanos = BigInt(Date.now()) * 1_000_000n;
   const anchorPerfNow = performance.now();
-  return new TraceRoot(trace_id as TraceId, anchorEpochNanos, anchorPerfNow, tracer);
+  return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, tracer);
 }

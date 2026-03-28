@@ -49,12 +49,10 @@ function hashDeterministic(value: unknown): string {
 
 function stableSerialize(value: unknown): string {
   if (value === null) return 'null';
-  const t = typeof value;
-  if (t === 'number' || t === 'boolean') return JSON.stringify(value);
-  if (t === 'string') return JSON.stringify(value);
-  if (t === 'bigint') {
-    const bigintValue = value as bigint;
-    return `"${bigintValue.toString()}n"`;
+  if (typeof value === 'number' || typeof value === 'boolean') return JSON.stringify(value);
+  if (typeof value === 'string') return JSON.stringify(value);
+  if (typeof value === 'bigint') {
+    return `"${value.toString()}n"`;
   }
   if (Array.isArray(value)) {
     return `[${value.map((item) => stableSerialize(item)).join(',')}]`;

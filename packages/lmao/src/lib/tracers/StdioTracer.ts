@@ -47,6 +47,10 @@ import type { TracerOptions } from '../tracer.js';
 import { Tracer } from '../tracer.js';
 import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 
+export interface StdioWritable {
+  write(chunk: string): boolean;
+}
+
 // ============================================================================
 // Formatting Helpers
 // ============================================================================
@@ -160,8 +164,7 @@ function formatTemplateMessage(buffer: AnySpanBuffer, row: number, template: str
     }
 
     if (ArrayBuffer.isView(values)) {
-      const typed = values as unknown as { [index: number]: unknown };
-      const value = typed[row];
+      const value = Reflect.get(values, row) as unknown;
       return value === null || value === undefined ? `{{${key}}}` : String(value);
     }
 
@@ -180,9 +183,9 @@ export interface StdioTracerOptions<
   T extends import('../schema/LogSchema.js').LogSchema = import('../schema/LogSchema.js').LogSchema,
 > extends TracerOptions<T> {
   /** Output stream (defaults to process.stdout) */
-  out?: NodeJS.WriteStream;
+  out?: StdioWritable;
   /** Error stream (defaults to process.stderr) */
-  err?: NodeJS.WriteStream;
+  err?: StdioWritable;
   /** Enable ANSI colors (defaults to true) */
   colorEnabled?: boolean;
 }
@@ -208,8 +211,8 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
    */
   private readonly indents = new Map<string, number>();
 
-  private readonly out: NodeJS.WriteStream;
-  private readonly err: NodeJS.WriteStream;
+  private readonly out: StdioWritable;
+  private readonly err: StdioWritable;
   private readonly colorEnabled: boolean;
 
   constructor(binding: B, options: StdioTracerOptions<B['logBinding']['logSchema']>) {
@@ -255,7 +258,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     return this.colorEnabled ? RESET : '';
   }
 
-  private printLogRows(buffer: SpanBuffer<B['logBinding']['logSchema']>, indent: number): void {
+  private printLogRows(buffer: AnySpanBuffer, indent: number): void {
     let current: AnySpanBuffer | null = buffer;
     let isRootSegment = true;
 
@@ -291,7 +294,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
   // Lifecycle Hooks
   // --------------------------------------------------------------------------
 
-  onTraceStart(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
+  onTraceStart(rootBuffer: SpanBuffer<B['logBinding']['logSchema']> | AnySpanBuffer): void {
     const traceId = rootBuffer.trace_id;
     const name = rootBuffer.message_values[0];
     const ts = formatTimestamp(rootBuffer.timestamp[0]);
@@ -300,7 +303,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     this.incrementIndent(traceId);
   }
 
-  onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
+  onTraceEnd(rootBuffer: SpanBuffer<B['logBinding']['logSchema']> | AnySpanBuffer): void {
     const traceId = rootBuffer.trace_id;
     this.printLogRows(rootBuffer, 1);
     this.decrementIndent(traceId);
@@ -323,7 +326,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     }
   }
 
-  onSpanStart(childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
+  onSpanStart(childBuffer: SpanBuffer<B['logBinding']['logSchema']> | AnySpanBuffer): void {
     const traceId = childBuffer.trace_id;
     const indent = this.getIndent(traceId);
     const name = childBuffer.message_values[0];
@@ -333,7 +336,7 @@ export class StdioTracer<B extends OpContextBinding = OpContextBinding> extends 
     this.incrementIndent(traceId);
   }
 
-  onSpanEnd(childBuffer: SpanBuffer<B['logBinding']['logSchema']>): void {
+  onSpanEnd(childBuffer: SpanBuffer<B['logBinding']['logSchema']> | AnySpanBuffer): void {
     const traceId = childBuffer.trace_id;
     this.decrementIndent(traceId);
     const indent = this.getIndent(traceId);

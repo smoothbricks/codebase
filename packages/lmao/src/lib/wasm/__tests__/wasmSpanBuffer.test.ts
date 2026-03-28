@@ -24,11 +24,11 @@ function getMethod<TArgs extends unknown[], TResult>(target: object, name: strin
   if (typeof value !== 'function') {
     throw new Error(`expected method '${name}' to exist on test buffer`);
   }
-  return value.bind(target) as (...args: TArgs) => TResult;
+  return (...args: TArgs) => value.call(target, ...args);
 }
 
 function getColumn<T>(target: object, name: string): T {
-  return Reflect.get(target, name) as T;
+  return Reflect.get(target, name);
 }
 
 describe('WasmSpanBuffer', () => {
@@ -442,8 +442,8 @@ describe('WasmSpanBuffer', () => {
 
       // Get custom inspect
       const inspectSymbol = Symbol.for('nodejs.util.inspect.custom');
-      const inspectFn = Reflect.get(buffer as object, inspectSymbol) as (() => string) | undefined;
-      if (!inspectFn) {
+      const inspectFn = Reflect.get(buffer, inspectSymbol);
+      if (typeof inspectFn !== 'function') {
         throw new Error('expected custom inspect function on WasmSpanBuffer');
       }
       const result = inspectFn.call(buffer);

@@ -47,6 +47,7 @@ interface WasmBufferInternals {
 
 /** Cast buffer to access WASM-specific internals */
 function asWasm<T>(buffer: T): T & WasmBufferInternals {
+  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- test helper narrows to the generated WASM-only fields asserted below.
   return buffer as T & WasmBufferInternals;
 }
 

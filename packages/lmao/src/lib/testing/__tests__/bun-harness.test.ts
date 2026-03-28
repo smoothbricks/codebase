@@ -2,48 +2,34 @@ import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
-import { makeBunTestSuiteTracer, makeTestTracer } from '../bun-harness.js';
+import { type BunTestModuleShape, makeBunTestSuiteTracer, makeTestTracer } from '../bun-harness.js';
 
-type BunTestModuleLike = {
-  it: (name: string, fn: () => unknown | Promise<unknown>) => unknown;
-  describe: (name: string, fn: () => void) => unknown;
-  test: (name: string, fn: () => unknown | Promise<unknown>) => unknown;
-};
+type BunTestModuleLike = BunTestModuleShape;
+
+function createImmediateTestFn(): BunTestModuleLike['it'] {
+  const runBase = (_name: string, fn: () => unknown | Promise<unknown>) => fn();
+  return Object.assign(runBase, it, {
+    only: runBase,
+    skipIf: (condition: boolean) => (condition ? it.skip : runBase),
+    if: (condition: boolean) => (condition ? runBase : it.skip),
+  });
+}
+
+function createImmediateDescribeFn(): BunTestModuleLike['describe'] {
+  const runBase = (_name: string, fn: () => void) => fn();
+  return Object.assign(runBase, describe, {
+    only: runBase,
+    skipIf: (condition: boolean) => (condition ? describe.skip : runBase),
+    if: (condition: boolean) => (condition ? runBase : describe.skip),
+  });
+}
 
 function createImmediateIt() {
-  const run = ((_: string, fn: () => unknown | Promise<unknown>) => fn()) as BunTestModuleLike['it'] & {
-    skip: (...args: unknown[]) => unknown;
-    only: BunTestModuleLike['it'];
-    todo: (...args: unknown[]) => unknown;
-    each: unknown;
-    skipIf: (condition: boolean) => unknown;
-    if: (condition: boolean) => unknown;
-  };
-  run.skip = () => undefined;
-  run.only = run;
-  run.todo = () => undefined;
-  run.each = run;
-  run.skipIf = (condition: boolean) => (condition ? run.skip : run);
-  run.if = (condition: boolean) => (condition ? run : run.skip);
-  return run;
+  return createImmediateTestFn();
 }
 
 function createImmediateDescribe() {
-  const run = ((_: string, fn: () => void) => fn()) as BunTestModuleLike['describe'] & {
-    skip: (...args: unknown[]) => unknown;
-    only: BunTestModuleLike['describe'];
-    todo: (...args: unknown[]) => unknown;
-    each: unknown;
-    skipIf: (condition: boolean) => unknown;
-    if: (condition: boolean) => unknown;
-  };
-  run.skip = () => undefined;
-  run.only = run;
-  run.todo = () => undefined;
-  run.each = run;
-  run.skipIf = (condition: boolean) => (condition ? run.skip : run);
-  run.if = (condition: boolean) => (condition ? run : run.skip);
-  return run;
+  return createImmediateDescribeFn();
 }
 
 function createImmediateBunTestModule(): BunTestModuleLike {
@@ -87,7 +73,7 @@ describe('bun harness test log schema extension', () => {
     });
     tracer.setup();
 
-    const wrappedModule = tracer.createBunTestMock(createImmediateBunTestModule()) as BunTestModuleLike;
+    const wrappedModule = tracer.createBunTestMock(createImmediateBunTestModule());
     await wrappedModule.it('writes test-only fields', async () => {
       const span = tracer.useTestSpan();
       span.tag.test_metric(123);

@@ -10,7 +10,7 @@ import {
   ENTRY_TYPE_SPAN_START,
   ENTRY_TYPE_WARN,
 } from '../../schema/systemSchema.js';
-import type { TraceId } from '../../traceId.js';
+import { createTraceId } from '../../traceId.js';
 import type { TracerLifecycleHooks } from '../../traceRoot.js';
 import type { AnySpanBuffer } from '../../types.js';
 import { createWasmAllocator, type WasmAllocator } from '../wasmAllocator.js';
@@ -47,7 +47,7 @@ describe('WasmTraceRoot', () => {
       const traceRoot = createWasmTraceRoot(allocator, 'test-trace-id', mockTracer);
 
       expect(traceRoot._traceRootPtr).toBeGreaterThan(0);
-      expect(traceRoot.trace_id).toBe('test-trace-id' as TraceId);
+      expect(traceRoot.trace_id).toBe(createTraceId('test-trace-id'));
       expect(traceRoot.tracer).toBe(mockTracer);
       expect(traceRoot.allocator).toBe(allocator);
     });

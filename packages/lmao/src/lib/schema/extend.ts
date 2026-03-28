@@ -11,6 +11,12 @@
 import { LogSchema } from './LogSchema.js';
 import type { SchemaFields } from './types.js';
 
+export function extendSchema<T extends SchemaFields, U extends SchemaFields>(
+  base: LogSchema<T>,
+  extension: U,
+): LogSchema<T & U>;
+export function extendSchema<T extends SchemaFields, U extends SchemaFields>(base: T, extension: U): T & U;
+
 /**
  * Merge two log schemas with conflict detection
  *
@@ -31,10 +37,10 @@ import type { SchemaFields } from './types.js';
  * @returns Merged schema
  * @throws Error if field names conflict
  */
-export function extendSchema<T extends LogSchema | SchemaFields, U extends SchemaFields>(
-  base: T,
+export function extendSchema<U extends SchemaFields>(
+  base: LogSchema | SchemaFields,
   extension: U,
-): T extends LogSchema<infer B> ? LogSchema<B & U> : T & U {
+): LogSchema | SchemaFields {
   // Extract base fields (from LogSchema.fields or plain object)
   const baseFields = base instanceof LogSchema ? base.fields : base;
   const baseKeys = new Set(Object.keys(baseFields));
@@ -57,7 +63,7 @@ export function extendSchema<T extends LogSchema | SchemaFields, U extends Schem
 
   // If base was LogSchema, return LogSchema; otherwise return plain object
   if (base instanceof LogSchema) {
-    return new LogSchema(merged) as unknown as T extends LogSchema<infer B> ? LogSchema<B & U> : T & U;
+    return new LogSchema(merged);
   }
-  return merged as unknown as T extends LogSchema<infer B> ? LogSchema<B & U> : T & U;
+  return merged;
 }

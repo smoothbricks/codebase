@@ -26,8 +26,16 @@ import {
   createWasmChildSpanBuffer,
   createWasmOverflowBuffer,
   createWasmSpanBuffer,
+  isWasmSpanBufferInstance,
   type WasmSpanBufferInstance,
 } from './wasmSpanBuffer.js';
+
+function requireWasmSpanBuffer(buffer: AnySpanBuffer): WasmSpanBufferInstance {
+  if (!isWasmSpanBufferInstance(buffer)) {
+    throw new Error('Expected WASM-backed span buffer');
+  }
+  return buffer;
+}
 
 /**
  * Options for WasmBufferStrategy.
@@ -107,6 +115,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       opMetadata, // _callsiteMetadata (same as opMetadata for root)
     );
 
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- generated WASM buffers implement the SpanBuffer contract for the same schema.
     return wasmBuffer as unknown as SpanBuffer<T>;
   }
 
@@ -117,7 +126,7 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
     capacity?: number,
     schema?: T,
   ): SpanBuffer<T> {
-    const wasmParent = parentBuffer as unknown as WasmSpanBufferInstance;
+    const wasmParent = requireWasmSpanBuffer(parentBuffer);
     const effectiveCapacity = capacity ?? wasmParent._capacity;
 
     // Use provided schema (for cross-library calls) or parent's schema
@@ -138,11 +147,12 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       callsiteMetadata, // _callsiteMetadata
     );
 
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- child buffers preserve the requested schema contract.
     return child as unknown as SpanBuffer<T>;
   }
 
   createOverflowBuffer(buffer: SpanBuffer<T>): SpanBuffer<T> {
-    const wasmBuffer = buffer as unknown as WasmSpanBufferInstance;
+    const wasmBuffer = requireWasmSpanBuffer(buffer);
     const overflow = createWasmOverflowBuffer(
       wasmBuffer,
       buffer._traceRoot, // _traceRoot (same as original)
@@ -151,17 +161,18 @@ export class WasmBufferStrategy<T extends LogSchema = LogSchema> implements Buff
       buffer._callsiteMetadata ?? buffer._opMetadata, // _callsiteMetadata (same as original, fallback to opMetadata)
     );
 
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- overflow buffers are schema-compatible continuations of the same span.
     return overflow as unknown as SpanBuffer<T>;
   }
 
   toArrowTable(buffer: AnySpanBuffer): Table {
     // Uses existing tree conversion with shared dictionaries
-    return convertSpanTreeToArrowTable(buffer) as unknown as Table;
+    return convertSpanTreeToArrowTable(buffer);
   }
 
   releaseBuffer(buffer: AnySpanBuffer): void {
     // Walk the span tree and free all WASM memory
-    this.freeSpanTree(buffer as unknown as WasmSpanBufferInstance);
+    this.freeSpanTree(requireWasmSpanBuffer(buffer));
   }
 
   /**

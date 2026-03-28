@@ -253,6 +253,20 @@ export interface ParsedFact {
   raw: TraceFact;
 }
 
+function parseFactNamespace(value: string): FactNamespace {
+  switch (value) {
+    case 'span':
+    case 'log':
+    case 'tag':
+    case 'scope':
+    case 'ff':
+    case 'metric':
+      return value;
+    default:
+      throw new Error(`Unknown fact namespace: ${value}`);
+  }
+}
+
 /**
  * Parse a fact string into its components.
  */
@@ -260,7 +274,7 @@ export function parseFact(fact: TraceFact): ParsedFact {
   const colonIndex = fact.indexOf(':');
   const secondColonIndex = fact.indexOf(':', colonIndex + 1);
 
-  const namespace = fact.slice(0, colonIndex) as FactNamespace;
+  const namespace = parseFactNamespace(fact.slice(0, colonIndex));
   const name = fact.slice(colonIndex + 1, secondColonIndex).trim();
   const content = fact.slice(secondColonIndex + 1).trim();
 
@@ -329,39 +343,43 @@ export interface FactArray extends ReadonlyArray<TraceFact> {
   match(pattern: string): FactArray;
 }
 
-/**
- * Create a FactArray from raw facts.
- */
-export function createFactArray(facts: TraceFact[]): FactArray {
-  const arr = [...facts] as TraceFact[] & FactArray;
+class TraceFactArray extends Array<TraceFact> implements FactArray {
+  constructor(facts: readonly TraceFact[] | number = []) {
+    if (typeof facts === 'number') {
+      super(facts);
+    } else {
+      super();
+      this.push(...facts);
+    }
+    Object.setPrototypeOf(this, TraceFactArray.prototype);
+  }
 
-  arr.has = function (fact: TraceFact): boolean {
+  has(fact: TraceFact): boolean {
     return this.includes(fact);
-  };
+  }
 
-  arr.hasMatch = function (pattern: string): boolean {
+  hasMatch(pattern: string): boolean {
     const regex = patternToRegex(pattern);
-    return this.some((f) => regex.test(f));
-  };
+    return this.some((fact) => regex.test(fact));
+  }
 
-  arr.byNamespace = function <N extends FactNamespace>(namespace: N): FactArray {
-    const filtered = this.filter((f) => f.startsWith(`${namespace}:`));
-    return createFactArray(filtered);
-  };
+  byNamespace<N extends FactNamespace>(namespace: N): FactArray {
+    return new TraceFactArray(this.filter((fact) => fact.startsWith(`${namespace}:`)));
+  }
 
-  arr.spans = function (): SpanFact[] {
+  spans(): SpanFact[] {
     return this.filter(isSpanFact);
-  };
+  }
 
-  arr.logs = function (): LogFact[] {
+  logs(): LogFact[] {
     return this.filter(isLogFact);
-  };
+  }
 
-  arr.tags = function (): TagFact[] {
+  tags(): TagFact[] {
     return this.filter(isTagFact);
-  };
+  }
 
-  arr.hasInOrder = function (expected: TraceFact[]): boolean {
+  hasInOrder(expected: TraceFact[]): boolean {
     let lastIndex = -1;
     for (const fact of expected) {
       const index = this.indexOf(fact);
@@ -371,15 +389,19 @@ export function createFactArray(facts: TraceFact[]): FactArray {
       lastIndex = index;
     }
     return true;
-  };
+  }
 
-  arr.match = function (pattern: string): FactArray {
+  match(pattern: string): FactArray {
     const regex = patternToRegex(pattern);
-    const filtered = this.filter((f) => regex.test(f));
-    return createFactArray(filtered);
-  };
+    return new TraceFactArray(this.filter((fact) => regex.test(fact)));
+  }
+}
 
-  return arr;
+/**
+ * Create a FactArray from raw facts.
+ */
+export function createFactArray(facts: TraceFact[]): FactArray {
+  return new TraceFactArray(facts);
 }
 
 // =============================================================================

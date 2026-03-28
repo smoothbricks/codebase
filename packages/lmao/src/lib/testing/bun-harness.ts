@@ -79,16 +79,15 @@ function writeDescribeTag(tag: unknown, describePath: string | null): void {
     return;
   }
 
-  const record = tag as Record<string, unknown>;
-  const describeWriter = record.describe;
+  const describeWriter = Reflect.get(tag, 'describe');
   if (typeof describeWriter === 'function') {
-    describeWriter.call(record, describePath);
+    describeWriter.call(tag, describePath);
     return;
   }
 
-  const batchWriter = record.with;
+  const batchWriter = Reflect.get(tag, 'with');
   if (typeof batchWriter === 'function') {
-    batchWriter.call(record, { describe: describePath });
+    batchWriter.call(tag, { describe: describePath });
   }
 }
 
@@ -96,6 +95,15 @@ type TestBody = () => unknown | Promise<unknown>;
 type HarnessSpanContext<B extends OpContextBinding> = SpanContext<OpContextOf<B>>;
 type BunTestHarnessBuiltins = { describe: ReturnType<typeof S.category> };
 type HarnessSchema<TExt extends SchemaFields> = BunTestHarnessBuiltins & TExt;
+type BunDescribe = typeof _describe;
+type BunIt = typeof _it;
+
+export interface BunTestModuleShape {
+  describe: BunDescribe;
+  it: BunIt;
+  test: BunIt;
+  [key: string]: unknown;
+}
 
 // WHY: Package-local `nx test` runs Bun from that package directory, so the
 // shared preload must not eagerly import unrelated packages' tracer modules just
@@ -125,24 +133,30 @@ export type BunTestSetupOptions<TExt extends SchemaFields = Record<never, never>
 function buildHarnessSchemaExtensions<TExt extends SchemaFields>(
   binding: OpContextBinding,
   testLogSchema: TExt | undefined,
-): HarnessSchema<TExt> {
-  const extension = {
-    describe: S.category(),
-    ...(testLogSchema ?? ({} as TExt)),
-  } as HarnessSchema<TExt>;
+): SchemaFields {
+  const extensionBase: BunTestHarnessBuiltins = { describe: S.category() };
+  const extension = testLogSchema ? { ...extensionBase, ...testLogSchema } : extensionBase;
 
   const baseColumnNames = new Set(binding.logBinding.logSchema._columnNames);
-  const safeExtension = Object.create(null) as Record<string, unknown>;
+  const safeExtension: SchemaFields = {};
   for (const [fieldName, fieldSchema] of Object.entries(extension)) {
     if (!baseColumnNames.has(fieldName)) {
       safeExtension[fieldName] = fieldSchema;
     }
   }
-  return safeExtension as HarnessSchema<TExt>;
+  return safeExtension;
 }
 
 function isTruthyEnvFlag(value: unknown): boolean {
   return value === true || value === '1' || value === 'true';
+}
+
+function isSchemaFieldsRecord(value: unknown): value is SchemaFields {
+  return typeof value === 'object' && value !== null;
+}
+
+function isOpContextBindingLike(value: unknown): value is OpContextBinding {
+  return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'logBinding') === 'object';
 }
 
 function isVerboseTraceEnabled(explicitVerbose: boolean | undefined): boolean {
@@ -150,23 +164,13 @@ function isVerboseTraceEnabled(explicitVerbose: boolean | undefined): boolean {
     return explicitVerbose;
   }
 
-  const globalVerbose = (globalThis as { __LMAO_TEST_TRACE_VERBOSE__?: unknown }).__LMAO_TEST_TRACE_VERBOSE__;
+  const globalVerbose = Reflect.get(globalThis, '__LMAO_TEST_TRACE_VERBOSE__');
   if (isTruthyEnvFlag(globalVerbose)) {
     return true;
   }
 
-  const env = (globalThis as { process?: { env?: Record<string, string | undefined> } }).process?.env;
-  return isTruthyEnvFlag(env?.LMAO_TEST_TRACE_VERBOSE);
+  return isTruthyEnvFlag(process.env.LMAO_TEST_TRACE_VERBOSE);
 }
-
-type RootSpanRunner<Ctx extends OpContext> = (
-  name: string,
-  fn: (ctx: SpanContext<Ctx>) => Promise<unknown>,
-) => Promise<unknown>;
-
-type ClosableTracer = {
-  close?: () => void | Promise<void>;
-};
 
 type TracerFactoryOptions = {
   binding: OpContextBinding;
@@ -213,7 +217,7 @@ function createRootTracer({ binding, sqlite, verbose }: TracerFactoryOptions): T
 }
 
 async function closeTracer(tracer: Tracer<OpContextBinding>): Promise<void> {
-  const close = (tracer as ClosableTracer).close;
+  const close = Reflect.get(tracer, 'close');
   if (typeof close === 'function') {
     await close.call(tracer);
   }
@@ -223,7 +227,7 @@ export interface BunTestTracerInstance<B extends OpContextBinding> {
   setup(): void;
   useTestSpan(): HarnessSpanContext<B>;
   getTracer(): Tracer<B>;
-  createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown>;
+  createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule;
 }
 
 export interface BunTestSuiteTracer<B extends OpContextBinding> {
@@ -242,15 +246,17 @@ export type TestTracer<
   TExt extends SchemaFields = Record<never, never>,
 > = BunTestSuiteUseTestTracer<B, TExt>;
 
-let _activeSuiteTracer: BunTestTracerInstance<OpContextBinding> | null = null;
+type ActiveBunTestTracer = BunTestTracerInstance<OpContextBinding>;
+
+let _activeSuiteTracer: ActiveBunTestTracer | null = null;
 
 /** Returns the active suite tracer set by installBunTestTracing(), or null if none is active. */
-export function getActiveSuiteTracer(): BunTestTracerInstance<OpContextBinding> | null {
+export function getActiveSuiteTracer(): ActiveBunTestTracer | null {
   return _activeSuiteTracer;
 }
 
-export function installBunTestTracing<B extends OpContextBinding>(tracer: BunTestTracerInstance<B>): void {
-  _activeSuiteTracer = tracer as unknown as BunTestTracerInstance<OpContextBinding>;
+export function installBunTestTracing(tracer: ActiveBunTestTracer): void {
+  _activeSuiteTracer = tracer;
   tracer.setup();
   mock.module('bun:test', () => tracer.createBunTestMock(bunTest));
 }
@@ -308,7 +314,7 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
 
   function runTracedTest(name: string, fn: TestBody, describePath: string | null): Promise<unknown> {
     const currentRoot = assertRootCtx();
-    return (currentRoot.span as RootSpanRunner<OpContextOf<ExtendedBinding>>)(name, async (ctx) => {
+    return currentRoot.span(name, async (ctx) => {
       writeDescribeTag(ctx.tag, describePath);
       try {
         await als.run(ctx, fn);
@@ -324,44 +330,34 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
   }
 
   function createWrappedDescribe(origDescribe: typeof _describe, describeStack: string[]): typeof _describe {
-    const wrappedDescribe = Object.assign(
-      (name: string, fn: () => void) =>
-        origDescribe(name, () => {
-          describeStack.push(name);
-          try {
-            fn();
-          } finally {
-            describeStack.pop();
-          }
-        }),
-      {
-        skip: origDescribe.skip,
-        only: origDescribe.only,
-        todo: origDescribe.todo,
-        each: origDescribe.each.bind(origDescribe),
-        skipIf: (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe),
-        if: (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip),
-      },
-    ) as typeof _describe;
+    const wrappedDescribeBase = (name: string, fn: () => void) =>
+      origDescribe(name, () => {
+        describeStack.push(name);
+        try {
+          fn();
+        } finally {
+          describeStack.pop();
+        }
+      });
+
+    const wrappedDescribe: typeof _describe = Object.assign(wrappedDescribeBase, origDescribe);
+    wrappedDescribe.each = origDescribe.each.bind(origDescribe);
+    wrappedDescribe.skipIf = (condition: boolean) => (condition ? origDescribe.skip : wrappedDescribe);
+    wrappedDescribe.if = (condition: boolean) => (condition ? wrappedDescribe : origDescribe.skip);
 
     return wrappedDescribe;
   }
 
   function createWrappedIt(origIt: typeof _it, describeStack: string[]): typeof _it {
-    const wrappedIt = Object.assign(
-      (name: string, fn: TestBody) => {
-        const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
-        return origIt(name, () => runTracedTest(name, fn, describePath));
-      },
-      {
-        skip: origIt.skip,
-        only: origIt.only,
-        todo: origIt.todo,
-        each: origIt.each.bind(origIt),
-        skipIf: (condition: boolean) => (condition ? origIt.skip : wrappedIt),
-        if: (condition: boolean) => (condition ? wrappedIt : origIt.skip),
-      },
-    ) as typeof _it;
+    const wrappedItBase = (name: string, fn: TestBody) => {
+      const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
+      return origIt(name, () => runTracedTest(name, fn, describePath));
+    };
+
+    const wrappedIt: typeof _it = Object.assign(wrappedItBase, origIt);
+    wrappedIt.each = origIt.each.bind(origIt);
+    wrappedIt.skipIf = (condition: boolean) => (condition ? origIt.skip : wrappedIt);
+    wrappedIt.if = (condition: boolean) => (condition ? wrappedIt : origIt.skip);
 
     return wrappedIt;
   }
@@ -375,6 +371,7 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
 
       const harnessSchema = buildHarnessSchemaExtensions(binding, options?.testLogSchema);
       const extendedSchema = binding.logBinding.logSchema.extend(harnessSchema);
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- logSchema.extend preserves the runtime binding shape but TS loses the merged schema parameter.
       const extendedBinding = {
         ...binding,
         logBinding: {
@@ -385,6 +382,7 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
 
       verboseTrace = isVerboseTraceEnabled(options?.verbose);
 
+      // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- the harness installs the schema-extended binding above, so the resulting tracer matches ExtendedBinding at runtime.
       tracer = createRootTracer({
         binding: extendedBinding,
         sqlite: options?.sqlite,
@@ -420,6 +418,7 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
           } catch (e) {
             console.error('[lmao/testing] SQLite flush error:', e);
           } finally {
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- closeTracer only reads the optional close() hook from the base tracer interface.
             await closeTracer(tracer as unknown as Tracer<OpContextBinding>);
           }
         }
@@ -436,9 +435,9 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
       return assertTracer();
     },
 
-    createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown> {
-      const origIt = bunTestModule.it as typeof _it;
-      const origDescribe = bunTestModule.describe as typeof _describe;
+    createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule {
+      const origIt = bunTestModule.it;
+      const origDescribe = bunTestModule.describe;
       const describeStack: string[] = [];
 
       const wrappedDescribe = createWrappedDescribe(origDescribe, describeStack);
@@ -466,7 +465,6 @@ let _rootTracePromise: Promise<unknown> | null = null;
 // AsyncLocalStorage for propagating SpanContext to test bodies.
 // Each it() runs in its own async context so concurrent tests don't collide.
 const _als = new AsyncLocalStorage<SpanContext<OpContext>>();
-type RootSpanInvoker = (name: string, fn: (ctx: SpanContext<OpContext>) => Promise<unknown>) => Promise<unknown>;
 
 /** Initialize the root tracer for the entire bun test run. Call once in preload. */
 export function initTraceTestRun<B extends OpContextBinding>(opContext: B, options?: BunTestSetupOptions): void {
@@ -537,7 +535,7 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
  *
  * @param bunTestModule - The original bun:test namespace (`import * as bunTest from 'bun:test'`)
  */
-export function createBunTestMock(bunTestModule: Record<string, unknown>): Record<string, unknown> {
+export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestModule: TModule): TModule {
   if (!_rootCtx) {
     if (_activeSuiteTracer) {
       return _activeSuiteTracer.createBunTestMock(bunTestModule);
@@ -545,8 +543,8 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
     throw new Error('Call initTraceTestRun() before createBunTestMock()');
   }
 
-  const origIt = bunTestModule.it as typeof _it;
-  const origDescribe = bunTestModule.describe as typeof _describe;
+  const origIt = bunTestModule.it;
+  const origDescribe = bunTestModule.describe;
   const rootCtx = _rootCtx;
   const als = _als;
   const describeStack: string[] = [];
@@ -577,7 +575,7 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
     // Capture describe path at registration time (synchronous)
     const describePath = describeStack.length > 0 ? describeStack.join(' > ') : null;
     return origIt(name, () =>
-      (rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
+      rootCtx.span(name, async (ctx: SpanContext<OpContext>) => {
         writeDescribeTag(ctx.tag, describePath);
         try {
           await als.run(ctx, fn);
@@ -612,14 +610,14 @@ export function createBunTestMock(bunTestModule: Record<string, unknown>): Recor
 }
 
 /** Get the current span context from AsyncLocalStorage (inside an it() block) */
-export function useTestSpan<Ctx extends SpanContext<OpContext> = SpanContext<OpContext>>(): Ctx {
+export function useTestSpan(): SpanContext<OpContext> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.useTestSpan() as unknown as Ctx;
+    return _activeSuiteTracer.useTestSpan();
   }
 
   const ctx = _als.getStore();
   if (!ctx) throw new Error('useTestSpan() called outside of a traced it()');
-  return ctx as unknown as Ctx;
+  return ctx;
 }
 
 /**
@@ -629,13 +627,13 @@ export function useTestSpan<Ctx extends SpanContext<OpContext> = SpanContext<OpC
  * the concrete binding (e.g. `getTracer<typeof opContext>()`). The underlying
  * tracer is always the one created by `installBunTestTracing()` or `initTraceTestRun()`.
  */
-export function getTracer<B extends OpContextBinding = OpContextBinding>(): Tracer<B> {
+export function getTracer(): Tracer<OpContextBinding> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.getTracer() as Tracer<B>;
+    return _activeSuiteTracer.getTracer();
   }
 
   if (!_tracer) throw new Error('Call initTraceTestRun() in preload before tests');
-  return _tracer as Tracer<B>;
+  return _tracer;
 }
 
 /**
@@ -675,7 +673,7 @@ export function it(name: string, fn: () => void | Promise<void>): void {
   const describePath = _standaloneDescribeStack.length > 0 ? _standaloneDescribeStack.join(' > ') : null;
   _it(name, () => {
     if (!_rootCtx) throw new Error('Call initTraceTestRun() in preload before tests');
-    return (_rootCtx.span as RootSpanInvoker)(name, async (ctx: SpanContext<OpContext>) => {
+    return _rootCtx.span(name, async (ctx: SpanContext<OpContext>) => {
       writeDescribeTag(ctx.tag, describePath);
       try {
         await _als.run(ctx, fn);
@@ -744,7 +742,7 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     const hasCustomSchema = Object.keys(mergedSchema).length > 0;
     const suite = makeBunTestSuiteTracer(opContext, {
       sqlite: { dbPath: '.trace-results.db' },
-      testLogSchema: hasCustomSchema ? (mergedSchema as SchemaFields) : undefined,
+      testLogSchema: hasCustomSchema && isSchemaFieldsRecord(mergedSchema) ? mergedSchema : undefined,
     });
 
     suite.setupBunTestSuiteTracing();
@@ -767,12 +765,8 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     }
 
     const mod = await import(tracerPath);
-    const mergedSchema =
-      mod.testLogSchema && typeof mod.testLogSchema === 'object' ? (mod.testLogSchema as Record<string, unknown>) : {};
-    const opContext =
-      mod.opContext && typeof mod.opContext === 'object'
-        ? (mod.opContext as OpContextBinding)
-        : defaultAutoSetupOpContext;
+    const mergedSchema = isSchemaFieldsRecord(mod.testLogSchema) ? mod.testLogSchema : {};
+    const opContext = isOpContextBindingLike(mod.opContext) ? mod.opContext : defaultAutoSetupOpContext;
 
     return installSuite(opContext, mergedSchema);
   }
@@ -793,8 +787,8 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     }
 
     // Use the first available opContext (they all bind the same opContext)
-    if (!opContext && mod.opContext) {
-      opContext = mod.opContext as OpContextBinding;
+    if (!opContext && isOpContextBindingLike(mod.opContext)) {
+      opContext = mod.opContext;
     }
   }
 

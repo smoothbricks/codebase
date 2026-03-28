@@ -37,6 +37,10 @@ type ResettableBufferStrategy = {
   reset: () => void;
 };
 
+function isResettableBufferStrategy(value: unknown): value is ResettableBufferStrategy {
+  return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'reset') === 'function';
+}
+
 /**
  * Snapshot of buffer stats captured before reset during capacity tuning.
  */
@@ -135,11 +139,8 @@ export class TestTracer<B extends OpContextBinding = OpContextBinding> extends T
     this.statsSnapshots.length = 0;
 
     // Reset the buffer strategy if it supports it (e.g., WasmBufferStrategy)
-    if (
-      'reset' in this.bufferStrategy &&
-      typeof (this.bufferStrategy as ResettableBufferStrategy).reset === 'function'
-    ) {
-      (this.bufferStrategy as ResettableBufferStrategy).reset();
+    if (isResettableBufferStrategy(this.bufferStrategy)) {
+      this.bufferStrategy.reset();
     }
   }
 }

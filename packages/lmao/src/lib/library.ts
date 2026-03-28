@@ -32,6 +32,44 @@ import { getEnumValues, getSchemaType } from './schema/typeGuards.js';
 import { LogSchema, type SchemaFields } from './schema/types.js';
 import type { AnySpanBuffer } from './types.js';
 
+type RemappedBufferViewConstructor = new (buffer: AnySpanBuffer) => AnySpanBuffer;
+type RemappedSpanLoggerConstructor<T extends LogSchema = LogSchema> = new (
+  buffer: AnySpanBuffer,
+  createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
+  initialScopedAttributes?: Record<string, unknown>,
+) => SpanLoggerImpl<T>;
+
+function isSchemaField(value: unknown): value is SchemaFields[string] {
+  return typeof value === 'object' && value !== null;
+}
+
+function isRemappedBufferViewClass(value: unknown): value is RemappedBufferViewConstructor {
+  if (typeof value !== 'function') {
+    return false;
+  }
+  const prototype = Reflect.get(value, 'prototype');
+  return (
+    typeof prototype === 'object' &&
+    prototype !== null &&
+    typeof Reflect.get(prototype, 'getColumnIfAllocated') === 'function' &&
+    typeof Reflect.get(prototype, 'getNullsIfAllocated') === 'function'
+  );
+}
+
+function isRemappedSpanLoggerClass<T extends LogSchema>(value: unknown): value is RemappedSpanLoggerConstructor<T> {
+  if (typeof value !== 'function') {
+    return false;
+  }
+  const prototype = Reflect.get(value, 'prototype');
+  return (
+    typeof prototype === 'object' &&
+    prototype !== null &&
+    typeof Reflect.get(prototype, 'with') === 'function' &&
+    typeof Reflect.get(prototype, 'info') === 'function' &&
+    typeof Reflect.get(prototype, 'error') === 'function'
+  );
+}
+
 /**
  * Prefix a tag attribute schema
  * Renames all fields with a prefix to avoid conflicts
@@ -43,14 +81,18 @@ import type { AnySpanBuffer } from './types.js';
  */
 export function prefixSchema(schema: LogSchema, prefix: string): LogSchema & Record<string, unknown> {
   const prefixedFields: Record<string, unknown> = {};
+  const constructorFields: SchemaFields = {};
 
   for (const [fieldName, fieldSchema] of schema._columns) {
     const prefixedName = `${prefix}_${fieldName}`;
     prefixedFields[prefixedName] = fieldSchema;
+    if (isSchemaField(fieldSchema)) {
+      constructorFields[prefixedName] = fieldSchema;
+    }
   }
 
   // Create LogSchema and spread fields directly onto result for direct access
-  const logSchema = new LogSchema(prefixedFields as SchemaFields);
+  const logSchema = new LogSchema(constructorFields);
   return Object.assign(logSchema, prefixedFields);
 }
 
@@ -103,20 +145,13 @@ export function createPrefixMapping<T extends LogSchema>(schema: T, prefix: stri
  * Key is a stable string representation of the mapping.
  * This avoids regenerating classes for the same mapping.
  */
-const remappedBufferViewClassCache = new Map<string, new (buffer: AnySpanBuffer) => AnySpanBuffer>();
+const remappedBufferViewClassCache = new Map<string, RemappedBufferViewConstructor>();
 
 /**
  * Cache for generated RemappedSpanLogger classes.
  * Key is a stable string representation of schema fields + prefix mapping.
  */
-const remappedSpanLoggerClassCache = new Map<
-  string,
-  new (
-    buffer: AnySpanBuffer,
-    createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-    initialScopedAttributes?: Record<string, unknown>,
-  ) => SpanLoggerImpl<LogSchema>
->();
+const remappedSpanLoggerClassCache = new Map<string, RemappedSpanLoggerConstructor>();
 
 /**
  * Create a stable cache key from a prefix mapping.
@@ -179,9 +214,7 @@ function createSchemaAndMappingCacheKey(schema: LogSchema, mapping: Record<strin
  */
 export function generateRemappedBufferViewClass(
   prefixToUnprefixedMapping: Record<string, string>,
-): new (
-  buffer: AnySpanBuffer,
-) => AnySpanBuffer {
+): RemappedBufferViewConstructor {
   // Check cache first
   const cacheKey = createMappingCacheKey(prefixToUnprefixedMapping);
   const cached = remappedBufferViewClassCache.get(cacheKey);
@@ -262,9 +295,10 @@ export function generateRemappedBufferViewClass(
   return RemappedBufferView;
 })()`;
 
-  // Compile the class using Function constructor (cold path - happens once per mapping)
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
-  const GeneratedClass = new Function(`return ${code}`)() as new (buffer: AnySpanBuffer) => AnySpanBuffer;
+  const GeneratedClass = new Function(`return ${code}`)();
+  if (!isRemappedBufferViewClass(GeneratedClass)) {
+    throw new TypeError('Generated remapped buffer view is missing column remapping methods');
+  }
 
   // Cache for future use
   remappedBufferViewClassCache.set(cacheKey, GeneratedClass);
@@ -626,27 +660,20 @@ export function generateRemappedSpanLoggerClass<T extends LogSchema>(
 export function createRemappedSpanLoggerClass<T extends LogSchema>(
   cleanSchema: T,
   prefixMapping: PrefixMapping,
-): new (
-  buffer: AnySpanBuffer,
-  createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-  initialScopedAttributes?: Record<string, unknown>,
-) => SpanLoggerImpl<T> {
+): RemappedSpanLoggerConstructor<T> {
   // Check cache first
   const cacheKey = createSchemaAndMappingCacheKey(cleanSchema, prefixMapping);
   const cached = remappedSpanLoggerClassCache.get(cacheKey);
-  if (cached) {
-    return cached as new (
-      buffer: AnySpanBuffer,
-      createOverflowBuffer: (buffer: AnySpanBuffer) => AnySpanBuffer,
-      initialScopedAttributes?: Record<string, unknown>,
-    ) => SpanLoggerImpl<T>;
+  if (cached && isRemappedSpanLoggerClass<T>(cached)) {
+    return cached;
   }
 
   const classCode = generateRemappedSpanLoggerClass(cleanSchema, prefixMapping).trim();
 
-  // Use Function constructor to create the class (cold path - happens once per schema/prefix combo)
-  // eslint-disable-next-line @typescript-eslint/no-implied-eval, no-new-func
   const GeneratedClass = new Function(`return ${classCode}`)();
+  if (!isRemappedSpanLoggerClass<T>(GeneratedClass)) {
+    throw new TypeError('Generated remapped span logger is missing required logging methods');
+  }
 
   remappedSpanLoggerClassCache.set(cacheKey, GeneratedClass);
 

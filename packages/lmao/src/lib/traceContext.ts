@@ -134,11 +134,11 @@ export interface TraceContextBase {
   /** Marker for prototype chain detection */
   readonly [TRACE_CONTEXT_MARKER]: true;
   /** Trace ID for this context */
-  trace_id: TraceId;
+  trace_id: TraceId | undefined;
   /** Epoch microseconds when trace started */
-  anchorEpochMicros: number;
+  anchorEpochMicros: number | undefined;
   /** performance.now() when trace started */
-  anchorPerfNow: number;
+  anchorPerfNow: number | undefined;
   /** Feature flag evaluator */
   ff: unknown;
   /** Root span function */
@@ -157,9 +157,9 @@ export interface TraceContextBase {
  */
 export const TraceContextProto: TraceContextBase = {
   [TRACE_CONTEXT_MARKER]: true,
-  trace_id: undefined as unknown as TraceId,
-  anchorEpochMicros: undefined as unknown as number,
-  anchorPerfNow: undefined as unknown as number,
+  trace_id: undefined,
+  anchorEpochMicros: undefined,
+  anchorPerfNow: undefined,
   ff: undefined,
   span: undefined,
   _extraKeys: undefined,

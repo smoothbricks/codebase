@@ -122,6 +122,60 @@ interface ColumnMeta {
   enumValues?: readonly string[];
 }
 
+function getFieldEager(value: unknown): boolean {
+  return typeof value === 'object' && value !== null && Reflect.get(value, '__eager') === true;
+}
+
+function getFieldEnumValues(value: unknown): readonly string[] | undefined {
+  if (typeof value !== 'object' || value === null) {
+    return undefined;
+  }
+  const enumValues = Reflect.get(value, '__enum_values');
+  return Array.isArray(enumValues) ? enumValues : undefined;
+}
+
+function isColumnValueType(value: unknown): value is ColumnValueType {
+  return value === undefined || Array.isArray(value) || ArrayBuffer.isView(value);
+}
+
+function getFreeMethod(
+  sizeClass: Exclude<SizeClass, 'string'>,
+): keyof Pick<WasmAllocator, 'free1B' | 'free4B' | 'free8B'> {
+  switch (sizeClass) {
+    case '1b':
+      return 'free1B';
+    case '4b':
+      return 'free4B';
+    case '8b':
+      return 'free8B';
+  }
+}
+
+function isWasmSpanBufferConstructor(value: unknown): value is WasmSpanBufferConstructor {
+  return (
+    typeof value === 'function' &&
+    typeof Reflect.get(value, 'schema') === 'object' &&
+    Reflect.get(value, 'schema') !== null &&
+    typeof Reflect.get(value, 'stats') === 'object' &&
+    Reflect.get(value, 'stats') !== null
+  );
+}
+
+export function isWasmSpanBufferInstance(value: unknown): value is WasmSpanBufferInstance {
+  return typeof value === 'object' && value !== null && typeof Reflect.get(value, '_systemPtr') === 'number';
+}
+
+function getWasmSpanBufferConstructor(instance: { constructor: unknown }): WasmSpanBufferConstructor {
+  if (!isWasmSpanBufferConstructor(instance.constructor)) {
+    throw new Error('Expected generated WasmSpanBuffer constructor');
+  }
+  return instance.constructor;
+}
+
+function isWasmSpanBufferFactory(value: unknown): value is () => WasmSpanBufferConstructor {
+  return typeof value === 'function';
+}
+
 /**
  * Build column metadata array from schema.
  * Maps each schema field to its storage characteristics.
@@ -134,8 +188,8 @@ function buildColumnMeta(schema: LogSchema): ColumnMeta[] {
   for (const name of schema._columnNames) {
     const field = fields[name];
     const schemaType = getSchemaType(field);
-    const isEager = (field as { __eager?: boolean }).__eager === true;
-    const enumValues = (field as { __enum_values?: readonly string[] }).__enum_values;
+    const isEager = getFieldEager(field);
+    const enumValues = getFieldEnumValues(field);
 
     let sizeClass: SizeClass;
     switch (schemaType) {
@@ -315,7 +369,7 @@ function wasmFree(this: WasmSpanBufferInstance): void {
   const columnMeta = buildColumnMeta(this._logSchema);
   for (const col of columnMeta) {
     if (col.sizeClass !== 'string' && this._columnPtrs[col.columnIndex] >= 0) {
-      const freeMethod = `free${col.sizeClass.toUpperCase()}` as 'free1B' | 'free4B' | 'free8B';
+      const freeMethod = getFreeMethod(col.sizeClass);
       this._allocator[freeMethod](this._columnPtrs[col.columnIndex]);
     }
   }
@@ -336,7 +390,8 @@ function wasmGetColumnIfAllocated(this: WasmSpanBufferInstance, columnName: stri
   if (idx === -1) return undefined;
   const getter = Object.getOwnPropertyDescriptor(Object.getPrototypeOf(this), `${columnName}_values`);
   if (getter?.get) {
-    return getter.get.call(this) as ColumnValueType | undefined;
+    const value = getter.get.call(this);
+    return isColumnValueType(value) ? value : undefined;
   }
   return undefined;
 }
@@ -376,24 +431,27 @@ function wasmGetOrCreateOverflow(this: WasmSpanBufferInstance): WasmSpanBufferIn
   if (this._overflow) return this._overflow;
   const tracer = this._traceRoot.tracer;
   tracer.onStatsWillResetFor(this);
-  checkCapacityTuning((this.constructor as WasmSpanBufferConstructor).stats);
+  checkCapacityTuning(getWasmSpanBufferConstructor(this).stats);
   // WasmSpanBufferInstance extends AnySpanBuffer and has all SpanBuffer properties at runtime
   const overflow = tracer.bufferStrategy.createOverflowBuffer(this);
-  return overflow as WasmSpanBufferInstance;
+  if (!isWasmSpanBufferInstance(overflow)) {
+    throw new Error('Expected overflow buffer to be WASM-backed');
+  }
+  return overflow;
 }
 
 /**
  * Get _stats property.
  */
 function wasmGetStats(this: WasmSpanBufferInstance): SpanBufferStats {
-  return (this.constructor as WasmSpanBufferConstructor).stats;
+  return getWasmSpanBufferConstructor(this).stats;
 }
 
 /**
  * Get _columns property.
  */
 function wasmGetColumns(this: WasmSpanBufferInstance): LogSchema['_columns'] {
-  return (this.constructor as WasmSpanBufferConstructor).schema._columns;
+  return getWasmSpanBufferConstructor(this).schema._columns;
 }
 
 /**
@@ -691,7 +749,10 @@ return WasmSpanBuffer;
 `;
 
   // Create the class using Function constructor
-  const factory = new Function(classCode) as () => WasmSpanBufferConstructor;
+  const factory = new Function(classCode);
+  if (!isWasmSpanBufferFactory(factory)) {
+    throw new Error('Expected WasmSpanBuffer factory function');
+  }
   const WasmSpanBufferClass = factory();
 
   // Assign common methods to prototype (shared by all schemas)

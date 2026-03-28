@@ -36,14 +36,34 @@ import {
   tagFact,
 } from './facts.js';
 
-type DynamicRowBuffer = Record<string, unknown>;
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
 
-function getOptionalArray<T>(buffer: unknown, key: string): T[] | undefined {
-  if (typeof buffer !== 'object' || buffer === null) {
+function isUint8Array(value: unknown): value is Uint8Array {
+  return value instanceof Uint8Array;
+}
+
+function isUnknownArray(value: unknown): value is unknown[] {
+  return Array.isArray(value);
+}
+
+function getIndexedValue(container: unknown, index: number): unknown {
+  if (Array.isArray(container)) {
+    return container[index];
+  }
+  if (ArrayBuffer.isView(container)) {
+    return Reflect.get(container, index) as unknown;
+  }
+  return undefined;
+}
+
+function getOptionalArray(buffer: unknown, key: string): unknown[] | undefined {
+  if (!isRecord(buffer)) {
     return undefined;
   }
-  const value = (buffer as Record<string, unknown>)[key];
-  return Array.isArray(value) ? (value as T[]) : undefined;
+  const value = Reflect.get(buffer, key) as unknown;
+  return Array.isArray(value) ? value : undefined;
 }
 
 /**
@@ -176,7 +196,7 @@ function walkBuffer<T extends LogSchema>(
   // - Row 1: span-ok/err/exception (completion status)
   // - Row 2+: log entries (info/debug/warn/error), ff entries
   const entryTypes = buffer.entry_type;
-  const messages = getOptionalArray<string | undefined>(buffer, 'message_values');
+  const messages = getOptionalArray(buffer, 'message_values');
 
   // Process log/ff entries from row 2 onwards
   for (let row = 2; row < writeIndex; row++) {
@@ -189,7 +209,8 @@ function walkBuffer<T extends LogSchema>(
       case ENTRY_TYPE_ERROR: {
         if (opts.includeLogs && messages) {
           const level = entryTypeToLogLevel(entryType);
-          const message = messages[row] ?? '';
+          const rowMessage = messages[row];
+          const message = typeof rowMessage === 'string' ? rowMessage : '';
           facts.push(logFact(level, message));
         }
         break;
@@ -263,15 +284,14 @@ function extractTagFacts<T extends LogSchema>(
     const nullsKey = `${fieldName}_nulls`;
     const valuesKey = `${fieldName}_values`;
 
-    const dynamicBuffer = buffer as DynamicRowBuffer;
-    const nulls = dynamicBuffer[nullsKey] as Uint8Array | undefined;
-    const values = dynamicBuffer[valuesKey] as unknown[] | undefined;
+    const nulls = Reflect.get(buffer, nullsKey) as unknown;
+    const values = Reflect.get(buffer, valuesKey) as unknown;
 
-    if (!nulls || !values) continue;
+    if (!isUint8Array(nulls) || (!isUnknownArray(values) && !ArrayBuffer.isView(values))) continue;
 
     // Check if value is non-null at this row
     if (!isNull(nulls, row)) {
-      const value = values[row];
+      const value = getIndexedValue(values, row);
       if (value !== undefined) {
         facts.push(tagFact(fieldName, String(value)));
       }
@@ -284,13 +304,13 @@ function extractTagFacts<T extends LogSchema>(
  */
 function extractFFfacts<T extends LogSchema>(buffer: SpanBuffer<T>, row: number, facts: TraceFact[]): void {
   // ff_name and ff_value are system schema fields
-  const ffNameValues = getOptionalArray<string>(buffer, 'ff_name_values');
-  const ffValueValues = getOptionalArray<string>(buffer, 'ff_value_values');
+  const ffNameValues = getOptionalArray(buffer, 'ff_name_values');
+  const ffValueValues = getOptionalArray(buffer, 'ff_value_values');
 
   if (ffNameValues && ffValueValues) {
     const name = ffNameValues[row];
     const value = ffValueValues[row];
-    if (name !== undefined && value !== undefined) {
+    if (typeof name === 'string' && typeof value === 'string') {
       facts.push(ffFact(name, value));
     }
   }
@@ -327,16 +347,16 @@ function entryTypeToLogLevel(entryType: number): LogLevel {
  * Get error code from a span-err row.
  */
 function getErrorCode<T extends LogSchema>(buffer: SpanBuffer<T>, row: number): string {
-  const errorCodes = getOptionalArray<string>(buffer, 'error_code_values');
-  return errorCodes?.[row] ?? 'UNKNOWN';
+  const errorCodes = getOptionalArray(buffer, 'error_code_values');
+  return typeof errorCodes?.[row] === 'string' ? errorCodes[row] : 'UNKNOWN';
 }
 
 /**
  * Get exception message from a span-exception row.
  */
 function getExceptionMessage<T extends LogSchema>(buffer: SpanBuffer<T>, row: number): string {
-  const messages = getOptionalArray<string>(buffer, 'message_values');
-  return messages?.[row] ?? 'Unknown exception';
+  const messages = getOptionalArray(buffer, 'message_values');
+  return typeof messages?.[row] === 'string' ? messages[row] : 'Unknown exception';
 }
 
 /**

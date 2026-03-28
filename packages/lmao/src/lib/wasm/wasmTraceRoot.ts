@@ -9,9 +9,9 @@
  * @module wasmTraceRoot
  */
 
-import type { Nanoseconds } from '@smoothbricks/arrow-builder';
+import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from '../schema/systemSchema.js';
-import type { TraceId } from '../traceId.js';
+import { createTraceId, type TraceId } from '../traceId.js';
 import type { ITraceRoot, TracerLifecycleHooks } from '../traceRoot.js';
 import type { AnySpanBuffer } from '../types.js';
 import type { WasmAllocator } from './wasmAllocator.js';
@@ -39,12 +39,7 @@ export interface WasmSpanBufferLike {
  * Type guard to check if a buffer is WASM-backed.
  */
 export function isWasmSpanBuffer(buffer: unknown): buffer is WasmSpanBufferLike {
-  return (
-    typeof buffer === 'object' &&
-    buffer !== null &&
-    '_systemPtr' in buffer &&
-    typeof (buffer as WasmSpanBufferLike)._systemPtr === 'number'
-  );
+  return typeof buffer === 'object' && buffer !== null && typeof Reflect.get(buffer, '_systemPtr') === 'number';
 }
 
 // =============================================================================
@@ -130,7 +125,7 @@ export class WasmTraceRoot implements ITraceRoot {
   getTimestampNanos(): Nanoseconds {
     const elapsedMs = performance.now() - this.anchorPerfNow;
     const elapsedNanos = BigInt(Math.round(elapsedMs * 1_000_000));
-    return (this.anchorEpochNanos + elapsedNanos) as Nanoseconds;
+    return Nanoseconds.unsafe(this.anchorEpochNanos + elapsedNanos);
   }
 
   // ===========================================================================
@@ -302,7 +297,7 @@ export function createWasmTraceRoot(
   trace_id: string,
   tracer: TracerLifecycleHooks,
 ): WasmTraceRoot {
-  return new WasmTraceRoot(allocator, trace_id as TraceId, tracer);
+  return new WasmTraceRoot(allocator, createTraceId(trace_id), tracer);
 }
 
 /**
@@ -315,6 +310,6 @@ export function createWasmTraceRoot(
  */
 export function createWasmTraceRootFactory(allocator: WasmAllocator) {
   return (trace_id: string, tracer: TracerLifecycleHooks): WasmTraceRoot => {
-    return new WasmTraceRoot(allocator, trace_id as TraceId, tracer);
+    return new WasmTraceRoot(allocator, createTraceId(trace_id), tracer);
   };
 }

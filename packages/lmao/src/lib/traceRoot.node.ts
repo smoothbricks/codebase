@@ -9,9 +9,9 @@
  * @module traceRoot.node
  */
 
-import type { Nanoseconds } from '@smoothbricks/arrow-builder';
+import { Nanoseconds } from '@smoothbricks/arrow-builder';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_START } from './schema/systemSchema.js';
-import type { TraceId } from './traceId.js';
+import { createTraceId, type TraceId } from './traceId.js';
 import {
   type ITraceRoot,
   TRACE_ROOT_ANCHOR_EPOCH_OFFSET,
@@ -105,7 +105,7 @@ export class TraceRoot implements ITraceRoot {
    */
   get trace_id(): TraceId {
     const len = new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_LEN_OFFSET, 1)[0];
-    return textDecoder.decode(new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, len)) as TraceId;
+    return createTraceId(textDecoder.decode(new Uint8Array(this._system, TRACE_ROOT_TRACE_ID_OFFSET, len)));
   }
 
   /**
@@ -115,7 +115,7 @@ export class TraceRoot implements ITraceRoot {
   getTimestampNanos(): Nanoseconds {
     const currentHrtime = process.hrtime.bigint();
     const elapsedNanos = currentHrtime - this._anchorHrtimeBigInt;
-    return (this._epochView[0] + elapsedNanos) as Nanoseconds;
+    return Nanoseconds.unsafe(this._epochView[0] + elapsedNanos);
   }
 
   /**
@@ -166,5 +166,5 @@ export function createTraceRoot(trace_id: string, tracer: TracerLifecycleHooks):
   const anchorHrtimeBigInt = process.hrtime.bigint();
   // Store as number for NAPI to read as f64
   const anchorPerfNow = Number(anchorHrtimeBigInt);
-  return new TraceRoot(trace_id as TraceId, anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer);
+  return new TraceRoot(createTraceId(trace_id), anchorEpochNanos, anchorPerfNow, anchorHrtimeBigInt, tracer);
 }

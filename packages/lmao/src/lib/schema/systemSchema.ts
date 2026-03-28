@@ -165,15 +165,16 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
   const systemKeys = new Set(systemSchema._columnNames);
   const reservedKeys = RESERVED_SYSTEM_COLUMN_NAMES;
   const userKeys = userSchema instanceof LogSchema ? userSchema._columnNames : Object.keys(userSchema);
+  const userFields = userSchema instanceof LogSchema ? userSchema.fields : userSchema;
 
   const conflictingSystemKeys = userKeys.filter((key) => {
     // Only check if it's a schema field (not a method like validate/parse/extend)
-    const value = userSchema[key];
+    const value = userFields[key];
     return systemKeys.has(key) && typeof value !== 'function';
   });
 
   const conflictingReservedKeys = userKeys.filter((key) => {
-    const value = userSchema[key];
+    const value = userFields[key];
     return reservedKeys.has(key) && typeof value !== 'function';
   });
 
@@ -195,10 +196,11 @@ export function mergeWithSystemSchema<T extends Record<string, unknown>>(userSch
 
   // Spread .fields to get the actual schema field definitions
   // (spreading systemSchema directly would spread class instance properties like _fieldNames, not schema fields)
-  return {
+  const merged: SystemSchemaFieldTypes & T = {
     ...systemSchema.fields,
-    ...userSchema,
-  } as SystemSchemaFieldTypes & T;
+    ...userFields,
+  };
+  return merged;
 }
 
 // =============================================================================

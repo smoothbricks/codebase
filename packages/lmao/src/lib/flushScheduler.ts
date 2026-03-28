@@ -19,6 +19,14 @@ import type { AnySpanBuffer, OpMetadata } from './types.js';
  */
 const CAPACITY_STATS_FLUSH_INTERVAL = 100;
 
+function isSpanBufferConstructor(value: unknown): value is SpanBufferConstructor {
+  return typeof value === 'function' && typeof Reflect.get(value, 'stats') === 'object';
+}
+
+function isNodeTimer(value: unknown): value is NodeJS.Timeout {
+  return typeof value === 'object' && value !== null && typeof Reflect.get(value, 'hasRef') === 'function';
+}
+
 function mergeTables(first: Table, rest: Table[]): Table {
   if (rest.length === 0) return first;
 
@@ -30,7 +38,7 @@ function mergeTables(first: Table, rest: Table[]): Table {
       if (!col) continue;
       batches.push(...col.data);
     }
-    return [name, new Column(batches as never[])];
+    return [name, new Column(batches)];
   });
 
   return tableFromColumns(merged);
@@ -308,7 +316,10 @@ export class FlushScheduler {
     for (const buffer of buffersToFlush) {
       let currentBuffer: AnySpanBuffer | undefined = buffer;
       while (currentBuffer) {
-        const bufferClass = currentBuffer.constructor as SpanBufferConstructor;
+        const bufferClass = currentBuffer.constructor;
+        if (!isSpanBufferConstructor(bufferClass)) {
+          throw new TypeError('Expected span buffer constructor with shared stats metadata');
+        }
         // Only add if we haven't seen this buffer class before
         if (!bufferClassesInThisFlush.has(bufferClass)) {
           bufferClassesInThisFlush.set(bufferClass, currentBuffer._opMetadata);
@@ -355,7 +366,7 @@ export class FlushScheduler {
     if (totalRows === 0 && !shouldLogCapacityStats) return;
 
     // Convert all buffers to Arrow tables and concatenate
-    const tables = [];
+    const tables: Table[] = [];
 
     for (const buffer of buffersToFlush) {
       try {
@@ -394,7 +405,7 @@ export class FlushScheduler {
     };
 
     try {
-      await this.handler(combinedTable as unknown as Table, metadata);
+      await this.handler(combinedTable, metadata);
       this.lastFlushTime = now;
 
       // Reset flush counter and module tracking if we logged capacity stats
@@ -470,27 +481,29 @@ export const FlushSchedulerTestUtils = {
    * Get the flush timer for a scheduler instance (for testing)
    */
   getFlushTimer(scheduler: FlushScheduler): NodeJS.Timeout | undefined {
-    return (scheduler as unknown as { flushTimer?: NodeJS.Timeout }).flushTimer;
+    const timer = Reflect.get(scheduler, 'flushTimer');
+    return isNodeTimer(timer) ? timer : undefined;
   },
 
   /**
    * Set the flush timer for a scheduler instance (for testing)
    */
   setFlushTimer(scheduler: FlushScheduler, timer: NodeJS.Timeout | undefined): void {
-    (scheduler as unknown as { flushTimer?: NodeJS.Timeout }).flushTimer = timer;
+    Reflect.set(scheduler, 'flushTimer', timer);
   },
 
   /**
    * Get the last activity time for a scheduler instance (for testing)
    */
   getLastActivityTime(scheduler: FlushScheduler): number | undefined {
-    return (scheduler as unknown as { lastActivityTime?: number }).lastActivityTime;
+    const time = Reflect.get(scheduler, 'lastActivityTime');
+    return typeof time === 'number' ? time : undefined;
   },
 
   /**
    * Set the last activity time for a scheduler instance (for testing)
    */
   setLastActivityTime(scheduler: FlushScheduler, time: number | null | undefined): void {
-    (scheduler as unknown as { lastActivityTime?: number | null }).lastActivityTime = time;
+    Reflect.set(scheduler, 'lastActivityTime', time);
   },
 };

@@ -17,11 +17,13 @@
  */
 
 import { describe, expect, it } from 'bun:test';
-import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
+import { createTestTracerOptions, requireFloat64Array, requireStringArray } from '../../__tests__/test-helpers.js';
 import { defineOpContext } from '../../defineOpContext.js';
 import { Blocked } from '../../errors/Blocked.js';
 import { Code } from '../../errors/CodeError.js';
 import { exponentialBackoff, fixedDelay, linearBackoff, Transient, TransientError } from '../../errors/Transient.js';
+import type { OpContextOf, SpanContext } from '../../opContext/types.js';
+import type { Result } from '../../result.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_SPAN_RETRY } from '../../schema/systemSchema.js';
@@ -39,6 +41,7 @@ const testOpContext = defineOpContext({
 });
 
 const { defineOp } = testOpContext;
+type TestSpanContext = SpanContext<OpContextOf<typeof testOpContext>>;
 
 // Define transient error codes with SHORT delays for fast tests
 // Using jitter: false and 0-1ms delays to avoid slow tests
@@ -62,17 +65,11 @@ const CHILD_FAILED = Code<Record<string, never>>('CHILD_FAILED');
 describe('LMAO Op Retry', () => {
   // Helper to test retry behavior via child span
   // Retry logic is in span execution (ctx.span()), not tracer.trace()
-  const executeWithRetry = async (
+  const executeWithRetry = async <TValue, TError>(
     tracer: TestTracer<typeof testOpContext>,
     spanName: string,
-    opFn: (
-      ctx: import('../../opContext/types.js').SpanContext<
-        import('../../opContext/types.js').OpContextOf<typeof testOpContext>
-      >,
-    ) =>
-      | import('../../result.js').Result<unknown, unknown>
-      | Promise<import('../../result.js').Result<unknown, unknown>>,
-  ) => {
+    opFn: (ctx: TestSpanContext) => Result<TValue, TError> | Promise<Result<TValue, TError>>,
+  ): Promise<Result<TValue, TError>> => {
     return tracer.trace('root', async (ctx) => {
       // Use ctx.span() to trigger span execution with retry logic
       return ctx.span(spanName, opFn);
@@ -171,9 +168,11 @@ describe('LMAO Op Retry', () => {
       expect(attempts).toBe(1); // No retries
       expect(result.success).toBe(false);
       if (!result.success) {
-        const error = result.error as Blocked;
+        const error = result.error;
         expect(error).toBeInstanceOf(Blocked);
-        expect(error.reason.type).toBe('ended');
+        if (error instanceof Blocked) {
+          expect(error.reason.type).toBe('ended');
+        }
       }
     });
   });
@@ -499,9 +498,9 @@ describe('LMAO Op Retry', () => {
       // Verify message format: retry:op:{opName}
       // Note: For inline functions, the opMetadata name comes from the parent context
       // which in this test is 'root' (the root trace name)
-      const messages = spanBuffer.getColumnIfAllocated('message') as string[];
-      const retryAttempts = spanBuffer.getColumnIfAllocated('retry_attempt') as Float64Array;
-      const retryDelays = spanBuffer.getColumnIfAllocated('retry_delay_ms') as Float64Array;
+      const messages = requireStringArray(spanBuffer.getColumnIfAllocated('message'), 'retry messages');
+      const retryAttempts = requireFloat64Array(spanBuffer.getColumnIfAllocated('retry_attempt'), 'retry attempts');
+      const retryDelays = requireFloat64Array(spanBuffer.getColumnIfAllocated('retry_delay_ms'), 'retry delays');
       for (const idx of retryEntries) {
         expect(messages[idx]).toBe('retry:op:root');
       }
@@ -598,7 +597,7 @@ describe('LMAO Op Retry', () => {
 
       expect(retryIdx).toBeGreaterThan(-1);
       // Check error_code was written
-      const errorCodes = spanBuffer.getColumnIfAllocated('error_code') as string[];
+      const errorCodes = requireStringArray(spanBuffer.getColumnIfAllocated('error_code'), 'error codes');
       expect(errorCodes[retryIdx]).toBe('SERVICE_UNAVAILABLE');
     });
   });
@@ -617,8 +616,7 @@ describe('LMAO Op Retry', () => {
       expect(attempts).toBe(1);
       expect(result.success).toBe(true);
       if (result.success) {
-        const value = result.value as { immediate: boolean };
-        expect(value.immediate).toBe(true);
+        expect(result.value.immediate).toBe(true);
       }
     });
 
@@ -669,8 +667,8 @@ describe('LMAO Op Retry', () => {
       const spanBuffer = rootBuffer._children[0];
 
       // Tags are written at row 0 (span-start)
-      const operations = spanBuffer.getColumnIfAllocated('operation') as string[];
-      const services = spanBuffer.getColumnIfAllocated('service') as string[];
+      const operations = requireStringArray(spanBuffer.getColumnIfAllocated('operation'), 'operations');
+      const services = requireStringArray(spanBuffer.getColumnIfAllocated('service'), 'services');
       expect(operations[0]).toBe('INSERT');
       expect(services[0]).toBe('payment-api');
     });

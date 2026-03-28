@@ -211,6 +211,16 @@ interface WasmExports {
   get_freelist_merge_count(sizeClass: number, capacity: number): number;
 }
 
+function isWasmExports(value: unknown): value is WasmExports {
+  if (typeof value !== 'object' || value === null) {
+    return false;
+  }
+
+  return (
+    typeof Reflect.get(value, 'init') === 'function' && typeof Reflect.get(value, 'alloc_span_system') === 'function'
+  );
+}
+
 // =============================================================================
 // Implementation
 // =============================================================================
@@ -236,7 +246,10 @@ function createViews(memory: WebAssembly.Memory) {
  * Create WasmAllocator from instantiated WASM module.
  */
 function wrapWasmInstance(instance: WebAssembly.Instance, memory: WebAssembly.Memory, capacity: number): WasmAllocator {
-  const exports = instance.exports as unknown as WasmExports;
+  if (!isWasmExports(instance.exports)) {
+    throw new Error('allocator.wasm exports did not match the expected ABI');
+  }
+  const exports = instance.exports;
   let views = createViews(memory);
   let currentBuffer = memory.buffer;
 

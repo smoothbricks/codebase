@@ -18,6 +18,11 @@ export const MAX_TRACE_ID_LENGTH = 128;
 /** Branded type for validated trace IDs */
 export type TraceId = string & { readonly __brand: 'TraceId' };
 
+function brandTraceId(value: string): TraceId;
+function brandTraceId(value: string): string {
+  return value;
+}
+
 /** Precompiled regex for non-ASCII detection (2x faster than loop) */
 const NON_ASCII_REGEX = /[^\x20-\x7E]/;
 
@@ -38,7 +43,7 @@ export function createTraceId(value: string): TraceId {
   if (NON_ASCII_REGEX.test(value)) {
     throw new Error('TraceId must be ASCII printable characters only');
   }
-  return value as TraceId;
+  return brandTraceId(value);
 }
 
 /**
@@ -60,7 +65,6 @@ export function generateTraceId(): TraceId {
     crypto.getRandomValues(bytes);
   } else {
     try {
-      // eslint-disable-next-line @typescript-eslint/no-require-imports
       const nodeCrypto = require('node:crypto');
       if (nodeCrypto?.randomFillSync) {
         nodeCrypto.randomFillSync(bytes);
@@ -79,7 +83,7 @@ export function generateTraceId(): TraceId {
     hex += bytes[i].toString(16).padStart(2, '0');
   }
 
-  return hex as TraceId;
+  return brandTraceId(hex);
 }
 
 // ============================================================================
