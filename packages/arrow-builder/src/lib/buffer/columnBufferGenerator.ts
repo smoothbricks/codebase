@@ -430,10 +430,20 @@ return ${className};
  */
 const classCache = new Map<string, new (capacity: number, ...args: unknown[]) => AnyColumnBuffer>();
 
-function compileColumnBufferFactory(
-  ...args: string[]
-): (...factoryArgs: unknown[]) => new (capacity: number, ...ctorArgs: unknown[]) => AnyColumnBuffer;
-function compileColumnBufferFactory(...args: string[]): Function {
+type ColumnBufferConstructor = new (capacity: number, ...ctorArgs: unknown[]) => AnyColumnBuffer;
+
+type ColumnBufferFactory = (...factoryArgs: unknown[]) => ColumnBufferConstructor;
+
+function isColumnBufferFactory(value: unknown): value is ColumnBufferFactory {
+  return typeof value === 'function';
+}
+
+function isColumnBufferConstructor(value: unknown): value is ColumnBufferConstructor {
+  return typeof value === 'function';
+}
+
+function compileColumnBufferFactory(...args: string[]): ColumnBufferFactory;
+function compileColumnBufferFactory(...args: string[]): unknown {
   return new Function(...args);
 }
 
@@ -477,7 +487,16 @@ export function getColumnBufferClass(
     }
 
     const factory = compileColumnBufferFactory(...depNames, classCode);
-    BufferClass = factory(...depValues);
+    if (!isColumnBufferFactory(factory)) {
+      throw new Error('Generated ColumnBuffer factory must compile to a callable function.');
+    }
+
+    const generatedClass = factory(...depValues);
+    if (!isColumnBufferConstructor(generatedClass)) {
+      throw new Error('Generated ColumnBuffer factory must return a constructor.');
+    }
+
+    BufferClass = generatedClass;
     classCache.set(cacheKey, BufferClass);
   }
 

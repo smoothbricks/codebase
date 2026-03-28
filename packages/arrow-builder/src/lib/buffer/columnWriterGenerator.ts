@@ -358,10 +358,20 @@ ${extensionMethods}
  */
 const writerClassCache = new Map<string, new (buffer: AnyColumnBuffer, ...args: unknown[]) => ColumnWriter>();
 
-function compileColumnWriterFactory(
-  ...args: string[]
-): (...factoryArgs: unknown[]) => new (buffer: AnyColumnBuffer, ...ctorArgs: unknown[]) => ColumnWriter;
-function compileColumnWriterFactory(...args: string[]): Function {
+type ColumnWriterConstructor = new (buffer: AnyColumnBuffer, ...ctorArgs: unknown[]) => ColumnWriter;
+
+type ColumnWriterFactory = (...factoryArgs: unknown[]) => ColumnWriterConstructor;
+
+function isColumnWriterFactory(value: unknown): value is ColumnWriterFactory {
+  return typeof value === 'function';
+}
+
+function isColumnWriterConstructor(value: unknown): value is ColumnWriterConstructor {
+  return typeof value === 'function';
+}
+
+function compileColumnWriterFactory(...args: string[]): ColumnWriterFactory;
+function compileColumnWriterFactory(...args: string[]): unknown {
   return new Function(...args);
 }
 
@@ -443,7 +453,16 @@ export function getColumnWriterClass(
 
     // Create function that takes dependencies as parameters and returns the class
     const factory = compileColumnWriterFactory(...depNames, classCode);
-    WriterClass = factory(...depValues);
+    if (!isColumnWriterFactory(factory)) {
+      throw new Error('Generated ColumnWriter factory must compile to a callable function.');
+    }
+
+    const generatedClass = factory(...depValues);
+    if (!isColumnWriterConstructor(generatedClass)) {
+      throw new Error('Generated ColumnWriter factory must return a constructor.');
+    }
+
+    WriterClass = generatedClass;
 
     writerClassCache.set(cacheKey, WriterClass);
   }
