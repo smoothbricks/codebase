@@ -18,7 +18,7 @@ import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
 import { getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferConstructor } from '../spanBuffer.js';
 import type { OpMetadata } from '../types.js';
-import { hasArrowIndexType, makeArrowColumn } from './flechette.js';
+import { getArrowIndexTypeOr, makeArrowColumn } from './flechette.js';
 import { getArrowFieldName } from './utils.js';
 
 export interface CapacityStatsEntry {
@@ -313,7 +313,7 @@ export function createCapacityStatsTable(
 
     let idxType: IntType = uint8();
     if (lmaoType === 'enum') {
-      idxType = hasArrowIndexType(fieldSchema) ? fieldSchema.__arrow_index_type : uint8();
+      idxType = getArrowIndexTypeOr(fieldSchema, uint8());
     }
     const dictType = dictionary(utf8(), idxType);
     append(
