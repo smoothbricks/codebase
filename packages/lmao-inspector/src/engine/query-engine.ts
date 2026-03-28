@@ -70,10 +70,20 @@ async function initEngine(): Promise<ArrowQueryEngine> {
     },
 
     async close(): Promise<void> {
-      await conn.close();
-      await db.terminate();
-      worker.terminate();
-      _enginePromise = null;
+      try {
+        for (const fileName of registeredFiles) {
+          await db.dropFile(fileName);
+        }
+        registeredFiles.clear();
+        await conn.close();
+      } finally {
+        try {
+          await db.terminate();
+        } finally {
+          worker.terminate();
+          _enginePromise = null;
+        }
+      }
     },
   };
 }

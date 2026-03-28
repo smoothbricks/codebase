@@ -51,8 +51,10 @@ export interface TaggedError<Tag extends string = string> {
  * Constructor type for tagged errors.
  * Used with Result.isErr(Tag) to check error type via instanceof.
  */
-export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> extends Function {
+export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> {
   readonly _tag: T['_tag'];
+  readonly prototype: T;
+  readonly [Symbol.hasInstance]: (value: unknown) => boolean;
 }
 
 type OkJson<V> = { ok: true; value: V };

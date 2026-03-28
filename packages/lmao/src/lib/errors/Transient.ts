@@ -88,6 +88,12 @@ export interface TransientConstructorVoid<C extends string> extends TaggedErrorC
   readonly defaultPolicy: RetryPolicy;
 }
 
+type TransientFactoryReturn<C extends string, D> = [unknown] extends [D]
+  ? TransientConstructor<C, D>
+  : undefined extends D
+    ? TransientConstructorVoid<C>
+    : TransientConstructor<C, D>;
+
 /**
  * Define a typed transient error code with default retry policy.
  *
@@ -121,14 +127,10 @@ export interface TransientConstructorVoid<C extends string> extends TaggedErrorC
  * ```
  */
 export function Transient<C extends string>(code: C, defaultPolicy: RetryPolicy): TransientConstructorVoid<C>;
-export function Transient<_D extends void, C extends string = string>(
-  code: C,
-  defaultPolicy: RetryPolicy,
-): TransientConstructorVoid<C>;
 export function Transient<D, C extends string = string>(
   code: C,
   defaultPolicy: RetryPolicy,
-): TransientConstructor<C, D>;
+): TransientFactoryReturn<C, D>;
 export function Transient(
   code: string,
   defaultPolicy: RetryPolicy,

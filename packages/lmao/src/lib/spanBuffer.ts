@@ -164,10 +164,14 @@ function isGeneratedSpanBufferClass<T extends LogSchema>(
 }
 
 function isSpanBufferConstructorForSchema<T extends LogSchema>(
-  ctor: Function | undefined,
+  ctor: unknown,
   schema: T,
 ): ctor is SpanBufferConstructor<T> {
-  return ctor !== undefined && Reflect.get(ctor, 'schema') === schema && typeof Reflect.get(ctor, 'stats') === 'object';
+  return (
+    typeof ctor === 'function' &&
+    Reflect.get(ctor, 'schema') === schema &&
+    typeof Reflect.get(ctor, 'stats') === 'object'
+  );
 }
 
 function getSpanBufferConstructorForBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBufferConstructor<T> {

@@ -92,6 +92,12 @@ export interface CodeConstructorVoid<C extends string> extends TaggedErrorConstr
   readonly _tag: C;
 }
 
+type CodeFactoryReturn<C extends string, D> = [unknown] extends [D]
+  ? CodeConstructor<C, D>
+  : undefined extends D
+    ? CodeConstructorVoid<C>
+    : CodeConstructor<C, D>;
+
 /**
  * Define a typed error code.
  *
@@ -115,8 +121,7 @@ export interface CodeConstructorVoid<C extends string> extends TaggedErrorConstr
  * ```
  */
 export function Code<C extends string>(code: C): CodeConstructorVoid<C>;
-export function Code<_D extends void, C extends string = string>(code: C): CodeConstructorVoid<C>;
-export function Code<D, C extends string = string>(code: C): CodeConstructor<C, D>;
+export function Code<D, C extends string = string>(code: C): CodeFactoryReturn<C, D>;
 export function Code(code: string) {
   function createCodeError(data?: unknown) {
     return new CodeError(code, data);
