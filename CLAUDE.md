@@ -67,6 +67,11 @@ carries only what the **receiver** needs to act. For the full rules with code ex
   success/failure wrapper can be an immutable singleton or eliminated entirely, do that instead of allocating fresh
   `{ ok: true }` / tiny throwaway objects. Keep small result objects only when they are truly the right contract and not
   an avoidable churn point.
+- **Boundary types must come from real contracts.** At transport/storage/IPC boundaries, prefer Typia or
+  `@smoothbricks/validation` over ad-hoc guards/normalizers. Prefer real public types over manually restating
+  `Record<string, unknown>` surfaces.
+- **Preserve WHY comments.** If you refactor a block with a WHY comment, keep or improve that rationale. Replacing it
+  with weaker glue or deleting it without preserving intent is a regression.
 
 ## Common Development Commands
 

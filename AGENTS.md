@@ -600,10 +600,24 @@ fc.assert(
  Deep fork of-fork interleavings with append/switch/reset operations
  Rollback/rollforward reversibility across long randomized operation sequences
 
-**Policy:**
+ **Policy:**
 
  Start with a small example test for readability, then add a property test that stress-tests the same invariant.
  For fork/undo logic, prefer randomized traces over manually enumerated branch cases.
+
+### Boundary Validation And Contract Preservation (MANDATORY)
+
+- At transport/storage/IPC boundaries, prefer Typia or `@smoothbricks/validation` over ad-hoc local validators,
+  normalizers, or one-off guard helpers.
+- If a boundary already has a meaningful public type (for example `Record<string, unknown>`), use that type instead of manually
+  restating `Record<string, unknown>` unions across multiple files.
+- Treat new helpers named like `normalizeX`, `coerceX`, `toRecord`, `isStringKeyRecord`, or similar as suspicious by
+  default. Before adding one, search for an existing shared validator/helper and justify why the new helper is
+  necessary.
+- If you replace a hand-written boundary parser with Typia, preserve the surrounding WHY comment or add a better one
+  that explains the invariant being protected.
+- When a typed boundary change alters an error message, update the test expectation deliberately; do not preserve stale
+  message assertions just because they existed first.
 
 **Key properties to test:**
 
