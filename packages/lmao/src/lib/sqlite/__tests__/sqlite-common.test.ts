@@ -5,7 +5,7 @@ import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../../types.js';
-import { buildInsertParams, type SpanSegment } from '../sqlite-common.js';
+import { buildInsertParams, parseSqliteTableInfoRows, type SpanSegment } from '../sqlite-common.js';
 
 const opContext = defineOpContext({
   logSchema: defineLogSchema({
@@ -53,5 +53,37 @@ describe('sqlite-common scope fallback', () => {
 
     expect(row0.slice(7)).toEqual(['scope-text', 7, 'direct-mixed']);
     expect(row1.slice(7)).toEqual(['scope-text', 7, 'scope-mixed']);
+  });
+});
+
+describe('parseSqliteTableInfoRows', () => {
+  it('accepts bigint PRAGMA integers from SQLite adapters', () => {
+    expect(
+      parseSqliteTableInfoRows([
+        {
+          cid: 0n,
+          name: 'trace_id',
+          type: 'TEXT',
+          notnull: 1n,
+          dflt_value: null,
+          pk: 1n,
+        },
+      ]),
+    ).toEqual([
+      {
+        cid: 0,
+        name: 'trace_id',
+        type: 'TEXT',
+        notnull: 1,
+        dflt_value: null,
+        pk: 1,
+      },
+    ]);
+  });
+
+  it('throws a descriptive error for invalid row shapes', () => {
+    expect(() =>
+      parseSqliteTableInfoRows([{ cid: 0, name: 'trace_id', type: 1, notnull: 1, dflt_value: null, pk: 1 }]),
+    ).toThrow('PRAGMA table_info(spans) returned an invalid SQLite row 0: type expected string, got number');
   });
 });

@@ -32,6 +32,8 @@ import { createTestTracerOptions } from './test-helpers.js';
 
 // Error code factory for tests
 const VALIDATION_ERROR = defineCodeError('VALIDATION_ERROR')<{ field: string }>();
+const HTTP_OPERATIONS = ['GET', 'POST', 'PUT', 'DELETE'] as const;
+const EMPTY_CTX: Record<string, never> = {};
 
 type CapturedBuffer = AnySpanBuffer | undefined;
 
@@ -55,7 +57,7 @@ const testSchema = defineLogSchema({
 // Create op context factory
 const ctx = defineOpContext({
   logSchema: testSchema,
-  ctx: {} as Record<string, never>,
+  ctx: EMPTY_CTX,
 });
 
 const { defineOp } = ctx;
@@ -67,16 +69,16 @@ function createTestTracer() {
   return new TestTracer(ctx, { ...createTestTracerOptions() });
 }
 
-function getColumnValue<T>(
+function getColumnValue(
   table: ReturnType<typeof convertSpanTreeToArrowTable>,
   columnName: string,
   rowIndex: number,
-): T {
+): unknown {
   const column = table.getChild(columnName);
   if (!column) {
     throw new Error(`column not found: ${columnName}`);
   }
-  return column.get(rowIndex) as T;
+  return column.get(rowIndex);
 }
 
 /**
@@ -85,8 +87,8 @@ function getColumnValue<T>(
 function countRowsByEntryType(table: ReturnType<typeof convertSpanTreeToArrowTable>): Record<string, number> {
   const counts: Record<string, number> = {};
   for (let i = 0; i < table.numRows; i++) {
-    const entryType = getColumnValue<string | null>(table, 'entry_type', i);
-    if (!entryType) {
+    const entryType = getColumnValue(table, 'entry_type', i);
+    if (typeof entryType !== 'string' || entryType.length === 0) {
       continue;
     }
     counts[entryType] = (counts[entryType] || 0) + 1;
@@ -141,7 +143,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
                   .info(`message-${i}`)
                   .userId(`user-${i % 5}`)
                   .requestId(`req-${i % 3}`)
-                  .operation(['GET', 'POST', 'PUT', 'DELETE'][i % 4] as 'GET')
+                  .operation(HTTP_OPERATIONS[i % 4])
                   .index(i);
               }
 
@@ -257,7 +259,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
                 .info(`msg-${i}`)
                 .userId(`user-${i}`)
                 .requestId(`req-${i}`)
-                .operation(['GET', 'POST', 'PUT', 'DELETE'][i % 4] as 'GET')
+                .operation(HTTP_OPERATIONS[i % 4])
                 .duration(i * 1.5)
                 .index(i);
             }
@@ -300,7 +302,7 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
           ctx.log
             .info(`text-message-${i}`) // text in message (system column)
             .userId(`category-${i % 5}`) // category
-            .operation(['GET', 'POST', 'PUT', 'DELETE'][i % 4] as 'GET') // enum
+            .operation(HTTP_OPERATIONS[i % 4]) // enum
             .duration(i * Math.PI) // number (float)
             .index(i) // number (int stored as float)
             .errorMsg(`unique-error-${i}-${Date.now()}`); // text (unique values)
@@ -324,7 +326,12 @@ describe('Buffer Overflow - Op-centric API Integration', () => {
       expect(infoRows[0].operation).toBe('GET');
       expect(infoRows[0].duration).toBeCloseTo(0, 5);
       expect(infoRows[0].index).toBe(0);
-      expect((infoRows[0].errorMsg as string).startsWith('unique-error-0-')).toBe(true);
+      const firstErrorMsg = infoRows[0].errorMsg;
+      expect(typeof firstErrorMsg).toBe('string');
+      if (typeof firstErrorMsg !== 'string') {
+        throw new Error('Expected first errorMsg to be a string');
+      }
+      expect(firstErrorMsg.startsWith('unique-error-0-')).toBe(true);
 
       expect(infoRows[25].message).toBe('text-message-25');
       expect(infoRows[25].duration).toBeCloseTo(25 * Math.PI, 5);

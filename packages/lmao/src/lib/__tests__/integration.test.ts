@@ -182,11 +182,12 @@ describe('Schema Integration Patterns', () => {
         const validationFlag = ctx.ff.advancedValidation;
         const retriesFlag = ctx.ff.maxRetries;
 
-        expect(validationFlag).toBeDefined();
-        expect((validationFlag as { value: boolean }).value).toBe(true);
+        if (!validationFlag || !retriesFlag) {
+          throw new Error('Expected sync feature flags to be available in test fixture');
+        }
 
-        expect(retriesFlag).toBeDefined();
-        expect((retriesFlag as { value: number }).value).toBe(5);
+        expect(validationFlag.value).toBe(true);
+        expect(retriesFlag.value).toBe(5);
 
         return ctx.ok({ validated: true });
       });

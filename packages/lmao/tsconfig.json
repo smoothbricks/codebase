@@ -4,6 +4,9 @@
   "include": [],
   "references": [
     {
+      "path": "../validation"
+    },
+    {
       "path": "../arrow-builder"
     },
     {

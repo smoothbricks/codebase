@@ -2,6 +2,11 @@
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
     "baseUrl": ".",
+    "paths": {
+      "@smoothbricks/validation": [
+        "../validation/src/index.ts"
+      ]
+    },
     "rootDir": "src",
     "types": [
       "bun"

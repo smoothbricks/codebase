@@ -17,7 +17,7 @@ import { defineLogSchema } from '../schema/defineLogSchema.js';
 import type { LogSchema } from '../schema/LogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
-import { createBuffer, createTestTracerOptions } from './test-helpers.js';
+import { createBuffer, createTestTracerOptions, requireFloat64Array } from './test-helpers.js';
 
 describe('generateRemappedBufferViewClass', () => {
   describe('class generation', () => {
@@ -516,9 +516,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const child = parentBuffer._children[0];
 
       // Access via prefixed name through the view
-      const childStatus = child.getColumnIfAllocated('http_status');
-      expect(childStatus).toBeInstanceOf(Float64Array);
-      expect((childStatus as Float64Array)[0]).toBe(404);
+      const childStatus = requireFloat64Array(child.getColumnIfAllocated('http_status'), 'child http_status');
+      expect(childStatus[0]).toBe(404);
 
       // System columns pass through unchanged
       expect(child.span_id).toBe(childBuffer.span_id);
@@ -568,9 +567,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const dbGrandchild = httpChild._children[0];
 
       // Each level returns correct prefixed columns
-      const httpStatus = httpChild.getColumnIfAllocated('http_status');
-      expect(httpStatus).toBeInstanceOf(Float64Array);
-      expect((httpStatus as Float64Array)[0]).toBe(200);
+      const httpStatus = requireFloat64Array(httpChild.getColumnIfAllocated('http_status'), 'http child status');
+      expect(httpStatus[0]).toBe(200);
       expect(dbGrandchild.getColumnIfAllocated('db_query')).toEqual(['SELECT * FROM users']);
     });
   });
@@ -590,9 +588,8 @@ describe('nested tasks with library modules - 4+ levels deep', () => {
       const view = new ViewClass(buffer);
 
       // No remapping, pass through directly
-      const statusCol = view.getColumnIfAllocated('status');
-      expect(statusCol).toBeInstanceOf(Float64Array);
-      expect((statusCol as Float64Array)[0]).toBe(200);
+      const statusCol = requireFloat64Array(view.getColumnIfAllocated('status'), 'status');
+      expect(statusCol[0]).toBe(200);
     });
 
     it('should handle special characters in column names', () => {

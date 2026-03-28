@@ -39,7 +39,7 @@ import { TransientError } from './errors/Transient.js';
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
-import { type ApplyTagsFn, Err, hasErrorCode, Ok, type Result } from './result.js';
+import { Err, hasErrorCode, Ok, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import {
   ENTRY_TYPE_SPAN_ERR,
@@ -47,6 +47,7 @@ import {
   ENTRY_TYPE_SPAN_OK,
   ENTRY_TYPE_SPAN_RETRY,
 } from './schema/systemSchema.js';
+import { isRecord } from './schema/typeGuards.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { LogBinding, SpanBuffer } from './types.js';
@@ -98,16 +99,15 @@ type SpanDispatchTarget<Ctx extends OpContext> = {
   readonly fn: SpanDispatchFn<Ctx>;
 };
 
-function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
-  return typeof value === 'object' && value !== null;
-}
-
-function isSpanDispatchFn<Ctx extends OpContext>(value: unknown): value is SpanDispatchFn<Ctx> {
-  return typeof value === 'function';
-}
-
 function isOpInstance<Ctx extends OpContext>(value: unknown): value is Op<Ctx, unknown[], unknown, unknown> {
   return value instanceof Op;
+}
+
+// WHY: resolveSpanTarget() accepts either an Op instance or a raw span
+// function. TypeScript needs an explicit predicate here to preserve the call
+// signature when the non-Op branch passes `value` through as `fn`.
+function isSpanDispatchFn<Ctx extends OpContext>(value: unknown): value is SpanDispatchFn<Ctx> {
+  return typeof value === 'function';
 }
 
 function isSpanBufferConstructorForSchema<T extends LogSchema>(
@@ -388,7 +388,7 @@ async function executeWithRetry<T extends LogSchema, S, E>(
  * - entry_type (SPAN_OK or SPAN_ERR based on result instanceof)
  * - timestamp
  * - error_code (for Err only)
- * - deferred tags via result.applyTags()
+ * - result row attributes already written eagerly by the fixed-position ResultWriter
  *
  * @param buffer - SpanBuffer to write to
  * @param result - The result returned by the span function
@@ -403,12 +403,6 @@ export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, r
     if (hasErrorCode(result.error)) {
       buffer.error_code(1, result.error.code);
     }
-  }
-
-  // Apply deferred tags if present
-  const applyTags = result.applyTags as ApplyTagsFn<T> | undefined;
-  if (applyTags) {
-    applyTags(buffer);
   }
 }
 
@@ -669,9 +663,9 @@ export function createSpanContextClass<Ctx extends OpContext>(
         spanLogger._setScope(attributes ?? {});
       };
 
-      this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value);
+      this.ok = <V>(value: V): Ok<V, Ctx['logSchema']> => new Ok<V, Ctx['logSchema']>(value, schema, buffer);
 
-      this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error);
+      this.err = <E>(error: E): Err<E, Ctx['logSchema']> => new Err<E, Ctx['logSchema']>(error, schema, buffer);
 
       // span uses regular function to access `arguments` (no ...rest spread allocation)
       // Closes over `self` for calling prototype methods
@@ -1195,10 +1189,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
       };
 
       ctx.ok = function ok<V>(value: V): Ok<V, Ctx['logSchema']> {
-        return new Ok<V, Ctx['logSchema']>(value);
+        return new Ok<V, Ctx['logSchema']>(value, childSchema, childBuffer);
       };
       ctx.err = function err<E>(error: E): Err<E, Ctx['logSchema']> {
-        return new Err<E, Ctx['logSchema']>(error);
+        return new Err<E, Ctx['logSchema']>(error, childSchema, childBuffer);
       };
       ctx.setScope = function setScope(attributes: ScopeUpdate<Ctx['logSchema']> | null): void {
         childLogger._setScope(attributes ?? {});

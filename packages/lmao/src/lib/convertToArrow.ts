@@ -77,20 +77,20 @@ export type SystemColumnBuilder = (
 
 const EMPTY_VALIDITY = new Uint8Array(0);
 const BINARY_TYPE = binary();
-type LegacyColumnDataBase<TType, TValues = unknown> = {
+type ArrowColumnDataBase<TType, TValues = unknown> = {
   type: TType;
   length: number;
   nullCount: number;
   data?: TValues;
   nullBitmap?: Uint8Array;
 };
-type LegacyDictionaryColumnData = LegacyColumnDataBase<ReturnType<typeof dictionary>> & {
+type DictionaryColumnBuildData = ArrowColumnDataBase<ReturnType<typeof dictionary>> & {
   dictionary: Column<unknown>;
 };
-type LegacyUtf8ColumnData = LegacyColumnDataBase<ReturnType<typeof utf8>, Uint8Array> & {
+type Utf8ColumnBuildData = ArrowColumnDataBase<ReturnType<typeof utf8>, Uint8Array> & {
   valueOffsets: Int32Array;
 };
-type LegacyGenericColumnData<TType extends DataType = DataType, TValues = unknown> = LegacyColumnDataBase<
+type GenericColumnBuildData<TType extends DataType = DataType, TValues = unknown> = ArrowColumnDataBase<
   TType,
   TValues
 > & {
@@ -102,13 +102,11 @@ function buildData<T extends Record<string, unknown>>(data: T): T {
   return data;
 }
 
-function buildColumn(data: LegacyDictionaryColumnData): Column<unknown>;
-function buildColumn(data: LegacyUtf8ColumnData): Column<unknown>;
-function buildColumn(data: LegacyGenericColumnData): Column<unknown>;
-function buildColumn(
-  data: LegacyDictionaryColumnData | LegacyUtf8ColumnData | LegacyGenericColumnData,
-): Column<unknown> {
-  if (isLegacyDictionaryColumnData(data)) {
+function buildColumn(data: DictionaryColumnBuildData): Column<unknown>;
+function buildColumn(data: Utf8ColumnBuildData): Column<unknown>;
+function buildColumn(data: GenericColumnBuildData): Column<unknown>;
+function buildColumn(data: DictionaryColumnBuildData | Utf8ColumnBuildData | GenericColumnBuildData): Column<unknown> {
+  if (isDictionaryColumnBuildData(data)) {
     const dictionaryData: DictionaryColumnData = {
       type: data.type,
       length: data.length,
@@ -119,7 +117,7 @@ function buildColumn(
     };
     return makeArrowColumn(dictionaryData);
   }
-  if (isLegacyUtf8ColumnData(data)) {
+  if (isUtf8ColumnBuildData(data)) {
     const utf8Data: Utf8ColumnData = {
       type: data.type,
       length: data.length,
@@ -140,15 +138,15 @@ function buildColumn(
   return makeArrowColumn(genericData);
 }
 
-function isLegacyDictionaryColumnData(
-  data: LegacyDictionaryColumnData | LegacyUtf8ColumnData | LegacyGenericColumnData,
-): data is LegacyDictionaryColumnData {
+function isDictionaryColumnBuildData(
+  data: DictionaryColumnBuildData | Utf8ColumnBuildData | GenericColumnBuildData,
+): data is DictionaryColumnBuildData {
   return 'dictionary' in data && data.dictionary instanceof Column;
 }
 
-function isLegacyUtf8ColumnData(
-  data: LegacyDictionaryColumnData | LegacyUtf8ColumnData | LegacyGenericColumnData,
-): data is LegacyUtf8ColumnData {
+function isUtf8ColumnBuildData(
+  data: DictionaryColumnBuildData | Utf8ColumnBuildData | GenericColumnBuildData,
+): data is Utf8ColumnBuildData {
   return 'valueOffsets' in data && data.valueOffsets instanceof Int32Array;
 }
 

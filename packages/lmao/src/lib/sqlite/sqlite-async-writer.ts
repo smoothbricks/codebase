@@ -7,7 +7,6 @@
  * @module sqlite-async-writer
  */
 
-import typia from 'typia';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
 import {
@@ -19,47 +18,12 @@ import {
   getInsertStatementCacheKey,
   getMissingSchemaColumns,
   isSqliteDuplicateColumnError,
+  parseSqliteTableInfoRows,
   SPANS_TABLE_INFO_SQL,
   SPANS_TABLE_INIT_SQL,
-  type SQLiteTableInfoRow,
   walkSpanSegments,
 } from './sqlite-common.js';
 import type { AsyncSQLiteDatabase, AsyncSQLiteStatement } from './sqlite-db.js';
-
-let validateSpansTableInfoRow: ((input: unknown) => typia.IValidation<SQLiteTableInfoRow>) | undefined;
-
-function getValidateSpansTableInfoRow(): (input: unknown) => typia.IValidation<SQLiteTableInfoRow> {
-  validateSpansTableInfoRow ??= typia.createValidateEquals<SQLiteTableInfoRow>();
-  return validateSpansTableInfoRow;
-}
-
-function describeSqliteBoundaryError(
-  boundary: string,
-  errors: readonly { path: string; expected: string }[],
-  rowIndex: number,
-): string {
-  const firstError = errors[0];
-  if (!firstError) {
-    return `${boundary} returned an invalid SQLite row ${rowIndex}`;
-  }
-
-  return `${boundary} returned an invalid SQLite row ${rowIndex} at ${firstError.path}: expected ${firstError.expected}`;
-}
-
-function parseSqliteBoundaryRows<T>(
-  boundary: string,
-  rows: unknown[],
-  validate: (input: unknown) => typia.IValidation<T>,
-): T[] {
-  return rows.map((row, rowIndex) => {
-    const validation = validate(row);
-    if (!validation.success) {
-      throw new Error(describeSqliteBoundaryError(boundary, validation.errors, rowIndex));
-    }
-
-    return validation.data;
-  });
-}
 
 export class SQLiteAsyncTraceWriter {
   private knownColumns = new Set<string>();
@@ -84,11 +48,7 @@ export class SQLiteAsyncTraceWriter {
     this.knownColumns.clear();
     // WHY: async drivers are still a real schema boundary; validate PRAGMA rows before caching column names that drive
     // later DDL and inserts.
-    const rows = parseSqliteBoundaryRows(
-      'PRAGMA table_info(spans)',
-      await this.db.prepare(SPANS_TABLE_INFO_SQL).all(),
-      getValidateSpansTableInfoRow(),
-    );
+    const rows = parseSqliteTableInfoRows(await this.db.prepare(SPANS_TABLE_INFO_SQL).all());
     for (const column of extractSqliteColumnsFromTableInfo(rows)) {
       this.knownColumns.add(column.name);
     }

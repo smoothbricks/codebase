@@ -8,11 +8,11 @@
  * ## Error Factories
  * - `defineCodeError(code)` - Create callable error class with `code` on prototype
  *
- * ## Deferred Tag Application
+ * ## Result Row Writer
  *
- * Ok and Err capture tag operations as closures via the `applyTags` property.
- * When span()/trace() completes, it calls `result.applyTags(buffer)` to apply
- * all captured tags to the correct buffer row 1.
+ * Span start reserves row 1 for the eventual span-end entry, so fluent result
+ * methods can write directly to that fixed row instead of capturing deferred
+ * closure chains.
  *
  * @example
  * ```typescript
@@ -31,6 +31,7 @@
  * ```
  */
 
+import { createResultWriter, type ResultWriter } from './codegen/fixedPositionWriterGenerator.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import type { AnySpanBuffer } from './types.js';
 
@@ -54,42 +55,31 @@ export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> ext
   readonly _tag: T['_tag'];
 }
 
-// =============================================================================
-// APPLY TAGS FUNCTION TYPE
-// =============================================================================
-
-/**
- * Type for the deferred tag application closure.
- * Called by span()/trace() at span-end to apply captured tags to the buffer.
- */
-export type ApplyTagsFn<T extends LogSchema> = (buffer: AnySpanBuffer) => void;
-
 type OkJson<V> = { ok: true; value: V };
 type ErrJson<E> = { ok: false; error: E };
 
-type BufferRowWriter = (row: number, value: unknown) => void;
 type ErrPredicate<E> = (error: E) => boolean;
 type ErrClassMatcher = abstract new (...args: never[]) => unknown;
 type ErrMatcher<E> = TaggedErrorConstructor<TaggedError> | ErrClassMatcher | ErrPredicate<E>;
 
-function isBufferRowWriter(value: unknown): value is BufferRowWriter {
-  return typeof value === 'function';
-}
+type BoundResultWriter<T extends LogSchema, R, E> = ResultWriter<T, R, E>;
 
-function applyDeferredAttributes<T extends LogSchema>(
-  buffer: AnySpanBuffer,
-  attributes: Partial<InferSchema<T>>,
-): void {
-  for (const [key, value] of Object.entries(attributes)) {
-    if (value == null) {
-      continue;
-    }
-
-    const writer = Reflect.get(buffer, key);
-    if (isBufferRowWriter(writer)) {
-      Reflect.apply(writer, buffer, [1, value]);
-    }
+function ensureResultWriter<T extends LogSchema, R, E>(
+  writer: BoundResultWriter<T, R, E> | undefined,
+  schema: T | undefined,
+  buffer: AnySpanBuffer | undefined,
+  resultOrError: R | E,
+  isError: boolean,
+): BoundResultWriter<T, R, E> | undefined {
+  if (writer) {
+    return writer;
   }
+
+  if (!schema || !buffer) {
+    return undefined;
+  }
+
+  return createResultWriter<T, R, E>(schema, buffer, resultOrError, isError);
 }
 
 function isErrPredicate<E>(value: ErrMatcher<E>): value is ErrPredicate<E> {
@@ -130,15 +120,19 @@ function createCodeErrorValue<Code extends string, Fields extends object>(
 export class Ok<V, T extends LogSchema = LogSchema> {
   readonly value: V;
 
-  /**
-   * Closure chain for deferred tag application.
-   * Applied by span()/trace() at span-end to write tags to buffer row 1.
-   * undefined if no chained methods were called.
-   */
-  applyTags?: ApplyTagsFn<T>;
+  private readonly _schema: T | undefined;
+  private readonly _buffer: AnySpanBuffer | undefined;
+  private _writer: BoundResultWriter<T, V, never> | undefined;
 
-  constructor(value: V) {
+  constructor(value: V, schema?: T, buffer?: AnySpanBuffer) {
     this.value = value;
+    this._schema = schema;
+    this._buffer = buffer;
+  }
+
+  private _resultWriter(): BoundResultWriter<T, V, never> | undefined {
+    this._writer = ensureResultWriter<T, V, never>(this._writer, this._schema, this._buffer, this.value, false);
+    return this._writer;
   }
 
   /** Discriminant for type narrowing. */
@@ -175,9 +169,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 
   /** Transform the success value. */
   map<U>(fn: (value: V) => U): Ok<U, T> {
-    const mapped = new Ok<U, T>(fn(this.value));
-    mapped.applyTags = this.applyTags;
-    return mapped;
+    return new Ok<U, T>(fn(this.value), this._schema, this._buffer);
   }
 
   /** No-op for Ok (error transformation). */
@@ -212,11 +204,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
    * @example ctx.ok(result).with({ userId: 'u1', operation: 'CREATE' })
    */
   with(attributes: Partial<InferSchema<T>>): this {
-    const prev = this.applyTags;
-    this.applyTags = (buffer) => {
-      if (prev) prev(buffer);
-      applyDeferredAttributes(buffer, attributes);
-    };
+    this._resultWriter()?.with(attributes);
     return this;
   }
 
@@ -227,11 +215,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
    * @example ctx.ok(result).message('User created successfully')
    */
   message(text: string): this {
-    const prev = this.applyTags;
-    this.applyTags = (buffer) => {
-      if (prev) prev(buffer);
-      buffer.message(1, text);
-    };
+    this._resultWriter()?.message(text);
     return this;
   }
 
@@ -242,11 +226,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
    * @example ctx.ok(result).line(42)
    */
   line(lineNumber: number): this {
-    const prev = this.applyTags;
-    this.applyTags = (buffer) => {
-      if (prev) prev(buffer);
-      buffer.line(1, lineNumber);
-    };
+    this._resultWriter()?.line(lineNumber);
     return this;
   }
 
@@ -285,16 +265,19 @@ export class Ok<V, T extends LogSchema = LogSchema> {
 export class Err<E, T extends LogSchema = LogSchema> {
   readonly error: E;
 
-  /**
-   * Closure chain for deferred tag application.
-   * Applied by span()/trace() at span-end to write tags to buffer row 1.
-   * Note: error_code is written directly by span()/trace() from this.error.code,
-   * not via this closure.
-   */
-  applyTags?: ApplyTagsFn<T>;
+  private readonly _schema: T | undefined;
+  private readonly _buffer: AnySpanBuffer | undefined;
+  private _writer: BoundResultWriter<T, never, E> | undefined;
 
-  constructor(error: E) {
+  constructor(error: E, schema?: T, buffer?: AnySpanBuffer) {
     this.error = error;
+    this._schema = schema;
+    this._buffer = buffer;
+  }
+
+  private _resultWriter(): BoundResultWriter<T, never, E> | undefined {
+    this._writer = ensureResultWriter<T, never, E>(this._writer, this._schema, this._buffer, this.error, true);
+    return this._writer;
   }
 
   /** Discriminant for type narrowing. */
@@ -361,9 +344,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
 
   /** Transform the error. */
   mapErr<F>(fn: (error: E) => F): Err<F, T> {
-    const mapped = new Err<F, T>(fn(this.error));
-    mapped.applyTags = this.applyTags as ApplyTagsFn<T> | undefined;
-    return mapped;
+    return new Err<F, T>(fn(this.error), this._schema, this._buffer);
   }
 
   /** No-op for Err (returns self). */
@@ -393,11 +374,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
    * @example ctx.err(error).with({ user_id: 'u1' })
    */
   with(attributes: Partial<InferSchema<T>>): this {
-    const prev = this.applyTags;
-    this.applyTags = (buffer) => {
-      if (prev) prev(buffer);
-      applyDeferredAttributes(buffer, attributes);
-    };
+    this._resultWriter()?.with(attributes);
     return this;
   }
 
@@ -408,11 +385,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
    * @example ctx.err('ERROR', details).message('Operation failed')
    */
   message(text: string): this {
-    const prev = this.applyTags;
-    this.applyTags = (buffer) => {
-      if (prev) prev(buffer);
-      buffer.message(1, text);
-    };
+    this._resultWriter()?.message(text);
     return this;
   }
 
@@ -423,11 +396,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
    * @example ctx.err('ERROR', details).line(42)
    */
   line(lineNumber: number): this {
-    const prev = this.applyTags;
-    this.applyTags = (buffer) => {
-      if (prev) prev(buffer);
-      buffer.line(1, lineNumber);
-    };
+    this._resultWriter()?.line(lineNumber);
     return this;
   }
 

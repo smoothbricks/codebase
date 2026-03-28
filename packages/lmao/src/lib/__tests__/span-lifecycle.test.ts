@@ -19,7 +19,7 @@ import {
 } from '../schema/systemSchema.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import { TestTracer } from '../tracers/TestTracer.js';
-import type { AnySpanBuffer } from '../types.js';
+import type { AnySpanBuffer, SpanBuffer } from '../types.js';
 import { createTestOpMetadata, createTestTraceRoot, createTestTracerOptions } from './test-helpers.js';
 
 // Error code factories for tests
@@ -486,7 +486,7 @@ describe('FluentResult Type Compatibility', () => {
  */
 describe('Fixed Row Layout', () => {
   it('should have span-start at row 0 and span-ok at row 1 after ctx.ok()', async () => {
-    let capturedBuffer: AnySpanBuffer | undefined;
+    let capturedBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
 
     const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
     const result = await trace('test-task', async (ctx) => {
@@ -513,6 +513,50 @@ describe('Fixed Row Layout', () => {
     expect(capturedBuffer).toBeDefined();
     expect(capturedBuffer?.entry_type[0]).toBe(ENTRY_TYPE_SPAN_START);
     expect(capturedBuffer?.entry_type[1]).toBe(ENTRY_TYPE_SPAN_ERR);
+  });
+
+  it('should write ok fluent result attributes directly to row 1', async () => {
+    let capturedBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
+
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+    await trace('test', async (ctx) => {
+      capturedBuffer = ctx.buffer;
+      return ctx.ok('done').with({ userId: 'user-1', operation: 'CREATE' }).message('completed').line(42);
+    });
+
+    expect(capturedBuffer).toBeDefined();
+    if (!capturedBuffer) {
+      throw new Error('capturedBuffer is undefined');
+    }
+
+    expect(capturedBuffer.message_values[1]).toBe('completed');
+    expect(capturedBuffer.userId_values[1]).toBe('user-1');
+    expect(capturedBuffer.operation_values[1]).toBe(0);
+    expect(capturedBuffer.line_values[1]).toBe(42);
+  });
+
+  it('should write err fluent result attributes directly to row 1', async () => {
+    let capturedBuffer: SpanBuffer<(typeof ctx)['logBinding']['logSchema']> | undefined;
+
+    const { trace } = new TestTracer(ctx, { ...createTestTracerOptions() });
+    await trace('test', async (ctx) => {
+      capturedBuffer = ctx.buffer;
+      return ctx
+        .err(VALIDATION_ERROR({ field: 'email' }))
+        .with({ userId: 'user-2' })
+        .message('failed')
+        .line(99);
+    });
+
+    expect(capturedBuffer).toBeDefined();
+    if (!capturedBuffer) {
+      throw new Error('capturedBuffer is undefined');
+    }
+
+    expect(capturedBuffer.message_values[1]).toBe('failed');
+    expect(capturedBuffer.userId_values[1]).toBe('user-2');
+    expect(capturedBuffer.error_code_values[1]).toBe('VALIDATION_ERROR');
+    expect(capturedBuffer.line_values[1]).toBe(99);
   });
 
   it('should have span-start at row 0 and span-exception at row 1 on thrown error', async () => {

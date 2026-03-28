@@ -87,6 +87,16 @@ export type ResultWriter<T extends LogSchema, R = unknown, E = unknown> = {
    * Bulk set multiple attributes at once.
    */
   with(attributes: Partial<InferSchema<T>>): ResultWriter<T, R, E>;
+
+  /**
+   * Set the result-row message (row 1).
+   */
+  message(text: string): ResultWriter<T, R, E>;
+
+  /**
+   * Set the result-row source line (row 1).
+   */
+  line(lineNumber: number): ResultWriter<T, R, E>;
 } & {
   /**
    * Individual attribute setters - each returns `this` for chaining.
@@ -357,6 +367,17 @@ const resultWriterExtension: FixedPositionWriterExtension = {
       this._error = undefined;
     }
   `,
+  methods: `
+message(text) {
+  this._buffer.message(this._pos, text);
+  return this;
+}
+
+line(lineNumber) {
+  this._buffer.line(this._pos, lineNumber);
+  return this;
+}
+`,
 };
 
 /**

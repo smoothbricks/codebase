@@ -7,34 +7,54 @@ type ExportConditions = {
   default?: string;
 };
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function requireRecord(value: unknown, label: string): Record<string, unknown> {
+  if (!isRecord(value)) {
+    throw new Error(`Expected ${label} to be an object`);
+  }
+  return value;
+}
+
+function requireStringProperty(entry: Record<string, unknown>, key: keyof ExportConditions): string {
+  const value = entry[key];
+  if (typeof value !== 'string') {
+    throw new Error(`Expected export condition '${key}' to be a string`);
+  }
+  return value;
+}
+
 function expectCoreConditions(entry: unknown): asserts entry is ExportConditions {
-  expect(typeof entry).toBe('object');
-  expect(entry).not.toBeNull();
-  expect(typeof (entry as ExportConditions).development).toBe('string');
-  expect(typeof (entry as ExportConditions).types).toBe('string');
-  expect(typeof (entry as ExportConditions).import).toBe('string');
-  expect(typeof (entry as ExportConditions).default).toBe('string');
+  const record = requireRecord(entry, 'export conditions');
+  expect(requireStringProperty(record, 'development')).toBeString();
+  expect(requireStringProperty(record, 'types')).toBeString();
+  expect(requireStringProperty(record, 'import')).toBeString();
+  expect(requireStringProperty(record, 'default')).toBeString();
+}
+
+async function readPackageExports(packageUrl: URL): Promise<Record<string, unknown>> {
+  const pkg = await Bun.file(packageUrl).json();
+  const pkgRecord = requireRecord(pkg, 'package.json');
+  return requireRecord(pkgRecord.exports, 'package.json exports');
 }
 
 describe('package export conditions', () => {
   it('lmao package exposes root + platform entry points with expected conditions', async () => {
-    const pkg = (await Bun.file(new URL('../../../package.json', import.meta.url)).json()) as {
-      exports: Record<string, unknown>;
-    };
+    const exports = await readPackageExports(new URL('../../../package.json', import.meta.url));
 
-    expectCoreConditions(pkg.exports['.']);
-    expectCoreConditions(pkg.exports['./node']);
-    expectCoreConditions(pkg.exports['./es']);
+    expectCoreConditions(exports['.']);
+    expectCoreConditions(exports['./node']);
+    expectCoreConditions(exports['./es']);
 
-    expect(pkg.exports['./package.json']).toBe('./package.json');
+    expect(exports['./package.json']).toBe('./package.json');
   });
 
   it('arrow-builder package root export has expected conditions', async () => {
-    const pkg = (await Bun.file(new URL('../../../../arrow-builder/package.json', import.meta.url)).json()) as {
-      exports: Record<string, unknown>;
-    };
+    const exports = await readPackageExports(new URL('../../../../arrow-builder/package.json', import.meta.url));
 
-    expectCoreConditions(pkg.exports['.']);
-    expect(pkg.exports['./package.json']).toBe('./package.json');
+    expectCoreConditions(exports['.']);
+    expect(exports['./package.json']).toBe('./package.json');
   });
 });

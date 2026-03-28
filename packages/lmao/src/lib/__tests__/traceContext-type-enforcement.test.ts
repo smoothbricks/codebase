@@ -173,90 +173,98 @@ describe('Reserved Keys Enforcement', () => {
   // Reserved context props are: buffer, tag, log, scope, setScope, ok, err, span, ff, deps
 
   it('should throw at runtime for buffer reserved key', () => {
+    const invalidCtx: Record<string, unknown> = {
+      buffer: 'should-fail',
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          buffer: 'should-fail',
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });
 
   it('should throw at runtime for span reserved key', () => {
+    const invalidCtx: Record<string, unknown> = {
+      span: () => {},
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          span: () => {},
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });
 
   it('should throw at runtime for ff reserved key', () => {
+    const invalidCtx: Record<string, unknown> = {
+      ff: {},
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          ff: {},
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });
 
   it('should throw at runtime for tag reserved key', () => {
+    const invalidCtx: Record<string, unknown> = {
+      tag: {},
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          tag: {},
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });
 
   it('should throw at runtime for log reserved key', () => {
+    const invalidCtx: Record<string, unknown> = {
+      log: {},
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          log: {},
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });
 
   it('should throw at runtime for ok reserved key', () => {
+    const invalidCtx: Record<string, unknown> = {
+      ok: () => {},
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          ok: () => {},
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });
 
   it('should throw at runtime for err reserved key', () => {
+    const invalidCtx: Record<string, unknown> = {
+      err: () => {},
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          err: () => {},
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });
 
   it('should throw for underscore-prefixed properties', () => {
     // Properties starting with _ are reserved for internal use
+    const invalidCtx: Record<string, unknown> = {
+      _internal: 'should-fail',
+    };
     expect(() =>
       defineOpContext({
         logSchema: defineLogSchema({}),
-        ctx: {
-          _internal: 'should-fail',
-        } as Record<string, unknown>,
+        ctx: invalidCtx,
       }),
     ).toThrow(/reserved/i);
   });

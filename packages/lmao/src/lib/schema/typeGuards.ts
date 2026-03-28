@@ -18,7 +18,7 @@ import type { EvaluationContext, UsageContext } from './defineFeatureFlags.js';
 import type { FeatureFlagDefinition } from './types.js';
 
 /** Narrow unknown to Record<string, unknown> — non-null object with string-keyed access. */
-function isRecord(value: unknown): value is Record<string, unknown> {
+export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
 

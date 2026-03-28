@@ -132,9 +132,9 @@ describe('Op Metadata', () => {
       const ctx = defineOpContext({ logSchema: testSchema });
       const { defineOp } = ctx;
 
-      let capturedMetadata: { name: string } | undefined;
+      let capturedMetadata: ReturnType<typeof createOpMetadata> | undefined;
       const myOp = defineOp('traced-op', (ctx) => {
-        capturedMetadata = ctx.buffer._opMetadata as { name: string };
+        capturedMetadata = ctx.buffer._opMetadata;
         return ctx.ok('done');
       });
 
@@ -149,12 +149,12 @@ describe('Op Metadata', () => {
       const ctx = defineOpContext({ logSchema: testSchema });
       const { defineOp } = ctx;
 
-      let innerCallsiteMetadata: { name: string } | undefined;
-      let innerOpMetadata: { name: string } | undefined;
+      let innerCallsiteMetadata: ReturnType<typeof createOpMetadata> | undefined;
+      let innerOpMetadata: ReturnType<typeof createOpMetadata> | undefined;
 
       const innerOp = defineOp('inner-op', (ctx) => {
-        innerCallsiteMetadata = ctx.buffer._callsiteMetadata as { name: string };
-        innerOpMetadata = ctx.buffer._opMetadata as { name: string };
+        innerCallsiteMetadata = ctx.buffer._callsiteMetadata;
+        innerOpMetadata = ctx.buffer._opMetadata;
         return ctx.ok('inner-done');
       });
 

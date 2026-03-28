@@ -39,6 +39,7 @@ const testSchema = new LogSchema(
  * before overflow in the first buffer.
  */
 const RESERVED_ROWS = 2;
+const DB_OPERATIONS = ['SELECT', 'INSERT', 'UPDATE', 'DELETE'] as const;
 
 type BufferChainAnalysis = {
   bufferCount: number;
@@ -142,11 +143,13 @@ function collectEntries(
     const durationValues = current.getColumnIfAllocated('duration');
 
     for (let row = start; row < end; row++) {
+      const requestIdValue = Array.isArray(requestIdValues) ? requestIdValues[row] : undefined;
+      const userIdValue = Array.isArray(userIdValues) ? userIdValues[row] : undefined;
       entries.push({
         bufferIndex,
         rowIndex: row,
-        requestId: Array.isArray(requestIdValues) ? (requestIdValues[row] as string | undefined) : undefined,
-        userId: Array.isArray(userIdValues) ? (userIdValues[row] as string | undefined) : undefined,
+        requestId: typeof requestIdValue === 'string' ? requestIdValue : undefined,
+        userId: typeof userIdValue === 'string' ? userIdValue : undefined,
         operation: operationValues instanceof Uint8Array ? operationValues[row] : undefined,
         duration: durationValues instanceof Float64Array ? durationValues[row] : undefined,
       });
@@ -203,7 +206,7 @@ describe('Buffer Overflow Property Tests', () => {
                 .info(`msg-${i}`)
                 .requestId(`req-${i}`)
                 .userId(`user-${i}`)
-                .operation(['SELECT', 'INSERT', 'UPDATE', 'DELETE'][i % 4] as 'SELECT')
+                .operation(DB_OPERATIONS[i % 4])
                 .duration(i * 10);
             }
 

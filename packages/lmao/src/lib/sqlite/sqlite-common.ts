@@ -1,5 +1,7 @@
 import type { SchemaType } from '@smoothbricks/arrow-builder';
+import { hasOwn, hasOwnString, isRecord } from '@smoothbricks/validation';
 import type { LogSchema } from '../schema/LogSchema.js';
+import { getSchemaType } from '../schema/typeGuards.js';
 import type { AnySpanBuffer } from '../types.js';
 
 export const SPANS_TABLE_INIT_SQL = `
@@ -20,7 +22,7 @@ export const SPANS_TABLE_INIT_SQL = `
 
 export const SPANS_TABLE_INFO_SQL = 'PRAGMA table_info(spans)';
 
-type DynamicUserColumnBuffer = Record<string, unknown>;
+type SQLiteTableInfoIntegerField = keyof Pick<SQLiteTableInfoRow, 'cid' | 'notnull' | 'pk'>;
 
 export interface SQLiteColumnDefinition {
   name: string;
@@ -55,25 +57,105 @@ function isBitSet(bitmap: Uint8Array, idx: number): boolean {
  * Typed arrays are pre-allocated with zeros, so null bitmaps distinguish
  * "set to zero" from "never written". JS arrays use `undefined` for unwritten slots.
  */
-function readUserValue(buffer: DynamicUserColumnBuffer, fieldName: string, row: number): unknown {
-  const values = buffer[`${fieldName}_values`];
+function readUserValue(buffer: AnySpanBuffer, fieldName: string, row: number): unknown {
+  const values = Reflect.get(buffer, `${fieldName}_values`);
   if (!values) return undefined;
 
   if (ArrayBuffer.isView(values)) {
-    const nulls = buffer[`${fieldName}_nulls`] as Uint8Array | undefined;
-    if (!('length' in values)) {
+    const nulls = Reflect.get(buffer, `${fieldName}_nulls`);
+    if (!(nulls instanceof Uint8Array) || !('length' in values)) {
       return undefined;
     }
-    const typedValues = values as unknown as { [index: number]: unknown; length: number };
-    return nulls && isBitSet(nulls, row) ? typedValues[row] : undefined;
+
+    return isBitSet(nulls, row) ? Reflect.get(values, row) : undefined;
   }
 
-  return (values as unknown[])[row];
+  return Array.isArray(values) ? values[row] : undefined;
 }
 
 function readScopeValue(buffer: AnySpanBuffer, fieldName: string): unknown {
-  const scopeValues = buffer._scopeValues as Record<string, unknown> | undefined;
-  return scopeValues?.[fieldName];
+  return isRecord(buffer._scopeValues) ? buffer._scopeValues[fieldName] : undefined;
+}
+
+function describeSqliteBoundaryType(value: unknown): string {
+  return typeof value;
+}
+
+function invalidSqliteBoundaryRow(boundary: string, rowIndex: number, message: string): Error {
+  return new Error(`${boundary} returned an invalid SQLite row ${rowIndex}: ${message}`);
+}
+
+function normalizeSqliteTableInfoInteger(
+  value: unknown,
+  boundary: string,
+  rowIndex: number,
+  fieldName: SQLiteTableInfoIntegerField,
+): number {
+  if (typeof value === 'number') {
+    return value;
+  }
+  if (typeof value === 'bigint') {
+    return Number(value);
+  }
+
+  throw invalidSqliteBoundaryRow(
+    boundary,
+    rowIndex,
+    `${fieldName} expected number, got ${describeSqliteBoundaryType(value)}`,
+  );
+}
+
+function parseSqliteTableInfoRow(row: unknown, boundary: string, rowIndex: number): SQLiteTableInfoRow {
+  if (!isRecord(row)) {
+    throw invalidSqliteBoundaryRow(boundary, rowIndex, `expected record, got ${describeSqliteBoundaryType(row)}`);
+  }
+
+  const rowRecord = row;
+
+  if (!hasOwn(rowRecord, 'cid')) {
+    throw invalidSqliteBoundaryRow(boundary, rowIndex, 'missing cid');
+  }
+  if (!hasOwnString(rowRecord, 'name')) {
+    throw invalidSqliteBoundaryRow(
+      boundary,
+      rowIndex,
+      `name expected string, got ${describeSqliteBoundaryType(rowRecord.name)}`,
+    );
+  }
+  if (!hasOwnString(rowRecord, 'type')) {
+    throw invalidSqliteBoundaryRow(
+      boundary,
+      rowIndex,
+      `type expected string, got ${describeSqliteBoundaryType(rowRecord.type)}`,
+    );
+  }
+  if (!hasOwn(rowRecord, 'notnull')) {
+    throw invalidSqliteBoundaryRow(boundary, rowIndex, 'missing notnull');
+  }
+  if (!hasOwn(rowRecord, 'dflt_value')) {
+    throw invalidSqliteBoundaryRow(boundary, rowIndex, 'missing dflt_value');
+  }
+  if (typeof rowRecord.dflt_value !== 'string' && rowRecord.dflt_value !== null) {
+    throw invalidSqliteBoundaryRow(
+      boundary,
+      rowIndex,
+      `dflt_value expected string|null, got ${describeSqliteBoundaryType(rowRecord.dflt_value)}`,
+    );
+  }
+  if (!hasOwn(rowRecord, 'pk')) {
+    throw invalidSqliteBoundaryRow(boundary, rowIndex, 'missing pk');
+  }
+
+  return {
+    // WHY: some SQLite adapters promote PRAGMA integer metadata to bigint, but the shared table-info contract uses
+    // numeric counters plus string column descriptors.
+    cid: normalizeSqliteTableInfoInteger(rowRecord.cid, boundary, rowIndex, 'cid'),
+    name: rowRecord.name,
+    type: rowRecord.type,
+    notnull: normalizeSqliteTableInfoInteger(rowRecord.notnull, boundary, rowIndex, 'notnull'),
+    dflt_value: rowRecord.dflt_value,
+    pk: normalizeSqliteTableInfoInteger(rowRecord.pk, boundary, rowIndex, 'pk'),
+  };
 }
 
 /** Map arrow-builder SchemaType to SQLite column type */
@@ -138,6 +220,13 @@ export function extractSqliteColumnsFromTableInfo(columns: readonly SQLiteTableI
   }));
 }
 
+export function parseSqliteTableInfoRows(
+  rows: readonly unknown[],
+  boundary = 'PRAGMA table_info(spans)',
+): SQLiteTableInfoRow[] {
+  return rows.map((row, rowIndex) => parseSqliteTableInfoRow(row, boundary, rowIndex));
+}
+
 function* walkOverflowSegments(
   buffer: AnySpanBuffer,
   traceId: string,
@@ -174,11 +263,10 @@ export function getMissingSchemaColumns(
   schema: LogSchema,
   knownColumns: ReadonlySet<string>,
 ): SQLiteColumnDefinition[] {
-  const fields = schema.fields as Record<string, { __schema_type?: SchemaType }>;
   const schemaColumns: SQLiteColumnDefinition[] = [];
 
-  for (const [name, field] of Object.entries(fields)) {
-    const schemaType = field.__schema_type;
+  for (const [name, field] of Object.entries(schema.fields)) {
+    const schemaType = getSchemaType(field);
     if (!schemaType) continue;
 
     schemaColumns.push({ name, sqliteType: schemaTypeToSqlite(schemaType) });
@@ -209,7 +297,7 @@ export function buildInsertParams(segment: SpanSegment, row: number, activeUserF
   const message = buffer.message_values[row] ?? null;
 
   const userValues = activeUserFields.map((fieldName) => {
-    const directValue = readUserValue(buffer as unknown as DynamicUserColumnBuffer, fieldName, row);
+    const directValue = readUserValue(buffer, fieldName, row);
     const val = directValue ?? readScopeValue(buffer, fieldName);
     if (val === undefined || val === null) {
       return null;

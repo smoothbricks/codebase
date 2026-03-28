@@ -390,10 +390,11 @@ describe('Effective Schema Computation', () => {
       const reservedProps = ['buffer', 'tag', 'log', 'scope', 'setScope', 'ok', 'err', 'span', 'ff', 'deps'];
 
       for (const prop of reservedProps) {
+        const invalidCtx: Record<string, unknown> = { [prop]: 'bad' };
         expect(() => {
           defineOpContext({
             logSchema: schema,
-            ctx: { [prop]: 'bad' } as Record<string, unknown>,
+            ctx: invalidCtx,
           });
         }).toThrow(`Cannot use '${prop}' in ctx - it is a reserved SpanContext property`);
       }
@@ -407,10 +408,11 @@ describe('Effective Schema Computation', () => {
       const underscoreProps = ['_internal', '_private', '_meta', '_custom', '_foo'];
 
       for (const prop of underscoreProps) {
+        const invalidCtx: Record<string, unknown> = { [prop]: 'bad' };
         expect(() => {
           defineOpContext({
             logSchema: schema,
-            ctx: { [prop]: 'bad' } as Record<string, unknown>,
+            ctx: invalidCtx,
           });
         }).toThrow(`Cannot use '${prop}' in ctx - properties starting with '_' are reserved for internal use`);
       }

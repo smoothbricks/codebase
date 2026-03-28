@@ -34,6 +34,52 @@ import type { LogBinding, SpanBuffer } from '../types.js';
 // Create a minimal OpContextBinding for the NoOpTracer (it doesn't actually use it)
 const minimalOpContext = defineOpContext({ logSchema: new LogSchema({}) });
 
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function requireLogSchema(value: unknown, label: string): LogSchema {
+  if (!(value instanceof LogSchema)) {
+    throw new Error(`Expected ${label} to be a LogSchema`);
+  }
+  return value;
+}
+
+function requireColumnMapping(value: unknown, label: string): Record<string, string | null> {
+  if (!isRecord(value)) {
+    throw new Error(`Expected ${label} to be a column mapping record`);
+  }
+  const mapping: Record<string, string | null> = {};
+  for (const [key, mappingValue] of Object.entries(value)) {
+    if (typeof mappingValue !== 'string' && mappingValue !== null) {
+      throw new Error(`Expected column mapping '${key}' in ${label} to be a string or null`);
+    }
+    mapping[key] = mappingValue;
+  }
+  return mapping;
+}
+
+export function requireStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value) || value.some((entry) => typeof entry !== 'string')) {
+    throw new Error(`Expected ${label} to be a string[]`);
+  }
+  return value;
+}
+
+export function requireFloat64Array(value: unknown, label: string): Float64Array {
+  if (!(value instanceof Float64Array)) {
+    throw new Error(`Expected ${label} to be a Float64Array`);
+  }
+  return value;
+}
+
+export function requireUint8Array(value: unknown, label: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) {
+    throw new Error(`Expected ${label} to be a Uint8Array`);
+  }
+  return value;
+}
+
 /**
  * Default TracerOptions for tests.
  * Includes JsBufferStrategy and createTraceRoot.
@@ -49,10 +95,7 @@ export function createTestTracerOptions<T extends LogSchema>(): TracerOptions<T>
  * Shared NoOpTracer instance for tests that create buffers directly.
  * Cast to TracerLifecycleHooks since that's what TraceRoot expects.
  */
-export const TEST_TRACER = new NoOpTracer(
-  minimalOpContext,
-  createTestTracerOptions(),
-) as unknown as TracerLifecycleHooks;
+export const TEST_TRACER: TracerLifecycleHooks = new NoOpTracer(minimalOpContext, createTestTracerOptions());
 
 type TestSpanBufferBundle<T extends SchemaFields> = {
   logBinding: LogBinding;
@@ -119,7 +162,9 @@ export function createTestSchema<T extends SchemaFields>(fields: T): LogSchema<T
  * @param schema - LogSchema or SchemaFields to use (will be wrapped in LogSchema if needed)
  * @returns LogBinding ready for use with createSpanBuffer
  */
-export function createTestLogBinding<T extends SchemaFields>(schema: SchemaFields | LogSchema<T>): LogBinding {
+export function createTestLogBinding<T extends SchemaFields>(schema: LogSchema<T>): LogBinding;
+export function createTestLogBinding<T extends SchemaFields>(schema: T): LogBinding;
+export function createTestLogBinding<T extends SchemaFields>(schema: T | LogSchema<T>): LogBinding {
   // Wrap in LogSchema if plain SchemaFields provided
   const logSchema = schema instanceof LogSchema ? schema : createTestSchema(schema);
 
@@ -140,14 +185,28 @@ export function createTestLogBinding<T extends SchemaFields>(schema: SchemaField
  * @returns Object with logBinding and spanBuffer
  */
 export function createTestSpanBuffer<T extends SchemaFields>(
-  schema: SchemaFields | LogSchema<T>,
+  schema: LogSchema<T>,
+  options?: {
+    trace_id?: TraceId;
+    capacity?: number;
+  },
+): TestSpanBufferBundle<T>;
+export function createTestSpanBuffer<T extends SchemaFields>(
+  schema: T,
+  options?: {
+    trace_id?: TraceId;
+    capacity?: number;
+  },
+): TestSpanBufferBundle<T>;
+export function createTestSpanBuffer<T extends SchemaFields>(
+  schema: T | LogSchema<T>,
   options: {
     trace_id?: TraceId;
     capacity?: number;
   } = {},
 ): TestSpanBufferBundle<T> {
   // Wrap in LogSchema if plain SchemaFields provided
-  const logSchema = schema instanceof LogSchema ? (schema as LogSchema<T>) : createTestSchema(schema);
+  const logSchema: LogSchema<T> = schema instanceof LogSchema ? schema : createTestSchema(schema);
 
   // Create LogBinding (stats are on SpanBufferClass.stats, not LogBinding)
   const logBinding = createTestLogBinding(logSchema);
@@ -161,7 +220,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
     traceRoot,
     DEFAULT_METADATA,
     options.capacity ?? DEFAULT_BUFFER_CAPACITY,
-  ) as SpanBuffer<LogSchema<T>>;
+  );
 
   return { logBinding, spanBuffer };
 }
@@ -197,8 +256,13 @@ export function createTestLogger<T extends LogSchema>(schema: T): TestLoggerBund
  * @param opGroup - The OpGroup to access
  * @returns Internal interface with _logSchema and _flags
  */
-export function getOpGroupInternals<Ctx extends OpContext>(opGroup: OpGroup<Ctx>): OpGroupInternal<Ctx> {
-  return opGroup as unknown as OpGroupInternal<Ctx>;
+export function getOpGroupInternals<Ctx extends OpContext>(
+  opGroup: OpGroup<Ctx>,
+): Pick<OpGroupInternal<Ctx>, '_logSchema'> {
+  return {
+    ...opGroup,
+    _logSchema: requireLogSchema(Reflect.get(opGroup, '_logSchema'), 'OpGroup._logSchema') as Ctx['logSchema'],
+  };
 }
 
 /**
@@ -213,8 +277,15 @@ export function getOpGroupInternals<Ctx extends OpContext>(opGroup: OpGroup<Ctx>
  */
 export function getMappedOpGroupInternals<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
   opGroup: MappedOpGroup<Ctx, ContributedSchema>,
-): MappedOpGroupInternal<Ctx, ContributedSchema> {
-  return opGroup as unknown as MappedOpGroupInternal<Ctx, ContributedSchema>;
+): Pick<MappedOpGroupInternal<Ctx, ContributedSchema>, '_logSchema' | '_columnMapping'> {
+  return {
+    ...opGroup,
+    _logSchema: requireLogSchema(Reflect.get(opGroup, '_logSchema'), 'MappedOpGroup._logSchema') as Ctx['logSchema'],
+    _columnMapping: requireColumnMapping(
+      Reflect.get(opGroup, '_columnMapping'),
+      'MappedOpGroup._columnMapping',
+    ) as MappedOpGroupInternal<Ctx, ContributedSchema>['_columnMapping'],
+  };
 }
 
 /**

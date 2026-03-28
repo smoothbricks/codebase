@@ -128,11 +128,10 @@ describe('FlushScheduler', () => {
 
       it('should handle buffer with missing properties', () => {
         const buffer = createTestBuffer();
-        // Create a partial buffer missing timestamps to test error handling
-        const { timestamp: _timestamps, ...partialBuffer } = buffer;
+        Reflect.set(buffer, 'timestamp', undefined);
 
         expect(() => {
-          scheduler.register(partialBuffer as AnySpanBuffer);
+          scheduler.register(buffer);
         }).not.toThrow();
       });
     });
@@ -331,10 +330,9 @@ describe('FlushScheduler', () => {
 
         try {
           const buffer = createTestBuffer();
-          // Create a partial buffer missing timestamps to test error handling
-          const { timestamp: _timestamps, ...partialBuffer } = buffer;
+          Reflect.set(buffer, 'timestamp', undefined);
 
-          scheduler.register(partialBuffer as AnySpanBuffer);
+          scheduler.register(buffer);
 
           // Should complete without throwing (error is caught and logged)
           await scheduler.flush();

@@ -9,27 +9,10 @@ import { describe, expect, it } from 'bun:test';
 import { decode } from '@msgpack/msgpack';
 import { createColumnWriter } from '@smoothbricks/arrow-builder';
 import { convertSpanTreeToArrowTable, convertToArrowTable, createSpanBuffer, S } from '@smoothbricks/lmao';
+import typia from 'typia';
 import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
 import { invokeWriterMethod, nextWriterRow, requireBinaryCell, requireColumn } from '../arrow-test-helpers.js';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';
-
-function isHttpRequest(value: unknown): value is {
-  method: string;
-  url: string;
-  headers: Record<string, string>;
-} {
-  return (
-    typeof value === 'object' &&
-    value !== null &&
-    'method' in value &&
-    'url' in value &&
-    'headers' in value &&
-    typeof value.method === 'string' &&
-    typeof value.url === 'string' &&
-    typeof value.headers === 'object' &&
-    value.headers !== null
-  );
-}
 
 describe('Binary Arrow Conversion', () => {
   describe('convertToArrowTable (Path 1: single buffer)', () => {
@@ -83,6 +66,8 @@ describe('Binary Arrow Conversion', () => {
         headers: Record<string, string>;
       }
 
+      const assertHttpRequest = typia.createAssertEquals<HttpRequest>();
+
       const schema = createTestSchema({
         request: S.object<HttpRequest>(),
       });
@@ -106,10 +91,7 @@ describe('Binary Arrow Conversion', () => {
 
       const bytes = requireBinaryCell(requestCol, 0);
       expect(bytes).toBeInstanceOf(Uint8Array);
-      const decoded = decode(bytes);
-      if (!isHttpRequest(decoded)) {
-        throw new Error('Decoded request payload did not match HttpRequest shape');
-      }
+      const decoded = assertHttpRequest(decode(bytes));
       expect(decoded.method).toBe('POST');
       expect(decoded.url).toBe('/api/users');
       expect(decoded.headers['content-type']).toBe('application/json');

@@ -48,11 +48,14 @@ describe('Library Integration Pattern', () => {
       });
 
       const prefixed = prefixSchema(schema, 'db');
+      const dbOperation = prefixed.db_operation;
 
-      expect(prefixed.db_operation).toHaveProperty('__schema_type', 'enum');
-      expect(prefixed.db_operation).toHaveProperty('__enum_values');
-      const enumSchema = prefixed.db_operation as { __enum_values?: readonly string[] };
-      expect(enumSchema.__enum_values).toEqual(['CREATE', 'DELETE']);
+      if (typeof dbOperation !== 'object' || dbOperation === null) {
+        throw new Error('Expected prefixed db_operation metadata to be an object');
+      }
+      expect(dbOperation).toHaveProperty('__schema_type', 'enum');
+      expect(dbOperation).toHaveProperty('__enum_values');
+      expect(Reflect.get(dbOperation, '__enum_values')).toEqual(['CREATE', 'DELETE']);
     });
 
     it('should create correct prefix mapping', () => {
