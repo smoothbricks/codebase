@@ -27,9 +27,13 @@ export interface SQLiteColumnDefinition {
   sqliteType: string;
 }
 
-interface SQLiteTableInfoColumn {
+export interface SQLiteTableInfoRow {
+  cid: number;
   name: string;
   type: string;
+  notnull: number;
+  dflt_value: string | null;
+  pk: number;
 }
 
 export interface SpanSegment {
@@ -127,7 +131,7 @@ export function getMissingSqliteColumns(
   return missing;
 }
 
-export function extractSqliteColumnsFromTableInfo(columns: readonly SQLiteTableInfoColumn[]): SQLiteColumnDefinition[] {
+export function extractSqliteColumnsFromTableInfo(columns: readonly SQLiteTableInfoRow[]): SQLiteColumnDefinition[] {
   return columns.map((column) => ({
     name: column.name,
     sqliteType: normalizeSqliteColumnType(column.type),

@@ -2,5 +2,6 @@
 preload = ["./packages/lmao/src/bun/preload.ts"]
 
 [test]
-# Typia codegen + LMAO test tracing (flushes spans to .trace-results.db).
-preload = ["./packages/lmao/src/bun/test-preload"]
+# Keep Typia and test tracing as separate preloads so Typia is registered before
+# the tracing preload imports any source files that call typia.createValidate*().
+preload = ["./packages/lmao/src/bun/preload.ts", "./packages/lmao/src/bun/trace-preload.ts"]

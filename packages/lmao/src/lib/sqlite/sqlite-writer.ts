@@ -15,12 +15,14 @@
  * @module sqlite-writer
  */
 
+import typia from 'typia';
 import type { LogSchema } from '../schema/LogSchema.js';
 import type { AnySpanBuffer } from '../types.js';
 import {
   buildAddColumnSql,
   buildInsertParams,
   buildInsertSql,
+  extractSqliteColumnsFromTableInfo,
   getActiveUserFields,
   getInsertStatementCacheKey,
   getMissingSchemaColumns,
@@ -28,6 +30,7 @@ import {
   SPANS_TABLE_INFO_SQL,
   SPANS_TABLE_INIT_SQL,
   type SpanSegment,
+  type SQLiteTableInfoRow,
   walkSpanSegments,
 } from './sqlite-common.js';
 import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
@@ -35,6 +38,41 @@ import type { SyncSQLiteDatabase, SyncSQLiteStatement } from './sqlite-db.js';
 export interface SQLiteWriterConfig {
   /** Path to SQLite file. Default: '.trace-results.db' */
   dbPath?: string;
+}
+
+let validateSpansTableInfoRow: ((input: unknown) => typia.IValidation<SQLiteTableInfoRow>) | undefined;
+
+function getValidateSpansTableInfoRow(): (input: unknown) => typia.IValidation<SQLiteTableInfoRow> {
+  validateSpansTableInfoRow ??= typia.createValidateEquals<SQLiteTableInfoRow>();
+  return validateSpansTableInfoRow;
+}
+
+function describeSqliteBoundaryError(
+  boundary: string,
+  errors: readonly { path: string; expected: string }[],
+  rowIndex: number,
+): string {
+  const firstError = errors[0];
+  if (!firstError) {
+    return `${boundary} returned an invalid SQLite row ${rowIndex}`;
+  }
+
+  return `${boundary} returned an invalid SQLite row ${rowIndex} at ${firstError.path}: expected ${firstError.expected}`;
+}
+
+function parseSqliteBoundaryRows<T>(
+  boundary: string,
+  rows: unknown[],
+  validate: (input: unknown) => typia.IValidation<T>,
+): T[] {
+  return rows.map((row, rowIndex) => {
+    const validation = validate(row);
+    if (!validation.success) {
+      throw new Error(describeSqliteBoundaryError(boundary, validation.errors, rowIndex));
+    }
+
+    return validation.data;
+  });
 }
 
 export class SQLiteTraceWriter {
@@ -53,10 +91,15 @@ export class SQLiteTraceWriter {
 
   private refreshKnownColumns(): void {
     this.knownColumns.clear();
-    // Cache existing user columns from spans table
-    const cols = this.db.prepare(SPANS_TABLE_INFO_SQL).all() as { name: string }[];
-    for (const col of cols) {
-      this.knownColumns.add(col.name);
+    // WHY: PRAGMA row shape changes would make later ALTER/INSERT logic drift silently, so validate here before
+    // mutating the writer's cached schema view.
+    const rows = parseSqliteBoundaryRows(
+      'PRAGMA table_info(spans)',
+      this.db.prepare(SPANS_TABLE_INFO_SQL).all(),
+      getValidateSpansTableInfoRow(),
+    );
+    for (const column of extractSqliteColumnsFromTableInfo(rows)) {
+      this.knownColumns.add(column.name);
     }
   }
 
