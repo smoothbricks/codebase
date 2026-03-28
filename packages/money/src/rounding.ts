@@ -48,7 +48,7 @@ export function roundBasisToAmount<C extends string>(
 
   if (divisor === 1n) {
     // No rounding needed when scales are identical
-    return Amount<C>(basis as bigint);
+    return Amount<C>(basis);
   }
 
   // BigInt division truncates toward zero

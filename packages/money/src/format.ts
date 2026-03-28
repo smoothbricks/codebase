@@ -9,7 +9,7 @@
  */
 
 import type { CurrencyDef } from './currency-registry.js';
-import type { Amount, Basis } from './types.js';
+import { Amount, type Amount as AmountValue, Basis, type Basis as BasisValue } from './types.js';
 
 /**
  * Parse a canonical decimal string into an Amount<C>.
@@ -19,8 +19,8 @@ import type { Amount, Basis } from './types.js';
  *
  * @throws if the string is empty, contains non-numeric characters, or has too many decimal points
  */
-export function parseAmount<C extends string>(str: string, currency: CurrencyDef): Amount<C> {
-  return parseDecimalToBigInt(str, currency.decimals) as Amount<C>;
+export function parseAmount<C extends string>(str: string, currency: CurrencyDef): AmountValue<C> {
+  return Amount<C>(parseDecimalToBigInt(str, currency.decimals));
 }
 
 /**
@@ -28,8 +28,8 @@ export function parseAmount<C extends string>(str: string, currency: CurrencyDef
  *
  * Always produces exact decimal places per currency (e.g., "1.50" for USD, "100" for JPY).
  */
-export function formatAmount<C extends string>(amount: Amount<C>, currency: CurrencyDef): string {
-  return formatBigIntToDecimal(amount as bigint, currency.decimals);
+export function formatAmount<C extends string>(amount: AmountValue<C>, currency: CurrencyDef): string {
+  return formatBigIntToDecimal(amount, currency.decimals);
 }
 
 /**
@@ -37,15 +37,15 @@ export function formatAmount<C extends string>(amount: Amount<C>, currency: Curr
  *
  * Same rules as parseAmount but uses basisDecimals for scale.
  */
-export function parseBasis<C extends string>(str: string, currency: CurrencyDef): Basis<C> {
-  return parseDecimalToBigInt(str, currency.basisDecimals) as Basis<C>;
+export function parseBasis<C extends string>(str: string, currency: CurrencyDef): BasisValue<C> {
+  return Basis<C>(parseDecimalToBigInt(str, currency.basisDecimals));
 }
 
 /**
  * Format a Basis<C> as a canonical decimal string.
  */
-export function formatBasis<C extends string>(basis: Basis<C>, currency: CurrencyDef): string {
-  return formatBigIntToDecimal(basis as bigint, currency.basisDecimals);
+export function formatBasis<C extends string>(basis: BasisValue<C>, currency: CurrencyDef): string {
+  return formatBigIntToDecimal(basis, currency.basisDecimals);
 }
 
 /**
@@ -59,7 +59,7 @@ export function formatBasis<C extends string>(basis: Basis<C>, currency: Currenc
  * ```
  */
 export function formatAmountDisplay<C extends string>(
-  amount: Amount<C>,
+  amount: AmountValue<C>,
   currency: CurrencyDef,
   locale?: string,
 ): string {

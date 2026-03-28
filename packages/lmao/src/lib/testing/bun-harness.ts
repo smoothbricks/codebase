@@ -609,8 +609,15 @@ export function createBunTestMock<TModule extends BunTestModuleShape>(bunTestMod
   };
 }
 
-/** Get the current span context from AsyncLocalStorage (inside an it() block) */
-export function useTestSpan(): SpanContext<OpContext> {
+/**
+ * Get the current span context from AsyncLocalStorage (inside an it() block).
+ *
+ * Package-local tracer modules pass their own exported span-context type here so
+ * `useTestSpan()` preserves the suite-local schema extension instead of falling
+ * back to the erased global singleton shape.
+ */
+export function useTestSpan<TCtx extends SpanContext<OpContextOf<OpContextBinding>>>(): TCtx;
+export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
   if (_activeSuiteTracer) {
     return _activeSuiteTracer.useTestSpan();
   }

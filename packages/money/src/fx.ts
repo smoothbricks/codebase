@@ -11,14 +11,14 @@
 import type { CurrencyDef } from './currency-registry.js';
 import type { RoundingMode } from './rounding.js';
 import { roundBasisToAmount } from './rounding.js';
-import type { Amount, Basis } from './types.js';
+import { type Amount, Basis, type Basis as BasisValue } from './types.js';
 
 /**
  * Audit trail for an FX conversion. Captures all inputs for traceability.
  */
 export interface FxAudit<From extends string, To extends string> {
   readonly fromAmount: Amount<From>;
-  readonly rate: Basis<To>;
+  readonly rate: BasisValue<To>;
   readonly mode: RoundingMode;
 }
 
@@ -27,7 +27,7 @@ export interface FxAudit<From extends string, To extends string> {
  */
 export interface FxResult<From extends string, To extends string> {
   readonly result: Amount<To>;
-  readonly remainder: Basis<To>;
+  readonly remainder: BasisValue<To>;
   readonly audit: FxAudit<From, To>;
 }
 
@@ -56,13 +56,13 @@ export interface FxResult<From extends string, To extends string> {
  */
 export function convertFx<From extends string, To extends string>(
   amount: Amount<From>,
-  rate: Basis<To>,
+  rate: BasisValue<To>,
   _fromCurrency: CurrencyDef,
   toCurrency: CurrencyDef,
   mode: RoundingMode,
 ): FxResult<From, To> {
   // Multiply amount by rate in Basis precision
-  const basisTotal = ((amount as bigint) * (rate as bigint)) as Basis<To>;
+  const basisTotal = Basis<To>(amount * rate);
 
   // Round to target Amount
   const settled = roundBasisToAmount(basisTotal, toCurrency, mode);
@@ -70,8 +70,8 @@ export function convertFx<From extends string, To extends string>(
   // Compute remainder: what was lost in rounding
   const scaleDiff = BigInt(toCurrency.basisDecimals - toCurrency.decimals);
   const divisor = 10n ** scaleDiff;
-  const settledInBasis = (settled as bigint) * divisor;
-  const remainder = ((basisTotal as bigint) - settledInBasis) as Basis<To>;
+  const settledInBasis = settled * divisor;
+  const remainder = Basis<To>(basisTotal - settledInBasis);
 
   return {
     result: settled,

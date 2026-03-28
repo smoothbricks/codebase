@@ -5,7 +5,7 @@
  * for rounding to Amount via roundBasisToAmount when settling.
  */
 
-import type { Basis, Rate } from './types.js';
+import { Basis, type Basis as BasisValue, type Rate } from './types.js';
 
 /**
  * Multiply a rate by a quantity to produce a Basis total.
@@ -20,6 +20,6 @@ import type { Basis, Rate } from './types.js';
  * const settled = roundBasisToAmount(total, usd, RoundingMode.HalfUp);
  * ```
  */
-export function applyRate<C extends string>(rate: Rate<C>, quantity: bigint): Basis<C> {
-  return (rate.value * quantity) as Basis<C>;
+export function applyRate<C extends string>(rate: Rate<C>, quantity: bigint): BasisValue<C> {
+  return Basis<C>(rate.value * quantity);
 }

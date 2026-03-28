@@ -6,7 +6,7 @@
  * ensuring the most mathematically fair distribution.
  */
 
-import type { Amount } from './types.js';
+import { Amount, type Amount as AmountValue } from './types.js';
 
 /**
  * Distribute a total amount proportionally across weights.
@@ -17,7 +17,10 @@ import type { Amount } from './types.js';
  *
  * @throws if weights array is empty or all weights sum to 0n (invariant -- programmer bug)
  */
-export function allocateProportional<C extends string>(total: Amount<C>, weights: readonly bigint[]): Amount<C>[] {
+export function allocateProportional<C extends string>(
+  total: AmountValue<C>,
+  weights: readonly bigint[],
+): AmountValue<C>[] {
   if (weights.length === 0) {
     throw new Error('Cannot allocate to empty weights array');
   }
@@ -38,12 +41,12 @@ export function allocateProportional<C extends string>(total: Amount<C>, weights
     parts[i] = share;
     // Remainder is how much the "true" fractional value exceeds the floor
     // remainder_i = (total * weight_i) % totalWeight
-    remainders[i] = ((total as bigint) * weights[i]) % totalWeight;
+    remainders[i] = (total * weights[i]) % totalWeight;
     allocated += share;
   }
 
   // Step 2: distribute leftover units to entries with largest remainders
-  let leftover = (total as bigint) - allocated;
+  let leftover = total - allocated;
 
   if (leftover > 0n) {
     // Build index array sorted by remainder descending, then by original index ascending for stability
@@ -62,5 +65,5 @@ export function allocateProportional<C extends string>(total: Amount<C>, weights
     }
   }
 
-  return parts as Amount<C>[];
+  return parts.map((part) => Amount<C>(part));
 }
