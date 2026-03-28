@@ -316,9 +316,9 @@ function clearComments(node: ts.Node): void {
   // Clear source map range to prevent source comment inheritance
   ts.setSourceMapRange(node, undefined);
 
-  // Clear positional information to prevent source comment inheritance
-  (node as any).pos = -1;
-  (node as any).end = -1;
+  // Clear positional information to prevent source comment inheritance.
+  // Use the public helper so we reset the text range without type-erasing casts.
+  ts.setTextRange(node, { pos: -1, end: -1 });
 
   // Recursively clear comments from all child nodes
   ts.forEachChild(node, clearComments);
@@ -562,16 +562,6 @@ function generateBooleanWrite(
     );
     clearComments(outerIfStmt);
     statements.push(outerIfStmt);
-
-    ifBody.push(factory.createIfStatement(varIdent, factory.createBlock([trueStmt]), factory.createBlock([falseStmt])));
-
-    // if ($$v0 != null) { ... }
-    statements.push(
-      factory.createIfStatement(
-        factory.createBinaryExpression(varIdent, ts.SyntaxKind.ExclamationEqualsToken, factory.createNull()),
-        factory.createBlock(ifBody, true),
-      ),
-    );
   }
 }
 

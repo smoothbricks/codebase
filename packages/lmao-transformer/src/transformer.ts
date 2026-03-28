@@ -801,17 +801,23 @@ function hasLineInChain(node: ts.CallExpression): boolean {
  * Rebuild a method chain on top of a base expression
  */
 function rebuildChain(base: ts.Expression, chain: ChainLink[], factory: ts.NodeFactory): ts.CallExpression {
-  let current = base;
+  let current: ts.Expression = base;
+  let lastCall: ts.CallExpression | null = null;
 
   for (const link of chain) {
-    current = factory.createCallExpression(
+    lastCall = factory.createCallExpression(
       factory.createPropertyAccessExpression(current, factory.createIdentifier(link.methodName)),
       link.typeArguments,
       [...link.arguments],
     );
+    current = lastCall;
   }
 
-  return current as ts.CallExpression;
+  if (!lastCall) {
+    throw new Error('rebuildChain requires at least one chain link');
+  }
+
+  return lastCall;
 }
 
 /**

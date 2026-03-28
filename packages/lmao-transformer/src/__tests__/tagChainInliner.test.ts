@@ -52,7 +52,7 @@ type TestBufferPair<T extends ReturnType<typeof defineLogSchema>> = {
 };
 
 function setTagWriterPos<T extends object>(tagWriter: T, pos: number): void {
-  (tagWriter as T & { _pos: number })._pos = pos;
+  Reflect.set(tagWriter, '_pos', pos);
 }
 
 function getTableValue(table: Table, fieldName: string, row: number): unknown {
