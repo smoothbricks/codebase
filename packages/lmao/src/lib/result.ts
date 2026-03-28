@@ -106,6 +106,11 @@ export class Ok<V, T extends LogSchema = LogSchema> {
     return true;
   }
 
+  /** Tag discriminant for tagged result interop — matches the { _tag: 'ok' } protocol. */
+  get _tag(): 'ok' {
+    return 'ok';
+  }
+
   /** Type guard - always returns true for Ok. */
   isOk(): this is Ok<V, T> {
     return true;
@@ -259,6 +264,11 @@ export class Err<E, T extends LogSchema = LogSchema> {
   /** Discriminant for type narrowing. */
   get success(): false {
     return false;
+  }
+
+  /** Tag discriminant for tagged result interop — matches the { _tag: 'err' } protocol. */
+  get _tag(): 'err' {
+    return 'err';
   }
 
   /** Type guard - always returns false for Err. */
