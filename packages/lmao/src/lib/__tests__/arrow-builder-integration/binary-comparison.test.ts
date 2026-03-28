@@ -18,8 +18,8 @@ import { convertToArrowTable } from '../../convertToArrow.js';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
 import { ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
-
 import { createSpanBuffer } from '../../spanBuffer.js';
+import { callBufferWriter, requireColumn } from '../arrow-test-helpers.js';
 
 import { createTestSchema, createTestTraceRoot } from '../test-helpers.js';
 
@@ -71,16 +71,27 @@ function getColumn(table: Table, columnName: string) {
   return column;
 }
 
-function getColumnValue<T>(table: Table, columnName: string, rowIndex: number): T {
-  return getColumn(table, columnName).get(rowIndex) as T;
+function getColumnValue(table: Table, columnName: string, rowIndex: number): unknown {
+  return getColumn(table, columnName).get(rowIndex);
 }
 
-function getNumericWriter(buffer: object, columnName: string): (pos: number, value: number) => unknown {
-  const writer = Reflect.get(buffer, columnName);
-  if (typeof writer !== 'function') {
-    throw new Error(`Expected numeric writer for column '${columnName}'`);
+function requireBigInt64Values(table: Table, columnName: string): BigInt64Array {
+  const column = requireColumn(table, columnName);
+  const batch = column.data[0];
+  if (!batch || !(batch.values instanceof BigInt64Array)) {
+    throw new Error(`Expected raw BigInt64Array values for column '${columnName}'`);
   }
-  return writer.bind(buffer) as (pos: number, value: number) => unknown;
+  return batch.values;
+}
+
+function requireDictionaryLength(table: Table, columnName: string): number {
+  const column = requireColumn(table, columnName);
+  const batch = column.data[0];
+  const dictionary = batch ? Reflect.get(batch, 'dictionary') : undefined;
+  if (!(dictionary instanceof Object) || !('length' in dictionary) || typeof dictionary.length !== 'number') {
+    throw new Error(`Expected dictionary-encoded column '${columnName}'`);
+  }
+  return dictionary.length;
 }
 
 /**
@@ -122,8 +133,8 @@ describe('Arrow IPC Round-Trip', () => {
 
       // Verify data values match
       for (let i = 0; i < testValues.length; i++) {
-        const original = getColumnValue<number>(table, 'value', i);
-        const restored = getColumnValue<number>(roundTripped, 'value', i);
+        const original = getColumnValue(table, 'value', i);
+        const restored = getColumnValue(roundTripped, 'value', i);
 
         if (Number.isNaN(testValues[i])) {
           expect(Number.isNaN(original)).toBe(true);
@@ -156,7 +167,7 @@ describe('Arrow IPC Round-Trip', () => {
       const roundTripped = verifyRoundTrip(table, ['flag']);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(getColumnValue<boolean>(roundTripped, 'flag', i)).toBe(testValues[i]);
+        expect(getColumnValue(roundTripped, 'flag', i)).toBe(testValues[i]);
       }
     });
 
@@ -170,18 +181,17 @@ describe('Arrow IPC Round-Trip', () => {
       // Note: Buffer setters accept numeric indices for enum columns at runtime.
       const testIndices = [0, 2, 1, 0, 2];
       const expectedStrings = ['pending', 'completed', 'active', 'pending', 'completed'];
-      const statusWriter = getNumericWriter(buffer, 'status');
       for (const enumIdx of testIndices) {
         const idx = buffer._writeIndex;
         buffer.timestamp[idx] = 1000n;
         buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
-        statusWriter(idx, enumIdx);
+        callBufferWriter(buffer, 'status', idx, enumIdx);
         buffer._writeIndex++;
       }
 
       const table = convertToArrowTable(buffer);
       for (let i = 0; i < expectedStrings.length; i++) {
-        expect(getColumnValue<string>(table, 'status', i)).toBe(expectedStrings[i]);
+        expect(getColumnValue(table, 'status', i)).toBe(expectedStrings[i]);
       }
     });
 
@@ -207,7 +217,7 @@ describe('Arrow IPC Round-Trip', () => {
       expect(originalField?.type.typeId).toBe(DICTIONARY_TYPE_ID);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(getColumnValue<string>(table, 'userId', i)).toBe(testValues[i]);
+        expect(getColumnValue(table, 'userId', i)).toBe(testValues[i]);
       }
     });
 
@@ -231,7 +241,7 @@ describe('Arrow IPC Round-Trip', () => {
       const table = convertToArrowTable(buffer);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(getColumnValue<string>(table, 'userMessage', i)).toBe(testValues[i]);
+        expect(getColumnValue(table, 'userMessage', i)).toBe(testValues[i]);
       }
     });
 
@@ -264,7 +274,7 @@ describe('Arrow IPC Round-Trip', () => {
       const roundTripped = verifyRoundTrip(table, ['value']);
 
       for (let i = 0; i < testValues.length; i++) {
-        expect(getColumnValue<number | null>(roundTripped, 'value', i)).toBe(testValues[i]);
+        expect(getColumnValue(roundTripped, 'value', i)).toBe(testValues[i]);
       }
     });
 
@@ -285,8 +295,6 @@ describe('Arrow IPC Round-Trip', () => {
         { count: 100, active: false, status: 1, userId: 'user-456', userMessage: 'Second message' },
         { count: null, active: true, status: 2, userId: 'user-123', userMessage: 'First message' },
       ];
-      const statusWriter = getNumericWriter(buffer, 'status');
-
       for (const row of testData) {
         const idx = buffer._writeIndex;
         buffer.timestamp[idx] = 1000n;
@@ -301,7 +309,7 @@ describe('Arrow IPC Round-Trip', () => {
           }
         }
         buffer.active(idx, row.active);
-        statusWriter(idx, row.status);
+        callBufferWriter(buffer, 'status', idx, row.status);
         buffer.userId(idx, row.userId);
         buffer.userMessage(idx, row.userMessage);
         buffer._writeIndex++;
@@ -311,25 +319,25 @@ describe('Arrow IPC Round-Trip', () => {
       const roundTripped = verifyRoundTrip(table, ['count', 'active']);
 
       // Verify first row
-      expect(getColumnValue<number>(roundTripped, 'count', 0)).toBe(42);
-      expect(getColumnValue<boolean>(roundTripped, 'active', 0)).toBe(true);
-      expect(getColumnValue<string>(table, 'status', 0)).toBe('pending');
-      expect(getColumnValue<string>(table, 'userId', 0)).toBe('user-123');
-      expect(getColumnValue<string>(table, 'userMessage', 0)).toBe('First message');
+      expect(getColumnValue(roundTripped, 'count', 0)).toBe(42);
+      expect(getColumnValue(roundTripped, 'active', 0)).toBe(true);
+      expect(getColumnValue(table, 'status', 0)).toBe('pending');
+      expect(getColumnValue(table, 'userId', 0)).toBe('user-123');
+      expect(getColumnValue(table, 'userMessage', 0)).toBe('First message');
 
       // Verify second row
-      expect(getColumnValue<number>(roundTripped, 'count', 1)).toBe(100);
-      expect(getColumnValue<boolean>(roundTripped, 'active', 1)).toBe(false);
-      expect(getColumnValue<string>(table, 'status', 1)).toBe('active');
-      expect(getColumnValue<string>(table, 'userId', 1)).toBe('user-456');
-      expect(getColumnValue<string>(table, 'userMessage', 1)).toBe('Second message');
+      expect(getColumnValue(roundTripped, 'count', 1)).toBe(100);
+      expect(getColumnValue(roundTripped, 'active', 1)).toBe(false);
+      expect(getColumnValue(table, 'status', 1)).toBe('active');
+      expect(getColumnValue(table, 'userId', 1)).toBe('user-456');
+      expect(getColumnValue(table, 'userMessage', 1)).toBe('Second message');
 
       // Verify third row with null
-      expect(getColumnValue<number | null>(roundTripped, 'count', 2)).toBeNull();
-      expect(getColumnValue<boolean>(roundTripped, 'active', 2)).toBe(true);
-      expect(getColumnValue<string>(table, 'status', 2)).toBe('completed');
-      expect(getColumnValue<string>(table, 'userId', 2)).toBe('user-123');
-      expect(getColumnValue<string>(table, 'userMessage', 2)).toBe('First message');
+      expect(getColumnValue(roundTripped, 'count', 2)).toBeNull();
+      expect(getColumnValue(roundTripped, 'active', 2)).toBe(true);
+      expect(getColumnValue(table, 'status', 2)).toBe('completed');
+      expect(getColumnValue(table, 'userId', 2)).toBe('user-123');
+      expect(getColumnValue(table, 'userMessage', 2)).toBe('First message');
     });
 
     it('system columns survive round-trip', () => {
@@ -383,7 +391,7 @@ describe('Arrow IPC Round-Trip', () => {
       if (!timestampVector) {
         throw new Error('Timestamp vector not found');
       }
-      const rawTimestamps = timestampVector.data[0].values as BigInt64Array;
+      const rawTimestamps = requireBigInt64Values(roundTripped, 'timestamp');
       for (let i = 0; i < 3; i++) {
         expect(rawTimestamps[i]).toBe(timestamps[i]);
       }
@@ -444,8 +452,7 @@ describe('Arrow IPC Round-Trip', () => {
       buffer.entry_type[idx] = ENTRY_TYPE_SPAN_START;
       buffer.category(idx, 'cat1');
       buffer.text(idx, 'text1');
-      const statusWriter = getNumericWriter(buffer, 'status');
-      statusWriter(idx, 0);
+      callBufferWriter(buffer, 'status', idx, 0);
       buffer._writeIndex++;
 
       const table = convertToArrowTable(buffer);
@@ -544,7 +551,7 @@ describe('Arrow IPC Round-Trip', () => {
 
       // Verify all values round-trip correctly
       for (let i = 0; i < values.length; i++) {
-        expect(getColumnValue<number | null>(table, 'value', i)).toBe(values[i]);
+        expect(getColumnValue(table, 'value', i)).toBe(values[i]);
       }
     });
 
@@ -599,7 +606,7 @@ describe('Arrow IPC Round-Trip', () => {
 
       const table = convertToArrowTable(buffer);
       for (let i = 0; i < testValues.length; i++) {
-        expect(getColumnValue<string>(table, 'category', i)).toBe(testValues[i]);
+        expect(getColumnValue(table, 'category', i)).toBe(testValues[i]);
       }
     });
 
@@ -634,8 +641,7 @@ describe('Arrow IPC Round-Trip', () => {
       }
 
       // Dictionary should only have 1 unique value
-      const dictData = userIdVector.data[0] as { dictionary?: { length: number } };
-      expect(dictData.dictionary?.length).toBe(1);
+      expect(requireDictionaryLength(table, 'userId')).toBe(1);
     });
   });
 });

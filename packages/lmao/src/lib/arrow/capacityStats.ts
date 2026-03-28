@@ -1,8 +1,6 @@
 import {
-  batchType,
   bool,
-  Column,
-  type DataType,
+  type Column,
   dictionary,
   float64,
   type IntType,
@@ -20,6 +18,7 @@ import { SYSTEM_SCHEMA_FIELD_NAMES } from '../schema/systemSchema.js';
 import { getSchemaType } from '../schema/typeGuards.js';
 import type { SpanBufferConstructor } from '../spanBuffer.js';
 import type { OpMetadata } from '../types.js';
+import { hasArrowIndexType, makeArrowColumn } from './flechette.js';
 import { getArrowFieldName } from './utils.js';
 
 export interface CapacityStatsEntry {
@@ -27,95 +26,12 @@ export interface CapacityStatsEntry {
   metadata: OpMetadata;
 }
 
-const EMPTY_VALIDITY = new Uint8Array(0);
-const BOOL_TYPE_ID = (bool() as { typeId?: unknown }).typeId;
 const F64Array = Float64Array;
 
 type Utf8Encoded = {
   data: Uint8Array;
   offsets: Int32Array;
 };
-
-type BoolType = ReturnType<typeof bool>;
-type DictionaryType = ReturnType<typeof dictionary>;
-type Utf8Type = ReturnType<typeof utf8>;
-
-type ColumnDataBase<TType, TValues = unknown> = {
-  type: TType;
-  length: number;
-  nullCount: number;
-  values?: TValues;
-  validity?: Uint8Array;
-};
-
-type DictionaryColumnData = ColumnDataBase<DictionaryType> & { dict: Column<unknown> };
-type Utf8ColumnData = ColumnDataBase<Utf8Type, Uint8Array> & { offsets: Int32Array };
-type BoolColumnData = ColumnDataBase<BoolType, Uint8Array>;
-type GenericColumnData = ColumnDataBase<DataType>;
-
-function hasTypeId(value: unknown): value is { readonly typeId: unknown } {
-  return typeof value === 'object' && value !== null && 'typeId' in value;
-}
-
-function isBoolType(value: unknown): value is BoolType {
-  return hasTypeId(value) && value.typeId === BOOL_TYPE_ID;
-}
-
-function hasArrowIndexType(value: unknown): value is { readonly __arrow_index_type: IntType } {
-  return typeof value === 'object' && value !== null && '__arrow_index_type' in value;
-}
-
-function makeColumn(data: DictionaryColumnData): Column<unknown>;
-function makeColumn(data: Utf8ColumnData): Column<unknown>;
-function makeColumn(data: BoolColumnData): Column<unknown>;
-function makeColumn(data: GenericColumnData): Column<unknown>;
-function makeColumn(data: DictionaryColumnData | Utf8ColumnData | BoolColumnData | GenericColumnData): Column<unknown> {
-  const validity = data.validity ?? EMPTY_VALIDITY;
-
-  if ('dict' in data) {
-    const batch = new (batchType(data.type))({
-      type: data.type,
-      length: data.length,
-      nullCount: data.nullCount,
-      validity,
-      values: data.values,
-    });
-    batch.setDictionary(data.dict);
-    return new Column([batch]);
-  }
-
-  if ('offsets' in data) {
-    const batch = new (batchType(data.type))({
-      type: data.type,
-      length: data.length,
-      nullCount: data.nullCount,
-      validity,
-      offsets: data.offsets,
-      values: data.values,
-    });
-    return new Column([batch]);
-  }
-
-  if (isBoolType(data.type)) {
-    const batch = new (batchType(data.type))({
-      type: data.type,
-      length: data.length,
-      nullCount: data.nullCount,
-      validity,
-      values: data.values,
-    });
-    return new Column([batch]);
-  }
-
-  const batch = new (batchType(data.type))({
-    type: data.type,
-    length: data.length,
-    nullCount: data.nullCount,
-    validity,
-    values: data.values,
-  });
-  return new Column([batch]);
-}
 
 function encodeUtf8(strings: string[]): Utf8Encoded {
   const enc = new TextEncoder();
@@ -222,18 +138,18 @@ export function createCapacityStatsTable(
   append(
     cols,
     'timestamp',
-    makeColumn({ type: timestamp(TimeUnit.NANOSECOND), length: totalRows, nullCount: 0, values: timestamps }),
+    makeArrowColumn({ type: timestamp(TimeUnit.NANOSECOND), length: totalRows, nullCount: 0, values: timestamps }),
   );
 
   append(
     cols,
     'trace_id',
-    makeColumn({
+    makeArrowColumn({
       type: dictionary(utf8(), indexTypeForCount(traceIdStrings.length), false, 0),
       length: totalRows,
       nullCount: 0,
       values: traceIds,
-      dict: makeColumn({
+      dictionary: makeArrowColumn({
         type: utf8(),
         length: traceIdStrings.length,
         nullCount: 0,
@@ -243,12 +159,12 @@ export function createCapacityStatsTable(
     }),
   );
 
-  append(cols, 'thread_id', makeColumn({ type: uint64(), length: totalRows, nullCount: 0, values: threadIds }));
-  append(cols, 'span_id', makeColumn({ type: uint32(), length: totalRows, nullCount: 0, values: spanIds }));
+  append(cols, 'thread_id', makeArrowColumn({ type: uint64(), length: totalRows, nullCount: 0, values: threadIds }));
+  append(cols, 'span_id', makeArrowColumn({ type: uint32(), length: totalRows, nullCount: 0, values: spanIds }));
   append(
     cols,
     'parent_thread_id',
-    makeColumn({
+    makeArrowColumn({
       type: uint64(),
       length: totalRows,
       nullCount: totalRows,
@@ -259,7 +175,7 @@ export function createCapacityStatsTable(
   append(
     cols,
     'parent_span_id',
-    makeColumn({
+    makeArrowColumn({
       type: uint32(),
       length: totalRows,
       nullCount: totalRows,
@@ -271,12 +187,12 @@ export function createCapacityStatsTable(
   append(
     cols,
     'entry_type',
-    makeColumn({
+    makeArrowColumn({
       type: dictionary(utf8(), int8(), false, 1),
       length: totalRows,
       nullCount: 0,
       values: entryTypes,
-      dict: makeColumn({
+      dictionary: makeArrowColumn({
         type: utf8(),
         length: entryTypeStrings.length,
         nullCount: 0,
@@ -289,12 +205,12 @@ export function createCapacityStatsTable(
   append(
     cols,
     'package_name',
-    makeColumn({
+    makeArrowColumn({
       type: dictionary(utf8(), indexTypeForCount(packageNameStrings.length), false, 2),
       length: totalRows,
       nullCount: 0,
       values: packageNames,
-      dict: makeColumn({
+      dictionary: makeArrowColumn({
         type: utf8(),
         length: packageNameStrings.length,
         nullCount: 0,
@@ -306,12 +222,12 @@ export function createCapacityStatsTable(
   append(
     cols,
     'package_file',
-    makeColumn({
+    makeArrowColumn({
       type: dictionary(utf8(), indexTypeForCount(packageFileStrings.length), false, 3),
       length: totalRows,
       nullCount: 0,
       values: packageFiles,
-      dict: makeColumn({
+      dictionary: makeArrowColumn({
         type: utf8(),
         length: packageFileStrings.length,
         nullCount: 0,
@@ -323,12 +239,12 @@ export function createCapacityStatsTable(
   append(
     cols,
     'git_sha',
-    makeColumn({
+    makeArrowColumn({
       type: dictionary(utf8(), indexTypeForCount(gitShaStrings.length), false, 4),
       length: totalRows,
       nullCount: 0,
       values: gitShas,
-      dict: makeColumn({
+      dictionary: makeArrowColumn({
         type: utf8(),
         length: gitShaStrings.length,
         nullCount: 0,
@@ -340,12 +256,12 @@ export function createCapacityStatsTable(
   append(
     cols,
     'message',
-    makeColumn({
+    makeArrowColumn({
       type: dictionary(utf8(), indexTypeForCount(messageStrings.length), false, 5),
       length: totalRows,
       nullCount: 0,
       values: messages,
-      dict: makeColumn({
+      dictionary: makeArrowColumn({
         type: utf8(),
         length: messageStrings.length,
         nullCount: 0,
@@ -354,7 +270,11 @@ export function createCapacityStatsTable(
       }),
     }),
   );
-  append(cols, 'uint64_value', makeColumn({ type: uint64(), length: totalRows, nullCount: 0, values: uint64Values }));
+  append(
+    cols,
+    'uint64_value',
+    makeArrowColumn({ type: uint64(), length: totalRows, nullCount: 0, values: uint64Values }),
+  );
 
   for (const [fieldName, fieldSchema] of Object.entries(mergedSchema)) {
     if (SYSTEM_SCHEMA_FIELD_NAMES.has(fieldName)) continue;
@@ -365,7 +285,7 @@ export function createCapacityStatsTable(
       append(
         cols,
         arrowFieldName,
-        makeColumn({
+        makeArrowColumn({
           type: float64(),
           length: totalRows,
           nullCount: totalRows,
@@ -380,7 +300,7 @@ export function createCapacityStatsTable(
       append(
         cols,
         arrowFieldName,
-        makeColumn({
+        makeArrowColumn({
           type: bool(),
           length: totalRows,
           nullCount: totalRows,
@@ -399,13 +319,13 @@ export function createCapacityStatsTable(
     append(
       cols,
       arrowFieldName,
-      makeColumn({
+      makeArrowColumn({
         type: dictType,
         length: totalRows,
         nullCount: totalRows,
         values: new Uint8Array(totalRows),
         validity: new Uint8Array(Math.ceil(totalRows / 8)),
-        dict: makeColumn({
+        dictionary: makeArrowColumn({
           type: utf8(),
           length: 1,
           nullCount: 0,

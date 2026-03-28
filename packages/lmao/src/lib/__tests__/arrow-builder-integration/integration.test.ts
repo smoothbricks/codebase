@@ -11,20 +11,13 @@ import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { ENTRY_TYPE_INFO } from '../../schema/systemSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../../types.js';
+import { invokeWriterMethod, nextWriterRow, requireAnySpanBuffer } from '../arrow-test-helpers.js';
 import {
   createTestOpMetadata,
   createTestSchema,
   createTestTraceRoot,
   createTestTracerOptions,
 } from '../test-helpers.js';
-
-type LooseRowWriter = {
-  [method: string]: (value: unknown) => LooseRowWriter;
-};
-
-function nextLooseRow(writer: { nextRow(): unknown }): LooseRowWriter {
-  return writer.nextRow() as LooseRowWriter;
-}
 
 describe('Buffer Integration', () => {
   it('generates columns with proper names for defined schema', () => {
@@ -147,7 +140,7 @@ describe('Buffer Integration', () => {
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
     // Dynamic fluent API - schema methods are generated at runtime and can't be typed statically
-    nextLooseRow(writer).userId('user-12345').plainUserId('user-12345');
+    invokeWriterMethod(invokeWriterMethod(nextWriterRow(writer), 'userId', 'user-12345'), 'plainUserId', 'user-12345');
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
@@ -186,10 +179,12 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write values (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    nextLooseRow(writer)
-      .email('john@example.com')
-      .sqlQuery("SELECT * FROM users WHERE id = 123 AND name = 'test'")
-      .plainText('Plain unmasked text');
+    const textRow = invokeWriterMethod(nextWriterRow(writer), 'email', 'john@example.com');
+    invokeWriterMethod(
+      invokeWriterMethod(textRow, 'sqlQuery', "SELECT * FROM users WHERE id = 123 AND name = 'test'"),
+      'plainText',
+      'Plain unmasked text',
+    );
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
@@ -231,7 +226,7 @@ describe('Buffer Integration', () => {
 
     // Use ColumnWriter fluent API to write value (createColumnWriter expects ColumnSchema instance)
     const writer = createColumnWriter(schema, buffer);
-    nextLooseRow(writer).secretKey('sk_live_abcd1234efgh5678');
+    invokeWriterMethod(nextWriterRow(writer), 'secretKey', 'sk_live_abcd1234efgh5678');
 
     // Set required system columns
     buffer.timestamp[0] = 1000n;
@@ -292,11 +287,16 @@ describe('Buffer Integration', () => {
 
       // Use ColumnWriter API to write data (more robust than direct array access)
       const writer = createColumnWriter(schema, buffer);
-      nextLooseRow(writer)
-        .userId('user-123')
-        .operation('POST') // Use enum value string (ColumnWriter validates against enum values)
-        .httpStatus(200)
-        .error('john@example.com');
+      const row = invokeWriterMethod(nextWriterRow(writer), 'userId', 'user-123');
+      invokeWriterMethod(
+        invokeWriterMethod(
+          invokeWriterMethod(row, 'operation', 'POST'), // Use enum value string (ColumnWriter validates against enum values)
+          'httpStatus',
+          200,
+        ),
+        'error',
+        'john@example.com',
+      );
 
       // Set system columns
       buffer.timestamp[0] = 1000n;
@@ -363,9 +363,9 @@ describe('Buffer Integration', () => {
         await new Promise((r) => setTimeout(r, 5));
         ctx.log.info('third');
         // Access internal buffer for test verification
-        const internalBuffer = Reflect.get(ctx as object, '_buffer');
+        const internalBuffer = Reflect.get(ctx, '_buffer');
         if (internalBuffer) {
-          capturedBuffer = internalBuffer as AnySpanBuffer;
+          capturedBuffer = requireAnySpanBuffer(internalBuffer, 'Expected trace callback to expose a span buffer');
         }
         return ctx.ok('done');
       });

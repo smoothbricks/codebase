@@ -10,14 +10,25 @@ import { decode } from '@msgpack/msgpack';
 import { createColumnWriter } from '@smoothbricks/arrow-builder';
 import { convertSpanTreeToArrowTable, convertToArrowTable, createSpanBuffer, S } from '@smoothbricks/lmao';
 import { ENTRY_TYPE_INFO, ENTRY_TYPE_SPAN_START } from '../../schema/systemSchema.js';
+import { invokeWriterMethod, nextWriterRow, requireBinaryCell, requireColumn } from '../arrow-test-helpers.js';
 import { createTestOpMetadata, createTestSchema, createTestTraceRoot } from '../test-helpers.js';
 
-type LooseRowWriter = {
-  [method: string]: (value: unknown) => LooseRowWriter;
-};
-
-function nextLooseRow(writer: { nextRow(): unknown }): LooseRowWriter {
-  return writer.nextRow() as LooseRowWriter;
+function isHttpRequest(value: unknown): value is {
+  method: string;
+  url: string;
+  headers: Record<string, string>;
+} {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'method' in value &&
+    'url' in value &&
+    'headers' in value &&
+    typeof value.method === 'string' &&
+    typeof value.url === 'string' &&
+    typeof value.headers === 'object' &&
+    value.headers !== null
+  );
 }
 
 describe('Binary Arrow Conversion', () => {
@@ -32,12 +43,14 @@ describe('Binary Arrow Conversion', () => {
       const writer = createColumnWriter(schema, buffer);
 
       // Write row with an object payload
-      nextLooseRow(writer).payload({ action: 'click', x: 100, y: 200 }).requestId('req-1');
+      const row0 = invokeWriterMethod(nextWriterRow(writer), 'payload', { action: 'click', x: 100, y: 200 });
+      invokeWriterMethod(row0, 'requestId', 'req-1');
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
       // Write row with a string payload
-      nextLooseRow(writer).payload('simple-string').requestId('req-2');
+      const row1 = invokeWriterMethod(nextWriterRow(writer), 'payload', 'simple-string');
+      invokeWriterMethod(row1, 'requestId', 'req-2');
       buffer.timestamp[1] = 2000n;
       buffer.entry_type[1] = ENTRY_TYPE_INFO;
 
@@ -46,18 +59,18 @@ describe('Binary Arrow Conversion', () => {
       const table = convertToArrowTable(buffer);
 
       // Verify the payload column exists and is binary
-      const payloadCol = table.getChild('payload');
+      const payloadCol = requireColumn(table, 'payload');
       expect(payloadCol).toBeDefined();
-      expect(payloadCol?.length).toBe(2);
+      expect(payloadCol.length).toBe(2);
 
       // Row 0: msgpack-decoded object should match original
-      const row0Bytes = payloadCol?.at(0) as Uint8Array;
+      const row0Bytes = requireBinaryCell(payloadCol, 0);
       expect(row0Bytes).toBeInstanceOf(Uint8Array);
       const decoded0 = decode(row0Bytes);
       expect(decoded0).toEqual({ action: 'click', x: 100, y: 200 });
 
       // Row 1: msgpack-decoded string should match original
-      const row1Bytes = payloadCol?.at(1) as Uint8Array;
+      const row1Bytes = requireBinaryCell(payloadCol, 1);
       expect(row1Bytes).toBeInstanceOf(Uint8Array);
       const decoded1 = decode(row1Bytes);
       expect(decoded1).toBe('simple-string');
@@ -82,18 +95,21 @@ describe('Binary Arrow Conversion', () => {
         url: '/api/users',
         headers: { 'content-type': 'application/json' },
       };
-      nextLooseRow(writer).request(requestData);
+      invokeWriterMethod(nextWriterRow(writer), 'request', requestData);
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
-      const requestCol = table.getChild('request');
+      const requestCol = requireColumn(table, 'request');
       expect(requestCol).toBeDefined();
 
-      const bytes = requestCol?.at(0) as Uint8Array;
+      const bytes = requireBinaryCell(requestCol, 0);
       expect(bytes).toBeInstanceOf(Uint8Array);
-      const decoded = decode(bytes) as HttpRequest;
+      const decoded = decode(bytes);
+      if (!isHttpRequest(decoded)) {
+        throw new Error('Decoded request payload did not match HttpRequest shape');
+      }
       expect(decoded.method).toBe('POST');
       expect(decoded.url).toBe('/api/users');
       expect(decoded.headers['content-type']).toBe('application/json');
@@ -108,16 +124,16 @@ describe('Binary Arrow Conversion', () => {
       const writer = createColumnWriter(schema, buffer);
 
       const rawBytes = new Uint8Array([0xde, 0xad, 0xbe, 0xef]);
-      nextLooseRow(writer).rawData(rawBytes);
+      invokeWriterMethod(nextWriterRow(writer), 'rawData', rawBytes);
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer._writeIndex = 1;
 
       const table = convertToArrowTable(buffer);
-      const rawDataCol = table.getChild('rawData');
+      const rawDataCol = requireColumn(table, 'rawData');
       expect(rawDataCol).toBeDefined();
 
-      const bytes = rawDataCol?.at(0) as Uint8Array;
+      const bytes = requireBinaryCell(rawDataCol, 0);
       expect(bytes).toBeInstanceOf(Uint8Array);
       expect(bytes).toEqual(new Uint8Array([0xde, 0xad, 0xbe, 0xef]));
     });
@@ -132,24 +148,25 @@ describe('Binary Arrow Conversion', () => {
       const writer = createColumnWriter(schema, buffer);
 
       // Row 0: payload set
-      nextLooseRow(writer).payload({ key: 'value' }).requestId('req-1');
+      const firstRow = invokeWriterMethod(nextWriterRow(writer), 'payload', { key: 'value' });
+      invokeWriterMethod(firstRow, 'requestId', 'req-1');
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
       // Row 1: payload NOT set (null)
-      nextLooseRow(writer).requestId('req-2');
+      invokeWriterMethod(nextWriterRow(writer), 'requestId', 'req-2');
       buffer.timestamp[1] = 2000n;
       buffer.entry_type[1] = ENTRY_TYPE_INFO;
 
       buffer._writeIndex = 2;
 
       const table = convertToArrowTable(buffer);
-      const payloadCol = table.getChild('payload');
+      const payloadCol = requireColumn(table, 'payload');
       expect(payloadCol).toBeDefined();
-      expect(payloadCol?.length).toBe(2);
+      expect(payloadCol.length).toBe(2);
 
       // Row 0: should have data
-      const row0 = payloadCol?.at(0) as Uint8Array;
+      const row0 = requireBinaryCell(payloadCol, 0);
       expect(row0).toBeInstanceOf(Uint8Array);
       expect(decode(row0)).toEqual({ key: 'value' });
 
@@ -169,11 +186,12 @@ describe('Binary Arrow Conversion', () => {
       const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const writer = createColumnWriter(schema, buffer);
 
-      nextLooseRow(writer)
-        .userId('user-1')
-        .httpStatus(200)
-        .payload({ items: [1, 2, 3] })
-        .operation('GET');
+      const mixedRow = invokeWriterMethod(nextWriterRow(writer), 'userId', 'user-1');
+      invokeWriterMethod(
+        invokeWriterMethod(invokeWriterMethod(mixedRow, 'httpStatus', 200), 'payload', { items: [1, 2, 3] }),
+        'operation',
+        'GET',
+      );
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer._writeIndex = 1;
@@ -185,7 +203,7 @@ describe('Binary Arrow Conversion', () => {
       expect(table.getChild('httpStatus')?.at(0)).toBe(200);
       expect(table.getChild('operation')?.at(0)).toBe('GET');
 
-      const payloadBytes = table.getChild('payload')?.at(0) as Uint8Array;
+      const payloadBytes = requireBinaryCell(requireColumn(table, 'payload'), 0);
       expect(decode(payloadBytes)).toEqual({ items: [1, 2, 3] });
     });
   });
@@ -201,9 +219,8 @@ describe('Binary Arrow Conversion', () => {
       const rootBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const rootWriter = createColumnWriter(schema, rootBuffer);
 
-      nextLooseRow(rootWriter)
-        .payload({ level: 'root', data: [1, 2] })
-        .userId('user-root');
+      const rootRow = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { level: 'root', data: [1, 2] });
+      invokeWriterMethod(rootRow, 'userId', 'user-root');
       rootBuffer.timestamp[0] = 1000n;
       rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       rootBuffer._writeIndex = 1;
@@ -212,9 +229,8 @@ describe('Binary Arrow Conversion', () => {
       const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const childWriter = createColumnWriter(schema, childBuffer);
 
-      nextLooseRow(childWriter)
-        .payload({ level: 'child', nested: { a: 1 } })
-        .userId('user-child');
+      const childRow = invokeWriterMethod(nextWriterRow(childWriter), 'payload', { level: 'child', nested: { a: 1 } });
+      invokeWriterMethod(childRow, 'userId', 'user-child');
       childBuffer.timestamp[0] = 2000n;
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       childBuffer._writeIndex = 1;
@@ -224,13 +240,13 @@ describe('Binary Arrow Conversion', () => {
       childBuffer._parent = rootBuffer;
 
       const table = convertSpanTreeToArrowTable(rootBuffer);
-      const payloadCol = table.getChild('payload');
+      const payloadCol = requireColumn(table, 'payload');
       expect(payloadCol).toBeDefined();
-      expect(payloadCol?.length).toBe(2);
+      expect(payloadCol.length).toBe(2);
 
       // Both rows should have msgpack-encoded binary data
-      const row0 = decode(payloadCol?.at(0) as Uint8Array);
-      const row1 = decode(payloadCol?.at(1) as Uint8Array);
+      const row0 = decode(requireBinaryCell(payloadCol, 0));
+      const row1 = decode(requireBinaryCell(payloadCol, 1));
 
       // Values should match what was written (order may vary due to tree walk)
       const payloads = [row0, row1];
@@ -251,7 +267,7 @@ describe('Binary Arrow Conversion', () => {
 
       const obj: Record<string, unknown> = { x: 1, y: 2, label: 'original' };
 
-      nextLooseRow(writer).payload(obj);
+      invokeWriterMethod(nextWriterRow(writer), 'payload', obj);
       buffer.timestamp[0] = 1000n;
       buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
       buffer._writeIndex = 1;
@@ -262,11 +278,11 @@ describe('Binary Arrow Conversion', () => {
       }).toThrow(); // frozen objects throw in strict mode
 
       const table = convertToArrowTable(buffer);
-      const payloadCol = table.getChild('payload');
+      const payloadCol = requireColumn(table, 'payload');
       expect(payloadCol).toBeDefined();
 
-      const bytes = payloadCol?.at(0) as Uint8Array;
-      const decoded = decode(bytes) as Record<string, unknown>;
+      const bytes = requireBinaryCell(payloadCol, 0);
+      const decoded = decode(bytes);
       expect(decoded).toEqual({ x: 1, y: 2, label: 'original' });
     });
   });
@@ -283,15 +299,18 @@ describe('Binary Arrow Conversion', () => {
       const rootBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const rootWriter = createColumnWriter(schema, rootBuffer);
 
-      nextLooseRow(rootWriter).payload({ req: 1 }).userId('user-A').action('click');
+      const rootRow0 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 1 });
+      invokeWriterMethod(invokeWriterMethod(rootRow0, 'userId', 'user-A'), 'action', 'click');
       rootBuffer.timestamp[0] = 1000n;
       rootBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
-      nextLooseRow(rootWriter).payload({ req: 2 }).userId('user-A').action('scroll');
+      const rootRow1 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 2 });
+      invokeWriterMethod(invokeWriterMethod(rootRow1, 'userId', 'user-A'), 'action', 'scroll');
       rootBuffer.timestamp[1] = 2000n;
       rootBuffer.entry_type[1] = ENTRY_TYPE_INFO;
 
-      nextLooseRow(rootWriter).payload({ req: 3 }).userId('user-B').action('click');
+      const rootRow2 = invokeWriterMethod(nextWriterRow(rootWriter), 'payload', { req: 3 });
+      invokeWriterMethod(invokeWriterMethod(rootRow2, 'userId', 'user-B'), 'action', 'click');
       rootBuffer.timestamp[2] = 3000n;
       rootBuffer.entry_type[2] = ENTRY_TYPE_INFO;
 
@@ -301,7 +320,8 @@ describe('Binary Arrow Conversion', () => {
       const childBuffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
       const childWriter = createColumnWriter(schema, childBuffer);
 
-      nextLooseRow(childWriter).payload({ req: 4 }).userId('user-B').action('submit');
+      const childDataRow = invokeWriterMethod(nextWriterRow(childWriter), 'payload', { req: 4 });
+      invokeWriterMethod(invokeWriterMethod(childDataRow, 'userId', 'user-B'), 'action', 'submit');
       childBuffer.timestamp[0] = 4000n;
       childBuffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
 
@@ -330,12 +350,14 @@ describe('Binary Arrow Conversion', () => {
       expect(actions).toContain('submit');
 
       // Binary column should have msgpack-encoded objects
-      const payloadCol = table.getChild('payload');
+      const payloadCol = requireColumn(table, 'payload');
       expect(payloadCol).toBeDefined();
       const payloads: unknown[] = [];
-      for (let i = 0; i < payloadCol?.length; i++) {
-        const bytes = payloadCol?.at(i);
-        if (bytes !== null) payloads.push(decode(bytes as Uint8Array));
+      for (let i = 0; i < payloadCol.length; i++) {
+        const bytes = payloadCol.at(i);
+        if (bytes instanceof Uint8Array) {
+          payloads.push(decode(bytes));
+        }
       }
       expect(payloads).toContainEqual({ req: 1 });
       expect(payloads).toContainEqual({ req: 2 });
@@ -364,14 +386,14 @@ describe('Binary Arrow Conversion', () => {
         const buffer = createSpanBuffer(schema, createTestTraceRoot('test-trace'), createTestOpMetadata());
         const writer = createColumnWriter(schema, buffer);
 
-        nextLooseRow(writer).payload(testValue);
+        invokeWriterMethod(nextWriterRow(writer), 'payload', testValue);
         buffer.timestamp[0] = 1000n;
         buffer.entry_type[0] = ENTRY_TYPE_SPAN_START;
         buffer._writeIndex = 1;
 
         const table = convertToArrowTable(buffer);
-        const payloadCol = table.getChild('payload');
-        const bytes = payloadCol?.at(0) as Uint8Array;
+        const payloadCol = requireColumn(table, 'payload');
+        const bytes = requireBinaryCell(payloadCol, 0);
         const decoded = decode(bytes);
 
         if (testValue instanceof Uint8Array) {

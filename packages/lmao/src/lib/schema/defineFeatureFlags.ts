@@ -12,8 +12,16 @@ type DefinedFeatureFlags<T extends FeatureFlagSchema> = {
   schema: T;
   syncFlags: SyncFlagKeys<T>[];
   asyncFlags: AsyncFlagKeys<T>[];
-  type: InferFeatureFlags<T>;
+  readonly type?: InferFeatureFlags<T>;
 };
+
+function isSyncFlagKey<T extends FeatureFlagSchema>(schema: T, key: keyof T): key is SyncFlagKeys<T> {
+  return schema[key].evaluationType === 'sync';
+}
+
+function isAsyncFlagKey<T extends FeatureFlagSchema>(schema: T, key: keyof T): key is AsyncFlagKeys<T> {
+  return schema[key].evaluationType === 'async';
+}
 
 /**
  * Define feature flags with type-safe access patterns
@@ -22,22 +30,21 @@ type DefinedFeatureFlags<T extends FeatureFlagSchema> = {
  * @returns Feature flag definition object for use with evaluator
  */
 export function defineFeatureFlags<T extends FeatureFlagSchema>(schema: T): DefinedFeatureFlags<T> {
-  const syncFlags: string[] = [];
-  const asyncFlags: string[] = [];
+  const syncFlags: SyncFlagKeys<T>[] = [];
+  const asyncFlags: AsyncFlagKeys<T>[] = [];
 
-  for (const [key, definition] of Object.entries(schema)) {
-    if (definition.evaluationType === 'sync') {
+  for (const key in schema) {
+    if (isSyncFlagKey(schema, key)) {
       syncFlags.push(key);
-    } else {
+    } else if (isAsyncFlagKey(schema, key)) {
       asyncFlags.push(key);
     }
   }
 
   return {
     schema,
-    syncFlags: syncFlags as SyncFlagKeys<T>[],
-    asyncFlags: asyncFlags as AsyncFlagKeys<T>[],
-    type: undefined as unknown as InferFeatureFlags<T>,
+    syncFlags,
+    asyncFlags,
   };
 }
 

@@ -470,6 +470,9 @@ export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
   _parent?: SpanBuffer<T>;
   _overflow?: SpanBuffer<T>;
 
+  // Override schema access with the concrete schema for this buffer family
+  readonly _logSchema: T;
+
   // Override methods with typed versions
   isParentOf(other: SpanBuffer<T>): boolean;
   isChildOf(other: SpanBuffer<T>): boolean;

@@ -258,6 +258,11 @@ export interface OpContextBinding<
   readonly logBinding: import('../logBinding.js').LogBinding<T>;
 
   /**
+   * Feature flag schema needed by tracers to bootstrap typed evaluators.
+   */
+  readonly flags: FF;
+
+  /**
    * User context defaults from ctx config.
    * Used by Tracer to merge with trace-level overrides.
    * Properties with null values are required at trace creation.

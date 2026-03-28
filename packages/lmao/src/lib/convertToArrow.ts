@@ -23,6 +23,7 @@ import {
   binary,
   bool,
   Column,
+  type DataType,
   dictionary,
   float64,
   type IntType,
@@ -39,6 +40,14 @@ import {
 } from '@uwdata/flechette';
 import { type CapacityStatsEntry, createCapacityStatsTable } from './arrow/capacityStats.js';
 import { buildSortedCategoryDictionary, buildTextDictionary } from './arrow/dictionaries.js';
+import {
+  type DictionaryColumnData,
+  type GenericColumnData,
+  getArrowIndexArrayConstructorOr,
+  getArrowIndexTypeOr,
+  makeArrowColumn,
+  type Utf8ColumnData,
+} from './arrow/flechette.js';
 import {
   calculateUtf8Offsets,
   concatenateFloat64Arrays,
@@ -68,96 +77,141 @@ export type SystemColumnBuilder = (
 
 const EMPTY_VALIDITY = new Uint8Array(0);
 const BINARY_TYPE = binary();
-const BOOL_TYPE_ID = (bool() as { typeId?: unknown }).typeId;
+type LegacyColumnDataBase<TType, TValues = unknown> = {
+  type: TType;
+  length: number;
+  nullCount: number;
+  data?: TValues;
+  nullBitmap?: Uint8Array;
+};
+type LegacyDictionaryColumnData = LegacyColumnDataBase<ReturnType<typeof dictionary>> & {
+  dictionary: Column<unknown>;
+};
+type LegacyUtf8ColumnData = LegacyColumnDataBase<ReturnType<typeof utf8>, Uint8Array> & {
+  valueOffsets: Int32Array;
+};
+type LegacyGenericColumnData<TType extends DataType = DataType, TValues = unknown> = LegacyColumnDataBase<
+  TType,
+  TValues
+> & {
+  dictionary?: never;
+  valueOffsets?: never;
+};
 
 function buildData<T extends Record<string, unknown>>(data: T): T {
   return data;
 }
 
-function isBoolType(value: unknown): boolean {
-  return (value as { typeId?: unknown })?.typeId === BOOL_TYPE_ID;
-}
-
-function buildColumn(data: {
-  type: unknown;
-  length: number;
-  nullCount: number;
-  data?: unknown;
-  nullBitmap?: Uint8Array;
-  valueOffsets?: Int32Array;
-  dictionary?: Column<unknown>;
-}): Column<unknown> {
-  const validity = data.nullBitmap ?? EMPTY_VALIDITY;
-
-  if (data.dictionary) {
-    const dictType = data.type as ReturnType<typeof dictionary>;
-    const batch = new (batchType(dictType))({
-      type: dictType,
+function buildColumn(data: LegacyDictionaryColumnData): Column<unknown>;
+function buildColumn(data: LegacyUtf8ColumnData): Column<unknown>;
+function buildColumn(data: LegacyGenericColumnData): Column<unknown>;
+function buildColumn(
+  data: LegacyDictionaryColumnData | LegacyUtf8ColumnData | LegacyGenericColumnData,
+): Column<unknown> {
+  if (isLegacyDictionaryColumnData(data)) {
+    const dictionaryData: DictionaryColumnData = {
+      type: data.type,
       length: data.length,
       nullCount: data.nullCount,
-      validity,
       values: data.data,
-    }) as {
-      setDictionary(dictionaryColumn: Column<unknown>): void;
+      validity: data.nullBitmap,
+      dictionary: data.dictionary,
     };
-    batch.setDictionary(data.dictionary);
-    return new Column([batch as never]);
+    return makeArrowColumn(dictionaryData);
   }
-
-  if (data.valueOffsets) {
-    const utf8Type = data.type as ReturnType<typeof utf8>;
-    const batch = new (batchType(utf8Type))({
-      type: utf8Type,
+  if (isLegacyUtf8ColumnData(data)) {
+    const utf8Data: Utf8ColumnData = {
+      type: data.type,
       length: data.length,
       nullCount: data.nullCount,
-      validity,
+      values: data.data,
+      validity: data.nullBitmap,
       offsets: data.valueOffsets,
-      values: data.data,
-    });
-    return new Column([batch]);
+    };
+    return makeArrowColumn(utf8Data);
   }
-
-  if (isBoolType(data.type)) {
-    const boolType = data.type as ReturnType<typeof bool>;
-    const batch = new (batchType(boolType))({
-      type: boolType,
-      length: data.length,
-      nullCount: data.nullCount,
-      validity,
-      values: data.data,
-    });
-    return new Column([batch]);
-  }
-
-  const batch = new (batchType(data.type as never))({
+  const genericData: GenericColumnData<DataType> = {
     type: data.type,
     length: data.length,
     nullCount: data.nullCount,
-    validity,
     values: data.data,
-  });
-  return new Column([batch]);
+    validity: data.nullBitmap,
+  };
+  return makeArrowColumn(genericData);
+}
+
+function isLegacyDictionaryColumnData(
+  data: LegacyDictionaryColumnData | LegacyUtf8ColumnData | LegacyGenericColumnData,
+): data is LegacyDictionaryColumnData {
+  return 'dictionary' in data && data.dictionary instanceof Column;
+}
+
+function isLegacyUtf8ColumnData(
+  data: LegacyDictionaryColumnData | LegacyUtf8ColumnData | LegacyGenericColumnData,
+): data is LegacyUtf8ColumnData {
+  return 'valueOffsets' in data && data.valueOffsets instanceof Int32Array;
 }
 
 function buildTable(fields: string[], vectors: Column<unknown>[]): Table {
   if (fields.length === 0) return tableFromColumns({});
-  const entries: [string, Column<unknown>][] = fields.map((name, index) => [name, vectors[index] as Column<unknown>]);
-  return tableFromColumns(entries);
+  const columns: Record<string, Column<unknown>> = {};
+  for (let index = 0; index < fields.length; index++) {
+    columns[fields[index]] = vectors[index];
+  }
+  return tableFromColumns(columns);
 }
 
 function appendTables(base: Table, extra: Table): Table {
-  const entries: [string, Column<unknown>][] = [];
+  const columns: Record<string, Column<unknown>> = {};
   for (let i = 0; i < base.numCols; i++) {
-    const name = base.names[i] as string;
+    const name = base.names[i];
     const left = base.getChildAt(i);
     const right = extra.getChild(name);
     if (!left || !right) {
       throw new Error(`Cannot append tables: missing column '${name}'`);
     }
-    const batches = [...(left.data as unknown[]), ...(right.data as unknown[])];
-    entries.push([name, new Column(batches as never[])]);
+    columns[name] = new Column([...left.data, ...right.data]);
   }
-  return tableFromColumns(entries);
+  return tableFromColumns(columns);
+}
+
+function getAllocatedStringColumn(buffer: AnySpanBuffer, columnName: string): string[] | undefined {
+  const column = buffer.getColumnIfAllocated(columnName);
+  if (!Array.isArray(column)) {
+    return undefined;
+  }
+  return isStringArray(column) ? column : undefined;
+}
+
+function getAllocatedBinaryColumn(buffer: AnySpanBuffer, columnName: string): unknown[] | undefined {
+  const column = buffer.getColumnIfAllocated(columnName);
+  return Array.isArray(column) ? column : undefined;
+}
+
+function getStringScopeValue(buffer: AnySpanBuffer, fieldName: string): string | undefined {
+  const value = buffer._scopeValues?.[fieldName];
+  return typeof value === 'string' ? value : undefined;
+}
+
+function getNumberScopeValue(buffer: AnySpanBuffer, fieldName: string): number | undefined {
+  const value = buffer._scopeValues?.[fieldName];
+  return typeof value === 'number' ? value : undefined;
+}
+
+function getBooleanScopeValue(buffer: AnySpanBuffer, fieldName: string): boolean | undefined {
+  const value = buffer._scopeValues?.[fieldName];
+  return typeof value === 'boolean' ? value : undefined;
+}
+
+function requireUint8Array(value: unknown, message: string): Uint8Array {
+  if (!(value instanceof Uint8Array)) {
+    throw new Error(message);
+  }
+  return value;
+}
+
+function isStringArray(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((entry) => typeof entry === 'string' || entry == null);
 }
 
 function indexTypeForCount(count: number): IntType {
@@ -410,14 +464,18 @@ function buildBinaryColumnFromBuffers(
   // Collect all values from buffers, encode each if encoder is present
   const allValues: (Uint8Array | null)[] = [];
   for (const buf of buffers) {
-    const col = buf.getColumnIfAllocated(columnName) as unknown[] | undefined;
+    const col = getAllocatedBinaryColumn(buf, columnName);
     const srcNulls = buf.getNullsIfAllocated(columnName);
     for (let i = 0; i < buf._writeIndex; i++) {
       if (srcNulls) {
         const isValid = (srcNulls[i >>> 3] & (1 << (i & 7))) !== 0;
         if (isValid && col) {
           const raw = col[i];
-          allValues.push(encoder ? encoder.encode(raw) : (raw as Uint8Array));
+          allValues.push(
+            encoder
+              ? encoder.encode(raw)
+              : requireUint8Array(raw, `Binary column '${columnName}' must store Uint8Array values`),
+          );
         } else {
           allValues.push(null);
         }
@@ -425,7 +483,11 @@ function buildBinaryColumnFromBuffers(
         // No null bitmap -- column allocated but check for undefined/null values
         const raw = col[i];
         if (raw != null) {
-          allValues.push(encoder ? encoder.encode(raw) : (raw as Uint8Array));
+          allValues.push(
+            encoder
+              ? encoder.encode(raw)
+              : requireUint8Array(raw, `Binary column '${columnName}' must store Uint8Array values`),
+          );
         } else {
           allValues.push(null);
         }
@@ -586,11 +648,8 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
       const enumValues = getEnumValues(fieldSchema) || [];
       const enumUtf8 = getEnumUtf8(fieldSchema);
       // Get constructors from schema metadata
-      const enumSchema = fieldSchema as { __index_array_ctor?: unknown; __arrow_index_type?: unknown };
-      const indexArrayCtor =
-        (enumSchema.__index_array_ctor as Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor) ??
-        Uint8Array;
-      const arrowIndexType = (enumSchema.__arrow_index_type as IntType) ?? uint8();
+      const indexArrayCtor = getArrowIndexArrayConstructorOr(fieldSchema);
+      const arrowIndexType = getArrowIndexTypeOr(fieldSchema, uint8());
       // Collect value arrays - need to handle different TypedArray types
       const valueArrays: (Uint8Array | Uint16Array | Uint32Array)[] = [];
       for (const buf of buffers) {
@@ -605,7 +664,14 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
       // Concatenate arrays based on type
       let allIndices: Uint8Array | Uint16Array | Uint32Array;
       if (indexArrayCtor === Uint8Array) {
-        allIndices = concatenateUint8Arrays(valueArrays as Uint8Array[]);
+        const uint8ValueArrays: Uint8Array[] = [];
+        for (const array of valueArrays) {
+          if (!(array instanceof Uint8Array)) {
+            throw new Error(`Enum column '${columnName}' expected Uint8Array chunks`);
+          }
+          uint8ValueArrays.push(array);
+        }
+        allIndices = concatenateUint8Arrays(uint8ValueArrays);
       } else {
         const totalLength = valueArrays.reduce((sum, arr) => sum + arr.length, 0);
         allIndices = new indexArrayCtor(totalLength);
@@ -627,8 +693,8 @@ function convertBuffersToTable(buffers: AnySpanBuffer[], systemColumnBuilder?: S
         offset: 0,
         length: enumValues.length,
         nullCount: 0,
-        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues as readonly string[]),
-        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
+        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues),
+        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues),
       });
 
       const enumData = buildData({
@@ -992,7 +1058,7 @@ export function convertSpanTreeToArrowTable(
     }
 
     for (const [fieldName, builder] of categoryBuilders) {
-      const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
+      const col = getAllocatedStringColumn(buffer, fieldName);
       const maskTransform = categoryMaskTransforms.get(fieldName);
       const originalToMasked = categoryOriginalToMasked.get(fieldName);
       if (!originalToMasked) {
@@ -1013,7 +1079,7 @@ export function convertSpanTreeToArrowTable(
       }
       // Also add scope values to dictionary (they may not be in columns)
       // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
-      const scopeValue = buffer._scopeValues?.[fieldName] as string | undefined;
+      const scopeValue = getStringScopeValue(buffer, fieldName);
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
         if (maskedScopeValue === undefined) {
@@ -1025,7 +1091,7 @@ export function convertSpanTreeToArrowTable(
     }
 
     for (const [fieldName, builder] of textBuilders) {
-      const col = buffer.getColumnIfAllocated(fieldName) as string[] | undefined;
+      const col = getAllocatedStringColumn(buffer, fieldName);
       const maskTransform = textMaskTransforms.get(fieldName);
       const originalToMasked = textOriginalToMasked.get(fieldName);
       if (!originalToMasked) {
@@ -1046,7 +1112,7 @@ export function convertSpanTreeToArrowTable(
       }
       // Also add scope values to dictionary (they may not be in columns)
       // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
-      const scopeValue = buffer._scopeValues?.[fieldName] as string | undefined;
+      const scopeValue = getStringScopeValue(buffer, fieldName);
       if (scopeValue !== undefined) {
         let maskedScopeValue = originalToMasked.get(scopeValue);
         if (maskedScopeValue === undefined) {
@@ -1265,7 +1331,7 @@ function convertBuffersWithSharedDicts(
   const messageNullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
   let messageRowOffset = 0;
   for (const buf of buffers) {
-    const col = buf.getColumnIfAllocated('message') as string[] | undefined;
+    const col = getAllocatedStringColumn(buf, 'message');
     if (col) {
       for (let i = 0; i < buf._writeIndex; i++) {
         const v = col[i];
@@ -1339,9 +1405,9 @@ function convertBuffersWithSharedDicts(
 
       // Per specs/lmao/01i_span_scope_attributes.md: scope values fill NULL cells at Arrow conversion
       for (const buf of buffers) {
-        const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
+        const col = getAllocatedStringColumn(buf, columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf._scopeValues?.[fieldName] as string | undefined;
+        const scopeValue = getStringScopeValue(buf, fieldName);
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
@@ -1414,9 +1480,9 @@ function convertBuffersWithSharedDicts(
       let rowOffset = 0;
 
       for (const buf of buffers) {
-        const col = buf.getColumnIfAllocated(columnName) as string[] | undefined;
+        const col = getAllocatedStringColumn(buf, columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf._scopeValues?.[fieldName] as string | undefined;
+        const scopeValue = getStringScopeValue(buf, fieldName);
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           const maskedScopeValue = originalToMasked.get(scopeValue) ?? scopeValue;
@@ -1488,7 +1554,7 @@ function convertBuffersWithSharedDicts(
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf._scopeValues?.[fieldName] as number | undefined;
+        const scopeValue = getNumberScopeValue(buf, fieldName);
 
         if (col instanceof Float64Array) {
           allValues.set(col.subarray(0, buf._writeIndex), rowOffset);
@@ -1562,7 +1628,7 @@ function convertBuffersWithSharedDicts(
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf._scopeValues?.[fieldName] as boolean | undefined;
+        const scopeValue = getBooleanScopeValue(buf, fieldName);
 
         if (col instanceof Uint8Array) {
           // Copy boolean values bit by bit - can't avoid loop for bit-level operations
@@ -1635,11 +1701,8 @@ function convertBuffersWithSharedDicts(
       const enumValues = getEnumValues(fieldSchema) || [];
       const enumUtf8 = getEnumUtf8(fieldSchema);
       // Get constructors from schema metadata
-      const enumSchema = fieldSchema as { __index_array_ctor?: unknown; __arrow_index_type?: unknown };
-      const indexArrayCtor =
-        (enumSchema.__index_array_ctor as Uint8ArrayConstructor | Uint16ArrayConstructor | Uint32ArrayConstructor) ??
-        Uint8Array;
-      const arrowIndexType = (enumSchema.__arrow_index_type as IntType) ?? uint8();
+      const indexArrayCtor = getArrowIndexArrayConstructorOr(fieldSchema);
+      const arrowIndexType = getArrowIndexTypeOr(fieldSchema, uint8());
       const allIndices = new indexArrayCtor(totalRows);
       const nullBitmap = new Uint8Array(Math.ceil(totalRows / 8));
       // Start with all nulls (bits cleared) - we'll set bits as we find values
@@ -1649,14 +1712,14 @@ function convertBuffersWithSharedDicts(
       // Build enum value to index mapping for scope lookup
       const enumValueToIndex = new Map<string, number>();
       for (let i = 0; i < enumValues.length; i++) {
-        enumValueToIndex.set(enumValues[i] as string, i);
+        enumValueToIndex.set(enumValues[i], i);
       }
 
       for (const buf of buffers) {
         const col = buf.getColumnIfAllocated(columnName);
         const srcNulls = buf.getNullsIfAllocated(columnName);
         // Check if this buffer has a scope value for this field
-        const scopeValue = buf._scopeValues?.[fieldName] as string | undefined;
+        const scopeValue = getStringScopeValue(buf, fieldName);
         let scopeEncodedValue: number | undefined;
         if (scopeValue !== undefined) {
           scopeEncodedValue = enumValueToIndex.get(scopeValue);
@@ -1713,8 +1776,8 @@ function convertBuffersWithSharedDicts(
         offset: 0,
         length: enumValues.length,
         nullCount: 0,
-        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues as readonly string[]),
-        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues as readonly string[]),
+        valueOffsets: enumUtf8?.offsets ?? calculateUtf8Offsets(enumValues),
+        data: enumUtf8?.concatenated ?? encodeUtf8Strings(enumValues),
       });
 
       vectors.push(

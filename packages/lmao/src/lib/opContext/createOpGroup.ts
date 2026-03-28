@@ -33,6 +33,8 @@ import type {
 import { validateOpName } from './opGroupTypes.js';
 import type { OpContext } from './types.js';
 
+type OpRecord<Ctx extends OpContext> = Record<string, Op<Ctx, unknown[], unknown, unknown>>;
+
 // =============================================================================
 // INTERNAL HELPERS
 // =============================================================================
@@ -45,14 +47,47 @@ import type { OpContext } from './types.js';
  * Why reverse: RemappedBufferView wraps child buffer at registration time.
  * Arrow conversion asks for 'http_status', view needs to find 'status' in raw buffer.
  */
-function createReverseMapping(mapping: Record<string, string | null>): Record<string, string> {
+function createReverseMapping(mapping: Record<string, string | null | undefined>): Record<string, string> {
   const reverse: Record<string, string> = {};
   for (const [cleanName, prefixedName] of Object.entries(mapping)) {
-    if (prefixedName !== null) {
+    if (typeof prefixedName === 'string') {
       reverse[prefixedName] = cleanName;
     }
   }
   return reverse;
+}
+
+function isOpInstance<Ctx extends OpContext>(value: unknown): value is Op<Ctx, unknown[], unknown, unknown> {
+  return value instanceof Op;
+}
+
+function copyOpsWithView<Ctx extends OpContext>(
+  source: Record<string, unknown>,
+  target: Record<string, unknown>,
+  remappedViewClass: ReturnType<typeof generateRemappedBufferViewClass>,
+): void {
+  for (const [key, value] of Object.entries(source)) {
+    if (isOpInstance<Ctx>(value)) {
+      target[key] = new Op(value.metadata, value.SpanBufferClass, value.fn, remappedViewClass);
+    }
+  }
+}
+
+function prefixContributedSchema<T extends SchemaFields, P extends string>(fields: T, prefix: P): PrefixedSchema<T, P> {
+  const result: Record<string, unknown> = {};
+  for (const [key, value] of Object.entries(fields)) {
+    result[`${prefix}_${key}`] = value;
+  }
+  assertMappedSchema<PrefixedSchema<T, P>>(result);
+  return result;
+}
+
+function assertMappedSchema<T extends SchemaFields>(value: Record<string, unknown>): asserts value is T {
+  for (const schema of Object.values(value)) {
+    if (typeof schema !== 'object' || schema === null) {
+      throw new TypeError('Mapped schema must contain schema metadata objects');
+    }
+  }
 }
 
 /**
@@ -136,7 +171,8 @@ function buildContributedSchema<T extends SchemaFields, M extends ColumnMapping<
       result[key] = value;
     }
   }
-  return result as MappedSchema<T, M>;
+  assertMappedSchema<MappedSchema<T, M>>(result);
+  return result;
 }
 
 /**
@@ -176,13 +212,13 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
   [key: string]: unknown;
 
   // Private field - truly hidden, doesn't affect hidden class or enumeration
-  readonly #columnMapping: ColumnMapping<SchemaFields>;
+  readonly #columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
 
   constructor(
     readonly _logSchema: Ctx['logSchema'],
     readonly _flags: Ctx['flags'],
-    ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
-    columnMapping?: ColumnMapping<SchemaFields>,
+    ops: OpRecord<Ctx>,
+    columnMapping?: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>,
   ) {
     this.#columnMapping = columnMapping ?? {};
 
@@ -206,7 +242,7 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
 
     // Generate RemappedBufferView for this prefix
     // Why reverse mapping: Arrow conversion asks for 'http_status', needs to find 'status'
-    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const reverseMapping = createReverseMapping(newMapping);
     const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
 
     // Create new OpGroup with prefixed ops
@@ -215,28 +251,12 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
       this._flags,
       {},
       newMapping,
-      buildContributedSchema(
-        this._logSchema.fields as SchemaFields,
-        buildPrefixMapping(this._logSchema._columnNames, p),
-      ),
+      prefixContributedSchema(this._logSchema.fields, p),
     );
 
-    // Copy ops, creating new Op instances with remappedViewClass
-    // Why same SpanBufferClass: All ops from same defineOpContext share schema + stats
-    for (const key of Object.keys(this)) {
-      const value = this[key];
-      if (value instanceof Op) {
-        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        newGroup[key] = new Op(
-          oldOp.metadata,
-          oldOp.SpanBufferClass, // SAME class - shared schema + stats
-          oldOp.fn,
-          remappedViewClass, // for child buffer wrapping
-        );
-      }
-    }
+    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
 
-    return newGroup as unknown as MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>>;
+    return newGroup;
   }
 
   mapColumns<M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
@@ -246,31 +266,18 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
     const newMapping = { ...this.#columnMapping, ...mapping };
 
     // Generate RemappedBufferView for this mapping
-    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const reverseMapping = createReverseMapping(newMapping);
     const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
 
     // Build contributed schema from original fields with new mapping
-    const newContributed = buildContributedSchema(this._logSchema.fields as SchemaFields, newMapping);
+    const newContributed = buildContributedSchema(this._logSchema.fields, newMapping);
 
     // Create new OpGroup with mapped ops
-    const newGroup = new MappedOpGroupImpl(
-      this._logSchema,
-      this._flags,
-      {},
-      newMapping,
-      newContributed as MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>,
-    );
+    const newGroup = new MappedOpGroupImpl(this._logSchema, this._flags, {}, newMapping, newContributed);
 
-    // Copy ops with remappedViewClass
-    for (const key of Object.keys(this)) {
-      const value = this[key];
-      if (value instanceof Op) {
-        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        newGroup[key] = new Op(oldOp.metadata, oldOp.SpanBufferClass, oldOp.fn, remappedViewClass);
-      }
-    }
+    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
 
-    return newGroup as MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>>;
+    return newGroup;
   }
 }
 
@@ -292,16 +299,16 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
   // Allow dynamic op properties (ops spread as own properties in constructor)
   [key: string]: unknown;
 
-  readonly #columnMapping: ColumnMapping<SchemaFields>;
+  readonly #columnMapping: Record<string, string | null | undefined>;
 
   constructor(
     readonly _logSchema: Ctx['logSchema'],
     readonly _flags: Ctx['flags'],
-    ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
+    ops: OpRecord<Ctx>,
     readonly _columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>,
     readonly _contributedSchema: ContributedSchema,
   ) {
-    this.#columnMapping = _columnMapping as ColumnMapping<SchemaFields>;
+    this.#columnMapping = _columnMapping;
 
     // Validate op names before spreading
     validateAllOpNames(ops);
@@ -317,34 +324,18 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
     const newMapping = prefixMapping(this.#columnMapping, p);
 
     // Generate RemappedBufferView
-    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const reverseMapping = createReverseMapping(newMapping);
     const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
 
     // Build new contributed schema by prefixing current contributed schema
-    const newContributed = buildContributedSchema(
-      this._contributedSchema,
-      buildPrefixMapping(Object.keys(this._contributedSchema), p),
-    );
+    const newContributed = prefixContributedSchema(this._contributedSchema, p);
 
     // Create new MappedOpGroup
-    const newGroup = new MappedOpGroupImpl(
-      this._logSchema,
-      this._flags,
-      {},
-      newMapping,
-      newContributed as unknown as PrefixedSchema<ContributedSchema, P>,
-    );
+    const newGroup = new MappedOpGroupImpl(this._logSchema, this._flags, {}, newMapping, newContributed);
 
-    // Copy ops with new remappedViewClass
-    for (const key of Object.keys(this)) {
-      const value = this[key];
-      if (value instanceof Op) {
-        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        newGroup[key] = new Op(oldOp.metadata, oldOp.SpanBufferClass, oldOp.fn, remappedViewClass);
-      }
-    }
+    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
 
-    return newGroup as MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>>;
+    return newGroup;
   }
 
   mapColumns<M extends ColumnMapping<ContributedSchema>>(
@@ -354,34 +345,18 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
     const newMapping = { ...this.#columnMapping, ...mapping };
 
     // Generate RemappedBufferView
-    const reverseMapping = createReverseMapping(newMapping as Record<string, string | null>);
+    const reverseMapping = createReverseMapping(newMapping);
     const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
 
-    // Build contributed schema from original fields with new mapping
-    const newContributed = buildContributedSchema(
-      this._logSchema.fields as SchemaFields,
-      newMapping as ColumnMapping<SchemaFields>,
-    );
+    // Build contributed schema from current contributed fields so chained maps stay typed to the public surface.
+    const newContributed = buildContributedSchema(this._contributedSchema, mapping);
 
     // Create new MappedOpGroup
-    const newGroup = new MappedOpGroupImpl(
-      this._logSchema,
-      this._flags,
-      {},
-      newMapping,
-      newContributed as MappedSchema<ContributedSchema, M>,
-    );
+    const newGroup = new MappedOpGroupImpl(this._logSchema, this._flags, {}, newMapping, newContributed);
 
-    // Copy ops with new remappedViewClass
-    for (const key of Object.keys(this)) {
-      const value = this[key];
-      if (value instanceof Op) {
-        const oldOp = value as Op<Ctx, unknown[], unknown, unknown>;
-        newGroup[key] = new Op(oldOp.metadata, oldOp.SpanBufferClass, oldOp.fn, remappedViewClass);
-      }
-    }
+    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
 
-    return newGroup as MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>>;
+    return newGroup;
   }
 }
 

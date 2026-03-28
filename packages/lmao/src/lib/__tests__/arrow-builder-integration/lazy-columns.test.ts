@@ -344,8 +344,11 @@ describe('SpanBuffer Lazy Column Allocation', () => {
 
     // After TagWriter write, the column should be allocated
     expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
-    const userIdColumn = buffer.getColumnIfAllocated('userId') as string[];
+    const userIdColumn = buffer.getColumnIfAllocated('userId');
     expect(Array.isArray(userIdColumn)).toBe(true);
+    if (!Array.isArray(userIdColumn)) {
+      throw new Error('Expected userId column to allocate as a string array');
+    }
     expect(userIdColumn[0]).toBe('user-123');
 
     // Other columns should still be undefined
@@ -359,8 +362,11 @@ describe('SpanBuffer Lazy Column Allocation', () => {
     // Now both columns should be allocated
     expect(buffer.getColumnIfAllocated('userId')).toBeDefined();
     expect(buffer.getColumnIfAllocated('count')).toBeDefined();
-    const countColumn = buffer.getColumnIfAllocated('count') as Float64Array;
+    const countColumn = buffer.getColumnIfAllocated('count');
     expect(countColumn).toBeInstanceOf(Float64Array);
+    if (!(countColumn instanceof Float64Array)) {
+      throw new Error('Expected count column to allocate as Float64Array');
+    }
     expect(countColumn[0]).toBe(42);
 
     // Unaccessed columns should still be undefined
@@ -372,8 +378,11 @@ describe('SpanBuffer Lazy Column Allocation', () => {
 
     // Enum column should now be allocated
     expect(buffer.getColumnIfAllocated('operation')).toBeDefined();
-    const operationColumn = buffer.getColumnIfAllocated('operation') as Uint8Array;
+    const operationColumn = buffer.getColumnIfAllocated('operation');
     expect(operationColumn).toBeInstanceOf(Uint8Array);
+    if (!(operationColumn instanceof Uint8Array)) {
+      throw new Error('Expected operation column to allocate as Uint8Array');
+    }
     // Enum values are mapped to indices (CREATE = 0, READ = 1, etc.)
     expect(operationColumn[0]).toBe(0);
   });

@@ -39,7 +39,7 @@ import { TransientError } from './errors/Transient.js';
 import type { RemappedViewConstructor } from './logBinding.js';
 import { Op } from './op.js';
 import type { OpContext, OpMetadata, SpanContext, SpanFn, SpanLogger, SpanSyncFn } from './opContext/types.js';
-import { Err, hasErrorCode, Ok, type Result } from './result.js';
+import { type ApplyTagsFn, Err, hasErrorCode, Ok, type Result } from './result.js';
 import type { FeatureFlagEvaluator, InferFeatureFlagsWithContext } from './schema/evaluator.js';
 import {
   ENTRY_TYPE_SPAN_ERR,
@@ -86,6 +86,115 @@ export type SpanLoggerInternal<T extends LogSchema> = SpanLoggerImpl<T> & {
   ffUsage(flagName: string, context?: Record<string, unknown>): FluentLogEntry<T>;
 };
 
+type SpanDispatchFn<Ctx extends OpContext, Args extends unknown[] = unknown[], S = unknown, E = unknown> = (
+  ctx: SpanContext<Ctx>,
+  ...args: Args
+) => Result<S, E> | Promise<Result<S, E>>;
+
+type SpanDispatchTarget<Ctx extends OpContext> = {
+  readonly SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>;
+  readonly remappedViewClass: RemappedViewConstructor | undefined;
+  readonly opMetadata: OpMetadata;
+  readonly fn: SpanDispatchFn<Ctx>;
+};
+
+function isRecord(value: unknown): value is Record<PropertyKey, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isSpanDispatchFn<Ctx extends OpContext>(value: unknown): value is SpanDispatchFn<Ctx> {
+  return typeof value === 'function';
+}
+
+function isOpInstance<Ctx extends OpContext>(value: unknown): value is Op<Ctx, unknown[], unknown, unknown> {
+  return value instanceof Op;
+}
+
+function isSpanBufferConstructorForSchema<T extends LogSchema>(
+  value: unknown,
+  schema: T,
+): value is SpanBufferConstructor<T> {
+  return (
+    typeof value === 'function' &&
+    Reflect.get(value, 'schema') === schema &&
+    typeof Reflect.get(value, 'stats') === 'object'
+  );
+}
+
+function getBufferConstructor<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBufferConstructor<T> {
+  const ctor = buffer.constructor;
+  if (!isSpanBufferConstructorForSchema(ctor, buffer._logSchema)) {
+    throw new TypeError('Span buffer constructor does not match the buffer schema');
+  }
+  return ctor;
+}
+
+function isSpanBufferForSchema<T extends LogSchema>(buffer: unknown, schema: T): buffer is SpanBuffer<T> {
+  return isRecord(buffer) && '_logSchema' in buffer && Reflect.get(buffer, '_logSchema') === schema;
+}
+
+function isScopeValues<T extends LogSchema>(value: unknown): value is Readonly<Partial<InferSchema<T>>> {
+  return typeof value === 'object' && value !== null;
+}
+
+function isSpanContextInstance<Ctx extends OpContext>(value: unknown): value is SpanContextInstance<Ctx> {
+  return (
+    isSpanContext<Ctx>(value) && isRecord(value) && '_buffer' in value && '_spanLogger' in value && '_schema' in value
+  );
+}
+
+function createInheritedContext<Ctx extends OpContext>(parent: SpanContextInstance<Ctx>): SpanContextInstance<Ctx> {
+  const child: unknown = Object.create(parent);
+  if (!isSpanContextInstance<Ctx>(child)) {
+    throw new TypeError('Failed to create child span context');
+  }
+  return child;
+}
+
+function createInheritedContextWithOverrides<Ctx extends OpContext>(
+  parent: SpanContextInstance<Ctx>,
+  overrides: object,
+): SpanContextInstance<Ctx> {
+  const child: unknown = Object.assign(Object.create(parent), overrides);
+  if (!isSpanContextInstance<Ctx>(child)) {
+    throw new TypeError('Failed to create overridden child span context');
+  }
+  return child;
+}
+
+function readStringArgument(args: IArguments, index: number, label: string): string {
+  const value = args[index];
+  if (typeof value !== 'string') {
+    throw new TypeError(`${label} must be a string`);
+  }
+  return value;
+}
+
+function resolveSpanTarget<Ctx extends OpContext>(
+  value: unknown,
+  fallbackBuffer: SpanBuffer<Ctx['logSchema']>,
+): SpanDispatchTarget<Ctx> {
+  if (isOpInstance<Ctx>(value)) {
+    return {
+      SpanBufferClass: value.SpanBufferClass,
+      remappedViewClass: value.remappedViewClass,
+      opMetadata: value.metadata,
+      fn: value.fn,
+    };
+  }
+
+  if (!isSpanDispatchFn<Ctx>(value)) {
+    throw new TypeError('span() expects an Op or function');
+  }
+
+  return {
+    SpanBufferClass: getBufferConstructor(fallbackBuffer),
+    remappedViewClass: undefined,
+    opMetadata: fallbackBuffer._opMetadata,
+    fn: value,
+  };
+}
+
 // =============================================================================
 // Helper Functions
 // =============================================================================
@@ -119,7 +228,7 @@ export function writeSpanStart<T extends LogSchema>(buffer: SpanBuffer<T>, spanN
  * @returns SpanLogger with typed methods matching schema
  */
 export function createSpanLogger<T extends LogSchema>(schema: T, buffer: SpanBuffer<T>): SpanLoggerImpl<T> {
-  return createSpanLoggerFromGenerator(schema, buffer) as SpanLoggerImpl<T>;
+  return createSpanLoggerFromGenerator(schema, buffer);
 }
 
 /**
@@ -221,8 +330,8 @@ function sleep(ms: number): Promise<void> {
  * @param fn - Function to execute (may be retried)
  * @returns Final result (success, non-transient error, or exhausted transient error)
  */
-async function executeWithRetry<S, E>(
-  buffer: SpanBuffer<LogSchema>,
+async function executeWithRetry<T extends LogSchema, S, E>(
+  buffer: SpanBuffer<T>,
   fn: () => Result<S, E> | Promise<Result<S, E>>,
 ): Promise<Result<S, E>> {
   let attempt = 0;
@@ -297,11 +406,9 @@ export function writeSpanEnd<T extends LogSchema, S, E>(buffer: SpanBuffer<T>, r
   }
 
   // Apply deferred tags if present
-  if (result instanceof Ok || result instanceof Err) {
-    const applyTags = (result as Ok<S, T> | Err<E, T>).applyTags;
-    if (applyTags) {
-      applyTags(buffer);
-    }
+  const applyTags = result.applyTags as ApplyTagsFn<T> | undefined;
+  if (applyTags) {
+    applyTags(buffer);
   }
 }
 
@@ -349,8 +456,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   spanSync0<S, E>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
@@ -358,8 +465,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span0<S, E>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: import('./logBinding.js').RemappedViewConstructor | undefined,
     opMetadata: import('./opContext/opTypes.js').OpMetadata,
     fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
@@ -367,8 +474,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span1<S, E, A1>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
@@ -377,8 +484,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span2<S, E, A1, A2>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
@@ -388,8 +495,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span3<S, E, A1, A2, A3>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3) => Result<S, E> | Promise<Result<S, E>>,
@@ -400,8 +507,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span4<S, E, A1, A2, A3, A4>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4) => Result<S, E> | Promise<Result<S, E>>,
@@ -413,8 +520,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span5<S, E, A1, A2, A3, A4, A5>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Result<S, E> | Promise<Result<S, E>>,
@@ -427,8 +534,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span6<S, E, A1, A2, A3, A4, A5, A6>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5, a6: A6) => Result<S, E> | Promise<Result<S, E>>,
@@ -442,8 +549,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span7<S, E, A1, A2, A3, A4, A5, A6, A7>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (
@@ -467,8 +574,8 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
   span8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
     line: number,
     name: string,
-    childCtx: SpanContext<Ctx>,
-    SpanBufferClass: SpanBufferConstructor,
+    childCtx: SpanContextInstance<Ctx>,
+    SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
     remappedViewClass: RemappedViewConstructor | undefined,
     opMetadata: OpMetadata,
     fn: (
@@ -481,7 +588,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
       a6: A6,
       a7: A7,
       a8: A8,
-    ) => Result<S, E> | Promise<Result<S, E>>,
+    ) => Result<S, E, Ctx['logSchema']> | Promise<Result<S, E, Ctx['logSchema']>>,
     a1: A1,
     a2: A2,
     a3: A3,
@@ -490,7 +597,7 @@ export type SpanContextInstance<Ctx extends OpContext> = SpanContext<Ctx> & {
     a6: A6,
     a7: A7,
     a8: A8,
-  ): Promise<Result<S, E>>;
+  ): Promise<Result<S, E, Ctx['logSchema']>>;
 };
 
 // =============================================================================
@@ -526,7 +633,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
     _buffer: SpanBuffer<Ctx['logSchema']>;
     _schema: Ctx['logSchema'];
     _spanLogger: SpanLoggerImpl<Ctx['logSchema']>;
-    _logBinding: LogBinding = logBinding;
+    _logBinding: LogBinding<Ctx['logSchema']> = logBinding;
 
     // User-facing properties
     tag: TagWriter<Ctx['logSchema']>;
@@ -554,7 +661,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       this._schema = schema;
       this._spanLogger = spanLogger;
       this.tag = tag;
-      this.log = spanLogger as unknown as SpanLogger<Ctx['logSchema']>;
+      this.log = spanLogger;
 
       // Regular functions close over constructor args directly - no property lookups
       // Using regular function (not arrow) allows destructuring while closing over args
@@ -570,7 +677,20 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // Closes over `self` for calling prototype methods
       // Named function for better stack traces
       const self = this;
-      this.span = function span(nameOrLine: string | number): Promise<Result<unknown, unknown>> {
+      const span: SpanFn<Ctx> = function span(
+        nameOrLine: string | number,
+        _arg1?: unknown,
+        _arg2?: unknown,
+        _arg3?: unknown,
+        _arg4?: unknown,
+        _arg5?: unknown,
+        _arg6?: unknown,
+        _arg7?: unknown,
+        _arg8?: unknown,
+        _arg9?: unknown,
+        _arg10?: unknown,
+        _arg11?: unknown,
+      ): Promise<Result<unknown, unknown>> {
         // Use arguments.length instead of ...rest to avoid array allocation
         const len = arguments.length;
 
@@ -582,8 +702,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
         // Plus additional args for span arguments
 
         const hasLine = typeof nameOrLine === 'number';
-        const spanLine = hasLine ? (nameOrLine as number) : 0;
-        const spanName = hasLine ? (arguments[1] as string) : (nameOrLine as string);
+        const spanLine = hasLine ? nameOrLine : 0;
+        const spanName = hasLine ? readStringArgument(arguments, 1, 'span name') : nameOrLine;
 
         // Index where fn/op or overrides starts
         const checkIdx = hasLine ? 2 : 1;
@@ -597,24 +717,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
           typeof maybeOverrides !== 'function';
 
         const fnIdx = checkIdx + (hasOverrides ? 1 : 0);
-        const fnOrOp = arguments[fnIdx];
-        // Why extract all properties: Ops provide their own buffer class and metadata for cross-module calls
-        const isOp = fnOrOp instanceof Op;
-
-        // Why Op's class: Contains correct schema for tag methods and shared stats for self-tuning
-        const SpanBufferClass = isOp
-          ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).SpanBufferClass
-          : (self._buffer.constructor as SpanBufferConstructor);
-
-        // Why wrap buffer: RemappedBufferView translates prefixed column names during Arrow conversion
-        const remappedViewClass = isOp ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).remappedViewClass : undefined;
-
-        // Why Op's metadata: Identifies which op is executing (for rows 1+)
-        const opMetadata = isOp ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).metadata : self._buffer._opMetadata;
-        // Extract function from Op or use directly
-        const fn = isOp
-          ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).fn
-          : (fnOrOp as (ctx: SpanContext<Ctx>, ...args: unknown[]) => Promise<Result<unknown, unknown>>);
+        const target = resolveSpanTarget<Ctx>(arguments[fnIdx], self._buffer);
 
         // Create child context - use _newCtx0 or _newCtx1 based on overrides
         const childCtx = hasOverrides ? self._newCtx1(maybeOverrides) : self._newCtx0();
@@ -623,16 +726,24 @@ export function createSpanContextClass<Ctx extends OpContext>(
         const argCount = len - fnIdx - 1;
         switch (argCount) {
           case 0:
-            return self.span0(spanLine, spanName, childCtx, SpanBufferClass, remappedViewClass, opMetadata, fn);
+            return self.span0(
+              spanLine,
+              spanName,
+              childCtx,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
+            );
           case 1:
             return self.span1(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
             );
           case 2:
@@ -640,10 +751,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
             );
@@ -652,10 +763,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -665,10 +776,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -679,10 +790,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -694,10 +805,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -710,10 +821,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -727,10 +838,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               childCtx,
-              SpanBufferClass,
-              remappedViewClass,
-              opMetadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -743,20 +854,21 @@ export function createSpanContextClass<Ctx extends OpContext>(
           default:
             throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
         }
-      } as SpanFn<Ctx>;
+      };
+      this.span = span;
 
-      this.spanSync = function spanSync(name: string, fn: (ctx: SpanContext<Ctx>) => Result<unknown, unknown>) {
+      this.spanSync = function spanSync<S, E>(name: string, fn: (ctx: SpanContext<Ctx>) => Result<S, E>): Result<S, E> {
         const childCtx = self._newCtx0();
         return self.spanSync0(
           0,
           name,
           childCtx,
-          self._buffer.constructor as SpanBufferConstructor,
+          getBufferConstructor(self._buffer),
           undefined,
           self._buffer._opMetadata,
           fn,
         );
-      } as SpanSyncFn<Ctx>;
+      };
     }
 
     // =========================================================================
@@ -794,7 +906,11 @@ export function createSpanContextClass<Ctx extends OpContext>(
     }
 
     get scope(): Readonly<Partial<InferSchema<Ctx['logSchema']>>> {
-      return this._buffer._scopeValues as Readonly<Partial<InferSchema<Ctx['logSchema']>>>;
+      const scopeValues = this._buffer._scopeValues;
+      if (!isScopeValues<Ctx['logSchema']>(scopeValues)) {
+        throw new TypeError('Span scope must be an object');
+      }
+      return scopeValues;
     }
 
     // =========================================================================
@@ -808,7 +924,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * Transformer emits: ctx.span0(line, name, ctx._newCtx0(), fn)
      */
     _newCtx0(): SpanContextInstance<Ctx> {
-      return Object.create(this) as SpanContextInstance<Ctx>;
+      return createInheritedContext(this);
     }
 
     /**
@@ -818,7 +934,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
      * Transformer emits: ctx.span0(line, name, ctx._newCtx1({ requestId }), fn)
      */
     _newCtx1(overrides: object): SpanContextInstance<Ctx> {
-      return Object.assign(Object.create(this), overrides) as SpanContextInstance<Ctx>;
+      return createInheritedContextWithOverrides(this, overrides);
     }
 
     /**
@@ -839,22 +955,26 @@ export function createSpanContextClass<Ctx extends OpContext>(
       childCtx: SpanContextInstance<Ctx>,
       line: number,
       name: string,
-      SpanBufferClass: SpanBufferConstructor,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
     ): SpanContextInstance<Ctx> {
       // Get Op's schema for cross-library calls (child may have different schema than parent)
-      const childSchema = (SpanBufferClass as { schema: Ctx['logSchema'] }).schema;
+      const childSchema = SpanBufferClass.schema;
 
       // Use buffer strategy for child span creation (supports both JS and WASM buffers)
       // Pass schema for cross-library calls where child has different schema than parent
-      const childBuffer = this._buffer._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
+      const createdBuffer = this._buffer._traceRoot.tracer.bufferStrategy.createChildSpanBuffer(
         this._buffer, // parentBuffer
         this._buffer._opMetadata, // callsiteMetadata - WHO called span() (for row 0)
         opMetadata, // opMetadata - WHICH op is executing (for rows 1+)
         undefined, // capacity - use default
         childSchema, // schema - Op's schema for correct tag methods
-      ) as SpanBuffer<Ctx['logSchema']>;
+      );
+      if (!isSpanBufferForSchema(createdBuffer, childSchema)) {
+        throw new TypeError('Child span buffer does not match the requested schema');
+      }
+      const childBuffer = createdBuffer;
 
       // Why wrap buffer: RemappedBufferView translates prefixed column names during Arrow conversion
       // Parent sees remapped names, child sees unprefixed names (transparent to child)
@@ -872,7 +992,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       const childTagAPI = createTagWriter(childSchema, childBuffer);
 
       // Cast to impl for property assignment
-      const ctx = childCtx as unknown as SpanContextImpl;
+      const ctx = childCtx;
 
       // ═══════════════════════════════════════════════════════════════════
       // PROPERTY ASSIGNMENT ORDER: HOT → COLD (V8 in-object slots optimization)
@@ -882,8 +1002,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
       // SLOT 1-4: HOTTEST - accessed on every span operation
       ctx._buffer = childBuffer;
       ctx._spanLogger = childLogger;
-      ctx.tag = childTagAPI as SpanContext<Ctx>['tag'];
-      ctx.log = childLogger as unknown as SpanLogger<Ctx['logSchema']>;
+      ctx.tag = childTagAPI;
+      ctx.log = childLogger;
 
       // SLOT 5-7: HOT - reserved keys copied from parent for O(1) access
       ctx.deps = this.deps;
@@ -894,11 +1014,24 @@ export function createSpanContextClass<Ctx extends OpContext>(
 
       // SLOT 8-11: WARM - function properties (created per-context for destructuring)
       // Regular functions close over local variables directly - no property lookups
-      ctx.span = function span(nameOrLine: string | number): Promise<Result<unknown, unknown>> {
+      const childSpan: SpanFn<Ctx> = function span(
+        nameOrLine: string | number,
+        _arg1?: unknown,
+        _arg2?: unknown,
+        _arg3?: unknown,
+        _arg4?: unknown,
+        _arg5?: unknown,
+        _arg6?: unknown,
+        _arg7?: unknown,
+        _arg8?: unknown,
+        _arg9?: unknown,
+        _arg10?: unknown,
+        _arg11?: unknown,
+      ): Promise<Result<unknown, unknown>> {
         const len = arguments.length;
         const hasLine = typeof nameOrLine === 'number';
-        const spanLine = hasLine ? (nameOrLine as number) : 0;
-        const spanName = hasLine ? (arguments[1] as string) : (nameOrLine as string);
+        const spanLine = hasLine ? nameOrLine : 0;
+        const spanName = hasLine ? readStringArgument(arguments, 1, 'span name') : nameOrLine;
         const checkIdx = hasLine ? 2 : 1;
         const maybeOverrides = arguments[checkIdx];
         const hasOverrides =
@@ -907,41 +1040,31 @@ export function createSpanContextClass<Ctx extends OpContext>(
           !(maybeOverrides instanceof Op) &&
           typeof maybeOverrides !== 'function';
         const fnIdx = checkIdx + (hasOverrides ? 1 : 0);
-        const fnOrOp = arguments[fnIdx];
-
-        // Why extract all properties: Ops provide their own buffer class and metadata for cross-module calls
-        const isOp = fnOrOp instanceof Op;
-
-        // Why Op's class: Contains correct schema for tag methods and shared stats for self-tuning
-        const bufferClass = isOp
-          ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).SpanBufferClass
-          : (childBuffer.constructor as SpanBufferConstructor);
-
-        // Why wrap buffer: RemappedBufferView translates prefixed column names during Arrow conversion
-        const viewClass = isOp ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).remappedViewClass : undefined;
-
-        // Why Op's metadata: Identifies which op is executing (for rows 1+)
-        const metadata = isOp ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).metadata : childBuffer._opMetadata;
-
-        const fn = isOp
-          ? (fnOrOp as Op<Ctx, unknown[], unknown, unknown>).fn
-          : (fnOrOp as (ctx: SpanContext<Ctx>, ...args: unknown[]) => Promise<Result<unknown, unknown>>);
+        const target = resolveSpanTarget<Ctx>(arguments[fnIdx], childBuffer);
 
         // Create child context - use _newCtx0 or _newCtx1 based on overrides
         const newChildCtx = hasOverrides ? ctx._newCtx1(maybeOverrides) : ctx._newCtx0();
         const argCount = len - fnIdx - 1;
         switch (argCount) {
           case 0:
-            return ctx.span0(spanLine, spanName, newChildCtx, bufferClass, viewClass, metadata, fn);
+            return ctx.span0(
+              spanLine,
+              spanName,
+              newChildCtx,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
+            );
           case 1:
             return ctx.span1(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
             );
           case 2:
@@ -949,10 +1072,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
             );
@@ -961,10 +1084,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -974,10 +1097,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -988,10 +1111,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -1003,10 +1126,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -1019,10 +1142,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -1036,10 +1159,10 @@ export function createSpanContextClass<Ctx extends OpContext>(
               spanLine,
               spanName,
               newChildCtx,
-              bufferClass,
-              viewClass,
-              metadata,
-              fn,
+              target.SpanBufferClass,
+              target.remappedViewClass,
+              target.opMetadata,
+              target.fn,
               arguments[fnIdx + 1],
               arguments[fnIdx + 2],
               arguments[fnIdx + 3],
@@ -1052,20 +1175,24 @@ export function createSpanContextClass<Ctx extends OpContext>(
           default:
             throw new Error(`span() supports up to 8 arguments, got ${argCount}`);
         }
-      } as SpanFn<Ctx>;
+      };
+      ctx.span = childSpan;
 
-      ctx.spanSync = function spanSync(name: string, fn: (syncCtx: SpanContext<Ctx>) => Result<unknown, unknown>) {
+      ctx.spanSync = function spanSync<S, E>(
+        name: string,
+        fn: (syncCtx: SpanContext<Ctx>) => Result<S, E>,
+      ): Result<S, E> {
         const newChildCtx = ctx._newCtx0();
         return ctx.spanSync0(
           0,
           name,
           newChildCtx,
-          childBuffer.constructor as SpanBufferConstructor,
+          getBufferConstructor(childBuffer),
           undefined,
           childBuffer._opMetadata,
           fn,
         );
-      } as SpanSyncFn<Ctx>;
+      };
 
       ctx.ok = function ok<V>(value: V): Ok<V, Ctx['logSchema']> {
         return new Ok<V, Ctx['logSchema']>(value);
@@ -1081,7 +1208,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
       ctx._schema = childSchema;
       ctx._logBinding = logBinding;
 
-      return ctx as SpanContextInstance<Ctx>;
+      return ctx;
     }
 
     /**
@@ -1109,24 +1236,17 @@ export function createSpanContextClass<Ctx extends OpContext>(
     spanSync0<S, E>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>) => Result<S, E>,
     ): Result<S, E> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
-        const result = fn(ctx as unknown as SpanContext<Ctx>);
+        const result = fn(ctx);
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1140,27 +1260,18 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span0<S, E>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>) => Result<S, E> | Promise<Result<S, E>>,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1174,28 +1285,19 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span1<S, E, A1>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>, a1: A1) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1209,29 +1311,20 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span2<S, E, A1, A2>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2) => Result<S, E> | Promise<Result<S, E>>,
       a1: A1,
       a2: A2,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1, a2),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1245,8 +1338,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span3<S, E, A1, A2, A3>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3) => Result<S, E> | Promise<Result<S, E>>,
@@ -1254,21 +1347,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a2: A2,
       a3: A3,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1282,8 +1366,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span4<S, E, A1, A2, A3, A4>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4) => Result<S, E> | Promise<Result<S, E>>,
@@ -1292,21 +1376,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a3: A3,
       a4: A4,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1320,8 +1395,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span5<S, E, A1, A2, A3, A4, A5>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (ctx: SpanContext<Ctx>, a1: A1, a2: A2, a3: A3, a4: A4, a5: A5) => Result<S, E> | Promise<Result<S, E>>,
@@ -1331,21 +1406,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a4: A4,
       a5: A5,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1359,8 +1425,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span6<S, E, A1, A2, A3, A4, A5, A6>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (
@@ -1379,21 +1445,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a5: A5,
       a6: A6,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5, a6));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1407,8 +1464,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span7<S, E, A1, A2, A3, A4, A5, A6, A7>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (
@@ -1429,21 +1486,12 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a6: A6,
       a7: A7,
     ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5, a6, a7));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1457,8 +1505,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     async span8<S, E, A1, A2, A3, A4, A5, A6, A7, A8>(
       line: number,
       name: string,
-      childCtx: SpanContext<Ctx>,
-      SpanBufferClass: SpanBufferConstructor,
+      childCtx: SpanContextInstance<Ctx>,
+      SpanBufferClass: SpanBufferConstructor<Ctx['logSchema']>,
       remappedViewClass: RemappedViewConstructor | undefined,
       opMetadata: OpMetadata,
       fn: (
@@ -1471,7 +1519,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
         a6: A6,
         a7: A7,
         a8: A8,
-      ) => Result<S, E> | Promise<Result<S, E>>,
+      ) => Result<S, E, Ctx['logSchema']> | Promise<Result<S, E, Ctx['logSchema']>>,
       a1: A1,
       a2: A2,
       a3: A3,
@@ -1480,22 +1528,13 @@ export function createSpanContextClass<Ctx extends OpContext>(
       a6: A6,
       a7: A7,
       a8: A8,
-    ): Promise<Result<S, E>> {
-      const ctx = this._spanPre(
-        childCtx as unknown as SpanContextInstance<Ctx>,
-        line,
-        name,
-        SpanBufferClass,
-        remappedViewClass,
-        opMetadata,
-      );
+    ): Promise<Result<S, E, Ctx['logSchema']>> {
+      const ctx = this._spanPre(childCtx, line, name, SpanBufferClass, remappedViewClass, opMetadata);
       const buffer = ctx._buffer;
       buffer._traceRoot.tracer.onSpanStart(buffer);
       try {
         // Execute with retry loop - TransientError triggers retry, BlockedError returns immediately
-        const result = await executeWithRetry(buffer as SpanBuffer<LogSchema>, () =>
-          fn(ctx as unknown as SpanContext<Ctx>, a1, a2, a3, a4, a5, a6, a7, a8),
-        );
+        const result = await executeWithRetry(buffer, () => fn(ctx, a1, a2, a3, a4, a5, a6, a7, a8));
         writeSpanEnd(buffer, result);
         return result;
       } catch (error) {
@@ -1507,7 +1546,8 @@ export function createSpanContextClass<Ctx extends OpContext>(
     }
   }
 
-  return SpanContextImpl as unknown as SpanContextClass<Ctx>;
+  const SpanContextCtor: SpanContextClass<Ctx> = SpanContextImpl;
+  return SpanContextCtor;
 }
 
 // =============================================================================
@@ -1522,7 +1562,7 @@ export function isSpanContext<Ctx extends OpContext>(value: unknown): value is S
     typeof value === 'object' &&
     value !== null &&
     SPAN_CONTEXT_MARKER in value &&
-    (value as Record<symbol, unknown>)[SPAN_CONTEXT_MARKER] === true
+    Reflect.get(value, SPAN_CONTEXT_MARKER) === true
   );
 }
 

@@ -26,6 +26,13 @@ import {
 import type { ITraceRoot } from './traceRoot.js';
 import type { AnySpanBuffer, SpanBuffer } from './types.js';
 
+function isSpanBufferConstructorForSchema<TSchema extends LogSchema>(
+  ctor: SpanBufferConstructor | undefined,
+  schema: TSchema,
+): ctor is SpanBufferConstructor<TSchema> {
+  return ctor !== undefined && ctor.schema === schema;
+}
+
 /**
  * JsBufferStrategy - Default buffer strategy using GC-managed TypedArrays.
  *
@@ -50,11 +57,14 @@ export class JsBufferStrategy<T extends LogSchema = LogSchema> implements Buffer
   /**
    * Get or create SpanBuffer class for a schema.
    */
-  private getSpanBufferClassForSchema(schema: LogSchema): SpanBufferConstructor {
+  private getSpanBufferClassForSchema<TSchema extends LogSchema>(schema: TSchema): SpanBufferConstructor<TSchema> {
     let cached = this.spanBufferClassCache.get(schema);
     if (!cached) {
       cached = getSpanBufferClass(schema);
       this.spanBufferClassCache.set(schema, cached);
+    }
+    if (!isSpanBufferConstructorForSchema(cached, schema)) {
+      throw new TypeError('Cached SpanBuffer class does not match schema');
     }
     return cached;
   }

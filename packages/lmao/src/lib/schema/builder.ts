@@ -13,10 +13,8 @@ import {
   S as ArrowS,
   type BinaryEncoder,
   type LazyBinarySchema,
-  type LazyBooleanSchema,
   type LazyCategorySchema,
   type LazyEnumSchema,
-  type LazyNumberSchema,
   type LazyTextSchema,
   type Schema,
 } from '@smoothbricks/arrow-builder';
@@ -39,23 +37,28 @@ const msgpackEncoder: BinaryEncoder = {
  * Create a flag builder that wraps a schema object
  * This allows schemas to be used for both tag attributes and feature flags
  */
-function createSchemaWithFlagBuilder<T>(schema: Schema<T>): SchemaOrFlagBuilder<T> {
-  const schemaWithBuilder = schema as SchemaOrFlagBuilder<T>;
+type SchemaWithFlagBuilder<TSchema extends Schema<Value>, Value> = TSchema & SchemaOrFlagBuilder<Value>;
 
-  // Add the .default() method for feature flag definitions
-  schemaWithBuilder.default = (defaultValue: T): FlagBuilderWithDefault<T> => ({
-    sync(): FeatureFlagDefinition<T, 'sync'> {
+function createSchemaWithFlagBuilder<Value, TSchema extends Schema<Value>>(
+  schema: TSchema,
+): SchemaWithFlagBuilder<TSchema, Value> {
+  const schemaWithBuilder: SchemaWithFlagBuilder<TSchema, Value> = Object.assign(schema, {
+    default(defaultValue: Value): FlagBuilderWithDefault<Value> {
       return {
-        schema,
-        defaultValue,
-        evaluationType: 'sync' as const,
-      };
-    },
-    async(): FeatureFlagDefinition<T, 'async'> {
-      return {
-        schema,
-        defaultValue,
-        evaluationType: 'async' as const,
+        sync(): FeatureFlagDefinition<Value, 'sync'> {
+          return {
+            schema,
+            defaultValue,
+            evaluationType: 'sync' as const,
+          };
+        },
+        async(): FeatureFlagDefinition<Value, 'async'> {
+          return {
+            schema,
+            defaultValue,
+            evaluationType: 'async' as const,
+          };
+        },
       };
     },
   });
@@ -82,7 +85,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    */
   number: () => {
     const schema = ArrowS.number();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<number> & LazyNumberSchema;
+    return createSchemaWithFlagBuilder(schema);
   },
 
   /**
@@ -94,7 +97,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    */
   boolean: () => {
     const schema = ArrowS.boolean();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<boolean> & LazyBooleanSchema;
+    return createSchemaWithFlagBuilder(schema);
   },
 
   /**
@@ -130,7 +133,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    */
   enum: <T extends readonly string[]>(values: T): SchemaOrFlagBuilder<T[number]> & LazyEnumSchema<T[number]> => {
     const schema = ArrowS.enum(values);
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<T[number]> & LazyEnumSchema<T[number]>;
+    return createSchemaWithFlagBuilder(schema);
   },
 
   /**
@@ -142,7 +145,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    */
   category: (): SchemaOrFlagBuilder<string> & LazyCategorySchema => {
     const schema = ArrowS.category();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & LazyCategorySchema;
+    return createSchemaWithFlagBuilder(schema);
   },
 
   /**
@@ -154,7 +157,7 @@ const schemaBuilderImpl: SchemaBuilder = {
    */
   text: (): SchemaOrFlagBuilder<string> & LazyTextSchema => {
     const schema = ArrowS.text();
-    return createSchemaWithFlagBuilder(schema) as SchemaOrFlagBuilder<string> & LazyTextSchema;
+    return createSchemaWithFlagBuilder(schema);
   },
 
   /**

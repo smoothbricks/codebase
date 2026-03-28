@@ -14,6 +14,7 @@ import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 import { TestTracer } from '../tracers/TestTracer.js';
 import type { AnySpanBuffer } from '../types.js';
+import { requireColumn } from './arrow-test-helpers.js';
 import { createTestTracerOptions } from './test-helpers.js';
 
 function requireCapturedBuffer(buffer: AnySpanBuffer | undefined): AnySpanBuffer {
@@ -21,6 +22,18 @@ function requireCapturedBuffer(buffer: AnySpanBuffer | undefined): AnySpanBuffer
     throw new Error('Expected trace to capture a root buffer');
   }
   return buffer;
+}
+
+function isResponsePayload(value: unknown): value is { items: number[]; total: number } {
+  return (
+    typeof value === 'object' &&
+    value !== null &&
+    'items' in value &&
+    'total' in value &&
+    Array.isArray(value.items) &&
+    value.items.every((item) => typeof item === 'number') &&
+    typeof value.total === 'number'
+  );
 }
 
 describe('Binary columns E2E through Tracer API', () => {
@@ -75,15 +88,15 @@ describe('Binary columns E2E through Tracer API', () => {
     expect(table.numRows).toBeGreaterThan(0);
 
     // Find the requestBody column
-    const requestBodyCol = table.getChild('requestBody');
+    const requestBodyCol = requireColumn(table, 'requestBody');
     expect(requestBodyCol).toBeDefined();
 
     // Find a row that has a non-null requestBody
     let foundPayload = false;
-    for (let i = 0; i < requestBodyCol?.length; i++) {
-      const bytes = requestBodyCol?.at(i);
-      if (bytes !== null) {
-        const decoded = decode(bytes as Uint8Array);
+    for (let i = 0; i < requestBodyCol.length; i++) {
+      const bytes = requestBodyCol.at(i);
+      if (bytes instanceof Uint8Array) {
+        const decoded = decode(bytes);
         expect(decoded).toEqual({
           params: { id: 42 },
           filters: ['active', 'verified'],
@@ -115,15 +128,18 @@ describe('Binary columns E2E through Tracer API', () => {
     const rootBuffer = requireCapturedBuffer(capturedBuffer);
 
     const table = convertSpanTreeToArrowTable(rootBuffer);
-    const responseCol = table.getChild('responsePayload');
+    const responseCol = requireColumn(table, 'responsePayload');
     expect(responseCol).toBeDefined();
 
     // Find a non-null response row
     let foundResponse = false;
-    for (let i = 0; i < responseCol?.length; i++) {
-      const bytes = responseCol?.at(i);
-      if (bytes !== null) {
-        const decoded = decode(bytes as Uint8Array) as { items: number[]; total: number };
+    for (let i = 0; i < responseCol.length; i++) {
+      const bytes = responseCol.at(i);
+      if (bytes instanceof Uint8Array) {
+        const decoded = decode(bytes);
+        if (!isResponsePayload(decoded)) {
+          throw new Error('Decoded response payload did not match the expected shape');
+        }
         expect(decoded.items).toEqual([1, 2, 3, 4, 5]);
         expect(decoded.total).toBe(5);
         foundResponse = true;
@@ -161,17 +177,17 @@ describe('Binary columns E2E through Tracer API', () => {
     const rootBuffer = requireCapturedBuffer(capturedBuffer);
 
     const table = convertSpanTreeToArrowTable(rootBuffer);
-    const requestBodyCol = table.getChild('requestBody');
+    const requestBodyCol = requireColumn(table, 'requestBody');
     expect(requestBodyCol).toBeDefined();
 
     // Count non-null binary entries (tag row + 2 log rows = at least 3)
     let nonNullCount = 0;
     const decodedPayloads: unknown[] = [];
-    for (let i = 0; i < requestBodyCol?.length; i++) {
-      const bytes = requestBodyCol?.at(i);
-      if (bytes !== null) {
+    for (let i = 0; i < requestBodyCol.length; i++) {
+      const bytes = requestBodyCol.at(i);
+      if (bytes instanceof Uint8Array) {
         nonNullCount++;
-        decodedPayloads.push(decode(bytes as Uint8Array));
+        decodedPayloads.push(decode(bytes));
       }
     }
     expect(nonNullCount).toBeGreaterThanOrEqual(3);

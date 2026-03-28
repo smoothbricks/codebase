@@ -46,16 +46,40 @@ const ctx = defineOpContext({
   },
 });
 
-function getColumnValue<T>(
+function getColumnValue(
   table: ReturnType<typeof convertSpanTreeToArrowTable>,
   columnName: string,
   rowIndex: number,
-): T {
+): unknown {
   const column = table.getChild(columnName);
   if (!column) {
     throw new Error(`column not found: ${columnName}`);
   }
-  return column.get(rowIndex) as T;
+  return column.get(rowIndex);
+}
+
+function getNullableStringColumnValue(
+  table: ReturnType<typeof convertSpanTreeToArrowTable>,
+  columnName: string,
+  rowIndex: number,
+): string | null {
+  const value = getColumnValue(table, columnName, rowIndex);
+  if (value === null || typeof value === 'string') {
+    return value;
+  }
+  throw new Error(`Expected ${columnName} row ${rowIndex} to be string|null, got ${typeof value}`);
+}
+
+function getNullableBigintColumnValue(
+  table: ReturnType<typeof convertSpanTreeToArrowTable>,
+  columnName: string,
+  rowIndex: number,
+): bigint | number | null {
+  const value = getColumnValue(table, columnName, rowIndex);
+  if (value === null || typeof value === 'bigint' || typeof value === 'number') {
+    return value;
+  }
+  throw new Error(`Expected ${columnName} row ${rowIndex} to be bigint|number|null, got ${typeof value}`);
 }
 
 describe('Span Lifecycle', () => {
@@ -257,20 +281,27 @@ describe('Child Span Lifecycle', () => {
       // This should create a child span, not a root span
       const childResult = await ctx.span('child-task', async (childCtx) => {
         childBuffer = childCtx.buffer;
+        if (!childBuffer) {
+          throw new Error('childBuffer is undefined');
+        }
+        const child = childBuffer;
 
         // Verify child span is linked to parent
-        expect(childCtx.buffer._parent).toBeDefined();
+        expect(child._parent).toBeDefined();
         // Use === comparison to avoid type mismatch between SpanBuffer<Schema> and untyped SpanBuffer
-        expect(childCtx.buffer._parent === parentBuffer).toBe(true);
+        expect(child._parent === parentBuffer).toBe(true);
         expect(parentBuffer).toBeDefined();
-        const parent = parentBuffer as NonNullable<typeof parentBuffer>;
+        if (!parentBuffer) {
+          throw new Error('parentBuffer is undefined');
+        }
+        const parent = parentBuffer;
 
         // Verify child span inherits parent's schema
-        expect(childCtx.buffer._logSchema).toBe(parent._logSchema);
+        expect(child._logSchema).toBe(parent._logSchema);
 
         // Verify child span has different spanId but same traceId
-        expect(childCtx.buffer.span_id).not.toBe(parent.span_id);
-        expect(childCtx.buffer.trace_id).toBe(parent.trace_id);
+        expect(child.span_id).not.toBe(parent.span_id);
+        expect(child.trace_id).toBe(parent.trace_id);
 
         return childCtx.ok('child-done');
       });
@@ -320,11 +351,11 @@ describe('Child Span Lifecycle', () => {
     expect(table.numRows).toBeGreaterThanOrEqual(4);
 
     const rows = Array.from({ length: table.numRows }, (_, rowIndex) => ({
-      entry_type: getColumnValue<string | null>(table, 'entry_type', rowIndex),
-      message: getColumnValue<string | null>(table, 'message', rowIndex),
-      span_id: getColumnValue<bigint | null>(table, 'span_id', rowIndex),
-      parent_span_id: getColumnValue<bigint | null>(table, 'parent_span_id', rowIndex),
-      trace_id: getColumnValue<bigint | null>(table, 'trace_id', rowIndex),
+      entry_type: getNullableStringColumnValue(table, 'entry_type', rowIndex),
+      message: getNullableStringColumnValue(table, 'message', rowIndex),
+      span_id: getNullableBigintColumnValue(table, 'span_id', rowIndex),
+      parent_span_id: getNullableBigintColumnValue(table, 'parent_span_id', rowIndex),
+      trace_id: getNullableStringColumnValue(table, 'trace_id', rowIndex),
     }));
 
     // Find root span-start (entry_type = span-start, message matches)
@@ -374,12 +405,19 @@ describe('Child Span Lifecycle', () => {
       // Child will inherit parent's schema (same factory)
       await ctx.span('child-task', async (childCtx) => {
         childBuffer = childCtx.buffer;
+        if (!childBuffer) {
+          throw new Error('childBuffer is undefined');
+        }
+        const child = childBuffer;
 
         // Verify child span inherits parent's schema
         // All ops in the factory share the same schema
         expect(parentBuffer).toBeDefined();
-        const parent = parentBuffer as NonNullable<typeof parentBuffer>;
-        expect(childCtx.buffer._logSchema).toEqual(parent._logSchema);
+        if (!parentBuffer) {
+          throw new Error('parentBuffer is undefined');
+        }
+        const parent = parentBuffer;
+        expect(child._logSchema).toBe(parent._logSchema);
 
         // Child should be able to access parent's schema fields
         childCtx.tag.userId('user123').operation('READ');
@@ -395,7 +433,7 @@ describe('Child Span Lifecycle', () => {
     expect(childBuffer?._parent).toBe(parentBuffer);
     // Child buffer's schema is the same as parent's schema (inherited)
     // Both buffers are instances of the same SpanBuffer class, so they share the same static schema
-    expect(childBuffer?._logSchema).toEqual(parentBuffer?._logSchema);
+    expect(childBuffer?._logSchema).toBe(parentBuffer?._logSchema);
   });
 });
 

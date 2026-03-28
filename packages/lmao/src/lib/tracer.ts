@@ -68,7 +68,7 @@ import { Op } from './op.js';
 import { createOpMetadata } from './opContext/defineOp.js';
 import type { OpContext, OpContextBinding, OpContextOf, SpanContext } from './opContext/types.js';
 import { Err, Ok, type Result } from './result.js';
-import type { FlagEvaluator } from './schema/evaluator.js';
+import { createFeatureFlagEvaluator, type FlagEvaluator, InMemoryFlagEvaluator } from './schema/evaluator.js';
 import { ENTRY_TYPE_SPAN_EXCEPTION, ENTRY_TYPE_SPAN_OK } from './schema/systemSchema.js';
 
 import { EMPTY_SCOPE } from './spanBuffer.js';
@@ -79,7 +79,7 @@ import {
   writeSpanEnd,
   writeSpanStart,
 } from './spanContext.js';
-import { generateTraceId, type TraceId } from './traceId.js';
+import { generateTraceId, isValidTraceId, type TraceId } from './traceId.js';
 import type { TraceRootFactory } from './traceRoot.js';
 import type { SpanBuffer } from './types.js';
 
@@ -114,6 +114,22 @@ export interface TracerOptions<
 
   /** Feature flag evaluator - provides flag values at runtime */
   flagEvaluator?: FlagEvaluator<OpContext>;
+}
+
+function isTraceOverridesArg(value: unknown): value is Record<string, unknown> {
+  return value !== null && typeof value === 'object' && !(value instanceof Op);
+}
+
+function isTraceFn<Ctx extends OpContext>(value: unknown): value is (ctx: SpanContext<Ctx>) => unknown {
+  return typeof value === 'function';
+}
+
+function isPromiseResult<R>(value: R | Promise<R>): value is Promise<R> {
+  return (
+    value !== null &&
+    (typeof value === 'object' || typeof value === 'function') &&
+    typeof Reflect.get(value, 'then') === 'function'
+  );
 }
 
 /**
@@ -237,7 +253,7 @@ export type TraceFn<Ctx extends OpContext> = {
 export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   private readonly logBinding: LogBinding<B['logBinding']['logSchema']>;
   private readonly SpanContextClass: SpanContextClass<OpContextOf<B>>;
-  private readonly flagEvaluator?: FlagEvaluator<OpContext>;
+  private readonly flagEvaluator: FlagEvaluator<OpContextOf<B>>;
   private readonly ctxDefaults: Record<string, unknown>;
   private readonly deps: Record<string, unknown>;
   private readonly createTraceRoot: TraceRootFactory;
@@ -254,7 +270,7 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     this.bufferStrategy = options.bufferStrategy;
     this.ctxDefaults = binding.ctxDefaults ?? EMPTY_SCOPE;
     this.deps = binding.deps ?? EMPTY_SCOPE;
-    this.flagEvaluator = options.flagEvaluator;
+    this.flagEvaluator = this._createFlagEvaluator(binding.flags, options.flagEvaluator);
     this.createTraceRoot = options.createTraceRoot;
 
     // Create SpanContext class for all contexts created by this tracer
@@ -262,10 +278,24 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     this.SpanContextClass = createSpanContextClass<OpContextOf<B>>(binding.logBinding.logSchema, binding.logBinding);
 
     // Bind methods for destructuring (per AGENTS.md - "Always destructure")
-    // Note: trace is an arrow function property, already bound via closure
+    this.trace = this.trace.bind(this);
     this.trace_op = this.trace_op.bind(this);
     this.trace_fn = this.trace_fn.bind(this);
     this.flush = this.flush.bind(this);
+  }
+
+  private _createFlagEvaluator(
+    flags: B['flags'],
+    evaluator: FlagEvaluator<OpContext> | undefined,
+  ): FlagEvaluator<OpContextOf<B>> {
+    const delegate = evaluator ?? new InMemoryFlagEvaluator<OpContextOf<B>>(flags);
+    const boundEvaluator: FlagEvaluator<OpContextOf<B>> = {
+      getSync: (ctx, flag) => delegate.getSync(ctx, flag),
+      getAsync: (ctx, flag) => delegate.getAsync(ctx, flag),
+      forContext: (ctx) => createFeatureFlagEvaluator<OpContextOf<B>>(flags, ctx, boundEvaluator),
+    };
+
+    return boundEvaluator;
   }
 
   // ===========================================================================
@@ -342,59 +372,116 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
    *
    * @see TraceFn for type-level documentation of all overloads
    */
-  trace: TraceFn<OpContextOf<B>> = ((...args: unknown[]): unknown => {
+  trace<S, E, Args extends unknown[]>(
+    line: number,
+    name: string,
+    op: Op<OpContextOf<B>, Args, S, E>,
+    ...args: Args
+  ): Promise<Result<S, E>>;
+  trace<S, E, Args extends unknown[]>(
+    line: number,
+    name: string,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
+    op: Op<OpContextOf<B>, Args, S, E>,
+    ...args: Args
+  ): Promise<Result<S, E>>;
+  trace<R>(line: number, name: string, fn: (ctx: SpanContext<OpContextOf<B>>) => R): R;
+  trace<R>(
+    line: number,
+    name: string,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => R,
+  ): R;
+  trace<S, E, Args extends unknown[]>(
+    name: string,
+    op: Op<OpContextOf<B>, Args, S, E>,
+    ...args: Args
+  ): Promise<Result<S, E>>;
+  trace<S, E, Args extends unknown[]>(
+    name: string,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
+    op: Op<OpContextOf<B>, Args, S, E>,
+    ...args: Args
+  ): Promise<Result<S, E>>;
+  trace<R>(name: string, fn: (ctx: SpanContext<OpContextOf<B>>) => R): R;
+  trace<R>(
+    name: string,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => R,
+  ): R;
+  trace(...args: [number | string, ...unknown[]]): unknown {
     const len = args.length;
     if (len === 0) throw new Error('trace() requires at least 1 argument');
 
     // Detect if first arg is a line number (transformer-injected)
-    const hasLine = typeof args[0] === 'number';
-    const line = hasLine ? (args[0] as number) : 0;
+    const firstArg = args[0];
+    const hasLine = typeof firstArg === 'number';
+    const line = hasLine ? firstArg : 0;
 
     // Name is always required and comes after optional line
     const nameIdx = hasLine ? 1 : 0;
-    const name = args[nameIdx] as string;
+    const name = args[nameIdx];
+    if (typeof name !== 'string') {
+      throw new Error('trace() requires a trace name string');
+    }
 
     // Check if next arg is overrides (object but not Op or function)
     const nextIdx = nameIdx + 1;
     const nextArg = args[nextIdx];
-    const hasOverrides =
-      nextArg !== null && typeof nextArg === 'object' && !(nextArg instanceof Op) && typeof nextArg !== 'function';
+    const hasOverrides = isTraceOverridesArg(nextArg) && !isTraceFn<OpContextOf<B>>(nextArg);
 
-    const overrides = hasOverrides ? (nextArg as TraceOverrides<unknown>) : {};
+    const overrides = hasOverrides ? nextArg : EMPTY_SCOPE;
     const fnIdx = nextIdx + (hasOverrides ? 1 : 0);
     const fnOrOp = args[fnIdx];
-    const isOp = fnOrOp instanceof Op;
     const argCount = len - fnIdx - 1;
 
     // Dispatch to monomorphic methods
-    if (isOp) {
-      const op = fnOrOp as Op<OpContext, unknown[], unknown, unknown>;
+    if (fnOrOp instanceof Op) {
       switch (argCount) {
         case 0:
-          return this._trace_op(line, name, overrides, op);
+          return this._trace_unknown_op(line, name, overrides, fnOrOp.metadata, fnOrOp.fn);
         case 1:
-          return this._trace_op(line, name, overrides, op, args[fnIdx + 1]);
+          return this._trace_unknown_op(line, name, overrides, fnOrOp.metadata, fnOrOp.fn, args[fnIdx + 1]);
         case 2:
-          return this._trace_op(line, name, overrides, op, args[fnIdx + 1], args[fnIdx + 2]);
-        case 3:
-          return this._trace_op(line, name, overrides, op, args[fnIdx + 1], args[fnIdx + 2], args[fnIdx + 3]);
-        case 4:
-          return this._trace_op(
+          return this._trace_unknown_op(
             line,
             name,
             overrides,
-            op,
+            fnOrOp.metadata,
+            fnOrOp.fn,
+            args[fnIdx + 1],
+            args[fnIdx + 2],
+          );
+        case 3:
+          return this._trace_unknown_op(
+            line,
+            name,
+            overrides,
+            fnOrOp.metadata,
+            fnOrOp.fn,
+            args[fnIdx + 1],
+            args[fnIdx + 2],
+            args[fnIdx + 3],
+          );
+        case 4:
+          return this._trace_unknown_op(
+            line,
+            name,
+            overrides,
+            fnOrOp.metadata,
+            fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
             args[fnIdx + 3],
             args[fnIdx + 4],
           );
         case 5:
-          return this._trace_op(
+          return this._trace_unknown_op(
             line,
             name,
             overrides,
-            op,
+            fnOrOp.metadata,
+            fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
             args[fnIdx + 3],
@@ -402,11 +489,12 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             args[fnIdx + 5],
           );
         case 6:
-          return this._trace_op(
+          return this._trace_unknown_op(
             line,
             name,
             overrides,
-            op,
+            fnOrOp.metadata,
+            fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
             args[fnIdx + 3],
@@ -415,11 +503,12 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             args[fnIdx + 6],
           );
         case 7:
-          return this._trace_op(
+          return this._trace_unknown_op(
             line,
             name,
             overrides,
-            op,
+            fnOrOp.metadata,
+            fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
             args[fnIdx + 3],
@@ -429,11 +518,12 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
             args[fnIdx + 7],
           );
         case 8:
-          return this._trace_op(
+          return this._trace_unknown_op(
             line,
             name,
             overrides,
-            op,
+            fnOrOp.metadata,
+            fnOrOp.fn,
             args[fnIdx + 1],
             args[fnIdx + 2],
             args[fnIdx + 3],
@@ -452,8 +542,11 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     if (argCount > 0) {
       throw new Error('trace() with inline function does not accept additional arguments');
     }
-    return this._trace_fn(line, name, overrides, fnOrOp as (ctx: SpanContext<OpContextOf<B>>) => unknown);
-  }) as TraceFn<OpContextOf<B>>;
+    if (!isTraceFn<OpContextOf<B>>(fnOrOp)) {
+      throw new Error('trace() requires an Op or function callback');
+    }
+    return this._trace_unknown_fn(line, name, overrides, fnOrOp);
+  }
 
   // ===========================================================================
   // Monomorphic trace methods (for transformer optimization)
@@ -463,16 +556,30 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
    * Execute an Op as a root trace (internal monomorphic method).
    * Supports 0-8 arguments. The transformer rewrites trace() calls to this.
    */
-  private _trace_op(
+  private _trace_op<S, E, Args extends unknown[]>(
     line: number,
     name: string,
-    overrides: TraceOverrides<unknown>,
-    op: Op<OpContext, unknown[], unknown, unknown>,
-    ...opArgs: unknown[]
-  ): unknown {
+    overrides: Record<string, unknown>,
+    op: Op<OpContextOf<B>, Args, S, E>,
+    ...opArgs: Args
+  ): Result<S, E> | Promise<Result<S, E>> {
     const ctx = this._createRootContext(line, name, overrides, op.metadata);
-    // biome-ignore lint/complexity/noBannedTypes: Function is needed for dynamic dispatch with spread args
-    return this._executeWithContext(ctx, (c) => (op.fn as Function)(c, ...opArgs));
+    return this._executeResultWithContext(ctx, (c) => op.fn(c, ...opArgs));
+  }
+
+  private _trace_unknown_op(
+    line: number,
+    name: string,
+    overrides: Record<string, unknown>,
+    metadata: ReturnType<typeof createOpMetadata>,
+    fn: (
+      ctx: SpanContext<OpContextOf<B>>,
+      ...opArgs: unknown[]
+    ) => Result<unknown, unknown> | Promise<Result<unknown, unknown>>,
+    ...opArgs: unknown[]
+  ): Result<unknown, unknown> | Promise<Result<unknown, unknown>> {
+    const ctx = this._createRootContext(line, name, overrides, metadata);
+    return this._executeResultWithContext(ctx, (childCtx) => fn(childCtx, ...opArgs));
   }
 
   /**
@@ -482,16 +589,37 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   private _trace_fn<R>(
     line: number,
     name: string,
-    overrides: TraceOverrides<unknown>,
+    overrides: Record<string, unknown>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => Promise<R>,
+  ): Promise<R>;
+  private _trace_fn<R>(
+    line: number,
+    name: string,
+    overrides: Record<string, unknown>,
     fn: (ctx: SpanContext<OpContextOf<B>>) => R,
-  ): R {
+  ): R;
+  private _trace_fn(
+    line: number,
+    name: string,
+    overrides: Record<string, unknown>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
+  ): unknown {
     const ctx = this._createRootContext(
       line,
       name,
       overrides,
       createOpMetadata('root', 'tracer', 'runtime', 'unknown', 0),
     );
-    return this._executeWithContext(ctx, fn);
+    return this._executeUnknownWithContext(ctx, fn);
+  }
+
+  private _trace_unknown_fn(
+    line: number,
+    name: string,
+    overrides: Record<string, unknown>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
+  ): unknown {
+    return this._trace_fn(line, name, overrides, fn);
   }
 
   // ===========================================================================
@@ -505,12 +633,11 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   trace_op<S, E, Args extends unknown[]>(
     line: number,
     name: string,
-    overrides: TraceOverrides<unknown>,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
     op: Op<OpContextOf<B>, Args, S, E>,
     ...opArgs: Args
   ): Result<S, E> | Promise<Result<S, E>> {
-    // biome-ignore lint/suspicious/noExplicitAny: Internal dispatch - Op types are validated at call site
-    return this._trace_op(line, name, overrides, op as any, ...opArgs) as Result<S, E> | Promise<Result<S, E>>;
+    return this._trace_op(line, name, overrides, op, ...opArgs);
   }
 
   /**
@@ -520,9 +647,21 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   trace_fn<R>(
     line: number,
     name: string,
-    overrides: TraceOverrides<unknown>,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => Promise<R>,
+  ): Promise<R>;
+  trace_fn<R>(
+    line: number,
+    name: string,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
     fn: (ctx: SpanContext<OpContextOf<B>>) => R,
-  ): R {
+  ): R;
+  trace_fn(
+    line: number,
+    name: string,
+    overrides: TraceOverrides<OpContextOf<B>['userCtx']>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
+  ): unknown {
     return this._trace_fn(line, name, overrides, fn);
   }
 
@@ -533,16 +672,17 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
   private _createRootContext(
     _line: number,
     name: string,
-    overrides: TraceOverrides<unknown>,
+    overrides: Record<string, unknown>,
     metadata: ReturnType<typeof createOpMetadata>,
   ): SpanContextInstance<OpContextOf<B>> {
     // Extract trace_id from overrides if present
-    const traceId: TraceId = overrides.trace_id ?? generateTraceId();
+    const traceId: TraceId = isValidTraceId(overrides.trace_id) ? overrides.trace_id : generateTraceId();
     const schema = this.logBinding.logSchema;
 
     // Validate null-sentinel required fields and merge user context.
     // _resolveUserContext ignores trace_id (transport-only field).
-    const resolvedUserCtx = this._resolveUserContext(overrides as Record<string, unknown>);
+    const overrideRecord: Record<string, unknown> = { ...overrides };
+    const resolvedUserCtx = this._resolveUserContext(overrideRecord);
 
     // Create TraceRoot via platform-specific factory
     const traceRoot = this.createTraceRoot(traceId, this);
@@ -558,23 +698,16 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
     writeSpanStart(buffer, name);
 
     // Create tag writer and span logger (needed for constructor)
-    const tagWriter = createTagWriter(schema, buffer) as TagWriter<B['logBinding']['logSchema']>;
+    const tagWriter: TagWriter<B['logBinding']['logSchema']> = createTagWriter(schema, buffer);
     const spanLogger = createSpanLoggerFromGenerator(schema, buffer);
 
     // Instantiate SpanContext class with direct arguments (no temp object allocation)
-    const ctx = new this.SpanContextClass(buffer, schema, spanLogger, tagWriter) as SpanContextInstance<OpContextOf<B>>;
+    const ctx = new this.SpanContextClass(buffer, schema, spanLogger, tagWriter);
 
     // Set up deps from config (may be EMPTY_SCOPE if none provided)
     ctx.deps = this.deps;
 
-    // Set up feature flags if evaluator provided
-    if (this.flagEvaluator) {
-      // biome-ignore lint/suspicious/noExplicitAny: FF types are complex, forContext handles it
-      ctx.ff = (this.flagEvaluator as any).forContext(ctx);
-    } else {
-      // biome-ignore lint/suspicious/noExplicitAny: Empty object as fallback when no evaluator
-      ctx.ff = EMPTY_SCOPE as any;
-    }
+    ctx.ff = this.flagEvaluator.forContext(ctx);
 
     // Copy resolved user context onto SpanContext.
     for (const key in resolvedUserCtx) {
@@ -631,40 +764,29 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
    * Writes span-end entry (entry_type, timestamp, error_code) and applies deferred tags
    * when the function returns an Ok/Err result.
    */
-  private _executeWithContext<R>(
+  private _executeResultWithContext<S, E>(
     ctx: SpanContextInstance<OpContextOf<B>>,
-    fn: (ctx: SpanContext<OpContextOf<B>>) => R,
-  ): R {
+    fn: (ctx: SpanContext<OpContextOf<B>>) => Result<S, E> | Promise<Result<S, E>>,
+  ): Result<S, E> | Promise<Result<S, E>> {
     const buffer = ctx._buffer;
 
-    // Call trace start hook
     this.onTraceStart(buffer as SpanBuffer<B['logBinding']['logSchema']>);
 
     let isAsync = false;
     try {
-      const result = fn(ctx as SpanContext<OpContextOf<B>>);
+      const result = fn(ctx);
 
-      // Check if result is a Promise
-      if (result && typeof (result as { then?: unknown }).then === 'function') {
+      if (isPromiseResult(result)) {
         isAsync = true;
-        // Async path - use .then for success/error handling, .finally for hook
-        return (result as unknown as Promise<unknown>)
+        return result
           .then(
             (resolved) => {
-              // Write span-end: entry_type, timestamp, error_code (if err), deferred tags
-              if (resolved instanceof Ok || resolved instanceof Err) {
-                writeSpanEnd(buffer, resolved);
-              } else {
-                // Fallback for non-FluentResult returns
-                buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
-              }
+              writeSpanEnd(buffer, resolved);
               return resolved;
             },
             (error: unknown) => {
-              // Write span-exception to row 1
               buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
 
-              // Write exception details
               const errorMessage = error instanceof Error ? error.message : String(error);
               const errorStack = error instanceof Error ? error.stack : undefined;
 
@@ -676,14 +798,76 @@ export abstract class Tracer<B extends OpContextBinding = OpContextBinding> {
               throw error;
             },
           )
-          .finally(() => this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>)) as R;
+          .finally(() => this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>));
+      }
+
+      writeSpanEnd(buffer, result);
+      return result;
+    } catch (error) {
+      buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+
+      const errorMessage = error instanceof Error ? error.message : String(error);
+      const errorStack = error instanceof Error ? error.stack : undefined;
+
+      buffer.message(1, errorMessage);
+      if (errorStack) {
+        buffer.exception_stack(1, errorStack);
+      }
+
+      throw error;
+    } finally {
+      if (!isAsync) {
+        this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>);
+      }
+    }
+  }
+
+  private _executeUnknownWithContext(
+    ctx: SpanContextInstance<OpContextOf<B>>,
+    fn: (ctx: SpanContext<OpContextOf<B>>) => unknown,
+  ): unknown {
+    const buffer = ctx._buffer;
+
+    // Call trace start hook
+    this.onTraceStart(buffer as SpanBuffer<B['logBinding']['logSchema']>);
+
+    let isAsync = false;
+    try {
+      const result = fn(ctx);
+
+      if (isPromiseResult(result)) {
+        isAsync = true;
+        return result
+          .then(
+            (resolved) => {
+              if (resolved instanceof Ok || resolved instanceof Err) {
+                writeSpanEnd(buffer, resolved);
+              } else {
+                buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
+              }
+              return resolved;
+            },
+            (error: unknown) => {
+              buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_EXCEPTION);
+
+              const errorMessage = error instanceof Error ? error.message : String(error);
+              const errorStack = error instanceof Error ? error.stack : undefined;
+
+              buffer.message(1, errorMessage);
+              if (errorStack) {
+                buffer.exception_stack(1, errorStack);
+              }
+
+              throw error;
+            },
+          )
+          .finally(() => this.onTraceEnd(buffer as SpanBuffer<B['logBinding']['logSchema']>));
       }
 
       // Sync path - write span-end
       if (result instanceof Ok || result instanceof Err) {
         writeSpanEnd(buffer, result);
       } else {
-        // Fallback for non-FluentResult returns
         buffer._traceRoot.writeSpanEnd(buffer, ENTRY_TYPE_SPAN_OK);
       }
 

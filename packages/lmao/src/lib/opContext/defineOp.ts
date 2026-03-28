@@ -201,7 +201,7 @@ export function createDefineOp<Ctx extends OpContext>(
     // - Handles exceptions with span-exception
     // Why SpanBufferClass: All ops from same defineOpContext share this class for stats coordination
     // Why undefined for remappedViewClass: Only prefixed ops need remapping - set by .prefix() method
-    return new OpClass(finalMetadata, SpanBufferClass, fn, undefined) as unknown as Op<Ctx, Args, S, E>;
+    return new OpClass(finalMetadata, SpanBufferClass, fn, undefined);
   };
 }
 
@@ -214,6 +214,18 @@ export function createDefineOp<Ctx extends OpContext>(
  */
 function isOp<Ctx extends OpContext>(def: unknown): def is Op<Ctx, unknown[], unknown, unknown> {
   return def instanceof OpClass;
+}
+
+function hasAllDefinedOps<
+  Ctx extends OpContext,
+  Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
+>(definitions: Defs, ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>): ops is OpsFromRecord<Ctx, Defs> {
+  for (const name in definitions) {
+    if (!(name in ops)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**
@@ -245,24 +257,23 @@ export function createDefineOps<Ctx extends OpContext>(
   return function defineOpsImpl<
     Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
   >(definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>): OpGroup<Ctx> & OpsFromRecord<Ctx, Defs> {
-    // Build the ops record by processing each definition
-    // Ops stored with unknown context for flexibility - type checked at call site
+    // Build the ops record by processing each definition.
+    // Keep the runtime container broad, then narrow once we've populated every key.
     const ops: Record<string, Op<Ctx, unknown[], unknown, unknown>> = {};
 
-    for (const [name, def] of Object.entries(definitions)) {
-      if (isOp<Ctx>(def)) {
-        // Already an Op instance, use as-is
-        ops[name] = def;
-      } else {
-        // Raw function, wrap with defineOp
-        ops[name] = defineOp(name, def);
-      }
+    for (const name in definitions) {
+      const def = definitions[name];
+      ops[name] = isOp<Ctx>(def) ? def : defineOp(name, def);
+    }
+
+    if (!hasAllDefinedOps(definitions, ops)) {
+      throw new Error('defineOps failed to normalize all op definitions');
     }
 
     // Create the OpGroup
     const opGroup = createOpGroup(factoryConfig.logSchema, factoryConfig.flags, ops);
 
     // Return OpGroup merged with individual ops for direct access
-    return Object.assign(opGroup, ops) as OpGroup<Ctx> & OpsFromRecord<Ctx, Defs>;
+    return Object.assign(opGroup, ops);
   };
 }

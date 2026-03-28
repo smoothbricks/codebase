@@ -32,7 +32,7 @@
  */
 
 import type { InferSchema, LogSchema } from './schema/types.js';
-import type { SpanBuffer } from './types.js';
+import type { AnySpanBuffer } from './types.js';
 
 // =============================================================================
 // TAGGED ERROR INTERFACE
@@ -62,7 +62,7 @@ export interface TaggedErrorConstructor<T extends TaggedError = TaggedError> ext
  * Type for the deferred tag application closure.
  * Called by span()/trace() at span-end to apply captured tags to the buffer.
  */
-export type ApplyTagsFn<T extends LogSchema> = (buffer: SpanBuffer<T>) => void;
+export type ApplyTagsFn<T extends LogSchema> = (buffer: AnySpanBuffer) => void;
 
 type OkJson<V> = { ok: true; value: V };
 type ErrJson<E> = { ok: false; error: E };
@@ -77,7 +77,7 @@ function isBufferRowWriter(value: unknown): value is BufferRowWriter {
 }
 
 function applyDeferredAttributes<T extends LogSchema>(
-  buffer: SpanBuffer<T>,
+  buffer: AnySpanBuffer,
   attributes: Partial<InferSchema<T>>,
 ): void {
   for (const [key, value] of Object.entries(attributes)) {
@@ -186,7 +186,7 @@ export class Ok<V, T extends LogSchema = LogSchema> {
   }
 
   /** Transform the success value, potentially returning an error. */
-  flatMap<U, F>(fn: (value: V) => Result<U, F>): Result<U, F> {
+  flatMap<U, F>(fn: (value: V) => Result<U, F, T>): Result<U, F, T> {
     return fn(this.value);
   }
 
@@ -445,7 +445,7 @@ export class Err<E, T extends LogSchema = LogSchema> {
 // =============================================================================
 
 /** Union type for Result - either Ok or Err. */
-export type Result<V, E> = Ok<V> | Err<E>;
+export type Result<V, E, T extends LogSchema = LogSchema> = Ok<V, T> | Err<E, T>;
 
 // =============================================================================
 // CODE ERROR FACTORY
@@ -546,13 +546,13 @@ export function hasErrorCode(error: unknown): error is { code: string } {
  * Extract success type from a Result type.
  * Returns `never` if R is not a Result.
  */
-export type ResultSuccess<R> = R extends Result<infer S, unknown> ? S : never;
+export type ResultSuccess<R> = R extends Result<infer S, unknown, LogSchema> ? S : never;
 
 /**
  * Extract success type from a Promise<Result> type.
  * Returns `never` if R is not a Promise<Result>.
  */
-export type PromiseResultSuccess<R> = R extends Promise<Result<infer S, unknown>> ? S : never;
+export type PromiseResultSuccess<R> = R extends Promise<Result<infer S, unknown, LogSchema>> ? S : never;
 
 /**
  * Extract success type from either Result or Promise<Result>.
@@ -564,13 +564,13 @@ export type ExtractSuccess<R> = ResultSuccess<R> | PromiseResultSuccess<R>;
  * Extract error type from a Result type.
  * Returns `never` if R is not a Result.
  */
-export type ResultError<R> = R extends Result<unknown, infer E> ? E : never;
+export type ResultError<R> = R extends Result<unknown, infer E, LogSchema> ? E : never;
 
 /**
  * Extract error type from a Promise<Result> type.
  * Returns `never` if R is not a Promise<Result>.
  */
-export type PromiseResultError<R> = R extends Promise<Result<unknown, infer E>> ? E : never;
+export type PromiseResultError<R> = R extends Promise<Result<unknown, infer E, LogSchema>> ? E : never;
 
 /**
  * Extract error type from either Result or Promise<Result>.

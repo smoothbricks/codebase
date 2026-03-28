@@ -2,7 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
 import { DEFAULT_METADATA } from '../../opContext/defineOp.js';
 import { S } from '../../schema/builder.js';
-import { createSpanBuffer, getSpanBufferClass, type SpanBufferConstructor } from '../../spanBuffer.js';
+import { createSpanBuffer, getSpanBufferClass } from '../../spanBuffer.js';
 
 import { createBuffer, createTestSchema, createTestTraceRoot, createTraceId } from '../test-helpers.js';
 
@@ -64,9 +64,8 @@ describe('Buffer Foundation', () => {
     const buf = createSpanBuffer(schema, createTestTraceRoot('trace-456'), DEFAULT_METADATA, 64);
 
     // Stats are accessible from constructor
-    const bufferClass = buf.constructor as SpanBufferConstructor;
-    expect(bufferClass.stats).toBe(SpanBufferClass.stats);
-    expect(bufferClass.stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
+    expect(buf).toBeInstanceOf(SpanBufferClass);
+    expect(SpanBufferClass.stats.capacity).toBe(DEFAULT_BUFFER_CAPACITY);
   });
 
   it('handles different schema sizes', () => {
@@ -102,8 +101,8 @@ describe('Buffer Foundation', () => {
       count: S.number(),
     });
 
-    const buf = createSpanBuffer(schema, createTestTraceRoot('trace-123'), DEFAULT_METADATA);
-    const SpanBufferClass = buf.constructor as SpanBufferConstructor;
+    createSpanBuffer(schema, createTestTraceRoot('trace-123'), DEFAULT_METADATA);
+    const SpanBufferClass = getSpanBufferClass(schema);
 
     // Schema is accessible via static property
     expect(SpanBufferClass.schema).toBe(schema);
@@ -117,8 +116,8 @@ describe('Buffer Foundation', () => {
       count: S.number(),
     });
 
-    const buf = createBuffer(schema);
-    const SpanBufferClass = buf.constructor as SpanBufferConstructor;
+    createBuffer(schema);
+    const SpanBufferClass = getSpanBufferClass(schema);
 
     // Stats are accessible via static property (utilization-based tuning)
     expect(typeof SpanBufferClass.stats.capacity).toBe('number');

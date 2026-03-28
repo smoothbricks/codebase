@@ -203,16 +203,30 @@ function validateObject<T extends SchemaFields>(
   data: unknown,
   columns: Iterable<readonly [string, SchemaWithMetadata]>,
 ): InferSchema<T> {
-  if (typeof data !== 'object' || data === null) {
+  if (!isUnknownRecord(data)) {
     throw new Error(`Expected object, got ${data === null ? 'null' : typeof data}`);
   }
-  // WHY: After null/typeof guard, data is a non-null object; cast enables string-indexed field access
-  const obj = data as Record<string, unknown>;
   const result: Record<string, unknown> = {};
   for (const [key, schema] of columns) {
-    result[key] = validateField(key, obj[key], schema);
+    result[key] = validateField(key, data[key], schema);
   }
-  return result as InferSchema<T>;
+  assertValidatedObject<T>(result, columns);
+  return result;
+}
+
+function isUnknownRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null;
+}
+
+function assertValidatedObject<T extends SchemaFields>(
+  value: Record<string, unknown>,
+  columns: Iterable<readonly [string, SchemaWithMetadata]>,
+): asserts value is InferSchema<T> {
+  for (const [key] of columns) {
+    if (!(key in value)) {
+      throw new Error(`Missing validated field "${key}"`);
+    }
+  }
 }
 
 export function defineLogSchema<T extends SchemaFields>(
@@ -229,7 +243,7 @@ export function defineLogSchema<T extends SchemaFields>(
 
   // Add validation methods directly to logSchema (preserves LogSchema instance)
   // Use Object.assign to mutate logSchema in place, preserving prototype chain
-  const result = Object.assign(logSchema, {
+  const result: ValidatedLogSchema<T> = Object.assign(logSchema, {
     /**
      * Validate data and throw on error
      *
@@ -273,5 +287,5 @@ export function defineLogSchema<T extends SchemaFields>(
   }
 
   // Return logSchema (still a LogSchema instance with added methods)
-  return result as ValidatedLogSchema<T>;
+  return result;
 }

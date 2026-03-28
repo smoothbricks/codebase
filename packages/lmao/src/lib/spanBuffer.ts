@@ -25,12 +25,7 @@
  * @module spanBuffer
  */
 
-import {
-  type AnyColumnBuffer,
-  type ColumnBufferExtension,
-  DEFAULT_BUFFER_CAPACITY,
-  getColumnBufferClass,
-} from '@smoothbricks/arrow-builder';
+import { type ColumnBufferExtension, DEFAULT_BUFFER_CAPACITY, getColumnBufferClass } from '@smoothbricks/arrow-builder';
 import { checkCapacityTuning } from './capacityTuning.js';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
@@ -103,10 +98,8 @@ export const SpanBufferTestUtils = {
    * Accepts ColumnBuffer (from ColumnWriter._buffer) but casts to AnySpanBuffer
    * since at runtime all buffers are AnySpanBuffer instances
    */
-  getWriteIndex(buffer: AnyColumnBuffer): number {
-    // At runtime, ColumnBuffer is actually AnySpanBuffer (SpanBuffer extends TypedSpanBuffer extends AnySpanBuffer)
-    // Cast internally so callers don't need to
-    return (buffer as unknown as AnySpanBuffer)._writeIndex;
+  getWriteIndex(buffer: AnySpanBuffer): number {
+    return buffer._writeIndex;
   },
 };
 
@@ -129,7 +122,7 @@ export const SpanBufferTestUtils = {
  *
  * traceRoot is ALWAYS provided - factories extract it from parent when needed.
  */
-export interface SpanBufferConstructor {
+export interface SpanBufferConstructor<T extends LogSchema = LogSchema> {
   new (
     capacity: number,
     stats: SpanBufferStats,
@@ -138,17 +131,66 @@ export interface SpanBufferConstructor {
     callsiteMetadata: OpMetadata | undefined,
     opMetadata: OpMetadata | undefined,
     traceRoot: ITraceRoot,
-  ): AnySpanBuffer;
+  ): SpanBuffer<T>;
 
   // Static properties added after class generation
-  readonly schema: LogSchema;
+  readonly schema: T;
   readonly stats: SpanBufferStats;
 }
 
-type MutableSpanBufferConstructor = SpanBufferConstructor & {
-  schema: LogSchema;
-  stats: SpanBufferStats;
-};
+type GeneratedSpanBufferClass<T extends LogSchema> = new (
+  capacity: number,
+  stats: SpanBufferStats,
+  parent: AnySpanBuffer | undefined,
+  isChained: boolean,
+  callsiteMetadata: OpMetadata | undefined,
+  opMetadata: OpMetadata | undefined,
+  traceRoot: ITraceRoot,
+) => SpanBuffer<T>;
+
+function isGeneratedSpanBufferClass<T extends LogSchema>(
+  ctor: new (...args: never[]) => unknown,
+): ctor is GeneratedSpanBufferClass<T> {
+  const prototype = Reflect.get(ctor, 'prototype');
+  if (typeof prototype !== 'object' || prototype === null) {
+    return false;
+  }
+
+  return (
+    typeof Reflect.get(prototype, 'getOrCreateOverflow') === 'function' &&
+    typeof Reflect.get(prototype, 'isParentOf') === 'function' &&
+    typeof Reflect.get(prototype, 'isChildOf') === 'function'
+  );
+}
+
+function isSpanBufferConstructorForSchema<T extends LogSchema>(
+  ctor: Function | undefined,
+  schema: T,
+): ctor is SpanBufferConstructor<T> {
+  return ctor !== undefined && Reflect.get(ctor, 'schema') === schema && typeof Reflect.get(ctor, 'stats') === 'object';
+}
+
+function getSpanBufferConstructorForBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBufferConstructor<T> {
+  const ctor = buffer.constructor;
+  if (!isSpanBufferConstructorForSchema(ctor, buffer._logSchema)) {
+    throw new TypeError('Buffer constructor does not match buffer schema');
+  }
+  return ctor;
+}
+
+function createSpanBufferConstructor<T extends LogSchema>(
+  schema: T,
+  generatedClass: GeneratedSpanBufferClass<T>,
+): SpanBufferConstructor<T> {
+  return Object.assign(generatedClass, {
+    schema,
+    stats: {
+      capacity: DEFAULT_BUFFER_CAPACITY,
+      totalWrites: 0,
+      spansCreated: 0,
+    } satisfies SpanBufferStats,
+  });
+}
 
 /**
  * Cache for generated SpanBuffer classes per schema.
@@ -168,9 +210,9 @@ const spanBufferClassCache = new WeakMap<LogSchema, SpanBufferConstructor>();
  * @param schema - LogSchema defining the buffer structure
  * @returns SpanBufferConstructor with static schema and stats properties
  */
-export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
+export function getSpanBufferClass<T extends LogSchema>(schema: T): SpanBufferConstructor<T> {
   const cached = spanBufferClassCache.get(schema);
-  if (cached) {
+  if (isSpanBufferConstructorForSchema(cached, schema)) {
     return cached;
   }
 
@@ -379,17 +421,14 @@ export function getSpanBufferClass(schema: LogSchema): SpanBufferConstructor {
   };
 
   // Generate class with arrow-builder
-  const SpanBufferClass = getColumnBufferClass(schema, extension) as unknown as SpanBufferConstructor;
+  const generatedClass = getColumnBufferClass(schema, extension);
+  if (!isGeneratedSpanBufferClass<T>(generatedClass)) {
+    throw new TypeError('Generated column buffer is missing SpanBuffer methods');
+  }
 
   // Add static properties to the generated class
   // These are shared across all instances from the same defineOpContext
-  const mutableCtor = SpanBufferClass as MutableSpanBufferConstructor;
-  mutableCtor.schema = schema;
-  mutableCtor.stats = {
-    capacity: DEFAULT_BUFFER_CAPACITY,
-    totalWrites: 0,
-    spansCreated: 0,
-  } satisfies SpanBufferStats;
+  const SpanBufferClass = createSpanBufferConstructor(schema, generatedClass);
 
   // Cache for future use
   spanBufferClassCache.set(schema, SpanBufferClass);
@@ -440,7 +479,7 @@ export function createSpanBuffer<T extends LogSchema>(
     opMetadata, // callsiteMetadata for row 0
     opMetadata, // opMetadata for rows 1+ (same as callsite for root)
     traceRoot, // pre-built TraceRoot with trace_id, anchors, tracer
-  ) as SpanBuffer<T>;
+  );
 }
 
 /**
@@ -454,7 +493,7 @@ export function createSpanBuffer<T extends LogSchema>(
  * @returns New SpanBuffer linked via `buffer._overflow`, with same schema type
  */
 export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>): SpanBuffer<T> {
-  const SpanBufferClass = buffer.constructor as SpanBufferConstructor;
+  const SpanBufferClass = getSpanBufferConstructorForBuffer(buffer);
   const stats = SpanBufferClass.stats;
 
   // Ensure capacity is multiple of 8 for byte-aligned null bitmaps
@@ -470,7 +509,7 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
     buffer._callsiteMetadata,
     buffer._opMetadata,
     buffer._traceRoot, // traceRoot from parent
-  ) as SpanBuffer<T>;
+  );
 
   // Link current buffer to next
   buffer._overflow = nextBuffer;
@@ -496,12 +535,12 @@ export function createOverflowBuffer<T extends LogSchema>(buffer: SpanBuffer<T>)
  */
 export function createChildSpanBuffer<T extends LogSchema>(
   parentBuffer: AnySpanBuffer,
-  SpanBufferClass: SpanBufferConstructor,
+  SpanBufferClass: SpanBufferConstructor<T>,
   callsiteMetadata: OpMetadata,
   opMetadata: OpMetadata,
   capacity?: number,
 ): SpanBuffer<T> {
-  const stats = (SpanBufferClass as MutableSpanBufferConstructor).stats;
+  const stats = SpanBufferClass.stats;
   const actualCapacity = capacity ?? stats.capacity;
 
   // Track non-chained buffer creation for capacity tuning
@@ -516,7 +555,7 @@ export function createChildSpanBuffer<T extends LogSchema>(
     callsiteMetadata, // callsiteMetadata - CALLER's op metadata (for row 0)
     opMetadata, // opMetadata - EXECUTING op metadata (for rows 1+)
     parentBuffer._traceRoot, // traceRoot from parent
-  ) as SpanBuffer<T>;
+  );
 
   return childBuffer;
 }
