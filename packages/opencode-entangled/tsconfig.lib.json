@@ -10,5 +10,9 @@
   },
   "include": ["src/**/*.ts"],
   "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"],
-  "references": []
+  "references": [
+    {
+      "path": "../validation/tsconfig.lib.json"
+    }
+  ]
 }

@@ -18,6 +18,13 @@ export interface FileStat {
   hexdigest: string; // SHA-256 hex digest
 }
 
+/** Raw shape from .entangled/filedb.json — fields may be missing in older versions */
+interface FileDBRaw {
+  version?: string;
+  files?: Record<string, FileStat>;
+  targets?: string[];
+}
+
 export interface FileDBData {
   version: string;
   files: Record<string, FileStat>;
@@ -56,7 +63,7 @@ export class FileDB {
       return { version: '', files: {}, targets: [] };
     }
 
-    const data = validateFileDB(parsed);
+    const data = parseFileDB(parsed);
     this.version = data.version;
     this.targets = new Set(data.targets);
     this.files = new Map(Object.entries(data.files));
@@ -115,40 +122,22 @@ function posixJoin(...segments: string[]): string {
   return segments.map((s) => s.replace(/\/$/, '')).join('/');
 }
 
-// --- Validation ---
+// --- Validation via Typia ---
 
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return v != null && typeof v === 'object' && !Array.isArray(v);
-}
+import typia from 'typia';
 
-function str(v: unknown): string {
-  return typeof v === 'string' ? v : '';
-}
+const validateFileDB = typia.createValidate<FileDBRaw>();
 
-function validateFileDB(raw: unknown): FileDBData {
-  if (!isRecord(raw)) {
+function parseFileDB(raw: unknown): FileDBData {
+  const result = validateFileDB(raw);
+  if (!result.success) {
+    // WHY: invalid data is recoverable — treat as empty so the plugin doesn't crash
     return { version: '', files: {}, targets: [] };
   }
-
-  const version = str(raw.version);
-
-  // WHY: targets is serialized as a JSON array (Python set -> sorted list via msgspec)
-  let targets: string[] = [];
-  if (Array.isArray(raw.targets)) {
-    targets = raw.targets.filter((t): t is string => typeof t === 'string');
-  }
-
-  const files: Record<string, FileStat> = {};
-  if (isRecord(raw.files)) {
-    for (const [key, val] of Object.entries(raw.files)) {
-      if (isRecord(val)) {
-        files[key] = {
-          modified: str(val.modified),
-          hexdigest: str(val.hexdigest),
-        };
-      }
-    }
-  }
-
-  return { version, files, targets };
+  // WHY: normalize optional fields to required with defaults
+  return {
+    version: result.data.version ?? '',
+    files: result.data.files ?? {},
+    targets: result.data.targets ?? [],
+  };
 }

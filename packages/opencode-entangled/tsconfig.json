@@ -2,5 +2,15 @@
   "extends": "../../tsconfig.base.json",
   "files": [],
   "include": [],
-  "references": [{ "path": "./tsconfig.lib.json" }, { "path": "./tsconfig.test.json" }]
+  "references": [
+    {
+      "path": "../validation"
+    },
+    {
+      "path": "./tsconfig.lib.json"
+    },
+    {
+      "path": "./tsconfig.test.json"
+    }
+  ]
 }
