@@ -41,6 +41,7 @@ export {
 export type { JsonBoundaryParseOptions, JsonBoundaryParser, JsonBoundaryValidator, JsonParseResult } from './json.js';
 export {
   expectJsonBoundary,
+  expectJsonRecord,
   parseJsonArray,
   parseJsonBoundary,
   parseJsonBoundaryValue,

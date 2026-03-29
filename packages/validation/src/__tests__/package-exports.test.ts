@@ -38,6 +38,7 @@ describe('package export contract', () => {
     expect(typeof mod.assertDefined).toBe('function');
     expect(typeof mod.assertRecord).toBe('function');
     expect(typeof mod.expectJsonBoundary).toBe('function');
+    expect(typeof mod.expectJsonRecord).toBe('function');
     expect(typeof mod.isRecord).toBe('function');
     expect(typeof mod.parseJsonRecord).toBe('function');
     expect(typeof mod.safeJsonParse).toBe('function');

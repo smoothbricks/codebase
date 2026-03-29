@@ -59,6 +59,15 @@ export function expectJsonBoundary<T>(
   throw new Error(`Failed to parse ${options?.expected ?? fallbackExpected}: ${result.error}`);
 }
 
+export function expectJsonRecord(raw: string, errorPrefix = 'Invalid JSON object'): Record<string, unknown> {
+  const result = parseJsonRecord(raw);
+  if (result.ok) {
+    return result.value;
+  }
+
+  throw new Error(`${errorPrefix}: ${result.error}`);
+}
+
 export function parseJsonValue<T>(raw: string, parse: JsonBoundaryParser<T>, expected: string): JsonParseResult<T> {
   const result = safeJsonParse(raw);
   if (!result.ok) {

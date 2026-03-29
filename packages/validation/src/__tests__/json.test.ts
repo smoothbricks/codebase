@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 
 import {
   expectJsonBoundary,
+  expectJsonRecord,
   parseJsonArray,
   parseJsonBoundary,
   parseJsonBoundaryValue,
@@ -268,6 +269,16 @@ describe('expectJsonBoundary', () => {
         'signal payload',
       ),
     ).toThrow('Failed to parse signal envelope: Expected signal envelope');
+  });
+});
+
+describe('expectJsonRecord', () => {
+  it('returns a parsed JSON object', () => {
+    expect(expectJsonRecord('{"kind":"signal"}', 'signal payload')).toEqual({ kind: 'signal' });
+  });
+
+  it('throws a contextual parse error when the payload is not an object', () => {
+    expect(() => expectJsonRecord('[1,2,3]', 'signal payload')).toThrow('signal payload: Expected JSON object');
   });
 });
 
