@@ -5,6 +5,7 @@
  * normal closures and `Object.defineProperties()` instead of `new Function(...)`.
  */
 
+import { isRecord } from '@smoothbricks/validation';
 import type { OpContext } from '../opContext/types.js';
 import type { FeatureFlagSchema } from '../schema/defineFeatureFlags.js';
 import type {
@@ -60,21 +61,21 @@ function isGeneratedEvaluatorConstructor<Ctx extends OpContext>(
 }
 
 function isGeneratedEvaluatorInstance<Ctx extends OpContext>(value: unknown): value is GeneratedEvaluatorInstance<Ctx> {
-  return typeof value === 'object' && value !== null;
+  return isRecord(value);
 }
 
 function isAnySpanBuffer(value: unknown): value is AnySpanBuffer {
-  return typeof value === 'object' && value !== null && '_writeIndex' in value && 'entry_type' in value;
+  return isRecord(value) && '_writeIndex' in value && 'entry_type' in value;
 }
 
 function isInternalSpanLogger<T extends OpContext['logSchema']>(value: unknown): value is SpanLoggerInternal<T> {
-  return typeof value === 'object' && value !== null && 'ffAccess' in value && 'ffUsage' in value;
+  return isRecord(value) && 'ffAccess' in value && 'ffUsage' in value;
 }
 
 function getEvaluatorRuntimeContext<Ctx extends OpContext>(
   ctx: SpanContextWithoutFf<Ctx>,
 ): EvaluatorRuntimeContext<Ctx> {
-  if (typeof ctx !== 'object' || ctx === null || !('_buffer' in ctx) || !('log' in ctx)) {
+  if (!isRecord(ctx) || !('_buffer' in ctx) || !('log' in ctx)) {
     throw new Error('Feature-flag evaluator requires an internal span context');
   }
 
