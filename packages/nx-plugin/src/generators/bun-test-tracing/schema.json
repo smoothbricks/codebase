@@ -18,20 +18,11 @@
       "description": "Named export for the package op context",
       "default": "opContext"
     },
-    "spanContextModule": {
-      "type": "string",
-      "description": "Module specifier that exports the span context type"
-    },
-    "spanContextExport": {
-      "type": "string",
-      "description": "Named type export for the span context",
-      "default": "SpanContext"
-    },
     "tracerModule": {
       "type": "string",
-      "description": "Module specifier for makeBunTestSuiteTracer/TestTracer",
+      "description": "Module specifier for defineTestTracer",
       "default": "@smoothbricks/lmao/testing/bun"
     }
   },
-  "required": ["project", "opContextModule", "spanContextModule"]
+  "required": ["project", "opContextModule"]
 }
