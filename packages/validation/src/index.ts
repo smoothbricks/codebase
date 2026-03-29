@@ -1,13 +1,13 @@
 /**
  * @smoothbricks/validation
  *
- * Eval-free shared runtime narrowing, assertions, and JSON boundary parsing.
+ * Eval-free shared runtime narrowing and assertions.
  * Zero runtime dependencies (only tslib). Safe for all runtimes
  * (Bun, Node, browser, Expo, AWS, Cloudflare).
  *
  * @example
  * ```typescript
- * import { isRecord, assertDefined, parseJsonRecord } from '@smoothbricks/validation';
+ * import { isRecord, assertDefined } from '@smoothbricks/validation';
  *
  * if (isRecord(data)) {
  *   console.log(data.someKey);  // narrowed to Record<string, unknown>
@@ -15,10 +15,7 @@
  *
  * assertDefined(user, 'User must exist');  // throws if null/undefined
  *
- * const result = parseJsonRecord(raw);
- * if (result.ok) {
- *   console.log(result.value);  // Record<string, unknown>
- * }
+ * console.log('validated');
  * ```
  *
  * @packageDocumentation
@@ -38,17 +35,3 @@ export {
   isRecord,
   isString,
 } from './guards.js';
-export type { JsonBoundaryParseOptions, JsonBoundaryParser, JsonBoundaryValidator, JsonParseResult } from './json.js';
-export {
-  expectJsonBoundary,
-  expectJsonRecord,
-  parseJsonArray,
-  parseJsonBoundary,
-  parseJsonBoundaryValue,
-  parseJsonRecord,
-  parseJsonRecordString,
-  parseJsonValue,
-  parseOptionalJsonRecordString,
-  safeJsonParse,
-  validateJsonValue,
-} from './json.js';

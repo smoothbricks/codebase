@@ -37,13 +37,14 @@ describe('package export contract', () => {
 
     expect(typeof mod.assertDefined).toBe('function');
     expect(typeof mod.assertRecord).toBe('function');
-    expect(typeof mod.expectJsonBoundary).toBe('function');
-    expect(typeof mod.expectJsonRecord).toBe('function');
     expect(typeof mod.isRecord).toBe('function');
-    expect(typeof mod.parseJsonRecordString).toBe('function');
-    expect(typeof mod.parseJsonRecord).toBe('function');
-    expect(typeof mod.parseOptionalJsonRecordString).toBe('function');
-    expect(typeof mod.safeJsonParse).toBe('function');
+    expect('expectJsonBoundary' in mod).toBe(false);
+    expect('expectJsonRecord' in mod).toBe(false);
+    expect('parseJsonRecordString' in mod).toBe(false);
+    expect('parseJsonRecord' in mod).toBe(false);
+    expect('parseOptionalJsonRecordString' in mod).toBe(false);
+    expect('safeJsonParse' in mod).toBe(false);
+    expect('validateJsonValue' in mod).toBe(false);
   });
 
   it('loads the published testing target', async () => {
