@@ -81,12 +81,17 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Bundle related generics when possible.** If multiple generic parameters always travel together, prefer one bundled
   type parameter/object over a long generic list.
   - WHY: bundled generics preserve inference and prevent APIs from collapsing into cast-heavy call sites.
-- **Typia is the default validation system.**
+- **Typia is the default validation system.** Never hand-write `isRecord`, `typeof` guards, or similar for data that
+  crosses a trust boundary — use Typia instead.
   - parsed/runtime value boundary -> `typia.assert/validate/assertEquals/validateEquals`
   - JSON string boundary -> `typia.json.assertParse/validateParse/isParse`
   - repeated boundary -> `typia.create*` / `typia.json.create*Parse`
   - WHY: Typia generates optimal runtime code directly from the type definition. Changing the type changes the validator
     automatically, so validation stays aligned with the real contract with near-zero authoring/runtime overhead.
+  - **New package setup:** Every package that validates data needs `typia` in dependencies, `@smoothbricks/validation`
+    in devDependencies, and a Typia preload in `bunfig.toml`. Packages with LMAO tracing use
+    `"@smoothbricks/lmao/bun/preload"` (which re-exports the Typia preload). Packages without LMAO use
+    `"@smoothbricks/validation/bun/preload"` directly.
 - **`@smoothbricks/validation` is last resort only.** Use it only for thin shared wrappers around Typia, shared error
   formatting, or tiny utilities Typia truly cannot express.
   - WHY: otherwise it becomes a dumping ground for hand-written validators that drift from the type.

@@ -206,6 +206,15 @@ explicit `"nx".targets` config). If a package doesn't declare the target, the ta
 Also create `tsconfig.test.json` for the package (see existing packages for the pattern: `types: ["bun"]`,
 `composite: false`, `noEmit: true`, includes test globs, references `tsconfig.lib.json`).
 
+**Typia setup for new packages:** Every package that validates data at runtime needs:
+
+1. `typia` in `dependencies` and `@smoothbricks/validation` in `devDependencies`
+2. A Typia preload in `bunfig.toml`:
+   - With LMAO tracing: `preload = ["@smoothbricks/lmao/bun/preload", "@smoothbricks/lmao/bun/trace-preload"]`
+   - Without LMAO: `preload = ["@smoothbricks/validation/bun/preload"]`
+3. Use `typia.createValidate<T>()` / `typia.json.createValidateParse<T>()` for validation — never hand-write `isRecord`,
+   `typeof` guards, or manual narrowing for data crossing trust boundaries (JSON parsing, external input, file loading).
+
 **After any tsconfig or dependency changes**, run `nx sync` to update project references. Verify with `nx sync:check`.
 
 ### Nx Cache Reliability Policy
