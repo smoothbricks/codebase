@@ -70,6 +70,34 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Boundary types must come from real contracts.** At transport/storage/IPC boundaries, prefer Typia or
   `@smoothbricks/validation` over ad-hoc guards/normalizers. Prefer real public types over manually restating
   `Record<string, unknown>` surfaces.
+
+## TypeScript Rules
+
+- **Inference quality is API quality.** Prefer types inferred from `defineAgent()`, `defineState()`, `defineSignals()`,
+- **Thread generics end-to-end.** If inference breaks, fix the source generic/signature/return type. Do not patch the
+  caller with casts or hand-restated shapes.
+  - WHY: once a boundary is validated, the concrete type should flow through the system. That removes internal casts,
+    duplicate validation, impossible runtime checks, and makes autocomplete/refactors straightforward.
+- **Bundle related generics when possible.** If multiple generic parameters always travel together, prefer one bundled
+  type parameter/object over a long generic list.
+  - WHY: bundled generics preserve inference and prevent APIs from collapsing into cast-heavy call sites.
+- **Typia is the default validation system.**
+  - parsed/runtime value boundary -> `typia.assert/validate/assertEquals/validateEquals`
+  - JSON string boundary -> `typia.json.assertParse/validateParse/isParse`
+  - repeated boundary -> `typia.create*` / `typia.json.create*Parse`
+  - WHY: Typia generates optimal runtime code directly from the type definition. Changing the type changes the validator
+    automatically, so validation stays aligned with the real contract with near-zero authoring/runtime overhead.
+- **`@smoothbricks/validation` is last resort only.** Use it only for thin shared wrappers around Typia, shared error
+  formatting, or tiny utilities Typia truly cannot express.
+  - WHY: otherwise it becomes a dumping ground for hand-written validators that drift from the type.
+- **Zero cast policy.** No `as any`, no `as unknown as`, no `as never`, no `JSON.parse(...) as T`, no
+  `as Record<string, unknown>` fake validation.
+  - WHY: casts suppress the exact signal telling you where the type surface is broken.
+- **Do not hand-write validators Typia already provides.** New helpers like `isRecord`, `normalizeX`, `parseJsonX`,
+  `expectJsonX`, `toRecord`, `coerceX`, `isHttpRequest`, or similar are wrong by default.
+  - WHY: they manually duplicate the contract instead of using the contract itself.
+- **Use real contract types.** Prefer `AxEvent['value']` and other inferred/public types over manually restating
+  `Record<string, unknown>` surfaces.
 - **Preserve WHY comments.** If you refactor a block with a WHY comment, keep or improve that rationale. Replacing it
   with weaker glue or deleting it without preserving intent is a regression.
 

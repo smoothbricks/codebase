@@ -47,11 +47,39 @@
 
 ## Type Inference Rules
 
-- **Inference quality is API quality.** Prefer types inferred from library definitions.
-- **Zero casts in code and tests.** No `as any`, `as unknown as`, or type-erasing helpers. If a cast seems necessary,
-  fix the source typing first.
-- **Do not manually restate large inferred context/state shapes.** Only add a local type when it truly narrows the
-  surface.
+### TypeScript / Typia Non-Negotiables (MANDATORY)
+
+- **Thread generics end-to-end.** If inference breaks, fix the source generic/signature/return type. Do not patch the
+  caller with casts, hand-restated shapes, or local wrapper types.
+  - **WHY:** once a boundary is validated, the concrete type should flow through the system. That removes internal
+    casts, duplicate validation, impossible runtime checks, and keeps autocomplete/refactoring honest.
+- **Bundle related generic parameters when possible.** If multiple generic parameters always travel together, prefer one
+  bundled type parameter/object over passing them separately.
+  - **WHY:** type bundling preserves inference and prevents giant generic lists from forcing cast-heavy APIs.
+- **Typia is THE validator to use by default.**
+  - parsed/runtime value boundary -> `typia.assert/validate/assertEquals/validateEquals`
+  - JSON string boundary -> `typia.json.assertParse/validateParse/isParse`
+  - repeated boundary -> `typia.create*` / `typia.json.create*Parse`
+  - **WHY:** Typia generates optimal runtime code directly from the type definition. Changing the type changes the
+    validator automatically, so validation stays aligned with the real contract without hand-written drift or wasted
+    tokens.
+- **Use `*Equals` when extra properties must be rejected.**
+  - **WHY:** exactness belongs in the validator contract, not in hand-written property filtering logic.
+- **`@smoothbricks/validation` is LAST RESORT only.** It may contain thin shared wrappers around Typia, shared error
+  formatting, or tiny utilities Typia truly cannot express. It is NOT a license to hand-write validators instead of
+  using Typia directly.
+  - **WHY:** otherwise it becomes a dumping ground for custom validators that duplicate and drift from the real type.
+- **Do not hand-write validators Typia already provides.** New helpers like `isRecord`, `normalizeX`, `parseJsonX`,
+  `toRecord`, `coerceX`, `isHttpRequest`, or similar are wrong by default.
+  - **WHY:** they manually duplicate the contract instead of using the contract itself.
+- **No cast-based fake validation.** `JSON.parse(...) as T`, `as Record<string, unknown>` property walking, `as any`,
+  `as unknown as`, and `as never` are all banned.
+  - **WHY:** those suppress the exact compile-time signal that should force a real type/generic/API fix.
+- **Use real public contract types.** Prefer inferred/public types over manually restating
+  `Record<string, unknown>` or giant local context/state shapes.
+  - **WHY:** restated broad shapes erase domain meaning and force more downstream validation/casts.
+- **Review gate:** if a diff introduces a manual validator/helper that Typia already covers, reject or fix it before
+  commit.
 
 ## 💡 DEVELOPMENT TOOLS NOTE
 
@@ -484,10 +512,12 @@ When a test needs casts, follow this exact sequence:
 
 Rules:
 
- Do not introduce test-only generic wrappers that hide poor API inference.
- Prefer runtime validators/type guards at boundary seams (`postMessage`, network payloads, storage reads) over casts.
- Treat integration tests as user experience tests: if test code must cast to call public APIs, API typing is not ready.
- Make **atomic commits per fix cluster** (e.g., boundary parser + its call sites, decide context typing upgrade, etc.).
+- Do not introduce test-only generic wrappers that hide poor API inference.
+- Prefer Typia-backed runtime validation at boundary seams (`postMessage`, network payloads, storage reads) over casts.
+  Hand-written type guards are allowed only as last-resort shared helpers in `@smoothbricks/validation` when Typia truly
+  cannot express the contract.
+- Treat integration tests as user experience tests: if test code must cast to call public APIs, API typing is not ready.
+- Make **atomic commits per fix cluster** (e.g., boundary parser + its call sites, decide context typing upgrade, etc.).
 
 ### No Type Erasure Policy (MANDATORY)
 
@@ -607,13 +637,22 @@ fc.assert(
 
 ### Boundary Validation And Contract Preservation (MANDATORY)
 
-- At transport/storage/IPC boundaries, prefer Typia or `@smoothbricks/validation` over ad-hoc local validators,
-  normalizers, or one-off guard helpers.
+- At transport/storage/IPC boundaries, use Typia by default. `@smoothbricks/validation` is only for thin shared wrappers
+  around Typia, shared error formatting, or tiny utilities Typia cannot express.
+  - **WHY:** the type definition should be the source of truth for the validator. If the type changes, the validator
+    should change automatically with it.
+- For JSON string boundaries, use `typia.json.assertParse/validateParse/isParse` (or `create*Parse` for repeated paths)
+  instead of hand-written `JSON.parse` wrappers.
+- For parsed/runtime value boundaries, use `typia.assert/validate/assertEquals/validateEquals` (or `create*` for
+  repeated paths).
+- If extra properties must be rejected, use `*Equals` instead of hand-written exactness checks.
 - If a boundary already has a meaningful public type (for example `Record<string, unknown>`), use that type instead of manually
   restating `Record<string, unknown>` unions across multiple files.
 - Treat new helpers named like `normalizeX`, `coerceX`, `toRecord`, `isStringKeyRecord`, or similar as suspicious by
   default. Before adding one, search for an existing shared validator/helper and justify why the new helper is
   necessary.
+- Treat `isRecord`, `parseJsonX`, `expectJsonX`, `toRecord`, `coerceX`, `normalizeX`, `isHttpRequest`, and similar names
+  as red flags by default. If you are about to add one, stop and justify why direct Typia is not the correct tool.
 - If you replace a hand-written boundary parser with Typia, preserve the surrounding WHY comment or add a better one
   that explains the invariant being protected.
 - When a typed boundary change alters an error message, update the test expectation deliberately; do not preserve stale
