@@ -104,10 +104,10 @@
       "development": "./src/bun/preload.ts",
       "default": "./dist/bun/preload.js"
     },
-    "./bun/test-preload": {
-      "bun": "./src/bun/test-preload.ts",
-      "development": "./src/bun/test-preload.ts",
-      "default": "./dist/bun/test-preload.js"
+    "./bun/trace-preload": {
+      "bun": "./src/bun/trace-preload.ts",
+      "development": "./src/bun/trace-preload.ts",
+      "default": "./dist/bun/trace-preload.js"
     }
   },
   "files": [
