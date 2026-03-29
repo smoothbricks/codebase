@@ -1,3 +1,6 @@
+[install]
+linker = "hoisted"
+
 [test]
 # Keep Typia and test tracing as separate preloads so Typia is registered before
 # the tracing preload imports any source files that call typia.createValidate*().
