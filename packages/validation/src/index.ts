@@ -46,7 +46,9 @@ export {
   parseJsonBoundary,
   parseJsonBoundaryValue,
   parseJsonRecord,
+  parseJsonRecordString,
   parseJsonValue,
+  parseOptionalJsonRecordString,
   safeJsonParse,
   validateJsonValue,
 } from './json.js';

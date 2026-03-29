@@ -40,7 +40,9 @@ describe('package export contract', () => {
     expect(typeof mod.expectJsonBoundary).toBe('function');
     expect(typeof mod.expectJsonRecord).toBe('function');
     expect(typeof mod.isRecord).toBe('function');
+    expect(typeof mod.parseJsonRecordString).toBe('function');
     expect(typeof mod.parseJsonRecord).toBe('function');
+    expect(typeof mod.parseOptionalJsonRecordString).toBe('function');
     expect(typeof mod.safeJsonParse).toBe('function');
   });
 

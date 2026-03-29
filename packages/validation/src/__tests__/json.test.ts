@@ -7,7 +7,9 @@ import {
   parseJsonBoundary,
   parseJsonBoundaryValue,
   parseJsonRecord,
+  parseJsonRecordString,
   parseJsonValue,
+  parseOptionalJsonRecordString,
   safeJsonParse,
   validateJsonValue,
 } from '../json.js';
@@ -279,6 +281,50 @@ describe('expectJsonRecord', () => {
 
   it('throws a contextual parse error when the payload is not an object', () => {
     expect(() => expectJsonRecord('[1,2,3]', 'signal payload')).toThrow('signal payload: Expected JSON object');
+  });
+});
+
+describe('parseJsonRecordString', () => {
+  it('parses a JSON object from an unknown string boundary', () => {
+    expect(parseJsonRecordString('{"kind":"signal"}', 'signal payload')).toEqual({
+      ok: true,
+      value: { kind: 'signal' },
+    });
+  });
+
+  it('returns a contextual type error for non-string inputs', () => {
+    expect(parseJsonRecordString(42, 'signal payload')).toEqual({
+      ok: false,
+      error: 'signal payload must be a JSON string, got number',
+    });
+  });
+
+  it('returns a contextual parse error for non-object JSON strings', () => {
+    expect(parseJsonRecordString('[1,2,3]', 'signal payload')).toEqual({
+      ok: false,
+      error: 'signal payload must be valid JSON: Expected JSON object',
+    });
+  });
+});
+
+describe('parseOptionalJsonRecordString', () => {
+  it('returns undefined for nullish boundaries', () => {
+    expect(parseOptionalJsonRecordString(undefined, 'signal payload')).toEqual({ ok: true, value: undefined });
+    expect(parseOptionalJsonRecordString(null, 'signal payload')).toEqual({ ok: true, value: undefined });
+  });
+
+  it('parses a JSON object when the boundary provides a string', () => {
+    expect(parseOptionalJsonRecordString('{"kind":"signal"}', 'signal payload')).toEqual({
+      ok: true,
+      value: { kind: 'signal' },
+    });
+  });
+
+  it('returns a contextual type error for non-string non-null inputs', () => {
+    expect(parseOptionalJsonRecordString(42, 'signal payload')).toEqual({
+      ok: false,
+      error: 'signal payload must be a JSON string or null, got number',
+    });
   });
 });
 
