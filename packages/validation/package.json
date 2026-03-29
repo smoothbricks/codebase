@@ -22,6 +22,11 @@
       "types": "./dist/testing/index.d.ts",
       "import": "./dist/testing/index.js",
       "default": "./dist/testing/index.js"
+    },
+    "./bun/preload": {
+      "bun": "./src/bun/preload.ts",
+      "development": "./src/bun/preload.ts",
+      "default": "./dist/bun/preload.js"
     }
   },
   "files": [
@@ -31,5 +36,8 @@
   "dependencies": {
     "typia": "^9.7.2",
     "tslib": "^2.3.0"
+  },
+  "devDependencies": {
+    "@typia/unplugin": "^12.0.1"
   }
 }
