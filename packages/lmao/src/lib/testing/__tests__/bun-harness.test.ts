@@ -46,7 +46,7 @@ const baseBinding = defineOpContext({
 });
 
 const suiteWithExtension = makeBunTestSuiteTracer(baseBinding, {
-  testLogSchema: {
+  extraTestColumns: {
     test_metric: S.number(),
   },
 });
@@ -66,7 +66,7 @@ describe('bun harness test log schema extension', () => {
 
   it('writes extension fields through tag and log APIs', async () => {
     const tracer = makeTestTracer(baseBinding, {
-      testLogSchema: {
+      extraTestColumns: {
         test_metric: S.number(),
         test_note: S.text(),
       },

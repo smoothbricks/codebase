@@ -126,16 +126,16 @@ export type BunTestSetupOptions<TExt extends SchemaFields = Record<never, never>
   sqlite?: SQLiteWriterConfig;
   /** Optional verbose stdout tracing; defaults to env flag detection. */
   verbose?: boolean;
-  /** Optional test-only schema fields merged into span tag/log methods. */
-  testLogSchema?: TExt;
+  /** Optional test-only schema columns merged into span tag/log methods. */
+  extraTestColumns?: TExt;
 };
 
 function buildHarnessSchemaExtensions<TExt extends SchemaFields>(
   binding: OpContextBinding,
-  testLogSchema: TExt | undefined,
+  extraTestColumns: TExt | undefined,
 ): SchemaFields {
   const extensionBase: BunTestHarnessBuiltins = { describe: S.category() };
-  const extension = testLogSchema ? { ...extensionBase, ...testLogSchema } : extensionBase;
+  const extension = extraTestColumns ? { ...extensionBase, ...extraTestColumns } : extensionBase;
 
   const baseColumnNames = new Set(binding.logBinding.logSchema._columnNames);
   const safeExtension: SchemaFields = {};
@@ -278,6 +278,32 @@ export function makeBunTestSuiteTracer<B extends OpContextBinding, TExt extends 
 }
 
 /**
+ * Define a per-package test tracer — metadata for preload discovery + typed span accessor.
+ *
+ * Returns plain data that `autoSetupBunTestTracing` reads at discovery time, plus a
+ * `useTestSpan()` that delegates to the global `_activeSuiteTracer` with the correct
+ * binding type restored.
+ *
+ * WHY cast: The global `useTestSpan()` erases the binding to `OpContextBinding`. The cast
+ * is safe because `autoSetupBunTestTracing` creates the active tracer FROM the same
+ * `opContext` binding that was passed here — so the runtime type matches `B`.
+ */
+export function defineTestTracer<B extends OpContextBinding>(
+  binding: B,
+  options?: { extraTestColumns?: SchemaFields },
+): {
+  useTestSpan: () => SpanContext<OpContextOf<B>>;
+  opContext: B;
+  extraTestColumns: SchemaFields | undefined;
+} {
+  return {
+    opContext: binding,
+    extraTestColumns: options?.extraTestColumns,
+    useTestSpan: () => useTestSpan() as SpanContext<OpContextOf<B>>,
+  };
+}
+
+/**
  * Create an instance-scoped Bun test tracer harness.
  *
  * Unlike initTraceTestRun(), this keeps tracer/root/ALS state isolated per instance.
@@ -369,7 +395,7 @@ export function makeTestTracer<B extends OpContextBinding, TExt extends SchemaFi
       }
       isSetup = true;
 
-      const harnessSchema = buildHarnessSchemaExtensions(binding, options?.testLogSchema);
+      const harnessSchema = buildHarnessSchemaExtensions(binding, options?.extraTestColumns);
       const extendedSchema = binding.logBinding.logSchema.extend(harnessSchema);
       // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- logSchema.extend preserves the runtime binding shape but TS loses the merged schema parameter.
       const extendedBinding = {
@@ -471,7 +497,7 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
   _activeSuiteTracer = null;
 
   // Extend user's schema with `describe` column for test grouping
-  const harnessSchema = buildHarnessSchemaExtensions(opContext, options?.testLogSchema);
+  const harnessSchema = buildHarnessSchemaExtensions(opContext, options?.extraTestColumns);
   const extendedSchema = opContext.logBinding.logSchema.extend(harnessSchema);
   const extendedBinding = {
     ...opContext,
@@ -749,7 +775,7 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     const hasCustomSchema = Object.keys(mergedSchema).length > 0;
     const suite = makeBunTestSuiteTracer(opContext, {
       sqlite: { dbPath: '.trace-results.db' },
-      testLogSchema: hasCustomSchema && isSchemaFieldsRecord(mergedSchema) ? mergedSchema : undefined,
+      extraTestColumns: hasCustomSchema && isSchemaFieldsRecord(mergedSchema) ? mergedSchema : undefined,
     });
 
     suite.setupBunTestSuiteTracing();
@@ -772,7 +798,7 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     }
 
     const mod = await import(tracerPath);
-    const mergedSchema = isSchemaFieldsRecord(mod.testLogSchema) ? mod.testLogSchema : {};
+    const mergedSchema = isSchemaFieldsRecord(mod.extraTestColumns) ? mod.extraTestColumns : {};
     const opContext = isOpContextBindingLike(mod.opContext) ? mod.opContext : defaultAutoSetupOpContext;
 
     return installSuite(opContext, mergedSchema);
@@ -789,8 +815,8 @@ export async function autoSetupBunTestTracing(options: AutoSetupOptions): Promis
     const mod = await import(tracerPath);
 
     // Collect custom schema columns from each package
-    if (mod.testLogSchema && typeof mod.testLogSchema === 'object') {
-      Object.assign(mergedSchema, mod.testLogSchema);
+    if (mod.extraTestColumns && typeof mod.extraTestColumns === 'object') {
+      Object.assign(mergedSchema, mod.extraTestColumns);
     }
 
     // Use the first available opContext (they all bind the same opContext)

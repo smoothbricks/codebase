@@ -13,8 +13,6 @@ interface BunTestTracingGeneratorSchema {
   project: string;
   opContextModule: string;
   opContextExport?: string;
-  spanContextModule: string;
-  spanContextExport?: string;
   tracerModule?: string;
 }
 
@@ -79,8 +77,6 @@ function normalizeOptions(schema: BunTestTracingGeneratorSchema): Required<BunTe
     project: schema.project,
     opContextModule: schema.opContextModule,
     opContextExport: schema.opContextExport ?? 'opContext',
-    spanContextModule: schema.spanContextModule,
-    spanContextExport: schema.spanContextExport ?? 'SpanContext',
     tracerModule: schema.tracerModule ?? '@smoothbricks/lmao/testing/bun',
   };
 }
@@ -179,39 +175,11 @@ function writeBunfig(tree: Tree, projectRoot: string): void {
 }
 
 function renderSuiteTracer(options: Required<BunTestTracingGeneratorSchema>): string {
-  const tracerImport = `import { makeBunTestSuiteTracer, type TestTracer, useTestSpan as globalUseTestSpan } from '${options.tracerModule}';`;
-  const contextImport =
-    options.opContextModule === options.spanContextModule
-      ? `import { type ${options.spanContextExport}, ${options.opContextExport} } from '${options.opContextModule}';`
-      : [
-          `import { ${options.opContextExport} } from '${options.opContextModule}';`,
-          `import { type ${options.spanContextExport} } from '${options.spanContextModule}';`,
-        ].join('\n');
-
   return [
-    '/// <reference types="bun" />',
+    `import { ${options.opContextExport} } from '${options.opContextModule}';`,
+    `import { defineTestTracer } from '${options.tracerModule}';`,
     '',
-    contextImport,
-    tracerImport,
-    '',
-    '/** No custom schema columns — exported for root preload auto-discovery. */',
-    'export const testLogSchema = undefined;',
-    '',
-    '/** Exported for root preload auto-discovery to pick up the shared opContext. */',
-    `export { ${options.opContextExport} as opContext };`,
-    '',
-    `const suite = makeBunTestSuiteTracer(${options.opContextExport}, {`,
-    `  sqlite: { dbPath: '.trace-results.db' },`,
-    '});',
-    '',
-    `export const useTestTracer: TestTracer<typeof ${options.opContextExport}> = suite.useTestTracer;`,
-    '',
-    'export function setupBunTestSuiteTracing(): void {',
-    '  suite.setupBunTestSuiteTracing();',
-    '}',
-    '',
-    '// Delegate to the global useTestSpan which checks _activeSuiteTracer (set by root preload)',
-    `export const useTestSpan = (): ${options.spanContextExport} => globalUseTestSpan();`,
+    `export const { useTestSpan, opContext, extraTestColumns } = defineTestTracer(${options.opContextExport});`,
     '',
   ].join('\n');
 }
@@ -356,10 +324,7 @@ function readStringArray(value: unknown): string[] {
   return [];
 }
 
-function mergeReferences(
-  existing: Array<{ path: string }> | undefined,
-  newPaths: string[],
-): Array<{ path: string }> {
+function mergeReferences(existing: Array<{ path: string }> | undefined, newPaths: string[]): Array<{ path: string }> {
   const existingPaths = existing ?? [];
   const existingSet = new Set(existingPaths.map((ref) => ref.path));
 
