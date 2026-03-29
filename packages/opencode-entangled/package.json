@@ -23,7 +23,7 @@
     "@opencode-ai/plugin": "latest",
     "fenceparser": "^2.2.0",
     "typia": "^12.0.1",
-    "zod": "^3.25.67"
+    "zod": "4"
   },
   "devDependencies": {
     "@smoothbricks/validation": "workspace:*",

@@ -1,11 +1,13 @@
 /// <reference types="bun-types" />
 
 // WHY: bun-types reference is needed because the lib tsconfig has "types": [],
-// but this plugin entry point runs in Bun and needs Bun.file/Bun.write APIs.
+// but this plugin entry point runs in Bun and needs node:fs APIs.
 
 import { readFile as nodeReadFile, writeFile as nodeWriteFile, readdir } from 'node:fs/promises';
 import { join, relative } from 'node:path';
-import type { Hooks, Plugin, PluginModule } from '@opencode-ai/plugin';
+import type { Plugin, PluginModule } from '@opencode-ai/plugin';
+import { type ToolDefinition, tool } from '@opencode-ai/plugin';
+import type { z } from 'zod';
 import { BlockIndex } from './block-index.js';
 import { FileDB } from './filedb.js';
 import { createEditRerouteHook } from './hooks/edit-reroute.js';
@@ -21,9 +23,9 @@ import { createListTargetsTool } from './tools/list-targets.js';
 import { createMoveBlockTool } from './tools/move-block.js';
 import { createRenameBlockTool } from './tools/rename-block.js';
 
+// --- Re-exports for consumers ---
 export type { BlockEntry } from './block-index.js';
 export { BlockIndex } from './block-index.js';
-// --- Re-exports for consumers ---
 export type { ParsedBlock } from './fence-parser.js';
 export { FileDB } from './filedb.js';
 
@@ -49,38 +51,26 @@ async function listMdFilesRecursive(dir: string): Promise<string[]> {
   return results;
 }
 
-// WHY: the internal tool factories return zod v3 schemas + typed execute functions,
-// but @opencode-ai/plugin's ToolDefinition uses zod v4. At runtime the shapes are
-// identical (description + args + execute), so we adapt structurally. The tool map in
-// Hooks is typed as { [key: string]: ToolDefinition } which accepts structural matches.
-type InternalTool = {
+// WHY: internal tools use { name, description, parameters: z.object(...), execute(args) => { title, output, metadata } }
+// but OpenCode ToolDefinition expects { description, args: ZodRawShape, execute(args, ctx) => string }
+// adaptTool bridges a single tool with proper generic threading; adaptTools collects into Hooks['tool'].
+function adaptTool<S extends z.core.$ZodLooseShape>(t: {
   name: string;
   description: string;
-  parameters: { shape: Record<string, unknown> };
-  execute: (args: Record<string, unknown>) => Promise<{ title: string; output: string; metadata: unknown }>;
-};
-
-function adaptTool(internal: InternalTool) {
-  return {
-    description: internal.description,
-    args: internal.parameters.shape,
-    async execute(args: Record<string, unknown>) {
-      const result = await internal.execute(args);
-      return result.output;
-    },
-  };
-}
-
-// WHY: we cast the tool map once at the plugin boundary because the internal tools use
-// zod v3 while the plugin SDK expects zod v4. The runtime shape is identical
-// (description + args shape + execute), but the zod type brands differ at compile time.
-function adaptTools(tools: InternalTool[]): NonNullable<Hooks['tool']> {
-  const result: Record<string, ReturnType<typeof adaptTool>> = {};
-  for (const t of tools) {
-    result[t.name] = adaptTool(t);
-  }
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: zod v3/v4 brand mismatch; runtime shapes are identical
-  return result as NonNullable<Hooks['tool']>;
+  parameters: z.ZodObject<S>;
+  execute: (args: z.infer<z.ZodObject<S>>) => Promise<{ output: string }>;
+}): [string, ToolDefinition] {
+  return [
+    t.name,
+    tool({
+      description: t.description,
+      args: t.parameters.shape,
+      async execute(args) {
+        const r = await t.execute(args);
+        return r.output;
+      },
+    }),
+  ];
 }
 
 // --- Plugin ---
@@ -124,19 +114,18 @@ const server: Plugin = async ({ directory, $ }) => {
   return {
     'tool.execute.before': editReroute,
     'tool.execute.after': tangleStitch,
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: tool factories return typed execute args (contravariant); InternalTool uses Record<string, unknown> for uniform adaptation at the zod v3/v4 boundary
-    tool: adaptTools([
-      createFindReferencesTool(index),
-      createFindDefinitionTool(index),
-      createListBlocksTool(index),
-      createExpandTool(index),
-      createListTargetsTool(index),
-      createBlockDependentsTool(index),
-      createAbsorbTool(index, io, runCommand),
-      createAbsorbFunctionTool(index, io, runCommand),
-      createMoveBlockTool(index, io, runCommand),
-      createRenameBlockTool(index, io, runCommand),
-    ] as unknown as InternalTool[]),
+    tool: Object.fromEntries([
+      adaptTool(createFindReferencesTool(index)),
+      adaptTool(createFindDefinitionTool(index)),
+      adaptTool(createListBlocksTool(index)),
+      adaptTool(createExpandTool(index)),
+      adaptTool(createListTargetsTool(index)),
+      adaptTool(createBlockDependentsTool(index)),
+      adaptTool(createAbsorbTool(index, io, runCommand)),
+      adaptTool(createAbsorbFunctionTool(index, io, runCommand)),
+      adaptTool(createMoveBlockTool(index, io, runCommand)),
+      adaptTool(createRenameBlockTool(index, io, runCommand)),
+    ]),
   };
 };
 
