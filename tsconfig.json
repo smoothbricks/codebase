@@ -34,6 +34,9 @@
       "path": "./packages/validation"
     },
     {
+      "path": "./packages/opencode-entangled"
+    },
+    {
       "path": "./packages/statebus-core"
     },
     {

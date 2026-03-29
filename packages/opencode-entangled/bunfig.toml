@@ -1,0 +1,2 @@
+[test]
+preload = ["@smoothbricks/lmao/bun/preload", "@smoothbricks/lmao/bun/trace-preload"]
