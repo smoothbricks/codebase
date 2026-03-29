@@ -1,9 +1,6 @@
+import { isRecord } from '@smoothbricks/validation';
 import type { Column, Table } from '@uwdata/flechette';
 import type { AnySpanBuffer } from '../types.js';
-
-function isObject(value: unknown): value is object {
-  return typeof value === 'object' && value !== null;
-}
 
 export function requireColumn(table: Table, columnName: string): Column<unknown> {
   const column = table.getChild(columnName);
@@ -36,7 +33,7 @@ export function requireBinaryCell(column: Column<unknown>, rowIndex: number): Ui
 
 export function nextWriterRow(writer: { nextRow(): unknown }): object {
   const row = writer.nextRow();
-  if (!isObject(row)) {
+  if (!isRecord(row)) {
     throw new Error('Expected createColumnWriter().nextRow() to return a row writer object');
   }
   return row;
@@ -48,7 +45,7 @@ export function invokeWriterMethod(writer: object, methodName: string, value: un
     throw new Error(`Expected row writer method '${methodName}'`);
   }
   const next = Reflect.apply(method, writer, [value]);
-  if (!isObject(next)) {
+  if (!isRecord(next)) {
     throw new Error(`Expected row writer method '${methodName}' to return a row writer object`);
   }
   return next;
@@ -63,7 +60,7 @@ export function callBufferWriter(buffer: object, methodName: string, rowIndex: n
 }
 
 export function isAnySpanBuffer(value: unknown): value is AnySpanBuffer {
-  return isObject(value) && 'timestamp' in value && 'entry_type' in value && '_writeIndex' in value;
+  return isRecord(value) && 'timestamp' in value && 'entry_type' in value && '_writeIndex' in value;
 }
 
 export function requireAnySpanBuffer(value: unknown, message: string): AnySpanBuffer {

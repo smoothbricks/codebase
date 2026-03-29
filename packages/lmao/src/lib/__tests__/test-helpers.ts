@@ -6,6 +6,7 @@
  */
 
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
+import { isRecord } from '@smoothbricks/validation';
 import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
@@ -33,10 +34,6 @@ import type { LogBinding, SpanBuffer } from '../types.js';
 
 // Create a minimal OpContextBinding for the NoOpTracer (it doesn't actually use it)
 const minimalOpContext = defineOpContext({ logSchema: new LogSchema({}) });
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
 
 function requireLogSchema(value: unknown, label: string): LogSchema {
   if (!(value instanceof LogSchema)) {

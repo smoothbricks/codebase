@@ -1,4 +1,5 @@
 import { describe, expect, it } from 'bun:test';
+import { isRecord } from '@smoothbricks/validation';
 
 type ExportConditions = {
   development?: string;
@@ -6,10 +7,6 @@ type ExportConditions = {
   import?: string;
   default?: string;
 };
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
 
 function requireRecord(value: unknown, label: string): Record<string, unknown> {
   if (!isRecord(value)) {

@@ -20,6 +20,7 @@
  * - createRemappedSpanLoggerClass() - Compile and cache SpanLogger classes
  */
 
+import { isRecord } from '@smoothbricks/validation';
 import type { SpanLoggerImpl } from './codegen/spanLoggerGenerator.js';
 import {
   ENTRY_TYPE_DEBUG,
@@ -40,7 +41,7 @@ type RemappedSpanLoggerConstructor<T extends LogSchema = LogSchema> = new (
 ) => SpanLoggerImpl<T>;
 
 function isSchemaField(value: unknown): value is SchemaFields[string] {
-  return typeof value === 'object' && value !== null;
+  return isRecord(value);
 }
 
 function isRemappedBufferViewClass(value: unknown): value is RemappedBufferViewConstructor {

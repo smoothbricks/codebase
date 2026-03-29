@@ -25,6 +25,7 @@
  * - const { span, ok, err } = ctx; // Just works!
  */
 
+import { isRecord } from '@smoothbricks/validation';
 import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import {
@@ -47,7 +48,6 @@ import {
   ENTRY_TYPE_SPAN_OK,
   ENTRY_TYPE_SPAN_RETRY,
 } from './schema/systemSchema.js';
-import { isRecord } from './schema/typeGuards.js';
 import type { InferSchema, LogSchema } from './schema/types.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 import type { LogBinding, SpanBuffer } from './types.js';
@@ -134,7 +134,7 @@ function isSpanBufferForSchema<T extends LogSchema>(buffer: unknown, schema: T):
 }
 
 function isScopeValues<T extends LogSchema>(value: unknown): value is Readonly<Partial<InferSchema<T>>> {
-  return typeof value === 'object' && value !== null;
+  return isRecord(value);
 }
 
 function isSpanContextInstance<Ctx extends OpContext>(value: unknown): value is SpanContextInstance<Ctx> {

@@ -7,6 +7,7 @@
  * @module testing/extractFacts
  */
 
+import { isRecord } from '@smoothbricks/validation';
 import type { LogSchema } from '../schema/LogSchema.js';
 import {
   ENTRY_TYPE_DEBUG,
@@ -35,10 +36,6 @@ import {
   type TraceFact,
   tagFact,
 } from './facts.js';
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === 'object' && value !== null;
-}
 
 function isUint8Array(value: unknown): value is Uint8Array {
   return value instanceof Uint8Array;
