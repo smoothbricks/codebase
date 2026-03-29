@@ -96,8 +96,8 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Do not hand-write validators Typia already provides.** New helpers like `isRecord`, `normalizeX`, `parseJsonX`,
   `expectJsonX`, `toRecord`, `coerceX`, `isHttpRequest`, or similar are wrong by default.
   - WHY: they manually duplicate the contract instead of using the contract itself.
-- **Use real contract types.** Prefer `AxEvent['value']` and other inferred/public types over manually restating
-  `Record<string, unknown>` surfaces.
+- **Use real contract types.** Prefer inferred/public types over manually restating
+    `Record<string, unknown>` surfaces.
 - **Preserve WHY comments.** If you refactor a block with a WHY comment, keep or improve that rationale. Replacing it
   with weaker glue or deleting it without preserving intent is a regression.
 
@@ -117,7 +117,7 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Lint (all rules):** `nx lint <project>` — runs biome + eslint (type-checked) + custom checks, cached
 - **Lint before tests:** always `nx lint <project>` first
 - **Test:** `nx test <project>` — ALWAYS through Nx, never bare `bun test`
-- **Test with filter:** `nx test <project> -- --filter \"test name pattern\"`
+- **Test with filter/args:** pass runner args through Nx, e.g. `nx test <project> -- --filter \"test name pattern\"`
 - **Typecheck / build:** `nx typecheck <project>`, `nx build <project>`
 - **After tsconfig or dependency changes:** `nx sync` and `nx sync:check`
 - **Query test results:** Use `.trace-results.db` SQLite databases:
@@ -131,12 +131,10 @@ carries only what the **receiver** needs to act. For the full rules with code ex
     for (const f of failures) console.log('[FAIL]', f.name);
   \"
   ```
-- **ALWAYS run tests through Nx:** `nx test <project>` — this builds dependencies first, ensuring `.d.ts` files are
-  fresh. Direct `bun test` from a package directory uses whatever declarations are on disk, which causes false
-  passes/failures when a dependency changed but wasn't rebuilt. The ONLY exception: `bun test <file>` from the repo root
-  for a quick single-file check when you are certain the build is fresh (e.g. immediately after `nx typecheck`).
-- **Package-local extra preloads still matter.** If a package adds its own extra preload beyond the shared root ones
-  (for example for package-specific test setup), `nx test` handles this automatically.
+- **ALWAYS run tests through Nx:** `nx test <project>` — this builds dependencies first, keeps declarations fresh, and
+  loads the package's real test config/preloads. Pass extra runner args through Nx instead of switching to `bun test`.
+- **Package-local extra preloads still matter.** If a package adds its own extra preload beyond the shared root ones,
+  `nx test` handles this automatically.
 - **Never skip Nx cache** unless diagnosing cache issues — fix the config instead. If a task only passes with
   `--skip-nx-cache`, treat that as a broken target/input/output/dependency configuration.
 

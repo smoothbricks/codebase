@@ -31,16 +31,14 @@
 - **Known operational failures return `Err`/`Result`.** `throw` is only for invariants, impossible states, or programmer
   bugs.
 - **No default `NoOpTracer`.** `createNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
-  `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
-  Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
-- **Direct `bun test` now loads the shared tracing preload from either the repo root or a package directory.** The root
-  `bunfig.toml` and the package-level `bunfig.toml` files preload `test-trace-preload.ts`, so traced single-file runs no
-  longer fail just because they start at the monorepo root. Use whichever invocation is clearest:
-  `bun test packages/foo/src/...` from the repo root or `bun test src/...` inside `packages/foo`.
-  `nx test <project>` remains valid because Nx runs from the package directory.
-- **Package-local extra preloads still require the package `bunfig.toml`.** Example: `packages/lmao-expo/bunfig.toml`
-  also preloads `src/test-preload.ts`, so run Expo proofs from `packages/lmao-expo` when that extra setup matters.
-- **Lint before tests.** Use `nx lint <project>` before `bun test` or `nx test <project>`.
+   `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
+   Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
+- **Lint before tests.** Use `nx lint <project>` before `nx test <project>`.
+- **Run tests through Nx.** Use `nx test <project>` as the default and expected path so dependencies are built, package
+  test config is honored, and the real preloads/setup files load correctly. Pass runner args/filters through Nx instead
+  of switching to `bun test`.
+- **Direct `bun test` is diagnostic-only.** Use it only when you are explicitly debugging Bun itself (preload behavior,
+  Bun-specific runner issues, etc.), not as the normal validation path.
 - **Nx cache is not flaky; config is.** If a task only passes with `--skip-nx-cache`, fix the target's inputs, outputs,
   dependency graph, or task wiring so cached and uncached runs agree.
 - **Do not normalize cache bypasses.** `--skip-nx-cache` is for diagnosis only, not routine development or validation.
@@ -586,10 +584,10 @@ Three distinct string types, each with different storage strategies:
 
 ### Testing
 
- **Test Single**: `bun test path/to/file.test.ts`
- **Test Pattern**: `bun test -t "pattern"`
- **Test All**: `nx test <project>` (runs all tests for a package)
- **Note**: Tests no longer depend on typecheck-tests - linting handles that. Tests only depend on build.
+- **Test**: `nx test <project>`
+- **Test with filter/args**: pass runner args through Nx, e.g. `nx test <project> -- --filter "test name pattern"`
+- **Note**: Tests no longer depend on `typecheck-tests`; linting handles that. Tests only depend on build. Direct
+  `bun test` is diagnostic-only, not the standard validation path.
 
 **Repository requirement:** Every package test suite (except `packages/lmao`) MUST be LMAO-traced and MUST flush
 traces through a SQLite sink (local `.trace-results.db` or worker D1 binding such as `TRACE_RESULTS`).
