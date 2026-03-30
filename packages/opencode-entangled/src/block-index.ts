@@ -118,11 +118,6 @@ export class BlockIndex {
     return results;
   }
 
-  /** Get the block where blockId is defined */
-  findDefinition(blockId: string): BlockEntry | undefined {
-    return this.byId.get(blockId);
-  }
-
   /** List all blocks in a specific markdown file */
   listBlocks(filePath: string): BlockEntry[] {
     return this.byFile.get(filePath) ?? [];

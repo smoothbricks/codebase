@@ -55,6 +55,13 @@ describe('BlockIndex', () => {
     expect(idx.get('nonexistent')).toBeUndefined();
   });
 
+  it('get returns the defining block by id', () => {
+    idx.addFile('doc.md', md('```ts {#def file="d.ts"}', 'x', '```'));
+    const def = idx.get('def');
+    expect(def).toBeDefined();
+    expect(def?.id).toBe('def');
+  });
+
   // --- getByTarget ---
 
   it('getByTarget finds blocks by tangle target path', () => {
@@ -125,19 +132,6 @@ describe('BlockIndex', () => {
   it('findReferences returns empty for unreferenced block', () => {
     idx.addFile('doc.md', md('```ts {#lonely}', 'alone', '```'));
     expect(idx.findReferences('lonely')).toEqual([]);
-  });
-
-  // --- findDefinition ---
-
-  it('findDefinition returns the defining block', () => {
-    idx.addFile('doc.md', md('```ts {#def file="d.ts"}', 'x', '```'));
-    const def = idx.findDefinition('def');
-    expect(def).toBeDefined();
-    expect(def?.id).toBe('def');
-  });
-
-  it('findDefinition returns undefined for unknown id', () => {
-    expect(idx.findDefinition('ghost')).toBeUndefined();
   });
 
   // --- listBlocks ---
@@ -282,7 +276,7 @@ describe('BlockIndex', () => {
     expect(idx.getByTarget('x')).toEqual([]);
     expect(idx.listTargets()).toEqual([]);
     expect(idx.findReferences('x')).toEqual([]);
-    expect(idx.findDefinition('x')).toBeUndefined();
+    expect(idx.get('x')).toBeUndefined();
     expect(idx.listBlocks('x.md')).toEqual([]);
   });
 });

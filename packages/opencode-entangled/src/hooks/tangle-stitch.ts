@@ -114,7 +114,8 @@ async function handleTangleTargetEdit(
 
 function appendError(output: Record<string, unknown>, command: string, result: RunCommandResult): void {
   const errorInfo = `[${command}] failed (exit ${result.exitCode}):\n${result.stderr || result.stdout}`;
-  // WHY: append to existing output so the LLM sees the error alongside the tool result
-  const existing = typeof output.error === 'string' ? `${output.error}\n` : '';
-  output.error = existing + errorInfo;
+  // WHY: append to existing output so the LLM sees the error alongside the tool result.
+  // The plugin's tool.execute.after output type has { title, output, metadata } — no error field.
+  const existing = typeof output.output === 'string' ? `${output.output}\n` : '';
+  output.output = existing + errorInfo;
 }

@@ -108,7 +108,7 @@ const server: Plugin = async ({ directory, $ }) => {
   await filedb.load(readFile);
 
   // Create hooks
-  const editReroute = createEditRerouteHook(index, filedb);
+  const editReroute = createEditRerouteHook(index);
   const tangleStitch = createTangleStitchHook(index, filedb, runCommand, readFile);
 
   return {

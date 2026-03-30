@@ -20,7 +20,7 @@
     "test": "bun test tests"
   },
   "dependencies": {
-    "@opencode-ai/plugin": "latest",
+    "@opencode-ai/plugin": "^1.3.5",
     "fenceparser": "^2.2.0",
     "typia": "^12.0.1",
     "zod": "4"

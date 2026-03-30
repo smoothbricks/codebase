@@ -92,11 +92,6 @@ export class FileDB {
     return [...this.files.keys()];
   }
 
-  /** Get the entangled version that created the database. */
-  getVersion(): string | undefined {
-    return this.version;
-  }
-
   private clear(): void {
     this.targets = new Set();
     this.files = new Map();

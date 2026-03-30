@@ -9,7 +9,7 @@ export function createFindDefinitionTool(index: BlockIndex) {
       blockName: z.string().describe('The block name to find the definition of'),
     }),
     execute: async (args: { blockName: string }) => {
-      const def = index.findDefinition(args.blockName);
+      const def = index.get(args.blockName);
       if (!def) {
         return {
           title: `Definition of <<${args.blockName}>>`,

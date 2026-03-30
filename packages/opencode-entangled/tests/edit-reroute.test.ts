@@ -1,6 +1,5 @@
 import { beforeEach, describe, expect, it } from 'bun:test';
 import { BlockIndex } from '../src/block-index.js';
-import { FileDB } from '../src/filedb.js';
 import { createEditRerouteHook } from '../src/hooks/edit-reroute.js';
 
 function md(...lines: string[]): string {
@@ -9,13 +8,11 @@ function md(...lines: string[]): string {
 
 describe('createEditRerouteHook', () => {
   let index: BlockIndex;
-  let filedb: FileDB;
   let hook: ReturnType<typeof createEditRerouteHook>;
 
   beforeEach(() => {
     index = new BlockIndex();
-    filedb = new FileDB('/project');
-    hook = createEditRerouteHook(index, filedb);
+    hook = createEditRerouteHook(index);
   });
 
   function makeInput(tool: string) {

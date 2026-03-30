@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { insertAfterBlock } from './block-utils.js';
 
 export interface FileIO {
   readFile: (path: string) => Promise<string>;
@@ -188,46 +189,6 @@ function appendToBlock(mdContent: string, blockId: string, extraContent: string)
     // WHY: block was not found in the file content, which shouldn't happen
     // if the caller validated via BlockIndex — return content unchanged
     return mdContent;
-  }
-
-  return result.join('\n');
-}
-
-/** Insert a new block after the closing fence of the named block */
-function insertAfterBlock(mdContent: string, afterBlockId: string, newBlock: string): string {
-  const lines = mdContent.split('\n');
-  const result: string[] = [];
-  let insideTarget = false;
-  let backtickCount = 0;
-  let inserted = false;
-
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i] ?? '';
-
-    if (!insideTarget && !inserted) {
-      const openMatch = line.match(/^(`{3,})\S*\s*\{[^}]*#(\w[\w-]*)[^}]*\}/);
-      if (openMatch && openMatch[2] === afterBlockId) {
-        insideTarget = true;
-        backtickCount = (openMatch[1] ?? '```').length;
-      }
-      result.push(line);
-      continue;
-    }
-
-    if (insideTarget) {
-      const trimmed = line.trim();
-      if (trimmed.length >= backtickCount && /^`+$/.test(trimmed)) {
-        result.push(line);
-        // WHY: insert the new block after the closing fence with a blank line separator
-        result.push('');
-        result.push(newBlock);
-        insideTarget = false;
-        inserted = true;
-        continue;
-      }
-    }
-
-    result.push(line);
   }
 
   return result.join('\n');

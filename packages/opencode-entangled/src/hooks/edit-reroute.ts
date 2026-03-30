@@ -1,5 +1,4 @@
 import type { BlockIndex } from '../block-index.js';
-import type { FileDB } from '../filedb.js';
 
 interface HookInput {
   tool: string;
@@ -20,10 +19,7 @@ const INTERCEPTED_TOOLS = new Set(['edit', 'write']);
  * WHY: the LLM sees .md files but its edits to code blocks should land in the tangled
  * output files so LSP feedback and file watchers work correctly.
  */
-export function createEditRerouteHook(
-  index: BlockIndex,
-  _filedb: FileDB,
-): (input: HookInput, output: HookOutput) => Promise<void> {
+export function createEditRerouteHook(index: BlockIndex): (input: HookInput, output: HookOutput) => Promise<void> {
   return async (input, output) => {
     if (!INTERCEPTED_TOOLS.has(input.tool)) return;
 
