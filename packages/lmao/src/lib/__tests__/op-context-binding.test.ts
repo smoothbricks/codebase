@@ -57,7 +57,9 @@ describe('Op._opContextBinding', () => {
 
     // WHY: bracket access — MappedOpGroup types don't carry named op properties,
     // but ops are spread as own properties at runtime
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
     const fetchOp = (prefixed as unknown as OpRecord).fetch;
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
     const saveOp = (prefixed as unknown as OpRecord).save;
 
     expect(fetchOp._opContextBinding).toBeDefined();
@@ -76,6 +78,7 @@ describe('Op._opContextBinding', () => {
     const mapped = ops.mapColumns({ userId: 'mapped_user' });
 
     // WHY: bracket access — MappedOpGroup types don't carry named op properties
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
     const fetchOp = (mapped as unknown as OpRecord).fetch;
     expect(fetchOp._opContextBinding).toBeDefined();
     expect(fetchOp._opContextBinding!.logBinding.logSchema.fields).toHaveProperty('userId');
@@ -123,7 +126,9 @@ describe('Op._opContextBinding', () => {
 
     const prefixed = group.prefix('http');
     // WHY: bracket access — MappedOpGroup types don't carry named op properties
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
     const fetchOp = (prefixed as unknown as OpRecord).fetch;
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
     const saveOp = (prefixed as unknown as OpRecord).save;
 
     // WHY: prefix creates new Op instances but preserves the binding reference
