@@ -287,7 +287,7 @@ export class FlushScheduler {
       if (availableMemory < this.config.memoryPressureThreshold) {
         this.doFlush('memory').catch(console.error);
       }
-    } catch (_error) {
+    } catch {
       // Ignore errors in memory detection
     }
   }
