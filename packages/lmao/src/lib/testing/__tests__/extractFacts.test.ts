@@ -7,10 +7,12 @@ import { createTestTracerOptions } from '../../__tests__/test-helpers.js';
 import { defineOpContext } from '../../defineOpContext.js';
 import { defineCodeError } from '../../result.js';
 import { S } from '../../schema/builder.js';
+import { defineFeatureFlags } from '../../schema/defineFeatureFlags.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import { InMemoryFlagEvaluator } from '../../schema/evaluator.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
 import { extractFacts } from '../extractFacts.js';
-import { logInfo, logWarn, spanErr, spanOk, spanStarted, tagFact } from '../facts.js';
+import { ffFact, logInfo, logWarn, spanErr, spanOk, spanStarted, tagFact } from '../facts.js';
 
 // Define a test error for ctx.err tests
 const NOT_FOUND = defineCodeError('NOT_FOUND')<{ detail: string }>();
@@ -24,6 +26,16 @@ describe('extractFacts', () => {
   });
 
   const opContext = defineOpContext({ logSchema: testSchema });
+  const featureFlags = defineFeatureFlags({
+    advancedValidation: S.boolean().default(false).sync(),
+  });
+  const opContextWithFlags = defineOpContext({
+    logSchema: testSchema,
+    flags: featureFlags.schema,
+  });
+  const flagEvaluator = new InMemoryFlagEvaluator(featureFlags.schema, {
+    advancedValidation: true,
+  });
 
   it('extracts span lifecycle facts from a simple trace', async () => {
     const tracer = new TestTracer(opContext, { ...createTestTracerOptions() });
@@ -111,6 +123,23 @@ describe('extractFacts', () => {
     expect(facts.has(spanStarted('failing-op'))).toBe(true);
     expect(facts.has(spanErr('failing-op', 'NOT_FOUND'))).toBe(true);
     expect(facts.has(spanOk('failing-op'))).toBe(false);
+  });
+
+  it('extracts feature flag access facts from system columns', async () => {
+    const tracer = new TestTracer(opContextWithFlags, {
+      ...createTestTracerOptions(),
+      flagEvaluator,
+    });
+
+    await tracer.trace('with-ff', async (ctx) => {
+      const validationFlag = ctx.ff.advancedValidation;
+      expect(validationFlag?.value).toBe(true);
+      return ctx.ok('done');
+    });
+
+    const facts = extractFacts(tracer.rootBuffers[0]);
+
+    expect(facts.has(ffFact('advancedValidation', 'true'))).toBe(true);
   });
 
   it('filters facts by namespace', async () => {
