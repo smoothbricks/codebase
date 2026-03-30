@@ -29,10 +29,10 @@ import { createTraceId, type TraceId } from '../traceId.js';
 import type { ITraceRoot, TracerLifecycleHooks } from '../traceRoot.js';
 import { createTraceRoot } from '../traceRoot.node.js';
 import type { TracerOptions } from '../tracer.js';
-import { NoOpTracer } from '../tracers/NoOpTracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 import type { LogBinding, SpanBuffer } from '../types.js';
 
-// Create a minimal OpContextBinding for the NoOpTracer (it doesn't actually use it)
+// Create a minimal OpContextBinding for shared test trace roots.
 const minimalOpContext = defineOpContext({ logSchema: new LogSchema({}) });
 
 function requireLogSchema(value: unknown, label: string): LogSchema {
@@ -89,10 +89,10 @@ export function createTestTracerOptions<T extends LogSchema>(): TracerOptions<T>
 }
 
 /**
- * Shared NoOpTracer instance for tests that create buffers directly.
+ * Shared TestTracer instance for tests that create buffers directly.
  * Cast to TracerLifecycleHooks since that's what TraceRoot expects.
  */
-export const TEST_TRACER: TracerLifecycleHooks = new NoOpTracer(minimalOpContext, createTestTracerOptions());
+export const TEST_TRACER: TracerLifecycleHooks = new TestTracer(minimalOpContext, createTestTracerOptions());
 
 type TestSpanBufferBundle<T extends SchemaFields> = {
   logBinding: LogBinding;

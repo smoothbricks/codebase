@@ -44,9 +44,9 @@ import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
 import type { Tracer } from '../tracer.js';
 import { CompositeTracer } from '../tracers/CompositeTracer.js';
-import { NoOpTracer } from '../tracers/NoOpTracer.js';
 import { SQLiteAsyncTracer, SQLiteTracer } from '../tracers/SQLiteTracer.js';
 import { StdioTracer } from '../tracers/StdioTracer.js';
+import { TestTracer } from '../tracers/TestTracer.js';
 
 /** vitest expect() errors start with 'expect(received).' — distinguishes assertion failures from other throws */
 function isExpectError(error: unknown): boolean {
@@ -317,7 +317,7 @@ function createRootTracer<B extends OpContextBinding>({
     });
   }
 
-  return new NoOpTracer(binding, {
+  return new TestTracer(binding, {
     ...tracerOptions,
   });
 }

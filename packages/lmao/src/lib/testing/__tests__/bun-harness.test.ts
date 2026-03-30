@@ -2,6 +2,7 @@ import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
+import { TestTracer } from '../../tracers/TestTracer.js';
 import { type BunTestModuleShape, makeBunTestSuiteTracer, makeTestTracer } from '../bun-harness.js';
 
 type BunTestModuleLike = BunTestModuleShape;
@@ -84,5 +85,12 @@ describe('bun harness test log schema extension', () => {
       expect(buffer.test_metric_values[2]).toBe(456);
       expect(buffer.test_note_values[2]).toBe('hello');
     });
+  });
+
+  it('defaults to an in-memory TestTracer when sqlite and verbose are off', () => {
+    const tracer = makeTestTracer(baseBinding);
+    tracer.setup();
+
+    expect(tracer.getTracer()).toBeInstanceOf(TestTracer);
   });
 });
