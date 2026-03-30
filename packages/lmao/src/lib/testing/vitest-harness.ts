@@ -601,7 +601,7 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
   };
 }
 
-// Global singleton compatibility path (legacy API)
+// Global singleton path for shared Vitest helpers.
 let _defaultHarness: VitestTestTracer<OpContextBinding> | null = null;
 
 /** Initialize the root tracer for the entire vitest run. Call once in setupFiles. */
