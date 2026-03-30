@@ -228,6 +228,26 @@ describe('EvaluatorGenerator', () => {
       expect(childFlag?.value).toBe(true);
     });
 
+    test('span context scope getter returns the typed buffer scope contract', () => {
+      const ffSchema = defineFeatureFlags({
+        debugMode: S.boolean().default(false).sync(),
+      });
+      const logSchema = createTestSchema({
+        requestId: S.category(),
+      });
+      const spanBuffer = createBuffer(logSchema);
+      const mockCtx = createMockSpanContext<typeof logSchema, typeof ffSchema.schema>(logSchema, spanBuffer);
+
+      spanBuffer._scopeValues = Object.freeze({ requestId: 'req-123' });
+
+      const scope = mockCtx.scope;
+      expect(scope).toBe(spanBuffer._scopeValues);
+      expect(scope.requestId).toBe('req-123');
+
+      const requestId: string | undefined = scope.requestId;
+      expect(requestId).toBe('req-123');
+    });
+
     test('flag access is deduplicated via buffer scan', () => {
       const ffSchema = defineFeatureFlags({
         debugMode: S.boolean().default(false).sync(),

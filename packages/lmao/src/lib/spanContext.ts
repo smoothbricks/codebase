@@ -25,7 +25,6 @@
  * - const { span, ok, err } = ctx; // Just works!
  */
 
-import { isRecord } from '@smoothbricks/validation';
 import type { TagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import { createTagWriter } from './codegen/fixedPositionWriterGenerator.js';
 import {
@@ -130,16 +129,20 @@ function getBufferConstructor<T extends LogSchema>(buffer: SpanBuffer<T>): SpanB
 }
 
 function isSpanBufferForSchema<T extends LogSchema>(buffer: unknown, schema: T): buffer is SpanBuffer<T> {
-  return isRecord(buffer) && '_logSchema' in buffer && Reflect.get(buffer, '_logSchema') === schema;
-}
-
-function isScopeValues<T extends LogSchema>(value: unknown): value is Readonly<Partial<InferSchema<T>>> {
-  return isRecord(value);
+  return (
+    typeof buffer === 'object' &&
+    buffer !== null &&
+    Reflect.get(buffer, '_logSchema') === schema &&
+    isSpanBufferConstructorForSchema(Reflect.get(buffer, 'constructor'), schema)
+  );
 }
 
 function isSpanContextInstance<Ctx extends OpContext>(value: unknown): value is SpanContextInstance<Ctx> {
   return (
-    isSpanContext<Ctx>(value) && isRecord(value) && '_buffer' in value && '_spanLogger' in value && '_schema' in value
+    isSpanContext<Ctx>(value) &&
+    Reflect.has(value, '_buffer') &&
+    Reflect.has(value, '_spanLogger') &&
+    Reflect.has(value, '_schema')
   );
 }
 
@@ -900,11 +903,7 @@ export function createSpanContextClass<Ctx extends OpContext>(
     }
 
     get scope(): Readonly<Partial<InferSchema<Ctx['logSchema']>>> {
-      const scopeValues = this._buffer._scopeValues;
-      if (!isScopeValues<Ctx['logSchema']>(scopeValues)) {
-        throw new TypeError('Span scope must be an object');
-      }
-      return scopeValues;
+      return this._buffer._scopeValues;
     }
 
     // =========================================================================

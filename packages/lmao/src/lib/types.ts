@@ -20,6 +20,7 @@ import type {
 } from '@smoothbricks/arrow-builder';
 import type { OpMetadata } from './opContext/opTypes.js';
 import type { LogSchema } from './schema/LogSchema.js';
+import type { InferSchema } from './schema/types.js';
 import type { SpanBufferStats } from './spanBufferStats.js';
 import type { TraceId } from './traceId.js';
 import type { ITraceRoot } from './traceRoot.js';
@@ -472,6 +473,7 @@ export type SpanBuffer<T extends LogSchema> = AnySpanBuffer & {
 
   // Override schema access with the concrete schema for this buffer family
   readonly _logSchema: T;
+  _scopeValues: Readonly<Partial<InferSchema<T>>>;
 
   // Override methods with typed versions
   isParentOf(other: SpanBuffer<T>): boolean;
