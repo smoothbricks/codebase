@@ -31,10 +31,12 @@ describe('package export contract', () => {
     expect(Object.keys(mod).sort()).toEqual([
       'EpochMicros',
       'EpochMillis',
+      'TIME_BOUNDARIES',
       'dateToMicros',
       'dateToMillis',
       'epochMicrosToMillis',
       'epochMillisToMicros',
+      'isTimeBoundary',
       'microsToDate',
       'microsToISODate',
       'millisToDate',

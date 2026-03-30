@@ -28,4 +28,5 @@ export {
   nowMicros,
   nowMillis,
 } from './conversions.js';
+export { isTimeBoundary, TIME_BOUNDARIES, type TimeBoundary } from './time-boundaries.js';
 export { EpochMicros, EpochMillis } from './types.js';
