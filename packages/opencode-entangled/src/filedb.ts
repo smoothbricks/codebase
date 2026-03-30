@@ -36,7 +36,6 @@ export interface FileDBData {
 export class FileDB {
   private targets = new Set<string>();
   private files = new Map<string, FileStat>();
-  private version: string | undefined;
 
   constructor(private projectRoot: string) {}
 
@@ -64,7 +63,6 @@ export class FileDB {
     }
 
     const data = parseFileDB(parsed);
-    this.version = data.version;
     this.targets = new Set(data.targets);
     this.files = new Map(Object.entries(data.files));
     return data;
@@ -95,7 +93,6 @@ export class FileDB {
   private clear(): void {
     this.targets = new Set();
     this.files = new Map();
-    this.version = undefined;
   }
 
   // WHY: entangled stores posix-style relative paths; normalize input for consistent lookups.
