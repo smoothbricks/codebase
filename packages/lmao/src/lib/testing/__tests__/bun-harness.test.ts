@@ -93,4 +93,16 @@ describe('bun harness test log schema extension', () => {
 
     expect(tracer.getTracer()).toBeInstanceOf(TestTracer);
   });
+
+  it('rejects duplicate extra test columns instead of silently erasing them', () => {
+    const tracer = makeTestTracer(baseBinding, {
+      extraTestColumns: {
+        base_field: S.category(),
+      },
+    });
+
+    expect(() => tracer.setup()).toThrow(
+      "Test harness schema column 'base_field' already exists in the bound log schema",
+    );
+  });
 });
