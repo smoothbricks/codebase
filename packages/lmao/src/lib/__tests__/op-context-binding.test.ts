@@ -12,22 +12,18 @@
 import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../defineOpContext.js';
 import { Op } from '../op.js';
-import type { OpContext } from '../opContext/types.js';
+import type { OpContextBinding } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
+
+// WHY: MappedOpGroup types don't carry named op properties, but ops are
+// spread as own properties at runtime. This accessor type lets us reach them.
+type OpRecord = Record<string, { _opContextBinding?: OpContextBinding }>;
 
 const testSchema = defineLogSchema({
   userId: S.category(),
   endpoint: S.text(),
 });
-
-function requireOpContextBinding<Ctx extends OpContext, Args extends unknown[], S, E>(op: Op<Ctx, Args, S, E>) {
-  const binding = op._opContextBinding;
-  if (!binding) {
-    throw new Error('Expected Op to carry _opContextBinding');
-  }
-  return binding;
-}
 
 describe('Op._opContextBinding', () => {
   it('defineOp produces an Op with _opContextBinding set', () => {
@@ -42,7 +38,7 @@ describe('Op._opContextBinding', () => {
     const ctx = defineOpContext({ logSchema: testSchema });
     const op = ctx.defineOp('test-op', (ctx) => ctx.ok('done'));
 
-    const binding = requireOpContextBinding(op);
+    const binding = op._opContextBinding!;
     const fields = binding.logBinding.logSchema.fields;
 
     // WHY: user-defined fields should be present in the schema
@@ -59,15 +55,16 @@ describe('Op._opContextBinding', () => {
 
     const prefixed = ops.prefix('http');
 
-    // WHY: after prefix, each Op in the group should still carry the same binding
-    const fetchOp = prefixed.fetch;
-    const saveOp = prefixed.save;
+    // WHY: bracket access — MappedOpGroup types don't carry named op properties,
+    // but ops are spread as own properties at runtime
+    const fetchOp = (prefixed as unknown as OpRecord).fetch;
+    const saveOp = (prefixed as unknown as OpRecord).save;
 
     expect(fetchOp._opContextBinding).toBeDefined();
     expect(saveOp._opContextBinding).toBeDefined();
 
     // Binding should still reference the original schema fields
-    expect(requireOpContextBinding(fetchOp).logBinding.logSchema.fields).toHaveProperty('userId');
+    expect(fetchOp._opContextBinding!.logBinding.logSchema.fields).toHaveProperty('userId');
   });
 
   it('.mapColumns() preserves _opContextBinding', () => {
@@ -78,9 +75,10 @@ describe('Op._opContextBinding', () => {
 
     const mapped = ops.mapColumns({ userId: 'mapped_user' });
 
-    const fetchOp = mapped.fetch;
+    // WHY: bracket access — MappedOpGroup types don't carry named op properties
+    const fetchOp = (mapped as unknown as OpRecord).fetch;
     expect(fetchOp._opContextBinding).toBeDefined();
-    expect(requireOpContextBinding(fetchOp).logBinding.logSchema.fields).toHaveProperty('userId');
+    expect(fetchOp._opContextBinding!.logBinding.logSchema.fields).toHaveProperty('userId');
   });
 
   it('two Ops from the same defineOpContext share the same binding reference', () => {
@@ -124,8 +122,9 @@ describe('Op._opContextBinding', () => {
     });
 
     const prefixed = group.prefix('http');
-    const fetchOp = prefixed.fetch;
-    const saveOp = prefixed.save;
+    // WHY: bracket access — MappedOpGroup types don't carry named op properties
+    const fetchOp = (prefixed as unknown as OpRecord).fetch;
+    const saveOp = (prefixed as unknown as OpRecord).save;
 
     // WHY: prefix creates new Op instances but preserves the binding reference
     expect(fetchOp._opContextBinding).toBe(saveOp._opContextBinding);
