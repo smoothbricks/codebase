@@ -6,7 +6,6 @@
  */
 
 import { DEFAULT_BUFFER_CAPACITY } from '@smoothbricks/arrow-builder';
-import { isRecord } from '@smoothbricks/validation';
 import { createSpanLogger, type SpanLoggerImpl } from '../codegen/spanLoggerGenerator.js';
 import { defineOpContext } from '../defineOpContext.js';
 import { JsBufferStrategy } from '../JsBufferStrategy.js';
@@ -42,18 +41,34 @@ function requireLogSchema(value: unknown, label: string): LogSchema {
   return value;
 }
 
-function requireColumnMapping(value: unknown, label: string): Record<string, string | null> {
-  if (!isRecord(value)) {
+function assertColumnMapping<LibSchema extends SchemaFields>(
+  value: unknown,
+  label: string,
+): asserts value is ColumnMapping<LibSchema> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     throw new Error(`Expected ${label} to be a column mapping record`);
   }
-  const mapping: Record<string, string | null> = {};
   for (const [key, mappingValue] of Object.entries(value)) {
     if (typeof mappingValue !== 'string' && mappingValue !== null) {
       throw new Error(`Expected column mapping '${key}' in ${label} to be a string or null`);
     }
-    mapping[key] = mappingValue;
   }
-  return mapping;
+}
+
+function assertOpGroupInternals<Ctx extends OpContext>(
+  opGroup: OpGroup<Ctx>,
+  label: string,
+): asserts opGroup is OpGroupInternal<Ctx> {
+  requireLogSchema(Reflect.get(opGroup, '_logSchema'), `${label}._logSchema`);
+}
+
+function assertMappedOpGroupInternals<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
+  opGroup: MappedOpGroup<Ctx, ContributedSchema>,
+  label: string,
+): asserts opGroup is MappedOpGroupInternal<Ctx, ContributedSchema> {
+  requireLogSchema(Reflect.get(opGroup, '_logSchema'), `${label}._logSchema`);
+  const columnMapping = Reflect.get(opGroup, '_columnMapping');
+  assertColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>(columnMapping, `${label}._columnMapping`);
 }
 
 export function requireStringArray(value: unknown, label: string): string[] {
@@ -90,7 +105,7 @@ export function createTestTracerOptions<T extends LogSchema>(): TracerOptions<T>
 
 /**
  * Shared TestTracer instance for tests that create buffers directly.
- * Cast to TracerLifecycleHooks since that's what TraceRoot expects.
+ * Typed as TracerLifecycleHooks because that's what TraceRoot expects.
  */
 export const TEST_TRACER: TracerLifecycleHooks = new TestTracer(minimalOpContext, createTestTracerOptions());
 
@@ -201,7 +216,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
     trace_id?: TraceId;
     capacity?: number;
   } = {},
-): TestSpanBufferBundle<T> {
+) {
   // Wrap in LogSchema if plain SchemaFields provided
   const logSchema: LogSchema<T> = schema instanceof LogSchema ? schema : createTestSchema(schema);
 
@@ -256,10 +271,8 @@ export function createTestLogger<T extends LogSchema>(schema: T): TestLoggerBund
 export function getOpGroupInternals<Ctx extends OpContext>(
   opGroup: OpGroup<Ctx>,
 ): Pick<OpGroupInternal<Ctx>, '_logSchema'> {
-  return {
-    ...opGroup,
-    _logSchema: requireLogSchema(Reflect.get(opGroup, '_logSchema'), 'OpGroup._logSchema') as Ctx['logSchema'],
-  };
+  assertOpGroupInternals(opGroup, 'OpGroup');
+  return { _logSchema: opGroup._logSchema };
 }
 
 /**
@@ -275,13 +288,10 @@ export function getOpGroupInternals<Ctx extends OpContext>(
 export function getMappedOpGroupInternals<Ctx extends OpContext, ContributedSchema extends SchemaFields>(
   opGroup: MappedOpGroup<Ctx, ContributedSchema>,
 ): Pick<MappedOpGroupInternal<Ctx, ContributedSchema>, '_logSchema' | '_columnMapping'> {
+  assertMappedOpGroupInternals(opGroup, 'MappedOpGroup');
   return {
-    ...opGroup,
-    _logSchema: requireLogSchema(Reflect.get(opGroup, '_logSchema'), 'MappedOpGroup._logSchema') as Ctx['logSchema'],
-    _columnMapping: requireColumnMapping(
-      Reflect.get(opGroup, '_columnMapping'),
-      'MappedOpGroup._columnMapping',
-    ) as MappedOpGroupInternal<Ctx, ContributedSchema>['_columnMapping'],
+    _logSchema: opGroup._logSchema,
+    _columnMapping: opGroup._columnMapping,
   };
 }
 
