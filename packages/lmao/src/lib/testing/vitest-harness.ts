@@ -376,8 +376,8 @@ export function installVitestTestTracing<B extends OpContextBinding>(
   tracer: VitestTestTracer<B>,
   options?: InitTraceTestRunOptions,
 ): void {
-  _activeSuiteTracer = createActiveVitestTestTracer(tracer);
   tracer.initTraceTestRun(options);
+  _activeSuiteTracer = createActiveVitestTestTracer(tracer);
 }
 
 export function makeVitestTestSuiteTracer<B extends OpContextBinding>(
@@ -601,47 +601,35 @@ export function makeVitestTestTracer<B extends OpContextBinding>(config: VitestH
   };
 }
 
-// Global singleton path for shared Vitest helpers.
-let _defaultHarness: VitestTestTracer<OpContextBinding> | null = null;
+function requireActiveSuiteTracer(message: string): ActiveVitestTestTracer {
+  if (!_activeSuiteTracer) {
+    throw new Error(message);
+  }
+
+  return _activeSuiteTracer;
+}
 
 /** Initialize the root tracer for the entire vitest run. Call once in setupFiles. */
 export function initTraceTestRun<B extends OpContextBinding>(opContext: B, options?: InitTraceTestRunOptions): void {
-  _activeSuiteTracer = null;
-  const harness = makeVitestTestTracer({ binding: opContext });
-  harness.initTraceTestRun(options);
-  _defaultHarness = harness;
+  installVitestTestTracing(makeVitestTestTracer({ binding: opContext }), options);
 }
 
 /** Get the current span context from AsyncLocalStorage (inside an it() block) */
 export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
-  if (_activeSuiteTracer) {
-    const ctx = _activeSuiteTracer.useTestSpan();
-    if (!isSpanContext(ctx)) {
-      throw new Error('Active suite tracer returned a non-span context');
-    }
-    return ctx;
+  const ctx = requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').useTestSpan();
+  if (!isSpanContext(ctx)) {
+    throw new Error('Active suite tracer returned a non-span context');
   }
-
-  if (!_defaultHarness) {
-    throw new Error('Call initTraceTestRun() in setupFiles before tests');
-  }
-  return _defaultHarness.useTestSpan();
+  return ctx;
 }
 
 /** Get the root tracer instance */
 export function getTracer(): Tracer<OpContextBinding> {
-  if (_activeSuiteTracer) {
-    const tracer = _activeSuiteTracer.getTracer();
-    if (!(tracer instanceof Tracer)) {
-      throw new Error('Active suite tracer returned a non-tracer');
-    }
-    return tracer;
+  const tracer = requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').getTracer();
+  if (!(tracer instanceof Tracer)) {
+    throw new Error('Active suite tracer returned a non-tracer');
   }
-
-  if (!_defaultHarness) {
-    throw new Error('Call initTraceTestRun() in setupFiles before tests');
-  }
-  return _defaultHarness.getTracer();
+  return tracer;
 }
 
 /**
@@ -654,21 +642,14 @@ export function getTracer(): Tracer<OpContextBinding> {
  *     importOriginal(),
  *     import('@smoothbricks/lmao/testing/vitest'),
  *   ]);
- *   return createVitestMock(mod as Record<string, unknown>);
+ *   return createVitestMock(mod);
  * });
  * ```
  *
  * @param vitestModule - The original vitest namespace from importOriginal()
  */
 export function createVitestMock<T extends VitestModuleShape>(vitestModule: T): T {
-  if (_activeSuiteTracer) {
-    return _activeSuiteTracer.createVitestMock(vitestModule);
-  }
-
-  if (!_defaultHarness) {
-    throw new Error('Call initTraceTestRun() before createVitestMock()');
-  }
-  return _defaultHarness.createVitestMock(vitestModule);
+  return requireActiveSuiteTracer('Call initTraceTestRun() before createVitestMock()').createVitestMock(vitestModule);
 }
 
 /**
@@ -676,14 +657,7 @@ export function createVitestMock<T extends VitestModuleShape>(vitestModule: T): 
  * describe() callbacks run synchronously (just registering tests).
  */
 const describeBase: VitestDescribeBranch = (name, fn) => {
-  if (_activeSuiteTracer) {
-    return _activeSuiteTracer.describe(name, fn);
-  }
-
-  if (!_defaultHarness) {
-    throw new Error('Call initTraceTestRun() in setupFiles before tests');
-  }
-  return _defaultHarness.describe(name, fn);
+  return requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').describe(name, fn);
 };
 
 export const describe: VitestDescribe = Object.assign(describeBase, {
@@ -696,14 +670,7 @@ export const describe: VitestDescribe = Object.assign(describeBase, {
 
 /** Wrapped it — creates a child span of the root trace for the test case */
 const itBase: VitestPublicTestBranch = (name, fn) => {
-  if (_activeSuiteTracer) {
-    return _activeSuiteTracer.it(name, fn);
-  }
-
-  if (!_defaultHarness) {
-    throw new Error('Call initTraceTestRun() in setupFiles before tests');
-  }
-  return _defaultHarness.it(name, fn);
+  return requireActiveSuiteTracer('Call initTraceTestRun() in setupFiles before tests').it(name, fn);
 };
 
 export const it: VitestIt = Object.assign(itBase, {
