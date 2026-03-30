@@ -39,10 +39,11 @@ import { JsBufferStrategy } from '../JsBufferStrategy.js';
 import type { SpanContext } from '../opContext/spanContextTypes.js';
 import type { OpContextBinding, OpContextOf } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
+import { isSpanContext } from '../spanContext.js';
 import type { AsyncSQLiteDatabase, SyncSQLiteDatabase } from '../sqlite/sqlite-db.js';
 import type { SQLiteWriterConfig } from '../sqlite/sqlite-writer.js';
 import { createTraceRoot } from '../traceRoot.universal.js';
-import type { Tracer } from '../tracer.js';
+import { Tracer } from '../tracer.js';
 import { CompositeTracer } from '../tracers/CompositeTracer.js';
 import { SQLiteAsyncTracer, SQLiteTracer } from '../tracers/SQLiteTracer.js';
 import { StdioTracer } from '../tracers/StdioTracer.js';
@@ -349,14 +350,33 @@ export type VitestTestSuiteTracer<B extends OpContextBinding> = {
   setupVitestTestSuiteTracing(): void;
 };
 
-let _activeSuiteTracer: VitestTestTracer<OpContextBinding> | null = null;
+type ActiveVitestTestTracer = {
+  initTraceTestRun(options?: InitTraceTestRunOptions): void;
+  useTestSpan(): unknown;
+  getTracer(): unknown;
+  createVitestMock<T extends VitestModuleShape>(vitestModule: T): T;
+  describe(name: string, fn: () => void): unknown;
+  it(name: string, fn: () => void | Promise<void>): void;
+};
+
+let _activeSuiteTracer: ActiveVitestTestTracer | null = null;
+
+function createActiveVitestTestTracer<B extends OpContextBinding>(tracer: VitestTestTracer<B>): ActiveVitestTestTracer {
+  return {
+    initTraceTestRun: (options) => tracer.initTraceTestRun(options),
+    useTestSpan: () => tracer.useTestSpan(),
+    getTracer: () => tracer.getTracer(),
+    createVitestMock: (vitestModule) => tracer.createVitestMock(vitestModule),
+    describe: (name, fn) => tracer.describe(name, fn),
+    it: (name, fn) => tracer.it(name, fn),
+  };
+}
 
 export function installVitestTestTracing<B extends OpContextBinding>(
   tracer: VitestTestTracer<B>,
   options?: InitTraceTestRunOptions,
 ): void {
-  // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- suite-global helpers intentionally erase the concrete binding to the public base binding shape.
-  _activeSuiteTracer = tracer as unknown as VitestTestTracer<OpContextBinding>;
+  _activeSuiteTracer = createActiveVitestTestTracer(tracer);
   tracer.initTraceTestRun(options);
 }
 
@@ -595,7 +615,11 @@ export function initTraceTestRun<B extends OpContextBinding>(opContext: B, optio
 /** Get the current span context from AsyncLocalStorage (inside an it() block) */
 export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.useTestSpan();
+    const ctx = _activeSuiteTracer.useTestSpan();
+    if (!isSpanContext(ctx)) {
+      throw new Error('Active suite tracer returned a non-span context');
+    }
+    return ctx;
   }
 
   if (!_defaultHarness) {
@@ -607,7 +631,11 @@ export function useTestSpan(): SpanContext<OpContextOf<OpContextBinding>> {
 /** Get the root tracer instance */
 export function getTracer(): Tracer<OpContextBinding> {
   if (_activeSuiteTracer) {
-    return _activeSuiteTracer.getTracer();
+    const tracer = _activeSuiteTracer.getTracer();
+    if (!(tracer instanceof Tracer)) {
+      throw new Error('Active suite tracer returned a non-tracer');
+    }
+    return tracer;
   }
 
   if (!_defaultHarness) {

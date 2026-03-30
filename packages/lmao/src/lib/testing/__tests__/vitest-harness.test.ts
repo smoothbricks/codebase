@@ -3,7 +3,7 @@ import { defineOpContext } from '../../defineOpContext.js';
 import { S } from '../../schema/builder.js';
 import { defineLogSchema } from '../../schema/defineLogSchema.js';
 import { TestTracer } from '../../tracers/TestTracer.js';
-import { makeVitestTestTracer } from '../vitest-harness.js';
+import { getTracer, installVitestTestTracing, makeVitestTestTracer } from '../vitest-harness.js';
 
 const vitestBinding = defineOpContext({
   logSchema: defineLogSchema({ test_field: S.category() }),
@@ -15,5 +15,12 @@ describe('vitest harness tracer defaults', () => {
     tracer.initTraceTestRun();
 
     expect(tracer.getTracer()).toBeInstanceOf(TestTracer);
+  });
+
+  it('uses the installed suite tracer for the global tracer accessor', () => {
+    const tracer = makeVitestTestTracer({ binding: vitestBinding });
+    installVitestTestTracing(tracer);
+
+    expect(getTracer()).toBe(tracer.getTracer());
   });
 });
