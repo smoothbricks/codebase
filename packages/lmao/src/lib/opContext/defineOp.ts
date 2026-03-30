@@ -10,7 +10,7 @@
 import { intern, PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import { Op as OpClass } from '../op.js';
 import { getSpanBufferClass } from '../spanBuffer.js';
-import type { OpGroup } from './opGroupTypes.js';
+import type { OpGroup, OpGroupOps } from './opGroupTypes.js';
 import type { Op, OpFn, OpMetadata, OpsFromRecord } from './opTypes.js';
 import type { OpContext } from './types.js';
 
@@ -150,11 +150,11 @@ interface DefineOpFactoryConfig<Ctx extends OpContext> {
  * Factory function type for creating OpGroups.
  * Used by createDefineOps to delegate OpGroup creation.
  */
-type CreateOpGroupFn<Ctx extends OpContext> = (
+type CreateOpGroupFn<Ctx extends OpContext> = <Ops extends OpGroupOps<Ctx>>(
   logSchema: Ctx['logSchema'],
   flags: Ctx['flags'],
-  ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
-) => OpGroup<Ctx>;
+  ops: Ops,
+) => OpGroup<Ctx, Ops>;
 
 // =============================================================================
 // CREATE DEFINE OP
@@ -252,13 +252,13 @@ export function createDefineOps<Ctx extends OpContext>(
   createOpGroup: CreateOpGroupFn<Ctx>,
 ): <Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>>(
   definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>,
-) => OpGroup<Ctx> & OpsFromRecord<Ctx, Defs> {
+) => OpGroup<Ctx, OpsFromRecord<Ctx, Defs>> {
   // Get the defineOp function for wrapping raw functions
   const defineOp = createDefineOp<Ctx>(factoryConfig);
 
   return function defineOpsImpl<
     Defs extends Record<string, Op<Ctx, unknown[], unknown, unknown> | OpFn<Ctx, unknown[], unknown, unknown>>,
-  >(definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>): OpGroup<Ctx> & OpsFromRecord<Ctx, Defs> {
+  >(definitions: Defs & ThisType<OpsFromRecord<Ctx, Defs>>): OpGroup<Ctx, OpsFromRecord<Ctx, Defs>> {
     // Build the ops record by processing each definition.
     // Keep the runtime container broad, then narrow once we've populated every key.
     const ops: Record<string, Op<Ctx, unknown[], unknown, unknown>> = {};

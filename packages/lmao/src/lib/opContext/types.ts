@@ -399,5 +399,5 @@ export interface OpContextFactory<
       | OpFn<OpContext<T, FF, Deps, UserCtx>, unknown[], unknown, unknown>
       | Op<OpContext<T, FF, Deps, UserCtx>, unknown[], unknown, unknown>
     >,
-  >(definitions: Defs): OpGroup<OpContext<T, FF, Deps, UserCtx>> & OpsFromRecord<OpContext<T, FF, Deps, UserCtx>, Defs>;
+  >(definitions: Defs): OpGroup<OpContext<T, FF, Deps, UserCtx>, OpsFromRecord<OpContext<T, FF, Deps, UserCtx>, Defs>>;
 }

@@ -12,6 +12,7 @@
 import { describe, expect, it } from 'bun:test';
 import { defineOpContext } from '../defineOpContext.js';
 import { Op } from '../op.js';
+import type { OpContext } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 
@@ -19,6 +20,14 @@ const testSchema = defineLogSchema({
   userId: S.category(),
   endpoint: S.text(),
 });
+
+function requireOpContextBinding<Ctx extends OpContext, Args extends unknown[], S, E>(op: Op<Ctx, Args, S, E>) {
+  const binding = op._opContextBinding;
+  if (!binding) {
+    throw new Error('Expected Op to carry _opContextBinding');
+  }
+  return binding;
+}
 
 describe('Op._opContextBinding', () => {
   it('defineOp produces an Op with _opContextBinding set', () => {
@@ -33,7 +42,7 @@ describe('Op._opContextBinding', () => {
     const ctx = defineOpContext({ logSchema: testSchema });
     const op = ctx.defineOp('test-op', (ctx) => ctx.ok('done'));
 
-    const binding = op._opContextBinding!;
+    const binding = requireOpContextBinding(op);
     const fields = binding.logBinding.logSchema.fields;
 
     // WHY: user-defined fields should be present in the schema
@@ -51,14 +60,14 @@ describe('Op._opContextBinding', () => {
     const prefixed = ops.prefix('http');
 
     // WHY: after prefix, each Op in the group should still carry the same binding
-    const fetchOp = prefixed.fetch as Op<never, never[], never, never>;
-    const saveOp = prefixed.save as Op<never, never[], never, never>;
+    const fetchOp = prefixed.fetch;
+    const saveOp = prefixed.save;
 
     expect(fetchOp._opContextBinding).toBeDefined();
     expect(saveOp._opContextBinding).toBeDefined();
 
     // Binding should still reference the original schema fields
-    expect(fetchOp._opContextBinding!.logBinding.logSchema.fields).toHaveProperty('userId');
+    expect(requireOpContextBinding(fetchOp).logBinding.logSchema.fields).toHaveProperty('userId');
   });
 
   it('.mapColumns() preserves _opContextBinding', () => {
@@ -69,9 +78,9 @@ describe('Op._opContextBinding', () => {
 
     const mapped = ops.mapColumns({ userId: 'mapped_user' });
 
-    const fetchOp = mapped.fetch as Op<never, never[], never, never>;
+    const fetchOp = mapped.fetch;
     expect(fetchOp._opContextBinding).toBeDefined();
-    expect(fetchOp._opContextBinding!.logBinding.logSchema.fields).toHaveProperty('userId');
+    expect(requireOpContextBinding(fetchOp).logBinding.logSchema.fields).toHaveProperty('userId');
   });
 
   it('two Ops from the same defineOpContext share the same binding reference', () => {
@@ -101,7 +110,7 @@ describe('Op._opContextBinding', () => {
       grouped: (ctx) => ctx.ok('grouped'),
     });
 
-    const groupedOp = group.grouped as Op<never, never[], never, never>;
+    const groupedOp = group.grouped;
 
     // WHY: all Ops from one defineOpContext share the same binding reference
     expect(singleOp._opContextBinding).toBe(groupedOp._opContextBinding);
@@ -115,8 +124,8 @@ describe('Op._opContextBinding', () => {
     });
 
     const prefixed = group.prefix('http');
-    const fetchOp = prefixed.fetch as Op<never, never[], never, never>;
-    const saveOp = prefixed.save as Op<never, never[], never, never>;
+    const fetchOp = prefixed.fetch;
+    const saveOp = prefixed.save;
 
     // WHY: prefix creates new Op instances but preserves the binding reference
     expect(fetchOp._opContextBinding).toBe(saveOp._opContextBinding);

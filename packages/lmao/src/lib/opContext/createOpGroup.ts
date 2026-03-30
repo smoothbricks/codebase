@@ -27,17 +27,20 @@ import type {
   MappedSchema,
   OpGroup,
   OpGroupInternal,
+  OpGroupOps,
   PrefixedSchema,
   SchemaFieldsOf,
 } from './opGroupTypes.js';
 import { validateOpName } from './opGroupTypes.js';
 import type { OpContext } from './types.js';
 
-type OpRecord<Ctx extends OpContext> = Record<string, Op<Ctx, unknown[], unknown, unknown>>;
-
 // =============================================================================
 // INTERNAL HELPERS
 // =============================================================================
+
+function getSchemaFields<Schema extends { readonly fields: SchemaFields }>(fieldsSchema: Schema): Schema['fields'] {
+  return fieldsSchema.fields;
+}
 
 /**
  * Create reverse mapping for RemappedBufferView.
@@ -62,15 +65,36 @@ function isOpInstance<Ctx extends OpContext>(value: unknown): value is Op<Ctx, u
 }
 
 function copyOpsWithView<Ctx extends OpContext>(
-  source: Record<string, unknown>,
+  source: OpGroupOps<Ctx>,
   target: Record<string, unknown>,
   remappedViewClass: ReturnType<typeof generateRemappedBufferViewClass>,
-): void {
+) {
   for (const [key, value] of Object.entries(source)) {
     if (isOpInstance<Ctx>(value)) {
       target[key] = new Op(value.metadata, value.SpanBufferClass, value.fn, remappedViewClass, value._opContextBinding);
     }
   }
+}
+
+function assertGroupCarriesOps<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>>(
+  group: Record<string, unknown>,
+  ops: Ops,
+): asserts group is Record<string, unknown> & Ops {
+  for (const name of Object.keys(ops)) {
+    if (!isOpInstance<Ctx>(group[name])) {
+      throw new TypeError(`Expected OpGroup to expose op '${name}' as an Op instance`);
+    }
+  }
+}
+
+function cloneOpsWithView<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>>(
+  source: Ops,
+  remappedViewClass: ReturnType<typeof generateRemappedBufferViewClass>,
+): Ops {
+  const cloned: Record<string, unknown> = {};
+  copyOpsWithView<Ctx>(source, cloned, remappedViewClass);
+  assertGroupCarriesOps<Ctx, Ops>(cloned, source);
+  return cloned;
 }
 
 function prefixContributedSchema<T extends SchemaFields, P extends string>(fields: T, prefix: P): PrefixedSchema<T, P> {
@@ -207,20 +231,22 @@ function validateAllOpNames(ops: Record<string, unknown>): void {
  * Internal properties use underscore prefix (_logSchema, _flags) to avoid
  * collision with user-defined op names.
  */
-class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
+class OpGroupImpl<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>> implements OpGroupInternal<Ctx, Ops> {
   // Allow dynamic op properties (ops spread as own properties in constructor)
   [key: string]: unknown;
 
   // Private field - truly hidden, doesn't affect hidden class or enumeration
   readonly #columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>;
+  readonly #ops: Ops;
 
   constructor(
     readonly _logSchema: Ctx['logSchema'],
     readonly _flags: Ctx['flags'],
-    ops: OpRecord<Ctx>,
+    ops: Ops,
     columnMapping?: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>,
   ) {
     this.#columnMapping = columnMapping ?? {};
+    this.#ops = ops;
 
     // Validate op names before spreading
     validateAllOpNames(ops);
@@ -232,7 +258,7 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
     }
   }
 
-  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<SchemaFieldsOf<Ctx['logSchema']>, P>> {
+  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<Ctx['logSchema']['fields'], P>, Ops> {
     // Apply prefix to the current mapping
     // Check if mapping is non-empty (empty object {} is truthy but has no entries)
     const hasMapping = this.#columnMapping && Object.keys(this.#columnMapping).length > 0;
@@ -246,22 +272,21 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
     const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
 
     // Create new OpGroup with prefixed ops
-    const newGroup = new MappedOpGroupImpl(
+    const newGroup = new MappedOpGroupImpl<Ctx, PrefixedSchema<Ctx['logSchema']['fields'], P>, Ops>(
       this._logSchema,
       this._flags,
-      {},
+      cloneOpsWithView<Ctx, Ops>(this.#ops, remappedViewClass),
       newMapping,
-      prefixContributedSchema(this._logSchema.fields, p),
+      prefixContributedSchema<Ctx['logSchema']['fields'], P>(getSchemaFields(this._logSchema), p),
     );
 
-    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
-
+    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
     return newGroup;
   }
 
-  mapColumns<M extends ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>>(
+  mapColumns<M extends ColumnMapping<Ctx['logSchema']['fields']>>(
     mapping: M,
-  ): MappedOpGroup<Ctx, MappedSchema<SchemaFieldsOf<Ctx['logSchema']>, M>> {
+  ): MappedOpGroup<Ctx, MappedSchema<Ctx['logSchema']['fields'], M>, Ops> {
     // Override/extend the existing mapping with new mapping
     const newMapping = { ...this.#columnMapping, ...mapping };
 
@@ -270,13 +295,21 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
     const remappedViewClass = generateRemappedBufferViewClass(reverseMapping);
 
     // Build contributed schema from original fields with new mapping
-    const newContributed = buildContributedSchema(this._logSchema.fields, newMapping);
+    const newContributed = buildContributedSchema<Ctx['logSchema']['fields'], M>(
+      getSchemaFields(this._logSchema),
+      newMapping,
+    );
 
     // Create new OpGroup with mapped ops
-    const newGroup = new MappedOpGroupImpl(this._logSchema, this._flags, {}, newMapping, newContributed);
+    const newGroup = new MappedOpGroupImpl<Ctx, MappedSchema<Ctx['logSchema']['fields'], M>, Ops>(
+      this._logSchema,
+      this._flags,
+      cloneOpsWithView<Ctx, Ops>(this.#ops, remappedViewClass),
+      newMapping,
+      newContributed,
+    );
 
-    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
-
+    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
     return newGroup;
   }
 }
@@ -293,22 +326,24 @@ class OpGroupImpl<Ctx extends OpContext> implements OpGroupInternal<Ctx> {
  *
  * Internal properties use underscore prefix to avoid collision with op names.
  */
-class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaFields>
-  implements MappedOpGroupInternal<Ctx, ContributedSchema>
+class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaFields, Ops extends OpGroupOps<Ctx>>
+  implements MappedOpGroupInternal<Ctx, ContributedSchema, Ops>
 {
   // Allow dynamic op properties (ops spread as own properties in constructor)
   [key: string]: unknown;
 
   readonly #columnMapping: Record<string, string | null | undefined>;
+  readonly #ops: Ops;
 
   constructor(
     readonly _logSchema: Ctx['logSchema'],
     readonly _flags: Ctx['flags'],
-    ops: OpRecord<Ctx>,
+    ops: Ops,
     readonly _columnMapping: ColumnMapping<SchemaFieldsOf<Ctx['logSchema']>>,
     readonly _contributedSchema: ContributedSchema,
   ) {
     this.#columnMapping = _columnMapping;
+    this.#ops = ops;
 
     // Validate op names before spreading
     validateAllOpNames(ops);
@@ -319,7 +354,7 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
     }
   }
 
-  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>> {
+  prefix<P extends string>(p: P): MappedOpGroup<Ctx, PrefixedSchema<ContributedSchema, P>, Ops> {
     // Apply prefix to the current mapping's target names
     const newMapping = prefixMapping(this.#columnMapping, p);
 
@@ -331,16 +366,21 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
     const newContributed = prefixContributedSchema(this._contributedSchema, p);
 
     // Create new MappedOpGroup
-    const newGroup = new MappedOpGroupImpl(this._logSchema, this._flags, {}, newMapping, newContributed);
+    const newGroup = new MappedOpGroupImpl<Ctx, PrefixedSchema<ContributedSchema, P>, Ops>(
+      this._logSchema,
+      this._flags,
+      cloneOpsWithView<Ctx, Ops>(this.#ops, remappedViewClass),
+      newMapping,
+      newContributed,
+    );
 
-    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
-
+    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
     return newGroup;
   }
 
   mapColumns<M extends ColumnMapping<ContributedSchema>>(
     mapping: M,
-  ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>> {
+  ): MappedOpGroup<Ctx, MappedSchema<ContributedSchema, M>, Ops> {
     // Override/extend the existing mapping
     const newMapping = { ...this.#columnMapping, ...mapping };
 
@@ -352,10 +392,15 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
     const newContributed = buildContributedSchema(this._contributedSchema, mapping);
 
     // Create new MappedOpGroup
-    const newGroup = new MappedOpGroupImpl(this._logSchema, this._flags, {}, newMapping, newContributed);
+    const newGroup = new MappedOpGroupImpl<Ctx, MappedSchema<ContributedSchema, M>, Ops>(
+      this._logSchema,
+      this._flags,
+      cloneOpsWithView<Ctx, Ops>(this.#ops, remappedViewClass),
+      newMapping,
+      newContributed,
+    );
 
-    copyOpsWithView<Ctx>(this, newGroup, remappedViewClass);
-
+    assertGroupCarriesOps<Ctx, Ops>(newGroup, this.#ops);
     return newGroup;
   }
 }
@@ -400,10 +445,12 @@ class MappedOpGroupImpl<Ctx extends OpContext, ContributedSchema extends SchemaF
  * // Columns become: http_status, http_url, http_duration, etc.
  * ```
  */
-export function createOpGroup<Ctx extends OpContext>(
+export function createOpGroup<Ctx extends OpContext, Ops extends OpGroupOps<Ctx>>(
   logSchema: Ctx['logSchema'],
   flags: Ctx['flags'],
-  ops: Record<string, Op<Ctx, unknown[], unknown, unknown>>,
-): OpGroup<Ctx> {
-  return new OpGroupImpl(logSchema, flags, ops);
+  ops: Ops,
+): OpGroup<Ctx, Ops> {
+  const group = new OpGroupImpl<Ctx, Ops>(logSchema, flags, ops);
+  assertGroupCarriesOps<Ctx, Ops>(group, ops);
+  return group;
 }

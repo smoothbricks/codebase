@@ -200,15 +200,6 @@ function isTracerForBinding<B extends OpContextBinding>(value: unknown, binding:
   );
 }
 
-function isTracerForBinding<B extends OpContextBinding>(value: unknown, binding: B): value is Tracer<B> {
-  const logBinding = typeof value === 'object' && value !== null ? Reflect.get(value, 'logBinding') : null;
-  return (
-    typeof logBinding === 'object' &&
-    logBinding !== null &&
-    Reflect.get(logBinding, 'logSchema') === binding.logBinding.logSchema
-  );
-}
-
 function isVerboseTraceEnabled(explicitVerbose: boolean | undefined): boolean {
   if (explicitVerbose !== undefined) {
     return explicitVerbose;
