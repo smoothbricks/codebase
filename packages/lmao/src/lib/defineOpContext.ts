@@ -216,6 +216,10 @@ function buildOpContextFactory<
     remappedViewClass: undefined,
   };
 
+  // WHY: build the binding first so Ops created by defineOp carry it via _opContextBinding.
+  // This enables downstream consumers (defineAgentOps, OpRegistry) to extract the LMAO schema.
+  const opContextBinding = { logBinding, flags, ctxDefaults, deps };
+
   // Create the defineOp and defineOps functions bound to this config.
   // CRITICAL: Use mergedSchema (with system columns), not just the app schema, because
   // runtime SpanBuffer generation needs the full row shape even though public factory.logSchema
@@ -223,10 +227,11 @@ function buildOpContextFactory<
   const defineOp = createDefineOp<OpContext<typeof mergedSchema, FF, Deps, UserCtx>>({
     logSchema: mergedSchema,
     flags,
+    opContextBinding,
   });
 
   const defineOps = createDefineOps<OpContext<typeof mergedSchema, FF, Deps, UserCtx>>(
-    { logSchema: mergedSchema, flags },
+    { logSchema: mergedSchema, flags, opContextBinding },
     createOpGroup,
   );
 

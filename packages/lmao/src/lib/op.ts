@@ -16,7 +16,7 @@
 import type { PreEncodedEntry } from '@smoothbricks/arrow-builder';
 import type { RemappedViewConstructor } from './logBinding.js';
 import type { SpanContext } from './opContext/spanContextTypes.js';
-import type { OpContext } from './opContext/types.js';
+import type { OpContext, OpContextBinding } from './opContext/types.js';
 import type { Result } from './result.js';
 import type { SpanBufferConstructor } from './spanBuffer.js';
 
@@ -93,5 +93,11 @@ export class Op<Ctx extends OpContext, Args extends unknown[], S, E> {
     readonly fn: (ctx: SpanContext<Ctx>, ...args: Args) => Result<S, E> | Promise<Result<S, E>>,
     /** Only set for prefixed ops - wraps child buffers during registration */
     readonly remappedViewClass?: RemappedViewConstructor,
+    /**
+     * WHY: Carries the OpContextBinding from the factory that created this Op.
+     * Enables downstream consumers (defineAgentOps, OpRegistry) to extract the
+     * LMAO schema for context merging and conflict detection.
+     */
+    readonly _opContextBinding?: OpContextBinding,
   ) {}
 }

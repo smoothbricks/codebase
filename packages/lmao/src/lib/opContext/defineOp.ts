@@ -142,6 +142,8 @@ export function extractMetadataFromStack(skipFrames = 2): OpMetadata {
 interface DefineOpFactoryConfig<Ctx extends OpContext> {
   readonly logSchema: Ctx['logSchema'];
   readonly flags: Ctx['flags'];
+  /** WHY: threaded to Op._opContextBinding so downstream can extract schema */
+  readonly opContextBinding?: import('./types.js').OpContextBinding;
 }
 
 /**
@@ -201,7 +203,7 @@ export function createDefineOp<Ctx extends OpContext>(
     // - Handles exceptions with span-exception
     // Why SpanBufferClass: All ops from same defineOpContext share this class for stats coordination
     // Why undefined for remappedViewClass: Only prefixed ops need remapping - set by .prefix() method
-    return new OpClass(finalMetadata, SpanBufferClass, fn, undefined);
+    return new OpClass(finalMetadata, SpanBufferClass, fn, undefined, factoryConfig.opContextBinding);
   };
 }
 
