@@ -16,14 +16,17 @@ import type { OpContextBinding } from '../opContext/types.js';
 import { S } from '../schema/builder.js';
 import { defineLogSchema } from '../schema/defineLogSchema.js';
 
-// WHY: MappedOpGroup types don't carry named op properties, but ops are
-// spread as own properties at runtime. This accessor type lets us reach them.
-type OpRecord = Record<string, { _opContextBinding?: OpContextBinding }>;
-
 const testSchema = defineLogSchema({
   userId: S.category(),
   endpoint: S.text(),
 });
+
+function requireBinding(binding: OpContextBinding | undefined, label: string): OpContextBinding {
+  if (!binding) {
+    throw new Error(`Expected ${label} to have an _opContextBinding`);
+  }
+  return binding;
+}
 
 describe('Op._opContextBinding', () => {
   it('defineOp produces an Op with _opContextBinding set', () => {
@@ -38,7 +41,7 @@ describe('Op._opContextBinding', () => {
     const ctx = defineOpContext({ logSchema: testSchema });
     const op = ctx.defineOp('test-op', (ctx) => ctx.ok('done'));
 
-    const binding = op._opContextBinding!;
+    const binding = requireBinding(op._opContextBinding, 'op');
     const fields = binding.logBinding.logSchema.fields;
 
     // WHY: user-defined fields should be present in the schema
@@ -55,18 +58,16 @@ describe('Op._opContextBinding', () => {
 
     const prefixed = ops.prefix('http');
 
-    // WHY: bracket access — MappedOpGroup types don't carry named op properties,
-    // but ops are spread as own properties at runtime
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
-    const fetchOp = (prefixed as unknown as OpRecord).fetch;
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
-    const saveOp = (prefixed as unknown as OpRecord).save;
+    const fetchOp = prefixed.fetch;
+    const saveOp = prefixed.save;
 
     expect(fetchOp._opContextBinding).toBeDefined();
     expect(saveOp._opContextBinding).toBeDefined();
 
     // Binding should still reference the original schema fields
-    expect(fetchOp._opContextBinding!.logBinding.logSchema.fields).toHaveProperty('userId');
+    expect(requireBinding(fetchOp._opContextBinding, 'prefixed.fetch').logBinding.logSchema.fields).toHaveProperty(
+      'userId',
+    );
   });
 
   it('.mapColumns() preserves _opContextBinding', () => {
@@ -77,11 +78,11 @@ describe('Op._opContextBinding', () => {
 
     const mapped = ops.mapColumns({ userId: 'mapped_user' });
 
-    // WHY: bracket access — MappedOpGroup types don't carry named op properties
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
-    const fetchOp = (mapped as unknown as OpRecord).fetch;
+    const fetchOp = mapped.fetch;
     expect(fetchOp._opContextBinding).toBeDefined();
-    expect(fetchOp._opContextBinding!.logBinding.logSchema.fields).toHaveProperty('userId');
+    expect(requireBinding(fetchOp._opContextBinding, 'mapped.fetch').logBinding.logSchema.fields).toHaveProperty(
+      'userId',
+    );
   });
 
   it('two Ops from the same defineOpContext share the same binding reference', () => {
@@ -125,11 +126,8 @@ describe('Op._opContextBinding', () => {
     });
 
     const prefixed = group.prefix('http');
-    // WHY: bracket access — MappedOpGroup types don't carry named op properties
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
-    const fetchOp = (prefixed as unknown as OpRecord).fetch;
-    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- WHY: MappedOpGroup runtime properties not reflected in types
-    const saveOp = (prefixed as unknown as OpRecord).save;
+    const fetchOp = prefixed.fetch;
+    const saveOp = prefixed.save;
 
     // WHY: prefix creates new Op instances but preserves the binding reference
     expect(fetchOp._opContextBinding).toBe(saveOp._opContextBinding);

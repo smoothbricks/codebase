@@ -244,8 +244,11 @@ describe('EvaluatorGenerator', () => {
       expect(scope).toBe(spanBuffer._scopeValues);
       expect(scope.requestId).toBe('req-123');
 
-      const requestId: string | undefined = scope.requestId;
-      expect(requestId).toBe('req-123');
+      expect(typeof scope.requestId).toBe('string');
+      if (typeof scope.requestId === 'string') {
+        const requestId = scope.requestId;
+        expect(requestId).toBe('req-123');
+      }
     });
 
     test('flag access is deduplicated via buffer scan', () => {

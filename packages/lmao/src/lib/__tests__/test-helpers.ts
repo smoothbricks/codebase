@@ -21,7 +21,7 @@ import type {
 import type { OpMetadata } from '../opContext/opTypes.js';
 import type { OpContext } from '../opContext/types.js';
 import { LogSchema } from '../schema/LogSchema.js';
-import { mergeWithSystemSchema } from '../schema/systemSchema.js';
+import { mergeWithSystemSchema, type SystemSchemaFieldTypes } from '../schema/systemSchema.js';
 import type { SchemaFields } from '../schema/types.js';
 import { createSpanBuffer } from '../spanBuffer.js';
 import { createTraceId, type TraceId } from '../traceId.js';
@@ -157,9 +157,9 @@ export function createTestOpMetadata(overrides: Partial<OpMetadata> = {}): OpMet
  * Create a LogSchema with system fields merged for testing.
  * Use this when calling createSpanBuffer directly in tests.
  */
-export function createTestSchema<T extends SchemaFields>(fields: T): LogSchema<T> {
+export function createTestSchema<T extends SchemaFields>(fields: T): LogSchema<SystemSchemaFieldTypes & T> {
   const merged = mergeWithSystemSchema(fields);
-  return new LogSchema(merged as T);
+  return new LogSchema(merged);
 }
 
 /**
@@ -209,7 +209,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
     trace_id?: TraceId;
     capacity?: number;
   },
-): TestSpanBufferBundle<T>;
+): TestSpanBufferBundle<SystemSchemaFieldTypes & T>;
 export function createTestSpanBuffer<T extends SchemaFields>(
   schema: T | LogSchema<T>,
   options: {
@@ -218,7 +218,7 @@ export function createTestSpanBuffer<T extends SchemaFields>(
   } = {},
 ) {
   // Wrap in LogSchema if plain SchemaFields provided
-  const logSchema: LogSchema<T> = schema instanceof LogSchema ? schema : createTestSchema(schema);
+  const logSchema = schema instanceof LogSchema ? schema : createTestSchema(schema);
 
   // Create LogBinding (stats are on SpanBufferClass.stats, not LogBinding)
   const logBinding = createTestLogBinding(logSchema);

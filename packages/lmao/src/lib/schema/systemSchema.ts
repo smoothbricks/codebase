@@ -20,7 +20,7 @@ import { LogSchema, type Schema } from './types.js';
 /**
  * System schema field type - explicit type to avoid Sury's internal brand symbol leaking.
  */
-interface SystemSchemaFieldTypes extends Record<string, Schema<unknown>> {
+export interface SystemSchemaFieldTypes extends Record<string, Schema<unknown>> {
   message: EagerCategorySchema;
   line: LazyNumberSchema;
   error_code: LazyCategorySchema;
