@@ -81,6 +81,12 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Bundle related generics when possible.** If multiple generic parameters always travel together, prefer one bundled
   type parameter/object over a long generic list.
   - WHY: bundled generics preserve inference and prevent APIs from collapsing into cast-heavy call sites.
+- **Proper generic defaults for type inference.** When a generic has a known shape but needs to allow inference:
+  - Use `State = unknown` instead of `State = Record<string, unknown>` to allow type inference from init()
+  - Use `Def = AnyEventSchema` instead of unconstrained generics to carry schema definitions
+  - Use conditional types with `infer` to extract actual types from definition structures
+  - Avoid broad constraints that erase type information (e.g., `extends Record<string, unknown>` on defaults)
+  - WHY: defaults like `Record<string, unknown>` prevent inference; `unknown` allows the actual type to flow through
 - **Typia is the default validation system.** Never hand-write `isRecord`, `typeof` guards, or similar for data that
   crosses a trust boundary — use Typia instead.
   - parsed/runtime value boundary -> `typia.assert/validate/assertEquals/validateEquals`
