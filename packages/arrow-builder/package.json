@@ -39,6 +39,7 @@
     "sourceRoot": "packages/arrow-builder/src",
     "projectType": "library",
     "targets": {
+      "lint": {},
       "build": {
         "executor": "nx:run-commands",
         "options": {

@@ -131,6 +131,7 @@
     "sourceRoot": "packages/lmao/src",
     "projectType": "library",
     "targets": {
+      "lint": {},
       "typecheck": {
         "dependsOn": [
           "build",

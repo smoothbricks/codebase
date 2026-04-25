@@ -9,6 +9,11 @@
   "scripts": {
     "test": "bun test"
   },
+  "nx": {
+    "targets": {
+      "lint": {}
+    }
+  },
   "exports": {
     "./package.json": "./package.json",
     ".": {

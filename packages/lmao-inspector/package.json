@@ -38,6 +38,9 @@
   "nx": {
     "sourceRoot": "packages/lmao-inspector/src",
     "projectType": "library",
+    "targets": {
+      "lint": {}
+    },
     "tags": [
       "npm:public"
     ]
