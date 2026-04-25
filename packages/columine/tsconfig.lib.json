@@ -3,9 +3,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@smoothbricks/validation": [
-        "../validation/src/index.ts"
-      ]
+      "@smoothbricks/validation": ["../validation/src/index.ts"]
     },
     "outDir": "./dist",
     "rootDir": "./src",
@@ -14,15 +12,10 @@
     "emitDeclarationOnly": false,
     "declaration": true,
     "sourceMap": true,
-    "lib": [
-      "es2022",
-      "webworker"
-    ],
+    "lib": ["es2022", "webworker"],
     "types": []
   },
-  "include": [
-    "src/**/*.ts"
-  ],
+  "include": ["src/**/*.ts"],
   "exclude": [
     "node_modules",
     "dist",

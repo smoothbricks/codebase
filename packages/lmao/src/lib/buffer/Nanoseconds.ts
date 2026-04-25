@@ -39,7 +39,14 @@
  * A `bigint` with a compile-time brand that prevents accidental mixing of time units.
  * The brand is erased at runtime, so there is zero overhead.
  */
-export type Nanoseconds = bigint & { readonly __brand: 'Nanoseconds' };
+declare const nanosecondsBrand: unique symbol;
+
+export type Nanoseconds = bigint & { readonly [nanosecondsBrand]: 'Nanoseconds' };
+
+function toNanoseconds(value: bigint): Nanoseconds;
+function toNanoseconds(value: bigint): bigint {
+  return value;
+}
 
 /**
  * Utility functions for working with Nanoseconds
@@ -71,7 +78,7 @@ export namespace Nanoseconds {
     // with sub-millisecond precision (e.g., 1702789123456.789)
     // Convert to microseconds first (safe as Number), then to nanoseconds as BigInt
     const epochMicros = Math.round((performance.timeOrigin + performance.now()) * 1000);
-    return (BigInt(epochMicros) * 1000n) as Nanoseconds;
+    return toNanoseconds(BigInt(epochMicros) * 1000n);
   }
 
   /**
@@ -86,7 +93,7 @@ export namespace Nanoseconds {
    * ```
    */
   export function fromMillis(millis: number): Nanoseconds {
-    return (BigInt(Math.trunc(millis)) * 1_000_000n) as Nanoseconds;
+    return toNanoseconds(BigInt(Math.trunc(millis)) * 1_000_000n);
   }
 
   /**
@@ -99,7 +106,7 @@ export namespace Nanoseconds {
    * @returns Branded Nanoseconds value
    */
   export function unsafe(value: bigint): Nanoseconds {
-    return value as Nanoseconds;
+    return toNanoseconds(value);
   }
 
   /**

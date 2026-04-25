@@ -3,9 +3,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@smoothbricks/validation": [
-        "../validation/src/index.ts"
-      ]
+      "@smoothbricks/validation": ["../validation/src/index.ts"]
     },
     "rootDir": "src",
     "outDir": "dist",
@@ -14,13 +12,8 @@
     "forceConsistentCasingInFileNames": true,
     "types": []
   },
-  "include": [
-    "src/**/*.ts"
-  ],
-  "exclude": [
-    "src/**/*.test.ts",
-    "src/**/__tests__/**"
-  ],
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/*.test.ts", "src/**/__tests__/**"],
   "references": [
     {
       "path": "../validation/tsconfig.lib.json"

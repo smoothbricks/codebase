@@ -36,7 +36,7 @@ const textDecoder = new TextDecoder();
 export class TraceRoot implements ITraceRoot {
   /**
    * Raw backing buffer containing anchor timestamps and trace_id.
-     */
+   */
   readonly _system: ArrayBuffer;
 
   /**
@@ -95,7 +95,7 @@ export class TraceRoot implements ITraceRoot {
 
   /**
    * High-resolution timer anchor when trace was created.
-     */
+   */
   get anchorPerfNow(): number {
     return this._perfView[0];
   }

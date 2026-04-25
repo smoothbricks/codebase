@@ -3,19 +3,14 @@
   "compilerOptions": {
     "baseUrl": ".",
     "rootDir": "src",
-    "types": [
-      "bun"
-    ],
+    "types": ["bun"],
     "composite": true,
     "declaration": true,
     "declarationMap": true,
     "outDir": "dist-test",
     "tsBuildInfoFile": "dist-test/tsconfig.test.tsbuildinfo"
   },
-  "include": [
-    "src/**/*.test.ts",
-    "src/**/__tests__/*.ts"
-  ],
+  "include": ["src/**/*.test.ts", "src/**/__tests__/*.ts"],
   "references": [
     {
       "path": "../lmao/tsconfig.lib.json"

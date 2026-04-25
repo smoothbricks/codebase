@@ -3,31 +3,21 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@smoothbricks/validation": [
-        "../validation/src/index.ts"
-      ]
+      "@smoothbricks/validation": ["../validation/src/index.ts"]
     },
     "rootDir": "src",
     "outDir": "dist",
     "tsBuildInfoFile": "dist/tsconfig.lib.tsbuildinfo",
     "emitDeclarationOnly": false,
     "forceConsistentCasingInFileNames": true,
+    "types": [],
     "jsx": "react-jsx",
-    "lib": [
-      "es2022",
-      "dom"
-    ],
+    "lib": ["es2022", "dom"],
     "module": "esnext",
     "moduleResolution": "bundler"
   },
-  "include": [
-    "src/**/*.ts",
-    "src/**/*.tsx"
-  ],
-  "exclude": [
-    "src/**/*.test.ts",
-    "src/**/*.test.tsx"
-  ],
+  "include": ["src/**/*.ts", "src/**/*.tsx"],
+  "exclude": ["src/**/*.test.ts", "src/**/*.test.tsx"],
   "references": [
     {
       "path": "../validation/tsconfig.lib.json"

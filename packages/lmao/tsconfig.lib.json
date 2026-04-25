@@ -3,9 +3,7 @@
   "compilerOptions": {
     "baseUrl": ".",
     "paths": {
-      "@smoothbricks/validation": [
-        "../validation/src/index.ts"
-      ]
+      "@smoothbricks/validation": ["../validation/src/index.ts"]
     },
     "rootDir": "src",
     "outDir": "dist",
@@ -13,21 +11,12 @@
     "emitDeclarationOnly": false,
     "forceConsistentCasingInFileNames": true,
     "types": [],
-    "lib": [
-      "es2022",
-      "webworker"
-    ],
+    "lib": ["es2022", "webworker"],
     "skipLibCheck": true,
     "customConditions": []
   },
-  "include": [
-    "src/**/*.ts"
-  ],
-  "exclude": [
-    "src/**/__tests__/**",
-    "src/**/*.test.ts",
-    "src/**/*.spec.ts"
-  ],
+  "include": ["src/**/*.ts"],
+  "exclude": ["src/**/__tests__/**", "src/**/*.test.ts", "src/**/*.spec.ts"],
   "references": [
     {
       "path": "../validation/tsconfig.lib.json"

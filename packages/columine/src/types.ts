@@ -184,7 +184,7 @@ export enum ErrorCode {
 // Bytecode Constants
 // =============================================================================
 
-export const MAGIC = 0x314D4C43; // "CLM1"
+export const MAGIC = 0x314d4c43; // "CLM1"
 export const HEADER_SIZE = 14;
 /** Reserved bytes at program start for SHA-256 hash (content starts at offset 32) */
 export const PROGRAM_HASH_PREFIX = 32;
