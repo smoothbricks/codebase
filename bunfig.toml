@@ -1,5 +1,5 @@
 [install]
-linker = "hoisted"
+linker = "isolated"
 
 [run]
 preload = ["@smoothbricks/validation/bun/preload", "./packages/lmao/src/bun/preload.ts"]

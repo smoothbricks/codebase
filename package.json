@@ -2,7 +2,7 @@
   "name": "@smoothbricks/codebase",
   "version": "0.0.0",
   "private": true,
-  "packageManager": "bun@1.3.11",
+  "packageManager": "bun@1.3.13",
   "engines": {
     "node": ">=24.0.0"
   },
@@ -45,7 +45,7 @@
     "show:tree": "tree --gitignore -d",
     "update:devenv": "cd tooling/direnv; devenv update",
     "update:npm:interactive": "bunx npm-check-updates -i",
-    "update:nixpkgs-overlay": "cd tooling/direnv/nixpkgs-overlay && nix run github:berberman/nvfetcher"
+    "update:nixpkgs-overlay": "cd tooling/direnv/nixpkgs-overlay && nix shell nixpkgs#nvfetcher -c nvfetcher"
   },
   "workspaces": [
     "packages/*",
