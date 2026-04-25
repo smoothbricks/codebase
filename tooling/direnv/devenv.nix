@@ -8,6 +8,10 @@
 # https://devenv.sh/inputs/
 let
   git-format-staged = inputs.git-format-staged.packages.${pkgs.stdenv.system}.default;
+  zig =
+    if pkgs.stdenv.isDarwin
+    then inputs.zig.packages.${pkgs.stdenv.system}.brew."0.16.0"
+    else inputs.zig.packages.${pkgs.stdenv.system}."0.16.0";
 in {
   # https://devenv.sh/overlays/
   overlays = [

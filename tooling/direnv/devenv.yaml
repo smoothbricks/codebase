@@ -10,3 +10,6 @@ inputs:
   git-format-staged:
     url: github:smoothbricks/git-format-staged
     flake: true
+  zig:
+    url: github:mitchellh/zig-overlay
+    flake: true

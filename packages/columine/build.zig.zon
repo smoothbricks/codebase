@@ -4,22 +4,22 @@
     .version = "0.0.0",
     // Unique fingerprint for this package
     .fingerprint = 0x4050e82ce1a0e7b2, // Changing this has security and trust implications.
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     // zig-msgpack for serializing data to/from msgpack format in the reducer
     // simdjzon: SIMD JSON parser for native targets (x86_64, aarch64).
     // WASM targets use std.json.Scanner fallback (simdjzon requires 64-bit SIMD).
     .dependencies = .{
         .zig_msgpack = .{
             .url = "https://github.com/zigcc/zig-msgpack/archive/main.tar.gz",
-            .hash = "zig_msgpack-0.0.14-evvueGolBQBs_m726tBf4ISJQqC926AM96EtxZy9LUaI",
+            .hash = "zig_msgpack-0.0.14-evvueEc7BQATytDqy8wFvDb883Jv3yLk_8cF5EoYaKFB",
         },
         .simdjzon = .{
-            .url = "git+https://github.com/travisstaloch/simdjzon#7c586bada71603a3a28e0f63dbb81cfd5dbb4619",
-            .hash = "simdjzon-0.0.1-7uNSgHJ_BQDkK6pvdhXPjeGkqSxQw_hy7TlA1USZ7Ala",
+            .url = "git+https://github.com/smoothbricks/simdjzon#d53d9b301fefd2cdf3327ff65b3b9f5771ba680d",
+            .hash = "simdjzon-0.0.1-7uNSgOOABQDE9lo1T3fgUBuki3LvKcGWnt6u0hMuhFte",
         },
         .rawr = .{
-            .url = "git+https://github.com/smoothbricks/rawr#5166e12cac5c6da6a03f2c70b9a3f716fd80bb57",
-            .hash = "rawr-0.0.1-qsnO1N2TBQCubp8dKbK97A60Wm--IjWadsnXwgiWVDmw",
+            .url = "git+https://github.com/smoothbricks/rawr#75619edcc8a2255d01a8dd89c844065794ab7775",
+            .hash = "rawr-0.0.1-qsnO1BKVBQDRI9Xva2zO5b8CyEhtLsO16R-VJ-pCl4tu",
         },
     },
     .paths = .{

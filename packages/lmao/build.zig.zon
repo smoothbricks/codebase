@@ -2,7 +2,7 @@
     .name = .lmao_wasm,
     .version = "0.0.1",
     .fingerprint = 0xf17c7f521e82566e, // Generated fingerprint for lmao package
-    .minimum_zig_version = "0.15.2",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
         "build.zig",
