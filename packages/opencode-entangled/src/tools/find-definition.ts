@@ -1,8 +1,8 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZString, z } from '../tool-schema.js';
 
-export function createFindDefinitionTool(index: BlockIndex) {
-  return {
+export function createFindDefinitionTool(index: BlockIndex): InternalTool<{ blockName: ZString }> {
+  return defineTool({
     name: 'entangled_find_definition',
     description: 'Find where a named block is defined — returns file, line, and content',
     parameters: z.object({
@@ -27,5 +27,5 @@ export function createFindDefinitionTool(index: BlockIndex) {
         metadata: { found: true },
       };
     },
-  };
+  });
 }

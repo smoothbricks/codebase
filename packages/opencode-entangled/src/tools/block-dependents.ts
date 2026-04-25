@@ -1,8 +1,8 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZString, z } from '../tool-schema.js';
 
-export function createBlockDependentsTool(index: BlockIndex) {
-  return {
+export function createBlockDependentsTool(index: BlockIndex): InternalTool<{ blockName: ZString }> {
+  return defineTool({
     name: 'entangled_block_dependents',
     description: 'Find all blocks that depend on a named block (transitive reverse dependency graph)',
     parameters: z.object({
@@ -20,5 +20,5 @@ export function createBlockDependentsTool(index: BlockIndex) {
         metadata: { count: deps.length },
       };
     },
-  };
+  });
 }

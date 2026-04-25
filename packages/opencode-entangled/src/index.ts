@@ -7,11 +7,11 @@ import { readFile as nodeReadFile, writeFile as nodeWriteFile, readdir } from 'n
 import { join, relative } from 'node:path';
 import type { Plugin, PluginModule } from '@opencode-ai/plugin';
 import { type ToolDefinition, tool } from '@opencode-ai/plugin';
-import type { z } from 'zod';
 import { BlockIndex } from './block-index.js';
 import { FileDB } from './filedb.js';
 import { createEditRerouteHook } from './hooks/edit-reroute.js';
 import { createTangleStitchHook } from './hooks/tangle-stitch.js';
+import type { InternalTool, ToolArgsShape, ToolInput } from './tool-schema.js';
 import { createAbsorbTool, type FileIO, type RunCommand } from './tools/absorb.js';
 import { createAbsorbFunctionTool } from './tools/absorb-function.js';
 import { createBlockDependentsTool } from './tools/block-dependents.js';
@@ -51,22 +51,15 @@ async function listMdFilesRecursive(dir: string): Promise<string[]> {
   return results;
 }
 
-// WHY: internal tools use { name, description, parameters: z.object(...), execute(args) => { title, output, metadata } }
-// but OpenCode ToolDefinition expects { description, args: ZodRawShape, execute(args, ctx) => string }
-// adaptTool bridges a single tool with proper generic threading; adaptTools collects into Hooks['tool'].
-function adaptTool<S extends z.core.$ZodLooseShape>(t: {
-  name: string;
-  description: string;
-  parameters: z.ZodObject<S>;
-  execute: (args: z.infer<z.ZodObject<S>>) => Promise<{ output: string }>;
-}): [string, ToolDefinition] {
+function adaptTool<Shape extends ToolArgsShape>(t: InternalTool<Shape>): [string, ToolDefinition] {
   return [
     t.name,
     tool({
       description: t.description,
       args: t.parameters.shape,
-      async execute(args) {
+      async execute(args: ToolInput<Shape>, context) {
         const r = await t.execute(args);
+        context.metadata({ title: r.title, metadata: r.metadata });
         return r.output;
       },
     }),

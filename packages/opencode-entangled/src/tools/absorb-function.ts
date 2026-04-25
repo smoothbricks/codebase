@@ -1,15 +1,25 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZOptionalString, type ZString, z } from '../tool-schema.js';
 import { createAbsorbTool, type FileIO, type RunCommand } from './absorb.js';
 
 // WHY: matches exported function/const/class declarations — the opening line is enough to find the start,
 // then we scan for the balanced end. This avoids pulling in a full TS parser for a simple heuristic.
 const EXPORT_RE = /^export\s+(?:async\s+)?(?:function|const|class)\s+(\w+)/;
 
-export function createAbsorbFunctionTool(index: BlockIndex, io: FileIO, runCommand: RunCommand) {
+export function createAbsorbFunctionTool(
+  index: BlockIndex,
+  io: FileIO,
+  runCommand: RunCommand,
+): InternalTool<{
+  sourcePath: ZString;
+  exportName: ZString;
+  targetMd: ZString;
+  blockName: ZOptionalString;
+  prose: ZOptionalString;
+}> {
   const absorbTool = createAbsorbTool(index, io, runCommand);
 
-  return {
+  return defineTool({
     name: 'entangled_absorb_function',
     description: 'Absorb an exported function/const/class from a .ts file into a markdown code block by export name',
     parameters: z.object({
@@ -59,7 +69,7 @@ export function createAbsorbFunctionTool(index: BlockIndex, io: FileIO, runComma
         prose: args.prose,
       });
     },
-  };
+  });
 }
 
 /** Find the 1-indexed start and end lines of an export declaration */

@@ -1,8 +1,8 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZString, z } from '../tool-schema.js';
 
-export function createExpandTool(index: BlockIndex) {
-  return {
+export function createExpandTool(index: BlockIndex): InternalTool<{ blockName: ZString }> {
+  return defineTool({
     name: 'entangled_expand',
     description: 'Recursively expand all <<ref>> references in a block and return the fully assembled content',
     parameters: z.object({
@@ -26,5 +26,5 @@ export function createExpandTool(index: BlockIndex) {
         };
       }
     },
-  };
+  });
 }

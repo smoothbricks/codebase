@@ -1,8 +1,8 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZString, z } from '../tool-schema.js';
 
-export function createFindReferencesTool(index: BlockIndex) {
-  return {
+export function createFindReferencesTool(index: BlockIndex): InternalTool<{ blockName: ZString }> {
+  return defineTool({
     name: 'entangled_find_references',
     description: 'Find all <<ref>> references to a named block across all markdown files',
     parameters: z.object({
@@ -20,5 +20,5 @@ export function createFindReferencesTool(index: BlockIndex) {
         metadata: { count: refs.length },
       };
     },
-  };
+  });
 }

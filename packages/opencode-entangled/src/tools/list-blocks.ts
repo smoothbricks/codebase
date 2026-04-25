@@ -1,8 +1,8 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZString, z } from '../tool-schema.js';
 
-export function createListBlocksTool(index: BlockIndex) {
-  return {
+export function createListBlocksTool(index: BlockIndex): InternalTool<{ filePath: ZString }> {
+  return defineTool({
     name: 'entangled_list_blocks',
     description: 'List all code blocks in a markdown file — shows id, language, target, and line number',
     parameters: z.object({
@@ -26,5 +26,5 @@ export function createListBlocksTool(index: BlockIndex) {
         metadata: { count: blocks.length },
       };
     },
-  };
+  });
 }

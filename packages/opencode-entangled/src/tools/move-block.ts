@@ -1,10 +1,14 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZOptionalString, type ZString, z } from '../tool-schema.js';
 import type { FileIO, RunCommand } from './absorb.js';
 import { insertAfterBlock } from './block-utils.js';
 
-export function createMoveBlockTool(index: BlockIndex, io: FileIO, runCommand: RunCommand) {
-  return {
+export function createMoveBlockTool(
+  index: BlockIndex,
+  io: FileIO,
+  runCommand: RunCommand,
+): InternalTool<{ blockName: ZString; targetMd: ZString; insertAfter: ZOptionalString }> {
+  return defineTool({
     name: 'entangled_move_block',
     description: 'Move a code block from one .md file to another',
     parameters: z.object({
@@ -95,7 +99,7 @@ export function createMoveBlockTool(index: BlockIndex, io: FileIO, runCommand: R
         },
       };
     },
-  };
+  });
 }
 
 interface ExtractionResult {

@@ -1,9 +1,13 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZString, z } from '../tool-schema.js';
 import type { FileIO, RunCommand } from './absorb.js';
 
-export function createRenameBlockTool(index: BlockIndex, io: FileIO, runCommand: RunCommand) {
-  return {
+export function createRenameBlockTool(
+  index: BlockIndex,
+  io: FileIO,
+  runCommand: RunCommand,
+): InternalTool<{ oldName: ZString; newName: ZString }> {
+  return defineTool({
     name: 'entangled_rename_block',
     description: 'Rename a block id and update all <<ref>> references across all markdown files',
     parameters: z.object({
@@ -74,7 +78,7 @@ export function createRenameBlockTool(index: BlockIndex, io: FileIO, runCommand:
         },
       };
     },
-  };
+  });
 }
 
 function escapeRegex(str: string): string {

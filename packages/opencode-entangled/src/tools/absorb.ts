@@ -1,5 +1,5 @@
-import { z } from 'zod';
 import type { BlockIndex } from '../block-index.js';
+import { defineTool, type InternalTool, type ZNumber, type ZOptionalString, type ZString, z } from '../tool-schema.js';
 import { insertAfterBlock } from './block-utils.js';
 
 export interface FileIO {
@@ -15,8 +15,21 @@ export interface CommandResult {
 
 export type RunCommand = (cmd: string, args: string[]) => Promise<CommandResult>;
 
-export function createAbsorbTool(index: BlockIndex, io: FileIO, runCommand: RunCommand) {
-  return {
+export function createAbsorbTool(
+  index: BlockIndex,
+  io: FileIO,
+  runCommand: RunCommand,
+): InternalTool<{
+  sourcePath: ZString;
+  startLine: ZNumber;
+  endLine: ZNumber;
+  targetMd: ZString;
+  blockName: ZString;
+  insertAfter: ZOptionalString;
+  appendTo: ZOptionalString;
+  prose: ZOptionalString;
+}> {
+  return defineTool({
     name: 'entangled_absorb',
     description:
       'Move lines from a .ts file into a new or existing .md code block, replacing the source lines with a tangle marker',
@@ -137,7 +150,7 @@ export function createAbsorbTool(index: BlockIndex, io: FileIO, runCommand: RunC
         },
       };
     },
-  };
+  });
 }
 
 /** Build a new fenced code block with optional prose */
