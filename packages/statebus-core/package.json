@@ -1,10 +1,17 @@
 {
   "name": "@smoothbricks/statebus-core",
   "version": "0.0.1",
+  "author": "SmoothBricks Contributors",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/statebus.git"
+  },
   "type": "module",
   "main": "./dist/index.js",
   "module": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "bugs": "https://github.com/smoothbricks/statebus/issues",
+  "description": "Platform-agnostic core types and runtime for StateBus.",
   "exports": {
     "./package.json": "./package.json",
     ".": {
@@ -18,6 +25,20 @@
     "dist",
     "!**/*.tsbuildinfo"
   ],
+  "homepage": "https://smoothbricks.dev/statebus",
+  "keywords": [
+    "data flow",
+    "event bus",
+    "eventbus",
+    "observable",
+    "reducer",
+    "store",
+    "state manager",
+    "state management",
+    "predictable",
+    "functional"
+  ],
+  "license": "MIT",
   "dependencies": {
     "@tldraw/state": "^3.15.5",
     "tslib": "^2.8.1"

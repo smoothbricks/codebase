@@ -1,5 +1,7 @@
 import type { StateKeys } from './types.js';
 
+export type { Computed } from '@tldraw/state';
+
 declare const _byID_: unique symbol;
 
 declare module '@smoothbricks/statebus-core' {
@@ -27,18 +29,31 @@ export { StateBus } from './api.js';
 export { ManualStateBus } from './manual.js';
 export type {
   AnyEvent,
+  AnyListener,
   Event,
+  EventBus,
   EventPayload,
+  EventReducer,
+  EventReducers,
   EventTypes,
+  InitialState,
   Listener,
   ReadonlyState,
   StateBusConfig,
   StateBusReader,
+  StateBusWriter,
   StateByIDKey,
   StateKeys,
   StatePropKey,
   StateValue,
+  Substate,
+  SubstateRepository,
+  Substates,
+  SubstatesWriter,
+  TopicReducer,
+  TopicReducers,
   Topics,
+  TopLevelReducer,
   WritableState,
 } from './types.js';
 export type { ViewFunction, ViewProps } from './view.js';

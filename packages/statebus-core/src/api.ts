@@ -2,10 +2,8 @@ import { atom } from '@tldraw/state';
 import type {
   AnyEvent,
   AnyEventReducer,
-  AnyEventType,
   AnyTopicListenerMap,
   AnyTopicReducer,
-  AnyTopicReducerMap,
   Atom,
   Event,
   EventTypes,
@@ -16,7 +14,6 @@ import type {
   StateBusConfig,
   StateBusReader,
   StateKeys,
-  TopicListenerMap,
   Topics,
   TopLevelReducer,
   WritableState,
@@ -25,12 +22,12 @@ import type {
 class Substates<T> implements ISubstates<T> {
   private readonly _byID = new Map<string | number, Atom<T | undefined>>();
 
-  constructor(readonly defaultValue: () => T | undefined) {}
+  constructor(readonly defaultValue: (id: string | number) => T | undefined) {}
 
   get(id: string | number) {
     let substate = this._byID.get(id);
     if (!substate) {
-      const value = this.defaultValue();
+      const value = this.defaultValue(id);
       substate = atom(`${id}`, value); // new Substate(value);
       this._byID.set(id, substate);
     }
@@ -51,7 +48,7 @@ class Substates<T> implements ISubstates<T> {
     // Return an iterator that filters undefined values
     const iter = this._byID.values();
     const filtered = {
-      next: (): IteratorResult<T> => {
+      next: (): IteratorResult<T, undefined> => {
         let result = iter.next();
         while (!result.done) {
           const value = result.value?.get();
@@ -60,18 +57,29 @@ class Substates<T> implements ISubstates<T> {
           }
           result = iter.next();
         }
-        // biome-ignore lint/suspicious/noExplicitAny: iterator protocol requires value field
-        return { value: undefined as any, done: true };
+        return { value: undefined, done: true };
       },
     };
     return filtered;
   }
 }
 
+function toError(error: unknown): Error {
+  return error instanceof Error ? error : new Error(String(error));
+}
+
+function isSubstateFactory(value: unknown): value is (id: string | number) => unknown {
+  return typeof value === 'function';
+}
+
+function createStateEntry(key: string, value: unknown) {
+  return isSubstateFactory(value) ? new Substates(value) : atom(`${key}`, value);
+}
+
 export abstract class StateBus implements StateBusReader {
   readonly isolates: Record<string, ReadonlyState> = {};
   readonly reduceEvent: TopLevelReducer;
-  readonly state: ReadonlyState;
+  readonly state: WritableState;
   readonly substateInterestCount = new Map<string, number>();
   private initialState: InitialState;
 
@@ -83,15 +91,15 @@ export abstract class StateBus implements StateBusReader {
       this.reduceEvent = reducers;
     } else {
       // Build an object of per-topic reducer functions
-      const topicMap: AnyTopicReducerMap = {};
+      const topicMap: Record<string, AnyTopicReducer | undefined> = {};
       for (const [topicString, reducer] of Object.entries(reducers)) {
-        const topic = topicString as Topics;
         if (typeof reducer === 'function') {
-          topicMap[topic] = reducer as AnyTopicReducer;
+          topicMap[topicString] = reducer as AnyTopicReducer;
         } else {
-          const reducerMap = Object.freeze(reducer) as Record<AnyEventType, AnyEventReducer>;
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Event type lookup is guarded by the already matched topic.
+          const reducerMap = Object.freeze(reducer) as Record<string, AnyEventReducer>;
           // Create a function that dispatches on event type
-          topicMap[topic] = (state, event) => reducerMap[event.type]?.(state, event.payload);
+          topicMap[topicString] = (state, event) => reducerMap[event.type]?.(state, event.payload);
         }
       }
       Object.freeze(topicMap);
@@ -101,12 +109,9 @@ export abstract class StateBus implements StateBusReader {
 
     // Build the state object of Atoms and Substates
     const s = Object.fromEntries(
-      Object.entries(this.initialState).map(([key, value]) => [
-        key,
-        (value as unknown) instanceof Function ? new Substates(value as unknown as () => void) : atom(`${key}`, value),
-      ]),
+      Object.entries(this.initialState).map(([key, value]) => [key, createStateEntry(key, value)]),
     );
-    this.state = Object.freeze(s) as unknown as ReadonlyState;
+    this.state = Object.freeze(s) as WritableState;
   }
 
   private eventQueue: AnyEvent[] = [];
@@ -123,10 +128,9 @@ export abstract class StateBus implements StateBusReader {
       this.dispatchingEventQueue = eventQueue;
 
       // Reduce all events first, to make sure all state is up to date
-      const writableState = this.state as WritableState;
       for (const event of eventQueue) {
         if (!event) continue;
-        this.reduceEvent(writableState, event);
+        this.reduceEvent(this.state, event);
       }
 
       // Dispatch events to listeners, that may read updated state
@@ -162,7 +166,7 @@ export abstract class StateBus implements StateBusReader {
           this.publish({
             topic: 'statebus',
             type: 'error',
-            payload: error instanceof Error ? error : new Error(error as string),
+            payload: toError(error),
           });
         }
       }
@@ -182,8 +186,9 @@ export abstract class StateBus implements StateBusReader {
     type: Type,
     listener: Listener<Topic, Type>,
   ): () => void {
-    let topicListeners = (this.listeners as TopicListenerMap<Topic, Type>)[topic];
-    if (!topicListeners) this.listeners[topic] = topicListeners = {};
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Listener storage is keyed by topic/type and only read back through the same keys.
+    const topicListeners = (this.listeners[topic] ?? {}) as Record<Type, Set<Listener<Topic, Type>> | undefined>;
+    this.listeners[topic] = topicListeners as AnyTopicListenerMap[Topic];
 
     const typeListeners = topicListeners[type];
     if (!typeListeners) {
@@ -198,7 +203,7 @@ export abstract class StateBus implements StateBusReader {
   substateInterest<SK extends StateKeys>(keys: SK[]): () => void {
     if (keys.length === 0) return () => {};
 
-    const subscribers = {} as Record<SK, number>;
+    const subscribers: Record<SK, number> = {};
     for (const key of keys) {
       const count = (this.substateInterestCount.get(key) ?? 0) + 1;
       subscribers[key] = count;
@@ -209,7 +214,7 @@ export abstract class StateBus implements StateBusReader {
     this.publish({ topic: 'statebus', type: 'substateInterest', payload: { subscribers } });
 
     return () => {
-      const subscribers = {} as Record<SK, number>;
+      const subscribers: Record<SK, number> = {};
       for (const key of keys) {
         const count = (this.substateInterestCount.get(key) ?? 1) - 1;
         if (count > 0) this.substateInterestCount.set(key, count);

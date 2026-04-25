@@ -62,7 +62,7 @@ export type StateValue<BT extends StateKeys> = States[BT] extends ByID<infer T> 
 export type StatePropKey<SK extends StateKeys> = States[SK] extends ByID<infer _T> ? never : SK;
 export type StateByIDKey<SK extends StateKeys> = States[SK] extends ByID<infer _T> ? SK : never;
 
-export type { Substate, Atom };
+export type { Atom, Substate };
 
 export interface Substates<T> extends Iterable<T> {
   get(id: string | number): Substate<T | undefined>;

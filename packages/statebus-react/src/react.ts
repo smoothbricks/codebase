@@ -1,4 +1,5 @@
 import type {
+  AnyEvent,
   EventPayload,
   EventTypes,
   StateBus,
@@ -13,9 +14,15 @@ import { isSignal, type Signal } from '@tldraw/state';
 import { useValue } from '@tldraw/state-react';
 import React, { useContext, useEffect, useMemo } from 'react';
 
-const StatebusReactContext = React.createContext<StateBus>({} as unknown as StateBus);
+const StatebusReactContext = React.createContext<StateBus | null>(null);
 export const StatebusProvider = StatebusReactContext.Provider;
-export const useStateBus = () => useContext(StatebusReactContext);
+export const useStateBus = () => {
+  const bus = useContext(StatebusReactContext);
+  if (!bus) {
+    throw new Error('StateBus React hooks require a StatebusProvider.');
+  }
+  return bus;
+};
 
 function useBusSignal<T, SK extends StateKeys>(
   bus: StateBus,
@@ -55,8 +62,7 @@ export function computedHook<SK extends StateKeys, Props extends ViewProps, R>(
   return (props) => {
     const bus = useStateBus();
     const deps = useMemo(
-      () =>
-        !props || typeof props !== 'object' ? [props, bus] : [bus as unknown].concat(...sortedKeyValuePairs(props)),
+      () => (!props || typeof props !== 'object' ? [props, bus] : [bus, ...sortedKeyValuePairs(props)]),
       [props, bus],
     );
     // biome-ignore lint/correctness/useExhaustiveDependencies: dynamic deps array
@@ -70,8 +76,19 @@ export function useSubstate<SK extends StateKeys>(key: StateByIDKey<SK>, id: str
 export function useSubstate<SK extends StateKeys>(key: SK, id?: string | number): StateValue<SK> {
   const bus = useStateBus();
   const sub = bus.state[key];
-  // biome-ignore lint/style/noNonNullAssertion: id is required when sub is ByID
-  const signal = (isSignal(sub) ? sub : sub.get(id!)) as Signal<StateValue<SK>>;
+  let signal: Signal<StateValue<SK>, unknown>;
+
+  if (isSignal(sub)) {
+    signal = sub as Signal<StateValue<SK>, unknown>;
+  } else {
+    if (id === undefined) {
+      throw new Error(`StateBus substate '${String(key)}' requires an id.`);
+    }
+
+    // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Library source compiles without app-specific StateKeys augmentation.
+    signal = sub.get(id) as Signal<StateValue<SK>, unknown>;
+  }
+
   return useBusSignal(bus, key, signal, [key]);
 }
 
@@ -94,10 +111,13 @@ export function eventPublisher<Topic extends Topics>(bus: StateBus, topic: Topic
     {},
     {
       get: (target, prop) => {
-        // biome-ignore lint/suspicious/noExplicitAny: symbol properties pass through
-        if (typeof prop === 'symbol') return (target as any)[prop];
-        // biome-ignore lint/suspicious/noExplicitAny: payload type varies by event
-        return (payload: any) => bus.publish({ topic, type: prop as EventTypes, payload });
+        if (typeof prop === 'symbol') return Reflect.get(target, prop);
+        return (payload: EventPayload<Topic, EventTypes<Topic>>) => {
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Proxy property names are the runtime event keys for this topic.
+          const event = { topic, type: prop as EventTypes<Topic>, payload };
+          // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Proxy property names are the runtime event keys for this topic.
+          return bus.publish(event as AnyEvent);
+        };
       },
     },
   );
@@ -113,8 +133,8 @@ export function useBus(topic?: Topics) {
         {},
         {
           get: (target, prop) => {
-            // biome-ignore lint/suspicious/noExplicitAny: symbol properties pass through
-            if (typeof prop === 'symbol') return (target as any)[prop];
+            if (typeof prop === 'symbol') return Reflect.get(target, prop);
+            // eslint-disable-next-line @typescript-eslint/no-unsafe-type-assertion -- Proxy property names are the runtime topic keys for the bus.
             return eventPublisher(bus, prop as Topics);
           },
         },

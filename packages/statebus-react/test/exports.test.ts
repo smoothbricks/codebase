@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'bun:test';
-import { ManualStateBus } from '../src';
+import { AnimationFrameStateBus, computed, ManualStateBus, StateBus, track, useStateTracking } from '../src';
 
 declare module '@smoothbricks/statebus-core' {
   export interface States {
@@ -13,6 +13,13 @@ declare module '@smoothbricks/statebus-core' {
 }
 
 describe('StateBus React exports', () => {
+  it('should expose the broad app-facing surface', () => {
+    expect(StateBus).toBe(AnimationFrameStateBus);
+    expect(typeof computed).toBe('function');
+    expect(typeof track).toBe('function');
+    expect(typeof useStateTracking).toBe('function');
+  });
+
   it('should export ManualStateBus for testing', () => {
     const bus = new ManualStateBus({
       initialState: { counter: 0 },
