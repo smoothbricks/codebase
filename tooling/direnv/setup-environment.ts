@@ -13,11 +13,11 @@ try {
   // Install dependencies first so node_modules/.bin tools are available
   if (process.env.CI) {
     try {
-      await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`);
+      await runSetupCommand('bun install --frozen-lockfile', $`bun install --frozen-lockfile`, { quiet: false });
     } catch (error) {
       console.error('! Failed to install dependencies with frozen lockfile');
       replayCapturedOutput(error);
-      await runSetupCommand('bun install', $`bun install`);
+      await runSetupCommand('bun install', $`bun install`, { quiet: false });
       console.error('git diff after install:');
       await runSetupCommand('git diff', $`git diff`, { quiet: false, allowNonzero: true });
       process.exit(1);
