@@ -3,18 +3,37 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { $ } from 'bun';
 
-export async function run(command: string, args: string[], cwd: string): Promise<void> {
-  const status = await runStatus(command, args, cwd);
+export async function run(command: string, args: string[], cwd: string, env?: Record<string, string>): Promise<void> {
+  const status = await runStatus(command, args, cwd, false, env);
   if (status !== 0) {
     throw new Error(`${command} ${args.join(' ')} failed with exit code ${status}`);
   }
 }
 
-export async function runStatus(command: string, args: string[], cwd: string, quiet = false): Promise<number> {
+export async function runStatus(
+  command: string,
+  args: string[],
+  cwd: string,
+  quiet = false,
+  env?: Record<string, string>,
+): Promise<number> {
   const invocation = resolveCommandInvocation(cwd, command, args);
-  const shell = $`${invocation.command} ${invocation.args}`.cwd(cwd).nothrow();
+  let shell = $`${invocation.command} ${invocation.args}`.cwd(cwd).nothrow();
+  if (env) {
+    shell = shell.env(mergeEnv(env));
+  }
   const result = quiet ? await shell.quiet() : await shell;
   return result.exitCode;
+}
+
+function mergeEnv(env: Record<string, string>): Record<string, string> {
+  const merged: Record<string, string> = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (value !== undefined) {
+      merged[key] = value;
+    }
+  }
+  return { ...merged, ...env };
 }
 
 function resolveCommandInvocation(root: string, command: string, args: string[]): { command: string; args: string[] } {

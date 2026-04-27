@@ -1,5 +1,7 @@
 import { existsSync } from 'node:fs';
 import { join } from 'node:path';
+import { createInterface } from 'node:readline/promises';
+import { Writable } from 'node:stream';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
 import { listPublicPackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
@@ -23,6 +25,7 @@ export interface ReleaseGithubOptions extends ReleasePublishOptions {
 
 export interface ReleaseTrustPublisherOptions {
   dryRun?: boolean;
+  otp?: string;
   skipLogin?: boolean;
 }
 
@@ -112,6 +115,20 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
     throw new Error('No npm:public packages found.');
   }
 
+  if (!options.dryRun) {
+    const packageStates = await Promise.all(
+      packages.map(async (pkg) => ((await npmPackageExists(pkg.name)) ? null : pkg.name)),
+    );
+    const missingPackages = packageStates.filter((name): name is string => name !== null);
+    if (missingPackages.length > 0) {
+      throw new Error(
+        'npm trusted publishing can only be configured after packages exist on the registry. ' +
+          'Bootstrap the first publish with a temporary NPM_TOKEN, then rerun trust-publisher. ' +
+          `Missing packages: ${missingPackages.join(', ')}`,
+      );
+    }
+  }
+
   if (!options.dryRun && !options.skipLogin) {
     await runLatestNpm(root, ['login', '--auth-type=web']);
   }
@@ -122,7 +139,8 @@ export async function releaseTrustPublisher(root: string, options: ReleaseTrustP
     if (options.dryRun) {
       args.push('--dry-run');
     }
-    await runLatestNpm(root, args);
+    const otp = options.dryRun ? undefined : (options.otp ?? (await promptForNpmOtp(pkg.name)));
+    await runLatestNpm(root, args, otp ? { NPM_CONFIG_OTP: otp } : undefined);
   }
 }
 
@@ -149,6 +167,11 @@ async function getReleaseState(root: string): Promise<ReleaseState> {
 async function npmVersionExists(name: string, version: string): Promise<boolean> {
   const result = await $`bun pm view ${`${name}@${version}`} version`.cwd(process.cwd()).quiet().nothrow();
   return result.exitCode === 0 && decode(result.stdout).trim() === version;
+}
+
+async function npmPackageExists(name: string): Promise<boolean> {
+  const result = await $`bun pm view ${name} name`.cwd(process.cwd()).quiet().nothrow();
+  return result.exitCode === 0;
 }
 
 async function gitTagsAtHead(root: string): Promise<string[]> {
@@ -211,6 +234,32 @@ function githubRepositoryFromUrl(url: string): string {
   throw new Error(`Root package.json repository.url must be a GitHub repository URL, got ${url}`);
 }
 
-async function runLatestNpm(root: string, npmArgs: string[]): Promise<void> {
-  await run('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root);
+async function runLatestNpm(root: string, npmArgs: string[], env?: Record<string, string>): Promise<void> {
+  await run('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root, env);
+}
+
+async function promptForNpmOtp(packageName: string): Promise<string> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY) {
+    throw new Error(
+      `npm trust requires a one-time password for ${packageName}. Pass --otp <code> in non-interactive shells.`,
+    );
+  }
+
+  const mutedOutput = new Writable({
+    write(_chunk, _encoding, callback) {
+      callback();
+    },
+  });
+  const rl = createInterface({ input: process.stdin, output: mutedOutput, terminal: true });
+  process.stdout.write(`Enter npm OTP for ${packageName}: `);
+  try {
+    const otp = (await rl.question('')).trim();
+    process.stdout.write('\n');
+    if (!otp) {
+      throw new Error(`npm OTP is required for ${packageName}.`);
+    }
+    return otp;
+  } finally {
+    rl.close();
+  }
 }

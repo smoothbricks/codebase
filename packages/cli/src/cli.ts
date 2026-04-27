@@ -107,11 +107,13 @@ function buildProgram(): Command {
     .command('trust-publisher')
     .description('Configure npm trusted publishing for public packages')
     .option('--dry-run [dryRun]', 'show npm trust changes without saving them')
+    .option('--otp <otp>', 'npm one-time password for trust operations')
     .option('--skip-login', 'skip npm browser login before configuring trust')
-    .action(async (options: { dryRun?: string | boolean; skipLogin?: boolean }) => {
+    .action(async (options: { dryRun?: string | boolean; otp?: string; skipLogin?: boolean }) => {
       const { releaseTrustPublisher } = await import('./release/index.js');
       await releaseTrustPublisher(await findRepoRoot(), {
         dryRun: booleanOption(options.dryRun),
+        otp: options.otp,
         skipLogin: options.skipLogin === true,
       });
     });
