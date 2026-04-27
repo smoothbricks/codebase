@@ -44,7 +44,7 @@ const DEFAULT_WORKFLOW_NAME = 'Update Dependencies';
 
 /**
  * Process unified template placeholders
- * Only handles AI-related placeholders - auth detection is runtime
+ * Handles AI-related placeholders, schedule, and base branch - auth detection is runtime
  */
 function processUnifiedTemplate(
   template: string,
@@ -55,9 +55,10 @@ function processUnifiedTemplate(
     workflowName?: string;
     configPath?: string;
     forceSkipAI?: boolean;
+    baseBranch?: string;
   },
 ): string {
-  const { useAI, schedule, workflowName, configPath, forceSkipAI } = options;
+  const { useAI, schedule, workflowName, configPath, forceSkipAI, baseBranch } = options;
   let result = template;
 
   if (forceSkipAI) {
@@ -86,6 +87,7 @@ function processUnifiedTemplate(
 
   result = result.replace('{{WORKFLOW_NAME}}', JSON.stringify(workflowName || DEFAULT_WORKFLOW_NAME));
   result = result.replace('{{SCHEDULE}}', schedule || DEFAULT_SCHEDULE);
+  result = result.replace('{{BASE_BRANCH}}', baseBranch || 'main');
   result = result.replace(
     '{{CONFIG_PATH_BLOCK}}',
     configPath ? `\n          config-path: ${JSON.stringify(configPath)}` : '',
@@ -104,6 +106,7 @@ async function generateWorkflowContentFromTemplate(options: {
   workflowName?: string;
   configPath?: string;
   forceSkipAI?: boolean;
+  baseBranch?: string;
 }): Promise<string> {
   const templatesDir = getTemplatesDir();
   const templatePath = join(templatesDir, 'unified.yml');
@@ -135,6 +138,7 @@ export async function generateWorkflow(config: PatchnoteConfig, options: Generat
     workflowName: options.workflowName,
     configPath: options.configPath,
     forceSkipAI: options.skipAI,
+    baseBranch: config.git?.baseBranch || 'main',
   });
 
   // Compute paths first so we can show them in dry-run

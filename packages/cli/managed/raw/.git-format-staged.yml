@@ -1,6 +1,7 @@
 # git-format-staged configuration for SmoothBricks-style monorepos
 
 formatters:
+  # ESLint for Astro files (run first as it only handles .astro files)
   eslint:
     command: eslint-stdout '{}'
     patterns:
@@ -8,6 +9,7 @@ formatters:
       - '!.*'
       - '!.*/**'
 
+  # Biome for JS/TS/JSX/TSX/JSON/HTML/CSS/GraphQL files
   biome:
     command: biome check --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}' --fix
     patterns:
@@ -21,11 +23,15 @@ formatters:
       - '*.css'
       - '*.graphql'
 
+  # Prettier for all other files (mainly Markdown)
   prettier:
     command: prettier --ignore-unknown --stdin-filepath '{}'
     patterns:
+      # Match all files
       - '*'
+      # Exclude hidden files
       - '!.*'
+      # Exclude files handled by Biome
       - '!*.js'
       - '!*.ts'
       - '!*.jsx'
@@ -35,8 +41,10 @@ formatters:
       - '!*.html'
       - '!*.css'
       - '!*.graphql'
+      # Exclude files handled by Alejandra
       - '!*.nix'
 
+  # Alejandra for Nix files
   alejandra:
     command: alejandra
     patterns:

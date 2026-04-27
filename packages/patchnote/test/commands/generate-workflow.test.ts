@@ -56,6 +56,7 @@ describe('Action Wrapper Workflow Generation', () => {
       expect(template).toContain('{{SKIP_AI_INPUT}}');
       expect(template).toContain('{{WORKFLOW_NAME}}');
       expect(template).toContain('{{SCHEDULE}}');
+      expect(template).toContain('{{BASE_BRANCH}}');
       expect(template).toContain('{{CONFIG_PATH_BLOCK}}');
       expect(template).not.toContain('{{AI_STEP_SUFFIX}}');
       expect(template).not.toContain('{{STEP_VAR}}');
@@ -63,6 +64,16 @@ describe('Action Wrapper Workflow Generation', () => {
       expect(template).not.toContain('{{STEP_COPY}}');
       expect(template).not.toContain('{{STEP_COMMIT}}');
       expect(template).not.toContain('{{STEP_VALIDATE}}');
+    });
+
+    it('should have push trigger and rebase-open-prs job in template', async () => {
+      const template = await readFile(join(templatesDir, 'unified.yml'), 'utf-8');
+
+      expect(template).toContain('push:');
+      expect(template).toContain("branches: ['{{BASE_BRANCH}}']");
+      expect(template).toContain('rebase-open-prs:');
+      expect(template).toContain('patchnote-rebase');
+      expect(template).toContain('fetch-depth: 0');
     });
 
     it('should have runtime auth detection and action usage in template', async () => {
@@ -272,6 +283,75 @@ describe('Action Wrapper Workflow Generation', () => {
 
         expect(runStep).toBeDefined();
         expect(runStep!.with?.['config-path']).toBe('config/custom-patchnote.json');
+      });
+    });
+
+    describe('Push Trigger and Rebase Job', () => {
+      let workflow: string;
+      let parsed: ParsedWorkflow;
+
+      beforeEach(async () => {
+        workflow = await generateWorkflow(['--skip-ai']);
+        parsed = parseYaml(workflow);
+      });
+
+      it('should have push trigger on base branch', () => {
+        expect(parsed.on.push).toBeDefined();
+        const pushConfig = parsed.on.push as { branches: string[] };
+        expect(pushConfig.branches).toEqual(['main']);
+      });
+
+      it('should have no leftover {{BASE_BRANCH}} placeholder', () => {
+        expect(workflow).not.toContain('{{BASE_BRANCH}}');
+      });
+
+      it('should have workflow_dispatch with command input', () => {
+        const wd = parsed.on.workflow_dispatch as { inputs: { command: { type: string; options: string[] } } };
+        expect(wd.inputs.command).toBeDefined();
+        expect(wd.inputs.command.type).toBe('choice');
+        expect(wd.inputs.command.options).toContain('update-deps');
+        expect(wd.inputs.command.options).toContain('rebase-open-prs');
+      });
+
+      it('should have conditional update-deps job (not on push)', () => {
+        const job = parsed.jobs['update-deps'] as { if?: string; 'runs-on': string; steps: WorkflowStep[] };
+        expect(job.if).toBeDefined();
+        expect(job.if).toContain("github.event_name == 'schedule'");
+        expect(job.if).toContain("inputs.command == 'update-deps'");
+      });
+
+      it('should have rebase-open-prs job', () => {
+        expect(parsed.jobs['rebase-open-prs']).toBeDefined();
+      });
+
+      it('should have rebase job with correct condition', () => {
+        const job = parsed.jobs['rebase-open-prs'] as { if?: string; 'runs-on': string; steps: WorkflowStep[] };
+        expect(job.if).toContain("github.event_name == 'push'");
+        expect(job.if).toContain("inputs.command == 'rebase-open-prs'");
+      });
+
+      it('should have concurrency group on rebase job', () => {
+        const job = parsed.jobs['rebase-open-prs'] as {
+          concurrency?: { group: string; 'cancel-in-progress': boolean };
+        };
+        expect(job.concurrency).toBeDefined();
+        expect(job.concurrency!.group).toBe('patchnote-rebase');
+        expect(job.concurrency!['cancel-in-progress']).toBe(true);
+      });
+
+      it('should have full git history checkout in rebase job', () => {
+        const job = parsed.jobs['rebase-open-prs'] as { steps: WorkflowStep[] };
+        const checkoutStep = job.steps.find((s) => s.uses?.startsWith('actions/checkout'));
+        expect(checkoutStep).toBeDefined();
+        expect(checkoutStep!.with?.['fetch-depth']).toBe(0);
+      });
+
+      it('should have GH_TOKEN env var in rebase step', () => {
+        const job = parsed.jobs['rebase-open-prs'] as { steps: WorkflowStep[] };
+        const rebaseStep = job.steps.find((s) => s.name === 'Rebase open PRs');
+        expect(rebaseStep).toBeDefined();
+        expect(rebaseStep!.env?.GH_TOKEN).toBeDefined();
+        expect(rebaseStep!.env?.GH_TOKEN).toContain('steps.app-token.outputs.token');
       });
     });
 
