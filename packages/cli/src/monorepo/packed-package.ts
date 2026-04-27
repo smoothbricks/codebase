@@ -3,7 +3,7 @@ import { join } from 'node:path';
 import { publint } from 'publint';
 import { formatMessage } from 'publint/utils';
 import { isRecord } from '../lib/json.js';
-import { run, runStatus } from '../lib/run.js';
+import { runStatus } from '../lib/run.js';
 import type { PackageInfo } from '../lib/workspace.js';
 import { listPublicPackages } from '../lib/workspace.js';
 
@@ -83,7 +83,15 @@ async function packPackage(root: string, pkg: PackageInfo): Promise<{ path: stri
   const tarballName = `.smoo-${process.pid}-${Date.now()}.tgz`;
   const tarballPath = join(root, tarballName);
   try {
-    await run('bun', ['pm', 'pack', '--filename', tarballName, '--ignore-scripts', '--quiet'], packageDir);
+    const status = await runStatus(
+      'bun',
+      ['pm', 'pack', '--filename', tarballName, '--ignore-scripts', '--quiet'],
+      packageDir,
+      true,
+    );
+    if (status !== 0) {
+      throw new Error(`bun pm pack failed with exit code ${status}`);
+    }
     const bytes = new Uint8Array(readFileSync(tarballPath));
     return { path: tarballPath, arrayBuffer: bytes.slice().buffer };
   } catch (error) {

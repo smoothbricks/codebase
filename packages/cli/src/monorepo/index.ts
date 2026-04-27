@@ -13,6 +13,10 @@ export interface InitOptions {
   syncRuntime?: boolean;
 }
 
+export interface ValidateOptions {
+  failFast?: boolean;
+}
+
 export async function initMonorepo(root: string, options: InitOptions): Promise<void> {
   if (options.runtimeOnly) {
     await syncRootRuntimeVersions(root);
@@ -23,11 +27,12 @@ export async function initMonorepo(root: string, options: InitOptions): Promise<
   await runInitPacks({ root, syncRuntime: process.env.DEVENV_ROOT !== undefined || options.syncRuntime === true });
 }
 
-export async function validateMonorepo(root: string): Promise<void> {
-  const failures = await runValidatePacks({ root, syncRuntime: false });
+export async function validateMonorepo(root: string, options: ValidateOptions = {}): Promise<void> {
+  const failures = await runValidatePacks({ root, syncRuntime: false }, options);
   if (failures > 0) {
-    throw new Error(`Monorepo validation failed with ${failures} problem(s). Run: smoo monorepo init`);
+    throw new Error(`Monorepo validation failed with ${failures} problem(s).`);
   }
+  console.log('\n== summary ==');
   console.log('Monorepo configuration is valid.');
 }
 

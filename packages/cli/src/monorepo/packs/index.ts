@@ -1,6 +1,7 @@
 import { chmodSync, existsSync, statSync } from 'node:fs';
 import { join } from 'node:path';
 import { validateManagedFiles } from '../managed-files.js';
+import { validateNxSync } from '../nx-sync.js';
 import { fixPackageHygiene, validatePackageHygiene } from '../package-hygiene.js';
 import {
   applyPublicPackageDefaults,
@@ -17,6 +18,10 @@ import { syncRootRuntimeVersions } from '../runtime.js';
 export interface MonorepoContext {
   root: string;
   syncRuntime: boolean;
+}
+
+export interface ValidatePackOptions {
+  failFast?: boolean;
 }
 
 interface MonorepoPack {
@@ -36,8 +41,13 @@ const packs: MonorepoPack[] = [
         console.log('skip           root runtime versions (outside devenv; pass --sync-runtime to force)');
       }
     },
-    validate(ctx) {
-      return validateManagedFiles(ctx.root) + validateRootPackagePolicy(ctx.root) + validateNxReleaseConfig(ctx.root);
+    async validate(ctx) {
+      return (
+        validateManagedFiles(ctx.root) +
+        validateRootPackagePolicy(ctx.root) +
+        validateNxReleaseConfig(ctx.root) +
+        (await validateNxSync(ctx.root))
+      );
     },
   },
   {
@@ -73,10 +83,20 @@ export async function runInitPacks(ctx: MonorepoContext): Promise<void> {
   }
 }
 
-export async function runValidatePacks(ctx: MonorepoContext): Promise<number> {
+export async function runValidatePacks(ctx: MonorepoContext, options: ValidatePackOptions = {}): Promise<number> {
   let failures = 0;
+  let checkedPacks = 0;
   for (const pack of packs) {
-    failures += (await pack.validate?.(ctx)) ?? 0;
+    if (!pack.validate) {
+      continue;
+    }
+    console.log(`${checkedPacks === 0 ? '' : '\n'}== ${pack.name} ==`);
+    checkedPacks++;
+    const packFailures = await pack.validate(ctx);
+    failures += packFailures;
+    if (packFailures > 0 && options.failFast) {
+      break;
+    }
   }
   return failures;
 }
