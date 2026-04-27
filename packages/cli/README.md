@@ -41,6 +41,7 @@ smoo monorepo release-state
 smoo release version --bump <auto|patch|minor|major|prerelease> [--dry-run]
 smoo release publish --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
 smoo release github-release --tags <tags> --bump <auto|patch|minor|major|prerelease> [--tag <tag>] [--npm-tag <tag>] [--dry-run]
+smoo release trust-publisher [--dry-run] [--skip-login]
 
 smoo github-ci cleanup-cache
 smoo github-ci nx-smart --target <target> --name <check-name> --step <number>
@@ -225,6 +226,11 @@ Publishing:
 - Conflicting explicit dist-tags are rejected.
 - `--dry-run` skips npm publishing entirely. Bun still requires npm authentication for `bun publish --dry-run`, and
   publish artifact validation is already covered by `smoo monorepo validate`.
+- `smoo release trust-publisher` configures npm trusted publishing for every `npm:public` package. It uses the root
+  `package.json` `repository.url` as the GitHub `owner/repo`, uses `publish.yml` as the trusted workflow, and runs
+  `npm trust` through `nix shell nixpkgs#nodejs_latest` because the Lambda-pinned Node 24/npm toolchain may lag the npm
+  CLI feature. By default it runs `npm login --auth-type=web` first so npm can open a browser login; pass `--skip-login`
+  when the current npm session is already authenticated.
 
 GitHub Releases:
 

@@ -2,7 +2,7 @@ import { existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { $ } from 'bun';
 import { decode, run, runStatus } from '../lib/run.js';
-import { listPublicPackages } from '../lib/workspace.js';
+import { listPublicPackages, readPackageJson, repositoryInfo } from '../lib/workspace.js';
 import { syncBunLockfileVersions } from '../monorepo/lockfile.js';
 
 export interface ReleaseVersionOptions {
@@ -19,6 +19,11 @@ export interface ReleasePublishOptions {
 
 export interface ReleaseGithubOptions extends ReleasePublishOptions {
   tags?: string;
+}
+
+export interface ReleaseTrustPublisherOptions {
+  dryRun?: boolean;
+  skipLogin?: boolean;
 }
 
 export async function releaseVersion(root: string, options: ReleaseVersionOptions): Promise<void> {
@@ -99,6 +104,28 @@ export async function releaseGithubRelease(root: string, options: ReleaseGithubO
   }
 }
 
+export async function releaseTrustPublisher(root: string, options: ReleaseTrustPublisherOptions): Promise<void> {
+  const repository = githubRepositoryFromRootPackage(root);
+  const workflow = 'publish.yml';
+  const packages = listPublicPackages(root);
+  if (packages.length === 0) {
+    throw new Error('No npm:public packages found.');
+  }
+
+  if (!options.dryRun && !options.skipLogin) {
+    await runLatestNpm(root, ['login', '--auth-type=web']);
+  }
+
+  for (const pkg of packages) {
+    console.log(`${pkg.name}: trusting GitHub Actions ${repository}/${workflow}`);
+    const args = ['trust', 'github', pkg.name, '--file', workflow, '--repo', repository, '--yes'];
+    if (options.dryRun) {
+      args.push('--dry-run');
+    }
+    await runLatestNpm(root, args);
+  }
+}
+
 export async function printReleaseState(root: string): Promise<void> {
   console.log(JSON.stringify(await getReleaseState(root), null, 2));
 }
@@ -153,4 +180,37 @@ function releaseNpmTagArg(options: ReleasePublishOptions): string {
     throw new Error(`--bump ${bump} publishes with npm dist-tag ${derivedTag}, not ${explicitTag}.`);
   }
   return explicitTag;
+}
+
+function githubRepositoryFromRootPackage(root: string): string {
+  const pkg = readPackageJson(join(root, 'package.json'));
+  const repository = pkg ? repositoryInfo(pkg.json) : null;
+  if (!repository) {
+    throw new Error('Root package.json must define repository.url before configuring npm trusted publishing.');
+  }
+  return githubRepositoryFromUrl(repository.url);
+}
+
+function githubRepositoryFromUrl(url: string): string {
+  const normalized = url
+    .replace(/^git\+/, '')
+    .replace(/#.*$/, '')
+    .replace(/\.git$/, '');
+  const https = /^https:\/\/github\.com\/([^/]+)\/([^/]+)$/.exec(normalized);
+  if (https?.[1] && https[2]) {
+    return `${https[1]}/${https[2]}`;
+  }
+  const ssh = /^git@github\.com:([^/]+)\/([^/]+)$/.exec(normalized);
+  if (ssh?.[1] && ssh[2]) {
+    return `${ssh[1]}/${ssh[2]}`;
+  }
+  const shorthand = /^github:([^/]+)\/([^/]+)$/.exec(normalized);
+  if (shorthand?.[1] && shorthand[2]) {
+    return `${shorthand[1]}/${shorthand[2]}`;
+  }
+  throw new Error(`Root package.json repository.url must be a GitHub repository URL, got ${url}`);
+}
+
+async function runLatestNpm(root: string, npmArgs: string[]): Promise<void> {
+  await run('nix', ['shell', 'nixpkgs#nodejs_latest', '-c', 'npm', ...npmArgs], root);
 }
