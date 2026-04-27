@@ -21,7 +21,7 @@ try {
       process.exit(1);
     }
   } else {
-    await $`bun install --no-summary`;
+    await $`bun install --no-summary`.quiet();
   }
 
   // Make sure Biome is executable
@@ -36,9 +36,12 @@ try {
   await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
   console.error(`--- ERROR: setup-environment.ts failed: ${error}`);
+  if (error.stdout) {
+    process.stdout.write(error.stdout);
+  }
   if (error.stderr) {
     process.stderr.write(error.stderr);
-    console.error('\n---');
   }
+  console.error('\n---');
   process.exit(1);
 }

@@ -29,8 +29,6 @@ export async function syncRootRuntimeVersions(root: string): Promise<void> {
   if (changed) {
     writeJsonObject(packageJsonPath, packageJson);
     console.log('updated        package.json runtime versions');
-  } else {
-    console.log('unchanged      package.json runtime versions');
   }
 }
 
