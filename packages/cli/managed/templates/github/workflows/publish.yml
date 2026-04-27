@@ -42,7 +42,7 @@ jobs:
       - name: 📥 Checkout
         uses: actions/checkout@v6.0.2
         with:
-          filter: tree:0
+          filter: blob:none
           fetch-depth: 0
 
       # Step 3. Composite action internals do not affect top-level job step
@@ -83,6 +83,7 @@ jobs:
           path: packages/*/.trace-results.db
           if-no-files-found: ignore
           retention-days: 14
+          include-hidden-files: true
 
       # Step 10
       - name: ✅ Validate monorepo config

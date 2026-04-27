@@ -102,7 +102,7 @@ function getLastGitCommit(filePath: string, projectRoot: string): string {
     const result = execFileSync('git', ['-C', absoluteProjectRoot, 'rev-list', '-1', 'HEAD', '--', relativePath], {
       encoding: 'utf-8',
       stdio: ['ignore', 'pipe', 'pipe'],
-      timeout: 2000,
+      timeout: 10000,
     });
     return result.trim() || 'unknown';
   } catch {
