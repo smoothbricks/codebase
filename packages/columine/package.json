@@ -1,6 +1,6 @@
 {
   "name": "@smoothbricks/columine",
-  "version": "0.1.0",
+  "version": "0.0.1",
   "description": "Columine - Generic columnar processing pipeline (Parse, Reduce, Compact, Undo) for Arrow column data",
   "type": "module",
   "sideEffects": false,

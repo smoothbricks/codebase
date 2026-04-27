@@ -60,7 +60,7 @@
     },
     "packages/columine": {
       "name": "@smoothbricks/columine",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "devDependencies": {
         "@smoothbricks/validation": "workspace:*",
         "typescript": "^5.9.3",
@@ -113,7 +113,7 @@
     },
     "packages/lmao-inspector": {
       "name": "@smoothbricks/lmao-inspector",
-      "version": "0.1.0",
+      "version": "0.0.1",
       "dependencies": {
         "@duckdb/duckdb-wasm": "1.33.1-dev20.0",
         "@uwdata/flechette": "^2.3.0",

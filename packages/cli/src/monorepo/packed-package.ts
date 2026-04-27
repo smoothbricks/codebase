@@ -28,7 +28,7 @@ async function validatePackedPublicPackage(root: string, pkg: PackageInfo): Prom
     const attwArgs = [
       packed.path,
       '--format',
-      'table',
+      'ascii',
       '--no-color',
       '--profile',
       'node16',
@@ -36,10 +36,13 @@ async function validatePackedPublicPackage(root: string, pkg: PackageInfo): Prom
       'cjs-resolves-to-esm',
       ...attwExcludedEntrypointArgs(pkg),
     ];
-    const attwStatus = await runStatus('attw', attwArgs, root);
+    const attwStatus = await runStatus('attw', ['--quiet', ...attwArgs], root, true);
     if (attwStatus !== 0) {
+      await runStatus('attw', attwArgs, root);
       console.error(`${pkg.path}: are-the-types-wrong validation failed`);
       failures++;
+    } else {
+      console.log(`${pkg.path}: are-the-types-wrong valid.`);
     }
   } catch (error) {
     const message = error instanceof Error ? error.message : String(error);
