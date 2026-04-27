@@ -5,9 +5,7 @@
     "emitDeclarationOnly": true,
     "importHelpers": true,
     "isolatedModules": true,
-    "lib": [
-      "es2022"
-    ],
+    "lib": ["es2022"],
     "module": "nodenext",
     "moduleResolution": "nodenext",
     "noEmitOnError": true,
@@ -24,25 +22,14 @@
         "transform": "typia/lib/transform"
       }
     ],
-    "customConditions": [
-      "development"
-    ],
+    "customConditions": ["development"],
     "paths": {
-      "@smoothbricks/arrow-builder": [
-        "./packages/arrow-builder/src/index.ts"
-      ],
-      "@smoothbricks/duration": [
-        "./packages/duration/src/index.ts"
-      ],
-      "@smoothbricks/lmao": [
-        "./packages/lmao/src/index.ts"
-      ],
-      "@smoothbricks/lmao-transformer": [
-        "./packages/lmao-transformer/src/index.ts"
-      ],
-      "@smoothbricks/validation": [
-        "./packages/validation/src/index.ts"
-      ]
+      "@smoothbricks/arrow-builder": ["./packages/arrow-builder/src/index.ts"],
+      "@smoothbricks/cli": ["./packages/cli/src/index.ts"],
+      "@smoothbricks/duration": ["./packages/duration/src/index.ts"],
+      "@smoothbricks/lmao": ["./packages/lmao/src/index.ts"],
+      "@smoothbricks/lmao-transformer": ["./packages/lmao-transformer/src/index.ts"],
+      "@smoothbricks/validation": ["./packages/validation/src/index.ts"]
     }
   }
 }

@@ -1,0 +1,47 @@
+# git-format-staged configuration for SmoothBricks-style monorepos
+
+formatters:
+  eslint:
+    command: eslint-stdout '{}'
+    patterns:
+      - '*.astro'
+      - '!.*'
+      - '!.*/**'
+
+  biome:
+    command: biome check --files-ignore-unknown=true --use-editorconfig=true '--stdin-file-path={}' --fix
+    patterns:
+      - '*.js'
+      - '*.ts'
+      - '*.jsx'
+      - '*.tsx'
+      - '*.json'
+      - '*.jsonc'
+      - '*.html'
+      - '*.css'
+      - '*.graphql'
+
+  prettier:
+    command: prettier --ignore-unknown --stdin-filepath '{}'
+    patterns:
+      - '*'
+      - '!.*'
+      - '!*.js'
+      - '!*.ts'
+      - '!*.jsx'
+      - '!*.tsx'
+      - '!*.json'
+      - '!*.jsonc'
+      - '!*.html'
+      - '!*.css'
+      - '!*.graphql'
+      - '!*.nix'
+
+  alejandra:
+    command: alejandra
+    patterns:
+      - '*.nix'
+
+settings:
+  update_working_tree: true
+  show_commands: true

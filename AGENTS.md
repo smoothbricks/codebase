@@ -31,8 +31,8 @@
 - **Known operational failures return `Err`/`Result`.** `throw` is only for invariants, impossible states, or programmer
   bugs.
 - **No default `NoOpTracer`.** `createNoOpTracer()` is banned/removed. `NoOpTracer` may still exist in
-   `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
-   Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
+  `@smoothbricks/lmao` for API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
+  Require tracing context from callers, use child spans, and use observable suite/test tracers in tests.
 - **Lint before tests.** Use `nx lint <project>` before `nx test <project>`.
 - **Run tests through Nx.** Use `nx test <project>` as the default and expected path so dependencies are built, package
   test config is honored, and the real preloads/setup files load correctly. Pass runner args/filters through Nx instead
@@ -73,8 +73,8 @@
 - **No cast-based fake validation.** `JSON.parse(...) as T`, `as Record<string, unknown>` property walking, `as any`,
   `as unknown as`, and `as never` are all banned.
   - **WHY:** those suppress the exact compile-time signal that should force a real type/generic/API fix.
-- **Use real public contract types.** Prefer inferred/public types over manually restating
-  `Record<string, unknown>` or giant local context/state shapes.
+- **Use real public contract types.** Prefer inferred/public types over manually restating `Record<string, unknown>` or
+  giant local context/state shapes.
   - **WHY:** restated broad shapes erase domain meaning and force more downstream validation/casts.
 - **Review gate:** if a diff introduces a manual validator/helper that Typia already covers, reject or fix it before
   commit.
@@ -89,13 +89,13 @@ codebases.
 
 When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
 
- **Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
-  ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`.
- **Example**:
-  ```
-  tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
-  tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
-  ```
+**Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
+ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`. **Example**:
+
+```
+tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
+tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
+```
 
 ### Comby for Structural Search/Replace
 
@@ -139,11 +139,10 @@ comby 'new Tracer(:[factory:e], { sink: :[sink:e] })' 'new Tracer({ logBinding: 
 
 **Tips**:
 
- **ALWAYS use `-diff` first** - never go straight to `-in-place`
- Use `-matcher .ts` for TypeScript (better than `-extensions ts`)
- Use `:[var:e]` for expressions that may contain parens/brackets
- Comby handles balanced delimiters automatically - `{:[x]}` matches balanced braces
- Patterns can match more broadly than expected - review the diff carefully!
+**ALWAYS use `-diff` first** - never go straight to `-in-place` Use `-matcher .ts` for TypeScript (better than
+`-extensions ts`) Use `:[var:e]` for expressions that may contain parens/brackets Comby handles balanced delimiters
+automatically - `{:[x]}` matches balanced braces Patterns can match more broadly than expected - review the diff
+carefully!
 
 ### git-reword-commit (for rewriting commit messages)
 
@@ -166,13 +165,13 @@ echo "Co-authored-by: Someone" | ./tooling/git-reword-commit abc123 --append
 
 When using `mcp-tsmorph_rename_symbol_by_tsmorph` or other ts-morph tools:
 
- **Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
-  ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`.
- **Example**:
-  ```
-  tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
-  tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
-  ```
+**Use `tsconfig.lib.json`** NOT `tsconfig.json` - The root tsconfig uses project references with empty `include`, so
+ts-morph won't find any files. Always use the lib-specific tsconfig that has `include: ["src/**/*.ts"]`. **Example**:
+
+```
+tsconfigPath: "/path/to/packages/lmao/tsconfig.lib.json"  ✅
+tsconfigPath: "/path/to/packages/lmao/tsconfig.json"      ❌ (files not found)
+```
 
 ### Nx targetDefaults and New Package Checklist
 
@@ -200,8 +199,11 @@ explicit `"nx".targets` config). If a package doesn't declare the target, the ta
 }
 ```
 
- `"lint": {}` — creates the target; `nx.json` targetDefault fills in biome executor + `dependsOn: ["typecheck-tests"]`
- `"typecheck-tests"` — explicit target because it has package-specific `cwd`; runs `tsc --noEmit` on test tsconfig
+If the package is published to npm, add `"npm:public"` to `package.json` `"nx".tags`. If the package is private or
+internal-only, do not add that tag. `smoo` and release workflows use `npm:public` as the source of truth.
+
+`"lint": {}` — creates the target; `nx.json` targetDefault fills in biome executor + `dependsOn: ["typecheck-tests"]`
+`"typecheck-tests"` — explicit target because it has package-specific `cwd`; runs `tsc --noEmit` on test tsconfig
 
 Also create `tsconfig.test.json` for the package (see existing packages for the pattern: `types: ["bun"]`,
 `composite: false`, `noEmit: true`, includes test globs, references `tsconfig.lib.json`).
@@ -242,38 +244,35 @@ directives:
 
 **THIS IS A GREENFIELD PROJECT.** There is NO legacy code. There are NO existing users.
 
- **DO NOT** add backwards compatibility layers or deprecated API support
- **DO NOT** maintain old function signatures "just in case"
- **DO NOT** keep dead code around
- **CRITICALLY ANALYZE** specs vs implementation - specs evolve and may be outdated or incorrect
- If implementation diverges from spec → **EVALUATE WHICH IS CORRECT** and update accordingly
- **GENERATE TASKS FOR BOTH** implementation fixes AND spec updates when inconsistencies are found
- **QUESTION ASSUMPTIONS** - implementation may have discovered better approaches than spec requirements
- When in doubt, ask - don't blindly follow specs if implementation suggests better patterns
+**DO NOT** add backwards compatibility layers or deprecated API support **DO NOT** maintain old function signatures
+"just in case" **DO NOT** keep dead code around **CRITICALLY ANALYZE** specs vs implementation - specs evolve and may be
+outdated or incorrect If implementation diverges from spec → **EVALUATE WHICH IS CORRECT** and update accordingly
+**GENERATE TASKS FOR BOTH** implementation fixes AND spec updates when inconsistencies are found **QUESTION
+ASSUMPTIONS** - implementation may have discovered better approaches than spec requirements When in doubt, ask - don't
+blindly follow specs if implementation suggests better patterns
 
 ## ERROR HANDLING POLICY (RESULT VS THROW)
 
 This repo uses a strict policy:
 
- **Known operational failures MUST return `Err`/`Result`** (validation failures, business-rule failures, transient
-  errors, blocked state, missing optional dependencies, missing runtime data, retryable failures).
- **`throw` is ONLY for invariants / impossible states / programmer bugs** (type exhaustiveness failures, impossible
-  internal state, broken build/runtime contracts).
- **No SQS exception to this rule**: known retry cases MUST be represented as structured failures and mapped to platform
-  responses (e.g. Lambda SQS `batchItemFailures`), not thrown.
+**Known operational failures MUST return `Err`/`Result`** (validation failures, business-rule failures, transient
+errors, blocked state, missing optional dependencies, missing runtime data, retryable failures). **`throw` is ONLY for
+invariants / impossible states / programmer bugs** (type exhaustiveness failures, impossible internal state, broken
+build/runtime contracts). **No SQS exception to this rule**: known retry cases MUST be represented as structured
+failures and mapped to platform responses (e.g. Lambda SQS `batchItemFailures`), not thrown.
 
 ### Trace semantics
 
- `span-err`: expected operational error represented via `ctx.err(...)` / `Err`.
- `span-exception`: unexpected thrown exception (bug/invariant break).
+`span-err`: expected operational error represented via `ctx.err(...)` / `Err`. `span-exception`: unexpected thrown
+exception (bug/invariant break).
 
 ### NoOpTracer policy
 
-**`NoOpTracer` is not an approved default wiring pattern in this
-codebase.**
+**`NoOpTracer` is not an approved default wiring pattern in this codebase.**
 
- **Production code**: Requires real tracing. If code needs a spanContext, require it from the caller
- **Tests**: MUST use `TestTracer` or suite tracer that flushes to SQLite (per CLAUDE.md test tracing policy)
+**Production code**: Requires real tracing. If code needs a spanContext, require it from the caller **Tests**: MUST use
+`TestTracer` or suite tracer that flushes to SQLite (per CLAUDE.md test tracing policy)
+
 - **Benchmarking / comparison**: `NoOpTracer` may still exist in `@smoothbricks/lmao` for API proof or overhead
   measurement, but ordinary app/test wiring in this repo should not use it as the default pattern
 
@@ -305,10 +304,9 @@ DO fetch) starts a root trace; all subsequent operations use child spans.
 
 ### Agent implementation requirements
 
- If code currently throws for a known operational failure, migrate it to a typed `Err` with explicit error code.
- If a throw is retained, add a short comment explaining invariant intent, e.g.
-  `// invariant throw: programmer/config bug`.
- Prefer type guards and exhaustive checks so impossible states are prevented at compile-time where feasible.
+If code currently throws for a known operational failure, migrate it to a typed `Err` with explicit error code. If a
+throw is retained, add a short comment explaining invariant intent, e.g. `// invariant throw: programmer/config bug`.
+Prefer type guards and exhaustive checks so impossible states are prevented at compile-time where feasible.
 
 --
 
@@ -333,25 +331,23 @@ The agent should:
 
 ### When Implementation Diverges from Spec
 
- **Don't blindly fix implementation** - specs may be wrong or outdated
- **Evaluate trade-offs**: Performance, ergonomics, correctness, maintainability
- **Implementation may be right**: Greenfield projects often discover better patterns during coding
- **Update specs proactively**: If implementation proves superior, update the spec to match
- **Document rationale**: When diverging from spec, explain WHY in commit messages and spec updates
+**Don't blindly fix implementation** - specs may be wrong or outdated **Evaluate trade-offs**: Performance, ergonomics,
+correctness, maintainability **Implementation may be right**: Greenfield projects often discover better patterns during
+coding **Update specs proactively**: If implementation proves superior, update the spec to match **Document rationale**:
+When diverging from spec, explain WHY in commit messages and spec updates
 
 ### Spec Quality Assessment
 
- **Question assumptions**: Are spec requirements still valid? Do they make sense?
- **Check for outdated patterns**: Specs written early may not reflect current best practices
- **Validate constraints**: Are spec limitations still necessary or were they premature optimizations?
- **Consider real-world usage**: Does the spec match actual developer needs and workflows?
+**Question assumptions**: Are spec requirements still valid? Do they make sense? **Check for outdated patterns**: Specs
+written early may not reflect current best practices **Validate constraints**: Are spec limitations still necessary or
+were they premature optimizations? **Consider real-world usage**: Does the spec match actual developer needs and
+workflows?
 
 ### Task Generation Strategy
 
- **Implementation fixes**: When spec is clearly correct and implementation is wrong
- **Spec updates**: When implementation demonstrates better approach or spec is outdated
- **Hybrid tasks**: When both spec and implementation need refinement
- **Documentation updates**: Always update this file when discovering new patterns or insights
+**Implementation fixes**: When spec is clearly correct and implementation is wrong **Spec updates**: When implementation
+demonstrates better approach or spec is outdated **Hybrid tasks**: When both spec and implementation need refinement
+**Documentation updates**: Always update this file when discovering new patterns or insights
 
 --
 
@@ -359,17 +355,15 @@ The agent should:
 
 **MULTIPLE AI AGENTS WORK IN THIS REPO** - coordinate carefully to avoid conflicts:
 
- **NEVER use `git checkout`** - This can reset other agents' work in progress
- **NEVER use `git reset`** - Same issue, destroys other agents' changes
- **Check git status first** - See what others are working on before making changes
- **Communicate changes** - If you modify shared interfaces/types, notify other agents
- **Avoid conflicting edits** - Work on different files when possible, coordinate on shared files
+**NEVER use `git checkout`** - This can reset other agents' work in progress **NEVER use `git reset`** - Same issue,
+destroys other agents' changes **Check git status first** - See what others are working on before making changes
+**Communicate changes** - If you modify shared interfaces/types, notify other agents **Avoid conflicting edits** - Work
+on different files when possible, coordinate on shared files
 
 **If you accidentally use git checkout/reset:**
 
- IMMEDIATELY notify other agents what you changed
- They may need to reapply their work
- Use this as a lesson to check git status first next time
+IMMEDIATELY notify other agents what you changed They may need to reapply their work Use this as a lesson to check git
+status first next time
 
 --
 
@@ -379,48 +373,42 @@ The agent should:
 
 ### Package Architecture (Read FIRST!)
 
- **Package Architecture**: specs/lmao/00_package_architecture.md - Defines arrow-builder vs lmao responsibilities,
-  dependency direction, what each package OWNS and MUST NOT know about
+**Package Architecture**: specs/lmao/00_package_architecture.md - Defines arrow-builder vs lmao responsibilities,
+dependency direction, what each package OWNS and MUST NOT know about
 
 ### Core System
 
- **System Overview**: specs/lmao/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8
-  Optimization Patterns** (see also [V8 Optimization References](#v8-optimization-references) below)
- **Schema System**: specs/lmao/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema [**LMAO**]
- **Feature Flags**: specs/lmao/01p_feature_flags.md - Flag schema, evaluator, analytics [**LMAO**]
- **Context Flow**: specs/lmao/01c_context_flow_and_op_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern
-  [**LMAO**]
- **Buffer Architecture**: specs/lmao/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow
-  builders!) [**ARROW-BUILDER**]
- **TypeScript Transformer**: specs/lmao/01o_typescript_transformer.md - Compile-time V8 optimizations, span_op/span_fn
-  monomorphic methods [**LMAO-TRANSFORMER**]
+**System Overview**: specs/lmao/01_trace_logging_system.md - Architecture overview, hot/cold path design, **V8
+Optimization Patterns** (see also [V8 Optimization References](#v8-optimization-references) below) **Schema System**:
+specs/lmao/01a_trace_schema_system.md - S.enum/S.category/S.text, logSchema [**LMAO**] **Feature Flags**:
+specs/lmao/01p_feature_flags.md - Flag schema, evaluator, analytics [**LMAO**] **Context Flow**:
+specs/lmao/01c_context_flow_and_op_wrappers.md - TraceContext→Op→Span hierarchy, op() pattern [**LMAO**] **Buffer
+Architecture**: specs/lmao/01b_columnar_buffer_architecture.md - TypedArray columnar storage (NOT Arrow builders!)
+[**ARROW-BUILDER**] **TypeScript Transformer**: specs/lmao/01o_typescript_transformer.md - Compile-time V8
+optimizations, span_op/span_fn monomorphic methods [**LMAO-TRANSFORMER**]
 
 ### Buffer System Details (All in @packages/arrow-builder)
 
- **Performance Opts**: specs/lmao/01b1_buffer_performance_optimizations.md - Cache alignment, string interning, enum
-  optimization
- **Self-Tuning**: specs/lmao/01b2_buffer_self_tuning.md - Zero-config capacity management
- **High-Precision Timestamps**: specs/lmao/01b3_high_precision_timestamps.md - Nanosecond timestamps, BigInt64Array
- **Span Identity**: specs/lmao/01b4_span_identity.md - Span ID design, TraceId, distributed tracing
- **SpanBuffer Memory Layout**: specs/lmao/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization,
-  SpanBuffer interface
- **Buffer Codegen Extension**: specs/lmao/01b6_buffer_codegen_extension.md - ColumnBufferExtension, lazy getters,
-  schema-generated buffers
- **Arrow Table**: specs/lmao/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
+**Performance Opts**: specs/lmao/01b1_buffer_performance_optimizations.md - Cache alignment, string interning, enum
+optimization **Self-Tuning**: specs/lmao/01b2_buffer_self_tuning.md - Zero-config capacity management **High-Precision
+Timestamps**: specs/lmao/01b3_high_precision_timestamps.md - Nanosecond timestamps, BigInt64Array **Span Identity**:
+specs/lmao/01b4_span_identity.md - Span ID design, TraceId, distributed tracing **SpanBuffer Memory Layout**:
+specs/lmao/01b5_spanbuffer_memory_layout.md - Memory diagrams, column organization, SpanBuffer interface **Buffer
+Codegen Extension**: specs/lmao/01b6_buffer_codegen_extension.md - ColumnBufferExtension, lazy getters, schema-generated
+buffers **Arrow Table**: specs/lmao/01f_arrow_table_structure.md - Final queryable format & zero-copy conversion
 
 ### API & Code Generation (All in @packages/lmao)
 
- **Entry Types**: specs/lmao/01h_entry_types_and_logging_primitives.md - Unified entry type enum, fluent API
- **Context API Codegen**: specs/lmao/01g_trace_context_api_codegen.md - Runtime code generation for tag methods
- **Module Context**: specs/lmao/01j_module_context_and_spanlogger_generation.md - Op/SpanLogger class generation
- **Span Scope**: specs/lmao/01i_span_scope_attributes.md - Scoped attributes for zero-overhead propagation
+**Entry Types**: specs/lmao/01h_entry_types_and_logging_primitives.md - Unified entry type enum, fluent API **Context
+API Codegen**: specs/lmao/01g_trace_context_api_codegen.md - Runtime code generation for tag methods **Module Context**:
+specs/lmao/01j_module_context_and_spanlogger_generation.md - Op/SpanLogger class generation **Span Scope**:
+specs/lmao/01i_span_scope_attributes.md - Scoped attributes for zero-overhead propagation
 
 ### Integration & Output
 
- **Op Context Pattern**: specs/lmao/01l_op_context_pattern.md - `defineOpContext()`, `defineOp()`, and Tracer
-  [**LMAO**]
- **Library Integration**: specs/lmao/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
- **AI Agent Integration**: specs/lmao/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
+**Op Context Pattern**: specs/lmao/01l_op_context_pattern.md - `defineOpContext()`, `defineOp()`, and Tracer [**LMAO**]
+**Library Integration**: specs/lmao/01e_library_integration_pattern.md - RemappedBufferView for prefixing [**LMAO**]
+**AI Agent Integration**: specs/lmao/01d_ai_agent_integration.md - MCP server for AI trace querying [**LMAO**]
 
 ## 🏗️ PACKAGE ARCHITECTURE - TWO SIBLING PACKAGES:
 
@@ -432,26 +420,20 @@ The agent should:
 
 **Owns**:
 
- Cache-aligned TypedArray buffer creation (64-byte alignment)
- Lazy column storage pattern (nulls + values share ONE ArrayBuffer per column)
- Runtime class generation via `new Function()` for V8 optimization
- Schema extensibility via composition (NOT inheritance)
- Zero-copy Arrow conversion
+Cache-aligned TypedArray buffer creation (64-byte alignment) Lazy column storage pattern (nulls + values share ONE
+ArrayBuffer per column) Runtime class generation via `new Function()` for V8 optimization Schema extensibility via
+composition (NOT inheritance) Zero-copy Arrow conversion
 
 **CRITICAL - Does NOT know about**:
 
- ❌ Logging/tracing concepts (spans, traces, contexts)
- ❌ Entry types (info, warn, error, span-start)
- ❌ Scope or scoped attributes
- ❌ System vs user column distinction
- ❌ Any `@smoothbricks/lmao` dependency
+❌ Logging/tracing concepts (spans, traces, contexts) ❌ Entry types (info, warn, error, span-start) ❌ Scope or scoped
+attributes ❌ System vs user column distinction ❌ Any `@smoothbricks/lmao` dependency
 
 **Key Files**:
 
- `src/lib/buffer/types.ts` - ColumnBuffer interface
- `src/lib/buffer/columnBufferGenerator.ts` - new Function() codegen for lazy columns
- `src/lib/buffer/createColumnBuffer.ts` - Buffer factory
- `src/lib/schema-types.ts` - Generic schema types
+`src/lib/buffer/types.ts` - ColumnBuffer interface `src/lib/buffer/columnBufferGenerator.ts` - new Function() codegen
+for lazy columns `src/lib/buffer/createColumnBuffer.ts` - Buffer factory `src/lib/schema-types.ts` - Generic schema
+types
 
 ### @packages/lmao - High-Level Logging/Runtime
 
@@ -459,50 +441,41 @@ The agent should:
 
 **Owns**:
 
- Schema DSL (S.enum/category/text/number/boolean) (specs/lmao/01a)
- logSchema definitions with masking
- **System columns (timestamps, operations) - ALWAYS eager, never lazy**
- **Scope storage - plain object on buffer, NO codegen needed**
- SpanBuffer creation (extends ColumnBuffer with span metadata)
- SpanLogger/ctx API generation (specs/lmao/01g, 01j)
- Fluent logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/lmao/01h)
- Context propagation (traceContext→module→op→span) (specs/lmao/01c)
- Feature flag evaluation (specs/lmao/01a)
- Library integration & prefixing (specs/lmao/01e)
+Schema DSL (S.enum/category/text/number/boolean) (specs/lmao/01a) logSchema definitions with masking **System columns
+(timestamps, operations) - ALWAYS eager, never lazy** **Scope storage - plain object on buffer, NO codegen needed**
+SpanBuffer creation (extends ColumnBuffer with span metadata) SpanLogger/ctx API generation (specs/lmao/01g, 01j) Fluent
+logging (ctx.tag, ctx.log, ctx.ok, ctx.err) (specs/lmao/01h) Context propagation (traceContext→module→op→span)
+(specs/lmao/01c) Feature flag evaluation (specs/lmao/01a) Library integration & prefixing (specs/lmao/01e)
 
 **Key Architectural Decisions**:
 
- System columns NEVER lazy (written every entry, zero conditionals)
- User attribute columns lazy by default (sparse data)
- Scope is a plain object (`buffer.scopeValues`) - filled at Arrow conversion via SIMD
- Direct properties on SpanBuffer (`$name_nulls` + `$name_values` for each schema field)
+System columns NEVER lazy (written every entry, zero conditionals) User attribute columns lazy by default (sparse data)
+Scope is a plain object (`buffer.scopeValues`) - filled at Arrow conversion via SIMD Direct properties on SpanBuffer
+(`$name_nulls` + `$name_values` for each schema field)
 
 **Key Files**:
 
- `src/lib/schema/` - Schema builders, logSchema, feature flags
- `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger class generation (tag methods)
- `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer)
- `src/lib/lmao.ts` - Main integration, context creation
- `src/lib/types.ts` - SpanBuffer interfaces
+`src/lib/schema/` - Schema builders, logSchema, feature flags `src/lib/codegen/spanLoggerGenerator.ts` - SpanLogger
+class generation (tag methods) `src/lib/spanBuffer.ts` - SpanBuffer factory (extends ColumnBuffer) `src/lib/lmao.ts` -
+Main integration, context creation `src/lib/types.ts` - SpanBuffer interfaces
 
 **Relationship**: lmao depends on arrow-builder. arrow-builder MUST NOT depend on lmao.
 
 ## 🚫 CRITICAL RULES:
 
- **Hot Path**: TypedArray assignments ONLY in arrow-builder. No Arrow builders, no objects!
- **Package Imports**: lmao can import from `@smoothbricks/arrow-builder`. arrow-builder MUST NOT import from lmao!
- **DO NOT**: Use Apache Arrow builders in hot path - only TypedArray assignments per
-  specs/lmao/01b_columnar_buffer_architecture.md
- **⚠️ SEARCH BEFORE IMPLEMENTING**: Before writing ANY new code, ALWAYS search for existing implementations in BOTH
-  packages:
-  - Use `grep` or `glob` to find similar functions/types/patterns
-  - Check `packages/lmao/src/lib/` for high-level APIs
-  - Check `packages/arrow-builder/src/lib/` for low-level buffer operations
-  - Look for existing helper functions, types, and patterns
-  - **DO NOT re-implement what already exists** - reuse existing code
-  - **DO NOT create raw objects** - use `defineLogSchema()` and `S` schema builder
-  - **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineLogSchema` and use
-    it properly
+**Hot Path**: TypedArray assignments ONLY in arrow-builder. No Arrow builders, no objects! **Package Imports**: lmao can
+import from `@smoothbricks/arrow-builder`. arrow-builder MUST NOT import from lmao! **DO NOT**: Use Apache Arrow
+builders in hot path - only TypedArray assignments per specs/lmao/01b_columnar_buffer_architecture.md **⚠️ SEARCH BEFORE
+IMPLEMENTING**: Before writing ANY new code, ALWAYS search for existing implementations in BOTH packages:
+
+- Use `grep` or `glob` to find similar functions/types/patterns
+- Check `packages/lmao/src/lib/` for high-level APIs
+- Check `packages/arrow-builder/src/lib/` for low-level buffer operations
+- Look for existing helper functions, types, and patterns
+- **DO NOT re-implement what already exists** - reuse existing code
+- **DO NOT create raw objects** - use `defineLogSchema()` and `S` schema builder
+- **Example**: Before creating a schema object like `{ __lmao_type: 'number' }`, search for `defineLogSchema` and use it
+  properly
 
 ## ✅ TYPE-DRIVEN TEST ERGONOMICS WORKFLOW (MANDATORY)
 
@@ -528,26 +501,25 @@ Rules:
 
 ### No Type Erasure Policy (MANDATORY)
 
-These rules are grounded in recent repository direction: typed API inference, generic threading across runtime
-chains, and sustained cast-removal refactors across the codebase.
+These rules are grounded in recent repository direction: typed API inference, generic threading across runtime chains,
+and sustained cast-removal refactors across the codebase.
 
 Policy:
 
- Keep generic type parameters threaded end-to-end (input -> storage -> accessor return type).
- Do not erase specific generic types into broad singleton storage when those values are later returned to callers.
- If a helper accepts a generic context/tracer, exposed getters/handles must preserve that exact generic.
- Do not patch inference gaps with `as unknown as ...`, `as any`, or broad cast bridges in library code.
- If a cast seems required, treat it as a typing bug in source API design and fix types first.
- Back-compat `unknown` defaults may exist in core public generics, but helper/harness APIs must still preserve concrete
-  inferred types at the call site.
+Keep generic type parameters threaded end-to-end (input -> storage -> accessor return type). Do not erase specific
+generic types into broad singleton storage when those values are later returned to callers. If a helper accepts a
+generic context/tracer, exposed getters/handles must preserve that exact generic. Do not patch inference gaps with
+`as unknown as ...`, `as any`, or broad cast bridges in library code. If a cast seems required, treat it as a typing bug
+in source API design and fix types first. Back-compat `unknown` defaults may exist in core public generics, but
+helper/harness APIs must still preserve concrete inferred types at the call site.
 
 Scenario paths write facts to VM state via the RETE bridge (`vm-rete-bridge.ts` runs JS `:then` callbacks, writes
 results to VM state via `vm_rete_insert_fact`). The VM facts reader (`vm-facts-reader.ts`) reads directly from WASM
 memory with zero-copy Uint32Array views.
 
 - **Domain/agent tests:** Use Scenario with `defineRuleset` — rules fire automatically after reduce, facts are stored in
-  VM state, `scenario.facts` returns a snapshot-backed reader.
-  pattern as reducer parity: run both paths, compare with fast-check. See `rete-parity.test.ts`.
+  VM state, `scenario.facts` returns a snapshot-backed reader. pattern as reducer parity: run both paths, compare with
+  fast-check. See `rete-parity.test.ts`.
 
 ## 🎯 STRING TYPE SYSTEM (CRITICAL - See specs/lmao/01a_trace_schema_system.md):
 
@@ -555,41 +527,33 @@ Three distinct string types, each with different storage strategies:
 
 ### S.enum - Known Values (Uint8Array)
 
- **When**: All possible values known at compile time
- **Storage**: Uint8Array (1 byte) with compile-time mapping
- **Example**: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']) → switch case mapping
- **Arrow**: Dictionary with pre-defined values
- **Use for**: Operations, HTTP methods, entry types, status enums
+**When**: All possible values known at compile time **Storage**: Uint8Array (1 byte) with compile-time mapping
+**Example**: S.enum(['CREATE', 'READ', 'UPDATE', 'DELETE']) → switch case mapping **Arrow**: Dictionary with pre-defined
+values **Use for**: Operations, HTTP methods, entry types, status enums
 
 ### S.category - Repeated Values (Dictionary Encoded)
 
- **When**: Values often repeat (limited cardinality)
- **Storage**: Raw strings in hot path, dictionary built in cold path
- **Example**: buffer.userId_values[idx] = userId (raw string stored, dict built at Arrow conversion)
- **Arrow**: Dictionary built dynamically from unique values
- **Use for**: userIds, sessionIds, moduleNames, spanNames, table names
+**When**: Values often repeat (limited cardinality) **Storage**: Raw strings in hot path, dictionary built in cold path
+**Example**: buffer.userId_values[idx] = userId (raw string stored, dict built at Arrow conversion) **Arrow**:
+Dictionary built dynamically from unique values **Use for**: userIds, sessionIds, moduleNames, spanNames, table names
 
 ### S.text - Unique Values (No Dictionary)
 
- **When**: Values rarely repeat
- **Storage**: Raw strings without interning
- **Example**: Error messages, stack traces, SQL queries after masking
- **Arrow**: Plain string column (no dictionary overhead)
- **Use for**: Unique error messages, URLs, request bodies, masked queries **IMPORTANT**: Never use generic "S.string" -
-  always choose enum/category/text explicitly!
+**When**: Values rarely repeat **Storage**: Raw strings without interning **Example**: Error messages, stack traces, SQL
+queries after masking **Arrow**: Plain string column (no dictionary overhead) **Use for**: Unique error messages, URLs,
+request bodies, masked queries **IMPORTANT**: Never use generic "S.string" - always choose enum/category/text
+explicitly!
 
 ## Build/Test Commands (Use Bun, Never npm/npx)
 
 ### Build & Typecheck
 
- **Build**: `nx build <project>`
- **Typecheck**: `nx typecheck <project>` (typechecks source code)
+**Build**: `nx build <project>` **Typecheck**: `nx typecheck <project>` (typechecks source code)
 
 ### Linting (ALWAYS run before tests!)
 
- **Lint**: `nx lint <project>`
- **Lint Fix**: `nx lint:fix <project>`
- **⚠️ CRITICAL**: Agents MUST run `nx lint <project>` before running tests to catch type errors early
+**Lint**: `nx lint <project>` **Lint Fix**: `nx lint:fix <project>` **⚠️ CRITICAL**: Agents MUST run `nx lint <project>`
+before running tests to catch type errors early
 
 ### Testing
 
@@ -598,18 +562,17 @@ Three distinct string types, each with different storage strategies:
 - **Note**: Tests no longer depend on `typecheck-tests`; linting handles that. Tests only depend on build. Direct
   `bun test` is diagnostic-only, not the standard validation path.
 
-**Repository requirement:** Every package test suite (except `packages/lmao`) MUST be LMAO-traced and MUST flush
-traces through a SQLite sink (local `.trace-results.db` or worker D1 binding such as `TRACE_RESULTS`).
- Configure SQLite once in the package-local tracer module (`src/test-suite-tracer.ts` or vitest equivalent), not in
-  individual tests.
- Preload/setup files must stay wiring-only (one call to setup helper + runner mock bridge when needed).
- If a runner-specific package needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner harness
-  module, not in setup files.
+**Repository requirement:** Every package test suite (except `packages/lmao`) MUST be LMAO-traced and MUST flush traces
+through a SQLite sink (local `.trace-results.db` or worker D1 binding such as `TRACE_RESULTS`). Configure SQLite once in
+the package-local tracer module (`src/test-suite-tracer.ts` or vitest equivalent), not in individual tests.
+Preload/setup files must stay wiring-only (one call to setup helper + runner mock bridge when needed). If a
+runner-specific package needs extra wiring (e.g. Worker/Vitest bridge), put that logic in the runner harness module, not
+in setup files.
 
 ### Property-Based Testing with fast-check
 
-**Prefer property-based tests by default** for buffer/overflow semantics, fork graphs,
-and data integrity scenarios. The `fast-check` library is installed.
+**Prefer property-based tests by default** for buffer/overflow semantics, fork graphs, and data integrity scenarios. The
+`fast-check` library is installed.
 
 ```typescript
 import fc from 'fast-check';
@@ -630,17 +593,15 @@ fc.assert(
 
 **When to use property-based tests:**
 
- Buffer overflow and chaining (entry preservation, buffer count formulas)
- Data integrity across serialization/deserialization
- Mathematical invariants (e.g., `sb_overflows === bufferCount - 1`)
- Any scenario where "it works for N" should imply "it works for all N"
- Deep fork of-fork interleavings with append/switch/reset operations
- Rollback/rollforward reversibility across long randomized operation sequences
+Buffer overflow and chaining (entry preservation, buffer count formulas) Data integrity across
+serialization/deserialization Mathematical invariants (e.g., `sb_overflows === bufferCount - 1`) Any scenario where "it
+works for N" should imply "it works for all N" Deep fork of-fork interleavings with append/switch/reset operations
+Rollback/rollforward reversibility across long randomized operation sequences
 
- **Policy:**
+**Policy:**
 
- Start with a small example test for readability, then add a property test that stress-tests the same invariant.
- For fork/undo logic, prefer randomized traces over manually enumerated branch cases.
+Start with a small example test for readability, then add a property test that stress-tests the same invariant. For
+fork/undo logic, prefer randomized traces over manually enumerated branch cases.
 
 ### Boundary Validation And Contract Preservation (MANDATORY)
 
@@ -653,8 +614,8 @@ fc.assert(
 - For parsed/runtime value boundaries, use `typia.assert/validate/assertEquals/validateEquals` (or `create*` for
   repeated paths).
 - If extra properties must be rejected, use `*Equals` instead of hand-written exactness checks.
-- If a boundary already has a meaningful public type (for example `Record<string, unknown>`), use that type instead of manually
-  restating `Record<string, unknown>` unions across multiple files.
+- If a boundary already has a meaningful public type (for example `Record<string, unknown>`), use that type instead of
+  manually restating `Record<string, unknown>` unions across multiple files.
 - Treat new helpers named like `normalizeX`, `coerceX`, `toRecord`, `isStringKeyRecord`, or similar as suspicious by
   default. Before adding one, search for an existing shared validator/helper and justify why the new helper is
   necessary.
@@ -667,10 +628,9 @@ fc.assert(
 
 **Key properties to test:**
 
- **Preservation**: All N inputs produce exactly N outputs
- **Formulas**: Buffer count matches `1 + ceil((N - reservedRows) / capacity)`
- **Bounds**: Values stay within expected ranges
- **Consistency**: Related counters/metrics stay in sync
+**Preservation**: All N inputs produce exactly N outputs **Formulas**: Buffer count matches
+`1 + ceil((N - reservedRows) / capacity)` **Bounds**: Values stay within expected ranges **Consistency**: Related
+counters/metrics stay in sync
 
 ## SPANBUFFER PROPERTY NAMING: EXACT ARROW COLUMN MATCH
 
@@ -679,44 +639,31 @@ ensures obvious data flow and enables users to define custom columns with consis
 
 ### Core Arrow Columns → SpanBuffer Properties (Exact Match)
 
- `trace_id` → `trace_id` getter
- `thread_id` → `thread_id` getter
- `span_id` → `span_id` getter
- `parent_thread_id` → `parent_thread_id` getter
- `parent_span_id` → `parent_span_id` getter
- `timestamp` → `timestamp` (direct TypedArray)
- `entry_type` → `entry_type` (direct TypedArray)
- `package_name` → `package_name` (dictionary encoded)
- `package_file` → `package_file` (dictionary encoded)
- `git_sha` → `git_sha` (dictionary encoded)
+`trace_id` → `trace_id` getter `thread_id` → `thread_id` getter `span_id` → `span_id` getter `parent_thread_id` →
+`parent_thread_id` getter `parent_span_id` → `parent_span_id` getter `timestamp` → `timestamp` (direct TypedArray)
+`entry_type` → `entry_type` (direct TypedArray) `package_name` → `package_name` (dictionary encoded) `package_file` →
+`package_file` (dictionary encoded) `git_sha` → `git_sha` (dictionary encoded)
 
 ### System Schema Fields (snake_case)
 
- `message` (eager category)
- `line` (lazy number)
- `error_code` (lazy category)
- `exception_stack` (lazy text)
- `ff_value` (lazy category)
- `uint64_value` (lazy bigUint64)
+`message` (eager category) `line` (lazy number) `error_code` (lazy category) `exception_stack` (lazy text) `ff_value`
+(lazy category) `uint64_value` (lazy bigUint64)
 
 ### SpanContext Changes
 
- No `traceId` (access via `ctx.buffer.trace_id`)
- New `module` getter for direct access to module metadata
- `callee_package`, `callee_file`, `callee_line`, `callee_git_sha` getters (pull from `buffer.module` and
-  `buffer.line(0)`)
- `SpanLogger` methods use `snake_case` (e.g., `error_code()`, `ff_value()`)
+No `traceId` (access via `ctx.buffer.trace_id`) New `module` getter for direct access to module metadata
+`callee_package`, `callee_file`, `callee_line`, `callee_git_sha` getters (pull from `buffer.module` and
+`buffer.line(0)`) `SpanLogger` methods use `snake_case` (e.g., `error_code()`, `ff_value()`)
 
 ### Internal Properties (underscore prefix)
 
- `_system`, `_identity`, `_writeIndex`, `_capacity`, `_next`, `_hasParent`, `_children`, `_parent`, `_module`,
-  `_spanName`, `_callsiteModule`, `_scopeValues`
+`_system`, `_identity`, `_writeIndex`, `_capacity`, `_next`, `_hasParent`, `_children`, `_parent`, `_module`,
+`_spanName`, `_callsiteModule`, `_scopeValues`
 
 ### Implementation Details
 
- **Arrow columns**: Use exact underscore names (correspond 1:1 with Arrow table)
- **System fields**: `snake_case` (same as Arrow columns)
- **Internal**: `_` prefix for encapsulation (implementation details)
+**Arrow columns**: Use exact underscore names (correspond 1:1 with Arrow table) **System fields**: `snake_case` (same as
+Arrow columns) **Internal**: `_` prefix for encapsulation (implementation details)
 
 ### Example
 
@@ -737,37 +684,37 @@ buffer._module; // Internal context
 
 ## Implementation Patterns (See specs/lmao/01h_entry_types_and_logging_primitives.md)
 
- **Schema Definition**: ALWAYS use `defineLogSchema()` with `S` builder:
+**Schema Definition**: ALWAYS use `defineLogSchema()` with `S` builder:
 
-  ```typescript
-  // ✅ CORRECT
-  const schema = defineLogSchema({
-    userId: S.category(),
-    operation: S.enum(['CREATE', 'READ']),
-    errorMsg: S.text(),
-    count: S.number(),
-  });
+```typescript
+// ✅ CORRECT
+const schema = defineLogSchema({
+  userId: S.category(),
+  operation: S.enum(['CREATE', 'READ']),
+  errorMsg: S.text(),
+  count: S.number(),
+});
 
-  // ❌ WRONG - Never create raw objects
-  const schema = { userId: { __lmao_type: 'category' } };
-  ```
+// ❌ WRONG - Never create raw objects
+const schema = { userId: { __lmao_type: 'category' } };
+```
 
- **Buffer Creation**: arrow-builder provides TypedArray buffers, lmao wraps with logging API
- **Hot Path Writes**: Direct TypedArray assignment only
-  - Enums: buffer.operation_values[idx] = OPERATION_MAP[value] (compile-time lookup)
-  - Categories: buffer.userId_values[idx] = rawString (raw string, dict built in cold path)
-  - Text: buffer.errorMsg_values[idx] = rawString (no interning)
- **Method Chaining**: Return this from tag methods for fluent API: .userId(id).requestId(req)
- **Per-Span Buffers**: Each span owns its columnar TypedArrays (Uint8Array, Float64Array, etc.)
+**Buffer Creation**: arrow-builder provides TypedArray buffers, lmao wraps with logging API **Hot Path Writes**: Direct
+TypedArray assignment only
+
+- Enums: buffer.operation_values[idx] = OPERATION_MAP[value] (compile-time lookup)
+- Categories: buffer.userId_values[idx] = rawString (raw string, dict built in cold path)
+- Text: buffer.errorMsg_values[idx] = rawString (no interning) **Method Chaining**: Return this from tag methods for
+  fluent API: .userId(id).requestId(req) **Per-Span Buffers**: Each span owns its columnar TypedArrays (Uint8Array,
+  Float64Array, etc.)
 
 ## Entry Type System (See specs/lmao/01h_entry_types_and_logging_primitives.md)
 
 Unified enum for ALL trace events:
 
- **Span lifecycle**: span-start, span-ok, span-err, span-exception
- **Logging**: info, debug, warn, error
- **Structured data**: tag
- **Feature flags**: ff-access, ff-usage Entry types use compile-time enum mapping to Uint8Array for 1-byte storage.
+**Span lifecycle**: span-start, span-ok, span-err, span-exception **Logging**: info, debug, warn, error **Structured
+data**: tag **Feature flags**: ff-access, ff-usage Entry types use compile-time enum mapping to Uint8Array for 1-byte
+storage.
 
 ## Critical Performance Rules (See specs/lmao/01b1_buffer_performance_optimizations.md)
 
@@ -783,22 +730,19 @@ Unified enum for ALL trace events:
 
 ## Code Generation (See specs/lmao/01g_trace_context_api_codegen.md & 01j)
 
- **SpanLogger generation**: Runtime class generation with typed methods per schema
- **Attribute methods**: Each schema field gets a typed method on SpanLogger
- **Dual API**: Object-based (ctx.tag({ userId: "123" })) and property-based (ctx.tag.userId("123"))
- **Zero allocation**: Fluent methods return this, no intermediate objects
+**SpanLogger generation**: Runtime class generation with typed methods per schema **Attribute methods**: Each schema
+field gets a typed method on SpanLogger **Dual API**: Object-based (ctx.tag({ userId: "123" })) and property-based
+(ctx.tag.userId("123")) **Zero allocation**: Fluent methods return this, no intermediate objects
 
 ## Library Integration (See specs/lmao/01l_op_context_pattern.md & 01e)
 
- Libraries use `defineOpContext({ logSchema, deps, flags, ctx })` to define their op context
- Ops are defined via
-  `const { defineOp, defineOps } = opContext; const myOp = defineOp('name', async (ctx, ...args) => {})`
- Ops receive full ctx and can destructure: `{ span, log, tag, deps, ff, env }` - take only what you need
- Span names at call site: `await ctx.span('contextual-name', someOp, args)` - caller names spans
- Deps can be destructured: `const { retry, auth } = ctx.deps`
- Prefix applied at use time: `httpOps.prefix('http')` for column prefixing
- RemappedBufferView maps prefixed names to unprefixed columns for Arrow conversion
- `ctx` properties require all keys enumerable for V8 hidden class optimization
+Libraries use `defineOpContext({ logSchema, deps, flags, ctx })` to define their op context Ops are defined via
+`const { defineOp, defineOps } = opContext; const myOp = defineOp('name', async (ctx, ...args) => {})` Ops receive full
+ctx and can destructure: `{ span, log, tag, deps, ff, env }` - take only what you need Span names at call site:
+`await ctx.span('contextual-name', someOp, args)` - caller names spans Deps can be destructured:
+`const { retry, auth } = ctx.deps` Prefix applied at use time: `httpOps.prefix('http')` for column prefixing
+RemappedBufferView maps prefixed names to unprefixed columns for Arrow conversion `ctx` properties require all keys
+enumerable for V8 hidden class optimization
 
 ## Tracer Usage Pattern
 
@@ -852,15 +796,12 @@ await trace('my-op', { trace_id: incomingTraceId, env: myEnv }, myOp);
 
 **Key Points:**
 
- **Tracer is abstract** - use `TestTracer`, `StdioTracer`, or `ArrayQueueTracer` here
- **Do not default to `NoOpTracer` in repo code** - if ordinary code seems to need it, the tracing API/call graph is
-  wrong
- **Pass full opContext** - `new TestTracer(opContext)` not just logBinding
- **Always destructure** `{ trace, flush }` from concrete tracer instance
- `TestTracer.rootBuffers` - accumulated root buffers for inspection
- `TestTracer.statsSnapshots` - captured capacity tuning stats
- `ArrayQueueTracer.drain()` - consume and clear batched buffers
- `StdioTracer` - prints spans with color-coded trace IDs and indentation
+**Tracer is abstract** - use `TestTracer`, `StdioTracer`, or `ArrayQueueTracer` here **Do not default to `NoOpTracer` in
+repo code** - if ordinary code seems to need it, the tracing API/call graph is wrong **Pass full opContext** -
+`new TestTracer(opContext)` not just logBinding **Always destructure** `{ trace, flush }` from concrete tracer instance
+`TestTracer.rootBuffers` - accumulated root buffers for inspection `TestTracer.statsSnapshots` - captured capacity
+tuning stats `ArrayQueueTracer.drain()` - consume and clear batched buffers `StdioTracer` - prints spans with
+color-coded trace IDs and indentation
 
 **Lifecycle Hooks** (for custom Tracer implementations): | Hook | When Called | |------|-------------| |
 `onTraceStart(rootBuffer)` | Before root fn execution | | `onTraceEnd(rootBuffer)` | After root fn completes (in
@@ -869,101 +810,75 @@ fn completes | | `onStatsWillResetFor(buffer)` | Before capacity tuning stats re
 
 ## Span Scope Attributes (See specs/lmao/01i_span_scope_attributes.md)
 
- Set scoped attributes: `ctx.setScope({ requestId, userId })` - merge semantics, `null` to clear
- Read scope: `ctx.scope.requestId` - readonly view
- Scope appears on ALL rows in Arrow output (default for all rows)
- **Direct writes win**: `tag.X()` wins on row 0, `ctx.ok().X()` wins on row 1, scope fills rows 2+
- **Immutable objects**: `setScope` creates NEW frozen object (never mutates)
- Child spans inherit parent scope by reference (safe because immutable - zero-cost!)
- **Snapshot semantics**: Child's scope is frozen at creation time (async safe, no race conditions)
- Columns filled via `TypedArray.fill()` at Arrow conversion (SIMD optimized)
+Set scoped attributes: `ctx.setScope({ requestId, userId })` - merge semantics, `null` to clear Read scope:
+`ctx.scope.requestId` - readonly view Scope appears on ALL rows in Arrow output (default for all rows) **Direct writes
+win**: `tag.X()` wins on row 0, `ctx.ok().X()` wins on row 1, scope fills rows 2+ **Immutable objects**: `setScope`
+creates NEW frozen object (never mutates) Child spans inherit parent scope by reference (safe because immutable -
+zero-cost!) **Snapshot semantics**: Child's scope is frozen at creation time (async safe, no race conditions) Columns
+filled via `TypedArray.fill()` at Arrow conversion (SIMD optimized)
 
 ## Self-Tuning Buffers (See specs/lmao/01b2_buffer_self_tuning.md)
 
- Per-module capacity learning
- Buffer chaining for overflow
- Zero configuration needed
- Adapts to workload patterns
+Per-module capacity learning Buffer chaining for overflow Zero configuration needed Adapts to workload patterns
 
 ## AI Agent Integration (See specs/lmao/01d_ai_agent_integration.md)
 
- MCP server for structured trace querying
- Tool-based interface for AI agents
- Context-efficient (detailed data only loaded on request)
- Works with Claude Desktop, Cursor, VS Code Copilot
+MCP server for structured trace querying Tool-based interface for AI agents Context-efficient (detailed data only loaded
+on request) Works with Claude Desktop, Cursor, VS Code Copilot
 
 ## Arrow Table Output (See specs/lmao/01f_arrow_table_structure.md)
 
- Enum columns: Dictionary with compile-time values
- Category columns: Dictionary with runtime-built values
- Text columns: Plain strings without dictionary
- Zero-copy conversion from SpanBuffer to Arrow
- Optimized for ClickHouse/Parquet analytics
+Enum columns: Dictionary with compile-time values Category columns: Dictionary with runtime-built values Text columns:
+Plain strings without dictionary Zero-copy conversion from SpanBuffer to Arrow Optimized for ClickHouse/Parquet
+analytics
 
 ## ✅ IMPLEMENTED FEATURES (Search These First!)
 
 ### Core Schema System (@packages/lmao/src/lib/schema/)
 
- ✅ `S.enum()` - Compile-time known values with Uint8Array storage
- ✅ `S.category()` - Runtime string interning for repeated values
- ✅ `S.text()` - Raw strings for unique values
- ✅ `S.number()` - Float64Array storage
- ✅ `S.boolean()` - Uint8Array (0/1) storage
- ✅ `defineLogSchema()` - Schema definition with validation
- ✅ `defineFeatureFlags()` - Feature flag schema with sync/async evaluation
- ✅ Schema extension with `.extend()` method
- ✅ Masking transforms (hash, url, sql, email)
+✅ `S.enum()` - Compile-time known values with Uint8Array storage ✅ `S.category()` - Runtime string interning for
+repeated values ✅ `S.text()` - Raw strings for unique values ✅ `S.number()` - Float64Array storage ✅ `S.boolean()` -
+Uint8Array (0/1) storage ✅ `defineLogSchema()` - Schema definition with validation ✅ `defineFeatureFlags()` - Feature
+flag schema with sync/async evaluation ✅ Schema extension with `.extend()` method ✅ Masking transforms (hash, url,
+sql, email)
 
 ### Buffer System (@packages/arrow-builder/src/lib/buffer/)
 
- ✅ `createSpanBuffer()` - Cache-aligned TypedArray buffer creation
- ✅ `createChildSpanBuffer()` - Child span buffer with tree structure
- ✅ `createNextBuffer()` - Buffer chaining for overflow
- ✅ `createAttributeColumns()` - Schema-based column creation
- ✅ Null bitmap management (Arrow format)
- ✅ `convertToArrowTable()` - Zero-copy Arrow conversion
- ✅ `convertSpanTreeToArrowTable()` - Recursive tree conversion
+✅ `createSpanBuffer()` - Cache-aligned TypedArray buffer creation ✅ `createChildSpanBuffer()` - Child span buffer with
+tree structure ✅ `createNextBuffer()` - Buffer chaining for overflow ✅ `createAttributeColumns()` - Schema-based
+column creation ✅ Null bitmap management (Arrow format) ✅ `convertToArrowTable()` - Zero-copy Arrow conversion ✅
+`convertSpanTreeToArrowTable()` - Recursive tree conversion
 
 ### Code Generation (@packages/lmao/src/lib/codegen/)
 
- ✅ `generateSpanLoggerClass()` - Runtime class code generation
- ✅ `createSpanLoggerClass()` - Compile and cache SpanLogger classes
- ✅ Compile-time enum mapping via switch-case (V8 JIT-inlined)
- ✅ Prototype methods for zero-overhead tag writing
- ✅ Distinct entry types (info/debug/warn/error)
+✅ `generateSpanLoggerClass()` - Runtime class code generation ✅ `createSpanLoggerClass()` - Compile and cache
+SpanLogger classes ✅ Compile-time enum mapping via switch-case (V8 JIT-inlined) ✅ Prototype methods for zero-overhead
+tag writing ✅ Distinct entry types (info/debug/warn/error)
 
 ### Context & Integration (@packages/lmao/src/lib/)
 
- ✅ `createTraceContext()` - Root trace context with ff/env
- ✅ `createModuleContext()` - Module-level context with op wrapper
- ✅ `ctx.ok()` / `ctx.err()` - Fluent result API
- ✅ `ctx.span()` - Child span creation (polymorphic dispatcher)
- ✅ `ctx.span_op()` / `ctx.span_fn()` - Monomorphic span methods (for transformer)
- ✅ `ctx.tag` - Chainable tag API for span attributes
- ✅ `ctx.setScope()` - Set scope values (merge semantics, null to clear)
- ✅ `ctx.scope` - Read-only view of current scope
- ✅ Feature flag evaluation with analytics tracking
- ✅ `callsiteModule` on SpanBuffer for dual module attribution (row 0 vs rows 1+)
+✅ `createTraceContext()` - Root trace context with ff/env ✅ `createModuleContext()` - Module-level context with op
+wrapper ✅ `ctx.ok()` / `ctx.err()` - Fluent result API ✅ `ctx.span()` - Child span creation (polymorphic dispatcher)
+✅ `ctx.span_op()` / `ctx.span_fn()` - Monomorphic span methods (for transformer) ✅ `ctx.tag` - Chainable tag API for
+span attributes ✅ `ctx.setScope()` - Set scope values (merge semantics, null to clear) ✅ `ctx.scope` - Read-only view
+of current scope ✅ Feature flag evaluation with analytics tracking ✅ `callsiteModule` on SpanBuffer for dual module
+attribution (row 0 vs rows 1+)
 
 ### Library Integration (@packages/lmao/src/lib/library.ts)
 
- ✅ `prefixSchema()` - Add prefix to all schema fields
- ✅ `generateRemappedBufferViewClass()` - Generate view for Arrow conversion
- ✅ `generateRemappedSpanLoggerClass()` - Generate SpanLogger with prefix mapping
- ✅ `defineModule().ctx<Extra>(defaults).make()` - Fluent module definition API
+✅ `prefixSchema()` - Add prefix to all schema fields ✅ `generateRemappedBufferViewClass()` - Generate view for Arrow
+conversion ✅ `generateRemappedSpanLoggerClass()` - Generate SpanLogger with prefix mapping ✅
+`defineModule().ctx<Extra>(defaults).make()` - Fluent module definition API
 
 ### Background Processing (@packages/lmao/src/lib/flushScheduler.ts)
 
- ✅ `FlushScheduler` - Adaptive background flushing
- ✅ Capacity-based flushing (80% threshold)
- ✅ Time-based flushing (10s max, 1s min intervals)
- ✅ Idle detection (5s timeout)
- ✅ Memory pressure detection (Node.js only)
- ✅ Manual flush with `flush()` method
+✅ `FlushScheduler` - Adaptive background flushing ✅ Capacity-based flushing (80% threshold) ✅ Time-based flushing
+(10s max, 1s min intervals) ✅ Idle detection (5s timeout) ✅ Memory pressure detection (Node.js only) ✅ Manual flush
+with `flush()` method
 
 ### String Storage
 
- ✅ `Utf8Cache` (SIEVE-based) - Bounded UTF-8 encoding cache for Arrow conversion (cold path only)
+✅ `Utf8Cache` (SIEVE-based) - Bounded UTF-8 encoding cache for Arrow conversion (cold path only)
 
 **Note**: CATEGORY and TEXT columns store raw `string[]` on hot path. Dictionary building and UTF-8 encoding happen
 during Arrow conversion (cold path). There is NO hot-path interning.
@@ -977,12 +892,12 @@ Module IDs and span names are accessed directly from `buf.module.package_name`, 
 
 When implementing performance-critical code, refer to these V8 optimization resources:
 
- **Primary Spec**: [V8 Optimization Patterns](specs/lmao/01_trace_logging_system.md#v8-optimization-patterns) -
-  Complete guide to V8 optimization patterns used in LMAO
- **External References**:
-  - [V8 Fast Properties Blog](https://v8.dev/blog/fast-properties) - Hidden class internals and property access
-    optimization
-  - [Web.dev V8 Performance Tips](https://web.dev/articles/speed-v8) - Best practices for V8 optimization
-  - [V8 Hidden Classes and Inline Caching](https://richardartoul.github.io/jekyll/update/2015/04/26/hidden-classes.html) -
-    Detailed explanation of hidden classes
- **Key Principle**: Objects with same properties in same order share hidden classes = optimized property access
+**Primary Spec**: [V8 Optimization Patterns](specs/lmao/01_trace_logging_system.md#v8-optimization-patterns) - Complete
+guide to V8 optimization patterns used in LMAO **External References**:
+
+- [V8 Fast Properties Blog](https://v8.dev/blog/fast-properties) - Hidden class internals and property access
+  optimization
+- [Web.dev V8 Performance Tips](https://web.dev/articles/speed-v8) - Best practices for V8 optimization
+- [V8 Hidden Classes and Inline Caching](https://richardartoul.github.io/jekyll/update/2015/04/26/hidden-classes.html) -
+  Detailed explanation of hidden classes **Key Principle**: Objects with same properties in same order share hidden
+  classes = optimized property access

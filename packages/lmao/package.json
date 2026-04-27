@@ -9,93 +9,93 @@
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "development": "./src/index.ts",
       "types": "./dist/index.d.ts",
+      "development": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./node": {
-      "development": "./src/node.ts",
       "types": "./dist/node.d.ts",
+      "development": "./src/node.ts",
       "import": "./dist/node.js",
       "default": "./dist/node.js"
     },
     "./es": {
-      "development": "./src/es.ts",
       "types": "./dist/es.d.ts",
+      "development": "./src/es.ts",
       "import": "./dist/es.js",
       "default": "./dist/es.js"
     },
     "./tracers": {
-      "development": "./src/lib/tracers/index.ts",
       "types": "./dist/lib/tracers/index.d.ts",
+      "development": "./src/lib/tracers/index.ts",
       "import": "./dist/lib/tracers/index.js",
       "default": "./dist/lib/tracers/index.js"
     },
     "./errors": {
-      "development": "./src/lib/errors/index.ts",
       "types": "./dist/lib/errors/index.d.ts",
+      "development": "./src/lib/errors/index.ts",
       "import": "./dist/lib/errors/index.js",
       "default": "./dist/lib/errors/index.js"
     },
     "./errors/Blocked": {
-      "development": "./src/lib/errors/Blocked.ts",
       "types": "./dist/lib/errors/Blocked.d.ts",
+      "development": "./src/lib/errors/Blocked.ts",
       "import": "./dist/lib/errors/Blocked.js",
       "default": "./dist/lib/errors/Blocked.js"
     },
     "./errors/RetriesExhausted": {
-      "development": "./src/lib/errors/RetriesExhausted.ts",
       "types": "./dist/lib/errors/RetriesExhausted.d.ts",
+      "development": "./src/lib/errors/RetriesExhausted.ts",
       "import": "./dist/lib/errors/RetriesExhausted.js",
       "default": "./dist/lib/errors/RetriesExhausted.js"
     },
     "./errors/CodeError": {
-      "development": "./src/lib/errors/CodeError.ts",
       "types": "./dist/lib/errors/CodeError.d.ts",
+      "development": "./src/lib/errors/CodeError.ts",
       "import": "./dist/lib/errors/CodeError.js",
       "default": "./dist/lib/errors/CodeError.js"
     },
     "./errors/retry-policy": {
-      "development": "./src/lib/errors/retry-policy.ts",
       "types": "./dist/lib/errors/retry-policy.d.ts",
+      "development": "./src/lib/errors/retry-policy.ts",
       "import": "./dist/lib/errors/retry-policy.js",
       "default": "./dist/lib/errors/retry-policy.js"
     },
     "./errors/Transient": {
-      "development": "./src/lib/errors/Transient.ts",
       "types": "./dist/lib/errors/Transient.d.ts",
+      "development": "./src/lib/errors/Transient.ts",
       "import": "./dist/lib/errors/Transient.js",
       "default": "./dist/lib/errors/Transient.js"
     },
     "./sqlite": {
-      "development": "./src/lib/sqlite/index.ts",
       "types": "./dist/lib/sqlite/index.d.ts",
+      "development": "./src/lib/sqlite/index.ts",
       "import": "./dist/lib/sqlite/index.js",
       "default": "./dist/lib/sqlite/index.js"
     },
     "./sqlite/node": {
-      "development": "./src/lib/sqlite/sqlite-node.ts",
       "types": "./dist/lib/sqlite/sqlite-node.d.ts",
+      "development": "./src/lib/sqlite/sqlite-node.ts",
       "import": "./dist/lib/sqlite/sqlite-node.js",
       "default": "./dist/lib/sqlite/sqlite-node.js"
     },
     "./testing": {
-      "development": "./src/testing.ts",
       "types": "./dist/testing.d.ts",
+      "development": "./src/testing.ts",
       "import": "./dist/testing.js",
       "default": "./dist/testing.js"
     },
     "./testing/bun": {
+      "types": "./dist/lib/testing/bun-harness.d.ts",
       "bun": "./src/lib/testing/bun-harness.ts",
       "development": "./src/lib/testing/bun-harness.ts",
-      "types": "./dist/lib/testing/bun-harness.d.ts",
       "import": "./dist/lib/testing/bun-harness.js",
       "default": "./dist/lib/testing/bun-harness.js"
     },
     "./testing/vitest": {
-      "development": "./src/lib/testing/vitest-harness.ts",
       "types": "./dist/lib/testing/vitest-harness.d.ts",
+      "development": "./src/lib/testing/vitest-harness.ts",
       "import": "./dist/lib/testing/vitest-harness.js",
       "default": "./dist/lib/testing/vitest-harness.js"
     },
@@ -112,6 +112,7 @@
   },
   "files": [
     "dist",
+    "src",
     "!**/*.tsbuildinfo"
   ],
   "dependencies": {
@@ -120,7 +121,7 @@
     "@smoothbricks/arrow-builder": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@uwdata/flechette": "^2.3.0",
-    "tslib": "^2.3.0"
+    "tslib": "^2.8.1"
   },
   "scripts": {
     "bench": "bun run benchmarks/*.bench.ts",
@@ -179,5 +180,14 @@
     "vitest": {
       "optional": true
     }
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/lmao"
   }
 }

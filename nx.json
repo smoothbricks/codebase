@@ -95,10 +95,7 @@
         "{workspaceRoot}/tooling/checks/**/*"
       ],
       "options": {
-        "commands": [
-          "biome check --files-ignore-unknown=true {projectRoot}",
-          "eslint {projectRoot}/src"
-        ],
+        "commands": ["biome check --files-ignore-unknown=true {projectRoot}", "eslint {projectRoot}/src"],
         "cwd": "{workspaceRoot}",
         "parallel": false
       }
@@ -130,6 +127,7 @@
   "release": {
     "projectsRelationship": "independent",
     "version": {
+      "specifierSource": "conventional-commits",
       "preVersionCommand": "nx run-many -t build"
     }
   }

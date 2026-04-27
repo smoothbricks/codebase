@@ -1,0 +1,112 @@
+name: Publish
+
+on:
+  workflow_dispatch:
+    inputs:
+      bump:
+        type: choice
+        description:
+          Use auto for conventional commits, or force a semver bump. Prerelease publishes to next; all others publish to
+          latest.
+        options: [auto, patch, minor, major, prerelease]
+        default: auto
+      dry_run:
+        type: boolean
+        description: Run release commands without writing versions, tags, publishes, or GitHub Releases.
+        default: false
+
+permissions:
+  contents: write
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+defaults:
+  run:
+    working-directory: tooling/direnv
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    env:
+      NIX_STORE_NAR: ${{ github.workspace }}/nix-store.nar
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      # --- Setup --------------------------------------------------------------
+
+      - name: 📥 Checkout
+        uses: ./.github/actions/checkout
+
+      - name: ❄️ Install Nix
+        uses: DeterminateSystems/nix-installer-action@v21
+
+      - name: 🧊 Cache Nix profiles, devenv and direnv
+        uses: ./.github/actions/cache-nix-devenv
+
+      - name: ♻️ Restore Nix store from NAR
+        run: ./github-actions-bootstrap.sh restore-store
+
+      - name: ⚡ Enable Cachix
+        uses: cachix/cachix-action@v16
+        with:
+          name: devenv
+
+      - name: 🧰 Install devenv
+        run: ./github-actions-bootstrap.sh install-devenv
+
+      - name: 📦 Cache node_modules
+        uses: ./.github/actions/cache-node-modules
+
+      - name: 🐚 Build devenv shell
+        run: ./github-actions-bootstrap.sh build-shell
+
+      - name: 🧭 Set Nx SHAs
+        uses: nrwl/nx-set-shas@v4.4.0
+
+      # --- Validation ---------------------------------------------------------
+
+      - name: ✅ Validate monorepo config
+        run: smoo monorepo validate
+
+      - name: 📦 Resolve release projects
+        id: projects
+        run: echo "projects=$(smoo monorepo list-public-projects)" >> "$GITHUB_OUTPUT"
+
+      - name: 🔍 Lint
+        run: smoo github-ci nx-run-many --targets lint --projects "${{ steps.projects.outputs.projects }}"
+
+      - name: 🧪 Unit Tests
+        run: smoo github-ci nx-run-many --targets test --projects "${{ steps.projects.outputs.projects }}"
+
+      - name: 🔨 Build
+        run: smoo github-ci nx-run-many --targets build --projects "${{ steps.projects.outputs.projects }}"
+
+      # --- Release ------------------------------------------------------------
+
+      - name: 🤖 Configure release author
+        run:
+          git config user.name "github-actions[bot]" && git config user.email
+          "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: 🏷️ Version packages
+        run: smoo release version --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
+
+      - name: 🔖 Collect release tags
+        id: tags
+        run: echo "tags=$(git tag --points-at HEAD | tr '\n' ' ')" >> "$GITHUB_OUTPUT"
+
+      - name: 📦 Publish packages
+        run: smoo release publish --bump "${{ inputs.bump }}" --dry-run "${{ inputs.dry_run }}"
+
+      - name: 🚀 Create or update GitHub Releases
+        if: ${{ inputs.dry_run != true }}
+        run:
+          smoo release github-release --tags "${{ steps.tags.outputs.tags }}" --bump "${{ inputs.bump }}" --dry-run "${{
+          inputs.dry_run }}"
+
+      # --- Cleanup ------------------------------------------------------------
+
+      - name: 🧹 Cleanup and cache Nix store
+        run: smoo github-ci cleanup-cache

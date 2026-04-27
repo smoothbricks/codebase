@@ -26,11 +26,23 @@
   },
   "devDependencies": {
     "@smoothbricks/validation": "workspace:*",
-    "typescript": "^5.8.3"
+    "typescript": "^5.9.3"
   },
   "nx": {
     "targets": {
       "lint": {}
-    }
+    },
+    "tags": [
+      "npm:public"
+    ]
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/opencode-entangled"
   }
 }

@@ -4,7 +4,8 @@
   "author": "SmoothBricks Contributors",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/smoothbricks/statebus.git"
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/statebus-react"
   },
   "type": "module",
   "main": "./dist/index.js",
@@ -15,14 +16,15 @@
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "development": "./src/index.ts",
       "types": "./dist/index.d.ts",
+      "development": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     }
   },
   "files": [
     "dist",
+    "src",
     "!**/*.tsbuildinfo"
   ],
   "homepage": "https://smoothbricks.dev/statebus",
@@ -55,6 +57,12 @@
     "targets": {
       "lint": {},
       "lint:fix": {}
-    }
+    },
+    "tags": [
+      "npm:public"
+    ]
+  },
+  "publishConfig": {
+    "access": "public"
   }
 }

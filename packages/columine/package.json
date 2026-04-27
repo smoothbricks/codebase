@@ -9,8 +9,8 @@
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "import": "./dist/index.js",
       "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./wasm": "./dist/columine.wasm"
@@ -51,10 +51,22 @@
           "^typecheck"
         ]
       }
-    }
+    },
+    "tags": [
+      "npm:public"
+    ]
   },
   "devDependencies": {
     "@smoothbricks/validation": "workspace:*",
-    "typescript": "^5.3.0"
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/columine"
   }
 }

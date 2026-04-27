@@ -1,0 +1,21 @@
+name: Cache Nix profiles, devenv and direnv
+description: Restore cached Nix/devenv state for SmoothBricks GitHub Actions jobs.
+
+runs:
+  using: composite
+  steps:
+    - name: Cache Nix profiles, devenv and direnv
+      uses: actions/cache@v5
+      with:
+        path: |
+          ${{ env.NIX_STORE_NAR }}
+          ~/.nix-profile
+          ~/.local/state/nix/profiles
+          ~/.cache/nix
+          ${{ github.workspace }}/tooling/direnv/.devenv
+          ${{ github.workspace }}/tooling/direnv/.direnv
+        key:
+          ${{ runner.os }}-nar-${{ hashFiles('tooling/direnv/devenv.yaml', 'tooling/direnv/devenv.nix',
+          'tooling/direnv/devenv.lock') }}
+        restore-keys: |
+          ${{ runner.os }}-nar-

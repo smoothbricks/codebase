@@ -9,31 +9,32 @@
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "development": "./src/index.ts",
       "types": "./dist/index.d.ts",
+      "development": "./src/index.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
     },
     "./arrow": {
-      "development": "./src/lib/arrow/index.ts",
       "types": "./dist/lib/arrow/index.d.ts",
+      "development": "./src/lib/arrow/index.ts",
       "import": "./dist/lib/arrow/index.js",
       "default": "./dist/lib/arrow/index.js"
     },
     "./schema": {
-      "development": "./src/lib/schema/index.ts",
       "types": "./dist/lib/schema/index.d.ts",
+      "development": "./src/lib/schema/index.ts",
       "import": "./dist/lib/schema/index.js",
       "default": "./dist/lib/schema/index.js"
     }
   },
   "files": [
     "dist",
+    "src",
     "!**/*.tsbuildinfo"
   ],
   "dependencies": {
-    "tslib": "^2.3.0",
-    "@uwdata/flechette": "^2.3.0"
+    "@uwdata/flechette": "^2.3.0",
+    "tslib": "^2.8.1"
   },
   "nx": {
     "sourceRoot": "packages/arrow-builder/src",
@@ -61,5 +62,14 @@
     "tags": [
       "npm:public"
     ]
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/arrow-builder"
   }
 }

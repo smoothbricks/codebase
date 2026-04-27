@@ -9,8 +9,8 @@
   "exports": {
     "./package.json": "./package.json",
     ".": {
-      "development": "./src/index.ts",
       "types": "./src/index.ts",
+      "development": "./src/index.ts",
       "import": "./src/index.ts",
       "default": "./src/index.ts"
     }
@@ -25,9 +25,9 @@
     "@uwdata/flechette": "^2.3.0"
   },
   "peerDependencies": {
-    "tamagui": ">=2.0.0-rc.0",
     "react": ">=18.0.0",
-    "react-native": ">=0.73.0"
+    "react-native": ">=0.73.0",
+    "tamagui": ">=2.0.0-rc.0"
   },
   "scripts": {
     "test": "bun test --pass-with-no-tests"
@@ -44,5 +44,14 @@
     "tags": [
       "npm:public"
     ]
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/lmao-inspector"
   }
 }

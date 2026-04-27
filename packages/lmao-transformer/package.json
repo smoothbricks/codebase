@@ -23,7 +23,7 @@
     "@smoothbricks/lmao": "workspace:*",
     "@smoothbricks/validation": "workspace:*",
     "@uwdata/flechette": "^2.3.0",
-    "typescript": "^5.0.0"
+    "typescript": "^5.9.3"
   },
   "nx": {
     "sourceRoot": "packages/lmao-transformer/src",
@@ -41,5 +41,14 @@
     "tags": [
       "npm:public"
     ]
+  },
+  "license": "MIT",
+  "publishConfig": {
+    "access": "public"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/smoothbricks/codebase.git",
+    "directory": "packages/lmao-transformer"
   }
 }

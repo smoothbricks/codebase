@@ -23,7 +23,7 @@
   ],
   "dependencies": {
     "nx": "22.5.4",
-    "tslib": "^2.3.0"
+    "tslib": "^2.8.1"
   },
   "devDependencies": {
     "@smoothbricks/lmao": "workspace:*"

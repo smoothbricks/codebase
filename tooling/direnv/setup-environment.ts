@@ -1,5 +1,5 @@
 #!/usr/bin/env bun
-import { $, file } from 'bun';
+import { $ } from 'bun';
 import { existsSync } from 'fs';
 import path from 'path';
 
@@ -29,29 +29,7 @@ try {
   await $`chmod +x ${projectRoot}/node_modules/@biomejs/biome/bin/biome`;
 
   if (!process.env.CI) {
-    // Update package.json with current versions from devenv
-    const nodeVersion = (await $`node --version`.text()).trim().replace('v', '');
-    const bunVersion = (await $`bun --version`.text()).trim();
-
-    const packageJson = await file('package.json').json();
-
-    const expectedNodeEngine = `>=${nodeVersion.split('.')[0]}.0.0`;
-    const expectedPkgManager = `bun@${bunVersion}`;
-    const expectedTypesNode = `~${nodeVersion.split('.')[0]}.0.0`;
-
-    if (
-      packageJson.engines?.node !== expectedNodeEngine ||
-      packageJson.packageManager !== expectedPkgManager ||
-      packageJson.devDependencies?.['@types/node'] !== expectedTypesNode
-    ) {
-      packageJson.engines ||= {};
-      packageJson.engines.node = expectedNodeEngine;
-      packageJson.packageManager = expectedPkgManager;
-      packageJson.devDependencies ||= {};
-      packageJson.devDependencies['@types/node'] = expectedTypesNode;
-
-      await $`echo ${JSON.stringify(packageJson)} | biome format --stdin-file-path=package.json > package.json`;
-    }
+    await $`smoo monorepo init --runtime-only`;
   }
 
   // Apply workspace git configuration

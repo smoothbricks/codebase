@@ -1,0 +1,1 @@
+../../packages/cli/managed/raw/tooling/git-hooks/commit-msg.sh

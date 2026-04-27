@@ -8,6 +8,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 of `npm run`. Dev tools like `nx`, `biome`, etc. are available directly on PATH (via node_modules/.bin) so use them
 directly without `bunx`.
 
+**Use conventional commits:** Release versioning is derived from commit history. Use subjects like
+`feat(statebus-core): add optimistic transactions`, `fix(money): round negative amounts`, or
+`feat!: remove deprecated API`.
+
+**Use `npm:public` for publishability:** Every publishable package must have `nx.tags` containing `npm:public`.
+Private/internal packages must not have that tag. Release tooling discovers packages from `npm:public`, never hardcoded
+package lists.
+
+**Use `smoo` for shared monorepo tooling:** `@smoothbricks/cli` provides the `smoo` command and owns generated CI,
+release, and Git hook files. Update generated copies with `smoo monorepo update`; check drift with
+`smoo monorepo check`.
+
 **Error handling policy:** Known operational failures must return `Err`/`Result`; reserve `throw` for invariants or
 impossible programmer/configuration bugs. For full policy and examples, follow `AGENTS.md`.
 
@@ -16,10 +28,9 @@ sink (local `.trace-results.db` or worker D1 binding like `TRACE_RESULTS`). Keep
 move runner-specific behavior into shared harness modules (`@smoothbricks/lmao/testing/bun`,
 `@smoothbricks/lmao/testing/vitest`) plus package-local typed tracer modules.
 
-**Tracing policy — No default `NoOpTracer`:** `NoOpTracer` may exist in `@smoothbricks/lmao` for
-API proof, comparison, and overhead benchmarking, but it is not the normal repo pattern.
-Require tracing context from callers, use child spans, and use observable suite/test tracers
-in tests.
+**Tracing policy — No default `NoOpTracer`:** `NoOpTracer` may exist in `@smoothbricks/lmao` for API proof, comparison,
+and overhead benchmarking, but it is not the normal repo pattern. Require tracing context from callers, use child spans,
+and use observable suite/test tracers in tests.
 
 If code creates a throwaway tracer to satisfy a `spanContext` parameter, the API is wrong — fix it by:
 
@@ -107,8 +118,7 @@ carries only what the **receiver** needs to act. For the full rules with code ex
 - **Do not hand-write validators Typia already provides.** New helpers like `isRecord`, `normalizeX`, `parseJsonX`,
   `expectJsonX`, `toRecord`, `coerceX`, `isHttpRequest`, or similar are wrong by default.
   - WHY: they manually duplicate the contract instead of using the contract itself.
-- **Use real contract types.** Prefer inferred/public types over manually restating
-    `Record<string, unknown>` surfaces.
+- **Use real contract types.** Prefer inferred/public types over manually restating `Record<string, unknown>` surfaces.
 - **Preserve WHY comments.** If you refactor a block with a WHY comment, keep or improve that rationale. Replacing it
   with weaker glue or deleting it without preserving intent is a regression.
 
@@ -228,8 +238,8 @@ Tests use Bun's built-in test runner:
 import { describe, expect, it } from 'bun:test';
 ```
 
-**Property-based testing (preferred):** For state machines, rollback/undo semantics, fork graphs, and any \"works for N\"
-invariant, default to `fast-check` properties over generated traces rather than only hand-picked examples.
+**Property-based testing (preferred):** For state machines, rollback/undo semantics, fork graphs, and any \"works for
+N\" invariant, default to `fast-check` properties over generated traces rather than only hand-picked examples.
 
 - Prefer property tests for deep fork-of-fork interleavings and reset/rollback correctness.
 - Keep at least one focused example test for readability, then scale coverage with properties.

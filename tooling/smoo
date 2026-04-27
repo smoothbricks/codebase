@@ -1,0 +1,6 @@
+#!/usr/bin/env bun
+// SmoothBricks self-hosts smoo before @smoothbricks/cli/dist exists.
+// Published installs use packages/cli/bin/smoo, which imports built JS.
+import { runCli } from '../packages/cli/src/cli.ts';
+
+await runCli();
