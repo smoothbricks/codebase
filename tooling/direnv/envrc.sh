@@ -18,6 +18,7 @@ use devenv
 # Watch JS tooling changes
 watch_file bun.lock
 watch_file package.json
+watch_file setup-environment.ts
 
 unset \
   CONFIG_SHELL HOST_PATH IN_NIX_SHELL MACOSX_DEPLOYMENT_TARGET NIX_BUILD_CORES NIX_CFLAGS_COMPILE \

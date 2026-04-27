@@ -1,1 +1,0 @@
-../../packages/cli/managed/raw/tooling/direnv/apply-workspace-git-config.sh

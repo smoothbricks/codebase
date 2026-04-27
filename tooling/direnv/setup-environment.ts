@@ -1,6 +1,5 @@
 #!/usr/bin/env bun
 import { $ } from 'bun';
-import { existsSync } from 'fs';
 import path from 'path';
 
 const devenvRoot = process.env.DEVENV_ROOT;
@@ -29,14 +28,12 @@ try {
   await $`chmod +x ${projectRoot}/node_modules/@biomejs/biome/bin/biome`;
 
   if (!process.env.CI) {
-    await $`smoo monorepo init --runtime-only`;
+    const { syncRootRuntimeVersions } = await import('@smoothbricks/cli/monorepo/runtime');
+    await syncRootRuntimeVersions(projectRoot);
   }
 
-  // Apply workspace git configuration
-  const gitConfigScript = `${devenvRoot}/apply-workspace-git-config.sh`;
-  if (existsSync(gitConfigScript)) {
-    await $`${gitConfigScript}`;
-  }
+  const { applyWorkspaceGitConfig } = await import('@smoothbricks/cli/monorepo/git-config');
+  await applyWorkspaceGitConfig(projectRoot);
 } catch (error) {
   console.error(`--- ERROR: setup-environment.ts failed: ${error}`);
   if (error.stderr) {
