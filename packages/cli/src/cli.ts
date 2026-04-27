@@ -31,10 +31,13 @@ function buildProgram(): Command {
       const { initMonorepo } = await import('./monorepo/index.js');
       await initMonorepo(await findRepoRoot(), options);
     });
-  monorepo.command('validate').action(async () => {
-    const { validateMonorepo } = await import('./monorepo/index.js');
-    await validateMonorepo(await findRepoRoot());
-  });
+  monorepo
+    .command('validate')
+    .option('--fail-fast', 'stop after the first failing validation pack')
+    .action(async (options: { failFast?: boolean }) => {
+      const { validateMonorepo } = await import('./monorepo/index.js');
+      await validateMonorepo(await findRepoRoot(), options);
+    });
   monorepo.command('update').action(async () => {
     const { updateManagedFiles } = await import('./monorepo/index.js');
     updateManagedFiles(await findRepoRoot());
